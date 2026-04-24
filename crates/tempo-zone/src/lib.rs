@@ -28,7 +28,7 @@ mod tx_context;
 pub mod withdrawals;
 pub mod zonemonitor;
 
-pub use batch::{BatchData, BatchSubmitter};
+pub use batch::{BatchAnchorConfig, BatchData, BatchSubmitter};
 pub use engine::ZoneEngine;
 pub use l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1BlockDeposits, L1Deposit,

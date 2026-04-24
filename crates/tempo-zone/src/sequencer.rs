@@ -9,8 +9,8 @@ use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
 use tokio::sync::Notify;
 
 use crate::{
-    SharedWithdrawalStore, WithdrawalProcessorConfig, ZoneMonitorConfig, spawn_zone_monitor,
-    withdrawals,
+    BatchAnchorConfig, SharedWithdrawalStore, WithdrawalProcessorConfig, ZoneMonitorConfig,
+    spawn_zone_monitor, withdrawals,
 };
 
 /// Configuration for all zone sequencer background tasks.
@@ -36,6 +36,8 @@ pub struct ZoneSequencerConfig {
     pub zone_poll_interval: Duration,
     /// Maximum time to accumulate zone blocks before submitting a batch to L1.
     pub batch_interval: Duration,
+    /// EIP-2935 history and safety-margin limits used by the batch submitter.
+    pub batch_anchor_config: BatchAnchorConfig,
 }
 
 /// Handles returned by [`spawn_zone_sequencer`] for managing background tasks.
@@ -93,6 +95,7 @@ pub async fn spawn_zone_sequencer(
         poll_interval: config.zone_poll_interval,
         batch_interval: config.batch_interval,
         portal_address: config.portal_address,
+        batch_anchor_config: config.batch_anchor_config,
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(
