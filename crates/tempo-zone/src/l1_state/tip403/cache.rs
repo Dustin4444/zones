@@ -510,14 +510,39 @@ mod tests {
     }
 
     #[test]
-    fn policy_set_below_baseline_updates_directly() {
+    fn policy_set_at_or_below_baseline_is_ignored() {
         let mut set = PolicySet::default();
         set.record_status(USER_A, 10, true);
         set.advance(20);
 
-        // Set below baseline updates directly
+        // Delayed writes from finalized heights must not rewrite baseline membership.
         set.record_status(USER_A, 15, false);
-        assert!(!set.contains(USER_A, 20));
+        set.record_status(USER_A, 20, false);
+        assert!(set.contains(USER_A, 20));
+
+        // Stale writes must not mark unknown users as observed either.
+        set.record_status(USER_B, 15, false);
+        assert!(!set.is_known(&USER_B));
+
+        set.record_status(USER_A, 21, false);
+        assert!(!set.contains(USER_A, 21));
+    }
+
+    #[test]
+    fn policy_set_initial_baseline_write_is_ignored() {
+        let mut set = PolicySet::default();
+
+        set.record_status(USER_A, 0, false);
+        assert!(!set.is_known(&USER_A));
+        assert!(!set.contains(USER_A, 0));
+
+        set.record_status(USER_B, 0, true);
+        assert!(!set.is_known(&USER_B));
+        assert!(!set.contains(USER_B, 0));
+
+        set.record_status(USER_B, 1, true);
+        assert!(set.is_known(&USER_B));
+        assert!(set.contains(USER_B, 1));
     }
 
     // --- PolicyCacheInner tests: simple policies ---
@@ -529,6 +554,19 @@ mod tests {
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn token_policy_seed_after_genesis_is_cached() {
+        let mut cache = PolicyCacheInner::default();
+
+        cache.set_token_policy(TOKEN, 1, 1);
+
+        assert_eq!(cache.get_token_policy(TOKEN, 1), Some(1));
+        assert_eq!(
+            cache.is_authorized(TOKEN, USER_A, 1, AuthRole::Transfer),
+            Some(true)
         );
     }
 
@@ -797,6 +835,72 @@ mod tests {
             cache.is_authorized(TOKEN, USER_A, 25, AuthRole::Transfer),
             Some(true)
         ); // unblacklisted at 20
+    }
+
+    #[test]
+    fn stale_membership_write_after_advance_cannot_poison_blacklist() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_token_policy(TOKEN, 10, 3);
+        cache.set_policy_type(3, PolicyType::BLACKLIST);
+        cache.set_policy_status(3, USER_A, 10, false);
+        cache.advance(10);
+
+        assert_eq!(
+            cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
+            Some(true)
+        );
+
+        cache.set_policy_status(3, USER_A, 12, true);
+        cache.advance(12);
+
+        assert_eq!(
+            cache.is_authorized(TOKEN, USER_A, 12, AuthRole::Transfer),
+            Some(false)
+        );
+
+        // Simulates an RPC fallback result captured before the block-12 blacklist event
+        // and returning after the engine advanced the cache baseline.
+        cache.set_policy_status(3, USER_A, 10, false);
+        cache.set_policy_status(3, USER_A, 12, false);
+
+        assert_eq!(
+            cache.is_authorized(TOKEN, USER_A, 13, AuthRole::Transfer),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn stale_membership_write_after_advance_does_not_mark_unknown_observed() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_token_policy(TOKEN, 10, 3);
+        cache.set_policy_type(3, PolicyType::BLACKLIST);
+        cache.advance(10);
+
+        cache.set_policy_status(3, USER_B, 10, false);
+
+        assert_eq!(
+            cache.is_authorized(TOKEN, USER_B, 10, AuthRole::Transfer),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_token_policy_write_after_advance_cannot_revert_policy() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_token_policy(TOKEN, 10, 2);
+        cache.advance(10);
+
+        cache.set_token_policy(TOKEN, 12, 3);
+        cache.advance(12);
+
+        cache.set_token_policy(TOKEN, 10, 1);
+        cache.set_token_policy(TOKEN, 12, 1);
+
+        assert_eq!(cache.get_token_policy(TOKEN, 12), Some(3));
+        assert_eq!(cache.get_token_policy(TOKEN, 13), Some(3));
+
+        cache.set_token_policy(TOKEN, 13, 1);
+        assert_eq!(cache.get_token_policy(TOKEN, 13), Some(1));
     }
 
     #[test]

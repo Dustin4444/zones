@@ -54,23 +54,23 @@ impl PolicySet {
     }
 
     /// Record a set update at the given block height.
+    ///
+    /// Updates at or below the baseline height are ignored. The baseline represents finalized
+    /// engine-consumed state and is only updated by [`advance`](Self::advance), which prevents
+    /// delayed RPC fallback results from overwriting newer event-derived membership.
     pub fn record_status(&mut self, user: Address, block_number: u64, in_set: bool) {
-        self.observed.insert(user);
         if block_number <= self.baseline_height {
-            if in_set {
-                self.baseline.insert(user);
-            } else {
-                self.baseline.remove(&user);
-            }
-        } else {
-            self.pending
-                .entry(block_number)
-                .or_default()
-                .push(PolicySetUpdate {
-                    account: user,
-                    in_set,
-                });
+            return;
         }
+
+        self.observed.insert(user);
+        self.pending
+            .entry(block_number)
+            .or_default()
+            .push(PolicySetUpdate {
+                account: user,
+                in_set,
+            });
     }
 
     /// Advance the baseline to `new_height`, folding pending deltas.

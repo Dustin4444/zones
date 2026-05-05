@@ -1069,10 +1069,7 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
         // holding a parking_lot guard across an await point.
         let l1_block = l1.provider().get_block_number().await?;
         let mut cache = policy_cache.write();
-        cache.set_token_policy(PATH_USD_ADDRESS, 0, policy_id);
         cache.set_policy_type(policy_id, PolicyType::BLACKLIST);
-        cache.set_policy_status(policy_id, blacklisted_recipient, 0, true);
-        // Also seed for current and future blocks
         cache.set_token_policy(PATH_USD_ADDRESS, l1_block, policy_id);
         cache.set_policy_status(policy_id, blacklisted_recipient, l1_block, true);
     }
@@ -1215,7 +1212,6 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
 
         let l1_block = l1.provider().get_block_number().await?;
         let mut cache = zone.policy_cache().write();
-        cache.set_token_policy(PATH_USD_ADDRESS, 0, compound_policy_id);
         cache.set_token_policy(PATH_USD_ADDRESS, l1_block, compound_policy_id);
         cache.set_policy_type(compound_policy_id, PolicyType::COMPOUND);
         cache.set_compound(
@@ -1227,7 +1223,6 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
             },
         );
         cache.set_policy_type(sender_policy_id, PolicyType::BLACKLIST);
-        cache.set_policy_status(sender_policy_id, alice, 0, true);
         cache.set_policy_status(sender_policy_id, alice, l1_block, true);
     }
 

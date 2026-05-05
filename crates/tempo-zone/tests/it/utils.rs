@@ -129,9 +129,14 @@ const DUMMY_L1_URL: &str = "http://127.0.0.1:1";
 /// (allow all), and local tests rely on that behavior for outbox `transferFrom`
 /// flows.
 fn seed_local_policy_cache(policy_cache: &zone::PolicyCache) {
-    policy_cache
-        .write()
-        .set_token_policy(PATH_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+    const LOCAL_POLICY_CACHE_SEED_BLOCK: u64 = 1;
+
+    policy_cache.set_last_l1_block(LOCAL_POLICY_CACHE_SEED_BLOCK);
+    policy_cache.write().set_token_policy(
+        PATH_USD_ADDRESS,
+        LOCAL_POLICY_CACHE_SEED_BLOCK,
+        ALLOW_ALL_POLICY_ID,
+    );
 }
 
 /// Compute the TIP-20 token address for a given sender and salt.
@@ -2263,10 +2268,7 @@ pub(crate) async fn start_local_zone_with_fixture(
 
     // Local tests have no real L1, so the RPC fallback in resolve_transfer_policy_id
     // fails. Seed pathUSD with the default allow-all policy (mirrors L1 default).
-    use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
-    zone.policy_cache()
-        .write()
-        .set_token_policy(PATH_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
+    seed_local_policy_cache(zone.policy_cache());
 
     fixture.seed_l1_cache(
         zone.l1_state_cache(),

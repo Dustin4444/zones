@@ -110,7 +110,6 @@ where
             mut cached_reads,
             config,
             cancel,
-            best_payload: _,
             ..
         } = args;
         let PayloadConfig {
