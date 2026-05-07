@@ -53,7 +53,7 @@ pub struct L1SubscriberConfig {
     /// Shared TIP-403 policy cache. The subscriber applies policy events
     /// extracted from L1 receipts directly into this cache before enqueuing
     /// blocks.
-    pub policy_cache: crate::l1_state::tip403::SharedPolicyCache,
+    pub policy_cache: crate::l1_state::tip403::PolicyCache,
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
     /// confirmed block and clears it on reorgs.
     pub l1_state_cache: crate::l1_state::cache::SharedL1StateCache,
@@ -1823,7 +1823,7 @@ mod tests {
                 l1_rpc_url: "http://127.0.0.1:8545".to_owned(),
                 portal_address,
                 genesis_tempo_block_number,
-                policy_cache: crate::SharedPolicyCache::default(),
+                policy_cache: crate::PolicyCache::default(),
                 l1_state_cache: crate::SharedL1StateCache::new(HashSet::from([portal_address])),
                 l1_fetch_concurrency: 1,
                 retry_connection_interval: Duration::from_secs(1),

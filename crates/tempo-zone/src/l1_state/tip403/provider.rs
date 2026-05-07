@@ -1,6 +1,6 @@
 //! Cache-first, RPC-fallback provider for TIP-403 policy authorization.
 //!
-//! [`PolicyProvider`] wraps a [`SharedPolicyCache`] and an L1 HTTP provider. Authorization
+//! [`PolicyProvider`] wraps a [`PolicyCache`] and an L1 HTTP provider. Authorization
 //! checks are served from the in-memory cache when possible. On cache miss the provider
 //! falls back to `isAuthorized(policyId, user)` via the L1 RPC and writes the result back
 //! into the cache so subsequent lookups are instant.
@@ -22,11 +22,11 @@ use zone_precompiles::policy::PolicyCheck;
 
 use super::builtin_authorization;
 
-use super::{AuthRole, CompoundData, SharedPolicyCache, metrics::Tip403Metrics};
+use super::{AuthRole, CompoundData, PolicyCache, metrics::Tip403Metrics};
 
 /// Cache-first, RPC-fallback provider for TIP-403 policy authorization.
 ///
-/// Wraps a [`SharedPolicyCache`] (populated by the [`L1Subscriber`](crate::l1::L1Subscriber))
+/// Wraps a [`PolicyCache`] (populated by the [`L1Subscriber`](crate::l1::L1Subscriber))
 /// and an L1 HTTP provider. When the cache cannot resolve an authorization query (e.g. the
 /// policy existed before the subscriber started), the provider falls back to L1 RPC calls and
 /// caches the result for future lookups.
@@ -39,7 +39,7 @@ use super::{AuthRole, CompoundData, SharedPolicyCache, metrics::Tip403Metrics};
 #[derive(Debug, Clone)]
 pub struct PolicyProvider {
     /// Shared in-memory policy cache, populated by the subscriber and RPC fallback.
-    cache: SharedPolicyCache,
+    cache: PolicyCache,
     /// L1 HTTP provider for RPC fallback on cache miss.
     provider: DynProvider<TempoNetwork>,
     /// Tokio runtime handle for `block_in_place` + `block_on` in sync call sites.
@@ -51,7 +51,7 @@ pub struct PolicyProvider {
 impl PolicyProvider {
     /// Create a new provider from components.
     pub fn new(
-        cache: SharedPolicyCache,
+        cache: PolicyCache,
         provider: DynProvider<TempoNetwork>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
@@ -64,7 +64,7 @@ impl PolicyProvider {
     }
 
     /// Returns a reference to the underlying shared policy cache.
-    pub fn cache(&self) -> &SharedPolicyCache {
+    pub fn cache(&self) -> &PolicyCache {
         &self.cache
     }
 

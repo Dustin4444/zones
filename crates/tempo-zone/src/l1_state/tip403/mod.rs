@@ -2,7 +2,7 @@
 //!
 //! This module tracks TIP-403 transfer policy state from Tempo L1:
 //!
-//! - [`PolicyCache`] — block-versioned in-memory cache of policy data.
+//! - [`PolicyCacheInner`] — block-versioned in-memory cache of policy data.
 //! - [`PolicyProvider`] — cache-first, RPC-fallback authorization provider.
 //! - [`PolicyResolutionTask`] — background task for pre-fetching authorization data.
 //!
@@ -18,7 +18,7 @@
 //!                  |              |          |
 //!            write |         read |          |
 //!                  v              |          |
-//!           SharedPolicyCache-----+     engine + EVM
+//!           PolicyCache-----+     engine + EVM
 //!                  ^                        ^
 //!                  |                        | pre-fetch
 //!             seed (startup)    pool_prefetch + ResolutionTask
@@ -26,20 +26,20 @@
 //!
 //! The [`L1Subscriber`](crate::l1::L1Subscriber) extracts policy events from
 //! `eth_getBlockReceipts` and applies them (creates, membership updates,
-//! compound configs) to the [`SharedPolicyCache`].
+//! compound configs) to the [`PolicyCache`].
 //! [`PolicyProvider`] serves authorization queries from cache, falling back to L1
 //! RPC on miss and writing the result back for future lookups.
 //!
 //! # Startup sequence
 //!
-//! 1. [`SharedPolicyCache::seed_token_policies`] — bulk-fetch current policy state from L1 for all
+//! 1. [`PolicyCache::seed_token_policies`] — bulk-fetch current policy state from L1 for all
 //!    tracked tokens and populate the cache baseline.
 //! 2. [`spawn_policy_resolution_task`] — start the background resolution task
 //!    (processes pre-fetch requests from the pool and other callers).
 //! 3. [`spawn_pool_prefetch_task`] — watch incoming pool transactions and submit
 //!    sender/recipient addresses for cache warming.
 //! 4. Create [`PolicyProvider`] instances — one for the engine payload builder,
-//!    one for the EVM precompile, both backed by the same [`SharedPolicyCache`].
+//!    one for the EVM precompile, both backed by the same [`PolicyCache`].
 //!
 //! # Cache miss resolution
 //!
@@ -59,7 +59,7 @@
 //!
 //! - **Only the engine drives `advance()`**: the L1Subscriber writes events via
 //!   `apply_events` but never advances the cache baseline. The engine calls
-//!   `SharedPolicyCache::advance()` after processing each L1 block, ensuring the
+//!   `PolicyCache::advance()` after processing each L1 block, ensuring the
 //!   cache never runs ahead of the engine's view.
 
 mod cache;
@@ -69,7 +69,7 @@ pub mod provider;
 pub mod task;
 
 pub use cache::{
-    CachedPolicy, CompoundData, MembershipSet, PolicyCache, PolicyEvent, SharedPolicyCache,
+    CachedPolicy, CompoundData, MembershipSet, PolicyCacheInner, PolicyEvent, PolicyCache,
 };
 use tempo_precompiles::tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID};
 pub use zone_primitives::policy::AuthRole;

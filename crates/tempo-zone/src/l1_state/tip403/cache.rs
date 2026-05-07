@@ -17,7 +17,7 @@
 //! ## Special policies
 //!
 //! Policy ID `0` always rejects, policy ID `1` always allows. These are handled inline by
-//! [`PolicyCache::is_authorized`] without any storage lookups.
+//! [`PolicyCacheInner::is_authorized`] without any storage lookups.
 //!
 //! ## Default membership
 //!
@@ -29,12 +29,12 @@
 //! ## Compound policies (TIP-1015)
 //!
 //! A compound policy delegates authorization to sub-policies based on the user's role
-//! (sender, recipient, or mint recipient). The [`is_authorized`](PolicyCache::is_authorized)
+//! (sender, recipient, or mint recipient). The [`is_authorized`](PolicyCacheInner::is_authorized)
 //! method accepts an [`AuthRole`] to resolve the correct sub-policy.
 //!
 //! ## Reorg handling
 //!
-//! On reorgs the caller is expected to [`PolicyCache::clear`] the entire cache. There is no
+//! On reorgs the caller is expected to [`PolicyCacheInner::clear`] the entire cache. There is no
 //! per-block rollback.
 
 use alloy_primitives::Address;
@@ -54,6 +54,81 @@ use super::builtin_authorization;
 
 use crate::l1_state::versioned::HeightVersioned;
 
+/// Thread-safe TIP-403 policy cache backed by an `Arc<RwLock<PolicyCacheInner>>`.
+#[derive(Debug, Clone, Deref, Default)]
+pub struct PolicyCache {
+    #[deref]
+    inner: Arc<RwLock<PolicyCacheInner>>,
+}
+
+impl PolicyCache {
+    /// Returns the last L1 block number tracked by the cache.
+    pub fn last_l1_block(&self) -> u64 {
+        self.read().last_l1_block()
+    }
+
+    /// Seeds the cache with the initial L1 block height so RPC fallback queries
+    /// target the correct block before the subscriber has processed any events.
+    pub fn set_last_l1_block(&self, block_number: u64) {
+        self.write().set_last_l1_block(block_number);
+    }
+
+    /// Collapse versioned entries up to `block_number`.
+    ///
+    /// Called by the engine after successfully processing an L1 block. Only the
+    /// engine should drive this — the subscriber must not advance past blocks the
+    /// engine hasn't consumed yet.
+    pub fn advance(&self, block_number: u64) {
+        self.write().advance(block_number);
+    }
+
+    /// Query the current `transferPolicyId` for each tracked token and seed it
+    /// into the cache. This ensures the cache knows about tokens that have never
+    /// had a `TransferPolicyUpdate` event (i.e. still using the default policy).
+    ///
+    /// Fails if any token's `transferPolicyId` cannot be resolved — all enabled
+    /// tokens must be seeded for the zone to enforce policies correctly.
+    pub async fn seed_token_policies(
+        &self,
+        portal_address: Address,
+        tracked_tokens: &[Address],
+        provider: &DynProvider<TempoNetwork>,
+    ) -> eyre::Result<()> {
+        use tempo_contracts::precompiles::ITIP20;
+
+        let block_number = self.last_l1_block();
+
+        let seeded = futures::future::join_all(tracked_tokens.iter().map(|token| {
+            let tip20 = ITIP20::new(*token, provider);
+            async move {
+                let policy_id = tip20
+                    .transferPolicyId()
+                    .block(alloy_rpc_types_eth::BlockId::number(block_number))
+                    .call()
+                    .await
+                    .map_err(|e| {
+                        eyre::eyre!(
+                            "failed to seed transferPolicyId for token {token} \
+                             (portal {portal_address}): {e}"
+                        )
+                    })?;
+                Ok::<_, eyre::Report>((*token, policy_id))
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<eyre::Result<Vec<_>>>()?;
+
+        let mut w = self.write();
+        for (token, policy_id) in seeded {
+            info!(%token, policy_id, block_number, "Seeded token policy from L1");
+            w.set_token_policy(token, block_number, policy_id);
+        }
+
+        Ok(())
+    }
+}
+
 /// Block-versioned cache of TIP-403 policy state from Tempo L1.
 ///
 /// Mirrors the on-chain `TIP403Registry` storage layout with:
@@ -62,7 +137,7 @@ use crate::l1_state::versioned::HeightVersioned;
 ///
 /// This allows the zone sequencer to evaluate transfer authorization without RPC round-trips.
 #[derive(Debug, Default)]
-pub struct PolicyCache {
+pub struct PolicyCacheInner {
     /// Per-token transfer policy ID.
     tokens: HashMap<Address, HeightVersioned<u64>>,
     /// Per-policy-ID records (type, membership, compound data).
@@ -84,7 +159,7 @@ pub struct PolicyCache {
     last_l1_block: u64,
 }
 
-impl PolicyCache {
+impl PolicyCacheInner {
     /// Returns the `transferPolicyId` for a token at the given block, or `None` if not cached.
     pub fn get_token_policy(&self, token: Address, block_number: u64) -> Option<u64> {
         self.tokens.get(&token)?.get(block_number)
@@ -352,89 +427,11 @@ impl PolicyCache {
     }
 }
 
-/// Shared handle to the policy cache.
-#[derive(Debug, Clone, Deref)]
-pub struct SharedPolicyCache(Arc<RwLock<PolicyCache>>);
-
-impl Default for SharedPolicyCache {
-    fn default() -> Self {
-        Self(Arc::new(RwLock::new(PolicyCache::default())))
-    }
-}
-
-impl SharedPolicyCache {
-    /// Returns the last L1 block number tracked by the cache.
-    pub fn last_l1_block(&self) -> u64 {
-        self.read().last_l1_block()
-    }
-
-    /// Seeds the cache with the initial L1 block height so RPC fallback queries
-    /// target the correct block before the subscriber has processed any events.
-    pub fn set_last_l1_block(&self, block_number: u64) {
-        self.write().set_last_l1_block(block_number);
-    }
-
-    /// Collapse versioned entries up to `block_number`.
-    ///
-    /// Called by the engine after successfully processing an L1 block. Only the
-    /// engine should drive this — the subscriber must not advance past blocks the
-    /// engine hasn't consumed yet.
-    pub fn advance(&self, block_number: u64) {
-        self.write().advance(block_number);
-    }
-
-    /// Query the current `transferPolicyId` for each tracked token and seed it
-    /// into the cache. This ensures the cache knows about tokens that have never
-    /// had a `TransferPolicyUpdate` event (i.e. still using the default policy).
-    ///
-    /// Fails if any token's `transferPolicyId` cannot be resolved — all enabled
-    /// tokens must be seeded for the zone to enforce policies correctly.
-    pub async fn seed_token_policies(
-        &self,
-        portal_address: Address,
-        tracked_tokens: &[Address],
-        provider: &DynProvider<TempoNetwork>,
-    ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-
-        let block_number = self.last_l1_block();
-
-        let seeded = futures::future::join_all(tracked_tokens.iter().map(|token| {
-            let tip20 = ITIP20::new(*token, provider);
-            async move {
-                let policy_id = tip20
-                    .transferPolicyId()
-                    .block(alloy_rpc_types_eth::BlockId::number(block_number))
-                    .call()
-                    .await
-                    .map_err(|e| {
-                        eyre::eyre!(
-                            "failed to seed transferPolicyId for token {token} \
-                             (portal {portal_address}): {e}"
-                        )
-                    })?;
-                Ok::<_, eyre::Report>((*token, policy_id))
-            }
-        }))
-        .await
-        .into_iter()
-        .collect::<eyre::Result<Vec<_>>>()?;
-
-        let mut w = self.write();
-        for (token, policy_id) in seeded {
-            info!(%token, policy_id, block_number, "Seeded token policy from L1");
-            w.set_token_policy(token, block_number, policy_id);
-        }
-
-        Ok(())
-    }
-}
-
 /// A decoded L1 policy event ready to be applied to the cache.
 ///
 /// The [`L1Subscriber`](crate::l1::L1Subscriber) decodes raw logs into these events
 /// outside the cache write lock, then applies them in batch via
-/// [`PolicyCache::apply_events`].
+/// [`PolicyCacheInner::apply_events`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PolicyEvent {
@@ -833,11 +830,11 @@ mod tests {
         assert!(!set.is_member(USER_A, 20));
     }
 
-    // --- PolicyCache tests: simple policies ---
+    // --- PolicyCacheInner tests: simple policies ---
 
     #[test]
     fn special_policy_always_reject() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 0);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -847,7 +844,7 @@ mod tests {
 
     #[test]
     fn special_policy_always_allow() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 1);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -857,7 +854,7 @@ mod tests {
 
     #[test]
     fn whitelist_authorized_when_in_set() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_member(2, USER_A, 10, true);
@@ -875,7 +872,7 @@ mod tests {
 
     #[test]
     fn blacklist_authorized_when_not_in_set() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 3);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
         cache.set_member(3, USER_A, 10, true);
@@ -893,7 +890,7 @@ mod tests {
 
     #[test]
     fn blacklist_unknown_user_returns_none() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 3);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
 
@@ -906,7 +903,7 @@ mod tests {
 
     #[test]
     fn whitelist_unknown_user_returns_none() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
@@ -919,7 +916,7 @@ mod tests {
 
     #[test]
     fn returns_none_on_missing_token_policy() {
-        let cache = PolicyCache::default();
+        let cache = PolicyCacheInner::default();
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             None
@@ -928,7 +925,7 @@ mod tests {
 
     #[test]
     fn returns_none_on_missing_policy_type() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 5);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -938,7 +935,7 @@ mod tests {
 
     #[test]
     fn block_versioned_policy_change() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 1);
         cache.set_token_policy(TOKEN, 20, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
@@ -968,7 +965,7 @@ mod tests {
 
     #[test]
     fn block_versioned_membership_change() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_member(2, USER_A, 10, false);
@@ -986,7 +983,7 @@ mod tests {
 
     #[test]
     fn clear_removes_all_data() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_member(2, USER_A, 10, true);
@@ -1001,7 +998,7 @@ mod tests {
 
     #[test]
     fn flatten_keeps_baseline() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 5, 1);
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_token_policy(TOKEN, 20, 3);
@@ -1017,7 +1014,7 @@ mod tests {
 
     #[test]
     fn shared_policy_across_tokens() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         let token2: Address = address!("0x20C0000000000000000000000000000000000001");
 
         // Two tokens share policy 2
@@ -1039,7 +1036,7 @@ mod tests {
 
     #[test]
     fn shared_blacklist_across_tokens() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         let token2: Address = address!("0x20C0000000000000000000000000000000000001");
 
         cache.set_token_policy(TOKEN, 10, 2);
@@ -1069,7 +1066,7 @@ mod tests {
 
     #[test]
     fn tokens_with_different_policies() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         let token2: Address = address!("0x20C0000000000000000000000000000000000001");
 
         cache.set_token_policy(TOKEN, 10, 2);
@@ -1093,7 +1090,7 @@ mod tests {
 
     #[test]
     fn advance_then_lookup() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
         cache.set_member(2, USER_A, 10, true);
@@ -1114,7 +1111,7 @@ mod tests {
 
     #[test]
     fn flatten_preserves_token_entries() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         let token2: Address = address!("0x20C0000000000000000000000000000000000001");
 
         cache.set_token_policy(TOKEN, 10, 2);
@@ -1129,7 +1126,7 @@ mod tests {
 
     #[test]
     fn policy_change_mid_block_range() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
 
         // Start with whitelist at block 10, switch to blacklist policy at block 20
         cache.set_token_policy(TOKEN, 10, 2);
@@ -1155,7 +1152,7 @@ mod tests {
 
     #[test]
     fn compound_policy_sender_check() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         // Simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST); // sender policy
         cache.set_policy_type(3, PolicyType::WHITELIST); // recipient policy
@@ -1189,7 +1186,7 @@ mod tests {
 
     #[test]
     fn compound_policy_transfer_checks_both() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_policy_type(2, PolicyType::WHITELIST); // sender
         cache.set_policy_type(3, PolicyType::WHITELIST); // recipient
 
@@ -1226,7 +1223,7 @@ mod tests {
 
     #[test]
     fn compound_policy_with_builtin_sub_policies() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         // Compound: sender=allow(1), recipient=reject(0), mint=allow(1)
         cache.set_compound(
             5,
@@ -1259,7 +1256,7 @@ mod tests {
 
     #[test]
     fn compound_returns_none_when_sub_policy_missing() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         // Compound references sub-policy 99 which doesn't exist
         cache.set_compound(
             5,
@@ -1279,7 +1276,7 @@ mod tests {
 
     #[test]
     fn compound_returns_none_when_compound_data_missing() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         // Policy 5 has COMPOUND type but no compound data set
         cache.set_policy_type(5, PolicyType::COMPOUND);
         cache.set_token_policy(TOKEN, 10, 5);
@@ -1292,7 +1289,7 @@ mod tests {
 
     #[test]
     fn apply_events_with_policy_created() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         let events = vec![
             PolicyEvent::PolicyCreated {
                 policy_id: 2,
@@ -1326,7 +1323,7 @@ mod tests {
 
     #[test]
     fn observed_survives_advance() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_member(2, USER_A, 10, true);
@@ -1355,7 +1352,7 @@ mod tests {
 
     #[test]
     fn observed_survives_advance_for_removed_member() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
@@ -1375,7 +1372,7 @@ mod tests {
 
     #[test]
     fn observed_survives_advance_blacklist() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
         cache.set_member(2, USER_A, 10, true); // blacklisted
@@ -1397,7 +1394,7 @@ mod tests {
 
     #[test]
     fn clear_resets_observed() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_member(2, USER_A, 10, true);
@@ -1444,7 +1441,7 @@ mod tests {
 
     #[test]
     fn multiple_advances_preserve_observed() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 5, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
@@ -1477,7 +1474,7 @@ mod tests {
 
     #[test]
     fn apply_events_with_compound_policy() {
-        let mut cache = PolicyCache::default();
+        let mut cache = PolicyCacheInner::default();
         // Pre-populate simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST);
         cache.set_policy_type(3, PolicyType::WHITELIST);

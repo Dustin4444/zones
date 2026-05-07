@@ -1,7 +1,7 @@
 //! E2E tests for the TIP-403 policy proxy precompile on the zone.
 //!
 //! These tests verify that the `ZoneTip403ProxyRegistry` precompile correctly
-//! serves authorization queries from the `SharedPolicyCache` and rejects
+//! serves authorization queries from the `PolicyCache` and rejects
 //! mutating calls. The cache is populated directly in tests (no L1 subscriber).
 
 use alloy::primitives::{U256, address};

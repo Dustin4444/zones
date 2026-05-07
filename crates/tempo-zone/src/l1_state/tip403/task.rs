@@ -3,7 +3,7 @@
 //! The [`PolicyResolutionTask`] receives [`PolicyTaskMessage`]s via a channel and resolves
 //! them concurrently using [`FuturesUnordered`]. Each request triggers a
 //! [`PolicyProvider::is_authorized_async`] call which will populate the
-//! [`SharedPolicyCache`] on cache miss, ensuring the payload builder hits the cache
+//! [`PolicyCache`] on cache miss, ensuring the payload builder hits the cache
 //! at block-building time.
 //!
 //! Typical producers are the transaction pool (mempool) validation layer, which can
@@ -16,7 +16,7 @@ use tempo_alloy::TempoNetwork;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use super::{AuthRole, SharedPolicyCache, metrics::Tip403Metrics};
+use super::{AuthRole, PolicyCache, metrics::Tip403Metrics};
 use crate::l1_state::PolicyProvider;
 
 /// Background task that processes [`PolicyTaskMessage`]s concurrently.
@@ -168,7 +168,7 @@ impl PolicyTaskHandle {
 ///
 /// Returns a [`PolicyTaskHandle`] for sending pre-fetch requests.
 pub fn spawn_policy_resolution_task(
-    cache: SharedPolicyCache,
+    cache: PolicyCache,
     l1_provider: DynProvider<TempoNetwork>,
     max_concurrent: usize,
     channel_capacity: usize,

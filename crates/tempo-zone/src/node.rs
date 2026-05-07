@@ -4,7 +4,7 @@
 //! It reuses Tempo's EVM, primitives, and pool, but with noop consensus/network/payload.
 
 use crate::{
-    DepositQueue, L1SubscriberConfig, SharedPolicyCache, ZoneEngine, ZoneSequencerConfig,
+    DepositQueue, L1SubscriberConfig, PolicyCache, ZoneEngine, ZoneSequencerConfig,
     abi::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal},
     builder::ZonePayloadFactory,
     evm::ZoneEvmConfig,
@@ -113,7 +113,7 @@ pub struct ZoneNode {
     l1_state_cache: SharedL1StateCache,
     /// Shared TIP-403 policy cache, populated by the unified [`L1Subscriber`](crate::l1::L1Subscriber)
     /// and read by the precompile during block building.
-    policy_cache: SharedPolicyCache,
+    policy_cache: PolicyCache,
     /// Address of the L1 deposit portal contract.
     portal_address: Address,
     /// Optional pre-configured list of enabled token addresses. When set, the
@@ -136,7 +136,7 @@ impl ZoneNode {
     ) -> Self {
         let deposit_queue = DepositQueue::default();
 
-        let policy_cache = SharedPolicyCache::default();
+        let policy_cache = PolicyCache::default();
         let l1_state_cache = SharedL1StateCache::new(HashSet::from([portal_address]));
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
@@ -199,7 +199,7 @@ impl ZoneNode {
     }
 
     /// Returns the current TIP-403 policy cache
-    pub fn policy_cache(&self) -> SharedPolicyCache {
+    pub fn policy_cache(&self) -> PolicyCache {
         self.policy_cache.clone()
     }
 
@@ -249,7 +249,7 @@ pub struct ZoneAddOns<N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfi
     /// Configuration for the L1 event subscriber
     l1_config: L1SubscriberConfig,
     /// TIP-403 policy cache
-    policy_cache: SharedPolicyCache,
+    policy_cache: PolicyCache,
     /// ZonePortal address on L1.
     portal_address: Address,
     /// Pre-configured list of initial tokens.
@@ -276,7 +276,7 @@ where
     pub fn new(
         deposit_queue: DepositQueue,
         l1_config: L1SubscriberConfig,
-        policy_cache: SharedPolicyCache,
+        policy_cache: PolicyCache,
         portal_address: Address,
         initial_tokens: Option<Vec<Address>>,
         private_rpc_config: ZonePrivateRpcConfig,
@@ -711,7 +711,7 @@ impl PayloadAttributesBuilder<ZonePayloadAttributes, TempoHeader> for ZonePayloa
 pub struct ZoneExecutorBuilder {
     l1_state_provider_config: L1StateProviderConfig,
     l1_state_cache: SharedL1StateCache,
-    policy_cache: SharedPolicyCache,
+    policy_cache: PolicyCache,
 }
 
 impl ZoneExecutorBuilder {
@@ -719,7 +719,7 @@ impl ZoneExecutorBuilder {
     pub fn new(
         l1_state_provider_config: L1StateProviderConfig,
         l1_state_cache: SharedL1StateCache,
-        policy_cache: SharedPolicyCache,
+        policy_cache: PolicyCache,
     ) -> Self {
         Self {
             l1_state_provider_config,

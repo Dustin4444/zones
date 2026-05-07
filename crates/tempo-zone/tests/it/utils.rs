@@ -128,7 +128,7 @@ const DUMMY_L1_URL: &str = "http://127.0.0.1:1";
 /// token's `transferPolicyId` via RPC. pathUSD defaults to builtin policy `1`
 /// (allow all), and local tests rely on that behavior for outbox `transferFrom`
 /// flows.
-fn seed_local_policy_cache(policy_cache: &zone::SharedPolicyCache) {
+fn seed_local_policy_cache(policy_cache: &zone::PolicyCache) {
     policy_cache
         .write()
         .set_token_policy(PATH_USD_ADDRESS, 0, ALLOW_ALL_POLICY_ID);
@@ -194,7 +194,7 @@ pub(crate) struct ZoneTestNode {
     http_url: url::Url,
     deposit_queue: DepositQueue,
     l1_state_cache: SharedL1StateCache,
-    policy_cache: zone::SharedPolicyCache,
+    policy_cache: zone::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
@@ -224,7 +224,7 @@ impl ZoneTestNode {
     }
 
     /// Returns a handle to the policy cache for TIP-403 authorization.
-    pub(crate) fn policy_cache(&self) -> &zone::SharedPolicyCache {
+    pub(crate) fn policy_cache(&self) -> &zone::PolicyCache {
         &self.policy_cache
     }
 
