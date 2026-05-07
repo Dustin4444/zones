@@ -69,7 +69,7 @@ pub mod provider;
 pub mod task;
 
 pub use cache::{
-    CachedPolicy, CompoundData, MembershipSet, PolicyCacheInner, PolicyEvent, PolicyCache,
+    CachedPolicy, CompoundData, MembershipSet, PolicyCache, PolicyCacheInner, PolicyEvent,
 };
 use tempo_precompiles::tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID};
 pub use zone_primitives::policy::AuthRole;
