@@ -15,13 +15,10 @@
     - [Zone Predeploys](#zone-predeploys)
     - [Zone Token Model](#zone-token-model)
   - [Sequencer Operations](#sequencer-operations)
+    - [Token Management](#token-management)
     - [Gas Rate Configuration](#gas-rate-configuration)
     - [Encryption Key Management](#encryption-key-management)
-  - [Admin Operations](#admin-operations)
-    - [Token Management](#token-management)
-    - [Deposit Pause Controls](#deposit-pause-controls)
     - [Sequencer Transfer](#sequencer-transfer)
-    - [Admin Transfer](#admin-transfer)
   - [Deposits](#deposits)
     - [Regular Deposits](#regular-deposits)
     - [Deposit Fees](#deposit-fees)
@@ -114,7 +111,7 @@ This document specifies the zone protocol: deployment, sequencer operations, dep
 | Zone | A private execution environment anchored to Tempo. |
 | Portal | The contract on Tempo that locks deposited tokens and finalizes withdrawals for a zone. |
 | Batch | A sequencer-produced commitment covering one or more zone blocks, submitted to Tempo with a proof. |
-| Admin | The privileged governance role for a zone. Cold/mission-critical key. Controls token enablement, sequencer rotation, and admin rotation. See [Access Control](#access-control). |
+| Admin | The privileged governance role for a zone. Cold/mission-critical key. Controls token enablement. See [Access Control](#access-control). |
 | Sequencer | The privileged operational role for a zone. Hot/online key. Sole block producer; submits batches and processes withdrawals. See [Access Control](#access-control). |
 | Enabled token | A TIP-20 token that the admin has activated for deposits and withdrawals on a zone. Enablement is permanent. |
 | TIP-20 | Tempo's fungible token standard. |
@@ -125,7 +122,7 @@ This document specifies the zone protocol: deployment, sequencer operations, dep
 
 ## System Overview
 
-Each zone is operated by a **sequencer** that collects transactions, produces blocks, generates proofs, and submits batches to Tempo. A single registered address controls sequencer operations for each zone. Each zone also has a separate **admin** role that holds governance powers (enabling tokens, rotating the sequencer, rotating itself); see [Access Control](#access-control). **Users** deposit TIP-20 tokens from Tempo into the zone, transact privately, and withdraw back to Tempo.
+Each zone is operated by a **sequencer** that collects transactions, produces blocks, generates proofs, and submits batches to Tempo. A single registered address controls sequencer operations for each zone. Each zone also has a separate **admin** role that holds governance powers (enabling tokens, configuring deposit pause/resume); see [Access Control](#access-control). **Users** deposit TIP-20 tokens from Tempo into the zone, transact privately, and withdraw back to Tempo.
 
 On the Tempo side, an onchain **verifier** contract validates that each batch was executed correctly. The verifier is abstracted behind a minimal interface (`IVerifier`) and is proof-agnostic. Any proving backend (ZK, TEE, or otherwise) can implement the interface. The portal does not care how the proof was produced.
 
@@ -176,35 +173,31 @@ Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal
 ### Roles
 
 **Admin.**
-- Holds governance powers over the zone.
+- Holds governance powers over the zone (token enablement, deposit pause/resume).
 - Expected to be a cold key, multisig, or governance contract.
-- Set at zone creation via [`IZoneFactory.createZone`](#izonefactory) and rotated via two-step transfer (see [Admin Transfer](#admin-transfer)).
+- Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
 - Cannot be renounced. The zero address is never a valid admin.
 
 **Sequencer.**
 - Operates the zone: collects transactions, produces blocks, advances Tempo, processes deposits and withdrawals, and submits batches with proofs.
 - Expected to be an online operational key.
-- Set at zone creation via [`IZoneFactory.createZone`](#izonefactory) and rotated via two-step transfer (see [Sequencer Transfer](#sequencer-transfer)). Either the admin or the current sequencer MAY initiate the transfer.
+- Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
 - Holds the encryption private key used to decrypt [encrypted deposits](#encrypted-deposits). The admin MUST NOT hold this key.
 
-A zone MAY be deployed with `admin == sequencer`. In that case the same address holds both roles, but the protocol still treats each privileged call as belonging to its role; rotating one role does not rotate the other.
+A zone MAY be deployed with `admin == sequencer`. In that case the same address holds both roles, but the protocol still treats each privileged call as belonging to its role.
 
 ### Permission Matrix
 
-The following table lists every privileged action and the role(s) authorized to invoke it. "Both" means either role may invoke independently; the protocol does not require co-signing.
+The following table lists every privileged action and the role authorized to invoke it.
 
-| Action | Contract | Authorized caller(s) |
+| Action | Contract | Authorized caller |
 |---|---|---|
-| `enableToken(token)` (irreversible) | [`ZonePortal`](#izoneportal) | **admin** |
-| `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **both** |
-| `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **both** |
-| `setZoneGasRate(rate)` | [`ZonePortal`](#izoneportal) | **both** |
-| `setTempoGasRate(rate)` | [`ZoneOutbox`](#izoneoutbox) (zone-side) | **both** |
+| `enableToken(token)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `setZoneGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
+| `setTempoGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setSequencerEncryptionKey(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
-| `transferSequencer(newSequencer)` | [`ZonePortal`](#izoneportal) | **both** (admin or current sequencer) |
-| `acceptSequencer()` | [`ZonePortal`](#izoneportal) | **pendingSequencer** |
-| `transferAdmin(newAdmin)` | [`ZonePortal`](#izoneportal) | **admin** |
-| `acceptAdmin()` | [`ZonePortal`](#izoneportal) | **pendingAdmin** |
 | `submitBatch(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `processWithdrawal(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `finalizeWithdrawalBatch(...)` | [`ZoneOutbox`](#izoneoutbox) (zone-side) | **sequencer** (block beneficiary) |
@@ -212,13 +205,10 @@ The following table lists every privileged action and the role(s) authorized to 
 
 Rationale notes:
 
-- **`enableToken` is admin-only** because enablement is permanent and defines what the zone is. A compromised sequencer hot key MUST NOT be able to enable arbitrary tokens.
-- **Pause/resume and gas rates are accessible to both roles** because the sequencer needs to react quickly to operational events (gas-price spikes, issuer pause requests) without involving the cold key, while the admin retains an override for governance-driven actions.
+- **Token enablement and deposit pause/resume are admin-only** because they govern what the zone is and which deposit flows are open. A compromised sequencer hot key MUST NOT be able to enable arbitrary tokens or unilaterally re-open paused deposits.
+- **Gas rates are sequencer-controlled** because the sequencer takes the economic risk on gas-price fluctuations and needs to react quickly to operational events without involving the cold key.
 - **Encryption key management is sequencer-only** because the proof of possession requires the encryption private key, which the admin does not hold by design.
-- **`transferSequencer` is initiable by either role** so that the admin can fire a misbehaving operator (case where admin and sequencer are different entities) and so that the current sequencer can rotate its own hot key (case of suspected hot-key compromise). In both paths, the new sequencer MUST `acceptSequencer` before the rotation takes effect.
 - **`processWithdrawal` is sequencer-only** today; whether to make it permissionless once the proof has settled is tracked separately.
-
-> **TODO (open in this revision):** behavior of in-flight encrypted deposits during admin-initiated sequencer rotation, automatic invalidation of old encryption keys on `acceptSequencer`, zone-side propagation of the admin address through `ZoneConfig`, emergency pause / kill switch, multi-signer (N-of-M) sequencer support, and migration semantics for already-deployed zones. These are intentionally left unresolved in this revision.
 
 <br>
 
@@ -229,7 +219,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | Parameter | Description |
 |-----------|-------------|
 | `initialToken` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
-| `admin` | The address that holds the admin role for the zone (governance, sequencer rotation, token enablement). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
+| `admin` | The address that holds the admin role for the zone (token enablement, deposit pause/resume). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
@@ -289,13 +279,13 @@ The zone-side supply of each token always equals net deposits minus net withdraw
 
 ### Token Management
 
-The sequencer manages which TIP-20 tokens are available on the zone:
+The admin manages which TIP-20 tokens are available on the zone (see [Access Control](#access-control)):
 
 - `enableToken(token)`: Enable a new TIP-20 for deposits and withdrawals. This is **irreversible**. Once enabled, a token can never be disabled.
 - `pauseDeposits(token)`: Pause new deposits for a token. Does not affect withdrawals.
 - `resumeDeposits(token)`: Resume deposits for a previously paused token.
 
-The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The sequencer can halt deposits but cannot disable withdrawals for an enabled token. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
+The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The admin can halt deposits but cannot disable withdrawals for an enabled token. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
 
 ### Gas Rate Configuration
 
