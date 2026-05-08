@@ -19,7 +19,7 @@
 //! Policy ID `0` always rejects, policy ID `1` always allows. These are handled inline by
 //! [`PolicyCacheInner::is_authorized`] without any storage lookups.
 //!
-//! ## Unknown set entries
+//! ## Unknown entries
 //!
 //! Users with no recorded set event are treated as "unknown" — cache lookups return
 //! `None` so the caller falls back to RPC. This avoids silent false negatives when the
@@ -174,8 +174,8 @@ impl PolicyCacheInner {
         self.get_policy_entry(policy_id).policy_type = Some(policy_type);
     }
 
-    /// Records whether `user` is in a policy set at the given block.
-    pub fn record_set_status(
+    /// Sets whether `user` is in a policy set at the given block.
+    pub fn set_policy_status(
         &mut self,
         policy_id: u64,
         user: Address,
@@ -357,7 +357,7 @@ impl PolicyCacheInner {
                     account,
                     in_set,
                 } => {
-                    self.record_set_status(*policy_id, *account, block_number, *in_set);
+                    self.set_policy_status(*policy_id, *account, block_number, *in_set);
                 }
                 PolicyEvent::TokenPolicyChanged { token, policy_id } => {
                     self.set_token_policy(*token, block_number, *policy_id);
@@ -547,8 +547,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(2, USER_B, 10, false);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_B, 10, false);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -565,8 +565,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 3);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.record_set_status(3, USER_A, 10, true);
-        cache.record_set_status(3, USER_B, 10, false);
+        cache.set_policy_status(3, USER_A, 10, true);
+        cache.set_policy_status(3, USER_B, 10, false);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -629,7 +629,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 1);
         cache.set_token_policy(TOKEN, 20, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 20, true);
+        cache.set_policy_status(2, USER_A, 20, true);
 
         // At block 15: policy_id=1 (always allow)
         assert_eq!(
@@ -658,8 +658,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, false);
-        cache.record_set_status(2, USER_A, 20, true);
+        cache.set_policy_status(2, USER_A, 10, false);
+        cache.set_policy_status(2, USER_A, 20, true);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 15, AuthRole::Transfer),
@@ -676,7 +676,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
 
         cache.clear();
 
@@ -711,7 +711,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_token_policy(token2, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
 
         // Both tokens see the same policy set (per-policy, no fan-out needed)
         assert_eq!(
@@ -732,7 +732,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_token_policy(token2, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
 
         // BLACKLIST: authorized when NOT in set
         assert_eq!(
@@ -763,8 +763,8 @@ mod tests {
         cache.set_token_policy(token2, 10, 3);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(3, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(3, USER_A, 10, true);
 
         // TOKEN uses whitelist policy 2: USER_A whitelisted → authorized
         assert_eq!(
@@ -783,8 +783,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(2, USER_A, 20, false);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 20, false);
 
         cache.advance(15);
 
@@ -823,8 +823,8 @@ mod tests {
         cache.set_token_policy(TOKEN, 20, 3);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(3, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(3, USER_A, 10, true);
 
         // At block 15 (whitelist policy 2), USER_A is in set → authorized
         assert_eq!(
@@ -846,8 +846,8 @@ mod tests {
         // Simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST); // sender policy
         cache.set_policy_type(3, PolicyType::WHITELIST); // recipient policy
-        cache.record_set_status(2, USER_A, 10, true); // USER_A blacklisted as sender
-        cache.record_set_status(3, USER_A, 10, true); // USER_A whitelisted as recipient
+        cache.set_policy_status(2, USER_A, 10, true); // USER_A blacklisted as sender
+        cache.set_policy_status(3, USER_A, 10, true); // USER_A whitelisted as recipient
 
         // Compound policy referencing sub-policies
         cache.set_compound(
@@ -897,14 +897,14 @@ mod tests {
         );
 
         // Only sender whitelisted → fails on recipient (still unknown for recipient sub-policy)
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             None
         );
 
         // Both whitelisted → authorized
-        cache.record_set_status(3, USER_A, 10, true);
+        cache.set_policy_status(3, USER_A, 10, true);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             Some(true)
@@ -1016,7 +1016,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
 
         // Before advance: known and authorized
         assert_eq!(
@@ -1047,8 +1047,8 @@ mod tests {
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
         // Add then remove USER_A
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(2, USER_A, 20, false);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 20, false);
 
         // Advance past both events
         cache.advance(25);
@@ -1065,7 +1065,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.record_set_status(2, USER_A, 10, true); // blacklisted
+        cache.set_policy_status(2, USER_A, 10, true); // blacklisted
 
         cache.advance(20);
 
@@ -1087,7 +1087,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, true);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -1133,8 +1133,8 @@ mod tests {
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
         // Events at different blocks
-        cache.record_set_status(2, USER_A, 10, true);
-        cache.record_set_status(2, USER_B, 20, true);
+        cache.set_policy_status(2, USER_A, 10, true);
+        cache.set_policy_status(2, USER_B, 20, true);
 
         // Advance past first event only
         cache.advance(15);
@@ -1165,8 +1165,8 @@ mod tests {
         // Pre-populate simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST);
         cache.set_policy_type(3, PolicyType::WHITELIST);
-        cache.record_set_status(2, USER_A, 10, false); // explicitly not blacklisted
-        cache.record_set_status(3, USER_A, 10, true);
+        cache.set_policy_status(2, USER_A, 10, false); // explicitly not blacklisted
+        cache.set_policy_status(3, USER_A, 10, true);
 
         let events = vec![
             PolicyEvent::CompoundPolicyCreated {

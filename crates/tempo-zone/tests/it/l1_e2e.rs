@@ -1071,10 +1071,10 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
         let mut cache = policy_cache.write();
         cache.set_token_policy(PATH_USD_ADDRESS, 0, policy_id);
         cache.set_policy_type(policy_id, PolicyType::BLACKLIST);
-        cache.record_set_status(policy_id, blacklisted_recipient, 0, true);
+        cache.set_policy_status(policy_id, blacklisted_recipient, 0, true);
         // Also seed for current and future blocks
         cache.set_token_policy(PATH_USD_ADDRESS, l1_block, policy_id);
-        cache.record_set_status(policy_id, blacklisted_recipient, l1_block, true);
+        cache.set_policy_status(policy_id, blacklisted_recipient, l1_block, true);
     }
 
     // --- Step 6: Make an encrypted deposit targeting the blacklisted recipient ---
@@ -1227,8 +1227,8 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
             },
         );
         cache.set_policy_type(sender_policy_id, PolicyType::BLACKLIST);
-        cache.record_set_status(sender_policy_id, alice, 0, true);
-        cache.record_set_status(sender_policy_id, alice, l1_block, true);
+        cache.set_policy_status(sender_policy_id, alice, 0, true);
+        cache.set_policy_status(sender_policy_id, alice, l1_block, true);
     }
 
     // --- Step 4: Deposit to Alice via the dev account ---

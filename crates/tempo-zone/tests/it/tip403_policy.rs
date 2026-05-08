@@ -105,8 +105,8 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.record_set_status(5, alice, 1, true);
-        w.record_set_status(5, bob, 1, false);
+        w.set_policy_status(5, alice, 1, true);
+        w.set_policy_status(5, bob, 1, false);
     }
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
@@ -155,8 +155,8 @@ async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::BLACKLIST);
-        w.record_set_status(5, alice, 1, true);
-        w.record_set_status(5, bob, 1, false);
+        w.set_policy_status(5, alice, 1, true);
+        w.set_policy_status(5, bob, 1, false);
     }
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
@@ -194,9 +194,9 @@ async fn test_policy_proxy_compound_policy() -> eyre::Result<()> {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.record_set_status(5, alice, 1, true); // Alice whitelisted as sender
+        w.set_policy_status(5, alice, 1, true); // Alice whitelisted as sender
         w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.record_set_status(6, bob, 1, true); // Bob blacklisted as recipient
+        w.set_policy_status(6, bob, 1, true); // Bob blacklisted as recipient
         w.set_compound(
             10,
             CompoundData {
@@ -314,11 +314,11 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.record_set_status(5, alice, 1, true); // Alice whitelisted as sender
-        w.record_set_status(5, bob, 1, false); // Bob not whitelisted as sender
+        w.set_policy_status(5, alice, 1, true); // Alice whitelisted as sender
+        w.set_policy_status(5, bob, 1, false); // Bob not whitelisted as sender
         w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.record_set_status(6, alice, 1, false); // Alice not blacklisted as recipient
-        w.record_set_status(6, bob, 1, true); // Bob blacklisted as recipient
+        w.set_policy_status(6, alice, 1, false); // Alice not blacklisted as recipient
+        w.set_policy_status(6, bob, 1, true); // Bob blacklisted as recipient
         w.set_compound(
             10,
             CompoundData {
@@ -349,8 +349,8 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
     {
         let cache = zone.policy_cache();
         let mut w = cache.write();
-        w.record_set_status(5, carol, 1, true); // whitelisted as sender
-        w.record_set_status(6, carol, 1, true); // blacklisted as recipient
+        w.set_policy_status(5, carol, 1, true); // whitelisted as sender
+        w.set_policy_status(6, carol, 1, true); // blacklisted as recipient
     }
 
     // Carol passes sender check but fails recipient → false

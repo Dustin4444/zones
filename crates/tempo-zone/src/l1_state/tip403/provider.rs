@@ -200,7 +200,7 @@ impl PolicyProvider {
 
         self.cache
             .write()
-            .record_set_status(policy_id, user, block_number, in_set);
+            .set_policy_status(policy_id, user, block_number, in_set);
 
         info!(
             policy_id, %user, block_number, authorized, in_set,

@@ -1885,7 +1885,7 @@ mod tests {
             let mut cache = subscriber.config.policy_cache.write();
             cache.set_token_policy(token, 10, 2);
             cache.set_policy_type(2, PolicyType::WHITELIST);
-            cache.record_set_status(2, user, 10, true);
+            cache.set_policy_status(2, user, 10, true);
             cache.advance(10);
         }
 
