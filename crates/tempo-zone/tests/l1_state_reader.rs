@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use alloy_primitives::{Address, B256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use tempo_alloy::TempoNetwork;
-use zone::l1_state::{L1StateProvider, L1StateProviderConfig, SharedL1StateCache};
+use zone::l1_state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
 
 /// ZonePortal address on Tempo L1 moderato.
 const ZONE_PORTAL: Address = address!("0x1bc99e6a8c4689f1884527152ba542f012316149");
@@ -24,7 +24,7 @@ async fn make_provider() -> L1StateProvider {
         portal_address: ZONE_PORTAL,
         ..Default::default()
     };
-    let cache = SharedL1StateCache::new(HashSet::from([ZONE_PORTAL]));
+    let cache = L1StateCache::new(HashSet::from([ZONE_PORTAL]));
     let rt = tokio::runtime::Handle::current();
     L1StateProvider::new(config, cache, rt)
         .await

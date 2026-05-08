@@ -33,7 +33,7 @@ use crate::{
         },
     },
     ext::TempoStateExt,
-    l1_state::{cache::L1StateCache, tip403::PolicyEvent},
+    l1_state::{cache::L1StateCacheInner, tip403::PolicyEvent},
 };
 
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
@@ -56,7 +56,7 @@ pub struct L1SubscriberConfig {
     pub policy_cache: crate::l1_state::tip403::PolicyCache,
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
     /// confirmed block and clears it on reorgs.
-    pub l1_state_cache: crate::l1_state::cache::SharedL1StateCache,
+    pub l1_state_cache: crate::l1_state::cache::L1StateCache,
     /// Maximum number of concurrent L1 RPC receipt fetches. Used directly for
     /// the live stream and halved for backfill (which sends 2 requests per block).
     pub l1_fetch_concurrency: usize,
@@ -723,7 +723,7 @@ impl L1Subscriber {
 }
 
 fn apply_sequencer_events_to_cache(
-    cache: &mut L1StateCache,
+    cache: &mut L1StateCacheInner,
     portal_address: Address,
     block_number: u64,
     sequencer_events: &[L1SequencerEvent],
@@ -1824,7 +1824,7 @@ mod tests {
                 portal_address,
                 genesis_tempo_block_number,
                 policy_cache: crate::PolicyCache::default(),
-                l1_state_cache: crate::SharedL1StateCache::new(HashSet::from([portal_address])),
+                l1_state_cache: crate::L1StateCache::new(HashSet::from([portal_address])),
                 l1_fetch_concurrency: 1,
                 retry_connection_interval: Duration::from_secs(1),
             },
@@ -2085,7 +2085,7 @@ mod tests {
         let portal_address = address!("0x0000000000000000000000000000000000000ABC");
         let current_sequencer = address!("0x00000000000000000000000000000000000000A1");
         let pending_sequencer = address!("0x00000000000000000000000000000000000000B2");
-        let mut cache = L1StateCache::new(HashSet::from([portal_address]));
+        let mut cache = L1StateCacheInner::new(HashSet::from([portal_address]));
 
         apply_sequencer_events_to_cache(
             &mut cache,
@@ -2112,7 +2112,7 @@ mod tests {
         let portal_address = address!("0x0000000000000000000000000000000000000ABC");
         let previous_sequencer = address!("0x00000000000000000000000000000000000000A1");
         let new_sequencer = address!("0x00000000000000000000000000000000000000B2");
-        let mut cache = L1StateCache::new(HashSet::from([portal_address]));
+        let mut cache = L1StateCacheInner::new(HashSet::from([portal_address]));
 
         apply_sequencer_events_to_cache(
             &mut cache,
@@ -2140,7 +2140,7 @@ mod tests {
         let sequencer_a = address!("0x00000000000000000000000000000000000000A1");
         let sequencer_b = address!("0x00000000000000000000000000000000000000B2");
         let sequencer_c = address!("0x00000000000000000000000000000000000000C3");
-        let mut cache = L1StateCache::new(HashSet::from([portal_address]));
+        let mut cache = L1StateCacheInner::new(HashSet::from([portal_address]));
 
         apply_sequencer_events_to_cache(
             &mut cache,

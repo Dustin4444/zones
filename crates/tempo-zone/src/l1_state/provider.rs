@@ -1,6 +1,6 @@
 //! Cache-first, RPC-fallback provider for reading L1 contract storage slots.
 //!
-//! [`L1StateProvider`] wraps a [`SharedL1StateCache`] and a [`DynProvider<TempoNetwork>`] backed by an
+//! [`L1StateProvider`] wraps a [`L1StateCache`] and a [`DynProvider<TempoNetwork>`] backed by an
 //! HTTP transport. Reads are served from the in-memory cache when possible. On cache miss the
 //! provider falls back to `eth_getStorageAt` via the shared HTTP provider and writes the result
 //! back into the cache.
@@ -20,7 +20,7 @@ use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
 use zone_precompiles::SequencerExt;
 
-use super::cache::SharedL1StateCache;
+use super::cache::L1StateCache;
 use crate::abi::PORTAL_SEQUENCER_SLOT;
 
 /// Configuration for the [`L1StateProvider`].
@@ -58,7 +58,7 @@ impl Default for L1StateProviderConfig {
 /// `L1StateProvider` is the core bridge between synchronous EVM execution (precompiles) and the
 /// asynchronous L1 RPC layer. It holds:
 ///
-/// - A [`SharedL1StateCache`] for fast in-memory lookups.
+/// - A [`L1StateCache`] for fast in-memory lookups.
 /// - A [`DynProvider<TempoNetwork>`] (alloy HTTP provider) created once and reused across calls.
 /// - A [`tokio::runtime::Handle`] used by the synchronous [`get_storage`](Self::get_storage)
 ///   method to dispatch async work from a blocking context.
@@ -72,7 +72,7 @@ impl Default for L1StateProviderConfig {
 #[derive(Debug, Clone)]
 pub struct L1StateProvider {
     /// In-memory cache of L1 contract storage slots, checked before any RPC call.
-    cache: SharedL1StateCache,
+    cache: L1StateCache,
     /// Zone portal address on Tempo L1 used for sequencer lookups.
     portal_address: Address,
     /// HTTP provider pointed at **Tempo L1**, used as a fallback when the cache misses.
@@ -92,7 +92,7 @@ impl L1StateProvider {
     /// [`get_storage`](Self::get_storage) method.
     pub async fn new(
         config: L1StateProviderConfig,
-        cache: SharedL1StateCache,
+        cache: L1StateCache,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self> {
         let retry_layer =
@@ -129,7 +129,7 @@ impl L1StateProvider {
     /// to build a fallback provider that won't panic on an empty RPC URL.
     pub fn new_raw(
         config: L1StateProviderConfig,
-        cache: SharedL1StateCache,
+        cache: L1StateCache,
         provider: DynProvider<TempoNetwork>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
@@ -244,7 +244,7 @@ impl L1StateProvider {
     }
 
     /// Expose the shared cache handle for external use (e.g. the engine).
-    pub fn cache(&self) -> &SharedL1StateCache {
+    pub fn cache(&self) -> &L1StateCache {
         &self.cache
     }
 

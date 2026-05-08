@@ -2,7 +2,8 @@
 //!
 //! This module provides:
 //!
-//! - [`L1StateCache`] — an in-memory cache of L1 contract storage slots, anchored by block hash.
+//! - [`L1StateCache`] — a shared in-memory cache of L1 contract storage slots.
+//! - [`L1StateCacheInner`] — the block-versioned cache storage guarded by [`L1StateCache`].
 //! - [`L1StateProvider`] — a cache-first, RPC-fallback reader for `eth_getStorageAt`.
 //! - [`TempoStateReader`] — a standalone `DynPrecompile` that handles `readStorageAt` calls.
 //! - [`tip403`] — TIP-403 policy cache and provider.
@@ -13,7 +14,7 @@ pub mod provider;
 pub mod tip403;
 pub mod versioned;
 
-pub use cache::{L1StateCache, SharedL1StateCache};
+pub use cache::{L1StateCache, L1StateCacheInner};
 pub use precompile::TempoStateReader;
 pub use provider::{L1StateProvider, L1StateProviderConfig};
 pub use tip403::{

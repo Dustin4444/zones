@@ -42,7 +42,7 @@ The harness provides two independent testing paths:
 ### Injection Path (`e2e.rs`)
 
 Uses `L1Fixture` to manually construct `TempoHeader` and `Deposit` objects,
-push them into the `DepositQueue`, and seed the `SharedL1StateCache` for
+push them into the `DepositQueue`, and seed the `L1StateCache` for
 `TempoStateReader` precompile reads. Fast (~1s per test) and deterministic.
 
 ```rust

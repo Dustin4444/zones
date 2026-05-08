@@ -34,7 +34,7 @@ pub use l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1BlockDeposits, L1Deposit,
     L1PortalEvents, L1SequencerEvent, L1Subscriber, L1SubscriberConfig,
 };
-pub use l1_state::{PolicyCache, PolicyProvider, SharedL1StateCache};
+pub use l1_state::{L1StateCache, PolicyCache, PolicyProvider};
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};
 pub use payload::{ZonePayloadAttributes, ZonePayloadTypes};
 pub(crate) use rpc_client::rpc_connection_config;

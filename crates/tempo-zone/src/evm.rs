@@ -7,7 +7,7 @@
 use crate::{
     abi::{TEMPO_STATE_READER_ADDRESS, ZONE_TX_CONTEXT_ADDRESS},
     executor::ZoneBlockExecutor,
-    l1_state::{L1StateProvider, PolicyProvider, SharedL1StateCache, TempoStateReader},
+    l1_state::{L1StateCache, L1StateProvider, PolicyProvider, TempoStateReader},
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
         ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneTip20Token,
@@ -243,7 +243,7 @@ impl ZoneEvmConfig {
     /// portal address defaults to the zero address in this mode, so sequencer
     /// reads are treated as unavailable.
     pub fn new_without_l1(chain_spec: Arc<TempoChainSpec>) -> Self {
-        let cache = SharedL1StateCache::default();
+        let cache = L1StateCache::default();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_http("http://127.0.0.1:1".parse().expect("valid fallback URL"))
             .erased();

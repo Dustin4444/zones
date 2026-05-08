@@ -31,8 +31,8 @@ use tempo_contracts::precompiles::{
 };
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use zone::{
-    Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents,
-    SharedL1StateCache, ZoneNode,
+    Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
+    ZoneNode,
 };
 
 use alloy_provider::{Provider, ProviderBuilder};
@@ -177,7 +177,7 @@ where
 /// Wraps an in-process reth node configured as a Zone, providing:
 /// - An HTTP RPC endpoint for provider connections
 /// - A [`DepositQueue`] handle for injecting synthetic L1 blocks
-/// - A [`SharedL1StateCache`] for seeding TempoStateReader precompile data
+/// - A [`L1StateCache`] for seeding TempoStateReader precompile data
 ///
 /// # Construction
 ///
@@ -193,7 +193,7 @@ type RpcApiFactory = dyn Fn(zone::rpc::PrivateRpcConfig) -> RpcApiFuture + Send 
 pub(crate) struct ZoneTestNode {
     http_url: url::Url,
     deposit_queue: DepositQueue,
-    l1_state_cache: SharedL1StateCache,
+    l1_state_cache: L1StateCache,
     policy_cache: zone::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
     node_handle: Box<dyn TestNodeHandle>,
@@ -219,7 +219,7 @@ impl ZoneTestNode {
     }
 
     /// Returns a handle to the L1 state cache for seeding precompile data.
-    pub(crate) fn l1_state_cache(&self) -> &SharedL1StateCache {
+    pub(crate) fn l1_state_cache(&self) -> &L1StateCache {
         &self.l1_state_cache
     }
 
@@ -2941,7 +2941,7 @@ impl L1Fixture {
     /// for each block we plan to inject.
     pub(crate) fn seed_l1_cache(
         &self,
-        cache: &SharedL1StateCache,
+        cache: &L1StateCache,
         portal_address: Address,
         sequencer: Address,
         num_blocks: u64,

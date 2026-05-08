@@ -10,7 +10,7 @@ use crate::{
     ext::TempoStateExt,
     l1::L1Subscriber,
     l1_state::{
-        L1StateProvider, L1StateProviderConfig, PolicyProvider, SharedL1StateCache,
+        L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider,
         spawn_policy_resolution_task, spawn_pool_prefetch_task,
     },
     payload::{ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes},
@@ -109,7 +109,7 @@ pub struct ZoneNode {
     /// Configuration for the L1 state provider (contract addresses, query parameters).
     l1_state_provider_config: L1StateProviderConfig,
     /// Shared L1 state cache (enabled tokens, zone metadata, etc.).
-    l1_state_cache: SharedL1StateCache,
+    l1_state_cache: L1StateCache,
     /// Shared TIP-403 policy cache, populated by the unified [`L1Subscriber`](crate::l1::L1Subscriber)
     /// and read by the precompile during block building.
     policy_cache: PolicyCache,
@@ -136,7 +136,7 @@ impl ZoneNode {
         let deposit_queue = DepositQueue::default();
 
         let policy_cache = PolicyCache::default();
-        let l1_state_cache = SharedL1StateCache::new(HashSet::from([portal_address]));
+        let l1_state_cache = L1StateCache::new(HashSet::from([portal_address]));
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
@@ -193,7 +193,7 @@ impl ZoneNode {
     }
 
     /// Returns the current l1 state cache
-    pub fn l1_state_cache(&self) -> SharedL1StateCache {
+    pub fn l1_state_cache(&self) -> L1StateCache {
         self.l1_state_cache.clone()
     }
 
@@ -709,7 +709,7 @@ impl PayloadAttributesBuilder<ZonePayloadAttributes, TempoHeader> for ZonePayloa
 #[non_exhaustive]
 pub struct ZoneExecutorBuilder {
     l1_state_provider_config: L1StateProviderConfig,
-    l1_state_cache: SharedL1StateCache,
+    l1_state_cache: L1StateCache,
     policy_cache: PolicyCache,
 }
 
@@ -717,7 +717,7 @@ impl ZoneExecutorBuilder {
     /// Create a zone executor builder with the shared L1 state/policy caches.
     pub fn new(
         l1_state_provider_config: L1StateProviderConfig,
-        l1_state_cache: SharedL1StateCache,
+        l1_state_cache: L1StateCache,
         policy_cache: PolicyCache,
     ) -> Self {
         Self {
