@@ -86,7 +86,7 @@ async fn test_tip20_transfer_on_zone() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Whitelist policy: members are authorized, non-members are not (fail-closed).
+/// Whitelist policy: set entries are authorized, non-set entries are not (fail-closed).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -100,13 +100,13 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Populate the cache: policy 5 = WHITELIST, Alice is a member, Bob is not
+    // Populate the cache: policy 5 = WHITELIST, Alice is in the set, Bob is not
     {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_member(5, alice, 1, true);
-        w.set_member(5, bob, 1, false);
+        w.record_set_status(5, alice, 1, true);
+        w.record_set_status(5, bob, 1, false);
     }
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
@@ -137,7 +137,7 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Blacklist policy: members are NOT authorized, non-members ARE authorized.
+/// Blacklist policy: set entries are NOT authorized, non-set entries ARE authorized.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -155,8 +155,8 @@ async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_member(5, alice, 1, true);
-        w.set_member(5, bob, 1, false);
+        w.record_set_status(5, alice, 1, true);
+        w.record_set_status(5, bob, 1, false);
     }
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
@@ -194,9 +194,9 @@ async fn test_policy_proxy_compound_policy() -> eyre::Result<()> {
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_member(5, alice, 1, true); // Alice whitelisted as sender
+        w.record_set_status(5, alice, 1, true); // Alice whitelisted as sender
         w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_member(6, bob, 1, true); // Bob blacklisted as recipient
+        w.record_set_status(6, bob, 1, true); // Bob blacklisted as recipient
         w.set_compound(
             10,
             CompoundData {
@@ -314,11 +314,11 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
         let cache = zone.policy_cache();
         let mut w = cache.write();
         w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_member(5, alice, 1, true); // Alice whitelisted as sender
-        w.set_member(5, bob, 1, false); // Bob not whitelisted as sender
+        w.record_set_status(5, alice, 1, true); // Alice whitelisted as sender
+        w.record_set_status(5, bob, 1, false); // Bob not whitelisted as sender
         w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_member(6, alice, 1, false); // Alice not blacklisted as recipient
-        w.set_member(6, bob, 1, true); // Bob blacklisted as recipient
+        w.record_set_status(6, alice, 1, false); // Alice not blacklisted as recipient
+        w.record_set_status(6, bob, 1, true); // Bob blacklisted as recipient
         w.set_compound(
             10,
             CompoundData {
@@ -349,8 +349,8 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
     {
         let cache = zone.policy_cache();
         let mut w = cache.write();
-        w.set_member(5, carol, 1, true); // whitelisted as sender
-        w.set_member(6, carol, 1, true); // blacklisted as recipient
+        w.record_set_status(5, carol, 1, true); // whitelisted as sender
+        w.record_set_status(6, carol, 1, true); // blacklisted as recipient
     }
 
     // Carol passes sender check but fails recipient → false

@@ -5,12 +5,12 @@
 //! layout:
 //!
 //! - **Token → policy ID**: Each token address maps to a `transferPolicyId` via
-//!   [`HeightVersioned`](super::versioned::HeightVersioned), tracking the
+//!   [`HeightVersioned`](crate::l1_state::versioned::HeightVersioned), tracking the
 //!   `TransferPolicyUpdate` event.
 //!
 //! - **Policy records**: Each policy ID maps to a [`CachedPolicy`] containing:
 //!   - The policy type (whitelist, blacklist, or compound).
-//!   - Set membership via [`MembershipSet`] — a `HashSet` baseline plus per-block deltas
+//!   - Policy set via [`PolicySet`] — a `HashSet` baseline plus per-block deltas
 //!     mirroring `WhitelistUpdated` / `BlacklistUpdated` events.
 //!   - Compound sub-policy IDs for sender, recipient, and mint recipient roles.
 //!
@@ -19,12 +19,12 @@
 //! Policy ID `0` always rejects, policy ID `1` always allows. These are handled inline by
 //! [`PolicyCacheInner::is_authorized`] without any storage lookups.
 //!
-//! ## Default membership
+//! ## Unknown set entries
 //!
-//! Users with no recorded membership event are treated as "unknown" — cache lookups return
+//! Users with no recorded set event are treated as "unknown" — cache lookups return
 //! `None` so the caller falls back to RPC. This avoids silent false negatives when the
 //! subscriber started after a user was added to a whitelist. Users who were explicitly added
-//! or removed are tracked in [`MembershipSet::observed`].
+//! or removed are tracked by [`PolicySet`].
 //!
 //! ## Compound policies (TIP-1015)
 //!
@@ -32,25 +32,21 @@
 //! (sender, recipient, or mint recipient). The [`is_authorized`](PolicyCacheInner::is_authorized)
 //! method accepts an [`AuthRole`] to resolve the correct sub-policy.
 //!
-//! ## Reorg handling
+//! ## Resync handling
 //!
-//! On reorgs the caller is expected to [`PolicyCacheInner::clear`] the entire cache. There is no
-//! per-block rollback.
+//! The cache has no per-block rollback. Defensive resync paths should call
+//! [`PolicyCacheInner::clear`] and let event replay plus RPC fallback repopulate entries.
 
 use alloy_primitives::Address;
 use alloy_provider::DynProvider;
-use alloy_sol_types::{SolEvent, SolEventInterface};
 use derive_more::Deref;
 use parking_lot::RwLock;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use tempo_alloy::TempoNetwork;
 use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
 use tracing::info;
 
-use super::builtin_authorization;
+use super::{builtin_authorization, events::PolicyEvent, policy_set::PolicySet};
 
 use crate::l1_state::versioned::HeightVersioned;
 
@@ -133,14 +129,14 @@ impl PolicyCache {
 ///
 /// Mirrors the on-chain `TIP403Registry` storage layout with:
 /// - Token → `transferPolicyId` mapping (from TIP-20 `TransferPolicyUpdate` events).
-/// - Policy ID → policy record (type, membership, compound data).
+/// - Policy ID → policy record (type, policy set, compound data).
 ///
 /// This allows the zone sequencer to evaluate transfer authorization without RPC round-trips.
 #[derive(Debug, Default)]
 pub struct PolicyCacheInner {
     /// Per-token transfer policy ID.
     tokens: HashMap<Address, HeightVersioned<u64>>,
-    /// Per-policy-ID records (type, membership, compound data).
+    /// Per-policy-ID records (type, policy set, compound data).
     ///
     /// Populated from **all** `PolicyCreated`, `CompoundPolicyCreated`,
     /// `WhitelistUpdated`, and `BlacklistUpdated` events on the global
@@ -178,11 +174,17 @@ impl PolicyCacheInner {
         self.get_policy_entry(policy_id).policy_type = Some(policy_type);
     }
 
-    /// Sets whether `user` is a member of the policy set at the given block.
-    pub fn set_member(&mut self, policy_id: u64, user: Address, block_number: u64, in_set: bool) {
+    /// Records whether `user` is in a policy set at the given block.
+    pub fn record_set_status(
+        &mut self,
+        policy_id: u64,
+        user: Address,
+        block_number: u64,
+        in_set: bool,
+    ) {
         self.get_policy_entry(policy_id)
-            .members
-            .set(user, block_number, in_set);
+            .set
+            .record_status(user, block_number, in_set);
     }
 
     /// Sets compound policy sub-policy IDs and marks the policy as compound.
@@ -248,7 +250,7 @@ impl PolicyCacheInner {
     /// Resolve authorization for a policy ID, handling builtins, simple, and compound policies.
     ///
     /// - **Builtins** (0 = reject all, 1 = allow all): resolved inline.
-    /// - **Simple** (whitelist/blacklist): checks membership set.
+    /// - **Simple** (whitelist/blacklist): checks policy set.
     /// - **Compound** (TIP-1015): delegates to the sub-policy selected by `role`.
     ///
     /// Returns `None` when the policy data is not cached (caller should fail-closed or
@@ -269,16 +271,16 @@ impl PolicyCacheInner {
 
         match policy_type {
             PolicyType::WHITELIST => {
-                if !policy.members.membership_known(&user) {
+                if !policy.set.is_known(&user) {
                     return None;
                 }
-                Some(policy.members.is_member(user, block_number))
+                Some(policy.set.contains(user, block_number))
             }
             PolicyType::BLACKLIST => {
-                if !policy.members.membership_known(&user) {
+                if !policy.set.is_known(&user) {
                     return None;
                 }
-                Some(!policy.members.is_member(user, block_number))
+                Some(!policy.set.contains(user, block_number))
             }
             PolicyType::COMPOUND => {
                 let compound = policy.compound.as_ref()?;
@@ -321,16 +323,16 @@ impl PolicyCacheInner {
 
         match policy_type {
             PolicyType::WHITELIST => {
-                if !policy.members.membership_known(&user) {
+                if !policy.set.is_known(&user) {
                     return None;
                 }
-                Some(policy.members.is_member(user, block_number))
+                Some(policy.set.contains(user, block_number))
             }
             PolicyType::BLACKLIST => {
-                if !policy.members.membership_known(&user) {
+                if !policy.set.is_known(&user) {
                     return None;
                 }
-                Some(!policy.members.is_member(user, block_number))
+                Some(!policy.set.contains(user, block_number))
             }
             _ => None,
         }
@@ -342,11 +344,11 @@ impl PolicyCacheInner {
     /// Events are decoded outside the write lock, then applied here in one batch.
     ///
     /// **NOTE:** When a `TokenPolicyChanged` event points to a policy ID that was created
-    /// before the subscriber started, the cache will have no membership data for that policy.
+    /// before the subscriber started, the cache will have no set data for that policy.
     /// Authorization queries will return `None` (cache miss), causing the
     /// [`PolicyProvider`](super::PolicyProvider) to fall back to per-user L1 RPC. Ideally,
     /// the subscriber should kick off background pre-fetching of the new policy's type and
-    /// membership set on `TokenPolicyChanged` to avoid cold-start RPC latency.
+    /// policy set on `TokenPolicyChanged` to avoid cold-start RPC latency.
     pub fn apply_events(&mut self, block_number: u64, events: &[PolicyEvent]) {
         for event in events {
             match event {
@@ -355,7 +357,7 @@ impl PolicyCacheInner {
                     account,
                     in_set,
                 } => {
-                    self.set_member(*policy_id, *account, block_number, *in_set);
+                    self.record_set_status(*policy_id, *account, block_number, *in_set);
                 }
                 PolicyEvent::TokenPolicyChanged { token, policy_id } => {
                     self.set_token_policy(*token, block_number, *policy_id);
@@ -398,7 +400,7 @@ impl PolicyCacheInner {
             v.flatten(min_block);
         }
         for policy in self.policies.values_mut() {
-            policy.members.flatten(min_block);
+            policy.set.flatten(min_block);
         }
     }
 
@@ -422,172 +424,8 @@ impl PolicyCacheInner {
             v.advance(new_height);
         }
         for policy in self.policies.values_mut() {
-            policy.members.advance(new_height);
+            policy.set.advance(new_height);
         }
-    }
-}
-
-/// A decoded L1 policy event ready to be applied to the cache.
-///
-/// The [`L1Subscriber`](crate::l1::L1Subscriber) decodes raw logs into these events
-/// outside the cache write lock, then applies them in batch via
-/// [`PolicyCacheInner::apply_events`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PolicyEvent {
-    /// A user's membership in a policy set changed (`WhitelistUpdated` / `BlacklistUpdated`).
-    MembershipChanged {
-        policy_id: u64,
-        account: Address,
-        in_set: bool,
-    },
-    /// A token's transfer policy ID changed (`TransferPolicyUpdate`).
-    TokenPolicyChanged { token: Address, policy_id: u64 },
-    /// A new simple policy was created on L1 (`PolicyCreated`).
-    PolicyCreated {
-        policy_id: u64,
-        policy_type: PolicyType,
-    },
-    /// A new compound policy was created on L1 (`CompoundPolicyCreated`).
-    CompoundPolicyCreated {
-        policy_id: u64,
-        sender_policy_id: u64,
-        recipient_policy_id: u64,
-        mint_recipient_policy_id: u64,
-    },
-}
-
-impl PolicyEvent {
-    /// Try to decode an `ITIP403Registry` log into a [`PolicyEvent`].
-    ///
-    /// Handles `WhitelistUpdated`, `BlacklistUpdated`, `PolicyCreated`, and
-    /// `CompoundPolicyCreated` events. `PolicyAdminUpdated` is logged but ignored
-    /// (returns `None`). Returns `None` for unrecognised logs.
-    pub fn decode_registry(log: &alloy_rpc_types_eth::Log) -> Option<Self> {
-        use tempo_contracts::precompiles::ITIP403Registry::{
-            BlacklistUpdated, CompoundPolicyCreated, ITIP403RegistryEvents, PolicyCreated,
-            WhitelistUpdated,
-        };
-
-        let event = match ITIP403RegistryEvents::decode_log(&log.inner) {
-            Ok(decoded) => decoded.data,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to decode TIP-403 event");
-                return None;
-            }
-        };
-
-        match event {
-            ITIP403RegistryEvents::BlacklistUpdated(BlacklistUpdated {
-                policyId,
-                account,
-                restricted,
-                ..
-            }) => {
-                tracing::info!(
-                    policy_id = policyId,
-                    account = %account,
-                    restricted,
-                    "Decoded BlacklistUpdated"
-                );
-                Some(Self::MembershipChanged {
-                    policy_id: policyId,
-                    account,
-                    in_set: restricted,
-                })
-            }
-            ITIP403RegistryEvents::WhitelistUpdated(WhitelistUpdated {
-                policyId,
-                account,
-                allowed,
-                ..
-            }) => {
-                tracing::info!(
-                    policy_id = policyId,
-                    account = %account,
-                    allowed,
-                    "Decoded WhitelistUpdated"
-                );
-                Some(Self::MembershipChanged {
-                    policy_id: policyId,
-                    account,
-                    in_set: allowed,
-                })
-            }
-            ITIP403RegistryEvents::PolicyCreated(PolicyCreated {
-                policyId,
-                policyType,
-                ..
-            }) => {
-                tracing::info!(
-                    policy_id = policyId,
-                    policy_type = ?policyType,
-                    "New policy created on L1"
-                );
-                Some(Self::PolicyCreated {
-                    policy_id: policyId,
-                    policy_type: policyType,
-                })
-            }
-            ITIP403RegistryEvents::CompoundPolicyCreated(CompoundPolicyCreated {
-                policyId,
-                senderPolicyId,
-                recipientPolicyId,
-                mintRecipientPolicyId,
-                ..
-            }) => {
-                tracing::info!(
-                    policy_id = policyId,
-                    sender_policy_id = senderPolicyId,
-                    recipient_policy_id = recipientPolicyId,
-                    mint_recipient_policy_id = mintRecipientPolicyId,
-                    "Compound policy created on L1"
-                );
-                Some(Self::CompoundPolicyCreated {
-                    policy_id: policyId,
-                    sender_policy_id: senderPolicyId,
-                    recipient_policy_id: recipientPolicyId,
-                    mint_recipient_policy_id: mintRecipientPolicyId,
-                })
-            }
-            ITIP403RegistryEvents::PolicyAdminUpdated(event) => {
-                tracing::debug!(
-                    policy_id = event.policyId,
-                    admin = %event.admin,
-                    "Policy admin updated on L1"
-                );
-                None
-            }
-        }
-    }
-
-    /// Try to decode a TIP-20 `TransferPolicyUpdate` log into a
-    /// [`PolicyEvent::TokenPolicyChanged`].
-    ///
-    /// The caller should pre-filter by topic hash before calling this — it will
-    /// return `None` (with a warning) if the log doesn't match.
-    pub fn decode_tip20(log: &alloy_rpc_types_eth::Log) -> Option<Self> {
-        use tempo_contracts::precompiles::ITIP20::TransferPolicyUpdate;
-
-        let event = match TransferPolicyUpdate::decode_log(&log.inner) {
-            Ok(decoded) => decoded.data,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to decode TIP-20 TransferPolicyUpdate");
-                return None;
-            }
-        };
-
-        let token = log.address();
-        tracing::info!(
-            token = %token,
-            new_policy_id = event.newPolicyId,
-            updater = %event.updater,
-            "Decoded TransferPolicyUpdate"
-        );
-        Some(Self::TokenPolicyChanged {
-            token,
-            policy_id: event.newPolicyId,
-        })
     }
 }
 
@@ -598,8 +436,8 @@ pub(super) use zone_primitives::policy::AuthRole;
 pub struct CachedPolicy {
     /// Policy type. `None` if the `PolicyCreated` event hasn't been observed yet.
     pub policy_type: Option<PolicyType>,
-    /// Set membership for simple (non-compound) policies.
-    pub members: MembershipSet,
+    /// Policy set for simple (non-compound) policies.
+    pub set: PolicySet,
     /// Compound sub-policy IDs. `None` for simple policies.
     pub compound: Option<CompoundData>,
 }
@@ -614,154 +452,6 @@ pub struct CompoundData {
     pub mint_recipient_policy_id: u64,
 }
 
-/// Block-versioned membership set for TIP-403 policy tracking.
-///
-/// Models set membership as a baseline [`HashSet`] plus per-block [`MembershipUpdate`] deltas,
-/// matching the L1 event model where `WhitelistUpdated` and `BlacklistUpdated` events arrive
-/// as `(address, add/remove)` updates per block.
-///
-/// Users not explicitly tracked are treated as "not in set", matching the L1 storage default
-/// for `policy_set[policyId][user]`.
-#[derive(Debug, Default)]
-pub struct MembershipSet {
-    /// Addresses in the set at `baseline_height`.
-    baseline: HashSet<Address>,
-    /// Block height up to which the baseline is valid.
-    baseline_height: u64,
-    /// Per-block membership changes above `baseline_height`.
-    pending: BTreeMap<u64, Vec<MembershipUpdate>>,
-    /// All addresses for which we've ever recorded a membership event. Survives `advance()` so
-    /// we can distinguish "explicitly not a member" from "never observed by the subscriber".
-    observed: HashSet<Address>,
-}
-
-impl MembershipSet {
-    /// Check if `user` is in the set at the given block height.
-    ///
-    /// Returns `false` for users with no recorded state, matching the L1 storage default.
-    pub fn is_member(&self, user: Address, block_number: u64) -> bool {
-        if block_number <= self.baseline_height {
-            return self.baseline.contains(&user);
-        }
-
-        // Scan pending blocks in reverse for the latest change affecting this user.
-        for (_, updates) in self.pending.range(..=block_number).rev() {
-            for update in updates.iter().rev() {
-                if update.account == user {
-                    return update.change.is_in_set();
-                }
-            }
-        }
-
-        self.baseline.contains(&user)
-    }
-
-    /// Returns `true` if we've ever recorded a membership event for `user` (added or removed).
-    ///
-    /// When `false`, the caller should not trust [`is_member`](Self::is_member) returning `false`
-    /// because the user may have been added before the subscriber started.
-    pub fn membership_known(&self, user: &Address) -> bool {
-        self.observed.contains(user) || self.baseline.contains(user)
-    }
-
-    /// Record a membership change at the given block height.
-    pub fn set(&mut self, user: Address, block_number: u64, in_set: bool) {
-        self.observed.insert(user);
-        let change = MembershipChange::from_in_set(in_set);
-        if block_number <= self.baseline_height {
-            match change {
-                MembershipChange::Add => {
-                    self.baseline.insert(user);
-                }
-                MembershipChange::Remove => {
-                    self.baseline.remove(&user);
-                }
-            }
-        } else {
-            self.pending
-                .entry(block_number)
-                .or_default()
-                .push(MembershipUpdate {
-                    account: user,
-                    change,
-                });
-        }
-    }
-
-    /// Advance the baseline to `new_height`, folding pending deltas.
-    pub fn advance(&mut self, new_height: u64) {
-        if new_height <= self.baseline_height {
-            return;
-        }
-
-        let to_apply: Vec<u64> = self.pending.range(..=new_height).map(|(k, _)| *k).collect();
-        for block in to_apply {
-            if let Some(updates) = self.pending.remove(&block) {
-                for update in updates {
-                    match update.change {
-                        MembershipChange::Add => {
-                            self.baseline.insert(update.account);
-                        }
-                        MembershipChange::Remove => {
-                            self.baseline.remove(&update.account);
-                        }
-                    }
-                }
-            }
-        }
-
-        self.baseline_height = new_height;
-    }
-
-    /// Equivalent to [`advance`](Self::advance).
-    pub fn flatten(&mut self, min_block: u64) {
-        self.advance(min_block);
-    }
-
-    /// Returns `true` if no membership data has been recorded.
-    pub fn is_empty(&self) -> bool {
-        self.baseline.is_empty() && self.pending.is_empty()
-    }
-
-    /// Clears all membership data and resets the baseline height.
-    pub fn clear(&mut self) {
-        self.baseline.clear();
-        self.baseline_height = 0;
-        self.pending.clear();
-        self.observed.clear();
-    }
-}
-
-/// Whether a policy set member was added or removed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MembershipChange {
-    /// Address was added to the policy set (whitelisted / blacklisted).
-    Add,
-    /// Address was removed from the policy set (un-whitelisted / un-blacklisted).
-    Remove,
-}
-
-impl MembershipChange {
-    /// Convert from the L1 event's boolean (`allowed` / `restricted`) to a change.
-    pub(super) fn from_in_set(in_set: bool) -> Self {
-        if in_set { Self::Add } else { Self::Remove }
-    }
-
-    /// Whether this change means the address is in the set.
-    pub(super) fn is_in_set(self) -> bool {
-        matches!(self, Self::Add)
-    }
-}
-
-/// A single membership update within a block.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct MembershipUpdate {
-    /// The address whose membership changed.
-    pub account: Address,
-    /// Whether the address was added to or removed from the set.
-    pub change: MembershipChange,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,63 +461,63 @@ mod tests {
     const USER_A: Address = address!("0x0000000000000000000000000000000000000001");
     const USER_B: Address = address!("0x0000000000000000000000000000000000000002");
 
-    // --- MembershipSet tests ---
+    // --- PolicySet tests ---
 
     #[test]
-    fn membership_default_is_not_in_set() {
-        let set = MembershipSet::default();
-        assert!(!set.is_member(USER_A, 100));
+    fn policy_set_default_is_not_in_set() {
+        let set = PolicySet::default();
+        assert!(!set.contains(USER_A, 100));
     }
 
     #[test]
-    fn membership_add_and_remove() {
-        let mut set = MembershipSet::default();
-        set.set(USER_A, 10, true);
-        assert!(set.is_member(USER_A, 10));
-        assert!(set.is_member(USER_A, 15));
-        assert!(!set.is_member(USER_A, 5));
+    fn policy_set_add_and_remove() {
+        let mut set = PolicySet::default();
+        set.record_status(USER_A, 10, true);
+        assert!(set.contains(USER_A, 10));
+        assert!(set.contains(USER_A, 15));
+        assert!(!set.contains(USER_A, 5));
 
-        set.set(USER_A, 20, false);
-        assert!(set.is_member(USER_A, 15));
-        assert!(!set.is_member(USER_A, 25));
+        set.record_status(USER_A, 20, false);
+        assert!(set.contains(USER_A, 15));
+        assert!(!set.contains(USER_A, 25));
     }
 
     #[test]
-    fn membership_multiple_users_same_block() {
-        let mut set = MembershipSet::default();
-        set.set(USER_A, 10, true);
-        set.set(USER_B, 10, true);
+    fn policy_set_multiple_users_same_block() {
+        let mut set = PolicySet::default();
+        set.record_status(USER_A, 10, true);
+        set.record_status(USER_B, 10, true);
 
-        assert!(set.is_member(USER_A, 10));
-        assert!(set.is_member(USER_B, 10));
+        assert!(set.contains(USER_A, 10));
+        assert!(set.contains(USER_B, 10));
     }
 
     #[test]
-    fn membership_advance_folds_deltas() {
-        let mut set = MembershipSet::default();
-        set.set(USER_A, 10, true);
-        set.set(USER_B, 15, true);
-        set.set(USER_A, 20, false);
+    fn policy_set_advance_folds_deltas() {
+        let mut set = PolicySet::default();
+        set.record_status(USER_A, 10, true);
+        set.record_status(USER_B, 15, true);
+        set.record_status(USER_A, 20, false);
 
         set.advance(15);
 
         // USER_A added at 10 (folded into baseline), USER_B added at 15 (folded)
-        assert!(set.is_member(USER_A, 15));
-        assert!(set.is_member(USER_B, 15));
+        assert!(set.contains(USER_A, 15));
+        assert!(set.contains(USER_B, 15));
 
         // USER_A removed at 20 (still pending)
-        assert!(!set.is_member(USER_A, 25));
+        assert!(!set.contains(USER_A, 25));
     }
 
     #[test]
-    fn membership_set_below_baseline_updates_directly() {
-        let mut set = MembershipSet::default();
-        set.set(USER_A, 10, true);
+    fn policy_set_below_baseline_updates_directly() {
+        let mut set = PolicySet::default();
+        set.record_status(USER_A, 10, true);
         set.advance(20);
 
         // Set below baseline updates directly
-        set.set(USER_A, 15, false);
-        assert!(!set.is_member(USER_A, 20));
+        set.record_status(USER_A, 15, false);
+        assert!(!set.contains(USER_A, 20));
     }
 
     // --- PolicyCacheInner tests: simple policies ---
@@ -857,8 +547,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(2, USER_B, 10, false);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_B, 10, false);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -875,8 +565,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 3);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.set_member(3, USER_A, 10, true);
-        cache.set_member(3, USER_B, 10, false);
+        cache.record_set_status(3, USER_A, 10, true);
+        cache.record_set_status(3, USER_B, 10, false);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -894,7 +584,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 3);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
 
-        // USER_A has no membership data — unknown, caller should fall back to RPC
+        // USER_A has no set data — unknown, caller should fall back to RPC
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             None
@@ -907,7 +597,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
-        // USER_A has no membership data — unknown, caller should fall back to RPC
+        // USER_A has no set data — unknown, caller should fall back to RPC
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             None
@@ -939,7 +629,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 1);
         cache.set_token_policy(TOKEN, 20, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 20, true);
+        cache.record_set_status(2, USER_A, 20, true);
 
         // At block 15: policy_id=1 (always allow)
         assert_eq!(
@@ -964,12 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn block_versioned_membership_change() {
+    fn block_versioned_set_change() {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, false);
-        cache.set_member(2, USER_A, 20, true);
+        cache.record_set_status(2, USER_A, 10, false);
+        cache.record_set_status(2, USER_A, 20, true);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 15, AuthRole::Transfer),
@@ -986,7 +676,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
 
         cache.clear();
 
@@ -1021,9 +711,9 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_token_policy(token2, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
 
-        // Both tokens see the same membership (per-policy, no fan-out needed)
+        // Both tokens see the same policy set (per-policy, no fan-out needed)
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             Some(true)
@@ -1042,7 +732,7 @@ mod tests {
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_token_policy(token2, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
 
         // BLACKLIST: authorized when NOT in set
         assert_eq!(
@@ -1073,8 +763,8 @@ mod tests {
         cache.set_token_policy(token2, 10, 3);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(3, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(3, USER_A, 10, true);
 
         // TOKEN uses whitelist policy 2: USER_A whitelisted → authorized
         assert_eq!(
@@ -1093,8 +783,8 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(2, USER_A, 20, false);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 20, false);
 
         cache.advance(15);
 
@@ -1133,8 +823,8 @@ mod tests {
         cache.set_token_policy(TOKEN, 20, 3);
         cache.set_policy_type(2, PolicyType::WHITELIST);
         cache.set_policy_type(3, PolicyType::BLACKLIST);
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(3, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(3, USER_A, 10, true);
 
         // At block 15 (whitelist policy 2), USER_A is in set → authorized
         assert_eq!(
@@ -1156,8 +846,8 @@ mod tests {
         // Simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST); // sender policy
         cache.set_policy_type(3, PolicyType::WHITELIST); // recipient policy
-        cache.set_member(2, USER_A, 10, true); // USER_A blacklisted as sender
-        cache.set_member(3, USER_A, 10, true); // USER_A whitelisted as recipient
+        cache.record_set_status(2, USER_A, 10, true); // USER_A blacklisted as sender
+        cache.record_set_status(3, USER_A, 10, true); // USER_A whitelisted as recipient
 
         // Compound policy referencing sub-policies
         cache.set_compound(
@@ -1207,14 +897,14 @@ mod tests {
         );
 
         // Only sender whitelisted → fails on recipient (still unknown for recipient sub-policy)
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             None
         );
 
         // Both whitelisted → authorized
-        cache.set_member(3, USER_A, 10, true);
+        cache.record_set_status(3, USER_A, 10, true);
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
             Some(true)
@@ -1326,7 +1016,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
 
         // Before advance: known and authorized
         assert_eq!(
@@ -1334,7 +1024,7 @@ mod tests {
             Some(true)
         );
 
-        // Advance past the membership block — folds pending into baseline
+        // Advance past the set block — folds pending into baseline
         cache.advance(20);
 
         // After advance: still known and still authorized (observed persists)
@@ -1351,14 +1041,14 @@ mod tests {
     }
 
     #[test]
-    fn observed_survives_advance_for_removed_member() {
+    fn observed_survives_advance_for_removed_set_entry() {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
         // Add then remove USER_A
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(2, USER_A, 20, false);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 20, false);
 
         // Advance past both events
         cache.advance(25);
@@ -1375,7 +1065,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.set_member(2, USER_A, 10, true); // blacklisted
+        cache.record_set_status(2, USER_A, 10, true); // blacklisted
 
         cache.advance(20);
 
@@ -1397,7 +1087,7 @@ mod tests {
         let mut cache = PolicyCacheInner::default();
         cache.set_token_policy(TOKEN, 10, 2);
         cache.set_policy_type(2, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, true);
 
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::Transfer),
@@ -1414,29 +1104,26 @@ mod tests {
     }
 
     #[test]
-    fn membership_known_direct() {
-        let mut set = MembershipSet::default();
+    fn policy_set_known_direct() {
+        let mut set = PolicySet::default();
 
         // Fresh set: nobody known
-        assert!(!set.membership_known(&USER_A));
-        assert!(!set.membership_known(&USER_B));
+        assert!(!set.is_known(&USER_A));
+        assert!(!set.is_known(&USER_B));
 
         // Add USER_A
-        set.set(USER_A, 10, true);
-        assert!(set.membership_known(&USER_A));
-        assert!(!set.membership_known(&USER_B));
+        set.record_status(USER_A, 10, true);
+        assert!(set.is_known(&USER_A));
+        assert!(!set.is_known(&USER_B));
 
         // Advance past the event
         set.advance(20);
-        assert!(
-            set.membership_known(&USER_A),
-            "observed must survive advance"
-        );
-        assert!(!set.membership_known(&USER_B));
+        assert!(set.is_known(&USER_A), "observed must survive advance");
+        assert!(!set.is_known(&USER_B));
 
         // Clear resets everything
         set.clear();
-        assert!(!set.membership_known(&USER_A));
+        assert!(!set.is_known(&USER_A));
     }
 
     #[test]
@@ -1446,8 +1133,8 @@ mod tests {
         cache.set_policy_type(2, PolicyType::WHITELIST);
 
         // Events at different blocks
-        cache.set_member(2, USER_A, 10, true);
-        cache.set_member(2, USER_B, 20, true);
+        cache.record_set_status(2, USER_A, 10, true);
+        cache.record_set_status(2, USER_B, 20, true);
 
         // Advance past first event only
         cache.advance(15);
@@ -1478,8 +1165,8 @@ mod tests {
         // Pre-populate simple sub-policies
         cache.set_policy_type(2, PolicyType::BLACKLIST);
         cache.set_policy_type(3, PolicyType::WHITELIST);
-        cache.set_member(2, USER_A, 10, false); // explicitly not blacklisted
-        cache.set_member(3, USER_A, 10, true);
+        cache.record_set_status(2, USER_A, 10, false); // explicitly not blacklisted
+        cache.record_set_status(3, USER_A, 10, true);
 
         let events = vec![
             PolicyEvent::CompoundPolicyCreated {

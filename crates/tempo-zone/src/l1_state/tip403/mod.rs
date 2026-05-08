@@ -25,15 +25,15 @@
 //! ```
 //!
 //! The [`L1Subscriber`](crate::l1::L1Subscriber) extracts policy events from
-//! `eth_getBlockReceipts` and applies them (creates, membership updates,
+//! `eth_getBlockReceipts` and applies them (creates, set updates,
 //! compound configs) to the [`PolicyCache`].
 //! [`PolicyProvider`] serves authorization queries from cache, falling back to L1
 //! RPC on miss and writing the result back for future lookups.
 //!
 //! # Startup sequence
 //!
-//! 1. [`PolicyCache::seed_token_policies`] — bulk-fetch current policy state from L1 for all
-//!    tracked tokens and populate the cache baseline.
+//! 1. [`PolicyCache::seed_token_policies`] — bulk-fetch current `transferPolicyId` values
+//!    from L1 for all tracked tokens and populate the cache baseline.
 //! 2. [`spawn_policy_resolution_task`] — start the background resolution task
 //!    (processes pre-fetch requests from the pool and other callers).
 //! 3. [`spawn_pool_prefetch_task`] — watch incoming pool transactions and submit
@@ -50,10 +50,10 @@
 //! cold cache.
 //!
 //! On a miss, [`PolicyProvider::is_authorized`] falls back to an RPC call against
-//! L1 at the zone's current height and writes the result into the cache. This is
+//! L1 at the block being evaluated and writes the result into the cache. This is
 //! safe because L1 is authoritative and the zone never runs ahead of it: the
-//! queried state is final for the current block, and the subscriber will apply any
-//! future changes that supersede it.
+//! queried state is final for that block, and the subscriber will apply any future
+//! changes that supersede it.
 //!
 //! # Key invariants
 //!
@@ -63,14 +63,16 @@
 //!   cache never runs ahead of the engine's view.
 
 mod cache;
+mod events;
 mod metrics;
+mod policy_set;
 mod pool_prefetch;
 pub mod provider;
 pub mod task;
 
-pub use cache::{
-    CachedPolicy, CompoundData, MembershipSet, PolicyCache, PolicyCacheInner, PolicyEvent,
-};
+pub use cache::{CachedPolicy, CompoundData, PolicyCache, PolicyCacheInner};
+pub use events::PolicyEvent;
+pub use policy_set::PolicySet;
 use tempo_precompiles::tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID};
 pub use zone_primitives::policy::AuthRole;
 

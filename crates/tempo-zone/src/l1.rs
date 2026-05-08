@@ -666,9 +666,11 @@ impl L1Subscriber {
         }
     }
 
-    /// Write decoded policy events into the shared cache and advance its L1 block
-    /// cursor. The cursor is always updated — even for blocks with no policy events —
-    /// so that cache-miss fallback queries target the correct L1 height.
+    /// Write decoded policy events into the shared cache.
+    ///
+    /// The subscriber may write events ahead of the engine's processed L1 height;
+    /// the engine advances the cache baseline after it accepts the corresponding
+    /// zone payload.
     fn apply_policy_events(&self, block_number: u64, policy_events: &[PolicyEvent]) {
         let mut cache = self.config.policy_cache.write();
         cache.apply_events(block_number, policy_events);
@@ -1883,7 +1885,7 @@ mod tests {
             let mut cache = subscriber.config.policy_cache.write();
             cache.set_token_policy(token, 10, 2);
             cache.set_policy_type(2, PolicyType::WHITELIST);
-            cache.set_member(2, user, 10, true);
+            cache.record_set_status(2, user, 10, true);
             cache.advance(10);
         }
 

@@ -176,8 +176,8 @@ impl PolicyProvider {
 
     /// Fetch authorization for a simple (whitelist/blacklist) policy.
     ///
-    /// Calls `isAuthorized(policyId, user)` on L1, derives the raw membership boolean
-    /// from the result + policy type, and caches it in the [`MembershipSet`](super::MembershipSet).
+    /// Calls `isAuthorized(policyId, user)` on L1, derives the raw policy-set boolean
+    /// from the result + policy type, and caches it in the [`PolicySet`](super::PolicySet).
     async fn fetch_and_cache_simple(
         &self,
         policy_id: u64,
@@ -189,7 +189,7 @@ impl PolicyProvider {
             .rpc_is_authorized(policy_id, user, block_number)
             .await?;
 
-        // Derive raw membership from the authorization result:
+        // Derive the raw policy-set value from the authorization result:
         // - Whitelist: authorized == in_set
         // - Blacklist: authorized == !in_set
         let in_set = match policy_type {
@@ -200,11 +200,11 @@ impl PolicyProvider {
 
         self.cache
             .write()
-            .set_member(policy_id, user, block_number, in_set);
+            .record_set_status(policy_id, user, block_number, in_set);
 
         info!(
             policy_id, %user, block_number, authorized, in_set,
-            "Cached policy membership from L1 RPC"
+            "Cached policy set entry from L1 RPC"
         );
 
         Ok(authorized)
@@ -213,7 +213,7 @@ impl PolicyProvider {
     /// Fetch authorization for a compound policy.
     ///
     /// Fetches the compound sub-policy structure from L1, resolves the relevant sub-policy
-    /// for the requested role, and recursively fetches/caches the sub-policy membership.
+    /// for the requested role, and recursively fetches/caches the sub-policy set state.
     async fn fetch_and_cache_compound(
         &self,
         policy_id: u64,
@@ -267,7 +267,7 @@ impl PolicyProvider {
         }
 
         // Check cache first for this sub-policy.
-        // If the policy type is known but the user's membership was never observed by the
+        // If the policy type is known but the user was never observed by the
         // subscriber, `check_simple` returns `None` and we fall through to RPC.
         {
             let cache = self.cache.read();
@@ -464,7 +464,7 @@ impl PolicyProvider {
         result
     }
 
-    /// Resolve authorization for a policy ID by fetching policy type and membership
+    /// Resolve authorization for a policy ID by fetching policy type and set state
     /// from L1, caching the results.
     ///
     /// Shared implementation used by both [`fetch_and_cache`](Self::fetch_and_cache)

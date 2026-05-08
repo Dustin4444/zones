@@ -37,8 +37,8 @@ use super::{AuthRole, task::PolicyTaskHandle};
 /// 4. **Batch calls** — Tempo AA transactions can include multiple top-level calls,
 ///    and each call is inspected independently.
 ///
-/// The resolution task fetches the latest L1 block number for each request,
-/// so callers don't need to track block heights.
+/// The resolution task resolves each request at the cache's last engine-processed
+/// L1 block, so callers don't need to track block heights.
 ///
 /// The task is spawned as a non-critical background task — if it stops, block
 /// building still works but may incur more synchronous RPC round-trips on cache

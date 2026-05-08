@@ -107,8 +107,8 @@ impl PolicyResolutionTask {
 pub enum PolicyTaskMessage {
     /// Pre-fetch and cache authorization data for a (token, user) pair.
     ///
-    /// The resolution task queries L1 at the latest block number — callers
-    /// don't need to specify one.
+    /// The resolution task queries L1 at the cache's last engine-processed L1 block;
+    /// callers don't need to specify one.
     ResolveAuthorization {
         /// The TIP-20 token whose transfer policy to check.
         token: Address,
@@ -136,7 +136,7 @@ impl PolicyTaskHandle {
 
     /// Request pre-fetch of authorization data for a (token, user) pair.
     ///
-    /// The resolution task will query L1 at the latest block number.
+    /// The resolution task will query L1 at the cache's last engine-processed L1 block.
     /// Returns `Ok(())` if the message was queued, or `Err` if the
     /// resolution task has shut down.
     pub async fn resolve_authorization(
