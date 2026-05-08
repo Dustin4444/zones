@@ -183,7 +183,7 @@ impl PolicyCacheInner {
         in_set: bool,
     ) {
         self.get_policy_entry(policy_id)
-            .set
+            .policy_set
             .record_status(user, block_number, in_set);
     }
 
@@ -271,16 +271,16 @@ impl PolicyCacheInner {
 
         match policy_type {
             PolicyType::WHITELIST => {
-                if !policy.set.is_known(&user) {
+                if !policy.policy_set.is_known(&user) {
                     return None;
                 }
-                Some(policy.set.contains(user, block_number))
+                Some(policy.policy_set.contains(user, block_number))
             }
             PolicyType::BLACKLIST => {
-                if !policy.set.is_known(&user) {
+                if !policy.policy_set.is_known(&user) {
                     return None;
                 }
-                Some(!policy.set.contains(user, block_number))
+                Some(!policy.policy_set.contains(user, block_number))
             }
             PolicyType::COMPOUND => {
                 let compound = policy.compound.as_ref()?;
@@ -323,16 +323,16 @@ impl PolicyCacheInner {
 
         match policy_type {
             PolicyType::WHITELIST => {
-                if !policy.set.is_known(&user) {
+                if !policy.policy_set.is_known(&user) {
                     return None;
                 }
-                Some(policy.set.contains(user, block_number))
+                Some(policy.policy_set.contains(user, block_number))
             }
             PolicyType::BLACKLIST => {
-                if !policy.set.is_known(&user) {
+                if !policy.policy_set.is_known(&user) {
                     return None;
                 }
-                Some(!policy.set.contains(user, block_number))
+                Some(!policy.policy_set.contains(user, block_number))
             }
             _ => None,
         }
@@ -400,7 +400,7 @@ impl PolicyCacheInner {
             v.flatten(min_block);
         }
         for policy in self.policies.values_mut() {
-            policy.set.flatten(min_block);
+            policy.policy_set.flatten(min_block);
         }
     }
 
@@ -424,7 +424,7 @@ impl PolicyCacheInner {
             v.advance(new_height);
         }
         for policy in self.policies.values_mut() {
-            policy.set.advance(new_height);
+            policy.policy_set.advance(new_height);
         }
     }
 }
@@ -437,7 +437,7 @@ pub struct CachedPolicy {
     /// Policy type. `None` if the `PolicyCreated` event hasn't been observed yet.
     pub policy_type: Option<PolicyType>,
     /// Policy set for simple (non-compound) policies.
-    pub set: PolicySet,
+    pub policy_set: PolicySet,
     /// Compound sub-policy IDs. `None` for simple policies.
     pub compound: Option<CompoundData>,
 }
