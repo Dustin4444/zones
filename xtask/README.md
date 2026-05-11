@@ -6,3 +6,4 @@ Subcommands currently supported:
 
 + `create-zone`: creates a new zone on Tempo L1 via the ZoneFactory contract.
 + `generate-zone-genesis`: generates a zone L2 genesis file.
++ `set-zone-rpc-url`: updates the public RPC URL metadata on a ZonePortal.

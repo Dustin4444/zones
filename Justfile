@@ -112,7 +112,7 @@ zone-info identifier:
     cargo run -p tempo-xtask -- zone-info {{identifier}}
 
 [group('zone')]
-[doc('Creates a new zone on L1 via ZoneFactory and generates genesis + zone.json in generated/<name>/. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Requires L1_RPC_URL, PRIVATE_KEY, and SEQUENCER_KEY env vars.')]
+[doc('Creates a new zone on L1 via ZoneFactory and generates genesis + zone.json in generated/<name>/. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Set ZONE_RPC_URL to publish an HTTPS zone RPC URL. Requires L1_RPC_URL, PRIVATE_KEY, and SEQUENCER_KEY env vars.')]
 create-zone name token="":
     #!/bin/bash
     set -euo pipefail
@@ -133,6 +133,7 @@ create-zone name token="":
     esac
     SEQ_KEY="${SEQUENCER_KEY:?Set SEQUENCER_KEY env var}"
     L1_RPC="${L1_RPC_URL:?Set L1_RPC_URL env var (wss://...)}"
+    ZONE_RPC_METADATA="${ZONE_RPC_URL:-}"
     HTTP_RPC=$(echo "$L1_RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
     SEQUENCER_ADDR=$(cast wallet address "$SEQ_KEY")
     OUTPUT="generated/{{name}}"
@@ -148,6 +149,7 @@ create-zone name token="":
         --l1-rpc-url "$HTTP_RPC" \
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
+        --zone-rpc-url "$ZONE_RPC_METADATA" \
         --private-key "$PK"
     echo "Zone '{{name}}' created. Artifacts in $OUTPUT/"
 
@@ -312,6 +314,21 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
         fi
         sleep 0.25
     done
+
+[group('zone')]
+[doc('Updates the public Zone RPC URL stored on the ZonePortal. Pass an HTTPS URL, or "" to clear. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and SEQUENCER_KEY env vars.')]
+set-zone-rpc-url url:
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    PK="${SEQUENCER_KEY:?Set SEQUENCER_KEY env var (only the sequencer can update zone RPC URL)}"
+    PORTAL="${L1_PORTAL_ADDRESS:?Set L1_PORTAL_ADDRESS env var}"
+    HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
+    cargo run -p tempo-xtask -- set-zone-rpc-url \
+        --l1-rpc-url "$HTTP_RPC" \
+        --portal "$PORTAL" \
+        --private-key "$PK" \
+        --zone-rpc-url "{{url}}"
 
 [group('zone')]
 [doc('Enables a TIP-20 token on the ZonePortal for bridging. Token can be an address or alias (pathusd, alphausd, betausd). Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and SEQUENCER_KEY env vars.')]
@@ -631,13 +648,14 @@ check-balance-private name token="0x20C0000000000000000000000000000000000000" rp
     echo "Balance of $ACCOUNT: $BALANCE"
 
 [group('zone')]
-[doc('End-to-end: generates a sequencer key, funds it on L1, creates a zone on-chain, generates genesis, and starts the zone node. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Requires L1_RPC_URL env var.')]
+[doc('End-to-end: generates a sequencer key, funds it on L1, creates a zone on-chain, generates genesis, and starts the zone node. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Set ZONE_RPC_URL to publish an HTTPS zone RPC URL. Requires L1_RPC_URL env var.')]
 deploy-zone name token="":
     #!/bin/bash
     set -euo pipefail
     L1_RPC="${L1_RPC_URL:?Set L1_RPC_URL env var (wss://...)}"
     HTTP_RPC=$(echo "$L1_RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
     OUTPUT="generated/{{name}}"
+    ZONE_RPC_METADATA="${ZONE_RPC_URL:-}"
     ZONE_TOKEN_L1="{{token}}"
     if [[ -z "$ZONE_TOKEN_L1" ]]; then
         ZONE_TOKEN_L1="${ZONE_TOKEN:-0x20C0000000000000000000000000000000000000}"
@@ -687,6 +705,7 @@ deploy-zone name token="":
         --l1-rpc-url "$HTTP_RPC" \
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
+        --zone-rpc-url "$ZONE_RPC_METADATA" \
         --private-key "$SEQUENCER_KEY"
     echo ""
 
@@ -717,6 +736,7 @@ deploy-zone name token="":
     echo "  Portal:          $PORTAL"
     echo "  Initial Token:   $ZONE_TOKEN_L1"
     echo "  Sequencer:       $SEQUENCER_ADDR"
+    echo "  Zone RPC URL:    ${ZONE_RPC_METADATA:-<unset>}"
     echo "  Anchor Block:    $ANCHOR_BLOCK"
     echo ""
     echo "  Artifacts:       $OUTPUT/"

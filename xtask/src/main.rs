@@ -3,7 +3,8 @@ use crate::{
     create_zone::CreateZone, demo_blacklist::DemoBlacklist,
     demo_swap_and_deposit::DemoSwapAndDeposit, deploy_router::DeployRouter,
     encrypted_deposit::EncryptedDeposit, generate_zone_genesis::GenerateZoneGenesis,
-    set_encryption_key::SetEncryptionKey, spam_deposits::SpamDeposits, zone_info::ZoneInfoCmd,
+    set_encryption_key::SetEncryptionKey, set_zone_rpc_url::SetZoneRpcUrl,
+    spam_deposits::SpamDeposits, zone_info::ZoneInfoCmd,
 };
 use clap::Parser as _;
 use eyre::Context;
@@ -15,6 +16,7 @@ mod deploy_router;
 mod encrypted_deposit;
 mod generate_zone_genesis;
 mod set_encryption_key;
+mod set_zone_rpc_url;
 mod spam_deposits;
 mod zone_info;
 mod zone_utils;
@@ -42,6 +44,7 @@ async fn main() -> eyre::Result<()> {
             args.run().await.wrap_err("failed to generate zone genesis")
         }
         Action::SetEncryptionKey(args) => args.run().await.wrap_err("failed to set encryption key"),
+        Action::SetZoneRpcUrl(args) => args.run().await.wrap_err("failed to set zone RPC URL"),
         Action::SpamDeposits(args) => args.run().await.wrap_err("failed to spam deposits"),
         Action::ZoneInfo(args) => args.run().await.wrap_err("failed to fetch zone info"),
     }
@@ -66,6 +69,7 @@ enum Action {
     EncryptedDeposit(EncryptedDeposit),
     GenerateZoneGenesis(GenerateZoneGenesis),
     SetEncryptionKey(SetEncryptionKey),
+    SetZoneRpcUrl(SetZoneRpcUrl),
     SpamDeposits(SpamDeposits),
     ZoneInfo(ZoneInfoCmd),
 }

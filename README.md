@@ -43,10 +43,12 @@ Prerequisites: [Rust](https://rustup.rs/), [Foundry](https://book.getfoundry.sh/
 ```bash
 # Deploy and start a zone on Moderato testnet
 export L1_RPC_URL="wss://rpc.moderato.tempo.xyz"
+# Optional: publish a public HTTPS RPC URL in the zone's on-chain metadata
+export ZONE_RPC_URL="https://rpc.my-zone.example"
 just deploy-zone my-zone
 ```
 
-The `deploy-zone` command generates a sequencer keypair, funds it on L1, deploys the portal via `ZoneFactory`, generates genesis, and starts the node.
+The `deploy-zone` command generates a sequencer keypair, funds it on L1, deploys the portal via `ZoneFactory`, stores the optional zone RPC URL, generates genesis, and starts the node.
 
 ```bash
 # Start/restart a zone after initial deployment

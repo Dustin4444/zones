@@ -1009,6 +1009,7 @@ impl L1TestNode {
                     genesisTempoBlockHash: genesis_tempo_block_hash,
                     genesisTempoBlockNumber: l1_header.inner.number,
                 },
+                zoneRpcUrl: String::new(),
             })
             .send()
             .await?

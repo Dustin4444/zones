@@ -137,6 +137,7 @@ contract ZonePortalTest is BaseTest {
     uint32 public testZoneId;
     bytes32 public constant GENESIS_BLOCK_HASH = keccak256("genesis");
     bytes32 public constant GENESIS_TEMPO_BLOCK_HASH = keccak256("tempoGenesis");
+    string public constant ZONE_RPC_URL = "https://rpc.zone.example:8545/path";
     uint64 public genesisTempoBlockNumber;
 
     function setUp() public override {
@@ -168,7 +169,8 @@ contract ZonePortalTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: genesisTempoBlockNumber
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         address portalAddr;
@@ -215,6 +217,26 @@ contract ZonePortalTest is BaseTest {
         });
     }
 
+    function _invalidZoneRpcUrls() internal pure returns (string[6] memory) {
+        return [
+            "http://rpc.zone.example",
+            "javascript:alert(1)",
+            "no-scheme-here",
+            "://missing-scheme.example",
+            "1https://digit-leading.example",
+            " https://leading-space.example"
+        ];
+    }
+
+    function _httpsUrlOfLength(uint256 len) internal pure returns (string memory) {
+        bytes memory prefix = bytes("https://example.com/");
+        bytes memory out = new bytes(len);
+        for (uint256 i = 0; i < len; i++) {
+            out[i] = i < prefix.length ? prefix[i] : bytes1("a");
+        }
+        return string(out);
+    }
+
     /*//////////////////////////////////////////////////////////////
                             ZONE CREATION TESTS
     //////////////////////////////////////////////////////////////*/
@@ -227,6 +249,56 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
+        assertEq(portal.zoneRpcUrl(), ZONE_RPC_URL);
+    }
+
+    function test_setZoneRpcUrl_success() public {
+        string memory newUrl = "HTTPS://rpc2.zone.example:443/path?x=1";
+
+        vm.expectEmit(true, false, false, true);
+        emit IZonePortal.ZoneRpcUrlUpdated(admin, newUrl);
+        portal.setZoneRpcUrl(newUrl);
+
+        assertEq(portal.zoneRpcUrl(), newUrl);
+    }
+
+    function test_setZoneRpcUrl_allowsEmptyString() public {
+        portal.setZoneRpcUrl("");
+
+        assertEq(portal.zoneRpcUrl(), "");
+    }
+
+    function test_setZoneRpcUrl_allowsHttpsSchemeOnlyValidation() public {
+        portal.setZoneRpcUrl("https:foo:bar");
+
+        assertEq(portal.zoneRpcUrl(), "https:foo:bar");
+    }
+
+    function test_setZoneRpcUrl_allowsMaxLength() public {
+        string memory atLimit = _httpsUrlOfLength(portal.MAX_ZONE_RPC_URL_BYTES());
+
+        portal.setZoneRpcUrl(atLimit);
+
+        assertEq(portal.zoneRpcUrl(), atLimit);
+    }
+
+    function test_setZoneRpcUrl_revertsForNonSequencer() public {
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.NotSequencer.selector);
+        portal.setZoneRpcUrl("https://rpc.zone.example");
+    }
+
+    function test_setZoneRpcUrl_revertsOnInvalidZoneRpcUrl() public {
+        string[6] memory invalidUrls = _invalidZoneRpcUrls();
+        for (uint256 i = 0; i < invalidUrls.length; i++) {
+            vm.expectRevert(IZonePortal.InvalidZoneRpcUrl.selector);
+            portal.setZoneRpcUrl(invalidUrls[i]);
+        }
+    }
+
+    function test_setZoneRpcUrl_revertsOnZoneRpcUrlTooLong() public {
+        vm.expectRevert(IZonePortal.ZoneRpcUrlTooLong.selector);
+        portal.setZoneRpcUrl(_httpsUrlOfLength(257));
     }
 
     function test_zoneFactoryTracksZones() public view {
@@ -2339,6 +2411,7 @@ contract ZonePortalTest is BaseTest {
     ///        slot 4: currentDepositQueueHash (bytes32)
     ///        slot 5: lastSyncedTempoBlockNumber (uint64)
     ///        slot 6: _encryptionKeys.length (EncryptionKeyEntry[])
+    ///        slot 12: zoneRpcUrl (string)
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));

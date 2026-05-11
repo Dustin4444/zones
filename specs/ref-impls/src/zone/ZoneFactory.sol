@@ -5,6 +5,7 @@ import { IZoneFactory, ZoneInfo } from "./IZone.sol";
 import { Verifier } from "./Verifier.sol";
 import { ZoneMessenger } from "./ZoneMessenger.sol";
 import { ZonePortal } from "./ZonePortal.sol";
+import { ZoneRpcUrlLib } from "./ZoneRpcUrlLib.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
 
@@ -59,6 +60,7 @@ contract ZoneFactory is IZoneFactory {
         }
         if (params.sequencer == address(0)) revert InvalidSequencer();
         if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
+        ZoneRpcUrlLib.validate(params.zoneRpcUrl);
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
 
         zoneId = _nextZoneId;
@@ -94,7 +96,8 @@ contract ZoneFactory is IZoneFactory {
             params.sequencer,
             params.verifier,
             params.zoneParams.genesisBlockHash,
-            params.zoneParams.genesisTempoBlockNumber
+            params.zoneParams.genesisTempoBlockNumber,
+            params.zoneRpcUrl
         );
         portal = address(portalContract);
 
@@ -111,7 +114,8 @@ contract ZoneFactory is IZoneFactory {
             verifier: params.verifier,
             genesisBlockHash: params.zoneParams.genesisBlockHash,
             genesisTempoBlockHash: params.zoneParams.genesisTempoBlockHash,
-            genesisTempoBlockNumber: params.zoneParams.genesisTempoBlockNumber
+            genesisTempoBlockNumber: params.zoneParams.genesisTempoBlockNumber,
+            zoneRpcUrl: params.zoneRpcUrl
         });
 
         _isZonePortal[portal] = true;
@@ -126,7 +130,8 @@ contract ZoneFactory is IZoneFactory {
             params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockHash,
-            params.zoneParams.genesisTempoBlockNumber
+            params.zoneParams.genesisTempoBlockNumber,
+            params.zoneRpcUrl
         );
     }
 

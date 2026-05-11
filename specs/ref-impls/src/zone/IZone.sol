@@ -24,6 +24,7 @@ struct ZoneInfo {
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
+    string zoneRpcUrl;
 }
 
 /// @notice Zone creation parameters stored in genesis
@@ -363,6 +364,10 @@ interface IZoneTxContext {
 //   slot 6: _encryptionKeys (EncryptionKeyEntry[])
 //   slot 7: _tokenConfigs (mapping(address => TokenConfig))
 //   slot 8: _enabledTokens (address[])
+//   slot 9: _withdrawalQueue.head (uint256)
+//   slot 10: _withdrawalQueue.tail (uint256)
+//   slot 11: _withdrawalQueue.slots (mapping(uint256 => bytes32))
+//   slot 12: zoneRpcUrl (string)
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -426,6 +431,7 @@ interface IZoneFactory {
         address sequencer;
         address verifier;
         ZoneParams zoneParams;
+        string zoneRpcUrl;
     }
 
     event ZoneCreated(
@@ -437,7 +443,8 @@ interface IZoneFactory {
         address verifier,
         bytes32 genesisBlockHash,
         bytes32 genesisTempoBlockHash,
-        uint64 genesisTempoBlockNumber
+        uint64 genesisTempoBlockNumber,
+        string zoneRpcUrl
     );
 
     error InvalidToken();
@@ -445,6 +452,8 @@ interface IZoneFactory {
     error InvalidVerifier();
     error InsufficientGas();
     error ZoneIdOverflow();
+    error ZoneRpcUrlTooLong();
+    error InvalidZoneRpcUrl();
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
@@ -553,6 +562,7 @@ interface IZonePortal {
         bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock
     );
     event ZoneGasRateUpdated(uint128 zoneGasRate);
+    event ZoneRpcUrlUpdated(address indexed updater, string newZoneRpcUrl);
 
     /// @notice Emitted when sequencer enables a new TIP-20 token for bridging
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -581,6 +591,8 @@ interface IZonePortal {
     error TokenNotEnabled();
     error DepositsNotActive();
     error TokenAlreadyEnabled();
+    error ZoneRpcUrlTooLong();
+    error InvalidZoneRpcUrl();
 
     /// @notice Fixed gas value for deposit fee calculation (100,000 gas)
     function FIXED_DEPOSIT_GAS() external view returns (uint64);
@@ -588,10 +600,14 @@ interface IZonePortal {
     /// @notice Maximum allowed gas fee rate (1e18)
     function MAX_GAS_FEE_RATE() external view returns (uint128);
 
+    /// @notice Maximum allowed byte length of the zone RPC URL.
+    function MAX_ZONE_RPC_URL_BYTES() external view returns (uint256);
+
     function zoneId() external view returns (uint32);
     function messenger() external view returns (address);
     function sequencer() external view returns (address);
     function pendingSequencer() external view returns (address);
+    function zoneRpcUrl() external view returns (string memory);
     function zoneGasRate() external view returns (uint128);
     function verifier() external view returns (address);
     function withdrawalBatchIndex() external view returns (uint64);
@@ -686,6 +702,12 @@ interface IZonePortal {
     /// @notice Set zone gas rate. Only callable by sequencer.
     /// @param _zoneGasRate Zone token units per gas unit on the zone
     function setZoneGasRate(uint128 _zoneGasRate) external;
+
+    /// @notice Set the zone's public RPC URL metadata. Only callable by sequencer.
+    /// @dev Empty strings are valid and clear the URL. Non-empty URLs must use
+    ///      the `https` scheme and be at most 256 bytes.
+    /// @param newZoneRpcUrl The new zone RPC URL metadata value.
+    function setZoneRpcUrl(string calldata newZoneRpcUrl) external;
 
     /// @notice Calculate the fee for a deposit
     function calculateDepositFee() external view returns (uint128 fee);

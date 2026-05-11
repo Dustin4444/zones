@@ -21,6 +21,7 @@ import {
     Withdrawal
 } from "./IZone.sol";
 import { WithdrawalQueue, WithdrawalQueueLib } from "./WithdrawalQueueLib.sol";
+import { ZoneRpcUrlLib } from "./ZoneRpcUrlLib.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
@@ -48,6 +49,9 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Maximum allowed gas fee rate to prevent overflows
     uint128 public constant MAX_GAS_FEE_RATE = 1e18;
+
+    /// @notice Maximum allowed byte length of the zone RPC URL.
+    uint256 public constant MAX_ZONE_RPC_URL_BYTES = ZoneRpcUrlLib.MAX_ZONE_RPC_URL_BYTES;
 
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
@@ -103,6 +107,10 @@ contract ZonePortal is IZonePortal {
     /// @notice Withdrawal queue (zone→Tempo): fixed-size ring buffer
     WithdrawalQueue internal _withdrawalQueue;
 
+    /// @notice Public RPC URL metadata for this zone.
+    /// @dev Empty string means unset.
+    string public zoneRpcUrl;
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -114,14 +122,18 @@ contract ZonePortal is IZonePortal {
         address _sequencer,
         address _verifier,
         bytes32 _genesisBlockHash,
-        uint64 _genesisTempoBlockNumber
+        uint64 _genesisTempoBlockNumber,
+        string memory _zoneRpcUrl
     ) {
+        ZoneRpcUrlLib.validate(_zoneRpcUrl);
+
         zoneId = _zoneId;
         messenger = _messenger;
         sequencer = _sequencer;
         verifier = _verifier;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
+        zoneRpcUrl = _zoneRpcUrl;
 
         // Enable the initial token
         _enableTokenInternal(_initialToken);
@@ -165,6 +177,15 @@ contract ZonePortal is IZonePortal {
         if (_zoneGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
         zoneGasRate = _zoneGasRate;
         emit ZoneGasRateUpdated(_zoneGasRate);
+    }
+
+    /// @notice Set the zone's public RPC URL metadata. Only callable by sequencer.
+    /// @dev Empty strings are valid and clear the URL. Non-empty URLs must use
+    ///      the `https` scheme and be at most 256 bytes.
+    function setZoneRpcUrl(string calldata newZoneRpcUrl) external onlySequencer {
+        ZoneRpcUrlLib.validate(newZoneRpcUrl);
+        zoneRpcUrl = newZoneRpcUrl;
+        emit ZoneRpcUrlUpdated(msg.sender, newZoneRpcUrl);
     }
 
     /*//////////////////////////////////////////////////////////////

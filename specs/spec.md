@@ -197,6 +197,7 @@ The following table lists every privileged action and the role authorized to inv
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setZoneGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setTempoGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
+| `setZoneRpcUrl(url)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setSequencerEncryptionKey(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `submitBatch(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `processWithdrawal(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
@@ -223,8 +224,11 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
+| `zoneRpcUrl` | Public zone RPC URL metadata stored on the `ZonePortal`. Empty string means unset; non-empty values must be at most 256 bytes and use the `https` scheme. |
 
-The factory assigns a unique `zoneId`, deploys a [`ZonePortal`](#izoneportal) and a [`ZoneMessenger`](#izonemessenger), and enables the initial token. The [`ZoneCreated`](#izonefactory) event emits all deployment parameters.
+The factory assigns a unique `zoneId`, deploys a [`ZonePortal`](#izoneportal) and a [`ZoneMessenger`](#izonemessenger), stores the initial zone RPC URL, and enables the initial token. The [`ZoneCreated`](#izonefactory) event emits all deployment parameters.
+
+`zoneRpcUrl` is mutable metadata. Empty string is valid and means unset. Non-empty values MUST be at most 256 bytes and MUST have an `https` scheme, compared ASCII-case-insensitively. The protocol validates only the scheme before the first `:` and does not validate the URI body, so values like `https:` and `https:foo` are accepted.
 
 ### Chain ID
 
@@ -1478,6 +1482,7 @@ struct ZoneInfo {
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
+    string zoneRpcUrl;
 }
 
 struct ZoneParams {
@@ -1501,12 +1506,14 @@ interface IZoneFactory {
         address sequencer;
         address verifier;
         ZoneParams zoneParams;
+        string zoneRpcUrl;
     }
 
     event ZoneCreated(
         uint32 indexed zoneId, address indexed portal, address indexed messenger,
         address initialToken, address sequencer, address verifier,
-        bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
+        bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber,
+        string zoneRpcUrl
     );
 
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
@@ -1555,6 +1562,7 @@ interface IZonePortal {
     event SequencerTransferred(address indexed previousSequencer, address indexed newSequencer);
     event SequencerEncryptionKeyUpdated(bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock);
     event ZoneGasRateUpdated(uint128 zoneGasRate);
+    event ZoneRpcUrlUpdated(address indexed updater, string newZoneRpcUrl);
     event TempoGasRateUpdated(uint128 tempoGasRate);
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
     event DepositsPaused(address indexed token);
@@ -1568,6 +1576,8 @@ interface IZonePortal {
     function areDepositsActive(address token) external view returns (bool);
     function enabledTokenCount() external view returns (uint256);
     function enabledTokenAt(uint256 index) external view returns (address);
+    function zoneRpcUrl() external view returns (string memory);
+    function setZoneRpcUrl(string calldata newZoneRpcUrl) external;
 
     // Deposits
     /// @dev Reverts (`MissingBouncebackRecipient`) if `bouncebackRecipient == address(0)`.

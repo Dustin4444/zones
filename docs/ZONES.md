@@ -130,9 +130,17 @@ To choose the initial TIP-20 enabled on the portal, pass it as the second positi
 just create-zone my-zone alphausd
 ```
 
+To publish a public RPC endpoint in the on-chain zone metadata at deploy time, set
+`ZONE_RPC_URL` to an HTTPS URL before creating the zone. Empty is allowed and means unset.
+
+```bash
+export ZONE_RPC_URL="https://rpc.my-zone.example"
+just create-zone my-zone
+```
+
 This creates `generated/my-zone/` containing:
 - **`genesis.json`** — Zone L2 genesis state (system contracts, fee token, etc.)
-- **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, `zoneFactory`, and optional router/sequencer metadata)
+- **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, `zoneFactory`, `zoneRpcUrl`, and optional router/sequencer metadata)
 
 This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. The zone's fee token in genesis remains `pathUSD`.
 
@@ -143,7 +151,14 @@ cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
   --sequencer "$SEQUENCER_ADDR" \
+  --zone-rpc-url "https://rpc.my-zone.example" \
   --private-key "$SEQUENCER_KEY"
+```
+
+The current sequencer can update the on-chain RPC URL later:
+
+```bash
+just set-zone-rpc-url "https://rpc.my-zone.example/v2"
 ```
 
 ### 5. Start the Zone Node
@@ -209,7 +224,7 @@ just send-deposit-encrypted 1000000                       # to your own address
 just send-deposit-encrypted 1000000 <recipient-address>   # to a specific address
 ```
 
-Set `ZONE_RPC_URL` to poll the zone for processing confirmation:
+For local polling helpers, set `ZONE_RPC_URL` to the running zone node:
 
 ```bash
 export ZONE_RPC_URL="http://localhost:8546"
@@ -368,7 +383,7 @@ just enable-token pathusd
 just enable-token alphausd
 ```
 
-If `ZONE_RPC_URL` is set (defaults to `http://localhost:8546`), the command waits for the zone to process the L1 block and confirms the token is available on L2.
+If `ZONE_RPC_URL` is set for local polling (defaults to `http://localhost:8546`), the command waits for the zone to process the L1 block and confirms the token is available on L2.
 
 Once the token is enabled, approve the portal and deposit as usual — just pass the token address:
 
@@ -542,6 +557,7 @@ The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zo
 | `L1_PORTAL_ADDRESS` | For deposits | ZonePortal address (from `zone.json`) |
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
+| `ZONE_RPC_URL` | No | Public HTTPS zone RPC URL to publish on `ZonePortal` during `just create-zone` / `just deploy-zone`; helper commands also use it as the local zone-node URL |
 
 ## Justfile Commands Reference
 
@@ -555,6 +571,7 @@ The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zo
 | `just send-deposit [to]` | Deposit tokens from L1 to zone (defaults to sender) |
 | `just send-deposit-encrypted [to]` | Encrypted deposit — hides recipient and memo on-chain |
 | `just enable-token <token>` | Enable a TIP-20 token on the portal for bridging (sequencer only) |
+| `just set-zone-rpc-url <url>` | Update the public zone RPC URL stored on the portal (sequencer only; pass `""` to clear) |
 | `just max-approve-outbox` | Approve outbox to spend tokens on zone |
 | `just send-withdrawal [to]` | Withdraw tokens from zone to L1 (defaults to sender) |
 | `just demo-swap-and-deposit <name>` | Self-contained same-zone router demo: create tokens, seed DEX liquidity, swap on L1, deposit output back into the zone |

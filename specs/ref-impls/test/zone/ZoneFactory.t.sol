@@ -17,6 +17,7 @@ contract ZoneFactoryTest is BaseTest {
 
     bytes32 constant GENESIS_BLOCK_HASH = keccak256("genesis");
     bytes32 constant GENESIS_TEMPO_BLOCK_HASH = keccak256("tempoGenesis");
+    string constant ZONE_RPC_URL = "https://rpc.zone.example:8545/path";
 
     function setUp() public override {
         super.setUp();
@@ -36,7 +37,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
@@ -55,6 +57,8 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(info.verifier, zoneFactory.verifier());
         assertEq(info.genesisBlockHash, GENESIS_BLOCK_HASH);
         assertEq(info.genesisTempoBlockHash, GENESIS_TEMPO_BLOCK_HASH);
+        assertEq(info.zoneRpcUrl, ZONE_RPC_URL);
+        assertEq(ZonePortal(portal).zoneRpcUrl(), ZONE_RPC_URL);
     }
 
     function test_createZone_deploysMessenger() public {
@@ -66,7 +70,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
@@ -92,7 +97,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         (uint32 zoneId1, address portal1) = zoneFactory.createZone(params1);
@@ -105,7 +111,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: keccak256("genesis2"),
                 genesisTempoBlockHash: keccak256("tempoGenesis2"),
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: "HTTPS://rpc2.zone.example:443"
         });
 
         (uint32 zoneId2, address portal2) = zoneFactory.createZone(params2);
@@ -132,7 +139,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         // Record logs and verify ZoneCreated event was emitted
@@ -146,7 +154,7 @@ contract ZoneFactoryTest is BaseTest {
             if (
                 logs[i].topics[0]
                     == keccak256(
-                        "ZoneCreated(uint32,address,address,address,address,address,bytes32,bytes32,uint64)"
+                        "ZoneCreated(uint32,address,address,address,address,address,bytes32,bytes32,uint64,string)"
                     )
             ) {
                 found = true;
@@ -176,7 +184,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -195,7 +204,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -211,7 +221,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -231,7 +242,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         vm.expectRevert(IZoneFactory.InvalidSequencer.selector);
@@ -251,10 +263,57 @@ contract ZoneFactoryTest is BaseTest {
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
-            })
+            }),
+            zoneRpcUrl: ZONE_RPC_URL
         });
 
         vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.createZone(params);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       ZONE RPC URL VALIDATION TESTS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_createZone_allowsEmptyZoneRpcUrl() public {
+        IZoneFactory.CreateZoneParams memory params = _validCreateZoneParams("");
+
+        (uint32 zoneId, address portal) = zoneFactory.createZone(params);
+
+        assertEq(zoneFactory.zones(zoneId).zoneRpcUrl, "");
+        assertEq(ZonePortal(portal).zoneRpcUrl(), "");
+    }
+
+    function test_createZone_allowsHttpsSchemeOnlyValidation() public {
+        IZoneFactory.CreateZoneParams memory params = _validCreateZoneParams("HTTPS:foo:bar");
+
+        (, address portal) = zoneFactory.createZone(params);
+
+        assertEq(ZonePortal(portal).zoneRpcUrl(), "HTTPS:foo:bar");
+    }
+
+    function test_createZone_allowsMaxLengthZoneRpcUrl() public {
+        IZoneFactory.CreateZoneParams memory params = _validCreateZoneParams(_httpsUrlOfLength(256));
+
+        (, address portal) = zoneFactory.createZone(params);
+
+        assertEq(bytes(ZonePortal(portal).zoneRpcUrl()).length, 256);
+    }
+
+    function test_createZone_revertsOnInvalidZoneRpcUrl() public {
+        string[6] memory invalidUrls = _invalidZoneRpcUrls();
+        for (uint256 i = 0; i < invalidUrls.length; i++) {
+            IZoneFactory.CreateZoneParams memory params = _validCreateZoneParams(invalidUrls[i]);
+
+            vm.expectRevert(IZoneFactory.InvalidZoneRpcUrl.selector);
+            zoneFactory.createZone(params);
+        }
+    }
+
+    function test_createZone_revertsOnZoneRpcUrlTooLong() public {
+        IZoneFactory.CreateZoneParams memory params = _validCreateZoneParams(_httpsUrlOfLength(257));
+
+        vm.expectRevert(IZoneFactory.ZoneRpcUrlTooLong.selector);
         zoneFactory.createZone(params);
     }
 
@@ -278,6 +337,44 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(info.portal, address(0));
         assertEq(info.messenger, address(0));
         assertEq(info.initialToken, address(0));
+    }
+
+    function _validCreateZoneParams(string memory zoneRpcUrl)
+        internal
+        view
+        returns (IZoneFactory.CreateZoneParams memory)
+    {
+        return IZoneFactory.CreateZoneParams({
+            initialToken: address(pathUSD),
+            sequencer: admin,
+            verifier: zoneFactory.verifier(),
+            zoneParams: ZoneParams({
+                genesisBlockHash: GENESIS_BLOCK_HASH,
+                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
+                genesisTempoBlockNumber: uint64(block.number)
+            }),
+            zoneRpcUrl: zoneRpcUrl
+        });
+    }
+
+    function _invalidZoneRpcUrls() internal pure returns (string[6] memory) {
+        return [
+            "http://rpc.zone.example",
+            "javascript:alert(1)",
+            "no-scheme-here",
+            "://missing-scheme.example",
+            "1https://digit-leading.example",
+            " https://leading-space.example"
+        ];
+    }
+
+    function _httpsUrlOfLength(uint256 len) internal pure returns (string memory) {
+        bytes memory prefix = bytes("https://example.com/");
+        bytes memory out = new bytes(len);
+        for (uint256 i = 0; i < len; i++) {
+            out[i] = i < prefix.length ? prefix[i] : bytes1("a");
+        }
+        return string(out);
     }
 
 }

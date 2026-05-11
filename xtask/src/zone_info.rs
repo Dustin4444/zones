@@ -62,6 +62,7 @@ impl ZoneInfoCmd {
         println!("  Genesis Block Hash:    {}", info.genesisBlockHash);
         println!("  Genesis Tempo Hash:    {}", info.genesisTempoBlockHash);
         println!("  Genesis Tempo Block:   {}", info.genesisTempoBlockNumber);
+        println!("  Zone RPC URL:          {}", info.zoneRpcUrl);
 
         // Query live portal state
         let portal = ZonePortal::new(info.portal, &provider);
@@ -69,6 +70,7 @@ impl ZoneInfoCmd {
         let sequencer = portal.sequencer().call().await?;
         let pending = portal.pendingSequencer().call().await?;
         let gas_rate = portal.zoneGasRate().call().await?;
+        let zone_rpc_url = portal.zoneRpcUrl().call().await?;
         let batch_index = portal.withdrawalBatchIndex().call().await?;
         let block_hash = portal.blockHash().call().await?;
         let deposit_queue = portal.currentDepositQueueHash().call().await?;
@@ -80,6 +82,7 @@ impl ZoneInfoCmd {
             println!("  Pending Sequencer:     {pending}");
         }
         println!("  Zone Gas Rate:         {gas_rate}");
+        println!("  Zone RPC URL (live):   {zone_rpc_url}");
         println!("  Withdrawal Batch:      {batch_index}");
         println!("  Block Hash:            {block_hash}");
         println!("  Deposit Queue Hash:    {deposit_queue}");

@@ -180,6 +180,9 @@ macro_rules! define_abi {
                     address indexed newSequencer
                 );
 
+                #[derive(Debug)]
+                event ZoneRpcUrlUpdated(address indexed updater, string newZoneRpcUrl);
+
                 // -- Errors --
 
                 #[derive(Debug)]
@@ -190,13 +193,19 @@ macro_rules! define_abi {
                 error InvalidTempoBlockNumber();
                 #[derive(Debug)]
                 error DepositPolicyForbids();
+                #[derive(Debug)]
+                error ZoneRpcUrlTooLong();
+                #[derive(Debug)]
+                error InvalidZoneRpcUrl();
 
                 // -- View functions --
 
                 function zoneId() external view returns (uint32);
                 function sequencer() external view returns (address);
+                function zoneRpcUrl() external view returns (string memory);
                 function verifier() external view returns (address);
                 function sequencerPubkey() external view returns (bytes32);
+                function MAX_ZONE_RPC_URL_BYTES() external view returns (uint256);
                 function withdrawalBatchIndex() external view returns (uint64);
                 function blockHash() external view returns (bytes32);
                 function currentDepositQueueHash() external view returns (bytes32);
@@ -229,6 +238,8 @@ macro_rules! define_abi {
                 ) external;
 
                 function enableToken(address token) external;
+
+                function setZoneRpcUrl(string calldata newZoneRpcUrl) external;
 
                 function depositEncrypted(
                     address token,
@@ -408,6 +419,7 @@ macro_rules! define_abi {
                 bytes32 genesisBlockHash;
                 bytes32 genesisTempoBlockHash;
                 uint64 genesisTempoBlockNumber;
+                string zoneRpcUrl;
             }
 
             $($rpc_attr)*
@@ -422,6 +434,7 @@ macro_rules! define_abi {
                     address sequencer;
                     address verifier;
                     ZoneParams zoneParams;
+                    string zoneRpcUrl;
                 }
                 #[derive(Debug)]
                 event ZoneCreated(
@@ -433,7 +446,8 @@ macro_rules! define_abi {
                     address verifier,
                     bytes32 genesisBlockHash,
                     bytes32 genesisTempoBlockHash,
-                    uint64 genesisTempoBlockNumber
+                    uint64 genesisTempoBlockNumber,
+                    string zoneRpcUrl
                 );
                 function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
                 function verifier() external view returns (address);
@@ -667,6 +681,8 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::DepositPolicyForbids(_) => f.write_str("DepositPolicyForbids"),
+            Self::ZoneRpcUrlTooLong(_) => f.write_str("ZoneRpcUrlTooLong"),
+            Self::InvalidZoneRpcUrl(_) => f.write_str("InvalidZoneRpcUrl"),
         }
     }
 }

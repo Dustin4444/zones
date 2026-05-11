@@ -29,6 +29,7 @@ sol! {
         address sequencer;
         address verifier;
         ZoneParams zoneParams;
+        string zoneRpcUrl;
     }
 
     #[sol(rpc)]
@@ -42,7 +43,8 @@ sol! {
             address verifier,
             bytes32 genesisBlockHash,
             bytes32 genesisTempoBlockHash,
-            uint64 genesisTempoBlockNumber
+            uint64 genesisTempoBlockNumber,
+            string zoneRpcUrl
         );
 
         function verifier() external view returns (address);
@@ -73,6 +75,10 @@ pub(crate) struct CreateZone {
     /// Sequencer address that will operate the zone.
     #[arg(long)]
     sequencer: Address,
+
+    /// Public HTTPS RPC URL metadata to store on the ZonePortal. Empty clears/unsets it.
+    #[arg(long, default_value = "")]
+    zone_rpc_url: String,
 
     /// Private key (hex) for signing the createZone transaction on L1.
     #[arg(long)]
@@ -124,6 +130,7 @@ impl CreateZone {
                 genesisTempoBlockHash: B256::ZERO,
                 genesisTempoBlockNumber: current_block,
             },
+            zoneRpcUrl: self.zone_rpc_url.clone(),
         };
 
         println!(
@@ -202,6 +209,7 @@ impl CreateZone {
             "portal": format!("{portal}"),
             "initialToken": format!("{}", self.initial_token),
             "sequencer": format!("{}", self.sequencer),
+            "zoneRpcUrl": self.zone_rpc_url,
             "tempoAnchorBlock": confirm_header.inner.number,
             "zoneFactory": format!("{}", self.zone_factory),
         });
@@ -218,6 +226,10 @@ impl CreateZone {
         println!("  Portal: {portal}");
         println!("  Initial Token: {}", self.initial_token);
         println!("  Sequencer: {}", self.sequencer);
+        println!(
+            "  Zone RPC URL: {}",
+            zone_json["zoneRpcUrl"].as_str().unwrap_or("")
+        );
         println!("  ZoneFactory: {}", self.zone_factory);
         println!("  Tempo anchor block: {}", confirm_header.inner.number);
         println!(
