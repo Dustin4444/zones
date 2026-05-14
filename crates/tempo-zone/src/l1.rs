@@ -413,8 +413,16 @@ impl L1Subscriber {
                         receipts = receipts.len(),
                         "Fetched L1 block data"
                     );
+                    // Use the RPC-provided hash instead of recomputing via
+                    // seal_slow. This ensures the hash matches the canonical
+                    // chain even if the local TempoHeader struct is missing
+                    // fields added in newer hardforks (e.g. consensus_context
+                    // from T4/TIP-1031).
+                    // TODO: once tempo dep is bumped, recalculate the hash
+                    // locally and assert it matches the RPC-provided hash.
+                    let rpc_hash = header_resp.inner.hash;
                     let header = header_resp.inner.inner;
-                    Ok::<_, eyre::Report>((header, receipts))
+                    Ok::<_, eyre::Report>((header, rpc_hash, receipts))
                 }
             })
             .buffered(concurrency);
@@ -422,12 +430,12 @@ impl L1Subscriber {
         let mut enqueued = 0u64;
         let backfill_start = std::time::Instant::now();
 
-        while let Some((header, receipts)) = fetched.try_next().await? {
+        while let Some((header, rpc_hash, receipts)) = fetched.try_next().await? {
             let block_number = header.number();
             let (events, policy_events) = self.extract_events(block_number, &receipts);
             self.record_seen_block(block_number, to.saturating_sub(block_number));
 
-            let sealed = SealedHeader::seal_slow(header);
+            let sealed = SealedHeader::new(header, rpc_hash);
             self.update_l1_state_anchor(block_number, sealed.hash(), sealed.parent_hash());
             self.apply_policy_events(block_number, &policy_events);
             self.apply_portal_state_events(block_number, &events);
@@ -508,7 +516,11 @@ impl L1Subscriber {
                 break;
             };
             let block_number = header.number();
-            let sealed = SealedHeader::seal_slow(header.inner.into_consensus());
+            // Use the RPC-provided hash — see backfill path comment for rationale.
+            // TODO: once tempo dep is bumped, recalculate the hash locally and
+            // assert it matches the RPC-provided hash.
+            let rpc_hash = header.inner.hash;
+            let sealed = SealedHeader::new(header.inner.into_consensus(), rpc_hash);
             let (events, policy_events) = self.extract_events(block_number, &receipts);
             self.record_seen_block(block_number, 0);
 
