@@ -34,10 +34,12 @@ use reth_transaction_pool::{
     TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
+use reth_primitives_traits::SealedBlock;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::TempoChainSpec;
 use tempo_evm::TempoEvmConfig;
+use tempo_payload_types::TempoExecutionData;
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoReceiptConverter,
 };
@@ -292,6 +294,7 @@ where
                 NoopEngineApiBuilder::default(),
                 BasicEngineValidatorBuilder::default(),
                 Identity::default(),
+                Identity::default(),
             ),
             deposit_queue,
             l1_config,
@@ -487,10 +490,14 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ZoneNode {
     type RpcBlock =
         alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeader>;
 
-    fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> tempo_primitives::Block {
-        rpc_block
+    fn rpc_to_execution_data(rpc_block: Self::RpcBlock) -> TempoExecutionData {
+        let block = rpc_block
             .into_consensus_block()
-            .map_transactions(|tx| tx.into_inner())
+            .map_transactions(|tx| tx.into_inner());
+        TempoExecutionData {
+            block: Arc::new(SealedBlock::seal_slow(block)),
+            validator_set: None,
+        }
     }
 
     fn local_payload_attributes_builder(

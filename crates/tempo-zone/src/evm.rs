@@ -17,7 +17,8 @@ use crate::{
 };
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory,
-    block::{BlockExecutorFactory, BlockExecutorFor},
+    block::BlockExecutorFactory,
+    eth::EthTxResult,
     precompiles::PrecompilesMap,
     revm::{Inspector, inspector::NoOpInspector},
 };
@@ -44,7 +45,7 @@ use tempo_precompiles::{
     tip20::is_tip20_prefix, validator_config::ValidatorConfig,
     validator_config_v2::ValidatorConfigV2,
 };
-use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope};
+use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType};
 
 type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 
@@ -278,6 +279,8 @@ impl BlockExecutorFactory for ZoneEvmConfig {
     type ExecutionCtx<'a> = TempoBlockExecutionCtx<'a>;
     type Transaction = TempoTxEnvelope;
     type Receipt = TempoReceipt;
+    type TxExecutionResult = EthTxResult<<ZoneEvmFactory as EvmFactory>::HaltReason, TempoTxType>;
+    type Executor<'a, DB: StateDB, I: Inspector<TempoCtx<DB>>> = ZoneBlockExecutor<'a, DB, I>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.zone_factory
@@ -287,10 +290,10 @@ impl BlockExecutorFactory for ZoneEvmConfig {
         &'a self,
         evm: TempoEvm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: StateDB + 'a,
-        I: Inspector<TempoCtx<DB>> + 'a,
+        DB: StateDB,
+        I: Inspector<TempoCtx<DB>>,
     {
         ZoneBlockExecutor::new(evm, ctx, self.chain_spec())
     }
@@ -343,10 +346,12 @@ impl ConfigureEvm for ZoneEvmConfig {
                     .map(|withdrawals| Cow::Borrowed(withdrawals.as_slice())),
                 extra_data: block.header().extra_data().clone(),
                 tx_count_hint: Some(block.body().transactions.len()),
+                slot_number: None,
             },
             general_gas_limit: 0,
             shared_gas_limit: 0,
             validator_set: None,
+            consensus_context: block.header().consensus_context,
             subblock_fee_recipients: Default::default(),
         })
     }

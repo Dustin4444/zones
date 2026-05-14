@@ -257,7 +257,7 @@ fn advance_tempo_repro() {
     match &config_result {
         Ok(result) => {
             println!("config() result: {:?}", result.result);
-            let gas_used = result.result.gas_used();
+            let gas_used = result.result.tx_gas_used();
             match &result.result {
                 ExecutionResult::Success { output, .. } => {
                     if let Output::Call(data) = output {
@@ -285,7 +285,7 @@ fn advance_tempo_repro() {
         evm.transact_system_call(sequencer, TEMPO_STATE_ADDRESS, Bytes::from(hash_calldata));
     match &hash_result {
         Ok(result) => {
-            let gas_used = result.result.gas_used();
+            let gas_used = result.result.tx_gas_used();
             match &result.result {
                 ExecutionResult::Success { output, .. } => {
                     if let Output::Call(data) = output {
@@ -386,7 +386,7 @@ fn advance_tempo_repro() {
         evm.transact_system_call(sequencer, ZONE_INBOX_ADDRESS, Bytes::from(advance_calldata));
     match &advance_result {
         Ok(result) => {
-            let gas_used = result.result.gas_used();
+            let gas_used = result.result.tx_gas_used();
             match &result.result {
                 ExecutionResult::Success { output, .. } => {
                     if let Output::Call(data) = output {

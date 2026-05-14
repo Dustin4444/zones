@@ -1113,7 +1113,7 @@ impl L1TestNode {
         let provider = self.dev_provider();
         let factory = ITIP20Factory::new(TIP20_FACTORY_ADDRESS, &provider);
         let receipt = factory
-            .createToken(
+            .createToken_0(
                 name.to_string(),
                 symbol.to_string(),
                 "USD".to_string(),
@@ -2717,7 +2717,7 @@ impl PrivateRpcTestCtx {
             .connect_http(self.zone.http_url().clone());
         let keychain = IAccountKeychainInstance::new(ACCOUNT_KEYCHAIN_ADDRESS, &provider);
         let pending = keychain
-            .authorizeKey(key_id, signature_type, expiry, false, vec![])
+            .authorizeKey_0(key_id, signature_type, expiry, false, vec![])
             .send()
             .await?;
         self.fixture.inject_empty_block(self.zone.deposit_queue());
