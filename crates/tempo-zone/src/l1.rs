@@ -509,7 +509,13 @@ impl L1Subscriber {
                 break;
             };
             let block_number = header.number();
-            let sealed = SealedHeader::seal_slow(header.inner.into_consensus());
+            // Use the RPC-provided canonical hash instead of recomputing via
+            // seal_slow. The locally recomputed hash can diverge from the
+            // canonical hash when the RPC node and zone binary use different
+            // dependency versions (e.g. alloy-consensus) that produce different
+            // RLP encodings for the same header fields.
+            let rpc_hash = header.inner.hash;
+            let sealed = SealedHeader::new(header.inner.into_consensus(), rpc_hash);
             let (events, policy_events) = self.extract_events(block_number, &receipts);
             self.record_seen_block(block_number, 0);
 
