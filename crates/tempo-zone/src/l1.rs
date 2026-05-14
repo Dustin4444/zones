@@ -1868,6 +1868,23 @@ mod tests {
         keccak256(alloy_rlp::encode(header))
     }
 
+    /// Create a deterministic ed25519 public key for tests.
+    ///
+    /// Uses a known-valid ed25519 verification key (basepoint * 1, i.e. the
+    /// ed25519 generator point).
+    fn make_test_pubkey(_seed: [u8; 32]) -> tempo_primitives::ed25519::PublicKey {
+        use alloy_primitives::B256;
+        // This is the ed25519 basepoint (generator) — a valid verification key.
+        let basepoint: [u8; 32] = [
+            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66,
+        ];
+        B256::from(basepoint)
+            .try_into()
+            .expect("basepoint is a valid ed25519 public key")
+    }
+
     #[test]
     fn update_l1_state_anchor_reorg_clears_stale_policy_state() {
         use crate::l1_state::tip403::AuthRole;
@@ -3675,5 +3692,374 @@ mod tests {
         assert_eq!(queue.pending_len(), 2);
         assert_eq!(queue.pending_block(0).unwrap().header.number(), 103);
         assert_eq!(queue.pending_block(1).unwrap().header.number(), 104);
+    }
+
+    /// Regression test: verify that the live-stream seal path
+    /// (`header.inner.into_consensus()` → `SealedHeader::seal_slow`) produces
+    /// a hash that matches the RPC-provided canonical hash for headers with
+    /// `consensus_context: Some(...)`.
+    ///
+    /// If the locally-computed hash diverges from the canonical hash, the
+    /// confirmation buffer rejects every block as a "reorg" and the zone
+    /// stalls.
+    #[test]
+    fn seal_slow_matches_rpc_hash_with_consensus_context() {
+        use tempo_alloy::rpc::TempoHeaderResponse;
+        use tempo_primitives::TempoConsensusContext;
+
+        // Build a TempoHeader with consensus_context (post-T4).
+        let consensus_ctx = TempoConsensusContext {
+            epoch: 42,
+            view: 7,
+            parent_view: 6,
+            proposer: make_test_pubkey([0xab; 32]),
+        };
+        let tempo_header = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 123,
+            inner: Header {
+                number: 100,
+                timestamp: 1_700_000_000,
+                base_fee_per_gas: Some(1_000_000_000),
+                ..Default::default()
+            },
+            consensus_context: Some(consensus_ctx),
+        };
+
+        // Compute the canonical hash — this is what the L1 block producer
+        // stores as the block hash and what successor blocks reference as
+        // parent_hash.
+        let canonical_hash = header_hash(&tempo_header);
+
+        // Simulate what the RPC server does: wrap in Header<TempoHeader> with
+        // the canonical hash, then in TempoHeaderResponse.
+        let rpc_header = alloy_rpc_types_eth::Header {
+            hash: canonical_hash,
+            inner: tempo_header.clone(),
+            total_difficulty: None,
+            size: None,
+        };
+        let rpc_response = TempoHeaderResponse {
+            inner: rpc_header,
+            timestamp_millis: 1_700_000_000_123,
+        };
+
+        // Simulate the JSON round-trip that happens over the RPC wire.
+        let json = serde_json::to_string(&rpc_response).unwrap();
+        let deserialized: TempoHeaderResponse = serde_json::from_str(&json).unwrap();
+
+        // --- Live stream path (l1.rs line 511) ---
+        let live_sealed =
+            SealedHeader::seal_slow(deserialized.inner.into_consensus());
+        assert_eq!(
+            live_sealed.hash(),
+            canonical_hash,
+            "Live stream seal_slow must match the canonical hash.\n\
+             This means the JSON round-trip preserved all RLP-relevant fields \
+             (including consensus_context).\n\
+             canonical: {canonical_hash}\n\
+             sealed:    {}",
+            live_sealed.hash(),
+        );
+    }
+
+    /// Same as above but for the backfill path (l1.rs line 430), which uses
+    /// `header_resp.inner.inner` instead of `header.inner.into_consensus()`.
+    #[test]
+    fn seal_slow_matches_rpc_hash_backfill_path() {
+        use tempo_alloy::rpc::TempoHeaderResponse;
+        use tempo_primitives::TempoConsensusContext;
+
+        let consensus_ctx = TempoConsensusContext {
+            epoch: 42,
+            view: 7,
+            parent_view: 6,
+            proposer: make_test_pubkey([0xab; 32]),
+        };
+        let tempo_header = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 123,
+            inner: Header {
+                number: 100,
+                timestamp: 1_700_000_000,
+                base_fee_per_gas: Some(1_000_000_000),
+                ..Default::default()
+            },
+            consensus_context: Some(consensus_ctx),
+        };
+
+        let canonical_hash = header_hash(&tempo_header);
+
+        let rpc_header = alloy_rpc_types_eth::Header {
+            hash: canonical_hash,
+            inner: tempo_header.clone(),
+            total_difficulty: None,
+            size: None,
+        };
+        let rpc_response = TempoHeaderResponse {
+            inner: rpc_header,
+            timestamp_millis: 1_700_000_000_123,
+        };
+
+        let json = serde_json::to_string(&rpc_response).unwrap();
+        let deserialized: TempoHeaderResponse = serde_json::from_str(&json).unwrap();
+
+        // --- Backfill path (l1.rs line 416 + 430) ---
+        let header = deserialized.inner.inner; // Header<TempoHeader>.inner = TempoHeader
+        let backfill_sealed = SealedHeader::seal_slow(header);
+        assert_eq!(
+            backfill_sealed.hash(),
+            canonical_hash,
+            "Backfill seal_slow must match the canonical hash.\n\
+             canonical: {canonical_hash}\n\
+             sealed:    {}",
+            backfill_sealed.hash(),
+        );
+    }
+
+    /// Test what happens when the RPC server omits `consensusContext` from
+    /// the JSON response, even though the canonical block hash was computed
+    /// WITH consensus_context. This simulates a misconfigured RPC or version
+    /// mismatch.
+    #[test]
+    fn seal_slow_diverges_when_rpc_omits_consensus_context() {
+        use tempo_primitives::TempoConsensusContext;
+
+        // Build a header WITH consensus_context.
+        let consensus_ctx = TempoConsensusContext {
+            epoch: 42,
+            view: 7,
+            parent_view: 6,
+            proposer: make_test_pubkey([0xab; 32]),
+        };
+        let header_with_ctx = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 123,
+            inner: Header {
+                number: 100,
+                timestamp: 1_700_000_000,
+                base_fee_per_gas: Some(1_000_000_000),
+                ..Default::default()
+            },
+            consensus_context: Some(consensus_ctx),
+        };
+        let canonical_hash = header_hash(&header_with_ctx);
+
+        // Same header WITHOUT consensus_context — as if the RPC server
+        // serialized the block without including that field.
+        let header_without_ctx = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 123,
+            inner: Header {
+                number: 100,
+                timestamp: 1_700_000_000,
+                base_fee_per_gas: Some(1_000_000_000),
+                ..Default::default()
+            },
+            consensus_context: None,
+        };
+        let wrong_hash = header_hash(&header_without_ctx);
+
+        // The two hashes MUST differ — consensus_context changes the RLP.
+        assert_ne!(
+            canonical_hash, wrong_hash,
+            "Hash with consensus_context must differ from hash without it"
+        );
+
+        // If the zone seals a header that's missing consensus_context, the
+        // hash diverges from canonical. This IS the root cause of the stall
+        // if the RPC doesn't include the field.
+        let sealed_wrong = SealedHeader::seal_slow(header_without_ctx);
+        assert_ne!(sealed_wrong.hash(), canonical_hash);
+
+        // The correct header produces the right hash.
+        let sealed_correct = SealedHeader::seal_slow(header_with_ctx);
+        assert_eq!(sealed_correct.hash(), canonical_hash);
+    }
+
+    /// End-to-end test: fetch a real block header from an L1 RPC endpoint,
+    /// deserialize it as TempoHeaderResponse, extract the TempoHeader,
+    /// recompute the hash via seal_slow, and verify it matches the RPC hash.
+    ///
+    /// This is the definitive test for the hash mismatch bug: if this fails,
+    /// the zone's confirmation buffer will reject every block.
+    #[test]
+    fn seal_slow_matches_rpc_hash_real_block() {
+        use tempo_alloy::rpc::TempoHeaderResponse;
+
+        // Fetch the latest block header from the Moderato testnet RPC.
+        // This is an actual production header with real consensus_context.
+        // Fetch using a simple synchronous HTTP request via ureq-style approach.
+        // We use std::process::Command to call curl since reqwest blocking
+        // isn't available.
+        let output = std::process::Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "https://rpc.testnet.tempo.xyz",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                r#"{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}"#,
+            ])
+            .output();
+
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                eprintln!("Skipping test — curl failed: {}", String::from_utf8_lossy(&o.stderr));
+                return;
+            }
+            Err(e) => {
+                eprintln!("Skipping test — cannot run curl: {e}");
+                return;
+            }
+        };
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let result = &body["result"];
+
+        // Deserialize the full block response. The header is at the top level.
+        // We need to deserialize just the header part as TempoHeaderResponse.
+        let header_response: TempoHeaderResponse =
+            serde_json::from_value(result.clone()).unwrap();
+
+        let rpc_hash = header_response.inner.hash;
+        let tempo_header = header_response.inner.into_consensus();
+
+        // This is the critical check: does seal_slow reproduce the RPC hash?
+        let sealed = SealedHeader::seal_slow(tempo_header.clone());
+
+        // Print diagnostic info on failure.
+        if sealed.hash() != rpc_hash {
+            eprintln!("=== HASH MISMATCH DETECTED ===");
+            eprintln!("RPC hash:    {rpc_hash}");
+            eprintln!("Sealed hash: {}", sealed.hash());
+            eprintln!("Block number: {}", tempo_header.inner.number());
+            eprintln!(
+                "consensus_context present: {}",
+                tempo_header.consensus_context.is_some()
+            );
+            if let Some(ref ctx) = tempo_header.consensus_context {
+                eprintln!("  epoch: {}", ctx.epoch);
+                eprintln!("  view: {}", ctx.view);
+            }
+            // Also check the RLP hex for debugging.
+            let rlp = alloy_rlp::encode(&tempo_header);
+            let recomputed = keccak256(&rlp);
+            eprintln!("Recomputed from RLP: {recomputed}");
+            eprintln!("RLP length: {} bytes", rlp.len());
+        }
+
+        assert_eq!(
+            sealed.hash(),
+            rpc_hash,
+            "seal_slow hash must match the RPC-provided block hash. \
+             This mismatch causes the confirmation buffer to reject every \
+             block as a reorg, stalling the zone."
+        );
+    }
+
+    /// Verify the confirmation buffer works correctly when two consecutive
+    /// blocks have `consensus_context: Some(...)`.
+    ///
+    /// The confirmation check is: `sealed.parent_hash() == tip_header.hash()`
+    /// If seal_slow produces a hash that differs from the canonical hash,
+    /// consecutive blocks will fail the parent hash check and be treated as
+    /// reorgs.
+    #[test]
+    fn confirmation_buffer_works_with_consensus_context() {
+        use tempo_alloy::rpc::TempoHeaderResponse;
+        use tempo_primitives::TempoConsensusContext;
+
+        let consensus_ctx_1 = TempoConsensusContext {
+            epoch: 42,
+            view: 7,
+            parent_view: 6,
+            proposer: make_test_pubkey([0xab; 32]),
+        };
+        let header_1 = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 100,
+            inner: Header {
+                number: 100,
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            },
+            consensus_context: Some(consensus_ctx_1),
+        };
+        let hash_1 = header_hash(&header_1);
+
+        // Block 101 has parent_hash = hash of block 100.
+        let consensus_ctx_2 = TempoConsensusContext {
+            epoch: 42,
+            view: 8,
+            parent_view: 7,
+            proposer: make_test_pubkey([0xcd; 32]),
+        };
+        let header_2 = TempoHeader {
+            general_gas_limit: 15_000_000,
+            shared_gas_limit: 5_000_000,
+            timestamp_millis_part: 200,
+            inner: Header {
+                number: 101,
+                timestamp: 1_700_000_001,
+                parent_hash: hash_1, // canonical hash of block 100
+                ..Default::default()
+            },
+            consensus_context: Some(consensus_ctx_2),
+        };
+        let hash_2 = header_hash(&header_2);
+
+        // Simulate RPC responses and JSON round-trip for both blocks.
+        let rpc_1 = TempoHeaderResponse {
+            inner: alloy_rpc_types_eth::Header {
+                hash: hash_1,
+                inner: header_1.clone(),
+                total_difficulty: None,
+                size: None,
+            },
+            timestamp_millis: 1_700_000_000_100,
+        };
+        let rpc_2 = TempoHeaderResponse {
+            inner: alloy_rpc_types_eth::Header {
+                hash: hash_2,
+                inner: header_2.clone(),
+                total_difficulty: None,
+                size: None,
+            },
+            timestamp_millis: 1_700_000_001_200,
+        };
+
+        let json_1 = serde_json::to_string(&rpc_1).unwrap();
+        let json_2 = serde_json::to_string(&rpc_2).unwrap();
+        let deser_1: TempoHeaderResponse = serde_json::from_str(&json_1).unwrap();
+        let deser_2: TempoHeaderResponse = serde_json::from_str(&json_2).unwrap();
+
+        // Reproduce the live stream path.
+        let sealed_1 =
+            SealedHeader::seal_slow(deser_1.inner.into_consensus());
+        let sealed_2 =
+            SealedHeader::seal_slow(deser_2.inner.into_consensus());
+
+        // This is the confirmation buffer check (l1.rs line 517):
+        //   sealed.parent_hash() == tip_header.hash()
+        assert_eq!(
+            sealed_2.parent_hash(),
+            sealed_1.hash(),
+            "Block 101's parent_hash must equal the sealed hash of block 100.\n\
+             If this fails, the confirmation buffer treats every block as a reorg.\n\
+             sealed_1.hash():        {}\n\
+             sealed_2.parent_hash(): {}\n\
+             canonical hash_1:       {hash_1}",
+            sealed_1.hash(),
+            sealed_2.parent_hash(),
+        );
     }
 }
