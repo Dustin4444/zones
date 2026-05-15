@@ -1,0 +1,72 @@
+name: Forge PR
+
+on:
+  pull_request:
+    branches: [main, dr/validium]
+    paths:
+      - "specs/ref-impls/**"
+      - ".github/workflows/forge-pr.yml"
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  forge-test:
+    name: forge test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
+        with:
+          version: nightly
+
+      - name: Cache Forge artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            specs/ref-impls/cache
+            specs/ref-impls/out
+          key: forge-${{ runner.os }}-${{ hashFiles('specs/ref-impls/foundry.toml', 'specs/ref-impls/src/**/*.sol', 'specs/ref-impls/test/**/*.sol') }}
+          restore-keys: |
+            forge-${{ runner.os }}-
+
+      - name: Run Forge tests with gas report
+        working-directory: specs/ref-impls
+        run: forge test -vvv --gas-report | tee forge-gas-report.txt
+
+      - name: Upload gas report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: forge-gas-report
+          path: specs/ref-impls/forge-gas-report.txt
+          if-no-files-found: error
+
+      - name: Post gas report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- forge-gas-report -->';
+            const report = fs.readFileSync('specs/ref-impls/forge-gas-report.txt', 'utf8');
+            const body = `${marker}\n### Forge gas report\n\n\`\`\`text\n${report.slice(-60000)}\n\`\`\``;
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.rest.issues.listComments({owner, repo, issue_number, per_page: 100});
+            const existing = comments.data.find((comment) => comment.body && comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body});
+            } else {
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
+            }
