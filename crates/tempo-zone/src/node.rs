@@ -7,6 +7,7 @@ use crate::{
     BatchAnchorConfig, DepositQueue, L1SubscriberConfig, PolicyCache, ZoneEngine,
     ZoneSequencerConfig,
     abi::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal},
+    eth_api::ZoneEthApi,
     evm::ZoneEvmConfig,
     ext::TempoStateExt,
     l1::L1Subscriber,
@@ -43,7 +44,6 @@ use reth_primitives_traits::{
     AlloyBlockHeader, SealedBlock, SealedHeader, transaction::error::InvalidTransactionError,
 };
 use reth_provider::ChainSpecProvider;
-use reth_rpc::DynRpcConverter;
 use reth_rpc_builder::Identity;
 use reth_rpc_eth_api::{EthApiTypes, RpcConverter};
 use reth_storage_api::{BlockNumReader, EmptyBodyStorage, HeaderProvider, StateProviderFactory};
@@ -907,7 +907,7 @@ impl<N> EthApiBuilder<N> for ZoneEthApiBuilder
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
 {
-    type EthApi = reth_rpc::EthApi<N, DynRpcConverter<ZoneEvmConfig, TempoNetwork>>;
+    type EthApi = ZoneEthApi<N>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
         let chain_spec = ctx.components.provider().chain_spec();
@@ -917,6 +917,6 @@ where
             .map_converter(|_| RpcConverter::new(TempoReceiptConverter::new(chain_spec)).erased())
             .build();
 
-        Ok(eth_api)
+        Ok(ZoneEthApi::new(eth_api))
     }
 }

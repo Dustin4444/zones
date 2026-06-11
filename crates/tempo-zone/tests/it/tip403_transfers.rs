@@ -59,6 +59,13 @@ async fn test_deposit_then_transfer() -> eyre::Result<()> {
         .connect_http(zone.http_url().clone());
     let tip20 = ITIP20::new(PATH_USD_ADDRESS, &provider);
 
+    let estimated_gas = tip20
+        .transfer(bob, U256::from(transfer_amount))
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .estimate_gas()
+        .await?;
+    assert!(estimated_gas > 0, "transfer gas estimate should be nonzero");
+
     let pending = tip20
         .transfer(bob, U256::from(transfer_amount))
         .gas_price(TEMPO_T0_BASE_FEE as u128)

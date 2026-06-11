@@ -12,6 +12,7 @@ pub mod ext;
 pub use ext::{ChainTempoStateExt, TempoStateExt};
 pub mod batch;
 pub mod engine;
+mod eth_api;
 pub mod evm;
 mod executor;
 pub mod l1;
