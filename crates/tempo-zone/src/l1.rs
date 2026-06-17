@@ -34,7 +34,9 @@ use crate::{
     },
     ext::TempoStateExt,
     l1_state::{cache::L1StateCacheInner, tip403::PolicyEvent},
+    rpc::rpc_connection_config,
 };
+use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
 
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -162,7 +164,7 @@ impl L1Subscriber {
         info!("Connecting to L1 node");
 
         let url = self.config.l1_rpc_url.parse::<url::Url>()?;
-        let mut conn_config = crate::rpc_connection_config(self.config.retry_connection_interval);
+        let mut conn_config = rpc_connection_config(self.config.retry_connection_interval);
 
         if !url.username().is_empty() {
             let auth = Authorization::basic(url.username(), url.password().unwrap_or_default());
@@ -555,8 +557,6 @@ impl L1Subscriber {
         block_number: u64,
         receipts: &[tempo_alloy::rpc::TempoTransactionReceipt],
     ) -> (L1PortalEvents, Vec<PolicyEvent>) {
-        use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
-
         let portal_address = self.config.portal_address;
         let mut portal_events = L1PortalEvents::default();
         let mut policy_events = Vec::new();
