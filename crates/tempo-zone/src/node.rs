@@ -19,7 +19,7 @@ use crate::{
     spawn_zone_sequencer,
 };
 use alloy_primitives::{Address, U256};
-use alloy_provider::{Provider as _, ProviderBuilder};
+use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
 use reth_eth_wire_types::primitives::BasicNetworkPrimitives;
@@ -395,7 +395,7 @@ where
     /// Resolve enabled tokens and seed the policy cache.
     async fn resolve_enabled_tokens(
         &mut self,
-        l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
+        l1_provider: &DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
         let portal = self.portal_address;
         let enabled_tokens = ZonePortal::new(portal, l1_provider)
