@@ -44,8 +44,7 @@ use derive_more::Deref;
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tempo_alloy::TempoNetwork;
-use tempo_contracts::precompiles::ITIP20;
-use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+use tempo_contracts::precompiles::{ITIP20, ITIP403Registry::PolicyType};
 use tracing::info;
 
 use super::{builtin_authorization, events::PolicyEvent, policy_set::PolicySet};
