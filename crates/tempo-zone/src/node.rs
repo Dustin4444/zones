@@ -12,14 +12,14 @@ use crate::{
     l1::L1Subscriber,
     l1_state::{
         L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider,
-        spawn_policy_resolution_task, spawn_pool_prefetch_task,
+        spawn_policy_resolution_task, tip403::task::spawn_pool_prefetch_task,
     },
     payload::{ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes},
     rpc::{TempoZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     spawn_zone_sequencer,
 };
 use alloy_primitives::{Address, U256};
-use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
+use alloy_provider::{Provider as _, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
 use reth_eth_wire_types::primitives::BasicNetworkPrimitives;

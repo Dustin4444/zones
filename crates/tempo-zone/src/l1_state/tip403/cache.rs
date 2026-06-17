@@ -47,9 +47,9 @@ use tempo_alloy::TempoNetwork;
 use tempo_contracts::precompiles::{ITIP20, ITIP403Registry::PolicyType};
 use tracing::info;
 
-use super::{builtin_authorization, events::PolicyEvent, policy_set::PolicySet};
+use super::{builtin_authorization, events::PolicyEvent};
 
-use crate::l1_state::versioned::HeightVersioned;
+use crate::l1_state::{tip403::PolicySet, versioned::HeightVersioned};
 
 /// Thread-safe TIP-403 policy cache backed by an `Arc<RwLock<PolicyCacheInner>>`.
 #[derive(Debug, Clone, Deref, Default)]
