@@ -753,6 +753,8 @@ If a block omits `advanceTempo`, the Tempo binding carries forward from the prev
 
 The function is a precompile stub. The actual storage reads are performed by the zone node and validated against the `tempoStateRoot` from the finalized header. The prover includes Merkle proofs for each unique account and storage slot accessed by system contracts during the batch.
 
+These are state proofs for the Tempo block the zone has already finalized via `advanceTempo`, not arbitrary historical state proofs. A batch witness may contain account and storage trie proofs for that committed Tempo `stateRoot`, but the portal does not need to verify old storage values directly onchain.
+
 Current callers:
 
 - `ZoneInbox`: `currentDepositQueueHash` and encryption keys from the portal
@@ -765,6 +767,8 @@ TIP-403 policy authorization on the zone is handled by a dedicated read-only pro
 The zone's view of Tempo is only as current as the most recent `advanceTempo` call. If the sequencer advances Tempo infrequently, zone-side reads of portal state (sequencer address, deposit queue, token registry) may lag behind Tempo.
 
 The zone node must only finalize Tempo headers that have reached finality on Tempo. Proofs should only reference finalized Tempo blocks to avoid reorg risk.
+
+For onchain batch submission, the portal anchors the batch to a Tempo block hash. Direct anchoring uses the EIP-2935 block-hash history contract, so the maximum direct lookback is 8192 Tempo blocks. With Tempo's ~500ms block time, that is roughly 68 minutes. Production submitters should keep a safety margin before this boundary; the current sequencer uses a 360-block margin, making the effective direct-submission window 7832 blocks, or roughly 65 minutes. If the committed Tempo block is older than the effective direct window, the batch must use an ancestry proof anchored at a recent Tempo block whose hash is still available from EIP-2935.
 
 <br>
 
