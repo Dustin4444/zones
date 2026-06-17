@@ -39,13 +39,16 @@ use crate::{
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-pub type L1BlockStream<'a> = Box<
-    dyn Stream<
-            Item = eyre::Result<(
-                <TempoNetwork as alloy_network::Network>::HeaderResponse,
-                Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
-            )>,
-        > + Send
+type L1Block = (
+    <TempoNetwork as alloy_network::Network>::HeaderResponse,
+    Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
+);
+
+type L1BlockStream<'a> = Pin<Box<dyn Stream<Item = eyre::Result<L1Block>> + Send + 'a>>;
+
+type L1HeaderStream<'a> = Box<
+    dyn Stream<Item = eyre::Result<<TempoNetwork as alloy_network::Network>::HeaderResponse>>
+        + Send
         + 'a,
 >;
 
@@ -191,18 +194,7 @@ impl L1Subscriber {
     async fn header_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<
-        Pin<
-            Box<
-                dyn Stream<
-                        Item = eyre::Result<
-                            <TempoNetwork as alloy_network::Network>::HeaderResponse,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        >,
-    > {
+    ) -> eyre::Result<Pin<L1HeaderStream<'a>>> {
         match provider.subscribe_blocks().await {
             Ok(sub) => {
                 info!("Using WebSocket block subscription");
@@ -231,7 +223,19 @@ impl L1Subscriber {
     async fn l1_block_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<Pin<L1BlockStream<'a>>> {
+    ) -> eyre::Result<
+        Pin<
+            Box<
+                dyn Stream<
+                        Item = eyre::Result<(
+                            <TempoNetwork as alloy_network::Network>::HeaderResponse,
+                            Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
+                        )>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    > {
         let header_stream = self.header_stream(provider).await?;
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
