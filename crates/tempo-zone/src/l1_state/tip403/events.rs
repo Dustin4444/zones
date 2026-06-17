@@ -138,6 +138,17 @@ impl PolicyEvent {
                 );
                 None
             }
+            // T6 account-level receive policy. Zones does not model receive
+            // policies in its policy cache, so this event is ignored.
+            ITIP403RegistryEvents::ReceivePolicyUpdated(event) => {
+                tracing::debug!(
+                    account = %event.account,
+                    sender_policy_id = event.senderPolicyId,
+                    token_filter_id = event.tokenFilterId,
+                    "Receive policy updated on L1 (ignored by zone)"
+                );
+                None
+            }
         }
     }
 

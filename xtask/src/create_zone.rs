@@ -1,3 +1,8 @@
+// The `sol!`-generated `ZoneParams` constructor takes one argument per field
+// (9 since alloy 1.6.0 emits a positional constructor), tripping
+// `clippy::too_many_arguments` on generated code we don't control.
+#![allow(clippy::too_many_arguments)]
+
 use alloy::{
     network::{
         EthereumWallet,

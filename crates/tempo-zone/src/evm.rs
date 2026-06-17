@@ -17,7 +17,8 @@ use crate::{
 };
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory,
-    block::{BlockExecutorFactory, BlockExecutorFor},
+    block::BlockExecutorFactory,
+    eth::EthTxResult,
     precompiles::PrecompilesMap,
     revm::{Inspector, inspector::NoOpInspector},
 };
@@ -28,6 +29,7 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
 };
 use reth_primitives_traits::{SealedBlock, SealedHeader};
+use revm::context::DBErrorMarker;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::TempoChainSpec;
@@ -42,7 +44,9 @@ use tempo_precompiles::{
     TIP_FEE_MANAGER_ADDRESS, account_keychain::AccountKeychain, nonce::NonceManager,
     tip_fee_manager::TipFeeManager, tip20::is_tip20_prefix,
 };
-use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope};
+use tempo_primitives::{
+    Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
+};
 
 type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 
@@ -138,8 +142,7 @@ impl EvmFactory for ZoneEvmFactory {
     type Evm<DB: Database, I: Inspector<Self::Context<DB>>> = TempoEvm<DB, I>;
     type Context<DB: Database> = TempoCtx<DB>;
     type Tx = <TempoEvmFactory as EvmFactory>::Tx;
-    type Error<DBError: std::error::Error + Send + Sync + 'static> =
-        <TempoEvmFactory as EvmFactory>::Error<DBError>;
+    type Error<DBError: DBErrorMarker> = <TempoEvmFactory as EvmFactory>::Error<DBError>;
     type HaltReason = TempoHaltReason;
     type Spec = tempo_chainspec::hardfork::TempoHardfork;
     type BlockEnv = TempoBlockEnv;
@@ -196,11 +199,12 @@ impl BlockAssembler<ZoneEvmConfig> for ZoneBlockAssembler {
             bundle_state,
             state_provider,
             state_root,
+            block_access_list_hash,
             ..
         } = input;
 
-        self.inner
-            .assemble_block(BlockAssemblerInput::<TempoEvmConfig, TempoHeader>::new(
+        self.inner.assemble_block(
+            BlockAssemblerInput::<TempoEvmConfig, TempoHeader>::new(
                 evm_env,
                 execution_ctx,
                 parent,
@@ -209,7 +213,12 @@ impl BlockAssembler<ZoneEvmConfig> for ZoneBlockAssembler {
                 bundle_state,
                 state_provider,
                 state_root,
-            ))
+                block_access_list_hash,
+            ),
+            None,
+            None,
+            None,
+        )
     }
 }
 
@@ -270,6 +279,8 @@ impl BlockExecutorFactory for ZoneEvmConfig {
     type ExecutionCtx<'a> = TempoBlockExecutionCtx<'a>;
     type Transaction = TempoTxEnvelope;
     type Receipt = TempoReceipt;
+    type TxExecutionResult = EthTxResult<TempoHaltReason, TempoTxType>;
+    type Executor<'a, DB: StateDB, I: Inspector<TempoCtx<DB>>> = ZoneBlockExecutor<'a, DB, I>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.zone_factory
@@ -279,10 +290,10 @@ impl BlockExecutorFactory for ZoneEvmConfig {
         &'a self,
         evm: TempoEvm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> Self::Executor<'a, DB, I>
     where
-        DB: StateDB + 'a,
-        I: Inspector<TempoCtx<DB>> + 'a,
+        DB: StateDB,
+        I: Inspector<TempoCtx<DB>>,
     {
         ZoneBlockExecutor::new(evm, ctx, self.chain_spec())
     }
@@ -335,6 +346,7 @@ impl ConfigureEvm for ZoneEvmConfig {
                     .map(|withdrawals| Cow::Borrowed(withdrawals.as_slice())),
                 extra_data: block.header().extra_data().clone(),
                 tx_count_hint: Some(block.body().transactions.len()),
+                slot_number: block.slot_number(),
             },
             general_gas_limit: 0,
             shared_gas_limit: 0,
