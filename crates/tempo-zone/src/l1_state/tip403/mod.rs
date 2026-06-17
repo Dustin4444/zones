@@ -89,7 +89,6 @@ pub use task::{
     PolicyResolutionTask, PolicyTaskHandle, PolicyTaskMessage, spawn_policy_resolution_task,
 };
 
-
 // Block-versioned policy sets for TIP-403 policy tracking.
 
 use alloy_primitives::Address;
@@ -214,4 +213,3 @@ pub(super) struct PolicySetUpdate {
     /// Whether the address is in the policy set after this update.
     pub in_set: bool,
 }
-
