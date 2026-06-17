@@ -223,19 +223,7 @@ impl L1Subscriber {
     async fn l1_block_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<
-        Pin<
-            Box<
-                dyn Stream<
-                        Item = eyre::Result<(
-                            <TempoNetwork as alloy_network::Network>::HeaderResponse,
-                            Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
-                        )>,
-                    > + Send
-                    + 'a,
-            >,
-        >,
-    > {
+    ) -> eyre::Result<Pin<L1BlockStream<'a>>> {
         let header_stream = self.header_stream(provider).await?;
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
