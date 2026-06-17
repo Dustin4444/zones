@@ -159,6 +159,104 @@ impl L1Subscriber {
         );
     }
 
+    /// Runs the L1 subscriber until the stream ends or an error occurs.
+    ///
+    /// Backfills to the L1 tip, then streams new blocks. Live blocks are confirmed
+    /// one block behind to avoid enqueueing a tip that may be reorged.
+    pub async fn run(mut self) -> eyre::Result<()> {
+        self.enabled_tokens = self.config.policy_cache.read().enabled_tokens();
+
+        let provider = self.connect().await?;
+        self.sync_to_l1_tip(&provider).await?;
+
+        info!(portal = %self.config.portal_address, "Listening for L1 blocks");
+
+        let mut stream = self.l1_block_stream(&provider).await?;
+        let mut tip: Option<(SealedHeader<TempoHeader>, L1PortalEvents, Vec<PolicyEvent>)> = None;
+
+        loop {
+            let stream_wait_start = std::time::Instant::now();
+            let next = stream.try_next().await?;
+
+            self.subscriber_metrics
+                .stream_try_next_duration_seconds
+                .record(stream_wait_start.elapsed().as_secs_f64());
+
+            let Some((header, receipts)) = next else {
+                break;
+            };
+
+            let block_number = header.number();
+            let sealed = SealedHeader::seal_slow(header.inner.into_consensus());
+            let (events, policy_events) = self.extract_events(block_number, &receipts);
+
+            self.record_seen_block(block_number, 0);
+
+            if let Some(prev_tip) = tip.take() {
+                self.handle_tip(&provider, prev_tip, &sealed).await?;
+            }
+
+            tip = Some((sealed, events, policy_events));
+        }
+
+        warn!("L1 block subscription stream ended");
+        Ok(())
+    }
+
+    async fn handle_tip(
+        &mut self,
+        provider: &DynProvider<TempoNetwork>,
+        tip: (SealedHeader<TempoHeader>, L1PortalEvents, Vec<PolicyEvent>),
+        next_header: &SealedHeader<TempoHeader>,
+    ) -> eyre::Result<()> {
+        let (tip_header, tip_events, tip_policy_events) = tip;
+
+        if next_header.parent_hash() != tip_header.hash() {
+            self.subscriber_metrics.reorgs_detected.increment(1);
+
+            warn!(
+                discarded_block = tip_header.number(),
+                discarded_hash = %tip_header.hash(),
+                new_block = next_header.number(),
+                new_parent = %next_header.parent_hash(),
+                "Discarding unconfirmed L1 block (reorg)"
+            );
+
+            self.config.l1_state_cache.write().clear();
+            self.config.policy_cache.write().clear();
+
+            return Ok(());
+        }
+
+        let tip_number = tip_header.number();
+
+        self.update_l1_state_anchor(tip_number, tip_header.hash(), tip_header.parent_hash());
+        self.apply_policy_events(tip_number, &tip_policy_events);
+        self.apply_portal_state_events(tip_number, &tip_events);
+
+        match self
+            .deposit_queue
+            .try_enqueue(tip_header, tip_events, tip_policy_events)
+        {
+            EnqueueOutcome::Accepted => {
+                self.subscriber_metrics.blocks_enqueued.increment(1);
+            }
+            EnqueueOutcome::Duplicate => {}
+            EnqueueOutcome::NeedBackfill { from, to } => {
+                warn!(
+                    from,
+                    to,
+                    tip = tip_number,
+                    "Backfilling gap before confirmed tip"
+                );
+
+                self.backfill(provider, from, tip_number).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Connects to the L1 node, using HTTP or WebSocket based on the URL scheme.
     #[instrument(skip(self), fields(l1_rpc_url = %self.config.l1_rpc_url))]
     async fn connect(&self) -> eyre::Result<DynProvider<TempoNetwork>> {
@@ -442,104 +540,6 @@ impl L1Subscriber {
             elapsed_ms = elapsed.as_millis() as u64,
             "Backfill complete"
         );
-        Ok(())
-    }
-
-    /// Runs the L1 subscriber until the stream ends or an error occurs.
-    ///
-    /// Backfills to the L1 tip, then streams new blocks. Live blocks are confirmed
-    /// one block behind to avoid enqueueing a tip that may be reorged.
-    pub async fn run(mut self) -> eyre::Result<()> {
-        self.enabled_tokens = self.config.policy_cache.read().enabled_tokens();
-
-        let provider = self.connect().await?;
-        self.sync_to_l1_tip(&provider).await?;
-
-        info!(portal = %self.config.portal_address, "Listening for L1 blocks");
-
-        let mut stream = self.l1_block_stream(&provider).await?;
-        let mut tip: Option<(SealedHeader<TempoHeader>, L1PortalEvents, Vec<PolicyEvent>)> = None;
-
-        loop {
-            let stream_wait_start = std::time::Instant::now();
-            let next = stream.try_next().await?;
-
-            self.subscriber_metrics
-                .stream_try_next_duration_seconds
-                .record(stream_wait_start.elapsed().as_secs_f64());
-
-            let Some((header, receipts)) = next else {
-                break;
-            };
-
-            let block_number = header.number();
-            let sealed = SealedHeader::seal_slow(header.inner.into_consensus());
-            let (events, policy_events) = self.extract_events(block_number, &receipts);
-
-            self.record_seen_block(block_number, 0);
-
-            if let Some(prev_tip) = tip.take() {
-                self.handle_tip(&provider, prev_tip, &sealed).await?;
-            }
-
-            tip = Some((sealed, events, policy_events));
-        }
-
-        warn!("L1 block subscription stream ended");
-        Ok(())
-    }
-
-    async fn handle_tip(
-        &mut self,
-        provider: &DynProvider<TempoNetwork>,
-        tip: (SealedHeader<TempoHeader>, L1PortalEvents, Vec<PolicyEvent>),
-        next_header: &SealedHeader<TempoHeader>,
-    ) -> eyre::Result<()> {
-        let (tip_header, tip_events, tip_policy_events) = tip;
-
-        if next_header.parent_hash() != tip_header.hash() {
-            self.subscriber_metrics.reorgs_detected.increment(1);
-
-            warn!(
-                discarded_block = tip_header.number(),
-                discarded_hash = %tip_header.hash(),
-                new_block = next_header.number(),
-                new_parent = %next_header.parent_hash(),
-                "Discarding unconfirmed L1 block (reorg)"
-            );
-
-            self.config.l1_state_cache.write().clear();
-            self.config.policy_cache.write().clear();
-
-            return Ok(());
-        }
-
-        let tip_number = tip_header.number();
-
-        self.update_l1_state_anchor(tip_number, tip_header.hash(), tip_header.parent_hash());
-        self.apply_policy_events(tip_number, &tip_policy_events);
-        self.apply_portal_state_events(tip_number, &tip_events);
-
-        match self
-            .deposit_queue
-            .try_enqueue(tip_header, tip_events, tip_policy_events)
-        {
-            EnqueueOutcome::Accepted => {
-                self.subscriber_metrics.blocks_enqueued.increment(1);
-            }
-            EnqueueOutcome::Duplicate => {}
-            EnqueueOutcome::NeedBackfill { from, to } => {
-                warn!(
-                    from,
-                    to,
-                    tip = tip_number,
-                    "Backfilling gap before confirmed tip"
-                );
-
-                self.backfill(provider, from, tip_number).await?;
-            }
-        }
-
         Ok(())
     }
 
