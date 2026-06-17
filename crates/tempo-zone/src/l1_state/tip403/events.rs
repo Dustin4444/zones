@@ -5,7 +5,13 @@
 
 use alloy_primitives::Address;
 use alloy_sol_types::{SolEvent, SolEventInterface};
-use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+use tempo_contracts::precompiles::{
+    ITIP20::TransferPolicyUpdate,
+    ITIP403Registry::{
+        BlacklistUpdated, CompoundPolicyCreated, ITIP403RegistryEvents, PolicyCreated, PolicyType,
+        WhitelistUpdated,
+    },
+};
 
 /// A decoded L1 policy event ready to be applied to the cache.
 ///
@@ -44,11 +50,6 @@ impl PolicyEvent {
     /// `CompoundPolicyCreated` events. `PolicyAdminUpdated` is logged but ignored
     /// (returns `None`). Returns `None` for unrecognised logs.
     pub fn decode_registry(log: &alloy_rpc_types_eth::Log) -> Option<Self> {
-        use tempo_contracts::precompiles::ITIP403Registry::{
-            BlacklistUpdated, CompoundPolicyCreated, ITIP403RegistryEvents, PolicyCreated,
-            WhitelistUpdated,
-        };
-
         let event = match ITIP403RegistryEvents::decode_log(&log.inner) {
             Ok(decoded) => decoded.data,
             Err(e) => {
@@ -147,8 +148,6 @@ impl PolicyEvent {
     /// The caller should pre-filter by topic hash before calling this; it will
     /// return `None` with a warning if the log does not match.
     pub fn decode_tip20(log: &alloy_rpc_types_eth::Log) -> Option<Self> {
-        use tempo_contracts::precompiles::ITIP20::TransferPolicyUpdate;
-
         let event = match TransferPolicyUpdate::decode_log(&log.inner) {
             Ok(decoded) => decoded.data,
             Err(e) => {
