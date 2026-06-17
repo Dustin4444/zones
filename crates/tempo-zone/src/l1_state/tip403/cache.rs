@@ -199,8 +199,8 @@ impl PolicyCacheInner {
         &self.policies
     }
 
-    /// Returns all token addresses currently tracked by the cache.
-    pub fn tracked_tokens(&self) -> Vec<Address> {
+    /// Returns all currently enabled tokens tracked by the cache.
+    pub fn enabled_tokens(&self) -> Vec<Address> {
         self.tokens.keys().copied().collect()
     }
 

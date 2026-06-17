@@ -39,6 +39,16 @@ use crate::{
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+pub type L1BlockStream<'a> = Box<
+    dyn Stream<
+            Item = eyre::Result<(
+                <TempoNetwork as alloy_network::Network>::HeaderResponse,
+                Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
+            )>,
+        > + Send
+        + 'a,
+>;
+
 /// Configuration for the L1 subscriber.
 #[derive(Debug, Clone)]
 pub struct L1SubscriberConfig {
@@ -88,9 +98,8 @@ pub struct L1Subscriber {
     config: L1SubscriberConfig,
     local_state: Arc<dyn LocalTempoStateReader>,
     deposit_queue: DepositQueue,
-    /// Mutable set of token addresses tracked for TIP-403 policy events.
-    /// Initialized from config, grows dynamically when `TokenEnabled` events are seen.
-    tracked_tokens: Vec<Address>,
+    /// Set of token addresses enabled on the zone, used for tracking for TIP-403 policy events.
+    enabled_tokens: Vec<Address>,
     /// TIP-403 metrics (cache sizes, events applied).
     tip403_metrics: crate::l1_state::tip403::Tip403Metrics,
     /// L1 subscriber metrics for connection health, backfill, and event ingestion.
@@ -111,14 +120,14 @@ impl L1Subscriber {
     ) where
         P: StateProviderFactory + Clone + Send + Sync + 'static,
     {
-        let tracked_tokens = config.policy_cache.read().tracked_tokens();
+        let enabled_tokens = config.policy_cache.read().enabled_tokens();
         let subscriber = Self {
             config,
             local_state: Arc::new(ProviderLocalTempoStateReader {
                 provider: local_state_provider,
             }),
             deposit_queue,
-            tracked_tokens,
+            enabled_tokens,
             tip403_metrics: Default::default(),
             subscriber_metrics: Default::default(),
         };
@@ -222,19 +231,7 @@ impl L1Subscriber {
     async fn l1_block_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<
-        Pin<
-            Box<
-                dyn Stream<
-                        Item = eyre::Result<(
-                            <TempoNetwork as alloy_network::Network>::HeaderResponse,
-                            Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
-                        )>,
-                    > + Send
-                    + 'a,
-            >,
-        >,
-    > {
+    ) -> eyre::Result<Pin<L1BlockStream<'a>>> {
         let header_stream = self.header_stream(provider).await?;
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
@@ -475,9 +472,9 @@ impl L1Subscriber {
     ///
     /// Callers should retry on error (see [`Self::spawn`]).
     pub async fn run(mut self) -> eyre::Result<()> {
-        // Re-read tracked tokens from the policy cache so we pick up any
-        // tokens discovered during a previous run (before a reconnect).
-        self.tracked_tokens = self.config.policy_cache.read().tracked_tokens();
+        // Re-read enabled tokens from the policy cache so we pick up any
+        // tokens discovered during a previous run
+        self.enabled_tokens = self.config.policy_cache.read().enabled_tokens();
 
         let provider = self.connect().await?;
 
