@@ -46,10 +46,12 @@ type L1Block = (
 
 type L1BlockStream<'a> = Pin<Box<dyn Stream<Item = eyre::Result<L1Block>> + Send + 'a>>;
 
-type L1HeaderStream<'a> = Box<
-    dyn Stream<Item = eyre::Result<<TempoNetwork as alloy_network::Network>::HeaderResponse>>
-        + Send
-        + 'a,
+type L1HeaderStream<'a> = Pin<
+    Box<
+        dyn Stream<Item = eyre::Result<<TempoNetwork as alloy_network::Network>::HeaderResponse>>
+            + Send
+            + 'a,
+    >,
 >;
 
 /// Configuration for the L1 subscriber.
@@ -194,7 +196,7 @@ impl L1Subscriber {
     async fn header_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<Pin<L1HeaderStream<'a>>> {
+    ) -> eyre::Result<L1HeaderStream<'a>> {
         match provider.subscribe_blocks().await {
             Ok(sub) => {
                 info!("Using WebSocket block subscription");
@@ -223,40 +225,40 @@ impl L1Subscriber {
     async fn l1_block_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<Pin<L1BlockStream<'a>>> {
+    ) -> eyre::Result<L1BlockStream<'a>> {
         let header_stream = self.header_stream(provider).await?;
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
+
         let stream = header_stream
             .map_ok(move |header| {
-                let provider = provider;
                 let subscriber_metrics = subscriber_metrics.clone();
+
                 async move {
                     let block_number = header.number();
                     let start = std::time::Instant::now();
-                    let fetch_failures = &subscriber_metrics.fetch_failures;
+
                     let receipts = provider
                         .get_block_receipts(BlockId::number(block_number))
                         .await
-                        .map_err(eyre::Report::from)
-                        .and_then(|receipts| {
-                            receipts
-                                .ok_or_else(|| eyre::eyre!("no receipts for block {block_number}"))
-                        })
+                        .map_err(eyre::Report::from)?
+                        .ok_or_else(|| eyre::eyre!("no receipts for block {block_number}"))
                         .inspect_err(|_| {
-                            fetch_failures.increment(1);
+                            subscriber_metrics.fetch_failures.increment(1);
                         })?;
-                    let elapsed = start.elapsed();
+
                     debug!(
                         block_number,
-                        elapsed_ms = elapsed.as_millis() as u64,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
                         receipts = receipts.len(),
                         "Fetched live block receipts"
                     );
+
                     Ok::<_, eyre::Report>((header, receipts))
                 }
             })
             .try_buffered(concurrency);
+
         Ok(Box::pin(stream))
     }
 
