@@ -325,9 +325,6 @@ where
         let node = &ctx.node;
         let provider = node.provider();
         let task_executor = node.task_executor().clone();
-        // The payload builder handle is only reachable through the node
-        // components; the launched RPC `Handle` does not expose it, so capture
-        // it before `launch_add_ons` consumes `ctx`.
         let payload_builder = node.payload_builder_handle().clone();
         let chain_id = provider.chain_spec().inner.genesis().config.chain_id;
 
