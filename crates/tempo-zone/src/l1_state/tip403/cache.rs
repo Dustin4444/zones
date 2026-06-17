@@ -70,21 +70,14 @@ impl PolicyCache {
         self.write().set_last_l1_block(block_number);
     }
 
-    /// Collapse versioned entries up to `block_number`.
-    ///
-    /// Called by the engine after successfully processing an L1 block. Only the
-    /// engine should drive this — the subscriber must not advance past blocks the
-    /// engine hasn't consumed yet.
+    /// Called after the engine consumes an L1 block, marking policy updates through
+    /// the specified block height.
     pub fn advance(&self, block_number: u64) {
         self.write().advance(block_number);
     }
 
-    /// Query the current `transferPolicyId` for each tracked token and seed it
-    /// into the cache. This ensures the cache knows about tokens that have never
-    /// had a `TransferPolicyUpdate` event (i.e. still using the default policy).
-    ///
-    /// Fails if any token's `transferPolicyId` cannot be resolved — all enabled
-    /// tokens must be seeded for the zone to enforce policies correctly.
+    /// Seeds the cache with each enabled token's current `transferPolicyId`.
+    /// Fails if any token cannot be resolved from L1.
     pub async fn resolve_token_policies(
         &self,
         portal_address: Address,
@@ -124,33 +117,16 @@ impl PolicyCache {
     }
 }
 
-/// Block-versioned cache of TIP-403 policy state from Tempo L1.
-///
-/// Mirrors the on-chain `TIP403Registry` storage layout with:
-/// - Token → `transferPolicyId` mapping (from TIP-20 `TransferPolicyUpdate` events).
-/// - Policy ID → policy record (type, policy set, compound data).
-///
-/// This allows the zone sequencer to evaluate transfer authorization without RPC round-trips.
+/// Caches TIP-403 policy state by L1 block.
 #[derive(Debug, Default)]
 pub struct PolicyCacheInner {
-    /// Per-token transfer policy ID.
+    /// Tracks each token's transfer policy over time.
     tokens: HashMap<Address, HeightVersioned<u64>>,
-    /// Per-policy-ID records (type, policy set, compound data).
-    ///
-    /// Populated from **all** `PolicyCreated`, `CompoundPolicyCreated`,
-    /// `WhitelistUpdated`, and `BlacklistUpdated` events on the global
-    /// `TIP403Registry` — not filtered to this zone's tokens. This is
-    /// intentional: a token can switch to any policy via
-    /// `TransferPolicyUpdate`, so pre-caching all policies avoids RPC
-    /// round-trips on policy switch. The memory overhead is negligible.
+
+    /// Stores cached policy data.
     policies: HashMap<u64, CachedPolicy>,
-    /// Highest L1 block number processed by the engine.
-    ///
-    /// This equals the last block height the engine has processed and
-    /// should advance in lockstep with the L1 head tracked by the
-    /// `TempoStateReader` contract. The
-    /// [`PolicyResolutionTask`](super::PolicyResolutionTask) reads this to
-    /// query L1 at the correct block height for cache-miss RPC fallback.
+
+    /// Tracks the latest L1 block processed by the engine.
     last_l1_block: u64,
 }
 

@@ -331,6 +331,8 @@ where
             .erased();
 
         self.resolve_enabled_tokens(&l1_provider).await?;
+
+        // NOTE: these next
         self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
@@ -341,6 +343,7 @@ where
             let sequencer_addr = config.sequencer_signer.address();
             let sequencer_key = SecretKey::from(config.sequencer_signer.credential());
 
+            // NOTE: these next
             Self::spawn_zone_engine(
                 l1_provider,
                 &rpc_handle,
@@ -354,6 +357,7 @@ where
             )?;
         }
 
+        // NOTE: these next
         Self::launch_private_rpc(
             self.private_rpc_config,
             &rpc_handle,
@@ -367,6 +371,7 @@ where
         if let Some(config) = self.sequencer_config.take() {
             let sequencer_addr = config.sequencer_signer.address();
 
+            // NOTE: these next
             Self::launch_sequencer_tasks(
                 config,
                 &rpc_handle,
