@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use alloy_primitives::TxKind;
+use alloy_primitives::{Address, TxKind};
 use alloy_sol_types::SolCall;
 use reth_transaction_pool::TransactionPool;
 use tempo_contracts::precompiles::{DEFAULT_FEE_TOKEN, ITIP20};
@@ -20,29 +20,16 @@ use tracing::debug;
 
 use super::{AuthRole, task::PolicyTaskHandle};
 
-/// Spawns a background task that watches for new pool transactions and
-/// pre-fetches TIP-403 authorization data for sender/recipient addresses.
+/// Spawns a background task that warms TIP-403 policy cache entries
+/// for transactions entering the pool.
 ///
-/// For every incoming transaction the task warms three categories of cache entries:
+/// For each new transaction, this prefetches authorization for:
+/// - the fee payer against the fee token;
+/// - TIP-20 transfer senders;
+/// - TIP-20 transfer recipients.
 ///
-/// 1. **Fee payer** — the address paying gas fees, resolved as `AuthRole::Sender`
-///    against the transaction's fee token (defaults to pathUSD). AA transactions
-///    may specify a different fee token or delegate fee payment to another address.
-/// 2. **Transfer sender** — for TIP-20 transfer calls, the sender is resolved
-///    against the transfer token. For `transferFrom*`, this is the decoded `from`
-///    address rather than the transaction sender.
-/// 3. **Transfer recipient** — for `transfer`, `transferWithMemo`, `transferFrom`,
-///    and `transferFromWithMemo` calls, the `to` address is decoded from calldata
-///    and resolved as `AuthRole::Recipient`.
-/// 4. **Batch calls** — Tempo AA transactions can include multiple top-level calls,
-///    and each call is inspected independently.
-///
-/// The resolution task resolves each request at the cache's last engine-processed
-/// L1 block, so callers don't need to track block heights.
-///
-/// The task is spawned as a non-critical background task — if it stops, block
-/// building still works but may incur more synchronous RPC round-trips on cache
-/// misses.
+/// This is only an optimization. If the task exits or misses a transaction,
+/// block building still resolves policy data synchronously on cache misses.
 pub fn spawn_pool_prefetch_task<Pool>(
     pool: Pool,
     handle: PolicyTaskHandle,
@@ -63,75 +50,97 @@ where
 
     while let Some(tx_event) = new_txs.recv().await {
         let tx = &tx_event.transaction;
+        let inner = tx.transaction.inner();
         let sender = tx.sender();
-
-        // Resolve the fee token for this transaction (AA txs may specify one,
-        // otherwise falls back to DEFAULT_FEE_TOKEN / pathUSD).
-        let fee_token = tx
-            .transaction
-            .inner()
-            .fee_token()
-            .unwrap_or(DEFAULT_FEE_TOKEN);
-
-        // Resolve the fee payer (may differ from sender for AA txs with delegated fees)
-        let fee_payer = tx.transaction.inner().fee_payer(sender).unwrap_or(sender);
 
         let mut prefetched = HashSet::new();
 
-        // Pre-fetch fee payer authorization for the fee token (every tx pays fees)
-        if prefetched.insert((fee_token, fee_payer, AuthRole::Sender)) {
-            debug!(%fee_token, %fee_payer, "Pre-fetching TIP-403 fee token authorization");
-            let _ = handle.send_resolve_policy(fee_token, fee_payer, AuthRole::Sender);
-        }
+        let fee_token = inner.fee_token().unwrap_or(DEFAULT_FEE_TOKEN);
+        let fee_payer = tx.transaction.inner().fee_payer(sender).unwrap_or(sender);
 
-        for (kind, input) in tx.transaction.inner().calls() {
+        prefetch_policy(
+            &handle,
+            &mut prefetched,
+            fee_token,
+            fee_payer,
+            AuthRole::Sender,
+        );
+
+        for (kind, input) in inner.calls() {
             let TxKind::Call(token) = kind else {
                 continue;
             };
+
             if !is_tip20_prefix(token) {
                 continue;
             }
 
-            let Some(selector) = input.first_chunk::<4>() else {
-                continue;
-            };
-            let args = &input[4..];
-
-            let (transfer_sender, recipient) = if *selector == ITIP20::transferCall::SELECTOR {
-                let Ok(call) = ITIP20::transferCall::abi_decode_raw(args) else {
-                    continue;
-                };
-                (sender, call.to)
-            } else if *selector == ITIP20::transferWithMemoCall::SELECTOR {
-                let Ok(call) = ITIP20::transferWithMemoCall::abi_decode_raw(args) else {
-                    continue;
-                };
-                (sender, call.to)
-            } else if *selector == ITIP20::transferFromCall::SELECTOR {
-                let Ok(call) = ITIP20::transferFromCall::abi_decode_raw(args) else {
-                    continue;
-                };
-                (call.from, call.to)
-            } else if *selector == ITIP20::transferFromWithMemoCall::SELECTOR {
-                let Ok(call) = ITIP20::transferFromWithMemoCall::abi_decode_raw(args) else {
-                    continue;
-                };
-                (call.from, call.to)
-            } else {
+            let Some((transfer_sender, recipient)) = decode_tip20_transfer(input, sender) else {
                 continue;
             };
 
-            if prefetched.insert((token, transfer_sender, AuthRole::Sender)) {
-                debug!(%token, %transfer_sender, "Pre-fetching TIP-403 sender authorization");
-                let _ = handle.send_resolve_policy(token, transfer_sender, AuthRole::Sender);
-            }
+            prefetch_policy(
+                &handle,
+                &mut prefetched,
+                token,
+                transfer_sender,
+                AuthRole::Sender,
+            );
 
-            if prefetched.insert((token, recipient, AuthRole::Recipient)) {
-                debug!(%token, recipient = %recipient, "Pre-fetching TIP-403 recipient authorization");
-                let _ = handle.send_resolve_policy(token, recipient, AuthRole::Recipient);
-            }
+            prefetch_policy(
+                &handle,
+                &mut prefetched,
+                token,
+                recipient,
+                AuthRole::Recipient,
+            );
         }
     }
 
     debug!("Pool prefetch task shutting down");
+}
+
+#[inline]
+fn prefetch_policy(
+    handle: &PolicyTaskHandle,
+    prefetched: &mut HashSet<(Address, Address, AuthRole)>,
+    token: Address,
+    account: Address,
+    role: AuthRole,
+) {
+    if !prefetched.insert((token, account, role)) {
+        return;
+    }
+
+    debug!(
+        %token,
+        %account,
+        ?role,
+        "Pre-fetching TIP-403 authorization"
+    );
+
+    // NOTE: handle this error?
+    let _ = handle.send_resolve_policy(token, account, role);
+}
+
+#[inline]
+fn decode_tip20_transfer(input: &[u8], sender: Address) -> Option<(Address, Address)> {
+    let selector = input.first_chunk::<4>()?;
+    let args = &input[4..];
+
+    if *selector == ITIP20::transferCall::SELECTOR {
+        let call = ITIP20::transferCall::abi_decode_raw(args).ok()?;
+        Some((sender, call.to))
+    } else if *selector == ITIP20::transferWithMemoCall::SELECTOR {
+        let call = ITIP20::transferWithMemoCall::abi_decode_raw(args).ok()?;
+        Some((sender, call.to))
+    } else if *selector == ITIP20::transferFromCall::SELECTOR {
+        let call = ITIP20::transferFromCall::abi_decode_raw(args).ok()?;
+        Some((call.from, call.to))
+    } else if *selector == ITIP20::transferFromWithMemoCall::SELECTOR {
+        let call = ITIP20::transferFromWithMemoCall::abi_decode_raw(args).ok()?;
+        Some((call.from, call.to))
+    } else {
+        None
+    }
 }
