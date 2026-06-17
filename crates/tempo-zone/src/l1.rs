@@ -33,7 +33,8 @@ use crate::{
         },
     },
     ext::TempoStateExt,
-    l1_state::{cache::L1StateCacheInner, tip403::PolicyEvent},
+    l1_state::{Tip403Metrics, cache::L1StateCacheInner, tip403::PolicyEvent},
+    metrics::L1SubscriberMetrics,
     rpc::rpc_connection_config,
 };
 use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
@@ -108,9 +109,9 @@ pub struct L1Subscriber {
     /// Set of token addresses enabled on the zone, used for tracking for TIP-403 policy events.
     enabled_tokens: Vec<Address>,
     /// TIP-403 metrics (cache sizes, events applied).
-    tip403_metrics: crate::l1_state::tip403::Tip403Metrics,
+    tip403_metrics: Tip403Metrics,
     /// L1 subscriber metrics for connection health, backfill, and event ingestion.
-    subscriber_metrics: crate::metrics::L1SubscriberMetrics,
+    subscriber_metrics: L1SubscriberMetrics,
 }
 
 impl L1Subscriber {
