@@ -527,7 +527,6 @@ impl ZoneTestNode {
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_initial_tokens(vec![])
         .with_sequencer(zone::ZoneSequencerAddOnsConfig {
             sequencer_signer,
             zone_id: 0,

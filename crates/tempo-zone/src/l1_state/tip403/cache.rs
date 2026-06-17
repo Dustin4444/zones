@@ -37,12 +37,14 @@
 //! The cache has no per-block rollback. Defensive resync paths should call
 //! [`PolicyCacheInner::clear`] and let event replay plus RPC fallback repopulate entries.
 
+use alloy_eips::BlockId;
 use alloy_primitives::Address;
 use alloy_provider::DynProvider;
 use derive_more::Deref;
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tempo_alloy::TempoNetwork;
+use tempo_contracts::precompiles::ITIP20;
 use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
 use tracing::info;
 
@@ -84,14 +86,12 @@ impl PolicyCache {
     ///
     /// Fails if any token's `transferPolicyId` cannot be resolved — all enabled
     /// tokens must be seeded for the zone to enforce policies correctly.
-    pub async fn seed_token_policies(
+    pub async fn resolve_token_policies(
         &self,
         portal_address: Address,
         tracked_tokens: &[Address],
         provider: &DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let block_number = self.last_l1_block();
 
         let seeded = futures::future::join_all(tracked_tokens.iter().map(|token| {
@@ -99,7 +99,7 @@ impl PolicyCache {
             async move {
                 let policy_id = tip20
                     .transferPolicyId()
-                    .block(alloy_rpc_types_eth::BlockId::number(block_number))
+                    .block(BlockId::number(block_number))
                     .call()
                     .await
                     .map_err(|e| {

@@ -118,9 +118,6 @@ pub struct ZoneNode {
     policy_cache: PolicyCache,
     /// Address of the L1 deposit portal contract.
     portal_address: Address,
-    /// Optional pre-configured list of enabled token addresses. When set, the
-    /// startup L1 RPC query for `enabledTokenCount`/`enabledTokens` is skipped.
-    initial_tokens: Option<Vec<Address>>,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
@@ -164,7 +161,6 @@ impl ZoneNode {
             l1_state_cache,
             policy_cache,
             portal_address,
-            initial_tokens: None,
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
         }
@@ -180,13 +176,6 @@ impl ZoneNode {
     /// withdrawal processing tasks are spawned during node launch.
     pub fn with_sequencer(mut self, config: ZoneSequencerAddOnsConfig) -> Self {
         self.sequencer_config = Some(config);
-        self
-    }
-
-    /// Set the initial list of enabled token addresses.
-    /// When set, the startup L1 RPC query for enabled tokens is skipped.
-    pub fn with_initial_tokens(mut self, tokens: Vec<Address>) -> Self {
-        self.initial_tokens = Some(tokens);
         self
     }
 
@@ -254,8 +243,6 @@ pub struct ZoneAddOns<N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfi
     policy_cache: PolicyCache,
     /// ZonePortal address on L1.
     portal_address: Address,
-    /// Pre-configured list of initial tokens.
-    initial_tokens: Option<Vec<Address>>,
     /// Private RPC configuration.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Sequencer configuration.
@@ -280,7 +267,6 @@ where
         l1_config: L1SubscriberConfig,
         policy_cache: PolicyCache,
         portal_address: Address,
-        initial_tokens: Option<Vec<Address>>,
         private_rpc_config: ZonePrivateRpcConfig,
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     ) -> Self {
@@ -296,7 +282,6 @@ where
             l1_config,
             policy_cache,
             portal_address,
-            initial_tokens,
             private_rpc_config,
             sequencer_config,
         }
@@ -334,7 +319,7 @@ where
             .await?
             .erased();
 
-        self.resolve_and_seed_tokens(&l1_provider).await?;
+        self.resolve_enabled_tokens(&l1_provider).await?;
         self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
@@ -395,24 +380,18 @@ where
     ZoneEthApiBuilder: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     /// Resolve enabled tokens and seed the policy cache.
-    async fn resolve_and_seed_tokens(
+    async fn resolve_enabled_tokens(
         &mut self,
         l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
         let portal = self.portal_address;
-        let tracked_tokens = if let Some(tokens) = self.initial_tokens.take() {
-            info!(target: "reth::cli", count = tokens.len(), ?tokens, "Using pre-configured initial tokens");
-            tokens
-        } else {
-            let tokens = ZonePortal::new(portal, l1_provider)
-                .enabled_tokens()
-                .await?;
-            info!(target: "reth::cli", count = tokens.len(), ?tokens, "Discovered enabled tokens from L1");
-            tokens
-        };
+        let tracked_tokens = ZonePortal::new(portal, l1_provider)
+            .enabled_tokens()
+            .await?;
+        info!(target: "reth::cli", count = tracked_tokens.len(), ?tracked_tokens, "Discovered enabled tokens from L1");
 
         self.policy_cache
-            .seed_token_policies(portal, &tracked_tokens, l1_provider)
+            .resolve_token_policies(portal, &tracked_tokens, l1_provider)
             .await?;
         info!(target: "reth::cli", "Seeded token policies from L1");
         Ok(())
@@ -666,7 +645,6 @@ where
             self.l1_config.clone(),
             self.policy_cache.clone(),
             self.portal_address,
-            self.initial_tokens.clone(),
             self.private_rpc_config.clone(),
             self.sequencer_config.clone(),
         )
