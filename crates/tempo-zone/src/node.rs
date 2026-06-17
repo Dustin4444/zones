@@ -331,7 +331,6 @@ where
             .erased();
 
         self.resolve_enabled_tokens(&l1_provider).await?;
-
         self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
