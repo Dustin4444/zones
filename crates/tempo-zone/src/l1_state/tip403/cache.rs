@@ -89,12 +89,12 @@ impl PolicyCache {
     pub async fn resolve_token_policies(
         &self,
         portal_address: Address,
-        tracked_tokens: &[Address],
+        enabled_tokens: &[Address],
         provider: &DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
         let block_number = self.last_l1_block();
 
-        let seeded = futures::future::join_all(tracked_tokens.iter().map(|token| {
+        let seeded = futures::future::join_all(enabled_tokens.iter().map(|token| {
             let tip20 = ITIP20::new(*token, provider);
             async move {
                 let policy_id = tip20

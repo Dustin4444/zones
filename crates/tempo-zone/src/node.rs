@@ -385,13 +385,13 @@ where
         l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
         let portal = self.portal_address;
-        let tracked_tokens = ZonePortal::new(portal, l1_provider)
+        let enabled_tokens = ZonePortal::new(portal, l1_provider)
             .enabled_tokens()
             .await?;
-        info!(target: "reth::cli", count = tracked_tokens.len(), ?tracked_tokens, "Discovered enabled tokens from L1");
+        info!(target: "reth::cli", count = enabled_tokens.len(), ?enabled_tokens, "Discovered enabled tokens from L1");
 
         self.policy_cache
-            .resolve_token_policies(portal, &tracked_tokens, l1_provider)
+            .resolve_token_policies(portal, &enabled_tokens, l1_provider)
             .await?;
         info!(target: "reth::cli", "Seeded token policies from L1");
         Ok(())

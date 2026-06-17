@@ -156,14 +156,12 @@ impl L1Subscriber {
         );
     }
 
-    /// Connect to the L1 node.
-    ///
-    /// The transport (HTTP or WebSocket) is auto-detected from the URL scheme.
+    /// Connects to the L1 node, using HTTP or WebSocket based on the URL scheme.
     #[instrument(skip(self), fields(l1_rpc_url = %self.config.l1_rpc_url))]
     async fn connect(&self) -> eyre::Result<DynProvider<TempoNetwork>> {
-        info!(url = %self.config.l1_rpc_url, "Connecting to L1 node");
+        info!("Connecting to L1 node");
 
-        let url: url::Url = self.config.l1_rpc_url.parse()?;
+        let url = self.config.l1_rpc_url.parse::<url::Url>()?;
         let mut conn_config = crate::rpc_connection_config(self.config.retry_connection_interval);
 
         if !url.username().is_empty() {
@@ -182,17 +180,8 @@ impl L1Subscriber {
         Ok(provider)
     }
 
-    /// Returns a stream of new L1 block headers, abstracting over the transport.
-    ///
-    /// - **WebSocket**: uses `subscribe_blocks` for push-based delivery.
-    /// - **HTTP**: falls back to `watch_full_blocks` (filter-based polling via
-    ///   `eth_newBlockFilter` + `eth_getFilterChanges`), extracting the header
-    ///   from each block. The fallback is selected when `subscribe_blocks`
-    ///   returns `PubsubUnavailable`.
-    ///
-    /// Both paths produce the same header payloads; transport-specific polling
-    /// failures are surfaced as stream errors so [`run`](Self::run) can
-    /// reconnect and resync.
+    /// Returns a stream of new L1 block headers, using WebSocket subscriptions
+    /// when available and HTTP polling as a fallback.
     async fn header_stream<'a>(
         &self,
         provider: &'a DynProvider<TempoNetwork>,
@@ -202,21 +191,22 @@ impl L1Subscriber {
                 info!("Using WebSocket block subscription");
                 Ok(Box::pin(sub.into_stream().map(Ok)))
             }
-            Err(e) => {
+            Err(e)
                 if e.as_transport_err()
-                    .is_some_and(|t| t.is_pubsub_unavailable())
-                {
-                    info!("Pubsub unavailable, falling back to HTTP polling");
-                    let mut watcher = provider.watch_full_blocks().await?;
-                    watcher.set_poll_interval(HTTP_POLL_INTERVAL);
-                    let stream = watcher
-                        .into_stream()
-                        .map(|res| res.map(|block| block.header).map_err(Into::into));
-                    Ok(Box::pin(stream))
-                } else {
-                    Err(e.into())
-                }
+                    .is_some_and(|t| t.is_pubsub_unavailable()) =>
+            {
+                info!("Pubsub unavailable, falling back to HTTP polling");
+
+                let mut watcher = provider.watch_full_blocks().await?;
+                watcher.set_poll_interval(HTTP_POLL_INTERVAL);
+
+                let stream = watcher
+                    .into_stream()
+                    .map(|res| res.map(|block| block.header).map_err(Into::into));
+
+                Ok(Box::pin(stream))
             }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -582,16 +572,16 @@ impl L1Subscriber {
                     }
                     if let Some(enabled) = portal_events.enabled_tokens.get(prev_len) {
                         let token = enabled.token;
-                        if !self.tracked_tokens.contains(&token) {
+                        if !self.enabled_tokens.contains(&token) {
                             info!(%token, "New token enabled, adding to tracked tokens");
-                            self.tracked_tokens.push(token);
+                            self.enabled_tokens.push(token);
                         }
                     }
                 } else if addr == TIP403_REGISTRY_ADDRESS {
                     if let Some(event) = PolicyEvent::decode_registry(log) {
                         policy_events.push(event);
                     }
-                } else if self.tracked_tokens.contains(&addr)
+                } else if self.enabled_tokens.contains(&addr)
                     && log.topics().first() == Some(&TransferPolicyUpdate::SIGNATURE_HASH)
                     && let Some(event) = PolicyEvent::decode_tip20(log)
                 {
@@ -1823,7 +1813,7 @@ mod tests {
             },
             local_state,
             deposit_queue: DepositQueue::default(),
-            tracked_tokens: vec![],
+            enabled_tokens: vec![],
             tip403_metrics: Default::default(),
             subscriber_metrics: Default::default(),
         }
