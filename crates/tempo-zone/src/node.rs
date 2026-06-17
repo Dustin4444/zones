@@ -39,6 +39,7 @@ use reth_node_builder::{
         NoopEngineApiBuilder, PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns,
     },
 };
+use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::{
     AlloyBlockHeader, SealedBlock, SealedHeader, transaction::error::InvalidTransactionError,
 };
@@ -321,8 +322,16 @@ where
     > as NodeAddOns<N>>::Handle;
 
     async fn launch_add_ons(mut self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
-        let sp = ctx.node.provider().latest()?;
-        let tempo_block_number = sp.tempo_block_number()?;
+        let node = &ctx.node;
+        let provider = node.provider();
+        let task_executor = node.task_executor().clone();
+        // The payload builder handle is only reachable through the node
+        // components; the launched RPC `Handle` does not expose it, so capture
+        // it before `launch_add_ons` consumes `ctx`.
+        let payload_builder = node.payload_builder_handle().clone();
+        let chain_id = provider.chain_spec().inner.genesis().config.chain_id;
+
+        let tempo_block_number = provider.latest()?.tempo_block_number()?;
         self.policy_cache.set_last_l1_block(tempo_block_number);
         info!(target: "reth::cli", tempo_block_number, "Read local tempoBlockNumber for L1 subscriber");
 
@@ -338,27 +347,30 @@ where
         self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
-        if let Some(ref config) = self.sequencer_config {
+        let rpc_handle = self.inner.launch_add_ons(ctx).await?;
+
+        // If the sequencer is enabled, spawn the zone engine using the launched
+        // RPC handle for the provider and beacon engine handle.
+        if let Some(config) = &self.sequencer_config {
             let sequencer_addr = config.sequencer_signer.address();
             let sequencer_key = SecretKey::from(config.sequencer_signer.credential());
-            self.spawn_zone_engine(l1_provider, &ctx, sequencer_addr, sequencer_key)?;
+
+            Self::spawn_zone_engine(
+                l1_provider,
+                &rpc_handle,
+                payload_builder,
+                task_executor.clone(),
+                self.policy_cache.clone(),
+                self.deposit_queue.clone(),
+                self.portal_address,
+                sequencer_addr,
+                sequencer_key,
+            )?;
         }
-
-        let task_executor = ctx.node.task_executor().clone();
-
-        let chain_id = ctx
-            .node
-            .provider()
-            .chain_spec()
-            .inner
-            .genesis()
-            .config
-            .chain_id;
-        let handle = self.inner.launch_add_ons(ctx).await?;
 
         Self::launch_private_rpc(
             self.private_rpc_config,
-            &handle,
+            &rpc_handle,
             self.l1_config.l1_rpc_url.clone(),
             self.l1_config.retry_connection_interval,
             self.l1_config.portal_address,
@@ -371,7 +383,7 @@ where
 
             Self::launch_sequencer_tasks(
                 config,
-                &handle,
+                &rpc_handle,
                 &task_executor,
                 self.l1_config.l1_rpc_url,
                 self.l1_config.portal_address,
@@ -382,7 +394,7 @@ where
             .await?;
         }
 
-        Ok(handle)
+        Ok(rpc_handle)
     }
 }
 
@@ -451,36 +463,42 @@ where
     }
 
     /// Spawn the [`ZoneEngine`] for L1-event-driven block production.
+    ///
+    /// This is an associated function (no `&self`) because it is called after
+    /// `self.inner.launch_add_ons(ctx)` partially moves `self`, so the required
+    /// state (`policy_cache`, `deposit_queue`, `portal_address`) is captured and
+    /// passed in by the caller.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_zone_engine(
-        &self,
         l1_provider: alloy_provider::DynProvider<TempoNetwork>,
-        ctx: &AddOnsContext<'_, N>,
+        rpc_handle: &<Self as NodeAddOns<N>>::Handle,
+        payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
+        task_executor: reth_tasks::TaskExecutor,
+        policy_cache: PolicyCache,
+        deposit_queue: DepositQueue,
+        portal_address: Address,
         fee_recipient: Address,
         sequencer_key: SecretKey,
     ) -> eyre::Result<()> {
-        let policy_provider = PolicyProvider::new(
-            self.policy_cache.clone(),
-            l1_provider,
-            tokio::runtime::Handle::current(),
-        );
-        let provider = ctx.node.provider();
+        let policy_provider =
+            PolicyProvider::new(policy_cache, l1_provider, tokio::runtime::Handle::current());
+
+        let provider = rpc_handle.provider();
         let last_header = provider
             .sealed_header(provider.best_block_number()?)?
             .ok_or_else(|| eyre::eyre!("no latest block header"))?;
         let engine = ZoneEngine::new(
             provider.chain_spec(),
-            ctx.beacon_engine_handle.clone(),
-            ctx.node.payload_builder_handle().clone(),
-            self.deposit_queue.clone(),
+            rpc_handle.beacon_engine_handle.clone(),
+            payload_builder,
+            deposit_queue,
             last_header,
             fee_recipient,
             sequencer_key,
-            self.portal_address,
+            portal_address,
             policy_provider,
         );
-        ctx.node
-            .task_executor()
-            .spawn_critical_task("zone-engine", engine.run());
+        task_executor.spawn_critical_task("zone-engine", engine.run());
         info!(target: "reth::cli", "ZoneEngine spawned");
         Ok(())
     }
