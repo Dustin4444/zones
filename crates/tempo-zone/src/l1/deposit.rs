@@ -9,7 +9,7 @@ pub struct Deposit {
     pub sender: Address,
     /// Recipient on the zone.
     pub to: Address,
-    /// Net amount deposited (fee already deducted on L1).
+    /// Principal amount deposited; deposit fees were charged separately on L1.
     pub amount: u128,
     /// Fee paid on L1.
     pub fee: u128,
@@ -58,7 +58,7 @@ pub struct EncryptedDeposit {
     pub token: Address,
     /// Sender on L1.
     pub sender: Address,
-    /// Net amount deposited (fee already deducted on L1).
+    /// Principal amount deposited; deposit fees were charged separately on L1.
     pub amount: u128,
     /// Fee paid on L1.
     pub fee: u128,

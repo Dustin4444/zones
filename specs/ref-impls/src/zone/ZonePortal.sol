@@ -495,11 +495,11 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Deposit a TIP-20 token into the zone. Returns the new current deposit queue hash.
-    /// @dev Fee is deducted from amount and paid to sequencer in the same token.
+    /// @dev Fees are charged in addition to amount and paid to the sequencer in the same token.
     ///      The token must be enabled and deposits must be active.
     /// @param _token The TIP-20 token to deposit
     /// @param to Recipient address on the zone
-    /// @param amount Total amount to deposit (fee will be deducted)
+    /// @param amount Principal amount to deposit, before fees
     /// @param memo User-provided context
     /// @return newCurrentDepositQueueHash The new deposit queue hash after this deposit
     function deposit(
@@ -595,9 +595,9 @@ contract ZonePortal is IZonePortal {
     /// @dev The encrypted payload contains (to, memo) encrypted to the sequencer's key.
     ///      The token identity is public (not encrypted) since the portal must escrow it.
     ///      Validates that keyIndex is valid (exists and not expired).
-    ///      Charges the same deposit fee as regular deposits.
+    ///      Charges the same up-front fees as regular deposits.
     /// @param _token The TIP-20 token to deposit
-    /// @param amount Amount to deposit (fee deducted from this amount)
+    /// @param amount Principal amount to deposit, before fees
     /// @param keyIndex Index of the encryption key used (from encryptionKeyAt)
     /// @param encrypted The encrypted payload (recipient and memo)
     /// @return newCurrentDepositQueueHash The new deposit queue hash
