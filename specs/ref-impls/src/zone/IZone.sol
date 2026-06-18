@@ -443,20 +443,12 @@ interface IZoneFactory {
         uint64 genesisTempoBlockNumber
     );
 
-    event ForkVerifierUpdated(
-        address indexed verifier,
-        address indexed forkVerifier,
-        uint64 forkActivationBlock,
-        uint64 protocolVersion
-    );
-
     error InvalidToken();
     error InvalidSequencer();
     error InvalidVerifier();
     error NotUpgradeAuthority();
     error InsufficientGas();
     error ZoneIdOverflow();
-    error ProtocolVersionOverflow();
 
     /// @notice Returns whether a verifier contract is currently active in the factory.
     /// @param verifier The verifier contract address to check.
@@ -474,9 +466,6 @@ interface IZoneFactory {
 
     /// @notice Tempo block where the currently configured fork verifier activates.
     function forkActivationBlock() external view returns (uint64);
-
-    /// @notice Current zone protocol version.
-    function protocolVersion() external view returns (uint64);
 
     /// @notice Select the verifier that applies to a submitted Tempo block.
     /// @param tempoBlockNumber The Tempo block number committed to by the zone batch.

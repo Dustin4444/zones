@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { EIP2935 } from "../../src/zone/BlockHashHistory.sol";
-import {
-    BlockTransition,
-    DepositQueueTransition,
-    IZonePortal,
-    Withdrawal
-} from "../../src/zone/IZone.sol";
+import { IZonePortal, Withdrawal } from "../../src/zone/IZone.sol";
 import { EMPTY_SENTINEL } from "../../src/zone/WithdrawalQueueLib.sol";
 import { ZonePortal } from "../../src/zone/ZonePortal.sol";
-import { MockVerifier } from "./mocks/MockVerifier.sol";
 import { Test } from "forge-std/Test.sol";
 
 contract MockPortalToken {
@@ -21,15 +14,6 @@ contract MockPortalToken {
 
     function approve(address, uint256) external pure returns (bool) {
         return true;
-    }
-
-}
-
-contract MockBlockHashHistory {
-
-    fallback(bytes calldata input) external returns (bytes memory) {
-        uint256 blockNumber = abi.decode(input, (uint256));
-        return abi.encode(keccak256(abi.encode(blockNumber)));
     }
 
 }
@@ -86,84 +70,6 @@ contract ZonePortalGasLimitTest is Test {
 
     function _withdrawalQueueSlot(uint256 slot) internal pure returns (bytes32) {
         return keccak256(abi.encode(slot, WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT));
-    }
-
-}
-
-contract ZonePortalFactoryVerifierTest is Test {
-
-    ZonePortal public portal;
-    MockPortalToken public token;
-    MockVerifier public verifier;
-    MockVerifier public forkVerifier;
-
-    address public activeVerifier;
-
-    function setUp() public {
-        MockBlockHashHistory history = new MockBlockHashHistory();
-        vm.etch(EIP2935, address(history).code);
-
-        token = new MockPortalToken();
-        verifier = new MockVerifier();
-        forkVerifier = new MockVerifier();
-        activeVerifier = address(verifier);
-
-        portal = new ZonePortal(
-            1,
-            address(token),
-            address(0x400),
-            address(this),
-            keccak256("genesis"),
-            uint64(block.number)
-        );
-    }
-
-    function verifierForTempoBlock(uint64) external view returns (address) {
-        return activeVerifier;
-    }
-
-    function test_submitBatch_usesFactoryVerifierOnEachSubmission() public {
-        _submitBatch(keccak256("state-1"));
-
-        activeVerifier = address(forkVerifier);
-        forkVerifier.setShouldAccept(false);
-
-        assertEq(portal.factory(), address(this));
-        assertEq(this.verifierForTempoBlock(uint64(block.number)), address(forkVerifier));
-        assertFalse(forkVerifier.shouldAccept());
-
-        vm.roll(block.number + 1);
-        bytes32 prevBlockHash = portal.blockHash();
-        vm.expectRevert(IZonePortal.InvalidProof.selector);
-        _submitBatchAtCurrentBlock(prevBlockHash, keccak256("state-2-rejected"));
-
-        forkVerifier.setShouldAccept(true);
-        _submitBatch(keccak256("state-2"));
-
-        assertEq(portal.withdrawalBatchIndex(), 2);
-        assertEq(portal.blockHash(), keccak256("state-2"));
-    }
-
-    function _submitBatch(bytes32 nextBlockHash) internal {
-        vm.roll(block.number + 1);
-        _submitBatchAtCurrentBlock(portal.blockHash(), nextBlockHash);
-    }
-
-    function _submitBatchAtCurrentBlock(bytes32 prevBlockHash, bytes32 nextBlockHash) internal {
-        portal.submitBatch(
-            uint64(block.number - 1),
-            0,
-            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: nextBlockHash }),
-            DepositQueueTransition({
-                prevProcessedHash: bytes32(0),
-                nextProcessedHash: bytes32(0),
-                prevDepositNumber: 0,
-                nextDepositNumber: 0
-            }),
-            bytes32(0),
-            "",
-            ""
-        );
     }
 
 }

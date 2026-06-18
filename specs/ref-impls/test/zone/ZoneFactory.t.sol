@@ -262,7 +262,6 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(zoneFactory.verifier(), initialVerifier);
         assertEq(zoneFactory.forkVerifier(), address(forkVerifier));
         assertEq(zoneFactory.forkActivationBlock(), activationBlock);
-        assertEq(zoneFactory.protocolVersion(), 1);
         assertEq(zoneFactory.verifierForTempoBlock(activationBlock - 1), initialVerifier);
         assertEq(zoneFactory.verifierForTempoBlock(activationBlock), address(forkVerifier));
     }
@@ -282,7 +281,6 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(zoneFactory.verifier(), address(forkVerifier1));
         assertEq(zoneFactory.forkVerifier(), address(forkVerifier2));
         assertEq(zoneFactory.forkActivationBlock(), activationBlock);
-        assertEq(zoneFactory.protocolVersion(), 2);
         assertFalse(zoneFactory.isValidVerifier(initialVerifier));
         assertTrue(zoneFactory.isValidVerifier(address(forkVerifier1)));
         assertTrue(zoneFactory.isValidVerifier(address(forkVerifier2)));

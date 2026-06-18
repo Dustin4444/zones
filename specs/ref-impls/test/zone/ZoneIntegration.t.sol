@@ -51,36 +51,6 @@ contract TrackingReceiver is IWithdrawalReceiver {
 
 }
 
-contract ZoneIntegrationPortalFactory {
-
-    ZoneFactory public immutable verifierSource;
-
-    constructor(ZoneFactory _verifierSource) {
-        verifierSource = _verifierSource;
-    }
-
-    function createPortal(
-        uint32 zoneId,
-        address initialToken,
-        address messenger,
-        address sequencer,
-        bytes32 genesisBlockHash,
-        uint64 genesisTempoBlockNumber
-    )
-        external
-        returns (ZonePortal)
-    {
-        return new ZonePortal(
-            zoneId, initialToken, messenger, sequencer, genesisBlockHash, genesisTempoBlockNumber
-        );
-    }
-
-    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address) {
-        return verifierSource.verifierForTempoBlock(tempoBlockNumber);
-    }
-
-}
-
 /// @title ZoneIntegrationTest
 /// @notice Comprehensive integration tests for the full zone lifecycle
 contract ZoneIntegrationTest is BaseTest {
@@ -122,12 +92,11 @@ contract ZoneIntegrationTest is BaseTest {
 
         genesisTempoBlockNumber = uint64(block.number);
 
-        // Deploy messenger and portal via a test factory (bypass factory TIP20 prefix check)
-        ZoneIntegrationPortalFactory portalFactory = new ZoneIntegrationPortalFactory(l1Factory);
-        uint256 currentNonce = vm.getNonce(address(portalFactory));
-        address predictedPortal = vm.computeCreateAddress(address(portalFactory), currentNonce);
+        // Deploy messenger and portal directly (bypass factory TIP20 prefix check)
+        uint256 currentNonce = vm.getNonce(address(this));
+        address predictedPortal = vm.computeCreateAddress(address(this), currentNonce + 1);
         ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
-        l1Portal = portalFactory.createPortal(
+        l1Portal = new ZonePortal(
             1,
             address(l2ZoneToken),
             address(messengerContract),
@@ -148,6 +117,10 @@ contract ZoneIntegrationTest is BaseTest {
 
         l2ZoneToken.setMinter(address(l2Inbox), true);
         l2ZoneToken.setBurner(address(l2Outbox), true);
+    }
+
+    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address) {
+        return l1Factory.verifierForTempoBlock(tempoBlockNumber);
     }
 
     function _wrapDeposits(Deposit[] memory deposits)

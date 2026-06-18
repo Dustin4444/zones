@@ -436,18 +436,10 @@ macro_rules! define_abi {
                     bytes32 genesisTempoBlockHash,
                     uint64 genesisTempoBlockNumber
                 );
-                #[derive(Debug)]
-                event ForkVerifierUpdated(
-                    address indexed verifier,
-                    address indexed forkVerifier,
-                    uint64 forkActivationBlock,
-                    uint64 protocolVersion
-                );
                 function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
                 function verifier() external view returns (address);
                 function forkVerifier() external view returns (address);
                 function forkActivationBlock() external view returns (uint64);
-                function protocolVersion() external view returns (uint64);
                 function upgradeAuthority() external view returns (address);
                 function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address selectedVerifier);
                 function setForkVerifier(address newForkVerifier) external;

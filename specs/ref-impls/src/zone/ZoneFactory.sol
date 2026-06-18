@@ -30,7 +30,6 @@ contract ZoneFactory is IZoneFactory {
     address internal _verifier;
     address internal _forkVerifier;
     uint64 internal _forkActivationBlock;
-    uint64 public protocolVersion;
     address public immutable upgradeAuthority;
 
     /// @notice Tracks deployment count for CREATE address prediction
@@ -143,7 +142,6 @@ contract ZoneFactory is IZoneFactory {
         if (newForkVerifier == _verifier || newForkVerifier == _forkVerifier) {
             revert InvalidVerifier();
         }
-        if (protocolVersion == type(uint64).max) revert ProtocolVersionOverflow();
 
         if (_forkVerifier != address(0)) {
             _verifier = _forkVerifier;
@@ -151,9 +149,6 @@ contract ZoneFactory is IZoneFactory {
 
         _forkVerifier = newForkVerifier;
         _forkActivationBlock = uint64(block.number);
-        protocolVersion++;
-
-        emit ForkVerifierUpdated(_verifier, _forkVerifier, _forkActivationBlock, protocolVersion);
     }
 
     function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
