@@ -115,13 +115,12 @@ contract ZonePortal is IZonePortal {
 
     constructor(
         uint32 _zoneId,
-        address _token,
+        address _initialToken,
         address _messenger,
         address _sequencer,
         bytes32 _genesisBlockHash,
         uint64 _genesisTempoBlockNumber
     ) {
-        if (msg.sender.code.length == 0) revert InvalidFactory();
         zoneId = _zoneId;
         messenger = _messenger;
         sequencer = _sequencer;
@@ -130,7 +129,7 @@ contract ZonePortal is IZonePortal {
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
 
         // Enable the initial token
-        _enableTokenInternal(_token);
+        _enableTokenInternal(_initialToken);
     }
 
     /*//////////////////////////////////////////////////////////////

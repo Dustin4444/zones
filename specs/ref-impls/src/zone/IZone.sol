@@ -582,7 +582,6 @@ interface IZonePortal {
     error NotSequencer();
     error NotPendingSequencer();
     error InvalidProof();
-    error InvalidFactory();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);

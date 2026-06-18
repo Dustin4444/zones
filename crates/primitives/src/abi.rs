@@ -420,7 +420,7 @@ macro_rules! define_abi {
                     uint64 genesisTempoBlockNumber;
                 }
                 struct CreateZoneParams {
-                    address initialToken;
+                    address token;
                     address sequencer;
                     ZoneParams zoneParams;
                 }
@@ -429,7 +429,7 @@ macro_rules! define_abi {
                     uint32 indexed zoneId,
                     address indexed portal,
                     address indexed messenger,
-                    address initialToken,
+                    address token,
                     address sequencer,
                     bytes32 genesisBlockHash,
                     bytes32 genesisTempoBlockHash,
@@ -443,7 +443,6 @@ macro_rules! define_abi {
                 function zoneCount() external view returns (uint32);
                 function isZonePortal(address portal) external view returns (bool);
                 function isZoneMessenger(address messenger) external view returns (bool);
-                function isValidVerifier(address verifier) external view returns (bool);
             }
 
             // ---------------------------------------------------------------

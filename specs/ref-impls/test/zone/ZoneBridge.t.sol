@@ -152,7 +152,7 @@ contract ZoneBridgeTest is BaseTest {
         ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
         l1Portal = new ZonePortal(
             1, // zoneId
-            address(l2ZoneToken), // token = MockZoneToken (NOT pathUSD)
+            address(l2ZoneToken), // initialToken = MockZoneToken (NOT pathUSD)
             address(messengerContract),
             admin, // sequencer
             GENESIS_BLOCK_HASH,

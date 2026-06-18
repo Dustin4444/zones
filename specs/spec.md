@@ -1511,7 +1511,6 @@ interface IZoneFactory {
     function zoneCount() external view returns (uint32);
     function zones(uint32 zoneId) external view returns (ZoneInfo memory);
     function isZonePortal(address portal) external view returns (bool);
-    function isZoneMessenger(address messenger) external view returns (bool);
     function verifier() external view returns (address);
     function prevVerifier() external view returns (address);
     function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
