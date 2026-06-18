@@ -53,8 +53,8 @@ contract ZoneFactory is IZoneFactory {
         external
         returns (uint32 zoneId, address portal)
     {
-        // Validate token is a TIP-20
-        if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(params.token)) {
+        // Validate initial token is a TIP-20
+        if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(params.initialToken)) {
             revert InvalidToken();
         }
         if (params.sequencer == address(0)) revert InvalidSequencer();
@@ -84,11 +84,11 @@ contract ZoneFactory is IZoneFactory {
         ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
         address messengerAddress = address(messengerContract);
 
-        // Deploy portal with messenger address and token
-        // The portal constructor enables the token automatically
+        // Deploy portal with messenger address and initial token
+        // The portal constructor enables the initial token automatically
         ZonePortal portalContract = new ZonePortal(
             zoneId,
-            params.token,
+            params.initialToken,
             messengerAddress,
             params.sequencer,
             params.zoneParams.genesisBlockHash,
@@ -104,7 +104,7 @@ contract ZoneFactory is IZoneFactory {
             zoneId: zoneId,
             portal: portal,
             messenger: messengerAddress,
-            token: params.token,
+            initialToken: params.initialToken,
             sequencer: params.sequencer,
             genesisBlockHash: params.zoneParams.genesisBlockHash,
             genesisTempoBlockHash: params.zoneParams.genesisTempoBlockHash,
@@ -118,7 +118,7 @@ contract ZoneFactory is IZoneFactory {
             zoneId,
             portal,
             messengerAddress,
-            params.token,
+            params.initialToken,
             params.sequencer,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockHash,

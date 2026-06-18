@@ -1006,7 +1006,7 @@ impl L1TestNode {
 
         let receipt = factory
             .createZone(ZoneFactory::CreateZoneParams {
-                token: PATH_USD_ADDRESS,
+                initialToken: PATH_USD_ADDRESS,
                 sequencer,
                 zoneParams: ZoneFactory::ZoneParams {
                     genesisBlockHash: B256::ZERO,

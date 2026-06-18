@@ -18,7 +18,7 @@ struct ZoneInfo {
     uint32 zoneId;
     address portal;
     address messenger;
-    address token; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
+    address initialToken; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
     address sequencer;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
@@ -427,7 +427,7 @@ interface IVerifier {
 interface IZoneFactory {
 
     struct CreateZoneParams {
-        address token; // first TIP-20 to enable (sequencer can enable more later)
+        address initialToken; // first TIP-20 to enable (sequencer can enable more later)
         address sequencer;
         ZoneParams zoneParams;
     }
@@ -436,7 +436,7 @@ interface IZoneFactory {
         uint32 indexed zoneId,
         address indexed portal,
         address indexed messenger,
-        address token,
+        address initialToken,
         address sequencer,
         bytes32 genesisBlockHash,
         bytes32 genesisTempoBlockHash,

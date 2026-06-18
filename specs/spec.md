@@ -218,7 +218,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 
 | Parameter | Description |
 |-----------|-------------|
-| `token` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
+| `initialToken` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
 | `admin` | The address that holds the admin role for the zone (token enablement, deposit pause/resume). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
@@ -1473,7 +1473,7 @@ struct ZoneInfo {
     uint32 zoneId;
     address portal;
     address messenger;
-    address token;
+    address initialToken;
     address sequencer;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
@@ -1497,14 +1497,14 @@ struct LastBatch {
 ```solidity
 interface IZoneFactory {
     struct CreateZoneParams {
-        address token;
+        address initialToken;
         address sequencer;
         ZoneParams zoneParams;
     }
 
     event ZoneCreated(
         uint32 indexed zoneId, address indexed portal, address indexed messenger,
-        address token, address sequencer,
+        address initialToken, address sequencer,
         bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
     );
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
