@@ -84,23 +84,17 @@ contract MockZonePortalForRouter {
     bool public encryptedDepositCalled;
 
     uint128 public depositFee;
-    uint128 public bouncebackFee;
 
     function enableToken(address _token) external {
         enabledTokens[_token] = true;
     }
 
-    function setFees(uint128 _depositFee, uint128 _bouncebackFee) external {
+    function setDepositFee(uint128 _depositFee) external {
         depositFee = _depositFee;
-        bouncebackFee = _bouncebackFee;
     }
 
     function calculateDepositFee() external view returns (uint128) {
         return depositFee;
-    }
-
-    function calculateBouncebackFee() external view returns (uint128) {
-        return bouncebackFee;
     }
 
     function isTokenEnabled(address _token) external view returns (bool) {
@@ -116,7 +110,7 @@ contract MockZonePortalForRouter {
         external
         returns (bytes32)
     {
-        ITIP20(_token).transferFrom(msg.sender, address(this), amount + depositFee + bouncebackFee);
+        ITIP20(_token).transferFrom(msg.sender, address(this), amount + depositFee);
         lastDepositRecipient = to;
         lastDepositAmount = amount;
         lastDepositMemo = memo;
@@ -133,7 +127,7 @@ contract MockZonePortalForRouter {
         external
         returns (bytes32)
     {
-        ITIP20(_token).transferFrom(msg.sender, address(this), amount + depositFee + bouncebackFee);
+        ITIP20(_token).transferFrom(msg.sender, address(this), amount + depositFee);
         lastEncryptedAmount = amount;
         lastEncryptedKeyIndex = keyIndex;
         encryptedDepositCalled = true;
@@ -286,8 +280,7 @@ contract SwapAndDepositRouterTest is BaseTest {
 
     function test_plaintextDeposit_subtractsPortalFees() public {
         uint128 depositFee = 100;
-        uint128 bouncebackFee = 300;
-        mockPortal.setFees(depositFee, bouncebackFee);
+        mockPortal.setDepositFee(depositFee);
 
         bytes memory data =
             _buildPlaintextData(address(pathUSD), address(mockPortal), alice, bytes32("fees"), 0);
@@ -295,7 +288,7 @@ contract SwapAndDepositRouterTest is BaseTest {
         vm.prank(address(mockMessenger));
         router.onWithdrawalReceived(senderTag, address(pathUSD), AMOUNT, data);
 
-        assertEq(mockPortal.lastDepositAmount(), AMOUNT - depositFee - bouncebackFee);
+        assertEq(mockPortal.lastDepositAmount(), AMOUNT - depositFee);
         assertEq(pathUSD.balanceOf(address(mockPortal)), AMOUNT);
     }
 
@@ -331,7 +324,7 @@ contract SwapAndDepositRouterTest is BaseTest {
     }
 
     function test_revertAmountTooSmallForDepositFees() public {
-        mockPortal.setFees(AMOUNT, 1);
+        mockPortal.setDepositFee(AMOUNT);
         bytes memory data =
             _buildPlaintextData(address(pathUSD), address(mockPortal), alice, bytes32("fees"), 0);
 

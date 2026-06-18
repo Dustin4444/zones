@@ -89,17 +89,14 @@ impl SpamDeposits {
         let gas_price = provider.get_gas_price().await?;
         let portal = ZonePortal::new(self.portal, &provider);
         let deposit_fee = portal.calculateDepositFee().call().await?;
-        let bounceback_fee = portal.calculateBouncebackFee().call().await?;
         let per_deposit_debit = self
             .amount
             .checked_add(deposit_fee)
-            .and_then(|value| value.checked_add(bounceback_fee))
-            .ok_or_else(|| eyre!("deposit amount plus fees overflow"))?;
+            .ok_or_else(|| eyre!("deposit amount plus fee overflow"))?;
 
         println!("Chain ID: {chain_id}");
         println!("Gas price: {gas_price}");
         println!("Deposit fee: {deposit_fee}");
-        println!("Bounceback fee: {bounceback_fee}");
         println!("Per-deposit debit: {per_deposit_debit}");
 
         // ── Phase 1: Setup signers ──────────────────────────────────────

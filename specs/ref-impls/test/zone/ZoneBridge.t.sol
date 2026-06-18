@@ -257,7 +257,6 @@ contract ZoneBridgeTest is BaseTest {
             to: to,
             amount: amount,
             bouncebackRecipient: sender,
-            bouncebackFee: 0,
             memo: memo
         });
 
@@ -870,7 +869,6 @@ contract ZoneBridgeTest is BaseTest {
             sender: sender,
             amount: amount,
             bouncebackRecipient: sender,
-            bouncebackFee: 0,
             keyIndex: keyIndex,
             encrypted: encrypted
         });
@@ -1154,7 +1152,6 @@ contract ZoneBridgeTest is BaseTest {
             to: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
             memo: bytes32("regular")
         });
         bytes32 prevHash = l2Inbox.processedDepositQueueHash();
@@ -1167,7 +1164,6 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: depositAmount,
             bouncebackRecipient: bob,
-            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: payload
         });
@@ -1181,7 +1177,6 @@ contract ZoneBridgeTest is BaseTest {
             to: carol,
             amount: depositAmount,
             bouncebackRecipient: carol,
-            bouncebackFee: 0,
             memo: bytes32("carol")
         });
         bytes32 hash3 = keccak256(abi.encode(DepositType.Regular, d3, hash2));
@@ -1286,7 +1281,6 @@ contract ZoneBridgeTest is BaseTest {
             sender: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: payload1
         });
@@ -1298,7 +1292,6 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: depositAmount,
             bouncebackRecipient: bob,
-            bouncebackFee: 0,
             keyIndex: 1,
             encrypted: payload2
         });

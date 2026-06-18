@@ -53,7 +53,6 @@ macro_rules! define_abi {
                 address to;
                 uint128 amount;
                 address bouncebackRecipient;
-                uint128 bouncebackFee;
                 bytes32 memo;
             }
 
@@ -74,7 +73,6 @@ macro_rules! define_abi {
                 address sender;
                 uint128 amount;
                 address bouncebackRecipient;
-                uint128 bouncebackFee;
                 uint256 keyIndex;
                 EncryptedDepositPayload encrypted;
             }
@@ -127,7 +125,6 @@ macro_rules! define_abi {
                     address to,
                     uint128 amount,
                     uint128 fee,
-                    uint128 bouncebackFee,
                     bytes32 memo,
                     address bouncebackRecipient,
                     uint64 depositNumber
@@ -140,7 +137,6 @@ macro_rules! define_abi {
                     address token,
                     uint128 amount,
                     uint128 fee,
-                    uint128 bouncebackFee,
                     uint256 keyIndex,
                     bytes32 ephemeralPubkeyX,
                     uint8 ephemeralPubkeyYParity,
@@ -181,16 +177,14 @@ macro_rules! define_abi {
                 event DepositBounceBack(
                     address indexed bouncebackRecipient,
                     address token,
-                    uint128 amount,
-                    uint128 bouncebackFee
+                    uint128 amount
                 );
 
                 #[derive(Debug)]
                 event DepositBounceBackPending(
                     address indexed bouncebackRecipient,
                     address token,
-                    uint128 amount,
-                    uint128 bouncebackFee
+                    uint128 amount
                 );
 
                 #[derive(Debug)]
@@ -239,11 +233,9 @@ macro_rules! define_abi {
                 function withdrawalQueueSlot(uint256 slot) external view returns (bytes32);
                 function genesisTempoBlockNumber() external view returns (uint64);
                 function calculateDepositFee() external view returns (uint128 fee);
-                function calculateBouncebackFee() external view returns (uint128 fee);
                 function depositCount() external view returns (uint64);
                 function lastProcessedDepositNumber() external view returns (uint64);
                 function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
-                function zoneGasRate() external view returns (uint128);
                 function tempoGasRate() external view returns (uint128);
                 function refunds(address token, address owner) external view returns (uint128);
 
@@ -353,8 +345,7 @@ macro_rules! define_abi {
                 function enqueueDepositBounceBack(
                     address token,
                     uint128 amount,
-                    address bouncebackRecipient,
-                    uint128 bouncebackFee
+                    address bouncebackRecipient
                 ) external;
                 function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
             }
@@ -824,7 +815,6 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
-            bouncebackFee: 0,
             memo: B256::ZERO,
         };
 
@@ -849,7 +839,6 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
-            bouncebackFee: 0,
             memo: B256::ZERO,
         };
 
@@ -911,7 +900,6 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
-            bouncebackFee: 0,
             memo: B256::ZERO,
         };
         let prev_hash = B256::ZERO;

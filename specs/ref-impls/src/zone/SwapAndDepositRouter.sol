@@ -154,8 +154,7 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
         view
         returns (uint128)
     {
-        uint128 fees = IZonePortal(targetPortal).calculateDepositFee()
-            + IZonePortal(targetPortal).calculateBouncebackFee();
+        uint128 fees = IZonePortal(targetPortal).calculateDepositFee();
         if (amountAvailable <= fees) revert AmountTooSmallForDepositFees();
         return amountAvailable - fees;
     }

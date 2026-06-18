@@ -1638,7 +1638,6 @@ contract ZonePortalTest is BaseTest {
             to: bob,
             amount: 500e6,
             bouncebackRecipient: address(0),
-            bouncebackFee: 0,
             memo: bytes32(0)
         });
         bytes32 expectedHash =
@@ -1732,14 +1731,13 @@ contract ZonePortalTest is BaseTest {
                     to: bob,
                     amount: amount,
                     bouncebackRecipient: alice,
-                    bouncebackFee: 0,
                     memo: bytes32("test")
                 }),
                 bytes32(0)
             )
         );
         emit IZonePortal.DepositMade(
-            expectedHash, alice, address(pathUSD), bob, amount, fee, 0, bytes32("test"), alice, 1
+            expectedHash, alice, address(pathUSD), bob, amount, fee, bytes32("test"), alice, 1
         );
 
         portal.deposit(address(pathUSD), bob, amount, bytes32("test"));
@@ -2086,7 +2084,6 @@ contract ZonePortalTest is BaseTest {
             sender: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2115,14 +2112,11 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_depositEncrypted_chargesFeesUpfront() public {
-        portal.setZoneGasRate(1); // 1 token per gas -> fee = 100_000
-        portal.setTempoGasRate(2); // 2 tokens per gas -> bounceback fee = 600_000
+        portal.setTempoGasRate(2); // 2 tokens per gas -> fee = 800_000
         _setEncKeyWithPoP(ENC_KEY_1);
 
         uint128 depositAmount = 1000e6;
-        uint128 expectedDepositFee = uint128(100_000) * 1;
-        uint128 expectedBouncebackFee = uint128(300_000) * 2;
-        uint128 expectedTotalFee = expectedDepositFee + expectedBouncebackFee;
+        uint128 expectedTotalFee = uint128(400_000) * 2;
         uint128 expectedTotalDebit = depositAmount + expectedTotalFee;
         uint256 aliceBefore = pathUSD.balanceOf(alice);
         uint256 seqBefore = pathUSD.balanceOf(admin);
@@ -2155,7 +2149,6 @@ contract ZonePortalTest is BaseTest {
             sender: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2168,7 +2161,6 @@ contract ZonePortalTest is BaseTest {
             address(pathUSD),
             depositAmount,
             fee,
-            0,
             0,
             VALID_SECP256K1_X,
             0x02,
@@ -2255,7 +2247,7 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_depositEncrypted_revertsOnAmountPlusFeesOverflow() public {
-        portal.setZoneGasRate(1); // fee = 100_000
+        portal.setTempoGasRate(1); // fee = 400_000
         _setEncKeyWithPoP(ENC_KEY_1);
 
         vm.startPrank(alice);
@@ -2344,7 +2336,7 @@ contract ZonePortalTest is BaseTest {
     ///      Slot layout (non-immutable variables only):
     ///        slot 0: sequencer (address)
     ///        slot 1: pendingSequencer (address)
-    ///        slot 2: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
+    ///        slot 2: withdrawalBatchIndex (uint64)
     ///        slot 3: blockHash (bytes32)
     ///        slot 4: currentDepositQueueHash (bytes32)
     ///        slot 5: lastSyncedTempoBlockNumber (uint64)
@@ -2364,13 +2356,14 @@ contract ZonePortalTest is BaseTest {
             "slot 1: pendingSequencer mismatch"
         );
 
-        // --- Slot 2: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) packed ---
-        uint128 testRate = 42;
-        portal.setZoneGasRate(testRate);
+        // --- Slot 2: withdrawalBatchIndex (uint64) ---
         bytes32 slot2 = vm.load(address(portal), bytes32(uint256(2)));
-        // zoneGasRate is at the lowest 128 bits (uint128), withdrawalBatchIndex at bits 128-191
-        uint128 loadedRate = uint128(uint256(slot2));
-        assertEq(loadedRate, testRate, "slot 2: zoneGasRate mismatch");
+        uint64 loadedWithdrawalBatchIndex = uint64(uint256(slot2));
+        assertEq(
+            loadedWithdrawalBatchIndex,
+            portal.withdrawalBatchIndex(),
+            "slot 2: withdrawalBatchIndex mismatch"
+        );
 
         // --- Slot 3: blockHash ---
         bytes32 slot3 = vm.load(address(portal), bytes32(uint256(3)));

@@ -68,7 +68,7 @@ impl ZoneInfoCmd {
 
         let sequencer = portal.sequencer().call().await?;
         let pending = portal.pendingSequencer().call().await?;
-        let gas_rate = portal.zoneGasRate().call().await?;
+        let gas_rate = portal.tempoGasRate().call().await?;
         let batch_index = portal.withdrawalBatchIndex().call().await?;
         let block_hash = portal.blockHash().call().await?;
         let deposit_queue = portal.currentDepositQueueHash().call().await?;
@@ -79,7 +79,7 @@ impl ZoneInfoCmd {
         if pending != Address::ZERO {
             println!("  Pending Sequencer:     {pending}");
         }
-        println!("  Zone Gas Rate:         {gas_rate}");
+        println!("  Tempo Gas Rate:        {gas_rate}");
         println!("  Withdrawal Batch:      {batch_index}");
         println!("  Block Hash:            {block_hash}");
         println!("  Deposit Queue Hash:    {deposit_queue}");

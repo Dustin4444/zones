@@ -99,10 +99,9 @@ async fn test_l1_deposit_mints_on_zone() -> eyre::Result<()> {
     let portal = ZonePortal::new(portal_address, &l1_provider);
     let l1_token_address = PATH_USD_ADDRESS;
     let fee = portal.calculateDepositFee().call().await?;
-    let bounceback_fee = portal.calculateBouncebackFee().call().await?;
 
     let deposit_amount: u128 = 1_000_000;
-    let total_debit = deposit_amount + fee + bounceback_fee;
+    let total_debit = deposit_amount + fee;
 
     // Approve portal to transfer our L1 tokens
     let l1_token = ITIP20::new(l1_token_address, &l1_provider);

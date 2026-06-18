@@ -67,7 +67,6 @@ struct Deposit {
     address to;
     uint128 amount;
     address bouncebackRecipient;
-    uint128 bouncebackFee;
     bytes32 memo;
 }
 
@@ -95,7 +94,6 @@ struct EncryptedDeposit {
     address sender; // Depositor (public, for refunds)
     uint128 amount; // Amount (public, for accounting)
     address bouncebackRecipient;
-    uint128 bouncebackFee;
     uint256 keyIndex; // Index of encryption key used (specified by depositor)
     EncryptedDepositPayload encrypted; // Encrypted (to, memo)
 }
@@ -367,7 +365,7 @@ interface IZoneTxContext {
 // ZonePortal storage layout (non-immutable variables only):
 //   slot 0: sequencer (address)
 //   slot 1: pendingSequencer (address)
-//   slot 2: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
+//   slot 2: withdrawalBatchIndex (uint64)
 //   slot 3: blockHash (bytes32)
 //   slot 4: currentDepositQueueHash (bytes32)
 //   slot 5: lastSyncedTempoBlockNumber (uint64)
@@ -510,7 +508,6 @@ interface IZonePortal {
         address to,
         uint128 amount,
         uint128 fee,
-        uint128 bouncebackFee,
         bytes32 memo,
         address bouncebackRecipient,
         uint64 depositNumber
@@ -536,12 +533,10 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
-    event DepositBounceBack(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
-    );
+    event DepositBounceBack(address indexed bouncebackRecipient, address token, uint128 amount);
 
     event DepositBounceBackPending(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+        address indexed bouncebackRecipient, address token, uint128 amount
     );
 
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
@@ -558,7 +553,6 @@ interface IZonePortal {
         address token,
         uint128 amount,
         uint128 fee,
-        uint128 bouncebackFee,
         uint256 keyIndex,
         bytes32 ephemeralPubkeyX,
         uint8 ephemeralPubkeyYParity,
@@ -577,7 +571,6 @@ interface IZonePortal {
     event SequencerEncryptionKeyUpdated(
         bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock
     );
-    event ZoneGasRateUpdated(uint128 zoneGasRate);
     event TempoGasRateUpdated(uint128 tempoGasRate);
 
     /// @notice Emitted when sequencer enables a new TIP-20 token for bridging
@@ -622,7 +615,6 @@ interface IZonePortal {
     function messenger() external view returns (address);
     function sequencer() external view returns (address);
     function pendingSequencer() external view returns (address);
-    function zoneGasRate() external view returns (uint128);
     function tempoGasRate() external view returns (uint128);
     function verifier() external view returns (address);
     function withdrawalBatchIndex() external view returns (uint64);
@@ -714,18 +706,11 @@ interface IZonePortal {
         view
         returns (bytes32 x, uint8 yParity, uint256 keyIndex);
 
-    /// @notice Set zone gas rate. Only callable by sequencer.
-    /// @param _zoneGasRate Zone token units per gas unit on the zone
-    function setZoneGasRate(uint128 _zoneGasRate) external;
-
-    /// @notice Set Tempo gas rate used for deposit bounce-back fees.
+    /// @notice Set Tempo gas rate used for deposit and withdrawal fees.
     function setTempoGasRate(uint128 _tempoGasRate) external;
 
-    /// @notice Calculate the fee for a deposit
+    /// @notice Calculate the up-front fee for a deposit.
     function calculateDepositFee() external view returns (uint128 fee);
-
-    /// @notice Calculate the fee charged up front for a possible deposit bounce-back on Tempo.
-    function calculateBouncebackFee() external view returns (uint128 fee);
 
     /// @notice Check if an encryption key is still valid for new deposits
     /// @dev A key is valid if it's the current key OR if it was superseded less than
@@ -1116,8 +1101,7 @@ interface IZoneOutbox {
     function enqueueDepositBounceBack(
         address token,
         uint128 amount,
-        address bouncebackRecipient,
-        uint128 bouncebackFee
+        address bouncebackRecipient
     )
         external;
 

@@ -146,14 +146,6 @@ impl DemoSwapAndDeposit {
             .call()
             .await
             .wrap_err("failed to fetch portal deposit fee")?;
-        let bounceback_fee = ZonePortal::new(portal, &l1)
-            .calculateBouncebackFee()
-            .call()
-            .await
-            .wrap_err("failed to fetch portal bounceback fee")?;
-        let total_deposit_fee = deposit_fee
-            .checked_add(bounceback_fee)
-            .ok_or_else(|| eyre!("deposit fee overflow"))?;
         let withdrawal_fee = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &l2)
             .calculateWithdrawalFee(ROUTER_CALLBACK_GAS_LIMIT)
             .call()
@@ -168,11 +160,11 @@ impl DemoSwapAndDeposit {
             .checked_add(withdrawal_fee)
             .ok_or_else(|| eyre!("alpha deposit amount overflow"))?;
         let alpha_deposit_debit = alpha_deposit_amount
-            .checked_add(total_deposit_fee)
+            .checked_add(deposit_fee)
             .ok_or_else(|| eyre!("alpha deposit debit overflow"))?;
         let pathusd_deposit_amount = DEMO_PATHUSD_GAS_NET;
         let pathusd_deposit_debit = pathusd_deposit_amount
-            .checked_add(total_deposit_fee)
+            .checked_add(deposit_fee)
             .ok_or_else(|| eyre!("pathUSD deposit amount overflow"))?;
 
         println!("╔══════════════════════════════════════════════════════════════╗");
@@ -188,7 +180,6 @@ impl DemoSwapAndDeposit {
         println!("  Swap amount:      {}", self.amount);
         println!("  DEX tick:         {}", self.tick);
         println!("  Deposit fee:      {deposit_fee}");
-        println!("  Bounceback fee:   {bounceback_fee}");
         println!("  Withdrawal fee:   {withdrawal_fee}");
         println!();
 
@@ -245,8 +236,8 @@ impl DemoSwapAndDeposit {
             .call()
             .await
             .wrap_err("failed to quote DEX swap")?;
-        let expected_beta_net = expected_beta.checked_sub(total_deposit_fee).ok_or_else(|| {
-            eyre!("quoted swap output {expected_beta} does not cover portal fees {total_deposit_fee}")
+        let expected_beta_net = expected_beta.checked_sub(deposit_fee).ok_or_else(|| {
+            eyre!("quoted swap output {expected_beta} does not cover portal fee {deposit_fee}")
         })?;
         println!(
             "  Seeded liquidity: {dex_liquidity} units at tick {}",

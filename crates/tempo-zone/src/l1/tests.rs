@@ -402,7 +402,6 @@ fn test_deposit_queue_hash_chain() {
         to: address!("0x0000000000000000000000000000000000000002"),
         amount: 1000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
         memo: B256::ZERO,
     });
@@ -430,7 +429,6 @@ fn test_deposit_queue_hash_chain() {
         to: address!("0x0000000000000000000000000000000000000004"),
         amount: 2000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000003"),
         memo: B256::ZERO,
     });
@@ -453,7 +451,6 @@ fn test_process_deposits_transition() {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000,
             fee: 0,
-            bounceback_fee: 0,
             bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
             memo: B256::ZERO,
         }),
@@ -463,7 +460,6 @@ fn test_process_deposits_transition() {
             to: address!("0x0000000000000000000000000000000000000004"),
             amount: 2000,
             fee: 0,
-            bounceback_fee: 0,
             bounceback_recipient: address!("0x0000000000000000000000000000000000000003"),
             memo: B256::ZERO,
         }),
@@ -496,7 +492,6 @@ fn test_queue_and_process_deposits_hashes_match() {
         to: address!("0x0000000000000000000000000000000000000002"),
         amount: 500,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
         memo: FixedBytes::from([0xABu8; 32]),
     })];
@@ -522,7 +517,6 @@ fn test_drain_returns_block_grouped_deposits() {
         to: address!("0x0000000000000000000000000000000000000002"),
         amount: 100,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
         memo: B256::ZERO,
     });
@@ -533,7 +527,6 @@ fn test_drain_returns_block_grouped_deposits() {
         to: address!("0x0000000000000000000000000000000000000004"),
         amount: 200,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000003"),
         memo: B256::ZERO,
     });
@@ -568,7 +561,6 @@ fn test_encrypted_deposit_hash_chain() {
         sender,
         amount: 1_000_000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: sender,
         key_index: U256::ZERO,
         ephemeral_pubkey_x: B256::with_last_byte(0xAA),
@@ -588,7 +580,6 @@ fn test_encrypted_deposit_hash_chain() {
         sender: encrypted.sender,
         amount: encrypted.amount,
         bouncebackRecipient: encrypted.bounceback_recipient,
-        bouncebackFee: encrypted.bounceback_fee,
         keyIndex: encrypted.key_index,
         encrypted: abi::EncryptedDepositPayload {
             ephemeralPubkeyX: encrypted.ephemeral_pubkey_x,
@@ -623,7 +614,6 @@ fn test_mixed_deposit_hash_chain() {
         to: recipient,
         amount: 500_000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: sender,
         memo: B256::ZERO,
     };
@@ -633,7 +623,6 @@ fn test_mixed_deposit_hash_chain() {
         sender,
         amount: 300_000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: sender,
         key_index: U256::from(1u64),
         ephemeral_pubkey_x: B256::with_last_byte(0xBB),
@@ -660,7 +649,6 @@ fn test_mixed_deposit_hash_chain() {
                 to: regular.to,
                 amount: regular.amount,
                 bouncebackRecipient: regular.bounceback_recipient,
-                bouncebackFee: regular.bounceback_fee,
                 memo: regular.memo,
             },
             B256::ZERO,
@@ -676,7 +664,6 @@ fn test_mixed_deposit_hash_chain() {
                 sender: encrypted.sender,
                 amount: encrypted.amount,
                 bouncebackRecipient: encrypted.bounceback_recipient,
-                bouncebackFee: encrypted.bounceback_fee,
                 keyIndex: encrypted.key_index,
                 encrypted: abi::EncryptedDepositPayload {
                     ephemeralPubkeyX: encrypted.ephemeral_pubkey_x,
@@ -705,7 +692,6 @@ fn test_enqueue_and_transition_consistency() {
         sender,
         amount: 750_000,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: sender,
         key_index: U256::from(2u64),
         ephemeral_pubkey_x: B256::with_last_byte(0xCC),
@@ -932,7 +918,6 @@ fn test_purge_rolls_back_deposit_hash() {
         to: address!("0x0000000000000000000000000000000000000002"),
         amount: 100,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
         memo: B256::ZERO,
     });
@@ -949,7 +934,6 @@ fn test_purge_rolls_back_deposit_hash() {
         to: address!("0x0000000000000000000000000000000000000004"),
         amount: 200,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000003"),
         memo: B256::ZERO,
     });
@@ -984,7 +968,6 @@ fn make_deposit(amount: u128) -> L1Deposit {
         to: address!("0x0000000000000000000000000000000000000002"),
         amount,
         fee: 0,
-        bounceback_fee: 0,
         bounceback_recipient: address!("0x0000000000000000000000000000000000000001"),
         memo: B256::ZERO,
     })

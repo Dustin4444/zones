@@ -13,8 +13,6 @@ pub struct Deposit {
     pub amount: u128,
     /// Fee paid on L1.
     pub fee: u128,
-    /// Tempo-side refund fee reserved for failed deposit processing.
-    pub bounceback_fee: u128,
     /// Tempo recipient for failed deposit refunds.
     pub bounceback_recipient: Address,
     /// User-provided memo.
@@ -30,7 +28,6 @@ impl Deposit {
             to: event.to,
             amount: event.amount,
             fee: event.fee,
-            bounceback_fee: event.bouncebackFee,
             bounceback_recipient: event.bouncebackRecipient,
             memo: event.memo,
         }
@@ -44,7 +41,6 @@ impl Deposit {
             to: event.fallbackRecipient,
             amount: event.amount,
             fee: 0,
-            bounceback_fee: 0,
             bounceback_recipient: Address::ZERO,
             memo: B256::ZERO,
         }
@@ -62,8 +58,6 @@ pub struct EncryptedDeposit {
     pub amount: u128,
     /// Fee paid on L1.
     pub fee: u128,
-    /// Tempo-side refund fee reserved for failed deposit processing.
-    pub bounceback_fee: u128,
     /// Tempo recipient for failed deposit refunds.
     pub bounceback_recipient: Address,
     /// Index of the encryption key used.
@@ -88,7 +82,6 @@ impl EncryptedDeposit {
             sender: event.sender,
             amount: event.amount,
             fee: event.fee,
-            bounceback_fee: event.bouncebackFee,
             bounceback_recipient: event.bouncebackRecipient,
             key_index: event.keyIndex,
             ephemeral_pubkey_x: event.ephemeralPubkeyX,
@@ -122,7 +115,6 @@ impl L1Deposit {
                         to: d.to,
                         amount: d.amount,
                         bouncebackRecipient: d.bounceback_recipient,
-                        bouncebackFee: d.bounceback_fee,
                         memo: d.memo,
                     },
                     prev_hash,
@@ -137,7 +129,6 @@ impl L1Deposit {
                         sender: d.sender,
                         amount: d.amount,
                         bouncebackRecipient: d.bounceback_recipient,
-                        bouncebackFee: d.bounceback_fee,
                         keyIndex: d.key_index,
                         encrypted: AbiEncryptedDepositPayload {
                             ephemeralPubkeyX: d.ephemeral_pubkey_x,

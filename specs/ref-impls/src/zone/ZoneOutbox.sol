@@ -326,8 +326,7 @@ contract ZoneOutbox is IZoneOutbox {
     function enqueueDepositBounceBack(
         address token,
         uint128 amount,
-        address bouncebackRecipient,
-        uint128 bouncebackFee
+        address bouncebackRecipient
     )
         external
     {
@@ -340,7 +339,7 @@ contract ZoneOutbox is IZoneOutbox {
                 txHash: bytes32(0),
                 to: bouncebackRecipient,
                 amount: amount,
-                fee: bouncebackFee,
+                fee: 0,
                 memo: bytes32(0),
                 gasLimit: 0,
                 fallbackRecipient: address(0),
@@ -356,7 +355,7 @@ contract ZoneOutbox is IZoneOutbox {
             token,
             bouncebackRecipient,
             amount,
-            bouncebackFee,
+            0,
             bytes32(0),
             0,
             address(0),
