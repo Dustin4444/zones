@@ -30,7 +30,6 @@ contract ZoneFactory is IZoneFactory {
     address internal _verifier;
     address internal _forkVerifier;
     uint64 internal _forkActivationBlock;
-    address public immutable upgradeAuthority;
 
     /// @notice Tracks deployment count for CREATE address prediction
     /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
@@ -42,14 +41,8 @@ contract ZoneFactory is IZoneFactory {
     //////////////////////////////////////////////////////////////*/
 
     constructor() {
-        upgradeAuthority = msg.sender;
         address v = address(new Verifier());
         _verifier = v;
-    }
-
-    modifier onlyUpgradeAuthority() {
-        if (msg.sender != upgradeAuthority) revert NotUpgradeAuthority();
-        _;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -133,33 +126,11 @@ contract ZoneFactory is IZoneFactory {
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-                          VERIFIER ROTATION
-    //////////////////////////////////////////////////////////////*/
-
-    function setForkVerifier(address newForkVerifier) external onlyUpgradeAuthority {
-        if (!_isVerifierContract(newForkVerifier)) revert InvalidVerifier();
-        if (newForkVerifier == _verifier || newForkVerifier == _forkVerifier) {
-            revert InvalidVerifier();
-        }
-
-        if (_forkVerifier != address(0)) {
-            _verifier = _forkVerifier;
-        }
-
-        _forkVerifier = newForkVerifier;
-        _forkActivationBlock = uint64(block.number);
-    }
-
     function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
         if (_forkVerifier != address(0) && tempoBlockNumber >= _forkActivationBlock) {
             return _forkVerifier;
         }
         return _verifier;
-    }
-
-    function _isVerifierContract(address verifier_) internal view returns (bool) {
-        return verifier_ != address(0) && verifier_.code.length != 0;
     }
 
     /// @notice Compute the address of a contract deployed with CREATE

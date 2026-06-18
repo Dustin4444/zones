@@ -1516,7 +1516,6 @@ interface IZoneFactory {
     function forkVerifier() external view returns (address);
     function forkActivationBlock() external view returns (uint64);
     function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
-    function setForkVerifier(address newForkVerifier) external;
 }
 ```
 
@@ -1632,7 +1631,6 @@ interface IZonePortal {
 
     // State
     function sequencer() external view returns (address);
-    function factory() external view returns (address);
     function blockHash() external view returns (bytes32);
     function currentDepositQueueHash() external view returns (bytes32);
     function withdrawalBatchIndex() external view returns (uint64);
@@ -1828,7 +1826,7 @@ Deployed at the same address as on Tempo. Read-only on the zone. Its `isAuthoriz
 
 Zones activate hard fork upgrades in lockstep with Tempo using same-block activation. The trigger is the Tempo block number: the zone block whose `advanceTempo` imports the fork Tempo block uses the new execution rules for its entire scope.
 
-`ZoneFactory` maintains two verifier slots (`verifier` and `forkVerifier`) shared by all zones. Each portal stores its factory address and resolves the verifier for every `submitBatch` by calling `ZoneFactory.verifierForTempoBlock(tempoBlockNumber)`. The portal does not cache verifier addresses.
+`ZoneFactory` maintains two verifier slots (`verifier` and `forkVerifier`) shared by all zones. Each portal stores its factory address internally and resolves the verifier for every `submitBatch` by calling `ZoneFactory.verifierForTempoBlock(tempoBlockNumber)`. The portal does not cache verifier addresses.
 
 At each fork, verifiers rotate: the previous fork verifier is promoted to `verifier`, and the new fork verifier takes the `forkVerifier` slot. At most two verifiers are active at any time. The `IVerifier` interface is unchanged across forks. New proof parameters are passed via the opaque `verifierConfig` bytes.
 
@@ -1836,10 +1834,10 @@ No onchain action is required from zone operators. The new verifier is deployed 
 
 The factory enforces a `forkActivationBlock` cutoff through verifier selection. Batches with `tempoBlockNumber < forkActivationBlock` use `verifier`; batches with `tempoBlockNumber >= forkActivationBlock` use `forkVerifier`. This prevents post-fork batches from being submitted against old verification rules.
 
-The Tempo hard fork block executes the following as system transactions:
+The Tempo hard fork installs the new verifier at the factory level:
 
 1. Deploy the new `IVerifier` contract.
-2. Call `ZoneFactory.setForkVerifier(forkVerifier)`, which promotes the previous fork verifier if present, installs the new verifier as `forkVerifier`, and sets `forkActivationBlock = block.number`.
+2. Update the factory's verifier slots so the previous fork verifier is promoted to `verifier`, the new verifier is installed as `forkVerifier`, and `forkActivationBlock = block.number`.
 
 If the fork changes zone predeploy behavior, the zone node injects new bytecode at the predeploy addresses before `advanceTempo` executes in the first post-fork zone block.
 

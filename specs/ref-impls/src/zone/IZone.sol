@@ -445,8 +445,6 @@ interface IZoneFactory {
 
     error InvalidToken();
     error InvalidSequencer();
-    error InvalidVerifier();
-    error NotUpgradeAuthority();
     error InsufficientGas();
     error ZoneIdOverflow();
 
@@ -454,9 +452,6 @@ interface IZoneFactory {
     /// @param verifier The verifier contract address to check.
     /// @return valid True if `verifier` is one of the currently active factory verifiers.
     function isValidVerifier(address verifier) external view returns (bool);
-
-    /// @notice The address authorized to rotate fork verifiers.
-    function upgradeAuthority() external view returns (address);
 
     /// @notice Current pre-fork verifier.
     function verifier() external view returns (address);
@@ -474,10 +469,6 @@ interface IZoneFactory {
         external
         view
         returns (address selectedVerifier);
-
-    /// @notice Rotate the global fork verifier. Only callable by the upgrade authority.
-    /// @param newForkVerifier The verifier for batches targeting the new fork.
-    function setForkVerifier(address newForkVerifier) external;
 
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
     /// @param params The initial token, sequencer, and genesis parameters for the zone.
@@ -625,7 +616,6 @@ interface IZonePortal {
     function sequencer() external view returns (address);
     function pendingSequencer() external view returns (address);
     function zoneGasRate() external view returns (uint128);
-    function factory() external view returns (address);
     function withdrawalBatchIndex() external view returns (uint64);
     function blockHash() external view returns (bytes32);
     function currentDepositQueueHash() external view returns (bytes32);

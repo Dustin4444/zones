@@ -61,7 +61,7 @@ contract ZonePortal is IZonePortal {
 
     uint32 public immutable zoneId;
     address public immutable messenger;
-    address public immutable factory;
+    address private immutable _factory;
     uint64 public immutable genesisTempoBlockNumber;
 
     /// @notice Current sequencer address
@@ -125,7 +125,7 @@ contract ZonePortal is IZonePortal {
         zoneId = _zoneId;
         messenger = _messenger;
         sequencer = _sequencer;
-        factory = msg.sender;
+        _factory = msg.sender;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
 
@@ -769,7 +769,7 @@ contract ZonePortal is IZonePortal {
         }
 
         // Verify proof (handles both direct and ancestry modes)
-        address activeVerifier = IZoneFactory(factory).verifierForTempoBlock(tempoBlockNumber);
+        address activeVerifier = IZoneFactory(_factory).verifierForTempoBlock(tempoBlockNumber);
         bool valid = IVerifier(activeVerifier)
             .verify(
                 tempoBlockNumber,

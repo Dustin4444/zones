@@ -196,7 +196,6 @@ macro_rules! define_abi {
 
                 function zoneId() external view returns (uint32);
                 function sequencer() external view returns (address);
-                function factory() external view returns (address);
                 function sequencerPubkey() external view returns (bytes32);
                 function withdrawalBatchIndex() external view returns (uint64);
                 function blockHash() external view returns (bytes32);
@@ -440,9 +439,7 @@ macro_rules! define_abi {
                 function verifier() external view returns (address);
                 function forkVerifier() external view returns (address);
                 function forkActivationBlock() external view returns (uint64);
-                function upgradeAuthority() external view returns (address);
                 function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address selectedVerifier);
-                function setForkVerifier(address newForkVerifier) external;
                 function zones(uint32 zoneId) external view returns (ZoneInfo memory);
                 function zoneCount() external view returns (uint32);
                 function isZonePortal(address portal) external view returns (bool);

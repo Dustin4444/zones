@@ -6,7 +6,6 @@ import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
 import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/zone/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
-import { MockVerifier } from "./mocks/MockVerifier.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
@@ -227,65 +226,6 @@ contract ZoneFactoryTest is BaseTest {
 
         vm.expectRevert(IZoneFactory.InvalidSequencer.selector);
         zoneFactory.createZone(params);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                         VERIFIER ROTATION TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    function test_setForkVerifier_revertsIfNotUpgradeAuthority() public {
-        MockVerifier newVerifier = new MockVerifier();
-
-        vm.prank(alice);
-        vm.expectRevert(IZoneFactory.NotUpgradeAuthority.selector);
-        zoneFactory.setForkVerifier(address(newVerifier));
-    }
-
-    function test_setForkVerifier_revertsOnInvalidVerifier_zeroAddress() public {
-        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
-        zoneFactory.setForkVerifier(address(0));
-    }
-
-    function test_setForkVerifier_revertsOnInvalidVerifier_eoa() public {
-        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
-        zoneFactory.setForkVerifier(address(0xdead));
-    }
-
-    function test_setForkVerifier_installsForkVerifier() public {
-        address initialVerifier = zoneFactory.verifier();
-        MockVerifier forkVerifier = new MockVerifier();
-
-        vm.roll(block.number + 10);
-        uint64 activationBlock = uint64(block.number);
-        zoneFactory.setForkVerifier(address(forkVerifier));
-
-        assertEq(zoneFactory.verifier(), initialVerifier);
-        assertEq(zoneFactory.forkVerifier(), address(forkVerifier));
-        assertEq(zoneFactory.forkActivationBlock(), activationBlock);
-        assertEq(zoneFactory.verifierForTempoBlock(activationBlock - 1), initialVerifier);
-        assertEq(zoneFactory.verifierForTempoBlock(activationBlock), address(forkVerifier));
-    }
-
-    function test_setForkVerifier_secondForkPromotesPreviousForkVerifier() public {
-        address initialVerifier = zoneFactory.verifier();
-        MockVerifier forkVerifier1 = new MockVerifier();
-        MockVerifier forkVerifier2 = new MockVerifier();
-
-        vm.roll(block.number + 10);
-        zoneFactory.setForkVerifier(address(forkVerifier1));
-
-        vm.roll(block.number + 10);
-        uint64 activationBlock = uint64(block.number);
-        zoneFactory.setForkVerifier(address(forkVerifier2));
-
-        assertEq(zoneFactory.verifier(), address(forkVerifier1));
-        assertEq(zoneFactory.forkVerifier(), address(forkVerifier2));
-        assertEq(zoneFactory.forkActivationBlock(), activationBlock);
-        assertFalse(zoneFactory.isValidVerifier(initialVerifier));
-        assertTrue(zoneFactory.isValidVerifier(address(forkVerifier1)));
-        assertTrue(zoneFactory.isValidVerifier(address(forkVerifier2)));
-        assertEq(zoneFactory.verifierForTempoBlock(activationBlock - 1), address(forkVerifier1));
-        assertEq(zoneFactory.verifierForTempoBlock(activationBlock), address(forkVerifier2));
     }
 
     /*//////////////////////////////////////////////////////////////

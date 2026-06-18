@@ -32,7 +32,6 @@ import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
 import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/zone/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
-import { MockVerifier } from "./mocks/MockVerifier.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 /// @notice Mock withdrawal receiver that accepts funds
@@ -223,7 +222,6 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.zoneId(), testZoneId);
         assertTrue(portal.isTokenEnabled(address(pathUSD)));
         assertEq(portal.sequencer(), admin);
-        assertEq(portal.factory(), address(zoneFactory));
         assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
@@ -492,35 +490,6 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(IZonePortal.InvalidProof.selector);
         portal.submitBatch(
             uint64(block.number - 1),
-            0,
-            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: nextStateRoot }),
-            DepositQueueTransition({
-                prevProcessedHash: bytes32(0),
-                nextProcessedHash: bytes32(0),
-                prevDepositNumber: 0,
-                nextDepositNumber: 0
-            }),
-            bytes32(0),
-            "",
-            ""
-        );
-    }
-
-    function test_submitBatch_usesFactoryForkVerifierAfterActivation() public {
-        MockVerifier forkVerifier = new MockVerifier();
-        forkVerifier.setShouldAccept(false);
-
-        vm.roll(block.number + 1);
-        zoneFactory.setForkVerifier(address(forkVerifier));
-        uint64 activationBlock = zoneFactory.forkActivationBlock();
-
-        vm.roll(block.number + 1);
-
-        bytes32 prevBlockHash = portal.blockHash();
-        bytes32 nextStateRoot = keccak256("state");
-        vm.expectRevert(IZonePortal.InvalidProof.selector);
-        portal.submitBatch(
-            activationBlock,
             0,
             BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: nextStateRoot }),
             DepositQueueTransition({
@@ -1854,7 +1823,6 @@ contract ZonePortalTest is BaseTest {
     function test_immutableGetters() public view {
         assertEq(portal.zoneId(), testZoneId);
         assertEq(portal.sequencer(), admin);
-        assertEq(portal.factory(), address(zoneFactory));
         assertEq(portal.genesisTempoBlockNumber(), genesisTempoBlockNumber);
     }
 
