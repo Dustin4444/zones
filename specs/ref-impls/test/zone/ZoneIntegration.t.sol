@@ -119,8 +119,8 @@ contract ZoneIntegrationTest is BaseTest {
         l2ZoneToken.setBurner(address(l2Outbox), true);
     }
 
-    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address) {
-        return l1Factory.verifierForTempoBlock(tempoBlockNumber);
+    function verifier() external view returns (address) {
+        return l1Factory.verifier();
     }
 
     function _wrapDeposits(Deposit[] memory deposits)

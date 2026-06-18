@@ -29,7 +29,6 @@ contract ZoneFactory is IZoneFactory {
     mapping(address => bool) internal _isZoneMessenger;
     address internal _verifier;
     address internal _prevVerifier;
-    uint64 internal _verifierActivationBlock;
 
     /// @notice Tracks deployment count for CREATE address prediction
     /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
@@ -124,13 +123,6 @@ contract ZoneFactory is IZoneFactory {
             params.zoneParams.genesisTempoBlockHash,
             params.zoneParams.genesisTempoBlockNumber
         );
-    }
-
-    function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
-        if (_prevVerifier != address(0) && tempoBlockNumber < _verifierActivationBlock) {
-            return _prevVerifier;
-        }
-        return _verifier;
     }
 
     /// @notice Compute the address of a contract deployed with CREATE

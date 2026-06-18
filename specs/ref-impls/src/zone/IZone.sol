@@ -456,16 +456,8 @@ interface IZoneFactory {
     /// @notice Current verifier.
     function verifier() external view returns (address);
 
-    /// @notice Previous verifier accepted for batches before the current verifier activated.
+    /// @notice Previous verifier.
     function prevVerifier() external view returns (address);
-
-    /// @notice Select the verifier that applies to a submitted Tempo block.
-    /// @param tempoBlockNumber The Tempo block number committed to by the zone batch.
-    /// @return selectedVerifier The verifier for the submitted block.
-    function verifierForTempoBlock(uint64 tempoBlockNumber)
-        external
-        view
-        returns (address selectedVerifier);
 
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
     /// @param params The initial token, sequencer, and genesis parameters for the zone.

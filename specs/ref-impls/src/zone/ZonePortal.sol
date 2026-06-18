@@ -768,7 +768,7 @@ contract ZonePortal is IZonePortal {
         }
 
         // Verify proof (handles both direct and ancestry modes)
-        address activeVerifier = IZoneFactory(_factory).verifierForTempoBlock(tempoBlockNumber);
+        address activeVerifier = IZoneFactory(_factory).verifier();
         bool valid = IVerifier(activeVerifier)
             .verify(
                 tempoBlockNumber,

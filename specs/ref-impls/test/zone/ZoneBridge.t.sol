@@ -182,8 +182,8 @@ contract ZoneBridgeTest is BaseTest {
         l2BlockHash = GENESIS_BLOCK_HASH;
     }
 
-    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address) {
-        return l1Factory.verifierForTempoBlock(tempoBlockNumber);
+    function verifier() external view returns (address) {
+        return l1Factory.verifier();
     }
 
     function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
