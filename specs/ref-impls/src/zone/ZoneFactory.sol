@@ -27,8 +27,11 @@ contract ZoneFactory is IZoneFactory {
     mapping(uint32 => ZoneInfo) internal _zones;
     mapping(address => bool) internal _isZonePortal;
     mapping(address => bool) internal _isZoneMessenger;
-    mapping(address => bool) internal _validVerifiers;
     address internal _verifier;
+    address internal _forkVerifier;
+    uint64 internal _forkActivationBlock;
+    uint64 public protocolVersion;
+    address public immutable upgradeAuthority;
 
     /// @notice Tracks deployment count for CREATE address prediction
     /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
@@ -40,9 +43,14 @@ contract ZoneFactory is IZoneFactory {
     //////////////////////////////////////////////////////////////*/
 
     constructor() {
+        upgradeAuthority = msg.sender;
         address v = address(new Verifier());
-        _validVerifiers[v] = true;
         _verifier = v;
+    }
+
+    modifier onlyUpgradeAuthority() {
+        if (msg.sender != upgradeAuthority) revert NotUpgradeAuthority();
+        _;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -58,7 +66,6 @@ contract ZoneFactory is IZoneFactory {
             revert InvalidToken();
         }
         if (params.sequencer == address(0)) revert InvalidSequencer();
-        if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
 
         zoneId = _nextZoneId;
@@ -92,7 +99,6 @@ contract ZoneFactory is IZoneFactory {
             params.initialToken,
             messengerAddress,
             params.sequencer,
-            params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockNumber
         );
@@ -108,7 +114,6 @@ contract ZoneFactory is IZoneFactory {
             messenger: messengerAddress,
             initialToken: params.initialToken,
             sequencer: params.sequencer,
-            verifier: params.verifier,
             genesisBlockHash: params.zoneParams.genesisBlockHash,
             genesisTempoBlockHash: params.zoneParams.genesisTempoBlockHash,
             genesisTempoBlockNumber: params.zoneParams.genesisTempoBlockNumber
@@ -123,11 +128,43 @@ contract ZoneFactory is IZoneFactory {
             messengerAddress,
             params.initialToken,
             params.sequencer,
-            params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockHash,
             params.zoneParams.genesisTempoBlockNumber
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          VERIFIER ROTATION
+    //////////////////////////////////////////////////////////////*/
+
+    function setForkVerifier(address newForkVerifier) external onlyUpgradeAuthority {
+        if (!_isVerifierContract(newForkVerifier)) revert InvalidVerifier();
+        if (newForkVerifier == _verifier || newForkVerifier == _forkVerifier) {
+            revert InvalidVerifier();
+        }
+        if (protocolVersion == type(uint64).max) revert ProtocolVersionOverflow();
+
+        if (_forkVerifier != address(0)) {
+            _verifier = _forkVerifier;
+        }
+
+        _forkVerifier = newForkVerifier;
+        _forkActivationBlock = uint64(block.number);
+        protocolVersion++;
+
+        emit ForkVerifierUpdated(_verifier, _forkVerifier, _forkActivationBlock, protocolVersion);
+    }
+
+    function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
+        if (_forkVerifier != address(0) && tempoBlockNumber >= _forkActivationBlock) {
+            return _forkVerifier;
+        }
+        return _verifier;
+    }
+
+    function _isVerifierContract(address verifier_) internal view returns (bool) {
+        return verifier_ != address(0) && verifier_.code.length != 0;
     }
 
     /// @notice Compute the address of a contract deployed with CREATE
@@ -180,11 +217,19 @@ contract ZoneFactory is IZoneFactory {
     }
 
     function isValidVerifier(address v) external view returns (bool) {
-        return _validVerifiers[v];
+        return v != address(0) && (v == _verifier || v == _forkVerifier);
     }
 
     function verifier() external view returns (address) {
         return _verifier;
+    }
+
+    function forkVerifier() external view returns (address) {
+        return _forkVerifier;
+    }
+
+    function forkActivationBlock() external view returns (uint64) {
+        return _forkActivationBlock;
     }
 
 }

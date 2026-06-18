@@ -31,7 +31,6 @@ sol! {
     struct CreateZoneParams {
         address initialToken;
         address sequencer;
-        address verifier;
         ZoneParams zoneParams;
     }
 
@@ -43,13 +42,11 @@ sol! {
             address indexed messenger,
             address initialToken,
             address sequencer,
-            address verifier,
             bytes32 genesisBlockHash,
             bytes32 genesisTempoBlockHash,
             uint64 genesisTempoBlockNumber
         );
 
-        function verifier() external view returns (address);
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
     }
 }
@@ -109,9 +106,6 @@ impl CreateZone {
             .await?;
 
         let factory = ZoneFactory::new(self.zone_factory, &provider);
-        println!("Fetching verifier address from ZoneFactory...");
-        let verifier = Address::from(factory.verifier().call().await?.0);
-        println!("Verifier: {verifier}");
 
         // We cannot know the confirmation block number before sending, so we pass
         // the current block number. The tx typically confirms in the next block, but
@@ -122,7 +116,6 @@ impl CreateZone {
         let params = CreateZoneParams {
             initialToken: self.initial_token,
             sequencer: self.sequencer,
-            verifier,
             zoneParams: ZoneParams {
                 genesisBlockHash: B256::ZERO,
                 genesisTempoBlockHash: B256::ZERO,

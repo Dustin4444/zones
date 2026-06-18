@@ -196,7 +196,7 @@ macro_rules! define_abi {
 
                 function zoneId() external view returns (uint32);
                 function sequencer() external view returns (address);
-                function verifier() external view returns (address);
+                function factory() external view returns (address);
                 function sequencerPubkey() external view returns (bytes32);
                 function withdrawalBatchIndex() external view returns (uint64);
                 function blockHash() external view returns (bytes32);
@@ -408,7 +408,6 @@ macro_rules! define_abi {
                 address messenger;
                 address initialToken;
                 address sequencer;
-                address verifier;
                 bytes32 genesisBlockHash;
                 bytes32 genesisTempoBlockHash;
                 uint64 genesisTempoBlockNumber;
@@ -422,9 +421,8 @@ macro_rules! define_abi {
                     uint64 genesisTempoBlockNumber;
                 }
                 struct CreateZoneParams {
-                    address token;
+                    address initialToken;
                     address sequencer;
-                    address verifier;
                     ZoneParams zoneParams;
                 }
                 #[derive(Debug)]
@@ -432,19 +430,32 @@ macro_rules! define_abi {
                     uint32 indexed zoneId,
                     address indexed portal,
                     address indexed messenger,
-                    address token,
+                    address initialToken,
                     address sequencer,
-                    address verifier,
                     bytes32 genesisBlockHash,
                     bytes32 genesisTempoBlockHash,
                     uint64 genesisTempoBlockNumber
                 );
+                #[derive(Debug)]
+                event ForkVerifierUpdated(
+                    address indexed verifier,
+                    address indexed forkVerifier,
+                    uint64 forkActivationBlock,
+                    uint64 protocolVersion
+                );
                 function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
                 function verifier() external view returns (address);
+                function forkVerifier() external view returns (address);
+                function forkActivationBlock() external view returns (uint64);
+                function protocolVersion() external view returns (uint64);
+                function upgradeAuthority() external view returns (address);
+                function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address selectedVerifier);
+                function setForkVerifier(address newForkVerifier) external;
                 function zones(uint32 zoneId) external view returns (ZoneInfo memory);
                 function zoneCount() external view returns (uint32);
                 function isZonePortal(address portal) external view returns (bool);
                 function isZoneMessenger(address messenger) external view returns (bool);
+                function isValidVerifier(address verifier) external view returns (bool);
             }
 
             // ---------------------------------------------------------------

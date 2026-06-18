@@ -58,10 +58,22 @@ impl ZoneInfoCmd {
         println!("  Messenger:             {}", info.messenger);
         println!("  Initial Token:         {}", info.initialToken);
         println!("  Sequencer:             {}", info.sequencer);
-        println!("  Verifier:              {}", info.verifier);
         println!("  Genesis Block Hash:    {}", info.genesisBlockHash);
         println!("  Genesis Tempo Hash:    {}", info.genesisTempoBlockHash);
         println!("  Genesis Tempo Block:   {}", info.genesisTempoBlockNumber);
+
+        let verifier = factory.verifier().call().await?;
+        let fork_verifier = factory.forkVerifier().call().await?;
+        let fork_activation = factory.forkActivationBlock().call().await?;
+        let protocol_version = factory.protocolVersion().call().await?;
+
+        println!("\nFactory Verifier State");
+        println!("  Verifier:              {verifier}");
+        if fork_verifier != Address::ZERO {
+            println!("  Fork Verifier:         {fork_verifier}");
+            println!("  Fork Activation Block: {fork_activation}");
+        }
+        println!("  Protocol Version:      {protocol_version}");
 
         // Query live portal state
         let portal = ZonePortal::new(info.portal, &provider);

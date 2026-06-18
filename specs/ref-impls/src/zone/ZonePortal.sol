@@ -14,6 +14,7 @@ import {
     EncryptedDepositPayload,
     EncryptionKeyEntry,
     IVerifier,
+    IZoneFactory,
     IZoneMessenger,
     IZonePortal,
     MAX_WITHDRAWAL_CALLBACK_GAS,
@@ -60,7 +61,7 @@ contract ZonePortal is IZonePortal {
 
     uint32 public immutable zoneId;
     address public immutable messenger;
-    address public immutable verifier;
+    address public immutable factory;
     uint64 public immutable genesisTempoBlockNumber;
 
     /// @notice Current sequencer address
@@ -117,14 +118,14 @@ contract ZonePortal is IZonePortal {
         address _initialToken,
         address _messenger,
         address _sequencer,
-        address _verifier,
         bytes32 _genesisBlockHash,
         uint64 _genesisTempoBlockNumber
     ) {
+        if (msg.sender.code.length == 0) revert InvalidFactory();
         zoneId = _zoneId;
         messenger = _messenger;
         sequencer = _sequencer;
-        verifier = _verifier;
+        factory = msg.sender;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
 
@@ -768,7 +769,8 @@ contract ZonePortal is IZonePortal {
         }
 
         // Verify proof (handles both direct and ancestry modes)
-        bool valid = IVerifier(verifier)
+        address activeVerifier = IZoneFactory(factory).verifierForTempoBlock(tempoBlockNumber);
+        bool valid = IVerifier(activeVerifier)
             .verify(
                 tempoBlockNumber,
                 anchorBlockNumber,

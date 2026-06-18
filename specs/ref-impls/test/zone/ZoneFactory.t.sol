@@ -6,6 +6,7 @@ import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
 import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/zone/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
+import { MockVerifier } from "./mocks/MockVerifier.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
@@ -31,7 +32,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -52,7 +52,6 @@ contract ZoneFactoryTest is BaseTest {
         assertTrue(info.messenger != address(0));
         assertEq(info.initialToken, address(pathUSD));
         assertEq(info.sequencer, admin);
-        assertEq(info.verifier, zoneFactory.verifier());
         assertEq(info.genesisBlockHash, GENESIS_BLOCK_HASH);
         assertEq(info.genesisTempoBlockHash, GENESIS_TEMPO_BLOCK_HASH);
     }
@@ -61,7 +60,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -87,7 +85,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params1 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -100,7 +97,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params2 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: alice,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: keccak256("genesis2"),
                 genesisTempoBlockHash: keccak256("tempoGenesis2"),
@@ -127,7 +123,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -146,7 +141,7 @@ contract ZoneFactoryTest is BaseTest {
             if (
                 logs[i].topics[0]
                     == keccak256(
-                        "ZoneCreated(uint32,address,address,address,address,address,bytes32,bytes32,uint64)"
+                        "ZoneCreated(uint32,address,address,address,address,bytes32,bytes32,uint64)"
                     )
             ) {
                 found = true;
@@ -171,7 +166,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(0),
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -190,7 +184,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: notTip20,
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -206,7 +199,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: alice, // EOA, not a contract
             sequencer: admin,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -226,7 +218,6 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             sequencer: address(0),
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -239,23 +230,64 @@ contract ZoneFactoryTest is BaseTest {
     }
 
     /*//////////////////////////////////////////////////////////////
-                       INVALID VERIFIER TESTS
+                         VERIFIER ROTATION TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_createZone_revertsOnInvalidVerifier() public {
-        IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
-            initialToken: address(pathUSD),
-            sequencer: admin,
-            verifier: address(0xdead),
-            zoneParams: ZoneParams({
-                genesisBlockHash: GENESIS_BLOCK_HASH,
-                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
-                genesisTempoBlockNumber: uint64(block.number)
-            })
-        });
+    function test_setForkVerifier_revertsIfNotUpgradeAuthority() public {
+        MockVerifier newVerifier = new MockVerifier();
 
+        vm.prank(alice);
+        vm.expectRevert(IZoneFactory.NotUpgradeAuthority.selector);
+        zoneFactory.setForkVerifier(address(newVerifier));
+    }
+
+    function test_setForkVerifier_revertsOnInvalidVerifier_zeroAddress() public {
         vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
-        zoneFactory.createZone(params);
+        zoneFactory.setForkVerifier(address(0));
+    }
+
+    function test_setForkVerifier_revertsOnInvalidVerifier_eoa() public {
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.setForkVerifier(address(0xdead));
+    }
+
+    function test_setForkVerifier_installsForkVerifier() public {
+        address initialVerifier = zoneFactory.verifier();
+        MockVerifier forkVerifier = new MockVerifier();
+
+        vm.roll(block.number + 10);
+        uint64 activationBlock = uint64(block.number);
+        zoneFactory.setForkVerifier(address(forkVerifier));
+
+        assertEq(zoneFactory.verifier(), initialVerifier);
+        assertEq(zoneFactory.forkVerifier(), address(forkVerifier));
+        assertEq(zoneFactory.forkActivationBlock(), activationBlock);
+        assertEq(zoneFactory.protocolVersion(), 1);
+        assertEq(zoneFactory.verifierForTempoBlock(activationBlock - 1), initialVerifier);
+        assertEq(zoneFactory.verifierForTempoBlock(activationBlock), address(forkVerifier));
+    }
+
+    function test_setForkVerifier_secondForkPromotesPreviousForkVerifier() public {
+        address initialVerifier = zoneFactory.verifier();
+        MockVerifier forkVerifier1 = new MockVerifier();
+        MockVerifier forkVerifier2 = new MockVerifier();
+
+        vm.roll(block.number + 10);
+        zoneFactory.setForkVerifier(address(forkVerifier1));
+
+        vm.roll(block.number + 10);
+        uint64 activationBlock = uint64(block.number);
+        zoneFactory.setForkVerifier(address(forkVerifier2));
+
+        assertEq(zoneFactory.verifier(), address(forkVerifier1));
+        assertEq(zoneFactory.forkVerifier(), address(forkVerifier2));
+        assertEq(zoneFactory.forkActivationBlock(), activationBlock);
+        assertEq(zoneFactory.protocolVersion(), 2);
+        assertFalse(zoneFactory.isValidVerifier(initialVerifier));
+        assertTrue(zoneFactory.isValidVerifier(address(forkVerifier1)));
+        assertTrue(zoneFactory.isValidVerifier(address(forkVerifier2)));
+        assertEq(zoneFactory.verifierForTempoBlock(activationBlock - 1), address(forkVerifier1));
+        assertEq(zoneFactory.verifierForTempoBlock(activationBlock), address(forkVerifier2));
     }
 
     /*//////////////////////////////////////////////////////////////

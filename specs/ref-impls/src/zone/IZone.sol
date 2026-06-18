@@ -20,7 +20,6 @@ struct ZoneInfo {
     address messenger;
     address initialToken; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
     address sequencer;
-    address verifier;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
@@ -430,7 +429,6 @@ interface IZoneFactory {
     struct CreateZoneParams {
         address initialToken; // first TIP-20 to enable (sequencer can enable more later)
         address sequencer;
-        address verifier;
         ZoneParams zoneParams;
     }
 
@@ -440,25 +438,60 @@ interface IZoneFactory {
         address indexed messenger,
         address initialToken,
         address sequencer,
-        address verifier,
         bytes32 genesisBlockHash,
         bytes32 genesisTempoBlockHash,
         uint64 genesisTempoBlockNumber
     );
 
+    event ForkVerifierUpdated(
+        address indexed verifier,
+        address indexed forkVerifier,
+        uint64 forkActivationBlock,
+        uint64 protocolVersion
+    );
+
     error InvalidToken();
     error InvalidSequencer();
     error InvalidVerifier();
+    error NotUpgradeAuthority();
     error InsufficientGas();
     error ZoneIdOverflow();
+    error ProtocolVersionOverflow();
 
-    /// @notice Returns whether a verifier contract is approved for zone creation.
+    /// @notice Returns whether a verifier contract is currently active in the factory.
     /// @param verifier The verifier contract address to check.
-    /// @return valid True if `verifier` can be passed to `createZone`.
+    /// @return valid True if `verifier` is one of the currently active factory verifiers.
     function isValidVerifier(address verifier) external view returns (bool);
 
+    /// @notice The address authorized to rotate fork verifiers.
+    function upgradeAuthority() external view returns (address);
+
+    /// @notice Current pre-fork verifier.
+    function verifier() external view returns (address);
+
+    /// @notice Verifier for batches at or after the current fork activation block.
+    function forkVerifier() external view returns (address);
+
+    /// @notice Tempo block where the currently configured fork verifier activates.
+    function forkActivationBlock() external view returns (uint64);
+
+    /// @notice Current zone protocol version.
+    function protocolVersion() external view returns (uint64);
+
+    /// @notice Select the verifier that applies to a submitted Tempo block.
+    /// @param tempoBlockNumber The Tempo block number committed to by the zone batch.
+    /// @return selectedVerifier The verifier for the submitted block.
+    function verifierForTempoBlock(uint64 tempoBlockNumber)
+        external
+        view
+        returns (address selectedVerifier);
+
+    /// @notice Rotate the global fork verifier. Only callable by the upgrade authority.
+    /// @param newForkVerifier The verifier for batches targeting the new fork.
+    function setForkVerifier(address newForkVerifier) external;
+
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
-    /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
+    /// @param params The initial token, sequencer, and genesis parameters for the zone.
     /// @return zoneId The newly assigned zone ID.
     /// @return portal The deployed portal address for the new zone.
     function createZone(CreateZoneParams calldata params)
@@ -572,6 +605,7 @@ interface IZonePortal {
     error NotSequencer();
     error NotPendingSequencer();
     error InvalidProof();
+    error InvalidFactory();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
@@ -602,7 +636,7 @@ interface IZonePortal {
     function sequencer() external view returns (address);
     function pendingSequencer() external view returns (address);
     function zoneGasRate() external view returns (uint128);
-    function verifier() external view returns (address);
+    function factory() external view returns (address);
     function withdrawalBatchIndex() external view returns (uint64);
     function blockHash() external view returns (bytes32);
     function currentDepositQueueHash() external view returns (bytes32);
