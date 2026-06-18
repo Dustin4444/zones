@@ -1125,6 +1125,7 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
                     nonce: alloy_primitives::FixedBytes(enc.nonce),
                     tag: alloy_primitives::FixedBytes(enc.tag),
                 },
+                depositor.address(),
             )
             .send()
             .await?
@@ -1244,7 +1245,7 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
 
         let portal = ZonePortal::new(portal_address, &dev_provider);
         let receipt = portal
-            .deposit(PATH_USD_ADDRESS, alice, deposit_amount, B256::ZERO)
+            .deposit(PATH_USD_ADDRESS, alice, deposit_amount, B256::ZERO, alice)
             .send()
             .await?
             .get_receipt()
@@ -1302,13 +1303,13 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Test that a regular deposit to a blacklisted recipient reverts on L1.
+/// Test that a regular deposit to a blacklisted recipient is accepted on L1.
 ///
 ///  1. Start L1 dev node, deploy zone.
 ///  2. Create a blacklist policy, assign to pathUSD, blacklist a user.
 ///  3. Fund the blacklisted user on L1.
-///  4. Attempt a deposit targeting the blacklisted user — should revert with
-///     `DepositPolicyForbids` on the L1 portal contract.
+///  4. Deposit targeting the blacklisted user. The portal accepts it; zone-side
+///     processing handles any mint failure through deposit bounce-back.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deposit_to_blacklisted_recipient_reverts_on_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -1350,22 +1351,26 @@ async fn test_deposit_to_blacklisted_recipient_reverts_on_l1() -> eyre::Result<(
         .get_receipt()
         .await?;
 
-    // Attempt a deposit to the blacklisted recipient — should revert on L1
+    // Deposit to the blacklisted recipient. L1 accepts the deposit; zone-side
+    // processing is responsible for a bounce-back if minting is rejected.
     use zone::abi::ZonePortal;
     let portal = ZonePortal::new(portal_address, &depositor_provider);
-    let result = portal
+    let receipt = portal
         .deposit(
             PATH_USD_ADDRESS,
             blacklisted_recipient,
             deposit_amount,
             B256::ZERO,
+            depositor,
         )
         .send()
-        .await;
+        .await?
+        .get_receipt()
+        .await?;
 
     assert!(
-        result.is_err(),
-        "deposit to blacklisted recipient should revert on L1"
+        receipt.status(),
+        "deposit to blacklisted recipient should be accepted on L1"
     );
 
     Ok(())

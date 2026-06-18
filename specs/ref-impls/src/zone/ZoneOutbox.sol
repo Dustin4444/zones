@@ -10,6 +10,7 @@ import {
     MAX_WITHDRAWAL_CALLBACK_GAS,
     PendingWithdrawal,
     Withdrawal,
+    ZONE_INBOX,
     ZONE_TX_CONTEXT
 } from "./IZone.sol";
 
@@ -112,6 +113,7 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
     error GasLimitTooHigh();
+    error OnlyInbox();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -316,6 +318,50 @@ contract ZoneOutbox is IZoneOutbox {
             fallbackRecipient,
             data,
             revealTo
+        );
+    }
+
+    /// @notice Enqueue a Tempo-side refund for a deposit that failed on the zone.
+    /// @dev Called only by ZoneInbox while processing the deposit queue.
+    function enqueueDepositBounceBack(
+        address token,
+        uint128 amount,
+        address bouncebackRecipient,
+        uint128 bouncebackFee
+    )
+        external
+    {
+        if (msg.sender != ZONE_INBOX) revert OnlyInbox();
+
+        _pendingWithdrawals.push(
+            PendingWithdrawal({
+                token: token,
+                sender: address(0),
+                txHash: bytes32(0),
+                to: bouncebackRecipient,
+                amount: amount,
+                fee: bouncebackFee,
+                memo: bytes32(0),
+                gasLimit: 0,
+                fallbackRecipient: address(0),
+                callbackData: "",
+                revealTo: ""
+            })
+        );
+
+        uint64 index = nextWithdrawalIndex++;
+        emit WithdrawalRequested(
+            index,
+            address(0),
+            token,
+            bouncebackRecipient,
+            amount,
+            bouncebackFee,
+            bytes32(0),
+            0,
+            address(0),
+            "",
+            ""
         );
     }
 

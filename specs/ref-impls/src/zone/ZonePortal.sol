@@ -47,6 +47,10 @@ contract ZonePortal is IZonePortal {
     ///      flexibility to adjust the zoneGasRate based on operational costs.
     uint64 public constant FIXED_DEPOSIT_GAS = 100_000;
 
+    /// @notice Fixed gas value reserved for a Tempo-side deposit bounce-back.
+    /// @dev Set to 300,000 gas. Bounce-back fee = FIXED_BOUNCEBACK_GAS * tempoGasRate.
+    uint64 public constant FIXED_BOUNCEBACK_GAS = 300_000;
+
     /// @notice Maximum gas a withdrawal callback may request
     /// @dev Over-cap legacy withdrawals are dequeued and bounced back in `processWithdrawal`.
     uint64 public constant MAX_WITHDRAWAL_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
@@ -107,6 +111,12 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Withdrawal queue (zone→Tempo): fixed-size ring buffer
     WithdrawalQueue internal _withdrawalQueue;
+
+    /// @notice Tempo gas rate used for deposit bounce-back refunds.
+    uint128 public tempoGasRate;
+
+    /// @notice Refunds parked when a deposit bounce-back transfer reverts on Tempo.
+    mapping(address => mapping(address => uint128)) internal _refunds;
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -170,6 +180,13 @@ contract ZonePortal is IZonePortal {
         if (_zoneGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
         zoneGasRate = _zoneGasRate;
         emit ZoneGasRateUpdated(_zoneGasRate);
+    }
+
+    /// @notice Set Tempo gas rate used for deposit bounce-back fees.
+    function setTempoGasRate(uint128 _tempoGasRate) external onlySequencer {
+        if (_tempoGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
+        tempoGasRate = _tempoGasRate;
+        emit TempoGasRateUpdated(_tempoGasRate);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -472,6 +489,11 @@ contract ZonePortal is IZonePortal {
         fee = uint128(FIXED_DEPOSIT_GAS) * zoneGasRate;
     }
 
+    /// @notice Calculate the fee reserved for a deposit bounce-back on Tempo.
+    function calculateBouncebackFee() public view returns (uint128 fee) {
+        fee = uint128(FIXED_BOUNCEBACK_GAS) * tempoGasRate;
+    }
+
     /// @notice Deposit a TIP-20 token into the zone. Returns the new current deposit queue hash.
     /// @dev Fee is deducted from amount and paid to sequencer in the same token.
     ///      The token must be enabled and deposits must be active.
@@ -489,24 +511,43 @@ contract ZonePortal is IZonePortal {
         external
         returns (bytes32 newCurrentDepositQueueHash)
     {
+        return _deposit(_token, to, amount, memo, msg.sender);
+    }
+
+    function deposit(
+        address _token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        address bouncebackRecipient
+    )
+        external
+        returns (bytes32 newCurrentDepositQueueHash)
+    {
+        return _deposit(_token, to, amount, memo, bouncebackRecipient);
+    }
+
+    function _deposit(
+        address _token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        address bouncebackRecipient
+    )
+        internal
+        returns (bytes32 newCurrentDepositQueueHash)
+    {
+        if (bouncebackRecipient == address(0)) revert MissingBouncebackRecipient();
+
         // Validate token is enabled and deposits are active
         TokenConfig storage cfg = _tokenConfigs[_token];
         if (!cfg.enabled) revert TokenNotEnabled();
         if (!cfg.depositsActive) revert DepositsNotActive();
 
-        // Enforce TIP-403 policy: the recipient must be authorized under the
-        // token's transfer policy before accepting the deposit.
-        uint64 policyId = ITIP20(_token).transferPolicyId();
-        if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, to)) {
-            revert DepositPolicyForbids();
-        }
-        if (!TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, to)) {
-            revert DepositPolicyForbids();
-        }
-
         // Calculate deposit fee
         uint128 fee = calculateDepositFee();
-        if (amount <= fee) revert DepositTooSmall();
+        uint128 bouncebackFee = calculateBouncebackFee();
+        if (amount < fee || amount - fee < bouncebackFee) revert DepositTooSmall();
         uint128 netAmount = amount - fee;
 
         // Transfer full amount from sender to this contract
@@ -519,8 +560,15 @@ contract ZonePortal is IZonePortal {
         }
 
         // Build deposit struct with net amount (fee already paid to sequencer on Tempo)
-        Deposit memory depositData =
-            Deposit({ token: _token, sender: msg.sender, to: to, amount: netAmount, memo: memo });
+        Deposit memory depositData = Deposit({
+            token: _token,
+            sender: msg.sender,
+            to: to,
+            amount: netAmount,
+            bouncebackRecipient: bouncebackRecipient,
+            bouncebackFee: bouncebackFee,
+            memo: memo
+        });
 
         // Insert deposit into queue
         newCurrentDepositQueueHash = DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
@@ -528,7 +576,16 @@ contract ZonePortal is IZonePortal {
         uint64 thisDeposit = ++depositCount;
 
         emit DepositMade(
-            newCurrentDepositQueueHash, msg.sender, _token, to, netAmount, fee, memo, thisDeposit
+            newCurrentDepositQueueHash,
+            msg.sender,
+            _token,
+            to,
+            netAmount,
+            fee,
+            bouncebackFee,
+            memo,
+            bouncebackRecipient,
+            thisDeposit
         );
     }
 
@@ -551,6 +608,34 @@ contract ZonePortal is IZonePortal {
         external
         returns (bytes32 newCurrentDepositQueueHash)
     {
+        return _depositEncrypted(_token, amount, keyIndex, encrypted, msg.sender);
+    }
+
+    function depositEncrypted(
+        address _token,
+        uint128 amount,
+        uint256 keyIndex,
+        EncryptedDepositPayload calldata encrypted,
+        address bouncebackRecipient
+    )
+        external
+        returns (bytes32 newCurrentDepositQueueHash)
+    {
+        return _depositEncrypted(_token, amount, keyIndex, encrypted, bouncebackRecipient);
+    }
+
+    function _depositEncrypted(
+        address _token,
+        uint128 amount,
+        uint256 keyIndex,
+        EncryptedDepositPayload calldata encrypted,
+        address bouncebackRecipient
+    )
+        internal
+        returns (bytes32 newCurrentDepositQueueHash)
+    {
+        if (bouncebackRecipient == address(0)) revert MissingBouncebackRecipient();
+
         // Validate token is enabled and deposits are active
         TokenConfig storage cfg = _tokenConfigs[_token];
         if (!cfg.enabled) revert TokenNotEnabled();
@@ -584,7 +669,8 @@ contract ZonePortal is IZonePortal {
         }
 
         uint128 fee = calculateDepositFee();
-        if (amount <= fee) revert DepositTooSmall();
+        uint128 bouncebackFee = calculateBouncebackFee();
+        if (amount < fee || amount - fee < bouncebackFee) revert DepositTooSmall();
         uint128 netAmount = amount - fee;
 
         // Transfer full amount from sender to this contract
@@ -598,6 +684,8 @@ contract ZonePortal is IZonePortal {
             token: _token,
             sender: msg.sender,
             amount: netAmount,
+            bouncebackRecipient: bouncebackRecipient,
+            bouncebackFee: bouncebackFee,
             keyIndex: keyIndex,
             encrypted: encrypted
         });
@@ -614,12 +702,14 @@ contract ZonePortal is IZonePortal {
             _token,
             netAmount,
             fee,
+            bouncebackFee,
             keyIndex,
             encrypted.ephemeralPubkeyX,
             encrypted.ephemeralPubkeyYParity,
             encrypted.ciphertext,
             encrypted.nonce,
             encrypted.tag,
+            bouncebackRecipient,
             thisDeposit
         );
     }
@@ -643,6 +733,11 @@ contract ZonePortal is IZonePortal {
         _withdrawalQueue.dequeue(withdrawal, remainingQueue);
 
         address _token = withdrawal.token;
+
+        if (_isDepositBounceBack(withdrawal)) {
+            _processDepositBounceBack(_token, withdrawal.to, withdrawal.amount, withdrawal.fee);
+            return;
+        }
 
         // Transfer fee to sequencer (always, regardless of withdrawal success)
         if (withdrawal.fee > 0) {
@@ -709,6 +804,8 @@ contract ZonePortal is IZonePortal {
             sender: address(this),
             to: fallbackRecipient,
             amount: amount,
+            bouncebackRecipient: address(0),
+            bouncebackFee: 0,
             memo: bytes32(0)
         });
 
@@ -718,6 +815,63 @@ contract ZonePortal is IZonePortal {
         uint64 thisDeposit = ++depositCount;
 
         emit BounceBack(newCurrentDepositQueueHash, fallbackRecipient, _token, amount, thisDeposit);
+    }
+
+    function _isDepositBounceBack(Withdrawal calldata withdrawal) internal pure returns (bool) {
+        return withdrawal.gasLimit == 0 && withdrawal.fallbackRecipient == address(0)
+            && withdrawal.callbackData.length == 0;
+    }
+
+    function _processDepositBounceBack(
+        address _token,
+        address bouncebackRecipient,
+        uint128 amount,
+        uint128 bouncebackFee
+    )
+        internal
+    {
+        uint128 refundAmount = amount - bouncebackFee;
+
+        if (bouncebackFee > 0) {
+            ITIP20(_token).transfer(sequencer, bouncebackFee);
+        }
+
+        bool success = true;
+        if (refundAmount > 0) {
+            try ITIP20(_token).transfer(bouncebackRecipient, refundAmount) returns (bool ok) {
+                success = ok;
+            } catch {
+                success = false;
+            }
+        }
+
+        if (success) {
+            emit DepositBounceBack(bouncebackRecipient, _token, refundAmount, bouncebackFee);
+        } else {
+            _refunds[_token][bouncebackRecipient] += refundAmount;
+            emit DepositBounceBackPending(bouncebackRecipient, _token, refundAmount, bouncebackFee);
+        }
+    }
+
+    function refunds(address token, address owner) external view returns (uint128) {
+        return _refunds[token][owner];
+    }
+
+    function claimRefund(address token) external returns (uint128 amount) {
+        amount = _refunds[token][msg.sender];
+        if (amount == 0) return 0;
+
+        _refunds[token][msg.sender] = 0;
+
+        bool success;
+        try ITIP20(token).transfer(msg.sender, amount) returns (bool ok) {
+            success = ok;
+        } catch {
+            revert CallbackRejected();
+        }
+        if (!success) revert CallbackRejected();
+
+        emit RefundClaimed(msg.sender, token, amount);
     }
 
     /*//////////////////////////////////////////////////////////////

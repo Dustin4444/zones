@@ -1637,6 +1637,8 @@ contract ZonePortalTest is BaseTest {
             sender: address(portal),
             to: bob,
             amount: 500e6,
+            bouncebackRecipient: address(0),
+            bouncebackFee: 0,
             memo: bytes32(0)
         });
         bytes32 expectedHash =
@@ -1729,13 +1731,15 @@ contract ZonePortalTest is BaseTest {
                     sender: alice,
                     to: bob,
                     amount: netAmount,
+                    bouncebackRecipient: alice,
+                    bouncebackFee: 0,
                     memo: bytes32("test")
                 }),
                 bytes32(0)
             )
         );
         emit IZonePortal.DepositMade(
-            expectedHash, alice, address(pathUSD), bob, netAmount, fee, bytes32("test"), 1
+            expectedHash, alice, address(pathUSD), bob, netAmount, fee, 0, bytes32("test"), alice, 1
         );
 
         portal.deposit(address(pathUSD), bob, 500e6, bytes32("test"));
@@ -2083,6 +2087,8 @@ contract ZonePortalTest is BaseTest {
             token: address(pathUSD),
             sender: alice,
             amount: netAmount,
+            bouncebackRecipient: alice,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2147,6 +2153,8 @@ contract ZonePortalTest is BaseTest {
             token: address(pathUSD),
             sender: alice,
             amount: netAmount,
+            bouncebackRecipient: alice,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2160,11 +2168,13 @@ contract ZonePortalTest is BaseTest {
             netAmount,
             fee,
             0,
+            0,
             VALID_SECP256K1_X,
             0x02,
             encrypted.ciphertext,
             encrypted.nonce,
             encrypted.tag,
+            alice,
             1
         );
         portal.depositEncrypted(address(pathUSD), depositAmount, 0, encrypted);

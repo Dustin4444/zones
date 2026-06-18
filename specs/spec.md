@@ -952,13 +952,13 @@ flowchart TB
 
             subgraph DEP["deposits"]
                 direction TB
-                QD["QueuedDeposit[j]<br/>deposit_type<br/>deposit_data"]
+                QD["QueuedDeposit[j]<br/>deposit_type<br/>rejected<br/>deposit_data"]
 
                 subgraph PAYLOAD["deposit_data payload"]
                     direction TB
-                    D["Deposit<br/>token<br/>sender<br/>to<br/>amount<br/>memo"]
+                    D["Deposit<br/>token<br/>sender<br/>to<br/>amount<br/>bouncebackRecipient<br/>bouncebackFee<br/>memo"]
 
-                    ED["EncryptedDeposit<br/>token<br/>sender<br/>amount<br/>keyIndex<br/>encrypted"]
+                    ED["EncryptedDeposit<br/>token<br/>sender<br/>amount<br/>bouncebackRecipient<br/>bouncebackFee<br/>keyIndex<br/>encrypted"]
 
                     EDP["EncryptedDepositPayload<br/>ephemeralPubkeyX<br/>ephemeralPubkeyYParity<br/>ciphertext<br/>nonce<br/>tag"]
 
@@ -1103,6 +1103,7 @@ pub struct ZoneBlock {
 /// Mirrors the Solidity `QueuedDeposit` struct from IZone.sol
 pub struct QueuedDeposit {
     pub deposit_type: DepositType,
+    pub rejected: bool,
     pub deposit_data: Vec<u8>, // abi.encode(Deposit) or abi.encode(EncryptedDeposit)
 }
 
@@ -1220,7 +1221,7 @@ The stateless execution function must reject the witness on any failed check, mi
    If `tempo_header_rlp` is present, call `TempoState.finalizeTempo(header)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber`, `tempoBlockHash`, and `tempoStateRoot`, and make the new Tempo root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(tempo_header_rlp)`.
 
 6. **Process deposits and encrypted deposit decryptions inside `advanceTempo`.**
-   Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Process the `deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits, verify the supplied `DecryptionData` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and apply the fallback mint-to-sender path when AES-GCM decryption fails after a valid proof as specified in [Onchain Decryption Verification](#onchain-decryption-verification).
+   Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Process the `deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits that are not rejected, verify the supplied `DecryptionData` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and queue a deposit bounce-back when proof verification, AES-GCM validation, or the final mint fails as specified in [Deposit Failures and Bounce-Back](#deposit-failures-and-bounce-back). Rejected encrypted deposits skip decryption data and immediately queue the same bounce-back.
 
 7. **Execute user transactions in order.**
    Run each user transaction against the materialized zone state using the current block environment. Whenever execution calls `TempoState.readTempoStorageSlot`, satisfy that call by locating the corresponding `L1StateRead`, proving it against the Tempo root currently bound for this block, and requiring the decoded value to match the witness entry. Any zone-state or Tempo-state access not covered by the witness is an error.
@@ -1402,6 +1403,8 @@ struct Deposit {
     address sender;
     address to;
     uint128 amount;
+    address bouncebackRecipient;
+    uint128 bouncebackFee;
     bytes32 memo;
 }
 
@@ -1422,6 +1425,8 @@ struct EncryptedDeposit {
     address token;
     address sender;
     uint128 amount;
+    address bouncebackRecipient;
+    uint128 bouncebackFee;
     uint256 keyIndex;
     EncryptedDepositPayload encrypted;
 }
@@ -1441,6 +1446,7 @@ enum DepositType {
 
 struct QueuedDeposit {
     DepositType depositType;
+    bool rejected;
     bytes depositData;  // abi.encode(Deposit) or abi.encode(EncryptedDeposit)
 }
 
@@ -1699,8 +1705,8 @@ interface IZoneInbox {
     ///      address(0)) is silently ignored.
     struct QueuedDeposit {
         DepositType depositType;
-        bytes depositData; // abi.encode(Deposit) or abi.encode(EncryptedDeposit)
         bool rejected;
+        bytes depositData; // abi.encode(Deposit) or abi.encode(EncryptedDeposit)
     }
 
     event TempoAdvanced(

@@ -29,6 +29,7 @@ sol! {
 
     struct QueuedDeposit {
         uint8 depositType;
+        bool rejected;
         bytes depositData;
     }
     struct ChaumPedersenProof {

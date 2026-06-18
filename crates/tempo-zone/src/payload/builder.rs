@@ -271,6 +271,10 @@ where
                     return Err(PayloadBuilderError::evm(err));
                 }
             }
+
+            if let Some(receipt) = builder.executor().receipts().last() {
+                collect_requested_withdrawals(receipt, B256::ZERO, &mut requested_withdrawals)?;
+            }
         }
 
         // Execute pool transactions
@@ -671,23 +675,29 @@ mod tests {
             queued_deposits: vec![
                 abi::QueuedDeposit {
                     depositType: DepositType::Regular,
+                    rejected: false,
                     depositData: alloy_primitives::Bytes::from(
                         alloy_sol_types::SolValue::abi_encode(&abi::Deposit {
                             token,
                             sender,
                             to: recipient,
                             amount: 500_000,
+                            bouncebackRecipient: sender,
+                            bouncebackFee: 0,
                             memo: B256::ZERO,
                         }),
                     ),
                 },
                 abi::QueuedDeposit {
                     depositType: DepositType::Encrypted,
+                    rejected: false,
                     depositData: alloy_primitives::Bytes::from(
                         alloy_sol_types::SolValue::abi_encode(&abi::EncryptedDeposit {
                             token,
                             sender,
                             amount: 300_000,
+                            bouncebackRecipient: sender,
+                            bouncebackFee: 0,
                             keyIndex: U256::ZERO,
                             encrypted: abi::EncryptedDepositPayload {
                                 ephemeralPubkeyX: B256::with_last_byte(0xDD),

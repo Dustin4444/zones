@@ -329,7 +329,7 @@ impl DemoBlacklist {
             let mut pending = None;
             for attempt in 0..5u32 {
                 match portal
-                    .deposit(token_addr, admin, deposit_amount, B256::ZERO)
+                    .deposit(token_addr, admin, deposit_amount, B256::ZERO, admin)
                     .send()
                     .await
                 {
@@ -439,18 +439,19 @@ impl DemoBlacklist {
             "Step 6: Encrypted deposit {} DUSD to blacklisted address {target}",
             self.amount
         );
-        println!("  The zone should reject this deposit and bounce funds back to sender.");
+        println!("  The zone should reject this deposit and queue a Tempo bounce-back.");
         println!();
 
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
-        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount).await?;
+        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount, admin)
+            .await?;
 
         println!("  Waiting for zone to process (expecting EncryptedDepositFailed)...");
         let bounced = wait_for_encrypted_result(&l2, l2_block_before, admin, Some(target)).await?;
         if bounced {
             println!("  BOUNCED! Deposit to blacklisted address was correctly rejected.");
             let sender_l2_balance = get_l2_balance(&l2, token_addr, admin).await?;
-            println!("  Funds returned to sender on L2. Admin L2 balance: {sender_l2_balance}");
+            println!("  Tempo bounce-back queued. Admin L2 balance: {sender_l2_balance}");
         } else {
             println!("  WARNING: Deposit was processed — blacklist may need more time to sync.");
         }
@@ -467,7 +468,7 @@ impl DemoBlacklist {
         let gas_fund: u128 = 100_000;
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
         let receipt = portal
-            .deposit(PATH_USD_ADDRESS, target, gas_fund, B256::ZERO)
+            .deposit(PATH_USD_ADDRESS, target, gas_fund, B256::ZERO, admin)
             .send_sync()
             .await?;
         check(&receipt, "deposit pathUSD to target for gas")?;
@@ -510,7 +511,8 @@ impl DemoBlacklist {
         println!();
 
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
-        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount).await?;
+        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount, admin)
+            .await?;
 
         println!("  Waiting for zone to process (expecting EncryptedDepositProcessed)...");
         let bounced = wait_for_encrypted_result(&l2, l2_block_before, admin, Some(target)).await?;
@@ -624,6 +626,7 @@ async fn send_encrypted_deposit<P: Provider<TempoNetwork>>(
     token: Address,
     to: Address,
     amount: u128,
+    bounceback_recipient: Address,
 ) -> eyre::Result<()> {
     let (key, key_index) = portal
         .encryption_key()
@@ -646,7 +649,7 @@ async fn send_encrypted_deposit<P: Provider<TempoNetwork>>(
     };
 
     let receipt = portal
-        .depositEncrypted(token, amount, key_index, payload)
+        .depositEncrypted(token, amount, key_index, payload, bounceback_recipient)
         .send_sync()
         .await
         .wrap_err("depositEncrypted send failed")?;

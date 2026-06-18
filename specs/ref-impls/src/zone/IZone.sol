@@ -66,6 +66,8 @@ struct Deposit {
     address sender;
     address to;
     uint128 amount;
+    address bouncebackRecipient;
+    uint128 bouncebackFee;
     bytes32 memo;
 }
 
@@ -92,6 +94,8 @@ struct EncryptedDeposit {
     address token; // TIP-20 token being deposited (public, for escrow accounting)
     address sender; // Depositor (public, for refunds)
     uint128 amount; // Amount (public, for accounting)
+    address bouncebackRecipient;
+    uint128 bouncebackFee;
     uint256 keyIndex; // Index of encryption key used (specified by depositor)
     EncryptedDepositPayload encrypted; // Encrypted (to, memo)
 }
@@ -122,6 +126,7 @@ uint64 constant ENCRYPTION_KEY_GRACE_PERIOD = 86_400;
 ///      The depositData is ABI-encoded Deposit or EncryptedDeposit depending on type.
 struct QueuedDeposit {
     DepositType depositType;
+    bool rejected;
     bytes depositData; // abi.encode(Deposit) or abi.encode(EncryptedDeposit)
 }
 
@@ -505,7 +510,9 @@ interface IZonePortal {
         address to,
         uint128 netAmount,
         uint128 fee,
+        uint128 bouncebackFee,
         bytes32 memo,
+        address bouncebackRecipient,
         uint64 depositNumber
     );
 
@@ -529,6 +536,16 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
+    event DepositBounceBack(
+        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+    );
+
+    event DepositBounceBackPending(
+        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+    );
+
+    event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
+
     event SequencerTransferStarted(
         address indexed currentSequencer, address indexed pendingSequencer
     );
@@ -541,12 +558,14 @@ interface IZonePortal {
         address token,
         uint128 netAmount,
         uint128 fee,
+        uint128 bouncebackFee,
         uint256 keyIndex,
         bytes32 ephemeralPubkeyX,
         uint8 ephemeralPubkeyYParity,
         bytes ciphertext,
         bytes12 nonce,
         bytes16 tag,
+        address bouncebackRecipient,
         uint64 depositNumber
     );
 
@@ -559,6 +578,7 @@ interface IZonePortal {
         bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock
     );
     event ZoneGasRateUpdated(uint128 zoneGasRate);
+    event TempoGasRateUpdated(uint128 tempoGasRate);
 
     /// @notice Emitted when sequencer enables a new TIP-20 token for bridging
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -583,6 +603,7 @@ interface IZonePortal {
     error InvalidProofOfPossession();
     error DepositPolicyForbids();
     error DepositTooSmall();
+    error MissingBouncebackRecipient();
     error GasFeeRateTooHigh();
     error TokenNotEnabled();
     error DepositsNotActive();
@@ -602,6 +623,7 @@ interface IZonePortal {
     function sequencer() external view returns (address);
     function pendingSequencer() external view returns (address);
     function zoneGasRate() external view returns (uint128);
+    function tempoGasRate() external view returns (uint128);
     function verifier() external view returns (address);
     function withdrawalBatchIndex() external view returns (uint64);
     function blockHash() external view returns (bytes32);
@@ -696,8 +718,14 @@ interface IZonePortal {
     /// @param _zoneGasRate Zone token units per gas unit on the zone
     function setZoneGasRate(uint128 _zoneGasRate) external;
 
+    /// @notice Set Tempo gas rate used for deposit bounce-back fees.
+    function setTempoGasRate(uint128 _tempoGasRate) external;
+
     /// @notice Calculate the fee for a deposit
     function calculateDepositFee() external view returns (uint128 fee);
+
+    /// @notice Calculate the reserved fee for a deposit bounce-back on Tempo.
+    function calculateBouncebackFee() external view returns (uint128 fee);
 
     /// @notice Check if an encryption key is still valid for new deposits
     /// @dev A key is valid if it's the current key OR if it was superseded less than
@@ -715,6 +743,16 @@ interface IZonePortal {
         address to,
         uint128 amount,
         bytes32 memo
+    )
+        external
+        returns (bytes32 newCurrentDepositQueueHash);
+
+    function deposit(
+        address token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        address bouncebackRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -737,6 +775,19 @@ interface IZonePortal {
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
+
+    function depositEncrypted(
+        address token,
+        uint128 amount,
+        uint256 keyIndex,
+        EncryptedDepositPayload calldata encrypted,
+        address bouncebackRecipient
+    )
+        external
+        returns (bytes32 newCurrentDepositQueueHash);
+
+    function refunds(address token, address owner) external view returns (uint128);
+    function claimRefund(address token) external returns (uint128 amount);
 
     function processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) external;
     function submitBatch(
@@ -891,9 +942,28 @@ interface IZoneInbox {
         bytes32 memo
     );
 
-    /// @notice Emitted when an encrypted deposit fails (invalid ciphertext, funds returned to sender)
+    /// @notice Emitted when an encrypted deposit fails and funds are queued for Tempo bounce-back
     event EncryptedDepositFailed(
-        bytes32 indexed depositHash, address indexed sender, address token, uint128 amount
+        bytes32 indexed depositHash,
+        address indexed sender,
+        address token,
+        uint128 amount,
+        address bouncebackRecipient
+    );
+    event DepositFailed(
+        bytes32 indexed depositHash,
+        address indexed sender,
+        address indexed to,
+        address token,
+        uint128 amount,
+        address bouncebackRecipient
+    );
+    event DepositRejected(
+        bytes32 indexed depositHash,
+        address indexed sender,
+        address token,
+        uint128 amount,
+        address bouncebackRecipient
     );
     /// @notice Emitted when a TIP-20 token is enabled on the zone via advanceTempo
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -1041,6 +1111,15 @@ interface IZoneOutbox {
     )
         external
         returns (bytes32 withdrawalQueueHash);
+
+    /// @notice Enqueue a Tempo-side refund withdrawal for a failed deposit.
+    function enqueueDepositBounceBack(
+        address token,
+        uint128 amount,
+        address bouncebackRecipient,
+        uint128 bouncebackFee
+    )
+        external;
 
 }
 

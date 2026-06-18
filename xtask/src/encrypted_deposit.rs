@@ -117,7 +117,7 @@ impl EncryptedDeposit {
 
         println!("Sending encrypted deposit of {} to {to}...", self.amount);
         let receipt = portal
-            .depositEncrypted(self.token, self.amount, key_index, payload)
+            .depositEncrypted(self.token, self.amount, key_index, payload, sender)
             .send_sync()
             .await
             .wrap_err("failed to send depositEncrypted transaction")?;
@@ -191,7 +191,7 @@ impl EncryptedDeposit {
                     let block = log.block_number.unwrap_or(0);
                     println!(
                         "WARNING: Encrypted deposit FAILED on L2 (block {block}). \
-                         Funds returned to sender."
+                         Tempo bounce-back queued."
                     );
                     println!("  Token:  {}", event.data.token);
                     println!("  Sender: {}", event.data.sender);

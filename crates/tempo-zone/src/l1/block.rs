@@ -44,21 +44,27 @@ impl L1BlockDeposits {
                         sender: d.sender,
                         to: d.to,
                         amount: d.amount,
+                        bouncebackRecipient: d.bounceback_recipient,
+                        bouncebackFee: d.bounceback_fee,
                         memo: d.memo,
                     };
                     queued_deposits.push(abi::QueuedDeposit {
                         depositType: abi::DepositType::Regular,
+                        rejected: false,
                         depositData: Bytes::from(deposit.abi_encode()),
                     });
                 }
                 L1Deposit::Encrypted(d) => {
                     let queued = abi::QueuedDeposit {
                         depositType: abi::DepositType::Encrypted,
+                        rejected: false,
                         depositData: Bytes::from(
                             abi::EncryptedDeposit {
                                 token: d.token,
                                 sender: d.sender,
                                 amount: d.amount,
+                                bouncebackRecipient: d.bounceback_recipient,
+                                bouncebackFee: d.bounceback_fee,
                                 keyIndex: d.key_index,
                                 encrypted: abi::EncryptedDepositPayload {
                                     ephemeralPubkeyX: d.ephemeral_pubkey_x,

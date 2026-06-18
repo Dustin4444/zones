@@ -16,11 +16,13 @@ import {
     ITempoState,
     IZoneConfig,
     IZoneInbox,
+    IZoneOutbox,
     IZoneToken,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     QueuedDeposit,
-    TIP20_FACTORY_ADDRESS
+    TIP20_FACTORY_ADDRESS,
+    ZONE_OUTBOX
 } from "./IZone.sol";
 import { TempoState } from "./TempoState.sol";
 
@@ -210,13 +212,47 @@ contract ZoneInbox is IZoneInbox {
                 // Advance the hash chain with type discriminator
                 currentHash = keccak256(abi.encode(DepositType.Regular, d, currentHash));
 
-                // Mint the correct zone-side TIP-20 token to the recipient
-                IZoneToken(d.token).mint(d.to, d.amount);
-
-                emit DepositProcessed(currentHash, d.sender, d.to, d.token, d.amount, d.memo);
+                if (qd.rejected && d.bouncebackRecipient != address(0)) {
+                    _enqueueDepositBounceBack(
+                        d.token, d.amount, d.bouncebackRecipient, d.bouncebackFee
+                    );
+                    emit DepositRejected(
+                        currentHash, d.sender, d.token, d.amount, d.bouncebackRecipient
+                    );
+                } else if (d.bouncebackRecipient == address(0)) {
+                    // Internal withdrawal bounce-backs are terminal and keep the old direct-mint path.
+                    IZoneToken(d.token).mint(d.to, d.amount);
+                    emit DepositProcessed(currentHash, d.sender, d.to, d.token, d.amount, d.memo);
+                } else {
+                    try IZoneToken(d.token).mint(d.to, d.amount) {
+                        emit DepositProcessed(
+                            currentHash, d.sender, d.to, d.token, d.amount, d.memo
+                        );
+                    } catch {
+                        _enqueueDepositBounceBack(
+                            d.token, d.amount, d.bouncebackRecipient, d.bouncebackFee
+                        );
+                        emit DepositFailed(
+                            currentHash, d.sender, d.to, d.token, d.amount, d.bouncebackRecipient
+                        );
+                    }
+                }
             } else {
                 // Decode encrypted deposit
                 EncryptedDeposit memory ed = abi.decode(qd.depositData, (EncryptedDeposit));
+
+                // Advance the hash chain with type discriminator
+                currentHash = keccak256(abi.encode(DepositType.Encrypted, ed, currentHash));
+
+                if (qd.rejected && ed.bouncebackRecipient != address(0)) {
+                    _enqueueDepositBounceBack(
+                        ed.token, ed.amount, ed.bouncebackRecipient, ed.bouncebackFee
+                    );
+                    emit DepositRejected(
+                        currentHash, ed.sender, ed.token, ed.amount, ed.bouncebackRecipient
+                    );
+                    continue;
+                }
 
                 // Sequencer must provide decryption for this encrypted deposit
                 if (decryptionIndex >= decryptions.length) revert MissingDecryptionData();
@@ -239,7 +275,15 @@ contract ZoneInbox is IZoneInbox {
                         seqPubYParity,
                         dec.cpProof
                     );
-                if (!proofValid) revert InvalidSharedSecretProof();
+                if (!proofValid) {
+                    _enqueueDepositBounceBack(
+                        ed.token, ed.amount, ed.bouncebackRecipient, ed.bouncebackFee
+                    );
+                    emit EncryptedDepositFailed(
+                        currentHash, ed.sender, ed.token, ed.amount, ed.bouncebackRecipient
+                    );
+                    continue;
+                }
 
                 // Step 2: Derive AES key from shared secret using HKDF-SHA256
                 // This is done in Solidity using the SHA256 precompile (0x02)
@@ -272,25 +316,25 @@ contract ZoneInbox is IZoneInbox {
                     valid = false;
                 }
 
-                // Advance the hash chain with type discriminator
-                currentHash = keccak256(abi.encode(DepositType.Encrypted, ed, currentHash));
-
                 if (!valid) {
-                    // Decryption failed: credit the depositor's address on the zone.
-                    // L1 funds remain escrowed in the portal.
-                    IZoneToken(ed.token).mint(ed.sender, ed.amount);
-                    emit EncryptedDepositFailed(currentHash, ed.sender, ed.token, ed.amount);
+                    _enqueueDepositBounceBack(
+                        ed.token, ed.amount, ed.bouncebackRecipient, ed.bouncebackFee
+                    );
+                    emit EncryptedDepositFailed(
+                        currentHash, ed.sender, ed.token, ed.amount, ed.bouncebackRecipient
+                    );
                 } else {
-                    // Decryption succeeded — try minting to the decrypted recipient.
-                    // If the mint fails (e.g. recipient is blacklisted by TIP-403
-                    // policy), fall back to crediting the depositor instead.
                     try IZoneToken(ed.token).mint(decryptedTo, ed.amount) {
                         emit EncryptedDepositProcessed(
                             currentHash, ed.sender, decryptedTo, ed.token, ed.amount, decryptedMemo
                         );
                     } catch {
-                        IZoneToken(ed.token).mint(ed.sender, ed.amount);
-                        emit EncryptedDepositFailed(currentHash, ed.sender, ed.token, ed.amount);
+                        _enqueueDepositBounceBack(
+                            ed.token, ed.amount, ed.bouncebackRecipient, ed.bouncebackFee
+                        );
+                        emit EncryptedDepositFailed(
+                            currentHash, ed.sender, ed.token, ed.amount, ed.bouncebackRecipient
+                        );
                     }
                 }
             }
@@ -325,6 +369,18 @@ contract ZoneInbox is IZoneInbox {
             currentHash,
             processedDepositNumber
         );
+    }
+
+    function _enqueueDepositBounceBack(
+        address token,
+        uint128 amount,
+        address bouncebackRecipient,
+        uint128 bouncebackFee
+    )
+        internal
+    {
+        IZoneOutbox(ZONE_OUTBOX)
+            .enqueueDepositBounceBack(token, amount, bouncebackRecipient, bouncebackFee);
     }
 
 }
