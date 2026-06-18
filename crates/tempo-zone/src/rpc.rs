@@ -271,7 +271,7 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
                         sender: event.sender,
                         recipient: event.to,
                         token: event.token,
-                        amount: event.netAmount,
+                        amount: event.amount,
                         memo: event.memo,
                     });
                 }
@@ -280,7 +280,7 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
                         deposit_hash: event.newCurrentDepositQueueHash,
                         sender: event.sender,
                         token: event.token,
-                        amount: event.netAmount,
+                        amount: event.amount,
                     });
                 }
                 _ => {}

@@ -858,7 +858,7 @@ contract ZoneBridgeTest is BaseTest {
     /// @notice Simulate sequencer observing an encrypted deposit event on L1
     function _sequencerObserveEncryptedDeposit(
         address sender,
-        uint128 netAmount,
+        uint128 amount,
         uint256 keyIndex,
         EncryptedDepositPayload memory encrypted
     )
@@ -868,7 +868,7 @@ contract ZoneBridgeTest is BaseTest {
         EncryptedDeposit memory ed = EncryptedDeposit({
             token: address(l2ZoneToken),
             sender: sender,
-            amount: netAmount,
+            amount: amount,
             bouncebackRecipient: sender,
             bouncebackFee: 0,
             keyIndex: keyIndex,
@@ -1020,8 +1020,6 @@ contract ZoneBridgeTest is BaseTest {
 
         // === STEP 2: Alice makes encrypted deposit on L1 ===
         uint128 depositAmount = 1000e6;
-        uint128 fee = l1Portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
         EncryptedDepositPayload memory payload = _makeEncryptedPayload();
 
         vm.startPrank(alice);
@@ -1034,12 +1032,12 @@ contract ZoneBridgeTest is BaseTest {
         assertEq(l1Portal.currentDepositQueueHash(), l1DepositHash, "L1 queue hash mismatch");
         assertEq(
             l2ZoneToken.balanceOf(address(l1Portal)),
-            depositAmount - fee,
-            "Portal should hold net amount"
+            depositAmount,
+            "Portal should hold principal amount"
         );
 
         // === STEP 3: Sequencer observes encrypted deposit event ===
-        _sequencerObserveEncryptedDeposit(alice, netAmount, 0, payload);
+        _sequencerObserveEncryptedDeposit(alice, depositAmount, 0, payload);
 
         // Verify our local hash matches L1
         assertEq(
@@ -1059,7 +1057,7 @@ contract ZoneBridgeTest is BaseTest {
         // Verify zone state — tokens minted to decrypted recipient (bob starts with 100K)
         assertEq(
             l2ZoneToken.balanceOf(decryptedRecipient),
-            100_000e6 + netAmount,
+            100_000e6 + depositAmount,
             "Recipient should receive tokens"
         );
         assertEq(
@@ -1086,8 +1084,6 @@ contract ZoneBridgeTest is BaseTest {
 
         // === STEP 2: Alice makes encrypted deposit on L1 ===
         uint128 depositAmount = 1000e6;
-        uint128 fee = l1Portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
         EncryptedDepositPayload memory payload = _makeEncryptedPayload();
 
         vm.startPrank(alice);
@@ -1096,7 +1092,7 @@ contract ZoneBridgeTest is BaseTest {
         vm.stopPrank();
 
         // === STEP 3: Sequencer observes and relays with FAILED decryption ===
-        _sequencerObserveEncryptedDeposit(alice, netAmount, 0, payload);
+        _sequencerObserveEncryptedDeposit(alice, depositAmount, 0, payload);
         _setupEncryptionKeyMockOnZone(0, encKeyX, encKeyYParity);
 
         // Even with shouldSucceed=false, we still call the relay helper
@@ -1104,11 +1100,7 @@ contract ZoneBridgeTest is BaseTest {
             _sequencerRelayEncryptedDepositsToL2(address(0xBEEF), bytes32("wrong"), false);
 
         // Verify zone state — tokens bounced back to sender (alice = 100K - deposit + bounce)
-        assertEq(
-            l2ZoneToken.balanceOf(alice),
-            100_000e6 - depositAmount + netAmount,
-            "Sender should get bounced tokens"
-        );
+        assertEq(l2ZoneToken.balanceOf(alice), 100_000e6, "Sender should get bounced tokens");
         assertEq(l2ZoneToken.balanceOf(address(0xBEEF)), 0, "Failed recipient should get nothing");
         assertEq(
             l2Inbox.processedDepositQueueHash(), newProcessedHash, "Zone processed hash mismatch"
@@ -1125,8 +1117,6 @@ contract ZoneBridgeTest is BaseTest {
         (bytes32 encKeyX, uint8 encKeyYParity) = _setEncKeyOnL1(ENC_KEY_1);
 
         uint128 depositAmount = 1000e6;
-        uint128 fee = l1Portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
 
         // === STEP 2: Alice makes a regular deposit ===
         vm.startPrank(alice);
@@ -1175,7 +1165,7 @@ contract ZoneBridgeTest is BaseTest {
         EncryptedDeposit memory ed = EncryptedDeposit({
             token: address(l2ZoneToken),
             sender: bob,
-            amount: netAmount,
+            amount: depositAmount,
             bouncebackRecipient: bob,
             bouncebackFee: 0,
             keyIndex: 0,
@@ -1234,7 +1224,9 @@ contract ZoneBridgeTest is BaseTest {
         assertEq(l2ZoneToken.balanceOf(alice), 100_000e6, "Alice gets regular deposit");
         // decryptedTo (0x700) has no initial balance, receives only zone mint
         assertEq(
-            l2ZoneToken.balanceOf(decryptedTo), netAmount, "Bob's encrypted recipient gets tokens"
+            l2ZoneToken.balanceOf(decryptedTo),
+            depositAmount,
+            "Bob's encrypted recipient gets tokens"
         );
         // bob: 100K - deposit, no zone mint to bob (encrypted goes to decryptedTo)
         assertEq(
@@ -1249,7 +1241,7 @@ contract ZoneBridgeTest is BaseTest {
         // Total supply = initial (alice 100K + bob 100K + carol 100K) + zone mints
         assertEq(
             l2ZoneToken.totalSupply(),
-            300_000e6 + depositAmount + netAmount + depositAmount,
+            300_000e6 + depositAmount + depositAmount + depositAmount,
             "Total supply should equal initial funding plus all zone mints"
         );
 
@@ -1266,8 +1258,6 @@ contract ZoneBridgeTest is BaseTest {
 
         // === STEP 2: Alice deposits with keyIndex=0 ===
         uint128 depositAmount = 1000e6;
-        uint128 fee = l1Portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
         EncryptedDepositPayload memory payload1 = _makeEncryptedPayload();
 
         vm.startPrank(alice);
@@ -1294,7 +1284,7 @@ contract ZoneBridgeTest is BaseTest {
         EncryptedDeposit memory ed1 = EncryptedDeposit({
             token: address(l2ZoneToken),
             sender: alice,
-            amount: netAmount,
+            amount: depositAmount,
             bouncebackRecipient: alice,
             bouncebackFee: 0,
             keyIndex: 0,
@@ -1306,7 +1296,7 @@ contract ZoneBridgeTest is BaseTest {
         EncryptedDeposit memory ed2 = EncryptedDeposit({
             token: address(l2ZoneToken),
             sender: bob,
-            amount: netAmount,
+            amount: depositAmount,
             bouncebackRecipient: bob,
             bouncebackFee: 0,
             keyIndex: 1,
@@ -1376,7 +1366,7 @@ contract ZoneBridgeTest is BaseTest {
         // Both deposits go to sharedRecipient (no prior balance)
         assertEq(
             l2ZoneToken.balanceOf(sharedRecipient),
-            netAmount * 2,
+            depositAmount * 2,
             "Recipient should receive both deposits"
         );
         // alice/bob: 100K - deposit, no zone mint to them (encrypted goes to sharedRecipient)

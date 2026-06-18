@@ -28,7 +28,7 @@ impl Deposit {
             token: event.token,
             sender: event.sender,
             to: event.to,
-            amount: event.netAmount,
+            amount: event.amount,
             fee: event.fee,
             bounceback_fee: event.bouncebackFee,
             bounceback_recipient: event.bouncebackRecipient,
@@ -86,7 +86,7 @@ impl EncryptedDeposit {
         Self {
             token: event.token,
             sender: event.sender,
-            amount: event.netAmount,
+            amount: event.amount,
             fee: event.fee,
             bounceback_fee: event.bouncebackFee,
             bounceback_recipient: event.bouncebackRecipient,

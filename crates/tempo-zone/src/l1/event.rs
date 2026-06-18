@@ -102,7 +102,7 @@ impl L1PortalEvents {
                     token = %event.token,
                     sender = %event.sender,
                     to = %event.to,
-                    amount = %event.netAmount,
+                    amount = %event.amount,
                     "💰 Deposit from L1"
                 );
                 self.deposits
@@ -113,7 +113,7 @@ impl L1PortalEvents {
                     l1_block = block_number,
                     token = %event.token,
                     sender = %event.sender,
-                    amount = %event.netAmount,
+                    amount = %event.amount,
                     "🔒 Encrypted deposit from L1"
                 );
                 self.deposits

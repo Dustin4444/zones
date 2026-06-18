@@ -99,14 +99,15 @@ async fn test_l1_deposit_mints_on_zone() -> eyre::Result<()> {
     let portal = ZonePortal::new(portal_address, &l1_provider);
     let l1_token_address = PATH_USD_ADDRESS;
     let fee = portal.calculateDepositFee().call().await?;
+    let bounceback_fee = portal.calculateBouncebackFee().call().await?;
 
-    let deposit_amount: u128 = fee + 1_000_000;
-    let expected_net = deposit_amount - fee;
+    let deposit_amount: u128 = 1_000_000;
+    let total_debit = deposit_amount + fee + bounceback_fee;
 
     // Approve portal to transfer our L1 tokens
     let l1_token = ITIP20::new(l1_token_address, &l1_provider);
     l1_token
-        .approve(portal_address, U256::from(deposit_amount))
+        .approve(portal_address, U256::from(total_debit))
         .send()
         .await?
         .get_receipt()
@@ -162,8 +163,8 @@ async fn test_l1_deposit_mints_on_zone() -> eyre::Result<()> {
 
     assert_eq!(
         minted,
-        U256::from(expected_net),
-        "minted amount should equal net deposit (deposit {deposit_amount} - fee {fee})",
+        U256::from(deposit_amount),
+        "minted amount should equal deposit principal",
     );
 
     Ok(())

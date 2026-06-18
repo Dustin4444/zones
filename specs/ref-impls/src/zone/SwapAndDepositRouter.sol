@@ -33,6 +33,7 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     error UnauthorizedMessenger();
     error InvalidTargetPortal();
     error InvalidToken();
+    error AmountTooSmallForDepositFees();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -89,9 +90,10 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
             _validateTarget(targetPortal, tokenOut);
 
             uint128 amountOut = _swapIfNeeded(tokenIn, tokenOut, amount, minAmountOut);
+            uint128 principal = _principalAfterDepositFees(targetPortal, amountOut);
 
             ITIP20(tokenOut).approve(targetPortal, amountOut);
-            IZonePortal(targetPortal).depositEncrypted(tokenOut, amountOut, keyIndex, encrypted);
+            IZonePortal(targetPortal).depositEncrypted(tokenOut, principal, keyIndex, encrypted);
         } else {
             (, // skip isEncrypted
                 address tokenOut,
@@ -104,9 +106,10 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
             _validateTarget(targetPortal, tokenOut);
 
             uint128 amountOut = _swapIfNeeded(tokenIn, tokenOut, amount, minAmountOut);
+            uint128 principal = _principalAfterDepositFees(targetPortal, amountOut);
 
             ITIP20(tokenOut).approve(targetPortal, amountOut);
-            IZonePortal(targetPortal).deposit(tokenOut, recipient, amountOut, memo);
+            IZonePortal(targetPortal).deposit(tokenOut, recipient, principal, memo);
         }
 
         return IWithdrawalReceiver.onWithdrawalReceived.selector;
@@ -141,6 +144,20 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
 
         ITIP20(tokenIn).approve(address(stablecoinDEX), amountIn);
         amountOut = stablecoinDEX.swapExactAmountIn(tokenIn, tokenOut, amountIn, minAmountOut);
+    }
+
+    function _principalAfterDepositFees(
+        address targetPortal,
+        uint128 amountAvailable
+    )
+        internal
+        view
+        returns (uint128)
+    {
+        uint128 fees = IZonePortal(targetPortal).calculateDepositFee()
+            + IZonePortal(targetPortal).calculateBouncebackFee();
+        if (amountAvailable <= fees) revert AmountTooSmallForDepositFees();
+        return amountAvailable - fees;
     }
 
 }

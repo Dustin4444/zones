@@ -1722,7 +1722,7 @@ contract ZonePortalTest is BaseTest {
 
         vm.expectEmit(true, true, false, true);
         uint128 fee = portal.calculateDepositFee();
-        uint128 netAmount = 500e6 - fee;
+        uint128 amount = 500e6;
         bytes32 expectedHash = keccak256(
             abi.encode(
                 DepositType.Regular,
@@ -1730,7 +1730,7 @@ contract ZonePortalTest is BaseTest {
                     token: address(pathUSD),
                     sender: alice,
                     to: bob,
-                    amount: netAmount,
+                    amount: amount,
                     bouncebackRecipient: alice,
                     bouncebackFee: 0,
                     memo: bytes32("test")
@@ -1739,10 +1739,10 @@ contract ZonePortalTest is BaseTest {
             )
         );
         emit IZonePortal.DepositMade(
-            expectedHash, alice, address(pathUSD), bob, netAmount, fee, 0, bytes32("test"), alice, 1
+            expectedHash, alice, address(pathUSD), bob, amount, fee, 0, bytes32("test"), alice, 1
         );
 
-        portal.deposit(address(pathUSD), bob, 500e6, bytes32("test"));
+        portal.deposit(address(pathUSD), bob, amount, bytes32("test"));
         vm.stopPrank();
     }
 
@@ -2072,8 +2072,6 @@ contract ZonePortalTest is BaseTest {
         _setEncKeyWithPoP(ENC_KEY_1);
 
         uint128 depositAmount = 1000e6;
-        uint128 fee = portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
 
         EncryptedDepositPayload memory encrypted = _makeEncryptedPayload();
 
@@ -2086,7 +2084,7 @@ contract ZonePortalTest is BaseTest {
         EncryptedDeposit memory ed = EncryptedDeposit({
             token: address(pathUSD),
             sender: alice,
-            amount: netAmount,
+            amount: depositAmount,
             bouncebackRecipient: alice,
             bouncebackFee: 0,
             keyIndex: 0,
@@ -2116,24 +2114,28 @@ contract ZonePortalTest is BaseTest {
         assertTrue(h2 != bytes32(0));
     }
 
-    function test_depositEncrypted_deductsFee() public {
+    function test_depositEncrypted_chargesFeesUpfront() public {
         portal.setZoneGasRate(1); // 1 token per gas -> fee = 100_000
+        portal.setTempoGasRate(2); // 2 tokens per gas -> bounceback fee = 600_000
         _setEncKeyWithPoP(ENC_KEY_1);
 
         uint128 depositAmount = 1000e6;
-        uint128 expectedFee = uint128(100_000) * 1; // FIXED_DEPOSIT_GAS * zoneGasRate
+        uint128 expectedDepositFee = uint128(100_000) * 1;
+        uint128 expectedBouncebackFee = uint128(300_000) * 2;
+        uint128 expectedTotalFee = expectedDepositFee + expectedBouncebackFee;
+        uint128 expectedTotalDebit = depositAmount + expectedTotalFee;
         uint256 aliceBefore = pathUSD.balanceOf(alice);
         uint256 seqBefore = pathUSD.balanceOf(admin);
         uint256 portalBefore = pathUSD.balanceOf(address(portal));
 
         vm.startPrank(alice);
-        pathUSD.approve(address(portal), depositAmount);
+        pathUSD.approve(address(portal), expectedTotalDebit);
         portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload());
         vm.stopPrank();
 
-        assertEq(pathUSD.balanceOf(alice), aliceBefore - depositAmount);
-        assertEq(pathUSD.balanceOf(admin), seqBefore + expectedFee);
-        assertEq(pathUSD.balanceOf(address(portal)), portalBefore + depositAmount - expectedFee);
+        assertEq(pathUSD.balanceOf(alice), aliceBefore - expectedTotalDebit);
+        assertEq(pathUSD.balanceOf(admin), seqBefore + expectedTotalFee);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBefore + depositAmount);
     }
 
     function test_depositEncrypted_emitsEvent() public {
@@ -2141,7 +2143,6 @@ contract ZonePortalTest is BaseTest {
 
         uint128 depositAmount = 1000e6;
         uint128 fee = portal.calculateDepositFee();
-        uint128 netAmount = depositAmount - fee;
 
         EncryptedDepositPayload memory encrypted = _makeEncryptedPayload();
 
@@ -2152,7 +2153,7 @@ contract ZonePortalTest is BaseTest {
         EncryptedDeposit memory ed = EncryptedDeposit({
             token: address(pathUSD),
             sender: alice,
-            amount: netAmount,
+            amount: depositAmount,
             bouncebackRecipient: alice,
             bouncebackFee: 0,
             keyIndex: 0,
@@ -2165,7 +2166,7 @@ contract ZonePortalTest is BaseTest {
             expectedHash,
             alice,
             address(pathUSD),
-            netAmount,
+            depositAmount,
             fee,
             0,
             0,
@@ -2253,15 +2254,14 @@ contract ZonePortalTest is BaseTest {
         vm.stopPrank();
     }
 
-    function test_depositEncrypted_revertsOnDepositTooSmall() public {
+    function test_depositEncrypted_revertsOnAmountPlusFeesOverflow() public {
         portal.setZoneGasRate(1); // fee = 100_000
         _setEncKeyWithPoP(ENC_KEY_1);
 
         vm.startPrank(alice);
-        pathUSD.approve(address(portal), 100_000);
 
         vm.expectRevert(IZonePortal.DepositTooSmall.selector);
-        portal.depositEncrypted(address(pathUSD), 100_000, 0, _makeEncryptedPayload()); // amount == fee
+        portal.depositEncrypted(address(pathUSD), type(uint128).max, 0, _makeEncryptedPayload());
         vm.stopPrank();
     }
 

@@ -508,7 +508,7 @@ interface IZonePortal {
         address indexed sender,
         address token,
         address to,
-        uint128 netAmount,
+        uint128 amount,
         uint128 fee,
         uint128 bouncebackFee,
         bytes32 memo,
@@ -556,7 +556,7 @@ interface IZonePortal {
         bytes32 indexed newCurrentDepositQueueHash,
         address indexed sender,
         address token,
-        uint128 netAmount,
+        uint128 amount,
         uint128 fee,
         uint128 bouncebackFee,
         uint256 keyIndex,
@@ -724,7 +724,7 @@ interface IZonePortal {
     /// @notice Calculate the fee for a deposit
     function calculateDepositFee() external view returns (uint128 fee);
 
-    /// @notice Calculate the reserved fee for a deposit bounce-back on Tempo.
+    /// @notice Calculate the fee charged up front for a possible deposit bounce-back on Tempo.
     function calculateBouncebackFee() external view returns (uint128 fee);
 
     /// @notice Check if an encryption key is still valid for new deposits

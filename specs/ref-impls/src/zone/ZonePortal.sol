@@ -47,7 +47,7 @@ contract ZonePortal is IZonePortal {
     ///      flexibility to adjust the zoneGasRate based on operational costs.
     uint64 public constant FIXED_DEPOSIT_GAS = 100_000;
 
-    /// @notice Fixed gas value reserved for a Tempo-side deposit bounce-back.
+    /// @notice Fixed gas value charged up front for a possible Tempo-side deposit bounce-back.
     /// @dev Set to 300,000 gas. Bounce-back fee = FIXED_BOUNCEBACK_GAS * tempoGasRate.
     uint64 public constant FIXED_BOUNCEBACK_GAS = 300_000;
 
@@ -489,7 +489,7 @@ contract ZonePortal is IZonePortal {
         fee = uint128(FIXED_DEPOSIT_GAS) * zoneGasRate;
     }
 
-    /// @notice Calculate the fee reserved for a deposit bounce-back on Tempo.
+    /// @notice Calculate the fee charged up front for a possible deposit bounce-back on Tempo.
     function calculateBouncebackFee() public view returns (uint128 fee) {
         fee = uint128(FIXED_BOUNCEBACK_GAS) * tempoGasRate;
     }
@@ -544,27 +544,29 @@ contract ZonePortal is IZonePortal {
         if (!cfg.enabled) revert TokenNotEnabled();
         if (!cfg.depositsActive) revert DepositsNotActive();
 
-        // Calculate deposit fee
+        // Calculate fees. The user pays both up front; `amount` is the principal delivered
+        // on success or refunded on failure.
         uint128 fee = calculateDepositFee();
         uint128 bouncebackFee = calculateBouncebackFee();
-        if (amount < fee || amount - fee < bouncebackFee) revert DepositTooSmall();
-        uint128 netAmount = amount - fee;
+        uint128 totalFee = fee + bouncebackFee;
+        if (amount > type(uint128).max - totalFee) revert DepositTooSmall();
+        uint128 totalDebit = amount + totalFee;
 
-        // Transfer full amount from sender to this contract
+        // Transfer principal plus fees from sender to this contract
         // TIP-20 transfers revert on failure, so no boolean check is needed here.
-        ITIP20(_token).transferFrom(msg.sender, address(this), amount);
+        ITIP20(_token).transferFrom(msg.sender, address(this), totalDebit);
 
-        // Transfer fee to sequencer
-        if (fee > 0) {
-            ITIP20(_token).transfer(sequencer, fee);
+        // Transfer consumed fees to sequencer
+        if (totalFee > 0) {
+            ITIP20(_token).transfer(sequencer, totalFee);
         }
 
-        // Build deposit struct with net amount (fee already paid to sequencer on Tempo)
+        // Build deposit struct with principal amount (fees already paid to sequencer on Tempo)
         Deposit memory depositData = Deposit({
             token: _token,
             sender: msg.sender,
             to: to,
-            amount: netAmount,
+            amount: amount,
             bouncebackRecipient: bouncebackRecipient,
             bouncebackFee: bouncebackFee,
             memo: memo
@@ -580,7 +582,7 @@ contract ZonePortal is IZonePortal {
             msg.sender,
             _token,
             to,
-            netAmount,
+            amount,
             fee,
             bouncebackFee,
             memo,
@@ -670,20 +672,21 @@ contract ZonePortal is IZonePortal {
 
         uint128 fee = calculateDepositFee();
         uint128 bouncebackFee = calculateBouncebackFee();
-        if (amount < fee || amount - fee < bouncebackFee) revert DepositTooSmall();
-        uint128 netAmount = amount - fee;
+        uint128 totalFee = fee + bouncebackFee;
+        if (amount > type(uint128).max - totalFee) revert DepositTooSmall();
+        uint128 totalDebit = amount + totalFee;
 
-        // Transfer full amount from sender to this contract
-        ITIP20(_token).transferFrom(msg.sender, address(this), amount);
-        if (fee > 0) {
-            ITIP20(_token).transfer(sequencer, fee);
+        // Transfer principal plus consumed fees from sender to this contract.
+        ITIP20(_token).transferFrom(msg.sender, address(this), totalDebit);
+        if (totalFee > 0) {
+            ITIP20(_token).transfer(sequencer, totalFee);
         }
 
         // Build encrypted deposit struct
         EncryptedDeposit memory depositData = EncryptedDeposit({
             token: _token,
             sender: msg.sender,
-            amount: netAmount,
+            amount: amount,
             bouncebackRecipient: bouncebackRecipient,
             bouncebackFee: bouncebackFee,
             keyIndex: keyIndex,
@@ -700,7 +703,7 @@ contract ZonePortal is IZonePortal {
             newCurrentDepositQueueHash,
             msg.sender,
             _token,
-            netAmount,
+            amount,
             fee,
             bouncebackFee,
             keyIndex,
@@ -830,11 +833,7 @@ contract ZonePortal is IZonePortal {
     )
         internal
     {
-        uint128 refundAmount = amount - bouncebackFee;
-
-        if (bouncebackFee > 0) {
-            ITIP20(_token).transfer(sequencer, bouncebackFee);
-        }
+        uint128 refundAmount = amount;
 
         bool success = true;
         if (refundAmount > 0) {

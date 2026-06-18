@@ -89,17 +89,18 @@ impl SpamDeposits {
         let gas_price = provider.get_gas_price().await?;
         let portal = ZonePortal::new(self.portal, &provider);
         let deposit_fee = portal.calculateDepositFee().call().await?;
+        let bounceback_fee = portal.calculateBouncebackFee().call().await?;
+        let per_deposit_debit = self
+            .amount
+            .checked_add(deposit_fee)
+            .and_then(|value| value.checked_add(bounceback_fee))
+            .ok_or_else(|| eyre!("deposit amount plus fees overflow"))?;
 
         println!("Chain ID: {chain_id}");
         println!("Gas price: {gas_price}");
         println!("Deposit fee: {deposit_fee}");
-
-        if self.amount <= deposit_fee {
-            return Err(eyre!(
-                "amount ({}) must exceed deposit fee ({deposit_fee})",
-                self.amount
-            ));
-        }
+        println!("Bounceback fee: {bounceback_fee}");
+        println!("Per-deposit debit: {per_deposit_debit}");
 
         // ── Phase 1: Setup signers ──────────────────────────────────────
 
@@ -111,8 +112,8 @@ impl SpamDeposits {
             .map(|_| PrivateKeySigner::random())
             .collect();
 
-        // Budget: tokens for deposits + 10% headroom for gas (Tempo L1 pays gas in TIP-20)
-        let token_budget = U256::from(self.amount) * U256::from(deposits_per_signer);
+        // Budget: principal plus portal fees, with headroom for gas.
+        let token_budget = U256::from(per_deposit_debit) * U256::from(deposits_per_signer);
         let funding_per_signer = token_budget * U256::from(150) / U256::from(100);
 
         println!("Funding {num_signers} signers with {funding_per_signer} each...");

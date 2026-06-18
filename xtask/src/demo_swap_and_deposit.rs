@@ -146,6 +146,14 @@ impl DemoSwapAndDeposit {
             .call()
             .await
             .wrap_err("failed to fetch portal deposit fee")?;
+        let bounceback_fee = ZonePortal::new(portal, &l1)
+            .calculateBouncebackFee()
+            .call()
+            .await
+            .wrap_err("failed to fetch portal bounceback fee")?;
+        let total_deposit_fee = deposit_fee
+            .checked_add(bounceback_fee)
+            .ok_or_else(|| eyre!("deposit fee overflow"))?;
         let withdrawal_fee = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &l2)
             .calculateWithdrawalFee(ROUTER_CALLBACK_GAS_LIMIT)
             .call()
@@ -155,13 +163,16 @@ impl DemoSwapAndDeposit {
             .amount
             .checked_mul(DEX_LIQUIDITY_MULTIPLIER)
             .ok_or_else(|| eyre!("dex liquidity amount overflow"))?;
-        let alpha_gross_deposit = self
+        let alpha_deposit_amount = self
             .amount
             .checked_add(withdrawal_fee)
-            .and_then(|value| value.checked_add(deposit_fee))
             .ok_or_else(|| eyre!("alpha deposit amount overflow"))?;
-        let pathusd_gross_deposit = DEMO_PATHUSD_GAS_NET
-            .checked_add(deposit_fee)
+        let alpha_deposit_debit = alpha_deposit_amount
+            .checked_add(total_deposit_fee)
+            .ok_or_else(|| eyre!("alpha deposit debit overflow"))?;
+        let pathusd_deposit_amount = DEMO_PATHUSD_GAS_NET;
+        let pathusd_deposit_debit = pathusd_deposit_amount
+            .checked_add(total_deposit_fee)
             .ok_or_else(|| eyre!("pathUSD deposit amount overflow"))?;
 
         println!("╔══════════════════════════════════════════════════════════════╗");
@@ -177,13 +188,14 @@ impl DemoSwapAndDeposit {
         println!("  Swap amount:      {}", self.amount);
         println!("  DEX tick:         {}", self.tick);
         println!("  Deposit fee:      {deposit_fee}");
+        println!("  Bounceback fee:   {bounceback_fee}");
         println!("  Withdrawal fee:   {withdrawal_fee}");
         println!();
 
         println!("Step 1: Fund the operator with pathUSD on L1");
         fund_l1_wallet(&faucet_provider, operator).await?;
         let required_pathusd = dex_liquidity
-            .checked_add(pathusd_gross_deposit)
+            .checked_add(pathusd_deposit_debit)
             .and_then(|value| value.checked_add(PATHUSD_HEADROOM))
             .ok_or_else(|| eyre!("required pathUSD amount overflow"))?;
         let l1_balance = wait_for_balance(
@@ -209,7 +221,7 @@ impl DemoSwapAndDeposit {
 
         println!("Step 3: Configure and mint the demo tokens");
         let mint_amount = dex_liquidity
-            .checked_add(self.amount)
+            .checked_add(alpha_deposit_debit)
             .ok_or_else(|| eyre!("mint amount overflow"))?;
         configure_and_mint_demo_token(&l1, operator, alpha, mint_amount).await?;
         configure_and_mint_demo_token(&l1, operator, beta, mint_amount).await?;
@@ -233,10 +245,8 @@ impl DemoSwapAndDeposit {
             .call()
             .await
             .wrap_err("failed to quote DEX swap")?;
-        let expected_beta_net = expected_beta.checked_sub(deposit_fee).ok_or_else(|| {
-            eyre!(
-                "quoted swap output {expected_beta} does not cover the portal deposit fee {deposit_fee}"
-            )
+        let expected_beta_net = expected_beta.checked_sub(total_deposit_fee).ok_or_else(|| {
+            eyre!("quoted swap output {expected_beta} does not cover portal fees {total_deposit_fee}")
         })?;
         println!(
             "  Seeded liquidity: {dex_liquidity} units at tick {}",
@@ -246,7 +256,7 @@ impl DemoSwapAndDeposit {
             "  Quoted swap output for {} AlphaUSD: {expected_beta} BetaUSD",
             self.amount
         );
-        println!("  Expected L2 BetaUSD after portal fee: {expected_beta_net}");
+        println!("  Expected L2 BetaUSD after portal fees: {expected_beta_net}");
         println!();
 
         println!("Step 6: Deposit pathUSD for L2 gas and AlphaUSD for the swap");
@@ -262,7 +272,7 @@ impl DemoSwapAndDeposit {
             .deposit(
                 PATH_USD_ADDRESS,
                 operator,
-                pathusd_gross_deposit,
+                pathusd_deposit_amount,
                 B256::ZERO,
                 operator,
             )
@@ -280,7 +290,7 @@ impl DemoSwapAndDeposit {
             .await
             .wrap_err("failed to approve AlphaUSD for portal")?;
         let receipt = portal_contract
-            .deposit(alpha, operator, alpha_gross_deposit, B256::ZERO, operator)
+            .deposit(alpha, operator, alpha_deposit_amount, B256::ZERO, operator)
             .send_sync()
             .await
             .wrap_err("failed to deposit AlphaUSD to the zone")?;
