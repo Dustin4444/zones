@@ -161,7 +161,7 @@ contract ZonePortalTest is BaseTest {
 
         // Create a zone
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
-            initialToken: address(pathUSD),
+            token: address(pathUSD),
             sequencer: admin, // admin is the sequencer for tests
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -235,7 +235,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(info.zoneId, testZoneId);
         assertEq(info.portal, address(portal));
         assertEq(info.messenger, address(messenger));
-        assertEq(info.initialToken, address(pathUSD));
+        assertEq(info.token, address(pathUSD));
     }
 
     /*//////////////////////////////////////////////////////////////

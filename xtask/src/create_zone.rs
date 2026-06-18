@@ -29,7 +29,7 @@ sol! {
     }
 
     struct CreateZoneParams {
-        address initialToken;
+        address token;
         address sequencer;
         ZoneParams zoneParams;
     }
@@ -40,7 +40,7 @@ sol! {
             uint32 indexed zoneId,
             address indexed portal,
             address indexed messenger,
-            address initialToken,
+            address token,
             address sequencer,
             bytes32 genesisBlockHash,
             bytes32 genesisTempoBlockHash,
@@ -114,7 +114,7 @@ impl CreateZone {
         let current_block = provider.get_block_number().await?;
 
         let params = CreateZoneParams {
-            initialToken: self.initial_token,
+            token: self.initial_token,
             sequencer: self.sequencer,
             zoneParams: ZoneParams {
                 genesisBlockHash: B256::ZERO,
@@ -197,7 +197,7 @@ impl CreateZone {
             "zoneId": zone_id,
             "chainId": chain_id,
             "portal": format!("{portal}"),
-            "initialToken": format!("{}", self.initial_token),
+            "token": format!("{}", self.initial_token),
             "sequencer": format!("{}", self.sequencer),
             "tempoAnchorBlock": confirm_header.inner.number,
             "zoneFactory": format!("{}", self.zone_factory),

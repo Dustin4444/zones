@@ -405,7 +405,7 @@ macro_rules! define_abi {
                 uint32 zoneId;
                 address portal;
                 address messenger;
-                address initialToken;
+                address token;
                 address sequencer;
                 bytes32 genesisBlockHash;
                 bytes32 genesisTempoBlockHash;
@@ -420,7 +420,7 @@ macro_rules! define_abi {
                     uint64 genesisTempoBlockNumber;
                 }
                 struct CreateZoneParams {
-                    address initialToken;
+                    address token;
                     address sequencer;
                     ZoneParams zoneParams;
                 }
@@ -429,7 +429,7 @@ macro_rules! define_abi {
                     uint32 indexed zoneId,
                     address indexed portal,
                     address indexed messenger,
-                    address initialToken,
+                    address token,
                     address sequencer,
                     bytes32 genesisBlockHash,
                     bytes32 genesisTempoBlockHash,
