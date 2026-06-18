@@ -9,9 +9,9 @@ pub struct Deposit {
     pub sender: Address,
     /// Recipient on the zone.
     pub to: Address,
-    /// Principal amount deposited; deposit fees were charged separately on L1.
+    /// Principal amount deposited
     pub amount: u128,
-    /// Fee paid on L1.
+    /// Fee paid on L1 including bounceback fee.
     pub fee: u128,
     /// Tempo recipient for failed deposit refunds.
     pub bounceback_recipient: Address,
@@ -54,9 +54,10 @@ pub struct EncryptedDeposit {
     pub token: Address,
     /// Sender on L1.
     pub sender: Address,
-    /// Principal amount deposited; deposit fees were charged separately on L1.
+    /// Principal amount deposited
     pub amount: u128,
     /// Fee paid on L1.
+    /// Fee paid on L1 including bounceback fee.
     pub fee: u128,
     /// Tempo recipient for failed deposit refunds.
     pub bounceback_recipient: Address,
