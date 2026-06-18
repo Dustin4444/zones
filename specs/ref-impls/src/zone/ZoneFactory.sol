@@ -28,8 +28,8 @@ contract ZoneFactory is IZoneFactory {
     mapping(address => bool) internal _isZonePortal;
     mapping(address => bool) internal _isZoneMessenger;
     address internal _verifier;
-    address internal _forkVerifier;
-    uint64 internal _forkActivationBlock;
+    address internal _prevVerifier;
+    uint64 internal _verifierActivationBlock;
 
     /// @notice Tracks deployment count for CREATE address prediction
     /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
@@ -127,8 +127,8 @@ contract ZoneFactory is IZoneFactory {
     }
 
     function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
-        if (_forkVerifier != address(0) && tempoBlockNumber >= _forkActivationBlock) {
-            return _forkVerifier;
+        if (_prevVerifier != address(0) && tempoBlockNumber < _verifierActivationBlock) {
+            return _prevVerifier;
         }
         return _verifier;
     }
@@ -183,19 +183,15 @@ contract ZoneFactory is IZoneFactory {
     }
 
     function isValidVerifier(address v) external view returns (bool) {
-        return v != address(0) && (v == _verifier || v == _forkVerifier);
+        return v != address(0) && (v == _verifier || v == _prevVerifier);
     }
 
     function verifier() external view returns (address) {
         return _verifier;
     }
 
-    function forkVerifier() external view returns (address) {
-        return _forkVerifier;
-    }
-
-    function forkActivationBlock() external view returns (uint64) {
-        return _forkActivationBlock;
+    function prevVerifier() external view returns (address) {
+        return _prevVerifier;
     }
 
 }

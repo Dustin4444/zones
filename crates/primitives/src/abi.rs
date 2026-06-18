@@ -437,8 +437,7 @@ macro_rules! define_abi {
                 );
                 function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
                 function verifier() external view returns (address);
-                function forkVerifier() external view returns (address);
-                function forkActivationBlock() external view returns (uint64);
+                function prevVerifier() external view returns (address);
                 function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address selectedVerifier);
                 function zones(uint32 zoneId) external view returns (ZoneInfo memory);
                 function zoneCount() external view returns (uint32);

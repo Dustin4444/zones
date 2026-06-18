@@ -218,7 +218,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 
 | Parameter | Description |
 |-----------|-------------|
-| `initialToken` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
+| `token` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
 | `admin` | The address that holds the admin role for the zone (token enablement, deposit pause/resume). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
@@ -1473,7 +1473,7 @@ struct ZoneInfo {
     uint32 zoneId;
     address portal;
     address messenger;
-    address initialToken;
+    address token;
     address sequencer;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
@@ -1497,14 +1497,14 @@ struct LastBatch {
 ```solidity
 interface IZoneFactory {
     struct CreateZoneParams {
-        address initialToken;
+        address token;
         address sequencer;
         ZoneParams zoneParams;
     }
 
     event ZoneCreated(
         uint32 indexed zoneId, address indexed portal, address indexed messenger,
-        address initialToken, address sequencer,
+        address token, address sequencer,
         bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
     );
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
@@ -1513,8 +1513,7 @@ interface IZoneFactory {
     function isZonePortal(address portal) external view returns (bool);
     function isZoneMessenger(address messenger) external view returns (bool);
     function verifier() external view returns (address);
-    function forkVerifier() external view returns (address);
-    function forkActivationBlock() external view returns (uint64);
+    function prevVerifier() external view returns (address);
     function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
 }
 ```
@@ -1826,18 +1825,18 @@ Deployed at the same address as on Tempo. Read-only on the zone. Its `isAuthoriz
 
 Zones activate hard fork upgrades in lockstep with Tempo using same-block activation. The trigger is the Tempo block number: the zone block whose `advanceTempo` imports the fork Tempo block uses the new execution rules for its entire scope.
 
-`ZoneFactory` maintains two verifier slots (`verifier` and `forkVerifier`) shared by all zones. Each portal stores its factory address internally and resolves the verifier for every `submitBatch` by calling `ZoneFactory.verifierForTempoBlock(tempoBlockNumber)`. The portal does not cache verifier addresses.
+`ZoneFactory` maintains two verifier slots (`verifier` and `prevVerifier`) shared by all zones. Each portal stores its factory address internally and resolves the verifier for every `submitBatch` by calling `ZoneFactory.verifierForTempoBlock(tempoBlockNumber)`. The portal does not cache verifier addresses.
 
-At each fork, verifiers rotate: the previous fork verifier is promoted to `verifier`, and the new fork verifier takes the `forkVerifier` slot. At most two verifiers are active at any time. The `IVerifier` interface is unchanged across forks. New proof parameters are passed via the opaque `verifierConfig` bytes.
+At each fork, verifiers rotate: the current verifier becomes `prevVerifier`, and the new verifier becomes `verifier`. At most two verifiers are active at any time. The `IVerifier` interface is unchanged across forks. New proof parameters are passed via the opaque `verifierConfig` bytes.
 
 No onchain action is required from zone operators. The new verifier is deployed and rotated as part of the Tempo hard fork. Operators upgrade their zone node binary and prover program before the fork. When the fork Tempo block arrives, the node activates new rules automatically.
 
-The factory enforces a `forkActivationBlock` cutoff through verifier selection. Batches with `tempoBlockNumber < forkActivationBlock` use `verifier`; batches with `tempoBlockNumber >= forkActivationBlock` use `forkVerifier`. This prevents post-fork batches from being submitted against old verification rules.
+The factory enforces an internal activation block cutoff through verifier selection. Batches before the current verifier activation block use `prevVerifier`; batches at or after that block use `verifier`. This prevents post-fork batches from being submitted against old verification rules.
 
 The Tempo hard fork installs the new verifier at the factory level:
 
 1. Deploy the new `IVerifier` contract.
-2. Update the factory's verifier slots so the previous fork verifier is promoted to `verifier`, the new verifier is installed as `forkVerifier`, and `forkActivationBlock = block.number`.
+2. Update the factory's verifier slots so the current verifier is moved to `prevVerifier`, the new verifier is installed as `verifier`, and the internal activation block is set to `block.number`.
 
 If the fork changes zone predeploy behavior, the zone node injects new bytecode at the predeploy addresses before `advanceTempo` executes in the first post-fork zone block.
 

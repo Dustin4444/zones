@@ -453,14 +453,11 @@ interface IZoneFactory {
     /// @return valid True if `verifier` is one of the currently active factory verifiers.
     function isValidVerifier(address verifier) external view returns (bool);
 
-    /// @notice Current pre-fork verifier.
+    /// @notice Current verifier.
     function verifier() external view returns (address);
 
-    /// @notice Verifier for batches at or after the current fork activation block.
-    function forkVerifier() external view returns (address);
-
-    /// @notice Tempo block where the currently configured fork verifier activates.
-    function forkActivationBlock() external view returns (uint64);
+    /// @notice Previous verifier accepted for batches before the current verifier activated.
+    function prevVerifier() external view returns (address);
 
     /// @notice Select the verifier that applies to a submitted Tempo block.
     /// @param tempoBlockNumber The Tempo block number committed to by the zone batch.
