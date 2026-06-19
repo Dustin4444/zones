@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneOutbox, LastBatch, Withdrawal, ZONE_TX_CONTEXT } from "../../src/zone/IZone.sol";
+import {
+    IZoneOutbox,
+    LastBatch,
+    Withdrawal,
+    ZONE_INBOX,
+    ZONE_TX_CONTEXT
+} from "../../src/zone/IZone.sol";
 import { EMPTY_SENTINEL } from "../../src/zone/WithdrawalQueueLib.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
@@ -80,6 +86,7 @@ contract ZoneOutboxTest is Test {
             to: to,
             amount: amount,
             fee: 0,
+            bouncebackFee: 0,
             memo: memo,
             gasLimit: gasLimit,
             fallbackRecipient: fallbackRecipient,
@@ -106,6 +113,52 @@ contract ZoneOutboxTest is Test {
 
     function _finalizeWithdrawalBatch(uint256 count) internal returns (bytes32) {
         return _finalizeWithdrawalBatchAs(sequencer, count);
+    }
+
+    function test_enqueueDepositBounceBack_finalizesZeroFeeWithdrawalWithBouncebackFee() public {
+        uint128 amount = 1000e6;
+        uint128 bouncebackFee = 25e6;
+
+        vm.expectEmit(true, true, false, true);
+        emit IZoneOutbox.WithdrawalRequested(
+            0,
+            address(0),
+            address(zoneToken),
+            bob,
+            amount,
+            0,
+            bouncebackFee,
+            bytes32(0),
+            0,
+            address(0),
+            "",
+            ""
+        );
+
+        vm.prank(ZONE_INBOX);
+        outbox.enqueueDepositBounceBack(address(zoneToken), amount, bob, bouncebackFee);
+
+        Withdrawal memory expected = Withdrawal({
+            token: address(zoneToken),
+            senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
+            to: bob,
+            amount: amount,
+            fee: 0,
+            bouncebackFee: bouncebackFee,
+            memo: bytes32(0),
+            gasLimit: 0,
+            fallbackRecipient: address(0),
+            callbackData: "",
+            encryptedSender: ""
+        });
+
+        bytes32 expectedHash = keccak256(abi.encode(expected, EMPTY_SENTINEL));
+        assertEq(_finalizeWithdrawalBatch(1), expectedHash);
+    }
+
+    function test_enqueueDepositBounceBack_revertsUnlessInbox() public {
+        vm.expectRevert(ZoneOutbox.OnlyZoneInbox.selector);
+        outbox.enqueueDepositBounceBack(address(zoneToken), 1000e6, bob, 25e6);
     }
 
     function _finalizeWithdrawalBatchAs(address caller, uint256 count) internal returns (bytes32) {
@@ -805,6 +858,7 @@ contract ZoneOutboxTest is Test {
             bob, // to
             500e6, // amount
             expectedFee, // fee
+            0, // bouncebackFee
             bytes32("memo"),
             50_000, // gasLimit
             charlie, // fallbackRecipient

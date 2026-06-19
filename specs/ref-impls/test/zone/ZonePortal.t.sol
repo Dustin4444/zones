@@ -175,6 +175,8 @@ contract ZonePortalTest is BaseTest {
         address portalAddr;
         (testZoneId, portalAddr) = zoneFactory.createZone(params);
         portal = ZonePortal(portalAddr);
+        vm.prank(admin);
+        portal.setTempoGasRate(0);
 
         // Get the messenger
         ZoneInfo memory info = zoneFactory.zones(testZoneId);
@@ -208,6 +210,7 @@ contract ZonePortalTest is BaseTest {
             to: to,
             amount: amount,
             fee: 0,
+            bouncebackFee: 0,
             memo: memo,
             gasLimit: gasLimit,
             fallbackRecipient: fallbackRecipient,
@@ -1643,6 +1646,7 @@ contract ZonePortalTest is BaseTest {
             to: bob,
             amount: 500e6,
             bouncebackRecipient: address(0),
+            bouncebackFee: 0,
             memo: bytes32(0)
         });
         bytes32 expectedHash =
@@ -1736,13 +1740,14 @@ contract ZonePortalTest is BaseTest {
                     to: bob,
                     amount: netAmount,
                     bouncebackRecipient: bob,
+                    bouncebackFee: 0,
                     memo: bytes32("test")
                 }),
                 bytes32(0)
             )
         );
         emit IZonePortal.DepositMade(
-            expectedHash, alice, address(pathUSD), bob, netAmount, fee, bytes32("test"), bob, 1
+            expectedHash, alice, address(pathUSD), bob, netAmount, fee, 0, bytes32("test"), bob, 1
         );
 
         portal.deposit(address(pathUSD), bob, 500e6, bytes32("test"), bob);
@@ -2092,6 +2097,7 @@ contract ZonePortalTest is BaseTest {
             sender: alice,
             amount: netAmount,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2158,6 +2164,7 @@ contract ZonePortalTest is BaseTest {
             sender: alice,
             amount: netAmount,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2170,6 +2177,7 @@ contract ZonePortalTest is BaseTest {
             address(pathUSD),
             netAmount,
             fee,
+            0,
             0,
             VALID_SECP256K1_X,
             0x02,

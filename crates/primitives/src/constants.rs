@@ -65,6 +65,13 @@ pub const PORTAL_PENDING_SEQUENCER_SLOT: B256 = {
     B256::new(bytes)
 };
 
+/// ZonePortal storage slot 9: `tempoGasRate` (uint128).
+pub const PORTAL_TEMPO_GAS_RATE_SLOT: B256 = {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 9;
+    B256::new(bytes)
+};
+
 // ---------------------------------------------------------------------------
 //  Storage slot constants for the proof system
 // ---------------------------------------------------------------------------

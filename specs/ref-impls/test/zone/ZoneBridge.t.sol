@@ -160,6 +160,8 @@ contract ZoneBridgeTest is BaseTest {
             genesisTempoBlockNumber,
             ""
         );
+        vm.prank(admin);
+        l1Portal.setTempoGasRate(0);
         zoneId = 1;
 
         // === Deploy zone contracts ===
@@ -208,6 +210,7 @@ contract ZoneBridgeTest is BaseTest {
             to: to,
             amount: amount,
             fee: 0,
+            bouncebackFee: 0,
             memo: memo,
             gasLimit: gasLimit,
             fallbackRecipient: fallbackRecipient,
@@ -258,6 +261,7 @@ contract ZoneBridgeTest is BaseTest {
             to: to,
             amount: amount,
             bouncebackRecipient: to,
+            bouncebackFee: 0,
             memo: memo
         });
 
@@ -311,7 +315,9 @@ contract ZoneBridgeTest is BaseTest {
         queued = new QueuedDeposit[](deposits.length);
         for (uint256 i = 0; i < deposits.length; i++) {
             queued[i] = QueuedDeposit({
-                depositType: DepositType.Regular, depositData: abi.encode(deposits[i])
+                depositType: DepositType.Regular,
+                depositData: abi.encode(deposits[i]),
+                rejected: false
             });
         }
     }
@@ -869,6 +875,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: sender,
             amount: netAmount,
             bouncebackRecipient: sender,
+            bouncebackFee: 0,
             keyIndex: keyIndex,
             encrypted: encrypted
         });
@@ -970,7 +977,8 @@ contract ZoneBridgeTest is BaseTest {
         for (uint256 i = 0; i < pendingEncryptedDeposits.length; i++) {
             queued[i] = QueuedDeposit({
                 depositType: DepositType.Encrypted,
-                depositData: abi.encode(pendingEncryptedDeposits[i].encDeposit)
+                depositData: abi.encode(pendingEncryptedDeposits[i].encDeposit),
+                rejected: false
             });
             decs[i] = DecryptionData({
                 sharedSecret: bytes32(uint256(0xDEAD)),
@@ -1162,6 +1170,7 @@ contract ZoneBridgeTest is BaseTest {
             to: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             memo: bytes32("regular")
         });
         bytes32 prevHash = l2Inbox.processedDepositQueueHash();
@@ -1174,6 +1183,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: netAmount,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: payload
         });
@@ -1187,6 +1197,7 @@ contract ZoneBridgeTest is BaseTest {
             to: carol,
             amount: depositAmount,
             bouncebackRecipient: carol,
+            bouncebackFee: 0,
             memo: bytes32("carol")
         });
         bytes32 hash3 = keccak256(abi.encode(DepositType.Regular, d3, hash2));
@@ -1194,10 +1205,15 @@ contract ZoneBridgeTest is BaseTest {
 
         // === STEP 6: Build the mixed queue and relay to zone ===
         QueuedDeposit[] memory queued = new QueuedDeposit[](3);
-        queued[0] = QueuedDeposit({ depositType: DepositType.Regular, depositData: abi.encode(d1) });
-        queued[1] =
-            QueuedDeposit({ depositType: DepositType.Encrypted, depositData: abi.encode(ed) });
-        queued[2] = QueuedDeposit({ depositType: DepositType.Regular, depositData: abi.encode(d3) });
+        queued[0] = QueuedDeposit({
+            depositType: DepositType.Regular, depositData: abi.encode(d1), rejected: false
+        });
+        queued[1] = QueuedDeposit({
+            depositType: DepositType.Encrypted, depositData: abi.encode(ed), rejected: false
+        });
+        queued[2] = QueuedDeposit({
+            depositType: DepositType.Regular, depositData: abi.encode(d3), rejected: false
+        });
 
         // Decryption data (only 1 encrypted deposit)
         address decryptedTo = address(0x700);
@@ -1288,6 +1304,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: alice,
             amount: netAmount,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             keyIndex: 0,
             encrypted: payload1
         });
@@ -1299,6 +1316,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: netAmount,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             keyIndex: 1,
             encrypted: payload2
         });
@@ -1307,10 +1325,12 @@ contract ZoneBridgeTest is BaseTest {
 
         // === STEP 6: Build queue and relay ===
         QueuedDeposit[] memory queued = new QueuedDeposit[](2);
-        queued[0] =
-            QueuedDeposit({ depositType: DepositType.Encrypted, depositData: abi.encode(ed1) });
-        queued[1] =
-            QueuedDeposit({ depositType: DepositType.Encrypted, depositData: abi.encode(ed2) });
+        queued[0] = QueuedDeposit({
+            depositType: DepositType.Encrypted, depositData: abi.encode(ed1), rejected: false
+        });
+        queued[1] = QueuedDeposit({
+            depositType: DepositType.Encrypted, depositData: abi.encode(ed2), rejected: false
+        });
 
         address aliceRecipient = address(0x700);
         bytes32 aliceMemo = bytes32("alice-secret");

@@ -46,7 +46,7 @@ use tokio::{
 };
 
 use crate::abi::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZonePortal,
+    DepositType, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZonePortal,
 };
 use alloy_rpc_client::ConnectionConfig;
 use zone_rpc::{
@@ -310,8 +310,10 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             .from_block(0)
             .event_signature(vec![
                 ZoneInbox::DepositProcessed::SIGNATURE_HASH,
+                ZoneInbox::DepositFailed::SIGNATURE_HASH,
                 ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH,
                 ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH,
+                ZoneInbox::DepositRejected::SIGNATURE_HASH,
             ])
             .topic1(deposit_hash);
 
@@ -333,6 +335,11 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
             return Ok(Some(TerminalDepositEvent::RegularProcessed));
         }
 
+        if signature == ZoneInbox::DepositFailed::SIGNATURE_HASH {
+            ZoneInbox::DepositFailed::decode_log(&log.inner).map_err(internal)?;
+            return Ok(Some(TerminalDepositEvent::RegularFailed));
+        }
+
         if signature == ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH {
             let event =
                 ZoneInbox::EncryptedDepositProcessed::decode_log(&log.inner).map_err(internal)?;
@@ -345,6 +352,15 @@ impl<Api: EthApiTypes + 'static> TempoZoneRpc<Api> {
         if signature == ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH {
             ZoneInbox::EncryptedDepositFailed::decode_log(&log.inner).map_err(internal)?;
             return Ok(Some(TerminalDepositEvent::EncryptedFailed));
+        }
+
+        if signature == ZoneInbox::DepositRejected::SIGNATURE_HASH {
+            let event = ZoneInbox::DepositRejected::decode_log(&log.inner).map_err(internal)?;
+            return match event.depositType {
+                DepositType::Regular => Ok(Some(TerminalDepositEvent::RegularRejected)),
+                DepositType::Encrypted => Ok(Some(TerminalDepositEvent::EncryptedRejected)),
+                _ => Ok(None),
+            };
         }
 
         Ok(None)
@@ -984,8 +1000,11 @@ enum PortalDepositRecord {
 #[derive(Debug, Clone)]
 enum TerminalDepositEvent {
     RegularProcessed,
+    RegularFailed,
+    RegularRejected,
     EncryptedProcessed { recipient: Address, memo: B256 },
     EncryptedFailed,
+    EncryptedRejected,
 }
 
 fn regular_deposit_status(
@@ -993,12 +1012,17 @@ fn regular_deposit_status(
 ) -> Result<DepositState, JsonRpcError> {
     match terminal {
         Some(TerminalDepositEvent::RegularProcessed) => Ok(DepositState::Processed),
+        Some(TerminalDepositEvent::RegularFailed | TerminalDepositEvent::RegularRejected) => {
+            Ok(DepositState::Failed)
+        }
         Some(TerminalDepositEvent::EncryptedProcessed { .. }) => Err(JsonRpcError::internal(
             "encrypted deposit event matched regular deposit hash",
         )),
-        Some(TerminalDepositEvent::EncryptedFailed) => Err(JsonRpcError::internal(
-            "encrypted deposit failure matched regular deposit hash",
-        )),
+        Some(TerminalDepositEvent::EncryptedFailed | TerminalDepositEvent::EncryptedRejected) => {
+            Err(JsonRpcError::internal(
+                "encrypted deposit failure matched regular deposit hash",
+            ))
+        }
         None => Ok(DepositState::Pending),
     }
 }
@@ -1010,8 +1034,14 @@ fn encrypted_deposit_details(
         Some(TerminalDepositEvent::EncryptedProcessed { recipient, memo }) => {
             Ok((Some(recipient), Some(memo), DepositState::Processed))
         }
-        Some(TerminalDepositEvent::EncryptedFailed) => Ok((None, None, DepositState::Failed)),
-        Some(TerminalDepositEvent::RegularProcessed) => Err(JsonRpcError::internal(
+        Some(TerminalDepositEvent::EncryptedFailed | TerminalDepositEvent::EncryptedRejected) => {
+            Ok((None, None, DepositState::Failed))
+        }
+        Some(
+            TerminalDepositEvent::RegularProcessed
+            | TerminalDepositEvent::RegularFailed
+            | TerminalDepositEvent::RegularRejected,
+        ) => Err(JsonRpcError::internal(
             "regular deposit event matched encrypted deposit hash",
         )),
         None => Ok((None, None, DepositState::Pending)),

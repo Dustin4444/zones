@@ -36,8 +36,8 @@ use crate::{
         EncryptedDepositPayload as AbiEncryptedDepositPayload, PORTAL_PENDING_SEQUENCER_SLOT,
         PORTAL_SEQUENCER_SLOT,
         ZonePortal::{
-            self, BounceBack, DepositMade, EncryptedDepositMade, SequencerTransferStarted,
-            SequencerTransferred, TokenEnabled, ZonePortalEvents,
+            self, DepositMade, EncryptedDepositMade, SequencerTransferStarted,
+            SequencerTransferred, TokenEnabled, WithdrawalBounceBack, ZonePortalEvents,
         },
     },
     ext::TempoStateExt,

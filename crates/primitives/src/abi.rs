@@ -17,9 +17,9 @@ use alloy_sol_types::SolValue;
 
 pub use crate::constants::{
     EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_PENDING_SEQUENCER_SLOT, PORTAL_SEQUENCER_SLOT,
-    TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ADDRESS, TEMPO_STATE_READER_ADDRESS,
-    ZONE_CONFIG_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
-    ZONE_TX_CONTEXT_ADDRESS,
+    PORTAL_TEMPO_GAS_RATE_SLOT, TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ADDRESS,
+    TEMPO_STATE_READER_ADDRESS, ZONE_CONFIG_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    ZONE_TOKEN_ADDRESS, ZONE_TX_CONTEXT_ADDRESS,
 };
 
 /// Internal macro that emits the full `sol!` block, placing `$($rpc_attr)*`
@@ -39,6 +39,7 @@ macro_rules! define_abi {
                 address to;
                 uint128 amount;
                 uint128 fee;
+                uint128 bouncebackFee;
                 bytes32 memo;
                 uint64 gasLimit;
                 address fallbackRecipient;
@@ -53,6 +54,7 @@ macro_rules! define_abi {
                 address to;
                 uint128 amount;
                 address bouncebackRecipient;
+                uint128 bouncebackFee;
                 bytes32 memo;
             }
 
@@ -73,6 +75,7 @@ macro_rules! define_abi {
                 address sender;
                 uint128 amount;
                 address bouncebackRecipient;
+                uint128 bouncebackFee;
                 uint256 keyIndex;
                 EncryptedDepositPayload encrypted;
             }
@@ -125,6 +128,7 @@ macro_rules! define_abi {
                     address to,
                     uint128 netAmount,
                     uint128 fee,
+                    uint128 bouncebackFee,
                     bytes32 memo,
                     address bouncebackRecipient,
                     uint64 depositNumber
@@ -137,6 +141,7 @@ macro_rules! define_abi {
                     address token,
                     uint128 netAmount,
                     uint128 fee,
+                    uint128 bouncebackFee,
                     uint256 keyIndex,
                     bytes32 ephemeralPubkeyX,
                     uint8 ephemeralPubkeyYParity,
@@ -165,7 +170,7 @@ macro_rules! define_abi {
                 event WithdrawalProcessed(address indexed to, address token, uint128 amount, bool callbackSuccess);
 
                 #[derive(Debug)]
-                event BounceBack(
+                event WithdrawalBounceBack(
                     bytes32 indexed newCurrentDepositQueueHash,
                     address indexed fallbackRecipient,
                     address token,
@@ -178,7 +183,15 @@ macro_rules! define_abi {
                     address indexed bouncebackRecipient,
                     address token,
                     uint128 amount,
-                    bool success
+                    uint128 bouncebackFee
+                );
+
+                #[derive(Debug)]
+                event DepositBounceBackPending(
+                    address indexed bouncebackRecipient,
+                    address token,
+                    uint128 amount,
+                    uint128 bouncebackFee
                 );
 
                 #[derive(Debug)]
@@ -206,6 +219,8 @@ macro_rules! define_abi {
                 error InvalidTempoBlockNumber();
                 #[derive(Debug)]
                 error DepositPolicyForbids();
+                #[derive(Debug)]
+                error MissingBouncebackRecipient();
 
                 // -- View functions --
 
@@ -223,9 +238,11 @@ macro_rules! define_abi {
                 function withdrawalQueueSlot(uint256 slot) external view returns (bytes32);
                 function genesisTempoBlockNumber() external view returns (uint64);
                 function calculateDepositFee() external view returns (uint128 fee);
+                function calculateBouncebackFee() external view returns (uint128 fee);
                 function depositCount() external view returns (uint64);
                 function lastProcessedDepositNumber() external view returns (uint64);
                 function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
+                function tempoGasRate() external view returns (uint128);
 
                 // -- State-changing functions --
 
@@ -255,6 +272,7 @@ macro_rules! define_abi {
 
                 function rpcUrl() external view returns (string memory);
                 function setRpcUrl(string calldata rpcUrl) external;
+                function setTempoGasRate(uint128 _tempoGasRate) external;
 
                 function depositEncrypted(
                     address token,
@@ -279,10 +297,12 @@ macro_rules! define_abi {
                 function enabledTokenAt(uint256 index) external view returns (address);
                 function zoneGasRate() external view returns (uint128);
                 function pendingSequencer() external view returns (address);
+                function refunds(address token, address owner) external view returns (uint128);
 
                 function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity);
 
                 function encryptionKeyCount() external view returns (uint256);
+                function claimRefund(address token) external returns (uint128 amount);
             }
 
             // ---------------------------------------------------------------
@@ -300,6 +320,7 @@ macro_rules! define_abi {
                     address to,
                     uint128 amount,
                     uint128 fee,
+                    uint128 bouncebackFee,
                     bytes32 memo,
                     uint64 gasLimit,
                     address fallbackRecipient,
@@ -314,6 +335,7 @@ macro_rules! define_abi {
 
                 error OnlySequencer();
                 error GasLimitTooHigh();
+                error OnlyZoneInbox();
 
                 // -- View functions --
 
@@ -335,6 +357,12 @@ macro_rules! define_abi {
                     address fallbackRecipient,
                     bytes calldata data,
                     bytes calldata revealTo
+                ) external;
+                function enqueueDepositBounceBack(
+                    address token,
+                    uint128 amount,
+                    address bouncebackRecipient,
+                    uint128 bouncebackFee
                 ) external;
                 function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
             }
@@ -405,6 +433,7 @@ macro_rules! define_abi {
             struct QueuedDeposit {
                 DepositType depositType;
                 bytes depositData;
+                bool rejected;
             }
 
             /// Chaum-Pedersen proof for ECDH shared secret derivation.
@@ -517,6 +546,35 @@ macro_rules! define_abi {
                     uint128 amount
                 );
 
+                #[derive(Debug)]
+                event DepositFailed(
+                    bytes32 indexed depositHash,
+                    address indexed sender,
+                    address indexed to,
+                    address token,
+                    uint128 amount,
+                    address bouncebackRecipient
+                );
+
+                #[derive(Debug)]
+                event DepositRejected(
+                    bytes32 indexed depositHash,
+                    address indexed sender,
+                    DepositType depositType,
+                    address token,
+                    uint128 amount,
+                    address bouncebackRecipient
+                );
+
+                #[derive(Debug)]
+                event WithdrawalBounceBackProcessed(address indexed fallbackRecipient, address token, uint128 amount);
+
+                #[derive(Debug)]
+                event WithdrawalBounceBackPending(address indexed fallbackRecipient, address token, uint128 amount);
+
+                #[derive(Debug)]
+                event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
+
                 /// Emitted when a TIP-20 token is enabled on the zone via advanceTempo.
                 #[derive(Debug)]
                 event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -531,6 +589,8 @@ macro_rules! define_abi {
                 function tempoPortal() external view returns (address);
                 function tempoState() external view returns (address);
                 function config() external view returns (address);
+                function refunds(address token, address owner) external view returns (uint128);
+                function claimRefund(address token) external returns (uint128 amount);
 
                 function advanceTempo(
                     bytes calldata header,
@@ -698,6 +758,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::DepositPolicyForbids(_) => f.write_str("DepositPolicyForbids"),
+            Self::MissingBouncebackRecipient(_) => f.write_str("MissingBouncebackRecipient"),
         }
     }
 }
@@ -722,12 +783,19 @@ impl Withdrawal {
         tx_hash: B256,
         encrypted_sender: Bytes,
     ) -> Self {
+        let sender_tag = if event.sender.is_zero() && event.fallbackRecipient.is_zero() {
+            Self::sender_tag(Address::ZERO, B256::ZERO)
+        } else {
+            Self::sender_tag(event.sender, tx_hash)
+        };
+
         Self {
             token: event.token,
-            senderTag: Self::sender_tag(event.sender, tx_hash),
+            senderTag: sender_tag,
             to: event.to,
             amount: event.amount,
             fee: event.fee,
+            bouncebackFee: event.bouncebackFee,
             memo: event.memo,
             gasLimit: event.gasLimit,
             fallbackRecipient: event.fallbackRecipient,
@@ -773,6 +841,7 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
+            bouncebackFee: 0,
             memo: B256::ZERO,
         };
 
@@ -797,6 +866,7 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
+            bouncebackFee: 0,
             memo: B256::ZERO,
         };
 
@@ -805,6 +875,7 @@ mod tests {
         let qd = QueuedDeposit {
             depositType: DepositType::Regular,
             depositData: deposit_data,
+            rejected: false,
         };
 
         println!(
@@ -857,6 +928,7 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000000002"),
             amount: 1000u128,
             bouncebackRecipient: address!("0x0000000000000000000000000000000000000001"),
+            bouncebackFee: 0,
             memo: B256::ZERO,
         };
         let prev_hash = B256::ZERO;

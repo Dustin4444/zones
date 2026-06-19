@@ -18,7 +18,8 @@ import {
     IZoneInbox,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
-    QueuedDeposit
+    QueuedDeposit,
+    ZONE_OUTBOX
 } from "../../src/zone/IZone.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
@@ -52,6 +53,7 @@ contract ZoneInboxTest is Test {
             mockPortal, bytes32(uint256(0)), bytes32(uint256(uint160(sequencer)))
         );
         inbox = new ZoneInbox(address(config), mockPortal, address(tempoState));
+        vm.etch(ZONE_OUTBOX, hex"00");
 
         zoneToken.setMinter(address(inbox), true);
     }
@@ -64,7 +66,9 @@ contract ZoneInboxTest is Test {
         queued = new QueuedDeposit[](deposits.length);
         for (uint256 i = 0; i < deposits.length; i++) {
             queued[i] = QueuedDeposit({
-                depositType: DepositType.Regular, depositData: abi.encode(deposits[i])
+                depositType: DepositType.Regular,
+                depositData: abi.encode(deposits[i]),
+                rejected: false
             });
         }
     }
@@ -102,6 +106,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 1000e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("payment")
         });
 
@@ -127,6 +132,7 @@ contract ZoneInboxTest is Test {
             to: alice,
             amount: 100e6,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             memo: bytes32("d1")
         });
         deposits[1] = Deposit({
@@ -135,6 +141,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 200e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d2")
         });
         deposits[2] = Deposit({
@@ -143,6 +150,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 300e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d3")
         });
 
@@ -175,6 +183,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 1000e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("payment")
         });
 
@@ -202,6 +211,7 @@ contract ZoneInboxTest is Test {
             to: alice,
             amount: 100e6,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             memo: bytes32("d1")
         });
         allDeposits[1] = Deposit({
@@ -210,6 +220,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 200e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d2")
         });
 
@@ -276,6 +287,7 @@ contract ZoneInboxTest is Test {
             to: alice,
             amount: 100e6,
             bouncebackRecipient: alice,
+            bouncebackFee: 0,
             memo: bytes32("d1")
         });
         batch1[1] = Deposit({
@@ -284,6 +296,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 200e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d2")
         });
 
@@ -306,6 +319,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 500e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d3")
         });
 
@@ -333,6 +347,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 1000e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("payment")
         });
 
@@ -363,6 +378,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 1000e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("payment")
         });
 
@@ -392,6 +408,7 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 0,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("empty")
         });
 
@@ -434,6 +451,7 @@ contract ZoneInboxTest is Test {
                 to: bob,
                 amount: uint128(i + 1) * 1e6,
                 bouncebackRecipient: bob,
+                bouncebackFee: 0,
                 memo: bytes32(i)
             });
             currentHash = keccak256(abi.encode(DepositType.Regular, deposits[i], currentHash));
@@ -481,6 +499,7 @@ contract ZoneInboxTest is Test {
             sender: sender,
             amount: amount,
             bouncebackRecipient: sender,
+            bouncebackFee: 0,
             keyIndex: keyIndex,
             encrypted: EncryptedDepositPayload({
                 ephemeralPubkeyX: bytes32(uint256(0x1234)),
@@ -490,7 +509,9 @@ contract ZoneInboxTest is Test {
                 tag: bytes16(0)
             })
         });
-        qd = QueuedDeposit({ depositType: DepositType.Encrypted, depositData: abi.encode(ed) });
+        qd = QueuedDeposit({
+            depositType: DepositType.Encrypted, depositData: abi.encode(ed), rejected: false
+        });
     }
 
     /// @notice Set up precompile mocks for successful encrypted deposit processing
@@ -603,8 +624,8 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        // Funds should go to sender (alice), not the decrypted recipient
-        assertEq(zoneToken.balanceOf(alice), amount);
+        // Invalid encrypted deposits bounce to Tempo via the outbox; no zone mint is attempted.
+        assertEq(zoneToken.balanceOf(alice), 0);
         assertEq(zoneToken.balanceOf(address(0x500)), 0);
         assertEq(inbox.processedDepositQueueHash(), expectedHash);
     }
@@ -624,10 +645,12 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 100e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d1")
         });
-        QueuedDeposit memory qdRegular =
-            QueuedDeposit({ depositType: DepositType.Regular, depositData: abi.encode(d) });
+        QueuedDeposit memory qdRegular = QueuedDeposit({
+            depositType: DepositType.Regular, depositData: abi.encode(d), rejected: false
+        });
 
         // Build encrypted deposit
         (QueuedDeposit memory qdEnc, EncryptedDeposit memory ed) =
@@ -690,10 +713,12 @@ contract ZoneInboxTest is Test {
             to: bob,
             amount: 100e6,
             bouncebackRecipient: bob,
+            bouncebackFee: 0,
             memo: bytes32("d1")
         });
-        QueuedDeposit memory qd =
-            QueuedDeposit({ depositType: DepositType.Regular, depositData: abi.encode(d) });
+        QueuedDeposit memory qd = QueuedDeposit({
+            depositType: DepositType.Regular, depositData: abi.encode(d), rejected: false
+        });
 
         bytes32 expectedHash = keccak256(abi.encode(DepositType.Regular, d, bytes32(0)));
         tempoState.setMockStorageValue(
@@ -803,7 +828,7 @@ contract ZoneInboxTest is Test {
                     ENCRYPTED DEPOSIT TESTS (continued)
     //////////////////////////////////////////////////////////////*/
 
-    function test_advanceTempo_encryptedDeposit_invalidProof() public {
+    function test_advanceTempo_encryptedDeposit_invalidProof_bounces() public {
         uint128 amount = 1000e6;
 
         // Set up encryption key
@@ -838,8 +863,8 @@ contract ZoneInboxTest is Test {
         });
 
         vm.prank(sequencer);
-        vm.expectRevert(IZoneInbox.InvalidSharedSecretProof.selector);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
+        assertEq(zoneToken.balanceOf(alice), 0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -917,8 +942,8 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        // Deposit should bounce to sender (alice) because plaintext length != 64
-        assertEq(zoneToken.balanceOf(alice), 1000e6, "sender should receive bounced funds");
+        // Deposit should bounce via the outbox; no zone mint is attempted.
+        assertEq(zoneToken.balanceOf(alice), 0, "sender should not receive a zone mint");
         assertEq(zoneToken.balanceOf(recipient), 0, "recipient should get nothing");
     }
 
@@ -940,8 +965,8 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        // Deposit should bounce to sender
-        assertEq(zoneToken.balanceOf(alice), 1000e6, "sender should receive bounced funds");
+        // Deposit should bounce via the outbox; no zone mint is attempted.
+        assertEq(zoneToken.balanceOf(alice), 0, "sender should not receive a zone mint");
         assertEq(zoneToken.balanceOf(recipient), 0, "recipient should get nothing");
     }
 
@@ -958,8 +983,8 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        // Deposit should bounce to sender
-        assertEq(zoneToken.balanceOf(alice), 1000e6, "sender should receive bounced funds");
+        // Deposit should bounce via the outbox; no zone mint is attempted.
+        assertEq(zoneToken.balanceOf(alice), 0, "sender should not receive a zone mint");
         assertEq(zoneToken.balanceOf(recipient), 0, "recipient should get nothing");
     }
 

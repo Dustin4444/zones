@@ -10,7 +10,7 @@ use crate::{
     l1::PreparedL1Block,
     payload::ZonePayloadAttributes,
 };
-use alloy_consensus::{Signed, Transaction, TxLegacy, TxReceipt};
+use alloy_consensus::{Signed, Transaction, TxLegacy, TxReceipt, transaction::TxHashRef};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{B256, Bytes, U256};
 use alloy_rlp::Encodable;
@@ -236,6 +236,7 @@ where
         // Execute advanceTempo system transaction — exactly one per zone block.
         {
             let advance_tx = build_advance_tempo_tx(prepared);
+            let advance_tx_hash = *advance_tx.tx_hash();
             let mut reverted = false;
             match builder.execute_transaction_with_result_closure(advance_tx, |result| {
                 let evm_result = result.result();
@@ -270,6 +271,13 @@ where
                     );
                     return Err(PayloadBuilderError::evm(err));
                 }
+            }
+            if let Some(receipt) = builder.executor().receipts().last() {
+                collect_requested_withdrawals(
+                    receipt,
+                    advance_tx_hash,
+                    &mut requested_withdrawals,
+                )?;
             }
         }
 
@@ -625,6 +633,7 @@ mod tests {
             to: address!("0x0000000000000000000000000000000000002000"),
             amount: 500_000,
             fee: 0,
+            bouncebackFee: 0,
             memo: B256::ZERO,
             gasLimit: 0,
             fallbackRecipient: sender,
@@ -678,9 +687,11 @@ mod tests {
                             to: recipient,
                             amount: 500_000,
                             bouncebackRecipient: recipient,
+                            bouncebackFee: 0,
                             memo: B256::ZERO,
                         }),
                     ),
+                    rejected: false,
                 },
                 abi::QueuedDeposit {
                     depositType: DepositType::Encrypted,
@@ -690,6 +701,7 @@ mod tests {
                             sender,
                             amount: 300_000,
                             bouncebackRecipient: sender,
+                            bouncebackFee: 0,
                             keyIndex: U256::ZERO,
                             encrypted: abi::EncryptedDepositPayload {
                                 ephemeralPubkeyX: B256::with_last_byte(0xDD),
@@ -700,6 +712,7 @@ mod tests {
                             },
                         }),
                     ),
+                    rejected: false,
                 },
             ],
             decryptions: vec![abi::DecryptionData {

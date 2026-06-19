@@ -68,7 +68,7 @@ impl L1PortalEvents {
     const SIGNATURE_HASHES: [B256; 6] = [
         DepositMade::SIGNATURE_HASH,
         EncryptedDepositMade::SIGNATURE_HASH,
-        BounceBack::SIGNATURE_HASH,
+        WithdrawalBounceBack::SIGNATURE_HASH,
         TokenEnabled::SIGNATURE_HASH,
         SequencerTransferStarted::SIGNATURE_HASH,
         SequencerTransferred::SIGNATURE_HASH,
@@ -119,7 +119,7 @@ impl L1PortalEvents {
                 self.deposits
                     .push(L1Deposit::Encrypted(EncryptedDeposit::from_event(event)));
             }
-            ZonePortalEvents::BounceBack(event) => {
+            ZonePortalEvents::WithdrawalBounceBack(event) => {
                 info!(
                     l1_block = block_number,
                     token = %event.token,

@@ -45,11 +45,13 @@ impl L1BlockDeposits {
                         to: d.to,
                         amount: d.amount,
                         bouncebackRecipient: d.bounceback_recipient,
+                        bouncebackFee: d.bounceback_fee,
                         memo: d.memo,
                     };
                     queued_deposits.push(abi::QueuedDeposit {
                         depositType: abi::DepositType::Regular,
                         depositData: Bytes::from(deposit.abi_encode()),
+                        rejected: false,
                     });
                 }
                 L1Deposit::Encrypted(d) => {
@@ -61,6 +63,7 @@ impl L1BlockDeposits {
                                 sender: d.sender,
                                 amount: d.amount,
                                 bouncebackRecipient: d.bounceback_recipient,
+                                bouncebackFee: d.bounceback_fee,
                                 keyIndex: d.key_index,
                                 encrypted: abi::EncryptedDepositPayload {
                                     ephemeralPubkeyX: d.ephemeral_pubkey_x,
@@ -72,6 +75,7 @@ impl L1BlockDeposits {
                             }
                             .abi_encode(),
                         ),
+                        rejected: false,
                     };
 
                     // Attempt full ECIES decryption.
