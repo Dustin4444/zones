@@ -810,12 +810,11 @@ contract ZonePortal is IZonePortal {
             }
         }
 
-        if (success) {
-            emit DepositBounceBack(bouncebackRecipient, _token, refundAmount);
-        } else {
+        if (!success) {
             _refunds[_token][bouncebackRecipient] += refundAmount;
-            emit DepositBounceBackPending(bouncebackRecipient, _token, refundAmount);
         }
+
+        emit DepositBounceBack(bouncebackRecipient, _token, refundAmount, success);
     }
 
     function refunds(address token, address owner) external view returns (uint128) {

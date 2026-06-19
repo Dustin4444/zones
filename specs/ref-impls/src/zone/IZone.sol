@@ -533,10 +533,8 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
-    event DepositBounceBack(address indexed bouncebackRecipient, address token, uint128 amount);
-
-    event DepositBounceBackPending(
-        address indexed bouncebackRecipient, address token, uint128 amount
+    event DepositBounceBack(
+        address indexed bouncebackRecipient, address token, uint128 amount, bool success
     );
 
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);

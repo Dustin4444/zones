@@ -177,14 +177,8 @@ macro_rules! define_abi {
                 event DepositBounceBack(
                     address indexed bouncebackRecipient,
                     address token,
-                    uint128 amount
-                );
-
-                #[derive(Debug)]
-                event DepositBounceBackPending(
-                    address indexed bouncebackRecipient,
-                    address token,
-                    uint128 amount
+                    uint128 amount,
+                    bool success
                 );
 
                 #[derive(Debug)]

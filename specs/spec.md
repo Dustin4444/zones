@@ -474,7 +474,7 @@ The portal's internal withdrawal-bounce-back deposits are the only entries with 
 
 **Tempo-side refund.** The bounce-back withdrawal is submitted in the next batch alongside any user-initiated withdrawals. When `ZonePortal.processWithdrawal` runs on the deposit-bounce-back entry (`gasLimit == 0`, `fallbackRecipient == address(0)`), the upfront deposit fee has already been paid to the sequencer at deposit time, so the portal attempts `ITIP20.transfer(bouncebackRecipient, amount)` from the portal's escrow, wrapped in `try/catch`.
 
-If the transfer succeeds, the portal emits `DepositBounceBack(bouncebackRecipient, token, amount)`. If it reverts (e.g. the token's TIP-403 policy forbids `bouncebackRecipient`, or the token is paused), the funds stay in the portal's locked balance and the portal credits `_refunds[token][bouncebackRecipient] += amount` and emits `DepositBounceBackPending(...)`. Either way the bounce-back entry is fully retired; the sequencer already collected the upfront deposit fee at deposit time.
+Either way the portal emits `DepositBounceBack(bouncebackRecipient, token, amount, success)`. If the transfer succeeds (`success = true`), the recipient receives the funds directly. If it reverts (e.g. the token's TIP-403 policy forbids `bouncebackRecipient`, or the token is paused), `success = false`, the funds stay in the portal's locked balance, and the portal credits `_refunds[token][bouncebackRecipient] += amount` (claimable via `claimRefund(token)`). Either way the bounce-back entry is fully retired; the sequencer already collected the upfront deposit fee at deposit time.
 
 In the case of a failed bounceback, the recipient can claim the parked funds by calling `ZonePortal.claimRefund(token)` on Tempo. The portal zeroes `_refunds[token][msg.sender]` and calls `ITIP20.transfer(msg.sender, amount)`; on success it emits `RefundClaimed(msg.sender, token, amount)`, on revert storage is unchanged and the user retries later.
 
@@ -490,8 +490,7 @@ In the case of a failed bounceback, the recipient can claim the parked funds by 
 | `DepositFailed` | `ZoneInbox` | Mint for a regular deposit reverted, funds queued for bounce-back |
 | `EncryptedDepositFailed` | `ZoneInbox` | Encrypted deposit failed — either invalid encryption, or valid decryption with a mint that reverted; funds queued for bounce-back |
 | `DepositRejected` | `ZoneInbox` | Sequencer marked the deposit (regular or encrypted) as rejected; funds queued for bounce-back without invoking the token or decryption precompiles |
-| `DepositBounceBack` | `ZonePortal` | Bounce-back withdrawal processed on Tempo and the refund transfer to `bouncebackRecipient` succeeded |
-| `DepositBounceBackPending` | `ZonePortal` | Bounce-back transfer reverted on Tempo (e.g. TIP-403 forbids `bouncebackRecipient`); funds parked in the portal's refund registry, claimable via `claimRefund(token)` |
+| `DepositBounceBack` | `ZonePortal` | Bounce-back withdrawal processed on Tempo. `success = true` means the refund transfer to `bouncebackRecipient` succeeded; `success = false` means it reverted (e.g. TIP-403 forbids `bouncebackRecipient`) and the funds were parked in the portal's refund registry, claimable via `claimRefund(token)` |
 | `RefundClaimed` | `ZonePortal` | Recipient claimed an outstanding deposit-bounce-back refund |
 | `WithdrawalBounceBack` | `ZonePortal` | Withdrawal-side bounce-back processed on Tempo (zone-side refund mint will be attempted by the inbox; renamed from `BounceBack` for symmetry with `DepositBounceBack`) |
 
@@ -520,10 +519,10 @@ sequenceDiagram
     T->>T: ZonePortal.processWithdrawal (zero-callback)
     alt TIP20.transfer(bouncebackRecipient, amount) succeeds
         T->>U: receives amount
-        Note over T: emit DepositBounceBack
+        Note over T: emit DepositBounceBack(success=true)
     else transfer reverts (e.g. TIP-403)
         T->>T: _refunds[token][bouncebackRecipient] += amount
-        Note over T: emit DepositBounceBackPending
+        Note over T: emit DepositBounceBack(success=false)
         U->>T: later: ZonePortal.claimRefund(token)
         T->>U: TIP20.transfer(msg.sender, claimed)
         Note over T: emit RefundClaimed
@@ -1544,11 +1543,7 @@ interface IZonePortal {
     );
     event DepositBounceBack(
         address indexed bouncebackRecipient, address token,
-        uint128 amount
-    );
-    event DepositBounceBackPending(
-        address indexed bouncebackRecipient, address token,
-        uint128 amount
+        uint128 amount, bool success
     );
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
     event SequencerTransferStarted(address indexed currentSequencer, address indexed pendingSequencer);
