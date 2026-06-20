@@ -534,7 +534,7 @@ contract ZonePortal is IZonePortal {
         external
         returns (bytes32 newCurrentDepositQueueHash)
     {
-        if (bouncebackRecipient == address(0)) revert MissingBouncebackRecipient();
+        if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
 
         // Validate token is enabled and deposits are active
         TokenConfig storage cfg = _tokenConfigs[_token];
@@ -616,7 +616,7 @@ contract ZonePortal is IZonePortal {
         external
         returns (bytes32 newCurrentDepositQueueHash)
     {
-        if (bouncebackRecipient == address(0)) revert MissingBouncebackRecipient();
+        if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
 
         // Validate token is enabled and deposits are active
         TokenConfig storage cfg = _tokenConfigs[_token];

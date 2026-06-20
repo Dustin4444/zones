@@ -220,7 +220,7 @@ macro_rules! define_abi {
                 #[derive(Debug)]
                 error DepositPolicyForbids();
                 #[derive(Debug)]
-                error MissingBouncebackRecipient();
+                error InvalidBouncebackRecipient();
 
                 // -- View functions --
 
@@ -758,7 +758,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::DepositPolicyForbids(_) => f.write_str("DepositPolicyForbids"),
-            Self::MissingBouncebackRecipient(_) => f.write_str("MissingBouncebackRecipient"),
+            Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
         }
     }
 }

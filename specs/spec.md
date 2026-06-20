@@ -464,7 +464,7 @@ sequenceDiagram
 
 Deposits can fail for three main reasons: a recipient blocked by the TIP-403 policy, an invalid encrypted deposit, or rejection by the sequencer. To make sure that all cases can be handled without loss of user funds, every deposit carries a `bouncebackRecipient`: a Tempo address that receives a refund if zone-side processing fails.
 
-**Validation at deposit time.** Both `deposit(...)` and `depositEncrypted(...)` require `bouncebackRecipient != address(0)` and revert otherwise (`MissingBouncebackRecipient`). The portal does **not** validate `bouncebackRecipient` against the token's TIP-403 policy at deposit time; if the on-Tempo refund transfer is later rejected by the policy, the funds are parked in a per-recipient refund registry on the portal and the recipient claims them via `claimRefund(token)` (see [Tempo-side refund](#tempo-side-refund) below).
+**Validation at deposit time.** Both `deposit(...)` and `depositEncrypted(...)` require `bouncebackRecipient != address(0)` and revert otherwise (`InvalidBouncebackRecipient`). The portal does **not** validate `bouncebackRecipient` against the token's TIP-403 policy at deposit time; if the on-Tempo refund transfer is later rejected by the policy, the funds are parked in a per-recipient refund registry on the portal and the recipient claims them via `claimRefund(token)` (see [Tempo-side refund](#tempo-side-refund) below).
 
 **Triggering conditions.** There are three triggering sites:
 
@@ -1581,7 +1581,7 @@ interface IZonePortal {
     function setRpcUrl(string calldata rpcUrl) external; // sequencer-only
 
     // Deposits
-    /// @dev Reverts (`MissingBouncebackRecipient`) if `bouncebackRecipient == address(0)`.
+    /// @dev Reverts (`InvalidBouncebackRecipient`) if `bouncebackRecipient == address(0)`.
     ///      Every user-initiated deposit must carry a usable refund target so that a
     ///      failed mint can be recovered without stalling the deposit queue. The portal
     ///      does not validate the recipient against the token's TIP-403 policy at
@@ -1591,7 +1591,7 @@ interface IZonePortal {
     function deposit(
         address token, address to, uint128 amount, bytes32 memo, address bouncebackRecipient
     ) external returns (bytes32 newCurrentDepositQueueHash);
-    /// @dev Reverts (`MissingBouncebackRecipient`) if `bouncebackRecipient == address(0)`.
+    /// @dev Reverts (`InvalidBouncebackRecipient`) if `bouncebackRecipient == address(0)`.
     ///      A ciphertext that fails onchain decryption verification has no well-defined
     ///      recipient on the zone, so the bounce-back target must always be set.
     function depositEncrypted(
