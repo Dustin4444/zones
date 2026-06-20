@@ -52,7 +52,7 @@ contract ZonePortal is IZonePortal {
     uint64 public constant FIXED_BOUNCEBACK_GAS = 300_000;
 
     /// @notice Default Tempo gas rate used to price deposit bounce-back and withdrawal fees.
-    uint128 public constant TEMPO_T0_BASE_FEE = 10_000_000_000;
+    uint128 public constant TEMPO_T1_BASE_FEE = 20_000_000_000;
 
     /// @notice Maximum gas a withdrawal callback may request
     /// @dev Over-cap legacy withdrawals are dequeued and bounced back in `processWithdrawal`.
@@ -146,7 +146,7 @@ contract ZonePortal is IZonePortal {
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
         rpcUrl = _rpcUrl;
-        tempoGasRate = TEMPO_T0_BASE_FEE;
+        tempoGasRate = TEMPO_T1_BASE_FEE;
 
         // Enable the initial token
         _enableTokenInternal(_initialToken);

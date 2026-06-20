@@ -301,7 +301,7 @@ The sequencer configures two gas rates that determine fees for deposits, withdra
 
 Both rates live on `ZonePortal` on Tempo and are set by the sequencer. `zoneGasRate` is read on Tempo at deposit time. `tempoGasRate` is read on Tempo at deposit time (for the bounce-back fee snapshot) and on the zone at withdrawal-request time, where the outbox proxies it through the [`TempoState`](#tempostate-predeploy) predeploy via `readTempoStorageSlot(ZONE_PORTAL, TEMPO_GAS_RATE_SLOT)`. Both fees are snapshotted onto the queued entry, so in-flight rate changes never retroactively raise the fee on already-queued items.
 
-`tempoGasRate` defaults to `TEMPO_T0_BASE_FEE = 10,000,000,000` token units per gas unit at zone genesis. All rates are denominated in token units per gas unit and fees are paid in the same token being deposited or withdrawn. The sequencer takes the risk on gas-price fluctuations: if actual costs exceed the fee collected, the sequencer covers the difference; if they are lower, the sequencer keeps the surplus.
+`tempoGasRate` defaults to `TEMPO_T1_BASE_FEE = 20,000,000,000` token units per gas unit at zone genesis. All rates are denominated in token units per gas unit and fees are paid in the same token being deposited or withdrawn. The sequencer takes the risk on gas-price fluctuations: if actual costs exceed the fee collected, the sequencer covers the difference; if they are lower, the sequencer keeps the surplus.
 
 ### Encryption Key Management
 
