@@ -56,6 +56,13 @@ fn next_unique_chain_id() -> u64 {
     NEXT_CHAIN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn l1_dev_signer() -> alloy_signer_local::PrivateKeySigner {
+    MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()
+        .expect("valid test mnemonic")
+}
+
 /// Default timeout for polling loops in e2e tests.
 pub(crate) const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -389,8 +396,7 @@ impl ZoneTestNode {
         let (genesis, genesis_block_number) =
             build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
+        let signer = l1_dev_signer();
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
@@ -421,8 +427,7 @@ impl ZoneTestNode {
             build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
                 .await?;
 
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
+        let signer = l1_dev_signer();
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
@@ -798,6 +803,35 @@ impl L1TestNode {
             .erased()
     }
 
+    fn provider_with_signer(
+        &self,
+        signer: alloy_signer_local::PrivateKeySigner,
+    ) -> alloy_provider::DynProvider {
+        ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(self.http_url.clone())
+            .erased()
+    }
+
+    async fn set_test_tempo_gas_rate(
+        &self,
+        portal_address: Address,
+        sequencer_signer: alloy_signer_local::PrivateKeySigner,
+    ) -> eyre::Result<()> {
+        use zone::abi::ZonePortal;
+
+        let provider = self.provider_with_signer(sequencer_signer);
+        let portal = ZonePortal::new(portal_address, &provider);
+        let receipt = portal
+            .setTempoGasRate(0)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "setTempoGasRate failed");
+        Ok(())
+    }
+
     /// Deploy the ZoneFactory and create a zone in one step.
     ///
     /// Combines [`deploy_zone_factory`](Self::deploy_zone_factory) and
@@ -975,8 +1009,12 @@ impl L1TestNode {
     /// Captures the current L1 header as the genesis anchor, then calls
     /// `createZone()` with pathUSD as the token and the dev account as sequencer.
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
-        self.create_zone_with_sequencer(factory_address, self.dev_address())
-            .await
+        let portal_address = self
+            .create_zone_with_sequencer(factory_address, self.dev_address())
+            .await?;
+        self.set_test_tempo_gas_rate(portal_address, self.dev_signer())
+            .await?;
+        Ok(portal_address)
     }
 
     /// Create a zone on an existing ZoneFactory with a custom sequencer address.
@@ -1078,16 +1116,18 @@ impl L1TestNode {
     /// Deploy L1 infrastructure for a two-zone cross-zone test with separate sequencers.
     pub(crate) async fn deploy_two_zones_with_sequencers(
         &self,
-        sequencer_a: Address,
-        sequencer_b: Address,
+        sequencer_a: alloy_signer_local::PrivateKeySigner,
+        sequencer_b: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<(Address, Address, Address)> {
         let factory = self.deploy_zone_factory().await?;
         let portal_a = self
-            .create_zone_with_sequencer(factory, sequencer_a)
+            .create_zone_with_sequencer(factory, sequencer_a.address())
             .await?;
         let portal_b = self
-            .create_zone_with_sequencer(factory, sequencer_b)
+            .create_zone_with_sequencer(factory, sequencer_b.address())
             .await?;
+        self.set_test_tempo_gas_rate(portal_a, sequencer_a).await?;
+        self.set_test_tempo_gas_rate(portal_b, sequencer_b).await?;
         let router = self.deploy_router(factory).await?;
         Ok((portal_a, portal_b, router))
     }

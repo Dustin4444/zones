@@ -260,12 +260,24 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
 
     // --- Step 2: Deploy L1 infrastructure (factory, two portals, router) ---
     let (portal_a, portal_b, router) = l1
-        .deploy_two_zones_with_sequencers(seq_a_signer.address(), seq_b_signer.address())
+        .deploy_two_zones_with_sequencers(seq_a_signer.clone(), seq_b_signer.clone())
         .await?;
 
     // --- Step 3: Start both zone nodes ---
-    let zone_a = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_a).await?;
-    let zone_b = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_b).await?;
+    let zone_a = ZoneTestNode::start_from_l1_with_sequencer_signer(
+        l1.http_url(),
+        l1.ws_url(),
+        portal_a,
+        seq_a_signer.clone(),
+    )
+    .await?;
+    let zone_b = ZoneTestNode::start_from_l1_with_sequencer_signer(
+        l1.http_url(),
+        l1.ws_url(),
+        portal_b,
+        seq_b_signer.clone(),
+    )
+    .await?;
 
     zone_a.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
     zone_b.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
