@@ -4,6 +4,12 @@ pragma solidity ^0.8.13;
 import { BLOCKHASH_HISTORY } from "../src/zone/BlockHashHistory.sol";
 import { ZONE_TX_CONTEXT } from "../src/zone/IZone.sol";
 import { MockEIP2935 } from "./zone/mocks/MockEIP2935.sol";
+import {
+    MockTempoNoopPrecompile,
+    MockTempoTIP20,
+    MockTempoTIP20Factory,
+    MockTempoTIP403Registry
+} from "./zone/mocks/MockTempoPrecompiles.sol";
 import { MockZoneTxContext } from "./zone/mocks/MockZoneTxContext.sol";
 import { Test, console } from "forge-std/Test.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
@@ -64,6 +70,8 @@ contract BaseTest is Test {
     error CallShouldHaveReverted();
 
     function setUp() public virtual {
+        _installTempoPrecompileMocksIfMissing();
+
         if (_ACCOUNT_KEYCHAIN.code.length == 0) {
             revert MissingPrecompile("AccountKeychain", _ACCOUNT_KEYCHAIN);
         }
@@ -134,6 +142,56 @@ contract BaseTest is Test {
         token2 = ITIP20Token(
             factory.createToken("TOKEN2", "T2", "USD", ITIP20(_PATH_USD), admin, bytes32("token2"))
         );
+    }
+
+    function _installTempoPrecompileMocksIfMissing() internal {
+        if (_ACCOUNT_KEYCHAIN.code.length == 0) {
+            MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
+            vm.etch(_ACCOUNT_KEYCHAIN, address(mock).code);
+        }
+
+        if (_TIP403REGISTRY.code.length == 0) {
+            MockTempoTIP403Registry mock = new MockTempoTIP403Registry();
+            vm.etch(_TIP403REGISTRY, address(mock).code);
+        }
+
+        bool installedFactory = false;
+        if (_TIP20FACTORY.code.length == 0) {
+            MockTempoTIP20Factory mock = new MockTempoTIP20Factory();
+            vm.etch(_TIP20FACTORY, address(mock).code);
+            installedFactory = true;
+        }
+
+        if (_PATH_USD.code.length == 0) {
+            MockTempoTIP20 mock = new MockTempoTIP20();
+            vm.etch(_PATH_USD, address(mock).code);
+            MockTempoTIP20(_PATH_USD)
+                .initialize("Path USD", "pathUSD", "USD", ITIP20(address(0)), admin);
+        }
+
+        if (installedFactory) {
+            MockTempoTIP20Factory(_TIP20FACTORY).initialize(_PATH_USD);
+        }
+
+        if (_STABLECOIN_DEX.code.length == 0) {
+            MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
+            vm.etch(_STABLECOIN_DEX, address(mock).code);
+        }
+
+        if (_FEE_AMM.code.length == 0) {
+            MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
+            vm.etch(_FEE_AMM, address(mock).code);
+        }
+
+        if (_NONCE.code.length == 0) {
+            MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
+            vm.etch(_NONCE, address(mock).code);
+        }
+
+        if (_VALIDATOR_CONFIG.code.length == 0) {
+            MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
+            vm.etch(_VALIDATOR_CONFIG, address(mock).code);
+        }
     }
 
 }

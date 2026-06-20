@@ -24,6 +24,8 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     QueuedDeposit,
     Withdrawal,
+    ZONE_INBOX,
+    ZONE_OUTBOX,
     ZoneParams
 } from "../../src/zone/IZone.sol";
 import { EMPTY_SENTINEL } from "../../src/zone/WithdrawalQueueLib.sol";
@@ -175,11 +177,16 @@ contract ZoneBridgeTest is BaseTest {
         );
 
         // Zone inbox (advances Tempo state and processes deposits)
-        l2Inbox = new ZoneInbox(address(l2Config), address(l1Portal), address(l2TempoState));
+        ZoneInbox inboxImpl =
+            new ZoneInbox(address(l2Config), address(l1Portal), address(l2TempoState));
+        vm.etch(ZONE_INBOX, address(inboxImpl).code);
+        l2Inbox = ZoneInbox(ZONE_INBOX);
         l2ZoneToken.setMinter(address(l2Inbox), true);
 
         // Zone outbox (handles withdrawals)
-        l2Outbox = new ZoneOutbox(address(l2Config));
+        ZoneOutbox outboxImpl = new ZoneOutbox(address(l2Config));
+        vm.etch(ZONE_OUTBOX, address(outboxImpl).code);
+        l2Outbox = ZoneOutbox(ZONE_OUTBOX);
         l2ZoneToken.setBurner(address(l2Outbox), true);
 
         // Initialize zone block hash
@@ -1108,20 +1115,43 @@ contract ZoneBridgeTest is BaseTest {
         bytes32 newProcessedHash =
             _sequencerRelayEncryptedDepositsToL2(address(0xBEEF), bytes32("wrong"), false);
 
-        // Verify zone state — tokens bounced back to sender (alice = 100K - deposit + bounce)
+        // Verify zone state — no mint was attempted, and a Tempo refund withdrawal was enqueued.
         assertEq(
             l2ZoneToken.balanceOf(alice),
-            100_000e6 - depositAmount + netAmount,
-            "Sender should get bounced tokens"
+            100_000e6 - depositAmount,
+            "Sender should not receive a zone mint"
         );
         assertEq(l2ZoneToken.balanceOf(address(0xBEEF)), 0, "Failed recipient should get nothing");
+        assertEq(l2Outbox.pendingWithdrawalsCount(), 1, "Bounce-back withdrawal should be queued");
         assertEq(
             l2Inbox.processedDepositQueueHash(), newProcessedHash, "Zone processed hash mismatch"
         );
 
-        // === STEP 4: Submit batch to L1 ===
+        // === STEP 4: Submit batch to L1 with the deposit bounce-back withdrawal ===
+        uint256 aliceBeforeRefund = l2ZoneToken.balanceOf(alice);
+        uint256 portalBeforeRefund = l2ZoneToken.balanceOf(address(l1Portal));
         _sequencerSubmitBatch(newProcessedHash);
         assertEq(l1Portal.withdrawalBatchIndex(), 1, "Batch index should advance");
+
+        Withdrawal memory bounce = Withdrawal({
+            token: address(l2ZoneToken),
+            senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
+            to: alice,
+            amount: netAmount,
+            fee: 0,
+            bouncebackFee: 0,
+            memo: bytes32(0),
+            gasLimit: 0,
+            fallbackRecipient: address(0),
+            callbackData: "",
+            encryptedSender: ""
+        });
+        bytes32 expectedQueueHash = keccak256(abi.encode(bounce, EMPTY_SENTINEL));
+        assertEq(l1Portal.withdrawalQueueSlot(0), expectedQueueHash);
+
+        l1Portal.processWithdrawal(bounce, bytes32(0));
+        assertEq(l2ZoneToken.balanceOf(alice), aliceBeforeRefund + netAmount);
+        assertEq(l2ZoneToken.balanceOf(address(l1Portal)), portalBeforeRefund - netAmount);
     }
 
     /// @notice Mixed queue: regular deposit + encrypted deposit in single advanceTempo

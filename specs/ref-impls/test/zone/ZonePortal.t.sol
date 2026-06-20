@@ -2268,10 +2268,10 @@ contract ZonePortalTest is BaseTest {
         _setEncKeyWithPoP(ENC_KEY_1);
 
         vm.startPrank(alice);
-        pathUSD.approve(address(portal), 100_000);
+        pathUSD.approve(address(portal), 99_999);
 
         vm.expectRevert(IZonePortal.DepositTooSmall.selector);
-        portal.depositEncrypted(address(pathUSD), 100_000, 0, _makeEncryptedPayload(), alice); // amount == fee
+        portal.depositEncrypted(address(pathUSD), 99_999, 0, _makeEncryptedPayload(), alice);
         vm.stopPrank();
     }
 
