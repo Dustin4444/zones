@@ -22,8 +22,7 @@ use std::{
     },
     time::Duration,
 };
-use tempo_chainspec::spec::TEMPO_T1_BASE_FEE;
-use tempo_chainspec::spec::TempoChainSpec;
+use tempo_chainspec::spec::{TEMPO_T1_BASE_FEE, TempoChainSpec};
 use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS,
     account_keychain::IAccountKeychain::{

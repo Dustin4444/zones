@@ -55,7 +55,7 @@ impl L1BlockDeposits {
                     });
                 }
                 L1Deposit::Encrypted(d) => {
-                    let queued = abi::QueuedDeposit {
+                    let mut queued = abi::QueuedDeposit {
                         depositType: abi::DepositType::Encrypted,
                         depositData: Bytes::from(
                             abi::EncryptedDeposit {
@@ -127,8 +127,9 @@ impl L1BlockDeposits {
                                 recipient = %dec.to,
                                 token = %d.token,
                                 amount = %d.amount,
-                                "Encrypted deposit recipient unauthorized; ZoneInbox will refund if mint is rejected"
+                                "Encrypted deposit recipient unauthorized; queuing deposit bounce-back"
                             );
+                            queued.rejected = true;
                         }
 
                         let decryption = abi::DecryptionData {
