@@ -23,9 +23,9 @@ use tempo_precompiles::{
     storage::{StorageCtx, evm::EvmPrecompileStorageProvider},
     tip20::{IRolesAuth, ITIP20, RolesAuthError, TIP20Token},
 };
+use tempo_zone_contracts::Unauthorized;
 use tracing::{trace, warn};
 use zone_primitives::{
-    abi::Unauthorized,
     constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
     policy::AuthRole,
 };
