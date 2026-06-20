@@ -22,6 +22,7 @@ use std::{
     },
     time::Duration,
 };
+use tempo_chainspec::spec::TEMPO_T1_BASE_FEE;
 use tempo_chainspec::spec::TempoChainSpec;
 use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS,
@@ -34,6 +35,7 @@ use zone::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
     ZoneNode,
 };
+use zone_primitives::constants::PORTAL_TEMPO_GAS_RATE_SLOT;
 
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -3018,6 +3020,7 @@ impl L1Fixture {
     ) {
         let mut cache = cache.write();
         let deposit_queue_hash_slot = B256::with_last_byte(4);
+        let tempo_gas_rate = B256::from(U256::from(TEMPO_T1_BASE_FEE));
 
         for block in 0..=num_blocks {
             let mut sequencer_bytes = [0u8; 32];
@@ -3031,6 +3034,13 @@ impl L1Fixture {
             // Deposit queue hash slot (4) — read by ZoneInbox after finalizeTempo.
             // The initial value is B256::ZERO (empty queue).
             cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO);
+            // Tempo gas rate slot (9) — read by ZoneOutbox fee calculation.
+            cache.set(
+                portal_address,
+                PORTAL_TEMPO_GAS_RATE_SLOT,
+                block,
+                tempo_gas_rate,
+            );
         }
 
         cache.update_anchor(NumHash {
