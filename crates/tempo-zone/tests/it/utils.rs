@@ -439,30 +439,6 @@ impl ZoneTestNode {
         .await
     }
 
-    /// Start a zone node connected to a real L1, with a sequencer key for ECIES decryption.
-    ///
-    /// Same as [`start_from_l1`] but passes the sequencer signer through
-    /// so the payload builder can decrypt encrypted deposits.
-    pub(crate) async fn start_from_l1_with_sequencer_signer(
-        l1_http_url: &url::Url,
-        l1_ws_url: &url::Url,
-        portal_address: Address,
-        sequencer_signer: alloy_signer_local::PrivateKeySigner,
-    ) -> eyre::Result<Self> {
-        let (genesis, genesis_block_number) =
-            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
-
-        Self::launch_with_genesis(
-            l1_ws_url.to_string(),
-            portal_address,
-            Some(genesis_block_number),
-            next_unique_chain_id(),
-            Some(genesis),
-            sequencer_signer,
-        )
-        .await
-    }
-
     /// Start a self-contained zone node with no real L1 connection.
     ///
     /// The L1Subscriber retries a dummy URL in the background, but the
@@ -2906,17 +2882,7 @@ async fn start_zone_with_private_rpc_l1_inner(
     let l1 = L1TestNode::start().await?;
     let portal_address = l1.deploy_zone().await?;
 
-    let zone = if let Some(key) = encryption_key.clone() {
-        ZoneTestNode::start_from_l1_with_sequencer_signer(
-            l1.http_url(),
-            l1.ws_url(),
-            portal_address,
-            alloy_signer_local::PrivateKeySigner::from_signing_key(key.into()),
-        )
-        .await?
-    } else {
-        ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?
-    };
+    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
 
     zone.wait_for_l2_tempo_finalized(0, DEFAULT_TIMEOUT).await?;
 

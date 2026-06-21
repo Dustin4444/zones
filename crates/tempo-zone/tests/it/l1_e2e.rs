@@ -264,20 +264,8 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
         .await?;
 
     // --- Step 3: Start both zone nodes ---
-    let zone_a = ZoneTestNode::start_from_l1_with_sequencer_signer(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_a,
-        seq_a_signer.clone(),
-    )
-    .await?;
-    let zone_b = ZoneTestNode::start_from_l1_with_sequencer_signer(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_b,
-        seq_b_signer.clone(),
-    )
-    .await?;
+    let zone_a = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_a).await?;
+    let zone_b = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_b).await?;
 
     zone_a.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
     zone_b.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
@@ -886,13 +874,7 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
     // Must start the zone BEFORE registering the encryption key, so the zone's
     // genesis anchor captures the current L1 block. The encryption key registration
     // and deposit happen in subsequent L1 blocks that the zone processes naturally.
-    let zone = ZoneTestNode::start_from_l1_with_sequencer_signer(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_address,
-        alloy_signer_local::PrivateKeySigner::from_signing_key(encryption_key.clone().into()),
-    )
-    .await?;
+    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
 
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
@@ -1053,13 +1035,7 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
     );
 
     // --- Step 3: Start zone with sequencer key ---
-    let zone = ZoneTestNode::start_from_l1_with_sequencer_signer(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_address,
-        sequencer_signer.clone(),
-    )
-    .await?;
+    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
     // --- Step 4: Register encryption key ---
