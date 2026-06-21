@@ -534,14 +534,7 @@ impl ZoneTestNode {
             std::time::Duration::from_millis(100),
         )
         .with_initial_tokens(vec![])
-        .with_sequencer(zone::ZoneSequencerAddOnsConfig {
-            sequencer_signer,
-            zone_id: 0,
-            zone_poll_interval: std::time::Duration::from_secs(1),
-            batch_interval: std::time::Duration::from_secs(60),
-            batch_anchor_config: zone::BatchAnchorConfig::default(),
-            withdrawal_poll_interval: std::time::Duration::from_secs(5),
-        });
+        .with_zone_engine(sequencer_signer);
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
