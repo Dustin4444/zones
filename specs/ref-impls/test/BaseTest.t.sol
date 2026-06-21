@@ -70,7 +70,7 @@ contract BaseTest is Test {
     error CallShouldHaveReverted();
 
     function setUp() public virtual {
-        _installTempoPrecompileMocksIfMissing();
+        installTempoPrecompileMocks();
 
         if (_ACCOUNT_KEYCHAIN.code.length == 0) {
             revert MissingPrecompile("AccountKeychain", _ACCOUNT_KEYCHAIN);
@@ -144,7 +144,7 @@ contract BaseTest is Test {
         );
     }
 
-    function _installTempoPrecompileMocksIfMissing() internal {
+    function installTempoPrecompileMocks() internal {
         if (_ACCOUNT_KEYCHAIN.code.length == 0) {
             MockTempoNoopPrecompile mock = new MockTempoNoopPrecompile();
             vm.etch(_ACCOUNT_KEYCHAIN, address(mock).code);
