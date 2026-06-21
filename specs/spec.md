@@ -362,10 +362,8 @@ sequenceDiagram
 Every deposit is associated with two separate fees, both paid in the same token being deposited but priced at different gas rates because the work they cover runs on different chains:
 
 ```
-depositFee    = FIXED_DEPOSIT_GAS * zoneGasRate
-              = 100,000 * zoneGasRate
-bouncebackFee = ceil(FIXED_BOUNCEBACK_GAS * tempoGasRate / 1e12)
-              = ceil(300,000 * tempoGasRate / 1e12)
+depositFee    = 100,000 * zoneGasRate
+bouncebackFee = ceil(300,000 * tempoGasRate / 1e12)
 ```
 
 `zoneGasRate` and `tempoGasRate` both live on `ZonePortal` on Tempo and are sequencer-managed there via `setZoneGasRate()` / `setTempoGasRate()` (see [Gas Rate Configuration](#gas-rate-configuration)). The same `tempoGasRate` is used for withdrawal fees on Tempo; the zone reads it from Tempo state via the [`TempoState`](#tempostate-predeploy) predeploy when computing withdrawal fees at request time.
