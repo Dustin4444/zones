@@ -108,8 +108,12 @@ contract ZoneInbox is IZoneInbox {
                 keyWord0 := mload(add(key, 32))
                 // Load second word only if key > 32 bytes
                 switch gt(keyLen, 32)
-                case 1 { keyWord1 := mload(add(key, 64)) }
-                default { keyWord1 := 0 }
+                case 1 {
+                    keyWord1 := mload(add(key, 64))
+                }
+                default {
+                    keyWord1 := 0
+                }
                 // Zero out bytes beyond key length in first word
                 if lt(keyLen, 32) {
                     let shift := mul(sub(32, keyLen), 8)
@@ -179,7 +183,7 @@ contract ZoneInbox is IZoneInbox {
     ///      Protocol and proof enforce at most one call at the start of a block (or zero if skipping).
     /// @param header RLP-encoded Tempo block header
     /// @param deposits Array of queued deposits to process (oldest first, must be contiguous)
-    /// @param decryptions Decryption data for non-rejected encrypted deposits, in order
+    /// @param decryptions Decryption data for valid encrypted deposits, in order
     function advanceTempo(
         bytes calldata header,
         QueuedDeposit[] calldata deposits,
@@ -262,7 +266,9 @@ contract ZoneInbox is IZoneInbox {
                 }
 
                 // Sequencer must provide decryption for this encrypted deposit
-                if (decryptionIndex >= decryptions.length) revert MissingDecryptionData();
+                if (decryptionIndex >= decryptions.length) {
+                    revert MissingDecryptionData();
+                }
                 DecryptionData calldata dec = decryptions[decryptionIndex++];
 
                 // Step 1: Verify Chaum-Pedersen proof of correct shared secret derivation
