@@ -266,7 +266,7 @@ contract ZoneBridgeTest is BaseTest {
             to: to,
             amount: amount,
             bouncebackRecipient: to,
-            bouncebackFee: 0,
+            bouncebackFee: l1Portal.calculateBouncebackFee(),
             memo: memo
         });
 
@@ -880,7 +880,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: sender,
             amount: netAmount,
             bouncebackRecipient: sender,
-            bouncebackFee: 0,
+            bouncebackFee: l1Portal.calculateBouncebackFee(),
             keyIndex: keyIndex,
             encrypted: encrypted
         });
@@ -1097,6 +1097,7 @@ contract ZoneBridgeTest is BaseTest {
         // === STEP 2: Alice makes encrypted deposit on L1 ===
         uint128 depositAmount = 1000e6;
         uint128 fee = l1Portal.calculateDepositFee();
+        uint128 bouncebackFee = l1Portal.calculateBouncebackFee();
         uint128 netAmount = depositAmount - fee;
         EncryptedDepositPayload memory payload = _makeEncryptedPayload();
 
@@ -1137,7 +1138,7 @@ contract ZoneBridgeTest is BaseTest {
             to: alice,
             amount: netAmount,
             fee: 0,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             memo: bytes32(0),
             gasLimit: 0,
             fallbackRecipient: address(0),
@@ -1148,7 +1149,7 @@ contract ZoneBridgeTest is BaseTest {
         assertEq(l1Portal.withdrawalQueueSlot(0), expectedQueueHash);
 
         l1Portal.processWithdrawal(bounce, bytes32(0));
-        assertEq(l2ZoneToken.balanceOf(alice), aliceBeforeRefund + netAmount);
+        assertEq(l2ZoneToken.balanceOf(alice), aliceBeforeRefund + netAmount - bouncebackFee);
         assertEq(l2ZoneToken.balanceOf(address(l1Portal)), portalBeforeRefund - netAmount);
     }
 
@@ -1159,6 +1160,7 @@ contract ZoneBridgeTest is BaseTest {
 
         uint128 depositAmount = 1000e6;
         uint128 fee = l1Portal.calculateDepositFee();
+        uint128 bouncebackFee = l1Portal.calculateBouncebackFee();
         uint128 netAmount = depositAmount - fee;
 
         // === STEP 2: Alice makes a regular deposit ===
@@ -1198,7 +1200,7 @@ contract ZoneBridgeTest is BaseTest {
             to: alice,
             amount: depositAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             memo: bytes32("regular")
         });
         bytes32 prevHash = l2Inbox.processedDepositQueueHash();
@@ -1211,7 +1213,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: netAmount,
             bouncebackRecipient: bob,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             keyIndex: 0,
             encrypted: payload
         });
@@ -1225,7 +1227,7 @@ contract ZoneBridgeTest is BaseTest {
             to: carol,
             amount: depositAmount,
             bouncebackRecipient: carol,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             memo: bytes32("carol")
         });
         bytes32 hash3 = keccak256(abi.encode(DepositType.Regular, d3, hash2));
@@ -1301,6 +1303,7 @@ contract ZoneBridgeTest is BaseTest {
         // === STEP 2: Alice deposits with keyIndex=0 ===
         uint128 depositAmount = 1000e6;
         uint128 fee = l1Portal.calculateDepositFee();
+        uint128 bouncebackFee = l1Portal.calculateBouncebackFee();
         uint128 netAmount = depositAmount - fee;
         EncryptedDepositPayload memory payload1 = _makeEncryptedPayload();
 
@@ -1332,7 +1335,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: alice,
             amount: netAmount,
             bouncebackRecipient: alice,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             keyIndex: 0,
             encrypted: payload1
         });
@@ -1344,7 +1347,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: bob,
             amount: netAmount,
             bouncebackRecipient: bob,
-            bouncebackFee: 0,
+            bouncebackFee: bouncebackFee,
             keyIndex: 1,
             encrypted: payload2
         });
