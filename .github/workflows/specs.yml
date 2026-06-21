@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, dr/validium]
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
@@ -13,6 +15,8 @@ on:
   pull_request:
     branches: [main, dr/validium]
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
@@ -75,14 +79,52 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1.8.0
+      - name: Resolve Tempo revision
+        id: tempo-rev
+        run: |
+          rev="$(sed -nE 's/^tempo-precompiles = \{.*rev = "([^"]+)".*/\1/p' Cargo.toml)"
+          if [[ -z "$rev" ]]; then
+            echo "Failed to parse tempo-precompiles rev from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tempo
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          version: nightly
+          repository: tempoxyz/tempo
+          ref: ${{ steps.tempo-rev.outputs.rev }}
+          path: tempo
+          persist-credentials: false
+
+      - name: Checkout foundry
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: foundry-rs/foundry
+          ref: master
+          path: foundry
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: foundry
+
+      - name: Patch foundry to use pinned Tempo crates
+        run: tempo/scripts/foundry-patch.sh "$GITHUB_WORKSPACE/tempo" "$GITHUB_WORKSPACE/foundry"
+
+      - name: Build Tempo-capable forge
+        working-directory: foundry
+        run: cargo build --bin forge --profile release --no-default-features
 
       - name: Run Forge tests (zone-only)
         working-directory: specs/ref-impls
-        run: forge test -vvv --match-path "test/zone/**"
+        run: |
+          "$GITHUB_WORKSPACE/foundry/target/release/forge" test -vvv --match-path "test/zone/**"
 
   specs-success:
     name: specs success
