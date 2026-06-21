@@ -44,6 +44,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @dev Covers processWithdrawal overhead: queue dequeue, transfer, event emission
     uint64 public constant WITHDRAWAL_BASE_GAS = 50_000;
 
+    /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
+    uint256 internal constant TEMPO_GAS_RATE_SCALE = 1e12;
+
     /// @notice Length of a compressed secp256k1 public key
     uint256 public constant REVEAL_TO_KEY_LENGTH = 33;
 
@@ -134,7 +137,7 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Calculate the fee for a withdrawal with the given callback gas limit
     /// @dev Reverts if `gasLimit` exceeds MAX_WITHDRAWAL_GAS_LIMIT.
-    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
+    ///      Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12).
     /// @param gasLimit L1 callback gas limit (0 = no callback)
     /// @return fee The total fee in zone token units
     function calculateWithdrawalFee(uint64 gasLimit) public view returns (uint128 fee) {
@@ -486,11 +489,13 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Calculate the withdrawal processing fee for a validated gas limit
     /// @dev Caller must validate `gasLimit` with _validateGasLimit() first.
-    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
+    ///      Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12).
     /// @param gasLimit L1 callback gas limit included in the fee
     /// @return fee The total fee in zone token units
     function _calculateWithdrawalFee(uint64 gasLimit) internal view returns (uint128) {
-        return uint128(WITHDRAWAL_BASE_GAS + gasLimit) * _tempoGasRate();
+        uint256 gasFee = uint256(WITHDRAWAL_BASE_GAS + gasLimit) * _tempoGasRate();
+        // Round up after scaling so withdrawals do not underpay.
+        return uint128((gasFee + TEMPO_GAS_RATE_SCALE - 1) / TEMPO_GAS_RATE_SCALE);
     }
 
     function _validateRevealTo(bytes memory revealTo) internal view {

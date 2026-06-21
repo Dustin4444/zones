@@ -1125,7 +1125,7 @@ interface IZoneOutbox {
     function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock) external;
 
     /// @notice Calculate the fee for a withdrawal with the given gasLimit
-    /// @dev Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
+    /// @dev Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12)
     function calculateWithdrawalFee(uint64 gasLimit) external view returns (uint128);
 
     /// @notice Request a withdrawal from the zone back to Tempo
