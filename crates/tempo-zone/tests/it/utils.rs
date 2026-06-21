@@ -39,6 +39,8 @@ use zone_primitives::constants::PORTAL_TEMPO_GAS_RATE_SLOT;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
+use k256::SecretKey;
+use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
 use tempo_alloy::TempoNetwork;
 use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 
@@ -518,6 +520,7 @@ impl ZoneTestNode {
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
+        let l1_provider_url = l1_ws_url.clone();
 
         let mut genesis = custom_genesis.unwrap_or_else(|| {
             serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))
@@ -533,15 +536,7 @@ impl ZoneTestNode {
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_initial_tokens(vec![])
-        .with_sequencer(zone::ZoneSequencerAddOnsConfig {
-            sequencer_signer,
-            zone_id: 0,
-            zone_poll_interval: std::time::Duration::from_secs(1),
-            batch_interval: std::time::Duration::from_secs(60),
-            batch_anchor_config: zone::BatchAnchorConfig::default(),
-            withdrawal_poll_interval: std::time::Duration::from_secs(5),
-        });
+        .with_initial_tokens(vec![]);
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
@@ -571,6 +566,35 @@ impl ZoneTestNode {
             .node(zone_node)
             .launch_with_debug_capabilities()
             .await?;
+
+        let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect(&l1_provider_url)
+            .await?
+            .erased();
+        let policy_provider = zone::PolicyProvider::new(
+            policy_cache.clone(),
+            l1_provider,
+            tokio::runtime::Handle::current(),
+        );
+        let provider = node_handle.node.provider();
+        let last_header = provider
+            .sealed_header(provider.best_block_number()?)?
+            .ok_or_else(|| eyre::eyre!("no latest block header"))?;
+        let engine = zone::ZoneEngine::new(
+            provider.chain_spec(),
+            node_handle.node.add_ons_handle.beacon_engine_handle.clone(),
+            node_handle.node.payload_builder_handle.clone(),
+            deposit_queue.clone(),
+            last_header,
+            sequencer_signer.address(),
+            SecretKey::from(sequencer_signer.credential()),
+            portal_address,
+            policy_provider,
+        );
+        node_handle
+            .node
+            .task_executor
+            .spawn_critical_task("zone-engine", engine.run());
 
         let http_url: url::Url = node_handle
             .node
