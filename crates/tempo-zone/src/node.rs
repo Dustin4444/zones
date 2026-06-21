@@ -123,8 +123,6 @@ pub struct ZoneNode {
     initial_tokens: Option<Vec<Address>>,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
-    /// Optional signer used only for ZoneEngine block production.
-    zone_engine_signer: Option<PrivateKeySigner>,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
 }
@@ -168,7 +166,6 @@ impl ZoneNode {
             portal_address,
             initial_tokens: None,
             private_rpc_config: ZonePrivateRpcConfig::default(),
-            zone_engine_signer: None,
             sequencer_config: None,
         }
     }
@@ -183,15 +180,6 @@ impl ZoneNode {
     /// withdrawal processing tasks are spawned during node launch.
     pub fn with_sequencer(mut self, config: ZoneSequencerAddOnsConfig) -> Self {
         self.sequencer_config = Some(config);
-        self
-    }
-
-    /// Set the signer used by [`ZoneEngine`] without launching L1 sequencer tasks.
-    ///
-    /// This is useful for tests that need L1-driven block production but spawn
-    /// batch submission and withdrawal processing explicitly.
-    pub fn with_zone_engine(mut self, sequencer_signer: PrivateKeySigner) -> Self {
-        self.zone_engine_signer = Some(sequencer_signer);
         self
     }
 
@@ -274,8 +262,6 @@ where
     initial_tokens: Option<Vec<Address>>,
     /// Private RPC configuration.
     private_rpc_config: ZonePrivateRpcConfig,
-    /// ZoneEngine-only signer.
-    zone_engine_signer: Option<PrivateKeySigner>,
     /// Sequencer configuration.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
 }
@@ -302,7 +288,6 @@ where
         portal_address: Address,
         initial_tokens: Option<Vec<Address>>,
         private_rpc_config: ZonePrivateRpcConfig,
-        zone_engine_signer: Option<PrivateKeySigner>,
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     ) -> Self {
         Self {
@@ -320,7 +305,6 @@ where
             portal_address,
             initial_tokens,
             private_rpc_config,
-            zone_engine_signer,
             sequencer_config,
         }
     }
@@ -361,14 +345,9 @@ where
         self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
-        let zone_engine_signer = self.zone_engine_signer.as_ref().or_else(|| {
-            self.sequencer_config
-                .as_ref()
-                .map(|config| &config.sequencer_signer)
-        });
-        if let Some(signer) = zone_engine_signer {
-            let sequencer_addr = signer.address();
-            let sequencer_key = SecretKey::from(signer.credential());
+        if let Some(ref config) = self.sequencer_config {
+            let sequencer_addr = config.sequencer_signer.address();
+            let sequencer_key = SecretKey::from(config.sequencer_signer.credential());
             self.spawn_zone_engine(l1_provider, &ctx, sequencer_addr, sequencer_key)?;
         }
 
@@ -696,7 +675,6 @@ where
             self.portal_address,
             self.initial_tokens.clone(),
             self.private_rpc_config.clone(),
-            self.zone_engine_signer.clone(),
             self.sequencer_config.clone(),
         )
     }
