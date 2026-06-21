@@ -4,8 +4,6 @@ on:
   push:
     branches: [main, dr/validium]
     paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
@@ -15,8 +13,6 @@ on:
   pull_request:
     branches: [main, dr/validium]
     paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
       - "specs/ref-impls/src/**"
       - "specs/ref-impls/test/**"
       - "specs/ref-impls/foundry.toml"
