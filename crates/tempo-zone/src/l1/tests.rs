@@ -735,6 +735,86 @@ fn test_enqueue_and_transition_consistency() {
     );
 }
 
+#[tokio::test]
+async fn test_prepare_rejects_unauthorized_encrypted_deposit_without_decryption_data() {
+    use k256::{AffinePoint, ProjectivePoint, Scalar};
+    use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+
+    let token = address!("0x0000000000000000000000000000000000001000");
+    let sender = address!("0x0000000000000000000000000000000000001234");
+    let unauthorized_recipient = address!("0x000000000000000000000000000000000000BEEF");
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let block_number = 10;
+
+    let sequencer_key = k256::SecretKey::from_slice(&[0x11; 32]).expect("valid key");
+    let seq_scalar: Scalar = *sequencer_key.to_nonzero_scalar();
+    let seq_pub = AffinePoint::from(ProjectivePoint::GENERATOR * seq_scalar);
+    let (seq_pub_x, seq_pub_y_parity) =
+        crate::precompiles::ecies::compressed_x_and_parity(&seq_pub);
+    let encrypted = crate::precompiles::ecies::encrypt_deposit(
+        &seq_pub_x,
+        seq_pub_y_parity,
+        unauthorized_recipient,
+        B256::ZERO,
+        portal,
+        U256::ZERO,
+    )
+    .expect("encrypted deposit should be valid");
+
+    let policy_cache = crate::PolicyCache::default();
+    {
+        let mut cache = policy_cache.write();
+        cache.set_token_policy(token, block_number, 2);
+        cache.set_policy_type(2, PolicyType::BLACKLIST);
+        cache.set_policy_status(2, unauthorized_recipient, block_number, true);
+    }
+    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_mocked_client(Asserter::new())
+        .erased();
+    let policy_provider =
+        crate::PolicyProvider::new(policy_cache, provider, tokio::runtime::Handle::current());
+
+    let block = L1BlockDeposits {
+        header: seal(make_test_header(block_number)),
+        events: L1PortalEvents::from_deposits(vec![L1Deposit::Encrypted(EncryptedDeposit {
+            token,
+            sender,
+            amount: 1_000_000,
+            fee: 0,
+            bounceback_recipient: sender,
+            bounceback_fee: 300_000,
+            key_index: U256::ZERO,
+            ephemeral_pubkey_x: encrypted.eph_pub_x,
+            ephemeral_pubkey_y_parity: encrypted.eph_pub_y_parity,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            tag: encrypted.tag,
+        })]),
+        policy_events: vec![],
+        queue_hash_before: B256::ZERO,
+        queue_hash_after: B256::ZERO,
+    };
+
+    let prepared = block
+        .prepare(&sequencer_key, portal, &policy_provider)
+        .await
+        .expect("cached policy check should prepare block");
+
+    assert_eq!(prepared.queued_deposits.len(), 1);
+    assert_eq!(
+        prepared.queued_deposits[0].depositType,
+        DepositType::Encrypted
+    );
+    assert!(
+        prepared.queued_deposits[0].rejected,
+        "unauthorized encrypted recipient must be rejected for deposit bounce-back"
+    );
+    assert!(
+        prepared.decryptions.is_empty(),
+        "rejected encrypted deposits must not consume DecryptionData"
+    );
+}
+
 #[test]
 fn test_last_enqueued_survives_pop_and_drain() {
     let queue = DepositQueue::new();

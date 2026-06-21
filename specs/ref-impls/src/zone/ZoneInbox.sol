@@ -179,7 +179,7 @@ contract ZoneInbox is IZoneInbox {
     ///      Protocol and proof enforce at most one call at the start of a block (or zero if skipping).
     /// @param header RLP-encoded Tempo block header
     /// @param deposits Array of queued deposits to process (oldest first, must be contiguous)
-    /// @param decryptions Decryption data for encrypted deposits (1:1 with encrypted deposits, in order)
+    /// @param decryptions Decryption data for non-rejected encrypted deposits, in order
     function advanceTempo(
         bytes calldata header,
         QueuedDeposit[] calldata deposits,
