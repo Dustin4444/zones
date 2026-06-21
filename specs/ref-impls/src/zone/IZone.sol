@@ -148,7 +148,7 @@ struct ChaumPedersenProof {
 }
 
 /// @notice Decryption data provided by sequencer for encrypted deposits
-/// @dev Must match 1:1 with non-rejected encrypted deposits in the queue (in order of appearance).
+/// @dev Must match 1:1 with encrypted deposits in the queue (in order of appearance).
 ///      Includes a Chaum-Pedersen proof to verify the shared secret was correctly derived
 ///      without exposing the sequencer's private key.
 ///      The sequencer's public key is looked up from the deposit's keyIndex on-chain,
