@@ -168,7 +168,6 @@ crate::sol! {
         function depositCount() external view returns (uint64);
         function lastProcessedDepositNumber() external view returns (uint64);
         function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
-        function tempoGasRate() external view returns (uint128);
 
         // -- State-changing functions --
 
@@ -198,7 +197,6 @@ crate::sol! {
 
         function rpcUrl() external view returns (string memory);
         function setRpcUrl(string calldata rpcUrl) external;
-        function setTempoGasRate(uint128 _tempoGasRate) external;
 
         function depositEncrypted(
             address token,

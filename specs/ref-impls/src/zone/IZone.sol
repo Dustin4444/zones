@@ -381,12 +381,11 @@ interface IZoneTxContext {
 //   slot 6: _encryptionKeys (EncryptionKeyEntry[])
 //   slot 7: _tokenConfigs (mapping(address => TokenConfig))
 //   slot 8: _enabledTokens (address[])
-//   slot 9: tempoGasRate (uint128)
-//   slot 10: refunds (mapping(address => mapping(address => uint128)))
-//   slot 11: _withdrawalQueue.head
-//   slot 12: _withdrawalQueue.tail
-//   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
-//   slot 14: rpcUrl (string)
+//   slot 9: refunds (mapping(address => mapping(address => uint128)))
+//   slot 10: _withdrawalQueue.head
+//   slot 11: _withdrawalQueue.tail
+//   slot 12: _withdrawalQueue.slots (mapping(uint256 => bytes32))
+//   slot 13: rpcUrl (string)
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -398,7 +397,6 @@ bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(4));
 bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(6));
 bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(7));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(8));
-bytes32 constant PORTAL_TEMPO_GAS_RATE_SLOT = bytes32(uint256(9));
 
 /// @title IVerifier
 /// @notice Interface for zone proof/attestation verification
@@ -594,7 +592,6 @@ interface IZonePortal {
         bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock
     );
     event ZoneGasRateUpdated(uint128 zoneGasRate);
-    event TempoGasRateUpdated(uint128 tempoGasRate);
 
     /// @notice Emitted when sequencer enables a new TIP-20 token for bridging
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
@@ -649,8 +646,6 @@ interface IZonePortal {
     function pendingSequencer() external view returns (address);
 
     function zoneGasRate() external view returns (uint128);
-
-    function tempoGasRate() external view returns (uint128);
 
     function verifier() external view returns (address);
 
@@ -760,10 +755,6 @@ interface IZonePortal {
     /// @notice Set zone gas rate. Only callable by sequencer.
     /// @param _zoneGasRate Zone token units per gas unit on the zone
     function setZoneGasRate(uint128 _zoneGasRate) external;
-
-    /// @notice Set Tempo gas rate. Only callable by sequencer.
-    /// @param _tempoGasRate Token units per gas unit on Tempo
-    function setTempoGasRate(uint128 _tempoGasRate) external;
 
     /// @notice Calculate the fee for a deposit
     function calculateDepositFee() external view returns (uint128 fee);
@@ -1096,6 +1087,8 @@ interface IZoneOutbox {
         bytes revealTo
     );
 
+    event TempoGasRateUpdated(uint128 tempoGasRate);
+
     event MaxWithdrawalsPerBlockUpdated(uint256 maxWithdrawalsPerBlock);
 
     /// @notice Emitted when sequencer finalizes a batch at end of block
@@ -1104,6 +1097,10 @@ interface IZoneOutbox {
 
     /// @notice Zone configuration (reads sequencer from L1)
     function config() external view returns (IZoneConfig);
+
+    /// @notice Tempo gas rate (zone token units per gas unit on Tempo)
+    /// @dev Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
+    function tempoGasRate() external view returns (uint128);
 
     /// @notice Next withdrawal index (monotonically increasing)
     function nextWithdrawalIndex() external view returns (uint64);
@@ -1120,12 +1117,17 @@ interface IZoneOutbox {
     /// @notice Maximum number of withdrawal requests per zone block (0 = unlimited)
     function maxWithdrawalsPerBlock() external view returns (uint256);
 
+    /// @notice Set Tempo gas rate. Only callable by sequencer.
+    /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price fluctuations.
+    /// @param _tempoGasRate Zone token units per gas unit on Tempo
+    function setTempoGasRate(uint128 _tempoGasRate) external;
+
     /// @notice Set maximum withdrawal requests per zone block. Only callable by sequencer.
     /// @dev Set to 0 for unlimited. Provides rate-limiting in addition to the gas fee mechanism.
     function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock) external;
 
     /// @notice Calculate the fee for a withdrawal with the given gasLimit
-    /// @dev Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12)
+    /// @dev Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
     function calculateWithdrawalFee(uint64 gasLimit) external view returns (uint128);
 
     /// @notice Request a withdrawal from the zone back to Tempo

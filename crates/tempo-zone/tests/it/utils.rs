@@ -2,14 +2,18 @@ use alloy::genesis::Genesis;
 use alloy_consensus::Header;
 use alloy_eips::NumHash;
 use alloy_primitives::{Address, B256, U256, address, keccak256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_eth::Filter;
+use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
+use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::{SolEvent, SolValue};
 use eyre::WrapErr;
+use k256::SecretKey;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
 use reth_node_core::args::RpcServerArgs;
+use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
@@ -22,27 +26,20 @@ use std::{
     },
     time::Duration,
 };
-use tempo_chainspec::spec::{TEMPO_T1_BASE_FEE, TempoChainSpec};
+use tempo_alloy::TempoNetwork;
+use tempo_chainspec::spec::TempoChainSpec;
 use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS,
     account_keychain::IAccountKeychain::{
         IAccountKeychainInstance, SignatureType as KeyInfoSignatureType,
     },
 };
+use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use zone::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
     ZoneNode,
 };
-use zone_primitives::constants::PORTAL_TEMPO_GAS_RATE_SLOT;
-
-use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::BlockNumberOrTag;
-use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
-use k256::SecretKey;
-use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
-use tempo_alloy::TempoNetwork;
-use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -828,35 +825,6 @@ impl L1TestNode {
             .erased()
     }
 
-    fn provider_with_signer(
-        &self,
-        signer: alloy_signer_local::PrivateKeySigner,
-    ) -> alloy_provider::DynProvider {
-        ProviderBuilder::new()
-            .wallet(signer)
-            .connect_http(self.http_url.clone())
-            .erased()
-    }
-
-    async fn set_test_tempo_gas_rate(
-        &self,
-        portal_address: Address,
-        sequencer_signer: alloy_signer_local::PrivateKeySigner,
-    ) -> eyre::Result<()> {
-        use zone::abi::ZonePortal;
-
-        let provider = self.provider_with_signer(sequencer_signer);
-        let portal = ZonePortal::new(portal_address, &provider);
-        let receipt = portal
-            .setTempoGasRate(0)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
-        eyre::ensure!(receipt.status(), "setTempoGasRate failed");
-        Ok(())
-    }
-
     /// Deploy the ZoneFactory and create a zone in one step.
     ///
     /// Combines [`deploy_zone_factory`](Self::deploy_zone_factory) and
@@ -1034,12 +1002,8 @@ impl L1TestNode {
     /// Captures the current L1 header as the genesis anchor, then calls
     /// `createZone()` with pathUSD as the token and the dev account as sequencer.
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
-        let portal_address = self
-            .create_zone_with_sequencer(factory_address, self.dev_address())
-            .await?;
-        self.set_test_tempo_gas_rate(portal_address, self.dev_signer())
-            .await?;
-        Ok(portal_address)
+        self.create_zone_with_sequencer(factory_address, self.dev_address())
+            .await
     }
 
     /// Create a zone on an existing ZoneFactory with a custom sequencer address.
@@ -1151,8 +1115,6 @@ impl L1TestNode {
         let portal_b = self
             .create_zone_with_sequencer(factory, sequencer_b.address())
             .await?;
-        self.set_test_tempo_gas_rate(portal_a, sequencer_a).await?;
-        self.set_test_tempo_gas_rate(portal_b, sequencer_b).await?;
         let router = self.deploy_router(factory).await?;
         Ok((portal_a, portal_b, router))
     }
@@ -3043,7 +3005,6 @@ impl L1Fixture {
     ) {
         let mut cache = cache.write();
         let deposit_queue_hash_slot = B256::with_last_byte(4);
-        let tempo_gas_rate = B256::from(U256::from(TEMPO_T1_BASE_FEE));
 
         for block in 0..=num_blocks {
             let mut sequencer_bytes = [0u8; 32];
@@ -3057,13 +3018,6 @@ impl L1Fixture {
             // Deposit queue hash slot (4) — read by ZoneInbox after finalizeTempo.
             // The initial value is B256::ZERO (empty queue).
             cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO);
-            // Tempo gas rate slot (9) — read by ZoneOutbox fee calculation.
-            cache.set(
-                portal_address,
-                PORTAL_TEMPO_GAS_RATE_SLOT,
-                block,
-                tempo_gas_rate,
-            );
         }
 
         cache.update_anchor(NumHash {

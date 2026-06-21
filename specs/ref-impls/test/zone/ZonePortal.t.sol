@@ -175,8 +175,6 @@ contract ZonePortalTest is BaseTest {
         address portalAddr;
         (testZoneId, portalAddr) = zoneFactory.createZone(params);
         portal = ZonePortal(portalAddr);
-        vm.prank(admin);
-        portal.setTempoGasRate(0);
 
         // Get the messenger
         ZoneInfo memory info = zoneFactory.zones(testZoneId);

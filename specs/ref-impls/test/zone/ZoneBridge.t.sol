@@ -162,8 +162,6 @@ contract ZoneBridgeTest is BaseTest {
             genesisTempoBlockNumber,
             ""
         );
-        vm.prank(admin);
-        l1Portal.setTempoGasRate(0);
         zoneId = 1;
 
         // === Deploy zone contracts ===

@@ -106,8 +106,6 @@ contract ZoneIntegrationTest is BaseTest {
             genesisTempoBlockNumber,
             ""
         );
-        vm.prank(admin);
-        l1Portal.setTempoGasRate(0);
         zoneId = 1;
 
         // L2 setup

@@ -51,8 +51,11 @@ contract ZonePortal is IZonePortal {
     /// @dev Priced against Tempo gas because the refund is paid on Tempo.
     uint64 public constant FIXED_BOUNCEBACK_GAS = 300_000;
 
-    /// @notice Default Tempo gas rate used to price deposit bounce-back and withdrawal fees.
+    /// @notice Fixed Tempo gas rate used to price deposit bounce-back fees.
     uint128 public constant TEMPO_T1_BASE_FEE = 20_000_000_000;
+
+    /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
+    uint256 internal constant TEMPO_BASE_FEE_SCALE = 1e12;
 
     /// @notice Maximum gas a withdrawal callback may request
     /// @dev Over-cap legacy withdrawals are dequeued and bounced back in `processWithdrawal`.
@@ -112,10 +115,6 @@ contract ZonePortal is IZonePortal {
     /// @dev Tokens can never be removed from this list (non-custodial guarantee).
     address[] internal _enabledTokens;
 
-    /// @notice Tempo gas rate used for deposit bounce-back fees.
-    /// @dev Stored after the token registry to preserve existing cross-domain slot constants.
-    uint128 public tempoGasRate;
-
     /// @notice Refunds parked after a deposit bounce-back transfer reverts on Tempo.
     mapping(address token => mapping(address owner => uint128 amount)) public refunds;
 
@@ -146,7 +145,6 @@ contract ZonePortal is IZonePortal {
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
         rpcUrl = _rpcUrl;
-        tempoGasRate = TEMPO_T1_BASE_FEE;
 
         // Enable the initial token
         _enableTokenInternal(_initialToken);
@@ -190,14 +188,6 @@ contract ZonePortal is IZonePortal {
         if (_zoneGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
         zoneGasRate = _zoneGasRate;
         emit ZoneGasRateUpdated(_zoneGasRate);
-    }
-
-    /// @notice Set Tempo gas rate. Only callable by sequencer.
-    /// @param _tempoGasRate Token units per gas unit on Tempo
-    function setTempoGasRate(uint128 _tempoGasRate) external onlySequencer {
-        if (_tempoGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
-        tempoGasRate = _tempoGasRate;
-        emit TempoGasRateUpdated(_tempoGasRate);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -510,10 +500,12 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Calculate the reserved fee for a failed-deposit bounce-back
-    /// @dev Fee = FIXED_BOUNCEBACK_GAS * tempoGasRate
+    /// @dev Fee = ceil(FIXED_BOUNCEBACK_GAS * TEMPO_T1_BASE_FEE / 1e12)
     /// @return fee The bounce-back fee in token units
-    function calculateBouncebackFee() public view returns (uint128 fee) {
-        fee = uint128(FIXED_BOUNCEBACK_GAS) * tempoGasRate;
+    function calculateBouncebackFee() public pure returns (uint128 fee) {
+        uint256 gasFee = uint256(FIXED_BOUNCEBACK_GAS) * TEMPO_T1_BASE_FEE;
+        // Round up after scaling so bounce-backs do not underpay.
+        fee = uint128((gasFee + TEMPO_BASE_FEE_SCALE - 1) / TEMPO_BASE_FEE_SCALE);
     }
 
     /// @notice Deposit a TIP-20 token into the zone. Returns the new current deposit queue hash.

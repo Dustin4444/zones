@@ -198,7 +198,6 @@ The following table lists every privileged action and the role authorized to inv
 | `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setZoneGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
-| `setTempoGasRate(rate)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setSequencerEncryptionKey(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `setRpcUrl(url)` | [`ZonePortal`](#izoneportal) | **sequencer** |
 | `submitBatch(...)` | [`ZonePortal`](#izoneportal) | **sequencer** |
@@ -292,16 +291,15 @@ The portal maintains a `TokenConfig` per token with an `enabled` flag and a conf
 
 ### Gas Rate Configuration
 
-The sequencer configures two gas rates that determine fees for deposits, withdrawals, and bounce-backs. Each rate is the price (in token units) of one gas unit on the chain where the work runs:
+The sequencer configures the zone gas rate used for deposit fees:
 
 | Rate | Set via | Used for |
 |------|---------|----------|
 | `zoneGasRate` | `ZonePortal.setZoneGasRate()` | Deposit fees: `FIXED_DEPOSIT_GAS (100,000) * zoneGasRate` |
-| `tempoGasRate` | `ZonePortal.setTempoGasRate()` | Deposit bounce-back fees on Tempo: `ceil(FIXED_BOUNCEBACK_GAS (300,000) * tempoGasRate / 1e12)`; withdrawal fees on Tempo: `ceil((WITHDRAWAL_BASE_GAS (50,000) + gasLimit) * tempoGasRate / 1e12)` |
 
-Both rates live on `ZonePortal` on Tempo and are set by the sequencer. `zoneGasRate` is read on Tempo at deposit time. `tempoGasRate` is read on Tempo at deposit time (for the bounce-back fee snapshot) and on the zone at withdrawal-request time, where the outbox proxies it through the [`TempoState`](#tempostate-predeploy) predeploy via `readTempoStorageSlot(ZONE_PORTAL, TEMPO_GAS_RATE_SLOT)`. Both fees are snapshotted onto the queued entry, so in-flight rate changes never retroactively raise the fee on already-queued items.
+`zoneGasRate` lives on `ZonePortal` on Tempo and is read on Tempo at deposit time. Deposit fees are snapshotted onto the queued entry, so in-flight rate changes never retroactively raise the fee on already-queued deposits.
 
-`tempoGasRate` defaults to `TEMPO_T1_BASE_FEE = 20,000,000,000`, an 18-decimal fixed-point TIP-20 amount per gas unit. Because all supported TIP-20s use 6 decimals, fees are computed as `ceil(gasAmount * tempoGasRate / 1e12)` and paid in the same TIP-20 being deposited or withdrawn. The sequencer takes the risk on gas-price fluctuations: if actual costs exceed the fee collected, the sequencer covers the difference; if they are lower, the sequencer keeps the surplus.
+Deposit bounce-back fees use fixed `TEMPO_T1_BASE_FEE = 20,000,000,000`, an 18-decimal fixed-point TIP-20 amount per gas unit. Because all supported TIP-20s use 6 decimals, the fixed bounce-back fee is computed as `ceil(FIXED_BOUNCEBACK_GAS * TEMPO_T1_BASE_FEE / 1e12)` and paid in the same TIP-20 being deposited.
 
 ### Encryption Key Management
 
@@ -332,7 +330,7 @@ A user deposits by calling `deposit(token, to, amount, memo, bouncebackRecipient
 
 1. Validates the token is enabled and deposits are active.
 2. Requires `bouncebackRecipient != address(0)` (reverts otherwise).
-3. Snapshots the deposit fee at the current `zoneGasRate` and the bounce-back fee at the current portal-side `tempoGasRate` (see [Deposit Fees](#deposit-fees)), and requires `amount >= depositFee + bouncebackFee` (reverts `DepositTooSmall` otherwise). The bounce-back fee covers the worst-case Tempo gas of paying out a refund (including new-account creation for `bouncebackRecipient`), so it is priced in Tempo gas, not zone gas.
+3. Snapshots the deposit fee at the current `zoneGasRate` and the fixed bounce-back fee (see [Deposit Fees](#deposit-fees)), and requires `amount >= depositFee + bouncebackFee` (reverts `DepositTooSmall` otherwise). The bounce-back fee covers the worst-case Tempo gas of paying out a refund (including new-account creation for `bouncebackRecipient`), so it is priced in Tempo gas, not zone gas.
 4. Transfers `amount` from the user into the portal.
 5. Pays the `depositFee` to the sequencer immediately. The `bouncebackFee` is reserved on the queued entry; it is only consumed if the deposit later bounces back.
 6. Appends the deposit to the deposit queue hash chain with the net amount (`amount - depositFee`), `bouncebackRecipient`, and the snapshotted `bouncebackFee`.
@@ -363,10 +361,10 @@ Every deposit is associated with two separate fees, both paid in the same token 
 
 ```
 depositFee    = 100,000 * zoneGasRate
-bouncebackFee = ceil(300,000 * tempoGasRate / 1e12)
+bouncebackFee = ceil(300,000 * TEMPO_T1_BASE_FEE / 1e12)
 ```
 
-`zoneGasRate` and `tempoGasRate` both live on `ZonePortal` on Tempo and are sequencer-managed there via `setZoneGasRate()` / `setTempoGasRate()` (see [Gas Rate Configuration](#gas-rate-configuration)). The same `tempoGasRate` is used for withdrawal fees on Tempo; the zone reads it from Tempo state via the [`TempoState`](#tempostate-predeploy) predeploy when computing withdrawal fees at request time.
+`zoneGasRate` lives on `ZonePortal` on Tempo and is sequencer-managed there via `setZoneGasRate()` (see [Gas Rate Configuration](#gas-rate-configuration)). `TEMPO_T1_BASE_FEE` is fixed for deposit bounce-back fees in this version.
 
 The two fees are conceptually independent because their work happens on different chains:
 
@@ -580,8 +578,8 @@ sequenceDiagram
 The withdrawal fee compensates the sequencer for Tempo-side gas costs:
 
 ```
-fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12)
-    = ceil((50,000 + gasLimit) * tempoGasRate / 1e12)
+fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
+    = (50,000 + gasLimit) * tempoGasRate
 ```
 
 `WITHDRAWAL_BASE_GAS` (50,000) covers the fixed overhead of processing a withdrawal on Tempo (queue dequeue, transfer, event emission). The user specifies `gasLimit` covering any additional Tempo L1 callback gas. `gasLimit` must be less than or equal to `MAX_WITHDRAWAL_GAS_LIMIT` (10,000,000), which keeps the outer `processWithdrawal` transaction below the Tempo L1 block gas limit after portal overhead and the EIP-150 cushion are added. For simple withdrawals with no callback, use `gasLimit = 0`. The fee is paid in the same token being withdrawn. On success, `amount` goes to the recipient and `fee` goes to the sequencer. On failure (bounce-back), only `amount` is re-deposited to `fallbackRecipient`. The sequencer keeps the fee regardless of outcome.
@@ -1560,7 +1558,6 @@ interface IZonePortal {
     event SequencerTransferred(address indexed previousSequencer, address indexed newSequencer);
     event SequencerEncryptionKeyUpdated(bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock);
     event ZoneGasRateUpdated(uint128 zoneGasRate);
-    event TempoGasRateUpdated(uint128 tempoGasRate);
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
     event DepositsPaused(address indexed token);
     event DepositsResumed(address indexed token);
@@ -1625,11 +1622,6 @@ interface IZonePortal {
     function transferSequencer(address newSequencer) external;
     function acceptSequencer() external;
     function setZoneGasRate(uint128 _zoneGasRate) external;
-    /// @notice Set the canonical Tempo gas rate. Used to price both deposit-bounce-back
-    ///         fees on Tempo and withdrawal fees on Tempo (the latter is read by the
-    ///         zone via the TempoState predeploy).
-    function setTempoGasRate(uint128 _tempoGasRate) external;
-    function tempoGasRate() external view returns (uint128);
     function zoneGasRate() external view returns (uint128);
 
     // Encryption keys
@@ -1782,7 +1774,7 @@ Address: `0x1c00000000000000000000000000000000000002`
 interface IZoneOutbox {
     event WithdrawalRequested(
         uint64 indexed withdrawalIndex, address indexed sender, address token, address to,
-        uint128 amount, uint128 fee, bytes32 memo, uint64 gasLimit,
+        uint128 amount, uint128 fee, uint128 bouncebackFee, bytes32 memo, uint64 gasLimit,
         address fallbackRecipient, bytes data, bytes revealTo
     );
     event MaxWithdrawalsPerBlockUpdated(uint256 maxWithdrawalsPerBlock);

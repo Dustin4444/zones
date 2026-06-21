@@ -8,7 +8,6 @@ import {
     IZoneTxContext,
     LastBatch,
     MAX_WITHDRAWAL_CALLBACK_GAS,
-    PORTAL_TEMPO_GAS_RATE_SLOT,
     PendingWithdrawal,
     Withdrawal,
     ZONE_INBOX,
@@ -44,9 +43,6 @@ contract ZoneOutbox is IZoneOutbox {
     /// @dev Covers processWithdrawal overhead: queue dequeue, transfer, event emission
     uint64 public constant WITHDRAWAL_BASE_GAS = 50_000;
 
-    /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
-    uint256 internal constant TEMPO_GAS_RATE_SCALE = 1e12;
-
     /// @notice Length of a compressed secp256k1 public key
     uint256 public constant REVEAL_TO_KEY_LENGTH = 33;
 
@@ -68,6 +64,11 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Zone configuration (reads sequencer from L1)
     IZoneConfig public immutable config;
+
+    /// @notice Tempo gas rate (zone token units per gas unit on Tempo)
+    /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price changes.
+    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
+    uint128 public tempoGasRate;
 
     /// @notice Next withdrawal index (monotonically increasing)
     uint64 public nextWithdrawalIndex;
@@ -126,6 +127,18 @@ contract ZoneOutbox is IZoneOutbox {
                             FEE CONFIGURATION
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Set Tempo gas rate. Only callable by sequencer.
+    /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price fluctuations.
+    ///      If actual Tempo gas is higher, sequencer covers the difference.
+    ///      If actual Tempo gas is lower, sequencer keeps the surplus.
+    /// @param _tempoGasRate Zone token units per gas unit on Tempo
+    function setTempoGasRate(uint128 _tempoGasRate) external {
+        if (msg.sender != address(0) && msg.sender != config.sequencer()) revert OnlySequencer();
+        if (_tempoGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
+        tempoGasRate = _tempoGasRate;
+        emit TempoGasRateUpdated(_tempoGasRate);
+    }
+
     /// @notice Set maximum withdrawal requests per zone block. Only callable by sequencer.
     /// @dev Set to 0 for unlimited. Provides rate-limiting in addition to the gas fee mechanism.
     /// @param _maxWithdrawalsPerBlock The maximum number of requestWithdrawal() calls per block
@@ -137,18 +150,12 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Calculate the fee for a withdrawal with the given callback gas limit
     /// @dev Reverts if `gasLimit` exceeds MAX_WITHDRAWAL_GAS_LIMIT.
-    ///      Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12).
+    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
     /// @param gasLimit L1 callback gas limit (0 = no callback)
     /// @return fee The total fee in zone token units
     function calculateWithdrawalFee(uint64 gasLimit) public view returns (uint128 fee) {
         _validateGasLimit(gasLimit);
         fee = _calculateWithdrawalFee(gasLimit);
-    }
-
-    function _tempoGasRate() internal view returns (uint128) {
-        bytes32 value = config.tempoState()
-            .readTempoStorageSlot(config.tempoPortal(), PORTAL_TEMPO_GAS_RATE_SLOT);
-        return uint128(uint256(value));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -489,13 +496,11 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Calculate the withdrawal processing fee for a validated gas limit
     /// @dev Caller must validate `gasLimit` with _validateGasLimit() first.
-    ///      Fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12).
+    ///      Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
     /// @param gasLimit L1 callback gas limit included in the fee
     /// @return fee The total fee in zone token units
     function _calculateWithdrawalFee(uint64 gasLimit) internal view returns (uint128) {
-        uint256 gasFee = uint256(WITHDRAWAL_BASE_GAS + gasLimit) * _tempoGasRate();
-        // Round up after scaling so withdrawals do not underpay.
-        return uint128((gasFee + TEMPO_GAS_RATE_SCALE - 1) / TEMPO_GAS_RATE_SCALE);
+        return uint128(WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate;
     }
 
     function _validateRevealTo(bytes memory revealTo) internal view {

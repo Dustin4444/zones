@@ -4,7 +4,6 @@ pragma solidity ^0.8.13;
 import {
     IZoneOutbox,
     LastBatch,
-    PORTAL_TEMPO_GAS_RATE_SLOT,
     Withdrawal,
     ZONE_INBOX,
     ZONE_TX_CONTEXT
@@ -592,20 +591,6 @@ contract ZoneOutboxTest is Test {
 
         vm.expectRevert(ZoneOutbox.GasLimitTooHigh.selector);
         outbox.calculateWithdrawalFee(highGasLimit);
-    }
-
-    function test_calculateWithdrawalFee_scalesTempoGasRateToTip20Units() public {
-        tempoState.setMockStorageValue(
-            mockPortal, PORTAL_TEMPO_GAS_RATE_SLOT, bytes32(uint256(20_000_000_000))
-        );
-
-        assertEq(outbox.calculateWithdrawalFee(0), 1_000);
-        assertEq(outbox.calculateWithdrawalFee(50_000), 2_000);
-
-        tempoState.setMockStorageValue(
-            mockPortal, PORTAL_TEMPO_GAS_RATE_SLOT, bytes32(uint256(1))
-        );
-        assertEq(outbox.calculateWithdrawalFee(0), 1);
     }
 
     function test_requestWithdrawal_validRevealTo_ok() public {
