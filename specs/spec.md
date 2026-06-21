@@ -297,11 +297,11 @@ The sequencer configures two gas rates that determine fees for deposits, withdra
 | Rate | Set via | Used for |
 |------|---------|----------|
 | `zoneGasRate` | `ZonePortal.setZoneGasRate()` | Deposit fees: `FIXED_DEPOSIT_GAS (100,000) * zoneGasRate` |
-| `tempoGasRate` | `ZonePortal.setTempoGasRate()` | Deposit bounce-back fees on Tempo: `FIXED_BOUNCEBACK_GAS (300,000) * tempoGasRate`; withdrawal fees on Tempo: `(WITHDRAWAL_BASE_GAS (50,000) + gasLimit) * tempoGasRate` |
+| `tempoGasRate` | `ZonePortal.setTempoGasRate()` | Deposit bounce-back fees on Tempo: `ceil(FIXED_BOUNCEBACK_GAS (300,000) * tempoGasRate / 1e12)`; withdrawal fees on Tempo: `ceil((WITHDRAWAL_BASE_GAS (50,000) + gasLimit) * tempoGasRate / 1e12)` |
 
 Both rates live on `ZonePortal` on Tempo and are set by the sequencer. `zoneGasRate` is read on Tempo at deposit time. `tempoGasRate` is read on Tempo at deposit time (for the bounce-back fee snapshot) and on the zone at withdrawal-request time, where the outbox proxies it through the [`TempoState`](#tempostate-predeploy) predeploy via `readTempoStorageSlot(ZONE_PORTAL, TEMPO_GAS_RATE_SLOT)`. Both fees are snapshotted onto the queued entry, so in-flight rate changes never retroactively raise the fee on already-queued items.
 
-`tempoGasRate` defaults to `TEMPO_T1_BASE_FEE = 20,000,000,000` token units per gas unit at zone genesis. All rates are denominated in token units per gas unit and fees are paid in the same token being deposited or withdrawn. The sequencer takes the risk on gas-price fluctuations: if actual costs exceed the fee collected, the sequencer covers the difference; if they are lower, the sequencer keeps the surplus.
+`tempoGasRate` defaults to `TEMPO_T1_BASE_FEE = 20,000,000,000`, an 18-decimal fixed-point TIP-20 amount per gas unit. Because all supported TIP-20s use 6 decimals, fees are computed as `ceil(gasAmount * tempoGasRate / 1e12)` and paid in the same TIP-20 being deposited or withdrawn. The sequencer takes the risk on gas-price fluctuations: if actual costs exceed the fee collected, the sequencer covers the difference; if they are lower, the sequencer keeps the surplus.
 
 ### Encryption Key Management
 
@@ -362,8 +362,10 @@ sequenceDiagram
 Every deposit is associated with two separate fees, both paid in the same token being deposited but priced at different gas rates because the work they cover runs on different chains:
 
 ```
-depositFee    = FIXED_DEPOSIT_GAS    * zoneGasRate    (= 100,000 * zoneGasRate)
-bouncebackFee = FIXED_BOUNCEBACK_GAS * tempoGasRate   (= 300,000 * tempoGasRate)
+depositFee    = FIXED_DEPOSIT_GAS * zoneGasRate
+              = 100,000 * zoneGasRate
+bouncebackFee = ceil(FIXED_BOUNCEBACK_GAS * tempoGasRate / 1e12)
+              = ceil(300,000 * tempoGasRate / 1e12)
 ```
 
 `zoneGasRate` and `tempoGasRate` both live on `ZonePortal` on Tempo and are sequencer-managed there via `setZoneGasRate()` / `setTempoGasRate()` (see [Gas Rate Configuration](#gas-rate-configuration)). The same `tempoGasRate` is used for withdrawal fees on Tempo; the zone reads it from Tempo state via the [`TempoState`](#tempostate-predeploy) predeploy when computing withdrawal fees at request time.
@@ -580,8 +582,8 @@ sequenceDiagram
 The withdrawal fee compensates the sequencer for Tempo-side gas costs:
 
 ```
-fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
-    = (50,000 + gasLimit) * tempoGasRate
+fee = ceil((WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate / 1e12)
+    = ceil((50,000 + gasLimit) * tempoGasRate / 1e12)
 ```
 
 `WITHDRAWAL_BASE_GAS` (50,000) covers the fixed overhead of processing a withdrawal on Tempo (queue dequeue, transfer, event emission). The user specifies `gasLimit` covering any additional Tempo L1 callback gas. `gasLimit` must be less than or equal to `MAX_WITHDRAWAL_GAS_LIMIT` (10,000,000), which keeps the outer `processWithdrawal` transaction below the Tempo L1 block gas limit after portal overhead and the EIP-150 cushion are added. For simple withdrawals with no callback, use `gasLimit = 0`. The fee is paid in the same token being withdrawn. On success, `amount` goes to the recipient and `fee` goes to the sequencer. On failure (bounce-back), only `amount` is re-deposited to `fallbackRecipient`. The sequencer keeps the fee regardless of outcome.
