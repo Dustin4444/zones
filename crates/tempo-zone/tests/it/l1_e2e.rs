@@ -861,13 +861,9 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
 async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Generate sequencer encryption key (deterministic for test reproducibility)
-    use sha2::{Digest, Sha256};
-    let enc_key_bytes: [u8; 32] = Sha256::digest(b"test-sequencer-encryption-key-l1-e2e").into();
-    let encryption_key = k256::SecretKey::from_slice(&enc_key_bytes).expect("valid key");
-
     // --- Step 1: Start L1 + deploy zone ---
     let l1 = L1TestNode::start().await?;
+    let encryption_key = k256::SecretKey::from(l1.dev_signer().credential());
     let portal_address = l1.deploy_zone().await?;
 
     // --- Step 2: Start zone with sequencer key ---

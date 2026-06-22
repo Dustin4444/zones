@@ -2861,24 +2861,17 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
 
 /// Start a zone with a private RPC server backed by a real L1 + ZonePortal.
 pub(crate) async fn start_zone_with_private_rpc_l1() -> eyre::Result<PrivateRpcL1TestCtx> {
-    start_zone_with_private_rpc_l1_inner(None).await
+    start_zone_with_private_rpc_l1_inner().await
 }
 
 /// Start a zone with a private RPC server backed by a real L1 and a portal
 /// with a registered encryption key.
 pub(crate) async fn start_zone_with_private_rpc_l1_with_encryption()
 -> eyre::Result<PrivateRpcL1TestCtx> {
-    use sha2::{Digest, Sha256};
-
-    let key_bytes: [u8; 32] =
-        Sha256::digest(b"private-rpc-zone-specific-methods-encryption-key").into();
-    let encryption_key = k256::SecretKey::from_slice(&key_bytes).expect("valid encryption key");
-    start_zone_with_private_rpc_l1_inner(Some(encryption_key)).await
+    start_zone_with_private_rpc_l1_inner().await
 }
 
-async fn start_zone_with_private_rpc_l1_inner(
-    encryption_key: Option<k256::SecretKey>,
-) -> eyre::Result<PrivateRpcL1TestCtx> {
+async fn start_zone_with_private_rpc_l1_inner() -> eyre::Result<PrivateRpcL1TestCtx> {
     let l1 = L1TestNode::start().await?;
     let portal_address = l1.deploy_zone().await?;
 
@@ -2886,9 +2879,9 @@ async fn start_zone_with_private_rpc_l1_inner(
 
     zone.wait_for_l2_tempo_finalized(0, DEFAULT_TIMEOUT).await?;
 
-    if let Some(key) = encryption_key.as_ref() {
-        l1.set_sequencer_encryption_key(portal_address, key).await?;
-    }
+    let key = k256::SecretKey::from(l1.dev_signer().credential());
+    l1.set_sequencer_encryption_key(portal_address, &key)
+        .await?;
 
     let chain_id = zone_chain_id(&zone).await?;
 
@@ -2971,6 +2964,7 @@ impl L1Fixture {
     ) {
         let mut cache = cache.write();
         let deposit_queue_hash_slot = B256::with_last_byte(4);
+        let refunds_slot = B256::with_last_byte(9);
 
         for block in 0..=num_blocks {
             let mut sequencer_bytes = [0u8; 32];
@@ -2984,6 +2978,7 @@ impl L1Fixture {
             // Deposit queue hash slot (4) — read by ZoneInbox after finalizeTempo.
             // The initial value is B256::ZERO (empty queue).
             cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO);
+            cache.set(portal_address, refunds_slot, block, B256::ZERO);
         }
 
         cache.update_anchor(NumHash {
