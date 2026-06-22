@@ -18,7 +18,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
 use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
-use zone_precompiles::SequencerExt;
+use zone_precompiles::{SequencerExt, TempoStateReaderProvider};
 
 use super::cache::L1StateCache;
 use crate::{abi::PORTAL_SEQUENCER_SLOT, rpc::rpc_connection_config};
@@ -266,5 +266,18 @@ impl L1StateProvider {
 impl SequencerExt for L1StateProvider {
     fn latest_sequencer(&self) -> Option<Address> {
         self.get_latest_sequencer().ok()
+    }
+}
+
+impl TempoStateReaderProvider for L1StateProvider {
+    type Error = eyre::Report;
+
+    fn get_storage(
+        &self,
+        address: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> std::result::Result<B256, Self::Error> {
+        Self::get_storage(self, address, slot, block_number)
     }
 }

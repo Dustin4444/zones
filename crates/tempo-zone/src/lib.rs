@@ -23,7 +23,6 @@ pub mod payload;
 pub mod precompiles;
 pub mod rpc;
 pub mod sequencer;
-mod tx_context;
 pub mod withdrawals;
 pub mod zonemonitor;
 

@@ -19,8 +19,6 @@ use tempo_precompiles::{TIP_FEE_MANAGER_ADDRESS, tip_fee_manager::TipFeeManager}
 use tempo_primitives::{TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::{TempoStateAccess, evm::TempoContext};
 
-use crate::tx_context;
-
 /// Simplified block executor for zone nodes.
 ///
 /// Wraps [`EthBlockExecutor`] without any subblock validation, gas-section tracking,
@@ -95,7 +93,7 @@ where
         // transaction's resolved fee token, so the handler skips FeeAMM.
         self.override_validator_token();
 
-        let _tx_hash_guard = tx_context::set_current_tx_hash(*recovered.tx().tx_hash());
+        let _tx_hash_guard = zone_precompiles::set_current_tx_hash(*recovered.tx().tx_hash());
         self.inner
             .execute_transaction_without_commit((tx_env, recovered))
     }

@@ -16,6 +16,8 @@
 //! - **TIP-20 Factory** ([`tip20_factory`]) — zone-side TIP-20 token factory.
 //! - **TIP-403 Proxy** ([`tip403_proxy`]) — read-only TIP-403 registry proxy.
 //! - **Zone TIP-20** ([`ztip20`]) — policy-aware TIP-20 wrapper.
+//! - **TempoStateReader** ([`tempo_state_reader`]) — L1 storage reader for zone contracts.
+//! - **ZoneTxContext** ([`tx_context`]) — executing transaction hash context.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(clippy::too_many_arguments)]
@@ -29,14 +31,24 @@ pub mod aes_gcm;
 pub mod chaum_pedersen;
 pub mod ecies;
 pub mod policy;
+#[cfg(feature = "std")]
+pub mod registration;
+pub mod tempo_state_reader;
 pub mod tip20_factory;
 pub mod tip403_proxy;
+#[cfg(feature = "std")]
+pub mod tx_context;
 pub mod ztip20;
 
 pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
 pub use chaum_pedersen::{CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify};
+#[cfg(feature = "std")]
+pub use registration::extend_zone_precompiles;
+pub use tempo_state_reader::{TempoStateReader, TempoStateReaderProvider};
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};
 pub use tip403_proxy::{ZONE_TIP403_PROXY_ADDRESS, ZoneTip403ProxyRegistry};
+#[cfg(feature = "std")]
+pub use tx_context::{TxHashGuard, ZoneTxContext, set_current_tx_hash};
 pub use ztip20::{SequencerExt, ZoneTip20Token};
 
 use revm::precompile::PrecompileError;

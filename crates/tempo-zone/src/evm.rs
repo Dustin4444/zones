@@ -1,19 +1,11 @@
 //! Zone-specific EVM configuration.
 //!
 //! Wraps [`TempoEvmConfig`] with a custom [`ZoneEvmFactory`] that registers the
-//! [`TempoStateReader`](crate::l1_state::TempoStateReader) precompile at
-//! [`TEMPO_STATE_READER_ADDRESS`](crate::abi::TEMPO_STATE_READER_ADDRESS).
+//! zone precompile set via [`zone_precompiles::extend_zone_precompiles`].
 
 use crate::{
-    abi::{TEMPO_STATE_READER_ADDRESS, ZONE_TX_CONTEXT_ADDRESS},
     executor::ZoneBlockExecutor,
-    l1_state::{L1StateCache, L1StateProvider, PolicyProvider, TempoStateReader},
-    precompiles::{
-        AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
-        ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneTip20Token,
-        ZoneTip403ProxyRegistry, ZoneTokenFactory,
-    },
-    tx_context::ZoneTxContext,
+    l1_state::{L1StateCache, L1StateProvider, PolicyProvider},
 };
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory,
@@ -38,19 +30,13 @@ use tempo_evm::{
     evm::{TempoEvm, TempoEvmFactory},
 };
 use tempo_payload_types::TempoExecutionData;
-use tempo_precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, STABLECOIN_DEX_ADDRESS,
-    TIP_FEE_MANAGER_ADDRESS, account_keychain::AccountKeychain, nonce::NonceManager,
-    tip_fee_manager::TipFeeManager, tip20::is_tip20_prefix,
-};
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
 };
 
 type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 
-/// Zone EVM factory — wraps [`TempoEvmFactory`] and registers the
-/// [`TempoStateReader`] precompile for reading Tempo L1 storage from zone contracts.
+/// Zone EVM factory — wraps [`TempoEvmFactory`] and registers zone-specific precompiles.
 #[derive(Debug, Clone)]
 pub struct ZoneEvmFactory {
     l1_provider: L1StateProvider,
@@ -78,61 +64,12 @@ impl ZoneEvmFactory {
     ) -> TempoEvm<DB, I> {
         let cfg = evm.ctx().cfg.clone();
         let (_, _, precompiles) = evm.components_mut();
-        precompiles.apply_precompile(&TEMPO_STATE_READER_ADDRESS, |_| {
-            Some(TempoStateReader::create(self.l1_provider.clone()))
-        });
-        precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| Some(ZoneTxContext::create()));
-        precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
-            Some(ChaumPedersenVerify.into())
-        });
-        precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| Some(AesGcmDecrypt.into()));
-        precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
-            Some(ZoneTokenFactory::create(&cfg))
-        });
-        let registry = self
-            .policy_provider
-            .clone()
-            .map(ZoneTip403ProxyRegistry::new);
-        let sequencer: Arc<dyn crate::precompiles::SequencerExt> =
-            Arc::new(self.l1_provider.clone());
-
-        if let Some(provider) = self.policy_provider.clone() {
-            precompiles.apply_precompile(&ZONE_TIP403_PROXY_ADDRESS, |_| {
-                Some(ZoneTip403ProxyRegistry::create(provider.clone()))
-            });
-        }
-
-        // Override the TIP-20 precompile lookup so that all TIP-20 token
-        // calls go through ZoneTip20Token. When a live policy provider is
-        // available, the wrapper also enforces TIP-403 policy checks; without
-        // one, it still applies privacy, fixed-gas, and bridge-auth rules.
-        //
-        // This replaces the upstream `extend_tempo_precompiles` lookup, so we
-        // must also handle the non-TIP-20 Tempo precompiles that are zone-relevant
-        // (FeeManager, NonceManager, AccountKeychain).
-        // Zone-specific overrides (TIP20Factory, TIP403Proxy) are in the
-        // static map via `apply_precompile` and take priority over this.
-        let zone_cfg = cfg.clone();
-        precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
-            if is_tip20_prefix(*address) {
-                Some(ZoneTip20Token::create(
-                    *address,
-                    &zone_cfg,
-                    registry.clone(),
-                    sequencer.clone(),
-                ))
-            } else if *address == TIP_FEE_MANAGER_ADDRESS {
-                Some(TipFeeManager::create_precompile(&zone_cfg))
-            } else if *address == STABLECOIN_DEX_ADDRESS {
-                None
-            } else if *address == NONCE_PRECOMPILE_ADDRESS {
-                Some(NonceManager::create_precompile(&zone_cfg))
-            } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
-                Some(AccountKeychain::create_precompile(&zone_cfg))
-            } else {
-                None
-            }
-        });
+        zone_precompiles::extend_zone_precompiles(
+            precompiles,
+            &cfg,
+            self.l1_provider.clone(),
+            self.policy_provider.clone(),
+        );
         evm
     }
 }

@@ -22,8 +22,8 @@ thread_local! {
     static CURRENT_TX_HASH: RefCell<Option<B256>> = const { RefCell::new(None) };
 }
 
-/// Guard that clears the current tx hash when dropped.
-pub(crate) struct TxHashGuard;
+/// Guard that clears the current transaction hash when dropped.
+pub struct TxHashGuard;
 
 impl Drop for TxHashGuard {
     fn drop(&mut self) {
@@ -32,7 +32,7 @@ impl Drop for TxHashGuard {
 }
 
 /// Publish the current executing transaction hash for the duration of EVM execution.
-pub(crate) fn set_current_tx_hash(tx_hash: B256) -> TxHashGuard {
+pub fn set_current_tx_hash(tx_hash: B256) -> TxHashGuard {
     CURRENT_TX_HASH.with(|slot| {
         *slot.borrow_mut() = Some(tx_hash);
     });
@@ -61,16 +61,17 @@ fn synthetic_tx_hash(input: &PrecompileInput<'_>) -> B256 {
     keccak256(bytes)
 }
 
-/// `DynPrecompile` implementation that returns the currently executing zone tx hash.
-pub(crate) struct ZoneTxContext;
+/// `DynPrecompile` implementation that returns the currently executing zone transaction hash.
+pub struct ZoneTxContext;
 
 impl ZoneTxContext {
-    pub(crate) fn create() -> DynPrecompile {
+    /// Create the transaction-context precompile.
+    pub fn create() -> DynPrecompile {
         DynPrecompile::new_stateful(PrecompileId::Custom("ZoneTxContext".into()), move |input| {
             if !input.is_direct_call() {
                 warn!(
                     target: "zone::precompile",
-                    "ZoneTxContext called via DELEGATECALL — rejecting"
+                    "ZoneTxContext called via DELEGATECALL - rejecting"
                 );
                 return Ok(PrecompileOutput::revert(
                     0,
