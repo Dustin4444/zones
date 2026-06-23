@@ -393,8 +393,7 @@ impl ZoneTestNode {
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
-        let (genesis, genesis_block_number) =
-            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+        let (genesis, genesis_block_number) = build_l1_anchored_genesis(l1_http_url).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
@@ -424,8 +423,7 @@ impl ZoneTestNode {
         let portal = zone::abi::ZonePortal::new(portal_address, &l1_provider);
         let genesis_block_number = portal.genesisTempoBlockNumber().call().await?;
         let (genesis, genesis_block_number) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
-                .await?;
+            build_l1_anchored_genesis_at_block(l1_http_url, genesis_block_number).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
@@ -495,11 +493,16 @@ impl ZoneTestNode {
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
         let l1_provider_url = l1_ws_url.clone();
 
-        let mut genesis = custom_genesis.unwrap_or_else(|| {
-            serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))
-                .expect("valid zone test genesis")
-        });
+        let mut genesis = match custom_genesis {
+            Some(genesis) => genesis,
+            None => crate::genesis_artifacts::base_zone_test_genesis()?,
+        };
         genesis.config.chain_id = chain_id;
+        crate::genesis_artifacts::patch_genesis_with_compiled_system_contracts(
+            &mut genesis,
+            chain_id,
+            portal_address,
+        )?;
         let chain_spec = TempoChainSpec::from_genesis(genesis);
 
         let zone_node = ZoneNode::new(
@@ -1552,26 +1555,21 @@ impl L1TestNode {
 
 /// Build a zone test genesis anchored to a real L1 block.
 ///
-/// The base `zone-test-genesis.json` is a standalone genesis with:
-/// - TempoState anchored at block 0 with a zero block hash
-/// - ZoneInbox compiled with `tempoPortal = Address::ZERO` (Solidity immutable)
+/// The base `zone-test-genesis.json` is a standalone genesis with TempoState
+/// anchored at block 0 with a zero block hash.
 ///
-/// When connecting to a real L1, two things must be patched:
+/// When connecting to a real L1, TempoState storage must be patched:
 ///
 /// 1. **TempoState storage** — `tempoBlockHash` (slot 0) and the packed header fields
 ///    in slot 7 must reflect the L1 block that serves as the zone's genesis anchor.
 ///    Without this, `finalizeTempo` rejects the first L1 block for parent hash mismatch.
 ///
-/// 2. **ZoneInbox bytecode** — the `tempoPortal` immutable (embedded in deployed bytecode
-///    as `PUSH32` instructions) must be replaced with the real portal address. Without this,
-///    `readTempoStorageSlot` reads L1 state from `Address::ZERO` instead of the portal,
-///    causing `_readEncryptionKey` to revert with `InvalidSharedSecretProof`.
+/// System contract bytecode is filled from compiled Foundry artifacts later in
+/// [`ZoneTestNode::launch_with_genesis`], so Solidity immutables such as
+/// `tempoPortal` are applied by running constructors instead of patching bytes.
 ///
 /// Returns `(genesis, genesis_block_number)`.
-async fn build_l1_anchored_genesis(
-    l1_http_url: &url::Url,
-    portal_address: Address,
-) -> eyre::Result<(Genesis, u64)> {
+async fn build_l1_anchored_genesis(l1_http_url: &url::Url) -> eyre::Result<(Genesis, u64)> {
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
 
@@ -1580,13 +1578,12 @@ async fn build_l1_anchored_genesis(
         .await?
         .ok_or_else(|| eyre::eyre!("L1 latest block not found"))?;
     let l1_header: &TempoHeader = block.header.as_ref();
-    build_l1_anchored_genesis_from_header(l1_header, portal_address)
+    build_l1_anchored_genesis_from_header(l1_header)
 }
 
 /// Build a zone test genesis anchored to a specific L1 block number.
 async fn build_l1_anchored_genesis_at_block(
     l1_http_url: &url::Url,
-    portal_address: Address,
     block_number: u64,
 ) -> eyre::Result<(Genesis, u64)> {
     let l1_provider =
@@ -1597,13 +1594,10 @@ async fn build_l1_anchored_genesis_at_block(
         .await?
         .ok_or_else(|| eyre::eyre!("L1 block {block_number} not found"))?;
     let l1_header: &TempoHeader = block.header.as_ref();
-    build_l1_anchored_genesis_from_header(l1_header, portal_address)
+    build_l1_anchored_genesis_from_header(l1_header)
 }
 
-fn build_l1_anchored_genesis_from_header(
-    l1_header: &TempoHeader,
-    portal_address: Address,
-) -> eyre::Result<(Genesis, u64)> {
+fn build_l1_anchored_genesis_from_header(l1_header: &TempoHeader) -> eyre::Result<(Genesis, u64)> {
     use alloy_primitives::address;
 
     let genesis_block_number = l1_header.inner.number;
@@ -1612,8 +1606,7 @@ fn build_l1_anchored_genesis_from_header(
     l1_header.encode(&mut rlp_buf);
     let l1_genesis_hash = keccak256(&rlp_buf);
 
-    let mut genesis: Genesis =
-        serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))?;
+    let mut genesis = crate::genesis_artifacts::base_zone_test_genesis()?;
 
     // --- Patch 1: TempoState storage ---
     // TempoState is at 0x1c00...0000
@@ -1639,60 +1632,7 @@ fn build_l1_anchored_genesis_from_header(
         B256::from(new_slot7.to_be_bytes()),
     );
 
-    // --- Patch 2: Portal address immutables in ZoneInbox and ZoneConfig ---
-    // Solidity immutables are baked into deployed bytecode as `PUSH32 <value>`.
-    // The default genesis has tempoPortal = Address::ZERO. We replace the 32-byte
-    // zero-padded needle at the byte level. Both ZoneInbox (0x...0001) and
-    // ZoneConfig (0x...0003) have `tempoPortal` as an immutable.
-    if !portal_address.is_zero() {
-        let needle = [0u8; 32]; // Address::ZERO left-padded to 32 bytes
-        let mut replacement = [0u8; 32];
-        replacement[12..].copy_from_slice(portal_address.as_slice());
-
-        let contracts_to_patch: &[(Address, usize)] = &[
-            (address!("0x1c00000000000000000000000000000000000001"), 4), // ZoneInbox
-            (address!("0x1c00000000000000000000000000000000000003"), 5), // ZoneConfig
-        ];
-
-        for &(addr, expected_count) in contracts_to_patch {
-            let account = genesis
-                .alloc
-                .get_mut(&addr)
-                .unwrap_or_else(|| panic!("contract {addr} missing in genesis alloc"));
-            if let Some(code) = &account.code {
-                let mut buf = code.to_vec();
-                let count = patch_bytes(&mut buf, &needle, &replacement);
-                assert_eq!(
-                    count, expected_count,
-                    "expected {expected_count} tempoPortal immutable(s) in {addr}, found {count} \
-                     — contract bytecode may have changed, update expected_count"
-                );
-                account.code = Some(buf.into());
-            }
-        }
-    }
-
     Ok((genesis, genesis_block_number))
-}
-
-/// Replace all non-overlapping occurrences of `needle` with `replacement` in `buf`.
-///
-/// Both must have the same length. Returns the number of replacements made.
-fn patch_bytes(buf: &mut [u8], needle: &[u8], replacement: &[u8]) -> usize {
-    assert_eq!(needle.len(), replacement.len());
-    let len = needle.len();
-    let mut count = 0;
-    let mut i = 0;
-    while i + len <= buf.len() {
-        if buf[i..i + len] == *needle {
-            buf[i..i + len].copy_from_slice(replacement);
-            count += 1;
-            i += len;
-        } else {
-            i += 1;
-        }
-    }
-    count
 }
 
 /// Poll an async condition until it returns `Some(T)` or the timeout expires.

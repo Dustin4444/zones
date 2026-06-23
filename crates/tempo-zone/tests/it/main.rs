@@ -4,6 +4,8 @@ mod demo_shield_and_send;
 mod deposit;
 mod e2e;
 mod enable_token;
+#[path = "../genesis_artifacts.rs"]
+mod genesis_artifacts;
 mod l1_e2e;
 mod precompiles;
 mod private_rpc;

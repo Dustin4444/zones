@@ -73,15 +73,20 @@ Starts an in-process Tempo L1 dev node via `L1TestNode::start()`, then connects
 a zone node via `ZoneTestNode::start_from_l1()`. The `L1Subscriber` receives
 real blocks over WebSocket.
 
-**Genesis patching in `start_from_l1()`:**
+**Genesis construction in `start_from_l1()`:**
 
 The zone's `TempoState` genesis must be anchored to the L1's current state.
-`start_from_l1()` fetches the L1's latest header and patches `zone-test-genesis.json`:
+`start_from_l1()` fetches the L1's latest header and patches `zone-test-genesis.json` storage:
 
 1. **Slot 0** (`tempoBlockHash`): Set to `keccak256(rlp(l1_header))`
 2. **Slot 7** (packed `uint64` fields): Low 64 bits set to `l1_header.number`
    - Layout: `(tempoBlockNumber:u64, tempoGasLimit:u64, tempoGasUsed:u64, tempoTimestamp:u64)`
-   - Only `tempoBlockNumber` is currently patched; other fields retain genesis defaults
+   - All four packed fields are patched from the anchor header
+
+Before launch, `ZoneTestNode` fills the TempoState, ZoneConfig, ZoneInbox, and
+ZoneOutbox code from the compiled Foundry artifacts in `specs/ref-impls/out`.
+This keeps Solidity immutables, including `tempoPortal`, in sync with the
+artifacts instead of storing those bytecode blobs in the fixture.
 
 ## Test Inventory
 
@@ -139,8 +144,5 @@ Full `ZoneFactory` deployment + deposit-through-portal on local L1:
 - **Chain ID collisions:** `start_local()` hardcodes `chain_id = 1337`. Tests
   running in parallel can collide. Use `start_local_with_chain_id()` with unique
   IDs, or switch `start_local()` to pick random chain IDs.
-- **Slot 7 partial patch:** `start_from_l1()` only patches `tempoBlockNumber` in
-  the packed slot 7. Should also patch `tempoGasLimit`, `tempoGasUsed`, and
-  `tempoTimestamp` from the anchor header for full consistency.
 - **Event assertions:** Some tests query events from block 0 and assume ordering.
   Filter by sender/recipient/amount for robustness.
