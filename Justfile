@@ -3,6 +3,7 @@ cargo_build_binary := if cross_compile == "true" { "cross" } else { "cargo" }
 act_debug_mode := env("ACT", "false")
 zone_rpc := env("ZONE_RPC_URL", "http://localhost:8546")
 zone_http_port := env("ZONE_HTTP_PORT", "8546")
+zone_test_genesis_tmp := "./target/zone-test-genesis"
 
 [group('deps')]
 install-cross:
@@ -57,6 +58,28 @@ localnet accounts="1000" reset="false" profile="maxperf" features="asm-keccak" a
                       --faucet.amount 1000000000000 \
                       --faucet.address 0x20c0000000000000000000000000000000000001 \
                       {{args}}
+
+[group('zone')]
+[doc('Regenerates crates/tempo-zone/tests/assets/zone-test-genesis.json from the current zone Solidity artifacts')]
+regen-zone-test-genesis:
+    #!/bin/bash
+    set -euo pipefail
+    TEMPO_GENESIS_HEADER_RLP="f90217808080f90211a00000000000000000000000000000000000000000000000000000000000000000a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421940000000000000000000000000000000000000000a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421a056e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000808080808080a0000000000000000000000000000000000000000000000000000000000000000088000000000000000080a000000000000000000000000000000000000000000000000000000000000000008080"
+    rm -rf {{zone_test_genesis_tmp}}
+    forge build --root specs/ref-impls
+    cargo run -p tempo-xtask -- generate-zone-genesis \
+        --output {{zone_test_genesis_tmp}} \
+        --chain-id 1337 \
+        --tempo-portal 0x0000000000000000000000000000000000000000 \
+        --tempo-genesis-header-rlp "$TEMPO_GENESIS_HEADER_RLP" \
+        --specs-out specs/ref-impls/out
+    tmp="$(mktemp)"
+    jq '.alloc["0x1c00000000000000000000000000000000000000"].storage["0x0000000000000000000000000000000000000000000000000000000000000000"] = "0xb049644b1d5a0ec9d785dd48f95099e0f566112084acb1ba0814112209b432a1"' \
+        {{zone_test_genesis_tmp}}/genesis.json > "$tmp"
+    mv "$tmp" {{zone_test_genesis_tmp}}/genesis.json
+    truncate -s -1 {{zone_test_genesis_tmp}}/genesis.json
+    cp {{zone_test_genesis_tmp}}/genesis.json crates/tempo-zone/tests/assets/zone-test-genesis.json
+    rm -rf {{zone_test_genesis_tmp}}
 
 [group('zone')]
 [doc('Approves the ZonePortal to spend max tokens. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and PRIVATE_KEY env vars.')]
