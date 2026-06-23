@@ -1,7 +1,7 @@
 use super::*;
 
-/// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
-const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Poll interval for finalized L1 block polling (500ms, matching L1 block time).
+const FINALIZED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Configuration for the L1 subscriber.
 #[derive(Debug, Clone)]
@@ -19,7 +19,7 @@ pub struct L1SubscriberConfig {
     /// blocks.
     pub policy_cache: crate::l1_state::tip403::PolicyCache,
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
-    /// confirmed block and clears it on reorgs.
+    /// finalized block and clears it on reorgs.
     pub l1_state_cache: crate::l1_state::cache::L1StateCache,
     /// Maximum number of concurrent L1 RPC receipt fetches. Used directly for
     /// the live stream and halved for backfill (which sends 2 requests per block).
@@ -133,60 +133,22 @@ impl L1Subscriber {
         Ok(provider)
     }
 
-    /// Returns a stream of new L1 block headers, abstracting over the transport.
-    ///
-    /// - **WebSocket**: uses `subscribe_blocks` for push-based delivery.
-    /// - **HTTP**: falls back to `watch_full_blocks` (filter-based polling via
-    ///   `eth_newBlockFilter` + `eth_getFilterChanges`), extracting the header
-    ///   from each block. The fallback is selected when `subscribe_blocks`
-    ///   returns `PubsubUnavailable`.
-    ///
-    /// Both paths produce the same header payloads; transport-specific polling
-    /// failures are surfaced as stream errors so [`run`](Self::run) can
-    /// reconnect and resync.
-    async fn header_stream<'a>(
+    async fn finalized_block_number(
         &self,
-        provider: &'a DynProvider<TempoNetwork>,
-    ) -> eyre::Result<
-        Pin<
-            Box<
-                dyn Stream<
-                        Item = eyre::Result<
-                            <TempoNetwork as alloy_network::Network>::HeaderResponse,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        >,
-    > {
-        match provider.subscribe_blocks().await {
-            Ok(sub) => {
-                info!("Using WebSocket block subscription");
-                Ok(Box::pin(sub.into_stream().map(Ok)))
-            }
-            Err(e) => {
-                if e.as_transport_err()
-                    .is_some_and(|t| t.is_pubsub_unavailable())
-                {
-                    info!("Pubsub unavailable, falling back to HTTP polling");
-                    let mut watcher = provider.watch_full_blocks().await?;
-                    watcher.set_poll_interval(HTTP_POLL_INTERVAL);
-                    let stream = watcher
-                        .into_stream()
-                        .map(|res| res.map(|block| block.header).map_err(Into::into));
-                    Ok(Box::pin(stream))
-                } else {
-                    Err(e.into())
-                }
-            }
-        }
+        provider: &DynProvider<TempoNetwork>,
+    ) -> eyre::Result<u64> {
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .await?
+            .ok_or_else(|| eyre::eyre!("finalized L1 block not available"))?;
+        Ok(block.header().number())
     }
 
-    /// Build the live L1 block stream, fetching receipts for each new header
-    /// and buffering requests ahead of processing.
-    async fn l1_block_stream<'a>(
+    /// Build the live L1 block stream from finalized blocks only.
+    async fn l1_block_stream(
         &self,
-        provider: &'a DynProvider<TempoNetwork>,
+        provider: &DynProvider<TempoNetwork>,
+        start_block: u64,
     ) -> eyre::Result<
         Pin<
             Box<
@@ -195,44 +157,76 @@ impl L1Subscriber {
                             <TempoNetwork as alloy_network::Network>::HeaderResponse,
                             Vec<<TempoNetwork as alloy_network::Network>::ReceiptResponse>,
                         )>,
-                    > + Send
-                    + 'a,
+                    > + Send,
             >,
         >,
     > {
-        let header_stream = self.header_stream(provider).await?;
-        let concurrency = self.config.l1_fetch_concurrency.max(1);
+        use futures::stream;
+
+        let provider = provider.clone();
         let subscriber_metrics = self.subscriber_metrics.clone();
-        let stream = header_stream
-            .map_ok(move |header| {
-                let provider = provider;
-                let subscriber_metrics = subscriber_metrics.clone();
-                async move {
-                    let block_number = header.number();
-                    let start = std::time::Instant::now();
-                    let fetch_failures = &subscriber_metrics.fetch_failures;
-                    let receipts = provider
-                        .get_block_receipts(BlockId::number(block_number))
+        let stream = stream::unfold(start_block, move |block_number| {
+            let provider = provider.clone();
+            let subscriber_metrics = subscriber_metrics.clone();
+            async move {
+                loop {
+                    let finalized_number = match provider
+                        .get_block_by_number(BlockNumberOrTag::Finalized)
                         .await
                         .map_err(eyre::Report::from)
-                        .and_then(|receipts| {
-                            receipts
+                        .and_then(|block| {
+                            block.ok_or_else(|| eyre::eyre!("finalized L1 block not available"))
+                        }) {
+                        Ok(block) => block.header().number(),
+                        Err(err) => return Some((Err(err), block_number)),
+                    };
+
+                    if block_number > finalized_number {
+                        tokio::time::sleep(FINALIZED_POLL_INTERVAL).await;
+                        continue;
+                    }
+
+                    let start = std::time::Instant::now();
+                    let fetch_failures = &subscriber_metrics.fetch_failures;
+                    let fetched = tokio::try_join!(
+                        async {
+                            provider
+                                .get_block_by_number(block_number.into())
+                                .full()
+                                .await
+                                .map_err(eyre::Report::from)?
+                                .ok_or_else(|| {
+                                    eyre::eyre!("L1 block not found for block {block_number}")
+                                })
+                        },
+                        async {
+                            provider
+                                .get_block_receipts(BlockId::number(block_number))
+                                .await
+                                .map_err(eyre::Report::from)?
                                 .ok_or_else(|| eyre::eyre!("no receipts for block {block_number}"))
-                        })
-                        .inspect_err(|_| {
-                            fetch_failures.increment(1);
-                        })?;
-                    let elapsed = start.elapsed();
-                    debug!(
-                        block_number,
-                        elapsed_ms = elapsed.as_millis() as u64,
-                        receipts = receipts.len(),
-                        "Fetched live block receipts"
-                    );
-                    Ok::<_, eyre::Report>((header, receipts))
+                        },
+                    )
+                    .inspect_err(|_| {
+                        fetch_failures.increment(1);
+                    });
+
+                    let result = fetched.map(|(block, receipts)| {
+                        let header = block.header().clone();
+                        let elapsed = start.elapsed();
+                        debug!(
+                            block_number,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            receipts = receipts.len(),
+                            "Fetched finalized L1 block data"
+                        );
+                        (header, receipts)
+                    });
+
+                    return Some((result, block_number + 1));
                 }
-            })
-            .try_buffered(concurrency);
+            }
+        });
         Ok(Box::pin(stream))
     }
 
@@ -274,11 +268,11 @@ impl L1Subscriber {
         Ok(Some(on_chain + 1))
     }
 
-    /// Backfill deposit events from the starting block to the current L1 tip.
+    /// Backfill deposit events from the starting block to the current finalized L1 block.
     #[instrument(skip(self, l1_provider))]
-    async fn sync_to_l1_tip(
+    async fn sync_to_finalized_l1(
         &mut self,
-        l1_provider: &impl Provider<TempoNetwork>,
+        l1_provider: &DynProvider<TempoNetwork>,
     ) -> eyre::Result<()> {
         let Some(mut from) = self.resolve_start_block(l1_provider).await? else {
             self.subscriber_metrics.current_l1_lag_blocks.set(0.0);
@@ -299,10 +293,10 @@ impl L1Subscriber {
             from = from.max(adjusted);
         }
 
-        let tip = l1_provider.get_block_number().await?;
+        let tip = self.finalized_block_number(l1_provider).await?;
         self.record_seen_block(tip, 0);
         if from > tip {
-            info!(from, tip, "Already synced to L1 tip");
+            info!(from, tip, "Already synced to finalized L1");
             self.subscriber_metrics.current_l1_lag_blocks.set(0.0);
             return Ok(());
         }
@@ -311,7 +305,7 @@ impl L1Subscriber {
             from,
             tip,
             blocks = tip - from + 1,
-            "Backfilling deposit events"
+            "Backfilling finalized L1 deposit events"
         );
         let start = std::time::Instant::now();
         let result = self.backfill(l1_provider, from, tip).await;
@@ -428,15 +422,10 @@ impl L1Subscriber {
 
     /// Run the L1 subscriber until the stream ends or an error occurs.
     ///
-    /// Connects to the L1 node (HTTP or WebSocket), backfills deposit events
-    /// to the current L1 tip, then listens for new block headers. Each block —
-    /// with or without deposits — is enqueued so the zone engine sees a strict
-    /// sequential chain.
-    ///
-    /// Live-streamed blocks are buffered one block behind: a block is only
-    /// flushed to the deposit queue once the next block arrives with a
-    /// matching parent hash, proving the buffered block is canonical. This
-    /// prevents the zone from committing to an L1 tip that gets reorged away.
+    /// Connects to the L1 node, backfills deposit events to the current
+    /// finalized L1 block, then polls newly finalized blocks. Each block — with
+    /// or without deposits — is enqueued so the zone engine sees a strict
+    /// sequential finalized chain.
     ///
     /// Callers should retry on error (see [`Self::spawn`]).
     pub async fn run(mut self) -> eyre::Result<()> {
@@ -446,22 +435,23 @@ impl L1Subscriber {
 
         let provider = self.connect().await?;
 
-        // Backfill to the current tip before subscribing.
-        // Backfilled blocks are historical and considered confirmed.
-        self.sync_to_l1_tip(&provider).await?;
+        // Backfill to the current finalized block before polling for the next
+        // finalized block.
+        self.sync_to_finalized_l1(&provider).await?;
 
-        info!(portal = %self.config.portal_address, "Listening for L1 blocks");
-        let mut stream = self.l1_block_stream(&provider).await?;
-
-        // Confirmation buffer: holds the latest unconfirmed L1 block.
-        // A block is only flushed to the deposit queue once the NEXT block
-        // arrives with a matching parent hash, proving the buffered block
-        // is on the canonical chain.
-        let mut unconfirmed_tip: Option<(
-            SealedHeader<TempoHeader>,
-            L1PortalEvents,
-            Vec<PolicyEvent>,
-        )> = None;
+        let stream_start = if let Some(last) = self.deposit_queue.last_enqueued() {
+            last.number + 1
+        } else if let Some(start) = self.resolve_start_block(&provider).await? {
+            start
+        } else {
+            self.finalized_block_number(&provider).await? + 1
+        };
+        info!(
+            portal = %self.config.portal_address,
+            stream_start,
+            "Polling finalized L1 blocks"
+        );
+        let mut stream = self.l1_block_stream(&provider, stream_start).await?;
 
         loop {
             let stream_wait_start = std::time::Instant::now();
@@ -477,59 +467,30 @@ impl L1Subscriber {
             let (events, policy_events) = self.extract_events(block_number, &receipts);
             self.record_seen_block(block_number, 0);
 
-            // If we have a buffered tip, check if the new block confirms it.
-            if let Some((tip_header, tip_events, tip_policy_events)) = unconfirmed_tip.take() {
-                if sealed.parent_hash() == tip_header.hash() {
-                    // Confirmed — update the L1 state anchor, apply events, and
-                    // flush to the queue.
-                    let tip_number = tip_header.number();
-                    let tip_hash = tip_header.hash();
-                    let tip_parent = tip_header.parent_hash();
-                    self.update_l1_state_anchor(tip_number, tip_hash, tip_parent);
-                    self.apply_policy_events(tip_number, &tip_policy_events);
-                    self.apply_portal_state_events(tip_number, &tip_events);
-                    match self
-                        .deposit_queue
-                        .try_enqueue(tip_header, tip_events, tip_policy_events)
-                    {
-                        EnqueueOutcome::Accepted => {
-                            self.subscriber_metrics.blocks_enqueued.increment(1);
-                        }
-                        EnqueueOutcome::Duplicate => {}
-                        EnqueueOutcome::NeedBackfill { from, to } => {
-                            // Gap between queue head and confirmed tip — backfill
-                            // the missing range including the tip (re-fetched from
-                            // the provider since try_enqueue consumed ownership).
-                            warn!(
-                                from,
-                                to,
-                                tip = tip_number,
-                                "Backfilling gap before confirmed tip"
-                            );
-                            self.backfill(&provider, from, tip_number).await?;
-                        }
-                    }
-                } else {
-                    // Reorg — discard the buffered tip and clear L1 state and
-                    // policy caches.
-                    self.subscriber_metrics.reorgs_detected.increment(1);
+            self.update_l1_state_anchor(block_number, sealed.hash(), sealed.parent_hash());
+            self.apply_policy_events(block_number, &policy_events);
+            self.apply_portal_state_events(block_number, &events);
+            match self
+                .deposit_queue
+                .try_enqueue(sealed, events, policy_events)
+            {
+                EnqueueOutcome::Accepted => {
+                    self.subscriber_metrics.blocks_enqueued.increment(1);
+                }
+                EnqueueOutcome::Duplicate => {}
+                EnqueueOutcome::NeedBackfill { from, to } => {
                     warn!(
-                        discarded_block = tip_header.number(),
-                        discarded_hash = %tip_header.hash(),
-                        new_block = block_number,
-                        new_parent = %sealed.parent_hash(),
-                        "Discarding unconfirmed L1 block (reorg)"
+                        from,
+                        to,
+                        tip = block_number,
+                        "Backfilling gap before finalized block"
                     );
-                    self.config.l1_state_cache.write().clear();
-                    self.config.policy_cache.write().clear();
+                    self.backfill(&provider, from, block_number).await?;
                 }
             }
-
-            // Buffer the new block as unconfirmed tip.
-            unconfirmed_tip = Some((sealed, events, policy_events));
         }
 
-        warn!("L1 block subscription stream ended");
+        warn!("Finalized L1 block polling stream ended");
         Ok(())
     }
 

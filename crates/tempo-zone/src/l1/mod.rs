@@ -14,7 +14,8 @@
 //! - [`queue`] — the deposit hash-chain queue consumed by the engine.
 
 use alloy_consensus::BlockHeader as _;
-use alloy_eips::NumHash;
+use alloy_eips::{BlockNumberOrTag, NumHash};
+use alloy_network::BlockResponse as _;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
