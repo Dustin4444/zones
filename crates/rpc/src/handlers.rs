@@ -3,7 +3,10 @@
 //! Each handler calls the underlying EthApi via the [`ZoneRpcApi`] trait,
 //! which performs typed privacy redactions internally before serialization.
 
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{Address, B256, Bytes, U64};
 use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, Filter, FilterId, state::StateOverride};
@@ -20,6 +23,8 @@ use crate::{
         classify_method,
     },
 };
+
+const MIN_FETCH_THEN_CHECK_RESPONSE_TIME: Duration = Duration::from_millis(100);
 
 /// Interface to the underlying reth EthApi for the private zone RPC.
 ///
@@ -262,6 +267,7 @@ pub async fn dispatch(
     auth: &AuthContext,
     api: &dyn ZoneRpcApi,
 ) -> JsonRpcResponse {
+    let started_at = Instant::now();
     let id = req.id.clone();
 
     let tier = match classify_method(&req.method) {
@@ -282,7 +288,7 @@ pub async fn dispatch(
     // Raw params JSON — handlers deserialize directly, no intermediate Vec<Value>.
     let raw = req.params.as_deref().map(|p| p.get()).unwrap_or("[]");
 
-    match req.method.as_str() {
+    let response = match req.method.as_str() {
         // Simple passthrough methods (no params, no auth scoping)
         "eth_blockNumber" => api_result(id, "eth_blockNumber", api.block_number().await),
         "eth_chainId" => api_result(id, "eth_chainId", api.chain_id().await),
@@ -349,6 +355,30 @@ pub async fn dispatch(
                 JsonRpcError::internal("method not yet implemented in private RPC"),
             )
         }
+    };
+
+    if requires_min_response_time(&req.method) {
+        enforce_min_response_time(started_at).await;
+    }
+
+    response
+}
+
+fn requires_min_response_time(method: &str) -> bool {
+    matches!(
+        method,
+        "eth_getTransactionByHash"
+            | "eth_getTransactionReceipt"
+            | "eth_getLogs"
+            | "eth_getFilterLogs"
+            | "eth_getFilterChanges"
+    )
+}
+
+async fn enforce_min_response_time(started_at: Instant) {
+    let elapsed = started_at.elapsed();
+    if elapsed < MIN_FETCH_THEN_CHECK_RESPONSE_TIME {
+        tokio::time::sleep(MIN_FETCH_THEN_CHECK_RESPONSE_TIME - elapsed).await;
     }
 }
 
@@ -1003,5 +1033,16 @@ mod tests {
         let err = resp.error.expect("should reject extra simulation params");
         assert_eq!(err.code, -32602);
         assert_eq!(err.message, "expected [request, block?, stateOverride?]");
+    }
+
+    #[tokio::test]
+    async fn fetch_then_check_methods_enforce_min_response_time() {
+        let api = MockZoneRpcApi::default();
+        let started_at = Instant::now();
+
+        let resp = dispatch(&request("eth_getLogs", json!([{}])), &auth(), &api).await;
+
+        assert!(resp.result.is_none());
+        assert!(started_at.elapsed() >= MIN_FETCH_THEN_CHECK_RESPONSE_TIME);
     }
 }

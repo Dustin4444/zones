@@ -292,8 +292,12 @@ impl TestContext {
     }
 
     fn build_token(&self) -> String {
+        self.build_token_with_ttl(600)
+    }
+
+    fn build_token_with_ttl(&self, ttl_secs: u64) -> String {
         let now = now_secs();
-        let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
+        let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + ttl_secs);
         let sig = self.signer.sign_hash_sync(&digest).expect("signing failed");
 
         let mut blob = Vec::with_capacity(65 + fields.len());
@@ -324,6 +328,16 @@ async fn connect_with_header(
     ctx: &TestContext,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let token = ctx.build_token();
+    connect_with_token(&ctx.ws_url(), ctx.addr, &token)
+        .await
+        .expect("ws connect failed")
+}
+
+async fn connect_with_short_lived_header(
+    ctx: &TestContext,
+    ttl_secs: u64,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let token = ctx.build_token_with_ttl(ttl_secs);
     connect_with_token(&ctx.ws_url(), ctx.addr, &token)
         .await
         .expect("ws connect failed")
@@ -438,6 +452,20 @@ async fn ws_reject_invalid_token() {
         panic!("expected HTTP error, got {err:?}");
     };
     assert_eq!(response.status(), 403);
+}
+
+#[tokio::test]
+async fn ws_closes_when_auth_token_expires() {
+    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let mut ws = connect_with_short_lived_header(&ctx, 1).await;
+
+    let close = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("ws should close after token expiry");
+    match close {
+        None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_)) => {}
+        other => panic!("expected websocket close after token expiry, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -616,67 +644,24 @@ async fn ws_subscribe_logs_emits_notifications() {
 }
 
 #[tokio::test]
-async fn ws_subscribe_pending_transactions_hashes_emits_notifications() {
+async fn ws_subscribe_pending_transactions_is_disabled() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["newPendingTransactions"]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
-
-    assert_eq!(resp["id"], 1);
-    let subscription_id = resp["result"].as_str().expect("subscription id");
-
-    let notification = tokio::time::timeout(Duration::from_secs(2), ws.next())
+    for (id, params) in [
+        (1, json!(["newPendingTransactions"])),
+        (2, json!(["newPendingTransactions", true])),
+    ] {
+        ws.send(tungstenite::Message::Text(
+            jsonrpc_with_params("eth_subscribe", params, id).into(),
+        ))
         .await
-        .expect("timed out waiting for pending tx hash notification")
-        .unwrap()
         .unwrap();
-    let notification = parse_response(notification);
+        let resp = parse_response(ws.next().await.unwrap().unwrap());
 
-    assert_eq!(notification["method"], "eth_subscription");
-    assert_eq!(notification["params"]["subscription"], subscription_id);
-    assert_eq!(
-        notification["params"]["result"],
-        format!(
-            "{:#x}",
-            b256!("0x5555555555555555555555555555555555555555555555555555555555555555")
-        )
-    );
-}
-
-#[tokio::test]
-async fn ws_subscribe_pending_transactions_full_emits_notifications() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
-    let mut ws = connect_with_header(&ctx).await;
-
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["newPendingTransactions", true]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
-
-    assert_eq!(resp["id"], 1);
-    let subscription_id = resp["result"].as_str().expect("subscription id");
-
-    let notification = tokio::time::timeout(Duration::from_secs(2), ws.next())
-        .await
-        .expect("timed out waiting for full pending tx notification")
-        .unwrap()
-        .unwrap();
-    let notification = parse_response(notification);
-
-    assert_eq!(notification["method"], "eth_subscription");
-    assert_eq!(notification["params"]["subscription"], subscription_id);
-    assert_eq!(notification["params"]["result"]["nonce"], "0x7");
-    assert_eq!(
-        notification["params"]["result"]["from"],
-        format!("{:#x}", Address::repeat_byte(0x11))
-    );
+        assert_eq!(resp["id"], id);
+        assert_eq!(resp["error"]["code"], -32006);
+    }
 }
 
 #[tokio::test]
@@ -713,10 +698,10 @@ async fn ws_subscribe_rejects_invalid_param_shapes() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    for (id, params) in [
-        (1, json!(["newHeads", false])),
-        (2, json!(["logs", false])),
-        (3, json!(["newPendingTransactions", {}])),
+    for (id, params, code) in [
+        (1, json!(["newHeads", false]), -32602),
+        (2, json!(["logs", false]), -32602),
+        (3, json!(["newPendingTransactions", {}]), -32006),
     ] {
         ws.send(tungstenite::Message::Text(
             jsonrpc_with_params("eth_subscribe", params, id).into(),
@@ -725,7 +710,7 @@ async fn ws_subscribe_rejects_invalid_param_shapes() {
         .unwrap();
         let resp = parse_response(ws.next().await.unwrap().unwrap());
         assert_eq!(resp["id"], id);
-        assert_eq!(resp["error"]["code"], -32602);
+        assert_eq!(resp["error"]["code"], code);
     }
 }
 

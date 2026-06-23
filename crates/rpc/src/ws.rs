@@ -4,8 +4,9 @@
 //! a `?token=0x<hex>` query parameter (for browser clients that cannot set
 //! custom headers on the upgrade request).
 //!
-//! Auth is validated once during the HTTP upgrade handshake — individual
-//! messages are not re-authenticated since WS frames don't carry auth headers.
+//! Auth is validated during the HTTP upgrade handshake and the session is
+//! closed once that token expires. Individual messages are not re-authenticated
+//! since WS frames don't carry auth headers.
 
 use alloy_rpc_types_eth::{
     Filter, FilterId,
@@ -22,7 +23,11 @@ use axum::{
 use futures::{SinkExt, stream::StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -219,6 +224,15 @@ fn try_queue_notification(
     }
 }
 
+fn duration_until_unix_timestamp(timestamp: u64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs();
+
+    Duration::from_secs(timestamp.saturating_sub(now))
+}
+
 struct WsDispatchResult {
     response: JsonRpcResponse,
     pending_subscriptions: Vec<PendingSubscription>,
@@ -292,32 +306,10 @@ async fn handle_subscribe(
             }
         }
         SubscriptionKind::NewPendingTransactions => {
-            let full = match params.unwrap_or(SubscriptionParams::None) {
-                SubscriptionParams::None | SubscriptionParams::Bool(false) => false,
-                SubscriptionParams::Bool(true) => true,
-                SubscriptionParams::Logs(_) | SubscriptionParams::TransactionReceipts(_) => {
-                    return WsDispatchResult::response_only(JsonRpcResponse::error(
-                        req.id.clone(),
-                        JsonRpcError::invalid_params(
-                            "eth_subscribe(newPendingTransactions) expects an optional boolean",
-                        ),
-                    ));
-                }
-            };
-
-            match state
-                .api
-                .ws_subscribe_pending_transactions(full, auth.clone())
-                .await
-            {
-                Ok(subscription) => subscription,
-                Err(err) => {
-                    return WsDispatchResult::response_only(JsonRpcResponse::error(
-                        req.id.clone(),
-                        err,
-                    ));
-                }
-            }
+            return WsDispatchResult::response_only(JsonRpcResponse::error(
+                req.id.clone(),
+                JsonRpcError::method_disabled(),
+            ));
         }
         SubscriptionKind::Syncing => {
             return WsDispatchResult::response_only(JsonRpcResponse::error(
@@ -519,9 +511,19 @@ async fn handle_ws_session(
     });
 
     let mut session = WsSession::default();
+    let expiry = tokio::time::sleep(duration_until_unix_timestamp(auth.expires_at));
+    tokio::pin!(expiry);
 
     loop {
         let msg = tokio::select! {
+            _ = &mut expiry => {
+                warn!(
+                    target: "zone::rpc",
+                    caller = %auth.caller,
+                    "ws authorization token expired, closing session"
+                );
+                break;
+            }
             _ = close_session_rx.changed() => break,
             msg = ws_receiver.next() => match msg {
                 Some(msg) => msg,
