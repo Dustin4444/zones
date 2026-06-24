@@ -44,11 +44,14 @@ use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tempo_alloy::TempoNetwork;
 use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+use tempo_precompiles::tip403_registry::ALLOW_ALL_POLICY_ID;
 use tracing::info;
 
 use super::{builtin_authorization, events::PolicyEvent, policy_set::PolicySet};
 
 use crate::l1_state::versioned::HeightVersioned;
+
+const INITIAL_POLICY_ID_COUNTER: u64 = ALLOW_ALL_POLICY_ID + 1;
 
 /// Thread-safe TIP-403 policy cache backed by an `Arc<RwLock<PolicyCacheInner>>`.
 #[derive(Debug, Clone, Deref, Default)]
@@ -76,6 +79,32 @@ impl PolicyCache {
     /// engine hasn't consumed yet.
     pub fn advance(&self, block_number: u64) {
         self.write().advance(block_number);
+    }
+
+    /// Query and seed the authoritative TIP-403 `policyIdCounter` from L1.
+    pub async fn seed_policy_id_counter(
+        &self,
+        provider: &DynProvider<TempoNetwork>,
+    ) -> eyre::Result<()> {
+        use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
+
+        let block_number = self.last_l1_block();
+        let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, provider);
+        let counter = registry
+            .policyIdCounter()
+            .block(alloy_rpc_types_eth::BlockId::number(block_number))
+            .call()
+            .await
+            .map_err(|e| {
+                eyre::eyre!("failed to seed policyIdCounter at block {block_number}: {e}")
+            })?;
+
+        self.write().set_policy_id_counter(counter);
+        info!(
+            counter,
+            block_number, "Seeded TIP-403 policy ID counter from L1"
+        );
+        Ok(())
     }
 
     /// Query the current `transferPolicyId` for each tracked token and seed it
@@ -132,7 +161,7 @@ impl PolicyCache {
 /// - Policy ID → policy record (type, policy set, compound data).
 ///
 /// This allows the zone sequencer to evaluate transfer authorization without RPC round-trips.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PolicyCacheInner {
     /// Per-token transfer policy ID.
     tokens: HashMap<Address, HeightVersioned<u64>>,
@@ -153,6 +182,23 @@ pub struct PolicyCacheInner {
     /// [`PolicyResolutionTask`](super::PolicyResolutionTask) reads this to
     /// query L1 at the correct block height for cache-miss RPC fallback.
     last_l1_block: u64,
+    /// Next TIP-403 policy ID, mirroring L1 `policyIdCounter`.
+    ///
+    /// Seeded from L1 during startup or provider cache-miss fallback. The zone precompile serves
+    /// `policyIdCounter()` from this local value, never by doing RPC in the EVM
+    /// execution path.
+    policy_id_counter: Option<u64>,
+}
+
+impl Default for PolicyCacheInner {
+    fn default() -> Self {
+        Self {
+            tokens: HashMap::default(),
+            policies: HashMap::default(),
+            last_l1_block: 0,
+            policy_id_counter: None,
+        }
+    }
 }
 
 impl PolicyCacheInner {
@@ -197,6 +243,20 @@ impl PolicyCacheInner {
     /// Returns a reference to the per-policy-ID records for direct inspection.
     pub fn policies(&self) -> &HashMap<u64, CachedPolicy> {
         &self.policies
+    }
+
+    /// Returns the cached next TIP-403 policy ID.
+    pub fn policy_id_counter(&self) -> Option<u64> {
+        self.policy_id_counter
+    }
+
+    /// Sets the cached TIP-403 policy ID counter from an authoritative L1 read.
+    pub fn set_policy_id_counter(&mut self, counter: u64) {
+        let counter = counter.max(INITIAL_POLICY_ID_COUNTER);
+        self.policy_id_counter = Some(
+            self.policy_id_counter
+                .map_or(counter, |current| current.max(counter)),
+        );
     }
 
     /// Returns all token addresses currently tracked by the cache.
@@ -387,8 +447,11 @@ impl PolicyCacheInner {
         }
     }
 
-    /// Clears all cached policy data. `last_l1_block` is preserved — the engine
-    /// will advance it when it reprocesses blocks after a reorg.
+    /// Clears cached token and policy records.
+    ///
+    /// `last_l1_block` and `policy_id_counter` are preserved: clear paths do
+    /// not synchronously reseed from L1, so dropping the seeded counter would
+    /// make `policyIdCounter()` temporarily undercount after a resync.
     pub fn clear(&mut self) {
         self.tokens.clear();
         self.policies.clear();
@@ -455,11 +518,17 @@ pub struct CompoundData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{Bytes, U256, address};
+    use alloy_provider::{Provider, ProviderBuilder};
+    use alloy_transport::mock::Asserter;
 
     const TOKEN: Address = address!("0x20C0000000000000000000000000000000000000");
     const USER_A: Address = address!("0x0000000000000000000000000000000000000001");
     const USER_B: Address = address!("0x0000000000000000000000000000000000000002");
+
+    fn abi_encode_u64(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+    }
 
     // --- PolicySet tests ---
 
@@ -546,6 +615,67 @@ mod tests {
     }
 
     // --- PolicyCacheInner tests: simple policies ---
+
+    #[test]
+    fn policy_id_counter_defaults_to_unknown() {
+        let cache = PolicyCacheInner::default();
+        assert_eq!(cache.policy_id_counter(), None);
+    }
+
+    #[test]
+    fn policy_id_counter_ignores_learned_policies_before_seed() {
+        let mut cache = PolicyCacheInner::default();
+
+        cache.set_policy_type(5, PolicyType::WHITELIST);
+        assert_eq!(cache.policy_id_counter(), None);
+    }
+
+    #[test]
+    fn policy_id_counter_ignores_learned_policies_after_seed() {
+        let mut cache = PolicyCacheInner::default();
+
+        cache.set_policy_id_counter(10);
+        cache.set_policy_type(5, PolicyType::WHITELIST);
+        assert_eq!(cache.policy_id_counter(), Some(10));
+
+        cache.set_policy_type(3, PolicyType::BLACKLIST);
+        assert_eq!(cache.policy_id_counter(), Some(10));
+    }
+
+    #[test]
+    fn policy_id_counter_is_preserved_when_policy_cache_is_cleared() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_policy_id_counter(10);
+        cache.set_policy_type(5, PolicyType::WHITELIST);
+
+        cache.clear();
+
+        assert_eq!(cache.policy_id_counter(), Some(10));
+    }
+
+    #[test]
+    fn policy_id_counter_seed_does_not_regress_newer_cached_value() {
+        let mut cache = PolicyCacheInner::default();
+
+        cache.set_policy_id_counter(21);
+        cache.set_policy_id_counter(10);
+
+        assert_eq!(cache.policy_id_counter(), Some(21));
+    }
+
+    #[tokio::test]
+    async fn seed_policy_id_counter_reads_authoritative_value_from_l1() {
+        let asserter = Asserter::new();
+        asserter.push_success(&abi_encode_u64(42));
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        let cache = PolicyCache::default();
+
+        cache.seed_policy_id_counter(&provider).await.unwrap();
+
+        assert_eq!(cache.read().policy_id_counter(), Some(42));
+    }
 
     #[test]
     fn special_policy_always_reject() {

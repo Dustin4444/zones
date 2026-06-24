@@ -583,6 +583,41 @@ impl PolicyProvider {
         })
     }
 
+    /// Cache-first, RPC-fallback `policyIdCounter` resolution (sync).
+    ///
+    /// Falls back to L1 only when the counter has not been seeded into the
+    /// cache yet. The fetched authoritative value is stored locally so future
+    /// precompile calls do not perform network IO.
+    pub fn policy_id_counter_sync(&self) -> Result<u64> {
+        if let Some(counter) = self.cache.read().policy_id_counter() {
+            return Ok(counter);
+        }
+
+        let block_number = self.cache.read().last_l1_block();
+        debug!(
+            block_number,
+            "Policy ID counter cache miss, fetching from L1 RPC"
+        );
+        let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &self.provider);
+        let counter = tokio::task::block_in_place(|| {
+            self.runtime_handle.block_on(async {
+                registry
+                    .policyIdCounter()
+                    .block(BlockId::number(block_number))
+                    .call()
+                    .await
+                    .map_err(|e| {
+                        self.metrics.rpc_errors.increment(1);
+                        warn!(block_number, %e, "policyIdCounter RPC failed");
+                        eyre::eyre!("policyIdCounter RPC failed at block {block_number}: {e}")
+                    })
+            })
+        })?;
+
+        self.cache.write().set_policy_id_counter(counter);
+        Ok(counter)
+    }
+
     /// Call `isAuthorized(policyId, user)` on the TIP403Registry via L1 RPC.
     async fn rpc_is_authorized(
         &self,
@@ -658,8 +693,48 @@ impl PolicyCheck for PolicyProvider {
         })
     }
 
-    fn policy_id_counter(&self) -> u64 {
-        let cache = self.cache.read();
-        cache.policies().keys().max().map_or(2, |max| max + 1)
+    fn policy_id_counter(&self) -> Result<u64, PrecompileError> {
+        self.policy_id_counter_sync().map_err(|e| {
+            zone_precompiles::zone_rpc_error(format!("failed to resolve policyIdCounter: {e}"))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Bytes, U256};
+    use alloy_provider::{Provider, ProviderBuilder};
+    use alloy_transport::mock::Asserter;
+
+    fn abi_encode_u64(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+    }
+
+    fn provider_with(asserter: Asserter, cache: PolicyCache) -> PolicyProvider {
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        PolicyProvider::new(cache, provider, tokio::runtime::Handle::current())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn policy_id_counter_fetches_l1_once_when_cache_is_unknown() {
+        let asserter = Asserter::new();
+        asserter.push_success(&abi_encode_u64(42));
+        let cache = PolicyCache::default();
+        let provider = provider_with(asserter, cache.clone());
+
+        let counters = tokio::task::spawn_blocking(move || {
+            let first = provider.policy_id_counter()?;
+            let second = provider.policy_id_counter()?;
+            Ok::<_, PrecompileError>((first, second))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(counters, (42, 42));
+        assert_eq!(cache.read().policy_id_counter(), Some(42));
     }
 }

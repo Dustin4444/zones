@@ -41,5 +41,5 @@ pub trait PolicyCheck {
     fn policy_exists(&self, policy_id: u64) -> Result<bool, PrecompileError>;
 
     /// Return the highest known policy ID counter.
-    fn policy_id_counter(&self) -> u64;
+    fn policy_id_counter(&self) -> Result<u64, PrecompileError>;
 }

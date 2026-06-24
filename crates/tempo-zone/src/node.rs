@@ -419,6 +419,11 @@ where
         };
 
         self.policy_cache
+            .seed_policy_id_counter(l1_provider)
+            .await?;
+        info!(target: "reth::cli", "Seeded TIP-403 policy ID counter from L1");
+
+        self.policy_cache
             .seed_token_policies(portal, &tracked_tokens, l1_provider)
             .await?;
         info!(target: "reth::cli", "Seeded token policies from L1");
