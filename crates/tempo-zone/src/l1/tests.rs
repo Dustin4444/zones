@@ -146,6 +146,7 @@ fn test_subscriber(
             genesis_tempo_block_number,
             policy_cache: crate::PolicyCache::default(),
             l1_state_cache: crate::L1StateCache::new(HashSet::from([portal_address])),
+            l1_block_tag: BlockNumberOrTag::Finalized,
             l1_fetch_concurrency: 1,
             retry_connection_interval: Duration::from_secs(1),
         },

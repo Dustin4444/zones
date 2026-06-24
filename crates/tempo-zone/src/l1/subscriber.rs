@@ -21,6 +21,9 @@ pub struct L1SubscriberConfig {
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
     /// finalized block and clears it on reorgs.
     pub l1_state_cache: crate::l1_state::cache::L1StateCache,
+    /// L1 block tag used for polling. Production nodes use `Finalized`; tests
+    /// can use `Latest` for local dev chains that do not advance finalized.
+    pub l1_block_tag: BlockNumberOrTag,
     /// Maximum number of concurrent L1 RPC receipt fetches. Used directly for
     /// the live stream and halved for backfill (which sends 2 requests per block).
     pub l1_fetch_concurrency: usize,
@@ -133,18 +136,15 @@ impl L1Subscriber {
         Ok(provider)
     }
 
-    async fn finalized_block_number(
-        &self,
-        provider: &DynProvider<TempoNetwork>,
-    ) -> eyre::Result<u64> {
+    async fn tagged_block_number(&self, provider: &DynProvider<TempoNetwork>) -> eyre::Result<u64> {
         let block = provider
-            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .get_block_by_number(self.config.l1_block_tag)
             .await?
-            .ok_or_else(|| eyre::eyre!("finalized L1 block not available"))?;
+            .ok_or_else(|| eyre::eyre!("tagged L1 block not available"))?;
         Ok(block.header().number())
     }
 
-    /// Build the live L1 block stream from finalized blocks only.
+    /// Build the live L1 block stream from the configured finality tag.
     async fn l1_block_stream(
         &self,
         provider: &DynProvider<TempoNetwork>,
@@ -165,23 +165,24 @@ impl L1Subscriber {
 
         let provider = provider.clone();
         let subscriber_metrics = self.subscriber_metrics.clone();
+        let l1_block_tag = self.config.l1_block_tag;
         let stream = stream::unfold(start_block, move |block_number| {
             let provider = provider.clone();
             let subscriber_metrics = subscriber_metrics.clone();
             async move {
                 loop {
-                    let finalized_number = match provider
-                        .get_block_by_number(BlockNumberOrTag::Finalized)
+                    let tagged_number = match provider
+                        .get_block_by_number(l1_block_tag)
                         .await
                         .map_err(eyre::Report::from)
                         .and_then(|block| {
-                            block.ok_or_else(|| eyre::eyre!("finalized L1 block not available"))
+                            block.ok_or_else(|| eyre::eyre!("tagged L1 block not available"))
                         }) {
                         Ok(block) => block.header().number(),
                         Err(err) => return Some((Err(err), block_number)),
                     };
 
-                    if block_number > finalized_number {
+                    if block_number > tagged_number {
                         tokio::time::sleep(FINALIZED_POLL_INTERVAL).await;
                         continue;
                     }
@@ -218,7 +219,7 @@ impl L1Subscriber {
                             block_number,
                             elapsed_ms = elapsed.as_millis() as u64,
                             receipts = receipts.len(),
-                            "Fetched finalized L1 block data"
+                            "Fetched tagged L1 block data"
                         );
                         (header, receipts)
                     });
@@ -268,7 +269,7 @@ impl L1Subscriber {
         Ok(Some(on_chain + 1))
     }
 
-    /// Backfill deposit events from the starting block to the current finalized L1 block.
+    /// Backfill deposit events from the starting block to the current tagged L1 block.
     #[instrument(skip(self, l1_provider))]
     async fn sync_to_finalized_l1(
         &mut self,
@@ -293,10 +294,10 @@ impl L1Subscriber {
             from = from.max(adjusted);
         }
 
-        let tip = self.finalized_block_number(l1_provider).await?;
+        let tip = self.tagged_block_number(l1_provider).await?;
         self.record_seen_block(tip, 0);
         if from > tip {
-            info!(from, tip, "Already synced to finalized L1");
+            info!(from, tip, "Already synced to tagged L1");
             self.subscriber_metrics.current_l1_lag_blocks.set(0.0);
             return Ok(());
         }
@@ -305,7 +306,7 @@ impl L1Subscriber {
             from,
             tip,
             blocks = tip - from + 1,
-            "Backfilling finalized L1 deposit events"
+            "Backfilling tagged L1 deposit events"
         );
         let start = std::time::Instant::now();
         let result = self.backfill(l1_provider, from, tip).await;
@@ -423,7 +424,7 @@ impl L1Subscriber {
     /// Run the L1 subscriber until the stream ends or an error occurs.
     ///
     /// Connects to the L1 node, backfills deposit events to the current
-    /// finalized L1 block, then polls newly finalized blocks. Each block — with
+    /// configured L1 block tag, then polls newly available blocks. Each block — with
     /// or without deposits — is enqueued so the zone engine sees a strict
     /// sequential finalized chain.
     ///
@@ -435,8 +436,8 @@ impl L1Subscriber {
 
         let provider = self.connect().await?;
 
-        // Backfill to the current finalized block before polling for the next
-        // finalized block.
+        // Backfill to the current tagged block before polling for the next
+        // available block.
         self.sync_to_finalized_l1(&provider).await?;
 
         let stream_start = if let Some(last) = self.deposit_queue.last_enqueued() {
@@ -444,12 +445,12 @@ impl L1Subscriber {
         } else if let Some(start) = self.resolve_start_block(&provider).await? {
             start
         } else {
-            self.finalized_block_number(&provider).await? + 1
+            self.tagged_block_number(&provider).await? + 1
         };
         info!(
             portal = %self.config.portal_address,
             stream_start,
-            "Polling finalized L1 blocks"
+            "Polling tagged L1 blocks"
         );
         let mut stream = self.l1_block_stream(&provider, stream_start).await?;
 
@@ -483,14 +484,14 @@ impl L1Subscriber {
                         from,
                         to,
                         tip = block_number,
-                        "Backfilling gap before finalized block"
+                        "Backfilling gap before tagged block"
                     );
                     self.backfill(&provider, from, block_number).await?;
                 }
             }
         }
 
-        warn!("Finalized L1 block polling stream ended");
+        warn!("Tagged L1 block polling stream ended");
         Ok(())
     }
 

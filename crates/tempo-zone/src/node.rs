@@ -146,6 +146,7 @@ impl ZoneNode {
             genesis_tempo_block_number,
             policy_cache: policy_cache.clone(),
             l1_state_cache: l1_state_cache.clone(),
+            l1_block_tag: alloy_eips::BlockNumberOrTag::Finalized,
             l1_fetch_concurrency,
             retry_connection_interval,
         };
@@ -187,6 +188,12 @@ impl ZoneNode {
     /// When set, the startup L1 RPC query for enabled tokens is skipped.
     pub fn with_initial_tokens(mut self, tokens: Vec<Address>) -> Self {
         self.initial_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the L1 block tag used by the subscriber.
+    pub fn with_l1_block_tag(mut self, tag: alloy_eips::BlockNumberOrTag) -> Self {
+        self.l1_config.l1_block_tag = tag;
         self
     }
 

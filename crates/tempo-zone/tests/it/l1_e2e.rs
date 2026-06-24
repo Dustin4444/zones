@@ -5,7 +5,8 @@
 //! subscriber naturally receives blocks and deposits — no synthetic injection.
 
 use crate::utils::{
-    L1TestNode, STABLECOIN_DEX_ADDRESS, WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
+    DEFAULT_POLL, L1TestNode, STABLECOIN_DEX_ADDRESS, WithdrawalArgs, ZoneAccount, ZoneTestNode,
+    poll_until, spawn_sequencer,
 };
 use alloy::{
     primitives::{Address, B256, U256},
@@ -108,12 +109,14 @@ async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
 
     // Verify L1 is producing blocks
     let l1_block_0 = l1.provider().get_block_number().await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let l1_block_1 = l1.provider().get_block_number().await?;
-    assert!(
-        l1_block_1 > l1_block_0,
-        "L1 should be producing blocks in dev mode"
-    );
+    poll_until(L1_TIMEOUT, DEFAULT_POLL, "L1 block production", || {
+        let provider = l1.provider();
+        async move {
+            let l1_block_1 = provider.get_block_number().await?;
+            Ok((l1_block_1 > l1_block_0).then_some(l1_block_1))
+        }
+    })
+    .await?;
 
     // Start zone node connected to real L1 — genesis is patched from the L1's
     // current header so TempoState chain continuity works.

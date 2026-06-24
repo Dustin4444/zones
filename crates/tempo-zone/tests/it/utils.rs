@@ -509,7 +509,8 @@ impl ZoneTestNode {
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_initial_tokens(vec![]);
+        .with_initial_tokens(vec![])
+        .with_l1_block_tag(alloy_eips::BlockNumberOrTag::Latest);
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
