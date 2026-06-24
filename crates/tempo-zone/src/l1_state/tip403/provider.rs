@@ -18,11 +18,13 @@ use tempo_contracts::precompiles::{
     ITIP20, ITIP403Registry, ITIP403Registry::PolicyType, TIP403_REGISTRY_ADDRESS,
 };
 use tracing::{debug, info, warn};
-use zone_precompiles::policy::PolicyCheck;
+use zone_precompiles::policy::{PolicyCheck, ReceivePolicy, ReceivePolicyDecision};
 
 use super::builtin_authorization;
 
 use super::{AuthRole, CompoundData, PolicyCache, metrics::Tip403Metrics};
+
+type BlockedReason = tempo_contracts::precompiles::ITIP403Registry::BlockedReason;
 
 /// Cache-first, RPC-fallback provider for TIP-403 policy authorization.
 ///
@@ -541,6 +543,174 @@ impl PolicyProvider {
         })
     }
 
+    /// Cache-first, RPC-fallback receive-policy lookup (sync).
+    pub fn receive_policy_sync(&self, account: Address) -> Result<ReceivePolicy> {
+        let block_number = self.cache.read().last_l1_block();
+        tokio::task::block_in_place(|| {
+            self.runtime_handle
+                .block_on(self.resolve_receive_policy(account, block_number))
+        })
+    }
+
+    /// Cache-first, RPC-fallback receive-policy validation (sync).
+    pub fn check_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<ReceivePolicyDecision> {
+        self.metrics.authorization_checks_total.increment(1);
+
+        let block_number = self.cache.read().last_l1_block();
+        if let Some(decision) =
+            self.cache
+                .read()
+                .check_receive_policy(token, sender, receiver, block_number)
+        {
+            self.metrics.cache_hits.increment(1);
+            return Ok(decision);
+        }
+
+        self.metrics.cache_misses.increment(1);
+        debug!(
+            %token, %sender, %receiver, block_number,
+            "Receive policy cache miss, fetching from L1 RPC"
+        );
+        tokio::task::block_in_place(|| {
+            self.runtime_handle
+                .block_on(self.fetch_receive_policy_decision(token, sender, receiver, block_number))
+        })
+    }
+
+    /// Resolve an account receive policy, filling in policy types for event-sourced entries.
+    async fn resolve_receive_policy(
+        &self,
+        account: Address,
+        block_number: u64,
+    ) -> Result<ReceivePolicy> {
+        let policy = match self.cache.read().get_receive_policy(account, block_number) {
+            Some(policy) => policy,
+            None => self.fetch_receive_policy(account, block_number).await?,
+        };
+
+        if !policy.has_receive_policy {
+            return Ok(policy);
+        }
+
+        let sender_policy_type = self
+            .resolve_receive_policy_type(policy.sender_policy_id, block_number)
+            .await?;
+        let token_filter_type = self
+            .resolve_receive_policy_type(policy.token_filter_id, block_number)
+            .await?;
+
+        Ok(ReceivePolicy {
+            sender_policy_type,
+            token_filter_type,
+            ..policy
+        })
+    }
+
+    /// Fetch an account receive policy from L1 and cache the result.
+    async fn fetch_receive_policy(
+        &self,
+        account: Address,
+        block_number: u64,
+    ) -> Result<ReceivePolicy> {
+        let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &self.provider);
+        let result = registry
+            .receivePolicy(account)
+            .block(BlockId::number(block_number))
+            .call()
+            .await
+            .map_err(|e| {
+                self.metrics.rpc_errors.increment(1);
+                warn!(%account, block_number, %e, "receivePolicy RPC failed");
+                eyre::eyre!("receivePolicy RPC failed for account {account}: {e}")
+            })?;
+
+        let policy = ReceivePolicy {
+            has_receive_policy: result.hasReceivePolicy,
+            sender_policy_id: result.senderPolicyId,
+            sender_policy_type: result.senderPolicyType,
+            token_filter_id: result.tokenFilterId,
+            token_filter_type: result.tokenFilterType,
+            recovery_authority: result.recoveryAuthority,
+        };
+
+        {
+            let mut cache = self.cache.write();
+            cache.set_receive_policy(account, block_number, policy);
+            if policy.has_receive_policy {
+                if policy.sender_policy_id > 1 {
+                    cache.set_policy_type(policy.sender_policy_id, policy.sender_policy_type);
+                }
+                if policy.token_filter_id > 1 {
+                    cache.set_policy_type(policy.token_filter_id, policy.token_filter_type);
+                }
+            }
+        }
+
+        info!(
+            %account,
+            has_receive_policy = policy.has_receive_policy,
+            sender_policy_id = policy.sender_policy_id,
+            token_filter_id = policy.token_filter_id,
+            block_number,
+            "Cached receive policy from L1 RPC"
+        );
+
+        Ok(policy)
+    }
+
+    async fn resolve_receive_policy_type(
+        &self,
+        policy_id: u64,
+        block_number: u64,
+    ) -> Result<PolicyType> {
+        match policy_id {
+            0 => Ok(PolicyType::WHITELIST),
+            1 => Ok(PolicyType::BLACKLIST),
+            _ => self.resolve_policy_type(policy_id, block_number).await,
+        }
+    }
+
+    /// Fetch enough L1 state to validate one inbound transfer or mint.
+    async fn fetch_receive_policy_decision(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+        block_number: u64,
+    ) -> Result<ReceivePolicyDecision> {
+        let policy = self.resolve_receive_policy(receiver, block_number).await?;
+        if !policy.has_receive_policy {
+            return Ok(ReceivePolicyDecision::Authorized);
+        }
+
+        if !self
+            .resolve_simple_sub_policy(policy.token_filter_id, token, block_number)
+            .await?
+        {
+            return Ok(ReceivePolicyDecision::Blocked {
+                reason: BlockedReason::TOKEN_FILTER,
+                recovery_authority: policy.recovery_authority,
+            });
+        }
+
+        if !self
+            .resolve_simple_sub_policy(policy.sender_policy_id, sender, block_number)
+            .await?
+        {
+            return Ok(ReceivePolicyDecision::Blocked {
+                reason: BlockedReason::RECEIVE_POLICY,
+                recovery_authority: policy.recovery_authority,
+            });
+        }
+
+        Ok(ReceivePolicyDecision::Authorized)
+    }
+
     /// Cache-first, RPC-fallback policy existence check (sync).
     ///
     /// Returns `Ok(true)` if the policy exists, `Ok(false)` if it doesn't,
@@ -661,5 +831,27 @@ impl PolicyCheck for PolicyProvider {
     fn policy_id_counter(&self) -> u64 {
         let cache = self.cache.read();
         cache.policies().keys().max().map_or(2, |max| max + 1)
+    }
+
+    fn receive_policy(&self, account: Address) -> Result<ReceivePolicy, PrecompileError> {
+        self.receive_policy_sync(account).map_err(|e| {
+            zone_precompiles::zone_rpc_error(format!(
+                "receivePolicy failed for account {account}: {e}"
+            ))
+        })
+    }
+
+    fn validate_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<ReceivePolicyDecision, PrecompileError> {
+        self.check_receive_policy(token, sender, receiver)
+            .map_err(|e| {
+                zone_precompiles::zone_rpc_error(format!(
+                    "validateReceivePolicy failed for token {token} sender {sender} receiver {receiver}: {e}"
+                ))
+            })
     }
 }

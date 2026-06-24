@@ -5,7 +5,8 @@
 //! queries from the zone's [`PolicyCheck`] provider (cache-first, L1 RPC fallback).
 //!
 //! **Read-only calls** (`isAuthorized`, `isAuthorizedSender`, `isAuthorizedRecipient`,
-//! `isAuthorizedMintRecipient`, `policyData`, `compoundPolicyData`, `policyExists`)
+//! `isAuthorizedMintRecipient`, `policyData`, `compoundPolicyData`, `policyExists`,
+//! `receivePolicy`, `validateReceivePolicy`)
 //! are resolved via the [`PolicyCheck`] trait.
 //!
 //! **Mutating calls** (`createPolicy`, `modifyPolicyWhitelist`, etc.) are reverted —
@@ -23,7 +24,7 @@ use tempo_precompiles::tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_
 use tracing::{debug, warn};
 use zone_primitives::policy::AuthRole;
 
-use crate::policy::PolicyCheck;
+use crate::policy::{PolicyCheck, ReceivePolicyDecision};
 
 /// The precompile address — same as the L1 TIP403Registry.
 pub const ZONE_TIP403_PROXY_ADDRESS: Address = TIP403_REGISTRY_ADDRESS;
@@ -93,6 +94,17 @@ impl<P: PolicyCheck> ZoneTip403ProxyRegistry<P> {
         }
         self.is_authorized(policy_id, to, AuthRole::Recipient)
     }
+
+    /// Validate `receiver`'s TIP-1028 receive policy for an inbound transfer or mint.
+    pub fn validate_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+    ) -> Result<ReceivePolicyDecision, PrecompileError> {
+        self.provider
+            .validate_receive_policy(token, sender, receiver)
+    }
 }
 
 impl<P: PolicyCheck + Clone + Send + Sync + 'static> ZoneTip403ProxyRegistry<P> {
@@ -154,12 +166,19 @@ impl<P: PolicyCheck> ZoneTip403ProxyRegistry<P> {
         if selector == ITIP403Registry::policyIdCounterCall::SELECTOR {
             return self.handle_policy_id_counter(reservoir);
         }
+        if selector == ITIP403Registry::receivePolicyCall::SELECTOR {
+            return self.handle_receive_policy(data, reservoir);
+        }
+        if selector == ITIP403Registry::validateReceivePolicyCall::SELECTOR {
+            return self.handle_validate_receive_policy(data, reservoir);
+        }
 
         // Mutating functions — all reverted on zone
         if selector == ITIP403Registry::createPolicyCall::SELECTOR
             || selector == ITIP403Registry::createPolicyWithAccountsCall::SELECTOR
             || selector == ITIP403Registry::createCompoundPolicyCall::SELECTOR
             || selector == ITIP403Registry::setPolicyAdminCall::SELECTOR
+            || selector == ITIP403Registry::setReceivePolicyCall::SELECTOR
             || selector == ITIP403Registry::modifyPolicyWhitelistCall::SELECTOR
             || selector == ITIP403Registry::modifyPolicyBlacklistCall::SELECTOR
         {
@@ -295,6 +314,53 @@ impl<P: PolicyCheck> ZoneTip403ProxyRegistry<P> {
         let encoded = ITIP403Registry::policyIdCounterCall::abi_encode_returns(&counter);
         Ok(PrecompileOutput::new(
             POLICY_DATA_GAS,
+            encoded.into(),
+            reservoir,
+        ))
+    }
+
+    /// Handle `receivePolicy(account)`.
+    fn handle_receive_policy(&self, data: &[u8], reservoir: u64) -> PrecompileResult {
+        let call = match ITIP403Registry::receivePolicyCall::abi_decode(data) {
+            Ok(call) => call,
+            Err(_) => return Ok(PrecompileOutput::revert(0, Bytes::new(), reservoir)),
+        };
+
+        let policy = self.provider.receive_policy(call.account)?;
+        let ret = ITIP403Registry::receivePolicyReturn {
+            hasReceivePolicy: policy.has_receive_policy,
+            senderPolicyId: policy.sender_policy_id,
+            senderPolicyType: policy.sender_policy_type,
+            tokenFilterId: policy.token_filter_id,
+            tokenFilterType: policy.token_filter_type,
+            recoveryAuthority: policy.recovery_authority,
+        };
+        let encoded = ITIP403Registry::receivePolicyCall::abi_encode_returns(&ret);
+        Ok(PrecompileOutput::new(
+            POLICY_DATA_GAS,
+            encoded.into(),
+            reservoir,
+        ))
+    }
+
+    /// Handle `validateReceivePolicy(token, sender, receiver)`.
+    fn handle_validate_receive_policy(&self, data: &[u8], reservoir: u64) -> PrecompileResult {
+        let call = match ITIP403Registry::validateReceivePolicyCall::abi_decode(data) {
+            Ok(call) => call,
+            Err(_) => return Ok(PrecompileOutput::revert(0, Bytes::new(), reservoir)),
+        };
+
+        let (authorized, blocked_reason) = self
+            .provider
+            .validate_receive_policy(call.token, call.sender, call.receiver)?
+            .as_validate_return();
+        let ret = ITIP403Registry::validateReceivePolicyReturn {
+            authorized,
+            blockedReason: blocked_reason,
+        };
+        let encoded = ITIP403Registry::validateReceivePolicyCall::abi_encode_returns(&ret);
+        Ok(PrecompileOutput::new(
+            AUTH_CHECK_GAS,
             encoded.into(),
             reservoir,
         ))

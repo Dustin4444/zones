@@ -10,19 +10,28 @@
 //! [`PolicyCheck`] — cache-first, L1 RPC fallback), and only then delegates
 //! to the vanilla `TIP20Token` implementation.
 
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
 
 use alloy_evm::precompiles::DynPrecompile;
-use alloy_primitives::{Address, Bytes};
-use alloy_sol_types::{SolCall, SolError, SolInterface};
+use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_sol_types::{SolCall, SolError, SolInterface, SolValue};
 use revm::precompile::{
     PrecompileError, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
-use tempo_precompiles::{
-    DelegateCallNotAllowed, Precompile as TempoPrecompile,
-    storage::{StorageCtx, evm::EvmPrecompileStorageProvider},
-    tip20::{IRolesAuth, ITIP20, RolesAuthError, TIP20Token},
+use tempo_contracts::precompiles::{
+    IReceivePolicyGuard, ITIP403Registry::BlockedReason, ReceivePolicyGuardError,
 };
+use tempo_precompiles::{
+    DelegateCallNotAllowed, Precompile as TempoPrecompile, RECEIVE_POLICY_GUARD_ADDRESS,
+    StaticCallNotAllowed,
+    address_registry::AddressRegistry,
+    storage::{ContractStorage, Handler, Mapping, StorageCtx, evm::EvmPrecompileStorageProvider},
+    tip20::{
+        IRolesAuth, ISSUER_ROLE, ITIP20, RolesAuthError, TIP20Error, TIP20Event, TIP20Token,
+        is_tip20_prefix, rewards::UserRewardInfo,
+    },
+};
+use tempo_precompiles_macros::contract;
 use tempo_zone_contracts::Unauthorized;
 use tracing::{trace, warn};
 use zone_primitives::{
@@ -31,7 +40,7 @@ use zone_primitives::{
 };
 
 use crate::{
-    policy::PolicyCheck,
+    policy::{PolicyCheck, ReceivePolicyDecision},
     tip403_proxy::{AUTH_CHECK_GAS, ZoneTip403ProxyRegistry},
 };
 
@@ -52,6 +61,306 @@ macro_rules! decode_or_revert {
         }
     };
 }
+
+/// Convert token/precompile business errors into normal ABI reverts.
+macro_rules! token_or_revert {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => return StorageCtx::default().error_result(err),
+        }
+    };
+}
+
+/// Recipient resolved through the Tempo address registry.
+#[derive(Debug, Clone, Copy)]
+struct ZoneRecipient {
+    target: Address,
+    virtual_addr: Option<Address>,
+}
+
+impl ZoneRecipient {
+    fn direct(addr: Address) -> Self {
+        Self {
+            target: addr,
+            virtual_addr: None,
+        }
+    }
+
+    fn resolve(addr: Address) -> tempo_precompiles::error::Result<Self> {
+        let effective = AddressRegistry::new().resolve_recipient(addr)?;
+        Ok(if effective == addr {
+            Self::direct(addr)
+        } else {
+            Self {
+                target: effective,
+                virtual_addr: Some(addr),
+            }
+        })
+    }
+
+    fn validate(&self) -> tempo_precompiles::error::Result<()> {
+        if self.target.is_zero() || is_tip20_prefix(self.target) {
+            return Err(tempo_contracts::precompiles::TIP20Error::invalid_recipient().into());
+        }
+        Ok(())
+    }
+
+    fn addressed_recipient(&self) -> Address {
+        self.virtual_addr.unwrap_or(self.target)
+    }
+}
+
+/// Zone-local writer for the upstream `ReceivePolicyGuard` storage layout.
+#[contract(addr = RECEIVE_POLICY_GUARD_ADDRESS)]
+struct ZoneReceivePolicyGuard {
+    nonce: u64,
+    balances: Mapping<B256, U256>,
+}
+
+impl ZoneReceivePolicyGuard {
+    #[allow(clippy::too_many_arguments)]
+    fn store_blocked(
+        &mut self,
+        token: Address,
+        originator: Address,
+        recipient: &ZoneRecipient,
+        recovery_authority: Address,
+        amount: U256,
+        blocked_reason: BlockedReason,
+        kind: IReceivePolicyGuard::InboundKind,
+        memo: B256,
+    ) -> tempo_precompiles::error::Result<()> {
+        if matches!(
+            blocked_reason,
+            BlockedReason::NONE | BlockedReason::__Invalid
+        ) || matches!(kind, IReceivePolicyGuard::InboundKind::__Invalid)
+        {
+            return Err(ReceivePolicyGuardError::invalid_receipt().into());
+        }
+
+        let blocked_nonce = self.next_receipt_nonce()?;
+        let blocked_at = self.storage.timestamp().saturating_to::<u64>();
+        let receipt = IReceivePolicyGuard::ClaimReceiptV1::new(
+            token,
+            recovery_authority,
+            originator,
+            recipient.addressed_recipient(),
+            blocked_at,
+            blocked_nonce,
+            blocked_reason as u8,
+            kind,
+            memo,
+        );
+        let key = self.storage.keccak256(receipt.abi_encode().as_ref())?;
+        self.balances[key].write(amount)?;
+        self.emit_event(receipt.blocked_event(recipient.target, amount))
+    }
+
+    fn next_receipt_nonce(&mut self) -> tempo_precompiles::error::Result<u64> {
+        let nonce = self.nonce.read()?.max(1);
+        self.nonce.write(
+            nonce
+                .checked_add(1)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?,
+        )?;
+        Ok(nonce)
+    }
+}
+
+mod zone_tip20_ledger {
+    use super::*;
+
+    /// Zone-local writer for the upstream `TIP20Token` storage layout.
+    ///
+    /// This deliberately mirrors the upstream storage fields so a blocked inbound
+    /// transfer can move funds to the receive-policy guard without going through
+    /// the public TIP20 entrypoints that reject the guard as a direct recipient.
+    #[contract]
+    pub(super) struct ZoneTip20Ledger {
+        roles: Mapping<Address, Mapping<B256, bool>>,
+        role_admins: Mapping<B256, B256>,
+
+        name: String,
+        symbol: String,
+        currency: String,
+        logo_uri: String,
+        quote_token: Address,
+        next_quote_token: Address,
+        transfer_policy_id: u64,
+
+        total_supply: U256,
+        balances: Mapping<Address, U256>,
+        allowances: Mapping<Address, Mapping<Address, U256>>,
+        permit_nonces: Mapping<Address, U256>,
+        paused: bool,
+        supply_cap: U256,
+        _salts: Mapping<B256, bool>,
+
+        global_reward_per_token: U256,
+        opted_in_supply: u128,
+        user_reward_info: Mapping<Address, UserRewardInfo>,
+    }
+
+    impl ZoneTip20Ledger {
+        pub(super) fn from_valid_tip20_address(address: Address) -> Self {
+            Self::__new(address)
+        }
+
+        pub(super) fn consume_allowance(
+            &mut self,
+            owner: Address,
+            spender: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            let allowed = self.get_allowance(owner, spender)?;
+            if amount > allowed {
+                return Err(TIP20Error::insufficient_allowance().into());
+            }
+
+            if allowed != U256::MAX {
+                let new_allowance = allowed
+                    .checked_sub(amount)
+                    .ok_or_else(TIP20Error::insufficient_allowance)?;
+                self.set_allowance(owner, spender, new_allowance)?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn checked_from_balance_for_transfer(
+            &self,
+            from: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<Option<U256>> {
+            if self.storage.spec().is_t8() {
+                return Ok(None);
+            }
+
+            let from_balance = self.get_balance(from)?;
+            if amount > from_balance {
+                return Err(
+                    TIP20Error::insufficient_balance(from_balance, amount, self.address).into(),
+                );
+            }
+            Ok(Some(from_balance))
+        }
+
+        pub(super) fn transfer_to_guard(
+            &mut self,
+            from: Address,
+            amount: U256,
+            from_balance: Option<U256>,
+        ) -> tempo_precompiles::error::Result<()> {
+            if let Some(from_balance) = from_balance {
+                let new_from_balance = from_balance
+                    .checked_sub(amount)
+                    .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
+                self.set_balance(from, new_from_balance)?;
+            } else {
+                self.decrement_balance(from, amount)?;
+            }
+
+            self.increment_balance(RECEIVE_POLICY_GUARD_ADDRESS, amount)?;
+            self.emit_event(TIP20Event::transfer(
+                from,
+                RECEIVE_POLICY_GUARD_ADDRESS,
+                amount,
+            ))
+        }
+
+        pub(super) fn checked_mint_supply(
+            &self,
+            total_supply: U256,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<U256> {
+            let new_supply = total_supply
+                .checked_add(amount)
+                .ok_or_else(tempo_precompiles::error::TempoPrecompileError::under_overflow)?;
+
+            let supply_cap = self.supply_cap.read()?;
+            if new_supply > supply_cap {
+                return Err(TIP20Error::supply_cap_exceeded().into());
+            }
+
+            Ok(new_supply)
+        }
+
+        pub(super) fn mint_to_guard(
+            &mut self,
+            new_supply: U256,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            self.total_supply.write(new_supply)?;
+            self.increment_balance(RECEIVE_POLICY_GUARD_ADDRESS, amount)?;
+            self.emit_event(TIP20Event::transfer(
+                Address::ZERO,
+                RECEIVE_POLICY_GUARD_ADDRESS,
+                amount,
+            ))?;
+            self.emit_event(TIP20Event::mint(RECEIVE_POLICY_GUARD_ADDRESS, amount))
+        }
+
+        fn get_balance(&self, account: Address) -> tempo_precompiles::error::Result<U256> {
+            self.balances[account].read()
+        }
+
+        fn set_balance(
+            &mut self,
+            account: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            self.balances[account].write(amount)
+        }
+
+        fn increment_balance(
+            &mut self,
+            account: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            self.balances[account].sinc(amount).map_err(|err| {
+                if err == tempo_precompiles::error::TempoPrecompileError::under_overflow() {
+                    TIP20Error::supply_cap_exceeded().into()
+                } else {
+                    err
+                }
+            })
+        }
+
+        fn decrement_balance(
+            &mut self,
+            account: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            self.balances[account]
+                .sdec(amount)
+                .map_err(|err| match err {
+                    tempo_precompiles::error::TempoPrecompileError::StorageDeltaUnderflow(
+                        current,
+                    ) => TIP20Error::insufficient_balance(current, amount, self.address).into(),
+                    err => err,
+                })
+        }
+
+        fn get_allowance(
+            &self,
+            owner: Address,
+            spender: Address,
+        ) -> tempo_precompiles::error::Result<U256> {
+            self.allowances[owner][spender].read()
+        }
+
+        fn set_allowance(
+            &mut self,
+            owner: Address,
+            spender: Address,
+            amount: U256,
+        ) -> tempo_precompiles::error::Result<()> {
+            self.allowances[owner][spender].write(amount)
+        }
+    }
+}
+
+use zone_tip20_ledger::ZoneTip20Ledger;
 
 /// Capability trait for resolving the active zone sequencer.
 ///
@@ -137,33 +446,83 @@ impl<P: PolicyCheck> ZoneTip20Token<P> {
             }
             ITIP20::transferCall::SELECTOR => {
                 let call = decode_or_revert!(ITIP20::transferCall, args);
-                self.enforce_transfer(address, caller, call.to)
+                if let Some(revert) = self.enforce_transfer(address, caller, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_transfer(
+                    address,
+                    None,
+                    caller,
+                    call.to,
+                    call.amount,
+                    B256::ZERO,
+                    true,
+                )
             }
             ITIP20::transferFromCall::SELECTOR => {
                 let call = decode_or_revert!(ITIP20::transferFromCall, args);
-                self.enforce_transfer(address, call.from, call.to)
+                if let Some(revert) = self.enforce_transfer(address, call.from, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_transfer(
+                    address,
+                    Some(caller),
+                    call.from,
+                    call.to,
+                    call.amount,
+                    B256::ZERO,
+                    true,
+                )
             }
             ITIP20::transferWithMemoCall::SELECTOR => {
                 let call = decode_or_revert!(ITIP20::transferWithMemoCall, args);
-                self.enforce_transfer(address, caller, call.to)
+                if let Some(revert) = self.enforce_transfer(address, caller, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_transfer(
+                    address,
+                    None,
+                    caller,
+                    call.to,
+                    call.amount,
+                    call.memo,
+                    false,
+                )
             }
             ITIP20::transferFromWithMemoCall::SELECTOR => {
                 let call = decode_or_revert!(ITIP20::transferFromWithMemoCall, args);
-                self.enforce_transfer(address, call.from, call.to)
+                if let Some(revert) = self.enforce_transfer(address, call.from, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_transfer(
+                    address,
+                    Some(caller),
+                    call.from,
+                    call.to,
+                    call.amount,
+                    call.memo,
+                    true,
+                )
             }
             ITIP20::mintCall::SELECTOR => {
                 if let Some(revert) = self.reject_crossed_mint_caller(caller) {
                     return Some(revert);
                 }
                 let call = decode_or_revert!(ITIP20::mintCall, args);
-                self.enforce_mint(address, call.to)
+                if let Some(revert) = self.enforce_mint(address, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_mint(address, caller, call.to, call.amount, B256::ZERO)
             }
             ITIP20::mintWithMemoCall::SELECTOR => {
                 if let Some(revert) = self.reject_crossed_mint_caller(caller) {
                     return Some(revert);
                 }
                 let call = decode_or_revert!(ITIP20::mintWithMemoCall, args);
-                self.enforce_mint(address, call.to)
+                if let Some(revert) = self.enforce_mint(address, call.to) {
+                    return Some(revert);
+                }
+                self.enforce_receive_mint(address, caller, call.to, call.amount, call.memo)
             }
             ITIP20::burnCall::SELECTOR | ITIP20::burnWithMemoCall::SELECTOR => {
                 self.reject_crossed_burn_caller(caller)
@@ -281,6 +640,244 @@ impl<P: PolicyCheck> ZoneTip20Token<P> {
         }
     }
 
+    /// Apply TIP-1028 receive policy to a transfer-family call.
+    fn enforce_receive_transfer(
+        &self,
+        token: Address,
+        spender: Option<Address>,
+        from: Address,
+        to: Address,
+        amount: U256,
+        memo: B256,
+        returns_bool: bool,
+    ) -> Option<PrecompileResult> {
+        if !StorageCtx::default().spec().is_t6() {
+            return None;
+        }
+
+        let registry = self.registry.as_ref()?;
+        let recipient = match Self::resolve_and_validate_recipient(to) {
+            Ok(recipient) => recipient,
+            Err(e) => return Some(StorageCtx::default().error_result(e)),
+        };
+
+        if recipient.target == RECEIVE_POLICY_GUARD_ADDRESS {
+            return Some(Ok(Self::receive_policy_guard_address_reserved_output()));
+        }
+
+        match registry
+            .validate_receive_policy(token, from, recipient.target)
+            .map_err(|e| {
+                warn!(
+                    target: "zone::precompile",
+                    %token, %from, receiver = %recipient.target, error = %e,
+                    "failed to validate receive policy, rejecting transfer"
+                );
+                e
+            }) {
+            Ok(ReceivePolicyDecision::Authorized) => None,
+            Ok(ReceivePolicyDecision::Blocked {
+                reason,
+                recovery_authority,
+            }) => Some(self.block_transfer(
+                token,
+                spender,
+                from,
+                &recipient,
+                amount,
+                reason,
+                recovery_authority,
+                memo,
+                returns_bool,
+            )),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Apply TIP-1028 receive policy to a mint-family call.
+    fn enforce_receive_mint(
+        &self,
+        token: Address,
+        originator: Address,
+        to: Address,
+        amount: U256,
+        memo: B256,
+    ) -> Option<PrecompileResult> {
+        if !StorageCtx::default().spec().is_t6() {
+            return None;
+        }
+
+        let registry = self.registry.as_ref()?;
+        let recipient = match Self::resolve_and_validate_recipient(to) {
+            Ok(recipient) => recipient,
+            Err(e) => return Some(StorageCtx::default().error_result(e)),
+        };
+
+        if recipient.target == RECEIVE_POLICY_GUARD_ADDRESS {
+            return Some(Ok(Self::receive_policy_guard_address_reserved_output()));
+        }
+
+        match registry.validate_receive_policy(token, originator, recipient.target) {
+            Ok(ReceivePolicyDecision::Authorized) => None,
+            Ok(ReceivePolicyDecision::Blocked {
+                reason,
+                recovery_authority,
+            }) => Some(self.block_mint(
+                token,
+                originator,
+                &recipient,
+                amount,
+                reason,
+                recovery_authority,
+                memo,
+            )),
+            Err(e) => {
+                warn!(
+                    target: "zone::precompile",
+                    %token, %originator, receiver = %recipient.target, error = %e,
+                    "failed to validate receive policy for mint, deferring to L1 enforcement"
+                );
+                None
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_transfer(
+        &self,
+        token: Address,
+        spender: Option<Address>,
+        from: Address,
+        recipient: &ZoneRecipient,
+        amount: U256,
+        reason: BlockedReason,
+        recovery_authority: Address,
+        memo: B256,
+        returns_bool: bool,
+    ) -> PrecompileResult {
+        trace!(
+            target: "zone::precompile",
+            %token, %from, receiver = %recipient.target, ?reason,
+            "receive policy blocked transfer, moving funds to guard"
+        );
+
+        if StorageCtx::default().is_static() {
+            return Ok(Self::static_call_not_allowed_output());
+        }
+
+        let mut tip20 = token_or_revert!(TIP20Token::from_address(token));
+        if !token_or_revert!(tip20.is_initialized()) {
+            return StorageCtx::default().error_result(TIP20Error::uninitialized());
+        }
+
+        token_or_revert!(tip20.check_not_paused());
+        let mut ledger = ZoneTip20Ledger::from_valid_tip20_address(token);
+        if let Some(spender) = spender {
+            token_or_revert!(ledger.consume_allowance(from, spender, amount));
+        } else {
+            token_or_revert!(tip20.check_and_update_spending_limit(from, amount));
+        }
+        let from_balance = token_or_revert!(ledger.checked_from_balance_for_transfer(from, amount));
+        token_or_revert!(tip20.handle_rewards_on_transfer(
+            from,
+            RECEIVE_POLICY_GUARD_ADDRESS,
+            amount
+        ));
+        token_or_revert!(ledger.transfer_to_guard(from, amount, from_balance));
+
+        token_or_revert!(Self::store_blocked_receipt(
+            token,
+            from,
+            recipient,
+            recovery_authority,
+            amount,
+            reason,
+            IReceivePolicyGuard::InboundKind::TRANSFER,
+            memo,
+        ));
+        Ok(Self::transfer_success_output(returns_bool))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn block_mint(
+        &self,
+        token: Address,
+        originator: Address,
+        recipient: &ZoneRecipient,
+        amount: U256,
+        reason: BlockedReason,
+        recovery_authority: Address,
+        memo: B256,
+    ) -> PrecompileResult {
+        trace!(
+            target: "zone::precompile",
+            %token, %originator, receiver = %recipient.target, ?reason,
+            "receive policy blocked mint, moving funds to guard"
+        );
+
+        if StorageCtx::default().is_static() {
+            return Ok(Self::static_call_not_allowed_output());
+        }
+
+        let mut tip20 = token_or_revert!(TIP20Token::from_address(token));
+        if !token_or_revert!(tip20.is_initialized()) {
+            return StorageCtx::default().error_result(TIP20Error::uninitialized());
+        }
+
+        token_or_revert!(tip20.check_role(originator, *ISSUER_ROLE));
+        let total_supply = token_or_revert!(tip20.total_supply());
+        if StorageCtx::default().spec().is_t3() {
+            token_or_revert!(tip20.check_not_paused());
+        }
+
+        let mut ledger = ZoneTip20Ledger::from_valid_tip20_address(token);
+        let new_supply = token_or_revert!(ledger.checked_mint_supply(total_supply, amount));
+        token_or_revert!(tip20.handle_rewards_on_mint(RECEIVE_POLICY_GUARD_ADDRESS, amount));
+        token_or_revert!(ledger.mint_to_guard(new_supply, amount));
+
+        token_or_revert!(Self::store_blocked_receipt(
+            token,
+            originator,
+            recipient,
+            recovery_authority,
+            amount,
+            reason,
+            IReceivePolicyGuard::InboundKind::MINT,
+            memo,
+        ));
+        Ok(StorageCtx::default().success_output(Bytes::new()))
+    }
+
+    fn store_blocked_receipt(
+        token: Address,
+        originator: Address,
+        recipient: &ZoneRecipient,
+        recovery_authority: Address,
+        amount: U256,
+        reason: BlockedReason,
+        kind: IReceivePolicyGuard::InboundKind,
+        memo: B256,
+    ) -> tempo_precompiles::error::Result<()> {
+        ZoneReceivePolicyGuard::new().store_blocked(
+            token,
+            originator,
+            recipient,
+            recovery_authority,
+            amount,
+            reason,
+            kind,
+            memo,
+        )
+    }
+
+    fn resolve_and_validate_recipient(
+        to: Address,
+    ) -> tempo_precompiles::error::Result<ZoneRecipient> {
+        let recipient = ZoneRecipient::resolve(to)?;
+        recipient.validate()?;
+        Ok(recipient)
+    }
+
     /// Reject the system caller that is only allowed on the opposite bridge path.
     fn reject_crossed_mint_caller(&self, caller: Address) -> Option<PrecompileResult> {
         if caller == ZONE_OUTBOX_ADDRESS {
@@ -319,6 +916,32 @@ impl<P: PolicyCheck> ZoneTip20Token<P> {
 
     fn roles_unauthorized_output() -> PrecompileOutput {
         StorageCtx::default().revert_output(RolesAuthError::unauthorized().selector().into())
+    }
+
+    fn receive_policy_guard_address_reserved_output() -> PrecompileOutput {
+        StorageCtx::default().revert_output(
+            ReceivePolicyGuardError::address_reserved()
+                .selector()
+                .into(),
+        )
+    }
+
+    fn static_call_not_allowed_output() -> PrecompileOutput {
+        let storage = StorageCtx::default();
+        PrecompileOutput::revert(
+            0,
+            StaticCallNotAllowed {}.abi_encode().into(),
+            storage.reservoir(),
+        )
+    }
+
+    fn transfer_success_output(returns_bool: bool) -> PrecompileOutput {
+        let bytes = if returns_bool {
+            ITIP20::transferCall::abi_encode_returns(&true).into()
+        } else {
+            Bytes::new()
+        };
+        StorageCtx::default().success_output(bytes)
     }
 
     /// Build a reverted output with the `policyForbids()` error selector.
@@ -428,7 +1051,7 @@ mod tests {
     };
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_precompiles::{
-        PATH_USD_ADDRESS,
+        PATH_USD_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS,
         tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
     };
 
@@ -446,6 +1069,7 @@ mod tests {
         mint_authorized: bool,
         policy_id: u64,
         fail_policy_id_resolution: bool,
+        receive_policy_decision: Option<ReceivePolicyDecision>,
     }
 
     impl MockPolicyProvider {
@@ -455,6 +1079,7 @@ mod tests {
                 mint_authorized: true,
                 policy_id: 1,
                 fail_policy_id_resolution: false,
+                receive_policy_decision: None,
             }
         }
 
@@ -509,6 +1134,24 @@ mod tests {
         fn policy_id_counter(&self) -> u64 {
             self.policy_id
         }
+
+        fn receive_policy(
+            &self,
+            _account: Address,
+        ) -> Result<crate::policy::ReceivePolicy, PrecompileError> {
+            Ok(crate::policy::ReceivePolicy::none())
+        }
+
+        fn validate_receive_policy(
+            &self,
+            _token: Address,
+            _sender: Address,
+            _receiver: Address,
+        ) -> Result<ReceivePolicyDecision, PrecompileError> {
+            Ok(self
+                .receive_policy_decision
+                .unwrap_or(ReceivePolicyDecision::Authorized))
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -543,6 +1186,13 @@ mod tests {
         }
 
         fn new_with_registry(policy: Option<MockPolicyProvider>) -> TestResult<Self> {
+            Self::new_with_registry_and_spec(policy, TempoHardfork::default())
+        }
+
+        fn new_with_registry_and_spec(
+            policy: Option<MockPolicyProvider>,
+            spec: TempoHardfork,
+        ) -> TestResult<Self> {
             let token = PATH_USD_ADDRESS;
             let admin = address!("0x00000000000000000000000000000000000000a1");
             let alice = address!("0x00000000000000000000000000000000000000a2");
@@ -550,7 +1200,7 @@ mod tests {
             let spender = address!("0x00000000000000000000000000000000000000a4");
             let issuer = address!("0x00000000000000000000000000000000000000a5");
             let sequencer = address!("0x00000000000000000000000000000000000000a6");
-            let mut ctx = Context::new(CacheDB::new(EmptyDB::new()), TempoHardfork::default());
+            let mut ctx = Context::new(CacheDB::new(EmptyDB::new()), spec);
 
             Self::with_storage(&mut ctx, u64::MAX, |storage| {
                 StorageCtx::enter(storage, || -> TestResult {
@@ -774,6 +1424,74 @@ mod tests {
         assert!(transfer.is_success());
         assert_eq!(transfer.gas_used, FIXED_TRANSFER_GAS);
         assert_eq!(harness.balance_of(harness.bob)?, U256::from(12_345u64));
+
+        Ok(())
+    }
+
+    #[test]
+    fn receive_policy_blocked_transfer_moves_funds_to_guard() -> TestResult {
+        let mut policy = MockPolicyProvider::allow_all();
+        policy.receive_policy_decision = Some(ReceivePolicyDecision::Blocked {
+            reason: BlockedReason::RECEIVE_POLICY,
+            recovery_authority: Address::ZERO,
+        });
+        let mut harness =
+            PrecompileHarness::new_with_registry_and_spec(Some(policy), TempoHardfork::T6)?;
+
+        let amount = U256::from(42_000u64);
+        let transfer = harness.call(
+            harness.alice,
+            ITIP20::transferCall {
+                to: harness.bob,
+                amount,
+            }
+            .abi_encode()
+            .into(),
+            FIXED_TRANSFER_GAS,
+            false,
+        )?;
+
+        assert!(transfer.is_success());
+        assert_eq!(
+            ITIP20::transferCall::abi_decode_returns(&transfer.bytes)?,
+            true
+        );
+        assert_eq!(harness.balance_of(harness.bob)?, U256::ZERO);
+        assert_eq!(harness.balance_of(RECEIVE_POLICY_GUARD_ADDRESS)?, amount);
+        assert_eq!(
+            harness.balance_of(harness.alice)?,
+            U256::from(1_000_000u64) - amount
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn receive_policy_blocked_mint_moves_funds_to_guard() -> TestResult {
+        let mut policy = MockPolicyProvider::allow_all();
+        policy.receive_policy_decision = Some(ReceivePolicyDecision::Blocked {
+            reason: BlockedReason::TOKEN_FILTER,
+            recovery_authority: Address::ZERO,
+        });
+        let mut harness =
+            PrecompileHarness::new_with_registry_and_spec(Some(policy), TempoHardfork::T6)?;
+
+        let amount = U256::from(17_000u64);
+        let mint = harness.call(
+            harness.issuer,
+            ITIP20::mintCall {
+                to: harness.bob,
+                amount,
+            }
+            .abi_encode()
+            .into(),
+            200_000,
+            false,
+        )?;
+
+        assert!(mint.is_success());
+        assert_eq!(harness.balance_of(harness.bob)?, U256::ZERO);
+        assert_eq!(harness.balance_of(RECEIVE_POLICY_GUARD_ADDRESS)?, amount);
 
         Ok(())
     }

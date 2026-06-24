@@ -35,18 +35,26 @@ pub enum PolicyEvent {
         recipient_policy_id: u64,
         mint_recipient_policy_id: u64,
     },
+    /// An account's TIP-1028 receive policy changed on L1 (`ReceivePolicyUpdated`).
+    ReceivePolicyUpdated {
+        account: Address,
+        sender_policy_id: u64,
+        token_filter_id: u64,
+        recovery_authority: Address,
+    },
 }
 
 impl PolicyEvent {
     /// Try to decode an `ITIP403Registry` log into a [`PolicyEvent`].
     ///
-    /// Handles `WhitelistUpdated`, `BlacklistUpdated`, `PolicyCreated`, and
-    /// `CompoundPolicyCreated` events. `PolicyAdminUpdated` is logged but ignored
-    /// (returns `None`). Returns `None` for unrecognised logs.
+    /// Handles `WhitelistUpdated`, `BlacklistUpdated`, `PolicyCreated`,
+    /// `CompoundPolicyCreated`, and `ReceivePolicyUpdated` events.
+    /// `PolicyAdminUpdated` is logged but ignored (returns `None`). Returns
+    /// `None` for unrecognised logs.
     pub fn decode_registry(log: &alloy_rpc_types_eth::Log) -> Option<Self> {
         use tempo_contracts::precompiles::ITIP403Registry::{
             BlacklistUpdated, CompoundPolicyCreated, ITIP403RegistryEvents, PolicyCreated,
-            WhitelistUpdated,
+            ReceivePolicyUpdated, WhitelistUpdated,
         };
 
         let event = match ITIP403RegistryEvents::decode_log(&log.inner) {
@@ -138,12 +146,26 @@ impl PolicyEvent {
                 );
                 None
             }
-            ITIP403RegistryEvents::ReceivePolicyUpdated(event) => {
+            ITIP403RegistryEvents::ReceivePolicyUpdated(ReceivePolicyUpdated {
+                account,
+                senderPolicyId,
+                tokenFilterId,
+                recoveryAuthority,
+                ..
+            }) => {
                 tracing::debug!(
-                    policy_id = ?event,
-                    "Receive policy updated on L1 (ignored)"
+                    account = %account,
+                    sender_policy_id = senderPolicyId,
+                    token_filter_id = tokenFilterId,
+                    recovery_authority = %recoveryAuthority,
+                    "Receive policy updated on L1"
                 );
-                None
+                Some(Self::ReceivePolicyUpdated {
+                    account,
+                    sender_policy_id: senderPolicyId,
+                    token_filter_id: tokenFilterId,
+                    recovery_authority: recoveryAuthority,
+                })
             }
         }
     }

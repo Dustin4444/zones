@@ -14,6 +14,11 @@
 //!     mirroring `WhitelistUpdated` / `BlacklistUpdated` events.
 //!   - Compound sub-policy IDs for sender, recipient, and mint recipient roles.
 //!
+//! - **Receive policies**: Each account maps to its TIP-1028 receive policy via
+//!   [`HeightVersioned`](crate::l1_state::versioned::HeightVersioned), tracking
+//!   `ReceivePolicyUpdated` events plus negative RPC lookups for accounts with
+//!   no configured policy.
+//!
 //! ## Special policies
 //!
 //! Policy ID `0` always rejects, policy ID `1` always allows. These are handled inline by
@@ -49,6 +54,7 @@ use tracing::info;
 use super::{builtin_authorization, events::PolicyEvent, policy_set::PolicySet};
 
 use crate::l1_state::versioned::HeightVersioned;
+use zone_precompiles::policy::{ReceivePolicy, ReceivePolicyDecision};
 
 /// Thread-safe TIP-403 policy cache backed by an `Arc<RwLock<PolicyCacheInner>>`.
 #[derive(Debug, Clone, Deref, Default)]
@@ -145,6 +151,8 @@ pub struct PolicyCacheInner {
     /// `TransferPolicyUpdate`, so pre-caching all policies avoids RPC
     /// round-trips on policy switch. The memory overhead is negligible.
     policies: HashMap<u64, CachedPolicy>,
+    /// Per-account TIP-1028 receive-policy configuration.
+    receive_policies: HashMap<Address, HeightVersioned<ReceivePolicy>>,
     /// Highest L1 block number processed by the engine.
     ///
     /// This equals the last block height the engine has processed and
@@ -194,6 +202,24 @@ impl PolicyCacheInner {
         entry.compound = Some(compound);
     }
 
+    /// Returns an account's receive policy at the given block, if cached.
+    pub fn get_receive_policy(&self, account: Address, block_number: u64) -> Option<ReceivePolicy> {
+        self.receive_policies.get(&account)?.get(block_number)
+    }
+
+    /// Records an account receive policy at the given block.
+    pub fn set_receive_policy(
+        &mut self,
+        account: Address,
+        block_number: u64,
+        policy: ReceivePolicy,
+    ) {
+        self.receive_policies
+            .entry(account)
+            .or_default()
+            .set(block_number, policy);
+    }
+
     /// Returns a reference to the per-policy-ID records for direct inspection.
     pub fn policies(&self) -> &HashMap<u64, CachedPolicy> {
         &self.policies
@@ -207,6 +233,11 @@ impl PolicyCacheInner {
     /// Returns the number of token-to-policy mappings in the cache.
     pub fn num_token_policies(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Returns the number of cached receive-policy account records.
+    pub fn num_receive_policies(&self) -> usize {
+        self.receive_policies.len()
     }
 
     /// Returns the highest L1 block number processed by the cache.
@@ -338,6 +369,40 @@ impl PolicyCacheInner {
         }
     }
 
+    /// Validate `receiver`'s receive policy for an inbound token movement.
+    ///
+    /// Returns `None` when the receiver policy or one of its simple sub-policies
+    /// is not cached and the caller should fall back to L1 RPC.
+    pub fn check_receive_policy(
+        &self,
+        token: Address,
+        sender: Address,
+        receiver: Address,
+        block_number: u64,
+    ) -> Option<ReceivePolicyDecision> {
+        let policy = self.get_receive_policy(receiver, block_number)?;
+        if !policy.has_receive_policy {
+            return Some(ReceivePolicyDecision::Authorized);
+        }
+
+        if !self.check_simple(policy.token_filter_id, token, block_number)? {
+            return Some(ReceivePolicyDecision::Blocked {
+                reason: tempo_contracts::precompiles::ITIP403Registry::BlockedReason::TOKEN_FILTER,
+                recovery_authority: policy.recovery_authority,
+            });
+        }
+
+        if !self.check_simple(policy.sender_policy_id, sender, block_number)? {
+            return Some(ReceivePolicyDecision::Blocked {
+                reason:
+                    tempo_contracts::precompiles::ITIP403Registry::BlockedReason::RECEIVE_POLICY,
+                recovery_authority: policy.recovery_authority,
+            });
+        }
+
+        Some(ReceivePolicyDecision::Authorized)
+    }
+
     /// Apply a batch of decoded policy events for a single block.
     ///
     /// This is the primary ingestion path used by [`L1Subscriber`](crate::l1::L1Subscriber).
@@ -383,6 +448,25 @@ impl PolicyCacheInner {
                         },
                     );
                 }
+                PolicyEvent::ReceivePolicyUpdated {
+                    account,
+                    sender_policy_id,
+                    token_filter_id,
+                    recovery_authority,
+                } => {
+                    self.set_receive_policy(
+                        *account,
+                        block_number,
+                        ReceivePolicy {
+                            has_receive_policy: true,
+                            sender_policy_id: *sender_policy_id,
+                            sender_policy_type: policy_type_hint(*sender_policy_id),
+                            token_filter_id: *token_filter_id,
+                            token_filter_type: policy_type_hint(*token_filter_id),
+                            recovery_authority: *recovery_authority,
+                        },
+                    );
+                }
             }
         }
     }
@@ -392,6 +476,7 @@ impl PolicyCacheInner {
     pub fn clear(&mut self) {
         self.tokens.clear();
         self.policies.clear();
+        self.receive_policies.clear();
     }
 
     /// Collapse all history before `min_block` into single baseline entries.
@@ -401,6 +486,9 @@ impl PolicyCacheInner {
         }
         for policy in self.policies.values_mut() {
             policy.policy_set.flatten(min_block);
+        }
+        for policy in self.receive_policies.values_mut() {
+            policy.flatten(min_block);
         }
     }
 
@@ -426,6 +514,16 @@ impl PolicyCacheInner {
         for policy in self.policies.values_mut() {
             policy.policy_set.advance(new_height);
         }
+        for policy in self.receive_policies.values_mut() {
+            policy.advance(new_height);
+        }
+    }
+}
+
+fn policy_type_hint(policy_id: u64) -> PolicyType {
+    match policy_id {
+        1 => PolicyType::BLACKLIST,
+        _ => PolicyType::WHITELIST,
     }
 }
 
@@ -1296,6 +1394,63 @@ mod tests {
         assert_eq!(
             cache.is_authorized(TOKEN, USER_A, 10, AuthRole::MintRecipient),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn apply_events_with_receive_policy_blocks_sender() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_policy_type(2, PolicyType::BLACKLIST);
+        cache.set_policy_status(2, USER_A, 10, true);
+
+        cache.apply_events(
+            10,
+            &[PolicyEvent::ReceivePolicyUpdated {
+                account: USER_B,
+                sender_policy_id: 2,
+                token_filter_id: 1,
+                recovery_authority: USER_B,
+            }],
+        );
+
+        assert_eq!(
+            cache
+                .get_receive_policy(USER_B, 10)
+                .map(|p| p.has_receive_policy),
+            Some(true)
+        );
+        assert_eq!(
+            cache.check_receive_policy(TOKEN, USER_A, USER_B, 10),
+            Some(ReceivePolicyDecision::Blocked {
+                reason:
+                    tempo_contracts::precompiles::ITIP403Registry::BlockedReason::RECEIVE_POLICY,
+                recovery_authority: USER_B,
+            })
+        );
+    }
+
+    #[test]
+    fn receive_policy_reports_token_filter_before_sender_policy() {
+        let mut cache = PolicyCacheInner::default();
+        cache.set_policy_type(2, PolicyType::BLACKLIST);
+        cache.set_policy_status(2, TOKEN, 10, true);
+
+        cache.apply_events(
+            10,
+            &[PolicyEvent::ReceivePolicyUpdated {
+                account: USER_B,
+                sender_policy_id: 0,
+                token_filter_id: 2,
+                recovery_authority: USER_B,
+            }],
+        );
+
+        assert_eq!(
+            cache.check_receive_policy(TOKEN, USER_A, USER_B, 10),
+            Some(ReceivePolicyDecision::Blocked {
+                reason: tempo_contracts::precompiles::ITIP403Registry::BlockedReason::TOKEN_FILTER,
+                recovery_authority: USER_B,
+            })
         );
     }
 }
