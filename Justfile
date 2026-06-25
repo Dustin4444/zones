@@ -113,7 +113,7 @@ zone-info identifier:
     cargo run -p tempo-xtask -- zone-info {{identifier}}
 
 [group('zone')]
-[doc('Creates a new zone on L1 via ZoneFactory and generates genesis + zone.json in generated/<name>/. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Set ZONE_SALT for a deterministic nonzero salt. Requires L1_RPC_URL, PRIVATE_KEY, and SEQUENCER_KEY env vars. Set ZONE_FACTORY to override the Moderato default.')]
+[doc('Creates a new zone on L1 via ZoneFactory and generates genesis + zone.json in generated/<name>/. Optional second positional argument selects the initial TIP-20 enabled on the portal; defaults to pathUSD. Set ZONE_SALT for a deterministic nonzero salt and ZONE_ADMIN_SIGNATURE for delegated deployment. Requires L1_RPC_URL, PRIVATE_KEY, and SEQUENCER_KEY env vars. Set ZONE_FACTORY to override the Moderato default.')]
 create-zone name token="":
     #!/bin/bash
     set -euo pipefail
@@ -148,13 +148,18 @@ create-zone name token="":
     if [[ -n "${ZONE_SALT:-}" ]]; then
         ZONE_SALT_ARG=(--salt "$ZONE_SALT")
     fi
+    ZONE_ADMIN_SIGNATURE_ARG=()
+    if [[ -n "${ZONE_ADMIN_SIGNATURE:-}" ]]; then
+        ZONE_ADMIN_SIGNATURE_ARG=(--admin-signature "$ZONE_ADMIN_SIGNATURE")
+    fi
     cargo run -p tempo-xtask -- create-zone \
         --output "$OUTPUT" \
         --l1-rpc-url "$HTTP_RPC" \
         --initial-token "$ZONE_TOKEN_L1" \
         --sequencer "$SEQUENCER_ADDR" \
         --private-key "$PK" \
-        "${ZONE_SALT_ARG[@]}"
+        "${ZONE_SALT_ARG[@]}" \
+        "${ZONE_ADMIN_SIGNATURE_ARG[@]}"
     echo "Zone '{{name}}' created. Artifacts in $OUTPUT/"
 
 [group('zone')]

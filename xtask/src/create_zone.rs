@@ -7,7 +7,7 @@ use alloy::{
         EthereumWallet,
         primitives::{HeaderResponse, ReceiptResponse},
     },
-    primitives::{Address, B256, address},
+    primitives::{Address, B256, Bytes, address},
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
     sol,
@@ -36,6 +36,7 @@ sol! {
         address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
+        bytes adminSignature;
     }
 
     #[sol(rpc)]
@@ -55,6 +56,7 @@ sol! {
 
         function verifier() external view returns (address);
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
+        function zoneCreationDigest(CreateZoneParams calldata params, address caller) external view returns (bytes32);
     }
 }
 
@@ -89,6 +91,11 @@ pub(crate) struct CreateZone {
     /// Admin-scoped salt for deterministic zone ID derivation.
     #[arg(long, default_value_t = B256::ZERO)]
     salt: B256,
+
+    /// Admin authorization signature for delegated deployment.
+    /// Required when the transaction signer is not the admin.
+    #[arg(long)]
+    admin_signature: Option<Bytes>,
 
     /// Public RPC endpoint for the zone, published on-chain in the portal.
     /// Can be left empty and set later via `ZonePortal.setRpcUrl`.
@@ -152,6 +159,7 @@ impl CreateZone {
                 genesisTempoBlockNumber: current_block,
             },
             rpcUrl: self.rpc_url.clone(),
+            adminSignature: self.admin_signature.unwrap_or_default(),
         };
 
         println!(

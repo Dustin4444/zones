@@ -156,6 +156,8 @@ cargo run -p tempo-xtask -- create-zone \
 
 By default, `create-zone` sets the portal admin to the sequencer. To separate the cold admin role from the hot sequencer role, pass `--admin "$ADMIN_ADDR"` to the direct xtask command and keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`. Zone IDs are derived from `(admin, salt)`, so changing the admin also changes the derived zone ID for the same salt.
 
+If the L1 transaction signer is not the admin, pass `--admin-signature 0x...`. The signature must be produced by the admin over `ZoneFactory.zoneCreationDigest(params, caller)`, where `caller` is the relayer/deployer address that will submit `createZone`. Contract admins can authorize delegated deployment with EIP-1271 `isValidSignature`.
+
 ### 5. Start the Zone Node
 
 ```bash
@@ -603,6 +605,7 @@ Current deployment:
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
 | `ZONE_SALT` | No | Optional 32-byte salt for deterministic zone ID derivation in `just create-zone`; defaults to zero |
+| `ZONE_ADMIN_SIGNATURE` | No | Optional admin authorization signature for delegated `just create-zone` deployments |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 
 ## Justfile Commands Reference

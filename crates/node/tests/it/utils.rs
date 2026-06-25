@@ -1034,6 +1034,7 @@ impl L1TestNode {
                     genesisTempoBlockNumber: l1_header.inner.number,
                 },
                 rpcUrl: String::new(),
+                adminSignature: Default::default(),
             })
             .send()
             .await?

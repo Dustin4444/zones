@@ -170,7 +170,7 @@ sequenceDiagram
 
 Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal): an **admin** and a **sequencer**. The roles are intentionally separated so that mission-critical governance powers can be held in a cold key (or multisig) while day-to-day block production runs from a hot operational key. The two roles MAY be held by the same address; the protocol does not enforce separation.
 
-Zone creation is permissionless. Any account MAY call [`IZoneFactory.createZone`](#izonefactory), and the caller does not receive any implicit authority unless it is also specified as `admin` or `sequencer`. This allows delegated deployment by relayers or deployment tooling while keeping zone authority bound to the explicit role parameters.
+Zone creation supports both direct and delegated deployment. The admin MAY call [`IZoneFactory.createZone`](#izonefactory) directly, or any relayer MAY call it with an admin authorization signature over the full creation payload and the relayer address. The caller does not receive any implicit authority unless it is also specified as `admin` or `sequencer`. This allows relayers and deployment tooling to pay gas while keeping zone authority bound to the explicit role parameters.
 
 ### Roles
 
@@ -229,8 +229,9 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
+| `adminSignature` | Empty when `msg.sender == admin`; otherwise an EOA signature or EIP-1271 contract signature from `admin` authorizing the exact creation payload and caller. |
 
-The factory derives `zoneId = uint32(uint256(keccak256(abi.encode(admin, salt))))`, deploys a [`ZonePortal`](#izoneportal) and a [`ZoneMessenger`](#izonemessenger), and enables the initial token. If the derived ID is zero or already exists, creation reverts. Binding the ID to `admin` prevents a third party from front-running a deployment and consuming the intended zone ID or chain ID; callers can still deploy on behalf of the admin by using the admin's chosen salt. Portal and messenger addresses are emitted by [`ZoneCreated`](#izonefactory) and MUST be consumed from the event rather than assumed before confirmation.
+The factory derives `zoneId = uint32(uint256(keccak256(abi.encode(admin, salt))))`, deploys a [`ZonePortal`](#izoneportal) and a [`ZoneMessenger`](#izonemessenger), and enables the initial token. If the derived ID is zero or already exists, creation reverts. Binding the ID to `admin` prevents a third party from front-running a deployment and consuming the intended zone ID or chain ID with its own admin. Binding the admin signature to the exact `msg.sender` prevents another relayer from copying the salt and signature to consume the admin's intended ID with different deployment parameters. Portal and messenger addresses are emitted by [`ZoneCreated`](#izonefactory) and MUST be consumed from the event rather than assumed before confirmation.
 
 ### Chain ID
 
@@ -1513,6 +1514,7 @@ interface IZoneFactory {
         address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
+        bytes adminSignature;
     }
 
     event ZoneCreated(
@@ -1523,6 +1525,7 @@ interface IZoneFactory {
 
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
     function computeZoneId(address admin, bytes32 salt) external pure returns (uint32);
+    function zoneCreationDigest(CreateZoneParams calldata params, address caller) external view returns (bytes32);
     function zoneCount() external view returns (uint32);
     function zones(uint32 zoneId) external view returns (ZoneInfo memory);
     function isZonePortal(address portal) external view returns (bool);

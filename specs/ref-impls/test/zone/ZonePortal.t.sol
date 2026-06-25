@@ -172,7 +172,8 @@ contract ZonePortalTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: genesisTempoBlockNumber
             }),
-            rpcUrl: "https://rpc.test-zone.example"
+            rpcUrl: "https://rpc.test-zone.example",
+            adminSignature: ""
         });
 
         address portalAddr;

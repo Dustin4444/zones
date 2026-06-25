@@ -12,6 +12,8 @@ import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
 /// @notice Creates zones and registers parameters
 contract ZoneFactory is IZoneFactory {
 
+    bytes4 internal constant EIP1271_MAGIC_VALUE = 0x1626ba7e;
+
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
     //////////////////////////////////////////////////////////////*/
@@ -59,6 +61,7 @@ contract ZoneFactory is IZoneFactory {
         if (params.sequencer == address(0)) revert InvalidSequencer();
         if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
+        _validateAdminAuthorization(params);
 
         zoneId = computeZoneId(params.admin, params.salt);
         if (zoneId == 0 || _zones[zoneId].portal != address(0)) revert ZoneAlreadyExists();
@@ -134,6 +137,68 @@ contract ZoneFactory is IZoneFactory {
 
     function computeZoneId(address admin, bytes32 salt) public pure returns (uint32) {
         return uint32(uint256(keccak256(abi.encode(admin, salt))));
+    }
+
+    function zoneCreationDigest(
+        CreateZoneParams calldata params,
+        address caller
+    )
+        public
+        view
+        returns (bytes32)
+    {
+        bytes32 authorizationHash = keccak256(
+            abi.encode(
+                "TempoZoneFactory.createZone",
+                block.chainid,
+                address(this),
+                caller,
+                params.salt,
+                params.initialToken,
+                params.admin,
+                params.sequencer,
+                params.verifier,
+                params.zoneParams.genesisBlockHash,
+                params.zoneParams.genesisTempoBlockHash,
+                params.zoneParams.genesisTempoBlockNumber,
+                keccak256(bytes(params.rpcUrl))
+            )
+        );
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", authorizationHash));
+    }
+
+    function _validateAdminAuthorization(CreateZoneParams calldata params) internal view {
+        if (msg.sender == params.admin) {
+            if (params.adminSignature.length != 0) revert InvalidAdminSignature();
+            return;
+        }
+
+        bytes32 digest = zoneCreationDigest(params, msg.sender);
+        if (params.admin.code.length != 0) {
+            (bool ok, bytes memory result) = params.admin
+                .staticcall(
+                    abi.encodeWithSignature(
+                        "isValidSignature(bytes32,bytes)", digest, params.adminSignature
+                    )
+                );
+            if (!ok || result.length < 32 || bytes4(result) != EIP1271_MAGIC_VALUE) {
+                revert InvalidAdminSignature();
+            }
+            return;
+        }
+
+        if (params.adminSignature.length != 65) revert InvalidAdminSignature();
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        bytes calldata signature = params.adminSignature;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        if (ecrecover(digest, v, r, s) != params.admin) revert InvalidAdminSignature();
     }
 
     /// @notice Compute the address of a contract deployed with CREATE

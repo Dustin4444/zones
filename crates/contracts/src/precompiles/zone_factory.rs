@@ -31,6 +31,7 @@ crate::sol! {
             address verifier;
             ZoneParams zoneParams;
             string rpcUrl;
+            bytes adminSignature;
         }
         event ZoneCreated(
             uint32 indexed zoneId,
@@ -46,6 +47,7 @@ crate::sol! {
         );
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
         function computeZoneId(address admin, bytes32 salt) external pure returns (uint32);
+        function zoneCreationDigest(CreateZoneParams calldata params, address caller) external view returns (bytes32);
         function verifier() external view returns (address);
         function zones(uint32 zoneId) external view returns (ZoneInfo memory);
         function zoneCount() external view returns (uint32);

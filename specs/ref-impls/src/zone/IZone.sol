@@ -451,6 +451,7 @@ interface IZoneFactory {
         address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
+        bytes adminSignature;
     }
 
     event ZoneCreated(
@@ -472,6 +473,7 @@ interface IZoneFactory {
     error InvalidVerifier();
     error InsufficientGas();
     error ZoneAlreadyExists();
+    error InvalidAdminSignature();
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
@@ -488,6 +490,15 @@ interface IZoneFactory {
 
     /// @notice Returns the deterministic zone ID for an admin/salt pair.
     function computeZoneId(address admin, bytes32 salt) external pure returns (uint32);
+
+    /// @notice Returns the digest that `admin` must sign to authorize `caller`.
+    function zoneCreationDigest(
+        CreateZoneParams calldata params,
+        address caller
+    )
+        external
+        view
+        returns (bytes32);
 
     /// @notice Returns the number of zones created so far.
     /// @return count The total number of created zones, excluding reserved zone ID 0.

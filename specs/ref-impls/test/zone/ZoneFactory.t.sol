@@ -39,7 +39,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
@@ -73,7 +74,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
@@ -102,7 +104,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         (uint32 zoneId1, address portal1) = zoneFactory.createZone(params1);
@@ -118,7 +121,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: keccak256("tempoGenesis2"),
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         (uint32 zoneId2, address portal2) = zoneFactory.createZone(params2);
@@ -148,12 +152,64 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         zoneFactory.createZone(params);
 
         vm.expectRevert(IZoneFactory.ZoneAlreadyExists.selector);
+        zoneFactory.createZone(params);
+    }
+
+    function test_createZone_allowsDelegatedDeploymentWithAdminSignature() public {
+        uint256 adminKey = 0xA11CE;
+        address coldAdmin = vm.addr(adminKey);
+        IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32("delegated"),
+            initialToken: address(pathUSD),
+            admin: coldAdmin,
+            sequencer: admin,
+            verifier: zoneFactory.verifier(),
+            zoneParams: ZoneParams({
+                genesisBlockHash: GENESIS_BLOCK_HASH,
+                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
+                genesisTempoBlockNumber: uint64(block.number)
+            }),
+            rpcUrl: "https://rpc.delegated.example",
+            adminSignature: ""
+        });
+        params.adminSignature = _signCreateZone(adminKey, params, alice);
+
+        vm.prank(alice);
+        (uint32 zoneId, address portal) = zoneFactory.createZone(params);
+
+        ZoneInfo memory info = zoneFactory.zones(zoneId);
+        assertEq(info.portal, portal);
+        assertEq(info.admin, coldAdmin);
+        assertEq(info.sequencer, admin);
+    }
+
+    function test_createZone_revertsWhenSignatureCopiedByDifferentCaller() public {
+        uint256 adminKey = 0xB0B;
+        IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32("copied"),
+            initialToken: address(pathUSD),
+            admin: vm.addr(adminKey),
+            sequencer: admin,
+            verifier: zoneFactory.verifier(),
+            zoneParams: ZoneParams({
+                genesisBlockHash: GENESIS_BLOCK_HASH,
+                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
+                genesisTempoBlockNumber: uint64(block.number)
+            }),
+            rpcUrl: "https://rpc.delegated.example",
+            adminSignature: ""
+        });
+        params.adminSignature = _signCreateZone(adminKey, params, alice);
+
+        vm.prank(bob);
+        vm.expectRevert(IZoneFactory.InvalidAdminSignature.selector);
         zoneFactory.createZone(params);
     }
 
@@ -169,7 +225,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         // Record logs and verify ZoneCreated event was emitted
@@ -216,7 +273,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -238,7 +296,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -257,7 +316,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidToken.selector);
@@ -280,7 +340,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidAdmin.selector);
@@ -303,7 +364,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidSequencer.selector);
@@ -326,7 +388,8 @@ contract ZoneFactoryTest is BaseTest {
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
                 genesisTempoBlockNumber: uint64(block.number)
             }),
-            rpcUrl: ""
+            rpcUrl: "",
+            adminSignature: ""
         });
 
         vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
@@ -353,6 +416,20 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(info.portal, address(0));
         assertEq(info.messenger, address(0));
         assertEq(info.initialToken, address(0));
+    }
+
+    function _signCreateZone(
+        uint256 privateKey,
+        IZoneFactory.CreateZoneParams memory params,
+        address caller
+    )
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 digest = zoneFactory.zoneCreationDigest(params, caller);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        return bytes.concat(r, s, bytes1(v));
     }
 
 }
