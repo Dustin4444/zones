@@ -8,7 +8,7 @@ use alloy_primitives::Address;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::thread_rng;
 use tempo_primitives::transaction::tt_signature::TempoSignature;
-use zone::rpc::{
+use zone_node::rpc::{
     auth::{AuthorizationToken, build_token_fields},
     types::{MethodTier, classify_method},
 };

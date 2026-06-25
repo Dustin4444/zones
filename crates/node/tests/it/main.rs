@@ -14,6 +14,4 @@ mod tip403_policy;
 mod tip403_transfers;
 mod utils;
 
-use zone as _;
-
 fn main() {}

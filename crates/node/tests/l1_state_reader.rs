@@ -1,6 +1,6 @@
 //! Integration tests for the L1StateProvider against live Tempo L1 RPC.
 //!
-//! Run with: `cargo test -p zone --test l1_state_reader -- --ignored --nocapture`
+//! Run with: `cargo test -p zone-node --test l1_state_reader -- --ignored --nocapture`
 //!
 //! Requires `L1_RPC_URL` env var or defaults to moderato RPC.
 
@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use alloy_primitives::{Address, B256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use tempo_alloy::TempoNetwork;
-use zone::l1_state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
+use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
 
 /// ZonePortal address on Tempo L1 moderato.
 const ZONE_PORTAL: Address = address!("0x1bc99e6a8c4689f1884527152ba542f012316149");

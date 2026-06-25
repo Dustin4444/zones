@@ -3,7 +3,7 @@
 use crate::utils::{L1TestNode, WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::primitives::U256;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use zone::abi::ZONE_TOKEN_ADDRESS;
+use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
 
 /// Longer timeout for real L1 tests.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

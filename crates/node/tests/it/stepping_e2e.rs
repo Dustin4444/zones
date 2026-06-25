@@ -11,7 +11,8 @@ use crate::utils::{
 use alloy::providers::Provider;
 use alloy_sol_types::SolCall;
 use std::time::Duration;
-use zone::{BatchAnchorConfig, abi::ZonePortal};
+use tempo_zone_contracts::ZonePortal;
+use zone_sequencer::BatchAnchorConfig;
 
 const EIP2935_HISTORY_WINDOW: u64 = 8192;
 const EIP2935_SAFETY_MARGIN: u64 = 360;

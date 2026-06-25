@@ -16,7 +16,7 @@ use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_node::rpc::NATIVE_BALANCE_PLACEHOLDER;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use zone::abi::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
+use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, start_local_zone_with_fixture,

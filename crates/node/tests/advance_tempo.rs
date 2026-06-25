@@ -1,6 +1,6 @@
 //! Reproduce the `advanceTempo` system tx reverting at 232 gas.
 //!
-//! Run with: `cargo test -p zone --test advance_tempo -- --nocapture`
+//! Run with: `cargo test -p zone-node --test advance_tempo -- --nocapture`
 
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};

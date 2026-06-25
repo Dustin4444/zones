@@ -13,7 +13,7 @@ use alloy::{
 };
 use std::time::Duration;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use zone::abi::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
+use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
 /// 500ms and the L1Subscriber needs to connect, backfill, and subscribe.
@@ -1066,9 +1066,9 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
     // for the sender's L1 balance to be restored.
     {
         use tempo_contracts::precompiles::ITIP20;
-        use zone::precompiles::ecies;
+        use zone_precompiles::ecies;
 
-        let portal = zone::abi::ZonePortal::new(portal_address, depositor.l1_provider());
+        let portal = tempo_zone_contracts::ZonePortal::new(portal_address, depositor.l1_provider());
 
         ITIP20::new(PATH_USD_ADDRESS, depositor.l1_provider())
             .approve(portal_address, U256::MAX)
@@ -1098,7 +1098,7 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
                 PATH_USD_ADDRESS,
                 deposit_amount,
                 key_index,
-                zone::abi::EncryptedDepositPayload {
+                tempo_zone_contracts::EncryptedDepositPayload {
                     ephemeralPubkeyX: enc.eph_pub_x,
                     ephemeralPubkeyYParity: enc.eph_pub_y_parity,
                     ciphertext: enc.ciphertext.into(),
@@ -1198,7 +1198,7 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
         cache.set_policy_type(compound_policy_id, PolicyType::COMPOUND);
         cache.set_compound(
             compound_policy_id,
-            zone::l1_state::tip403::CompoundData {
+            zone_l1::state::tip403::CompoundData {
                 sender_policy_id,
                 recipient_policy_id: 1,
                 mint_recipient_policy_id: 1,
@@ -1214,7 +1214,7 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD
     {
         use tempo_contracts::precompiles::ITIP20;
-        use zone::abi::ZonePortal;
+        use tempo_zone_contracts::ZonePortal;
 
         let dev_provider = l1.dev_provider();
         ITIP20::new(PATH_USD_ADDRESS, &dev_provider)
@@ -1333,7 +1333,7 @@ async fn test_deposit_to_blacklisted_recipient_reverts_on_l1() -> eyre::Result<(
         .await?;
 
     // Attempt a deposit to the blacklisted recipient — should revert on L1
-    use zone::abi::ZonePortal;
+    use tempo_zone_contracts::ZonePortal;
     let portal = ZonePortal::new(portal_address, &depositor_provider);
     let result = portal
         .deposit(

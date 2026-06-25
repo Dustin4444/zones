@@ -7,7 +7,7 @@ use alloy::{
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{IRolesAuth, ITIP20, ITIP20Factory};
 use tempo_precompiles::{PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS, tip20::ISSUER_ROLE};
-use zone::abi::ZonePortal;
+use tempo_zone_contracts::ZonePortal;
 
 use crate::utils::{self, DEFAULT_POLL, ZoneTestNode, poll_until};
 

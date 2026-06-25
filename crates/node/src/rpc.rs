@@ -1,7 +1,7 @@
 //! [`ZoneRpcApi`] implementation backed by reth's EthApi (in-process reth-backed).
 //!
 //! Re-exports the standalone `zone-rpc` crate so everything is accessible
-//! via `zone::rpc::*`.
+//! via `zone_node::rpc::*`.
 
 pub use zone_rpc::*;
 

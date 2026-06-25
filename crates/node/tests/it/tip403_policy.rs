@@ -10,7 +10,7 @@ use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{ITIP20, ITIP403Registry};
 use tempo_precompiles::{PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS};
-use zone::l1_state::tip403::{CompoundData, PolicyEvent};
+use zone_l1::state::tip403::{CompoundData, PolicyEvent};
 
 use crate::utils::{DEFAULT_TIMEOUT, TEST_MNEMONIC, start_local_zone_with_fixture};
 

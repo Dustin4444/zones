@@ -12,13 +12,10 @@ use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use zone::{
-    ChainTempoStateExt,
-    abi::{
-        TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox,
-        ZoneOutbox,
-    },
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox,
 };
+use zone_l1::ChainTempoStateExt;
 
 use crate::utils::{
     DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, ZoneTestNode,

@@ -69,6 +69,42 @@ k256.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+alloy = { workspace = true, features = [
+  "full",
+  "genesis",
+  "providers",
+  "signers",
+  "signer-local",
+  "signer-mnemonic-all-languages",
+  "rpc-types",
+] }
+alloy-contract.workspace = true
+alloy-eips.workspace = true
+alloy-evm.workspace = true
+alloy-rlp.workspace = true
+alloy-signer.workspace = true
+base64.workspace = true
+const-hex.workspace = true
+p256.workspace = true
+rand.workspace = true
+reth-ethereum = { workspace = true, features = ["node", "test-utils"] }
+reth-node-core.workspace = true
+reth-tracing.workspace = true
+reqwest.workspace = true
+revm.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempo-payload-types.workspace = true
+tempo-precompiles = { workspace = true, features = ["test-utils"] }
+tempo-revm.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio-tungstenite.workspace = true
+url = "2"
+zone-precompiles = { workspace = true, features = ["std"] }
+
 [features]
 default = []
 cli = [
@@ -87,5 +123,6 @@ test-utils = [
   "reth-primitives-traits/test-utils",
   "reth-provider/test-utils",
   "reth-transaction-pool/test-utils",
+  "tempo-precompiles/test-utils",
   "tempo-transaction-pool/test-utils",
 ]

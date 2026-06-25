@@ -5,7 +5,7 @@
 //! tokens are correctly minted.
 
 use alloy::primitives::{U256, address};
-use zone::{EnabledToken, L1Deposit, L1PortalEvents};
+use zone_l1::{EnabledToken, L1Deposit, L1PortalEvents};
 
 use crate::utils::{DEFAULT_TIMEOUT, L1Fixture, start_local_zone_with_fixture};
 

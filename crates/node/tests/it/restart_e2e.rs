@@ -9,7 +9,7 @@
 
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::primitives::{Address, U256};
-use zone::abi::{ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneOutbox, ZonePortal};
+use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneOutbox, ZonePortal};
 
 /// Longer timeout for real L1 tests.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -186,7 +186,7 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     l1.fund_user(account.address(), deposit_amount).await?;
     account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
 
-    let zone::ZoneSequencerHandle {
+    let zone_sequencer::ZoneSequencerHandle {
         withdrawal_handle,
         monitor_handle,
     } = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
