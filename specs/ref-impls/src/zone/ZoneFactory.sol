@@ -20,20 +20,18 @@ contract ZoneFactory is IZoneFactory {
     /// @dev Prevents low-cost zone spam. The caller must supply at least this much gas.
     uint256 public constant ZONE_CREATION_GAS = 15_000_000;
 
-    /// @notice Next zone ID to be assigned
-    /// @dev Starts at 1, reserving zone ID 0 for potential future use (e.g., mainnet as zone 0)
-    uint32 internal _nextZoneId = 1;
+    uint32 internal _zoneCount;
+
+    /// @notice Tracks deployment count for CREATE address prediction
+    /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
+    ///      in the constructor, so zone deployments start at nonce 2.
+    uint256 internal _deploymentNonce = 2;
 
     mapping(uint32 => ZoneInfo) internal _zones;
     mapping(address => bool) internal _isZonePortal;
     mapping(address => bool) internal _isZoneMessenger;
     mapping(address => bool) internal _validVerifiers;
     address internal _verifier;
-
-    /// @notice Tracks deployment count for CREATE address prediction
-    /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
-    ///      in the constructor, so zone deployments start at nonce 2.
-    uint256 internal _deploymentNonce = 2;
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -62,9 +60,8 @@ contract ZoneFactory is IZoneFactory {
         if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
 
-        zoneId = _nextZoneId;
-        if (zoneId == type(uint32).max) revert ZoneIdOverflow();
-        _nextZoneId = zoneId + 1;
+        zoneId = computeZoneId(params.admin, params.salt);
+        if (zoneId == 0 || _zones[zoneId].portal != address(0)) revert ZoneAlreadyExists();
 
         // We deploy messenger first, then portal.
         // Messenger needs portal's address at construction (immutable).
@@ -75,11 +72,9 @@ contract ZoneFactory is IZoneFactory {
         // - portal will be at nonce N+1
         //
         // We track our own nonce since contract nonce isn't accessible.
-
         uint256 currentNonce = _deploymentNonce;
         _deploymentNonce += 2; // We'll deploy 2 contracts
 
-        // Compute portal's address (will be deployed at nonce+1)
         address predictedPortal = _computeCreateAddress(address(this), currentNonce + 1);
 
         // Deploy messenger with predicted portal address (no token needed -- portal grants approval per-token)
@@ -121,6 +116,7 @@ contract ZoneFactory is IZoneFactory {
 
         _isZonePortal[portal] = true;
         _isZoneMessenger[messengerAddress] = true;
+        _zoneCount++;
 
         emit ZoneCreated(
             zoneId,
@@ -134,6 +130,10 @@ contract ZoneFactory is IZoneFactory {
             params.zoneParams.genesisTempoBlockHash,
             params.zoneParams.genesisTempoBlockNumber
         );
+    }
+
+    function computeZoneId(address admin, bytes32 salt) public pure returns (uint32) {
+        return uint32(uint256(keccak256(abi.encode(admin, salt))));
     }
 
     /// @notice Compute the address of a contract deployed with CREATE
@@ -170,7 +170,7 @@ contract ZoneFactory is IZoneFactory {
 
     /// @notice Returns the number of zones created (not including reserved zone 0)
     function zoneCount() external view returns (uint32) {
-        return _nextZoneId - 1;
+        return _zoneCount;
     }
 
     function zones(uint32 zoneId) external view returns (ZoneInfo memory) {

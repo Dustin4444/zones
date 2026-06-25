@@ -29,6 +29,7 @@ sol! {
     }
 
     struct CreateZoneParams {
+        bytes32 salt;
         address initialToken;
         address admin;
         address sequencer;
@@ -136,6 +137,7 @@ impl CreateZone {
         println!("Sequencer: {}", self.sequencer);
 
         let params = CreateZoneParams {
+            salt: B256::ZERO,
             initialToken: self.initial_token,
             admin,
             sequencer: self.sequencer,

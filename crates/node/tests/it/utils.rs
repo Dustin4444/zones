@@ -1023,6 +1023,7 @@ impl L1TestNode {
         let verifier_address = factory.verifier().call().await?;
         let receipt = factory
             .createZone(ZoneFactory::CreateZoneParams {
+                salt: B256::ZERO,
                 admin: sequencer,
                 initialToken: PATH_USD_ADDRESS,
                 sequencer,

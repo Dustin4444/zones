@@ -162,6 +162,7 @@ contract ZonePortalTest is BaseTest {
 
         // Create a zone
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin, // admin is the sequencer for tests

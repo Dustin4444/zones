@@ -444,7 +444,8 @@ interface IVerifier {
 interface IZoneFactory {
 
     struct CreateZoneParams {
-        address initialToken; // first TIP-20 to enable (sequencer can enable more later)
+        bytes32 salt;
+        address initialToken; // first TIP-20 to enable (admin can enable more later)
         address admin;
         address sequencer;
         address verifier;
@@ -470,7 +471,7 @@ interface IZoneFactory {
     error InvalidSequencer();
     error InvalidVerifier();
     error InsufficientGas();
-    error ZoneIdOverflow();
+    error ZoneAlreadyExists();
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
@@ -478,12 +479,15 @@ interface IZoneFactory {
     function isValidVerifier(address verifier) external view returns (bool);
 
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
-    /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
-    /// @return zoneId The newly assigned zone ID.
+    /// @param params The salt, initial token, admin, sequencer, verifier, and genesis parameters for the zone.
+    /// @return zoneId The deterministic zone ID derived from the admin and salt.
     /// @return portal The deployed portal address for the new zone.
     function createZone(CreateZoneParams calldata params)
         external
         returns (uint32 zoneId, address portal);
+
+    /// @notice Returns the deterministic zone ID for an admin/salt pair.
+    function computeZoneId(address admin, bytes32 salt) external pure returns (uint32);
 
     /// @notice Returns the number of zones created so far.
     /// @return count The total number of created zones, excluding reserved zone ID 0.

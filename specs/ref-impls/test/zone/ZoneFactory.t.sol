@@ -29,6 +29,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_success() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin,
@@ -43,13 +44,13 @@ contract ZoneFactoryTest is BaseTest {
 
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
 
-        assertEq(zoneId, 1);
+        assertEq(zoneId, zoneFactory.computeZoneId(admin, bytes32(0)));
         assertTrue(portal != address(0));
         assertEq(zoneFactory.zoneCount(), 1);
         assertTrue(zoneFactory.isZonePortal(portal));
 
         ZoneInfo memory info = zoneFactory.zones(zoneId);
-        assertEq(info.zoneId, 1);
+        assertEq(info.zoneId, zoneId);
         assertEq(info.portal, portal);
         assertTrue(info.messenger != address(0));
         assertEq(info.initialToken, address(pathUSD));
@@ -62,6 +63,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_deploysMessenger() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin,
@@ -90,6 +92,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_multipleZones() public {
         IZoneFactory.CreateZoneParams memory params1 = IZoneFactory.CreateZoneParams({
+            salt: bytes32(uint256(1)),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin,
@@ -105,6 +108,7 @@ contract ZoneFactoryTest is BaseTest {
         (uint32 zoneId1, address portal1) = zoneFactory.createZone(params1);
 
         IZoneFactory.CreateZoneParams memory params2 = IZoneFactory.CreateZoneParams({
+            salt: bytes32(uint256(2)),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: alice,
@@ -119,8 +123,8 @@ contract ZoneFactoryTest is BaseTest {
 
         (uint32 zoneId2, address portal2) = zoneFactory.createZone(params2);
 
-        assertEq(zoneId1, 1);
-        assertEq(zoneId2, 2);
+        assertEq(zoneId1, zoneFactory.computeZoneId(admin, bytes32(uint256(1))));
+        assertEq(zoneId2, zoneFactory.computeZoneId(admin, bytes32(uint256(2))));
         assertTrue(portal1 != portal2);
         assertEq(zoneFactory.zoneCount(), 2);
         assertTrue(zoneFactory.isZonePortal(portal1));
@@ -132,8 +136,30 @@ contract ZoneFactoryTest is BaseTest {
         assertTrue(info1.messenger != info2.messenger);
     }
 
+    function test_createZone_revertsOnDuplicateAdminSalt() public {
+        IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32("same-salt"),
+            initialToken: address(pathUSD),
+            admin: admin,
+            sequencer: admin,
+            verifier: zoneFactory.verifier(),
+            zoneParams: ZoneParams({
+                genesisBlockHash: GENESIS_BLOCK_HASH,
+                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
+                genesisTempoBlockNumber: uint64(block.number)
+            }),
+            rpcUrl: ""
+        });
+
+        zoneFactory.createZone(params);
+
+        vm.expectRevert(IZoneFactory.ZoneAlreadyExists.selector);
+        zoneFactory.createZone(params);
+    }
+
     function test_createZone_emitsEvent() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin,
@@ -180,6 +206,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_revertsOnInvalidToken_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(0),
             admin: admin,
             sequencer: admin,
@@ -201,6 +228,7 @@ contract ZoneFactoryTest is BaseTest {
         address notTip20 = address(new NotATIP20());
 
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: notTip20,
             admin: admin,
             sequencer: admin,
@@ -219,6 +247,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_revertsOnInvalidToken_eoa() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: alice, // EOA, not a contract
             admin: admin,
             sequencer: admin,
@@ -241,6 +270,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_revertsOnInvalidAdmin_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: address(0),
             sequencer: admin,
@@ -263,6 +293,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_revertsOnInvalidSequencer_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: address(0),
@@ -285,6 +316,7 @@ contract ZoneFactoryTest is BaseTest {
 
     function test_createZone_revertsOnInvalidVerifier() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            salt: bytes32(0),
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: admin,
