@@ -8,6 +8,7 @@ use alloy_consensus::TxReceipt;
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, b256};
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
+use std::collections::HashSet;
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
 use crate::types::JsonRpcError;
@@ -40,6 +41,8 @@ pub const WHITELISTED_TOPICS: [B256; 5] = [
     MINT_TOPIC,
     BURN_TOPIC,
 ];
+
+const TWO_PARTY_TOPICS: [B256; 3] = [TRANSFER_TOPIC, APPROVAL_TOPIC, TRANSFER_WITH_MEMO_TOPIC];
 
 /// Returns `true` if `caller` appears in an eligible indexed-topic position
 /// for the log's event type.
@@ -83,6 +86,14 @@ pub fn is_log_visible(log: &Log, caller: &Address) -> bool {
 pub fn filter_logs(logs: Vec<Log>, caller: &Address) -> Vec<Log> {
     logs.into_iter()
         .filter(|log| is_log_visible(log, caller))
+        .collect()
+}
+
+/// Removes duplicate logs while preserving first-seen order.
+pub fn dedup_logs(logs: Vec<Log>) -> Vec<Log> {
+    let mut seen = HashSet::new();
+    logs.into_iter()
+        .filter(|log| seen.insert(log.clone()))
         .collect()
 }
 
@@ -146,6 +157,58 @@ pub fn scope_filter(filter: &mut Filter) {
     } else {
         filter.topics[0] = FilterSet::from(scoped_topic0);
     }
+}
+
+fn constrain_topic_to_caller(filter: &mut Filter, index: usize, caller_word: B256) -> bool {
+    if filter.topics[index].is_empty() || filter.topics[index].contains(&caller_word) {
+        filter.topics[index] = FilterSet::from(caller_word);
+        true
+    } else {
+        false
+    }
+}
+
+/// Splits a user-supplied log filter into backend filters that all constrain
+/// at least one caller-eligible topic position before backend log retrieval.
+///
+/// Ethereum log filters cannot express `(topic1 == caller OR topic2 == caller)`
+/// in a single query, so two-party events are queried through separate topic1
+/// and topic2 filters. Mint/Burn are only eligible through topic1.
+pub fn scope_filters_for_caller(filter: &Filter, caller: &Address) -> Vec<Filter> {
+    let mut base = filter.clone();
+    scope_filter(&mut base);
+
+    let caller_word = B256::left_padding_from(caller.as_slice());
+    let scoped_topic0 = base.topics[0].iter().copied().collect::<Vec<_>>();
+    let two_party_topic0 = scoped_topic0
+        .iter()
+        .copied()
+        .filter(|topic| TWO_PARTY_TOPICS.contains(topic))
+        .collect::<Vec<_>>();
+
+    let mut scoped = Vec::new();
+
+    let mut topic1_filter = base.clone();
+    if constrain_topic_to_caller(&mut topic1_filter, 1, caller_word) {
+        scoped.push(topic1_filter);
+    }
+
+    if !two_party_topic0.is_empty() {
+        let mut topic2_filter = base;
+        topic2_filter.topics[0] = FilterSet::from(two_party_topic0);
+        if constrain_topic_to_caller(&mut topic2_filter, 2, caller_word) {
+            scoped.push(topic2_filter);
+        }
+    }
+
+    if scoped.is_empty() {
+        let mut no_match = filter.clone();
+        no_match.topics[0] = FilterSet::from(B256::ZERO);
+        no_match.topics[1] = FilterSet::from(caller_word);
+        scoped.push(no_match);
+    }
+
+    scoped
 }
 
 #[cfg(test)]
@@ -513,6 +576,95 @@ mod tests {
         filter.topics[0] = FilterSet::from(bogus);
         scope_filter(&mut filter);
         assert_eq!(filter.topics[0], FilterSet::from(B256::ZERO));
+    }
+
+    #[test]
+    fn scope_filters_for_caller_narrows_broad_filter_to_caller_topics() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let caller_topic = caller_word(&caller);
+        let filter = Filter::default();
+
+        let scoped = scope_filters_for_caller(&filter, &caller);
+
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped[0].topics[0].len(), WHITELISTED_TOPICS.len());
+        assert_eq!(scoped[0].topics[1], FilterSet::from(caller_topic));
+        assert!(scoped[0].topics[2].is_empty());
+        assert_eq!(scoped[1].topics[0].len(), TWO_PARTY_TOPICS.len());
+        for topic in &TWO_PARTY_TOPICS {
+            assert!(scoped[1].topics[0].contains(topic));
+        }
+        assert!(scoped[1].topics[1].is_empty());
+        assert_eq!(scoped[1].topics[2], FilterSet::from(caller_topic));
+    }
+
+    #[test]
+    fn scope_filters_for_caller_preserves_transfer_recipient_visibility() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(TRANSFER_TOPIC);
+        filter.topics[1] = FilterSet::from(other_topic);
+
+        let scoped = scope_filters_for_caller(&filter, &caller);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].topics[0], FilterSet::from(TRANSFER_TOPIC));
+        assert_eq!(scoped[0].topics[1], FilterSet::from(other_topic));
+        assert_eq!(scoped[0].topics[2], FilterSet::from(caller_topic));
+    }
+
+    #[test]
+    fn scope_filters_for_caller_preserves_transfer_sender_visibility() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let other = address!("0x0000000000000000000000000000000000000002");
+        let caller_topic = caller_word(&caller);
+        let other_topic = caller_word(&other);
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(TRANSFER_TOPIC);
+        filter.topics[2] = FilterSet::from(other_topic);
+
+        let scoped = scope_filters_for_caller(&filter, &caller);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].topics[0], FilterSet::from(TRANSFER_TOPIC));
+        assert_eq!(scoped[0].topics[1], FilterSet::from(caller_topic));
+        assert_eq!(scoped[0].topics[2], FilterSet::from(other_topic));
+    }
+
+    #[test]
+    fn scope_filters_for_caller_uses_no_match_filter_when_caller_excluded() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let a = address!("0x0000000000000000000000000000000000000002");
+        let b = address!("0x0000000000000000000000000000000000000003");
+        let mut filter = Filter::default();
+        filter.topics[0] = FilterSet::from(TRANSFER_TOPIC);
+        filter.topics[1] = FilterSet::from(caller_word(&a));
+        filter.topics[2] = FilterSet::from(caller_word(&b));
+
+        let scoped = scope_filters_for_caller(&filter, &caller);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].topics[0], FilterSet::from(B256::ZERO));
+        assert_eq!(scoped[0].topics[1], FilterSet::from(caller_word(&caller)));
+    }
+
+    #[test]
+    fn dedup_logs_preserves_first_seen_order() {
+        let caller = address!("0x0000000000000000000000000000000000000001");
+        let mut first = make_log(
+            Address::ZERO,
+            vec![TRANSFER_TOPIC, caller_word(&caller), caller_word(&caller)],
+        );
+        first.log_index = Some(1);
+        let mut second = make_log(Address::ZERO, vec![MINT_TOPIC, caller_word(&caller)]);
+        second.log_index = Some(2);
+
+        let logs = dedup_logs(vec![first.clone(), second.clone(), first.clone()]);
+
+        assert_eq!(logs, vec![first, second]);
     }
 
     #[test]

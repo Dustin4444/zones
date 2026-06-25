@@ -11,11 +11,11 @@ use std::{
     time::Duration,
 };
 
-use alloy_network::{ReceiptResponse, TransactionResponse};
-use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
+use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
+use alloy_primitives::{Address, B256, Bloom, Bytes, TxKind, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
-    Block, BlockId, BlockNumberOrTag, BlockTransactions, Filter, FilterChanges, FilterId,
+    Block, BlockId, BlockNumberOrTag, BlockTransactions, Filter, FilterChanges, FilterId, Log,
     TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
@@ -81,9 +81,47 @@ fn stale_filter_owner_ids(
         .collect()
 }
 
+fn zone_inbox_refunds_owner(to: Option<Address>, input: Option<&Bytes>) -> Option<Address> {
+    if to != Some(ZONE_INBOX_ADDRESS) {
+        return None;
+    }
+
+    let input = input?;
+    if !input.starts_with(&ZoneInbox::refundsCall::SELECTOR) {
+        return None;
+    }
+
+    ZoneInbox::refundsCall::abi_decode(input)
+        .ok()
+        .map(|call| call.owner)
+}
+
+fn zone_inbox_refunds_owner_mismatch(
+    request: &TempoTransactionRequest,
+    caller: Address,
+) -> Option<Address> {
+    if let Some(owner) = zone_inbox_refunds_owner(
+        TransactionBuilder::to(request),
+        TransactionBuilder::input(request),
+    )
+    .filter(|owner| *owner != caller)
+    {
+        return Some(owner);
+    }
+
+    request.calls.iter().find_map(|call| {
+        let to = match call.to {
+            TxKind::Call(to) => Some(to),
+            TxKind::Create => None,
+        };
+        zone_inbox_refunds_owner(to, Some(&call.input)).filter(|owner| *owner != caller)
+    })
+}
+
 async fn prune_filter_owners<Api: EthApiTypes + 'static>(
     filter: &EthFilter<Api>,
     owners: &Mutex<HashMap<FilterId, Address>>,
+    backend_ids: &Mutex<HashMap<FilterId, Vec<FilterId>>>,
 ) {
     let owner_ids = {
         let owners = owners.lock().await;
@@ -107,7 +145,12 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
     let mut owners = owners.lock().await;
     for id in stale_ids {
         owners.remove(&id);
+        backend_ids.lock().await.remove(&id);
     }
+}
+
+fn sort_logs_by_chain_order(logs: &mut [Log]) {
+    logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
 }
 
 /// [`ZoneRpcApi`] implementation backed by reth's [`EthHandlers`].
@@ -146,6 +189,8 @@ pub struct ZoneRpc<Api: EthApiTypes> {
     /// Maps filter IDs to the authenticated account that created them.
     /// The reth filter registry remains the source of truth for filter liveness.
     filter_owners: Arc<Mutex<HashMap<FilterId, Address>>>,
+    /// Maps private log filter IDs to all caller-scoped backend filter IDs.
+    filter_backend_ids: Arc<Mutex<HashMap<FilterId, Vec<FilterId>>>>,
 }
 
 impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
@@ -181,6 +226,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             zone_provider,
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
+            filter_backend_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         rpc.spawn_filter_owner_pruner();
         Ok(rpc)
@@ -201,6 +247,8 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
     {
         let filter = self.filter().clone();
         let owners: Weak<Mutex<HashMap<FilterId, Address>>> = Arc::downgrade(&self.filter_owners);
+        let backend_ids: Weak<Mutex<HashMap<FilterId, Vec<FilterId>>>> =
+            Arc::downgrade(&self.filter_backend_ids);
         tokio::spawn(async move {
             let mut prune_interval = interval(FILTER_OWNER_PRUNE_INTERVAL);
             prune_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -208,11 +256,12 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             loop {
                 prune_interval.tick().await;
 
-                let Some(owners) = owners.upgrade() else {
+                let (Some(owners), Some(backend_ids)) = (owners.upgrade(), backend_ids.upgrade())
+                else {
                     break;
                 };
 
-                prune_filter_owners(&filter, &owners).await;
+                prune_filter_owners(&filter, &owners, &backend_ids).await;
             }
         });
     }
@@ -238,8 +287,23 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             Ok(())
         } else {
             self.filter_owners.lock().await.remove(id);
+            self.filter_backend_ids.lock().await.remove(id);
             Err(filter_not_found_error())
         }
+    }
+
+    async fn filter_backend_ids(&self, id: &FilterId) -> Vec<FilterId> {
+        self.filter_backend_ids
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| vec![id.clone()])
+    }
+
+    async fn remove_filter_tracking(&self, id: &FilterId) {
+        self.filter_owners.lock().await.remove(id);
+        self.filter_backend_ids.lock().await.remove(id);
     }
 
     async fn portal_deposits_for_block(
@@ -313,6 +377,22 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             .call()
             .await
             .map_err(internal)
+    }
+
+    async fn enforce_zone_inbox_refund_call_privacy(
+        &self,
+        request: &TempoTransactionRequest,
+        auth: &AuthContext,
+    ) -> Result<(), JsonRpcError> {
+        if zone_inbox_refunds_owner_mismatch(request, auth.caller).is_none() {
+            return Ok(());
+        }
+
+        if self.zone_sequencer().await? == auth.caller {
+            return Ok(());
+        }
+
+        Err(JsonRpcError::account_mismatch())
     }
 
     async fn terminal_event_for_deposit(
@@ -598,6 +678,8 @@ where
 
             zone_rpc::policy::enforce_from(&mut request, &auth)?;
             zone_rpc::policy::enforce_no_contract_creation(&request)?;
+            self.enforce_zone_inbox_refund_call_privacy(&request, &auth)
+                .await?;
 
             let result = EthCall::call(
                 &self.eth.api,
@@ -684,10 +766,17 @@ where
         Box::pin(async move {
             let zone_tokens = self.zone_tokens().await?;
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter(&mut filter);
-            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
+            let scoped_filters = zone_rpc::filter::scope_filters_for_caller(&filter, &auth.caller);
+            let mut logs = Vec::new();
+            for scoped_filter in scoped_filters {
+                logs.extend(
+                    EthFilterApiServer::logs(&self.eth.filter, scoped_filter)
+                        .await
+                        .map_err(internal)?,
+                );
+            }
+            sort_logs_by_chain_order(&mut logs);
+            let logs = zone_rpc::filter::dedup_logs(logs);
             let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
             to_raw(&filtered)
         })
@@ -697,14 +786,34 @@ where
         Box::pin(async move {
             let zone_tokens = self.zone_tokens().await?;
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter(&mut filter);
-            let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
+            let scoped_filters = zone_rpc::filter::scope_filters_for_caller(&filter, &auth.caller);
+            let mut backend_ids = Vec::with_capacity(scoped_filters.len());
+            for scoped_filter in scoped_filters {
+                match EthFilterApiServer::new_filter(&self.eth.filter, scoped_filter).await {
+                    Ok(id) => backend_ids.push(id),
+                    Err(err) => {
+                        for id in backend_ids {
+                            let _ =
+                                EthFilterApiServer::uninstall_filter(&self.eth.filter, id).await;
+                        }
+                        return Err(internal(err));
+                    }
+                }
+            }
+            let id = backend_ids
+                .first()
+                .cloned()
+                .ok_or_else(|| JsonRpcError::internal("no backend filters created"))?;
             self.filter_owners
                 .lock()
                 .await
                 .insert(id.clone(), auth.caller);
+            if backend_ids.len() > 1 {
+                self.filter_backend_ids
+                    .lock()
+                    .await
+                    .insert(id.clone(), backend_ids);
+            }
             to_raw(&id)
         })
     }
@@ -713,12 +822,19 @@ where
         Box::pin(async move {
             self.ensure_filter_owner(&id, &auth).await?;
 
-            let logs = self
-                .filter()
-                .filter_logs(id)
-                .await
-                .map_err(map_eth_filter_error)?;
+            let backend_ids = self.filter_backend_ids(&id).await;
+            let mut logs = Vec::new();
+            for backend_id in backend_ids {
+                logs.extend(
+                    self.filter()
+                        .filter_logs(backend_id)
+                        .await
+                        .map_err(map_eth_filter_error)?,
+                );
+            }
 
+            sort_logs_by_chain_order(&mut logs);
+            let logs = zone_rpc::filter::dedup_logs(logs);
             let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
             to_raw(&filtered)
         })
@@ -728,29 +844,48 @@ where
         Box::pin(async move {
             self.ensure_filter_owner(&id, &auth).await?;
 
-            let changes = self
-                .filter()
-                .filter_changes(id)
-                .await
-                .map_err(map_eth_filter_error)?;
+            let backend_ids = self.filter_backend_ids(&id).await;
+            let mut logs = Vec::new();
+            let mut hashes = Vec::new();
+            let mut saw_logs = false;
+            let mut saw_hashes = false;
 
-            match changes {
-                FilterChanges::Logs(logs) => {
-                    let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
-                    to_raw(&FilterChanges::<
-                        alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                    >::Logs(filtered))
+            for backend_id in backend_ids {
+                let changes = self
+                    .filter()
+                    .filter_changes(backend_id)
+                    .await
+                    .map_err(map_eth_filter_error)?;
+
+                match changes {
+                    FilterChanges::Logs(new_logs) => {
+                        saw_logs = true;
+                        logs.extend(new_logs);
+                    }
+                    FilterChanges::Hashes(new_hashes) => {
+                        saw_hashes = true;
+                        hashes.extend(new_hashes);
+                    }
+                    // Pending transaction filters are disabled — return empty if one somehow exists
+                    FilterChanges::Transactions(_) | FilterChanges::Empty => {}
                 }
-                FilterChanges::Hashes(hashes) => to_raw(&FilterChanges::<
+            }
+
+            if saw_logs {
+                sort_logs_by_chain_order(&mut logs);
+                let logs = zone_rpc::filter::dedup_logs(logs);
+                let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
+                to_raw(&FilterChanges::<
                     alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                >::Hashes(hashes)),
-                // Pending transaction filters are disabled — return empty if one somehow exists
-                FilterChanges::Transactions(_) => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
-                FilterChanges::Empty => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
+                >::Logs(filtered))
+            } else if saw_hashes {
+                hashes.sort();
+                hashes.dedup();
+                to_raw(&FilterChanges::<
+                    alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
+                >::Hashes(hashes))
+            } else {
+                to_raw(&FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty)
             }
         })
     }
@@ -772,12 +907,17 @@ where
         Box::pin(async move {
             self.ensure_filter_owner(&id, &auth).await?;
 
-            let result = EthFilterApiServer::uninstall_filter(&self.eth.filter, id.clone())
-                .await
-                .map_err(internal)?;
+            let backend_ids = self.filter_backend_ids(&id).await;
+            let mut result = false;
+            for backend_id in &backend_ids {
+                result |=
+                    EthFilterApiServer::uninstall_filter(&self.eth.filter, backend_id.clone())
+                        .await
+                        .map_err(internal)?;
+            }
 
             if result || !self.filter_is_active(&id).await {
-                self.filter_owners.lock().await.remove(&id);
+                self.remove_filter_tracking(&id).await;
             }
 
             to_raw(&result)
@@ -830,23 +970,29 @@ where
 
             let zone_tokens = self.zone_tokens().await?;
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter(&mut filter);
+            let scoped_filters = zone_rpc::filter::scope_filters_for_caller(&filter, &caller);
 
             let stream = provider
                 .canonical_state_stream()
                 .flat_map(|canon_state| futures::stream::iter(canon_state.block_receipts()))
                 .flat_map(move |(block_receipts, removed)| {
-                    let all_logs = logs_utils::matching_block_logs_with_tx_hashes(
-                        &filter,
-                        block_receipts.block,
-                        block_receipts.timestamp,
-                        block_receipts
-                            .tx_receipts
-                            .iter()
-                            .map(|(tx, receipt)| (*tx, receipt)),
-                        removed,
-                    );
-                    futures::stream::iter(all_logs)
+                    let mut all_logs = scoped_filters
+                        .iter()
+                        .flat_map(|filter| {
+                            logs_utils::matching_block_logs_with_tx_hashes(
+                                filter,
+                                block_receipts.block,
+                                block_receipts.timestamp,
+                                block_receipts
+                                    .tx_receipts
+                                    .iter()
+                                    .map(|(tx, receipt)| (*tx, receipt)),
+                                removed,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    sort_logs_by_chain_order(&mut all_logs);
+                    futures::stream::iter(zone_rpc::filter::dedup_logs(all_logs))
                 });
 
             let stream = stream.filter_map(move |log| {
@@ -1066,6 +1212,26 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_rpc_types_eth::TransactionInput;
+    use tempo_primitives::transaction::Call;
+
+    fn zone_inbox_refunds_request(owner: Address) -> TempoTransactionRequest {
+        TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(TxKind::Call(ZONE_INBOX_ADDRESS)),
+                input: TransactionInput::new(
+                    ZoneInbox::refundsCall {
+                        token: ZONE_TOKEN_ADDRESS,
+                        owner,
+                    }
+                    .abi_encode()
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn regular_deposit_status_maps_terminal_events() {
@@ -1140,5 +1306,62 @@ mod tests {
         let stale_ids = stale_filter_owner_ids(Vec::new(), &HashSet::new());
 
         assert!(stale_ids.is_empty());
+    }
+
+    #[test]
+    fn zone_inbox_refunds_owner_mismatch_detects_outer_call() {
+        let caller = Address::repeat_byte(0x11);
+        let owner = Address::repeat_byte(0x22);
+        let request = zone_inbox_refunds_request(owner);
+
+        assert_eq!(
+            zone_inbox_refunds_owner_mismatch(&request, caller),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn zone_inbox_refunds_owner_mismatch_allows_own_outer_call() {
+        let caller = Address::repeat_byte(0x11);
+        let request = zone_inbox_refunds_request(caller);
+
+        assert_eq!(zone_inbox_refunds_owner_mismatch(&request, caller), None);
+    }
+
+    #[test]
+    fn zone_inbox_refunds_owner_mismatch_detects_nested_tempo_call() {
+        let caller = Address::repeat_byte(0x11);
+        let owner = Address::repeat_byte(0x22);
+        let mut request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(TxKind::Call(Address::repeat_byte(0x33))),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        request.calls.push(Call {
+            to: TxKind::Call(ZONE_INBOX_ADDRESS),
+            value: U256::ZERO,
+            input: ZoneInbox::refundsCall {
+                token: ZONE_TOKEN_ADDRESS,
+                owner,
+            }
+            .abi_encode()
+            .into(),
+        });
+
+        assert_eq!(
+            zone_inbox_refunds_owner_mismatch(&request, caller),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn zone_inbox_refunds_owner_mismatch_ignores_other_calls() {
+        let caller = Address::repeat_byte(0x11);
+        let mut request = zone_inbox_refunds_request(Address::repeat_byte(0x22));
+        request.inner.to = Some(TxKind::Call(Address::repeat_byte(0x33)));
+
+        assert_eq!(zone_inbox_refunds_owner_mismatch(&request, caller), None);
     }
 }
