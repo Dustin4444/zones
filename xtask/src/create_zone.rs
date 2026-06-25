@@ -86,6 +86,10 @@ pub(crate) struct CreateZone {
     #[arg(long)]
     admin: Option<Address>,
 
+    /// Admin-scoped salt for deterministic zone ID derivation.
+    #[arg(long, default_value_t = B256::ZERO)]
+    salt: B256,
+
     /// Public RPC endpoint for the zone, published on-chain in the portal.
     /// Can be left empty and set later via `ZonePortal.setRpcUrl`.
     #[arg(long, default_value = "")]
@@ -137,7 +141,7 @@ impl CreateZone {
         println!("Sequencer: {}", self.sequencer);
 
         let params = CreateZoneParams {
-            salt: B256::ZERO,
+            salt: self.salt,
             initialToken: self.initial_token,
             admin,
             sequencer: self.sequencer,

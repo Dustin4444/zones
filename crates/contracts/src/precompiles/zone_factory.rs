@@ -24,6 +24,7 @@ crate::sol! {
             uint64 genesisTempoBlockNumber;
         }
         struct CreateZoneParams {
+            bytes32 salt;
             address initialToken;
             address admin;
             address sequencer;
@@ -44,6 +45,7 @@ crate::sol! {
             uint64 genesisTempoBlockNumber
         );
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
+        function computeZoneId(address admin, bytes32 salt) external pure returns (uint32);
         function verifier() external view returns (address);
         function zones(uint32 zoneId) external view returns (ZoneInfo memory);
         function zoneCount() external view returns (uint32);

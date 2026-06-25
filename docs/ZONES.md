@@ -136,6 +136,13 @@ This creates `generated/my-zone/` containing:
 
 This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. The zone's fee token in genesis remains `pathUSD`.
 
+`create-zone` defaults to a zero salt. To reserve a deterministic zone ID before deployment, choose a 32-byte salt and pass it through `ZONE_SALT`:
+
+```bash
+export ZONE_SALT=0x0000000000000000000000000000000000000000000000000000000000000001
+just create-zone my-zone
+```
+
 You can also run the xtask directly for more control:
 
 ```bash
@@ -143,10 +150,11 @@ cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
   --sequencer "$SEQUENCER_ADDR" \
+  --salt "$ZONE_SALT" \
   --private-key "$SEQUENCER_KEY"
 ```
 
-By default, `create-zone` sets the portal admin to the sequencer. To separate the cold admin role from the hot sequencer role, pass `--admin "$ADMIN_ADDR"` to the direct xtask command and keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
+By default, `create-zone` sets the portal admin to the sequencer. To separate the cold admin role from the hot sequencer role, pass `--admin "$ADMIN_ADDR"` to the direct xtask command and keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`. Zone IDs are derived from `(admin, salt)`, so changing the admin also changes the derived zone ID for the same salt.
 
 ### 5. Start the Zone Node
 
@@ -551,9 +559,10 @@ export ZONE_FACTORY=0x...
 cast code "$ZONE_FACTORY" --rpc-url "$ETH_RPC_URL"
 cast call "$ZONE_FACTORY" "zoneCount()(uint32)" --rpc-url "$ETH_RPC_URL"
 cast call "$ZONE_FACTORY" "verifier()(address)" --rpc-url "$ETH_RPC_URL"
+cast call "$ZONE_FACTORY" "computeZoneId(address,bytes32)(uint32)" "$ADMIN_ADDR" "$ZONE_SALT" --rpc-url "$ETH_RPC_URL"
 ```
 
-`zoneCount()` should be `0` on a fresh deployment, and `verifier()` should return the verifier deployed by the factory constructor. Update `MODERATO_ZONE_FACTORY` in `xtask/src/zone_utils.rs`, the Key Addresses table above, and any other `rg` hits for the previous address.
+`zoneCount()` should be `0` on a fresh deployment, `verifier()` should return the verifier deployed by the factory constructor, and `computeZoneId(admin, salt)` should be usable to precompute a zone ID before calling `createZone`. Update `MODERATO_ZONE_FACTORY` in `xtask/src/zone_utils.rs`, the Key Addresses table above, and any other `rg` hits for the previous address.
 
 Current deployment:
 
@@ -593,6 +602,7 @@ Current deployment:
 | `L1_PORTAL_ADDRESS` | For deposits | ZonePortal address (from `zone.json`) |
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
+| `ZONE_SALT` | No | Optional 32-byte salt for deterministic zone ID derivation in `just create-zone`; defaults to zero |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 
 ## Justfile Commands Reference
