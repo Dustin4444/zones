@@ -73,7 +73,8 @@ impl Precompile for AesGcmDecrypt {
             Err(_) => return Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir)),
         };
 
-        let gas = AES_GCM_BASE_GAS + AES_GCM_PER_BYTE_GAS * call.ciphertext.len() as u64;
+        let gas = AES_GCM_BASE_GAS
+            + AES_GCM_PER_BYTE_GAS * (call.ciphertext.len() + call.aad.len()) as u64;
 
         let (plaintext, valid) = decrypt_aes_gcm(
             &call.key.0,
@@ -141,6 +142,26 @@ pub fn decrypt_aes_gcm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_evm::{EvmInternals, eth::EthEvmContext};
+    use alloy_primitives::U256;
+    use revm::database::EmptyDB;
+
+    fn call_decrypt(calldata: Bytes) -> PrecompileOutput {
+        let mut ctx = EthEvmContext::new(EmptyDB::default(), Default::default());
+        AesGcmDecrypt
+            .call(PrecompileInput {
+                data: &calldata,
+                gas: u64::MAX,
+                reservoir: 0,
+                caller: Address::ZERO,
+                value: U256::ZERO,
+                target_address: AES_GCM_DECRYPT_ADDRESS,
+                is_static: true,
+                bytecode_address: AES_GCM_DECRYPT_ADDRESS,
+                internals: EvmInternals::from_context(&mut ctx),
+            })
+            .expect("precompile call")
+    }
 
     #[test]
     fn test_aes_gcm_roundtrip() {
@@ -256,6 +277,69 @@ mod tests {
         let (decrypted, valid) = decrypt_aes_gcm(&key, &nonce_bytes, ct, &[], &tag);
         assert!(!valid);
         assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_aes_gcm_precompile_gas_includes_aad() {
+        let key = [0x42u8; 32];
+        let nonce_bytes = [0x01u8; 12];
+        let ciphertext = Bytes::from_static(b"ciphertext");
+        let aad = Bytes::from_static(b"authenticated-data");
+        let tag = [0x24u8; 16];
+        let calldata: Bytes = decryptCall {
+            key: key.into(),
+            nonce: nonce_bytes.into(),
+            ciphertext: ciphertext.clone(),
+            aad: aad.clone(),
+            tag: tag.into(),
+        }
+        .abi_encode()
+        .into();
+
+        let output = call_decrypt(calldata);
+
+        assert_eq!(
+            output.gas_used,
+            AES_GCM_BASE_GAS + AES_GCM_PER_BYTE_GAS * (ciphertext.len() + aad.len()) as u64
+        );
+    }
+
+    #[test]
+    fn test_aes_gcm_precompile_decrypts_with_aad() {
+        let key = [0x42u8; 32];
+        let nonce_bytes = [0x01u8; 12];
+        let plaintext = b"hello world test";
+        let aad = Bytes::from_static(b"zone-inbox-v1");
+
+        let cipher = Aes256Gcm::new((&key).into());
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let encrypted = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_ref(),
+                    aad: aad.as_ref(),
+                },
+            )
+            .expect("encrypt");
+
+        let ciphertext = Bytes::copy_from_slice(&encrypted[..encrypted.len() - 16]);
+        let tag: [u8; 16] = encrypted[encrypted.len() - 16..].try_into().unwrap();
+        let calldata: Bytes = decryptCall {
+            key: key.into(),
+            nonce: nonce_bytes.into(),
+            ciphertext,
+            aad: aad.clone(),
+            tag: tag.into(),
+        }
+        .abi_encode()
+        .into();
+
+        let output = call_decrypt(calldata);
+        let decoded = decryptCall::abi_decode_returns(&output.bytes).expect("decode returns");
+
+        assert!(decoded.valid);
+        assert_eq!(decoded.plaintext.as_ref(), plaintext);
     }
 
     #[test]
