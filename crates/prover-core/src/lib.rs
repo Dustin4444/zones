@@ -10,7 +10,7 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
@@ -646,6 +646,7 @@ pub enum ProverError {
     },
     ExecutionBlockFailed {
         index: usize,
+        reason: String,
     },
     ExecutionBlockParentHashMismatch {
         index: usize,
@@ -1091,8 +1092,11 @@ impl fmt::Display for ProverError {
                 f,
                 "executed zone block {block_index} produced {actual} receipts, expected {expected}"
             ),
-            Self::ExecutionBlockFailed { index } => {
-                write!(f, "alloy block execution failed for zone block {index}")
+            Self::ExecutionBlockFailed { index, reason } => {
+                write!(
+                    f,
+                    "alloy block execution failed for zone block {index}: {reason}"
+                )
             }
             Self::ExecutionBlockParentHashMismatch {
                 index,
@@ -1931,7 +1935,7 @@ pub(crate) fn validate_node_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use alloc::{format, vec};
     use alloy_consensus::{
         TxReceipt,
         proofs::{calculate_receipt_root, calculate_transaction_root},
@@ -1956,6 +1960,9 @@ mod tests {
     use tempo_zone_contracts::TempoStateReader;
 
     const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
+    const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
+    const ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
+    const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
 
     fn fixture_cfg_env() -> ZoneCfgEnvWitness {
         ZoneCfgEnvWitness {
@@ -1981,6 +1988,25 @@ mod tests {
             slot_num: 0,
             timestamp_millis_part: 0,
         }
+    }
+
+    fn genesis_predeploy_code(addr: Address) -> Bytes {
+        let genesis: serde_json::Value = serde_json::from_str(include_str!(
+            "../../node/tests/assets/zone-test-genesis.json"
+        ))
+        .expect("zone test genesis should parse");
+        let key = format!("{addr:#x}");
+        let code = genesis["alloc"][&key]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing code for {key} in zone-test-genesis.json"));
+        Bytes::from(
+            const_hex::decode(code.strip_prefix("0x").unwrap_or(code))
+                .expect("genesis bytecode should decode"),
+        )
+    }
+
+    fn outbox_packed_slot(withdrawal_batch_index: u64) -> U256 {
+        U256::from(withdrawal_batch_index) << 192
     }
 
     fn fixture_witness() -> BatchWitness {
@@ -2039,9 +2065,81 @@ mod tests {
     fn production_prover_uses_witness_executor_and_fails_closed_on_execution_error() {
         let witness = fixture_witness();
 
+        let err = prove_zone_batch(witness).unwrap_err();
+        assert!(matches!(
+            err,
+            ProverError::ExecutionBlockFailed { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn production_prover_executes_real_outbox_zero_withdrawal_finalization() {
+        let mut witness = fixture_witness();
+        let mut parts = tempo_components_with_root(
+            witness.public_inputs.tempo_block_number,
+            witness.public_inputs.anchor_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        parts.extend(system_account_components(
+            ZONE_INBOX_ADDRESS,
+            &[
+                (
+                    ZONE_INBOX_PROCESSED_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x44)),
+                ),
+                (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
+            ],
+            [
+                ZONE_INBOX_PROCESSED_HASH_SLOT,
+                ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            ]
+            .as_slice(),
+        ));
+        parts.extend(system_account_components_with_code(
+            ZONE_OUTBOX_ADDRESS,
+            &[
+                (ZONE_OUTBOX_PACKED_SLOT, outbox_packed_slot(4)),
+                (
+                    ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x55)),
+                ),
+                (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(4)),
+            ],
+            [
+                ZONE_OUTBOX_PACKED_SLOT,
+                ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+            ]
+            .as_slice(),
+            Some(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
+        ));
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        let output = prove_zone_batch(witness.clone()).unwrap();
+
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
-            ProverError::ExecutionBlockFailed { index: 0 }
+            output.block_transition.prevBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
+        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_queue_hash,
+            B256::ZERO
+        );
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            witness.public_inputs.expected_withdrawal_batch_index
         );
     }
 
@@ -3114,8 +3212,7 @@ mod tests {
                 value: entries
                     .iter()
                     .find(|(entry_slot, _)| *entry_slot == slot)
-                    .map(|(_, value)| *value)
-                    .expect("proof slot must have a test storage entry"),
+                    .map_or(U256::ZERO, |(_, value)| *value),
                 proof_node_hashes: storage_proofs
                     .remove(&slot)
                     .expect("system storage proof was retained"),

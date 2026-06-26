@@ -13792,6 +13792,7 @@ dependencies = [
  "revm-database",
  "revm-database-interface",
  "serde",
+ "serde_json",
  "tempo-chainspec",
  "tempo-primitives",
  "tempo-zone-contracts",

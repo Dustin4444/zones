@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{string::ToString, vec::Vec};
 
 use alloy_consensus::{
     TxReceipt,
@@ -101,7 +101,10 @@ where
         let executor = self.provider.create_executor(state, input)?;
         executor
             .execute_block(transactions)
-            .map_err(|_| ProverError::ExecutionBlockFailed { index: block_index })
+            .map_err(|err| ProverError::ExecutionBlockFailed {
+                index: block_index,
+                reason: err.to_string(),
+            })
     }
 }
 
