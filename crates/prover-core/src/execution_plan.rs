@@ -5,6 +5,7 @@ use alloy_consensus::{
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_eips::eip2718::Decodable2718;
+use alloy_evm::FromRecoveredTx;
 use alloy_primitives::{Bytes, U256};
 use alloy_sol_types::SolCall;
 use tempo_primitives::{
@@ -14,7 +15,7 @@ use tempo_primitives::{
 use tempo_zone_contracts::{ZoneInbox, ZoneOutbox};
 use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
-use crate::{BatchWitness, ProverError, ZoneBlock};
+use crate::{BatchWitness, ProverError, ZoneBlock, ZoneTxEnv};
 
 pub type RecoveredTempoTx = Recovered<TempoTxEnvelope>;
 
@@ -108,6 +109,12 @@ pub struct PlannedZoneTransaction {
     pub tx: RecoveredTempoTx,
 }
 
+impl PlannedZoneTransaction {
+    pub fn tx_env(&self) -> ZoneTxEnv {
+        ZoneTxEnv::from_recovered_tx(self.tx.inner(), self.tx.signer())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlannedZoneTransactionKind {
     AdvanceTempo,
@@ -175,7 +182,9 @@ mod tests {
     use alloy_primitives::{Address, B256, Bytes, U256, address};
     use alloy_sol_types::SolCall;
     use const_hex::FromHex;
+    use revm::context::Transaction;
     use tempo_zone_contracts::EnabledToken;
+    use zone_primitives::constants::ZONE_INBOX_ADDRESS;
 
     use crate::ZoneBlockEnvWitness;
 
@@ -304,6 +313,17 @@ mod tests {
             plan.transactions[0].tx.signer(),
             address!("0x70997970C51812dc3A010C7d01b50e0d17dC79C8")
         );
+    }
+
+    #[test]
+    fn planned_transactions_materialize_zone_tx_envs() {
+        let plan = ZoneBlockExecutionPlan::from_block(0, &sample_block()).unwrap();
+
+        let env = plan.transactions[0].tx_env();
+
+        assert_eq!(env.caller(), TEMPO_SYSTEM_TX_SENDER);
+        assert_eq!(env.kind(), ZONE_INBOX_ADDRESS.into());
+        assert!(env.is_system_tx);
     }
 
     #[test]

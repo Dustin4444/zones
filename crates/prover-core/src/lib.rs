@@ -34,6 +34,7 @@ mod ancestry;
 mod execution_env;
 mod execution_output;
 mod execution_plan;
+mod execution_tx;
 mod post_state;
 mod tempo;
 mod tempo_reader;
@@ -53,6 +54,7 @@ pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
     ZoneExecutionPlan,
 };
+pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use post_state::ExecutionPostState;
 pub use tempo_reader::{
     TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS, TempoStateReaderCallResult,
