@@ -31,12 +31,17 @@ use zone_primitives::{
 };
 
 mod ancestry;
+mod execution_output;
 mod execution_plan;
 mod post_state;
 mod tempo;
 mod trie;
 mod witness_db;
 
+pub use execution_output::{
+    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput, StatelessZoneExecutor,
+    TempoExecutionCommitment, batch_output_from_execution, prove_zone_batch_with_executor,
+};
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
     ZoneExecutionPlan,
@@ -201,10 +206,20 @@ impl BatchOutput {
 pub struct PreparedStatelessExecution {
     pub public_inputs: PublicInputs,
     pub prev_block_header: ZoneHeader,
+    pub zone_blocks: Vec<PreparedZoneBlock>,
     pub execution_db: WitnessDatabase,
     pub execution_plan: ZoneExecutionPlan,
     pub tempo_witness_provider: TempoWitnessProvider,
     pub commitments: PreparedWitnessCommitments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedZoneBlock {
+    pub number: u64,
+    pub parent_hash: B256,
+    pub timestamp: u64,
+    pub beneficiary: Address,
+    pub protocol_version: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,6 +438,43 @@ pub enum ProverError {
         index: usize,
     },
     NonZeroWithdrawalFinalizationUnsupported,
+    ExecutionBlockCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ExecutionBlockParentHashMismatch {
+        index: usize,
+        expected: B256,
+        actual: B256,
+    },
+    ExecutionBlockNumberMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    ExecutionBlockTimestampMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    ExecutionBlockBeneficiaryMismatch {
+        index: usize,
+        expected: Address,
+        actual: Address,
+    },
+    ExecutionBlockProtocolVersionMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    ExecutionFinalTempoMismatch {
+        expected: TempoExecutionCommitment,
+        actual: TempoExecutionCommitment,
+    },
+    ExecutionWithdrawalBatchIndexMismatch {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 impl fmt::Display for ProverError {
@@ -799,6 +851,59 @@ impl fmt::Display for ProverError {
             Self::NonZeroWithdrawalFinalizationUnsupported => {
                 f.write_str("non-zero withdrawal finalization is not implemented yet")
             }
+            Self::ExecutionBlockCountMismatch { expected, actual } => write!(
+                f,
+                "execution returned {actual} zone blocks, expected {expected}"
+            ),
+            Self::ExecutionBlockParentHashMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {index} parent hash {actual} does not match expected {expected}"
+            ),
+            Self::ExecutionBlockNumberMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {index} number {actual} does not match expected {expected}"
+            ),
+            Self::ExecutionBlockTimestampMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {index} timestamp {actual} does not match expected {expected}"
+            ),
+            Self::ExecutionBlockBeneficiaryMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {index} beneficiary {actual} does not match expected {expected}"
+            ),
+            Self::ExecutionBlockProtocolVersionMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {index} protocol version {actual} does not match expected {expected}"
+            ),
+            Self::ExecutionFinalTempoMismatch { expected, actual } => write!(
+                f,
+                "executed final Tempo binding {:?} does not match expected {:?}",
+                actual, expected
+            ),
+            Self::ExecutionWithdrawalBatchIndexMismatch { expected, actual } => write!(
+                f,
+                "executed withdrawal batch index {actual} does not match expected {expected}"
+            ),
         }
     }
 }
@@ -877,6 +982,7 @@ pub fn prepare_stateless_execution(
     Ok(PreparedStatelessExecution {
         public_inputs: public.clone(),
         prev_block_header: witness.prev_block_header.clone(),
+        zone_blocks: prepared_zone_blocks(&witness.zone_blocks),
         execution_db,
         execution_plan,
         tempo_witness_provider,
@@ -891,6 +997,19 @@ pub fn prepare_stateless_execution(
             previous_last_batch: initial_zone_state.last_batch,
         },
     })
+}
+
+fn prepared_zone_blocks(blocks: &[ZoneBlock]) -> Vec<PreparedZoneBlock> {
+    blocks
+        .iter()
+        .map(|block| PreparedZoneBlock {
+            number: block.number,
+            parent_hash: block.parent_hash,
+            timestamp: block.timestamp,
+            beneficiary: block.beneficiary,
+            protocol_version: block.protocol_version,
+        })
+        .collect()
 }
 
 /// Execute the legacy deterministic empty-block transition.
@@ -1650,6 +1769,112 @@ mod tests {
         );
     }
 
+    struct SuccessfulExecutor;
+
+    impl StatelessZoneExecutor for SuccessfulExecutor {
+        fn execute(
+            &mut self,
+            prepared: &PreparedStatelessExecution,
+        ) -> Result<StatelessExecutionOutput, ProverError> {
+            Ok(successful_execution_output(prepared))
+        }
+    }
+
+    #[test]
+    fn prove_with_executor_derives_batch_output_from_execution() {
+        let witness = fixture_witness();
+        let mut executor = SuccessfulExecutor;
+
+        let output = prove_zone_batch_with_executor(witness.clone(), &mut executor).unwrap();
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            witness.public_inputs.expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn execution_output_rejects_wrong_block_parent() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut execution = successful_execution_output(&prepared);
+        execution.blocks[0].header.parent_hash = B256::repeat_byte(0xee);
+
+        assert_eq!(
+            batch_output_from_execution(&prepared, &execution).unwrap_err(),
+            ProverError::ExecutionBlockParentHashMismatch {
+                index: 0,
+                expected: witness.public_inputs.prev_block_hash,
+                actual: B256::repeat_byte(0xee),
+            }
+        );
+    }
+
+    #[test]
+    fn execution_output_rejects_block_count_mismatch() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut execution = successful_execution_output(&prepared);
+        execution.blocks.clear();
+
+        assert_eq!(
+            batch_output_from_execution(&prepared, &execution).unwrap_err(),
+            ProverError::ExecutionBlockCountMismatch {
+                expected: 1,
+                actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_output_rejects_wrong_final_tempo_binding() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut execution = successful_execution_output(&prepared);
+        execution.final_commitments.final_tempo.block_hash = B256::repeat_byte(0xee);
+
+        assert_eq!(
+            batch_output_from_execution(&prepared, &execution).unwrap_err(),
+            ProverError::ExecutionFinalTempoMismatch {
+                expected: TempoExecutionCommitment {
+                    block_number: prepared.commitments.final_tempo_block_number,
+                    block_hash: prepared.commitments.final_tempo_block_hash,
+                    state_root: prepared.commitments.final_tempo_state_root,
+                },
+                actual: execution.final_commitments.final_tempo,
+            }
+        );
+    }
+
+    #[test]
+    fn execution_output_rejects_wrong_withdrawal_batch_index() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut execution = successful_execution_output(&prepared);
+        execution
+            .final_commitments
+            .last_batch
+            .withdrawal_batch_index = 99;
+
+        assert_eq!(
+            batch_output_from_execution(&prepared, &execution).unwrap_err(),
+            ProverError::ExecutionWithdrawalBatchIndexMismatch {
+                expected: witness.public_inputs.expected_withdrawal_batch_index,
+                actual: 99,
+            }
+        );
+    }
+
     #[test]
     fn verifies_zone_ancestry_for_blockhash_witness() {
         let mut witness = fixture_witness();
@@ -1825,6 +2050,46 @@ mod tests {
         let prev_block_hash = witness.prev_block_header.hash();
         witness.public_inputs.prev_block_hash = prev_block_hash;
         witness.zone_blocks[0].parent_hash = prev_block_hash;
+    }
+
+    fn successful_execution_output(
+        prepared: &PreparedStatelessExecution,
+    ) -> StatelessExecutionOutput {
+        let mut parent_hash = prepared.public_inputs.prev_block_hash;
+        let blocks = prepared
+            .zone_blocks
+            .iter()
+            .map(|block| {
+                let header = ZoneHeader {
+                    parent_hash,
+                    beneficiary: block.beneficiary,
+                    state_root: prepared.prev_block_header.state_root,
+                    transactions_root: EMPTY_TRIE_ROOT,
+                    receipts_root: EMPTY_TRIE_ROOT,
+                    number: block.number,
+                    timestamp: block.timestamp,
+                    protocol_version: block.protocol_version,
+                };
+                parent_hash = header.hash();
+                ExecutedZoneBlock { header }
+            })
+            .collect();
+
+        StatelessExecutionOutput {
+            blocks,
+            final_commitments: ExecutedBatchCommitments {
+                final_deposit_queue: prepared.commitments.initial_deposit_queue,
+                last_batch: LastBatchCommitment {
+                    withdrawal_queue_hash: B256::ZERO,
+                    withdrawal_batch_index: prepared.public_inputs.expected_withdrawal_batch_index,
+                },
+                final_tempo: TempoExecutionCommitment {
+                    block_number: prepared.commitments.final_tempo_block_number,
+                    block_hash: prepared.commitments.final_tempo_block_hash,
+                    state_root: prepared.commitments.final_tempo_state_root,
+                },
+            },
+        }
     }
 
     fn insert_proof_nodes(
