@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_connection_fails_closed_on_execution_error() {
+    async fn server_connection_runs_prover_then_fails_when_attestation_disabled() {
         let server = test_server();
         let request = proof_request(server.signer());
         let wire_request = EnclaveRequest::Prove(Box::new(request.clone()));
@@ -346,7 +346,7 @@ mod tests {
             let EnclaveResponse::Error { message } = response else {
                 panic!("expected error response");
             };
-            assert!(message.contains("alloy block execution failed for zone block 0"));
+            assert!(message.contains("attestation provider is disabled"));
         };
 
         tokio::join!(server_task, client_task);

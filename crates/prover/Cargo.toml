@@ -43,6 +43,7 @@ tokio-vsock.workspace = true
 
 [dev-dependencies]
 alloy-trie = { workspace = true, features = ["ethereum"] }
+const-hex.workspace = true
 
 [[bin]]
 name = "zone-prover-enclave"

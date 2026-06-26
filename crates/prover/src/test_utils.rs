@@ -18,13 +18,17 @@ use crate::types::{
     ZoneStateWitness, ZoneStorageRead,
 };
 
-const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
+const TEST_INBOX_CONTRACT_CODE: &[u8] = &[0x00];
+const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
+const ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
+const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
 
 pub(crate) fn minimal_batch_witness() -> BatchWitness {
     let tempo_block_number = 10;
     let tempo_block_hash = B256::repeat_byte(0x33);
-    let initial_zone_state = tempo_bound_zone_state(tempo_block_number, tempo_block_hash);
     let beneficiary = address!("0x0000000000000000000000000000000000000001");
+    let initial_zone_state =
+        tempo_bound_zone_state(tempo_block_number, tempo_block_hash, beneficiary);
     let header = ZoneHeader {
         parent_hash: B256::repeat_byte(0x01),
         beneficiary,
@@ -88,7 +92,38 @@ pub(crate) fn minimal_batch_witness() -> BatchWitness {
     }
 }
 
-fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitness {
+fn genesis_predeploy_code(addr: Address) -> Bytes {
+    let genesis: serde_json::Value = serde_json::from_str(include_str!(
+        "../../node/tests/assets/zone-test-genesis.json"
+    ))
+    .expect("zone test genesis should parse");
+    let key = format!("{addr:#x}");
+    let code = genesis["alloc"][&key]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing code for {key} in zone-test-genesis.json"));
+    Bytes::from(
+        const_hex::decode(code.strip_prefix("0x").unwrap_or(code))
+            .expect("genesis bytecode should decode"),
+    )
+}
+
+fn absent_account_read(account: Address) -> ZoneAccountRead {
+    ZoneAccountRead {
+        account,
+        nonce: 0,
+        balance: U256::ZERO,
+        storage_root: EMPTY_TRIE_ROOT,
+        code_hash: KECCAK_EMPTY,
+        code: None,
+        proof_node_hashes: Vec::new(),
+    }
+}
+
+fn tempo_bound_zone_state(
+    block_number: u64,
+    block_hash: B256,
+    beneficiary: Address,
+) -> ZoneStateWitness {
     let block_hash_slot = storage_slot_u256(TEMPO_BLOCK_HASH_SLOT);
     let state_root_slot = storage_slot_u256(TEMPO_STATE_ROOT_SLOT);
     let packed_slot = storage_slot_u256(TEMPO_PACKED_SLOT);
@@ -129,8 +164,11 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
                 (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::ZERO),
             ],
             &[
+                ZONE_OUTBOX_PACKED_SLOT,
                 ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
                 ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
             ],
         );
     node_pool.extend(zone_outbox_nodes);
@@ -141,18 +179,20 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         storage_root: tempo_storage_root,
         code_hash: KECCAK_EMPTY,
     };
-    let system_code_hash = keccak256(TEST_SYSTEM_CONTRACT_CODE);
+    let inbox_code_hash = keccak256(TEST_INBOX_CONTRACT_CODE);
+    let outbox_code = genesis_predeploy_code(ZONE_OUTBOX_ADDRESS);
+    let outbox_code_hash = keccak256(outbox_code.as_ref());
     let zone_inbox_trie_account = TrieAccount {
         nonce: 0,
         balance: U256::ZERO,
         storage_root: zone_inbox_storage_root,
-        code_hash: system_code_hash,
+        code_hash: inbox_code_hash,
     };
     let zone_outbox_trie_account = TrieAccount {
         nonce: 0,
         balance: U256::ZERO,
         storage_root: zone_outbox_storage_root,
-        code_hash: system_code_hash,
+        code_hash: outbox_code_hash,
     };
     let tempo_account_read = ZoneAccountRead {
         account: TEMPO_STATE_ADDRESS,
@@ -169,7 +209,7 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         balance: zone_inbox_trie_account.balance,
         storage_root: zone_inbox_trie_account.storage_root,
         code_hash: zone_inbox_trie_account.code_hash,
-        code: Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
+        code: Some(Bytes::copy_from_slice(TEST_INBOX_CONTRACT_CODE)),
         proof_node_hashes: Vec::new(),
     };
     let zone_outbox_account_read = ZoneAccountRead {
@@ -178,7 +218,7 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         balance: zone_outbox_trie_account.balance,
         storage_root: zone_outbox_trie_account.storage_root,
         code_hash: zone_outbox_trie_account.code_hash,
-        code: Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
+        code: Some(outbox_code),
         proof_node_hashes: Vec::new(),
     };
     let mut storage_reads = vec![
@@ -226,6 +266,14 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
+            slot: ZONE_OUTBOX_PACKED_SLOT,
+            value: U256::ZERO,
+            proof_node_hashes: zone_outbox_storage_proofs
+                .remove(&ZONE_OUTBOX_PACKED_SLOT)
+                .expect("ZoneOutbox packed slot proof was retained"),
+        },
+        ZoneStorageRead {
+            account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
             value: storage_word(B256::repeat_byte(0x55)),
             proof_node_hashes: zone_outbox_storage_proofs
@@ -240,6 +288,22 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
                 .remove(&ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
                 .expect("ZoneOutbox last batch index proof was retained"),
         },
+        ZoneStorageRead {
+            account: ZONE_OUTBOX_ADDRESS,
+            slot: ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+            value: U256::ZERO,
+            proof_node_hashes: zone_outbox_storage_proofs
+                .remove(&ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT)
+                .expect("ZoneOutbox pending withdrawals proof was retained"),
+        },
+        ZoneStorageRead {
+            account: ZONE_OUTBOX_ADDRESS,
+            slot: ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+            value: U256::ZERO,
+            proof_node_hashes: zone_outbox_storage_proofs
+                .remove(&ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT)
+                .expect("ZoneOutbox pending withdrawals head proof was retained"),
+        },
     ]);
 
     let (state_root, account_nodes, mut account_proofs) = account_trie_with_proofs(
@@ -248,7 +312,12 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
             (ZONE_INBOX_ADDRESS, zone_inbox_trie_account),
             (ZONE_OUTBOX_ADDRESS, zone_outbox_trie_account),
         ],
-        &[TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS],
+        &[
+            TEMPO_STATE_ADDRESS,
+            ZONE_INBOX_ADDRESS,
+            ZONE_OUTBOX_ADDRESS,
+            beneficiary,
+        ],
     );
     node_pool.extend(account_nodes);
 
@@ -270,6 +339,12 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
                 .remove(&ZONE_OUTBOX_ADDRESS)
                 .expect("ZoneOutbox account proof was retained"),
             ..zone_outbox_account_read
+        },
+        ZoneAccountRead {
+            proof_node_hashes: account_proofs
+                .remove(&beneficiary)
+                .expect("beneficiary account proof was retained"),
+            ..absent_account_read(beneficiary)
         },
     ];
 
