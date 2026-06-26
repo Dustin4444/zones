@@ -1653,9 +1653,11 @@ mod tests {
     use alloc::vec;
     use alloy_primitives::{B256, address, keccak256};
     use alloy_rlp::Encodable;
+    use alloy_sol_types::SolCall;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
     use revm_database::{BundleState, primitives::StorageKeyMap};
     use revm_database_interface::Database;
+    use tempo_zone_contracts::TempoStateReader;
 
     fn fixture_witness() -> BatchWitness {
         let tempo_block_number = 100;
@@ -2799,6 +2801,45 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         prove_empty_zone_batch(witness).unwrap();
+    }
+
+    #[test]
+    fn witness_tempo_state_reader_uses_prepared_verified_reads() {
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let slot = U256::from(7);
+        let value = U256::from(9);
+        let tempo_block_number = 100;
+        let tempo_block_hash = B256::repeat_byte(0x03);
+        let (tempo_state_root, proof) = l1_state_proof(0, tempo_block_number, account, slot, value);
+
+        let mut witness = fixture_witness();
+        set_initial_zone_state(
+            &mut witness,
+            tempo_bound_zone_state_with_root(
+                tempo_block_number,
+                tempo_block_hash,
+                tempo_state_root,
+            ),
+        );
+        witness.tempo_state_proofs = proof;
+
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let reader = WitnessTempoStateReader::new(&prepared.tempo_witness_provider, 0);
+        let call = TempoStateReader::readStorageAtCall {
+            account,
+            slot: B256::from(slot),
+            blockNumber: tempo_block_number,
+        }
+        .abi_encode();
+
+        assert_eq!(
+            reader.call(TEMPO_STATE_ADDRESS, true, &call).unwrap(),
+            TempoStateReaderCallResult::Returned {
+                gas_used: tempo_state_reader_gas(1).unwrap(),
+                output: TempoStateReader::readStorageAtCall::abi_encode_returns(&B256::from(value))
+                    .into(),
+            }
+        );
     }
 
     #[test]
