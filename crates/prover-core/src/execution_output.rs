@@ -27,17 +27,18 @@ use crate::{
 };
 
 pub trait StatelessZoneBlockExecutor {
-    type Transaction: Encodable2718;
     type Receipt: TxReceipt;
 
     /// Execute one prepared Zone block and leave the block's revm transitions
     /// pending in `state`. The prover driver merges those transitions only
-    /// after it derives the block state root from the sparse trie witness.
+    /// after it derives the block state root from the sparse trie witness. The
+    /// driver owns the prepared transaction list used for the transaction root;
+    /// executors must execute `input.transactions` in order.
     fn execute_block(
         &mut self,
         state: &mut ZoneExecutionState,
-        input: ZoneBlockExecutionInput<'_>,
-    ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>;
+        input: &ZoneBlockExecutionInput<'_>,
+    ) -> Result<BlockExecutionResult<Self::Receipt>, ProverError>;
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +65,15 @@ impl<'a> ZoneExecutableTransaction<'a> {
             tx_env: planned.tx_env(),
             recovered: &planned.tx,
         }
+    }
+}
+
+impl<'a> ZoneBlockExecutionInput<'a> {
+    pub fn recovered_transactions(&self) -> Vec<RecoveredTempoTx> {
+        self.transactions
+            .iter()
+            .map(|transaction| transaction.recovered.clone())
+            .collect()
     }
 }
 
@@ -141,16 +151,10 @@ impl ExecutedZoneBlock {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ExecutedZoneBlockArtifacts<Tx, Receipt> {
-    pub transactions: Vec<Tx>,
-    pub result: BlockExecutionResult<Receipt>,
-}
-
 #[derive(Debug, Clone, Copy)]
-pub struct ZoneBlockExecutionArtifacts<'a, Tx, Receipt> {
+pub struct ZoneBlockExecutionArtifacts<'a, Receipt> {
     pub state_root: CalculatedStateRoot,
-    pub transactions: &'a [Tx],
+    pub transactions: &'a [RecoveredTempoTx],
     pub result: &'a BlockExecutionResult<Receipt>,
 }
 
@@ -169,12 +173,11 @@ pub struct TempoExecutionCommitment {
 }
 
 impl StatelessExecutionOutput {
-    pub fn from_alloy_execution<Tx, Receipt>(
-        blocks: &[ZoneBlockExecutionArtifacts<'_, Tx, Receipt>],
+    pub fn from_alloy_execution<Receipt>(
+        blocks: &[ZoneBlockExecutionArtifacts<'_, Receipt>],
         bundle_state: &BundleState,
     ) -> Result<Self, ProverError>
     where
-        Tx: Encodable2718,
         Receipt: TxReceipt,
         for<'receipt> alloy_consensus::ReceiptWithBloom<&'receipt Receipt>: Encodable2718,
     {
@@ -224,15 +227,16 @@ where
     let mut state_root_calculator = prepared.state_root_calculator()?;
     for block_index in 0..prepared.zone_blocks.len() {
         let input = prepared.block_execution_input(block_index)?;
-        let artifacts = executor.execute_block(&mut state, input)?;
+        let transactions = input.recovered_transactions();
+        let result = executor.execute_block(&mut state, &input)?;
         let block_post_state = execution_post_state_from_pending_transitions(&state);
         let state_root = state_root_calculator.calculate(block_post_state.into_hashed())?;
         state.merge_transitions(BundleRetention::PlainState);
         blocks.push(ExecutedZoneBlock::from_alloy_block_execution(
             block_index,
             state_root,
-            &artifacts.transactions,
-            &artifacts.result,
+            &transactions,
+            &result,
         )?);
     }
 

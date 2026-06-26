@@ -49,11 +49,10 @@ pub use execution_env::{
     tempo_gas_params_with_amsterdam, zone_general_gas_limit, zone_shared_gas_limit,
 };
 pub use execution_output::{
-    ExecutedBatchCommitments, ExecutedZoneBlock, ExecutedZoneBlockArtifacts,
-    StatelessExecutionOutput, StatelessZoneBlockExecutor, TempoExecutionCommitment,
-    ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput, ZoneExecutableTransaction,
-    batch_output_from_execution, execute_prepared_blocks, execution_commitments_from_post_state,
-    prove_zone_batch_with_executor,
+    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
+    StatelessZoneBlockExecutor, TempoExecutionCommitment, ZoneBlockExecutionArtifacts,
+    ZoneBlockExecutionInput, ZoneExecutableTransaction, batch_output_from_execution,
+    execute_prepared_blocks, execution_commitments_from_post_state, prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -2119,15 +2118,13 @@ mod tests {
     }
 
     impl StatelessZoneBlockExecutor for SuccessfulBlockExecutor {
-        type Transaction = RecoveredTempoTx;
         type Receipt = TempoReceipt;
 
         fn execute_block(
             &mut self,
             state: &mut ZoneExecutionState,
-            input: ZoneBlockExecutionInput<'_>,
-        ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>
-        {
+            input: &ZoneBlockExecutionInput<'_>,
+        ) -> Result<BlockExecutionResult<Self::Receipt>, ProverError> {
             let original = state
                 .storage(ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
                 .unwrap();
@@ -2160,16 +2157,7 @@ mod tests {
                     },
                 );
 
-            let transactions = input
-                .transactions
-                .iter()
-                .map(|transaction| transaction.recovered.clone())
-                .collect::<Vec<_>>();
-            let result = successful_block_result(transactions.len());
-            Ok(ExecutedZoneBlockArtifacts {
-                transactions,
-                result,
-            })
+            Ok(successful_block_result(input.transactions.len()))
         }
     }
 
@@ -3519,15 +3507,13 @@ mod tests {
         }
 
         impl StatelessZoneBlockExecutor for RecordingBlockExecutor {
-            type Transaction = RecoveredTempoTx;
             type Receipt = TempoReceipt;
 
             fn execute_block(
                 &mut self,
                 state: &mut ZoneExecutionState,
-                input: ZoneBlockExecutionInput<'_>,
-            ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>
-            {
+                input: &ZoneBlockExecutionInput<'_>,
+            ) -> Result<BlockExecutionResult<Self::Receipt>, ProverError> {
                 self.seen
                     .push((input.block_index, input.transactions.len()));
                 assert_eq!(
@@ -3548,16 +3534,7 @@ mod tests {
                 changes.insert(ZONE_INBOX_ADDRESS, account);
                 state.commit(changes);
 
-                let transactions = input
-                    .transactions
-                    .iter()
-                    .map(|transaction| transaction.recovered.clone())
-                    .collect::<Vec<_>>();
-                let result = successful_block_result(transactions.len());
-                Ok(ExecutedZoneBlockArtifacts {
-                    transactions,
-                    result,
-                })
+                Ok(successful_block_result(input.transactions.len()))
             }
         }
 
@@ -3569,6 +3546,15 @@ mod tests {
 
         assert_eq!(executor.seen, vec![(0, 1)]);
         assert_eq!(output.blocks.len(), 1);
+        let prepared_transactions = prepared
+            .block_execution_input(0)
+            .unwrap()
+            .recovered_transactions();
+        assert_eq!(
+            output.blocks[0].transactions_root(),
+            calculate_transaction_root(&prepared_transactions),
+            "transaction root must come from the prepared witness plan"
+        );
         assert_ne!(output.blocks[0].state_root(), EMPTY_TRIE_ROOT);
         let hashed_address = KeccakKeyHasher::hash_key(ZONE_INBOX_ADDRESS);
         let hashed_account = output
