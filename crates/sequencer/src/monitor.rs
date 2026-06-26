@@ -24,11 +24,12 @@
 //! within the EIP-2935 window, and the proof must include a block header chain
 //! linking that anchor back to `tempoBlockNumber`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
+use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::{Result, WrapErr};
 use tempo_alloy::TempoNetwork;
@@ -41,8 +42,8 @@ use crate::{
     abi::{self, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
-        AnchorGapKind, BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot,
-        fetch_slot_withdrawals, log_query_ranges,
+        AnchorGapKind, BatchAnchorConfig, BatchData, BatchSubmitter, LOG_QUERY_BLOCK_CHUNK,
+        ZoneBlockSnapshot, fetch_slot_withdrawals, log_query_ranges,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -52,6 +53,106 @@ const MAX_RETRIES: u32 = 3;
 
 /// Initial delay between retries (doubles on each attempt).
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn metric_u64(value: u64) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+}
+
+fn metric_usize(value: usize) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+}
+
+#[derive(Debug, Clone, Default)]
+struct FundsLedger {
+    tokens: BTreeMap<Address, TokenFunds>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TokenFunds {
+    unprocessed_deposits: U256,
+    pending_refunds: U256,
+    pending_withdrawals: U256,
+}
+
+impl FundsLedger {
+    fn add_unprocessed_deposit(&mut self, token: Address, amount: u128) -> Result<()> {
+        Self::add_amount(
+            &mut self.entry_mut(token).unprocessed_deposits,
+            U256::from(amount),
+            "unprocessed deposit liability overflow",
+        )
+    }
+
+    fn add_pending_refund(&mut self, token: Address, amount: u128) -> Result<()> {
+        Self::add_amount(
+            &mut self.entry_mut(token).pending_refunds,
+            U256::from(amount),
+            "pending refund liability overflow",
+        )
+    }
+
+    fn claim_refund(&mut self, token: Address, amount: u128) -> Result<()> {
+        let funds = self.entry_mut(token);
+        let amount = U256::from(amount);
+        let next = funds.pending_refunds.checked_sub(amount).ok_or_else(|| {
+            eyre::eyre!(
+                "portal refund claims exceed pending refunds for token {token}: claim={amount}, pending={}",
+                funds.pending_refunds
+            )
+        })?;
+        funds.pending_refunds = next;
+        Ok(())
+    }
+
+    fn add_withdrawals(&mut self, withdrawals: &[abi::Withdrawal]) -> Result<()> {
+        for withdrawal in withdrawals {
+            let amount = U256::from(withdrawal.amount);
+            let fee = U256::from(withdrawal.fee);
+            let liability = amount.checked_add(fee).ok_or_else(|| {
+                eyre::eyre!(
+                    "withdrawal liability overflow for token {}",
+                    withdrawal.token
+                )
+            })?;
+            Self::add_amount(
+                &mut self.entry_mut(withdrawal.token).pending_withdrawals,
+                liability,
+                "pending withdrawal liability overflow",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn liability(funds: &TokenFunds) -> Result<U256> {
+        let deposits_and_refunds = funds
+            .unprocessed_deposits
+            .checked_add(funds.pending_refunds)
+            .ok_or_else(|| eyre::eyre!("token funds liability overflow"))?;
+        deposits_and_refunds
+            .checked_add(funds.pending_withdrawals)
+            .ok_or_else(|| eyre::eyre!("token funds liability overflow"))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Address, &TokenFunds)> {
+        self.tokens.iter()
+    }
+
+    fn entry_mut(&mut self, token: Address) -> &mut TokenFunds {
+        self.tokens.entry(token).or_default()
+    }
+
+    fn add_amount(field: &mut U256, amount: U256, context: &'static str) -> Result<()> {
+        let next = (*field)
+            .checked_add(amount)
+            .ok_or_else(|| eyre::eyre!(context))?;
+        *field = next;
+        Ok(())
+    }
+}
 
 /// Configuration for the [`ZoneMonitor`].
 #[derive(Debug, Clone)]
@@ -76,6 +177,9 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Sequencer key used to produce native local verifier proofs when a batch
+    /// does not carry externally produced proof material.
+    pub native_proof_signer: Option<PrivateKeySigner>,
 }
 
 /// Monitors the Zone L2 chain for new blocks, aggregates them into batches, and
@@ -148,7 +252,7 @@ impl ZoneMonitor {
         let zone_rpc_url = config.zone_rpc_url.clone();
         let retry_layer = RetryBackoffLayer::new(
             u32::MAX,
-            config.retry_connection_interval.as_millis() as u64,
+            duration_millis_u64(config.retry_connection_interval),
             u64::MAX,
         );
         let client = RpcClient::builder()
@@ -194,12 +298,15 @@ impl ZoneMonitor {
                 .await
                 .wrap_err("failed to read genesisTempoBlockNumber during zone monitor startup")?;
 
-        let batch_submitter = BatchSubmitter::with_anchor_config(
+        let mut batch_submitter = BatchSubmitter::with_anchor_config(
             config.portal_address,
             l1_provider,
             genesis_tempo_block_number,
             config.batch_anchor_config,
         );
+        if let Some(signer) = config.native_proof_signer.clone() {
+            batch_submitter = batch_submitter.with_native_proof_signer(signer);
+        }
 
         let (prev_zone_block_hash, portal_withdrawal_queue_tail) = tokio::try_join!(
             batch_submitter.read_portal_block_hash(),
@@ -229,10 +336,10 @@ impl ZoneMonitor {
 
         metrics
             .latest_zone_block_observed
-            .set(last_submitted_zone_block as f64);
+            .set(metric_u64(last_submitted_zone_block));
         metrics
             .latest_zone_block_submitted_to_l1
-            .set(last_submitted_zone_block as f64);
+            .set(metric_u64(last_submitted_zone_block));
         metrics.zone_to_l1_submission_lag_blocks.set(0.0);
 
         let monitor = Self {
@@ -308,13 +415,18 @@ impl ZoneMonitor {
                 continue;
             }
 
-            let from = self.last_submitted_zone_block + 1;
+            let Some(from) = self.last_submitted_zone_block.checked_add(1) else {
+                error!("last submitted zone block overflowed u64");
+                continue;
+            };
             if let Err(e) = self.process_block_range(from, latest_zone_block).await {
                 error!(from, to = latest_zone_block, error = %e, "Failed to process zone block range");
                 continue;
             }
 
-            batch_deadline = tokio::time::Instant::now() + self.config.batch_interval;
+            batch_deadline = tokio::time::Instant::now()
+                .checked_add(self.config.batch_interval)
+                .unwrap_or_else(tokio::time::Instant::now);
         }
     }
 
@@ -391,7 +503,9 @@ impl ZoneMonitor {
     /// `finalizeWithdrawalBatch` runs as the last tx in every zone block. The
     /// correct signal is `BatchFinalized` events with non-zero withdrawal hashes.
     async fn has_pending_withdrawals(&self, latest_block: u64) -> bool {
-        let from = self.last_submitted_zone_block + 1;
+        let Some(from) = self.last_submitted_zone_block.checked_add(1) else {
+            return false;
+        };
         for (chunk_from, chunk_to) in log_query_ranges(from, latest_block) {
             match self
                 .outbox
@@ -450,7 +564,10 @@ impl ZoneMonitor {
     /// withdrawals, we recompute the combined hash from the collected withdrawal structs.
     #[instrument(skip(self), fields(from, to))]
     async fn process_block_range(&mut self, from: u64, to: u64) -> Result<()> {
-        let block_count = to - from + 1;
+        let block_count = to
+            .checked_sub(from)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| eyre::eyre!("invalid zone block range {from}..={to}"))?;
         info!(from, to, block_count, "Processing zone block range");
 
         // Read end-of-range state to check the anchor gap class.
@@ -500,6 +617,8 @@ impl ZoneMonitor {
             prev_deposit_number: self.prev_processed_deposit_number,
             next_deposit_number: end_state.processed_deposit_number,
             withdrawal_queue_hash,
+            verifier_config: Bytes::new(),
+            proof: Bytes::new(),
         };
 
         self.submit_batch_with_retry(&batch_data, to, all_withdrawals)
@@ -577,10 +696,12 @@ impl ZoneMonitor {
                 prev_deposit_number: self.prev_processed_deposit_number,
                 next_deposit_number: step_state.processed_deposit_number,
                 withdrawal_queue_hash,
+                verifier_config: Bytes::new(),
+                proof: Bytes::new(),
             };
 
             info!(
-                step = step_idx + 1,
+                step = step_idx.checked_add(1).unwrap_or(total_steps),
                 total_steps,
                 zone_from = range_start,
                 zone_to = step_end,
@@ -591,7 +712,9 @@ impl ZoneMonitor {
             self.submit_batch_with_retry(&batch_data, step_end, step_withdrawals)
                 .await?;
 
-            range_start = step_end + 1;
+            range_start = step_end
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("zone step range overflowed at {step_end}"))?;
         }
 
         Ok(())
@@ -627,6 +750,155 @@ impl ZoneMonitor {
             processed_deposit_number,
             block_hash,
         })
+    }
+
+    async fn verify_funds_ledger(
+        &self,
+        next_processed_deposit_number: u64,
+        current_batch_withdrawals: &[abi::Withdrawal],
+    ) -> Result<()> {
+        let ledger = self
+            .build_funds_ledger(next_processed_deposit_number, current_batch_withdrawals)
+            .await?;
+        let portal = ZonePortal::new(
+            self.config.portal_address,
+            self.batch_submitter.l1_provider().clone(),
+        );
+
+        for (token, funds) in ledger.iter() {
+            let liability = FundsLedger::liability(funds)?;
+            if liability.is_zero() {
+                continue;
+            }
+
+            let accounted_balance = portal.accountedBalance(*token).call().await?;
+            if accounted_balance < liability {
+                return Err(eyre::eyre!(
+                    "portal accounted funds invariant failed for token {token}: \
+                     accounted_balance={accounted_balance}, required_liability={liability}, \
+                     unprocessed_deposits={}, pending_refunds={}, pending_withdrawals={}",
+                    funds.unprocessed_deposits,
+                    funds.pending_refunds,
+                    funds.pending_withdrawals
+                ));
+            }
+
+            info!(
+                token = %token,
+                accounted_balance = %accounted_balance,
+                required_liability = %liability,
+                unprocessed_deposits = %funds.unprocessed_deposits,
+                pending_refunds = %funds.pending_refunds,
+                pending_withdrawals = %funds.pending_withdrawals,
+                "Portal accounted funds invariant passed"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn build_funds_ledger(
+        &self,
+        next_processed_deposit_number: u64,
+        current_batch_withdrawals: &[abi::Withdrawal],
+    ) -> Result<FundsLedger> {
+        let mut ledger = FundsLedger::default();
+
+        let pending = self
+            .batch_submitter
+            .fetch_pending_withdrawals(&self.provider, self.config.outbox_address)
+            .await?;
+        for withdrawals in pending.values() {
+            ledger.add_withdrawals(withdrawals)?;
+        }
+        ledger.add_withdrawals(current_batch_withdrawals)?;
+
+        let portal = ZonePortal::new(
+            self.config.portal_address,
+            self.batch_submitter.l1_provider().clone(),
+        );
+        let genesis_tempo_block_number = self
+            .batch_submitter
+            .read_genesis_tempo_block_number()
+            .await?;
+        let l1_tip = self
+            .batch_submitter
+            .l1_provider()
+            .get_block_number()
+            .await?;
+
+        let regular_deposits = portal
+            .DepositMade_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in regular_deposits {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.netAmount)?;
+            }
+        }
+
+        let encrypted_deposits = portal
+            .EncryptedDepositMade_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in encrypted_deposits {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.netAmount)?;
+            }
+        }
+
+        let withdrawal_bouncebacks = portal
+            .WithdrawalBounceBack_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in withdrawal_bouncebacks {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.amount)?;
+            }
+        }
+
+        let pending_refunds = portal
+            .DepositBounceBackPending_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in pending_refunds {
+            ledger.add_pending_refund(event.token, event.amount)?;
+        }
+
+        let claimed_refunds = portal
+            .RefundClaimed_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in claimed_refunds {
+            ledger.claim_refund(event.token, event.amount)?;
+        }
+
+        Ok(ledger)
     }
 
     /// Submit a `submitBatch` transaction to the ZonePortal on L1 with exponential
@@ -666,6 +938,14 @@ impl ZoneMonitor {
             _ => {}
         }
 
+        if let Err(err) = self
+            .verify_funds_ledger(batch_data.next_deposit_number, &withdrawals)
+            .await
+        {
+            self.metrics.funds_ledger_check_failure_total.increment(1);
+            return Err(err.wrap_err("portal accounted funds invariant check failed"));
+        }
+
         let mut delay = INITIAL_RETRY_DELAY;
 
         for attempt in 1..=MAX_RETRIES {
@@ -675,7 +955,9 @@ impl ZoneMonitor {
                     self.metrics
                         .batch_submit_latency_seconds
                         .record(submit_started.elapsed().as_secs_f64());
-                    let blocks_in_batch = last_zone_block - self.last_submitted_zone_block;
+                    let blocks_in_batch = last_zone_block
+                        .checked_sub(self.last_submitted_zone_block)
+                        .ok_or_else(|| eyre::eyre!("submitted zone block moved backwards"))?;
                     info!(
                         last_zone_block,
                         blocks_in_batch,
@@ -687,10 +969,10 @@ impl ZoneMonitor {
                     self.metrics.batch_submit_success_total.increment(1);
                     self.metrics
                         .batch_size_blocks
-                        .record(blocks_in_batch as f64);
+                        .record(metric_u64(blocks_in_batch));
                     self.metrics
                         .withdrawals_per_batch
-                        .record(withdrawals.len() as f64);
+                        .record(metric_usize(withdrawals.len()));
 
                     // Only advance local state on success.
                     self.prev_zone_block_hash = batch_data.next_block_hash;
@@ -699,7 +981,7 @@ impl ZoneMonitor {
                     self.last_submitted_zone_block = last_zone_block;
                     self.metrics
                         .latest_zone_block_submitted_to_l1
-                        .set(last_zone_block as f64);
+                        .set(metric_u64(last_zone_block));
                     self.update_submission_lag();
 
                     // Store withdrawals and advance portal queue tail if this batch had withdrawals.
@@ -714,7 +996,12 @@ impl ZoneMonitor {
                                 count, "Stored withdrawals for portal queue slot"
                             );
                         }
-                        self.portal_withdrawal_queue_tail += 1;
+                        self.portal_withdrawal_queue_tail = self
+                            .portal_withdrawal_queue_tail
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                eyre::eyre!("portal withdrawal queue tail overflowed")
+                            })?;
                     }
 
                     // Signal the withdrawal processor.
@@ -736,12 +1023,12 @@ impl ZoneMonitor {
                             "Batch submission failed, retrying"
                         );
                         tokio::time::sleep(delay).await;
-                        delay *= 2;
+                        delay = delay.saturating_mul(2);
                     } else {
                         self.metrics.batch_submit_failure_total.increment(1);
                         let revert_reason = decode_portal_revert(&e);
                         error!(
-                            error = %e,
+                            error = ?e,
                             revert_reason,
                             last_zone_block,
                             tempo_block_number = batch_data.tempo_block_number,
@@ -820,7 +1107,7 @@ impl ZoneMonitor {
                 self.prev_processed_deposit_number = deposit_number;
                 self.metrics
                     .latest_zone_block_submitted_to_l1
-                    .set(last_submitted_zone_block as f64);
+                    .set(metric_u64(last_submitted_zone_block));
                 self.update_submission_lag();
                 if let Err(e) = self.restore_pending_withdrawals_from_chain().await {
                     let (stale_store_batches, stale_store_first_slot, stale_store_last_slot) = {
@@ -933,15 +1220,17 @@ impl ZoneMonitor {
         self.latest_observed_zone_block = latest_zone_block;
         self.metrics
             .latest_zone_block_observed
-            .set(latest_zone_block as f64);
+            .set(metric_u64(latest_zone_block));
         self.update_submission_lag();
     }
 
     fn update_submission_lag(&self) {
-        self.metrics.zone_to_l1_submission_lag_blocks.set(
-            self.latest_observed_zone_block
-                .saturating_sub(self.last_submitted_zone_block) as f64,
-        );
+        self.metrics
+            .zone_to_l1_submission_lag_blocks
+            .set(metric_u64(
+                self.latest_observed_zone_block
+                    .saturating_sub(self.last_submitted_zone_block),
+            ));
     }
 }
 
@@ -994,8 +1283,8 @@ pub fn spawn_zone_monitor(
 /// `Panic(uint256)`, and ZonePortal custom errors (`NotSequencer`, etc.).
 fn decode_portal_revert(err: &eyre::Report) -> Option<String> {
     let msg = format!("{err}");
-    let start = msg.find("data: \"0x")? + "data: \"".len();
-    let end = msg[start..].find('"')? + start;
+    let start = msg.find("data: \"0x")?.checked_add("data: \"".len())?;
+    let end = msg[start..].find('"')?.checked_add(start)?;
     let bytes = alloy_primitives::hex::decode(&msg[start..end]).ok()?;
     let error = ContractError::<ZonePortal::ZonePortalErrors>::abi_decode(&bytes).ok()?;
     Some(error.to_string())
@@ -1005,8 +1294,8 @@ fn decode_portal_revert(err: &eyre::Report) -> Option<String> {
 mod tests {
     use super::*;
     use alloy_network::Network;
-    use alloy_primitives::{Bytes, U256};
-    use alloy_rpc_types_eth::{Block, Header};
+    use alloy_primitives::{Bytes, U64, U256};
+    use alloy_rpc_types_eth::{Block, Header, Log};
     use alloy_transport::mock::Asserter;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
@@ -1023,6 +1312,13 @@ mod tests {
 
     fn abi_encode_u64(value: u64) -> Bytes {
         Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+    }
+
+    fn push_empty_log_queries(asserter: &Asserter, count: usize) {
+        let logs: Vec<Log> = Vec::new();
+        for _ in 0..count {
+            asserter.push_success(&logs);
+        }
     }
 
     fn mock_block(hash: B256, number: u64) -> <TempoNetwork as Network>::BlockResponse {
@@ -1042,6 +1338,70 @@ mod tests {
         Block::empty(header)
     }
 
+    #[test]
+    fn funds_ledger_tracks_withdrawal_amount_and_fee() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+
+        ledger
+            .add_withdrawals(&[abi::Withdrawal {
+                token,
+                senderTag: B256::ZERO,
+                to: Address::repeat_byte(0x20),
+                amount: 100,
+                fee: 7,
+                memo: B256::ZERO,
+                gasLimit: 0,
+                fallbackRecipient: Address::repeat_byte(0x30),
+                callbackData: Default::default(),
+                encryptedSender: Default::default(),
+            }])
+            .unwrap();
+
+        let funds = ledger.tokens.get(&token).unwrap();
+        assert_eq!(funds.pending_withdrawals, U256::from(107));
+        assert_eq!(FundsLedger::liability(funds).unwrap(), U256::from(107));
+    }
+
+    #[test]
+    fn funds_ledger_sums_independent_liability_buckets() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+
+        ledger.add_unprocessed_deposit(token, 100).unwrap();
+        ledger.add_pending_refund(token, 25).unwrap();
+        ledger
+            .add_withdrawals(&[abi::Withdrawal {
+                token,
+                senderTag: B256::ZERO,
+                to: Address::repeat_byte(0x20),
+                amount: 50,
+                fee: 5,
+                memo: B256::ZERO,
+                gasLimit: 0,
+                fallbackRecipient: Address::repeat_byte(0x30),
+                callbackData: Default::default(),
+                encryptedSender: Default::default(),
+            }])
+            .unwrap();
+
+        let funds = ledger.tokens.get(&token).unwrap();
+        assert_eq!(FundsLedger::liability(funds).unwrap(), U256::from(180));
+    }
+
+    #[test]
+    fn funds_ledger_rejects_refund_claims_without_pending_refunds() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+
+        let err = ledger.claim_refund(token, 1).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("portal refund claims exceed pending refunds")
+        );
+    }
+
     fn test_monitor(l1: Asserter, zone: Asserter) -> ZoneMonitor {
         let portal_address = Address::repeat_byte(0x11);
         let config = ZoneMonitorConfig {
@@ -1054,6 +1414,7 @@ mod tests {
             batch_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            native_proof_signer: None,
         };
         let zone_provider = mock_provider(zone);
         let l1_provider = mock_provider(l1);
@@ -1093,6 +1454,7 @@ mod tests {
             batch_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            native_proof_signer: None,
         };
 
         l1.push_failure_msg("boom");
@@ -1265,6 +1627,8 @@ mod tests {
             prev_deposit_number: 0,
             next_deposit_number: 0,
             withdrawal_queue_hash: B256::ZERO,
+            verifier_config: Bytes::from_static(b"test-config"),
+            proof: Bytes::from_static(b"test-proof"),
         };
 
         monitor
@@ -1281,6 +1645,62 @@ mod tests {
             monitor.prev_processed_deposit_hash,
             batch_data.next_processed_deposit_hash
         );
+        assert!(l1.read_q().is_empty());
+        assert!(zone.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn funds_ledger_failure_stops_before_batch_submission() {
+        let l1 = Asserter::new();
+        let zone = Asserter::new();
+        let portal_hash = B256::repeat_byte(0xbb);
+        let token = Address::repeat_byte(0x10);
+
+        l1.push_success(&abi_encode_b256(portal_hash)); // preflight blockHash
+        l1.push_success(&abi_encode_u64(0)); // withdrawalQueueHead
+        l1.push_success(&abi_encode_u64(0)); // withdrawalQueueTail
+        l1.push_success(&abi_encode_u64(0)); // genesisTempoBlockNumber
+        l1.push_success(&U64::from(100)); // L1 tip for event scans
+        push_empty_log_queries(&l1, 5);
+        l1.push_success(&Bytes::from(U256::from(40).to_be_bytes::<32>())); // accountedBalance
+
+        let mut monitor = test_monitor(l1.clone(), zone.clone());
+        let batch_data = BatchData {
+            tempo_block_number: 123,
+            prev_block_hash: portal_hash,
+            next_block_hash: B256::repeat_byte(0x55),
+            prev_processed_deposit_hash: B256::repeat_byte(0x77),
+            next_processed_deposit_hash: B256::repeat_byte(0x66),
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::repeat_byte(0x44),
+            verifier_config: Bytes::from_static(b"test-config"),
+            proof: Bytes::from_static(b"test-proof"),
+        };
+        let withdrawals = vec![abi::Withdrawal {
+            token,
+            senderTag: B256::ZERO,
+            to: Address::repeat_byte(0x20),
+            amount: 50,
+            fee: 1,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: Address::repeat_byte(0x30),
+            callbackData: Default::default(),
+            encryptedSender: Default::default(),
+        }];
+
+        let err = monitor
+            .submit_batch_with_retry(&batch_data, 20, withdrawals)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("portal accounted funds invariant check failed"),
+            "{err:?}"
+        );
+        assert_eq!(monitor.last_submitted_zone_block, 10);
+        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
         assert!(l1.read_q().is_empty());
         assert!(zone.read_q().is_empty());
     }

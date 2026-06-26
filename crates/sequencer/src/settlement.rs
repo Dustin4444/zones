@@ -7,12 +7,6 @@
 //! [`BatchData`] is produced by the zone block builder (not implemented here) and
 //! sent to the submitter via a `tokio::sync::mpsc` channel.
 //!
-//! # POC limitations
-//!
-//! Proof validation is currently **skipped** by the stub verifier. Both direct
-//! and ancestry submissions use empty proof bytes until real proof generation is
-//! implemented.
-//!
 //! # Anchor modes
 //!
 //! | Gap | Mode | Description |
@@ -28,19 +22,29 @@
 
 use std::collections::BTreeMap;
 
-use crate::abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal};
+use crate::abi::{
+    self, BlockTransition, DepositQueueTransition, NativeSignatureVerifier, ZoneOutbox, ZonePortal,
+};
 use alloy_consensus::Transaction;
 use alloy_network::ReceiptResponse;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
+use alloy_rpc_types_eth::TransactionRequest;
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use futures::{StreamExt, TryStreamExt};
-use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
+use tempo_alloy::{TempoNetwork, rpc::TempoTransactionRequest};
 use tracing::{info, instrument, warn};
+use zone_prover::{
+    NativeVerifierConfig, encode_native_host_proof, native_batch_digest,
+    protocol::PROTOCOL_VERSION,
+    types::{BatchOutput, LastBatchCommitment, PublicInputs},
+};
 
-use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
+use zone_prover::crypto::RecoverableSignatureBytes;
 
 /// EIP-2935 stores the last 8192 block hashes (~68 min at 500ms block time).
 const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192;
@@ -96,7 +100,7 @@ impl BatchAnchorConfig {
 
     /// Effective direct-submission window after subtracting the safety margin.
     pub const fn effective_window(self) -> u64 {
-        self.history_window - self.safety_margin
+        self.history_window.saturating_sub(self.safety_margin)
     }
 }
 
@@ -111,6 +115,15 @@ impl Default for BatchAnchorConfig {
 
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
 const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
+
+/// Native verifier policy version registered by local e2e fixtures.
+const NATIVE_VERIFIER_VERSION: u64 = 1;
+
+/// Conservative gas limit for `ZonePortal.submitBatch`.
+const SUBMIT_BATCH_TX_GAS_LIMIT: u64 = 5_000_000;
+
+/// EIP-2935 block-hash history contract.
+const EIP2935_HISTORY_ADDRESS: Address = address!("0000F90827F1C53a10cb7A02335B175320002935");
 
 /// Maximum zone-block span for a single `eth_getLogs` request during catch-up.
 ///
@@ -139,6 +152,30 @@ pub struct BatchData {
     pub next_deposit_number: u64,
     /// Withdrawal queue hash for this batch (`B256::ZERO` if no withdrawals).
     pub withdrawal_queue_hash: B256,
+    /// Verifier configuration bytes accepted by the portal's verifier.
+    pub verifier_config: Bytes,
+    /// Proof bytes accepted by the portal's verifier.
+    pub proof: Bytes,
+}
+
+impl BatchData {
+    fn validate_proof_material(&self) -> Result<()> {
+        validate_proof_material(&self.verifier_config, &self.proof)
+    }
+}
+
+fn validate_proof_material(verifier_config: &Bytes, proof: &Bytes) -> Result<()> {
+    if verifier_config.is_empty() {
+        return Err(eyre::eyre!(
+            "missing verifierConfig: refusing to submit an unverified batch"
+        ));
+    }
+    if proof.is_empty() {
+        return Err(eyre::eyre!(
+            "missing proof: refusing to submit an unverified batch"
+        ));
+    }
+    Ok(())
 }
 
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
@@ -162,6 +199,9 @@ pub struct BatchSubmitter {
     l1_fetch_concurrency: usize,
     /// EIP-2935 history and safety-margin limits used for anchor decisions.
     anchor_config: BatchAnchorConfig,
+    /// Optional local signer used for NativeSignatureVerifier e2e proof bytes
+    /// when the batch does not already include verifier material.
+    native_proof_signer: Option<PrivateKeySigner>,
 }
 
 impl BatchSubmitter {
@@ -196,7 +236,15 @@ impl BatchSubmitter {
             genesis_tempo_block_number,
             l1_fetch_concurrency: 16,
             anchor_config,
+            native_proof_signer: None,
         }
+    }
+
+    /// Configure a local native verifier signer for batches that do not already
+    /// carry externally produced proof material.
+    pub fn with_native_proof_signer(mut self, signer: PrivateKeySigner) -> Self {
+        self.native_proof_signer = Some(signer);
+        self
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -213,9 +261,6 @@ impl BatchSubmitter {
     /// first so large gaps can be split into stepping submissions before this
     /// method performs ancestry header fetching.
     ///
-    /// `verifierConfig` and `proof` are empty until real proof generation is
-    /// implemented.
-    // TODO: pass real proof bytes once proof generation is implemented.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
         tempo_block = batch.tempo_block_number,
@@ -231,7 +276,6 @@ impl BatchSubmitter {
                 self.genesis_tempo_block_number
             ));
         }
-
         if !batch.withdrawal_queue_hash.is_zero() {
             self.check_withdrawal_queue_capacity().await?;
         }
@@ -248,22 +292,45 @@ impl BatchSubmitter {
             nextDepositNumber: batch.next_deposit_number,
         };
 
-        let anchor_mode = self.resolve_anchor_mode(batch.tempo_block_number).await?;
+        let anchor_mode = self
+            .resolve_anchor_mode(batch.tempo_block_number)
+            .await
+            .wrap_err("failed to resolve submitBatch anchor mode")?;
         let recent_tempo_block_number = anchor_mode.recent_block_number();
-        let (current_l1_block, portal_block_hash) = tokio::join!(
+        let anchor_block_number = anchor_mode.anchor_block_number(batch.tempo_block_number);
+        let (current_l1_block, portal_block_hash, anchor_block_hash) = tokio::join!(
             self.l1_provider.get_block_number(),
             self.read_portal_block_hash(),
+            self.read_eip2935_block_hash(anchor_block_number),
         );
-        let current_l1_block = current_l1_block?;
-        let portal_block_hash = portal_block_hash?;
+        let current_l1_block =
+            current_l1_block.wrap_err("failed to read current L1 block number")?;
+        let portal_block_hash =
+            portal_block_hash.wrap_err("failed to read ZonePortal blockHash")?;
+        let anchor_block_hash =
+            anchor_block_hash.wrap_err("failed to read EIP-2935 anchor block hash")?;
+
+        let (verifier_config, proof) = self
+            .proof_material(
+                batch,
+                &block_transition,
+                &deposit_transition,
+                anchor_block_number,
+                anchor_block_hash,
+            )
+            .await
+            .wrap_err("failed to build submitBatch proof material")?;
+        validate_proof_material(&verifier_config, &proof)
+            .wrap_err("invalid submitBatch proof material")?;
 
         info!(
             ?anchor_mode,
             recent_tempo_block_number,
+            anchor_block_number,
+            anchor_block_hash = %anchor_block_hash,
             current_l1_block,
             portal_block_hash = %portal_block_hash,
             batch_prev_block_hash = %batch.prev_block_hash,
-            nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             "Preparing submitBatch to ZonePortal on L1"
         );
 
@@ -277,7 +344,31 @@ impl BatchSubmitter {
 
         info!(?anchor_mode, "Submitting batch to ZonePortal on L1");
 
-        let pending = self
+        let preflight = self
+            .portal
+            .submitBatch(
+                batch.tempo_block_number,
+                recent_tempo_block_number,
+                block_transition.clone(),
+                deposit_transition.clone(),
+                batch.withdrawal_queue_hash,
+                verifier_config.clone(),
+                proof.clone(),
+            )
+            .gas(SUBMIT_BATCH_TX_GAS_LIMIT);
+        let preflight = if let Some(signer) = &self.native_proof_signer {
+            preflight.from(signer.address())
+        } else {
+            preflight
+        };
+        if let Err(err) = preflight.call().await {
+            tracing::error!(
+                error = ?err,
+                "submitBatch eth_call preflight reverted before L1 broadcast"
+            );
+        }
+
+        let submit = self
             .portal
             .submitBatch(
                 batch.tempo_block_number,
@@ -285,13 +376,19 @@ impl BatchSubmitter {
                 block_transition,
                 deposit_transition,
                 batch.withdrawal_queue_hash,
-                // verifierConfig and proof stay empty until real proof generation is wired in.
-                Bytes::new(),
-                Bytes::new(),
+                verifier_config,
+                proof,
             )
-            .nonce_key(SUBMIT_BATCH_NONCE_KEY)
+            .gas(SUBMIT_BATCH_TX_GAS_LIMIT);
+        let submit = if let Some(signer) = &self.native_proof_signer {
+            submit.from(signer.address())
+        } else {
+            submit
+        };
+        let pending = submit
             .send()
-            .await?;
+            .await
+            .wrap_err("submitBatch send failed before tx hash")?;
 
         let tx_hash = *pending.tx_hash();
         info!(
@@ -313,7 +410,7 @@ impl BatchSubmitter {
                 warn!(
                     %tx_hash,
                     timeout_secs = 30,
-                    error = %err,
+                    error = ?err,
                     "submitBatch tx was broadcast but receipt not obtained"
                 );
                 return Err(err.into());
@@ -422,8 +519,14 @@ impl BatchSubmitter {
         }
 
         let concurrency = self.l1_fetch_concurrency;
-        let range_start = from + 1;
-        let count = (to - from) as usize;
+        let range_start = from
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("L1 ancestry range start overflowed"))?;
+        let count_u64 = to
+            .checked_sub(from)
+            .ok_or_else(|| eyre::eyre!("invalid L1 ancestry range {from}..={to}"))?;
+        let count = usize::try_from(count_u64)
+            .map_err(|_| eyre::eyre!("L1 ancestry range too large: {count_u64} headers"))?;
 
         // Fetch the base block's header to seed the parent-hash chain validation.
         let base_header = self
@@ -499,10 +602,17 @@ impl BatchSubmitter {
             return step_points;
         }
 
-        let mut target = from_tempo + step_size;
+        let Some(mut target) = from_tempo.checked_add(step_size) else {
+            return step_points;
+        };
 
         while target < current_l1_block.saturating_sub(safety_margin) {
-            let zone_block = from_zone_block + (target - from_tempo);
+            let Some(delta) = target.checked_sub(from_tempo) else {
+                break;
+            };
+            let Some(zone_block) = from_zone_block.checked_add(delta) else {
+                break;
+            };
             if zone_block > max_zone_block {
                 break;
             }
@@ -510,7 +620,10 @@ impl BatchSubmitter {
                 zone_block,
                 target_tempo_block: target,
             });
-            target += step_size;
+            let Some(next_target) = target.checked_add(step_size) else {
+                break;
+            };
+            target = next_target;
         }
 
         step_points
@@ -560,6 +673,233 @@ impl BatchSubmitter {
             .try_into()
             .map_err(|_| eyre::eyre!("withdrawal queue head overflow"))?;
         Ok(head)
+    }
+
+    /// Read the current portal `withdrawalBatchIndex`.
+    pub async fn read_portal_withdrawal_batch_index(&self) -> Result<u64> {
+        Ok(self.portal.withdrawalBatchIndex().call().await?)
+    }
+
+    async fn read_eip2935_block_hash(&self, block_number: u64) -> Result<B256> {
+        let calldata = Bytes::copy_from_slice(&U256::from(block_number).to_be_bytes::<32>());
+        let request = TempoTransactionRequest {
+            inner: TransactionRequest::default()
+                .to(EIP2935_HISTORY_ADDRESS)
+                .input(calldata.into()),
+            ..Default::default()
+        };
+        let result = self.l1_provider.call(request).await?;
+        if result.len() < 32 {
+            return Err(eyre::eyre!(
+                "EIP-2935 returned {} bytes for block {block_number}; expected 32",
+                result.len()
+            ));
+        }
+        let hash = B256::from_slice(&result[..32]);
+        if hash.is_zero() {
+            return Err(eyre::eyre!(
+                "EIP-2935 returned zero hash for block {block_number}"
+            ));
+        }
+        Ok(hash)
+    }
+
+    async fn proof_material(
+        &self,
+        batch: &BatchData,
+        block_transition: &BlockTransition,
+        deposit_transition: &DepositQueueTransition,
+        anchor_block_number: u64,
+        anchor_block_hash: B256,
+    ) -> Result<(Bytes, Bytes)> {
+        if !batch.verifier_config.is_empty() || !batch.proof.is_empty() {
+            batch.validate_proof_material()?;
+            return Ok((batch.verifier_config.clone(), batch.proof.clone()));
+        }
+
+        let signer = self.native_proof_signer.as_ref().ok_or_else(|| {
+            eyre::eyre!("missing verifierConfig/proof and no native proof signer configured")
+        })?;
+
+        self.native_proof_material(
+            signer,
+            batch,
+            block_transition,
+            deposit_transition,
+            anchor_block_number,
+            anchor_block_hash,
+        )
+        .await
+    }
+
+    async fn native_proof_material(
+        &self,
+        signer: &PrivateKeySigner,
+        batch: &BatchData,
+        block_transition: &BlockTransition,
+        deposit_transition: &DepositQueueTransition,
+        anchor_block_number: u64,
+        anchor_block_hash: B256,
+    ) -> Result<(Bytes, Bytes)> {
+        let chain_id = self
+            .l1_provider
+            .get_chain_id()
+            .await
+            .wrap_err("failed to read L1 chain id for native proof")?;
+        let withdrawal_batch_index = self
+            .read_portal_withdrawal_batch_index()
+            .await
+            .wrap_err("failed to read ZonePortal withdrawalBatchIndex for native proof")?;
+        let expected_withdrawal_batch_index =
+            withdrawal_batch_index.checked_add(1).ok_or_else(|| {
+                eyre::eyre!("portal withdrawalBatchIndex overflowed native proof input")
+            })?;
+        let sequencer = signer.address();
+
+        let config = NativeVerifierConfig {
+            version: PROTOCOL_VERSION,
+            chain_id,
+            portal_address: self.portal_address,
+            verifier_version: NATIVE_VERIFIER_VERSION,
+        };
+        self.check_native_verifier_policy(sequencer, config.verifier_version)
+            .await
+            .wrap_err("native verifier policy check failed")?;
+
+        let public = PublicInputs {
+            prev_block_hash: batch.prev_block_hash,
+            tempo_block_number: batch.tempo_block_number,
+            anchor_block_number,
+            anchor_block_hash,
+            expected_withdrawal_batch_index,
+            sequencer,
+        };
+        let output = BatchOutput {
+            block_transition: block_transition.clone(),
+            deposit_queue_transition: deposit_transition.clone(),
+            withdrawal_queue_hash: batch.withdrawal_queue_hash,
+            last_batch_commitment: LastBatchCommitment {
+                withdrawal_queue_hash: batch.withdrawal_queue_hash,
+                withdrawal_batch_index: expected_withdrawal_batch_index,
+            },
+        };
+        let digest = native_batch_digest(&config, sequencer, &public, &output)
+            .wrap_err("failed to compute native batch digest")?;
+        let signature = signer
+            .sign_hash_sync(&digest)
+            .wrap_err("failed to sign native batch digest")?;
+        let signature = RecoverableSignatureBytes(Bytes::copy_from_slice(&signature.as_bytes()));
+        let host_proof = encode_native_host_proof(&config, sequencer, &public, &signature, output)
+            .wrap_err("failed to encode native host proof")?;
+        self.check_native_verifier_proof(
+            sequencer,
+            &public,
+            block_transition,
+            deposit_transition,
+            batch.withdrawal_queue_hash,
+            &host_proof.verifier_config,
+            &host_proof.proof,
+        )
+        .await
+        .wrap_err("native verifier local proof preflight failed")?;
+
+        Ok((host_proof.verifier_config, host_proof.proof))
+    }
+
+    async fn check_native_verifier_policy(
+        &self,
+        sequencer: Address,
+        verifier_version: u64,
+    ) -> Result<()> {
+        let verifier_address = self
+            .portal
+            .verifier()
+            .call()
+            .await
+            .wrap_err("failed to read ZonePortal verifier for native policy check")?;
+        let native_verifier =
+            NativeSignatureVerifier::new(verifier_address, self.l1_provider.clone());
+        let policy = native_verifier
+            .policies(self.portal_address)
+            .call()
+            .await
+            .wrap_err("failed to read NativeSignatureVerifier portal policy")?;
+        if !policy.enabled {
+            return Err(eyre::eyre!(
+                "native verifier policy for portal {} is disabled on verifier {}",
+                self.portal_address,
+                verifier_address
+            ));
+        }
+        if policy.signer != sequencer {
+            return Err(eyre::eyre!(
+                "native verifier policy signer mismatch for portal {}: expected {}, got {}",
+                self.portal_address,
+                sequencer,
+                policy.signer
+            ));
+        }
+        if policy.verifierVersion != verifier_version {
+            return Err(eyre::eyre!(
+                "native verifier policy version mismatch for portal {}: expected {}, got {}",
+                self.portal_address,
+                verifier_version,
+                policy.verifierVersion
+            ));
+        }
+        Ok(())
+    }
+
+    async fn check_native_verifier_proof(
+        &self,
+        sequencer: Address,
+        public: &PublicInputs,
+        block_transition: &BlockTransition,
+        deposit_transition: &DepositQueueTransition,
+        withdrawal_queue_hash: B256,
+        verifier_config: &Bytes,
+        proof: &Bytes,
+    ) -> Result<()> {
+        let verifier_address = self
+            .portal
+            .verifier()
+            .call()
+            .await
+            .wrap_err("failed to read ZonePortal verifier for native proof preflight")?;
+        let native_verifier =
+            NativeSignatureVerifier::new(verifier_address, self.l1_provider.clone());
+        let valid = native_verifier
+            .verify(
+                public.tempo_block_number,
+                public.anchor_block_number,
+                public.anchor_block_hash,
+                public.expected_withdrawal_batch_index,
+                sequencer,
+                NativeSignatureVerifier::BlockTransition {
+                    prevBlockHash: block_transition.prevBlockHash,
+                    nextBlockHash: block_transition.nextBlockHash,
+                },
+                NativeSignatureVerifier::DepositQueueTransition {
+                    prevProcessedHash: deposit_transition.prevProcessedHash,
+                    nextProcessedHash: deposit_transition.nextProcessedHash,
+                    prevDepositNumber: deposit_transition.prevDepositNumber,
+                    nextDepositNumber: deposit_transition.nextDepositNumber,
+                },
+                withdrawal_queue_hash,
+                verifier_config.clone(),
+                proof.clone(),
+            )
+            .from(self.portal_address)
+            .call()
+            .await
+            .wrap_err("NativeSignatureVerifier.verify eth_call reverted")?;
+        if !valid {
+            return Err(eyre::eyre!(
+                "native verifier rejected locally generated proof for portal {}",
+                self.portal_address
+            ));
+        }
+        Ok(())
     }
 
     /// Check if the withdrawal queue has capacity for another batch.
@@ -620,7 +960,7 @@ impl BatchSubmitter {
         info!(
             head,
             tail,
-            pending = tail - head,
+            pending = tail.saturating_sub(head),
             "Restoring pending withdrawals"
         );
 
@@ -655,8 +995,10 @@ impl BatchSubmitter {
             let zone_end = zone_end_by_slot[&portal_slot];
             let zone_start = if portal_slot == 0 {
                 1
-            } else if let Some(prev_end) = zone_end_by_slot.get(&(portal_slot - 1)) {
-                prev_end + 1
+            } else if let Some(prev_end) = zone_end_by_slot.get(&portal_slot.saturating_sub(1)) {
+                prev_end
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("zone block range start overflowed"))?
             } else {
                 warn!(
                     portal_slot,
@@ -721,7 +1063,11 @@ impl BatchSubmitter {
         tail: u64,
     ) -> Result<BTreeMap<u64, abi::ZonePortal::BatchSubmitted>> {
         let start = head.saturating_sub(1);
-        let needed = (tail - start) as usize;
+        let needed_u64 = tail
+            .checked_sub(start)
+            .ok_or_else(|| eyre::eyre!("invalid withdrawal restore range {start}..{tail}"))?;
+        let needed = usize::try_from(needed_u64)
+            .map_err(|_| eyre::eyre!("withdrawal restore range too large: {needed_u64} slots"))?;
         if needed == 0 {
             return Ok(BTreeMap::new());
         }
@@ -754,7 +1100,10 @@ impl BatchSubmitter {
             if lo == self.genesis_tempo_block_number {
                 break;
             }
-            hi = lo - 1;
+            let Some(next_hi) = lo.checked_sub(1) else {
+                break;
+            };
+            hi = next_hi;
         }
 
         // Sort chronologically — the n-th event = portal queue slot n.
@@ -764,14 +1113,20 @@ impl BatchSubmitter {
         // correspond to slots [tail - M, tail). Keep only [start, tail).
         // Truncate to at most `needed` events (the most recent ones) to
         // guard against extra events from race conditions.
-        if all_events.len() > needed {
-            all_events.drain(..all_events.len() - needed);
+        if let Some(excess) = all_events.len().checked_sub(needed) {
+            all_events.drain(..excess);
         }
 
         let mut found = BTreeMap::new();
-        let first_slot = tail.saturating_sub(all_events.len() as u64);
+        let event_count = u64::try_from(all_events.len())
+            .map_err(|_| eyre::eyre!("too many withdrawal batch events"))?;
+        let first_slot = tail.saturating_sub(event_count);
         for (i, event) in all_events.into_iter().enumerate() {
-            let portal_slot = first_slot + i as u64;
+            let offset =
+                u64::try_from(i).map_err(|_| eyre::eyre!("withdrawal event index overflowed"))?;
+            let portal_slot = first_slot
+                .checked_add(offset)
+                .ok_or_else(|| eyre::eyre!("portal slot overflowed"))?;
             if portal_slot >= start && portal_slot < tail {
                 found.insert(portal_slot, event);
             }
@@ -1055,6 +1410,15 @@ enum AnchorMode {
 }
 
 impl AnchorMode {
+    /// Returns the block number whose hash is verified on-chain: the batch's
+    /// `tempoBlockNumber` in direct mode, or the recent anchor in ancestry mode.
+    const fn anchor_block_number(&self, tempo_block_number: u64) -> u64 {
+        match self {
+            Self::Direct => tempo_block_number,
+            Self::Ancestry { anchor_block, .. } => *anchor_block,
+        }
+    }
+
     /// Returns the `recentTempoBlockNumber` argument for `submitBatch`:
     /// `0` for direct mode, or the anchor block number for ancestry mode.
     const fn recent_block_number(&self) -> u64 {
@@ -1119,6 +1483,32 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    fn valid_batch_data() -> BatchData {
+        BatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::repeat_byte(0x01),
+            next_block_hash: B256::repeat_byte(0x02),
+            prev_processed_deposit_hash: B256::repeat_byte(0x03),
+            next_processed_deposit_hash: B256::repeat_byte(0x04),
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+            verifier_config: Bytes::from_static(b"config"),
+            proof: Bytes::from_static(b"proof"),
+        }
+    }
+
+    #[test]
+    fn batch_data_rejects_empty_verifier_material() {
+        let mut batch = valid_batch_data();
+        batch.verifier_config = Bytes::new();
+        assert!(batch.validate_proof_material().is_err());
+
+        let mut batch = valid_batch_data();
+        batch.proof = Bytes::new();
+        assert!(batch.validate_proof_material().is_err());
     }
 
     #[test]

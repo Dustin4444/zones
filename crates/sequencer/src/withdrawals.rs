@@ -42,15 +42,21 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{
     abi::{self, MAX_WITHDRAWAL_GAS_LIMIT, ZonePortal},
     metrics::WithdrawalProcessorMetrics,
-    nonce_keys::PROCESS_WITHDRAWAL_NONCE_KEY,
 };
-use tempo_alloy::rpc::TempoCallBuilderExt;
 
 const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS: u64 = 2_000_000;
 #[cfg(test)]
 const MAX_PROCESS_WITHDRAWAL_TX_GAS: u64 =
     process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT);
+
+fn metric_u64(value: u64) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+}
+
+fn metric_usize(value: usize) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+}
 
 /// Shared handle to the withdrawal store.
 #[derive(Clone)]
@@ -208,7 +214,7 @@ struct StoreSnapshot {
 /// callback CALL to receive at least `gas_limit`. The cushion is `ceil(gas_limit / 63)`,
 /// which compensates for the 1/64 of remaining gas that EIP-150 withholds from the call.
 const fn eip150_cushion(gas_limit: u64) -> u64 {
-    gas_limit / 63 + if gas_limit.is_multiple_of(63) { 0 } else { 1 }
+    gas_limit.div_ceil(63)
 }
 
 /// Return the outer transaction gas limit for a callback withdrawal.
@@ -225,8 +231,8 @@ const fn process_withdrawal_tx_gas_limit(callback_gas_limit: u64) -> u64 {
     };
 
     bounded_callback_gas
-        + PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS
-        + eip150_cushion(bounded_callback_gas)
+        .saturating_add(PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS)
+        .saturating_add(eip150_cushion(bounded_callback_gas))
 }
 
 /// Background task that processes withdrawals from the ZonePortal queue on Tempo L1.
@@ -342,7 +348,7 @@ impl WithdrawalProcessor {
             return Ok(());
         }
 
-        let pending_slots = tail_val - head_val;
+        let pending_slots = tail_val.saturating_sub(head_val);
         info!(
             head = head_val,
             tail = tail_val,
@@ -379,8 +385,11 @@ impl WithdrawalProcessor {
 
         for (i, withdrawal) in withdrawals.iter().enumerate() {
             self.metrics.withdrawals_processed_total.increment(1);
-            let remaining_queue = compute_remaining_queue(&withdrawals, i + 1);
-            let is_last = i + 1 == withdrawals.len();
+            let next_index = i
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("withdrawal index overflowed"))?;
+            let remaining_queue = compute_remaining_queue(&withdrawals, next_index);
+            let is_last = next_index == withdrawals.len();
 
             info!(
                 slot = head_val,
@@ -397,8 +406,7 @@ impl WithdrawalProcessor {
 
             let call = self
                 .portal
-                .processWithdrawal(withdrawal.clone(), remaining_queue)
-                .nonce_key(PROCESS_WITHDRAWAL_NONCE_KEY);
+                .processWithdrawal(withdrawal.clone(), remaining_queue);
 
             // When the withdrawal has a callback (`gasLimit > 0`), we must
             // override `eth_estimateGas` because the estimate only covers the
@@ -535,12 +543,14 @@ impl WithdrawalProcessor {
     }
 
     fn record_queue_metrics(&mut self, head: u64, tail: u64, store_batch_count: usize) {
-        self.metrics.portal_queue_head.set(head as f64);
-        self.metrics.portal_queue_tail.set(tail as f64);
+        self.metrics.portal_queue_head.set(metric_u64(head));
+        self.metrics.portal_queue_tail.set(metric_u64(tail));
         self.metrics
             .portal_queue_pending_slots
-            .set((tail.saturating_sub(head)) as f64);
-        self.metrics.store_batch_count.set(store_batch_count as f64);
+            .set(metric_u64(tail.saturating_sub(head)));
+        self.metrics
+            .store_batch_count
+            .set(metric_usize(store_batch_count));
     }
 
     fn record_slot_duration(&self, duration: Duration) {
@@ -692,7 +702,11 @@ mod tests {
     #[test]
     fn callback_tx_gas_limit_is_capped_below_l1_block_limit() {
         let at_cap = process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT);
-        let over_cap = process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT + 1);
+        let over_cap = process_withdrawal_tx_gas_limit(
+            MAX_WITHDRAWAL_GAS_LIMIT
+                .checked_add(1)
+                .expect("test gas limit can be incremented"),
+        );
 
         assert_eq!(over_cap, at_cap);
         assert_eq!(at_cap, MAX_PROCESS_WITHDRAWAL_TX_GAS);
@@ -753,14 +767,18 @@ mod tests {
     fn store_add_batch() {
         let mut store = WithdrawalStore::new();
         let addr = address!("0x0000000000000000000000000000000000000042");
-        let batch: Vec<_> = (0..3).map(|i| test_withdrawal(addr, i * 100)).collect();
+        let batch: Vec<_> = (0_u128..3)
+            .map(|i| test_withdrawal(addr, i.saturating_mul(100)))
+            .collect();
 
         store.add_batch(0, batch);
         assert!(store.has_batch(0));
         assert_eq!(store.get_batch(0).unwrap().len(), 3);
 
         // Calling add_batch again replaces existing data (idempotent).
-        let more: Vec<_> = (0..2).map(|i| test_withdrawal(addr, i * 200)).collect();
+        let more: Vec<_> = (0_u128..2)
+            .map(|i| test_withdrawal(addr, i.saturating_mul(200)))
+            .collect();
         store.add_batch(0, more);
         assert_eq!(store.get_batch(0).unwrap().len(), 2);
 

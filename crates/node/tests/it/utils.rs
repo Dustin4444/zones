@@ -1002,7 +1002,7 @@ impl L1TestNode {
         sequencer: Address,
     ) -> eyre::Result<Address> {
         use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::ZoneFactory;
+        use tempo_zone_contracts::{NativeSignatureVerifier, ZoneFactory};
 
         let l1_provider = self.dev_provider();
         let factory = ZoneFactory::new(factory_address, &l1_provider);
@@ -1046,6 +1046,18 @@ impl L1TestNode {
             .iter()
             .find_map(|log| ZoneFactory::ZoneCreated::decode_log(&log.inner).ok())
             .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
+
+        let native_verifier = NativeSignatureVerifier::new(verifier_address, &l1_provider);
+        let receipt = native_verifier
+            .registerPortal(zone_created.portal, sequencer, 1)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(
+            receipt.status(),
+            "NativeSignatureVerifier registerPortal failed"
+        );
 
         Ok(zone_created.portal)
     }

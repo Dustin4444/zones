@@ -9,7 +9,7 @@ use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportResult;
-use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
+use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 
 pub mod abi {
@@ -79,6 +79,8 @@ pub async fn spawn_zone_sequencer(
     config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
 ) -> ZoneSequencerHandle {
+    let native_proof_signer = signer.clone();
+
     // Build a single shared L1 provider with the sequencer wallet.
     // Both the batch submitter (inside the zone monitor) and the withdrawal
     // processor use this provider, ensuring nonces are tracked in one place.
@@ -107,6 +109,7 @@ pub async fn spawn_zone_sequencer(
         batch_interval: config.batch_interval,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
+        native_proof_signer: Some(native_proof_signer),
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(
@@ -138,7 +141,6 @@ async fn connect_l1_provider(
 ) -> TransportResult<DynProvider<TempoNetwork>> {
     let wallet = alloy_network::EthereumWallet::from(signer);
     let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .with_nonce_key_filler()
         .wallet(wallet)
         .connect_with_config(l1_rpc_url, rpc_connection_config(retry_connection_interval))
         .await?

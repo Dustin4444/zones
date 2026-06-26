@@ -73,4 +73,7 @@ pub(crate) struct ZoneMonitorMetrics {
 
     /// Failed attempts to rebuild the in-memory withdrawal store from chain state.
     pub withdrawal_store_restore_failure_total: Counter,
+
+    /// Failed portal-accounted funds ledger checks before batch submission.
+    pub funds_ledger_check_failure_total: Counter,
 }
