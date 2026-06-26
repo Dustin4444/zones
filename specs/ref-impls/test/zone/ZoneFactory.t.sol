@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, ZoneInfo, ZoneParams } from "../../src/zone/IZone.sol";
+import {
+    BlockTransition,
+    DepositQueueTransition,
+    IVerifier,
+    IZoneFactory,
+    ZoneInfo,
+    ZoneParams
+} from "../../src/zone/IZone.sol";
+import { NativeSignatureVerifier } from "../../src/zone/NativeSignatureVerifier.sol";
 import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
 import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/zone/ZonePortal.sol";
@@ -21,6 +29,14 @@ contract ZoneFactoryTest is BaseTest {
     function setUp() public override {
         super.setUp();
         zoneFactory = new ZoneFactory();
+    }
+
+    function test_defaultVerifier_isNativeSignatureVerifier() public view {
+        NativeSignatureVerifier verifier = NativeSignatureVerifier(zoneFactory.verifier());
+
+        assertTrue(zoneFactory.isValidVerifier(address(verifier)));
+        assertEq(verifier.verifierAdmin(), address(this));
+        assertEq(verifier.PROTOCOL_VERSION(), 1);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -301,6 +317,59 @@ contract ZoneFactoryTest is BaseTest {
         zoneFactory.createZone(params);
     }
 
+    function test_createZone_revertsOnRegisteredVerifierThatIsNotCurrent() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        params.verifier = address(nextVerifier);
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.createZone(params);
+    }
+
+    function test_setVerifier_updatesCurrentVerifier() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        address previousVerifier = zoneFactory.verifier();
+
+        zoneFactory.registerVerifier(address(nextVerifier));
+
+        vm.expectEmit(true, true, false, true);
+        emit IZoneFactory.VerifierUpdated(previousVerifier, address(nextVerifier));
+        zoneFactory.setVerifier(address(nextVerifier));
+
+        assertEq(zoneFactory.verifier(), address(nextVerifier));
+
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        (uint32 zoneId, address portal) = zoneFactory.createZone(params);
+
+        assertEq(ZonePortal(portal).verifier(), zoneFactory.verifier());
+        assertEq(zoneFactory.zones(zoneId).verifier, zoneFactory.verifier());
+    }
+
+    function test_setVerifier_revertsOnUnregisteredVerifier() public {
+        TestVerifier nextVerifier = new TestVerifier();
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.setVerifier(address(nextVerifier));
+    }
+
+    function test_setVerifier_revertsForNonAdmin() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+
+        vm.prank(alice);
+        vm.expectRevert(IZoneFactory.OnlyVerifierAdmin.selector);
+        zoneFactory.setVerifier(address(nextVerifier));
+    }
+
+    function test_unregisterVerifier_revertsForCurrentVerifier() public {
+        address currentVerifier = zoneFactory.verifier();
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.unregisterVerifier(currentVerifier);
+    }
+
     /*//////////////////////////////////////////////////////////////
                             VIEW TESTS
     //////////////////////////////////////////////////////////////*/
@@ -462,6 +531,30 @@ contract NotATIP20 {
 
     function notATIP20Function() external pure returns (bool) {
         return true;
+    }
+
+}
+
+contract TestVerifier is IVerifier {
+
+    function verify(
+        uint64,
+        uint64,
+        bytes32,
+        uint64,
+        address,
+        BlockTransition calldata,
+        DepositQueueTransition calldata,
+        bytes32,
+        bytes calldata,
+        bytes calldata
+    )
+        external
+        pure
+        override
+        returns (bool)
+    {
+        return false;
     }
 
 }

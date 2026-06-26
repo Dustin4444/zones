@@ -276,6 +276,10 @@ Token supply on the zone is controlled exclusively by the system contracts:
 
 The zone-side supply of each token always equals net deposits minus net withdrawals. The corresponding tokens on Tempo are locked in the portal. No other actor can mint or burn zone tokens.
 
+The portal maintains a per-token protocol accounting record, `accountedBalance(token)`, that is updated only by zone protocol flows. User deposits and encrypted deposits increase it by the net deposit amount after the deposit fee. Successful user withdrawals decrease it by `amount + fee`. Failed user withdrawals decrease it by `fee` only, because `amount` remains locked and is re-enqueued as a withdrawal-bounce-back deposit. Deposit bounce-backs decrease it by the paid bounce-back fee plus any refund actually transferred out; if the refund transfer fails, the refund amount remains accounted until `claimRefund(token)` succeeds. Direct TIP-20 transfers to the portal are donations and MUST NOT increase `accountedBalance`.
+
+The sequencer monitor MUST fail closed before submitting a batch if reconstructed liabilities exceed the portal's `accountedBalance(token)` for any token. The first-pass monitor check reconstructs, per token, unprocessed portal deposits after the batch's `nextDepositNumber`, pending portal refund liabilities, pending L1 withdrawal queue liabilities, and the withdrawals in the candidate batch. This check is a safety tripwire and does not replace the verifier's proof of correct execution.
+
 <br>
 
 ## Sequencer Operations

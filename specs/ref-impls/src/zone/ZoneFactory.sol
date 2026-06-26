@@ -2,7 +2,7 @@
 pragma solidity ^0.8.13;
 
 import { IZoneFactory, ZoneInfo } from "./IZone.sol";
-import { Verifier } from "./Verifier.sol";
+import { NativeSignatureVerifier } from "./NativeSignatureVerifier.sol";
 import { ZoneMessenger } from "./ZoneMessenger.sol";
 import { ZonePortal } from "./ZonePortal.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
@@ -29,10 +29,11 @@ contract ZoneFactory is IZoneFactory {
     mapping(address => bool) internal _isZoneMessenger;
     mapping(address => bool) internal _validVerifiers;
     address internal _verifier;
+    address public immutable verifierAdmin;
 
     /// @notice Tracks deployment count for CREATE address prediction
-    /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment
-    ///      in the constructor, so zone deployments start at nonce 2.
+    /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the default verifier
+    ///      deployment in the constructor, so zone deployments start at nonce 2.
     uint256 internal _deploymentNonce = 2;
 
     /*//////////////////////////////////////////////////////////////
@@ -40,9 +41,17 @@ contract ZoneFactory is IZoneFactory {
     //////////////////////////////////////////////////////////////*/
 
     constructor() {
-        address v = address(new Verifier());
+        verifierAdmin = msg.sender;
+        address v = address(new NativeSignatureVerifier(msg.sender));
         _validVerifiers[v] = true;
         _verifier = v;
+        emit VerifierRegistered(v);
+        emit VerifierUpdated(address(0), v);
+    }
+
+    modifier onlyVerifierAdmin() {
+        if (msg.sender != verifierAdmin) revert OnlyVerifierAdmin();
+        _;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -59,7 +68,7 @@ contract ZoneFactory is IZoneFactory {
         }
         if (params.admin == address(0)) revert InvalidAdmin();
         if (params.sequencer == address(0)) revert InvalidSequencer();
-        if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
+        if (params.verifier != _verifier) revert InvalidVerifier();
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
 
         zoneId = _nextZoneId;
@@ -187,6 +196,25 @@ contract ZoneFactory is IZoneFactory {
 
     function isValidVerifier(address v) external view returns (bool) {
         return _validVerifiers[v];
+    }
+
+    function registerVerifier(address v) external onlyVerifierAdmin {
+        if (v == address(0) || v.code.length == 0) revert InvalidVerifier();
+        _validVerifiers[v] = true;
+        emit VerifierRegistered(v);
+    }
+
+    function unregisterVerifier(address v) external onlyVerifierAdmin {
+        if (v == _verifier) revert InvalidVerifier();
+        _validVerifiers[v] = false;
+        emit VerifierUnregistered(v);
+    }
+
+    function setVerifier(address v) external onlyVerifierAdmin {
+        if (!_validVerifiers[v]) revert InvalidVerifier();
+        address previousVerifier = _verifier;
+        _verifier = v;
+        emit VerifierUpdated(previousVerifier, v);
     }
 
     function verifier() external view returns (address) {

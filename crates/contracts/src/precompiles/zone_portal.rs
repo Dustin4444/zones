@@ -144,6 +144,7 @@ crate::sol! {
         error InvalidTempoBlockNumber();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
+        error AccountedBalanceUnderflow(address token, uint256 available, uint256 required);
 
         // -- View functions --
 
@@ -155,6 +156,7 @@ crate::sol! {
         function withdrawalBatchIndex() external view returns (uint64);
         function blockHash() external view returns (bytes32);
         function currentDepositQueueHash() external view returns (bytes32);
+        function accountedBalance(address token) external view returns (uint256);
         function lastSyncedTempoBlockNumber() external view returns (uint64);
         function withdrawalQueueHead() external view returns (uint256);
         function withdrawalQueueTail() external view returns (uint256);
@@ -280,7 +282,7 @@ impl ZonePortal::sequencerEncryptionKeyReturn {
     pub fn normalized_y_parity(&self) -> Option<u8> {
         match self.yParity {
             0x02 | 0x03 => Some(self.yParity),
-            0 | 1 => Some(0x02 + self.yParity),
+            0 | 1 => 0x02u8.checked_add(self.yParity),
             _ => None,
         }
     }
@@ -295,6 +297,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
+            Self::AccountedBalanceUnderflow(_) => f.write_str("AccountedBalanceUnderflow"),
         }
     }
 }

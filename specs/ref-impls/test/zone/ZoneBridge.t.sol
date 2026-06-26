@@ -28,6 +28,7 @@ import {
     ZONE_OUTBOX,
     ZoneParams
 } from "../../src/zone/IZone.sol";
+import { NativeSignatureVerifier } from "../../src/zone/NativeSignatureVerifier.sol";
 import { EMPTY_SENTINEL } from "../../src/zone/WithdrawalQueueLib.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
@@ -77,12 +78,21 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
 /// @dev Simulates sequencer relaying data between chains asynchronously
 contract ZoneBridgeTest is BaseTest {
 
+    uint16 private constant NATIVE_VERIFIER_PROTOCOL_VERSION = 1;
+    uint64 private constant NATIVE_VERIFIER_VERSION = 1;
+    uint256 private constant NATIVE_VERIFIER_SIGNER_KEY = 0xA11CE;
+    bytes32 private constant NATIVE_VERIFIER_DIGEST_DOMAIN =
+        keccak256("tempo.zone.native.verifier.batch.v1");
+    bytes32 private constant NATIVE_VERIFIER_CONFIG_DOMAIN =
+        keccak256("tempo.zone.native.verifier.config.v1");
+
     /*//////////////////////////////////////////////////////////////
                               L1 CONTRACTS
     //////////////////////////////////////////////////////////////*/
 
     ZoneFactory public l1Factory;
     ZonePortal public l1Portal;
+    NativeSignatureVerifier public nativeVerifier;
 
     /*//////////////////////////////////////////////////////////////
                              ZONE CONTRACTS
@@ -100,6 +110,8 @@ contract ZoneBridgeTest is BaseTest {
 
     MockWithdrawalReceiver public withdrawalReceiver;
     uint32 public zoneId;
+    address public nativeVerifierSigner;
+    uint64 private testWithdrawalBatchIndex;
 
     bytes32 constant GENESIS_BLOCK_HASH = keccak256("genesis");
     bytes32 constant GENESIS_TEMPO_BLOCK_HASH = keccak256("tempoGenesis");
@@ -131,6 +143,8 @@ contract ZoneBridgeTest is BaseTest {
 
         // === Deploy L1 Contracts ===
         l1Factory = new ZoneFactory(); // Keep factory for verifier only
+        nativeVerifier = new NativeSignatureVerifier(address(this));
+        nativeVerifierSigner = vm.addr(NATIVE_VERIFIER_SIGNER_KEY);
         withdrawalReceiver = new MockWithdrawalReceiver();
 
         // Deploy zone token FIRST (used for both L1 escrow and zone-side operations).
@@ -158,12 +172,15 @@ contract ZoneBridgeTest is BaseTest {
             address(messengerContract),
             admin, // admin
             admin, // sequencer
-            l1Factory.verifier(),
+            address(nativeVerifier),
             GENESIS_BLOCK_HASH,
             genesisTempoBlockNumber,
             ""
         );
         zoneId = 1;
+        nativeVerifier.registerPortal(
+            address(l1Portal), nativeVerifierSigner, NATIVE_VERIFIER_VERSION
+        );
 
         // === Deploy zone contracts ===
         // TempoState mock for testing
@@ -375,7 +392,7 @@ contract ZoneBridgeTest is BaseTest {
         vm.roll(block.number + 1);
 
         // Submit to Tempo
-        l1Portal.submitBatch(
+        _submitBatch(
             uint64(block.number - 1),
             0,
             BlockTransition({ prevBlockHash: l1Portal.blockHash(), nextBlockHash: l2BlockHash }),
@@ -392,6 +409,110 @@ contract ZoneBridgeTest is BaseTest {
 
         // Clear pending withdrawals observation (they're now in Tempo queue)
         delete pendingWithdrawals;
+    }
+
+    function _submitBatch(
+        uint64 tempoBlockNumber,
+        uint64 recentTempoBlockNumber,
+        BlockTransition memory blockTransition,
+        DepositQueueTransition memory depositQueueTransition,
+        bytes32 withdrawalQueueHash,
+        bytes memory verifierConfig,
+        bytes memory proof
+    )
+        internal
+    {
+        if (verifierConfig.length == 0 && proof.length == 0) {
+            (verifierConfig, proof) = _nativeProof(
+                tempoBlockNumber,
+                recentTempoBlockNumber,
+                blockTransition,
+                depositQueueTransition,
+                withdrawalQueueHash
+            );
+        }
+
+        l1Portal.submitBatch(
+            tempoBlockNumber,
+            recentTempoBlockNumber,
+            blockTransition,
+            depositQueueTransition,
+            withdrawalQueueHash,
+            verifierConfig,
+            proof
+        );
+        testWithdrawalBatchIndex++;
+    }
+
+    function _nativeProof(
+        uint64 tempoBlockNumber,
+        uint64 recentTempoBlockNumber,
+        BlockTransition memory blockTransition,
+        DepositQueueTransition memory depositQueueTransition,
+        bytes32 withdrawalQueueHash
+    )
+        internal
+        view
+        returns (bytes memory verifierConfig, bytes memory proof)
+    {
+        uint64 anchorBlockNumber =
+            recentTempoBlockNumber == 0 ? tempoBlockNumber : recentTempoBlockNumber;
+        bytes32 anchorBlockHash = _mockEip2935BlockHash(anchorBlockNumber);
+        uint64 expectedWithdrawalBatchIndex = testWithdrawalBatchIndex + 1;
+
+        verifierConfig = abi.encode(
+            NativeSignatureVerifier.NativeVerifierConfig({
+                version: NATIVE_VERIFIER_PROTOCOL_VERSION,
+                chainId: uint64(block.chainid),
+                portal: address(l1Portal),
+                verifierVersion: NATIVE_VERIFIER_VERSION
+            })
+        );
+        bytes32 configDigest = keccak256(
+            abi.encode(
+                NATIVE_VERIFIER_CONFIG_DOMAIN,
+                NATIVE_VERIFIER_PROTOCOL_VERSION,
+                uint64(block.chainid),
+                address(l1Portal),
+                NATIVE_VERIFIER_VERSION
+            )
+        );
+        bytes32 outputDigest = keccak256(
+            abi.encode(
+                blockTransition.prevBlockHash,
+                blockTransition.nextBlockHash,
+                depositQueueTransition.prevProcessedHash,
+                depositQueueTransition.nextProcessedHash,
+                depositQueueTransition.prevDepositNumber,
+                depositQueueTransition.nextDepositNumber,
+                withdrawalQueueHash,
+                withdrawalQueueHash,
+                expectedWithdrawalBatchIndex
+            )
+        );
+        bytes32 digest = keccak256(
+            abi.encode(
+                NATIVE_VERIFIER_DIGEST_DOMAIN,
+                configDigest,
+                nativeVerifierSigner,
+                tempoBlockNumber,
+                anchorBlockNumber,
+                anchorBlockHash,
+                admin,
+                outputDigest
+            )
+        );
+
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(NATIVE_VERIFIER_SIGNER_KEY, digest);
+        proof = abi.encode(
+            NativeSignatureVerifier.NativeProof({
+                digest: digest, signature: abi.encodePacked(r, s, v)
+            })
+        );
+    }
+
+    function _mockEip2935BlockHash(uint64 blockNumber) internal pure returns (bytes32) {
+        return blockNumber == 0 ? bytes32(0) : keccak256(abi.encode(uint256(blockNumber)));
     }
 
     /// @notice Get withdrawal from pending list by index

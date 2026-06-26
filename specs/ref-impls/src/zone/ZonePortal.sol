@@ -125,6 +125,13 @@ contract ZonePortal is IZonePortal {
     /// @notice Public RPC endpoint for the zone
     string public rpcUrl;
 
+    /// @notice Protocol-accounted escrow per token, excluding external donations.
+    /// @dev This records only funds that enter or leave through portal protocol
+    ///      paths. It backs zone supply, unprocessed deposits, pending withdrawals,
+    ///      and pending refunds; direct token transfers to this contract do not
+    ///      increase it.
+    mapping(address token => uint256 amount) public accountedBalance;
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -486,6 +493,15 @@ contract ZonePortal is IZonePortal {
         if (fee > 0) {
             ITIP20(_token).transfer(sequencer, fee);
         }
+        accountedBalance[_token] += netAmount;
+    }
+
+    function _decreaseAccountedBalance(address _token, uint256 amount) internal {
+        uint256 available = accountedBalance[_token];
+        if (available < amount) {
+            revert AccountedBalanceUnderflow(_token, available, amount);
+        }
+        accountedBalance[_token] = available - amount;
     }
 
     function _recordDeposit(bytes32 newCurrentDepositQueueHash)
@@ -674,6 +690,7 @@ contract ZonePortal is IZonePortal {
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
+            _decreaseAccountedBalance(_token, withdrawal.fee);
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
             emit WithdrawalProcessed(withdrawal.to, _token, withdrawal.amount, false);
             return;
@@ -706,9 +723,11 @@ contract ZonePortal is IZonePortal {
         }
         if (!success) {
             // Callback failed: bounce back to zone (only amount, not fee)
+            _decreaseAccountedBalance(_token, withdrawal.fee);
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
             emit WithdrawalProcessed(withdrawal.to, _token, withdrawal.amount, false);
         } else {
+            _decreaseAccountedBalance(_token, uint256(withdrawal.amount) + withdrawal.fee);
             emit WithdrawalProcessed(withdrawal.to, _token, withdrawal.amount, true);
         }
     }
@@ -733,8 +752,10 @@ contract ZonePortal is IZonePortal {
         }
 
         if (success) {
+            _decreaseAccountedBalance(_token, withdrawal.amount);
             emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);
         } else {
+            _decreaseAccountedBalance(_token, bouncebackFee);
             refunds[_token][withdrawal.to] += refundAmount;
             emit DepositBounceBackPending(withdrawal.to, _token, refundAmount, bouncebackFee);
         }
@@ -751,6 +772,8 @@ contract ZonePortal is IZonePortal {
         } catch {
             revert CallbackRejected();
         }
+
+        _decreaseAccountedBalance(token, amount);
 
         emit RefundClaimed(msg.sender, token, amount);
     }

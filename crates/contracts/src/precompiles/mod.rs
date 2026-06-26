@@ -1,4 +1,5 @@
 pub mod common;
+pub mod native_signature_verifier;
 pub mod swap_and_deposit_router;
 pub mod tempo_state;
 pub mod tempo_state_reader;
@@ -9,6 +10,7 @@ pub mod zone_portal;
 pub mod zone_tx_context;
 
 pub use common::*;
+pub use native_signature_verifier::*;
 pub use swap_and_deposit_router::*;
 pub use tempo_state::*;
 pub use tempo_state_reader::*;
@@ -24,6 +26,6 @@ pub use zone_tx_context::*;
 pub use zone_primitives::constants::{
     EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_ADMIN_SLOT, PORTAL_PENDING_SEQUENCER_SLOT,
     PORTAL_SEQUENCER_SLOT, TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ADDRESS,
-    TEMPO_STATE_READER_ADDRESS, ZONE_CONFIG_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
-    ZONE_TOKEN_ADDRESS, ZONE_TX_CONTEXT_ADDRESS,
+    TEMPO_STATE_READER_ADDRESS, TEMPO_STATE_ROOT_SLOT, ZONE_CONFIG_ADDRESS, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZONE_TX_CONTEXT_ADDRESS,
 };

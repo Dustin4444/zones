@@ -384,6 +384,7 @@ interface IZoneTxContext {
 //   slot 12: _withdrawalQueue.tail
 //   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
 //   slot 14: rpcUrl (string)
+//   slot 15: accountedBalance (mapping(address => uint256))
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -469,13 +470,34 @@ interface IZoneFactory {
     error InvalidAdmin();
     error InvalidSequencer();
     error InvalidVerifier();
+    error OnlyVerifierAdmin();
     error InsufficientGas();
     error ZoneIdOverflow();
+
+    event VerifierRegistered(address indexed verifier);
+    event VerifierUnregistered(address indexed verifier);
+    event VerifierUpdated(address indexed previousVerifier, address indexed verifier);
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
     /// @return valid True if `verifier` can be passed to `createZone`.
     function isValidVerifier(address verifier) external view returns (bool);
+
+    /// @notice Returns the verifier currently used for new zones.
+    /// @return verifier The verifier contract address.
+    function verifier() external view returns (address);
+
+    /// @notice Registers a verifier contract that can be used for new zones.
+    /// @param verifier The verifier contract to approve.
+    function registerVerifier(address verifier) external;
+
+    /// @notice Removes a verifier contract from the approved set for new zones.
+    /// @param verifier The verifier contract to remove.
+    function unregisterVerifier(address verifier) external;
+
+    /// @notice Sets the verifier contract used for new zones.
+    /// @param verifier The registered verifier contract to use.
+    function setVerifier(address verifier) external;
 
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
     /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
@@ -624,6 +646,7 @@ interface IZonePortal {
     error DepositsNotActive();
     error TokenAlreadyEnabled();
     error InvalidBouncebackRecipient();
+    error AccountedBalanceUnderflow(address token, uint256 available, uint256 required);
 
     /// @notice Fixed gas value for deposit fee calculation (100,000 gas)
     function FIXED_DEPOSIT_GAS() external view returns (uint64);
@@ -679,6 +702,9 @@ interface IZonePortal {
 
     /// @notice Get the token configuration for a specific token
     function tokenConfig(address token) external view returns (TokenConfig memory);
+
+    /// @notice Protocol-accounted escrow for `token`, excluding external donations.
+    function accountedBalance(address token) external view returns (uint256);
 
     /// @notice Get the number of enabled tokens
     function enabledTokenCount() external view returns (uint256);
