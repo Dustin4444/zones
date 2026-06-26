@@ -1,9 +1,10 @@
 //! Portable Zone batch prover core.
 //!
 //! This crate is the backend-agnostic state transition entry point. It is
-//! intentionally `no_std` compatible: Nitro, native, and future ZKVM wrappers
-//! should serialize inputs, call [`prove_zone_batch`], and wrap the resulting
-//! [`BatchOutput`] without embedding backend-specific behavior in this crate.
+//! intentionally `no_std` compatible: the Nitro enclave proof server and local
+//! native-signature proof path should serialize inputs, call
+//! [`prove_zone_batch`], and wrap the resulting [`BatchOutput`] without
+//! embedding backend-specific behavior in this crate.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -29,6 +30,9 @@ use zone_primitives::{
 
 mod tempo;
 mod trie;
+mod witness_db;
+
+pub use witness_db::{WitnessDatabase, WitnessDbError};
 
 /// Ethereum's canonical empty trie root.
 pub const EMPTY_TRIE_ROOT: B256 = EMPTY_ROOT_HASH;
@@ -177,6 +181,7 @@ impl BatchOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProverError {
+    FullStatelessExecutionUnsupported,
     PrevHeaderHashMismatch,
     InitialStateRootMismatch,
     ZoneStateNodeHashMismatch(B256),
@@ -223,6 +228,7 @@ pub enum ProverError {
         slot: U256,
     },
     AccountCodeHashMismatch(Address),
+    MissingAccountCode(Address),
     AccountProofMissing {
         account: Address,
         node_hash: B256,
@@ -327,6 +333,9 @@ pub enum ProverError {
 impl fmt::Display for ProverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FullStatelessExecutionUnsupported => f.write_str(
+                "full stateless zone execution is not implemented in the production prover",
+            ),
             Self::PrevHeaderHashMismatch => {
                 f.write_str("previous header hash does not match public prev_block_hash")
             }
@@ -425,6 +434,9 @@ impl fmt::Display for ProverError {
             }
             Self::AccountCodeHashMismatch(address) => {
                 write!(f, "account code preimage hash mismatch for {address}")
+            }
+            Self::MissingAccountCode(address) => {
+                write!(f, "account code preimage is missing for {address}")
             }
             Self::AccountProofMissing { account, node_hash } => {
                 write!(
@@ -607,13 +619,24 @@ impl fmt::Display for ProverError {
 #[cfg(feature = "std")]
 impl std::error::Error for ProverError {}
 
-/// Execute the Zone batch transition function.
+/// Execute the production Zone batch transition function.
+///
+/// The Nitro enclave proof server and local native-signature proof path call
+/// this entrypoint before signing or attesting a [`BatchOutput`]. Until the full
+/// no-std stateless executor is wired in, production proving fails closed
+/// instead of falling back to the legacy empty-block placeholder.
+pub fn prove_zone_batch(_witness: BatchWitness) -> Result<BatchOutput, ProverError> {
+    Err(ProverError::FullStatelessExecutionUnsupported)
+}
+
+/// Execute the legacy deterministic empty-block transition.
 ///
 /// This implementation is deliberately narrower than the final spec: it
 /// executes deterministic empty blocks, computes real successor zone header
 /// hashes, and fails closed for not-yet-implemented state, Tempo import,
-/// deposit, withdrawal, and user-transaction paths.
-pub fn prove_zone_batch(witness: BatchWitness) -> Result<BatchOutput, ProverError> {
+/// deposit, withdrawal, and user-transaction paths. It exists only to preserve
+/// focused tests while [`prove_zone_batch`] moves to full stateless execution.
+pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, ProverError> {
     let public = &witness.public_inputs;
 
     if witness.prev_block_header.hash() != public.prev_block_hash {
@@ -1001,7 +1024,7 @@ fn low_u64(value: U256) -> u64 {
     (value & U256::from(u64::MAX)).to::<u64>()
 }
 
-fn validate_node_pool(
+pub(crate) fn validate_node_pool(
     node_pool: &BTreeMap<B256, Bytes>,
     err: impl Fn(B256) -> ProverError,
 ) -> Result<(), ProverError> {
@@ -1020,6 +1043,7 @@ mod tests {
     use alloy_primitives::{B256, address, keccak256};
     use alloy_rlp::Encodable;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
+    use revm_database_interface::Database;
 
     fn fixture_witness() -> BatchWitness {
         let tempo_block_number = 100;
@@ -1065,6 +1089,77 @@ mod tests {
             },
             tempo_ancestry_headers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn production_prover_fails_closed_until_full_stateless_execution() {
+        assert_eq!(
+            prove_zone_batch(fixture_witness()).unwrap_err(),
+            ProverError::FullStatelessExecutionUnsupported
+        );
+    }
+
+    #[test]
+    fn witness_database_serves_only_verified_state_reads() {
+        let witness = fixture_witness();
+        let mut block_hashes = BTreeMap::new();
+        block_hashes.insert(6, B256::repeat_byte(0x06));
+        let mut db = WitnessDatabase::new(&witness.initial_zone_state, block_hashes).unwrap();
+
+        assert!(db.basic(TEMPO_STATE_ADDRESS).unwrap().is_some());
+        assert_eq!(
+            db.storage(ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_NUMBER_SLOT)
+                .unwrap(),
+            U256::from(12)
+        );
+        assert_eq!(db.block_hash(6).unwrap(), B256::repeat_byte(0x06));
+        assert!(db.code_by_hash(KECCAK_EMPTY).is_ok());
+    }
+
+    #[test]
+    fn witness_database_rejects_unwitnessed_reads() {
+        let witness = fixture_witness();
+        let mut db = WitnessDatabase::new(&witness.initial_zone_state, BTreeMap::new()).unwrap();
+        let missing = address!("0x0000000000000000000000000000000000009999");
+
+        assert_eq!(
+            db.basic(missing).unwrap_err(),
+            WitnessDbError::MissingAccount(missing)
+        );
+        assert_eq!(
+            db.storage(TEMPO_STATE_ADDRESS, U256::from(0xfe))
+                .unwrap_err(),
+            WitnessDbError::MissingStorage {
+                account: TEMPO_STATE_ADDRESS,
+                slot: U256::from(0xfe),
+            }
+        );
+        assert_eq!(
+            db.block_hash(9).unwrap_err(),
+            WitnessDbError::MissingBlockHash(9)
+        );
+    }
+
+    #[test]
+    fn witness_database_rejects_missing_code_preimage() {
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let trie_account = TrieAccount {
+            nonce: 1,
+            balance: U256::ZERO,
+            storage_root: EMPTY_TRIE_ROOT,
+            code_hash: B256::repeat_byte(0xaa),
+        };
+        let state = assemble_zone_state(
+            vec![(account, trie_account)],
+            vec![account_read(account, trie_account)],
+            Vec::new(),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(
+            WitnessDatabase::new(&state, BTreeMap::new()).unwrap_err(),
+            ProverError::MissingAccountCode(account)
+        );
     }
 
     fn set_initial_zone_state(witness: &mut BatchWitness, state: ZoneStateWitness) {
@@ -1460,7 +1555,7 @@ mod tests {
     #[test]
     fn empty_block_fixture_returns_computed_block_transition() {
         let witness = fixture_witness();
-        let output = prove_zone_batch(witness.clone()).unwrap();
+        let output = prove_empty_zone_batch(witness.clone()).unwrap();
         let expected_header = ZoneHeader {
             parent_hash: witness.public_inputs.prev_block_hash,
             beneficiary: witness.public_inputs.sequencer,
@@ -1509,7 +1604,7 @@ mod tests {
         });
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::MissingSystemStorageRead {
                 account: ZONE_INBOX_ADDRESS,
                 slot: ZONE_INBOX_PROCESSED_HASH_SLOT,
@@ -1525,7 +1620,7 @@ mod tests {
         });
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::MissingSystemStorageRead {
                 account: ZONE_OUTBOX_ADDRESS,
                 slot: ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
@@ -1539,7 +1634,7 @@ mod tests {
         witness.public_inputs.expected_withdrawal_batch_index = 0;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::ExpectedWithdrawalBatchIndexZero
         );
     }
@@ -1550,7 +1645,7 @@ mod tests {
         witness.public_inputs.expected_withdrawal_batch_index = 6;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::WithdrawalBatchIndexMismatch {
                 expected_previous: 5,
                 actual_previous: 4,
@@ -1563,7 +1658,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks.clear();
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::EmptyBatch
         );
     }
@@ -1573,7 +1668,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.public_inputs.prev_block_hash = B256::repeat_byte(0xff);
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::PrevHeaderHashMismatch
         );
     }
@@ -1583,7 +1678,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].parent_hash = B256::repeat_byte(0xfe);
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::BlockParentHashMismatch { index: 0 }
         );
     }
@@ -1593,7 +1688,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].number = 10;
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::BlockNumberMismatch {
                 index: 0,
                 expected: 8,
@@ -1607,7 +1702,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].timestamp = 10;
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::BlockTimestampRegression { index: 0 }
         );
     }
@@ -1617,7 +1712,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].beneficiary = address!("0x00000000000000000000000000000000000000ff");
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::BlockBeneficiaryMismatch { index: 0 }
         );
     }
@@ -1627,7 +1722,7 @@ mod tests {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].finalize_withdrawal_batch_count = None;
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::MissingFinalWithdrawalFinalization
         );
     }
@@ -1649,7 +1744,7 @@ mod tests {
         };
         witness.zone_blocks.push(second);
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::IntermediateWithdrawalFinalization { index: 0 }
         );
     }
@@ -1683,7 +1778,7 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        prove_zone_batch(witness).unwrap();
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
@@ -1706,7 +1801,7 @@ mod tests {
         );
         witness.tempo_state_proofs = proof;
 
-        prove_zone_batch(witness).unwrap();
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
@@ -1730,7 +1825,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoStateReadBlockIndexOutOfRange {
                 read_index: 0,
                 zone_block_index: 1,
@@ -1761,7 +1856,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoStateReadTempoBlockMismatch {
                 read_index: 0,
                 expected: 100,
@@ -1793,7 +1888,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::DuplicateTempoStateRead { read_index: 1 }
         );
     }
@@ -1822,7 +1917,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoStateAccountProofMissing {
                 read_index: 0,
                 account,
@@ -1855,7 +1950,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoStateStorageProofMissing {
                 read_index: 0,
                 account,
@@ -1888,7 +1983,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoStateStorageReadMismatch {
                 read_index: 0,
                 account,
@@ -1916,7 +2011,7 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        prove_zone_batch(witness).unwrap();
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
@@ -1948,7 +2043,7 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        prove_zone_batch(witness).unwrap();
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
@@ -1970,7 +2065,7 @@ mod tests {
         set_initial_zone_state(&mut witness, parts.assemble());
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::AccountReadMismatch(account)
         );
     }
@@ -1990,7 +2085,7 @@ mod tests {
             });
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::MissingAccountRead(account)
         );
     }
@@ -2024,7 +2119,7 @@ mod tests {
         set_initial_zone_state(&mut witness, parts.assemble());
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::StorageProofMissing {
                 account,
                 slot,
@@ -2062,7 +2157,7 @@ mod tests {
         set_initial_zone_state(&mut witness, parts.assemble());
 
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::StorageReadMismatch { account, slot }
         );
     }
@@ -2083,7 +2178,7 @@ mod tests {
                 proof_node_hashes: Vec::new(),
             });
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::AccountCodeHashMismatch(address!(
                 "0x0000000000000000000000000000000000001000"
             ))
@@ -2098,7 +2193,7 @@ mod tests {
             Bytes::from_static(b"bad proof node"),
         );
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::ZoneStateNodeHashMismatch(B256::repeat_byte(0xbb))
         );
     }
@@ -2110,7 +2205,7 @@ mod tests {
             .transactions
             .push(Bytes::from_static(b"signed tx"));
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::UserTransactionsUnsupported { index: 0 }
         );
     }
@@ -2124,7 +2219,7 @@ mod tests {
             .checked_add(1)
             .expect("test block number fits u64");
         assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
+            prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::TempoAncestryLengthMismatch {
                 expected: 1,
                 actual: 0,

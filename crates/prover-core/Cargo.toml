@@ -19,6 +19,7 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-sol-types = { workspace = true }
 alloy-trie = { workspace = true, features = ["ethereum"] }
+revm-database-interface = { workspace = true }
 serde = { workspace = true, optional = true }
 
 [features]
@@ -28,6 +29,7 @@ std = [
     "alloy-rlp/std",
     "alloy-sol-types/std",
     "alloy-trie/std",
+    "revm-database-interface/std",
     "serde?/std",
     "tempo-primitives/std",
     "tempo-zone-contracts/std",

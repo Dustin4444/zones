@@ -499,7 +499,7 @@ mod tests {
     use alloy_primitives::{B256, address};
 
     use super::*;
-    use crate::{crypto::EnclaveSigningKey, types::prove_zone_batch};
+    use crate::{crypto::EnclaveSigningKey, types::prove_empty_zone_batch};
 
     fn request_for(key: &EnclaveSigningKey) -> ProofRequest {
         ProofRequest {
@@ -524,7 +524,7 @@ mod tests {
     fn digest_changes_when_required_public_output_changes() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let base = batch_digest(&request, &output);
         output.block_transition.nextBlockHash = B256::repeat_byte(0xee);
         assert_ne!(base, batch_digest(&request, &output));
@@ -535,7 +535,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let config = native_config();
-        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let public = &request.witness.public_inputs;
         let base = native_batch_digest(&config, key.address(), public, &output).unwrap();
         output.block_transition.nextBlockHash = B256::repeat_byte(0xee);
@@ -551,7 +551,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let public = &request.witness.public_inputs;
-        let output = prove_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let config = native_config();
         let digest = native_batch_digest(&config, key.address(), public, &output).unwrap();
         let signature = key.sign_digest(digest);
@@ -585,7 +585,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let public = &request.witness.public_inputs;
-        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let config = native_config();
         output.last_batch_commitment.withdrawal_batch_index = output
             .last_batch_commitment
@@ -605,7 +605,7 @@ mod tests {
     fn rejects_signed_envelope_without_valid_attestation_doc() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let output = prove_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let digest = batch_digest(&request, &output);
         let envelope = ProofEnvelope {
             version: PROTOCOL_VERSION,
@@ -629,7 +629,7 @@ mod tests {
     fn rejects_forged_output_even_when_digest_was_signed() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let output = prove_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
         let digest = batch_digest(&request, &output);
         let mut envelope = ProofEnvelope {
             version: PROTOCOL_VERSION,
