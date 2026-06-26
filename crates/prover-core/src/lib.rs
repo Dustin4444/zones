@@ -14,8 +14,10 @@ use alloc::{collections::BTreeMap, vec::Vec};
 use core::fmt;
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_rlp::Decodable;
 use alloy_sol_types::SolValue;
 use alloy_trie::EMPTY_ROOT_HASH;
+use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{
     BlockTransition, DecryptionData, DepositQueueTransition, EnabledToken, QueuedDeposit,
 };
@@ -188,6 +190,33 @@ impl BatchOutput {
                 .abi_encode_params(),
         )
     }
+}
+
+/// Verified inputs prepared for stateless Zone execution.
+///
+/// This mirrors the upstream `stateless` flow: verify and materialize witness
+/// data first, then pass a strict witness-backed database and recovered
+/// transaction plan into the execution engine.
+#[derive(Debug, Clone)]
+pub struct PreparedStatelessExecution {
+    pub public_inputs: PublicInputs,
+    pub prev_block_header: ZoneHeader,
+    pub execution_db: WitnessDatabase,
+    pub execution_plan: ZoneExecutionPlan,
+    pub tempo_witness_provider: TempoWitnessProvider,
+    pub commitments: PreparedWitnessCommitments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedWitnessCommitments {
+    pub initial_tempo_block_number: u64,
+    pub initial_tempo_block_hash: B256,
+    pub initial_tempo_state_root: B256,
+    pub final_tempo_block_number: u64,
+    pub final_tempo_block_hash: B256,
+    pub final_tempo_state_root: B256,
+    pub initial_deposit_queue: DepositQueueState,
+    pub previous_last_batch: LastBatchCommitment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +399,19 @@ pub enum ProverError {
     UserTransactionSenderRecoveryFailed {
         block_index: usize,
         transaction_index: usize,
+    },
+    TempoImportHeaderInvalid {
+        index: usize,
+    },
+    TempoImportParentHashMismatch {
+        index: usize,
+        expected: B256,
+        actual: B256,
+    },
+    TempoImportBlockNumberMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
     },
     TempoImportUnsupported {
         index: usize,
@@ -720,6 +762,25 @@ impl fmt::Display for ProverError {
                 f,
                 "zone block {block_index} user transaction {transaction_index} signer recovery failed"
             ),
+            Self::TempoImportHeaderInvalid { index } => {
+                write!(f, "zone block {index} Tempo import header is not valid RLP")
+            }
+            Self::TempoImportParentHashMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "zone block {index} imports Tempo parent hash {actual}, expected {expected}"
+            ),
+            Self::TempoImportBlockNumberMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "zone block {index} imports Tempo block number {actual}, expected {expected}"
+            ),
             Self::TempoImportUnsupported { index } => {
                 write!(f, "zone block {index} tempo import is not implemented yet")
             }
@@ -751,8 +812,85 @@ impl std::error::Error for ProverError {}
 /// this entrypoint before signing or attesting a [`BatchOutput`]. Until the full
 /// no-std stateless executor is wired in, production proving fails closed
 /// instead of falling back to the legacy empty-block placeholder.
-pub fn prove_zone_batch(_witness: BatchWitness) -> Result<BatchOutput, ProverError> {
+pub fn prove_zone_batch(witness: BatchWitness) -> Result<BatchOutput, ProverError> {
+    let _prepared = prepare_stateless_execution(&witness)?;
     Err(ProverError::FullStatelessExecutionUnsupported)
+}
+
+pub fn prepare_stateless_execution(
+    witness: &BatchWitness,
+) -> Result<PreparedStatelessExecution, ProverError> {
+    let public = &witness.public_inputs;
+
+    if witness.prev_block_header.hash() != public.prev_block_hash {
+        return Err(ProverError::PrevHeaderHashMismatch);
+    }
+
+    if witness.prev_block_header.state_root != witness.initial_zone_state.state_root {
+        return Err(ProverError::InitialStateRootMismatch);
+    }
+
+    let final_index = witness
+        .zone_blocks
+        .len()
+        .checked_sub(1)
+        .ok_or(ProverError::EmptyBatch)?;
+
+    validate_block_envelopes(witness, final_index)?;
+
+    let zone_block_hashes = ancestry::verify_zone_ancestry_headers(
+        &witness.prev_block_header,
+        &witness.zone_ancestry_headers,
+    )?;
+    let execution_db = WitnessDatabase::new(&witness.initial_zone_state, zone_block_hashes)?;
+    let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
+
+    let (tempo_root_bindings, final_tempo_binding) =
+        tempo_root_bindings_for_witness(initial_zone_state.tempo_binding, &witness.zone_blocks)?;
+    validate_node_pool(
+        &witness.tempo_state_proofs.node_pool,
+        ProverError::TempoStateNodeHashMismatch,
+    )?;
+    let tempo_witness_provider = TempoWitnessProvider::new(
+        &witness.tempo_state_proofs,
+        witness.zone_blocks.len(),
+        &tempo_root_bindings,
+    )?;
+
+    let expected_previous_withdrawal_batch_index = public
+        .expected_withdrawal_batch_index
+        .checked_sub(1)
+        .ok_or(ProverError::ExpectedWithdrawalBatchIndexZero)?;
+    if initial_zone_state.last_batch.withdrawal_batch_index
+        != expected_previous_withdrawal_batch_index
+    {
+        return Err(ProverError::WithdrawalBatchIndexMismatch {
+            expected_previous: expected_previous_withdrawal_batch_index,
+            actual_previous: initial_zone_state.last_batch.withdrawal_batch_index,
+        });
+    }
+
+    tempo::verify_tempo_ancestry(public, final_tempo_binding, &witness.tempo_ancestry_headers)?;
+
+    let execution_plan = ZoneExecutionPlan::from_witness(witness)?;
+
+    Ok(PreparedStatelessExecution {
+        public_inputs: public.clone(),
+        prev_block_header: witness.prev_block_header.clone(),
+        execution_db,
+        execution_plan,
+        tempo_witness_provider,
+        commitments: PreparedWitnessCommitments {
+            initial_tempo_block_number: initial_zone_state.tempo_binding.block_number,
+            initial_tempo_block_hash: initial_zone_state.tempo_binding.block_hash,
+            initial_tempo_state_root: initial_zone_state.tempo_binding.state_root,
+            final_tempo_block_number: final_tempo_binding.block_number,
+            final_tempo_block_hash: final_tempo_binding.block_hash,
+            final_tempo_state_root: final_tempo_binding.state_root,
+            initial_deposit_queue: initial_zone_state.deposit_queue,
+            previous_last_batch: initial_zone_state.last_batch,
+        },
+    })
 }
 
 /// Execute the legacy deterministic empty-block transition.
@@ -867,6 +1005,113 @@ pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, Prov
     })
 }
 
+fn validate_block_envelopes(witness: &BatchWitness, final_index: usize) -> Result<(), ProverError> {
+    let mut prev_number = witness.prev_block_header.number;
+    let mut prev_timestamp = witness.prev_block_header.timestamp;
+
+    for (index, block) in witness.zone_blocks.iter().enumerate() {
+        if index == 0 && block.parent_hash != witness.public_inputs.prev_block_hash {
+            return Err(ProverError::BlockParentHashMismatch { index });
+        }
+
+        let expected_number = prev_number
+            .checked_add(1)
+            .ok_or(ProverError::BlockNumberOverflow { index })?;
+        if block.number != expected_number {
+            return Err(ProverError::BlockNumberMismatch {
+                index,
+                expected: expected_number,
+                actual: block.number,
+            });
+        }
+        if block.timestamp < prev_timestamp {
+            return Err(ProverError::BlockTimestampRegression { index });
+        }
+        if block.beneficiary != witness.public_inputs.sequencer {
+            return Err(ProverError::BlockBeneficiaryMismatch { index });
+        }
+
+        let is_final = index == final_index;
+        match (is_final, block.finalize_withdrawal_batch_count.is_some()) {
+            (false, true) => return Err(ProverError::IntermediateWithdrawalFinalization { index }),
+            (true, false) => return Err(ProverError::MissingFinalWithdrawalFinalization),
+            _ => {}
+        }
+
+        if block.tempo_header_rlp.is_none()
+            && (!block.deposits.is_empty()
+                || !block.decryptions.is_empty()
+                || !block.enabled_tokens.is_empty())
+        {
+            return Err(ProverError::DepositProcessingUnsupported { index });
+        }
+        if block.finalize_withdrawal_batch_count.is_none()
+            && !block.finalize_withdrawal_encrypted_senders.is_empty()
+        {
+            return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
+        }
+
+        prev_number = block.number;
+        prev_timestamp = block.timestamp;
+    }
+
+    Ok(())
+}
+
+fn tempo_root_bindings_for_witness(
+    initial_binding: tempo::TempoBinding,
+    blocks: &[ZoneBlock],
+) -> Result<(Vec<TempoRootBinding>, tempo::TempoBinding), ProverError> {
+    let mut bindings = Vec::new();
+    bindings.push(TempoRootBinding::from_tempo_binding(initial_binding));
+    let mut current = initial_binding;
+
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(encoded) = &block.tempo_header_rlp else {
+            continue;
+        };
+        let header = decode_tempo_import_header(index, encoded)?;
+        if header.inner.parent_hash != current.block_hash {
+            return Err(ProverError::TempoImportParentHashMismatch {
+                index,
+                expected: current.block_hash,
+                actual: header.inner.parent_hash,
+            });
+        }
+
+        let expected_number = current
+            .block_number
+            .checked_add(1)
+            .ok_or(ProverError::TempoAncestryBlockNumberOverflow { index })?;
+        if header.inner.number != expected_number {
+            return Err(ProverError::TempoImportBlockNumberMismatch {
+                index,
+                expected: expected_number,
+                actual: header.inner.number,
+            });
+        }
+
+        current = tempo::TempoBinding {
+            block_number: header.inner.number,
+            block_hash: keccak256(encoded.as_ref()),
+            state_root: header.inner.state_root,
+        };
+        bindings.push(TempoRootBinding::from_tempo_binding(current));
+    }
+
+    Ok((bindings, current))
+}
+
+fn decode_tempo_import_header(index: usize, encoded: &Bytes) -> Result<TempoHeader, ProverError> {
+    let mut cursor = encoded.as_ref();
+    let header = TempoHeader::decode(&mut cursor)
+        .map_err(|_| ProverError::TempoImportHeaderInvalid { index })?;
+    if !cursor.is_empty() {
+        return Err(ProverError::TempoImportHeaderInvalid { index });
+    }
+    Ok(header)
+}
+
 fn validate_block(
     index: usize,
     final_index: usize,
@@ -930,9 +1175,9 @@ struct VerifiedInitialZoneState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DepositQueueState {
-    processed_hash: B256,
-    processed_number: u64,
+pub struct DepositQueueState {
+    pub processed_hash: B256,
+    pub processed_number: u64,
 }
 
 fn validate_initial_zone_state(
@@ -1337,6 +1582,71 @@ mod tests {
         assert_eq!(
             prove_zone_batch(fixture_witness()).unwrap_err(),
             ProverError::FullStatelessExecutionUnsupported
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_bad_previous_header_before_executor_boundary() {
+        let mut witness = fixture_witness();
+        witness.public_inputs.prev_block_hash = B256::repeat_byte(0xff);
+
+        assert_eq!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::PrevHeaderHashMismatch
+        );
+    }
+
+    #[test]
+    fn production_prover_decodes_user_transactions_before_executor_boundary() {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0]
+            .transactions
+            .push(Bytes::from_static(b"not a transaction"));
+
+        assert_eq!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::UserTransactionDecodeFailed {
+                block_index: 0,
+                transaction_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn prepares_verified_stateless_execution_inputs() {
+        let witness = fixture_witness();
+        let mut prepared = prepare_stateless_execution(&witness).unwrap();
+
+        assert_eq!(
+            prepared
+                .execution_db
+                .block_hash(witness.prev_block_header.number),
+            Ok(witness.prev_block_header.hash())
+        );
+        assert_eq!(prepared.execution_plan.blocks.len(), 1);
+        assert_eq!(prepared.execution_plan.blocks[0].transactions.len(), 1);
+        assert_eq!(
+            prepared.commitments.initial_deposit_queue.processed_number,
+            12
+        );
+        assert_eq!(
+            prepared
+                .commitments
+                .previous_last_batch
+                .withdrawal_batch_index,
+            witness
+                .public_inputs
+                .expected_withdrawal_batch_index
+                .checked_sub(1)
+                .expect("fixture index is nonzero")
+        );
+        assert_eq!(
+            prepared.commitments.initial_tempo_block_number,
+            witness.public_inputs.tempo_block_number
+        );
+        assert_eq!(
+            prepared.commitments.final_tempo_block_hash,
+            witness.public_inputs.anchor_block_hash
         );
     }
 
