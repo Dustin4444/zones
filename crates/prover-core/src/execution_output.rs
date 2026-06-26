@@ -7,7 +7,7 @@ use alloy_consensus::{
 use alloy_eips::eip2718::Encodable2718;
 use alloy_evm::block::BlockExecutionResult;
 use alloy_primitives::{Address, B256, U256};
-use revm_database::BundleState;
+use revm_database::{BundleState, states::bundle_state::BundleRetention};
 use tempo_zone_contracts::{BlockTransition, DepositQueueTransition};
 use zone_primitives::{
     ZoneHeader,
@@ -21,8 +21,8 @@ use zone_primitives::{
 use crate::{
     BatchOutput, CalculatedStateRoot, DepositQueueState, ExecutionPostState, LastBatchCommitment,
     PlannedZoneTransaction, PlannedZoneTransactionKind, PreparedStatelessExecution,
-    PreparedZoneBlock, ProverError, RecoveredTempoTx, WitnessTempoStateReader,
-    ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
+    PreparedZoneBlock, ProverError, RecoveredTempoTx, SparseStateRootCalculator,
+    WitnessTempoStateReader, ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
     execution_post_state_from_state,
 };
 
@@ -34,11 +34,17 @@ pub trait StatelessZoneExecutor {
 }
 
 pub trait StatelessZoneBlockExecutor {
+    type Transaction: Encodable2718;
+    type Receipt: TxReceipt;
+
+    /// Execute one prepared Zone block and leave the block's revm transitions
+    /// pending in `state`. The prover driver merges those transitions only
+    /// after it derives the block state root from the sparse trie witness.
     fn execute_block(
         &mut self,
         state: &mut ZoneExecutionState,
         input: ZoneBlockExecutionInput<'_>,
-    ) -> Result<ExecutedZoneBlock, ProverError>;
+    ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>;
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +148,12 @@ impl ExecutedZoneBlock {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecutedZoneBlockArtifacts<Tx, Receipt> {
+    pub transactions: Vec<Tx>,
+    pub result: BlockExecutionResult<Receipt>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ZoneBlockExecutionArtifacts<'a, Tx, Receipt> {
     pub state_root: CalculatedStateRoot,
@@ -202,21 +214,48 @@ pub fn prove_zone_batch_with_executor(
     batch_output_from_execution(&prepared, &execution)
 }
 
-pub fn execute_prepared_blocks(
+pub fn execute_prepared_blocks<E>(
     prepared: &PreparedStatelessExecution,
-    executor: &mut impl StatelessZoneBlockExecutor,
-) -> Result<StatelessExecutionOutput, ProverError> {
+    executor: &mut E,
+    state_root_calculator: &mut SparseStateRootCalculator,
+) -> Result<StatelessExecutionOutput, ProverError>
+where
+    E: StatelessZoneBlockExecutor,
+    for<'receipt> alloy_consensus::ReceiptWithBloom<&'receipt E::Receipt>: Encodable2718,
+{
     let mut blocks = Vec::with_capacity(prepared.zone_blocks.len());
     let mut state = prepared.execution_state();
     for block_index in 0..prepared.zone_blocks.len() {
         let input = prepared.block_execution_input(block_index)?;
-        blocks.push(executor.execute_block(&mut state, input)?);
+        let artifacts = executor.execute_block(&mut state, input)?;
+        let block_post_state = execution_post_state_from_pending_transitions(&state);
+        let state_root = state_root_calculator.calculate(block_post_state.into_hashed())?;
+        state.merge_transitions(BundleRetention::PlainState);
+        blocks.push(ExecutedZoneBlock::from_alloy_block_execution(
+            block_index,
+            state_root,
+            &artifacts.transactions,
+            &artifacts.result,
+        )?);
     }
 
     Ok(StatelessExecutionOutput {
         blocks,
         post_state: execution_post_state_from_state(state),
     })
+}
+
+fn execution_post_state_from_pending_transitions(state: &ZoneExecutionState) -> ExecutionPostState {
+    let Some(transition_state) = state.transition_state.as_ref() else {
+        return ExecutionPostState::default();
+    };
+
+    let mut bundle = BundleState::default();
+    bundle.apply_transitions_and_create_reverts(
+        transition_state.clone(),
+        BundleRetention::PlainState,
+    );
+    ExecutionPostState::from_bundle_state(&bundle)
 }
 
 pub fn batch_output_from_execution(

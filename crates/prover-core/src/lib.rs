@@ -49,11 +49,11 @@ pub use execution_env::{
     tempo_gas_params_with_amsterdam, zone_general_gas_limit, zone_shared_gas_limit,
 };
 pub use execution_output::{
-    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
-    StatelessZoneBlockExecutor, StatelessZoneExecutor, TempoExecutionCommitment,
-    ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput, ZoneExecutableTransaction,
-    batch_output_from_execution, execute_prepared_blocks, execution_commitments_from_post_state,
-    prove_zone_batch_with_executor,
+    ExecutedBatchCommitments, ExecutedZoneBlock, ExecutedZoneBlockArtifacts,
+    StatelessExecutionOutput, StatelessZoneBlockExecutor, StatelessZoneExecutor,
+    TempoExecutionCommitment, ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput,
+    ZoneExecutableTransaction, batch_output_from_execution, execute_prepared_blocks,
+    execution_commitments_from_post_state, prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -3369,11 +3369,15 @@ mod tests {
         }
 
         impl StatelessZoneBlockExecutor for RecordingBlockExecutor {
+            type Transaction = RecoveredTempoTx;
+            type Receipt = TempoReceipt;
+
             fn execute_block(
                 &mut self,
                 state: &mut ZoneExecutionState,
                 input: ZoneBlockExecutionInput<'_>,
-            ) -> Result<ExecutedZoneBlock, ProverError> {
+            ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>
+            {
                 self.seen
                     .push((input.block_index, input.transactions.len()));
                 assert_eq!(
@@ -3400,23 +3404,24 @@ mod tests {
                     .map(|transaction| transaction.recovered.clone())
                     .collect::<Vec<_>>();
                 let result = successful_block_result(transactions.len());
-                ExecutedZoneBlock::from_alloy_block_execution(
-                    input.block_index,
-                    CalculatedStateRoot::trusted_for_test(EMPTY_TRIE_ROOT),
-                    &transactions,
-                    &result,
-                )
+                Ok(ExecutedZoneBlockArtifacts {
+                    transactions,
+                    result,
+                })
             }
         }
 
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut executor = RecordingBlockExecutor { seen: Vec::new() };
+        let mut state_root_calculator = SparseStateRootCalculator::revealed_empty();
 
-        let output = execute_prepared_blocks(&prepared, &mut executor).unwrap();
+        let output =
+            execute_prepared_blocks(&prepared, &mut executor, &mut state_root_calculator).unwrap();
 
         assert_eq!(executor.seen, vec![(0, 1)]);
         assert_eq!(output.blocks.len(), 1);
+        assert_ne!(output.blocks[0].state_root(), EMPTY_TRIE_ROOT);
         let hashed_address = KeccakKeyHasher::hash_key(ZONE_INBOX_ADDRESS);
         let hashed_account = output
             .post_state
