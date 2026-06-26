@@ -13779,6 +13779,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm",
+ "alloy-hardforks",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-sol-types",

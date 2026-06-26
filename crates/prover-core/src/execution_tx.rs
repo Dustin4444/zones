@@ -12,6 +12,7 @@ use revm::context::{
         AccessList, AccessListItem, RecoveredAuthority, RecoveredAuthorization, SignedAuthorization,
     },
 };
+use revm::handler::SystemCallTx;
 use tempo_primitives::{
     AASigned, TempoSignature, TempoTransaction, TempoTxEnvelope,
     transaction::{
@@ -218,6 +219,20 @@ impl TransactionEnvMut for ZoneTxEnv {
 impl IntoTxEnv<Self> for ZoneTxEnv {
     fn into_tx_env(self) -> Self {
         self
+    }
+}
+
+impl SystemCallTx for ZoneTxEnv {
+    fn new_system_tx_with_caller(
+        caller: Address,
+        system_contract_address: Address,
+        data: Bytes,
+    ) -> Self {
+        Self {
+            inner: TxEnv::new_system_tx_with_caller(caller, system_contract_address, data),
+            is_system_tx: true,
+            ..Default::default()
+        }
     }
 }
 

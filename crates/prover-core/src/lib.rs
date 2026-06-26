@@ -33,6 +33,7 @@ use zone_primitives::{
 mod ancestry;
 mod execution_block;
 mod execution_env;
+mod execution_evm;
 mod execution_output;
 mod execution_plan;
 mod execution_precompiles;
@@ -51,6 +52,10 @@ pub use execution_env::{
     BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneBlockExecutionContext,
     ZoneBlockExecutionContextConfig, ZoneCfgEnv, ZoneCfgEnvConfig, ZoneEvmEnv, tempo_gas_params,
     tempo_gas_params_with_amsterdam, zone_general_gas_limit, zone_shared_gas_limit,
+};
+pub use execution_evm::{
+    WitnessZoneBlockExecutorProvider, ZoneEthExecutorSpec, ZoneEvmContext, ZoneRevm,
+    ZoneWitnessEvm, ZoneWitnessEvmFactory, zone_witness_precompiles,
 };
 pub use execution_output::{
     AlloyZoneBlockExecutor, AlloyZoneBlockExecutorProvider, ExecutedBatchCommitments,
