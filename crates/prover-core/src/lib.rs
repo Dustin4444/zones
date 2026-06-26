@@ -28,6 +28,7 @@ use zone_primitives::{
     },
 };
 
+mod ancestry;
 mod execution_plan;
 mod post_state;
 mod tempo;
@@ -65,6 +66,7 @@ pub struct PublicInputs {
 pub struct BatchWitness {
     pub public_inputs: PublicInputs,
     pub prev_block_header: ZoneHeader,
+    pub zone_ancestry_headers: Vec<Bytes>,
     pub zone_blocks: Vec<ZoneBlock>,
     pub initial_zone_state: ZoneStateWitness,
     pub tempo_state_proofs: BatchStateProof,
@@ -341,6 +343,26 @@ pub enum ProverError {
         index: usize,
     },
     MissingFinalWithdrawalFinalization,
+    ZoneAncestryHeaderLimitExceeded {
+        count: usize,
+        limit: usize,
+    },
+    ZoneAncestryHeaderInvalid {
+        index: usize,
+    },
+    ZoneAncestryBlockNumberUnderflow {
+        index: usize,
+    },
+    ZoneAncestryParentHashMismatch {
+        index: usize,
+        expected: B256,
+        actual: B256,
+    },
+    ZoneAncestryBlockNumberMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
     UserTransactionDecodeFailed {
         block_index: usize,
         transaction_index: usize,
@@ -654,6 +676,36 @@ impl fmt::Display for ProverError {
             Self::MissingFinalWithdrawalFinalization => {
                 f.write_str("final zone block is missing withdrawal finalization")
             }
+            Self::ZoneAncestryHeaderLimitExceeded { count, limit } => write!(
+                f,
+                "zone ancestry header count {count} exceeds BLOCKHASH ancestor limit {limit}"
+            ),
+            Self::ZoneAncestryHeaderInvalid { index } => {
+                write!(
+                    f,
+                    "zone ancestry header {index} is not valid ZoneHeader RLP"
+                )
+            }
+            Self::ZoneAncestryBlockNumberUnderflow { index } => write!(
+                f,
+                "zone ancestry header {index} cannot precede genesis block"
+            ),
+            Self::ZoneAncestryParentHashMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "zone ancestry header {index} hash {actual} does not match child parent hash {expected}"
+            ),
+            Self::ZoneAncestryBlockNumberMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "zone ancestry header {index} has block number {actual}, expected {expected}"
+            ),
             Self::UserTransactionDecodeFailed {
                 block_index,
                 transaction_index,
@@ -720,11 +772,12 @@ pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, Prov
     if witness.prev_block_header.state_root != witness.initial_zone_state.state_root {
         return Err(ProverError::InitialStateRootMismatch);
     }
-
-    validate_node_pool(
-        &witness.initial_zone_state.node_pool,
-        ProverError::ZoneStateNodeHashMismatch,
+    let zone_block_hashes = ancestry::verify_zone_ancestry_headers(
+        &witness.prev_block_header,
+        &witness.zone_ancestry_headers,
     )?;
+
+    let _execution_db = WitnessDatabase::new(&witness.initial_zone_state, zone_block_hashes)?;
     let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
     validate_node_pool(
         &witness.tempo_state_proofs.node_pool,
@@ -1255,6 +1308,7 @@ mod tests {
                 sequencer: header.beneficiary,
             },
             prev_block_header: header,
+            zone_ancestry_headers: Vec::new(),
             zone_blocks: vec![ZoneBlock {
                 number: 8,
                 parent_hash: prev_block_hash,
@@ -1283,6 +1337,80 @@ mod tests {
         assert_eq!(
             prove_zone_batch(fixture_witness()).unwrap_err(),
             ProverError::FullStatelessExecutionUnsupported
+        );
+    }
+
+    #[test]
+    fn verifies_zone_ancestry_for_blockhash_witness() {
+        let mut witness = fixture_witness();
+        let parent = parent_of(&witness.prev_block_header);
+        bind_parent_header(&mut witness, &parent);
+        witness
+            .zone_ancestry_headers
+            .push(encode_zone_header(&parent));
+
+        let hashes = ancestry::verify_zone_ancestry_headers(
+            &witness.prev_block_header,
+            &witness.zone_ancestry_headers,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hashes.get(&witness.prev_block_header.number).copied(),
+            Some(witness.prev_block_header.hash())
+        );
+        assert_eq!(hashes.get(&parent.number).copied(), Some(parent.hash()));
+        let mut db = WitnessDatabase::new(&witness.initial_zone_state, hashes).unwrap();
+        assert_eq!(db.block_hash(parent.number).unwrap(), parent.hash());
+        prove_empty_zone_batch(witness).unwrap();
+    }
+
+    #[test]
+    fn rejects_zone_ancestry_parent_hash_mismatch() {
+        let mut witness = fixture_witness();
+        let parent = parent_of(&witness.prev_block_header);
+        witness
+            .zone_ancestry_headers
+            .push(encode_zone_header(&parent));
+
+        assert_eq!(
+            prove_empty_zone_batch(witness).unwrap_err(),
+            ProverError::ZoneAncestryParentHashMismatch {
+                index: 0,
+                expected: B256::repeat_byte(0x01),
+                actual: parent.hash(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zone_ancestry_header_with_trailing_bytes() {
+        let mut witness = fixture_witness();
+        let parent = parent_of(&witness.prev_block_header);
+        bind_parent_header(&mut witness, &parent);
+        let mut encoded = encode_zone_header(&parent).to_vec();
+        encoded.push(0);
+        witness.zone_ancestry_headers.push(Bytes::from(encoded));
+
+        assert_eq!(
+            prove_empty_zone_batch(witness).unwrap_err(),
+            ProverError::ZoneAncestryHeaderInvalid { index: 0 }
+        );
+    }
+
+    #[test]
+    fn rejects_zone_ancestry_beyond_blockhash_window() {
+        let mut witness = fixture_witness();
+        witness.zone_ancestry_headers = vec![Bytes::new(); ancestry::BLOCKHASH_ANCESTOR_LIMIT];
+
+        assert_eq!(
+            prove_empty_zone_batch(witness).unwrap_err(),
+            ProverError::ZoneAncestryHeaderLimitExceeded {
+                count: ancestry::BLOCKHASH_ANCESTOR_LIMIT
+                    .checked_add(1)
+                    .expect("test count fits"),
+                limit: ancestry::BLOCKHASH_ANCESTOR_LIMIT,
+            }
         );
     }
 
@@ -1355,6 +1483,38 @@ mod tests {
         witness.public_inputs.prev_block_hash = prev_block_hash;
         witness.zone_blocks[0].parent_hash = prev_block_hash;
         witness.initial_zone_state = state;
+    }
+
+    fn encode_zone_header(header: &ZoneHeader) -> Bytes {
+        let mut encoded = Vec::new();
+        header.encode(&mut encoded);
+        Bytes::from(encoded)
+    }
+
+    fn parent_of(header: &ZoneHeader) -> ZoneHeader {
+        ZoneHeader {
+            parent_hash: B256::repeat_byte(0xaa),
+            beneficiary: header.beneficiary,
+            state_root: header.state_root,
+            transactions_root: EMPTY_TRIE_ROOT,
+            receipts_root: EMPTY_TRIE_ROOT,
+            number: header
+                .number
+                .checked_sub(1)
+                .expect("test header number has parent"),
+            timestamp: header
+                .timestamp
+                .checked_sub(1)
+                .expect("test header timestamp has parent"),
+            protocol_version: header.protocol_version,
+        }
+    }
+
+    fn bind_parent_header(witness: &mut BatchWitness, parent: &ZoneHeader) {
+        witness.prev_block_header.parent_hash = parent.hash();
+        let prev_block_hash = witness.prev_block_header.hash();
+        witness.public_inputs.prev_block_hash = prev_block_hash;
+        witness.zone_blocks[0].parent_hash = prev_block_hash;
     }
 
     fn insert_proof_nodes(

@@ -2,12 +2,12 @@
 
 use alloc::vec::Vec;
 use alloy_primitives::{Address, B256};
-use alloy_rlp::Encodable as _;
+use alloy_rlp::{Decodable, Encodable as _};
 
 /// Simplified zone block header for hash computation.
 ///
 /// The zone block hash is `keccak256(rlp_encode(header))`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ZoneHeader {
     pub parent_hash: B256,
@@ -47,6 +47,41 @@ impl alloy_rlp::Encodable for ZoneHeader {
     }
 }
 
+impl alloy_rlp::Decodable for ZoneHeader {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = alloy_rlp::Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+
+        let started_len = buf.len();
+        let decoded = Self {
+            parent_hash: Decodable::decode(buf)?,
+            beneficiary: Decodable::decode(buf)?,
+            state_root: Decodable::decode(buf)?,
+            transactions_root: Decodable::decode(buf)?,
+            receipts_root: Decodable::decode(buf)?,
+            number: u64::decode(buf)?,
+            timestamp: u64::decode(buf)?,
+            protocol_version: u64::decode(buf)?,
+        };
+
+        let consumed = started_len
+            .checked_sub(buf.len())
+            .ok_or(alloy_rlp::Error::Custom(
+                "zone header decode length underflow",
+            ))?;
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+
+        Ok(decoded)
+    }
+}
+
 impl ZoneHeader {
     fn fields_len(&self) -> usize {
         let len = self.parent_hash.length();
@@ -71,4 +106,55 @@ impl ZoneHeader {
 fn checked_len_add(left: usize, right: usize) -> usize {
     left.checked_add(right)
         .expect("zone header RLP length exceeds usize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+    use alloy_rlp::{Decodable, Encodable};
+
+    fn header() -> ZoneHeader {
+        ZoneHeader {
+            parent_hash: B256::repeat_byte(0x01),
+            beneficiary: address!("0x0000000000000000000000000000000000001000"),
+            state_root: B256::repeat_byte(0x02),
+            transactions_root: B256::repeat_byte(0x03),
+            receipts_root: B256::repeat_byte(0x04),
+            number: 7,
+            timestamp: 42,
+            protocol_version: 1,
+        }
+    }
+
+    #[test]
+    fn rlp_roundtrip_preserves_zone_header_hash() {
+        let original = header();
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded);
+
+        let decoded = ZoneHeader::decode(&mut encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.hash(), original.hash());
+    }
+
+    #[test]
+    fn rlp_decode_leaves_trailing_bytes_for_exact_callers() {
+        let mut encoded = Vec::new();
+        header().encode(&mut encoded);
+        encoded.push(0);
+
+        let mut cursor = encoded.as_slice();
+        ZoneHeader::decode(&mut cursor).unwrap();
+
+        assert!(!cursor.is_empty());
+    }
+
+    #[test]
+    fn rlp_decode_rejects_non_list_header() {
+        let mut cursor = [0x80].as_slice();
+
+        assert!(ZoneHeader::decode(&mut cursor).is_err());
+    }
 }

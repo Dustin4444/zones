@@ -943,7 +943,7 @@ It takes a complete witness of zone blocks and their dependencies, executes EVM 
 The witness contains everything needed to re-execute the batch:
 
 - **PublicInputs**: `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
-- **BatchWitness**: the public inputs, the previous batch's block header, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
+- **BatchWitness**: the public inputs, the previous batch's block header, Zone ancestry headers for `BLOCKHASH`, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
 - **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `tempo_header_rlp` (optional), `deposits`, `decryptions`, `enabled_tokens`, `finalize_withdrawal_batch_count` (optional), `finalize_withdrawal_encrypted_senders`, and user `transactions`.
 - **ZoneStateWitness**: the initial zone state root, a deduplicated pool of zone-state trie nodes, and decoded account / storage reads needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
 
@@ -1010,9 +1010,11 @@ flowchart TB
             BSPBOX ~~~ READ
         end
 
+        ZAH["zone_ancestry_headers<br/>ZoneHeader RLP [0..255]"]
         AH["tempo_ancestry_headers<br/>header bytes [0..n]"]
 
         PI ~~~ PH
+        PH ~~~ ZAH
         PH ~~~ ZB
         ZB ~~~ ZSWBOX
         ZSWBOX ~~~ BSPBOX
@@ -1051,6 +1053,12 @@ pub struct BatchWitness {
 
     /// Previous batch's block header (for state-root binding)
     pub prev_block_header: ZoneHeader,
+
+    /// Zone headers used for EVM BLOCKHASH lookups.
+    /// Ordered newest-to-oldest, starting at prev_block_header.number - 1.
+    /// At most 255 entries are permitted because prev_block_header itself is
+    /// the first accessible ancestor for the first block in the batch.
+    pub zone_ancestry_headers: Vec<Vec<u8>>,
 
     /// Zone blocks to execute
     pub zone_blocks: Vec<ZoneBlock>,
@@ -1239,37 +1247,40 @@ The stateless execution function must reject the witness on any failed check, mi
 1. **Bind the previous block header to the public inputs.**
    Require `keccak256(rlp(prev_block_header)) == public_inputs.prev_block_hash`. Require `prev_block_header.state_root == initial_zone_state.state_root`. These checks ensure that the witness starts from the exact predecessor block already committed on Tempo.
 
-2. **Verify and materialize the initial zone state.**
+2. **Verify Zone ancestry for `BLOCKHASH`.**
+   Decode each `zone_ancestry_headers` entry as an exact `ZoneHeader` RLP value. The entries are ordered newest-to-oldest, starting at `prev_block_header.number - 1`; each header hash must equal the child header's `parent_hash`, and block numbers must decrease by one. Including `prev_block_header`, the verified ancestry set must not exceed the EVM `BLOCKHASH` window of 256 ancestor blocks. The resulting `(block_number, block_hash)` map is the only source for `BLOCKHASH` during execution; missing entries fail closed.
+
+3. **Verify and materialize the initial zone state.**
    Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: validate every node in `initial_zone_state.node_pool`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every supplied account-code preimage, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
 
-3. **Verify and index the Tempo proof pool.**
+4. **Verify and index the Tempo proof pool.**
    Validate every node in `tempo_state_proofs.node_pool` once by recomputing `keccak256(rlp(node))` for each node.
 
-4. **For each `zone_blocks[i]`, verify the block witness before executing it.**
+5. **For each `zone_blocks[i]`, verify the block witness before executing it.**
    Require `block.parent_hash == prev_block_hash`. Require `block.number == prev_header.number + 1`. Require `block.timestamp >= prev_header.timestamp`. Require `block.beneficiary == public_inputs.sequencer`. Require `finalize_withdrawal_batch_count` to be absent in intermediate blocks and present in the final block of the batch. If `tempo_header_rlp` is absent, require `deposits`, `decryptions`, and `enabled_tokens` to be empty.
 
-5. **Execute `advanceTempo` if the block imports a Tempo header.**
+6. **Execute `advanceTempo` if the block imports a Tempo header.**
    If `tempo_header_rlp` is present, call `TempoState.finalizeTempo(header)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber`, `tempoBlockHash`, and `tempoStateRoot`, and make the new Tempo root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(tempo_header_rlp)`.
 
-6. **Process deposits and encrypted deposit decryptions inside `advanceTempo`.**
+7. **Process deposits and encrypted deposit decryptions inside `advanceTempo`.**
    Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Process the `deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits, verify the supplied `DecryptionData` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and enqueue a bounce-back when proof verification, AES-GCM authentication, plaintext length validation, or the decrypted-recipient mint fails as specified in [Onchain Decryption Verification](#onchain-decryption-verification).
 
-7. **Execute user transactions in order.**
+8. **Execute user transactions in order.**
    Run each user transaction against the materialized zone state using the current block environment. Whenever execution calls `TempoState.readTempoStorageSlot`, satisfy that call by locating the corresponding `L1StateRead`, proving it against the Tempo root currently bound for this block, and requiring the decoded value to match the witness entry. Any zone-state or Tempo-state access not covered by the witness is an error.
 
-8. **Execute `finalizeWithdrawalBatch` at the end of the final block.**
+9. **Execute `finalizeWithdrawalBatch` at the end of the final block.**
    If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_encrypted_senders)` after all user transactions in that block. The `finalize_withdrawal_encrypted_senders` array must contain exactly one entry for each finalized withdrawal; withdrawals without an authenticated-withdrawal reveal target use empty bytes. This must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. Intermediate blocks must not execute this call.
 
-9. **Compute the resulting block header and carry it forward.**
+10. **Compute the resulting block header and carry it forward.**
     After block execution, compute the `transactionsRoot` and `receiptsRoot` over the full ordered list of transactions and receipts for that block. Construct the simplified `ZoneHeader` from `parent_hash`, `beneficiary`, `state_root`, `transactions_root`, `receipts_root`, `number`, `timestamp`, and `protocol_version`, then compute `next_block_hash = keccak256(rlp(header))`. Set `prev_block_hash = next_block_hash` and `prev_header = header` before moving to the next block.
 
-10. **Extract the final batch commitments from the post-state.**
+11. **Extract the final batch commitments from the post-state.**
     Read the final `ZoneInbox.processedDepositQueueHash`, `ZoneOutbox.lastBatch`, `TempoState.tempoBlockNumber`, and `TempoState.tempoBlockHash` from the executed state.
 
-11. **Verify the batch's final Tempo binding and anchor.**
+12. **Verify the batch's final Tempo binding and anchor.**
     Require `TempoState.tempoBlockNumber == public_inputs.tempo_block_number`. If `anchor_block_number == tempo_block_number`, require `TempoState.tempoBlockHash == anchor_block_hash`. Otherwise, verify the parent-hash chain from `tempo_block_number` to `anchor_block_number` using `tempo_ancestry_headers`, ending at `anchor_block_hash`.
 
-12. **Return the batch outputs.**
+13. **Return the batch outputs.**
     Set `block_transition.prev_block_hash = public_inputs.prev_block_hash` and `block_transition.next_block_hash = prev_block_hash` after the final block. Set `deposit_queue_transition.prev_processed_hash` and `deposit_queue_transition.prev_deposit_number` to the values captured before executing the batch, and set `deposit_queue_transition.next_processed_hash` and `deposit_queue_transition.next_deposit_number` to the final inbox processed hash and processed deposit number. Set `withdrawal_queue_hash` and `last_batch_commitment.withdrawal_batch_index` from the final `ZoneOutbox.lastBatch` state.
 
 ### Tempo State Proofs

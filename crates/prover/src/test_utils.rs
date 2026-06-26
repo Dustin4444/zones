@@ -44,6 +44,7 @@ pub(crate) fn minimal_batch_witness() -> BatchWitness {
             sequencer: beneficiary,
         },
         prev_block_header: header,
+        zone_ancestry_headers: Vec::new(),
         zone_blocks: vec![ZoneBlock {
             number: 2,
             parent_hash: prev_block_hash,
