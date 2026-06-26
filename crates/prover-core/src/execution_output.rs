@@ -5,9 +5,10 @@ use alloy_consensus::{
     proofs::{calculate_receipt_root, calculate_transaction_root},
 };
 use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::block::BlockExecutionResult;
+use alloy_evm::block::{BlockExecutionResult, BlockExecutor, ExecutableTx};
 use alloy_primitives::{Address, B256, U256};
 use revm_database::{BundleState, states::bundle_state::BundleRetention};
+use tempo_primitives::TempoTxEnvelope;
 use tempo_zone_contracts::{BlockTransition, DepositQueueTransition};
 use zone_primitives::{
     ZoneHeader,
@@ -39,6 +40,69 @@ pub trait StatelessZoneBlockExecutor {
         state: &mut ZoneExecutionState,
         input: &ZoneBlockExecutionInput<'_>,
     ) -> Result<BlockExecutionResult<Self::Receipt>, ProverError>;
+}
+
+/// Builds an Alloy/Reth-style block executor for one prepared Zone block.
+///
+/// Implementations own the Tempo/Zone-specific executor construction: EVM
+/// factory, precompile set, block execution context, and any per-block witness
+/// adapters. The returned executor is driven by [`AlloyZoneBlockExecutor`], so
+/// transaction ordering and commitment derivation stay in the prover driver.
+pub trait AlloyZoneBlockExecutorProvider {
+    type Receipt: TxReceipt;
+    type Executor<'a>: BlockExecutor<Transaction = TempoTxEnvelope, Receipt = Self::Receipt>
+    where
+        Self: 'a;
+
+    fn create_executor<'a>(
+        &'a mut self,
+        state: &'a mut ZoneExecutionState,
+        input: &ZoneBlockExecutionInput<'_>,
+    ) -> Result<Self::Executor<'a>, ProverError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AlloyZoneBlockExecutor<P> {
+    provider: P,
+}
+
+impl<P> AlloyZoneBlockExecutor<P> {
+    pub const fn new(provider: P) -> Self {
+        Self { provider }
+    }
+
+    pub const fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    pub const fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
+    }
+
+    pub fn into_provider(self) -> P {
+        self.provider
+    }
+}
+
+impl<P> StatelessZoneBlockExecutor for AlloyZoneBlockExecutor<P>
+where
+    P: AlloyZoneBlockExecutorProvider,
+    for<'a> RecoveredTempoTx: ExecutableTx<P::Executor<'a>>,
+{
+    type Receipt = P::Receipt;
+
+    fn execute_block(
+        &mut self,
+        state: &mut ZoneExecutionState,
+        input: &ZoneBlockExecutionInput<'_>,
+    ) -> Result<BlockExecutionResult<Self::Receipt>, ProverError> {
+        let block_index = input.block_index;
+        let transactions = input.recovered_transactions();
+        let executor = self.provider.create_executor(state, input)?;
+        executor
+            .execute_block(transactions)
+            .map_err(|_| ProverError::ExecutionBlockFailed { index: block_index })
+    }
 }
 
 #[derive(Debug, Clone)]

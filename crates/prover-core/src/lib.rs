@@ -49,10 +49,11 @@ pub use execution_env::{
     tempo_gas_params_with_amsterdam, zone_general_gas_limit, zone_shared_gas_limit,
 };
 pub use execution_output::{
-    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
-    StatelessZoneBlockExecutor, TempoExecutionCommitment, ZoneBlockExecutionArtifacts,
-    ZoneBlockExecutionInput, ZoneExecutableTransaction, batch_output_from_execution,
-    execute_prepared_blocks, execution_commitments_from_post_state, prove_zone_batch_with_executor,
+    AlloyZoneBlockExecutor, AlloyZoneBlockExecutorProvider, ExecutedBatchCommitments,
+    ExecutedZoneBlock, StatelessExecutionOutput, StatelessZoneBlockExecutor,
+    TempoExecutionCommitment, ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput,
+    ZoneExecutableTransaction, batch_output_from_execution, execute_prepared_blocks,
+    execution_commitments_from_post_state, prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -632,6 +633,9 @@ pub enum ProverError {
         expected: usize,
         actual: usize,
     },
+    ExecutionBlockFailed {
+        index: usize,
+    },
     ExecutionBlockParentHashMismatch {
         index: usize,
         expected: B256,
@@ -1076,6 +1080,9 @@ impl fmt::Display for ProverError {
                 f,
                 "executed zone block {block_index} produced {actual} receipts, expected {expected}"
             ),
+            Self::ExecutionBlockFailed { index } => {
+                write!(f, "alloy block execution failed for zone block {index}")
+            }
             Self::ExecutionBlockParentHashMismatch {
                 index,
                 expected,
