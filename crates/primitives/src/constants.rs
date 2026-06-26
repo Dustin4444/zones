@@ -160,4 +160,15 @@ mod tests {
         assert_eq!(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT, U256::from(1));
         assert_eq!(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(2));
     }
+
+    #[test]
+    fn portal_deposit_queue_slot_matches_solidity_storage_layout() {
+        assert_eq!(
+            PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+            B256::from(U256::from(5))
+        );
+
+        let current_deposit_queue_hash_slot: U256 = PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT.into();
+        assert_eq!(current_deposit_queue_hash_slot, U256::from(5));
+    }
 }

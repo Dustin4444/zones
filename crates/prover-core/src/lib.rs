@@ -1961,7 +1961,7 @@ mod tests {
     use super::*;
     use alloc::{format, vec};
     use alloy_consensus::{
-        SignableTransaction, TxEip1559, TxEnvelope, TxReceipt,
+        Header, SignableTransaction, TxEip1559, TxEnvelope, TxReceipt,
         proofs::{calculate_receipt_root, calculate_transaction_root},
     };
     use alloy_eips::eip2718::Encodable2718;
@@ -1991,6 +1991,7 @@ mod tests {
     };
     use tempo_primitives::{TempoReceipt, TempoTxType};
     use tempo_zone_contracts::TempoStateReader;
+    use zone_primitives::constants::{PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, ZONE_CONFIG_ADDRESS};
 
     const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
     const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
@@ -2005,6 +2006,8 @@ mod tests {
     const USER_VALUE_TX_INITIAL_BALANCE: U256 = U256::from_limbs([0, 0, 1, 0]);
     const USER_TIP20_TX_AMOUNT: u64 = 50;
     const USER_TIP20_INITIAL_BALANCE: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
+    const TEST_TEMPO_PORTAL_ADDRESS: Address =
+        address!("0x0000000000000000000000000000000000000000");
 
     fn fixture_cfg_env() -> ZoneCfgEnvWitness {
         ZoneCfgEnvWitness {
@@ -2225,6 +2228,88 @@ mod tests {
         parts
     }
 
+    fn real_tempo_components_with_root(
+        block_number: u64,
+        block_hash: B256,
+        tempo_state_root: B256,
+    ) -> ZoneStateParts {
+        let block_hash_slot = storage_slot_u256(TEMPO_BLOCK_HASH_SLOT);
+        let state_root_slot = storage_slot_u256(TEMPO_STATE_ROOT_SLOT);
+        let packed_slot = storage_slot_u256(TEMPO_PACKED_SLOT);
+        let slots = (0_u64..=9).map(U256::from).collect::<Vec<_>>();
+        let entries = slots
+            .iter()
+            .map(|slot| {
+                let value = if *slot == block_hash_slot {
+                    storage_word(block_hash)
+                } else if *slot == state_root_slot {
+                    storage_word(tempo_state_root)
+                } else if *slot == packed_slot {
+                    U256::from(block_number)
+                } else {
+                    U256::ZERO
+                };
+                (*slot, value)
+            })
+            .collect::<Vec<_>>();
+
+        system_account_components_with_code(
+            TEMPO_STATE_ADDRESS,
+            &entries,
+            &slots,
+            Some(genesis_predeploy_code(TEMPO_STATE_ADDRESS)),
+        )
+    }
+
+    fn real_zone_system_state_parts(
+        block_number: u64,
+        block_hash: B256,
+        tempo_state_root: B256,
+    ) -> ZoneStateParts {
+        let mut parts = real_tempo_components_with_root(block_number, block_hash, tempo_state_root);
+        parts.extend(system_account_components_with_code(
+            ZONE_CONFIG_ADDRESS,
+            &[],
+            &[],
+            Some(genesis_predeploy_code(ZONE_CONFIG_ADDRESS)),
+        ));
+        parts.extend(system_account_components_with_code(
+            ZONE_INBOX_ADDRESS,
+            &[
+                (
+                    ZONE_INBOX_PROCESSED_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x44)),
+                ),
+                (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
+            ],
+            &[
+                ZONE_INBOX_PROCESSED_HASH_SLOT,
+                ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            ],
+            Some(genesis_predeploy_code(ZONE_INBOX_ADDRESS)),
+        ));
+        parts.extend(system_account_components_with_code(
+            ZONE_OUTBOX_ADDRESS,
+            &[
+                (ZONE_OUTBOX_PACKED_SLOT, outbox_packed_slot(4)),
+                (
+                    ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x55)),
+                ),
+                (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(4)),
+            ],
+            &[
+                ZONE_OUTBOX_PACKED_SLOT,
+                ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+                ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+            ],
+            Some(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
+        ));
+        parts
+    }
+
     fn real_outbox_zone_state_parts(witness: &BatchWitness) -> ZoneStateParts {
         real_outbox_zone_state_parts_with_tempo_root(witness, EMPTY_TRIE_ROOT)
     }
@@ -2237,6 +2322,28 @@ mod tests {
             .push(absent_account_read(witness.public_inputs.sequencer));
         set_initial_zone_state(&mut witness, parts.assemble());
         witness
+    }
+
+    fn encode_tempo_header(header: &TempoHeader) -> Bytes {
+        let mut encoded = Vec::new();
+        header.encode(&mut encoded);
+        Bytes::from(encoded)
+    }
+
+    fn tempo_import_header(parent_hash: B256, number: u64, state_root: B256) -> Bytes {
+        encode_tempo_header(&TempoHeader {
+            inner: Header {
+                parent_hash,
+                state_root,
+                transactions_root: EMPTY_TRIE_ROOT,
+                receipts_root: EMPTY_TRIE_ROOT,
+                number,
+                gas_limit: 30_000_000,
+                timestamp: 13,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -2271,6 +2378,75 @@ mod tests {
             output.last_batch_commitment.withdrawal_queue_hash,
             B256::ZERO
         );
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            witness.public_inputs.expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_executes_header_only_advance_tempo_import() {
+        let mut witness = fixture_witness();
+        let initial_tempo_block_number = witness.public_inputs.tempo_block_number;
+        let initial_tempo_block_hash = witness.public_inputs.anchor_block_hash;
+        let imported_tempo_block_number = initial_tempo_block_number + 1;
+        let processed_hash = B256::repeat_byte(0x44);
+        let portal_current_deposit_queue_hash_slot =
+            storage_slot_u256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+        let (imported_tempo_state_root, l1_proof) = l1_state_proof(
+            0,
+            imported_tempo_block_number,
+            TEST_TEMPO_PORTAL_ADDRESS,
+            portal_current_deposit_queue_hash_slot,
+            storage_word(processed_hash),
+        );
+        witness.tempo_state_proofs = l1_proof;
+
+        let tempo_header_rlp = tempo_import_header(
+            initial_tempo_block_hash,
+            imported_tempo_block_number,
+            imported_tempo_state_root,
+        );
+        let imported_tempo_block_hash = keccak256(tempo_header_rlp.as_ref());
+        witness.zone_blocks[0].tempo_header_rlp = Some(tempo_header_rlp);
+        witness.public_inputs.tempo_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_hash = imported_tempo_block_hash;
+
+        let mut parts = real_zone_system_state_parts(
+            initial_tempo_block_number,
+            initial_tempo_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        parts.account_reads.push(absent_account_read(
+            tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS,
+        ));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        let output = prove_zone_batch(witness.clone()).unwrap();
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.prevProcessedHash,
+            processed_hash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.nextProcessedHash,
+            processed_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
+        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
         assert_eq!(
             output.last_batch_commitment.withdrawal_batch_index,
             witness.public_inputs.expected_withdrawal_batch_index
@@ -3576,8 +3752,24 @@ mod tests {
         slot: U256,
         value: U256,
     ) -> (B256, BatchStateProof) {
-        let (account_storage_root, mut node_pool, storage_proof_node_hashes) =
-            storage_trie_with_proof(slot, value, slot);
+        l1_state_proof_with_entries(
+            zone_block_index,
+            tempo_block_number,
+            account,
+            &[(slot, value)],
+            &[slot],
+        )
+    }
+
+    fn l1_state_proof_with_entries(
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        account: Address,
+        entries: &[(U256, U256)],
+        proof_slots: &[U256],
+    ) -> (B256, BatchStateProof) {
+        let (account_storage_root, mut node_pool, mut storage_proofs) =
+            storage_trie_with_entries_and_proofs(entries, proof_slots);
         let trie_account = TrieAccount {
             nonce: 0,
             balance: U256::ZERO,
@@ -3595,19 +3787,28 @@ mod tests {
             state_root,
             BatchStateProof {
                 node_pool,
-                reads: vec![L1StateRead {
-                    zone_block_index,
-                    tempo_block_number,
-                    account,
-                    account_nonce: trie_account.nonce,
-                    account_balance: trie_account.balance,
-                    account_storage_root,
-                    account_code_hash: trie_account.code_hash,
-                    account_proof_node_hashes,
-                    slot,
-                    value,
-                    storage_proof_node_hashes,
-                }],
+                reads: proof_slots
+                    .iter()
+                    .copied()
+                    .map(|slot| L1StateRead {
+                        zone_block_index,
+                        tempo_block_number,
+                        account,
+                        account_nonce: trie_account.nonce,
+                        account_balance: trie_account.balance,
+                        account_storage_root,
+                        account_code_hash: trie_account.code_hash,
+                        account_proof_node_hashes: account_proof_node_hashes.clone(),
+                        slot,
+                        value: entries
+                            .iter()
+                            .find(|(entry_slot, _)| *entry_slot == slot)
+                            .map_or(U256::ZERO, |(_, value)| *value),
+                        storage_proof_node_hashes: storage_proofs
+                            .remove(&slot)
+                            .expect("L1 storage proof was retained"),
+                    })
+                    .collect(),
             },
         )
     }

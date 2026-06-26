@@ -9,6 +9,7 @@ use serde_json::Value;
 const TEMPO_STATE_ARTIFACT: &str = "../../specs/ref-impls/out/TempoState.sol/TempoState.json";
 const ZONE_INBOX_ARTIFACT: &str = "../../specs/ref-impls/out/ZoneInbox.sol/ZoneInbox.json";
 const ZONE_OUTBOX_ARTIFACT: &str = "../../specs/ref-impls/out/ZoneOutbox.sol/ZoneOutbox.json";
+const ZONE_PORTAL_ARTIFACT: &str = "../../specs/ref-impls/out/ZonePortal.sol/ZonePortal.json";
 
 fn main() -> io::Result<()> {
     let manifest_dir = path_from_env("CARGO_MANIFEST_DIR")?;
@@ -16,6 +17,7 @@ fn main() -> io::Result<()> {
     let tempo_state_artifact_path = manifest_dir.join(TEMPO_STATE_ARTIFACT);
     let zone_inbox_artifact_path = manifest_dir.join(ZONE_INBOX_ARTIFACT);
     let zone_outbox_artifact_path = manifest_dir.join(ZONE_OUTBOX_ARTIFACT);
+    let zone_portal_artifact_path = manifest_dir.join(ZONE_PORTAL_ARTIFACT);
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -29,10 +31,15 @@ fn main() -> io::Result<()> {
         "cargo:rerun-if-changed={}",
         zone_outbox_artifact_path.display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        zone_portal_artifact_path.display()
+    );
 
     let tempo_state_artifact = load_json(&tempo_state_artifact_path)?;
     let zone_inbox_artifact = load_json(&zone_inbox_artifact_path)?;
     let zone_outbox_artifact = load_json(&zone_outbox_artifact_path)?;
+    let zone_portal_artifact = load_json(&zone_portal_artifact_path)?;
     let tempo_block_hash_slot =
         storage_key(&tempo_state_artifact, "tempoBlockHash", 0, "bytes32", "32")?;
     let tempo_state_root_slot =
@@ -69,6 +76,13 @@ fn main() -> io::Result<()> {
         "uint64",
         "8",
     )?;
+    let portal_current_deposit_queue_hash_slot = storage_key(
+        &zone_portal_artifact,
+        "currentDepositQueueHash",
+        0,
+        "bytes32",
+        "32",
+    )?;
 
     let generated = format!(
         "\
@@ -99,6 +113,10 @@ pub const ZONE_OUTBOX_LAST_BATCH_HASH_SLOT: ::alloy_primitives::U256 =
 /// ZoneOutbox storage slot for `_lastBatch.withdrawalBatchIndex`, generated from the Foundry storage layout.
 pub const ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT: ::alloy_primitives::U256 =
     {};
+
+/// ZonePortal storage slot for `currentDepositQueueHash`, generated from the Foundry storage layout.
+pub const PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
 ",
         b256_literal(&tempo_block_hash_slot),
         b256_literal(&tempo_state_root_slot),
@@ -107,6 +125,7 @@ pub const ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT: ::alloy_primitives::U256 =
         u256_literal(inbox_processed_number_slot),
         u256_literal(outbox_last_batch_hash_slot),
         u256_literal(outbox_last_batch_index_slot),
+        b256_literal(&portal_current_deposit_queue_hash_slot),
     );
 
     fs::write(out_dir.join("tempo_state_slots.rs"), generated)
