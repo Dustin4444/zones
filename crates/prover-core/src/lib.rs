@@ -42,13 +42,14 @@ mod trie;
 mod witness_db;
 
 pub use execution_env::{
-    BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneCfgEnv, ZoneEvmEnv,
+    BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneCfgEnv, ZoneCfgEnvConfig,
+    ZoneEvmEnv, tempo_gas_params, tempo_gas_params_with_amsterdam,
 };
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
     StatelessZoneBlockExecutor, StatelessZoneExecutor, TempoExecutionCommitment,
-    ZoneBlockExecutionInput, batch_output_from_execution, execute_prepared_blocks,
-    execution_commitments_from_post_state, prove_zone_batch_with_executor,
+    ZoneBlockExecutionInput, ZoneExecutableTransaction, batch_output_from_execution,
+    execute_prepared_blocks, execution_commitments_from_post_state, prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -56,6 +57,7 @@ pub use execution_plan::{
 };
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use post_state::ExecutionPostState;
+pub use tempo_chainspec::hardfork::TempoHardfork;
 pub use tempo_reader::{
     TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS, TempoStateReaderCallResult,
     WitnessTempoStateReader, tempo_state_reader_gas,
@@ -102,6 +104,7 @@ pub struct ZoneBlock {
     pub timestamp: u64,
     pub beneficiary: Address,
     pub protocol_version: u64,
+    pub cfg_env: ZoneCfgEnvWitness,
     pub block_env: ZoneBlockEnvWitness,
     pub tempo_header_rlp: Option<Bytes>,
     pub deposits: Vec<QueuedDeposit>,
@@ -112,6 +115,25 @@ pub struct ZoneBlock {
     /// Raw transaction bytes. Full EVM re-execution is not yet implemented; any
     /// non-empty transaction list is rejected by the current prover core.
     pub transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ZoneCfgEnvWitness {
+    pub chain_id: u64,
+    pub spec: TempoHardfork,
+    pub enable_amsterdam_eip8037: bool,
+}
+
+impl ZoneCfgEnvWitness {
+    pub fn config(self) -> ZoneCfgEnvConfig {
+        ZoneCfgEnvConfig {
+            chain_id: self.chain_id,
+            spec: self.spec,
+            enable_amsterdam_eip8037: self.enable_amsterdam_eip8037,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,13 +294,18 @@ impl PreparedStatelessExecution {
             },
         )?;
         let block_env = ZoneBlockEnv::from_prepared_block(block, block.block_env);
-        let transactions = &self.execution_plan.blocks[block_index].transactions;
+        let evm_env = ZoneEvmEnv::new(block.cfg_env.cfg_env(), block_env);
+        let transactions = self.execution_plan.blocks[block_index]
+            .transactions
+            .iter()
+            .map(ZoneExecutableTransaction::from_planned)
+            .collect();
         let tempo_state_reader = self.tempo_state_reader(block_index)?;
 
         Ok(ZoneBlockExecutionInput {
             block_index,
             block,
-            block_env,
+            evm_env,
             transactions,
             tempo_state_reader,
         })
@@ -316,6 +343,7 @@ pub struct PreparedZoneBlock {
     pub timestamp: u64,
     pub beneficiary: Address,
     pub protocol_version: u64,
+    pub cfg_env: ZoneCfgEnvConfig,
     pub block_env: ZoneBlockEnvConfig,
 }
 
@@ -1137,6 +1165,7 @@ fn prepared_zone_blocks(blocks: &[ZoneBlock]) -> Vec<PreparedZoneBlock> {
             timestamp: block.timestamp,
             beneficiary: block.beneficiary,
             protocol_version: block.protocol_version,
+            cfg_env: block.cfg_env.config(),
             block_env: block.block_env.config(),
         })
         .collect()
@@ -1784,7 +1813,16 @@ mod tests {
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
     use revm_database::{BundleState, primitives::StorageKeyMap};
     use revm_database_interface::Database;
+    use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_zone_contracts::TempoStateReader;
+
+    fn fixture_cfg_env() -> ZoneCfgEnvWitness {
+        ZoneCfgEnvWitness {
+            chain_id: 421_700_001,
+            spec: TempoHardfork::T1,
+            enable_amsterdam_eip8037: false,
+        }
+    }
 
     fn fixture_block_env() -> ZoneBlockEnvWitness {
         ZoneBlockEnvWitness {
@@ -1829,6 +1867,7 @@ mod tests {
                 timestamp: 12,
                 beneficiary: address!("0x0000000000000000000000000000000000000001"),
                 protocol_version: 1,
+                cfg_env: fixture_cfg_env(),
                 block_env: fixture_block_env(),
                 tempo_header_rlp: None,
                 deposits: Vec::new(),
@@ -2872,6 +2911,7 @@ mod tests {
             timestamp: 13,
             beneficiary: witness.public_inputs.sequencer,
             protocol_version: 1,
+            cfg_env: fixture_cfg_env(),
             block_env: fixture_block_env(),
             tempo_header_rlp: None,
             deposits: Vec::new(),
@@ -3004,9 +3044,11 @@ mod tests {
 
         assert_eq!(input.block_index, 0);
         assert_eq!(input.block.number, 8);
-        assert_eq!(input.block_env.inner.gas_limit, 30_000_000);
-        assert_eq!(input.block_env.inner.basefee, 0);
-        assert_eq!(input.block_env.timestamp_millis_part, 0);
+        assert_eq!(input.evm_env.cfg_env.chain_id, 421_700_001);
+        assert_eq!(input.evm_env.cfg_env.spec, TempoHardfork::T1);
+        assert_eq!(input.evm_env.block_env.inner.gas_limit, 30_000_000);
+        assert_eq!(input.evm_env.block_env.inner.basefee, 0);
+        assert_eq!(input.evm_env.block_env.timestamp_millis_part, 0);
         assert_eq!(input.transactions.len(), 1);
         assert_eq!(
             input.transactions[0].kind,

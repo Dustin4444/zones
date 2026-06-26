@@ -183,10 +183,11 @@ mod tests {
     use alloy_sol_types::SolCall;
     use const_hex::FromHex;
     use revm::context::Transaction;
+    use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_zone_contracts::EnabledToken;
     use zone_primitives::constants::ZONE_INBOX_ADDRESS;
 
-    use crate::ZoneBlockEnvWitness;
+    use crate::{ZoneBlockEnvWitness, ZoneCfgEnvWitness};
 
     use super::*;
 
@@ -208,6 +209,14 @@ mod tests {
         }
     }
 
+    fn cfg_env() -> ZoneCfgEnvWitness {
+        ZoneCfgEnvWitness {
+            chain_id: 421_700_001,
+            spec: TempoHardfork::T1,
+            enable_amsterdam_eip8037: false,
+        }
+    }
+
     fn sample_block() -> ZoneBlock {
         ZoneBlock {
             number: 42,
@@ -215,6 +224,7 @@ mod tests {
             timestamp: 1,
             beneficiary: Address::ZERO,
             protocol_version: 0,
+            cfg_env: cfg_env(),
             block_env: block_env(),
             tempo_header_rlp: Some(Bytes::from_static(&[0xc0])),
             deposits: vec![],

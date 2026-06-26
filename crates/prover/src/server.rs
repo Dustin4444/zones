@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_connection_returns_error_when_attestation_disabled() {
+    async fn server_connection_fails_closed_until_full_prover_exists() {
         let server = test_server();
         let request = proof_request(server.signer());
         let wire_request = EnclaveRequest::Prove(Box::new(request.clone()));
@@ -346,7 +346,7 @@ mod tests {
             let EnclaveResponse::Error { message } = response else {
                 panic!("expected error response");
             };
-            assert!(message.contains("attestation provider is disabled"));
+            assert!(message.contains("full stateless zone execution is not implemented"));
         };
 
         tokio::join!(server_task, client_task);

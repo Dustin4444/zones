@@ -1,6 +1,11 @@
 use alloy_evm::{EvmEnv, env::BlockEnvironment};
 use alloy_primitives::{Address, B256, U256};
-use revm::context::{Block, BlockEnv};
+use revm::{
+    context::{Block, BlockEnv},
+    context_interface::cfg::{GasId, GasParams},
+    primitives::OnceLock,
+};
+use tempo_chainspec::constants::gas::{SSTORE_CREATE_COST, SSTORE_SET_COST};
 use tempo_chainspec::hardfork::TempoHardfork;
 
 use crate::PreparedZoneBlock;
@@ -16,6 +21,31 @@ pub type ZoneCfgEnv = revm::context::CfgEnv<TempoHardfork>;
 
 /// Complete EVM environment shape expected by a revm-backed Zone executor.
 pub type ZoneEvmEnv = EvmEnv<TempoHardfork, ZoneBlockEnv>;
+
+/// Explicit EVM cfg inputs for Zone execution.
+///
+/// These values affect transaction validity and gas accounting, so they must be
+/// proved or otherwise derived by the witness producer instead of defaulted by
+/// prover-core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ZoneCfgEnvConfig {
+    pub chain_id: u64,
+    pub spec: TempoHardfork,
+    pub enable_amsterdam_eip8037: bool,
+}
+
+impl ZoneCfgEnvConfig {
+    pub fn cfg_env(self) -> ZoneCfgEnv {
+        let mut cfg = ZoneCfgEnv::new_with_spec_and_gas_params(
+            self.spec,
+            tempo_gas_params_with_amsterdam(self.spec, self.enable_amsterdam_eip8037),
+        );
+        cfg.chain_id = self.chain_id;
+        cfg.tx_gas_limit_cap = self.spec.tx_gas_limit_cap();
+        cfg.enable_amsterdam_eip8037 = self.enable_amsterdam_eip8037;
+        cfg
+    }
+}
 
 /// Explicit EVM block environment inputs for Zone execution.
 ///
@@ -123,10 +153,124 @@ impl BlockEnvironment for ZoneBlockEnv {
     }
 }
 
+// Forked from tempo-revm::gas_params so prover-core can stay no_std while
+// using Tempo's gas schedule instead of generic Ethereum defaults.
+const CONTRACT_CREATE_COST: u64 = 500_000;
+const NEW_ACCOUNT_COST: u64 = 250_000;
+const CODE_DEPOSIT_COST_T1: u64 = 1_000;
+const EIP7702_PER_EMPTY_ACCOUNT_COST_T1: u64 = 12_500;
+
+const T4_SSTORE_SET_REGULAR: u64 = 20_000;
+const T4_NEW_ACCOUNT_REGULAR: u64 = 25_000;
+const T4_CREATE_REGULAR: u64 = 32_000;
+const T4_CODE_DEPOSIT_REGULAR: u64 = 200;
+
+const T4_SSTORE_SET_STATE: u64 = SSTORE_CREATE_COST - T4_SSTORE_SET_REGULAR;
+const T4_NEW_ACCOUNT_STATE: u64 = NEW_ACCOUNT_COST - T4_NEW_ACCOUNT_REGULAR;
+const T4_CREATE_STATE: u64 = CONTRACT_CREATE_COST - T4_CREATE_REGULAR;
+const T4_CODE_DEPOSIT_STATE: u64 = 2_300;
+const T4_SSTORE_SET_REFUND: u64 = T4_SSTORE_SET_STATE + 17_800;
+
+#[inline]
+pub fn tempo_gas_params_with_amsterdam(
+    spec: TempoHardfork,
+    amsterdam_eip8037_enabled: bool,
+) -> GasParams {
+    debug_assert!(
+        !(spec.is_t7() && amsterdam_eip8037_enabled),
+        "TODO(TIP-1016): generate combined TIP-1060 + EIP-8037 gas params before enabling both"
+    );
+
+    if amsterdam_eip8037_enabled {
+        static TABLE: OnceLock<GasParams> = OnceLock::new();
+        return TABLE.get_or_init(amsterdam_gas_params).clone();
+    }
+
+    if spec.is_t7() {
+        static TABLE: OnceLock<GasParams> = OnceLock::new();
+        return TABLE.get_or_init(t7_gas_params).clone();
+    }
+
+    if spec.is_t1() {
+        static TABLE: OnceLock<GasParams> = OnceLock::new();
+        return TABLE.get_or_init(t1_gas_params).clone();
+    }
+
+    GasParams::new_spec(spec.into())
+}
+
+#[inline]
+pub fn tempo_gas_params(spec: TempoHardfork) -> GasParams {
+    tempo_gas_params_with_amsterdam(spec, false)
+}
+
+fn t7_gas_params() -> GasParams {
+    let mut gas_params = t1_gas_params();
+    gas_params.override_gas([
+        (GasId::sstore_set_without_load_cost(), SSTORE_SET_COST),
+        (GasId::sstore_set_refund(), SSTORE_SET_COST),
+        (GasId::sstore_clearing_slot_refund(), 0),
+    ]);
+    gas_params
+}
+
+fn amsterdam_gas_params() -> GasParams {
+    let mut gas_params = GasParams::new_spec(TempoHardfork::T4.into());
+    gas_params.override_gas([
+        (GasId::sstore_set_without_load_cost(), T4_SSTORE_SET_REGULAR),
+        (GasId::sstore_set_state_gas(), T4_SSTORE_SET_STATE),
+        (GasId::sstore_set_refund(), T4_SSTORE_SET_REFUND),
+        (GasId::tx_create_cost(), T4_CREATE_REGULAR),
+        (GasId::create(), T4_CREATE_REGULAR),
+        (GasId::create_state_gas(), T4_CREATE_STATE),
+        (GasId::new_account_cost(), T4_NEW_ACCOUNT_REGULAR),
+        (GasId::new_account_state_gas(), T4_NEW_ACCOUNT_STATE),
+        (
+            GasId::new_account_cost_for_selfdestruct(),
+            T4_NEW_ACCOUNT_REGULAR,
+        ),
+        (GasId::code_deposit_cost(), T4_CODE_DEPOSIT_REGULAR),
+        (GasId::code_deposit_state_gas(), T4_CODE_DEPOSIT_STATE),
+        (
+            GasId::tx_eip7702_per_empty_account_cost(),
+            T4_NEW_ACCOUNT_REGULAR,
+        ),
+        (GasId::tx_eip7702_auth_refund(), 0),
+        (GasId::tx_eip7702_state_gas_bytecode(), 0),
+    ]);
+    gas_params
+}
+
+fn t1_gas_params() -> GasParams {
+    let mut gas_params = GasParams::new_spec(TempoHardfork::T1.into());
+    gas_params.override_gas([
+        (GasId::sstore_set_without_load_cost(), SSTORE_CREATE_COST),
+        (GasId::tx_create_cost(), CONTRACT_CREATE_COST),
+        (GasId::create(), CONTRACT_CREATE_COST),
+        (GasId::new_account_cost(), NEW_ACCOUNT_COST),
+        (GasId::new_account_cost_for_selfdestruct(), NEW_ACCOUNT_COST),
+        (GasId::code_deposit_cost(), CODE_DEPOSIT_COST_T1),
+        (
+            GasId::tx_eip7702_per_empty_account_cost(),
+            EIP7702_PER_EMPTY_ACCOUNT_COST_T1,
+        ),
+        (GasId::tx_eip7702_auth_refund(), 0),
+    ]);
+    gas_params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
+
+    fn cfg_config() -> ZoneCfgEnvConfig {
+        ZoneCfgEnvConfig {
+            chain_id: 421_700_001,
+            spec: TempoHardfork::T1,
+            enable_amsterdam_eip8037: false,
+        }
+    }
 
     fn prepared_block() -> PreparedZoneBlock {
         PreparedZoneBlock {
@@ -135,6 +279,7 @@ mod tests {
             timestamp: 123,
             beneficiary: address!("0x0000000000000000000000000000000000001000"),
             protocol_version: 1,
+            cfg_env: cfg_config(),
             block_env: env_config(),
         }
     }
@@ -207,12 +352,42 @@ mod tests {
 
     #[test]
     fn zone_evm_env_pairs_tempo_cfg_with_zone_block_env() {
-        let cfg = ZoneCfgEnv::new_with_spec(TempoHardfork::T1);
+        let cfg = cfg_config().cfg_env();
         let block_env = ZoneBlockEnv::from_prepared_block(&prepared_block(), env_config());
 
         let env = ZoneEvmEnv::new(cfg, block_env.clone());
 
         assert_eq!(env.cfg_env.spec, TempoHardfork::T1);
+        assert_eq!(env.cfg_env.chain_id, 421_700_001);
+        assert_eq!(
+            env.cfg_env.tx_gas_limit_cap,
+            TempoHardfork::T1.tx_gas_limit_cap()
+        );
         assert_eq!(env.block_env, block_env);
+    }
+
+    #[test]
+    fn tempo_cfg_env_uses_explicit_tip_1016_flag() {
+        let mut config = cfg_config();
+        config.spec = TempoHardfork::T4;
+        config.enable_amsterdam_eip8037 = false;
+        assert!(!config.cfg_env().enable_amsterdam_eip8037);
+
+        config.enable_amsterdam_eip8037 = true;
+        assert!(config.cfg_env().enable_amsterdam_eip8037);
+    }
+
+    #[test]
+    fn tempo_gas_params_apply_tip_1000_overrides() {
+        let gas_params = tempo_gas_params(TempoHardfork::T1);
+
+        assert_eq!(
+            gas_params.get(GasId::sstore_set_without_load_cost()),
+            SSTORE_CREATE_COST
+        );
+        assert_eq!(
+            gas_params.get(GasId::tx_create_cost()),
+            CONTRACT_CREATE_COST
+        );
     }
 }

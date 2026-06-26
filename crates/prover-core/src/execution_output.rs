@@ -13,8 +13,9 @@ use zone_primitives::{
 
 use crate::{
     BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
-    PlannedZoneTransaction, PreparedStatelessExecution, PreparedZoneBlock, ProverError,
-    WitnessTempoStateReader, ZoneBlockEnv,
+    PlannedZoneTransaction, PlannedZoneTransactionKind, PreparedStatelessExecution,
+    PreparedZoneBlock, ProverError, RecoveredTempoTx, WitnessTempoStateReader, ZoneEvmEnv,
+    ZoneTxEnv,
 };
 
 pub trait StatelessZoneExecutor {
@@ -37,9 +38,26 @@ pub trait StatelessZoneBlockExecutor {
 pub struct ZoneBlockExecutionInput<'a> {
     pub block_index: usize,
     pub block: &'a PreparedZoneBlock,
-    pub block_env: ZoneBlockEnv,
-    pub transactions: &'a [PlannedZoneTransaction],
+    pub evm_env: ZoneEvmEnv,
+    pub transactions: Vec<ZoneExecutableTransaction<'a>>,
     pub tempo_state_reader: WitnessTempoStateReader<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ZoneExecutableTransaction<'a> {
+    pub kind: PlannedZoneTransactionKind,
+    pub tx_env: ZoneTxEnv,
+    pub recovered: &'a RecoveredTempoTx,
+}
+
+impl<'a> ZoneExecutableTransaction<'a> {
+    pub fn from_planned(planned: &'a PlannedZoneTransaction) -> Self {
+        Self {
+            kind: planned.kind,
+            tx_env: planned.tx_env(),
+            recovered: &planned.tx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

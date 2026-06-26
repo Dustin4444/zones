@@ -52,6 +52,7 @@ std = [
 serde = [
     "dep:serde",
     "alloy-primitives/serde",
+    "tempo-chainspec/serde",
     "tempo-zone-contracts/serde",
     "zone-primitives/serde",
 ]

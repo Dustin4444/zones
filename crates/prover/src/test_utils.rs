@@ -13,8 +13,8 @@ use zone_primitives::{
 };
 
 use crate::types::{
-    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, ZoneAccountRead, ZoneBlock,
-    ZoneBlockEnvWitness, ZoneStateWitness, ZoneStorageRead,
+    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, TempoHardfork, ZoneAccountRead,
+    ZoneBlock, ZoneBlockEnvWitness, ZoneCfgEnvWitness, ZoneStateWitness, ZoneStorageRead,
 };
 
 pub(crate) fn minimal_batch_witness() -> BatchWitness {
@@ -51,6 +51,11 @@ pub(crate) fn minimal_batch_witness() -> BatchWitness {
             timestamp: 2,
             beneficiary,
             protocol_version: 1,
+            cfg_env: ZoneCfgEnvWitness {
+                chain_id: 421_700_001,
+                spec: TempoHardfork::T1,
+                enable_amsterdam_eip8037: false,
+            },
             block_env: ZoneBlockEnvWitness {
                 gas_limit: 30_000_000,
                 basefee: 0,
