@@ -1,0 +1,53 @@
+[package]
+name = "zone-prover"
+description = "Zone batch prover types, Nitro enclave protocol, and host client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+nsm-driver = ["aws-nitro-enclaves-nsm-api/nix"]
+
+[dependencies]
+# zones
+zone-prover-core = { workspace = true, features = ["std", "serde"] }
+tempo-zone-contracts = { workspace = true, features = ["std", "serde"] }
+zone-primitives = { workspace = true, features = ["std", "serde"] }
+
+# alloy
+alloy-primitives = { workspace = true, features = ["getrandom", "serde", "std"] }
+alloy-rlp = { workspace = true, features = ["std"] }
+alloy-sol-types = { workspace = true, features = ["std"] }
+
+# misc
+aws-nitro-enclaves-nsm-api.workspace = true
+clap.workspace = true
+eyre.workspace = true
+nitro_attest.workspace = true
+secp256k1.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock.workspace = true
+
+[dev-dependencies]
+alloy-trie = { workspace = true, features = ["ethereum"] }
+
+[[bin]]
+name = "zone-prover-enclave"
+path = "src/bin/enclave.rs"
+
+[[bin]]
+name = "zone-prover-host"
+path = "src/bin/host.rs"

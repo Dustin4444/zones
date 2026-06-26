@@ -95,12 +95,17 @@ impl Default for WsSession {
 
 impl WsSession {
     fn total_subscription_count(&self) -> usize {
-        self.pending_subscription_count + self.subscriptions.len()
+        self.pending_subscription_count
+            .checked_add(self.subscriptions.len())
+            .expect("websocket subscription count exceeds usize")
     }
 
     fn next_subscription_id(&mut self) -> FilterId {
         let id = FilterId::from(format!("0x{:x}", self.next_subscription_id));
-        self.next_subscription_id += 1;
+        self.next_subscription_id = self
+            .next_subscription_id
+            .checked_add(1)
+            .expect("websocket subscription id overflow");
         id
     }
 
@@ -111,7 +116,10 @@ impl WsSession {
             )));
         }
 
-        self.pending_subscription_count += 1;
+        self.pending_subscription_count = self
+            .pending_subscription_count
+            .checked_add(1)
+            .expect("websocket pending subscription count overflow");
         Ok(self.next_subscription_id())
     }
 
@@ -507,8 +515,9 @@ fn activate_pending_subscriptions(
 /// clock precision (not truncated to whole seconds) so the session closes as
 /// close as possible to the exact `expires_at` boundary.
 fn duration_until_unix_timestamp(timestamp: u64) -> Duration {
-    let deadline = UNIX_EPOCH + Duration::from_secs(timestamp);
-    deadline
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(timestamp))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
         .duration_since(SystemTime::now())
         .unwrap_or_default()
 }

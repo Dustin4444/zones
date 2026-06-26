@@ -80,7 +80,10 @@ impl ZoneProvider {
     pub fn provider(&self) -> DynProvider<TempoNetwork> {
         let now = now_secs();
         let mut state = self.state.lock();
-        if now + REFRESH_BUFFER_SECS < state.expires_at {
+        if now
+            .checked_add(REFRESH_BUFFER_SECS)
+            .is_some_and(|refresh_at| refresh_at < state.expires_at)
+        {
             return state.provider.clone();
         }
         self.metrics.token_refresh_attempts_total.increment(1);
@@ -105,7 +108,9 @@ fn build_provider_with_token(
     config: &ZoneProviderConfig,
 ) -> eyre::Result<(DynProvider<TempoNetwork>, u64)> {
     let now = now_secs();
-    let expires_at = now + config.token_ttl.as_secs();
+    let expires_at = now
+        .checked_add(config.token_ttl.as_secs())
+        .ok_or_else(|| eyre::eyre!("zone auth token expiry exceeds u64"))?;
 
     let (fields, digest) = build_token_fields(config.zone_id, config.chain_id, now, expires_at);
 
@@ -115,10 +120,14 @@ fn build_provider_with_token(
         .map_err(|e| eyre::eyre!("failed to sign zone auth token: {e}"))?;
 
     // Build blob: <65-byte sig><29-byte fields>
-    let mut blob = Vec::with_capacity(65 + fields.len());
+    let mut blob = Vec::with_capacity(
+        65usize
+            .checked_add(fields.len())
+            .expect("auth token blob capacity exceeds usize"),
+    );
     blob.extend_from_slice(&sig.r().to_be_bytes::<32>());
     blob.extend_from_slice(&sig.s().to_be_bytes::<32>());
-    blob.push(sig.v() as u8);
+    blob.push(u8::from(sig.v()));
     blob.extend_from_slice(&fields);
 
     let mut headers = reqwest::header::HeaderMap::new();

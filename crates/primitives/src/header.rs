@@ -38,25 +38,25 @@ impl alloy_rlp::Encodable for ZoneHeader {
     }
 
     fn length(&self) -> usize {
-        alloy_rlp::Header {
+        let header_len = alloy_rlp::Header {
             list: true,
             payload_length: self.fields_len(),
         }
-        .length()
-            + self.fields_len()
+        .length();
+        checked_len_add(header_len, self.fields_len())
     }
 }
 
 impl ZoneHeader {
     fn fields_len(&self) -> usize {
-        self.parent_hash.length()
-            + self.beneficiary.length()
-            + self.state_root.length()
-            + self.transactions_root.length()
-            + self.receipts_root.length()
-            + self.number.length()
-            + self.timestamp.length()
-            + self.protocol_version.length()
+        let len = self.parent_hash.length();
+        let len = checked_len_add(len, self.beneficiary.length());
+        let len = checked_len_add(len, self.state_root.length());
+        let len = checked_len_add(len, self.transactions_root.length());
+        let len = checked_len_add(len, self.receipts_root.length());
+        let len = checked_len_add(len, self.number.length());
+        let len = checked_len_add(len, self.timestamp.length());
+        checked_len_add(len, self.protocol_version.length())
     }
 
     /// Compute the block hash: `keccak256(rlp_encode(self))`.
@@ -66,4 +66,9 @@ impl ZoneHeader {
         self.encode(&mut buf);
         alloy_primitives::keccak256(&buf)
     }
+}
+
+fn checked_len_add(left: usize, right: usize) -> usize {
+    left.checked_add(right)
+        .expect("zone header RLP length exceeds usize")
 }

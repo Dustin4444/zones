@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.96-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+    build-essential \
+    clang \
+    libclang-dev \
+    mold \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked,id=cargo-git \
+    RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
+    cargo build --release -p zone-prover --bin zone-prover-enclave --features nsm-driver
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /data
+
+COPY --from=builder /app/target/release/zone-prover-enclave /usr/local/bin/zone-prover-enclave
+
+ENTRYPOINT ["/usr/local/bin/zone-prover-enclave"]
+CMD ["--vsock-port", "5005", "--attestation-provider", "nsm"]

@@ -1,6 +1,6 @@
 //! Zone protocol constants shared between host and guest.
 
-use alloy_primitives::{Address, B256, U256, address};
+use alloy_primitives::{Address, B256, address};
 
 /// Sentinel value for empty withdrawal queue slots.
 pub const EMPTY_SENTINEL: B256 = B256::new([0xff; 32]);
@@ -14,16 +14,7 @@ pub const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
 /// TempoState predeploy address on Zone L2.
 pub const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 
-/// TempoState storage slot for `tempoBlockHash` (slot 0).
-pub const TEMPO_BLOCK_HASH_SLOT: B256 = B256::ZERO;
-
-/// TempoState storage slot for packed
-/// `(tempoBlockNumber, tempoGasLimit, tempoGasUsed, tempoTimestamp)` (slot 7).
-pub const TEMPO_PACKED_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 7;
-    B256::new(bytes)
-};
+include!(concat!(env!("OUT_DIR"), "/tempo_state_slots.rs"));
 
 /// ZoneInbox predeploy address on Zone L2.
 pub const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
@@ -70,30 +61,6 @@ pub const PORTAL_PENDING_SEQUENCER_SLOT: B256 = {
     let mut bytes = [0u8; 32];
     bytes[31] = 2;
     B256::new(bytes)
-};
-
-// ---------------------------------------------------------------------------
-//  Storage slot constants for the proof system
-// ---------------------------------------------------------------------------
-
-/// ZoneInbox storage slot 0: `processedDepositQueueHash` (bytes32).
-pub const ZONE_INBOX_PROCESSED_HASH_SLOT: U256 = U256::ZERO;
-
-/// ZoneOutbox storage slot 1: `_lastBatch.withdrawalQueueHash` (bytes32).
-///
-/// Slot 0 is packed `(tempoGasRate, nextWithdrawalIndex, withdrawalBatchIndex)`.
-/// The `_lastBatch` struct starts at slot 1 with `withdrawalQueueHash` occupying the full slot.
-pub const ZONE_OUTBOX_LAST_BATCH_HASH_SLOT: U256 = {
-    let mut le = [0u8; 32];
-    le[0] = 1;
-    U256::from_le_bytes(le)
-};
-
-/// ZoneOutbox storage slot 2: `_lastBatch.withdrawalBatchIndex` (uint64, lower 8 bytes).
-pub const ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT: U256 = {
-    let mut le = [0u8; 32];
-    le[0] = 2;
-    U256::from_le_bytes(le)
 };
 
 /// Base offset for deriving **mainnet** zone chain IDs.
@@ -149,14 +116,48 @@ pub const ZONE_CHAIN_ID_RANGE_TESTNET: u64 = 723_173_648;
 ///
 /// Wraps via modulo so the result always falls in
 /// `[ZONE_CHAIN_ID_BASE, ZONE_CHAIN_ID_BASE + ZONE_CHAIN_ID_RANGE)`.
-pub const fn zone_chain_id(zone_id: u32) -> u64 {
-    ZONE_CHAIN_ID_BASE + (zone_id as u64 % ZONE_CHAIN_ID_RANGE)
+pub fn zone_chain_id(zone_id: u32) -> u64 {
+    let offset = u64::from(zone_id).rem_euclid(ZONE_CHAIN_ID_RANGE);
+    match ZONE_CHAIN_ID_BASE.checked_add(offset) {
+        Some(chain_id) => chain_id,
+        None => panic!("zone chain ID exceeds u64"),
+    }
 }
 
 /// Derives the EIP-155 chain ID for a **testnet** zone from its on-chain zone ID.
 ///
 /// Wraps via modulo so the result always falls in
 /// `[ZONE_CHAIN_ID_BASE_TESTNET, ZONE_CHAIN_ID_BASE_TESTNET + ZONE_CHAIN_ID_RANGE_TESTNET)`.
-pub const fn zone_chain_id_testnet(zone_id: u32) -> u64 {
-    ZONE_CHAIN_ID_BASE_TESTNET + (zone_id as u64 % ZONE_CHAIN_ID_RANGE_TESTNET)
+pub fn zone_chain_id_testnet(zone_id: u32) -> u64 {
+    let offset = u64::from(zone_id).rem_euclid(ZONE_CHAIN_ID_RANGE_TESTNET);
+    match ZONE_CHAIN_ID_BASE_TESTNET.checked_add(offset) {
+        Some(chain_id) => chain_id,
+        None => panic!("testnet zone chain ID exceeds u64"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn tempo_state_slots_use_solidity_storage_key_endianness() {
+        assert_eq!(TEMPO_BLOCK_HASH_SLOT, B256::from(U256::ZERO));
+        assert_eq!(TEMPO_STATE_ROOT_SLOT, B256::from(U256::from(4)));
+        assert_eq!(TEMPO_PACKED_SLOT, B256::from(U256::from(7)));
+
+        let tempo_state_root_slot: U256 = TEMPO_STATE_ROOT_SLOT.into();
+        let tempo_packed_slot: U256 = TEMPO_PACKED_SLOT.into();
+        assert_eq!(tempo_state_root_slot, U256::from(4));
+        assert_eq!(tempo_packed_slot, U256::from(7));
+    }
+
+    #[test]
+    fn inbox_and_outbox_slots_match_solidity_storage_layout() {
+        assert_eq!(ZONE_INBOX_PROCESSED_HASH_SLOT, U256::ZERO);
+        assert_eq!(ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(1));
+        assert_eq!(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT, U256::from(1));
+        assert_eq!(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(2));
+    }
 }

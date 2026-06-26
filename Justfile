@@ -21,6 +21,64 @@ build-release binary extra_args="": (build binary "-r " + extra_args)
 build binary extra_args="":
     {{cargo_build_binary}} build {{extra_args}} --bin {{binary}}
 
+[group('prover')]
+[doc('Builds the AWS Nitro enclave Docker image for the zone prover')]
+nitro-prover-image image="tempo-zone-prover:latest":
+    docker build -f Dockerfile.nitro-prover -t "{{image}}" .
+
+[group('prover')]
+[doc('Builds an EIF from the zone prover Docker image and prints Nitro PCR measurements')]
+nitro-prover-eif image="tempo-zone-prover:latest" out="build/zone-prover.eif":
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "$(dirname "{{out}}")"
+    nitro-cli build-enclave --docker-uri "{{image}}" --output-file "{{out}}"
+
+[group('prover')]
+[doc('Runs the zone prover EIF as a Nitro enclave')]
+nitro-prover-run eif="build/zone-prover.eif" cid="16" cpu="2" memory="2048":
+    nitro-cli run-enclave --eif-path "{{eif}}" --cpu-count {{cpu}} --memory {{memory}} --enclave-cid {{cid}}
+
+[group('prover')]
+[doc('Requests signer registration material from a running prover enclave and checks required PCR pins')]
+nitro-prover-register pcr0 pcr1 pcr2 cid="16" port="5005" out="build/zone-prover-registration.json":
+    cargo run -p zone-prover --bin zone-prover-host -- register --cid {{cid}} --port {{port}} --expected-pcr0 "{{pcr0}}" --expected-pcr1 "{{pcr1}}" --expected-pcr2 "{{pcr2}}" --out "{{out}}"
+
+[group('prover')]
+[doc('Sends a BatchWitness to a running prover enclave and writes verifierConfig/proof output')]
+nitro-prover-prove cid witness config out="build/zone-prover-proof.json" port="5005":
+    cargo run -p zone-prover --bin zone-prover-host -- prove --cid {{cid}} --port {{port}} --witness "{{witness}}" --config "{{config}}" --out "{{out}}"
+
+[group('prover')]
+[doc('Submits a host proof JSON produced by nitro-prover-prove to ZonePortal. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and PRIVATE_KEY env vars.')]
+nitro-prover-submit proof="build/zone-prover-proof.json":
+    #!/bin/bash
+    set -euo pipefail
+    RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
+    PORTAL="${L1_PORTAL_ADDRESS:?Set L1_PORTAL_ADDRESS env var}"
+    PK="${PRIVATE_KEY:?Set PRIVATE_KEY env var}"
+    tempo_block=$(jq -r '.tempoBlockNumber' "{{proof}}")
+    recent_block=$(jq -r '.recentTempoBlockNumber' "{{proof}}")
+    prev_block=$(jq -r '.output.blockTransition.prevBlockHash' "{{proof}}")
+    next_block=$(jq -r '.output.blockTransition.nextBlockHash' "{{proof}}")
+    prev_deposit_hash=$(jq -r '.output.depositQueueTransition.prevProcessedHash' "{{proof}}")
+    next_deposit_hash=$(jq -r '.output.depositQueueTransition.nextProcessedHash' "{{proof}}")
+    prev_deposit_number=$(jq -r '.output.depositQueueTransition.prevDepositNumber' "{{proof}}")
+    next_deposit_number=$(jq -r '.output.depositQueueTransition.nextDepositNumber' "{{proof}}")
+    withdrawal_hash=$(jq -r '.output.withdrawalQueueHash' "{{proof}}")
+    verifier_config=$(jq -r '.verifierConfig' "{{proof}}")
+    proof_bytes=$(jq -r '.proof' "{{proof}}")
+    cast send "$PORTAL" "submitBatch(uint64,uint64,(bytes32,bytes32),(bytes32,bytes32,uint64,uint64),bytes32,bytes,bytes)" \
+        "$tempo_block" \
+        "$recent_block" \
+        "($prev_block,$next_block)" \
+        "($prev_deposit_hash,$next_deposit_hash,$prev_deposit_number,$next_deposit_number)" \
+        "$withdrawal_hash" \
+        "$verifier_config" \
+        "$proof_bytes" \
+        --rpc-url "$RPC" \
+        --private-key "$PK"
+
 [group('localnet')]
 [doc('Generates a genesis file')]
 genesis accounts="1000" output="./" profile="maxperf":

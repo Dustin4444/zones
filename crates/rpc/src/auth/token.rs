@@ -73,7 +73,10 @@ impl AuthorizationToken {
             return Err(AuthError::TooShort);
         }
 
-        let fields_start = blob.len() - TOKEN_FIELDS_LEN;
+        let fields_start = blob
+            .len()
+            .checked_sub(TOKEN_FIELDS_LEN)
+            .expect("token length was checked before slicing fields");
         let fields = &blob[fields_start..];
         let signature = blob[..fields_start].to_vec();
 
@@ -144,7 +147,11 @@ impl AuthorizationToken {
         if self.expires_at <= now {
             return Err(AuthError::Expired);
         }
-        if self.issued_at > now + 60 {
+        if self.issued_at
+            > now
+                .checked_add(60)
+                .expect("current unix timestamp plus skew exceeds u64")
+        {
             return Err(AuthError::IssuedInFuture);
         }
 

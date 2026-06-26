@@ -17,7 +17,12 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 pub(crate) fn build_signed_token_blob(signature: TempoSignature, fields: &[u8]) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(signature.encoded_length() + fields.len());
+    let mut blob = Vec::with_capacity(
+        signature
+            .encoded_length()
+            .checked_add(fields.len())
+            .expect("auth token test blob capacity exceeds usize"),
+    );
     blob.extend_from_slice(signature.to_bytes().as_ref());
     blob.extend_from_slice(fields);
     blob
