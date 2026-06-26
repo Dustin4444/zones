@@ -34,6 +34,7 @@ mod ancestry;
 mod execution_env;
 mod execution_output;
 mod execution_plan;
+mod execution_receipt;
 mod execution_state;
 mod execution_tx;
 mod post_state;
@@ -59,6 +60,7 @@ pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
     ZoneExecutionPlan,
 };
+pub use execution_receipt::ZoneTempoReceiptBuilder;
 pub use execution_state::{
     ZoneExecutionState, execution_post_state_from_state, zone_execution_state,
 };
