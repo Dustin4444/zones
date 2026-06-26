@@ -1879,7 +1879,9 @@ mod tests {
     use reth_trie_common::{KeccakKeyHasher, KeyHasher};
     use revm_database::{BundleState, primitives::StorageKeyMap};
     use revm_database_interface::{
-        Database, DatabaseCommit, primitives::AddressMap, state::Account,
+        Database, DatabaseCommit,
+        primitives::AddressMap,
+        state::{Account, AccountInfo},
     };
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_primitives::{TempoReceipt, TempoTxType};
@@ -3300,6 +3302,82 @@ mod tests {
     }
 
     #[test]
+    fn sparse_state_root_calculator_is_seeded_from_initial_zone_witness() {
+        let witness = fixture_witness();
+        let mut calculator =
+            SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
+                .unwrap();
+
+        let root = calculator
+            .calculate(ExecutionPostState::default().into_hashed())
+            .unwrap();
+
+        assert_eq!(root.get(), witness.initial_zone_state.state_root);
+    }
+
+    #[test]
+    fn seeded_sparse_state_root_calculator_can_update_witnessed_storage() {
+        let witness = fixture_witness();
+        let mut calculator =
+            SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
+                .unwrap();
+        let account_read = witness
+            .initial_zone_state
+            .account_reads
+            .iter()
+            .find(|read| read.account == ZONE_INBOX_ADDRESS)
+            .expect("fixture witnesses zone inbox account");
+        let storage_read = witness
+            .initial_zone_state
+            .storage_reads
+            .iter()
+            .find(|read| {
+                read.account == ZONE_INBOX_ADDRESS && read.slot == ZONE_INBOX_PROCESSED_NUMBER_SLOT
+            })
+            .expect("fixture witnesses processed deposit number");
+        let account_info = AccountInfo {
+            balance: account_read.balance,
+            nonce: account_read.nonce,
+            code_hash: account_read.code_hash,
+            code: None,
+            account_id: None,
+        };
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            (storage_read.value, U256::from(99)),
+        );
+        let bundle = BundleState::builder(0..=0)
+            .state_original_account_info(ZONE_INBOX_ADDRESS, account_info.clone())
+            .state_present_account_info(ZONE_INBOX_ADDRESS, account_info)
+            .state_storage(ZONE_INBOX_ADDRESS, storage)
+            .build();
+
+        let root = calculator
+            .calculate(ExecutionPostState::from_bundle_state(&bundle).into_hashed())
+            .unwrap();
+
+        assert_ne!(root.get(), witness.initial_zone_state.state_root);
+    }
+
+    #[test]
+    fn sparse_state_root_calculator_rejects_missing_initial_witness_node() {
+        let mut witness = fixture_witness();
+        let read = witness.initial_zone_state.account_reads[0].clone();
+        let missing = read.proof_node_hashes[0];
+        witness.initial_zone_state.node_pool.remove(&missing);
+
+        assert_eq!(
+            SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
+                .unwrap_err(),
+            ProverError::AccountProofMissing {
+                account: read.account,
+                node_hash: missing,
+            }
+        );
+    }
+
+    #[test]
     fn prepared_execution_exposes_block_execution_input() {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
@@ -3414,7 +3492,9 @@ mod tests {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut executor = RecordingBlockExecutor { seen: Vec::new() };
-        let mut state_root_calculator = SparseStateRootCalculator::revealed_empty();
+        let mut state_root_calculator =
+            SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
+                .unwrap();
 
         let output =
             execute_prepared_blocks(&prepared, &mut executor, &mut state_root_calculator).unwrap();

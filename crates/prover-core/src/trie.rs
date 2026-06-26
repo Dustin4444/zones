@@ -1,9 +1,10 @@
 use alloc::{collections::BTreeMap, vec::Vec};
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_rlp::Encodable;
+use alloy_rlp::{Decodable, Encodable};
 use alloy_trie::{
     EMPTY_ROOT_HASH, KECCAK_EMPTY, Nibbles, TrieAccount,
+    nodes::{CHILD_INDEX_RANGE, TrieNode},
     proof::{ProofVerificationError, verify_proof},
 };
 
@@ -128,6 +129,69 @@ fn proof_nodes<'a>(
         proof.push(node_pool.get(hash).ok_or(*hash)?);
     }
     Ok(proof)
+}
+
+pub(crate) fn proof_subtrie_for_key(
+    key: Nibbles,
+    node_pool: &BTreeMap<B256, Bytes>,
+    proof_node_hashes: &[B256],
+) -> Result<alloy_trie::proof::ProofNodes, TrieProofError> {
+    let proof = proof_nodes(proof_node_hashes, node_pool).map_err(TrieProofError::MissingNode)?;
+    let mut subtrie = alloy_trie::proof::ProofNodes::default();
+    let mut path = Nibbles::new();
+
+    for node in proof {
+        subtrie.insert(path, node.clone());
+        let node = TrieNode::decode(&mut &node[..]).map_err(|_| TrieProofError::Invalid)?;
+        advance_proof_path(node, &mut path, &key)?;
+    }
+
+    Ok(subtrie)
+}
+
+fn advance_proof_path(
+    node: TrieNode,
+    path: &mut Nibbles,
+    key: &Nibbles,
+) -> Result<(), TrieProofError> {
+    match node {
+        TrieNode::Branch(mut branch) => {
+            let Some(next) = key.get(path.len()) else {
+                return Ok(());
+            };
+            let mut stack_ptr = branch.as_ref().first_child_index();
+            for index in CHILD_INDEX_RANGE {
+                if branch.state_mask.is_bit_set(index) {
+                    if index == next {
+                        path.push(next);
+                        let child = branch.stack.remove(stack_ptr);
+                        if child.is_hash() {
+                            return Ok(());
+                        }
+                        let child = TrieNode::decode(&mut &child[..])
+                            .map_err(|_| TrieProofError::Invalid)?;
+                        return advance_proof_path(child, path, key);
+                    }
+                    stack_ptr += 1;
+                }
+            }
+            Ok(())
+        }
+        TrieNode::Extension(extension) => {
+            path.extend(&extension.key);
+            if extension.child.is_hash() {
+                return Ok(());
+            }
+            let child =
+                TrieNode::decode(&mut &extension.child[..]).map_err(|_| TrieProofError::Invalid)?;
+            advance_proof_path(child, path, key)
+        }
+        TrieNode::Leaf(leaf) => {
+            path.extend(&leaf.key);
+            Ok(())
+        }
+        TrieNode::EmptyRoot => Ok(()),
+    }
 }
 
 fn expected_account_value(read: AccountProof<'_>) -> Option<Vec<u8>> {

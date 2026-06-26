@@ -1,12 +1,13 @@
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, vec::Vec};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256, keccak256, map::B256Map};
 use alloy_rlp::Decodable;
-use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount};
+use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount, proof::ProofNodes};
 use reth_trie_common::{HashedPostState, Nibbles};
+use reth_trie_common::{KeccakKeyHasher, KeyHasher, MultiProof, StorageMultiProof};
 use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie};
 
-use crate::ProverError;
+use crate::{ProverError, ZoneStateWitness, trie, validate_node_pool};
 
 /// State root computed by applying a reth hashed post-state to a verified sparse trie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,30 @@ impl SparseStateRootCalculator {
         Self { trie }
     }
 
+    pub fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
+        validate_node_pool(&state.node_pool, ProverError::ZoneStateNodeHashMismatch)?;
+
+        let multiproof = zone_state_multiproof(state)?;
+        if multiproof.is_empty() {
+            if state.state_root != EMPTY_ROOT_HASH {
+                return Err(ProverError::StateRootCalculationFailed);
+            }
+            return Ok(Self::revealed_empty());
+        }
+
+        let mut trie = SparseStateTrie::new();
+        trie.reveal_multiproof(multiproof)
+            .map_err(|_| ProverError::StateRootCalculationFailed)?;
+        let root = trie
+            .root()
+            .map_err(|_| ProverError::StateRootCalculationFailed)?;
+        if root != state.state_root {
+            return Err(ProverError::StateRootCalculationFailed);
+        }
+
+        Ok(Self::new(trie))
+    }
+
     pub fn revealed_empty() -> Self {
         let mut trie = SparseStateTrie::default();
         trie.set_accounts_trie(RevealableSparseTrie::revealed_empty());
@@ -50,6 +75,111 @@ impl SparseStateRootCalculator {
     pub fn trie_mut(&mut self) -> &mut SparseStateTrie {
         &mut self.trie
     }
+}
+
+fn zone_state_multiproof(state: &ZoneStateWitness) -> Result<MultiProof, ProverError> {
+    let mut account_subtree = ProofNodes::default();
+    let mut storage_roots = BTreeMap::new();
+
+    for read in &state.account_reads {
+        if let Some(code) = &read.code
+            && keccak256(code.as_ref()) != read.code_hash
+        {
+            return Err(ProverError::AccountCodeHashMismatch(read.account));
+        }
+
+        let proven = trie::verify_account_read(state.state_root, &state.node_pool, read)?;
+        storage_roots.insert(read.account, proven.storage_root);
+        let key = Nibbles::unpack(KeccakKeyHasher::hash_key(read.account));
+        account_subtree.extend_from(account_proof_subtrie(state, read, key)?);
+    }
+
+    let storages = storage_multiproofs(state, &storage_roots)?;
+
+    Ok(MultiProof {
+        account_subtree,
+        branch_node_masks: Default::default(),
+        storages,
+    })
+}
+
+fn account_proof_subtrie(
+    state: &ZoneStateWitness,
+    read: &crate::ZoneAccountRead,
+    key: Nibbles,
+) -> Result<ProofNodes, ProverError> {
+    trie::proof_subtrie_for_key(key, &state.node_pool, &read.proof_node_hashes).map_err(|err| {
+        match err {
+            trie::TrieProofError::MissingNode(node_hash) => ProverError::AccountProofMissing {
+                account: read.account,
+                node_hash,
+            },
+            trie::TrieProofError::Invalid => ProverError::AccountProofInvalid(read.account),
+            trie::TrieProofError::ValueMismatch => ProverError::AccountReadMismatch(read.account),
+        }
+    })
+}
+
+fn storage_multiproofs(
+    state: &ZoneStateWitness,
+    storage_roots: &BTreeMap<Address, B256>,
+) -> Result<B256Map<StorageMultiProof>, ProverError> {
+    let mut storage_subtries = BTreeMap::<Address, (B256, ProofNodes)>::new();
+
+    for read in &state.storage_reads {
+        let storage_root = storage_roots
+            .get(&read.account)
+            .ok_or(ProverError::MissingAccountRead(read.account))?;
+        trie::verify_storage_read(*storage_root, &state.node_pool, read)?;
+        let key = Nibbles::unpack(hashed_storage_slot(read.slot));
+        let subtrie = storage_proof_subtrie(state, read, key)?;
+        storage_subtries
+            .entry(read.account)
+            .and_modify(|(_, existing)| existing.extend_from(subtrie.clone()))
+            .or_insert((*storage_root, subtrie));
+    }
+
+    Ok(storage_subtries
+        .into_iter()
+        .map(|(account, (root, subtree))| {
+            (
+                KeccakKeyHasher::hash_key(account),
+                StorageMultiProof {
+                    root,
+                    subtree,
+                    branch_node_masks: Default::default(),
+                },
+            )
+        })
+        .collect())
+}
+
+fn storage_proof_subtrie(
+    state: &ZoneStateWitness,
+    read: &crate::ZoneStorageRead,
+    key: Nibbles,
+) -> Result<ProofNodes, ProverError> {
+    trie::proof_subtrie_for_key(key, &state.node_pool, &read.proof_node_hashes).map_err(|err| {
+        match err {
+            trie::TrieProofError::MissingNode(node_hash) => ProverError::StorageProofMissing {
+                account: read.account,
+                slot: read.slot,
+                node_hash,
+            },
+            trie::TrieProofError::Invalid => ProverError::StorageProofInvalid {
+                account: read.account,
+                slot: read.slot,
+            },
+            trie::TrieProofError::ValueMismatch => ProverError::StorageReadMismatch {
+                account: read.account,
+                slot: read.slot,
+            },
+        }
+    })
+}
+
+fn hashed_storage_slot(slot: U256) -> B256 {
+    KeccakKeyHasher::hash_key(B256::from(slot))
 }
 
 pub fn calculate_state_root(
