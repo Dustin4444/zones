@@ -50,10 +50,10 @@ pub use execution_env::{
 };
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, ExecutedZoneBlockArtifacts,
-    StatelessExecutionOutput, StatelessZoneBlockExecutor, StatelessZoneExecutor,
-    TempoExecutionCommitment, ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput,
-    ZoneExecutableTransaction, batch_output_from_execution, execute_prepared_blocks,
-    execution_commitments_from_post_state, prove_zone_batch_with_executor,
+    StatelessExecutionOutput, StatelessZoneBlockExecutor, TempoExecutionCommitment,
+    ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput, ZoneExecutableTransaction,
+    batch_output_from_execution, execute_prepared_blocks, execution_commitments_from_post_state,
+    prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -1883,7 +1883,10 @@ mod tests {
     use alloy_sol_types::SolCall;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
     use reth_trie_common::{KeccakKeyHasher, KeyHasher};
-    use revm_database::{BundleState, primitives::StorageKeyMap};
+    use revm_database::{
+        AccountStatus, BundleState, TransitionAccount, primitives::StorageKeyMap,
+        states::StorageSlot,
+    };
     use revm_database_interface::{
         Database, DatabaseCommit,
         primitives::AddressMap,
@@ -2111,21 +2114,71 @@ mod tests {
         assert_eq!(hashed_account.balance, U256::from(99));
     }
 
-    struct SuccessfulExecutor;
+    struct SuccessfulBlockExecutor {
+        expected_withdrawal_batch_index: u64,
+    }
 
-    impl StatelessZoneExecutor for SuccessfulExecutor {
-        fn execute(
+    impl StatelessZoneBlockExecutor for SuccessfulBlockExecutor {
+        type Transaction = RecoveredTempoTx;
+        type Receipt = TempoReceipt;
+
+        fn execute_block(
             &mut self,
-            prepared: &PreparedStatelessExecution,
-        ) -> Result<StatelessExecutionOutput, ProverError> {
-            Ok(successful_execution_output(prepared))
+            state: &mut ZoneExecutionState,
+            input: ZoneBlockExecutionInput<'_>,
+        ) -> Result<ExecutedZoneBlockArtifacts<Self::Transaction, Self::Receipt>, ProverError>
+        {
+            let original = state
+                .storage(ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
+                .unwrap();
+            let info = state
+                .basic(ZONE_OUTBOX_ADDRESS)
+                .unwrap()
+                .expect("fixture witnesses the zone outbox account");
+            let mut storage = StorageKeyMap::default();
+            storage.insert(
+                ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+                StorageSlot::new_changed(
+                    original,
+                    U256::from(self.expected_withdrawal_batch_index),
+                ),
+            );
+            state
+                .transition_state
+                .as_mut()
+                .expect("execution state must retain transitions")
+                .transitions
+                .insert(
+                    ZONE_OUTBOX_ADDRESS,
+                    TransitionAccount {
+                        info: Some(info.clone()),
+                        status: AccountStatus::Changed,
+                        previous_info: Some(info),
+                        previous_status: AccountStatus::Loaded,
+                        storage,
+                        storage_was_destroyed: false,
+                    },
+                );
+
+            let transactions = input
+                .transactions
+                .iter()
+                .map(|transaction| transaction.recovered.clone())
+                .collect::<Vec<_>>();
+            let result = successful_block_result(transactions.len());
+            Ok(ExecutedZoneBlockArtifacts {
+                transactions,
+                result,
+            })
         }
     }
 
     #[test]
     fn prove_with_executor_derives_batch_output_from_execution() {
         let witness = fixture_witness();
-        let mut executor = SuccessfulExecutor;
+        let mut executor = SuccessfulBlockExecutor {
+            expected_withdrawal_batch_index: witness.public_inputs.expected_withdrawal_batch_index,
+        };
 
         let output = prove_zone_batch_with_executor(witness.clone(), &mut executor).unwrap();
 

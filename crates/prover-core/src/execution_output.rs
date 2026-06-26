@@ -26,13 +26,6 @@ use crate::{
     execution_post_state_from_state,
 };
 
-pub trait StatelessZoneExecutor {
-    fn execute(
-        &mut self,
-        prepared: &PreparedStatelessExecution,
-    ) -> Result<StatelessExecutionOutput, ProverError>;
-}
-
 pub trait StatelessZoneBlockExecutor {
     type Transaction: Encodable2718;
     type Receipt: TxReceipt;
@@ -205,12 +198,16 @@ impl StatelessExecutionOutput {
     }
 }
 
-pub fn prove_zone_batch_with_executor(
+pub fn prove_zone_batch_with_executor<E>(
     witness: crate::BatchWitness,
-    executor: &mut impl StatelessZoneExecutor,
-) -> Result<BatchOutput, ProverError> {
+    executor: &mut E,
+) -> Result<BatchOutput, ProverError>
+where
+    E: StatelessZoneBlockExecutor,
+    for<'receipt> alloy_consensus::ReceiptWithBloom<&'receipt E::Receipt>: Encodable2718,
+{
     let prepared = crate::prepare_stateless_execution(&witness)?;
-    let execution = executor.execute(&prepared)?;
+    let execution = execute_prepared_blocks(&prepared, executor)?;
     batch_output_from_execution(&prepared, &execution)
 }
 
