@@ -17,11 +17,13 @@ zone-primitives = { workspace = true, features = ["serde"] }
 
 alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
+alloy-evm = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-sol-types = { workspace = true }
 alloy-trie = { workspace = true, features = ["ethereum"] }
 reth-trie-common = { workspace = true }
+revm = { workspace = true }
 revm-database = { workspace = true }
 revm-database-interface = { workspace = true }
 serde = { workspace = true, optional = true }
@@ -31,11 +33,13 @@ default = ["std", "serde"]
 std = [
     "alloy-consensus/std",
     "alloy-eips/std",
+    "alloy-evm/std",
     "alloy-primitives/std",
     "alloy-rlp/std",
     "alloy-sol-types/std",
     "alloy-trie/std",
     "reth-trie-common/std",
+    "revm/std",
     "revm-database/std",
     "revm-database-interface/std",
     "serde?/std",

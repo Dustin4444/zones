@@ -1,7 +1,9 @@
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, format, vec::Vec};
 
+use alloy_evm::precompiles::{Precompile, PrecompileInput};
 use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::{SolCall, SolError};
+use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
 use tempo_zone_contracts::TempoStateReader;
 use zone_primitives::constants::TEMPO_STATE_ADDRESS;
 
@@ -9,6 +11,9 @@ use crate::{ProverError, TempoWitnessProvider};
 
 pub const TEMPO_STATE_READER_BASE_GAS: u64 = 200;
 pub const TEMPO_STATE_READER_PER_SLOT_GAS: u64 = 200;
+
+static TEMPO_STATE_READER_PRECOMPILE_ID: PrecompileId =
+    PrecompileId::Custom(Cow::Borrowed("WitnessTempoStateReader"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TempoStateReaderCallResult {
@@ -103,6 +108,33 @@ impl<'a> WitnessTempoStateReader<'a> {
     }
 }
 
+impl Precompile for WitnessTempoStateReader<'_> {
+    fn precompile_id(&self) -> &PrecompileId {
+        &TEMPO_STATE_READER_PRECOMPILE_ID
+    }
+
+    fn call(&self, input: PrecompileInput<'_>) -> PrecompileResult {
+        match WitnessTempoStateReader::call(
+            self,
+            input.caller,
+            input.is_direct_call(),
+            input.data(),
+        ) {
+            Ok(TempoStateReaderCallResult::Returned { gas_used, output }) => {
+                Ok(PrecompileOutput::new(gas_used, output, input.reservoir))
+            }
+            Ok(TempoStateReaderCallResult::Reverted { output }) => {
+                Ok(PrecompileOutput::revert(0, output, input.reservoir))
+            }
+            Err(err) => Err(PrecompileError::Fatal(format!("{err}"))),
+        }
+    }
+
+    fn supports_caching(&self) -> bool {
+        false
+    }
+}
+
 pub fn tempo_state_reader_gas(slot_count: usize) -> Result<u64, ProverError> {
     let slot_count =
         u64::try_from(slot_count).map_err(|_| ProverError::TempoStateReaderGasOverflow)?;
@@ -128,7 +160,17 @@ fn revert(output: impl Into<Bytes>) -> TempoStateReaderCallResult {
 mod tests {
     use alloc::{collections::BTreeMap, vec};
 
+    use alloy_evm::{
+        EvmInternals,
+        eth::EthEvmContext,
+        precompiles::{Precompile, PrecompileInput},
+    };
     use alloy_primitives::{B256, U256, address, b256};
+    use revm::{
+        database::EmptyDB,
+        precompile::{PrecompileError, PrecompileOutput},
+    };
+    use tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS;
 
     use super::*;
     use crate::{TempoStateReadKey, TempoWitnessProvider};
@@ -155,6 +197,24 @@ mod tests {
             tempo_block_number,
             account,
             slot: slot.into(),
+        }
+    }
+
+    fn precompile_input<'a>(
+        ctx: &'a mut EthEvmContext<EmptyDB>,
+        data: &'a [u8],
+        caller: Address,
+    ) -> PrecompileInput<'a> {
+        PrecompileInput {
+            data,
+            gas: 1_000_000,
+            reservoir: 0,
+            caller,
+            value: U256::ZERO,
+            target_address: TEMPO_STATE_READER_ADDRESS,
+            is_static: false,
+            bytecode_address: TEMPO_STATE_READER_ADDRESS,
+            internals: EvmInternals::from_context(ctx),
         }
     }
 
@@ -244,6 +304,79 @@ mod tests {
                 account,
                 slot: slot.into(),
             }
+        );
+    }
+
+    #[test]
+    fn precompile_reads_single_slot_from_witness_provider() {
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let slot = b256!("0000000000000000000000000000000000000000000000000000000000000007");
+        let value = B256::repeat_byte(0xaa);
+        let provider = provider_for([(read_key(2, 100, account, slot), value)]);
+        let reader = WitnessTempoStateReader::new(&provider, 2);
+        let calldata = TempoStateReader::readStorageAtCall {
+            account,
+            slot,
+            blockNumber: 100,
+        }
+        .abi_encode();
+        let mut ctx = EthEvmContext::new(EmptyDB::default(), Default::default());
+
+        let output = Precompile::call(
+            &reader,
+            precompile_input(&mut ctx, &calldata, TEMPO_STATE_ADDRESS),
+        )
+        .expect("proved read must execute");
+
+        assert_eq!(
+            output,
+            PrecompileOutput::new(
+                tempo_state_reader_gas(1).unwrap(),
+                TempoStateReader::readStorageAtCall::abi_encode_returns(&value).into(),
+                0,
+            )
+        );
+        assert!(!reader.supports_caching());
+    }
+
+    #[test]
+    fn precompile_missing_witness_read_is_fatal() {
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let slot = b256!("0000000000000000000000000000000000000000000000000000000000000007");
+        let provider = provider_for([]);
+        let reader = WitnessTempoStateReader::new(&provider, 2);
+        let calldata = TempoStateReader::readStorageAtCall {
+            account,
+            slot,
+            blockNumber: 100,
+        }
+        .abi_encode();
+        let mut ctx = EthEvmContext::new(EmptyDB::default(), Default::default());
+
+        let err = Precompile::call(
+            &reader,
+            precompile_input(&mut ctx, &calldata, TEMPO_STATE_ADDRESS),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, PrecompileError::Fatal(message) if message.contains("missing proved Tempo state read"))
+        );
+    }
+
+    #[test]
+    fn precompile_unauthorized_call_reverts() {
+        let provider = provider_for([]);
+        let reader = WitnessTempoStateReader::new(&provider, 0);
+        let caller = address!("0x0000000000000000000000000000000000009999");
+        let mut ctx = EthEvmContext::new(EmptyDB::default(), Default::default());
+
+        let output = Precompile::call(&reader, precompile_input(&mut ctx, &[], caller))
+            .expect("unauthorized call must revert, not abort");
+
+        assert_eq!(
+            output,
+            PrecompileOutput::revert(0, TempoStateReader::Unauthorized {}.abi_encode().into(), 0,)
         );
     }
 
