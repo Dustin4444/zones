@@ -69,7 +69,24 @@ pub struct StatelessExecutionOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutedZoneBlock {
-    pub header: ZoneHeader,
+    pub state_root: B256,
+    pub transactions_root: B256,
+    pub receipts_root: B256,
+}
+
+impl ExecutedZoneBlock {
+    pub fn header(&self, parent_hash: B256, block: &PreparedZoneBlock) -> ZoneHeader {
+        ZoneHeader {
+            parent_hash,
+            beneficiary: block.beneficiary,
+            state_root: self.state_root,
+            transactions_root: self.transactions_root,
+            receipts_root: self.receipts_root,
+            number: block.number,
+            timestamp: block.timestamp,
+            protocol_version: block.protocol_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,43 +148,15 @@ pub fn batch_output_from_execution(
         .zip(execution.blocks.iter())
         .enumerate()
     {
-        let header = &executed.header;
-        if header.parent_hash != previous_hash {
+        if expected.parent_hash != previous_hash {
             return Err(ProverError::ExecutionBlockParentHashMismatch {
                 index,
                 expected: previous_hash,
-                actual: header.parent_hash,
-            });
-        }
-        if header.number != expected.number {
-            return Err(ProverError::ExecutionBlockNumberMismatch {
-                index,
-                expected: expected.number,
-                actual: header.number,
-            });
-        }
-        if header.timestamp != expected.timestamp {
-            return Err(ProverError::ExecutionBlockTimestampMismatch {
-                index,
-                expected: expected.timestamp,
-                actual: header.timestamp,
-            });
-        }
-        if header.beneficiary != expected.beneficiary {
-            return Err(ProverError::ExecutionBlockBeneficiaryMismatch {
-                index,
-                expected: expected.beneficiary,
-                actual: header.beneficiary,
-            });
-        }
-        if header.protocol_version != expected.protocol_version {
-            return Err(ProverError::ExecutionBlockProtocolVersionMismatch {
-                index,
-                expected: expected.protocol_version,
-                actual: header.protocol_version,
+                actual: expected.parent_hash,
             });
         }
 
+        let header = executed.header(previous_hash, expected);
         previous_hash = header.hash();
     }
 

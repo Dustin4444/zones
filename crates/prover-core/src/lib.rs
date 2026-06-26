@@ -2062,9 +2062,9 @@ mod tests {
     #[test]
     fn execution_output_rejects_wrong_block_parent() {
         let witness = fixture_witness();
-        let prepared = prepare_stateless_execution(&witness).unwrap();
-        let mut execution = successful_execution_output(&prepared);
-        execution.blocks[0].header.parent_hash = B256::repeat_byte(0xee);
+        let mut prepared = prepare_stateless_execution(&witness).unwrap();
+        prepared.zone_blocks[0].parent_hash = B256::repeat_byte(0xee);
+        let execution = successful_execution_output(&prepared);
 
         assert_eq!(
             batch_output_from_execution(&prepared, &execution).unwrap_err(),
@@ -2073,6 +2073,29 @@ mod tests {
                 expected: witness.public_inputs.prev_block_hash,
                 actual: B256::repeat_byte(0xee),
             }
+        );
+    }
+
+    #[test]
+    fn execution_roots_are_used_to_derive_next_block_hash() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut first = successful_execution_output(&prepared);
+        let mut second = successful_execution_output(&prepared);
+        second.blocks[0].receipts_root = B256::repeat_byte(0x99);
+
+        let first_output = batch_output_from_execution(&prepared, &first).unwrap();
+        let second_output = batch_output_from_execution(&prepared, &second).unwrap();
+
+        assert_ne!(
+            first_output.block_transition.nextBlockHash,
+            second_output.block_transition.nextBlockHash
+        );
+        first.blocks[0].state_root = B256::repeat_byte(0x98);
+        let third_output = batch_output_from_execution(&prepared, &first).unwrap();
+        assert_ne!(
+            third_output.block_transition.nextBlockHash,
+            first_output.block_transition.nextBlockHash
         );
     }
 
@@ -2340,23 +2363,13 @@ mod tests {
     fn successful_execution_output(
         prepared: &PreparedStatelessExecution,
     ) -> StatelessExecutionOutput {
-        let mut parent_hash = prepared.public_inputs.prev_block_hash;
         let blocks = prepared
             .zone_blocks
             .iter()
-            .map(|block| {
-                let header = ZoneHeader {
-                    parent_hash,
-                    beneficiary: block.beneficiary,
-                    state_root: prepared.prev_block_header.state_root,
-                    transactions_root: EMPTY_TRIE_ROOT,
-                    receipts_root: EMPTY_TRIE_ROOT,
-                    number: block.number,
-                    timestamp: block.timestamp,
-                    protocol_version: block.protocol_version,
-                };
-                parent_hash = header.hash();
-                ExecutedZoneBlock { header }
+            .map(|_| ExecutedZoneBlock {
+                state_root: prepared.prev_block_header.state_root,
+                transactions_root: EMPTY_TRIE_ROOT,
+                receipts_root: EMPTY_TRIE_ROOT,
             })
             .collect();
         let mut storage = StorageKeyMap::default();
@@ -3137,7 +3150,6 @@ mod tests {
     fn execute_prepared_blocks_drives_backend_in_order() {
         #[derive(Default)]
         struct RecordingBlockExecutor {
-            next_parent: B256,
             seen: Vec<(usize, usize)>,
         }
 
@@ -3148,18 +3160,11 @@ mod tests {
             ) -> Result<ExecutedZoneBlock, ProverError> {
                 self.seen
                     .push((input.block_index, input.transactions.len()));
-                let header = ZoneHeader {
-                    parent_hash: self.next_parent,
-                    beneficiary: input.block.beneficiary,
+                Ok(ExecutedZoneBlock {
                     state_root: EMPTY_TRIE_ROOT,
                     transactions_root: EMPTY_TRIE_ROOT,
                     receipts_root: EMPTY_TRIE_ROOT,
-                    number: input.block.number,
-                    timestamp: input.block.timestamp,
-                    protocol_version: input.block.protocol_version,
-                };
-                self.next_parent = header.hash();
-                Ok(ExecutedZoneBlock { header })
+                })
             }
 
             fn finish(&mut self) -> Result<ExecutionPostState, ProverError> {
@@ -3169,10 +3174,7 @@ mod tests {
 
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
-        let mut executor = RecordingBlockExecutor {
-            next_parent: prepared.public_inputs.prev_block_hash,
-            seen: Vec::new(),
-        };
+        let mut executor = RecordingBlockExecutor { seen: Vec::new() };
 
         let output = execute_prepared_blocks(&prepared, &mut executor).unwrap();
 
