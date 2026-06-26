@@ -1,7 +1,7 @@
 use alloc::{borrow::Cow, format, vec::Vec};
 
 use alloy_evm::precompiles::{DynPrecompile, Precompile, PrecompileInput};
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolCall, SolError};
 use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
 use tempo_zone_contracts::TempoStateReader;
@@ -37,6 +37,16 @@ impl<'a> WitnessTempoStateReader<'a> {
 
     pub const fn zone_block_index(&self) -> u64 {
         self.zone_block_index
+    }
+
+    pub fn read_storage_word(
+        &self,
+        tempo_block_number: u64,
+        account: Address,
+        slot: U256,
+    ) -> Result<U256, ProverError> {
+        self.provider
+            .read_storage_word(self.zone_block_index, tempo_block_number, account, slot)
     }
 
     pub fn call(
@@ -162,6 +172,16 @@ impl OwnedWitnessTempoStateReader {
 
     pub const fn zone_block_index(&self) -> u64 {
         self.zone_block_index
+    }
+
+    pub fn read_storage_word(
+        &self,
+        tempo_block_number: u64,
+        account: Address,
+        slot: U256,
+    ) -> Result<U256, ProverError> {
+        self.borrowed()
+            .read_storage_word(tempo_block_number, account, slot)
     }
 
     pub const fn borrowed(&self) -> WitnessTempoStateReader<'_> {

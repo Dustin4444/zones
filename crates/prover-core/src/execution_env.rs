@@ -349,6 +349,7 @@ mod tests {
             timestamp: 123,
             beneficiary: address!("0x0000000000000000000000000000000000001000"),
             protocol_version: 1,
+            tempo_block_number: 100,
             cfg_env: cfg_config(),
             execution_context: execution_context_config(),
             block_env: env_config(),

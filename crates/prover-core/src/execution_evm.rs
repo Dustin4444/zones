@@ -305,12 +305,16 @@ impl EthExecutorSpec for ZoneEthExecutorSpec {
 pub fn zone_witness_precompiles(
     evm_env: &ZoneEvmEnv,
     tempo_state_reader: WitnessTempoStateReader<'_>,
+    sequencer: Address,
+    tempo_block_number: u64,
 ) -> PrecompilesMap {
     let mut precompiles = ZoneWitnessEvmFactory::default_precompiles(evm_env.cfg_env.spec);
     register_witness_zone_precompiles(
         &mut precompiles,
         &evm_env.cfg_env,
         OwnedWitnessTempoStateReader::from_reader(tempo_state_reader),
+        sequencer,
+        tempo_block_number,
     );
     precompiles
 }
@@ -340,7 +344,12 @@ impl AlloyZoneBlockExecutorProvider for WitnessZoneBlockExecutorProvider {
         state: &'a mut ZoneExecutionState,
         input: &ZoneBlockExecutionInput<'_>,
     ) -> Result<Self::Executor<'a>, crate::ProverError> {
-        let precompiles = zone_witness_precompiles(&input.evm_env, input.tempo_state_reader);
+        let precompiles = zone_witness_precompiles(
+            &input.evm_env,
+            input.tempo_state_reader,
+            input.block.beneficiary,
+            input.block.tempo_block_number,
+        );
         let evm =
             self.evm_factory
                 .create_evm_with_precompiles(state, input.evm_env.clone(), precompiles);
@@ -359,6 +368,7 @@ mod tests {
     use tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS;
     use zone_precompiles::{
         AES_GCM_DECRYPT_ADDRESS, CHAUM_PEDERSEN_VERIFY_ADDRESS, ZONE_TIP20_FACTORY_ADDRESS,
+        ZONE_TIP403_PROXY_ADDRESS,
     };
 
     use super::*;
@@ -403,12 +413,13 @@ mod tests {
     fn witness_precompiles_include_zone_entries() {
         let provider = empty_tempo_provider();
         let reader = WitnessTempoStateReader::new(&provider, 0);
-        let precompiles = zone_witness_precompiles(&evm_env(), reader);
+        let precompiles = zone_witness_precompiles(&evm_env(), reader, Address::ZERO, 0);
 
         assert!(precompiles.get(&TEMPO_STATE_READER_ADDRESS).is_some());
         assert!(precompiles.get(&CHAUM_PEDERSEN_VERIFY_ADDRESS).is_some());
         assert!(precompiles.get(&AES_GCM_DECRYPT_ADDRESS).is_some());
         assert!(precompiles.get(&ZONE_TIP20_FACTORY_ADDRESS).is_some());
+        assert!(precompiles.get(&ZONE_TIP403_PROXY_ADDRESS).is_some());
     }
 
     #[test]

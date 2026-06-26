@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 tempo-zone-contracts = { workspace = true, features = ["serde"] }
 tempo-chainspec = { workspace = true, features = ["evm"] }
+tempo-contracts.workspace = true
+tempo-precompiles.workspace = true
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "65185565b01bc9f406a06c522357954d75ce7cb7", default-features = false }
 zone-precompiles = { workspace = true, default-features = false }
 zone-primitives = { workspace = true, features = ["serde"] }
@@ -49,6 +51,7 @@ std = [
     "revm-database-interface/std",
     "serde?/std",
     "tempo-chainspec/std",
+    "tempo-contracts/std",
     "tempo-primitives/std",
     "tempo-zone-contracts/std",
     "zone-precompiles/std",

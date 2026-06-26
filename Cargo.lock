@@ -13797,6 +13797,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempo-chainspec",
+ "tempo-contracts",
+ "tempo-precompiles",
  "tempo-primitives",
  "tempo-zone-contracts",
  "zone-precompiles",
