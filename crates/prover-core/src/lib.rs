@@ -219,6 +219,32 @@ pub struct PreparedStatelessExecution {
     pub commitments: PreparedWitnessCommitments,
 }
 
+impl PreparedStatelessExecution {
+    pub fn tempo_state_reader(
+        &self,
+        zone_block_index: usize,
+    ) -> Result<WitnessTempoStateReader<'_>, ProverError> {
+        if zone_block_index >= self.zone_blocks.len() {
+            return Err(ProverError::TempoReaderBlockIndexOutOfRange {
+                zone_block_index,
+                block_count: self.zone_blocks.len(),
+            });
+        }
+
+        let zone_block_index = u64::try_from(zone_block_index).map_err(|_| {
+            ProverError::TempoReaderBlockIndexOutOfRange {
+                zone_block_index,
+                block_count: self.zone_blocks.len(),
+            }
+        })?;
+
+        Ok(WitnessTempoStateReader::new(
+            &self.tempo_witness_provider,
+            zone_block_index,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedZoneBlock {
     pub number: u64,
@@ -266,6 +292,10 @@ pub enum ProverError {
     },
     DuplicateTempoStateRead {
         read_index: usize,
+    },
+    TempoReaderBlockIndexOutOfRange {
+        zone_block_index: usize,
+        block_count: usize,
     },
     MissingTempoStateRead {
         zone_block_index: u64,
@@ -543,6 +573,15 @@ impl fmt::Display for ProverError {
                 write!(
                     f,
                     "Tempo state read {read_index} duplicates an earlier read"
+                )
+            }
+            Self::TempoReaderBlockIndexOutOfRange {
+                zone_block_index,
+                block_count,
+            } => {
+                write!(
+                    f,
+                    "TempoStateReader requested out-of-range zone block {zone_block_index}; witness has {block_count} blocks"
                 )
             }
             Self::MissingTempoStateRead {
@@ -2824,7 +2863,7 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         let prepared = prepare_stateless_execution(&witness).unwrap();
-        let reader = WitnessTempoStateReader::new(&prepared.tempo_witness_provider, 0);
+        let reader = prepared.tempo_state_reader(0).unwrap();
         let call = TempoStateReader::readStorageAtCall {
             account,
             slot: B256::from(slot),
@@ -2838,6 +2877,20 @@ mod tests {
                 gas_used: tempo_state_reader_gas(1).unwrap(),
                 output: TempoStateReader::readStorageAtCall::abi_encode_returns(&B256::from(value))
                     .into(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_execution_rejects_out_of_range_tempo_state_reader() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+
+        assert_eq!(
+            prepared.tempo_state_reader(1).unwrap_err(),
+            ProverError::TempoReaderBlockIndexOutOfRange {
+                zone_block_index: 1,
+                block_count: 1,
             }
         );
     }
