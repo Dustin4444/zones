@@ -19,7 +19,7 @@ use zone_primitives::{
 };
 
 use crate::{
-    BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
+    BatchOutput, CalculatedStateRoot, DepositQueueState, ExecutionPostState, LastBatchCommitment,
     PlannedZoneTransaction, PlannedZoneTransactionKind, PreparedStatelessExecution,
     PreparedZoneBlock, ProverError, RecoveredTempoTx, WitnessTempoStateReader,
     ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
@@ -84,7 +84,7 @@ pub struct ExecutedZoneBlock {
 impl ExecutedZoneBlock {
     pub fn from_alloy_block_execution<Tx, Receipt>(
         block_index: usize,
-        state_root: B256,
+        state_root: CalculatedStateRoot,
         transactions: &[Tx],
         result: &BlockExecutionResult<Receipt>,
     ) -> Result<Self, ProverError>
@@ -104,7 +104,7 @@ impl ExecutedZoneBlock {
         }
 
         Ok(Self {
-            state_root,
+            state_root: state_root.get(),
             transactions_root: calculate_transaction_root(transactions),
             receipts_root: calculate_receipt_root(
                 &result
@@ -144,7 +144,7 @@ impl ExecutedZoneBlock {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ZoneBlockExecutionArtifacts<'a, Tx, Receipt> {
-    pub state_root: B256,
+    pub state_root: CalculatedStateRoot,
     pub transactions: &'a [Tx],
     pub result: &'a BlockExecutionResult<Receipt>,
 }

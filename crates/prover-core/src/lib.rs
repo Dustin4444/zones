@@ -37,6 +37,7 @@ mod execution_plan;
 mod execution_state;
 mod execution_tx;
 mod post_state;
+mod state_root;
 mod tempo;
 mod tempo_reader;
 mod trie;
@@ -63,6 +64,9 @@ pub use execution_state::{
 };
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use post_state::ExecutionPostState;
+pub use state_root::{
+    CalculatedStateRoot, SparseStateRootCalculator, calculate_state_root, empty_state_root,
+};
 pub use tempo_chainspec::hardfork::TempoHardfork;
 pub use tempo_reader::{
     TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS, TempoStateReaderCallResult,
@@ -610,6 +614,7 @@ pub enum ProverError {
     },
     NonZeroWithdrawalFinalizationUnsupported,
     TempoStateReaderGasOverflow,
+    StateRootCalculationFailed,
     ExecutionBlockCountMismatch {
         expected: usize,
         actual: usize,
@@ -1047,6 +1052,9 @@ impl fmt::Display for ProverError {
             }
             Self::TempoStateReaderGasOverflow => {
                 f.write_str("TempoStateReader gas calculation overflow")
+            }
+            Self::StateRootCalculationFailed => {
+                f.write_str("stateless sparse-trie state root calculation failed")
             }
             Self::ExecutionBlockCountMismatch { expected, actual } => write!(
                 f,
@@ -2180,7 +2188,7 @@ mod tests {
             .success = false;
         second.blocks[0] = ExecutedZoneBlock::from_alloy_block_execution(
             0,
-            prepared.prev_block_header.state_root,
+            CalculatedStateRoot::trusted_for_test(prepared.prev_block_header.state_root),
             &transactions,
             &different_receipts,
         )
@@ -2196,7 +2204,7 @@ mod tests {
         let block_result = successful_block_result(transactions.len());
         first.blocks[0] = ExecutedZoneBlock::from_alloy_block_execution(
             0,
-            B256::repeat_byte(0x98),
+            CalculatedStateRoot::trusted_for_test(B256::repeat_byte(0x98)),
             &transactions,
             &block_result,
         )
@@ -2216,7 +2224,7 @@ mod tests {
         let block_result = successful_block_result(transactions.len());
         let bundle_state = BundleState::default();
         let artifact = ZoneBlockExecutionArtifacts {
-            state_root: B256::repeat_byte(0x42),
+            state_root: CalculatedStateRoot::trusted_for_test(B256::repeat_byte(0x42)),
             transactions: &transactions,
             result: &block_result,
         };
@@ -2248,7 +2256,7 @@ mod tests {
         let transactions = recovered_transactions_for_block(&prepared, 0);
         let block_result = successful_block_result(0);
         let artifact = ZoneBlockExecutionArtifacts {
-            state_root: B256::repeat_byte(0x42),
+            state_root: CalculatedStateRoot::trusted_for_test(B256::repeat_byte(0x42)),
             transactions: &transactions,
             result: &block_result,
         };
@@ -2588,7 +2596,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(block_index, _)| ZoneBlockExecutionArtifacts {
-                state_root: prepared.prev_block_header.state_root,
+                state_root: CalculatedStateRoot::trusted_for_test(
+                    prepared.prev_block_header.state_root,
+                ),
                 transactions: transactions[block_index].as_slice(),
                 result: &block_results[block_index],
             })
@@ -3392,7 +3402,7 @@ mod tests {
                 let result = successful_block_result(transactions.len());
                 ExecutedZoneBlock::from_alloy_block_execution(
                     input.block_index,
-                    EMPTY_TRIE_ROOT,
+                    CalculatedStateRoot::trusted_for_test(EMPTY_TRIE_ROOT),
                     &transactions,
                     &result,
                 )

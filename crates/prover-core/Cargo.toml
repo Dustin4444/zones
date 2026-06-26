@@ -24,6 +24,7 @@ alloy-rlp.workspace = true
 alloy-sol-types = { workspace = true }
 alloy-trie = { workspace = true, features = ["ethereum"] }
 reth-trie-common = { workspace = true }
+reth-trie-sparse = { workspace = true }
 revm = { workspace = true }
 revm-database = { workspace = true }
 revm-database-interface = { workspace = true }
@@ -40,6 +41,7 @@ std = [
     "alloy-sol-types/std",
     "alloy-trie/std",
     "reth-trie-common/std",
+    "reth-trie-sparse/std",
     "revm/std",
     "revm-database/std",
     "revm-database-interface/std",
@@ -59,3 +61,4 @@ serde = [
 
 [dev-dependencies]
 const-hex.workspace = true
+reth-primitives-traits.workspace = true
