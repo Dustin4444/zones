@@ -35,6 +35,10 @@ impl<'a> WitnessTempoStateReader<'a> {
         }
     }
 
+    pub const fn zone_block_index(&self) -> u64 {
+        self.zone_block_index
+    }
+
     pub fn call(
         &self,
         caller: Address,

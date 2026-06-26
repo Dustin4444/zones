@@ -13,7 +13,8 @@ use zone_primitives::{
 
 use crate::{
     BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
-    PreparedStatelessExecution, ProverError,
+    PlannedZoneTransaction, PreparedStatelessExecution, PreparedZoneBlock, ProverError,
+    WitnessTempoStateReader,
 };
 
 pub trait StatelessZoneExecutor {
@@ -21,6 +22,23 @@ pub trait StatelessZoneExecutor {
         &mut self,
         prepared: &PreparedStatelessExecution,
     ) -> Result<StatelessExecutionOutput, ProverError>;
+}
+
+pub trait StatelessZoneBlockExecutor {
+    fn execute_block(
+        &mut self,
+        input: ZoneBlockExecutionInput<'_>,
+    ) -> Result<ExecutedZoneBlock, ProverError>;
+
+    fn finish(&mut self) -> Result<ExecutionPostState, ProverError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ZoneBlockExecutionInput<'a> {
+    pub block_index: usize,
+    pub block: &'a PreparedZoneBlock,
+    pub transactions: &'a [PlannedZoneTransaction],
+    pub tempo_state_reader: WitnessTempoStateReader<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +73,22 @@ pub fn prove_zone_batch_with_executor(
     let prepared = crate::prepare_stateless_execution(&witness)?;
     let execution = executor.execute(&prepared)?;
     batch_output_from_execution(&prepared, &execution)
+}
+
+pub fn execute_prepared_blocks(
+    prepared: &PreparedStatelessExecution,
+    executor: &mut impl StatelessZoneBlockExecutor,
+) -> Result<StatelessExecutionOutput, ProverError> {
+    let mut blocks = Vec::with_capacity(prepared.zone_blocks.len());
+    for block_index in 0..prepared.zone_blocks.len() {
+        let input = prepared.block_execution_input(block_index)?;
+        blocks.push(executor.execute_block(input)?);
+    }
+
+    Ok(StatelessExecutionOutput {
+        blocks,
+        post_state: executor.finish()?,
+    })
 }
 
 pub fn batch_output_from_execution(

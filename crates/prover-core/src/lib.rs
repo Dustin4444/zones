@@ -40,9 +40,10 @@ mod trie;
 mod witness_db;
 
 pub use execution_output::{
-    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput, StatelessZoneExecutor,
-    TempoExecutionCommitment, batch_output_from_execution, execution_commitments_from_post_state,
-    prove_zone_batch_with_executor,
+    ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
+    StatelessZoneBlockExecutor, StatelessZoneExecutor, TempoExecutionCommitment,
+    ZoneBlockExecutionInput, batch_output_from_execution, execute_prepared_blocks,
+    execution_commitments_from_post_state, prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -220,6 +221,34 @@ pub struct PreparedStatelessExecution {
 }
 
 impl PreparedStatelessExecution {
+    pub fn block_execution_input(
+        &self,
+        block_index: usize,
+    ) -> Result<ZoneBlockExecutionInput<'_>, ProverError> {
+        if self.execution_plan.blocks.len() != self.zone_blocks.len() {
+            return Err(ProverError::ExecutionPlanBlockCountMismatch {
+                expected: self.zone_blocks.len(),
+                actual: self.execution_plan.blocks.len(),
+            });
+        }
+
+        let block = self.zone_blocks.get(block_index).ok_or(
+            ProverError::TempoReaderBlockIndexOutOfRange {
+                zone_block_index: block_index,
+                block_count: self.zone_blocks.len(),
+            },
+        )?;
+        let transactions = &self.execution_plan.blocks[block_index].transactions;
+        let tempo_state_reader = self.tempo_state_reader(block_index)?;
+
+        Ok(ZoneBlockExecutionInput {
+            block_index,
+            block,
+            transactions,
+            tempo_state_reader,
+        })
+    }
+
     pub fn tempo_state_reader(
         &self,
         zone_block_index: usize,
@@ -476,6 +505,10 @@ pub enum ProverError {
     NonZeroWithdrawalFinalizationUnsupported,
     TempoStateReaderGasOverflow,
     ExecutionBlockCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    ExecutionPlanBlockCountMismatch {
         expected: usize,
         actual: usize,
     },
@@ -903,6 +936,10 @@ impl fmt::Display for ProverError {
             Self::ExecutionBlockCountMismatch { expected, actual } => write!(
                 f,
                 "execution returned {actual} zone blocks, expected {expected}"
+            ),
+            Self::ExecutionPlanBlockCountMismatch { expected, actual } => write!(
+                f,
+                "execution plan has {actual} blocks, expected {expected} prepared blocks"
             ),
             Self::ExecutionBlockParentHashMismatch {
                 index,
@@ -2893,6 +2930,89 @@ mod tests {
                 block_count: 1,
             }
         );
+    }
+
+    #[test]
+    fn prepared_execution_exposes_block_execution_input() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let input = prepared.block_execution_input(0).unwrap();
+
+        assert_eq!(input.block_index, 0);
+        assert_eq!(input.block.number, 8);
+        assert_eq!(input.transactions.len(), 1);
+        assert_eq!(
+            input.transactions[0].kind,
+            PlannedZoneTransactionKind::FinalizeWithdrawalBatch
+        );
+        assert_eq!(
+            input.tempo_state_reader.zone_block_index(),
+            0,
+            "reader must be bound to the block being executed"
+        );
+    }
+
+    #[test]
+    fn prepared_execution_rejects_mismatched_execution_plan_blocks() {
+        let witness = fixture_witness();
+        let mut prepared = prepare_stateless_execution(&witness).unwrap();
+        prepared.execution_plan.blocks.clear();
+
+        assert_eq!(
+            prepared.block_execution_input(0).unwrap_err(),
+            ProverError::ExecutionPlanBlockCountMismatch {
+                expected: 1,
+                actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn execute_prepared_blocks_drives_backend_in_order() {
+        #[derive(Default)]
+        struct RecordingBlockExecutor {
+            next_parent: B256,
+            seen: Vec<(usize, usize)>,
+        }
+
+        impl StatelessZoneBlockExecutor for RecordingBlockExecutor {
+            fn execute_block(
+                &mut self,
+                input: ZoneBlockExecutionInput<'_>,
+            ) -> Result<ExecutedZoneBlock, ProverError> {
+                self.seen
+                    .push((input.block_index, input.transactions.len()));
+                let header = ZoneHeader {
+                    parent_hash: self.next_parent,
+                    beneficiary: input.block.beneficiary,
+                    state_root: EMPTY_TRIE_ROOT,
+                    transactions_root: EMPTY_TRIE_ROOT,
+                    receipts_root: EMPTY_TRIE_ROOT,
+                    number: input.block.number,
+                    timestamp: input.block.timestamp,
+                    protocol_version: input.block.protocol_version,
+                };
+                self.next_parent = header.hash();
+                Ok(ExecutedZoneBlock { header })
+            }
+
+            fn finish(&mut self) -> Result<ExecutionPostState, ProverError> {
+                Ok(ExecutionPostState::default())
+            }
+        }
+
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut executor = RecordingBlockExecutor {
+            next_parent: prepared.public_inputs.prev_block_hash,
+            seen: Vec::new(),
+        };
+
+        let output = execute_prepared_blocks(&prepared, &mut executor).unwrap();
+
+        assert_eq!(executor.seen, vec![(0, 1)]);
+        assert_eq!(output.blocks.len(), 1);
+        assert!(output.post_state.is_empty());
     }
 
     #[test]
