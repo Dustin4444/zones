@@ -419,7 +419,6 @@ pub struct PreparedWitnessCommitments {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProverError {
-    FullStatelessExecutionUnsupported,
     PrevHeaderHashMismatch,
     InitialStateRootMismatch,
     ZoneStateNodeHashMismatch(B256),
@@ -686,9 +685,6 @@ pub enum ProverError {
 impl fmt::Display for ProverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FullStatelessExecutionUnsupported => f.write_str(
-                "full stateless zone execution is not implemented in the production prover",
-            ),
             Self::PrevHeaderHashMismatch => {
                 f.write_str("previous header hash does not match public prev_block_hash")
             }
@@ -1154,14 +1150,9 @@ impl fmt::Display for ProverError {
 impl std::error::Error for ProverError {}
 
 /// Execute the production Zone batch transition function.
-///
-/// The Nitro enclave proof server and local native-signature proof path call
-/// this entrypoint before signing or attesting a [`BatchOutput`]. Until the full
-/// no-std stateless executor is wired in, production proving fails closed
-/// instead of falling back to the legacy empty-block placeholder.
 pub fn prove_zone_batch(witness: BatchWitness) -> Result<BatchOutput, ProverError> {
-    let _prepared = prepare_stateless_execution(&witness)?;
-    Err(ProverError::FullStatelessExecutionUnsupported)
+    let mut executor = AlloyZoneBlockExecutor::new(WitnessZoneBlockExecutorProvider::new());
+    prove_zone_batch_with_executor(witness, &mut executor)
 }
 
 pub fn prepare_stateless_execution(
@@ -2045,10 +2036,12 @@ mod tests {
     }
 
     #[test]
-    fn production_prover_fails_closed_until_full_stateless_execution() {
+    fn production_prover_uses_witness_executor_and_fails_closed_on_execution_error() {
+        let witness = fixture_witness();
+
         assert_eq!(
-            prove_zone_batch(fixture_witness()).unwrap_err(),
-            ProverError::FullStatelessExecutionUnsupported
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::ExecutionBlockFailed { index: 0 }
         );
     }
 

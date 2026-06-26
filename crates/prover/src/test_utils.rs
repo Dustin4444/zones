@@ -18,6 +18,8 @@ use crate::types::{
     ZoneStateWitness, ZoneStorageRead,
 };
 
+const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
+
 pub(crate) fn minimal_batch_witness() -> BatchWitness {
     let tempo_block_number = 10;
     let tempo_block_hash = B256::repeat_byte(0x33);
@@ -139,17 +141,18 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         storage_root: tempo_storage_root,
         code_hash: KECCAK_EMPTY,
     };
+    let system_code_hash = keccak256(TEST_SYSTEM_CONTRACT_CODE);
     let zone_inbox_trie_account = TrieAccount {
         nonce: 0,
         balance: U256::ZERO,
         storage_root: zone_inbox_storage_root,
-        code_hash: KECCAK_EMPTY,
+        code_hash: system_code_hash,
     };
     let zone_outbox_trie_account = TrieAccount {
         nonce: 0,
         balance: U256::ZERO,
         storage_root: zone_outbox_storage_root,
-        code_hash: KECCAK_EMPTY,
+        code_hash: system_code_hash,
     };
     let tempo_account_read = ZoneAccountRead {
         account: TEMPO_STATE_ADDRESS,
@@ -166,7 +169,7 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         balance: zone_inbox_trie_account.balance,
         storage_root: zone_inbox_trie_account.storage_root,
         code_hash: zone_inbox_trie_account.code_hash,
-        code: None,
+        code: Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
         proof_node_hashes: Vec::new(),
     };
     let zone_outbox_account_read = ZoneAccountRead {
@@ -175,7 +178,7 @@ fn tempo_bound_zone_state(block_number: u64, block_hash: B256) -> ZoneStateWitne
         balance: zone_outbox_trie_account.balance,
         storage_root: zone_outbox_trie_account.storage_root,
         code_hash: zone_outbox_trie_account.code_hash,
-        code: None,
+        code: Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
         proof_node_hashes: Vec::new(),
     };
     let mut storage_reads = vec![
