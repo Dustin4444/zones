@@ -1,5 +1,5 @@
-use alloy_evm::{EvmEnv, env::BlockEnvironment};
-use alloy_primitives::{Address, B256, U256};
+use alloy_evm::{EvmEnv, env::BlockEnvironment, eth::EthBlockExecutionCtx};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use revm::{
     context::{Block, BlockEnv},
     context_interface::cfg::{GasId, GasParams},
@@ -21,6 +21,54 @@ pub type ZoneCfgEnv = revm::context::CfgEnv<TempoHardfork>;
 
 /// Complete EVM environment shape expected by a revm-backed Zone executor.
 pub type ZoneEvmEnv = EvmEnv<TempoHardfork, ZoneBlockEnv>;
+
+/// Complete block execution context shape expected by an alloy/reth-style
+/// block executor, plus Tempo gas-bucket limits.
+#[derive(Debug, Clone)]
+pub struct ZoneBlockExecutionContext {
+    pub inner: EthBlockExecutionCtx<'static>,
+    pub general_gas_limit: u64,
+    pub shared_gas_limit: u64,
+}
+
+/// Explicit non-environment block context inputs for Zone execution.
+///
+/// Gas bucket limits are not witness-controlled; they are derived from the
+/// block gas limit and Tempo hardfork in [`ZoneCfgEnvConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ZoneBlockExecutionContextConfig {
+    pub parent_beacon_block_root: Option<B256>,
+    pub extra_data: Bytes,
+}
+
+impl ZoneBlockExecutionContextConfig {
+    pub fn execution_context(
+        &self,
+        block: &PreparedZoneBlock,
+        transaction_count: usize,
+    ) -> ZoneBlockExecutionContext {
+        let shared_gas_limit = zone_shared_gas_limit(block.cfg_env.spec, block.block_env.gas_limit);
+        let general_gas_limit = zone_general_gas_limit(
+            block.cfg_env.spec,
+            block.block_env.gas_limit,
+            shared_gas_limit,
+        );
+
+        ZoneBlockExecutionContext {
+            inner: EthBlockExecutionCtx {
+                parent_hash: block.parent_hash,
+                parent_beacon_block_root: self.parent_beacon_block_root,
+                ommers: &[],
+                withdrawals: None,
+                extra_data: self.extra_data.clone(),
+                tx_count_hint: Some(transaction_count),
+                slot_number: Some(block.block_env.slot_num),
+            },
+            general_gas_limit,
+            shared_gas_limit,
+        }
+    }
+}
 
 /// Explicit EVM cfg inputs for Zone execution.
 ///
@@ -44,6 +92,21 @@ impl ZoneCfgEnvConfig {
         cfg.tx_gas_limit_cap = self.spec.tx_gas_limit_cap();
         cfg.enable_amsterdam_eip8037 = self.enable_amsterdam_eip8037;
         cfg
+    }
+}
+
+pub const fn zone_shared_gas_limit(spec: TempoHardfork, block_gas_limit: u64) -> u64 {
+    spec.shared_gas_limit(block_gas_limit)
+}
+
+pub const fn zone_general_gas_limit(
+    spec: TempoHardfork,
+    block_gas_limit: u64,
+    shared_gas_limit: u64,
+) -> u64 {
+    match spec.general_gas_limit() {
+        Some(limit) => limit,
+        None => block_gas_limit.saturating_sub(shared_gas_limit) / 2,
     }
 }
 
@@ -272,6 +335,13 @@ mod tests {
         }
     }
 
+    fn execution_context_config() -> ZoneBlockExecutionContextConfig {
+        ZoneBlockExecutionContextConfig {
+            parent_beacon_block_root: Some(B256::repeat_byte(0x33)),
+            extra_data: Bytes::from_static(b"zone"),
+        }
+    }
+
     fn prepared_block() -> PreparedZoneBlock {
         PreparedZoneBlock {
             number: 9,
@@ -280,6 +350,7 @@ mod tests {
             beneficiary: address!("0x0000000000000000000000000000000000001000"),
             protocol_version: 1,
             cfg_env: cfg_config(),
+            execution_context: execution_context_config(),
             block_env: env_config(),
         }
     }
@@ -364,6 +435,38 @@ mod tests {
             TempoHardfork::T1.tx_gas_limit_cap()
         );
         assert_eq!(env.block_env, block_env);
+    }
+
+    #[test]
+    fn block_execution_context_matches_alloy_executor_shape() {
+        let block = prepared_block();
+        let context = execution_context_config().execution_context(&block, 3);
+
+        assert_eq!(context.inner.parent_hash, block.parent_hash);
+        assert_eq!(
+            context.inner.parent_beacon_block_root,
+            execution_context_config().parent_beacon_block_root
+        );
+        assert_eq!(context.inner.ommers.len(), 0);
+        assert!(context.inner.withdrawals.is_none());
+        assert_eq!(context.inner.extra_data, Bytes::from_static(b"zone"));
+        assert_eq!(context.inner.tx_count_hint, Some(3));
+        assert_eq!(context.inner.slot_number, Some(block.block_env.slot_num));
+        assert_eq!(context.general_gas_limit, 30_000_000);
+        assert_eq!(context.shared_gas_limit, block.block_env.gas_limit / 10);
+    }
+
+    #[test]
+    fn derives_tempo_gas_buckets_from_spec_and_block_gas_limit() {
+        assert_eq!(zone_shared_gas_limit(TempoHardfork::T4, 30_000_000), 0);
+        assert_eq!(
+            zone_general_gas_limit(TempoHardfork::Genesis, 30_000_000, 3_000_000),
+            13_500_000
+        );
+        assert_eq!(
+            zone_general_gas_limit(TempoHardfork::T1, 30_000_000, 3_000_000),
+            30_000_000
+        );
     }
 
     #[test]

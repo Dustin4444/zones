@@ -217,6 +217,13 @@ mod tests {
         }
     }
 
+    fn execution_context() -> crate::ZoneBlockExecutionContextWitness {
+        crate::ZoneBlockExecutionContextWitness {
+            parent_beacon_block_root: None,
+            extra_data: Bytes::new(),
+        }
+    }
+
     fn sample_block() -> ZoneBlock {
         ZoneBlock {
             number: 42,
@@ -225,6 +232,7 @@ mod tests {
             beneficiary: Address::ZERO,
             protocol_version: 0,
             cfg_env: cfg_env(),
+            execution_context: execution_context(),
             block_env: block_env(),
             tempo_header_rlp: Some(Bytes::from_static(&[0xc0])),
             deposits: vec![],

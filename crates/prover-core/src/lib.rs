@@ -42,8 +42,9 @@ mod trie;
 mod witness_db;
 
 pub use execution_env::{
-    BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneCfgEnv, ZoneCfgEnvConfig,
-    ZoneEvmEnv, tempo_gas_params, tempo_gas_params_with_amsterdam,
+    BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneBlockExecutionContext,
+    ZoneBlockExecutionContextConfig, ZoneCfgEnv, ZoneCfgEnvConfig, ZoneEvmEnv, tempo_gas_params,
+    tempo_gas_params_with_amsterdam, zone_general_gas_limit, zone_shared_gas_limit,
 };
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
@@ -105,6 +106,7 @@ pub struct ZoneBlock {
     pub beneficiary: Address,
     pub protocol_version: u64,
     pub cfg_env: ZoneCfgEnvWitness,
+    pub execution_context: ZoneBlockExecutionContextWitness,
     pub block_env: ZoneBlockEnvWitness,
     pub tempo_header_rlp: Option<Bytes>,
     pub deposits: Vec<QueuedDeposit>,
@@ -115,6 +117,23 @@ pub struct ZoneBlock {
     /// Raw transaction bytes. Full EVM re-execution is not yet implemented; any
     /// non-empty transaction list is rejected by the current prover core.
     pub transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ZoneBlockExecutionContextWitness {
+    pub parent_beacon_block_root: Option<B256>,
+    pub extra_data: Bytes,
+}
+
+impl ZoneBlockExecutionContextWitness {
+    pub fn config(&self) -> ZoneBlockExecutionContextConfig {
+        ZoneBlockExecutionContextConfig {
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            extra_data: self.extra_data.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +314,10 @@ impl PreparedStatelessExecution {
         )?;
         let block_env = ZoneBlockEnv::from_prepared_block(block, block.block_env);
         let evm_env = ZoneEvmEnv::new(block.cfg_env.cfg_env(), block_env);
+        let transaction_count = self.execution_plan.blocks[block_index].transactions.len();
+        let execution_context = block
+            .execution_context
+            .execution_context(block, transaction_count);
         let transactions = self.execution_plan.blocks[block_index]
             .transactions
             .iter()
@@ -306,6 +329,7 @@ impl PreparedStatelessExecution {
             block_index,
             block,
             evm_env,
+            execution_context,
             transactions,
             tempo_state_reader,
         })
@@ -336,7 +360,7 @@ impl PreparedStatelessExecution {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedZoneBlock {
     pub number: u64,
     pub parent_hash: B256,
@@ -344,6 +368,7 @@ pub struct PreparedZoneBlock {
     pub beneficiary: Address,
     pub protocol_version: u64,
     pub cfg_env: ZoneCfgEnvConfig,
+    pub execution_context: ZoneBlockExecutionContextConfig,
     pub block_env: ZoneBlockEnvConfig,
 }
 
@@ -1166,6 +1191,7 @@ fn prepared_zone_blocks(blocks: &[ZoneBlock]) -> Vec<PreparedZoneBlock> {
             beneficiary: block.beneficiary,
             protocol_version: block.protocol_version,
             cfg_env: block.cfg_env.config(),
+            execution_context: block.execution_context.config(),
             block_env: block.block_env.config(),
         })
         .collect()
@@ -1824,6 +1850,13 @@ mod tests {
         }
     }
 
+    fn fixture_execution_context() -> ZoneBlockExecutionContextWitness {
+        ZoneBlockExecutionContextWitness {
+            parent_beacon_block_root: None,
+            extra_data: Bytes::new(),
+        }
+    }
+
     fn fixture_block_env() -> ZoneBlockEnvWitness {
         ZoneBlockEnvWitness {
             gas_limit: 30_000_000,
@@ -1868,6 +1901,7 @@ mod tests {
                 beneficiary: address!("0x0000000000000000000000000000000000000001"),
                 protocol_version: 1,
                 cfg_env: fixture_cfg_env(),
+                execution_context: fixture_execution_context(),
                 block_env: fixture_block_env(),
                 tempo_header_rlp: None,
                 deposits: Vec::new(),
@@ -2912,6 +2946,7 @@ mod tests {
             beneficiary: witness.public_inputs.sequencer,
             protocol_version: 1,
             cfg_env: fixture_cfg_env(),
+            execution_context: fixture_execution_context(),
             block_env: fixture_block_env(),
             tempo_header_rlp: None,
             deposits: Vec::new(),
@@ -3049,6 +3084,14 @@ mod tests {
         assert_eq!(input.evm_env.block_env.inner.gas_limit, 30_000_000);
         assert_eq!(input.evm_env.block_env.inner.basefee, 0);
         assert_eq!(input.evm_env.block_env.timestamp_millis_part, 0);
+        assert_eq!(
+            input.execution_context.inner.parent_hash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_eq!(input.execution_context.inner.tx_count_hint, Some(1));
+        assert_eq!(input.execution_context.inner.slot_number, Some(0));
+        assert_eq!(input.execution_context.general_gas_limit, 30_000_000);
+        assert_eq!(input.execution_context.shared_gas_limit, 3_000_000);
         assert_eq!(input.transactions.len(), 1);
         assert_eq!(
             input.transactions[0].kind,
