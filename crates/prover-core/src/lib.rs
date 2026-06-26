@@ -31,6 +31,7 @@ use zone_primitives::{
 };
 
 mod ancestry;
+mod execution_block;
 mod execution_env;
 mod execution_output;
 mod execution_plan;
@@ -44,6 +45,7 @@ mod tempo_reader;
 mod trie;
 mod witness_db;
 
+pub use execution_block::ZoneAlloyBlockExecutor;
 pub use execution_env::{
     BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneBlockExecutionContext,
     ZoneBlockExecutionContextConfig, ZoneCfgEnv, ZoneCfgEnvConfig, ZoneEvmEnv, tempo_gas_params,
