@@ -16,7 +16,7 @@ use core::fmt;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Decodable;
 use alloy_sol_types::SolValue;
-use alloy_trie::EMPTY_ROOT_HASH;
+use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{
     BlockTransition, DecryptionData, DepositQueueTransition, EnabledToken, QueuedDeposit,
@@ -485,6 +485,7 @@ pub enum ProverError {
     },
     AccountCodeHashMismatch(Address),
     MissingAccountCode(Address),
+    MissingSystemContractCode(Address),
     AccountProofMissing {
         account: Address,
         node_hash: B256,
@@ -827,6 +828,9 @@ impl fmt::Display for ProverError {
             }
             Self::MissingAccountCode(address) => {
                 write!(f, "account code preimage is missing for {address}")
+            }
+            Self::MissingSystemContractCode(address) => {
+                write!(f, "required system contract code is missing for {address}")
             }
             Self::AccountProofMissing { account, node_hash } => {
                 write!(
@@ -1216,6 +1220,7 @@ pub fn prepare_stateless_execution(
     tempo::verify_tempo_ancestry(public, final_tempo_binding, &witness.tempo_ancestry_headers)?;
 
     let execution_plan = ZoneExecutionPlan::from_witness(witness)?;
+    validate_required_system_contract_code(&witness.initial_zone_state, &execution_plan)?;
 
     Ok(PreparedStatelessExecution {
         public_inputs: public.clone(),
@@ -1577,6 +1582,52 @@ fn validate_initial_zone_state(
     })
 }
 
+fn validate_required_system_contract_code(
+    state: &ZoneStateWitness,
+    plan: &ZoneExecutionPlan,
+) -> Result<(), ProverError> {
+    let mut needs_inbox = false;
+    let mut needs_outbox = false;
+
+    for block in &plan.blocks {
+        for tx in &block.transactions {
+            match tx.kind {
+                PlannedZoneTransactionKind::AdvanceTempo => needs_inbox = true,
+                PlannedZoneTransactionKind::FinalizeWithdrawalBatch => needs_outbox = true,
+                PlannedZoneTransactionKind::User { .. } => {}
+            }
+        }
+    }
+
+    if needs_inbox {
+        require_system_contract_code(state, ZONE_INBOX_ADDRESS)?;
+    }
+    if needs_outbox {
+        require_system_contract_code(state, ZONE_OUTBOX_ADDRESS)?;
+    }
+
+    Ok(())
+}
+
+fn require_system_contract_code(
+    state: &ZoneStateWitness,
+    account: Address,
+) -> Result<(), ProverError> {
+    let Some(read) = state
+        .account_reads
+        .iter()
+        .find(|read| read.account == account)
+    else {
+        return Err(ProverError::MissingSystemContractCode(account));
+    };
+
+    if read.code_hash != KECCAK_EMPTY && read.code.as_ref().is_some_and(|code| !code.is_empty()) {
+        return Ok(());
+    }
+
+    Err(ProverError::MissingSystemContractCode(account))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TempoStateReadKey {
     zone_block_index: u64,
@@ -1913,6 +1964,8 @@ mod tests {
     use tempo_primitives::{TempoReceipt, TempoTxType};
     use tempo_zone_contracts::TempoStateReader;
 
+    const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
+
     fn fixture_cfg_env() -> ZoneCfgEnvWitness {
         ZoneCfgEnvWitness {
             chain_id: 421_700_001,
@@ -1996,6 +2049,51 @@ mod tests {
         assert_eq!(
             prove_zone_batch(fixture_witness()).unwrap_err(),
             ProverError::FullStatelessExecutionUnsupported
+        );
+    }
+
+    #[test]
+    fn production_preparation_rejects_empty_required_system_contract_code() {
+        let mut witness = fixture_witness();
+        let mut parts = tempo_components_with_root(
+            witness.public_inputs.tempo_block_number,
+            witness.public_inputs.anchor_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        parts.extend(system_account_components(
+            ZONE_INBOX_ADDRESS,
+            &[
+                (
+                    ZONE_INBOX_PROCESSED_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x44)),
+                ),
+                (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
+            ],
+            &[
+                ZONE_INBOX_PROCESSED_HASH_SLOT,
+                ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            ],
+        ));
+        parts.extend(system_account_components_with_code(
+            ZONE_OUTBOX_ADDRESS,
+            &[
+                (
+                    ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x55)),
+                ),
+                (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(4)),
+            ],
+            &[
+                ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            ],
+            None,
+        ));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        assert_eq!(
+            prepare_stateless_execution(&witness).unwrap_err(),
+            ProverError::MissingSystemContractCode(ZONE_OUTBOX_ADDRESS)
         );
     }
 
@@ -2989,13 +3087,30 @@ mod tests {
         entries: &[(U256, U256)],
         proof_slots: &[U256],
     ) -> ZoneStateParts {
+        system_account_components_with_code(
+            account,
+            entries,
+            proof_slots,
+            Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
+        )
+    }
+
+    fn system_account_components_with_code(
+        account: Address,
+        entries: &[(U256, U256)],
+        proof_slots: &[U256],
+        code: Option<Bytes>,
+    ) -> ZoneStateParts {
         let (storage_root, node_pool, mut storage_proofs) =
             storage_trie_with_entries_and_proofs(entries, proof_slots);
+        let code_hash = code
+            .as_ref()
+            .map_or(KECCAK_EMPTY, |code| keccak256(code.as_ref()));
         let trie_account = TrieAccount {
             nonce: 0,
             balance: U256::ZERO,
             storage_root,
-            code_hash: KECCAK_EMPTY,
+            code_hash,
         };
         let storage_reads = proof_slots
             .iter()
@@ -3016,7 +3131,15 @@ mod tests {
 
         ZoneStateParts {
             account_entries: vec![(account, trie_account)],
-            account_reads: vec![account_read(account, trie_account)],
+            account_reads: vec![ZoneAccountRead {
+                account,
+                nonce: trie_account.nonce,
+                balance: trie_account.balance,
+                storage_root: trie_account.storage_root,
+                code_hash: trie_account.code_hash,
+                code,
+                proof_node_hashes: Vec::new(),
+            }],
             storage_reads,
             node_pool,
         }
