@@ -28,10 +28,12 @@ use zone_primitives::{
     },
 };
 
+mod post_state;
 mod tempo;
 mod trie;
 mod witness_db;
 
+pub use post_state::ExecutionPostState;
 pub use witness_db::{WitnessDatabase, WitnessDbError};
 
 /// Ethereum's canonical empty trie root.

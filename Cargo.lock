@@ -13780,6 +13780,8 @@ dependencies = [
  "alloy-rlp",
  "alloy-sol-types",
  "alloy-trie",
+ "reth-trie-common",
+ "revm-database",
  "revm-database-interface",
  "serde",
  "tempo-primitives",

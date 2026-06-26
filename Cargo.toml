@@ -156,9 +156,11 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "f152114
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "f152114" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "f152114" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", rev = "f152114" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "f152114", default-features = false }
 revm = { version = "41.0.0", features = [
   "optional_fee_charge",
 ], default-features = false }
+revm-database = { version = "41.0.0", default-features = false }
 revm-database-interface = { version = "41.0.0", default-features = false }
 
 # alloy
