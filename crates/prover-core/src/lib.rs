@@ -35,6 +35,7 @@ mod execution_block;
 mod execution_env;
 mod execution_output;
 mod execution_plan;
+mod execution_precompiles;
 mod execution_receipt;
 mod execution_state;
 mod execution_tx;
@@ -62,6 +63,7 @@ pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
     ZoneExecutionPlan,
 };
+pub use execution_precompiles::register_witness_zone_precompiles;
 pub use execution_receipt::ZoneTempoReceiptBuilder;
 pub use execution_state::{
     ZoneExecutionState, execution_post_state_from_state, zone_execution_state,
@@ -73,8 +75,8 @@ pub use state_root::{
 };
 pub use tempo_chainspec::hardfork::TempoHardfork;
 pub use tempo_reader::{
-    TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS, TempoStateReaderCallResult,
-    WitnessTempoStateReader, tempo_state_reader_gas,
+    OwnedWitnessTempoStateReader, TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS,
+    TempoStateReaderCallResult, WitnessTempoStateReader, tempo_state_reader_gas,
 };
 pub use witness_db::{WitnessDatabase, WitnessDbError};
 

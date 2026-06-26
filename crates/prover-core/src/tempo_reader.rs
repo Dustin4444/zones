@@ -1,6 +1,6 @@
 use alloc::{borrow::Cow, format, vec::Vec};
 
-use alloy_evm::precompiles::{Precompile, PrecompileInput};
+use alloy_evm::precompiles::{DynPrecompile, Precompile, PrecompileInput};
 use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::{SolCall, SolError};
 use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
@@ -132,6 +132,57 @@ impl Precompile for WitnessTempoStateReader<'_> {
             }
             Err(err) => Err(PrecompileError::Fatal(format!("{err}"))),
         }
+    }
+
+    fn supports_caching(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedWitnessTempoStateReader {
+    provider: TempoWitnessProvider,
+    zone_block_index: u64,
+}
+
+impl OwnedWitnessTempoStateReader {
+    pub const fn new(provider: TempoWitnessProvider, zone_block_index: u64) -> Self {
+        Self {
+            provider,
+            zone_block_index,
+        }
+    }
+
+    pub fn from_reader(reader: WitnessTempoStateReader<'_>) -> Self {
+        Self {
+            provider: reader.provider.clone(),
+            zone_block_index: reader.zone_block_index,
+        }
+    }
+
+    pub const fn zone_block_index(&self) -> u64 {
+        self.zone_block_index
+    }
+
+    pub const fn borrowed(&self) -> WitnessTempoStateReader<'_> {
+        WitnessTempoStateReader::new(&self.provider, self.zone_block_index)
+    }
+
+    pub fn into_dyn(self) -> DynPrecompile {
+        DynPrecompile::new_stateful(
+            PrecompileId::Custom("WitnessTempoStateReader".into()),
+            move |input| Precompile::call(&self, input),
+        )
+    }
+}
+
+impl Precompile for OwnedWitnessTempoStateReader {
+    fn precompile_id(&self) -> &PrecompileId {
+        &TEMPO_STATE_READER_PRECOMPILE_ID
+    }
+
+    fn call(&self, input: PrecompileInput<'_>) -> PrecompileResult {
+        Precompile::call(&self.borrowed(), input)
     }
 
     fn supports_caching(&self) -> bool {

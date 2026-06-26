@@ -13794,6 +13794,7 @@ dependencies = [
  "tempo-chainspec",
  "tempo-primitives",
  "tempo-zone-contracts",
+ "zone-precompiles",
  "zone-primitives",
 ]
 
