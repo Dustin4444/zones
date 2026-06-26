@@ -40,7 +40,9 @@ mod tempo_reader;
 mod trie;
 mod witness_db;
 
-pub use execution_env::{BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig};
+pub use execution_env::{
+    BlobExcessGasAndPrice, ZoneBlockEnv, ZoneBlockEnvConfig, ZoneCfgEnv, ZoneEvmEnv,
+};
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
     StatelessZoneBlockExecutor, StatelessZoneExecutor, TempoExecutionCommitment,

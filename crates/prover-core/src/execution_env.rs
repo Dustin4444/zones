@@ -1,10 +1,21 @@
-use alloy_evm::env::BlockEnvironment;
+use alloy_evm::{EvmEnv, env::BlockEnvironment};
 use alloy_primitives::{Address, B256, U256};
 use revm::context::{Block, BlockEnv};
+use tempo_chainspec::hardfork::TempoHardfork;
 
 use crate::PreparedZoneBlock;
 
 pub use revm::context_interface::block::BlobExcessGasAndPrice;
+
+/// Tempo-typed revm cfg environment for Zone stateless execution.
+///
+/// The caller must construct this with canonical Tempo gas params. prover-core
+/// keeps this as an explicit input boundary until the no_std Tempo executor/gas
+/// parameter path is forked or reused directly.
+pub type ZoneCfgEnv = revm::context::CfgEnv<TempoHardfork>;
+
+/// Complete EVM environment shape expected by a revm-backed Zone executor.
+pub type ZoneEvmEnv = EvmEnv<TempoHardfork, ZoneBlockEnv>;
 
 /// Explicit EVM block environment inputs for Zone execution.
 ///
@@ -192,5 +203,16 @@ mod tests {
         env.inner_mut().gas_limit = 1;
 
         assert_eq!(env.gas_limit(), 1);
+    }
+
+    #[test]
+    fn zone_evm_env_pairs_tempo_cfg_with_zone_block_env() {
+        let cfg = ZoneCfgEnv::new_with_spec(TempoHardfork::T1);
+        let block_env = ZoneBlockEnv::from_prepared_block(&prepared_block(), env_config());
+
+        let env = ZoneEvmEnv::new(cfg, block_env.clone());
+
+        assert_eq!(env.cfg_env.spec, TempoHardfork::T1);
+        assert_eq!(env.block_env, block_env);
     }
 }
