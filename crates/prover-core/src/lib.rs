@@ -195,8 +195,22 @@ pub enum ProverError {
         expected: u64,
         actual: u64,
     },
+    TempoStateReadUnboundTempoRoot {
+        read_index: usize,
+        tempo_block_number: u64,
+    },
+    DuplicateTempoRootBinding {
+        root_index: usize,
+        tempo_block_number: u64,
+    },
     DuplicateTempoStateRead {
         read_index: usize,
+    },
+    MissingTempoStateRead {
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        account: Address,
+        slot: U256,
     },
     TempoStateAccountProofMissing {
         read_index: usize,
@@ -367,10 +381,39 @@ impl fmt::Display for ProverError {
                     "Tempo state read {read_index} block mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::TempoStateReadUnboundTempoRoot {
+                read_index,
+                tempo_block_number,
+            } => {
+                write!(
+                    f,
+                    "Tempo state read {read_index} references unbound Tempo block {tempo_block_number}"
+                )
+            }
+            Self::DuplicateTempoRootBinding {
+                root_index,
+                tempo_block_number,
+            } => {
+                write!(
+                    f,
+                    "Tempo root binding {root_index} duplicates Tempo block {tempo_block_number}"
+                )
+            }
             Self::DuplicateTempoStateRead { read_index } => {
                 write!(
                     f,
                     "Tempo state read {read_index} duplicates an earlier read"
+                )
+            }
+            Self::MissingTempoStateRead {
+                zone_block_index,
+                tempo_block_number,
+                account,
+                slot,
+            } => {
+                write!(
+                    f,
+                    "missing proved Tempo state read for zone block {zone_block_index}, Tempo block {tempo_block_number}, account {account}, slot {slot}"
                 )
             }
             Self::TempoStateAccountProofMissing {
@@ -840,65 +883,170 @@ struct TempoStateReadKey {
     slot: U256,
 }
 
+/// Tempo L1 state root that witness-backed reads may prove against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TempoRootBinding {
+    pub block_number: u64,
+    pub state_root: B256,
+}
+
+impl TempoRootBinding {
+    fn from_tempo_binding(binding: tempo::TempoBinding) -> Self {
+        Self {
+            block_number: binding.block_number,
+            state_root: binding.state_root,
+        }
+    }
+}
+
+/// Proof-backed provider for Tempo L1 storage reads needed during Zone execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempoWitnessProvider {
+    reads: BTreeMap<TempoStateReadKey, U256>,
+}
+
+impl TempoWitnessProvider {
+    pub fn new(
+        proofs: &BatchStateProof,
+        zone_block_count: usize,
+        root_bindings: &[TempoRootBinding],
+    ) -> Result<Self, ProverError> {
+        let mut roots = BTreeMap::new();
+        for (root_index, binding) in root_bindings.iter().enumerate() {
+            if roots
+                .insert(binding.block_number, binding.state_root)
+                .is_some()
+            {
+                return Err(ProverError::DuplicateTempoRootBinding {
+                    root_index,
+                    tempo_block_number: binding.block_number,
+                });
+            }
+        }
+
+        let mut verified_reads = BTreeMap::new();
+
+        for (read_index, read) in proofs.reads.iter().enumerate() {
+            if usize::try_from(read.zone_block_index)
+                .map_or(true, |index| index >= zone_block_count)
+            {
+                return Err(ProverError::TempoStateReadBlockIndexOutOfRange {
+                    read_index,
+                    zone_block_index: read.zone_block_index,
+                });
+            }
+
+            let Some(state_root) = roots.get(&read.tempo_block_number).copied() else {
+                return Err(ProverError::TempoStateReadUnboundTempoRoot {
+                    read_index,
+                    tempo_block_number: read.tempo_block_number,
+                });
+            };
+
+            let account = trie::verify_account_proof(
+                state_root,
+                &proofs.node_pool,
+                trie::AccountProof {
+                    account: read.account,
+                    nonce: read.account_nonce,
+                    balance: read.account_balance,
+                    storage_root: read.account_storage_root,
+                    code_hash: read.account_code_hash,
+                    proof_node_hashes: &read.account_proof_node_hashes,
+                },
+            )
+            .map_err(|err| tempo_state_account_error(read_index, read, err))?;
+
+            trie::verify_storage_proof(
+                account.storage_root,
+                &proofs.node_pool,
+                trie::StorageProof {
+                    slot: read.slot,
+                    value: read.value,
+                    proof_node_hashes: &read.storage_proof_node_hashes,
+                },
+            )
+            .map_err(|err| tempo_state_storage_error(read_index, read, err))?;
+
+            let key = TempoStateReadKey {
+                zone_block_index: read.zone_block_index,
+                tempo_block_number: read.tempo_block_number,
+                account: read.account,
+                slot: read.slot,
+            };
+            if verified_reads.insert(key, read.value).is_some() {
+                return Err(ProverError::DuplicateTempoStateRead { read_index });
+            }
+        }
+
+        Ok(Self {
+            reads: verified_reads,
+        })
+    }
+
+    pub fn read_storage_word(
+        &self,
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        account: Address,
+        slot: U256,
+    ) -> Result<U256, ProverError> {
+        let key = TempoStateReadKey {
+            zone_block_index,
+            tempo_block_number,
+            account,
+            slot,
+        };
+        self.reads
+            .get(&key)
+            .copied()
+            .ok_or(ProverError::MissingTempoStateRead {
+                zone_block_index,
+                tempo_block_number,
+                account,
+                slot,
+            })
+    }
+
+    pub fn read_storage_at(
+        &self,
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        account: Address,
+        slot: B256,
+    ) -> Result<B256, ProverError> {
+        Ok(B256::from(self.read_storage_word(
+            zone_block_index,
+            tempo_block_number,
+            account,
+            storage_slot_u256(slot),
+        )?))
+    }
+
+    fn into_verified_reads(self) -> BTreeMap<TempoStateReadKey, U256> {
+        self.reads
+    }
+}
+
 fn validate_tempo_state_proofs(
     proofs: &BatchStateProof,
     zone_block_count: usize,
     binding: tempo::TempoBinding,
 ) -> Result<BTreeMap<TempoStateReadKey, U256>, ProverError> {
-    let mut verified_reads = BTreeMap::new();
-
-    for (read_index, read) in proofs.reads.iter().enumerate() {
-        if usize::try_from(read.zone_block_index).map_or(true, |index| index >= zone_block_count) {
-            return Err(ProverError::TempoStateReadBlockIndexOutOfRange {
+    let roots = [TempoRootBinding::from_tempo_binding(binding)];
+    TempoWitnessProvider::new(proofs, zone_block_count, &roots)
+        .map(TempoWitnessProvider::into_verified_reads)
+        .map_err(|err| match err {
+            ProverError::TempoStateReadUnboundTempoRoot {
                 read_index,
-                zone_block_index: read.zone_block_index,
-            });
-        }
-        if read.tempo_block_number != binding.block_number {
-            return Err(ProverError::TempoStateReadTempoBlockMismatch {
+                tempo_block_number,
+            } => ProverError::TempoStateReadTempoBlockMismatch {
                 read_index,
                 expected: binding.block_number,
-                actual: read.tempo_block_number,
-            });
-        }
-
-        let account = trie::verify_account_proof(
-            binding.state_root,
-            &proofs.node_pool,
-            trie::AccountProof {
-                account: read.account,
-                nonce: read.account_nonce,
-                balance: read.account_balance,
-                storage_root: read.account_storage_root,
-                code_hash: read.account_code_hash,
-                proof_node_hashes: &read.account_proof_node_hashes,
+                actual: tempo_block_number,
             },
-        )
-        .map_err(|err| tempo_state_account_error(read_index, read, err))?;
-
-        trie::verify_storage_proof(
-            account.storage_root,
-            &proofs.node_pool,
-            trie::StorageProof {
-                slot: read.slot,
-                value: read.value,
-                proof_node_hashes: &read.storage_proof_node_hashes,
-            },
-        )
-        .map_err(|err| tempo_state_storage_error(read_index, read, err))?;
-
-        let key = TempoStateReadKey {
-            zone_block_index: read.zone_block_index,
-            tempo_block_number: read.tempo_block_number,
-            account: read.account,
-            slot: read.slot,
-        };
-        if verified_reads.insert(key, read.value).is_some() {
-            return Err(ProverError::DuplicateTempoStateRead { read_index });
-        }
-    }
-
-    Ok(verified_reads)
+            err => err,
+        })
 }
 
 fn tempo_state_account_error(
@@ -1802,6 +1950,103 @@ mod tests {
         witness.tempo_state_proofs = proof;
 
         prove_empty_zone_batch(witness).unwrap();
+    }
+
+    #[test]
+    fn tempo_witness_provider_verifies_reads_against_each_bound_root() {
+        let account_0 = address!("0x0000000000000000000000000000000000001000");
+        let account_1 = address!("0x0000000000000000000000000000000000002000");
+        let slot_0 = U256::from(7);
+        let slot_1 = U256::from(8);
+        let value_0 = U256::from(9);
+        let value_1 = U256::from(10);
+        let (root_0, mut proof) = l1_state_proof(0, 100, account_0, slot_0, value_0);
+        let (root_1, proof_1) = l1_state_proof(1, 101, account_1, slot_1, value_1);
+        proof.node_pool.extend(proof_1.node_pool);
+        proof.reads.extend(proof_1.reads);
+
+        let provider = TempoWitnessProvider::new(
+            &proof,
+            2,
+            &[
+                TempoRootBinding {
+                    block_number: 100,
+                    state_root: root_0,
+                },
+                TempoRootBinding {
+                    block_number: 101,
+                    state_root: root_1,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider
+                .read_storage_word(0, 100, account_0, slot_0)
+                .unwrap(),
+            value_0
+        );
+        assert_eq!(
+            provider
+                .read_storage_at(1, 101, account_1, B256::from(slot_1))
+                .unwrap(),
+            B256::from(value_1)
+        );
+    }
+
+    #[test]
+    fn tempo_witness_provider_rejects_unbound_tempo_root() {
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let slot = U256::from(7);
+        let value = U256::from(9);
+        let (_root, proof) = l1_state_proof(0, 101, account, slot, value);
+
+        assert_eq!(
+            TempoWitnessProvider::new(
+                &proof,
+                1,
+                &[TempoRootBinding {
+                    block_number: 100,
+                    state_root: B256::repeat_byte(0x03),
+                }],
+            )
+            .unwrap_err(),
+            ProverError::TempoStateReadUnboundTempoRoot {
+                read_index: 0,
+                tempo_block_number: 101,
+            }
+        );
+    }
+
+    #[test]
+    fn tempo_witness_provider_rejects_missing_read() {
+        let provider = TempoWitnessProvider::new(
+            &BatchStateProof {
+                node_pool: BTreeMap::new(),
+                reads: Vec::new(),
+            },
+            1,
+            &[TempoRootBinding {
+                block_number: 100,
+                state_root: EMPTY_TRIE_ROOT,
+            }],
+        )
+        .unwrap();
+        let account = address!("0x0000000000000000000000000000000000001000");
+        let slot = U256::from(7);
+
+        assert_eq!(
+            provider
+                .read_storage_word(0, 100, account, slot)
+                .unwrap_err(),
+            ProverError::MissingTempoStateRead {
+                zone_block_index: 0,
+                tempo_block_number: 100,
+                account,
+                slot,
+            }
+        );
     }
 
     #[test]
