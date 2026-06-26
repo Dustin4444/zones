@@ -17,7 +17,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
 use alloy_trie::EMPTY_ROOT_HASH;
 use tempo_zone_contracts::{
-    BlockTransition, DecryptionData, DepositQueueTransition, QueuedDeposit,
+    BlockTransition, DecryptionData, DepositQueueTransition, EnabledToken, QueuedDeposit,
 };
 use zone_primitives::{
     ZoneHeader,
@@ -28,11 +28,16 @@ use zone_primitives::{
     },
 };
 
+mod execution_plan;
 mod post_state;
 mod tempo;
 mod trie;
 mod witness_db;
 
+pub use execution_plan::{
+    PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
+    ZoneExecutionPlan,
+};
 pub use post_state::ExecutionPostState;
 pub use witness_db::{WitnessDatabase, WitnessDbError};
 
@@ -78,7 +83,9 @@ pub struct ZoneBlock {
     pub tempo_header_rlp: Option<Bytes>,
     pub deposits: Vec<QueuedDeposit>,
     pub decryptions: Vec<DecryptionData>,
+    pub enabled_tokens: Vec<EnabledToken>,
     pub finalize_withdrawal_batch_count: Option<U256>,
+    pub finalize_withdrawal_encrypted_senders: Vec<Bytes>,
     /// Raw transaction bytes. Full EVM re-execution is not yet implemented; any
     /// non-empty transaction list is rejected by the current prover core.
     pub transactions: Vec<Bytes>,
@@ -334,6 +341,14 @@ pub enum ProverError {
         index: usize,
     },
     MissingFinalWithdrawalFinalization,
+    UserTransactionDecodeFailed {
+        block_index: usize,
+        transaction_index: usize,
+    },
+    UserTransactionSenderRecoveryFailed {
+        block_index: usize,
+        transaction_index: usize,
+    },
     TempoImportUnsupported {
         index: usize,
     },
@@ -639,6 +654,20 @@ impl fmt::Display for ProverError {
             Self::MissingFinalWithdrawalFinalization => {
                 f.write_str("final zone block is missing withdrawal finalization")
             }
+            Self::UserTransactionDecodeFailed {
+                block_index,
+                transaction_index,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} is not valid EIP-2718 Tempo transaction bytes"
+            ),
+            Self::UserTransactionSenderRecoveryFailed {
+                block_index,
+                transaction_index,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} signer recovery failed"
+            ),
             Self::TempoImportUnsupported { index } => {
                 write!(f, "zone block {index} tempo import is not implemented yet")
             }
@@ -824,8 +853,14 @@ fn validate_block(
     if block.tempo_header_rlp.is_some() {
         return Err(ProverError::TempoImportUnsupported { index });
     }
-    if !block.deposits.is_empty() || !block.decryptions.is_empty() {
+    if !block.deposits.is_empty()
+        || !block.decryptions.is_empty()
+        || !block.enabled_tokens.is_empty()
+    {
         return Err(ProverError::DepositProcessingUnsupported { index });
+    }
+    if !block.finalize_withdrawal_encrypted_senders.is_empty() {
+        return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
     }
     if !block.transactions.is_empty() {
         return Err(ProverError::UserTransactionsUnsupported { index });
@@ -1229,7 +1264,9 @@ mod tests {
                 tempo_header_rlp: None,
                 deposits: Vec::new(),
                 decryptions: Vec::new(),
+                enabled_tokens: Vec::new(),
                 finalize_withdrawal_batch_count: Some(U256::ZERO),
+                finalize_withdrawal_encrypted_senders: Vec::new(),
                 transactions: Vec::new(),
             }],
             initial_zone_state,
@@ -1889,7 +1926,9 @@ mod tests {
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),
+            enabled_tokens: Vec::new(),
             finalize_withdrawal_batch_count: Some(U256::ZERO),
+            finalize_withdrawal_encrypted_senders: Vec::new(),
             transactions: Vec::new(),
         };
         witness.zone_blocks.push(second);
@@ -2454,6 +2493,33 @@ mod tests {
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::UserTransactionsUnsupported { index: 0 }
+        );
+    }
+
+    #[test]
+    fn rejects_enabled_tokens_until_execution_adapter_exists() {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0].enabled_tokens.push(EnabledToken {
+            token: address!("0x0000000000000000000000000000000000001000"),
+            name: "USD Test".into(),
+            symbol: "USDT".into(),
+            currency: "USD".into(),
+        });
+        assert_eq!(
+            prove_empty_zone_batch(witness).unwrap_err(),
+            ProverError::DepositProcessingUnsupported { index: 0 }
+        );
+    }
+
+    #[test]
+    fn rejects_withdrawal_sender_payloads_until_execution_adapter_exists() {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0]
+            .finalize_withdrawal_encrypted_senders
+            .push(Bytes::from_static(b"sender"));
+        assert_eq!(
+            prove_empty_zone_batch(witness).unwrap_err(),
+            ProverError::NonZeroWithdrawalFinalizationUnsupported
         );
     }
 

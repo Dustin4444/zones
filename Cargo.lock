@@ -13776,10 +13776,13 @@ dependencies = [
 name = "zone-prover-core"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-sol-types",
  "alloy-trie",
+ "const-hex",
  "reth-trie-common",
  "revm-database",
  "revm-database-interface",

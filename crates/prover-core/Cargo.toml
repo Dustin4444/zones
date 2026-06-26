@@ -15,6 +15,8 @@ tempo-zone-contracts = { workspace = true, features = ["serde"] }
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "65185565b01bc9f406a06c522357954d75ce7cb7", default-features = false }
 zone-primitives = { workspace = true, features = ["serde"] }
 
+alloy-consensus = { workspace = true }
+alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
 alloy-sol-types = { workspace = true }
@@ -27,6 +29,8 @@ serde = { workspace = true, optional = true }
 [features]
 default = ["std", "serde"]
 std = [
+    "alloy-consensus/std",
+    "alloy-eips/std",
     "alloy-primitives/std",
     "alloy-rlp/std",
     "alloy-sol-types/std",
@@ -45,3 +49,6 @@ serde = [
     "tempo-zone-contracts/serde",
     "zone-primitives/serde",
 ]
+
+[dev-dependencies]
+const-hex.workspace = true
