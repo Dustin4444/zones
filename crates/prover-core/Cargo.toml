@@ -63,6 +63,8 @@ serde = [
 ]
 
 [dev-dependencies]
+alloy-network.workspace = true
+alloy-signer-local.workspace = true
 const-hex.workspace = true
 reth-primitives-traits.workspace = true
 serde_json.workspace = true

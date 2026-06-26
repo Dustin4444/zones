@@ -88,6 +88,11 @@ pub use witness_db::{WitnessDatabase, WitnessDbError};
 /// Ethereum's canonical empty trie root.
 pub const EMPTY_TRIE_ROOT: B256 = EMPTY_ROOT_HASH;
 
+const ZONE_NO_BLOB_GAS: BlobExcessGasAndPrice = BlobExcessGasAndPrice {
+    excess_blob_gas: 0,
+    blob_gasprice: 1,
+};
+
 /// Prover-side public inputs that must match the values passed by `ZonePortal`
 /// into `IVerifier.verify(...)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,8 +139,7 @@ pub struct ZoneBlock {
     pub enabled_tokens: Vec<EnabledToken>,
     pub finalize_withdrawal_batch_count: Option<U256>,
     pub finalize_withdrawal_encrypted_senders: Vec<Bytes>,
-    /// Raw transaction bytes. Full EVM re-execution is not yet implemented; any
-    /// non-empty transaction list is rejected by the current prover core.
+    /// Raw user transaction bytes, decoded and executed in witness order.
     pub transactions: Vec<Bytes>,
 }
 
@@ -194,7 +198,7 @@ impl ZoneBlockEnvWitness {
             basefee: self.basefee,
             difficulty: self.difficulty,
             prevrandao: self.prevrandao,
-            blob_excess_gas_and_price: None,
+            blob_excess_gas_and_price: Some(ZONE_NO_BLOB_GAS),
             slot_num: self.slot_num,
             timestamp_millis_part: self.timestamp_millis_part,
         }
@@ -1937,12 +1941,15 @@ mod tests {
     use super::*;
     use alloc::{format, vec};
     use alloy_consensus::{
-        TxReceipt,
+        SignableTransaction, TxEip1559, TxEnvelope, TxReceipt,
         proofs::{calculate_receipt_root, calculate_transaction_root},
     };
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_evm::block::BlockExecutionResult;
+    use alloy_network::TxSignerSync;
     use alloy_primitives::{B256, address, keccak256};
     use alloy_rlp::Encodable;
+    use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::SolCall;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
     use reth_trie_common::{KeccakKeyHasher, KeyHasher};
@@ -1963,6 +1970,9 @@ mod tests {
     const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
     const ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
     const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
+    const USER_VALUE_TX_CHAIN_ID: u64 = 1337;
+    const USER_VALUE_TX_AMOUNT: u64 = 1234;
+    const USER_VALUE_TX_INITIAL_BALANCE: U256 = U256::from_limbs([0, 0, 1, 0]);
 
     fn fixture_cfg_env() -> ZoneCfgEnvWitness {
         ZoneCfgEnvWitness {
@@ -2007,6 +2017,37 @@ mod tests {
 
     fn outbox_packed_slot(withdrawal_batch_index: u64) -> U256 {
         U256::from(withdrawal_batch_index) << 192
+    }
+
+    fn user_value_tx_sender() -> Address {
+        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+    }
+
+    fn user_value_tx_recipient() -> Address {
+        address!("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")
+    }
+
+    fn signed_user_value_transfer_tx() -> Bytes {
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .expect("test private key should parse");
+        assert_eq!(signer.address(), user_value_tx_sender());
+
+        let mut tx = TxEip1559 {
+            chain_id: USER_VALUE_TX_CHAIN_ID,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: user_value_tx_recipient().into(),
+            value: U256::from(USER_VALUE_TX_AMOUNT),
+            ..Default::default()
+        };
+        let signature = signer
+            .sign_transaction_sync(&mut tx)
+            .expect("test transaction should sign");
+        Bytes::from(TxEnvelope::Eip1559(tx.into_signed(signature)).encoded_2718())
     }
 
     fn fixture_witness() -> BatchWitness {
@@ -2061,20 +2102,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn production_prover_uses_witness_executor_and_fails_closed_on_execution_error() {
-        let witness = fixture_witness();
-
-        let err = prove_zone_batch(witness).unwrap_err();
-        assert!(matches!(
-            err,
-            ProverError::ExecutionBlockFailed { index: 0, .. }
-        ));
-    }
-
-    #[test]
-    fn production_prover_executes_real_outbox_zero_withdrawal_finalization() {
-        let mut witness = fixture_witness();
+    fn real_outbox_zone_state_parts(witness: &BatchWitness) -> ZoneStateParts {
         let mut parts = tempo_components_with_root(
             witness.public_inputs.tempo_block_number,
             witness.public_inputs.anchor_block_hash,
@@ -2089,11 +2117,10 @@ mod tests {
                 ),
                 (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
             ],
-            [
+            &[
                 ZONE_INBOX_PROCESSED_HASH_SLOT,
                 ZONE_INBOX_PROCESSED_NUMBER_SLOT,
-            ]
-            .as_slice(),
+            ],
         ));
         parts.extend(system_account_components_with_code(
             ZONE_OUTBOX_ADDRESS,
@@ -2105,20 +2132,42 @@ mod tests {
                 ),
                 (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(4)),
             ],
-            [
+            &[
                 ZONE_OUTBOX_PACKED_SLOT,
                 ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
                 ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
-            ]
-            .as_slice(),
+            ],
             Some(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
         ));
+        parts
+    }
+
+    fn fixture_witness_with_real_outbox() -> BatchWitness {
+        let mut witness = fixture_witness();
+        let mut parts = real_outbox_zone_state_parts(&witness);
         parts
             .account_reads
             .push(absent_account_read(witness.public_inputs.sequencer));
         set_initial_zone_state(&mut witness, parts.assemble());
+        witness
+    }
+
+    #[test]
+    fn production_prover_uses_witness_executor_and_fails_closed_on_execution_error() {
+        let witness = fixture_witness();
+
+        let err = prove_zone_batch(witness).unwrap_err();
+        assert!(matches!(
+            err,
+            ProverError::ExecutionBlockFailed { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn production_prover_executes_real_outbox_zero_withdrawal_finalization() {
+        let witness = fixture_witness_with_real_outbox();
 
         let output = prove_zone_batch(witness.clone()).unwrap();
 
@@ -2137,6 +2186,55 @@ mod tests {
             output.last_batch_commitment.withdrawal_queue_hash,
             B256::ZERO
         );
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            witness.public_inputs.expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_executes_signed_user_value_transfer_before_real_outbox_finalization() {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0].cfg_env.chain_id = USER_VALUE_TX_CHAIN_ID;
+        witness.zone_blocks[0]
+            .transactions
+            .push(signed_user_value_transfer_tx());
+
+        let mut parts = real_outbox_zone_state_parts(&witness);
+        let sender_account = TrieAccount {
+            nonce: 0,
+            balance: USER_VALUE_TX_INITIAL_BALANCE,
+            storage_root: EMPTY_TRIE_ROOT,
+            code_hash: KECCAK_EMPTY,
+        };
+        parts
+            .account_entries
+            .push((user_value_tx_sender(), sender_account));
+        parts
+            .account_reads
+            .push(account_read(user_value_tx_sender(), sender_account));
+        parts
+            .account_reads
+            .push(absent_account_read(user_value_tx_recipient()));
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        let output = prove_zone_batch(witness.clone()).unwrap();
+        let empty_output = prove_zone_batch(fixture_witness_with_real_outbox()).unwrap();
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            empty_output.block_transition.nextBlockHash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
+        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
         assert_eq!(
             output.last_batch_commitment.withdrawal_batch_index,
             witness.public_inputs.expected_withdrawal_batch_index
@@ -3680,6 +3778,10 @@ mod tests {
         assert_eq!(input.evm_env.cfg_env.spec, TempoHardfork::T1);
         assert_eq!(input.evm_env.block_env.inner.gas_limit, 30_000_000);
         assert_eq!(input.evm_env.block_env.inner.basefee, 0);
+        assert_eq!(
+            input.evm_env.block_env.inner.blob_excess_gas_and_price,
+            Some(ZONE_NO_BLOB_GAS)
+        );
         assert_eq!(input.evm_env.block_env.timestamp_millis_part, 0);
         assert_eq!(
             input.execution_context.inner.parent_hash,

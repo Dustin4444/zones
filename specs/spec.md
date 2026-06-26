@@ -706,6 +706,8 @@ Sequencer encryption keys are already published (used for encrypted deposits), s
 
 Zone transactions specify which enabled TIP-20 token to use for gas fees via a `feeToken` field. The sequencer accepts all enabled tokens as gas. Transactions use Tempo transaction semantics for fee payer, max fee per gas, and gas limit.
 
+Zones do not admit EIP-4844 blob transactions. The zone node disables EIP-4844 transaction validation, and the prover pins the revm blob environment to `excessBlobGas = 0` with the minimum blob gas price. Blob gas values are therefore not witness-controlled.
+
 ### Block Structure
 
 Each zone block contains system transactions and user transactions in a fixed order:
