@@ -297,6 +297,7 @@ pub struct PreparedStatelessExecution {
     pub public_inputs: PublicInputs,
     pub prev_block_header: ZoneHeader,
     pub zone_blocks: Vec<PreparedZoneBlock>,
+    pub initial_zone_state: ZoneStateWitness,
     pub execution_db: WitnessDatabase,
     pub execution_plan: ZoneExecutionPlan,
     pub tempo_witness_provider: TempoWitnessProvider,
@@ -310,6 +311,10 @@ impl PreparedStatelessExecution {
 
     pub fn into_execution_state(self) -> ZoneExecutionState {
         zone_execution_state(self.execution_db)
+    }
+
+    pub fn state_root_calculator(&self) -> Result<SparseStateRootCalculator, ProverError> {
+        SparseStateRootCalculator::from_zone_state_witness(&self.initial_zone_state)
     }
 
     pub fn block_execution_input(
@@ -1199,6 +1204,7 @@ pub fn prepare_stateless_execution(
         public_inputs: public.clone(),
         prev_block_header: witness.prev_block_header.clone(),
         zone_blocks: prepared_zone_blocks(&witness.zone_blocks),
+        initial_zone_state: witness.initial_zone_state.clone(),
         execution_db,
         execution_plan,
         tempo_witness_provider,
@@ -2010,6 +2016,19 @@ mod tests {
                 .execution_db
                 .block_hash(witness.prev_block_header.number),
             Ok(witness.prev_block_header.hash())
+        );
+        assert_eq!(
+            prepared.initial_zone_state.state_root,
+            witness.initial_zone_state.state_root
+        );
+        assert_eq!(
+            prepared
+                .state_root_calculator()
+                .unwrap()
+                .calculate(ExecutionPostState::default().into_hashed())
+                .unwrap()
+                .get(),
+            witness.initial_zone_state.state_root
         );
         assert_eq!(prepared.execution_plan.blocks.len(), 1);
         assert_eq!(prepared.execution_plan.blocks[0].transactions.len(), 1);
@@ -3492,12 +3511,8 @@ mod tests {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut executor = RecordingBlockExecutor { seen: Vec::new() };
-        let mut state_root_calculator =
-            SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
-                .unwrap();
 
-        let output =
-            execute_prepared_blocks(&prepared, &mut executor, &mut state_root_calculator).unwrap();
+        let output = execute_prepared_blocks(&prepared, &mut executor).unwrap();
 
         assert_eq!(executor.seen, vec![(0, 1)]);
         assert_eq!(output.blocks.len(), 1);

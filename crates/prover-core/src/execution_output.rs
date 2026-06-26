@@ -21,8 +21,8 @@ use zone_primitives::{
 use crate::{
     BatchOutput, CalculatedStateRoot, DepositQueueState, ExecutionPostState, LastBatchCommitment,
     PlannedZoneTransaction, PlannedZoneTransactionKind, PreparedStatelessExecution,
-    PreparedZoneBlock, ProverError, RecoveredTempoTx, SparseStateRootCalculator,
-    WitnessTempoStateReader, ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
+    PreparedZoneBlock, ProverError, RecoveredTempoTx, WitnessTempoStateReader,
+    ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
     execution_post_state_from_state,
 };
 
@@ -217,7 +217,6 @@ pub fn prove_zone_batch_with_executor(
 pub fn execute_prepared_blocks<E>(
     prepared: &PreparedStatelessExecution,
     executor: &mut E,
-    state_root_calculator: &mut SparseStateRootCalculator,
 ) -> Result<StatelessExecutionOutput, ProverError>
 where
     E: StatelessZoneBlockExecutor,
@@ -225,6 +224,7 @@ where
 {
     let mut blocks = Vec::with_capacity(prepared.zone_blocks.len());
     let mut state = prepared.execution_state();
+    let mut state_root_calculator = prepared.state_root_calculator()?;
     for block_index in 0..prepared.zone_blocks.len() {
         let input = prepared.block_execution_input(block_index)?;
         let artifacts = executor.execute_block(&mut state, input)?;
