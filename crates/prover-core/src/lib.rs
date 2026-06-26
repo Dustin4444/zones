@@ -34,6 +34,7 @@ mod ancestry;
 mod execution_env;
 mod execution_output;
 mod execution_plan;
+mod execution_state;
 mod execution_tx;
 mod post_state;
 mod tempo;
@@ -56,6 +57,9 @@ pub use execution_output::{
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
     ZoneExecutionPlan,
+};
+pub use execution_state::{
+    ZoneExecutionState, execution_post_state_from_state, zone_execution_state,
 };
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use post_state::ExecutionPostState;
@@ -296,6 +300,14 @@ pub struct PreparedStatelessExecution {
 }
 
 impl PreparedStatelessExecution {
+    pub fn execution_state(&self) -> ZoneExecutionState {
+        zone_execution_state(self.execution_db.clone())
+    }
+
+    pub fn into_execution_state(self) -> ZoneExecutionState {
+        zone_execution_state(self.execution_db)
+    }
+
     pub fn block_execution_input(
         &self,
         block_index: usize,
@@ -1856,8 +1868,11 @@ mod tests {
     use alloy_rlp::Encodable;
     use alloy_sol_types::SolCall;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
+    use reth_trie_common::{KeccakKeyHasher, KeyHasher};
     use revm_database::{BundleState, primitives::StorageKeyMap};
-    use revm_database_interface::Database;
+    use revm_database_interface::{
+        Database, DatabaseCommit, primitives::AddressMap, state::Account,
+    };
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_primitives::{TempoReceipt, TempoTxType};
     use tempo_zone_contracts::TempoStateReader;
@@ -2011,6 +2026,60 @@ mod tests {
             prepared.commitments.final_tempo_block_hash,
             witness.public_inputs.anchor_block_hash
         );
+    }
+
+    #[test]
+    fn prepared_execution_state_uses_strict_witness_database() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut state = prepared.execution_state();
+
+        assert!(state.basic(TEMPO_STATE_ADDRESS).unwrap().is_some());
+        assert_eq!(
+            state
+                .storage(ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_NUMBER_SLOT)
+                .unwrap(),
+            U256::from(12)
+        );
+        assert_eq!(
+            state
+                .storage(TEMPO_STATE_ADDRESS, U256::from(0xfe))
+                .unwrap_err()
+                .into_external_error(),
+            WitnessDbError::MissingStorage {
+                account: TEMPO_STATE_ADDRESS,
+                slot: U256::from(0xfe),
+            }
+        );
+    }
+
+    #[test]
+    fn execution_state_commits_feed_hashed_post_state() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let mut state = prepared.clone().into_execution_state();
+        let info = state
+            .basic(ZONE_INBOX_ADDRESS)
+            .unwrap()
+            .expect("fixture witnesses the zone inbox account");
+
+        let mut account = Account::from(info);
+        account.info.balance = U256::from(99);
+        account.mark_touch();
+        let mut changes = AddressMap::default();
+        changes.insert(ZONE_INBOX_ADDRESS, account);
+        state.commit(changes);
+
+        let post_state = execution_post_state_from_state(state);
+        let hashed_address = KeccakKeyHasher::hash_key(ZONE_INBOX_ADDRESS);
+        let hashed_account = post_state
+            .hashed()
+            .accounts
+            .get(&hashed_address)
+            .expect("committed account should appear in post-state")
+            .expect("committed account should not be deleted");
+
+        assert_eq!(hashed_account.balance, U256::from(99));
     }
 
     struct SuccessfulExecutor;
