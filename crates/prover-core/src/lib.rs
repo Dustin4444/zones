@@ -35,6 +35,7 @@ mod execution_output;
 mod execution_plan;
 mod post_state;
 mod tempo;
+mod tempo_reader;
 mod trie;
 mod witness_db;
 
@@ -48,6 +49,10 @@ pub use execution_plan::{
     ZoneExecutionPlan,
 };
 pub use post_state::ExecutionPostState;
+pub use tempo_reader::{
+    TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS, TempoStateReaderCallResult,
+    WitnessTempoStateReader, tempo_state_reader_gas,
+};
 pub use witness_db::{WitnessDatabase, WitnessDbError};
 
 /// Ethereum's canonical empty trie root.
@@ -439,6 +444,7 @@ pub enum ProverError {
         index: usize,
     },
     NonZeroWithdrawalFinalizationUnsupported,
+    TempoStateReaderGasOverflow,
     ExecutionBlockCountMismatch {
         expected: usize,
         actual: usize,
@@ -852,6 +858,9 @@ impl fmt::Display for ProverError {
             Self::NonZeroWithdrawalFinalizationUnsupported => {
                 f.write_str("non-zero withdrawal finalization is not implemented yet")
             }
+            Self::TempoStateReaderGasOverflow => {
+                f.write_str("TempoStateReader gas calculation overflow")
+            }
             Self::ExecutionBlockCountMismatch { expected, actual } => write!(
                 f,
                 "execution returned {actual} zone blocks, expected {expected}"
@@ -898,8 +907,7 @@ impl fmt::Display for ProverError {
             ),
             Self::ExecutionFinalTempoMismatch { expected, actual } => write!(
                 f,
-                "executed final Tempo binding {:?} does not match expected {:?}",
-                actual, expected
+                "executed final Tempo binding {actual:?} does not match expected {expected:?}"
             ),
             Self::ExecutionWithdrawalBatchIndexMismatch { expected, actual } => write!(
                 f,
