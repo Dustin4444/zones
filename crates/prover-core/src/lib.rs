@@ -98,6 +98,7 @@ pub struct ZoneBlock {
     pub timestamp: u64,
     pub beneficiary: Address,
     pub protocol_version: u64,
+    pub block_env: ZoneBlockEnvWitness,
     pub tempo_header_rlp: Option<Bytes>,
     pub deposits: Vec<QueuedDeposit>,
     pub decryptions: Vec<DecryptionData>,
@@ -107,6 +108,32 @@ pub struct ZoneBlock {
     /// Raw transaction bytes. Full EVM re-execution is not yet implemented; any
     /// non-empty transaction list is rejected by the current prover core.
     pub transactions: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ZoneBlockEnvWitness {
+    pub gas_limit: u64,
+    pub basefee: u64,
+    pub difficulty: U256,
+    pub prevrandao: Option<B256>,
+    pub slot_num: u64,
+    pub timestamp_millis_part: u64,
+}
+
+impl ZoneBlockEnvWitness {
+    pub fn config(self) -> ZoneBlockEnvConfig {
+        ZoneBlockEnvConfig {
+            gas_limit: self.gas_limit,
+            basefee: self.basefee,
+            difficulty: self.difficulty,
+            prevrandao: self.prevrandao,
+            blob_excess_gas_and_price: None,
+            slot_num: self.slot_num,
+            timestamp_millis_part: self.timestamp_millis_part,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,12 +267,14 @@ impl PreparedStatelessExecution {
                 block_count: self.zone_blocks.len(),
             },
         )?;
+        let block_env = ZoneBlockEnv::from_prepared_block(block, block.block_env);
         let transactions = &self.execution_plan.blocks[block_index].transactions;
         let tempo_state_reader = self.tempo_state_reader(block_index)?;
 
         Ok(ZoneBlockExecutionInput {
             block_index,
             block,
+            block_env,
             transactions,
             tempo_state_reader,
         })
@@ -283,6 +312,7 @@ pub struct PreparedZoneBlock {
     pub timestamp: u64,
     pub beneficiary: Address,
     pub protocol_version: u64,
+    pub block_env: ZoneBlockEnvConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +476,10 @@ pub enum ProverError {
     },
     BlockTimestampRegression {
         index: usize,
+    },
+    BlockTimestampMillisPartOutOfRange {
+        index: usize,
+        actual: u64,
     },
     BlockBeneficiaryMismatch {
         index: usize,
@@ -839,6 +873,10 @@ impl fmt::Display for ProverError {
             Self::BlockTimestampRegression { index } => {
                 write!(f, "zone block {index} timestamp regressed")
             }
+            Self::BlockTimestampMillisPartOutOfRange { index, actual } => write!(
+                f,
+                "zone block {index} timestamp_millis_part {actual} is outside 0..1000"
+            ),
             Self::BlockBeneficiaryMismatch { index } => {
                 write!(f, "zone block {index} beneficiary does not match sequencer")
             }
@@ -1095,6 +1133,7 @@ fn prepared_zone_blocks(blocks: &[ZoneBlock]) -> Vec<PreparedZoneBlock> {
             timestamp: block.timestamp,
             beneficiary: block.beneficiary,
             protocol_version: block.protocol_version,
+            block_env: block.block_env.config(),
         })
         .collect()
 }
@@ -1232,6 +1271,12 @@ fn validate_block_envelopes(witness: &BatchWitness, final_index: usize) -> Resul
         }
         if block.timestamp < prev_timestamp {
             return Err(ProverError::BlockTimestampRegression { index });
+        }
+        if block.block_env.timestamp_millis_part >= 1000 {
+            return Err(ProverError::BlockTimestampMillisPartOutOfRange {
+                index,
+                actual: block.block_env.timestamp_millis_part,
+            });
         }
         if block.beneficiary != witness.public_inputs.sequencer {
             return Err(ProverError::BlockBeneficiaryMismatch { index });
@@ -1737,6 +1782,17 @@ mod tests {
     use revm_database_interface::Database;
     use tempo_zone_contracts::TempoStateReader;
 
+    fn fixture_block_env() -> ZoneBlockEnvWitness {
+        ZoneBlockEnvWitness {
+            gas_limit: 30_000_000,
+            basefee: 0,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            slot_num: 0,
+            timestamp_millis_part: 0,
+        }
+    }
+
     fn fixture_witness() -> BatchWitness {
         let tempo_block_number = 100;
         let tempo_block_hash = B256::repeat_byte(0x03);
@@ -1769,6 +1825,7 @@ mod tests {
                 timestamp: 12,
                 beneficiary: address!("0x0000000000000000000000000000000000000001"),
                 protocol_version: 1,
+                block_env: fixture_block_env(),
                 tempo_header_rlp: None,
                 deposits: Vec::new(),
                 decryptions: Vec::new(),
@@ -2811,6 +2868,7 @@ mod tests {
             timestamp: 13,
             beneficiary: witness.public_inputs.sequencer,
             protocol_version: 1,
+            block_env: fixture_block_env(),
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),
@@ -2942,6 +3000,9 @@ mod tests {
 
         assert_eq!(input.block_index, 0);
         assert_eq!(input.block.number, 8);
+        assert_eq!(input.block_env.inner.gas_limit, 30_000_000);
+        assert_eq!(input.block_env.inner.basefee, 0);
+        assert_eq!(input.block_env.timestamp_millis_part, 0);
         assert_eq!(input.transactions.len(), 1);
         assert_eq!(
             input.transactions[0].kind,
@@ -2965,6 +3026,20 @@ mod tests {
             ProverError::ExecutionPlanBlockCountMismatch {
                 expected: 1,
                 actual: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_timestamp_millis_part() {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0].block_env.timestamp_millis_part = 1000;
+
+        assert_eq!(
+            prepare_stateless_execution(&witness).unwrap_err(),
+            ProverError::BlockTimestampMillisPartOutOfRange {
+                index: 0,
+                actual: 1000,
             }
         );
     }

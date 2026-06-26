@@ -124,6 +124,7 @@ mod tests {
             timestamp: 123,
             beneficiary: address!("0x0000000000000000000000000000000000001000"),
             protocol_version: 1,
+            block_env: env_config(),
         }
     }
 

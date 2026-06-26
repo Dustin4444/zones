@@ -944,7 +944,7 @@ The witness contains everything needed to re-execute the batch:
 
 - **PublicInputs**: `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
 - **BatchWitness**: the public inputs, the previous batch's block header, Zone ancestry headers for `BLOCKHASH`, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
-- **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `tempo_header_rlp` (optional), `deposits`, `decryptions`, `enabled_tokens`, `finalize_withdrawal_batch_count` (optional), `finalize_withdrawal_encrypted_senders`, and user `transactions`.
+- **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `block_env`, `tempo_header_rlp` (optional), `deposits`, `decryptions`, `enabled_tokens`, `finalize_withdrawal_batch_count` (optional), `finalize_withdrawal_encrypted_senders`, and user `transactions`.
 - **ZoneStateWitness**: the initial zone state root, a deduplicated pool of zone-state trie nodes, and decoded account / storage reads needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
 
 ### Input Schematic
@@ -962,7 +962,8 @@ flowchart TB
 
         subgraph ZBL["zone_blocks"]
             direction TB
-            ZB["ZoneBlock[i]<br/>number<br/>parent_hash<br/>timestamp<br/>beneficiary<br/>protocol_version<br/>tempo_header_rlp<br/>deposits<br/>decryptions<br/>enabled_tokens<br/>finalize_withdrawal_batch_count<br/>finalize_withdrawal_encrypted_senders<br/>transactions"]
+            ZB["ZoneBlock[i]<br/>number<br/>parent_hash<br/>timestamp<br/>beneficiary<br/>protocol_version<br/>block_env<br/>tempo_header_rlp<br/>deposits<br/>decryptions<br/>enabled_tokens<br/>finalize_withdrawal_batch_count<br/>finalize_withdrawal_encrypted_senders<br/>transactions"]
+            ZBE["ZoneBlockEnvWitness<br/>gas_limit<br/>basefee<br/>difficulty<br/>prevrandao<br/>slot_num<br/>timestamp_millis_part"]
 
             subgraph DEP["deposits"]
                 direction TB
@@ -990,6 +991,7 @@ flowchart TB
                 DD ~~~ CP
             end
 
+            ZB ~~~ ZBE
             ZB ~~~ QD
             QD ~~~ DD
         end
@@ -1101,6 +1103,11 @@ pub struct ZoneBlock {
     /// Protocol version encoded into the zone block header
     pub protocol_version: u64,
 
+    /// EVM block environment values used by revm execution.
+    /// These must match the canonical zone payload attributes for this block;
+    /// `timestamp_millis_part` must be less than 1000.
+    pub block_env: ZoneBlockEnvWitness,
+
     /// Tempo header RLP used by the call (ZoneInbox.advanceTempo).
     /// If None, the block does not advance Tempo and the binding carries over.
     pub tempo_header_rlp: Option<Vec<u8>>,
@@ -1129,6 +1136,28 @@ pub struct ZoneBlock {
 
     /// Transactions to execute
     pub transactions: Vec<Transaction>,
+}
+
+pub struct ZoneBlockEnvWitness {
+    /// EVM block gas limit
+    pub gas_limit: u64,
+
+    /// EVM base fee per gas
+    pub basefee: u64,
+
+    /// EVM difficulty field
+    pub difficulty: U256,
+
+    /// EIP-4399 randomness value. Zones currently derive this from payload
+    /// attributes; the sequencer path uses zero when no randomness is supplied.
+    pub prevrandao: Option<B256>,
+
+    /// EIP-7843 slot number, if active for the configured fork.
+    pub slot_num: u64,
+
+    /// Sub-second timestamp component inherited from the Tempo/L1 payload.
+    /// Must be in the range 0..1000.
+    pub timestamp_millis_part: u64,
 }
 
 /// Mirrors the Solidity `EnabledToken` struct from IZone.sol

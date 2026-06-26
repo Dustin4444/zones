@@ -14,7 +14,7 @@ use zone_primitives::{
 use crate::{
     BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
     PlannedZoneTransaction, PreparedStatelessExecution, PreparedZoneBlock, ProverError,
-    WitnessTempoStateReader,
+    WitnessTempoStateReader, ZoneBlockEnv,
 };
 
 pub trait StatelessZoneExecutor {
@@ -33,10 +33,11 @@ pub trait StatelessZoneBlockExecutor {
     fn finish(&mut self) -> Result<ExecutionPostState, ProverError>;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ZoneBlockExecutionInput<'a> {
     pub block_index: usize,
     pub block: &'a PreparedZoneBlock,
+    pub block_env: ZoneBlockEnv,
     pub transactions: &'a [PlannedZoneTransaction],
     pub tempo_state_reader: WitnessTempoStateReader<'a>,
 }

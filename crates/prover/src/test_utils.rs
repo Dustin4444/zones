@@ -14,7 +14,7 @@ use zone_primitives::{
 
 use crate::types::{
     BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, ZoneAccountRead, ZoneBlock,
-    ZoneStateWitness, ZoneStorageRead,
+    ZoneBlockEnvWitness, ZoneStateWitness, ZoneStorageRead,
 };
 
 pub(crate) fn minimal_batch_witness() -> BatchWitness {
@@ -51,6 +51,14 @@ pub(crate) fn minimal_batch_witness() -> BatchWitness {
             timestamp: 2,
             beneficiary,
             protocol_version: 1,
+            block_env: ZoneBlockEnvWitness {
+                gas_limit: 30_000_000,
+                basefee: 0,
+                difficulty: U256::ZERO,
+                prevrandao: Some(B256::ZERO),
+                slot_num: 0,
+                timestamp_millis_part: 0,
+            },
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),

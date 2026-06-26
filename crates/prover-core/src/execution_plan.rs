@@ -172,10 +172,12 @@ fn build_finalize_withdrawal_batch_tx(
 mod tests {
     use alloc::vec;
 
-    use alloy_primitives::{Address, Bytes, U256, address};
+    use alloy_primitives::{Address, B256, Bytes, U256, address};
     use alloy_sol_types::SolCall;
     use const_hex::FromHex;
     use tempo_zone_contracts::EnabledToken;
+
+    use crate::ZoneBlockEnvWitness;
 
     use super::*;
 
@@ -186,6 +188,17 @@ mod tests {
         }
     }
 
+    fn block_env() -> ZoneBlockEnvWitness {
+        ZoneBlockEnvWitness {
+            gas_limit: 30_000_000,
+            basefee: 0,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            slot_num: 0,
+            timestamp_millis_part: 0,
+        }
+    }
+
     fn sample_block() -> ZoneBlock {
         ZoneBlock {
             number: 42,
@@ -193,6 +206,7 @@ mod tests {
             timestamp: 1,
             beneficiary: Address::ZERO,
             protocol_version: 0,
+            block_env: block_env(),
             tempo_header_rlp: Some(Bytes::from_static(&[0xc0])),
             deposits: vec![],
             decryptions: vec![],
