@@ -1,6 +1,13 @@
 use alloc::vec::Vec;
 
+use alloy_consensus::{
+    TxReceipt,
+    proofs::{calculate_receipt_root, calculate_transaction_root},
+};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_evm::block::BlockExecutionResult;
 use alloy_primitives::{Address, B256, U256};
+use revm_database::BundleState;
 use tempo_zone_contracts::{BlockTransition, DepositQueueTransition};
 use zone_primitives::{
     ZoneHeader,
@@ -69,12 +76,58 @@ pub struct StatelessExecutionOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutedZoneBlock {
-    pub state_root: B256,
-    pub transactions_root: B256,
-    pub receipts_root: B256,
+    state_root: B256,
+    transactions_root: B256,
+    receipts_root: B256,
 }
 
 impl ExecutedZoneBlock {
+    pub fn from_alloy_block_execution<Tx, Receipt>(
+        block_index: usize,
+        state_root: B256,
+        transactions: &[Tx],
+        result: &BlockExecutionResult<Receipt>,
+    ) -> Result<Self, ProverError>
+    where
+        Tx: Encodable2718,
+        Receipt: TxReceipt,
+        for<'receipt> alloy_consensus::ReceiptWithBloom<&'receipt Receipt>: Encodable2718,
+    {
+        let expected = transactions.len();
+        let actual = result.receipts.len();
+        if actual != expected {
+            return Err(ProverError::ExecutionReceiptCountMismatch {
+                block_index,
+                expected,
+                actual,
+            });
+        }
+
+        Ok(Self {
+            state_root,
+            transactions_root: calculate_transaction_root(transactions),
+            receipts_root: calculate_receipt_root(
+                &result
+                    .receipts
+                    .iter()
+                    .map(TxReceipt::with_bloom_ref)
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    }
+
+    pub const fn state_root(&self) -> B256 {
+        self.state_root
+    }
+
+    pub const fn transactions_root(&self) -> B256 {
+        self.transactions_root
+    }
+
+    pub const fn receipts_root(&self) -> B256 {
+        self.receipts_root
+    }
+
     pub fn header(&self, parent_hash: B256, block: &PreparedZoneBlock) -> ZoneHeader {
         ZoneHeader {
             parent_hash,
@@ -89,6 +142,13 @@ impl ExecutedZoneBlock {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ZoneBlockExecutionArtifacts<'a, Tx, Receipt> {
+    pub state_root: B256,
+    pub transactions: &'a [Tx],
+    pub result: &'a BlockExecutionResult<Receipt>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutedBatchCommitments {
     pub final_deposit_queue: DepositQueueState,
@@ -101,6 +161,36 @@ pub struct TempoExecutionCommitment {
     pub block_number: u64,
     pub block_hash: B256,
     pub state_root: B256,
+}
+
+impl StatelessExecutionOutput {
+    pub fn from_alloy_execution<Tx, Receipt>(
+        blocks: &[ZoneBlockExecutionArtifacts<'_, Tx, Receipt>],
+        bundle_state: &BundleState,
+    ) -> Result<Self, ProverError>
+    where
+        Tx: Encodable2718,
+        Receipt: TxReceipt,
+        for<'receipt> alloy_consensus::ReceiptWithBloom<&'receipt Receipt>: Encodable2718,
+    {
+        let blocks = blocks
+            .iter()
+            .enumerate()
+            .map(|(block_index, block)| {
+                ExecutedZoneBlock::from_alloy_block_execution(
+                    block_index,
+                    block.state_root,
+                    block.transactions,
+                    block.result,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            blocks,
+            post_state: ExecutionPostState::from_bundle_state(bundle_state),
+        })
+    }
 }
 
 pub fn prove_zone_batch_with_executor(

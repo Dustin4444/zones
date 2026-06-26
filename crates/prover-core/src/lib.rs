@@ -49,8 +49,9 @@ pub use execution_env::{
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput,
     StatelessZoneBlockExecutor, StatelessZoneExecutor, TempoExecutionCommitment,
-    ZoneBlockExecutionInput, ZoneExecutableTransaction, batch_output_from_execution,
-    execute_prepared_blocks, execution_commitments_from_post_state, prove_zone_batch_with_executor,
+    ZoneBlockExecutionArtifacts, ZoneBlockExecutionInput, ZoneExecutableTransaction,
+    batch_output_from_execution, execute_prepared_blocks, execution_commitments_from_post_state,
+    prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -605,6 +606,11 @@ pub enum ProverError {
         expected: usize,
         actual: usize,
     },
+    ExecutionReceiptCountMismatch {
+        block_index: usize,
+        expected: usize,
+        actual: usize,
+    },
     ExecutionBlockParentHashMismatch {
         index: usize,
         expected: B256,
@@ -1037,6 +1043,14 @@ impl fmt::Display for ProverError {
             Self::ExecutionPlanBlockCountMismatch { expected, actual } => write!(
                 f,
                 "execution plan has {actual} blocks, expected {expected} prepared blocks"
+            ),
+            Self::ExecutionReceiptCountMismatch {
+                block_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed zone block {block_index} produced {actual} receipts, expected {expected}"
             ),
             Self::ExecutionBlockParentHashMismatch {
                 index,
@@ -1833,6 +1847,11 @@ pub(crate) fn validate_node_pool(
 mod tests {
     use super::*;
     use alloc::vec;
+    use alloy_consensus::{
+        TxReceipt,
+        proofs::{calculate_receipt_root, calculate_transaction_root},
+    };
+    use alloy_evm::block::BlockExecutionResult;
     use alloy_primitives::{B256, address, keccak256};
     use alloy_rlp::Encodable;
     use alloy_sol_types::SolCall;
@@ -1840,6 +1859,7 @@ mod tests {
     use revm_database::{BundleState, primitives::StorageKeyMap};
     use revm_database_interface::Database;
     use tempo_chainspec::hardfork::TempoHardfork;
+    use tempo_primitives::{TempoReceipt, TempoTxType};
     use tempo_zone_contracts::TempoStateReader;
 
     fn fixture_cfg_env() -> ZoneCfgEnvWitness {
@@ -2082,7 +2102,20 @@ mod tests {
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut first = successful_execution_output(&prepared);
         let mut second = successful_execution_output(&prepared);
-        second.blocks[0].receipts_root = B256::repeat_byte(0x99);
+        let transactions = recovered_transactions_for_block(&prepared, 0);
+        let mut different_receipts = successful_block_result(transactions.len());
+        different_receipts
+            .receipts
+            .first_mut()
+            .expect("fixture block has a system transaction receipt")
+            .success = false;
+        second.blocks[0] = ExecutedZoneBlock::from_alloy_block_execution(
+            0,
+            prepared.prev_block_header.state_root,
+            &transactions,
+            &different_receipts,
+        )
+        .unwrap();
 
         let first_output = batch_output_from_execution(&prepared, &first).unwrap();
         let second_output = batch_output_from_execution(&prepared, &second).unwrap();
@@ -2091,11 +2124,74 @@ mod tests {
             first_output.block_transition.nextBlockHash,
             second_output.block_transition.nextBlockHash
         );
-        first.blocks[0].state_root = B256::repeat_byte(0x98);
+        let block_result = successful_block_result(transactions.len());
+        first.blocks[0] = ExecutedZoneBlock::from_alloy_block_execution(
+            0,
+            B256::repeat_byte(0x98),
+            &transactions,
+            &block_result,
+        )
+        .unwrap();
         let third_output = batch_output_from_execution(&prepared, &first).unwrap();
         assert_ne!(
             third_output.block_transition.nextBlockHash,
             first_output.block_transition.nextBlockHash
+        );
+    }
+
+    #[test]
+    fn alloy_execution_output_derives_roots_from_execution_artifacts() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let transactions = recovered_transactions_for_block(&prepared, 0);
+        let block_result = successful_block_result(transactions.len());
+        let bundle_state = BundleState::default();
+        let artifact = ZoneBlockExecutionArtifacts {
+            state_root: B256::repeat_byte(0x42),
+            transactions: &transactions,
+            result: &block_result,
+        };
+
+        let output =
+            StatelessExecutionOutput::from_alloy_execution(&[artifact], &bundle_state).unwrap();
+
+        let receipts_with_bloom = block_result
+            .receipts
+            .iter()
+            .map(TxReceipt::with_bloom_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(output.blocks[0].state_root(), B256::repeat_byte(0x42));
+        assert_eq!(
+            output.blocks[0].transactions_root(),
+            calculate_transaction_root(&transactions)
+        );
+        assert_eq!(
+            output.blocks[0].receipts_root(),
+            calculate_receipt_root(&receipts_with_bloom)
+        );
+        assert!(output.post_state.is_empty());
+    }
+
+    #[test]
+    fn alloy_execution_output_rejects_receipt_count_mismatch() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let transactions = recovered_transactions_for_block(&prepared, 0);
+        let block_result = successful_block_result(0);
+        let artifact = ZoneBlockExecutionArtifacts {
+            state_root: B256::repeat_byte(0x42),
+            transactions: &transactions,
+            result: &block_result,
+        };
+
+        assert_eq!(
+            StatelessExecutionOutput::from_alloy_execution(&[artifact], &BundleState::default())
+                .unwrap_err(),
+            ProverError::ExecutionReceiptCountMismatch {
+                block_index: 0,
+                expected: transactions.len(),
+                actual: 0,
+            }
         );
     }
 
@@ -2354,24 +2450,56 @@ mod tests {
         account: Address,
         storage: StorageKeyMap<(U256, U256)>,
     ) -> ExecutionPostState {
+        ExecutionPostState::from_bundle_state(&bundle_state_for_storage(account, storage))
+    }
+
+    fn bundle_state_for_storage(
+        account: Address,
+        storage: StorageKeyMap<(U256, U256)>,
+    ) -> BundleState {
         let bundle = BundleState::builder(0..=0)
             .state_storage(account, storage)
             .build();
-        ExecutionPostState::from_bundle_state(&bundle)
+        bundle
+    }
+
+    fn successful_block_result(receipt_count: usize) -> BlockExecutionResult<TempoReceipt> {
+        BlockExecutionResult {
+            receipts: vec![
+                TempoReceipt {
+                    tx_type: TempoTxType::Legacy,
+                    success: true,
+                    cumulative_gas_used: 0,
+                    logs: Vec::new(),
+                };
+                receipt_count
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn recovered_transactions_for_block(
+        prepared: &PreparedStatelessExecution,
+        block_index: usize,
+    ) -> Vec<RecoveredTempoTx> {
+        prepared.execution_plan.blocks[block_index]
+            .transactions
+            .iter()
+            .map(|transaction| transaction.tx.clone())
+            .collect()
     }
 
     fn successful_execution_output(
         prepared: &PreparedStatelessExecution,
     ) -> StatelessExecutionOutput {
-        let blocks = prepared
-            .zone_blocks
+        let transactions = (0..prepared.zone_blocks.len())
+            .map(|block_index| recovered_transactions_for_block(prepared, block_index))
+            .collect::<Vec<_>>();
+        let block_results = transactions
             .iter()
-            .map(|_| ExecutedZoneBlock {
-                state_root: prepared.prev_block_header.state_root,
-                transactions_root: EMPTY_TRIE_ROOT,
-                receipts_root: EMPTY_TRIE_ROOT,
-            })
-            .collect();
+            .map(|transactions| successful_block_result(transactions.len()))
+            .collect::<Vec<_>>();
+
         let mut storage = StorageKeyMap::default();
         storage.insert(
             ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
@@ -2385,11 +2513,19 @@ mod tests {
                 U256::from(prepared.public_inputs.expected_withdrawal_batch_index),
             ),
         );
+        let bundle_state = bundle_state_for_storage(ZONE_OUTBOX_ADDRESS, storage);
+        let artifacts = prepared
+            .zone_blocks
+            .iter()
+            .enumerate()
+            .map(|(block_index, _)| ZoneBlockExecutionArtifacts {
+                state_root: prepared.prev_block_header.state_root,
+                transactions: transactions[block_index].as_slice(),
+                result: &block_results[block_index],
+            })
+            .collect::<Vec<_>>();
 
-        StatelessExecutionOutput {
-            blocks,
-            post_state: post_state_for_storage(ZONE_OUTBOX_ADDRESS, storage),
-        }
+        StatelessExecutionOutput::from_alloy_execution(&artifacts, &bundle_state).unwrap()
     }
 
     fn insert_proof_nodes(
@@ -3160,11 +3296,18 @@ mod tests {
             ) -> Result<ExecutedZoneBlock, ProverError> {
                 self.seen
                     .push((input.block_index, input.transactions.len()));
-                Ok(ExecutedZoneBlock {
-                    state_root: EMPTY_TRIE_ROOT,
-                    transactions_root: EMPTY_TRIE_ROOT,
-                    receipts_root: EMPTY_TRIE_ROOT,
-                })
+                let transactions = input
+                    .transactions
+                    .iter()
+                    .map(|transaction| transaction.recovered.clone())
+                    .collect::<Vec<_>>();
+                let result = successful_block_result(transactions.len());
+                ExecutedZoneBlock::from_alloy_block_execution(
+                    input.block_index,
+                    EMPTY_TRIE_ROOT,
+                    &transactions,
+                    &result,
+                )
             }
 
             fn finish(&mut self) -> Result<ExecutionPostState, ProverError> {
