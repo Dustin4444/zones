@@ -40,7 +40,8 @@ mod witness_db;
 
 pub use execution_output::{
     ExecutedBatchCommitments, ExecutedZoneBlock, StatelessExecutionOutput, StatelessZoneExecutor,
-    TempoExecutionCommitment, batch_output_from_execution, prove_zone_batch_with_executor,
+    TempoExecutionCommitment, batch_output_from_execution, execution_commitments_from_post_state,
+    prove_zone_batch_with_executor,
 };
 pub use execution_plan::{
     PlannedZoneTransaction, PlannedZoneTransactionKind, RecoveredTempoTx, ZoneBlockExecutionPlan,
@@ -1645,6 +1646,7 @@ mod tests {
     use alloy_primitives::{B256, address, keccak256};
     use alloy_rlp::Encodable;
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
+    use revm_database::{BundleState, primitives::StorageKeyMap};
     use revm_database_interface::Database;
 
     fn fixture_witness() -> BatchWitness {
@@ -1804,6 +1806,38 @@ mod tests {
     }
 
     #[test]
+    fn execution_commitments_derive_deposit_queue_from_post_state() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let next_hash = B256::repeat_byte(0x66);
+        let next_number = 21;
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            ZONE_INBOX_PROCESSED_HASH_SLOT,
+            (
+                U256::from_be_bytes(prepared.commitments.initial_deposit_queue.processed_hash.0),
+                U256::from_be_bytes(next_hash.0),
+            ),
+        );
+        storage.insert(
+            ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            (
+                U256::from(prepared.commitments.initial_deposit_queue.processed_number),
+                U256::from(next_number),
+            ),
+        );
+
+        let post_state = post_state_for_storage(ZONE_INBOX_ADDRESS, storage);
+        let commitments = execution_commitments_from_post_state(&prepared, &post_state);
+
+        assert_eq!(commitments.final_deposit_queue.processed_hash, next_hash);
+        assert_eq!(
+            commitments.final_deposit_queue.processed_number,
+            next_number
+        );
+    }
+
+    #[test]
     fn execution_output_rejects_wrong_block_parent() {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
@@ -1841,7 +1875,15 @@ mod tests {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut execution = successful_execution_output(&prepared);
-        execution.final_commitments.final_tempo.block_hash = B256::repeat_byte(0xee);
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            storage_slot_u256(TEMPO_BLOCK_HASH_SLOT),
+            (
+                U256::from_be_bytes(prepared.commitments.initial_tempo_block_hash.0),
+                U256::from_be_bytes(B256::repeat_byte(0xee).0),
+            ),
+        );
+        execution.post_state = post_state_for_storage(TEMPO_STATE_ADDRESS, storage);
 
         assert_eq!(
             batch_output_from_execution(&prepared, &execution).unwrap_err(),
@@ -1851,7 +1893,8 @@ mod tests {
                     block_hash: prepared.commitments.final_tempo_block_hash,
                     state_root: prepared.commitments.final_tempo_state_root,
                 },
-                actual: execution.final_commitments.final_tempo,
+                actual: execution_commitments_from_post_state(&prepared, &execution.post_state)
+                    .final_tempo,
             }
         );
     }
@@ -1861,10 +1904,20 @@ mod tests {
         let witness = fixture_witness();
         let prepared = prepare_stateless_execution(&witness).unwrap();
         let mut execution = successful_execution_output(&prepared);
-        execution
-            .final_commitments
-            .last_batch
-            .withdrawal_batch_index = 99;
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            (
+                U256::from(
+                    prepared
+                        .commitments
+                        .previous_last_batch
+                        .withdrawal_batch_index,
+                ),
+                U256::from(99),
+            ),
+        );
+        execution.post_state = post_state_for_storage(ZONE_OUTBOX_ADDRESS, storage);
 
         assert_eq!(
             batch_output_from_execution(&prepared, &execution).unwrap_err(),
@@ -2052,6 +2105,16 @@ mod tests {
         witness.zone_blocks[0].parent_hash = prev_block_hash;
     }
 
+    fn post_state_for_storage(
+        account: Address,
+        storage: StorageKeyMap<(U256, U256)>,
+    ) -> ExecutionPostState {
+        let bundle = BundleState::builder(0..=0)
+            .state_storage(account, storage)
+            .build();
+        ExecutionPostState::from_bundle_state(&bundle)
+    }
+
     fn successful_execution_output(
         prepared: &PreparedStatelessExecution,
     ) -> StatelessExecutionOutput {
@@ -2074,21 +2137,23 @@ mod tests {
                 ExecutedZoneBlock { header }
             })
             .collect();
+        let mut storage = StorageKeyMap::default();
+        storage.insert(
+            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            (
+                U256::from(
+                    prepared
+                        .commitments
+                        .previous_last_batch
+                        .withdrawal_batch_index,
+                ),
+                U256::from(prepared.public_inputs.expected_withdrawal_batch_index),
+            ),
+        );
 
         StatelessExecutionOutput {
             blocks,
-            final_commitments: ExecutedBatchCommitments {
-                final_deposit_queue: prepared.commitments.initial_deposit_queue,
-                last_batch: LastBatchCommitment {
-                    withdrawal_queue_hash: B256::ZERO,
-                    withdrawal_batch_index: prepared.public_inputs.expected_withdrawal_batch_index,
-                },
-                final_tempo: TempoExecutionCommitment {
-                    block_number: prepared.commitments.final_tempo_block_number,
-                    block_hash: prepared.commitments.final_tempo_block_hash,
-                    state_root: prepared.commitments.final_tempo_state_root,
-                },
-            },
+            post_state: post_state_for_storage(ZONE_OUTBOX_ADDRESS, storage),
         }
     }
 

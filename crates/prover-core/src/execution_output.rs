@@ -1,11 +1,19 @@
 use alloc::vec::Vec;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, U256};
 use tempo_zone_contracts::{BlockTransition, DepositQueueTransition};
-use zone_primitives::ZoneHeader;
+use zone_primitives::{
+    ZoneHeader,
+    constants::{
+        TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ADDRESS, TEMPO_STATE_ROOT_SLOT,
+        ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_HASH_SLOT, ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+        ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_HASH_SLOT, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+    },
+};
 
 use crate::{
-    BatchOutput, DepositQueueState, LastBatchCommitment, PreparedStatelessExecution, ProverError,
+    BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
+    PreparedStatelessExecution, ProverError,
 };
 
 pub trait StatelessZoneExecutor {
@@ -18,7 +26,7 @@ pub trait StatelessZoneExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatelessExecutionOutput {
     pub blocks: Vec<ExecutedZoneBlock>,
-    pub final_commitments: ExecutedBatchCommitments,
+    pub post_state: ExecutionPostState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +117,9 @@ pub fn batch_output_from_execution(
         previous_hash = header.hash();
     }
 
-    let final_tempo = execution.final_commitments.final_tempo;
+    let final_commitments = execution_commitments_from_post_state(prepared, &execution.post_state);
+
+    let final_tempo = final_commitments.final_tempo;
     if final_tempo.block_number != prepared.commitments.final_tempo_block_number
         || final_tempo.block_hash != prepared.commitments.final_tempo_block_hash
         || final_tempo.state_root != prepared.commitments.final_tempo_state_root
@@ -125,18 +135,10 @@ pub fn batch_output_from_execution(
     }
 
     let expected_withdrawal_batch_index = prepared.public_inputs.expected_withdrawal_batch_index;
-    if execution
-        .final_commitments
-        .last_batch
-        .withdrawal_batch_index
-        != expected_withdrawal_batch_index
-    {
+    if final_commitments.last_batch.withdrawal_batch_index != expected_withdrawal_batch_index {
         return Err(ProverError::ExecutionWithdrawalBatchIndexMismatch {
             expected: expected_withdrawal_batch_index,
-            actual: execution
-                .final_commitments
-                .last_batch
-                .withdrawal_batch_index,
+            actual: final_commitments.last_batch.withdrawal_batch_index,
         });
     }
 
@@ -147,17 +149,129 @@ pub fn batch_output_from_execution(
         },
         deposit_queue_transition: DepositQueueTransition {
             prevProcessedHash: prepared.commitments.initial_deposit_queue.processed_hash,
-            nextProcessedHash: execution
-                .final_commitments
-                .final_deposit_queue
-                .processed_hash,
+            nextProcessedHash: final_commitments.final_deposit_queue.processed_hash,
             prevDepositNumber: prepared.commitments.initial_deposit_queue.processed_number,
-            nextDepositNumber: execution
-                .final_commitments
-                .final_deposit_queue
-                .processed_number,
+            nextDepositNumber: final_commitments.final_deposit_queue.processed_number,
         },
-        withdrawal_queue_hash: execution.final_commitments.last_batch.withdrawal_queue_hash,
-        last_batch_commitment: execution.final_commitments.last_batch,
+        withdrawal_queue_hash: final_commitments.last_batch.withdrawal_queue_hash,
+        last_batch_commitment: final_commitments.last_batch,
     })
+}
+
+pub fn execution_commitments_from_post_state(
+    prepared: &PreparedStatelessExecution,
+    post_state: &ExecutionPostState,
+) -> ExecutedBatchCommitments {
+    ExecutedBatchCommitments {
+        final_deposit_queue: final_deposit_queue_state(prepared, post_state),
+        last_batch: final_last_batch_commitment(prepared, post_state),
+        final_tempo: final_tempo_commitment(prepared, post_state),
+    }
+}
+
+fn final_deposit_queue_state(
+    prepared: &PreparedStatelessExecution,
+    post_state: &ExecutionPostState,
+) -> DepositQueueState {
+    let processed_hash = final_storage_word(
+        post_state,
+        ZONE_INBOX_ADDRESS,
+        ZONE_INBOX_PROCESSED_HASH_SLOT,
+        word_from_b256(prepared.commitments.initial_deposit_queue.processed_hash),
+    );
+    let processed_number = final_storage_word(
+        post_state,
+        ZONE_INBOX_ADDRESS,
+        ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+        U256::from(prepared.commitments.initial_deposit_queue.processed_number),
+    );
+
+    DepositQueueState {
+        processed_hash: B256::from(processed_hash),
+        processed_number: low_u64(processed_number),
+    }
+}
+
+fn final_last_batch_commitment(
+    prepared: &PreparedStatelessExecution,
+    post_state: &ExecutionPostState,
+) -> LastBatchCommitment {
+    let withdrawal_queue_hash = final_storage_word(
+        post_state,
+        ZONE_OUTBOX_ADDRESS,
+        ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+        word_from_b256(
+            prepared
+                .commitments
+                .previous_last_batch
+                .withdrawal_queue_hash,
+        ),
+    );
+    let withdrawal_batch_index = final_storage_word(
+        post_state,
+        ZONE_OUTBOX_ADDRESS,
+        ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+        U256::from(
+            prepared
+                .commitments
+                .previous_last_batch
+                .withdrawal_batch_index,
+        ),
+    );
+
+    LastBatchCommitment {
+        withdrawal_queue_hash: B256::from(withdrawal_queue_hash),
+        withdrawal_batch_index: low_u64(withdrawal_batch_index),
+    }
+}
+
+fn final_tempo_commitment(
+    prepared: &PreparedStatelessExecution,
+    post_state: &ExecutionPostState,
+) -> TempoExecutionCommitment {
+    let block_hash = final_storage_word(
+        post_state,
+        TEMPO_STATE_ADDRESS,
+        storage_slot_u256(TEMPO_BLOCK_HASH_SLOT),
+        word_from_b256(prepared.commitments.initial_tempo_block_hash),
+    );
+    let state_root = final_storage_word(
+        post_state,
+        TEMPO_STATE_ADDRESS,
+        storage_slot_u256(TEMPO_STATE_ROOT_SLOT),
+        word_from_b256(prepared.commitments.initial_tempo_state_root),
+    );
+    let packed = final_storage_word(
+        post_state,
+        TEMPO_STATE_ADDRESS,
+        storage_slot_u256(TEMPO_PACKED_SLOT),
+        U256::from(prepared.commitments.initial_tempo_block_number),
+    );
+
+    TempoExecutionCommitment {
+        block_number: low_u64(packed),
+        block_hash: B256::from(block_hash),
+        state_root: B256::from(state_root),
+    }
+}
+
+fn final_storage_word(
+    post_state: &ExecutionPostState,
+    account: Address,
+    slot: U256,
+    initial: U256,
+) -> U256 {
+    post_state.storage(account, slot).unwrap_or(initial)
+}
+
+fn storage_slot_u256(slot: B256) -> U256 {
+    slot.into()
+}
+
+fn word_from_b256(value: B256) -> U256 {
+    U256::from_be_bytes(value.0)
+}
+
+fn low_u64(value: U256) -> u64 {
+    (value & U256::from(u64::MAX)).to::<u64>()
 }

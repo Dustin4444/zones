@@ -1,8 +1,9 @@
-use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+use alloy_primitives::{Address, B256, U256};
+use reth_trie_common::{HashedPostState, KeccakKeyHasher, KeyHasher};
 use revm_database::BundleState;
 
 /// Hashed post-execution state derived from revm's bundle state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionPostState {
     hashed: HashedPostState,
 }
@@ -25,6 +26,18 @@ impl ExecutionPostState {
 
     pub fn is_empty(&self) -> bool {
         self.hashed.is_empty()
+    }
+
+    pub fn storage(&self, account: Address, slot: U256) -> Option<U256> {
+        let hashed_address = KeccakKeyHasher::hash_key(account);
+        let hashed_slot = KeccakKeyHasher::hash_key(B256::from(slot));
+        let storage = self.hashed.storages.get(&hashed_address)?;
+
+        storage
+            .storage
+            .get(&hashed_slot)
+            .copied()
+            .or_else(|| storage.wiped.then_some(U256::ZERO))
     }
 }
 
@@ -82,5 +95,6 @@ mod tests {
                 .get(&hashed_slot),
             Some(&value)
         );
+        assert_eq!(post_state.storage(account, slot), Some(value));
     }
 }
