@@ -22,7 +22,8 @@ use crate::{
     BatchOutput, DepositQueueState, ExecutionPostState, LastBatchCommitment,
     PlannedZoneTransaction, PlannedZoneTransactionKind, PreparedStatelessExecution,
     PreparedZoneBlock, ProverError, RecoveredTempoTx, WitnessTempoStateReader,
-    ZoneBlockExecutionContext, ZoneEvmEnv, ZoneTxEnv,
+    ZoneBlockExecutionContext, ZoneEvmEnv, ZoneExecutionState, ZoneTxEnv,
+    execution_post_state_from_state,
 };
 
 pub trait StatelessZoneExecutor {
@@ -35,10 +36,9 @@ pub trait StatelessZoneExecutor {
 pub trait StatelessZoneBlockExecutor {
     fn execute_block(
         &mut self,
+        state: &mut ZoneExecutionState,
         input: ZoneBlockExecutionInput<'_>,
     ) -> Result<ExecutedZoneBlock, ProverError>;
-
-    fn finish(&mut self) -> Result<ExecutionPostState, ProverError>;
 }
 
 #[derive(Debug, Clone)]
@@ -207,14 +207,15 @@ pub fn execute_prepared_blocks(
     executor: &mut impl StatelessZoneBlockExecutor,
 ) -> Result<StatelessExecutionOutput, ProverError> {
     let mut blocks = Vec::with_capacity(prepared.zone_blocks.len());
+    let mut state = prepared.execution_state();
     for block_index in 0..prepared.zone_blocks.len() {
         let input = prepared.block_execution_input(block_index)?;
-        blocks.push(executor.execute_block(input)?);
+        blocks.push(executor.execute_block(&mut state, input)?);
     }
 
     Ok(StatelessExecutionOutput {
         blocks,
-        post_state: executor.finish()?,
+        post_state: execution_post_state_from_state(state),
     })
 }
 

@@ -3361,10 +3361,29 @@ mod tests {
         impl StatelessZoneBlockExecutor for RecordingBlockExecutor {
             fn execute_block(
                 &mut self,
+                state: &mut ZoneExecutionState,
                 input: ZoneBlockExecutionInput<'_>,
             ) -> Result<ExecutedZoneBlock, ProverError> {
                 self.seen
                     .push((input.block_index, input.transactions.len()));
+                assert_eq!(
+                    state
+                        .storage(ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_NUMBER_SLOT)
+                        .unwrap(),
+                    U256::from(12)
+                );
+
+                let info = state
+                    .basic(ZONE_INBOX_ADDRESS)
+                    .unwrap()
+                    .expect("fixture witnesses the zone inbox account");
+                let mut account = Account::from(info);
+                account.info.balance = U256::from(77);
+                account.mark_touch();
+                let mut changes = AddressMap::default();
+                changes.insert(ZONE_INBOX_ADDRESS, account);
+                state.commit(changes);
+
                 let transactions = input
                     .transactions
                     .iter()
@@ -3378,10 +3397,6 @@ mod tests {
                     &result,
                 )
             }
-
-            fn finish(&mut self) -> Result<ExecutionPostState, ProverError> {
-                Ok(ExecutionPostState::default())
-            }
         }
 
         let witness = fixture_witness();
@@ -3392,7 +3407,15 @@ mod tests {
 
         assert_eq!(executor.seen, vec![(0, 1)]);
         assert_eq!(output.blocks.len(), 1);
-        assert!(output.post_state.is_empty());
+        let hashed_address = KeccakKeyHasher::hash_key(ZONE_INBOX_ADDRESS);
+        let hashed_account = output
+            .post_state
+            .hashed()
+            .accounts
+            .get(&hashed_address)
+            .expect("executor state commit should appear in post-state")
+            .expect("executor state commit should not delete account");
+        assert_eq!(hashed_account.balance, U256::from(77));
     }
 
     #[test]
