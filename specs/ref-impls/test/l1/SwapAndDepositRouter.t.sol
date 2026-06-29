@@ -6,9 +6,14 @@ import {
     IWithdrawalReceiver,
     IZoneFactory,
     IZoneMessenger,
-    IZonePortal
+    IZonePortal,
+    ZoneInfo,
+    ZoneParams
 } from "../../src/zone/IZone.sol";
 import { SwapAndDepositRouter } from "../../src/zone/SwapAndDepositRouter.sol";
+import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
+import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/zone/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { IStablecoinDEX } from "tempo-std/interfaces/IStablecoinDEX.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
@@ -114,6 +119,15 @@ contract SwapAndDepositRouterTest is BaseTest {
     // Shared fragmented order-book config (seeded in setUp).
     uint256 internal constant FRAG_NUM_ORDERS = 2;
     uint128 internal fragPerOrder;
+
+    // Real-zone infrastructure for the end-to-end tests (built lazily via
+    // _deployRealZone); the unit tests above keep using the mock portal/factory.
+    bytes32 internal constant GENESIS_BLOCK_HASH = keccak256("genesis");
+    bytes32 internal constant GENESIS_TEMPO_BLOCK_HASH = keccak256("tempoGenesis");
+    ZoneFactory internal realFactory;
+    ZonePortal internal realPortal;
+    ZoneMessenger internal realMessenger;
+    SwapAndDepositRouter internal realRouter;
 
     function setUp() public override {
         super.setUp();
@@ -388,6 +402,119 @@ contract SwapAndDepositRouterTest is BaseTest {
         vm.prank(address(mockMessenger));
         vm.expectRevert(IStablecoinDEX.InsufficientOutput.selector);
         router.onWithdrawalReceived(senderTag, address(pathUSD), amountIn, tightData);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  END-TO-END: ROUTER + REAL ZONEPORTAL
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Build a real ZoneFactory/ZonePortal/ZoneMessenger (instead of the
+    ///      mocks used above), enable token1 on it, and deploy a router wired to
+    ///      the real factory. Swaps reuse the fragmented book seeded in setUp.
+    ///      This exercises the real deposit path (fee + DepositTooSmall floor),
+    ///      which the mock portal cannot surface. admin is the sequencer.
+    function _deployRealZone() internal {
+        realFactory = new ZoneFactory();
+
+        IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
+            initialToken: address(pathUSD),
+            admin: admin,
+            sequencer: admin,
+            verifier: realFactory.verifier(),
+            zoneParams: ZoneParams({
+                genesisBlockHash: GENESIS_BLOCK_HASH,
+                genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
+                genesisTempoBlockNumber: uint64(block.number)
+            }),
+            rpcUrl: "https://rpc.test-zone.example"
+        });
+
+        (uint32 zoneId, address portalAddr) = realFactory.createZone(params);
+        realPortal = ZonePortal(portalAddr);
+        realMessenger = ZoneMessenger(realFactory.zones(zoneId).messenger);
+
+        vm.prank(admin);
+        realPortal.enableToken(address(token1));
+
+        realRouter = new SwapAndDepositRouter(address(exchange), address(realFactory));
+
+        vm.prank(pathUSDAdmin);
+        pathUSD.mint(address(realRouter), AMOUNT * 10);
+    }
+
+    function _realZoneData(
+        address recipient,
+        uint128 minAmountOut
+    )
+        internal
+        view
+        returns (bytes memory)
+    {
+        return abi.encode(
+            false, address(token1), address(realPortal), recipient, bytes32("e2e"), minAmountOut
+        );
+    }
+
+    /// @notice Full happy path against the real portal: swap pathUSD -> token1 and
+    ///         deposit the executed output; the portal takes its fee and escrows
+    ///         the remainder.
+    function test_e2e_depositsSwapOutputNetOfFee() public {
+        _deployRealZone();
+
+        vm.prank(admin);
+        realPortal.setZoneGasRate(1); // deposit fee = FIXED_DEPOSIT_GAS * 1 = 100_000
+        uint128 fee = realPortal.calculateDepositFee();
+
+        uint256 portalBefore = token1.balanceOf(address(realPortal));
+        uint256 seqBefore = token1.balanceOf(admin); // sequencer == admin
+        uint64 depositCountBefore = realPortal.depositCount();
+
+        vm.prank(address(realMessenger));
+        bytes4 ret = realRouter.onWithdrawalReceived(
+            senderTag, address(pathUSD), AMOUNT, _realZoneData(alice, 0)
+        );
+        assertEq(ret, IWithdrawalReceiver.onWithdrawalReceived.selector);
+
+        uint256 portalDelta = token1.balanceOf(address(realPortal)) - portalBefore;
+        uint256 seqDelta = token1.balanceOf(admin) - seqBefore;
+        uint256 executed = portalDelta + seqDelta; // total token1 the router handed over
+
+        // The sequencer collected exactly the deposit fee; the portal escrowed
+        // the executed output minus that fee.
+        assertEq(seqDelta, fee, "sequencer received the deposit fee");
+        assertEq(portalDelta, executed - fee, "portal escrowed executed minus fee");
+        assertGt(executed, fee, "executed output exceeds the fee");
+        assertEq(realPortal.depositCount(), depositCountBefore + 1, "deposit recorded");
+        // Nothing stranded in the router; the full pathUSD input was consumed.
+        assertEq(token1.balanceOf(address(realRouter)), 0, "no token1 dust in router");
+        assertEq(
+            AMOUNT * 10 - pathUSD.balanceOf(address(realRouter)), AMOUNT, "pathUSD input consumed"
+        );
+    }
+
+    /// @notice The portal's DepositTooSmall floor is a second bounce path: a swap
+    ///         that succeeds and clears minAmountOut can still make the deposit
+    ///         revert when the executed output is below fee + bouncebackFee,
+    ///         reverting the whole callback (the cross-zone withdrawal bounces).
+    function test_e2e_swapOutputBelowFeeFloorBounces() public {
+        _deployRealZone();
+
+        uint128 quoted = exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), AMOUNT);
+
+        // Set the gas rate so the deposit fee alone exceeds the swap output
+        // (executed <= quoted, so fee > quoted guarantees fee > executed).
+        uint128 rate = uint128(quoted / 100_000 + 1); // fee = 100_000 * rate > quoted
+        vm.prank(admin);
+        realPortal.setZoneGasRate(rate);
+        assertGt(realPortal.calculateDepositFee(), quoted, "setup: fee exceeds swap output");
+
+        // The swap itself succeeds (minAmountOut = 0); the portal deposit reverts,
+        // so the entire callback reverts and the withdrawal bounces back.
+        vm.prank(address(realMessenger));
+        vm.expectRevert(IZonePortal.DepositTooSmall.selector);
+        realRouter.onWithdrawalReceived(
+            senderTag, address(pathUSD), AMOUNT, _realZoneData(alice, 0)
+        );
     }
 
 }
