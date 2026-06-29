@@ -111,6 +111,10 @@ contract SwapAndDepositRouterTest is BaseTest {
     bytes32 public senderTag = keccak256(abi.encodePacked(address(0x500)));
     uint128 public constant AMOUNT = 1000e6;
 
+    // Shared fragmented order-book config (seeded in setUp).
+    uint256 internal constant FRAG_NUM_ORDERS = 2;
+    uint128 internal fragPerOrder;
+
     function setUp() public override {
         super.setUp();
 
@@ -136,23 +140,36 @@ contract SwapAndDepositRouterTest is BaseTest {
         pathUSD.mint(address(router), AMOUNT * 10);
         vm.stopPrank();
 
-        // Make admin a token1 issuer so liquidity-seeding helpers can mint.
+        // Make admin a token1 issuer so the liquidity-seeding helper can mint.
         vm.prank(admin);
         token1.grantRole(_ISSUER_ROLE, admin);
+
+        // Seed a fragmented book so every swap test runs against real per-order
+        // rounding (executed output can land below the quote).
+        fragPerOrder = exchange.MIN_ORDER_AMOUNT() * 5 + 3;
+        _seedFragmentedLiquidity(FRAG_NUM_ORDERS, fragPerOrder);
     }
 
-    /// @dev Create the token1/pathUSD pair and seed a single ask order so swaps
-    ///      execute deterministically. A single order at one tick has no
-    ///      fragmentation, so quoteSwapExactAmountIn == swapExactAmountIn (no
-    ///      PROTO-22 rounding gap), which keeps these unit assertions exact.
-    function _seedSwapLiquidity(int16 tick, uint128 baseLiquidity) internal {
+    /// @dev Seed fragmented ask liquidity for token1/pathUSD. Two orders per tick
+    ///      force per-order splitting, so quote and execution can diverge (executed
+    ///      output lands strictly below the quote).
+    function _seedFragmentedLiquidity(uint256 numOrders, uint128 perOrder) internal {
         exchange.createPair(address(token1));
+
         vm.prank(admin);
-        token1.mint(bob, baseLiquidity);
+        token1.mint(bob, uint256(perOrder) * numOrders * 2 + perOrder);
+
         vm.prank(bob);
         token1.approve(address(exchange), type(uint256).max);
-        vm.prank(bob);
-        exchange.place(address(token1), baseLiquidity, false, tick);
+
+        int16 spacing = exchange.TICK_SPACING();
+        for (uint256 i = 0; i < numOrders; i++) {
+            int16 tick = int16(int256(i + 1)) * spacing;
+            vm.prank(bob);
+            exchange.place(address(token1), perOrder, false, tick);
+            vm.prank(bob);
+            exchange.place(address(token1), perOrder, false, tick);
+        }
     }
 
     function _buildPlaintextData(
@@ -237,11 +254,10 @@ contract SwapAndDepositRouterTest is BaseTest {
     }
 
     function test_plaintextDeposit_withSwap() public {
-        // Seed a single ask at a positive tick so the swap has real price impact
-        // (output < input) and the deposited amount is the executed output.
-        _seedSwapLiquidity(100, AMOUNT * 10);
+        // Against the fragmented book, minAmountOut == quote can revert because
+        // per-order rounding makes the executed output fall below the quote.
         uint128 swapOut = exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), AMOUNT);
-        assertLt(swapOut, AMOUNT, "expected price impact at tick 100");
+        assertLt(swapOut, AMOUNT, "expected price impact");
 
         bytes memory data = _buildPlaintextData(
             address(token1), address(mockPortal2), alice, bytes32("swap"), swapOut
@@ -274,9 +290,9 @@ contract SwapAndDepositRouterTest is BaseTest {
     }
 
     function test_encryptedDeposit_withSwap() public {
-        _seedSwapLiquidity(100, AMOUNT * 10);
+        // Same caveat as the plaintext variant: minAmountOut == quote can revert.
         uint128 swapOut = exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), AMOUNT);
-        assertLt(swapOut, AMOUNT, "expected price impact at tick 100");
+        assertLt(swapOut, AMOUNT, "expected price impact");
 
         EncryptedDepositPayload memory payload = _defaultEncryptedPayload();
         bytes memory data =
@@ -293,8 +309,6 @@ contract SwapAndDepositRouterTest is BaseTest {
     }
 
     function test_swapSlippageReverts() public {
-        _seedSwapLiquidity(100, AMOUNT * 10);
-
         // Output is below AMOUNT (price impact), so requiring AMOUNT must revert.
         bytes memory data = _buildPlaintextData(
             address(token1), address(mockPortal2), alice, bytes32("slip"), AMOUNT
@@ -305,63 +319,20 @@ contract SwapAndDepositRouterTest is BaseTest {
         router.onWithdrawalReceived(senderTag, address(pathUSD), AMOUNT, data);
     }
 
-    /*//////////////////////////////////////////////////////////////
-            REAL-DEX FUZZ: PER-ORDER ROUNDING (Linear PROTO-22)
-    //////////////////////////////////////////////////////////////*/
-
-    // The router already runs against the REAL StablecoinDEX precompile (wired in
-    // setUp), so swaps exercise true per-order rounding. The DEX computes quotes
-    // (`quoteSwapExactAmountIn`) and executions (`swapExactAmountIn`) via separate
-    // code paths: the quote aggregates per tick-level while the swap iterates
-    // order-by-order, rounding each fill down and rounding the consumed input up.
-    // Summing those per-order rounded amounts means the executed output can be
-    // strictly less than the quote (Linear PROTO-22). These tests seed fragmented
-    // liquidity to surface that discrepancy and pin down how it affects the router.
-
-    /// @dev Seed fragmented ask liquidity for token1/pathUSD so a single swap
-    ///      fills across multiple orders and tick levels (where per-order rounding
-    ///      is observable). Unlike `_seedSwapLiquidity` (one clean order), this
-    ///      places two orders per tick to force per-order splitting.
-    function _seedFragmentedLiquidity(uint256 numOrders, uint128 perOrder) internal {
-        exchange.createPair(address(token1));
-
-        // bob sells token1 for pathUSD (ask orders). Two orders per tick force
-        // per-order (not just per-level) splitting during execution.
-        vm.prank(admin);
-        token1.mint(bob, uint256(perOrder) * numOrders * 2 + perOrder);
-
-        vm.prank(bob);
-        token1.approve(address(exchange), type(uint256).max);
-
-        int16 spacing = exchange.TICK_SPACING();
-        for (uint256 i = 0; i < numOrders; i++) {
-            int16 tick = int16(int256(i + 1)) * spacing;
-            vm.prank(bob);
-            exchange.place(address(token1), perOrder, false, tick);
-            vm.prank(bob);
-            exchange.place(address(token1), perOrder, false, tick);
-        }
-    }
-
     /// @notice The router must deposit exactly the DEX's executed output (never a
     ///         quote), strand no token dust, and consume the full input, even when
     ///         per-order rounding makes the execution diverge from the quote.
-    function testFuzz_realDex_depositsExecutedOutput(uint128 amountIn, uint8 rawOrders) public {
-        uint128 minOrder = exchange.MIN_ORDER_AMOUNT();
-        uint256 numOrders = bound(rawOrders, 2, 8);
-        uint128 perOrder = minOrder * 5 + 3;
-
-        _seedFragmentedLiquidity(numOrders, perOrder);
-
-        // Keep amountIn (quote) under the available base liquidity so the swap
-        // always fully fills, and above a min order so it actually executes.
-        amountIn = uint128(bound(amountIn, minOrder, perOrder * numOrders));
+    function testFuzz_depositsExecutedOutput(uint128 amountIn) public {
+        // Bound amountIn under the available liquidity (full fill) and above a
+        // min order (so it executes).
+        amountIn =
+            uint128(bound(amountIn, exchange.MIN_ORDER_AMOUNT(), fragPerOrder * FRAG_NUM_ORDERS));
 
         uint128 quoted =
             exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), amountIn);
 
         bytes memory data =
-            _buildPlaintextData(address(token1), address(mockPortal2), alice, bytes32("p22"), 0);
+            _buildPlaintextData(address(token1), address(mockPortal2), alice, bytes32("swap"), 0);
 
         uint256 routerPathBefore = pathUSD.balanceOf(address(router));
         uint256 portalToken1Before = token1.balanceOf(address(mockPortal2));
@@ -384,21 +355,16 @@ contract SwapAndDepositRouterTest is BaseTest {
         assertEq(
             routerPathBefore - pathUSD.balanceOf(address(router)), amountIn, "full input consumed"
         );
-        // PROTO-22 rounding direction: execution never exceeds the quote.
+        // Execution never exceeds the quote.
         assertLe(deposited, quoted, "executed output <= quote");
         assertGt(deposited, 0, "swap produced nonzero output");
     }
 
-    /// @notice Deterministic PROTO-22 reproduction: a single concrete swap whose
-    ///         executed output is strictly less than the quote, so depositing with
-    ///         `minAmountOut == quote` reverts the whole callback.
-    /// @dev Found by the fuzzer: 2 ticks, two odd-sized ask orders each, amountIn
-    ///      = 900000012 quotes to 899910020 but only executes 899910019 (1 short).
-    function test_realDex_minEqualsQuoteReverts() public {
-        uint128 perOrder = exchange.MIN_ORDER_AMOUNT() * 5 + 3;
+    /// @notice Deterministic case where the executed output is strictly below the
+    ///         quote, so depositing with `minAmountOut == quote` reverts.
+    /// @dev amountIn = 900000012 quotes to 899910020 but executes 899910019.
+    function test_minEqualsQuoteReverts() public {
         uint128 amountIn = 900_000_012;
-
-        _seedFragmentedLiquidity(2, perOrder);
 
         uint128 quoted =
             exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), amountIn);
@@ -406,48 +372,22 @@ contract SwapAndDepositRouterTest is BaseTest {
         // Execute the swap once (minAmountOut = 0) to observe the real output.
         uint256 snap = vm.snapshotState();
         bytes memory openData =
-            _buildPlaintextData(address(token1), address(mockPortal2), alice, bytes32("p22"), 0);
+            _buildPlaintextData(address(token1), address(mockPortal2), alice, bytes32("swap"), 0);
         vm.prank(address(mockMessenger));
         router.onWithdrawalReceived(senderTag, address(pathUSD), amountIn, openData);
         uint128 executed = mockPortal2.lastDepositAmount();
 
-        // The PROTO-22 discrepancy: per-order rounding makes execution fall short.
+        // Per-order rounding makes execution fall short of the quote.
         assertLt(executed, quoted, "executed must be strictly below quote here");
 
         // Replay from the same state, this time using the quote as minAmountOut.
         vm.revertToState(snap);
         bytes memory tightData = _buildPlaintextData(
-            address(token1), address(mockPortal2), alice, bytes32("p22"), quoted
+            address(token1), address(mockPortal2), alice, bytes32("swap"), quoted
         );
         vm.prank(address(mockMessenger));
         vm.expectRevert(IStablecoinDEX.InsufficientOutput.selector);
         router.onWithdrawalReceived(senderTag, address(pathUSD), amountIn, tightData);
-    }
-
-    /// @notice Demonstrates the PROTO-22 risk for zones: using the DEX quote as a
-    ///         tight minAmountOut makes the real swap revert (the cross-zone
-    ///         withdrawal would bounce back), because the executed output is <=
-    ///         the quote due to per-order rounding.
-    function testFuzz_realDex_quoteAsMinReverts(uint128 amountIn, uint8 rawOrders) public {
-        uint128 minOrder = exchange.MIN_ORDER_AMOUNT();
-        uint256 numOrders = bound(rawOrders, 2, 8);
-        uint128 perOrder = minOrder * 5 + 3;
-
-        _seedFragmentedLiquidity(numOrders, perOrder);
-
-        amountIn = uint128(bound(amountIn, minOrder, perOrder * numOrders));
-
-        uint128 quoted =
-            exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), amountIn);
-
-        // minAmountOut just above the quote is unsatisfiable: actual <= quoted.
-        bytes memory data = _buildPlaintextData(
-            address(token1), address(mockPortal2), alice, bytes32("p22"), quoted + 1
-        );
-
-        vm.prank(address(mockMessenger));
-        vm.expectRevert(IStablecoinDEX.InsufficientOutput.selector);
-        router.onWithdrawalReceived(senderTag, address(pathUSD), amountIn, data);
     }
 
 }
