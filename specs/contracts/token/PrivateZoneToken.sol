@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneConfig, ZONE_INBOX, ZONE_OUTBOX } from "../interfaces/IZone.sol";
+import { IZoneConfig, ZONE_INBOX, ZONE_OUTBOX } from "src/interfaces/IZone.sol";
 
 /**
  * @title PrivateZoneToken

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.13;
 
 import { ITempoState, IZoneConfig, ZONE_INBOX, ZONE_OUTBOX } from "../../src/interfaces/IZone.sol";
-import { PrivateZoneToken } from "../../src/token/PrivateZoneToken.sol";
+import { PrivateZoneToken } from "contracts/token/PrivateZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 
 contract MockPrivateZoneTokenConfig is IZoneConfig {
