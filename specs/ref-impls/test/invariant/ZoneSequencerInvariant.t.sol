@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ZoneMessenger } from "../../../src/zone/ZoneMessenger.sol";
-import { ZonePortal } from "../../../src/zone/ZonePortal.sol";
+import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/l1/ZonePortal.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 

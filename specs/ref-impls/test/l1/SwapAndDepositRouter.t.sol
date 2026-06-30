@@ -9,11 +9,11 @@ import {
     IZonePortal,
     ZoneInfo,
     ZoneParams
-} from "../../src/zone/IZone.sol";
-import { SwapAndDepositRouter } from "../../src/zone/SwapAndDepositRouter.sol";
-import { ZoneFactory } from "../../src/zone/ZoneFactory.sol";
-import { ZoneMessenger } from "../../src/zone/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/zone/ZonePortal.sol";
+} from "../../src/interfaces/IZone.sol";
+import { SwapAndDepositRouter } from "../../src/l1/SwapAndDepositRouter.sol";
+import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
+import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/l1/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { IStablecoinDEX } from "tempo-std/interfaces/IStablecoinDEX.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
@@ -197,7 +197,8 @@ contract SwapAndDepositRouterTest is BaseTest {
         pure
         returns (bytes memory)
     {
-        return abi.encode(false, tokenOut, targetPortal, recipient, memo, minAmountOut);
+        // bounceback recipient mirrors the deposit recipient for plaintext flows.
+        return abi.encode(false, tokenOut, targetPortal, recipient, recipient, memo, minAmountOut);
     }
 
     function _buildEncryptedData(
@@ -208,10 +209,13 @@ contract SwapAndDepositRouterTest is BaseTest {
         uint128 minAmountOut
     )
         internal
-        pure
+        view
         returns (bytes memory)
     {
-        return abi.encode(true, tokenOut, targetPortal, keyIndex, encrypted, minAmountOut);
+        // encrypted flows have no plaintext recipient; bounce back to the router.
+        return abi.encode(
+            true, tokenOut, targetPortal, keyIndex, encrypted, address(router), minAmountOut
+        );
     }
 
     function _defaultEncryptedPayload() internal pure returns (EncryptedDepositPayload memory) {
@@ -459,7 +463,13 @@ contract SwapAndDepositRouterTest is BaseTest {
         returns (bytes memory)
     {
         return abi.encode(
-            false, address(token1), address(realPortal), recipient, bytes32("e2e"), minAmountOut
+            false,
+            address(token1),
+            address(realPortal),
+            recipient,
+            recipient,
+            bytes32("e2e"),
+            minAmountOut
         );
     }
 

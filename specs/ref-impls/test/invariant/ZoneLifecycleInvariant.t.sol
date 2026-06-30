@@ -13,18 +13,18 @@ import {
     QueuedDeposit,
     Withdrawal,
     ZONE_TX_CONTEXT
-} from "../../../src/zone/IZone.sol";
+} from "../../src/interfaces/IZone.sol";
+import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
+import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/l1/ZonePortal.sol";
 import {
     EMPTY_SENTINEL,
     WITHDRAWAL_QUEUE_CAPACITY
-} from "../../../src/zone/WithdrawalQueueLib.sol";
-import { ZoneConfig } from "../../../src/zone/ZoneConfig.sol";
-import { ZoneFactory } from "../../../src/zone/ZoneFactory.sol";
-import { ZoneInbox } from "../../../src/zone/ZoneInbox.sol";
-import { ZoneMessenger } from "../../../src/zone/ZoneMessenger.sol";
-import { ZoneOutbox } from "../../../src/zone/ZoneOutbox.sol";
-import { ZonePortal } from "../../../src/zone/ZonePortal.sol";
-import { BaseTest } from "../../BaseTest.t.sol";
+} from "../../src/libraries/WithdrawalQueueLib.sol";
+import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
+import { ZoneInbox } from "../../src/predeploys/ZoneInbox.sol";
+import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
+import { BaseTest } from "../BaseTest.t.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
@@ -283,7 +283,7 @@ contract ZoneLifecycleHandler is Test {
         DepositQueueTransition memory dt = DepositQueueTransition({
             prevProcessedHash: bytes32(0),
             nextProcessedHash: inbox.processedDepositQueueHash(),
-            prevDepositNumber: 0,
+            prevDepositNumber: portal.lastProcessedDepositNumber(),
             nextDepositNumber: inbox.processedDepositNumber()
         });
         vm.roll(block.number + 1);

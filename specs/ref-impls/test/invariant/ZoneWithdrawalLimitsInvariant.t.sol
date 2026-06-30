@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ZONE_INBOX, ZONE_TX_CONTEXT } from "../../../src/zone/IZone.sol";
-import { ZoneConfig } from "../../../src/zone/ZoneConfig.sol";
-import { ZoneOutbox } from "../../../src/zone/ZoneOutbox.sol";
+import { ZONE_INBOX, ZONE_TX_CONTEXT } from "../../src/interfaces/IZone.sol";
+import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
+import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";

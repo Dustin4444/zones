@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ENCRYPTION_KEY_GRACE_PERIOD } from "../../../src/zone/IZone.sol";
-import { ZoneMessenger } from "../../../src/zone/ZoneMessenger.sol";
-import { ZonePortal } from "../../../src/zone/ZonePortal.sol";
+import { ENCRYPTION_KEY_GRACE_PERIOD } from "../../src/interfaces/IZone.sol";
+import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/l1/ZonePortal.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
