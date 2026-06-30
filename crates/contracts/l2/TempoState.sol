@@ -4,7 +4,7 @@ pragma solidity ^0.8.13;
 import { ITempoState, ITempoStateReader } from "../interfaces/IZone.sol";
 
 /// @title TempoState
-/// @notice Zone-side predeploy for Tempo state verification
+/// @notice Zone-side system contract for Tempo state verification
 /// @dev Deployed at 0x1c00000000000000000000000000000000000000
 ///      Stores the latest finalized Tempo block info. Sequencer submits Tempo headers
 ///      which are validated for chain continuity and decoded to update state.

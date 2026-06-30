@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { BLOCKHASH_HISTORY_WINDOW } from "../../src/libraries/BlockHashHistory.sol";
+import { BLOCKHASH_HISTORY_WINDOW } from "contracts/lib/BlockHashHistory.sol";
 
 /// @notice Mock EIP-2935 block hash history contract for tests.
 /// @dev EIP-2935 expects raw 32-byte calldata (block number, no function selector)

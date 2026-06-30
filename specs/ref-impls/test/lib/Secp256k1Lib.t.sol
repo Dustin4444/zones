@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { Secp256k1Lib } from "../../src/libraries/Secp256k1Lib.sol";
+import { Secp256k1Lib } from "contracts/lib/Secp256k1Lib.sol";
 import { Test } from "forge-std/Test.sol";
 
 contract Secp256k1LibHarness {

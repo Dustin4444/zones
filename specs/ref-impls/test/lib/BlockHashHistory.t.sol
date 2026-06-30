@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { BLOCKHASH_HISTORY_WINDOW, getBlockHash } from "../../src/libraries/BlockHashHistory.sol";
 import { BaseTest } from "../BaseTest.t.sol";
+import { BLOCKHASH_HISTORY_WINDOW, getBlockHash } from "contracts/lib/BlockHashHistory.sol";
 
 contract BlockHashHistoryTest is BaseTest {
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import { BaseTest } from "../BaseTest.t.sol";
+import { MockTempoState } from "../mocks/MockTempoState.sol";
 import {
     IZoneConfig,
     IZoneFactory,
@@ -10,12 +12,10 @@ import {
     PORTAL_SEQUENCER_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT,
     ZoneParams
-} from "../../src/interfaces/IZone.sol";
-import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { BaseTest } from "../BaseTest.t.sol";
-import { MockTempoState } from "../mocks/MockTempoState.sol";
+} from "contracts/interfaces/IZone.sol";
+import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
+import { ZonePortal } from "contracts/l1/ZonePortal.sol";
+import { ZoneConfig } from "contracts/l2/ZoneConfig.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 contract ZoneConfigTest is BaseTest {

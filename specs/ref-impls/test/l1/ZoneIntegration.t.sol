@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import { BaseTest } from "../BaseTest.t.sol";
 import {
     BlockTransition,
     DecryptionData,
@@ -15,15 +16,14 @@ import {
     QueuedDeposit,
     Withdrawal,
     ZoneParams
-} from "../../src/interfaces/IZone.sol";
-import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { ZoneInbox } from "../../src/predeploys/ZoneInbox.sol";
-import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
-import { BaseTest } from "../BaseTest.t.sol";
+} from "contracts/interfaces/IZone.sol";
+import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
+import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
+import { ZonePortal } from "contracts/l1/ZonePortal.sol";
+import { ZoneConfig } from "contracts/l2/ZoneConfig.sol";
+import { ZoneInbox } from "contracts/l2/ZoneInbox.sol";
+import { ZoneOutbox } from "contracts/l2/ZoneOutbox.sol";
+import { EMPTY_SENTINEL } from "contracts/lib/WithdrawalQueueLib.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 import { MockTempoState } from "../mocks/MockTempoState.sol";

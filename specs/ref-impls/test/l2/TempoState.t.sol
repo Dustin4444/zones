@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ITempoState, ZONE_INBOX } from "../../src/interfaces/IZone.sol";
-import { TempoState } from "../../src/predeploys/TempoState.sol";
+import { ITempoState, ZONE_INBOX } from "contracts/interfaces/IZone.sol";
+import { TempoState } from "contracts/l2/TempoState.sol";
 import { Test, stdJson } from "forge-std/Test.sol";
 
 contract TempoStateRlpHarness is TempoState {

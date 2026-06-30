@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockZoneToken } from "../mocks/MockZoneToken.sol";
+import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
 import {
     IZoneOutbox,
     IZonePortal,
@@ -8,14 +11,11 @@ import {
     Withdrawal,
     ZONE_INBOX,
     ZONE_TX_CONTEXT
-} from "../../src/interfaces/IZone.sol";
-import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { ZoneInbox } from "../../src/predeploys/ZoneInbox.sol";
-import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
-import { MockTempoState } from "../mocks/MockTempoState.sol";
-import { MockZoneToken } from "../mocks/MockZoneToken.sol";
-import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
+} from "contracts/interfaces/IZone.sol";
+import { ZoneConfig } from "contracts/l2/ZoneConfig.sol";
+import { ZoneInbox } from "contracts/l2/ZoneInbox.sol";
+import { ZoneOutbox } from "contracts/l2/ZoneOutbox.sol";
+import { EMPTY_SENTINEL } from "contracts/lib/WithdrawalQueueLib.sol";
 import { Test } from "forge-std/Test.sol";
 
 /// @title ZoneOutboxTest

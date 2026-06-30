@@ -5,11 +5,11 @@ import {
     DepositType,
     EncryptedDeposit,
     EncryptedDepositPayload
-} from "../../src/interfaces/IZone.sol";
+} from "contracts/interfaces/IZone.sol";
 import {
     ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
     EncryptedDepositLib
-} from "../../src/libraries/EncryptedDeposit.sol";
+} from "contracts/lib/EncryptedDeposit.sol";
 import { Test } from "forge-std/Test.sol";
 
 contract EncryptedDepositHarness {

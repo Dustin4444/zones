@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { PORTAL_TOKEN_CONFIGS_SLOT } from "../../src/interfaces/IZone.sol";
+import { PORTAL_TOKEN_CONFIGS_SLOT } from "contracts/interfaces/IZone.sol";
 
 /// @title MockTempoState
 /// @notice Mock TempoState for testing ZoneInbox

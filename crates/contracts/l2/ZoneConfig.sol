@@ -12,7 +12,7 @@ import {
 
 /// @title ZoneConfig
 /// @notice Central zone metadata and L1 state references
-/// @dev System contract predeploy at 0x1c00000000000000000000000000000000000003
+/// @dev System contract at 0x1c00000000000000000000000000000000000003
 ///      Provides single source of truth for zone configuration.
 ///      Reads sequencer from L1 ZonePortal, eliminating duplicate sequencer management.
 contract ZoneConfig is IZoneConfig {
@@ -24,7 +24,7 @@ contract ZoneConfig is IZoneConfig {
     /// @notice L1 ZonePortal address
     address public immutable tempoPortal;
 
-    /// @notice TempoState predeploy for L1 reads
+    /// @notice TempoState system contract for L1 reads
     ITempoState public immutable tempoState;
 
     /*//////////////////////////////////////////////////////////////

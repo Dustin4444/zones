@@ -4,18 +4,16 @@ on:
   push:
     branches: [main, dr/validium]
     paths:
-      - "specs/ref-impls/src/**"
-      - "specs/ref-impls/test/**"
-      - "specs/ref-impls/foundry.toml"
+      - "crates/contracts/**"
+      - "specs/ref-impls/**"
       - "crates/node/**"
       - ".github/workflows/specs.yml"
   merge_group:
   pull_request:
     branches: [main, dr/validium]
     paths:
-      - "specs/ref-impls/src/**"
-      - "specs/ref-impls/test/**"
-      - "specs/ref-impls/foundry.toml"
+      - "crates/contracts/**"
+      - "specs/ref-impls/**"
       - "crates/node/**"
       - ".github/workflows/specs.yml"
 
@@ -45,7 +43,7 @@ jobs:
 
       - name: Run Forge build
         working-directory: specs/ref-impls
-        run: forge build --sizes
+        run: forge build ../../crates/contracts src --sizes
 
   lint:
     name: Forge Fmt
@@ -63,7 +61,7 @@ jobs:
 
       - name: Run Forge fmt check
         working-directory: specs/ref-impls
-        run: forge fmt --check src test
+        run: forge fmt --check "$GITHUB_WORKSPACE/crates/contracts" src test
 
   test:
     name: Forge Test & Coverage
@@ -144,7 +142,9 @@ jobs:
           import os, re, sys
           ln = ld = bn = bd = 0
           for line in open("coverage.txt"):
-              if "| src/" in line and "| src/interfaces/" not in line:
+              is_contract = "crates/contracts/" in line
+              is_interface = "/interfaces/" in line
+              if is_contract and not is_interface:
                   c = line.split("|")
                   lm = re.search(r"\((\d+)/(\d+)\)", c[2])
                   bm = re.search(r"\((\d+)/(\d+)\)", c[4])
@@ -153,12 +153,12 @@ jobs:
                   if bm:
                       bn += int(bm.group(1)); bd += int(bm.group(2))
           if ld == 0 or bd == 0:
-              sys.exit("Coverage gate failed: no production src coverage rows matched")
+              sys.exit("Coverage gate failed: no production contract coverage rows matched")
           lines = 100 * ln / ld
           branches = 100 * bn / bd
           min_l = float(os.environ["MIN_LINES"])
           min_b = float(os.environ["MIN_BRANCHES"])
-          print(f"src: lines={lines:.2f}% (min {min_l}), branches={branches:.2f}% (min {min_b})")
+          print(f"contracts: lines={lines:.2f}% (min {min_l}), branches={branches:.2f}% (min {min_b})")
           failed = []
           if lines < min_l:
               failed.append(f"lines {lines:.2f}% < {min_l}%")

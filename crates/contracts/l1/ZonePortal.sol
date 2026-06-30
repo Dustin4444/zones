@@ -18,11 +18,11 @@ import {
     TokenConfig,
     Withdrawal
 } from "../interfaces/IZone.sol";
-import { getBlockHash } from "../libraries/BlockHashHistory.sol";
-import { DepositQueueLib } from "../libraries/DepositQueueLib.sol";
-import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE } from "../libraries/EncryptedDeposit.sol";
-import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
-import { WithdrawalQueue, WithdrawalQueueLib } from "../libraries/WithdrawalQueueLib.sol";
+import { getBlockHash } from "../lib/BlockHashHistory.sol";
+import { DepositQueueLib } from "../lib/DepositQueueLib.sol";
+import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE } from "../lib/EncryptedDeposit.sol";
+import { Secp256k1Lib } from "../lib/Secp256k1Lib.sol";
+import { WithdrawalQueue, WithdrawalQueueLib } from "../lib/WithdrawalQueueLib.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";

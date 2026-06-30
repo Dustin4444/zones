@@ -23,10 +23,7 @@ import {
     TIP20_FACTORY_ADDRESS,
     ZONE_OUTBOX
 } from "../interfaces/IZone.sol";
-import {
-    ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
-    EncryptedDepositLib
-} from "../libraries/EncryptedDeposit.sol";
+import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE, EncryptedDepositLib } from "../lib/EncryptedDeposit.sol";
 import { TempoState } from "./TempoState.sol";
 
 /// @title ZoneInbox
@@ -45,7 +42,7 @@ contract ZoneInbox is IZoneInbox {
     /// @notice The Tempo portal address (for reading deposit queue hash)
     address public immutable tempoPortal;
 
-    /// @notice The TempoState predeploy address (stored as concrete type for internal use)
+    /// @notice The TempoState system contract address (stored as concrete type for internal use)
     TempoState internal immutable _tempoState;
 
     /// @notice Last processed deposit queue hash (validated against Tempo state)
@@ -67,7 +64,7 @@ contract ZoneInbox is IZoneInbox {
         _tempoState = TempoState(_tempoStateAddr);
     }
 
-    /// @notice The TempoState predeploy address
+    /// @notice The TempoState system contract address
     function tempoState() external view returns (ITempoState) {
         return _tempoState;
     }

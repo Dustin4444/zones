@@ -15,11 +15,11 @@ import {
     ZONE_TX_CONTEXT
 } from "../interfaces/IZone.sol";
 
-import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
-import { EMPTY_SENTINEL } from "../libraries/WithdrawalQueueLib.sol";
+import { Secp256k1Lib } from "../lib/Secp256k1Lib.sol";
+import { EMPTY_SENTINEL } from "../lib/WithdrawalQueueLib.sol";
 
 /// @title ZoneOutbox
-/// @notice Zone-side predeploy for requesting withdrawals back to Tempo
+/// @notice Zone-side system contract for requesting withdrawals back to Tempo
 /// @dev Burns zone tokens and stores pending withdrawals. Sequencer calls finalizeWithdrawalBatch()
 ///      at the end of a block to construct withdrawal queue hash on-chain.
 contract ZoneOutbox is IZoneOutbox {

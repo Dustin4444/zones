@@ -45,7 +45,7 @@ jobs:
           version: nightly
       - name: Build Solidity artifacts
         working-directory: specs/ref-impls
-        run: forge build
+        run: forge build ../../crates/contracts src
       - name: Build and compile tests
         run: cargo nextest run --profile ci --no-run
       - name: Run tests

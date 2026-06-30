@@ -47,7 +47,7 @@ jobs:
           version: nightly
       - name: Build Solidity artifacts
         working-directory: specs/ref-impls
-        run: forge build
+        run: forge build ../../crates/contracts src
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --locked
         env:

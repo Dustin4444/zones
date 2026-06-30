@@ -347,7 +347,7 @@ fn zone_test_genesis_predeploy_bytecode_matches_foundry_artifacts() {
                  Compared bytecode excludes Solidity's CBOR metadata footer when present, because \
                  that metadata hash can vary by build environment. A mismatch here means the \
                  executable contract bytecode changed.\n\
-                 Refresh with: `forge build --root specs/ref-impls` then \
+                 Refresh with: `(cd specs/ref-impls && forge build ../../crates/contracts src)` then \
                  `cargo run --manifest-path xtask/Cargo.toml -- generate-zone-genesis ...`",
                 actual_view.raw.len(),
                 actual_view.compared.len(),

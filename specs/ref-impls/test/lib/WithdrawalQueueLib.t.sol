@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { Withdrawal } from "../../src/interfaces/IZone.sol";
+import { Withdrawal } from "contracts/interfaces/IZone.sol";
 import {
     EMPTY_SENTINEL,
     WITHDRAWAL_QUEUE_CAPACITY,
     WithdrawalQueue,
     WithdrawalQueueLib
-} from "../../src/libraries/WithdrawalQueueLib.sol";
+} from "contracts/lib/WithdrawalQueueLib.sol";
 import { Test } from "forge-std/Test.sol";
 
 /// @title WithdrawalQueueHarness

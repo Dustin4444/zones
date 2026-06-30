@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZonePortal, Withdrawal } from "../../src/interfaces/IZone.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
+import { IZonePortal, Withdrawal } from "contracts/interfaces/IZone.sol";
+import { ZonePortal } from "contracts/l1/ZonePortal.sol";
+import { EMPTY_SENTINEL } from "contracts/lib/WithdrawalQueueLib.sol";
 import { Test } from "forge-std/Test.sol";
 
 contract MockPortalToken {

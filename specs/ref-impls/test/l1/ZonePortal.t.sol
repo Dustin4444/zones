@@ -4,6 +4,7 @@ pragma solidity ^0.8.13;
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
+import { BaseTest } from "../BaseTest.t.sol";
 import {
     BlockTransition,
     Deposit,
@@ -26,15 +27,14 @@ import {
     Withdrawal,
     ZoneInfo,
     ZoneParams
-} from "../../src/interfaces/IZone.sol";
-import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { BLOCKHASH_HISTORY_WINDOW } from "../../src/libraries/BlockHashHistory.sol";
-import { DepositQueueLib } from "../../src/libraries/DepositQueueLib.sol";
-import { EMPTY_SENTINEL, WithdrawalQueueLib } from "../../src/libraries/WithdrawalQueueLib.sol";
-import { WITHDRAWAL_QUEUE_CAPACITY } from "../../src/libraries/WithdrawalQueueLib.sol";
-import { BaseTest } from "../BaseTest.t.sol";
+} from "contracts/interfaces/IZone.sol";
+import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
+import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
+import { ZonePortal } from "contracts/l1/ZonePortal.sol";
+import { BLOCKHASH_HISTORY_WINDOW } from "contracts/lib/BlockHashHistory.sol";
+import { DepositQueueLib } from "contracts/lib/DepositQueueLib.sol";
+import { EMPTY_SENTINEL, WithdrawalQueueLib } from "contracts/lib/WithdrawalQueueLib.sol";
+import { WITHDRAWAL_QUEUE_CAPACITY } from "contracts/lib/WithdrawalQueueLib.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 /// @notice Mock withdrawal receiver that accepts funds

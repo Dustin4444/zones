@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ITempoState, IZoneConfig, ZONE_INBOX, ZONE_OUTBOX } from "../../src/interfaces/IZone.sol";
-import { PrivateZoneToken } from "../../src/token/PrivateZoneToken.sol";
+import { ITempoState, IZoneConfig, ZONE_INBOX, ZONE_OUTBOX } from "contracts/interfaces/IZone.sol";
 import { Test } from "forge-std/Test.sol";
+import { PrivateZoneToken } from "ref-impls/token/PrivateZoneToken.sol";
 
 contract MockPrivateZoneTokenConfig is IZoneConfig {
 

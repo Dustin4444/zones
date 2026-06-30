@@ -6,12 +6,12 @@ import {
     DepositType,
     EncryptedDeposit,
     EncryptedDepositPayload
-} from "../../src/interfaces/IZone.sol";
-import { DepositQueueLib } from "../../src/libraries/DepositQueueLib.sol";
+} from "contracts/interfaces/IZone.sol";
+import { DepositQueueLib } from "contracts/lib/DepositQueueLib.sol";
 import {
     ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
     EncryptedDepositLib
-} from "../../src/libraries/EncryptedDeposit.sol";
+} from "contracts/lib/EncryptedDeposit.sol";
 import { Test, stdJson } from "forge-std/Test.sol";
 
 /// @notice External wrapper to test EncryptedDepositLib.decodePlaintext (which is internal)

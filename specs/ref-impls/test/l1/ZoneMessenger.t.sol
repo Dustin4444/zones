@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IWithdrawalReceiver } from "../../src/interfaces/IZone.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
+import { IWithdrawalReceiver } from "contracts/interfaces/IZone.sol";
+import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 contract AcceptingWithdrawalReceiver is IWithdrawalReceiver {

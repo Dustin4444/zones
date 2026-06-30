@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
+import { ZonePortalTest } from "../l1/ZonePortal.t.sol";
+import { ZoneOutboxTest } from "./ZoneOutbox.t.sol";
+import { EncryptedDepositLib } from "contracts/lib/EncryptedDeposit.sol";
 import {
     WITHDRAWAL_QUEUE_CAPACITY,
     WithdrawalQueue,
     WithdrawalQueueLib
-} from "../../src/libraries/WithdrawalQueueLib.sol";
-import { ZonePortalTest } from "../l1/ZonePortal.t.sol";
-import { ZoneOutboxTest } from "./ZoneOutbox.t.sol";
+} from "contracts/lib/WithdrawalQueueLib.sol";
 import { Test } from "forge-std/Test.sol";
 
 /// @title ZonePortal symbolic properties
