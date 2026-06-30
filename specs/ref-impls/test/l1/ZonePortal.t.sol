@@ -126,6 +126,66 @@ contract SuccessfulReceiver is IWithdrawalReceiver {
 
 }
 
+/// @notice Malicious receiver that re-enters the portal during its withdrawal callback.
+/// @dev Used to prove `processWithdrawal` (sequencer-gated) and `claimRefund` (checks-effects-
+///      interactions) cannot be abused for reentrancy while queue/refund state is mid-update.
+contract ReentrantReceiver is IWithdrawalReceiver {
+
+    ZonePortal public portal;
+    address public token;
+    Withdrawal public reenterWithdrawal;
+
+    bool public attemptProcessWithdrawal;
+    bool public attemptClaimRefund;
+
+    // Observations recorded during the callback.
+    bool public processWithdrawalReverted;
+    uint256 public claimRefundCallCount;
+    uint128 public totalClaimed;
+
+    function configure(ZonePortal _portal, address _token) external {
+        portal = _portal;
+        token = _token;
+    }
+
+    function setReenterWithdrawal(Withdrawal calldata w) external {
+        reenterWithdrawal = w;
+    }
+
+    function setAttempts(bool _processWithdrawal, bool _claimRefund) external {
+        attemptProcessWithdrawal = _processWithdrawal;
+        attemptClaimRefund = _claimRefund;
+    }
+
+    function onWithdrawalReceived(
+        bytes32,
+        address,
+        uint128,
+        bytes calldata
+    )
+        external
+        returns (bytes4)
+    {
+        if (attemptProcessWithdrawal) {
+            // Re-enter the queue mid-dequeue; must be rejected by `onlySequencer`.
+            try portal.processWithdrawal(reenterWithdrawal, bytes32(0)) {
+                processWithdrawalReverted = false;
+            } catch {
+                processWithdrawalReverted = true;
+            }
+        }
+        if (attemptClaimRefund) {
+            // Claim twice in one callback; CEI must zero the balance so the second yields 0.
+            uint128 c1 = portal.claimRefund(token);
+            uint128 c2 = portal.claimRefund(token);
+            totalClaimed = c1 + c2;
+            claimRefundCallCount = 2;
+        }
+        return IWithdrawalReceiver.onWithdrawalReceived.selector;
+    }
+
+}
+
 /// @notice Tests for ZonePortal - simulating L1/zone interface
 contract ZonePortalTest is BaseTest {
 
@@ -827,6 +887,105 @@ contract ZonePortalTest is BaseTest {
         assertEq(withdrawalReceiver.lastSenderTag(), _senderTag(alice));
         assertEq(withdrawalReceiver.lastAmount(), 500e6);
         assertEq(withdrawalReceiver.lastCallbackData(), "callback_data");
+    }
+
+    /// @notice Enqueue a single withdrawal into the L1 queue via a stub-verified batch.
+    function _enqueueSingleWithdrawal(Withdrawal memory w) internal {
+        bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(),
+                nextBlockHash: keccak256(abi.encode(wHash, block.number))
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: portal.currentDepositQueueHash(),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            wHash,
+            "",
+            ""
+        );
+    }
+
+    /// @notice A withdrawal callback that re-enters `processWithdrawal` is rejected by the
+    ///         sequencer gate, so it cannot re-process a queue entry mid-dequeue. The outer
+    ///         withdrawal still completes and the queue advances by exactly one slot.
+    function test_reentrancy_processWithdrawalGuardedBySequencer() public {
+        ReentrantReceiver attacker = new ReentrantReceiver();
+        attacker.configure(portal, address(pathUSD));
+
+        // Fund the portal.
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        Withdrawal memory w = _withdrawal(
+            address(pathUSD), alice, address(attacker), 500e6, bytes32(0), 5_000_000, alice, ""
+        );
+        attacker.setReenterWithdrawal(w);
+        attacker.setAttempts(true, false);
+
+        _enqueueSingleWithdrawal(w);
+
+        uint256 headBefore = portal.withdrawalQueueHead();
+        portal.processWithdrawal(w, bytes32(0));
+
+        // Outer withdrawal delivered funds and the queue advanced exactly once.
+        assertEq(pathUSD.balanceOf(address(attacker)), 500e6);
+        assertEq(portal.withdrawalQueueHead(), headBefore + 1);
+        // The reentrant processWithdrawal call reverted (NotSequencer).
+        assertTrue(attacker.processWithdrawalReverted());
+    }
+
+    /// @notice A withdrawal callback that re-enters `claimRefund` cannot double-spend a parked
+    ///         refund: checks-effects-interactions zeroes the balance before the transfer, so a
+    ///         second claim in the same callback returns zero.
+    function test_reentrancy_claimRefundNoDoubleSpend() public {
+        vm.fee(0); // bouncebackFee == 0, so the full amount is parked as a refund.
+        ReentrantReceiver attacker = new ReentrantReceiver();
+        attacker.configure(portal, address(pathUSD));
+
+        // Fund the portal enough for both the parked refund and the callback withdrawal.
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        // 1) Park a refund of 300e6 for the attacker via a failed deposit bounce-back.
+        uint128 refundAmount = 300e6;
+        Withdrawal memory wRefund = _withdrawal(
+            address(pathUSD), alice, address(attacker), refundAmount, bytes32(0), 0, address(0), ""
+        );
+        _enqueueSingleWithdrawal(wRefund);
+        vm.mockCall(
+            address(pathUSD),
+            abi.encodeWithSelector(ITIP20.transfer.selector, address(attacker), refundAmount),
+            abi.encode(false)
+        );
+        portal.processWithdrawal(wRefund, bytes32(0));
+        vm.clearMockedCalls();
+        assertEq(portal.refunds(address(pathUSD), address(attacker)), refundAmount);
+
+        // 2) Process a callback withdrawal; the callback re-enters claimRefund twice.
+        uint128 cbAmount = 400e6;
+        Withdrawal memory wCb = _withdrawal(
+            address(pathUSD), alice, address(attacker), cbAmount, bytes32(0), 5_000_000, alice, ""
+        );
+        attacker.setAttempts(false, true);
+        _enqueueSingleWithdrawal(wCb);
+        portal.processWithdrawal(wCb, bytes32(0));
+
+        // Attacker received exactly the callback amount plus a single refund, not a double claim.
+        assertEq(pathUSD.balanceOf(address(attacker)), cbAmount + refundAmount);
+        assertEq(attacker.totalClaimed(), refundAmount);
+        assertEq(attacker.claimRefundCallCount(), 2);
+        assertEq(portal.refunds(address(pathUSD), address(attacker)), 0);
     }
 
     function test_withdrawal_bounceBackOnRevert() public {
