@@ -21,7 +21,6 @@ interface IZoneToken {
 struct ZoneInfo {
     uint32 zoneId;
     address portal;
-    address messenger;
     address initialToken; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
     address admin;
     address sequencer;
@@ -455,7 +454,6 @@ interface IZoneFactory {
     event ZoneCreated(
         uint32 indexed zoneId,
         address indexed portal,
-        address indexed messenger,
         address initialToken,
         address admin,
         address sequencer,
@@ -477,7 +475,7 @@ interface IZoneFactory {
     /// @return valid True if `verifier` can be passed to `createZone`.
     function isValidVerifier(address verifier) external view returns (bool);
 
-    /// @notice Creates a new zone and deploys its portal and messenger contracts.
+    /// @notice Creates a new zone and deploys its portal contract.
     /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
     /// @return zoneId The newly assigned zone ID.
     /// @return portal The deployed portal address for the new zone.
@@ -498,11 +496,6 @@ interface IZoneFactory {
     /// @param portal The portal address to check.
     /// @return isPortal True if `portal` was created by this factory.
     function isZonePortal(address portal) external view returns (bool);
-
-    /// @notice Returns whether an address is a messenger deployed by this factory.
-    /// @param messenger The messenger address to check.
-    /// @return isMessenger True if `messenger` was created by this factory.
-    function isZoneMessenger(address messenger) external view returns (bool);
 
 }
 
@@ -614,7 +607,9 @@ interface IZonePortal {
     error NotPendingSequencer();
     error InvalidProof();
     error InvalidTempoBlockNumber();
+    error OnlyPortal();
     error CallbackRejected();
+    error TransferFailed();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
     error InvalidEncryptionKeyIndex(uint256 keyIndex);
     error NoEncryptionKeySet();
@@ -643,8 +638,6 @@ interface IZonePortal {
     function MAX_GAS_FEE_RATE() external view returns (uint128);
 
     function zoneId() external view returns (uint32);
-
-    function messenger() external view returns (address);
 
     function sequencer() external view returns (address);
 
@@ -693,7 +686,7 @@ interface IZonePortal {
 
     /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
     /// @dev Irreversible: once enabled, a token cannot be disabled.
-    ///      Validates the token is a TIP-20 and grants messenger max approval.
+    ///      Validates the token is a TIP-20.
     function enableToken(address token) external;
 
     /// @notice Pause deposits for a token. Only callable by admin.
@@ -812,6 +805,19 @@ interface IZonePortal {
 
     function processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) external;
 
+    /// @notice Relay a withdrawal callback in an external self-call.
+    /// @dev Only callable by the portal itself. Keeps token transfer and callback atomic while
+    ///      allowing processWithdrawal to catch failures and bounce back.
+    function relayWithdrawalCallback(
+        address token,
+        bytes32 senderTag,
+        address target,
+        uint128 amount,
+        uint64 gasLimit,
+        bytes calldata data
+    )
+        external;
+
     function refunds(address token, address owner) external view returns (uint128);
 
     function claimRefund(address token) external returns (uint128 amount);
@@ -824,34 +830,6 @@ interface IZonePortal {
         bytes32 withdrawalQueueHash,
         bytes calldata verifierConfig,
         bytes calldata proof
-    )
-        external;
-
-}
-
-/// @title IZoneMessenger
-/// @notice Interface for zone messenger on Tempo (handles withdrawal callbacks)
-interface IZoneMessenger {
-
-    /// @notice Returns the zone's portal address
-    function portal() external view returns (address);
-
-    /// @notice Relay a withdrawal message. Only callable by the portal.
-    /// @dev Transfers tokens from portal to target via transferFrom, then executes callback.
-    ///      If callback reverts, the entire call reverts (including the transfer).
-    /// @param token The TIP-20 token to transfer
-    /// @param senderTag The authenticated sender commitment from the zone
-    /// @param target The Tempo recipient
-    /// @param amount Tokens to transfer from portal to target
-    /// @param gasLimit Max gas for the callback
-    /// @param data Calldata for the target
-    function relayMessage(
-        address token,
-        bytes32 senderTag,
-        address target,
-        uint128 amount,
-        uint64 gasLimit,
-        bytes calldata data
     )
         external;
 

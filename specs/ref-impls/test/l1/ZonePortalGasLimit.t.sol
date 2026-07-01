@@ -53,7 +53,6 @@ contract ZonePortalGasLimitTest is Test {
         portal = new ZonePortal(
             1,
             address(token),
-            address(0x400),
             address(this),
             address(this),
             address(0),

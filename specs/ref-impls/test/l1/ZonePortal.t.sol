@@ -17,7 +17,6 @@ import {
     IVerifier,
     IWithdrawalReceiver,
     IZoneFactory,
-    IZoneMessenger,
     IZonePortal,
     PORTAL_ADMIN_SLOT,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
@@ -29,7 +28,6 @@ import {
     ZoneParams
 } from "contracts/interfaces/IZone.sol";
 import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
 import { ZonePortal } from "contracts/l1/ZonePortal.sol";
 import { BLOCKHASH_HISTORY_WINDOW } from "contracts/lib/BlockHashHistory.sol";
 import { DepositQueueLib } from "contracts/lib/DepositQueueLib.sol";
@@ -47,11 +45,6 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
     address public lastToken;
     uint128 public lastAmount;
     bytes public lastCallbackData;
-    address public expectedMessenger;
-
-    function setExpectedMessenger(address _messenger) external {
-        expectedMessenger = _messenger;
-    }
 
     function setShouldAccept(bool _shouldAccept) external {
         shouldAccept = _shouldAccept;
@@ -132,7 +125,6 @@ contract ZonePortalTest is BaseTest {
 
     ZoneFactory public zoneFactory;
     ZonePortal public portal;
-    ZoneMessenger public messenger;
     MockWithdrawalReceiver public withdrawalReceiver;
     GasConsumingReceiver public gasConsumingReceiver;
     SuccessfulReceiver public successfulReceiver;
@@ -179,13 +171,6 @@ contract ZonePortalTest is BaseTest {
         address portalAddr;
         (testZoneId, portalAddr) = zoneFactory.createZone(params);
         portal = ZonePortal(portalAddr);
-
-        // Get the messenger
-        ZoneInfo memory info = zoneFactory.zones(testZoneId);
-        messenger = ZoneMessenger(info.messenger);
-
-        // Set expected messenger for withdrawal receiver
-        withdrawalReceiver.setExpectedMessenger(address(messenger));
     }
 
     function _senderTag(address sender) internal pure returns (bytes32) {
@@ -232,7 +217,6 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.verifier(), zoneFactory.verifier());
         assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
         assertEq(portal.withdrawalBatchIndex(), 0);
-        assertEq(portal.messenger(), address(messenger));
     }
 
     function test_zoneFactoryTracksZones() public view {
@@ -242,7 +226,6 @@ contract ZonePortalTest is BaseTest {
         ZoneInfo memory info = zoneFactory.zones(testZoneId);
         assertEq(info.zoneId, testZoneId);
         assertEq(info.portal, address(portal));
-        assertEq(info.messenger, address(messenger));
         assertEq(info.initialToken, address(pathUSD));
         assertEq(info.admin, admin);
     }
@@ -777,6 +760,36 @@ contract ZonePortalTest is BaseTest {
     /*//////////////////////////////////////////////////////////////
                      CALLBACK & BOUNCE-BACK TESTS
     //////////////////////////////////////////////////////////////*/
+
+    function test_relayWithdrawalCallback_revertsIfNotPortal() public {
+        vm.expectRevert(IZonePortal.OnlyPortal.selector);
+        portal.relayWithdrawalCallback(
+            address(pathUSD), bytes32("sender"), address(withdrawalReceiver), 1, 50_000, ""
+        );
+    }
+
+    function test_relayWithdrawalCallback_success() public {
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        vm.prank(address(portal));
+        portal.relayWithdrawalCallback(
+            address(pathUSD),
+            _senderTag(alice),
+            address(withdrawalReceiver),
+            500e6,
+            5_000_000,
+            "callback_data"
+        );
+
+        assertEq(pathUSD.balanceOf(address(withdrawalReceiver)), 500e6);
+        assertEq(withdrawalReceiver.lastSenderTag(), _senderTag(alice));
+        assertEq(withdrawalReceiver.lastToken(), address(pathUSD));
+        assertEq(withdrawalReceiver.lastAmount(), 500e6);
+        assertEq(withdrawalReceiver.lastCallbackData(), "callback_data");
+    }
 
     function test_withdrawal_withCallback() public {
         // Fund portal

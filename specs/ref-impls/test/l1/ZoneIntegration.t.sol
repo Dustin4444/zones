@@ -18,7 +18,6 @@ import {
     ZoneParams
 } from "contracts/interfaces/IZone.sol";
 import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
 import { ZonePortal } from "contracts/l1/ZonePortal.sol";
 import { ZoneConfig } from "contracts/l2/ZoneConfig.sol";
 import { ZoneInbox } from "contracts/l2/ZoneInbox.sol";
@@ -92,14 +91,10 @@ contract ZoneIntegrationTest is BaseTest {
 
         genesisTempoBlockNumber = uint64(block.number);
 
-        // Deploy messenger and portal directly (bypass factory TIP20 prefix check)
-        uint256 currentNonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), currentNonce + 1);
-        ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
+        // Deploy portal directly (bypass factory TIP20 prefix check)
         l1Portal = new ZonePortal(
             1,
             address(l2ZoneToken),
-            address(messengerContract),
             admin,
             admin,
             l1Factory.verifier(),

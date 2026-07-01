@@ -11,7 +11,7 @@ import {
     EncryptedDepositPayload,
     EncryptionKeyEntry,
     IVerifier,
-    IZoneMessenger,
+    IWithdrawalReceiver,
     IZonePortal,
     MAX_WITHDRAWAL_CALLBACK_GAS,
     QueuedDeposit,
@@ -67,7 +67,6 @@ contract ZonePortal is IZonePortal {
     //////////////////////////////////////////////////////////////*/
 
     uint32 public immutable zoneId;
-    address public immutable messenger;
     address public immutable verifier;
     uint64 public immutable genesisTempoBlockNumber;
 
@@ -132,7 +131,6 @@ contract ZonePortal is IZonePortal {
     constructor(
         uint32 _zoneId,
         address _initialToken,
-        address _messenger,
         address _admin,
         address _sequencer,
         address _verifier,
@@ -141,7 +139,6 @@ contract ZonePortal is IZonePortal {
         string memory _rpcUrl
     ) {
         zoneId = _zoneId;
-        messenger = _messenger;
         admin = _admin;
         sequencer = _sequencer;
         verifier = _verifier;
@@ -246,7 +243,7 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
     /// @dev Irreversible: once enabled, a token cannot be disabled (non-custodial guarantee).
-    ///      Validates the token is a TIP-20 and grants messenger max approval.
+    ///      Validates the token is a TIP-20.
     function enableToken(address _token) external onlyAdmin {
         if (_tokenConfigs[_token].enabled) revert TokenAlreadyEnabled();
         if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(_token)) {
@@ -274,9 +271,6 @@ contract ZonePortal is IZonePortal {
     function _enableTokenInternal(address _token) internal {
         _tokenConfigs[_token] = TokenConfig({ enabled: true, depositsActive: true });
         _enabledTokens.push(_token);
-
-        // Give messenger max approval for this token
-        ITIP20(_token).approve(messenger, type(uint256).max);
 
         // Read token metadata for the event so zone-side can create matching TIP-20
         string memory name = ITIP20(_token).name();
@@ -691,16 +685,15 @@ contract ZonePortal is IZonePortal {
                 success = false;
             }
         } else {
-            // Try callback via messenger; revert is treated as failure
-            try IZoneMessenger(messenger)
-                .relayMessage(
-                    _token,
-                    withdrawal.senderTag,
-                    withdrawal.to,
-                    withdrawal.amount,
-                    withdrawal.gasLimit,
-                    withdrawal.callbackData
-                ) {
+            // Try callback via external self-call; revert is treated as failure.
+            try this.relayWithdrawalCallback(
+                _token,
+                withdrawal.senderTag,
+                withdrawal.to,
+                withdrawal.amount,
+                withdrawal.gasLimit,
+                withdrawal.callbackData
+            ) {
                 success = true;
             } catch {
                 success = false;
@@ -716,6 +709,34 @@ contract ZonePortal is IZonePortal {
             emit WithdrawalProcessed(
                 withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, true
             );
+        }
+    }
+
+    /// @notice Relay a callback withdrawal from an external self-call.
+    /// @dev This preserves atomicity for `transfer + callback`: if the callback reverts,
+    ///      the token transfer reverts too, while processWithdrawal can catch the self-call
+    ///      failure and enqueue a bounce-back.
+    function relayWithdrawalCallback(
+        address token,
+        bytes32 senderTag,
+        address target,
+        uint128 amount,
+        uint64 gasLimit,
+        bytes calldata data
+    )
+        external
+    {
+        if (msg.sender != address(this)) revert OnlyPortal();
+
+        if (!ITIP20(token).transfer(target, amount)) {
+            revert TransferFailed();
+        }
+
+        bytes4 selector = IWithdrawalReceiver(target).onWithdrawalReceived{ gas: gasLimit }(
+            senderTag, token, amount, data
+        );
+        if (selector != IWithdrawalReceiver.onWithdrawalReceived.selector) {
+            revert CallbackRejected();
         }
     }
 

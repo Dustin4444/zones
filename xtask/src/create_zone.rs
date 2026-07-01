@@ -42,7 +42,6 @@ sol! {
         event ZoneCreated(
             uint32 indexed zoneId,
             address indexed portal,
-            address indexed messenger,
             address initialToken,
             address admin,
             address sequencer,

@@ -31,7 +31,6 @@ import {
     ZoneParams
 } from "contracts/interfaces/IZone.sol";
 import { ZoneFactory } from "contracts/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "contracts/l1/ZoneMessenger.sol";
 import { ZonePortal } from "contracts/l1/ZonePortal.sol";
 import { ZoneConfig } from "contracts/l2/ZoneConfig.sol";
 import { ZoneInbox } from "contracts/l2/ZoneInbox.sol";
@@ -147,15 +146,10 @@ contract ZoneBridgeTest is BaseTest {
         // Record genesis block number for Tempo
         genesisTempoBlockNumber = uint64(block.number);
 
-        // Deploy messenger and portal directly (bypass factory to avoid TIP20 prefix check).
-        // Predict portal address so messenger can reference it in its constructor.
-        uint256 currentNonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), currentNonce + 1);
-        ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
+        // Deploy portal directly (bypass factory to avoid TIP20 prefix check).
         l1Portal = new ZonePortal(
             1, // zoneId
             address(l2ZoneToken), // initialToken = MockZoneToken (NOT pathUSD)
-            address(messengerContract),
             admin, // admin
             admin, // sequencer
             l1Factory.verifier(),

@@ -54,7 +54,6 @@ impl ZoneInfoCmd {
 
         println!("Zone {}", info.zoneId);
         println!("  Portal:                {}", info.portal);
-        println!("  Messenger:             {}", info.messenger);
         println!("  Initial Token:         {}", info.initialToken);
         println!("  Sequencer:             {}", info.sequencer);
         println!("  Verifier:              {}", info.verifier);

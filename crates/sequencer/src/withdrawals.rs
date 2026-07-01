@@ -214,7 +214,7 @@ const fn eip150_cushion(gas_limit: u64) -> u64 {
 /// Return the outer transaction gas limit for a callback withdrawal.
 ///
 /// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
-/// fixed portal/messenger overhead and the EIP-150 cushion. This keeps legacy over-cap
+/// fixed portal callback overhead and the EIP-150 cushion. This keeps legacy over-cap
 /// withdrawals submit-able so the portal can dequeue and bounce them instead of letting
 /// the RPC reject the transaction before it reaches L1 execution.
 const fn process_withdrawal_tx_gas_limit(callback_gas_limit: u64) -> u64 {
@@ -412,9 +412,9 @@ impl WithdrawalProcessor {
             //         + eip150_cushion
             //
             // 1. `gasLimit`          — gas the user requested for their callback.
-            // 2. `CALLBACK_OVERHEAD` — fixed cost for the portal + messenger
+            // 2. `CALLBACK_OVERHEAD` — fixed cost for the portal callback
             //    logic that runs *around* the callback: queue dequeue & hash
-            //    verification, TIP-20 transferFrom (~500k), messenger relay
+            //    verification, TIP-20 transfer, callback relay
             //    setup, fee payment, event emission, and the bounce-back path
             //    if the callback reverts.
             // 3. EIP-150 cushion     — the 63/64 forwarding rule means the

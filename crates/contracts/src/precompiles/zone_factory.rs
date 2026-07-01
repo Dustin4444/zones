@@ -8,7 +8,6 @@ crate::sol! {
         struct ZoneInfo {
             uint32 zoneId;
             address portal;
-            address messenger;
             address initialToken;
             address admin;
             address sequencer;
@@ -34,7 +33,6 @@ crate::sol! {
         event ZoneCreated(
             uint32 indexed zoneId,
             address indexed portal,
-            address indexed messenger,
             address initialToken,
             address admin,
             address sequencer,
@@ -48,6 +46,5 @@ crate::sol! {
         function zones(uint32 zoneId) external view returns (ZoneInfo memory);
         function zoneCount() external view returns (uint32);
         function isZonePortal(address portal) external view returns (bool);
-        function isZoneMessenger(address messenger) external view returns (bool);
     }
 }

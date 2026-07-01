@@ -82,7 +82,6 @@
     - [Common Types](#common-types)
     - [IZoneFactory](#izonefactory)
     - [IZonePortal](#izoneportal)
-    - [IZoneMessenger](#izonemessenger)
     - [IWithdrawalReceiver](#iwithdrawalreceiver)
     - [ITempoState](#itempostate)
     - [IZoneInbox](#izoneinbox)
@@ -229,7 +228,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
 
-The factory assigns a unique `zoneId`, deploys a [`ZonePortal`](#izoneportal) and a [`ZoneMessenger`](#izonemessenger), and enables the initial token. The [`ZoneCreated`](#izonefactory) event emits all deployment parameters.
+The factory assigns a unique `zoneId`, deploys a [`ZonePortal`](#izoneportal), and enables the initial token. The [`ZoneCreated`](#izonefactory) event emits all deployment parameters.
 
 ### Chain ID
 
@@ -243,14 +242,11 @@ The prefix `4217` is derived from the Tempo chain ID. This ensures replay protec
 
 ### Tempo Contracts
 
-A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the registry of all deployed zones. When a zone is created, the factory deploys two contracts for it:
+A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the registry of all deployed zones. When a zone is created, the factory deploys one contract for it:
 
 | Contract | Purpose |
 |----------|---------|
-| [`ZonePortal`](#izoneportal) | Locks deposited tokens, accepts batch submissions, verifies proofs, and processes withdrawals. Manages the token registry and deposit/withdrawal queues. |
-| [`ZoneMessenger`](#izonemessenger) | Relays withdrawal callbacks. When a withdrawal includes calldata, the messenger transfers tokens from the portal to the recipient and executes the callback atomically. Deployed separately from the portal to isolate callback execution. |
-
-The portal gives the messenger max approval for each enabled token so that withdrawal callbacks can transfer tokens from the portal to the recipient in a single call.
+| [`ZonePortal`](#izoneportal) | Locks deposited tokens, accepts batch submissions, verifies proofs, processes withdrawals, and relays withdrawal callbacks through an external self-call. Manages the token registry and deposit/withdrawal queues. |
 
 ### Zone Predeploys
 
@@ -582,7 +578,7 @@ sequenceDiagram
     T->>U: TIP20.transfer(to, amount)
 
     Note over T: if withdrawal callback
-    T->>T: ZoneMessenger.relayMessage()
+    T->>T: ZonePortal.relayWithdrawalCallback()
 
     Note over T: if failure
     T->>T: bounceBack to fallbackRecipient via deposit queue
@@ -633,11 +629,11 @@ For simple withdrawals (`gasLimit == 0`), the portal transfers tokens directly t
 
 ### Withdrawal Callbacks
 
-For withdrawals with `gasLimit > 0`, the portal delegates to the `ZoneMessenger`. The messenger calls `transferFrom` to move tokens from the portal to the recipient, then calls the recipient with the provided `callbackData`. Both operations are atomic: if the callback reverts, the transfer reverts too.
+For withdrawals with `gasLimit > 0`, the portal calls its own `relayWithdrawalCallback` function externally. The relay transfers tokens from the portal to the recipient, then calls the recipient with the provided `callbackData`. Both operations are atomic: if the callback reverts, the transfer reverts too, while `processWithdrawal` catches the failed self-call and creates a bounce-back.
 
 If a legacy or otherwise invalid withdrawal reaches the Tempo queue with `gasLimit > MAX_WITHDRAWAL_GAS_LIMIT`, `processWithdrawal` treats it as a failed callback after dequeueing it and creates a bounce-back deposit. This ensures an over-limit withdrawal cannot permanently block the FIFO queue.
 
-Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking `msg.sender == messenger`.
+Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking that `msg.sender` is a registered zone portal.
 
 This enables composable withdrawals where funds flow directly into Tempo contracts (DEX swaps, staking, cross-zone deposits).
 
@@ -698,7 +694,7 @@ Zones do not interoperate directly. Zone-to-zone transfers work through composab
 The sender on Zone A requests a withdrawal with `revealTo` set to Zone B's sequencer public key and `callbackData` that deposits into Zone B's portal. The flow:
 
 1. Zone A processes the withdrawal and submits the batch to Tempo.
-2. `processWithdrawal` on Tempo transfers tokens to Zone B's portal via the messenger callback.
+2. `processWithdrawal` on Tempo transfers tokens to Zone B's portal via the portal callback relay.
 3. Zone B's sequencer observes the incoming deposit and decrypts `encryptedSender` to learn `(sender, txHash)`.
 4. Zone B verifies `keccak256(sender || txHash) == senderTag`, enabling sender-aware processing.
 
@@ -1519,13 +1515,14 @@ struct TokenConfig {
 struct ZoneInfo {
     uint32 zoneId;
     address portal;
-    address messenger;
     address initialToken;
+    address admin;
     address sequencer;
     address verifier;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
+    string rpcUrl;
 }
 
 struct ZoneParams {
@@ -1546,14 +1543,16 @@ struct LastBatch {
 interface IZoneFactory {
     struct CreateZoneParams {
         address initialToken;
+        address admin;
         address sequencer;
         address verifier;
         ZoneParams zoneParams;
+        string rpcUrl;
     }
 
     event ZoneCreated(
-        uint32 indexed zoneId, address indexed portal, address indexed messenger,
-        address initialToken, address sequencer, address verifier,
+        uint32 indexed zoneId, address indexed portal,
+        address initialToken, address admin, address sequencer, address verifier,
         bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
     );
 
@@ -1638,7 +1637,9 @@ interface IZonePortal {
     error NotPendingSequencer();
     error InvalidProof();
     error InvalidTempoBlockNumber();
+    error OnlyPortal();
     error CallbackRejected();
+    error TransferFailed();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
     error InvalidEncryptionKeyIndex(uint256 keyIndex);
     error NoEncryptionKeySet();
@@ -1706,6 +1707,10 @@ interface IZonePortal {
 
     // Withdrawal processing
     function processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) external;
+    function relayWithdrawalCallback(
+        address token, bytes32 senderTag, address target,
+        uint128 amount, uint64 gasLimit, bytes calldata data
+    ) external;
 
     // Refund registry (deposit bounce-back transfers that reverted on Tempo, e.g.
     // because the recipient was rejected by the token's TIP-403 policy at refund time)
@@ -1733,7 +1738,6 @@ interface IZonePortal {
 
     // State
     function zoneId() external view returns (uint32);
-    function messenger() external view returns (address);
     function sequencer() external view returns (address);
     function admin() external view returns (address);
     function pendingSequencer() external view returns (address);
@@ -1748,18 +1752,6 @@ interface IZonePortal {
     function withdrawalQueueSlot(uint256 slot) external view returns (bytes32);
     function genesisTempoBlockNumber() external view returns (uint64);
 
-}
-```
-
-### IZoneMessenger
-
-```solidity
-interface IZoneMessenger {
-    function portal() external view returns (address);
-    function relayMessage(
-        address token, bytes32 senderTag, address target,
-        uint128 amount, uint64 gasLimit, bytes calldata data
-    ) external;
 }
 ```
 

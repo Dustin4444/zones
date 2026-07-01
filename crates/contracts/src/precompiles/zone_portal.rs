@@ -148,6 +148,9 @@ crate::sol! {
         error NotAdmin();
         error InvalidProof();
         error InvalidTempoBlockNumber();
+        error OnlyPortal();
+        error CallbackRejected();
+        error TransferFailed();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
 
@@ -185,6 +188,14 @@ crate::sol! {
             returns (bytes32 newCurrentDepositQueueHash);
 
         function processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) external;
+        function relayWithdrawalCallback(
+            address token,
+            bytes32 senderTag,
+            address target,
+            uint128 amount,
+            uint64 gasLimit,
+            bytes calldata data
+        ) external;
 
         function submitBatch(
             uint64 tempoBlockNumber,
@@ -299,6 +310,9 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::NotAdmin(_) => f.write_str("NotAdmin"),
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
+            Self::OnlyPortal(_) => f.write_str("OnlyPortal"),
+            Self::CallbackRejected(_) => f.write_str("CallbackRejected"),
+            Self::TransferFailed(_) => f.write_str("TransferFailed"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
         }

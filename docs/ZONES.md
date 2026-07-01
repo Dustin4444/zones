@@ -117,7 +117,7 @@ View on explorer: `https://explore.moderato.tempo.xyz/address/<SEQUENCER_ADDR>`
 
 ### 4. Create the Zone on L1
 
-This deploys a ZonePortal + ZoneMessenger on L1 and generates the zone's genesis file:
+This deploys a ZonePortal on L1 and generates the zone's genesis file:
 
 ```bash
 export PRIVATE_KEY="$SEQUENCER_KEY"
@@ -530,7 +530,7 @@ The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zo
 
 ### Deploying a New ZoneFactory
 
-Deploy a fresh shared factory when the Solidity `ZoneFactory`, `ZonePortal`, `ZoneMessenger`, or verifier ABI changes in a way that existing factory deployments cannot serve.
+Deploy a fresh shared factory when the Solidity `ZoneFactory`, `ZonePortal`, or verifier ABI changes in a way that existing factory deployments cannot serve.
 
 ```bash
 cd specs/ref-impls
