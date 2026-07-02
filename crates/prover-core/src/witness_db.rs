@@ -39,13 +39,17 @@ impl WitnessDatabase {
         bytecode.insert(KECCAK_EMPTY, Bytecode::new_raw(Bytes::new()));
 
         for read in &state.account_reads {
-            if let Some(code) = &read.code {
-                if keccak256(code.as_ref()) != read.code_hash {
-                    return Err(ProverError::AccountCodeHashMismatch(read.account));
+            match &read.code {
+                crate::ZoneAccountCode::Bytecode(code) => {
+                    if keccak256(code.as_ref()) != read.code_hash {
+                        return Err(ProverError::AccountCodeHashMismatch(read.account));
+                    }
+                    bytecode.insert(read.code_hash, Bytecode::new_raw(code.clone()));
                 }
-                bytecode.insert(read.code_hash, Bytecode::new_raw(code.clone()));
-            } else if read.code_hash != KECCAK_EMPTY {
-                return Err(ProverError::MissingAccountCode(read.account));
+                crate::ZoneAccountCode::Empty if read.code_hash != KECCAK_EMPTY => {
+                    return Err(ProverError::MissingAccountCode(read.account));
+                }
+                crate::ZoneAccountCode::Empty => {}
             }
 
             let proven_account =
@@ -157,10 +161,10 @@ fn account_info(read: &crate::ZoneAccountRead) -> Option<AccountInfo> {
         balance: read.balance,
         nonce: read.nonce,
         code_hash: read.code_hash,
-        code: read
-            .code
-            .as_ref()
-            .map(|code| Bytecode::new_raw(code.clone())),
+        code: match &read.code {
+            crate::ZoneAccountCode::Empty => None,
+            crate::ZoneAccountCode::Bytecode(code) => Some(Bytecode::new_raw(code.clone())),
+        },
         account_id: None,
     })
 }

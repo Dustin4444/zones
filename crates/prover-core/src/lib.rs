@@ -137,12 +137,8 @@ pub struct ZoneBlock {
     pub cfg_env: ZoneCfgEnvWitness,
     pub execution_context: ZoneBlockExecutionContextWitness,
     pub block_env: ZoneBlockEnvWitness,
-    pub tempo_header_rlp: Option<Bytes>,
-    pub deposits: Vec<QueuedDeposit>,
-    pub decryptions: Vec<DecryptionData>,
-    pub enabled_tokens: Vec<EnabledToken>,
-    pub finalize_withdrawal_batch_count: Option<U256>,
-    pub finalize_withdrawal_encrypted_senders: Vec<Bytes>,
+    pub tempo_import: ZoneTempoImport,
+    pub withdrawal_finalization: ZoneWithdrawalFinalization,
     /// Raw user transaction bytes, decoded and executed in witness order.
     pub transactions: Vec<Bytes>,
 }
@@ -150,8 +146,89 @@ pub struct ZoneBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ZoneAdvanceTempo {
+    pub header_rlp: Bytes,
+    pub deposits: Vec<QueuedDeposit>,
+    pub decryptions: Vec<DecryptionData>,
+    pub enabled_tokens: Vec<EnabledToken>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", content = "data", rename_all = "camelCase")
+)]
+pub enum ZoneTempoImport {
+    None,
+    Advance(ZoneAdvanceTempo),
+}
+
+impl ZoneTempoImport {
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    pub fn advance(
+        header_rlp: Bytes,
+        deposits: Vec<QueuedDeposit>,
+        decryptions: Vec<DecryptionData>,
+        enabled_tokens: Vec<EnabledToken>,
+    ) -> Self {
+        Self::Advance(ZoneAdvanceTempo {
+            header_rlp,
+            deposits,
+            decryptions,
+            enabled_tokens,
+        })
+    }
+
+    pub fn is_advance(&self) -> bool {
+        matches!(self, Self::Advance(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ZoneWithdrawalBatchFinalization {
+    pub count: U256,
+    pub encrypted_senders: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", content = "data", rename_all = "camelCase")
+)]
+pub enum ZoneWithdrawalFinalization {
+    None,
+    Finalize(ZoneWithdrawalBatchFinalization),
+}
+
+impl ZoneWithdrawalFinalization {
+    pub fn none() -> Self {
+        Self::None
+    }
+
+    pub fn finalize(count: U256, encrypted_senders: Vec<Bytes>) -> Self {
+        Self::Finalize(ZoneWithdrawalBatchFinalization {
+            count,
+            encrypted_senders,
+        })
+    }
+
+    pub fn is_finalize(&self) -> bool {
+        matches!(self, Self::Finalize(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct ZoneBlockExecutionContextWitness {
-    pub parent_beacon_block_root: Option<B256>,
+    pub parent_beacon_block_root: B256,
     pub extra_data: Bytes,
 }
 
@@ -183,6 +260,10 @@ impl ZoneCfgEnvWitness {
     }
 }
 
+/// Witness-supplied revm block environment fields.
+///
+/// EIP-4844 blob gas is intentionally absent: Zone execution always pins the
+/// revm blob environment to [`ZONE_NO_BLOB_GAS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
@@ -190,7 +271,7 @@ pub struct ZoneBlockEnvWitness {
     pub gas_limit: u64,
     pub basefee: u64,
     pub difficulty: U256,
-    pub prevrandao: Option<B256>,
+    pub prevrandao: B256,
     pub slot_num: u64,
     pub timestamp_millis_part: u64,
 }
@@ -202,7 +283,6 @@ impl ZoneBlockEnvWitness {
             basefee: self.basefee,
             difficulty: self.difficulty,
             prevrandao: self.prevrandao,
-            blob_excess_gas_and_price: Some(ZONE_NO_BLOB_GAS),
             slot_num: self.slot_num,
             timestamp_millis_part: self.timestamp_millis_part,
         }
@@ -228,8 +308,29 @@ pub struct ZoneAccountRead {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
-    pub code: Option<Bytes>,
+    pub code: ZoneAccountCode,
     pub proof_node_hashes: Vec<B256>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "kind", content = "data", rename_all = "camelCase")
+)]
+pub enum ZoneAccountCode {
+    Empty,
+    Bytecode(Bytes),
+}
+
+impl ZoneAccountCode {
+    pub fn empty() -> Self {
+        Self::Empty
+    }
+
+    pub fn bytecode(code: Bytes) -> Self {
+        Self::Bytecode(code)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,6 +716,26 @@ pub enum ProverError {
         block_index: usize,
         transaction_index: usize,
     },
+    UserTransactionCreateUnsupported {
+        block_index: usize,
+        transaction_index: usize,
+        call_index: usize,
+    },
+    UserTransactionValueUnsupported {
+        block_index: usize,
+        transaction_index: usize,
+        value: U256,
+    },
+    UserTransactionAuthorizationListUnsupported {
+        block_index: usize,
+        transaction_index: usize,
+    },
+    UserTransactionTargetUnsupported {
+        block_index: usize,
+        transaction_index: usize,
+        call_index: usize,
+        target: Address,
+    },
     TempoImportHeaderInvalid {
         index: usize,
     },
@@ -637,7 +758,9 @@ pub enum ProverError {
     UserTransactionsUnsupported {
         index: usize,
     },
-    NonZeroWithdrawalFinalizationUnsupported,
+    WithdrawalSenderPayloadsWithoutFinalization,
+    #[cfg(test)]
+    EmptyProverNonZeroWithdrawalFinalizationUnsupported,
     TempoStateReaderGasOverflow,
     StateRootCalculationFailed,
     ExecutionBlockCountMismatch {
@@ -685,6 +808,11 @@ pub enum ProverError {
     ExecutionFinalTempoMismatch {
         expected: TempoExecutionCommitment,
         actual: TempoExecutionCommitment,
+    },
+    ExecutionDepositQueueHashMismatch {
+        tempo_block_number: u64,
+        expected: B256,
+        actual: B256,
     },
     ExecutionWithdrawalBatchIndexMismatch {
         expected: u64,
@@ -1042,6 +1170,38 @@ impl fmt::Display for ProverError {
                 f,
                 "zone block {block_index} user transaction {transaction_index} signer recovery failed"
             ),
+            Self::UserTransactionCreateUnsupported {
+                block_index,
+                transaction_index,
+                call_index,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} call {call_index} uses contract creation, which zones do not support"
+            ),
+            Self::UserTransactionValueUnsupported {
+                block_index,
+                transaction_index,
+                value,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} transfers native value {value}, but zones use TIP-20 balances"
+            ),
+            Self::UserTransactionAuthorizationListUnsupported {
+                block_index,
+                transaction_index,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} uses EIP-7702 authorizations, which zones do not support"
+            ),
+            Self::UserTransactionTargetUnsupported {
+                block_index,
+                transaction_index,
+                call_index,
+                target,
+            } => write!(
+                f,
+                "zone block {block_index} user transaction {transaction_index} call {call_index} targets unsupported zone address or selector {target}"
+            ),
             Self::TempoImportHeaderInvalid { index } => {
                 write!(f, "zone block {index} Tempo import header is not valid RLP")
             }
@@ -1076,8 +1236,12 @@ impl fmt::Display for ProverError {
                     "zone block {index} user transaction execution is not implemented yet"
                 )
             }
-            Self::NonZeroWithdrawalFinalizationUnsupported => {
-                f.write_str("non-zero withdrawal finalization is not implemented yet")
+            Self::WithdrawalSenderPayloadsWithoutFinalization => f.write_str(
+                "withdrawal encrypted sender payloads require withdrawal finalization count",
+            ),
+            #[cfg(test)]
+            Self::EmptyProverNonZeroWithdrawalFinalizationUnsupported => {
+                f.write_str("legacy empty prover does not execute non-zero withdrawal finalization")
             }
             Self::TempoStateReaderGasOverflow => {
                 f.write_str("TempoStateReader gas calculation overflow")
@@ -1150,6 +1314,14 @@ impl fmt::Display for ProverError {
             Self::ExecutionFinalTempoMismatch { expected, actual } => write!(
                 f,
                 "executed final Tempo binding {actual:?} does not match expected {expected:?}"
+            ),
+            Self::ExecutionDepositQueueHashMismatch {
+                tempo_block_number,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "executed deposit queue hash {actual} does not match proved Tempo block {tempo_block_number} currentDepositQueueHash {expected}"
             ),
             Self::ExecutionWithdrawalBatchIndexMismatch { expected, actual } => write!(
                 f,
@@ -1276,6 +1448,7 @@ fn prepared_zone_blocks(
 /// hashes, and fails closed for not-yet-implemented state, Tempo import,
 /// deposit, withdrawal, and user-transaction paths. It exists only to preserve
 /// focused tests while [`prove_zone_batch`] moves to full stateless execution.
+#[cfg(test)]
 pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, ProverError> {
     let public = &witness.public_inputs;
 
@@ -1339,13 +1512,12 @@ pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, Prov
             block,
         )?;
 
-        let finalized_count = block
-            .finalize_withdrawal_batch_count
-            .filter(|_| index == final_index);
-        if let Some(count) = finalized_count
-            && !count.is_zero()
+        if index == final_index
+            && let ZoneWithdrawalFinalization::Finalize(finalization) =
+                &block.withdrawal_finalization
+            && !finalization.count.is_zero()
         {
-            return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
+            return Err(ProverError::EmptyProverNonZeroWithdrawalFinalizationUnsupported);
         }
 
         let header = ZoneHeader {
@@ -1414,23 +1586,10 @@ fn validate_block_envelopes(witness: &BatchWitness, final_index: usize) -> Resul
         }
 
         let is_final = index == final_index;
-        match (is_final, block.finalize_withdrawal_batch_count.is_some()) {
+        match (is_final, block.withdrawal_finalization.is_finalize()) {
             (false, true) => return Err(ProverError::IntermediateWithdrawalFinalization { index }),
             (true, false) => return Err(ProverError::MissingFinalWithdrawalFinalization),
             _ => {}
-        }
-
-        if block.tempo_header_rlp.is_none()
-            && (!block.deposits.is_empty()
-                || !block.decryptions.is_empty()
-                || !block.enabled_tokens.is_empty())
-        {
-            return Err(ProverError::DepositProcessingUnsupported { index });
-        }
-        if block.finalize_withdrawal_batch_count.is_none()
-            && !block.finalize_withdrawal_encrypted_senders.is_empty()
-        {
-            return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
         }
 
         prev_number = block.number;
@@ -1457,8 +1616,8 @@ fn tempo_root_bindings_for_witness(
     let mut current = initial_binding;
 
     for (index, block) in blocks.iter().enumerate() {
-        if let Some(encoded) = &block.tempo_header_rlp {
-            let header = decode_tempo_import_header(index, encoded)?;
+        if let ZoneTempoImport::Advance(import) = &block.tempo_import {
+            let header = decode_tempo_import_header(index, &import.header_rlp)?;
             if header.inner.parent_hash != current.block_hash {
                 return Err(ProverError::TempoImportParentHashMismatch {
                     index,
@@ -1481,7 +1640,7 @@ fn tempo_root_bindings_for_witness(
 
             current = tempo::TempoBinding {
                 block_number: header.inner.number,
-                block_hash: keccak256(encoded.as_ref()),
+                block_hash: keccak256(import.header_rlp.as_ref()),
                 state_root: header.inner.state_root,
             };
             bindings.push(TempoRootBinding::from_tempo_binding(current));
@@ -1503,6 +1662,7 @@ fn decode_tempo_import_header(index: usize, encoded: &Bytes) -> Result<TempoHead
     Ok(header)
 }
 
+#[cfg(test)]
 fn validate_block(
     index: usize,
     final_index: usize,
@@ -1533,23 +1693,19 @@ fn validate_block(
     }
 
     let is_final = index == final_index;
-    match (is_final, block.finalize_withdrawal_batch_count.is_some()) {
+    match (is_final, block.withdrawal_finalization.is_finalize()) {
         (false, true) => return Err(ProverError::IntermediateWithdrawalFinalization { index }),
         (true, false) => return Err(ProverError::MissingFinalWithdrawalFinalization),
         _ => {}
     }
 
-    if block.tempo_header_rlp.is_some() {
+    if block.tempo_import.is_advance() {
         return Err(ProverError::TempoImportUnsupported { index });
     }
-    if !block.deposits.is_empty()
-        || !block.decryptions.is_empty()
-        || !block.enabled_tokens.is_empty()
+    if let ZoneWithdrawalFinalization::Finalize(finalization) = &block.withdrawal_finalization
+        && !finalization.encrypted_senders.is_empty()
     {
-        return Err(ProverError::DepositProcessingUnsupported { index });
-    }
-    if !block.finalize_withdrawal_encrypted_senders.is_empty() {
-        return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
+        return Err(ProverError::WithdrawalSenderPayloadsWithoutFinalization);
     }
     if !block.transactions.is_empty() {
         return Err(ProverError::UserTransactionsUnsupported { index });
@@ -1576,10 +1732,11 @@ fn validate_initial_zone_state(
 ) -> Result<VerifiedInitialZoneState, ProverError> {
     let mut proven_accounts = BTreeMap::new();
     for account in &state.account_reads {
-        if let Some(code) = &account.code
-            && keccak256(code.as_ref()) != account.code_hash
-        {
-            return Err(ProverError::AccountCodeHashMismatch(account.account));
+        match &account.code {
+            ZoneAccountCode::Bytecode(code) if keccak256(code.as_ref()) != account.code_hash => {
+                return Err(ProverError::AccountCodeHashMismatch(account.account));
+            }
+            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
         }
 
         let proven_account =
@@ -1640,8 +1797,11 @@ fn require_system_contract_code(
         return Err(ProverError::MissingSystemContractCode(account));
     };
 
-    if read.code_hash != KECCAK_EMPTY && read.code.as_ref().is_some_and(|code| !code.is_empty()) {
-        return Ok(());
+    if read.code_hash != KECCAK_EMPTY {
+        match &read.code {
+            ZoneAccountCode::Bytecode(code) if !code.is_empty() => return Ok(()),
+            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
+        }
     }
 
     Err(ProverError::MissingSystemContractCode(account))
@@ -1795,11 +1955,27 @@ impl TempoWitnessProvider {
         )?))
     }
 
+    pub fn proved_storage_words(
+        &self,
+        tempo_block_number: u64,
+        slot: U256,
+    ) -> impl Iterator<Item = (u64, Address, U256)> + '_ {
+        self.reads.iter().filter_map(move |(key, value)| {
+            (key.tempo_block_number == tempo_block_number && key.slot == slot).then_some((
+                key.zone_block_index,
+                key.account,
+                *value,
+            ))
+        })
+    }
+
+    #[cfg(test)]
     fn into_verified_reads(self) -> BTreeMap<TempoStateReadKey, U256> {
         self.reads
     }
 }
 
+#[cfg(test)]
 fn validate_tempo_state_proofs(
     proofs: &BatchStateProof,
     zone_block_count: usize,
@@ -1967,11 +2143,12 @@ mod tests {
     use alloy_eips::eip2718::Encodable2718;
     use alloy_evm::block::BlockExecutionResult;
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{B256, address, keccak256};
+    use alloy_primitives::{B256, FixedBytes, address, keccak256};
     use alloy_rlp::Encodable;
     use alloy_signer_local::PrivateKeySigner;
-    use alloy_sol_types::SolCall;
+    use alloy_sol_types::{SolCall, SolValue};
     use alloy_trie::{HashBuilder, KECCAK_EMPTY, Nibbles, TrieAccount, proof::ProofRetainer};
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
     use reth_trie_common::{KeccakKeyHasher, KeyHasher};
     use revm_database::{
         AccountStatus, BundleState, TransitionAccount, primitives::StorageKeyMap,
@@ -1986,19 +2163,30 @@ mod tests {
     use tempo_precompiles::{
         PATH_USD_ADDRESS,
         storage::{StorageKey, packing::insert_into_word},
-        tip20::{ITIP20, rewards::__packing_user_reward_info as user_reward_info_slots},
+        tip20::{
+            ISSUER_ROLE, ITIP20, U128_MAX,
+            rewards::__packing_user_reward_info as user_reward_info_slots,
+        },
         tip403_registry::ALLOW_ALL_POLICY_ID,
     };
     use tempo_primitives::{TempoReceipt, TempoTxType};
-    use tempo_zone_contracts::TempoStateReader;
+    use tempo_zone_contracts::{
+        ChaumPedersenProof, DecryptionData, Deposit, DepositType, EncryptedDeposit,
+        EncryptedDepositPayload, TempoStateReader, Withdrawal,
+    };
     use zone_primitives::constants::{PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, ZONE_CONFIG_ADDRESS};
 
     const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
+    const PORTAL_ENCRYPTION_KEYS_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
     const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
     const ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
     const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
+    const PENDING_WITHDRAWAL_STORAGE_SLOTS: u64 = 9;
+    const TIP20_ROLES_SLOT: U256 = U256::ZERO;
+    const TIP20_TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
     const TIP20_BALANCES_SLOT: U256 = U256::from_limbs([9, 0, 0, 0]);
     const TIP20_PAUSED_SLOT: U256 = U256::from_limbs([12, 0, 0, 0]);
+    const TIP20_SUPPLY_CAP_SLOT: U256 = U256::from_limbs([13, 0, 0, 0]);
     const TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT: U256 = U256::from_limbs([15, 0, 0, 0]);
     const TIP20_USER_REWARD_INFO_SLOT: U256 = U256::from_limbs([17, 0, 0, 0]);
     const USER_VALUE_TX_CHAIN_ID: u64 = 1337;
@@ -2019,7 +2207,7 @@ mod tests {
 
     fn fixture_execution_context() -> ZoneBlockExecutionContextWitness {
         ZoneBlockExecutionContextWitness {
-            parent_beacon_block_root: None,
+            parent_beacon_block_root: B256::ZERO,
             extra_data: Bytes::new(),
         }
     }
@@ -2029,7 +2217,7 @@ mod tests {
             gas_limit: 30_000_000,
             basefee: 0,
             difficulty: U256::ZERO,
-            prevrandao: Some(B256::ZERO),
+            prevrandao: B256::ZERO,
             slot_num: 0,
             timestamp_millis_part: 0,
         }
@@ -2052,6 +2240,45 @@ mod tests {
 
     fn outbox_packed_slot(withdrawal_batch_index: u64) -> U256 {
         U256::from(withdrawal_batch_index) << 192
+    }
+
+    fn address_word(address: Address) -> U256 {
+        U256::from_be_bytes(B256::left_padding_from(address.as_slice()).0)
+    }
+
+    fn pending_withdrawal_slot(index: u64, offset: u64) -> U256 {
+        let base = U256::from_be_bytes(
+            keccak256(ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT.to_be_bytes::<32>()).0,
+        );
+        let element_offset = U256::from(index)
+            .checked_mul(U256::from(PENDING_WITHDRAWAL_STORAGE_SLOTS))
+            .and_then(|value| value.checked_add(U256::from(offset)))
+            .expect("test pending withdrawal slot should not overflow");
+        base.checked_add(element_offset)
+            .expect("test pending withdrawal slot should not overflow")
+    }
+
+    fn packed_withdrawal_amount_fee(amount: u128, fee: u128) -> U256 {
+        U256::from(amount) | (U256::from(fee) << 128)
+    }
+
+    fn packed_withdrawal_gas_fallback(gas_limit: u64, fallback_recipient: Address) -> U256 {
+        U256::from(gas_limit) | (address_word(fallback_recipient) << 64)
+    }
+
+    fn portal_encryption_key_slots(key_index: U256) -> (U256, U256) {
+        let base =
+            U256::from_be_bytes(keccak256(PORTAL_ENCRYPTION_KEYS_SLOT.to_be_bytes::<32>()).0);
+        let offset = key_index
+            .checked_mul(U256::from(2))
+            .expect("test encryption key slot should not overflow");
+        let slot_x = base
+            .checked_add(offset)
+            .expect("test encryption key slot should not overflow");
+        let slot_meta = slot_x
+            .checked_add(U256::ONE)
+            .expect("test encryption key slot should not overflow");
+        (slot_x, slot_meta)
     }
 
     fn user_value_tx_sender() -> Address {
@@ -2113,9 +2340,85 @@ mod tests {
         Bytes::from(TxEnvelope::Eip1559(tx.into_signed(signature)).encoded_2718())
     }
 
+    fn signed_tip20_transfer_witness(raw_tx: Bytes) -> BatchWitness {
+        let mut witness = fixture_witness();
+        witness.zone_blocks[0].cfg_env.chain_id = USER_VALUE_TX_CHAIN_ID;
+        witness.zone_blocks[0].transactions.push(raw_tx);
+
+        let policy_word = tip20_transfer_policy_word(ALLOW_ALL_POLICY_ID);
+        let (tempo_state_root, policy_proof) = l1_state_proof(
+            0,
+            witness.public_inputs.tempo_block_number,
+            PATH_USD_ADDRESS,
+            TIP20_TRANSFER_POLICY_ID_SLOT,
+            policy_word,
+        );
+        witness.tempo_state_proofs = policy_proof;
+
+        let mut parts = real_outbox_zone_state_parts_with_tempo_root(&witness, tempo_state_root);
+        let sender_account = TrieAccount {
+            nonce: 0,
+            balance: USER_VALUE_TX_INITIAL_BALANCE,
+            storage_root: EMPTY_TRIE_ROOT,
+            code_hash: KECCAK_EMPTY,
+        };
+        parts
+            .account_entries
+            .push((user_value_tx_sender(), sender_account));
+        parts
+            .account_reads
+            .push(account_read(user_value_tx_sender(), sender_account));
+
+        let sender_balance_slot = tip20_balance_slot(user_value_tx_sender());
+        let recipient_balance_slot = tip20_balance_slot(user_value_tx_recipient());
+        let sender_reward_slots = tip20_user_reward_info_slots(user_value_tx_sender());
+        let recipient_reward_slots = tip20_user_reward_info_slots(user_value_tx_recipient());
+        let token_code = Bytes::from_static(&[0xef]);
+        parts.extend(system_account_components_with_code(
+            PATH_USD_ADDRESS,
+            &[
+                (TIP20_TRANSFER_POLICY_ID_SLOT, policy_word),
+                (TIP20_PAUSED_SLOT, U256::ZERO),
+                (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
+                (sender_balance_slot, USER_TIP20_INITIAL_BALANCE),
+                (recipient_balance_slot, U256::ZERO),
+                (sender_reward_slots[0], U256::ZERO),
+                (sender_reward_slots[1], U256::ZERO),
+                (sender_reward_slots[2], U256::ZERO),
+                (recipient_reward_slots[0], U256::ZERO),
+                (recipient_reward_slots[1], U256::ZERO),
+                (recipient_reward_slots[2], U256::ZERO),
+            ],
+            &[
+                TIP20_TRANSFER_POLICY_ID_SLOT,
+                TIP20_PAUSED_SLOT,
+                TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
+                sender_balance_slot,
+                recipient_balance_slot,
+                sender_reward_slots[0],
+                sender_reward_slots[1],
+                sender_reward_slots[2],
+                recipient_reward_slots[0],
+                recipient_reward_slots[1],
+                recipient_reward_slots[2],
+            ],
+            ZoneAccountCode::bytecode(token_code),
+        ));
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        witness
+    }
+
     fn tip20_transfer_policy_word(policy_id: u64) -> U256 {
         insert_into_word(U256::ZERO, &policy_id, 20, core::mem::size_of::<u64>())
             .expect("policy id should pack into TIP-20 policy slot")
+    }
+
+    fn tip20_role_slot(account: Address, role: B256) -> U256 {
+        role.mapping_slot(account.mapping_slot(TIP20_ROLES_SLOT))
     }
 
     fn tip20_balance_slot(account: Address) -> U256 {
@@ -2166,12 +2469,11 @@ mod tests {
                 cfg_env: fixture_cfg_env(),
                 execution_context: fixture_execution_context(),
                 block_env: fixture_block_env(),
-                tempo_header_rlp: None,
-                deposits: Vec::new(),
-                decryptions: Vec::new(),
-                enabled_tokens: Vec::new(),
-                finalize_withdrawal_batch_count: Some(U256::ZERO),
-                finalize_withdrawal_encrypted_senders: Vec::new(),
+                tempo_import: ZoneTempoImport::none(),
+                withdrawal_finalization: ZoneWithdrawalFinalization::finalize(
+                    U256::ZERO,
+                    Vec::new(),
+                ),
                 transactions: Vec::new(),
             }],
             initial_zone_state,
@@ -2223,7 +2525,128 @@ mod tests {
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
             ],
-            Some(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
+            ZoneAccountCode::bytecode(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
+        ));
+        parts
+    }
+
+    fn pending_withdrawal_fixture() -> (Withdrawal, Address, B256) {
+        let sender = user_value_tx_sender();
+        let tx_hash = B256::repeat_byte(0xab);
+        (
+            Withdrawal {
+                token: PATH_USD_ADDRESS,
+                senderTag: Withdrawal::sender_tag(sender, tx_hash),
+                to: user_value_tx_recipient(),
+                amount: 321,
+                fee: 7,
+                memo: B256::repeat_byte(0xcd),
+                gasLimit: 0,
+                fallbackRecipient: sender,
+                callbackData: Bytes::new(),
+                encryptedSender: Bytes::new(),
+            },
+            sender,
+            tx_hash,
+        )
+    }
+
+    fn pending_withdrawal_entries(
+        index: u64,
+        withdrawal: &Withdrawal,
+        sender: Address,
+        tx_hash: B256,
+    ) -> Vec<(U256, U256)> {
+        assert!(
+            withdrawal.callbackData.is_empty(),
+            "test fixture stores empty callbackData inline as zero"
+        );
+        assert!(
+            withdrawal.encryptedSender.is_empty(),
+            "test fixture uses empty revealTo/encryptedSender"
+        );
+
+        vec![
+            (
+                pending_withdrawal_slot(index, 0),
+                address_word(withdrawal.token),
+            ),
+            (pending_withdrawal_slot(index, 1), address_word(sender)),
+            (pending_withdrawal_slot(index, 2), storage_word(tx_hash)),
+            (
+                pending_withdrawal_slot(index, 3),
+                address_word(withdrawal.to),
+            ),
+            (
+                pending_withdrawal_slot(index, 4),
+                packed_withdrawal_amount_fee(withdrawal.amount, withdrawal.fee),
+            ),
+            (
+                pending_withdrawal_slot(index, 5),
+                storage_word(withdrawal.memo),
+            ),
+            (
+                pending_withdrawal_slot(index, 6),
+                packed_withdrawal_gas_fallback(withdrawal.gasLimit, withdrawal.fallbackRecipient),
+            ),
+            (pending_withdrawal_slot(index, 7), U256::ZERO),
+            (pending_withdrawal_slot(index, 8), U256::ZERO),
+        ]
+    }
+
+    fn real_outbox_zone_state_parts_with_pending_withdrawal(
+        witness: &BatchWitness,
+        withdrawal: &Withdrawal,
+        sender: Address,
+        tx_hash: B256,
+    ) -> ZoneStateParts {
+        let mut parts = tempo_components_with_root(
+            witness.public_inputs.tempo_block_number,
+            witness.public_inputs.anchor_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        parts.extend(system_account_components(
+            ZONE_INBOX_ADDRESS,
+            &[
+                (
+                    ZONE_INBOX_PROCESSED_HASH_SLOT,
+                    storage_word(B256::repeat_byte(0x44)),
+                ),
+                (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
+            ],
+            &[
+                ZONE_INBOX_PROCESSED_HASH_SLOT,
+                ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            ],
+        ));
+
+        let pending_entries = pending_withdrawal_entries(0, withdrawal, sender, tx_hash);
+        let mut outbox_entries = vec![
+            (ZONE_OUTBOX_PACKED_SLOT, outbox_packed_slot(4)),
+            (
+                ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                storage_word(B256::repeat_byte(0x55)),
+            ),
+            (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::from(4)),
+            (ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT, U256::ONE),
+            (ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT, U256::ZERO),
+        ];
+        outbox_entries.extend(pending_entries.iter().copied());
+
+        let mut outbox_proof_slots = vec![
+            ZONE_OUTBOX_PACKED_SLOT,
+            ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+            ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+        ];
+        outbox_proof_slots.extend(pending_entries.iter().map(|(slot, _)| *slot));
+
+        parts.extend(system_account_components_with_code(
+            ZONE_OUTBOX_ADDRESS,
+            &outbox_entries,
+            &outbox_proof_slots,
+            ZoneAccountCode::bytecode(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
         ));
         parts
     }
@@ -2257,7 +2680,7 @@ mod tests {
             TEMPO_STATE_ADDRESS,
             &entries,
             &slots,
-            Some(genesis_predeploy_code(TEMPO_STATE_ADDRESS)),
+            ZoneAccountCode::bytecode(genesis_predeploy_code(TEMPO_STATE_ADDRESS)),
         )
     }
 
@@ -2271,7 +2694,7 @@ mod tests {
             ZONE_CONFIG_ADDRESS,
             &[],
             &[],
-            Some(genesis_predeploy_code(ZONE_CONFIG_ADDRESS)),
+            ZoneAccountCode::bytecode(genesis_predeploy_code(ZONE_CONFIG_ADDRESS)),
         ));
         parts.extend(system_account_components_with_code(
             ZONE_INBOX_ADDRESS,
@@ -2286,7 +2709,7 @@ mod tests {
                 ZONE_INBOX_PROCESSED_HASH_SLOT,
                 ZONE_INBOX_PROCESSED_NUMBER_SLOT,
             ],
-            Some(genesis_predeploy_code(ZONE_INBOX_ADDRESS)),
+            ZoneAccountCode::bytecode(genesis_predeploy_code(ZONE_INBOX_ADDRESS)),
         ));
         parts.extend(system_account_components_with_code(
             ZONE_OUTBOX_ADDRESS,
@@ -2305,7 +2728,7 @@ mod tests {
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
                 ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
             ],
-            Some(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
+            ZoneAccountCode::bytecode(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS)),
         ));
         parts
     }
@@ -2385,6 +2808,68 @@ mod tests {
     }
 
     #[test]
+    fn production_prover_executes_nonzero_withdrawal_finalization() {
+        let mut witness = fixture_witness();
+        let (withdrawal, sender, tx_hash) = pending_withdrawal_fixture();
+        witness.zone_blocks[0].withdrawal_finalization =
+            ZoneWithdrawalFinalization::finalize(U256::ONE, vec![Bytes::new()]);
+
+        let mut parts = real_outbox_zone_state_parts_with_pending_withdrawal(
+            &witness,
+            &withdrawal,
+            sender,
+            tx_hash,
+        );
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        let output = prove_zone_batch(witness.clone()).unwrap();
+        let expected_withdrawal_hash = Withdrawal::queue_hash(core::slice::from_ref(&withdrawal));
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            witness.public_inputs.prev_block_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
+        assert_eq!(output.withdrawal_queue_hash, expected_withdrawal_hash);
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_queue_hash,
+            expected_withdrawal_hash
+        );
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            witness.public_inputs.expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_withdrawal_sender_count_mismatch() {
+        let mut witness = fixture_witness();
+        let (withdrawal, sender, tx_hash) = pending_withdrawal_fixture();
+        witness.zone_blocks[0].withdrawal_finalization =
+            ZoneWithdrawalFinalization::finalize(U256::ONE, Vec::new());
+
+        let mut parts = real_outbox_zone_state_parts_with_pending_withdrawal(
+            &witness,
+            &withdrawal,
+            sender,
+            tx_hash,
+        );
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        assert!(matches!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::ExecutionBlockFailed { index: 0, .. }
+        ));
+    }
+
+    #[test]
     fn production_prover_executes_header_only_advance_tempo_import() {
         let mut witness = fixture_witness();
         let initial_tempo_block_number = witness.public_inputs.tempo_block_number;
@@ -2408,7 +2893,8 @@ mod tests {
             imported_tempo_state_root,
         );
         let imported_tempo_block_hash = keccak256(tempo_header_rlp.as_ref());
-        witness.zone_blocks[0].tempo_header_rlp = Some(tempo_header_rlp);
+        witness.zone_blocks[0].tempo_import =
+            ZoneTempoImport::advance(tempo_header_rlp, Vec::new(), Vec::new(), Vec::new());
         witness.public_inputs.tempo_block_number = imported_tempo_block_number;
         witness.public_inputs.anchor_block_number = imported_tempo_block_number;
         witness.public_inputs.anchor_block_hash = imported_tempo_block_hash;
@@ -2453,52 +2939,498 @@ mod tests {
         );
     }
 
+    struct RegularDepositWitness {
+        witness: BatchWitness,
+        initial_processed_hash: B256,
+        proved_next_processed_hash: B256,
+        witnessed_next_processed_hash: B256,
+        initial_tempo_block_number: u64,
+        initial_tempo_block_hash: B256,
+    }
+
+    struct EncryptedDepositWitness {
+        witness: BatchWitness,
+        initial_processed_hash: B256,
+        proved_next_processed_hash: B256,
+        initial_tempo_block_number: u64,
+        initial_tempo_block_hash: B256,
+    }
+
+    fn regular_deposit() -> Deposit {
+        Deposit {
+            token: PATH_USD_ADDRESS,
+            sender: user_value_tx_sender(),
+            to: user_value_tx_recipient(),
+            amount: u128::from(USER_TIP20_TX_AMOUNT),
+            bouncebackRecipient: user_value_tx_sender(),
+            memo: B256::ZERO,
+        }
+    }
+
+    fn test_sequencer_encryption_key() -> (k256::SecretKey, B256, u8) {
+        let key = k256::SecretKey::from_slice(&[0x11; 32])
+            .expect("test sequencer encryption key should parse");
+        let public = key.public_key();
+        let encoded = public.to_encoded_point(true);
+        let public_x = B256::from_slice(
+            encoded
+                .x()
+                .expect("compressed secp256k1 key has x coordinate")
+                .as_slice(),
+        );
+        (key, public_x, encoded.as_bytes()[0])
+    }
+
+    fn encrypted_deposit_witness() -> EncryptedDepositWitness {
+        let mut witness = fixture_witness();
+        let initial_tempo_block_number = witness.public_inputs.tempo_block_number;
+        let initial_tempo_block_hash = witness.public_inputs.anchor_block_hash;
+        let imported_tempo_block_number = initial_tempo_block_number + 1;
+        let initial_processed_hash = B256::repeat_byte(0x44);
+        let key_index = U256::ZERO;
+        let recipient = user_value_tx_recipient();
+        let memo = B256::repeat_byte(0xec);
+        let (sequencer_key, sequencer_pub_x, sequencer_pub_y_parity) =
+            test_sequencer_encryption_key();
+        let encrypted = zone_precompiles::ecies::encrypt_deposit(
+            &sequencer_pub_x,
+            sequencer_pub_y_parity,
+            recipient,
+            memo,
+            TEST_TEMPO_PORTAL_ADDRESS,
+            key_index,
+        )
+        .expect("test encrypted deposit should encrypt");
+        let proof = zone_precompiles::ecies::compute_ecdh_proof(
+            &sequencer_key,
+            &encrypted.eph_pub_x,
+            encrypted.eph_pub_y_parity,
+        )
+        .expect("test encrypted deposit proof should compute");
+        let encrypted_deposit = EncryptedDeposit {
+            token: PATH_USD_ADDRESS,
+            sender: user_value_tx_sender(),
+            amount: u128::from(USER_TIP20_TX_AMOUNT),
+            bouncebackRecipient: user_value_tx_sender(),
+            keyIndex: key_index,
+            encrypted: EncryptedDepositPayload {
+                ephemeralPubkeyX: encrypted.eph_pub_x,
+                ephemeralPubkeyYParity: encrypted.eph_pub_y_parity,
+                ciphertext: encrypted.ciphertext.into(),
+                nonce: FixedBytes(encrypted.nonce),
+                tag: FixedBytes(encrypted.tag),
+            },
+        };
+        let proved_next_processed_hash = keccak256(
+            (
+                DepositType::Encrypted,
+                encrypted_deposit.clone(),
+                initial_processed_hash,
+            )
+                .abi_encode_params(),
+        );
+
+        let portal_current_deposit_queue_hash_slot =
+            storage_slot_u256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+        let (encryption_key_x_slot, encryption_key_meta_slot) =
+            portal_encryption_key_slots(key_index);
+        let policy_word = tip20_transfer_policy_word(ALLOW_ALL_POLICY_ID);
+        let portal_entries = [
+            (
+                portal_current_deposit_queue_hash_slot,
+                storage_word(proved_next_processed_hash),
+            ),
+            (encryption_key_x_slot, storage_word(sequencer_pub_x)),
+            (encryption_key_meta_slot, U256::from(sequencer_pub_y_parity)),
+        ];
+        let portal_proof_slots = [
+            portal_current_deposit_queue_hash_slot,
+            encryption_key_x_slot,
+            encryption_key_meta_slot,
+        ];
+        let policy_entries = [(TIP20_TRANSFER_POLICY_ID_SLOT, policy_word)];
+        let policy_proof_slots = [TIP20_TRANSFER_POLICY_ID_SLOT];
+        let (imported_tempo_state_root, l1_proof) = l1_state_proof_for_accounts(
+            0,
+            imported_tempo_block_number,
+            &[
+                (
+                    TEST_TEMPO_PORTAL_ADDRESS,
+                    &portal_entries,
+                    &portal_proof_slots,
+                ),
+                (PATH_USD_ADDRESS, &policy_entries, &policy_proof_slots),
+            ],
+        );
+        witness.tempo_state_proofs = l1_proof;
+
+        let tempo_header_rlp = tempo_import_header(
+            initial_tempo_block_hash,
+            imported_tempo_block_number,
+            imported_tempo_state_root,
+        );
+        let imported_tempo_block_hash = keccak256(tempo_header_rlp.as_ref());
+        witness.zone_blocks[0].tempo_import = ZoneTempoImport::advance(
+            tempo_header_rlp,
+            vec![QueuedDeposit {
+                depositType: DepositType::Encrypted,
+                depositData: encrypted_deposit.abi_encode().into(),
+                rejected: false,
+            }],
+            vec![DecryptionData {
+                sharedSecret: proof.shared_secret,
+                sharedSecretYParity: proof.shared_secret_y_parity,
+                cpProof: ChaumPedersenProof {
+                    s: proof.cp_proof_s,
+                    c: proof.cp_proof_c,
+                },
+            }],
+            Vec::new(),
+        );
+        witness.public_inputs.tempo_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_hash = imported_tempo_block_hash;
+
+        let mut parts = real_zone_system_state_parts(
+            initial_tempo_block_number,
+            initial_tempo_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        let token_code = Bytes::from_static(&[0xef]);
+        let issuer_role_slot = tip20_role_slot(ZONE_INBOX_ADDRESS, *ISSUER_ROLE);
+        let recipient_balance_slot = tip20_balance_slot(recipient);
+        let recipient_reward_slots = tip20_user_reward_info_slots(recipient);
+        parts.extend(system_account_components_with_code(
+            PATH_USD_ADDRESS,
+            &[
+                (issuer_role_slot, U256::ONE),
+                (TIP20_TRANSFER_POLICY_ID_SLOT, policy_word),
+                (TIP20_TOTAL_SUPPLY_SLOT, U256::ZERO),
+                (TIP20_PAUSED_SLOT, U256::ZERO),
+                (TIP20_SUPPLY_CAP_SLOT, U128_MAX),
+                (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
+                (recipient_balance_slot, U256::ZERO),
+                (recipient_reward_slots[0], U256::ZERO),
+                (recipient_reward_slots[1], U256::ZERO),
+                (recipient_reward_slots[2], U256::ZERO),
+            ],
+            &[
+                issuer_role_slot,
+                TIP20_TRANSFER_POLICY_ID_SLOT,
+                TIP20_TOTAL_SUPPLY_SLOT,
+                TIP20_PAUSED_SLOT,
+                TIP20_SUPPLY_CAP_SLOT,
+                TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
+                recipient_balance_slot,
+                recipient_reward_slots[0],
+                recipient_reward_slots[1],
+                recipient_reward_slots[2],
+            ],
+            ZoneAccountCode::bytecode(token_code),
+        ));
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        parts.account_reads.push(absent_account_read(
+            tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS,
+        ));
+        parts.account_reads.push(absent_account_read(
+            zone_precompiles::CHAUM_PEDERSEN_VERIFY_ADDRESS,
+        ));
+        parts.account_reads.push(absent_account_read(
+            zone_precompiles::AES_GCM_DECRYPT_ADDRESS,
+        ));
+        parts.account_reads.push(absent_account_read(address!(
+            "0x0000000000000000000000000000000000000002"
+        )));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        EncryptedDepositWitness {
+            witness,
+            initial_processed_hash,
+            proved_next_processed_hash,
+            initial_tempo_block_number,
+            initial_tempo_block_hash,
+        }
+    }
+
+    fn regular_deposit_witness(
+        proved_deposit: Deposit,
+        witnessed_deposit: Deposit,
+    ) -> RegularDepositWitness {
+        let mut witness = fixture_witness();
+        let initial_tempo_block_number = witness.public_inputs.tempo_block_number;
+        let initial_tempo_block_hash = witness.public_inputs.anchor_block_hash;
+        let imported_tempo_block_number = initial_tempo_block_number + 1;
+        let initial_processed_hash = B256::repeat_byte(0x44);
+        let proved_next_processed_hash = keccak256(
+            (DepositType::Regular, proved_deposit, initial_processed_hash).abi_encode_params(),
+        );
+        let witnessed_next_processed_hash = keccak256(
+            (
+                DepositType::Regular,
+                witnessed_deposit.clone(),
+                initial_processed_hash,
+            )
+                .abi_encode_params(),
+        );
+        let portal_current_deposit_queue_hash_slot =
+            storage_slot_u256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+        let policy_word = tip20_transfer_policy_word(ALLOW_ALL_POLICY_ID);
+        let portal_entries = [(
+            portal_current_deposit_queue_hash_slot,
+            storage_word(proved_next_processed_hash),
+        )];
+        let portal_proof_slots = [portal_current_deposit_queue_hash_slot];
+        let policy_entries = [(TIP20_TRANSFER_POLICY_ID_SLOT, policy_word)];
+        let policy_proof_slots = [TIP20_TRANSFER_POLICY_ID_SLOT];
+        let (imported_tempo_state_root, l1_proof) = l1_state_proof_for_accounts(
+            0,
+            imported_tempo_block_number,
+            &[
+                (
+                    TEST_TEMPO_PORTAL_ADDRESS,
+                    &portal_entries,
+                    &portal_proof_slots,
+                ),
+                (PATH_USD_ADDRESS, &policy_entries, &policy_proof_slots),
+            ],
+        );
+        witness.tempo_state_proofs = l1_proof;
+
+        let tempo_header_rlp = tempo_import_header(
+            initial_tempo_block_hash,
+            imported_tempo_block_number,
+            imported_tempo_state_root,
+        );
+        let imported_tempo_block_hash = keccak256(tempo_header_rlp.as_ref());
+        witness.zone_blocks[0].tempo_import = ZoneTempoImport::advance(
+            tempo_header_rlp,
+            vec![QueuedDeposit {
+                depositType: DepositType::Regular,
+                depositData: witnessed_deposit.abi_encode().into(),
+                rejected: false,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        witness.public_inputs.tempo_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_number = imported_tempo_block_number;
+        witness.public_inputs.anchor_block_hash = imported_tempo_block_hash;
+
+        let mut parts = real_zone_system_state_parts(
+            initial_tempo_block_number,
+            initial_tempo_block_hash,
+            EMPTY_TRIE_ROOT,
+        );
+        let token_code = Bytes::from_static(&[0xef]);
+        let issuer_role_slot = tip20_role_slot(ZONE_INBOX_ADDRESS, *ISSUER_ROLE);
+        let recipient_balance_slot = tip20_balance_slot(witnessed_deposit.to);
+        let recipient_reward_slots = tip20_user_reward_info_slots(witnessed_deposit.to);
+        parts.extend(system_account_components_with_code(
+            PATH_USD_ADDRESS,
+            &[
+                (issuer_role_slot, U256::ONE),
+                (TIP20_TRANSFER_POLICY_ID_SLOT, policy_word),
+                (TIP20_TOTAL_SUPPLY_SLOT, U256::ZERO),
+                (TIP20_PAUSED_SLOT, U256::ZERO),
+                (TIP20_SUPPLY_CAP_SLOT, U128_MAX),
+                (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
+                (recipient_balance_slot, U256::ZERO),
+                (recipient_reward_slots[0], U256::ZERO),
+                (recipient_reward_slots[1], U256::ZERO),
+                (recipient_reward_slots[2], U256::ZERO),
+            ],
+            &[
+                issuer_role_slot,
+                TIP20_TRANSFER_POLICY_ID_SLOT,
+                TIP20_TOTAL_SUPPLY_SLOT,
+                TIP20_PAUSED_SLOT,
+                TIP20_SUPPLY_CAP_SLOT,
+                TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
+                recipient_balance_slot,
+                recipient_reward_slots[0],
+                recipient_reward_slots[1],
+                recipient_reward_slots[2],
+            ],
+            ZoneAccountCode::bytecode(token_code),
+        ));
+        parts
+            .account_reads
+            .push(absent_account_read(witness.public_inputs.sequencer));
+        parts.account_reads.push(absent_account_read(
+            tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS,
+        ));
+        set_initial_zone_state(&mut witness, parts.assemble());
+
+        RegularDepositWitness {
+            witness,
+            initial_processed_hash,
+            proved_next_processed_hash,
+            witnessed_next_processed_hash,
+            initial_tempo_block_number,
+            initial_tempo_block_hash,
+        }
+    }
+
     #[test]
-    fn production_prover_executes_signed_user_value_transfer_before_real_outbox_finalization() {
+    fn production_prover_executes_regular_deposit() {
+        let deposit = regular_deposit();
+        let fixture = regular_deposit_witness(deposit.clone(), deposit);
+
+        let output = prove_zone_batch(fixture.witness.clone()).unwrap();
+        let header_only_output = prove_zone_batch({
+            let mut header_only = fixture_witness();
+            let mut parts = real_zone_system_state_parts(
+                fixture.initial_tempo_block_number,
+                fixture.initial_tempo_block_hash,
+                EMPTY_TRIE_ROOT,
+            );
+            parts
+                .account_reads
+                .push(absent_account_read(header_only.public_inputs.sequencer));
+            parts.account_reads.push(absent_account_read(
+                tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS,
+            ));
+            set_initial_zone_state(&mut header_only, parts.assemble());
+            header_only
+        })
+        .unwrap();
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            fixture.witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            header_only_output.block_transition.nextBlockHash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.prevProcessedHash,
+            fixture.initial_processed_hash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.nextProcessedHash,
+            fixture.proved_next_processed_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 13);
+        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            fixture
+                .witness
+                .public_inputs
+                .expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_executes_encrypted_deposit() {
+        let fixture = encrypted_deposit_witness();
+
+        let output = prove_zone_batch(fixture.witness.clone()).unwrap();
+        let header_only_output = prove_zone_batch({
+            let mut header_only = fixture_witness();
+            let mut parts = real_zone_system_state_parts(
+                fixture.initial_tempo_block_number,
+                fixture.initial_tempo_block_hash,
+                EMPTY_TRIE_ROOT,
+            );
+            parts
+                .account_reads
+                .push(absent_account_read(header_only.public_inputs.sequencer));
+            parts.account_reads.push(absent_account_read(
+                tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS,
+            ));
+            set_initial_zone_state(&mut header_only, parts.assemble());
+            header_only
+        })
+        .unwrap();
+
+        assert_eq!(
+            output.block_transition.prevBlockHash,
+            fixture.witness.public_inputs.prev_block_hash
+        );
+        assert_ne!(
+            output.block_transition.nextBlockHash,
+            header_only_output.block_transition.nextBlockHash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.prevProcessedHash,
+            fixture.initial_processed_hash
+        );
+        assert_eq!(
+            output.deposit_queue_transition.nextProcessedHash,
+            fixture.proved_next_processed_hash
+        );
+        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
+        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 13);
+        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
+        assert_eq!(
+            output.last_batch_commitment.withdrawal_batch_index,
+            fixture
+                .witness
+                .public_inputs
+                .expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_encrypted_deposit_missing_decryption_data() {
+        let mut fixture = encrypted_deposit_witness();
+        let ZoneTempoImport::Advance(import) = &mut fixture.witness.zone_blocks[0].tempo_import
+        else {
+            panic!("encrypted deposit fixture should import Tempo");
+        };
+        import.decryptions.clear();
+
+        assert!(matches!(
+            prove_zone_batch(fixture.witness).unwrap_err(),
+            ProverError::ExecutionBlockFailed { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn production_prover_rejects_mutated_regular_deposit_queue_hash() {
+        let proved_deposit = regular_deposit();
+        let mut witnessed_deposit = proved_deposit.clone();
+        witnessed_deposit.amount = witnessed_deposit
+            .amount
+            .checked_add(1)
+            .expect("test deposit amount should not overflow");
+        let fixture = regular_deposit_witness(proved_deposit, witnessed_deposit);
+        assert_ne!(
+            fixture.proved_next_processed_hash,
+            fixture.witnessed_next_processed_hash
+        );
+        let tempo_block_number = fixture.witness.public_inputs.tempo_block_number;
+
+        assert_eq!(
+            prove_zone_batch(fixture.witness).unwrap_err(),
+            ProverError::ExecutionDepositQueueHashMismatch {
+                tempo_block_number,
+                expected: fixture.proved_next_processed_hash,
+                actual: fixture.witnessed_next_processed_hash,
+            }
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_signed_native_value_transfer() {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].cfg_env.chain_id = USER_VALUE_TX_CHAIN_ID;
         witness.zone_blocks[0]
             .transactions
             .push(signed_user_value_transfer_tx());
 
-        let mut parts = real_outbox_zone_state_parts(&witness);
-        let sender_account = TrieAccount {
-            nonce: 0,
-            balance: USER_VALUE_TX_INITIAL_BALANCE,
-            storage_root: EMPTY_TRIE_ROOT,
-            code_hash: KECCAK_EMPTY,
-        };
-        parts
-            .account_entries
-            .push((user_value_tx_sender(), sender_account));
-        parts
-            .account_reads
-            .push(account_read(user_value_tx_sender(), sender_account));
-        parts
-            .account_reads
-            .push(absent_account_read(user_value_tx_recipient()));
-        parts
-            .account_reads
-            .push(absent_account_read(witness.public_inputs.sequencer));
-        set_initial_zone_state(&mut witness, parts.assemble());
-
-        let output = prove_zone_batch(witness.clone()).unwrap();
-        let empty_output = prove_zone_batch(fixture_witness_with_real_outbox()).unwrap();
-
         assert_eq!(
-            output.block_transition.prevBlockHash,
-            witness.public_inputs.prev_block_hash
-        );
-        assert_ne!(
-            output.block_transition.nextBlockHash,
-            empty_output.block_transition.nextBlockHash
-        );
-        assert_eq!(output.deposit_queue_transition.prevDepositNumber, 12);
-        assert_eq!(output.deposit_queue_transition.nextDepositNumber, 12);
-        assert_eq!(output.withdrawal_queue_hash, B256::ZERO);
-        assert_eq!(
-            output.last_batch_commitment.withdrawal_batch_index,
-            witness.public_inputs.expected_withdrawal_batch_index
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::UserTransactionValueUnsupported {
+                block_index: 0,
+                transaction_index: 0,
+                value: U256::from(USER_VALUE_TX_AMOUNT),
+            }
         );
     }
 
@@ -2539,7 +3471,7 @@ mod tests {
             balance: token_account.balance,
             storage_root: token_account.storage_root,
             code_hash: token_account.code_hash,
-            code: Some(token_code),
+            code: ZoneAccountCode::bytecode(token_code),
             proof_node_hashes: Vec::new(),
         });
         parts
@@ -2559,75 +3491,7 @@ mod tests {
 
     #[test]
     fn production_prover_executes_signed_tip20_transfer_with_proved_l1_policy() {
-        let mut witness = fixture_witness();
-        witness.zone_blocks[0].cfg_env.chain_id = USER_VALUE_TX_CHAIN_ID;
-        witness.zone_blocks[0]
-            .transactions
-            .push(signed_user_tip20_transfer_tx());
-
-        let policy_word = tip20_transfer_policy_word(ALLOW_ALL_POLICY_ID);
-        let (tempo_state_root, policy_proof) = l1_state_proof(
-            0,
-            witness.public_inputs.tempo_block_number,
-            PATH_USD_ADDRESS,
-            TIP20_TRANSFER_POLICY_ID_SLOT,
-            policy_word,
-        );
-        witness.tempo_state_proofs = policy_proof;
-
-        let mut parts = real_outbox_zone_state_parts_with_tempo_root(&witness, tempo_state_root);
-        let sender_account = TrieAccount {
-            nonce: 0,
-            balance: USER_VALUE_TX_INITIAL_BALANCE,
-            storage_root: EMPTY_TRIE_ROOT,
-            code_hash: KECCAK_EMPTY,
-        };
-        parts
-            .account_entries
-            .push((user_value_tx_sender(), sender_account));
-        parts
-            .account_reads
-            .push(account_read(user_value_tx_sender(), sender_account));
-
-        let sender_balance_slot = tip20_balance_slot(user_value_tx_sender());
-        let recipient_balance_slot = tip20_balance_slot(user_value_tx_recipient());
-        let sender_reward_slots = tip20_user_reward_info_slots(user_value_tx_sender());
-        let recipient_reward_slots = tip20_user_reward_info_slots(user_value_tx_recipient());
-        let token_code = Bytes::from_static(&[0xef]);
-        parts.extend(system_account_components_with_code(
-            PATH_USD_ADDRESS,
-            &[
-                (TIP20_TRANSFER_POLICY_ID_SLOT, policy_word),
-                (TIP20_PAUSED_SLOT, U256::ZERO),
-                (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
-                (sender_balance_slot, USER_TIP20_INITIAL_BALANCE),
-                (recipient_balance_slot, U256::ZERO),
-                (sender_reward_slots[0], U256::ZERO),
-                (sender_reward_slots[1], U256::ZERO),
-                (sender_reward_slots[2], U256::ZERO),
-                (recipient_reward_slots[0], U256::ZERO),
-                (recipient_reward_slots[1], U256::ZERO),
-                (recipient_reward_slots[2], U256::ZERO),
-            ],
-            &[
-                TIP20_TRANSFER_POLICY_ID_SLOT,
-                TIP20_PAUSED_SLOT,
-                TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
-                sender_balance_slot,
-                recipient_balance_slot,
-                sender_reward_slots[0],
-                sender_reward_slots[1],
-                sender_reward_slots[2],
-                recipient_reward_slots[0],
-                recipient_reward_slots[1],
-                recipient_reward_slots[2],
-            ],
-            Some(token_code),
-        ));
-        parts
-            .account_reads
-            .push(absent_account_read(witness.public_inputs.sequencer));
-        set_initial_zone_state(&mut witness, parts.assemble());
+        let witness = signed_tip20_transfer_witness(signed_user_tip20_transfer_tx());
 
         let output = prove_zone_batch(witness.clone()).unwrap();
         let empty_output = prove_zone_batch(fixture_witness_with_real_outbox()).unwrap();
@@ -2646,6 +3510,21 @@ mod tests {
         assert_eq!(
             output.last_batch_commitment.withdrawal_batch_index,
             witness.public_inputs.expected_withdrawal_batch_index
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_mutated_user_transaction_bytes() {
+        let mut raw = signed_user_tip20_transfer_tx().to_vec();
+        raw.push(0xff);
+        let witness = signed_tip20_transfer_witness(Bytes::from(raw));
+
+        assert_eq!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::UserTransactionDecodeFailed {
+                block_index: 0,
+                transaction_index: 0,
+            }
         );
     }
 
@@ -2684,7 +3563,7 @@ mod tests {
                 ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
                 ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
             ],
-            None,
+            ZoneAccountCode::empty(),
         ));
         set_initial_zone_state(&mut witness, parts.assemble());
 
@@ -2989,6 +3868,56 @@ mod tests {
             third_output.block_transition.nextBlockHash,
             first_output.block_transition.nextBlockHash
         );
+    }
+
+    #[test]
+    fn mutated_execution_receipt_changes_public_batch_commitment() {
+        let witness = fixture_witness();
+        let prepared = prepare_stateless_execution(&witness).unwrap();
+        let transactions = recovered_transactions_for_block(&prepared, 0);
+        let state_root =
+            CalculatedStateRoot::trusted_for_test(prepared.prev_block_header.state_root);
+        let original_receipts = successful_block_result(transactions.len());
+        let mut mutated_receipts = original_receipts.clone();
+        mutated_receipts
+            .receipts
+            .first_mut()
+            .expect("fixture block has a system transaction receipt")
+            .success = false;
+
+        let original_block = ExecutedZoneBlock::from_alloy_block_execution(
+            0,
+            state_root,
+            &transactions,
+            &original_receipts,
+        )
+        .unwrap();
+        let mutated_block = ExecutedZoneBlock::from_alloy_block_execution(
+            0,
+            state_root,
+            &transactions,
+            &mutated_receipts,
+        )
+        .unwrap();
+
+        assert_ne!(
+            original_block.receipts_root(),
+            mutated_block.receipts_root()
+        );
+
+        let mut original_execution = successful_execution_output(&prepared);
+        original_execution.blocks[0] = original_block;
+        let mut mutated_execution = successful_execution_output(&prepared);
+        mutated_execution.blocks[0] = mutated_block;
+
+        let original_output = batch_output_from_execution(&prepared, &original_execution).unwrap();
+        let mutated_output = batch_output_from_execution(&prepared, &mutated_execution).unwrap();
+
+        assert_ne!(
+            original_output.block_transition.nextBlockHash,
+            mutated_output.block_transition.nextBlockHash
+        );
+        assert_ne!(original_output.digest(), mutated_output.digest());
     }
 
     #[test]
@@ -3528,7 +4457,7 @@ mod tests {
             balance: trie_account.balance,
             storage_root: trie_account.storage_root,
             code_hash: trie_account.code_hash,
-            code: None,
+            code: ZoneAccountCode::empty(),
             proof_node_hashes: Vec::new(),
         }
     }
@@ -3540,7 +4469,7 @@ mod tests {
             balance: U256::ZERO,
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: KECCAK_EMPTY,
-            code: None,
+            code: ZoneAccountCode::empty(),
             proof_node_hashes: Vec::new(),
         }
     }
@@ -3688,7 +4617,7 @@ mod tests {
             account,
             entries,
             proof_slots,
-            Some(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
+            ZoneAccountCode::bytecode(Bytes::copy_from_slice(TEST_SYSTEM_CONTRACT_CODE)),
         )
     }
 
@@ -3696,13 +4625,14 @@ mod tests {
         account: Address,
         entries: &[(U256, U256)],
         proof_slots: &[U256],
-        code: Option<Bytes>,
+        code: ZoneAccountCode,
     ) -> ZoneStateParts {
         let (storage_root, node_pool, mut storage_proofs) =
             storage_trie_with_entries_and_proofs(entries, proof_slots);
-        let code_hash = code
-            .as_ref()
-            .map_or(KECCAK_EMPTY, |code| keccak256(code.as_ref()));
+        let code_hash = match &code {
+            ZoneAccountCode::Empty => KECCAK_EMPTY,
+            ZoneAccountCode::Bytecode(code) => keccak256(code.as_ref()),
+        };
         let trie_account = TrieAccount {
             nonce: 0,
             balance: U256::ZERO,
@@ -3811,6 +4741,73 @@ mod tests {
                     .collect(),
             },
         )
+    }
+
+    fn l1_state_proof_for_accounts(
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        accounts: &[(Address, &[(U256, U256)], &[U256])],
+    ) -> (B256, BatchStateProof) {
+        let mut node_pool = BTreeMap::new();
+        let mut account_entries = Vec::new();
+        let mut storage_data = Vec::new();
+
+        for (account, entries, proof_slots) in accounts {
+            let (account_storage_root, storage_nodes, storage_proofs) =
+                storage_trie_with_entries_and_proofs(entries, proof_slots);
+            node_pool.extend(storage_nodes);
+            let trie_account = TrieAccount {
+                nonce: 0,
+                balance: U256::ZERO,
+                storage_root: account_storage_root,
+                code_hash: KECCAK_EMPTY,
+            };
+            account_entries.push((*account, trie_account));
+            storage_data.push((
+                *account,
+                trie_account,
+                entries.to_vec(),
+                proof_slots.to_vec(),
+                storage_proofs,
+            ));
+        }
+
+        let proof_accounts = account_entries
+            .iter()
+            .map(|(account, _)| *account)
+            .collect::<Vec<_>>();
+        let (state_root, account_nodes, mut account_proofs) =
+            account_trie_with_proofs(&account_entries, &proof_accounts);
+        node_pool.extend(account_nodes);
+
+        let mut reads = Vec::new();
+        for (account, trie_account, entries, proof_slots, mut storage_proofs) in storage_data {
+            let account_proof_node_hashes = account_proofs
+                .remove(&account)
+                .expect("L1 account proof was retained");
+            for slot in proof_slots {
+                reads.push(L1StateRead {
+                    zone_block_index,
+                    tempo_block_number,
+                    account,
+                    account_nonce: trie_account.nonce,
+                    account_balance: trie_account.balance,
+                    account_storage_root: trie_account.storage_root,
+                    account_code_hash: trie_account.code_hash,
+                    account_proof_node_hashes: account_proof_node_hashes.clone(),
+                    slot,
+                    value: entries
+                        .iter()
+                        .find(|(entry_slot, _)| *entry_slot == slot)
+                        .map_or(U256::ZERO, |(_, value)| *value),
+                    storage_proof_node_hashes: storage_proofs
+                        .remove(&slot)
+                        .expect("L1 storage proof was retained"),
+                });
+            }
+        }
+
+        (state_root, BatchStateProof { node_pool, reads })
     }
 
     #[test]
@@ -3981,7 +4978,7 @@ mod tests {
     #[test]
     fn rejects_missing_finalization_on_final_block() {
         let mut witness = fixture_witness();
-        witness.zone_blocks[0].finalize_withdrawal_batch_count = None;
+        witness.zone_blocks[0].withdrawal_finalization = ZoneWithdrawalFinalization::none();
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
             ProverError::MissingFinalWithdrawalFinalization
@@ -4000,12 +4997,8 @@ mod tests {
             cfg_env: fixture_cfg_env(),
             execution_context: fixture_execution_context(),
             block_env: fixture_block_env(),
-            tempo_header_rlp: None,
-            deposits: Vec::new(),
-            decryptions: Vec::new(),
-            enabled_tokens: Vec::new(),
-            finalize_withdrawal_batch_count: Some(U256::ZERO),
-            finalize_withdrawal_encrypted_senders: Vec::new(),
+            tempo_import: ZoneTempoImport::none(),
+            withdrawal_finalization: ZoneWithdrawalFinalization::finalize(U256::ZERO, Vec::new()),
             transactions: Vec::new(),
         };
         witness.zone_blocks.push(second);
@@ -4800,7 +5793,7 @@ mod tests {
                 balance: U256::ZERO,
                 storage_root: EMPTY_TRIE_ROOT,
                 code_hash: B256::repeat_byte(0xaa),
-                code: Some(Bytes::from_static(b"not matching")),
+                code: ZoneAccountCode::bytecode(Bytes::from_static(b"not matching")),
                 proof_node_hashes: Vec::new(),
             });
         assert_eq!(
@@ -4825,7 +5818,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_user_transactions_until_execution_adapter_exists() {
+    fn empty_prover_rejects_user_transactions() {
         let mut witness = fixture_witness();
         witness.zone_blocks[0]
             .transactions
@@ -4837,29 +5830,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_enabled_tokens_until_execution_adapter_exists() {
+    fn empty_prover_rejects_enabled_tokens() {
         let mut witness = fixture_witness();
-        witness.zone_blocks[0].enabled_tokens.push(EnabledToken {
-            token: address!("0x0000000000000000000000000000000000001000"),
-            name: "USD Test".into(),
-            symbol: "USDT".into(),
-            currency: "USD".into(),
-        });
+        witness.zone_blocks[0].tempo_import = ZoneTempoImport::advance(
+            Bytes::from_static(&[0xc0]),
+            Vec::new(),
+            Vec::new(),
+            vec![EnabledToken {
+                token: address!("0x0000000000000000000000000000000000001000"),
+                name: "USD Test".into(),
+                symbol: "USDT".into(),
+                currency: "USD".into(),
+            }],
+        );
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::DepositProcessingUnsupported { index: 0 }
+            ProverError::TempoImportUnsupported { index: 0 }
         );
     }
 
     #[test]
-    fn rejects_withdrawal_sender_payloads_until_execution_adapter_exists() {
+    fn empty_prover_rejects_withdrawal_sender_payloads() {
         let mut witness = fixture_witness();
-        witness.zone_blocks[0]
-            .finalize_withdrawal_encrypted_senders
-            .push(Bytes::from_static(b"sender"));
+        witness.zone_blocks[0].withdrawal_finalization =
+            ZoneWithdrawalFinalization::finalize(U256::ZERO, vec![Bytes::from_static(b"sender")]);
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::NonZeroWithdrawalFinalizationUnsupported
+            ProverError::WithdrawalSenderPayloadsWithoutFinalization
         );
     }
 

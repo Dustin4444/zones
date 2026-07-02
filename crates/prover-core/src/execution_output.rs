@@ -13,9 +13,10 @@ use tempo_zone_contracts::{BlockTransition, DepositQueueTransition};
 use zone_primitives::{
     ZoneHeader,
     constants::{
-        TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ADDRESS, TEMPO_STATE_ROOT_SLOT,
-        ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_HASH_SLOT, ZONE_INBOX_PROCESSED_NUMBER_SLOT,
-        ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_HASH_SLOT, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+        PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT,
+        TEMPO_STATE_ADDRESS, TEMPO_STATE_ROOT_SLOT, ZONE_INBOX_ADDRESS,
+        ZONE_INBOX_PROCESSED_HASH_SLOT, ZONE_INBOX_PROCESSED_NUMBER_SLOT, ZONE_OUTBOX_ADDRESS,
+        ZONE_OUTBOX_LAST_BATCH_HASH_SLOT, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
     },
 };
 
@@ -375,6 +376,8 @@ pub fn batch_output_from_execution(
         });
     }
 
+    validate_deposit_queue_matches_proved_tempo(prepared, final_commitments.final_deposit_queue)?;
+
     let expected_withdrawal_batch_index = prepared.public_inputs.expected_withdrawal_batch_index;
     if final_commitments.last_batch.withdrawal_batch_index != expected_withdrawal_batch_index {
         return Err(ProverError::ExecutionWithdrawalBatchIndexMismatch {
@@ -397,6 +400,32 @@ pub fn batch_output_from_execution(
         withdrawal_queue_hash: final_commitments.last_batch.withdrawal_queue_hash,
         last_batch_commitment: final_commitments.last_batch,
     })
+}
+
+fn validate_deposit_queue_matches_proved_tempo(
+    prepared: &PreparedStatelessExecution,
+    final_deposit_queue: DepositQueueState,
+) -> Result<(), ProverError> {
+    let slot = word_from_b256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+    let actual = final_deposit_queue.processed_hash;
+    let actual_word = word_from_b256(actual);
+
+    // TODO(stateless-prover): require this proof for batches that process
+    // advanceTempo deposits instead of only checking it when supplied.
+    for (_, _, proved_word) in prepared
+        .tempo_witness_provider
+        .proved_storage_words(prepared.commitments.final_tempo_block_number, slot)
+    {
+        if proved_word != actual_word {
+            return Err(ProverError::ExecutionDepositQueueHashMismatch {
+                tempo_block_number: prepared.commitments.final_tempo_block_number,
+                expected: B256::from(proved_word),
+                actual,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 pub fn execution_commitments_from_post_state(

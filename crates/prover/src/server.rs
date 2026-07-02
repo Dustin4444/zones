@@ -13,7 +13,8 @@ use crate::{
     crypto::EnclaveSigningKey,
     protocol::{
         NITRO_SHA384_PCR_BYTES, NitroPcr, PROTOCOL_VERSION, ProofEnvelope, ProofRequest,
-        RegistrationReport, batch_digest, registration_challenge_digest, registration_digest,
+        RegistrationReport, batch_digest, registration_challenge_digest_fields,
+        registration_digest_fields,
     },
     transport::{
         DEFAULT_MAX_REQUEST_BYTES, bind_tcp, bind_vsock, read_json_frame, write_json_frame,
@@ -97,7 +98,30 @@ impl ProverServer {
     ) -> Result<RegistrationReport, ServerError> {
         let public_key_uncompressed = self.signing_key.public_key_uncompressed();
         let attested_pcrs = self.attested_pcrs(nonce, public_key_uncompressed.as_ref())?;
-        let mut report = RegistrationReport {
+        let challenge_digest = registration_challenge_digest_fields(
+            version,
+            request_id,
+            nonce,
+            self.signer(),
+            public_key_uncompressed.as_ref(),
+            &attested_pcrs.pcr0,
+            &attested_pcrs.pcr1,
+            &attested_pcrs.pcr2,
+        );
+        let attestation_doc =
+            self.attest(challenge_digest, nonce, public_key_uncompressed.as_ref())?;
+        let digest = registration_digest_fields(
+            version,
+            request_id,
+            nonce,
+            self.signer(),
+            public_key_uncompressed.as_ref(),
+            &attested_pcrs.pcr0,
+            &attested_pcrs.pcr1,
+            &attested_pcrs.pcr2,
+            alloy_primitives::keccak256(attestation_doc.as_ref()),
+        );
+        Ok(RegistrationReport {
             version,
             request_id,
             nonce,
@@ -106,19 +130,10 @@ impl ProverServer {
             expected_pcr0: attested_pcrs.pcr0,
             expected_pcr1: attested_pcrs.pcr1,
             expected_pcr2: attested_pcrs.pcr2,
-            attestation_doc: Bytes::new(),
-            digest: B256::ZERO,
-            signature: self.signing_key.sign_digest(B256::ZERO),
-        };
-        let challenge_digest = registration_challenge_digest(&report);
-        report.attestation_doc = self.attest(
-            challenge_digest,
-            report.nonce,
-            report.public_key_uncompressed.as_ref(),
-        )?;
-        report.digest = registration_digest(&report);
-        report.signature = self.signing_key.sign_digest(report.digest);
-        Ok(report)
+            attestation_doc,
+            digest,
+            signature: self.signing_key.sign_digest(digest),
+        })
     }
 
     pub fn prove(&self, request: ProofRequest) -> Result<ProofEnvelope, ServerError> {

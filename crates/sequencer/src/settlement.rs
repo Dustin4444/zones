@@ -20,12 +20,12 @@
 //! window by falling back to ancestry mode — a recent anchor block plus a
 //! locally validated parent-hash header chain.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::abi::{
     self, BlockTransition, DepositQueueTransition, NativeSignatureVerifier, ZoneOutbox, ZonePortal,
 };
-use alloy_consensus::Transaction;
+use alloy_consensus::{BlockHeader, Transaction};
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::{DynProvider, Provider};
@@ -35,16 +35,60 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use eyre::{Result, WrapErr};
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use tempo_alloy::{TempoNetwork, rpc::TempoTransactionRequest};
 use tracing::{info, instrument, warn};
+use zone_primitives::{ZoneHeader, constants::ZONE_BLOCK_PROTOCOL_VERSION};
 use zone_prover::{
     NativeVerifierConfig, encode_native_host_proof, native_batch_digest,
     protocol::PROTOCOL_VERSION,
-    types::{BatchOutput, LastBatchCommitment, PublicInputs},
+    types::{BatchOutput, BatchWitness, PublicInputs, prove_zone_batch},
 };
 
 use zone_prover::crypto::RecoverableSignatureBytes;
+
+#[derive(Debug, Clone)]
+pub struct ProverWitnessRequest {
+    pub from_zone_block: u64,
+    pub to_zone_block: u64,
+    pub batch: UnprovenBatchData,
+    pub public_inputs: PublicInputs,
+    pub tempo_ancestry_headers: Vec<Bytes>,
+}
+
+pub trait ProverWitnessSource: fmt::Debug + Send + Sync {
+    fn build_witness<'a>(
+        &'a self,
+        request: ProverWitnessRequest,
+    ) -> BoxFuture<'a, Result<BatchWitness>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct UnavailableProverWitnessSource {
+    reason: String,
+}
+
+impl UnavailableProverWitnessSource {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl ProverWitnessSource for UnavailableProverWitnessSource {
+    fn build_witness<'a>(
+        &'a self,
+        _request: ProverWitnessRequest,
+    ) -> BoxFuture<'a, Result<BatchWitness>> {
+        Box::pin(async move {
+            Err(eyre::eyre!(
+                "prover witness source unavailable: {}",
+                self.reason
+            ))
+        })
+    }
+}
 
 /// EIP-2935 stores the last 8192 block hashes (~68 min at 500ms block time).
 const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192;
@@ -131,6 +175,94 @@ const EIP2935_HISTORY_ADDRESS: Address = address!("0000F90827F1C53a10cb7A02335B1
 /// query the entire unsent range in one request.
 pub(crate) const LOG_QUERY_BLOCK_CHUNK: u64 = 5_000;
 
+#[derive(Debug, Clone)]
+pub struct UnprovenBatchData {
+    /// Tempo L1 block number for EIP-2935 verification.
+    pub tempo_block_number: u64,
+    /// Previous zone block hash (must match portal's current `blockHash`).
+    pub prev_block_hash: B256,
+    /// New zone block hash after this batch.
+    pub next_block_hash: B256,
+    /// Deposit queue: where the zone started processing.
+    pub prev_processed_deposit_hash: B256,
+    /// Deposit queue: where the zone processed up to.
+    pub next_processed_deposit_hash: B256,
+    /// Deposit counter at the start of processing.
+    pub prev_deposit_number: u64,
+    /// Deposit counter after processing.
+    pub next_deposit_number: u64,
+    /// Withdrawal queue hash for this batch (`B256::ZERO` if no withdrawals).
+    pub withdrawal_queue_hash: B256,
+}
+
+impl UnprovenBatchData {
+    pub fn with_proof(self, proof: BatchProofSource) -> BatchData {
+        BatchData {
+            tempo_block_number: self.tempo_block_number,
+            prev_block_hash: self.prev_block_hash,
+            next_block_hash: self.next_block_hash,
+            prev_processed_deposit_hash: self.prev_processed_deposit_hash,
+            next_processed_deposit_hash: self.next_processed_deposit_hash,
+            prev_deposit_number: self.prev_deposit_number,
+            next_deposit_number: self.next_deposit_number,
+            withdrawal_queue_hash: self.withdrawal_queue_hash,
+            proof,
+        }
+    }
+}
+
+impl From<&BatchData> for UnprovenBatchData {
+    fn from(batch: &BatchData) -> Self {
+        Self {
+            tempo_block_number: batch.tempo_block_number,
+            prev_block_hash: batch.prev_block_hash,
+            next_block_hash: batch.next_block_hash,
+            prev_processed_deposit_hash: batch.prev_processed_deposit_hash,
+            next_processed_deposit_hash: batch.next_processed_deposit_hash,
+            prev_deposit_number: batch.prev_deposit_number,
+            next_deposit_number: batch.next_deposit_number,
+            withdrawal_queue_hash: batch.withdrawal_queue_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchProofMaterial {
+    pub verifier_config: Bytes,
+    pub proof: Bytes,
+}
+
+impl BatchProofMaterial {
+    pub fn new(verifier_config: Bytes, proof: Bytes) -> Result<Self> {
+        if verifier_config.is_empty() {
+            return Err(eyre::eyre!(
+                "missing verifierConfig: refusing to submit an unverified batch"
+            ));
+        }
+        if proof.is_empty() {
+            return Err(eyre::eyre!(
+                "missing proof: refusing to submit an unverified batch"
+            ));
+        }
+        Ok(Self {
+            verifier_config,
+            proof,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingProverWitness {
+    pub from_zone_block: u64,
+    pub to_zone_block: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum BatchProofSource {
+    Prebuilt(BatchProofMaterial),
+    ProverWitness(PendingProverWitness),
+}
+
 /// Data required to submit a single batch to the ZonePortal on L1.
 ///
 /// Produced by the zone block builder and sent to [`BatchSubmitter`] via channel.
@@ -152,29 +284,61 @@ pub struct BatchData {
     pub next_deposit_number: u64,
     /// Withdrawal queue hash for this batch (`B256::ZERO` if no withdrawals).
     pub withdrawal_queue_hash: B256,
-    /// Verifier configuration bytes accepted by the portal's verifier.
-    pub verifier_config: Bytes,
-    /// Proof bytes accepted by the portal's verifier.
-    pub proof: Bytes,
+    /// Required proof source. Batches cannot be constructed with missing proof
+    /// data; they either carry verifier-ready material or the full prover witness
+    /// used to produce native verifier material.
+    pub proof: BatchProofSource,
 }
 
-impl BatchData {
-    fn validate_proof_material(&self) -> Result<()> {
-        validate_proof_material(&self.verifier_config, &self.proof)
-    }
-}
-
-fn validate_proof_material(verifier_config: &Bytes, proof: &Bytes) -> Result<()> {
-    if verifier_config.is_empty() {
-        return Err(eyre::eyre!(
-            "missing verifierConfig: refusing to submit an unverified batch"
-        ));
-    }
-    if proof.is_empty() {
-        return Err(eyre::eyre!(
-            "missing proof: refusing to submit an unverified batch"
-        ));
-    }
+fn validate_prover_output_matches_batch(batch: &BatchData, output: &BatchOutput) -> Result<()> {
+    eyre::ensure!(
+        output.block_transition.prevBlockHash == batch.prev_block_hash,
+        "native prover output prevBlockHash mismatch: batch {}, prover {}",
+        batch.prev_block_hash,
+        output.block_transition.prevBlockHash
+    );
+    eyre::ensure!(
+        output.block_transition.nextBlockHash == batch.next_block_hash,
+        "native prover output nextBlockHash mismatch: batch {}, prover {}",
+        batch.next_block_hash,
+        output.block_transition.nextBlockHash
+    );
+    eyre::ensure!(
+        output.deposit_queue_transition.prevProcessedHash == batch.prev_processed_deposit_hash,
+        "native prover output prevProcessedHash mismatch: batch {}, prover {}",
+        batch.prev_processed_deposit_hash,
+        output.deposit_queue_transition.prevProcessedHash
+    );
+    eyre::ensure!(
+        output.deposit_queue_transition.nextProcessedHash == batch.next_processed_deposit_hash,
+        "native prover output nextProcessedHash mismatch: batch {}, prover {}",
+        batch.next_processed_deposit_hash,
+        output.deposit_queue_transition.nextProcessedHash
+    );
+    eyre::ensure!(
+        output.deposit_queue_transition.prevDepositNumber == batch.prev_deposit_number,
+        "native prover output prevDepositNumber mismatch: batch {}, prover {}",
+        batch.prev_deposit_number,
+        output.deposit_queue_transition.prevDepositNumber
+    );
+    eyre::ensure!(
+        output.deposit_queue_transition.nextDepositNumber == batch.next_deposit_number,
+        "native prover output nextDepositNumber mismatch: batch {}, prover {}",
+        batch.next_deposit_number,
+        output.deposit_queue_transition.nextDepositNumber
+    );
+    eyre::ensure!(
+        output.withdrawal_queue_hash == batch.withdrawal_queue_hash,
+        "native prover output withdrawalQueueHash mismatch: batch {}, prover {}",
+        batch.withdrawal_queue_hash,
+        output.withdrawal_queue_hash
+    );
+    eyre::ensure!(
+        output.last_batch_commitment.withdrawal_queue_hash == batch.withdrawal_queue_hash,
+        "native prover output lastBatch.withdrawalQueueHash mismatch: batch {}, prover {}",
+        batch.withdrawal_queue_hash,
+        output.last_batch_commitment.withdrawal_queue_hash
+    );
     Ok(())
 }
 
@@ -199,9 +363,12 @@ pub struct BatchSubmitter {
     l1_fetch_concurrency: usize,
     /// EIP-2935 history and safety-margin limits used for anchor decisions.
     anchor_config: BatchAnchorConfig,
-    /// Optional local signer used for NativeSignatureVerifier e2e proof bytes
-    /// when the batch does not already include verifier material.
-    native_proof_signer: Option<PrivateKeySigner>,
+    /// Local signer used for NativeSignatureVerifier proof bytes when the batch
+    /// includes a full prover witness but not prebuilt verifier material.
+    native_proof_signer: PrivateKeySigner,
+    /// Source used to build local prover witnesses after submit-time public
+    /// inputs have been resolved from L1 state.
+    prover_witness_source: Arc<dyn ProverWitnessSource>,
 }
 
 impl BatchSubmitter {
@@ -212,12 +379,14 @@ impl BatchSubmitter {
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
         genesis_tempo_block_number: u64,
+        native_proof_signer: PrivateKeySigner,
     ) -> Self {
         Self::with_anchor_config(
             portal_address,
             l1_provider,
             genesis_tempo_block_number,
             BatchAnchorConfig::default(),
+            native_proof_signer,
         )
     }
 
@@ -227,6 +396,29 @@ impl BatchSubmitter {
         l1_provider: DynProvider<TempoNetwork>,
         genesis_tempo_block_number: u64,
         anchor_config: BatchAnchorConfig,
+        native_proof_signer: PrivateKeySigner,
+    ) -> Self {
+        Self::with_anchor_config_and_witness_source(
+            portal_address,
+            l1_provider,
+            genesis_tempo_block_number,
+            anchor_config,
+            native_proof_signer,
+            Arc::new(UnavailableProverWitnessSource::new(
+                "no local prover witness source configured",
+            )),
+        )
+    }
+
+    /// Create a new batch submitter with custom EIP-2935 anchor limits and a
+    /// local prover witness source.
+    pub fn with_anchor_config_and_witness_source(
+        portal_address: Address,
+        l1_provider: DynProvider<TempoNetwork>,
+        genesis_tempo_block_number: u64,
+        anchor_config: BatchAnchorConfig,
+        native_proof_signer: PrivateKeySigner,
+        prover_witness_source: Arc<dyn ProverWitnessSource>,
     ) -> Self {
         let portal = ZonePortal::new(portal_address, l1_provider.clone());
         Self {
@@ -236,15 +428,9 @@ impl BatchSubmitter {
             genesis_tempo_block_number,
             l1_fetch_concurrency: 16,
             anchor_config,
-            native_proof_signer: None,
+            native_proof_signer,
+            prover_witness_source,
         }
-    }
-
-    /// Configure a local native verifier signer for batches that do not already
-    /// carry externally produced proof material.
-    pub fn with_native_proof_signer(mut self, signer: PrivateKeySigner) -> Self {
-        self.native_proof_signer = Some(signer);
-        self
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -315,14 +501,12 @@ impl BatchSubmitter {
                 batch,
                 &block_transition,
                 &deposit_transition,
+                anchor_mode.ancestry_headers(),
                 anchor_block_number,
                 anchor_block_hash,
             )
             .await
             .wrap_err("failed to build submitBatch proof material")?;
-        validate_proof_material(&verifier_config, &proof)
-            .wrap_err("invalid submitBatch proof material")?;
-
         info!(
             ?anchor_mode,
             recent_tempo_block_number,
@@ -356,11 +540,7 @@ impl BatchSubmitter {
                 proof.clone(),
             )
             .gas(SUBMIT_BATCH_TX_GAS_LIMIT);
-        let preflight = if let Some(signer) = &self.native_proof_signer {
-            preflight.from(signer.address())
-        } else {
-            preflight
-        };
+        let preflight = preflight.from(self.native_proof_signer.address());
         if let Err(err) = preflight.call().await {
             tracing::error!(
                 error = ?err,
@@ -380,11 +560,7 @@ impl BatchSubmitter {
                 proof,
             )
             .gas(SUBMIT_BATCH_TX_GAS_LIMIT);
-        let submit = if let Some(signer) = &self.native_proof_signer {
-            submit.from(signer.address())
-        } else {
-            submit
-        };
+        let submit = submit.from(self.native_proof_signer.address());
         let pending = submit
             .send()
             .await
@@ -554,15 +730,13 @@ impl BatchSubmitter {
             .buffered(concurrency);
 
         let mut headers = Vec::with_capacity(count);
-        let mut prev_hash: Option<B256> = Some(base_hash);
+        let mut prev_hash = base_hash;
 
         while let Some((block_number, header)) = fetched.try_next().await? {
-            if let Some(expected_parent) = prev_hash
-                && header.inner.parent_hash != expected_parent
-            {
+            if header.inner.parent_hash != prev_hash {
                 return Err(eyre::eyre!(
                     "parent-hash chain broken at block {block_number}: \
-                     expected parent_hash={expected_parent}, got={}",
+                     expected parent_hash={prev_hash}, got={}",
                     header.inner.parent_hash
                 ));
             }
@@ -570,7 +744,7 @@ impl BatchSubmitter {
             let mut buf = Vec::with_capacity(600);
             header.encode(&mut buf);
             let header_hash = alloy_primitives::keccak256(&buf);
-            prev_hash = Some(header_hash);
+            prev_hash = header_hash;
 
             headers.push(Bytes::from(buf));
         }
@@ -709,35 +883,38 @@ impl BatchSubmitter {
         batch: &BatchData,
         block_transition: &BlockTransition,
         deposit_transition: &DepositQueueTransition,
+        tempo_ancestry_headers: &[Bytes],
         anchor_block_number: u64,
         anchor_block_hash: B256,
     ) -> Result<(Bytes, Bytes)> {
-        if !batch.verifier_config.is_empty() || !batch.proof.is_empty() {
-            batch.validate_proof_material()?;
-            return Ok((batch.verifier_config.clone(), batch.proof.clone()));
+        match &batch.proof {
+            BatchProofSource::Prebuilt(material) => {
+                Ok((material.verifier_config.clone(), material.proof.clone()))
+            }
+            BatchProofSource::ProverWitness(pending) => {
+                self.native_proof_material(
+                    &self.native_proof_signer,
+                    batch,
+                    pending,
+                    block_transition,
+                    deposit_transition,
+                    tempo_ancestry_headers,
+                    anchor_block_number,
+                    anchor_block_hash,
+                )
+                .await
+            }
         }
-
-        let signer = self.native_proof_signer.as_ref().ok_or_else(|| {
-            eyre::eyre!("missing verifierConfig/proof and no native proof signer configured")
-        })?;
-
-        self.native_proof_material(
-            signer,
-            batch,
-            block_transition,
-            deposit_transition,
-            anchor_block_number,
-            anchor_block_hash,
-        )
-        .await
     }
 
     async fn native_proof_material(
         &self,
         signer: &PrivateKeySigner,
         batch: &BatchData,
+        pending: &PendingProverWitness,
         block_transition: &BlockTransition,
         deposit_transition: &DepositQueueTransition,
+        tempo_ancestry_headers: &[Bytes],
         anchor_block_number: u64,
         anchor_block_hash: B256,
     ) -> Result<(Bytes, Bytes)> {
@@ -774,15 +951,25 @@ impl BatchSubmitter {
             expected_withdrawal_batch_index,
             sequencer,
         };
-        let output = BatchOutput {
-            block_transition: block_transition.clone(),
-            deposit_queue_transition: deposit_transition.clone(),
-            withdrawal_queue_hash: batch.withdrawal_queue_hash,
-            last_batch_commitment: LastBatchCommitment {
-                withdrawal_queue_hash: batch.withdrawal_queue_hash,
-                withdrawal_batch_index: expected_withdrawal_batch_index,
-            },
-        };
+        let witness = self
+            .prover_witness_source
+            .build_witness(ProverWitnessRequest {
+                from_zone_block: pending.from_zone_block,
+                to_zone_block: pending.to_zone_block,
+                batch: UnprovenBatchData::from(batch),
+                public_inputs: public.clone(),
+                tempo_ancestry_headers: tempo_ancestry_headers.to_vec(),
+            })
+            .await
+            .wrap_err("failed to build prover witness for zone batch")?;
+        if witness.public_inputs != public {
+            return Err(eyre::eyre!(
+                "native prover witness public inputs do not match submitBatch inputs"
+            ));
+        }
+        let output =
+            prove_zone_batch(witness).wrap_err("failed to execute native prover witness")?;
+        validate_prover_output_matches_batch(batch, &output)?;
         let digest = native_batch_digest(&config, sequencer, &public, &output)
             .wrap_err("failed to compute native batch digest")?;
         let signature = signer
@@ -973,16 +1160,16 @@ impl BatchSubmitter {
         // Maps portal_slot → last zone L2 block in that batch.
         let mut zone_end_by_slot: BTreeMap<u64, u64> = BTreeMap::new();
         for (&portal_slot, event) in &events {
-            let block = zone_provider
-                .get_block_by_hash(event.nextBlockHash)
-                .await?
-                .ok_or_else(|| {
-                    eyre::eyre!(
-                        "zone block not found for hash {} (portal slot {portal_slot})",
-                        event.nextBlockHash
-                    )
-                })?;
-            zone_end_by_slot.insert(portal_slot, block.number());
+            let block_number =
+                resolve_zone_block_number_by_hash(zone_provider, event.nextBlockHash)
+                    .await?
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "zone block not found for hash {} (portal slot {portal_slot})",
+                            event.nextBlockHash
+                        )
+                    })?;
+            zone_end_by_slot.insert(portal_slot, block_number);
         }
 
         // Step 4: fetch WithdrawalRequested events from zone L2 for each pending slot.
@@ -1249,9 +1436,15 @@ pub(crate) async fn fetch_slot_withdrawals(
         .into_iter()
         .map(|(event, log)| -> Result<_> {
             Ok(RequestedWithdrawalLog {
-                block_number: log.block_number.unwrap_or(0),
-                tx_index: log.transaction_index.unwrap_or(0),
-                log_index: log.log_index.unwrap_or(0),
+                block_number: log
+                    .block_number
+                    .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing block number"))?,
+                tx_index: log.transaction_index.ok_or_else(|| {
+                    eyre::eyre!("WithdrawalRequested log missing transaction index")
+                })?,
+                log_index: log
+                    .log_index
+                    .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing log index"))?,
                 tx_hash: log.transaction_hash.ok_or_else(|| {
                     eyre::eyre!("WithdrawalRequested log missing transaction hash")
                 })?,
@@ -1274,9 +1467,15 @@ pub(crate) async fn fetch_slot_withdrawals(
         .filter(|(event, _)| !event.withdrawalQueueHash.is_zero())
         .map(|(_, log)| -> Result<_> {
             Ok(FinalizedBatchLog {
-                block_number: log.block_number.unwrap_or(0),
-                tx_index: log.transaction_index.unwrap_or(0),
-                log_index: log.log_index.unwrap_or(0),
+                block_number: log
+                    .block_number
+                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing block number"))?,
+                tx_index: log
+                    .transaction_index
+                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction index"))?,
+                log_index: log
+                    .log_index
+                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing log index"))?,
                 tx_hash: log
                     .transaction_hash
                     .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?,
@@ -1295,12 +1494,15 @@ pub(crate) async fn fetch_slot_withdrawals(
 
     let mut withdrawals = Vec::new();
     for finalized_batch in finalized_batches {
-        let requests = requests_by_block
-            .remove(&finalized_batch.block_number)
-            .unwrap_or_default();
-        if requests.is_empty() {
+        let Some(requests) = requests_by_block.remove(&finalized_batch.block_number) else {
             return Err(eyre::eyre!(
                 "BatchFinalized at zone block {} has no matching WithdrawalRequested events",
+                finalized_batch.block_number
+            ));
+        };
+        if requests.is_empty() {
+            return Err(eyre::eyre!(
+                "BatchFinalized at zone block {} matched an empty WithdrawalRequested group",
                 finalized_batch.block_number
             ));
         }
@@ -1352,6 +1554,77 @@ pub(crate) async fn fetch_slot_withdrawals(
     }
 
     Ok(withdrawals)
+}
+
+pub(crate) async fn derive_zone_block_hash_for_range(
+    provider: &DynProvider<TempoNetwork>,
+    from: u64,
+    to: u64,
+    prev_zone_block_hash: B256,
+) -> Result<B256> {
+    if from > to {
+        return Err(eyre::eyre!("invalid zone block range {from}..={to}"));
+    }
+
+    let mut parent_hash = prev_zone_block_hash;
+    for number in from..=to {
+        let block = provider
+            .get_block_by_number(number.into())
+            .await?
+            .ok_or_else(|| eyre::eyre!("zone block {number} not found"))?;
+        parent_hash = zone_header_hash_from_block_header(&block.header.inner, parent_hash);
+    }
+
+    Ok(parent_hash)
+}
+
+pub(crate) async fn resolve_zone_block_number_by_hash(
+    provider: &DynProvider<TempoNetwork>,
+    zone_block_hash: B256,
+) -> Result<Option<u64>> {
+    if zone_block_hash.is_zero() {
+        return Ok(Some(0));
+    }
+
+    if let Some(block) = provider.get_block_by_hash(zone_block_hash).await? {
+        return Ok(Some(block.number()));
+    }
+
+    let latest = provider.get_block_number().await?;
+    let mut previous_zone_hash = B256::ZERO;
+
+    for number in 0..=latest {
+        let block = provider
+            .get_block_by_number(number.into())
+            .await?
+            .ok_or_else(|| eyre::eyre!("zone block {number} not found"))?;
+        let parent_hash = if number == 0 {
+            block.header.inner.parent_hash()
+        } else {
+            previous_zone_hash
+        };
+        let zone_hash = zone_header_hash_from_block_header(&block.header.inner, parent_hash);
+        if zone_hash == zone_block_hash {
+            return Ok(Some(number));
+        }
+        previous_zone_hash = zone_hash;
+    }
+
+    Ok(None)
+}
+
+fn zone_header_hash_from_block_header(header: &impl BlockHeader, parent_hash: B256) -> B256 {
+    ZoneHeader {
+        parent_hash,
+        beneficiary: header.beneficiary(),
+        state_root: header.state_root(),
+        transactions_root: header.transactions_root(),
+        receipts_root: header.receipts_root(),
+        number: header.number(),
+        timestamp: header.timestamp(),
+        protocol_version: ZONE_BLOCK_PROTOCOL_VERSION,
+    }
+    .hash()
 }
 
 /// Lazily split an inclusive block range into bounded query windows.
@@ -1427,6 +1700,15 @@ impl AnchorMode {
             Self::Ancestry { anchor_block, .. } => *anchor_block,
         }
     }
+
+    fn ancestry_headers(&self) -> &[Bytes] {
+        match self {
+            Self::Direct => &[],
+            Self::Ancestry {
+                ancestry_headers, ..
+            } => ancestry_headers,
+        }
+    }
 }
 
 /// A step split point for stepping mode: identifies a zone L2 block at which
@@ -1457,6 +1739,7 @@ mod tests {
     use super::*;
     use crate::abi;
     use alloy_primitives::{B256, address};
+    use zone_prover::types::LastBatchCommitment;
 
     fn test_withdrawal(to: Address, amount: u128) -> abi::Withdrawal {
         abi::Withdrawal {
@@ -1486,7 +1769,7 @@ mod tests {
     }
 
     fn valid_batch_data() -> BatchData {
-        BatchData {
+        UnprovenBatchData {
             tempo_block_number: 1,
             prev_block_hash: B256::repeat_byte(0x01),
             next_block_hash: B256::repeat_byte(0x02),
@@ -1495,20 +1778,93 @@ mod tests {
             prev_deposit_number: 0,
             next_deposit_number: 0,
             withdrawal_queue_hash: B256::ZERO,
-            verifier_config: Bytes::from_static(b"config"),
-            proof: Bytes::from_static(b"proof"),
+        }
+        .with_proof(BatchProofSource::Prebuilt(
+            BatchProofMaterial::new(Bytes::from_static(b"config"), Bytes::from_static(b"proof"))
+                .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn unproven_batch_data_becomes_batch_data_only_with_proof_source() {
+        let unproven = UnprovenBatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::repeat_byte(0x01),
+            next_block_hash: B256::repeat_byte(0x02),
+            prev_processed_deposit_hash: B256::repeat_byte(0x03),
+            next_processed_deposit_hash: B256::repeat_byte(0x04),
+            prev_deposit_number: 0,
+            next_deposit_number: 1,
+            withdrawal_queue_hash: B256::repeat_byte(0x05),
+        };
+
+        let batch = unproven.clone().with_proof(BatchProofSource::Prebuilt(
+            BatchProofMaterial::new(Bytes::from_static(b"config"), Bytes::from_static(b"proof"))
+                .unwrap(),
+        ));
+
+        assert_eq!(batch.tempo_block_number, unproven.tempo_block_number);
+        assert_eq!(batch.next_deposit_number, unproven.next_deposit_number);
+        assert_eq!(batch.withdrawal_queue_hash, unproven.withdrawal_queue_hash);
+        assert!(matches!(batch.proof, BatchProofSource::Prebuilt(_)));
+    }
+
+    fn batch_output_for(batch: &BatchData) -> BatchOutput {
+        BatchOutput {
+            block_transition: BlockTransition {
+                prevBlockHash: batch.prev_block_hash,
+                nextBlockHash: batch.next_block_hash,
+            },
+            deposit_queue_transition: DepositQueueTransition {
+                prevProcessedHash: batch.prev_processed_deposit_hash,
+                nextProcessedHash: batch.next_processed_deposit_hash,
+                prevDepositNumber: batch.prev_deposit_number,
+                nextDepositNumber: batch.next_deposit_number,
+            },
+            withdrawal_queue_hash: batch.withdrawal_queue_hash,
+            last_batch_commitment: LastBatchCommitment {
+                withdrawal_queue_hash: batch.withdrawal_queue_hash,
+                withdrawal_batch_index: 1,
+            },
         }
     }
 
     #[test]
-    fn batch_data_rejects_empty_verifier_material() {
-        let mut batch = valid_batch_data();
-        batch.verifier_config = Bytes::new();
-        assert!(batch.validate_proof_material().is_err());
+    fn proof_material_rejects_empty_verifier_material() {
+        assert!(
+            BatchProofMaterial::new(Bytes::new(), Bytes::from_static(b"proof"))
+                .unwrap_err()
+                .to_string()
+                .contains("missing verifierConfig")
+        );
+        assert!(
+            BatchProofMaterial::new(Bytes::from_static(b"config"), Bytes::new())
+                .unwrap_err()
+                .to_string()
+                .contains("missing proof")
+        );
+    }
 
-        let mut batch = valid_batch_data();
-        batch.proof = Bytes::new();
-        assert!(batch.validate_proof_material().is_err());
+    #[test]
+    fn prover_output_validation_accepts_matching_batch_fields() {
+        let batch = valid_batch_data();
+        let output = batch_output_for(&batch);
+
+        validate_prover_output_matches_batch(&batch, &output).unwrap();
+    }
+
+    #[test]
+    fn prover_output_validation_rejects_mutated_block_hash() {
+        let batch = valid_batch_data();
+        let mut output = batch_output_for(&batch);
+        output.block_transition.nextBlockHash = B256::repeat_byte(0xee);
+
+        let err = validate_prover_output_matches_batch(&batch, &output).unwrap_err();
+
+        assert!(
+            err.to_string().contains("nextBlockHash mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportResult;
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
+pub use zone_prover::types::BatchWitness;
 
 pub mod abi {
     pub use tempo_zone_contracts::*;
@@ -24,7 +25,11 @@ pub mod settlement;
 pub mod withdrawals;
 
 pub use monitor::{ZoneMonitorConfig, spawn_zone_monitor};
-pub use settlement::{BatchAnchorConfig, BatchData, BatchSubmitter};
+pub use settlement::{
+    BatchAnchorConfig, BatchData, BatchProofMaterial, BatchProofSource, BatchSubmitter,
+    PendingProverWitness, ProverWitnessRequest, ProverWitnessSource,
+    UnavailableProverWitnessSource, UnprovenBatchData,
+};
 pub use withdrawals::{SharedWithdrawalStore, WithdrawalProcessorConfig, WithdrawalStore};
 
 use crate::rpc::rpc_connection_config;
@@ -54,6 +59,8 @@ pub struct ZoneSequencerConfig {
     pub batch_interval: Duration,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Source for full prover witnesses used by local native proof signing.
+    pub prover_witness_source: Arc<dyn ProverWitnessSource>,
 }
 
 /// Handles returned by [`spawn_zone_sequencer`] for managing background tasks.
@@ -109,7 +116,8 @@ pub async fn spawn_zone_sequencer(
         batch_interval: config.batch_interval,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
-        native_proof_signer: Some(native_proof_signer),
+        prover_witness_source: config.prover_witness_source.clone(),
+        native_proof_signer,
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(

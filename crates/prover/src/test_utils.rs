@@ -13,9 +13,10 @@ use zone_primitives::{
 };
 
 use crate::types::{
-    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, TempoHardfork, ZoneAccountRead,
-    ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneCfgEnvWitness,
-    ZoneStateWitness, ZoneStorageRead,
+    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, TempoHardfork, ZoneAccountCode,
+    ZoneAccountRead, ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness,
+    ZoneCfgEnvWitness, ZoneStateWitness, ZoneStorageRead, ZoneTempoImport,
+    ZoneWithdrawalFinalization,
 };
 
 const TEST_INBOX_CONTRACT_CODE: &[u8] = &[0x00];
@@ -64,23 +65,19 @@ pub(crate) fn minimal_batch_witness() -> BatchWitness {
                 enable_amsterdam_eip8037: false,
             },
             execution_context: ZoneBlockExecutionContextWitness {
-                parent_beacon_block_root: None,
+                parent_beacon_block_root: B256::ZERO,
                 extra_data: Bytes::new(),
             },
             block_env: ZoneBlockEnvWitness {
                 gas_limit: 30_000_000,
                 basefee: 0,
                 difficulty: U256::ZERO,
-                prevrandao: Some(B256::ZERO),
+                prevrandao: B256::ZERO,
                 slot_num: 0,
                 timestamp_millis_part: 0,
             },
-            tempo_header_rlp: None,
-            deposits: Vec::new(),
-            decryptions: Vec::new(),
-            enabled_tokens: Vec::new(),
-            finalize_withdrawal_batch_count: Some(U256::ZERO),
-            finalize_withdrawal_encrypted_senders: Vec::new(),
+            tempo_import: ZoneTempoImport::none(),
+            withdrawal_finalization: ZoneWithdrawalFinalization::finalize(U256::ZERO, Vec::new()),
             transactions: Vec::new(),
         }],
         initial_zone_state,
@@ -114,7 +111,7 @@ fn absent_account_read(account: Address) -> ZoneAccountRead {
         balance: U256::ZERO,
         storage_root: EMPTY_TRIE_ROOT,
         code_hash: KECCAK_EMPTY,
-        code: None,
+        code: ZoneAccountCode::empty(),
         proof_node_hashes: Vec::new(),
     }
 }
@@ -200,7 +197,7 @@ fn tempo_bound_zone_state(
         balance: tempo_trie_account.balance,
         storage_root: tempo_trie_account.storage_root,
         code_hash: tempo_trie_account.code_hash,
-        code: None,
+        code: ZoneAccountCode::empty(),
         proof_node_hashes: Vec::new(),
     };
     let zone_inbox_account_read = ZoneAccountRead {
@@ -209,7 +206,7 @@ fn tempo_bound_zone_state(
         balance: zone_inbox_trie_account.balance,
         storage_root: zone_inbox_trie_account.storage_root,
         code_hash: zone_inbox_trie_account.code_hash,
-        code: Some(Bytes::copy_from_slice(TEST_INBOX_CONTRACT_CODE)),
+        code: ZoneAccountCode::bytecode(Bytes::copy_from_slice(TEST_INBOX_CONTRACT_CODE)),
         proof_node_hashes: Vec::new(),
     };
     let zone_outbox_account_read = ZoneAccountRead {
@@ -218,7 +215,7 @@ fn tempo_bound_zone_state(
         balance: zone_outbox_trie_account.balance,
         storage_root: zone_outbox_trie_account.storage_root,
         code_hash: zone_outbox_trie_account.code_hash,
-        code: Some(outbox_code),
+        code: ZoneAccountCode::bytecode(outbox_code),
         proof_node_hashes: Vec::new(),
     };
     let mut storage_reads = vec![

@@ -26,24 +26,25 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{ContractError, SolInterface as _};
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::{Result, WrapErr};
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
 
-use alloy_sol_types::{ContractError, SolInterface as _};
-
 use crate::{
     abi::{self, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
-        AnchorGapKind, BatchAnchorConfig, BatchData, BatchSubmitter, LOG_QUERY_BLOCK_CHUNK,
-        ZoneBlockSnapshot, fetch_slot_withdrawals, log_query_ranges,
+        AnchorGapKind, BatchAnchorConfig, BatchData, BatchProofSource, BatchSubmitter,
+        LOG_QUERY_BLOCK_CHUNK, PendingProverWitness, ProverWitnessSource, UnprovenBatchData,
+        ZoneBlockSnapshot, derive_zone_block_hash_for_range, fetch_slot_withdrawals,
+        log_query_ranges, resolve_zone_block_number_by_hash,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -177,9 +178,12 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
-    /// Sequencer key used to produce native local verifier proofs when a batch
-    /// does not carry externally produced proof material.
-    pub native_proof_signer: Option<PrivateKeySigner>,
+    /// Witness source used to turn unproven batch proposals into submit-ready
+    /// [`BatchData`] before local native proof signing.
+    pub prover_witness_source: Arc<dyn ProverWitnessSource>,
+    /// Sequencer key used to produce native local verifier proofs for witnessed
+    /// batches that do not carry externally produced proof material.
+    pub native_proof_signer: PrivateKeySigner,
 }
 
 /// Monitors the Zone L2 chain for new blocks, aggregates them into batches, and
@@ -298,15 +302,14 @@ impl ZoneMonitor {
                 .await
                 .wrap_err("failed to read genesisTempoBlockNumber during zone monitor startup")?;
 
-        let mut batch_submitter = BatchSubmitter::with_anchor_config(
+        let batch_submitter = BatchSubmitter::with_anchor_config_and_witness_source(
             config.portal_address,
             l1_provider,
             genesis_tempo_block_number,
             config.batch_anchor_config,
+            config.native_proof_signer.clone(),
+            config.prover_witness_source.clone(),
         );
-        if let Some(signer) = config.native_proof_signer.clone() {
-            batch_submitter = batch_submitter.with_native_proof_signer(signer);
-        }
 
         let (prev_zone_block_hash, portal_withdrawal_queue_tail) = tokio::try_join!(
             batch_submitter.read_portal_block_hash(),
@@ -424,9 +427,17 @@ impl ZoneMonitor {
                 continue;
             }
 
-            batch_deadline = tokio::time::Instant::now()
-                .checked_add(self.config.batch_interval)
-                .unwrap_or_else(tokio::time::Instant::now);
+            let now = tokio::time::Instant::now();
+            batch_deadline = match now.checked_add(self.config.batch_interval) {
+                Some(deadline) => deadline,
+                None => {
+                    warn!(
+                        batch_interval_ms = duration_millis_u64(self.config.batch_interval),
+                        "batch interval overflowed tokio::time::Instant; submitting on next monitor tick"
+                    );
+                    now
+                }
+            };
         }
     }
 
@@ -571,7 +582,7 @@ impl ZoneMonitor {
         info!(from, to, block_count, "Processing zone block range");
 
         // Read end-of-range state to check the anchor gap class.
-        let end_state = self.fetch_block_snapshot(to).await?;
+        let end_state = self.fetch_block_snapshot(from, to).await?;
 
         // Lightweight gap check — no header fetching, just arithmetic.
         let gap_kind = self
@@ -608,7 +619,7 @@ impl ZoneMonitor {
             );
         }
 
-        let batch_data = BatchData {
+        let batch_data = UnprovenBatchData {
             tempo_block_number: end_state.tempo_block_number,
             prev_block_hash: self.prev_zone_block_hash,
             next_block_hash: end_state.block_hash,
@@ -617,9 +628,8 @@ impl ZoneMonitor {
             prev_deposit_number: self.prev_processed_deposit_number,
             next_deposit_number: end_state.processed_deposit_number,
             withdrawal_queue_hash,
-            verifier_config: Bytes::new(),
-            proof: Bytes::new(),
         };
+        let batch_data = self.attach_prover_witness(batch_data, from, to).await?;
 
         self.submit_batch_with_retry(&batch_data, to, all_withdrawals)
             .await?;
@@ -637,7 +647,7 @@ impl ZoneMonitor {
     ) -> Result<()> {
         // Read the tempo_block_number from the start of the range — this is the
         // oldest value that needs to be anchored.
-        let start_state = self.fetch_block_snapshot(from).await?;
+        let start_state = self.fetch_block_snapshot(from, from).await?;
         let current_l1_block = self
             .batch_submitter
             .l1_provider()
@@ -681,13 +691,13 @@ impl ZoneMonitor {
         let mut range_start = from;
 
         for (step_idx, &step_end) in boundaries.iter().enumerate() {
-            let step_state = self.fetch_block_snapshot(step_end).await?;
+            let step_state = self.fetch_block_snapshot(range_start, step_end).await?;
 
             let step_withdrawals =
                 fetch_slot_withdrawals(&self.outbox, &self.provider, range_start, step_end).await?;
             let withdrawal_queue_hash = abi::Withdrawal::queue_hash(&step_withdrawals);
 
-            let batch_data = BatchData {
+            let batch_data = UnprovenBatchData {
                 tempo_block_number: step_state.tempo_block_number,
                 prev_block_hash: self.prev_zone_block_hash,
                 next_block_hash: step_state.block_hash,
@@ -696,9 +706,10 @@ impl ZoneMonitor {
                 prev_deposit_number: self.prev_processed_deposit_number,
                 next_deposit_number: step_state.processed_deposit_number,
                 withdrawal_queue_hash,
-                verifier_config: Bytes::new(),
-                proof: Bytes::new(),
             };
+            let batch_data = self
+                .attach_prover_witness(batch_data, range_start, step_end)
+                .await?;
 
             info!(
                 step = step_idx.checked_add(1).unwrap_or(total_steps),
@@ -720,29 +731,39 @@ impl ZoneMonitor {
         Ok(())
     }
 
-    /// Read the zone state at block `to`: tempo block number, processed deposit
-    /// queue hash, and block hash.
-    async fn fetch_block_snapshot(&self, to: u64) -> Result<ZoneBlockSnapshot> {
+    async fn attach_prover_witness(
+        &self,
+        batch: UnprovenBatchData,
+        from_zone_block: u64,
+        to_zone_block: u64,
+    ) -> Result<BatchData> {
+        Ok(
+            batch.with_proof(BatchProofSource::ProverWitness(PendingProverWitness {
+                from_zone_block,
+                to_zone_block,
+            })),
+        )
+    }
+
+    /// Read the zone state at block `to` and derive the compact ZoneHeader hash
+    /// for the inclusive range `from..=to`, seeded by the portal-confirmed
+    /// previous ZoneHeader hash.
+    async fn fetch_block_snapshot(&self, from: u64, to: u64) -> Result<ZoneBlockSnapshot> {
         let tempo_call = self.tempo_state.tempoBlockNumber().block(to.into());
         let deposit_call = self.inbox.processedDepositQueueHash().block(to.into());
         let deposit_number_call = self.inbox.processedDepositNumber().block(to.into());
-        let block_fut = async {
-            self.provider
-                .get_block_by_number(to.into())
-                .await
-                .map_err(Into::into)
-        };
-        let (tempo_block_number, processed_deposit_hash, processed_deposit_number, block) = tokio::try_join!(
+        let block_hash_fut =
+            derive_zone_block_hash_for_range(&self.provider, from, to, self.prev_zone_block_hash);
+        let (tempo_block_number, processed_deposit_hash, processed_deposit_number, block_hash) = tokio::join!(
             tempo_call.call(),
             deposit_call.call(),
             deposit_number_call.call(),
-            block_fut,
-        )?;
-
-        let block_hash = block
-            .ok_or_else(|| eyre::eyre!("zone block {to} not found"))?
-            .header
-            .hash;
+            block_hash_fut,
+        );
+        let tempo_block_number = tempo_block_number?;
+        let processed_deposit_hash = processed_deposit_hash?;
+        let processed_deposit_number = processed_deposit_number?;
+        let block_hash = block_hash?;
 
         Ok(ZoneBlockSnapshot {
             tempo_block_number,
@@ -1138,12 +1159,8 @@ impl ZoneMonitor {
         provider: &DynProvider<TempoNetwork>,
         zone_block_hash: B256,
     ) -> u64 {
-        if zone_block_hash.is_zero() {
-            return 0;
-        }
-
-        match provider.get_block_by_hash(zone_block_hash).await {
-            Ok(Some(block)) => block.number(),
+        match resolve_zone_block_number_by_hash(provider, zone_block_hash).await {
+            Ok(Some(block_number)) => block_number,
             Ok(None) => {
                 warn!(
                     %zone_block_hash,
@@ -1300,10 +1317,18 @@ mod tests {
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
 
+    use crate::settlement::BatchProofMaterial;
+
     fn mock_provider(asserter: Asserter) -> DynProvider<TempoNetwork> {
         ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter)
             .erased()
+    }
+
+    fn unavailable_witness_source() -> Arc<dyn ProverWitnessSource> {
+        Arc::new(crate::settlement::UnavailableProverWitnessSource::new(
+            "test witness source unavailable",
+        ))
     }
 
     fn abi_encode_b256(value: B256) -> Bytes {
@@ -1414,7 +1439,8 @@ mod tests {
             batch_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
-            native_proof_signer: None,
+            prover_witness_source: unavailable_witness_source(),
+            native_proof_signer: PrivateKeySigner::random(),
         };
         let zone_provider = mock_provider(zone);
         let l1_provider = mock_provider(l1);
@@ -1427,7 +1453,12 @@ mod tests {
             inbox: ZoneInbox::new(Address::repeat_byte(0x33), zone_provider.clone()),
             tempo_state: TempoState::new(Address::repeat_byte(0x44), zone_provider),
             withdrawal_store: SharedWithdrawalStore::new(),
-            batch_submitter: BatchSubmitter::new(portal_address, l1_provider, 0),
+            batch_submitter: BatchSubmitter::new(
+                portal_address,
+                l1_provider,
+                0,
+                PrivateKeySigner::random(),
+            ),
             withdrawal_notify: Arc::new(Notify::new()),
             repair_notify: Arc::new(Notify::new()),
             last_submitted_zone_block: 10,
@@ -1437,6 +1468,37 @@ mod tests {
             portal_withdrawal_queue_tail: 3,
             latest_observed_zone_block: 50,
         }
+    }
+
+    fn unproven_batch_data() -> UnprovenBatchData {
+        UnprovenBatchData {
+            tempo_block_number: 123,
+            prev_block_hash: B256::repeat_byte(0x99),
+            next_block_hash: B256::repeat_byte(0x55),
+            prev_processed_deposit_hash: B256::repeat_byte(0x77),
+            next_processed_deposit_hash: B256::repeat_byte(0x66),
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_prover_witness_records_pending_range() {
+        let monitor = test_monitor(Asserter::new(), Asserter::new());
+
+        let batch = monitor
+            .attach_prover_witness(unproven_batch_data(), 11, 12)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            batch.proof,
+            BatchProofSource::ProverWitness(PendingProverWitness {
+                from_zone_block: 11,
+                to_zone_block: 12
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1454,7 +1516,8 @@ mod tests {
             batch_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
-            native_proof_signer: None,
+            prover_witness_source: unavailable_witness_source(),
+            native_proof_signer: PrivateKeySigner::random(),
         };
 
         l1.push_failure_msg("boom");
@@ -1627,8 +1690,13 @@ mod tests {
             prev_deposit_number: 0,
             next_deposit_number: 0,
             withdrawal_queue_hash: B256::ZERO,
-            verifier_config: Bytes::from_static(b"test-config"),
-            proof: Bytes::from_static(b"test-proof"),
+            proof: BatchProofSource::Prebuilt(
+                BatchProofMaterial::new(
+                    Bytes::from_static(b"test-config"),
+                    Bytes::from_static(b"test-proof"),
+                )
+                .unwrap(),
+            ),
         };
 
         monitor
@@ -1674,8 +1742,13 @@ mod tests {
             prev_deposit_number: 0,
             next_deposit_number: 0,
             withdrawal_queue_hash: B256::repeat_byte(0x44),
-            verifier_config: Bytes::from_static(b"test-config"),
-            proof: Bytes::from_static(b"test-proof"),
+            proof: BatchProofSource::Prebuilt(
+                BatchProofMaterial::new(
+                    Bytes::from_static(b"test-config"),
+                    Bytes::from_static(b"test-proof"),
+                )
+                .unwrap(),
+            ),
         };
         let withdrawals = vec![abi::Withdrawal {
             token,

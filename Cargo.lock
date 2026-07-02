@@ -13646,6 +13646,7 @@ dependencies = [
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
+ "reth-trie-common",
  "revm",
  "serde",
  "serde_json",
@@ -13671,6 +13672,7 @@ dependencies = [
  "zone-payload",
  "zone-precompiles",
  "zone-primitives",
+ "zone-prover",
  "zone-rpc",
  "zone-sequencer",
 ]
@@ -13788,6 +13790,7 @@ dependencies = [
  "alloy-sol-types",
  "alloy-trie",
  "const-hex",
+ "k256",
  "reth-primitives-traits",
  "reth-trie-common",
  "reth-trie-sparse",
@@ -13867,6 +13870,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tracing",
+ "zone-primitives",
  "zone-prover",
 ]
 

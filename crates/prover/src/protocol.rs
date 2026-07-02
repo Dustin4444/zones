@@ -290,25 +290,78 @@ fn validate_native_output(
 }
 
 pub fn registration_digest(report: &RegistrationReport) -> B256 {
-    registration_digest_inner(report, keccak256(report.attestation_doc.as_ref()))
+    registration_digest_fields(
+        report.version,
+        report.request_id,
+        report.nonce,
+        report.signer,
+        report.public_key_uncompressed.as_ref(),
+        &report.expected_pcr0,
+        &report.expected_pcr1,
+        &report.expected_pcr2,
+        keccak256(report.attestation_doc.as_ref()),
+    )
 }
 
 pub fn registration_challenge_digest(report: &RegistrationReport) -> B256 {
-    registration_digest_inner(report, B256::ZERO)
+    registration_digest_fields(
+        report.version,
+        report.request_id,
+        report.nonce,
+        report.signer,
+        report.public_key_uncompressed.as_ref(),
+        &report.expected_pcr0,
+        &report.expected_pcr1,
+        &report.expected_pcr2,
+        B256::ZERO,
+    )
 }
 
-fn registration_digest_inner(report: &RegistrationReport, attestation_doc_hash: B256) -> B256 {
+pub(crate) fn registration_challenge_digest_fields(
+    version: u16,
+    request_id: B256,
+    nonce: B256,
+    signer: Address,
+    public_key_uncompressed: &[u8],
+    expected_pcr0: &NitroPcr,
+    expected_pcr1: &NitroPcr,
+    expected_pcr2: &NitroPcr,
+) -> B256 {
+    registration_digest_fields(
+        version,
+        request_id,
+        nonce,
+        signer,
+        public_key_uncompressed,
+        expected_pcr0,
+        expected_pcr1,
+        expected_pcr2,
+        B256::ZERO,
+    )
+}
+
+pub(crate) fn registration_digest_fields(
+    version: u16,
+    request_id: B256,
+    nonce: B256,
+    signer: Address,
+    public_key_uncompressed: &[u8],
+    expected_pcr0: &NitroPcr,
+    expected_pcr1: &NitroPcr,
+    expected_pcr2: &NitroPcr,
+    attestation_doc_hash: B256,
+) -> B256 {
     keccak256(
         (
             keccak256(REGISTRATION_DOMAIN.as_bytes()),
-            report.version,
-            report.request_id,
-            report.nonce,
-            report.signer,
-            keccak256(report.public_key_uncompressed.as_ref()),
-            pcr_hash(&report.expected_pcr0),
-            pcr_hash(&report.expected_pcr1),
-            pcr_hash(&report.expected_pcr2),
+            version,
+            request_id,
+            nonce,
+            signer,
+            keccak256(public_key_uncompressed),
+            pcr_hash(expected_pcr0),
+            pcr_hash(expected_pcr1),
+            pcr_hash(expected_pcr2),
             attestation_doc_hash,
         )
             .abi_encode_params(),
@@ -499,7 +552,7 @@ mod tests {
     use alloy_primitives::{B256, address};
 
     use super::*;
-    use crate::{crypto::EnclaveSigningKey, types::prove_empty_zone_batch};
+    use crate::{crypto::EnclaveSigningKey, types::prove_zone_batch};
 
     fn request_for(key: &EnclaveSigningKey) -> ProofRequest {
         ProofRequest {
@@ -524,7 +577,7 @@ mod tests {
     fn digest_changes_when_required_public_output_changes() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
         let base = batch_digest(&request, &output);
         output.block_transition.nextBlockHash = B256::repeat_byte(0xee);
         assert_ne!(base, batch_digest(&request, &output));
@@ -535,7 +588,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let config = native_config();
-        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
         let public = &request.witness.public_inputs;
         let base = native_batch_digest(&config, key.address(), public, &output).unwrap();
         output.block_transition.nextBlockHash = B256::repeat_byte(0xee);
@@ -551,7 +604,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let public = &request.witness.public_inputs;
-        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_zone_batch(request.witness.clone()).unwrap();
         let config = native_config();
         let digest = native_batch_digest(&config, key.address(), public, &output).unwrap();
         let signature = key.sign_digest(digest);
@@ -585,7 +638,7 @@ mod tests {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
         let public = &request.witness.public_inputs;
-        let mut output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let mut output = prove_zone_batch(request.witness.clone()).unwrap();
         let config = native_config();
         output.last_batch_commitment.withdrawal_batch_index = output
             .last_batch_commitment
@@ -605,7 +658,7 @@ mod tests {
     fn rejects_signed_envelope_without_valid_attestation_doc() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_zone_batch(request.witness.clone()).unwrap();
         let digest = batch_digest(&request, &output);
         let envelope = ProofEnvelope {
             version: PROTOCOL_VERSION,
@@ -629,7 +682,7 @@ mod tests {
     fn rejects_forged_output_even_when_digest_was_signed() {
         let key = EnclaveSigningKey::from_secret_bytes([9u8; 32]).unwrap();
         let request = request_for(&key);
-        let output = prove_empty_zone_batch(request.witness.clone()).unwrap();
+        let output = prove_zone_batch(request.witness.clone()).unwrap();
         let digest = batch_digest(&request, &output);
         let mut envelope = ProofEnvelope {
             version: PROTOCOL_VERSION,

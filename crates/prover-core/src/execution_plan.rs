@@ -1,21 +1,25 @@
 use alloc::vec::Vec;
 
 use alloy_consensus::{
-    Signed, TxLegacy,
+    Signed, Transaction, TxLegacy,
     transaction::{Recovered, SignerRecoverable},
 };
 use alloy_eips::eip2718::Decodable2718;
 use alloy_evm::FromRecoveredTx;
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_sol_types::SolCall;
+use tempo_precompiles::tip20::ITIP20;
 use tempo_primitives::{
-    TempoTxEnvelope,
+    TempoAddressExt, TempoTxEnvelope,
     transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
 };
 use tempo_zone_contracts::{ZoneInbox, ZoneOutbox};
 use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
-use crate::{BatchWitness, ProverError, ZoneBlock, ZoneTxEnv};
+use crate::{
+    BatchWitness, ProverError, ZoneAdvanceTempo, ZoneBlock, ZoneTempoImport, ZoneTxEnv,
+    ZoneWithdrawalFinalization,
+};
 
 pub type RecoveredTempoTx = Recovered<TempoTxEnvelope>;
 
@@ -46,20 +50,14 @@ impl ZoneBlockExecutionPlan {
     pub fn from_block(block_index: usize, block: &ZoneBlock) -> Result<Self, ProverError> {
         let mut transactions = Vec::new();
 
-        match &block.tempo_header_rlp {
-            Some(header) => {
+        match &block.tempo_import {
+            ZoneTempoImport::Advance(import) => {
                 transactions.push(PlannedZoneTransaction {
                     kind: PlannedZoneTransactionKind::AdvanceTempo,
-                    tx: build_advance_tempo_tx(block, header.clone()),
+                    tx: build_advance_tempo_tx(import),
                 });
             }
-            None if !block.deposits.is_empty()
-                || !block.decryptions.is_empty()
-                || !block.enabled_tokens.is_empty() =>
-            {
-                return Err(ProverError::DepositProcessingUnsupported { index: block_index });
-            }
-            None => {}
+            ZoneTempoImport::None => {}
         }
 
         for (transaction_index, raw) in block.transactions.iter().enumerate() {
@@ -75,6 +73,7 @@ impl ZoneBlockExecutionPlan {
                     transaction_index,
                 }
             })?;
+            validate_user_transaction(block_index, transaction_index, &tx)?;
 
             transactions.push(PlannedZoneTransaction {
                 kind: PlannedZoneTransactionKind::User { transaction_index },
@@ -82,25 +81,98 @@ impl ZoneBlockExecutionPlan {
             });
         }
 
-        match block.finalize_withdrawal_batch_count {
-            Some(count) => {
+        match &block.withdrawal_finalization {
+            ZoneWithdrawalFinalization::Finalize(finalization) => {
                 transactions.push(PlannedZoneTransaction {
                     kind: PlannedZoneTransactionKind::FinalizeWithdrawalBatch,
                     tx: build_finalize_withdrawal_batch_tx(
-                        count,
+                        finalization.count,
                         block.number,
-                        block.finalize_withdrawal_encrypted_senders.clone(),
+                        finalization.encrypted_senders.clone(),
                     ),
                 });
             }
-            None if !block.finalize_withdrawal_encrypted_senders.is_empty() => {
-                return Err(ProverError::NonZeroWithdrawalFinalizationUnsupported);
-            }
-            None => {}
+            ZoneWithdrawalFinalization::None => {}
         }
 
         Ok(Self { transactions })
     }
+}
+
+fn validate_user_transaction(
+    block_index: usize,
+    transaction_index: usize,
+    tx: &RecoveredTempoTx,
+) -> Result<(), ProverError> {
+    if !tx.inner().value().is_zero() {
+        return Err(ProverError::UserTransactionValueUnsupported {
+            block_index,
+            transaction_index,
+            value: tx.inner().value(),
+        });
+    }
+
+    if tx
+        .inner()
+        .authorization_list()
+        .is_some_and(|authorizations| !authorizations.is_empty())
+    {
+        return Err(ProverError::UserTransactionAuthorizationListUnsupported {
+            block_index,
+            transaction_index,
+        });
+    }
+
+    let tx_env = ZoneTxEnv::from_recovered_tx(tx.inner(), tx.signer());
+    let mut saw_call = false;
+    for (call_index, (target, input)) in tx_env.calls().enumerate() {
+        saw_call = true;
+        let TxKind::Call(target) = *target else {
+            return Err(ProverError::UserTransactionCreateUnsupported {
+                block_index,
+                transaction_index,
+                call_index,
+            });
+        };
+
+        if !is_allowed_user_call(target, input) {
+            return Err(ProverError::UserTransactionTargetUnsupported {
+                block_index,
+                transaction_index,
+                call_index,
+                target,
+            });
+        }
+    }
+
+    if !saw_call {
+        return Err(ProverError::UserTransactionCreateUnsupported {
+            block_index,
+            transaction_index,
+            call_index: 0,
+        });
+    }
+
+    Ok(())
+}
+
+fn is_allowed_user_call(target: Address, input: &[u8]) -> bool {
+    target.is_tip20() && call_selector(input).is_some_and(is_allowed_tip20_user_transfer_selector)
+}
+
+fn is_allowed_tip20_user_transfer_selector(selector: [u8; 4]) -> bool {
+    matches!(
+        selector,
+        ITIP20::transferCall::SELECTOR
+            | ITIP20::transferWithMemoCall::SELECTOR
+            | ITIP20::transferFromCall::SELECTOR
+            | ITIP20::transferFromWithMemoCall::SELECTOR
+    )
+}
+
+fn call_selector(input: &[u8]) -> Option<[u8; 4]> {
+    let selector = input.get(..4)?;
+    Some([selector[0], selector[1], selector[2], selector[3]])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,12 +194,12 @@ pub enum PlannedZoneTransactionKind {
     FinalizeWithdrawalBatch,
 }
 
-fn build_advance_tempo_tx(block: &ZoneBlock, header: Bytes) -> RecoveredTempoTx {
+fn build_advance_tempo_tx(import: &ZoneAdvanceTempo) -> RecoveredTempoTx {
     let calldata = ZoneInbox::advanceTempoCall {
-        header,
-        deposits: block.deposits.clone(),
-        decryptions: block.decryptions.clone(),
-        enabledTokens: block.enabled_tokens.clone(),
+        header: import.header_rlp.clone(),
+        deposits: import.deposits.clone(),
+        decryptions: import.decryptions.clone(),
+        enabledTokens: import.enabled_tokens.clone(),
     }
     .abi_encode();
 
@@ -179,13 +251,17 @@ fn build_finalize_withdrawal_batch_tx(
 mod tests {
     use alloc::vec;
 
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_network::TxSignerSync;
     use alloy_primitives::{Address, B256, Bytes, U256, address};
+    use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::SolCall;
     use const_hex::FromHex;
     use revm::context::Transaction;
     use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_zone_contracts::EnabledToken;
-    use zone_primitives::constants::ZONE_INBOX_ADDRESS;
+    use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
     use crate::{ZoneBlockEnvWitness, ZoneCfgEnvWitness};
 
@@ -203,7 +279,7 @@ mod tests {
             gas_limit: 30_000_000,
             basefee: 0,
             difficulty: U256::ZERO,
-            prevrandao: Some(B256::ZERO),
+            prevrandao: B256::ZERO,
             slot_num: 0,
             timestamp_millis_part: 0,
         }
@@ -219,7 +295,7 @@ mod tests {
 
     fn execution_context() -> crate::ZoneBlockExecutionContextWitness {
         crate::ZoneBlockExecutionContextWitness {
-            parent_beacon_block_root: None,
+            parent_beacon_block_root: B256::ZERO,
             extra_data: Bytes::new(),
         }
     }
@@ -234,19 +310,51 @@ mod tests {
             cfg_env: cfg_env(),
             execution_context: execution_context(),
             block_env: block_env(),
-            tempo_header_rlp: Some(Bytes::from_static(&[0xc0])),
-            deposits: vec![],
-            decryptions: vec![],
-            enabled_tokens: vec![EnabledToken {
-                token: address!("0x0000000000000000000000000000000000001000"),
-                name: "USD Test".into(),
-                symbol: "USDT".into(),
-                currency: "USD".into(),
-            }],
-            finalize_withdrawal_batch_count: Some(U256::from(1)),
-            finalize_withdrawal_encrypted_senders: vec![Bytes::from_static(b"sender")],
+            tempo_import: ZoneTempoImport::advance(
+                Bytes::from_static(&[0xc0]),
+                vec![],
+                vec![],
+                vec![EnabledToken {
+                    token: address!("0x0000000000000000000000000000000000001000"),
+                    name: "USD Test".into(),
+                    symbol: "USDT".into(),
+                    currency: "USD".into(),
+                }],
+            ),
+            withdrawal_finalization: ZoneWithdrawalFinalization::finalize(
+                U256::from(1),
+                vec![Bytes::from_static(b"sender")],
+            ),
             transactions: vec![],
         }
+    }
+
+    fn clear_system_transactions(block: &mut ZoneBlock) {
+        block.tempo_import = ZoneTempoImport::none();
+        block.withdrawal_finalization = ZoneWithdrawalFinalization::none();
+    }
+
+    fn signed_user_call(target: Address, input: Bytes, value: U256) -> Bytes {
+        let signer: PrivateKeySigner =
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .expect("test private key should parse");
+
+        let mut tx = TxEip1559 {
+            chain_id: 421_700_001,
+            nonce: 0,
+            gas_limit: 150_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: target.into(),
+            value,
+            input,
+            ..Default::default()
+        };
+        let signature = signer
+            .sign_transaction_sync(&mut tx)
+            .expect("test transaction should sign");
+        Bytes::from(TxEnvelope::Eip1559(tx.into_signed(signature)).encoded_2718())
     }
 
     #[test]
@@ -289,10 +397,7 @@ mod tests {
     #[test]
     fn rejects_invalid_user_transaction_bytes() {
         let mut block = sample_block();
-        block.tempo_header_rlp = None;
-        block.enabled_tokens.clear();
-        block.finalize_withdrawal_batch_count = None;
-        block.finalize_withdrawal_encrypted_senders.clear();
+        clear_system_transactions(&mut block);
         block.transactions.push(Bytes::from_static(b"not a tx"));
 
         let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
@@ -306,16 +411,291 @@ mod tests {
     }
 
     #[test]
+    fn rejects_eip4844_user_transaction_bytes() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        block.transactions.push(Bytes::from_static(&[0x03, 0xc0]));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionDecodeFailed {
+                block_index: 7,
+                transaction_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_native_value_user_transaction() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        block.transactions.push(signed_user_call(
+            address!("0x20c0000000000000000000000000000000000000"),
+            Bytes::new(),
+            U256::from(1),
+        ));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionValueUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                value: U256::from(1),
+            }
+        );
+    }
+
+    #[test]
+    fn admits_user_call_to_tip20_transfer_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ITIP20::transferCall {
+            to: address!("0x0000000000000000000000000000000000001000"),
+            amount: U256::from(1),
+        }
+        .abi_encode()
+        .into();
+        block.transactions.push(signed_user_call(
+            address!("0x20c0000000000000000000000000000000000000"),
+            input,
+            U256::ZERO,
+        ));
+
+        let plan = ZoneBlockExecutionPlan::from_block(7, &block).unwrap();
+
+        assert_eq!(plan.transactions.len(), 1);
+        assert_eq!(
+            plan.transactions[0].kind,
+            PlannedZoneTransactionKind::User {
+                transaction_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_tip20_system_mint_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let token = address!("0x20c0000000000000000000000000000000000000");
+        let input = ITIP20::mintCall {
+            to: address!("0x0000000000000000000000000000000000001000"),
+            amount: U256::from(1),
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(token, input, U256::ZERO));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: token,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_tip20_approve_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let token = address!("0x20c0000000000000000000000000000000000000");
+        let input = ITIP20::approveCall {
+            spender: address!("0x0000000000000000000000000000000000001000"),
+            amount: U256::from(1),
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(token, input, U256::ZERO));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: token,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_tip403_policy_proxy() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let target = zone_precompiles::ZONE_TIP403_PROXY_ADDRESS;
+        block.transactions.push(signed_user_call(
+            target,
+            Bytes::from_static(&[0x00, 0x00, 0x00, 0x00]),
+            U256::ZERO,
+        ));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_system_advance_tempo_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ZoneInbox::advanceTempoCall {
+            header: Bytes::from_static(&[0xc0]),
+            deposits: vec![],
+            decryptions: vec![],
+            enabledTokens: vec![],
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(ZONE_INBOX_ADDRESS, input, U256::ZERO));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: ZONE_INBOX_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_claim_refund_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ZoneInbox::claimRefundCall {
+            token: address!("0x20c0000000000000000000000000000000000000"),
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(ZONE_INBOX_ADDRESS, input, U256::ZERO));
+
+        assert_eq!(
+            ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err(),
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: ZONE_INBOX_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_system_finalize_withdrawal_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ZoneOutbox::finalizeWithdrawalBatchCall {
+            count: U256::ZERO,
+            blockNumber: block.number,
+            encryptedSenders: vec![],
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(ZONE_OUTBOX_ADDRESS, input, U256::ZERO));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: ZONE_OUTBOX_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_system_deposit_bounce_back_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ZoneOutbox::enqueueDepositBounceBackCall {
+            token: address!("0x20c0000000000000000000000000000000000000"),
+            amount: 1,
+            bouncebackRecipient: address!("0x0000000000000000000000000000000000001000"),
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(ZONE_OUTBOX_ADDRESS, input, U256::ZERO));
+
+        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        assert_eq!(
+            err,
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: ZONE_OUTBOX_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_user_call_to_request_withdrawal_selector() {
+        let mut block = sample_block();
+        clear_system_transactions(&mut block);
+        let input = ZoneOutbox::requestWithdrawalCall {
+            token: address!("0x20c0000000000000000000000000000000000000"),
+            to: address!("0x0000000000000000000000000000000000001000"),
+            amount: 1,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: address!("0x0000000000000000000000000000000000001000"),
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
+        }
+        .abi_encode()
+        .into();
+        block
+            .transactions
+            .push(signed_user_call(ZONE_OUTBOX_ADDRESS, input, U256::ZERO));
+
+        assert_eq!(
+            ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err(),
+            ProverError::UserTransactionTargetUnsupported {
+                block_index: 7,
+                transaction_index: 0,
+                call_index: 0,
+                target: ZONE_OUTBOX_ADDRESS,
+            }
+        );
+    }
+
+    #[test]
     fn recovers_user_transaction_sender() {
         let raw = <Vec<u8>>::from_hex(
             "02f8b082053980018628048c5ec000831e84809420c000000000000000000000000000000000000080b844a9059cbb0000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc0000000000000000000000000000000000000000000000000000000005f5e100c001a0e7f78bca071cc3f0b41dabdee8b3b97c47ca8bfe3bf86861ba06cd97567d61f6a02ad11d6959be0eba004f1f3336c8b1c90aced228a00cbd5af990b519792e7b87",
         )
         .unwrap();
         let mut block = sample_block();
-        block.tempo_header_rlp = None;
-        block.enabled_tokens.clear();
-        block.finalize_withdrawal_batch_count = None;
-        block.finalize_withdrawal_encrypted_senders.clear();
+        clear_system_transactions(&mut block);
         block.transactions.push(Bytes::from(raw));
 
         let plan = ZoneBlockExecutionPlan::from_block(0, &block).unwrap();
@@ -345,22 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_advance_tempo_payloads_without_header() {
+    fn skips_system_transactions_when_variants_are_none() {
         let mut block = sample_block();
-        block.tempo_header_rlp = None;
-        block.finalize_withdrawal_batch_count = None;
-        block.finalize_withdrawal_encrypted_senders.clear();
+        clear_system_transactions(&mut block);
 
-        let err = ZoneBlockExecutionPlan::from_block(3, &block).unwrap_err();
-        assert_eq!(err, ProverError::DepositProcessingUnsupported { index: 3 });
-    }
+        let plan = ZoneBlockExecutionPlan::from_block(0, &block).unwrap();
 
-    #[test]
-    fn rejects_sender_payloads_without_finalization() {
-        let mut block = sample_block();
-        block.finalize_withdrawal_batch_count = None;
-
-        let err = ZoneBlockExecutionPlan::from_block(0, &block).unwrap_err();
-        assert_eq!(err, ProverError::NonZeroWithdrawalFinalizationUnsupported);
+        assert!(plan.transactions.is_empty());
     }
 }

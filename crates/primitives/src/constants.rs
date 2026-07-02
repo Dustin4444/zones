@@ -5,6 +5,9 @@ use alloy_primitives::{Address, B256, address};
 /// Sentinel value for empty withdrawal queue slots.
 pub const EMPTY_SENTINEL: B256 = B256::new([0xff; 32]);
 
+/// Current Zone block header protocol version.
+pub const ZONE_BLOCK_PROTOCOL_VERSION: u64 = 1;
+
 /// Maximum callback gas a withdrawal may request.
 ///
 /// The L1 processor adds fixed overhead plus an EIP-150 cushion, so this value

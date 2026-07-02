@@ -69,5 +69,6 @@ serde = [
 alloy-network.workspace = true
 alloy-signer-local.workspace = true
 const-hex.workspace = true
+k256.workspace = true
 reth-primitives-traits.workspace = true
 serde_json.workspace = true

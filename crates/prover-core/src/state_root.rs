@@ -7,7 +7,7 @@ use reth_trie_common::{HashedPostState, Nibbles};
 use reth_trie_common::{KeccakKeyHasher, KeyHasher, MultiProof, StorageMultiProof};
 use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie};
 
-use crate::{ProverError, ZoneStateWitness, trie, validate_node_pool};
+use crate::{ProverError, ZoneAccountCode, ZoneStateWitness, trie, validate_node_pool};
 
 /// State root computed by applying a reth hashed post-state to a verified sparse trie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,10 +82,11 @@ fn zone_state_multiproof(state: &ZoneStateWitness) -> Result<MultiProof, ProverE
     let mut storage_roots = BTreeMap::new();
 
     for read in &state.account_reads {
-        if let Some(code) = &read.code
-            && keccak256(code.as_ref()) != read.code_hash
-        {
-            return Err(ProverError::AccountCodeHashMismatch(read.account));
+        match &read.code {
+            ZoneAccountCode::Bytecode(code) if keccak256(code.as_ref()) != read.code_hash => {
+                return Err(ProverError::AccountCodeHashMismatch(read.account));
+            }
+            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
         }
 
         let proven = trie::verify_account_read(state.state_root, &state.node_pool, read)?;

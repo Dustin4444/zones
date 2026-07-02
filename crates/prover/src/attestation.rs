@@ -12,9 +12,9 @@ pub struct AttestationRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedAttestationDoc {
-    pub user_data: Option<Bytes>,
-    pub nonce: Option<Bytes>,
-    pub public_key: Option<Bytes>,
+    pub user_data: Bytes,
+    pub nonce: Bytes,
+    pub public_key: Bytes,
     pub pcrs: BTreeMap<usize, Bytes>,
 }
 
@@ -148,9 +148,18 @@ pub fn verify_attestation_doc_at(
         .map_err(|err| AttestationError::Verification(err.to_string()))?;
 
     Ok(VerifiedAttestationDoc {
-        user_data: parsed.user_data.map(|value| Bytes::from(value.into_vec())),
-        nonce: parsed.nonce.map(|value| Bytes::from(value.into_vec())),
-        public_key: parsed.public_key.map(|value| Bytes::from(value.into_vec())),
+        user_data: parsed
+            .user_data
+            .map(|value| Bytes::from(value.into_vec()))
+            .ok_or(AttestationError::MissingField("user_data"))?,
+        nonce: parsed
+            .nonce
+            .map(|value| Bytes::from(value.into_vec()))
+            .ok_or(AttestationError::MissingField("nonce"))?,
+        public_key: parsed
+            .public_key
+            .map(|value| Bytes::from(value.into_vec()))
+            .ok_or(AttestationError::MissingField("public_key"))?,
         pcrs: parsed
             .pcrs
             .into_iter()
@@ -163,21 +172,9 @@ pub fn validate_attestation_doc(
     doc: &VerifiedAttestationDoc,
     expected: ExpectedAttestation<'_>,
 ) -> Result<(), AttestationError> {
-    assert_attestation_field(
-        "user_data",
-        doc.user_data.as_ref().map(|value| value.as_ref()),
-        expected.user_data,
-    )?;
-    assert_attestation_field(
-        "nonce",
-        doc.nonce.as_ref().map(|value| value.as_ref()),
-        expected.nonce,
-    )?;
-    assert_attestation_field(
-        "public_key",
-        doc.public_key.as_ref().map(|value| value.as_ref()),
-        expected.public_key,
-    )?;
+    assert_attestation_field("user_data", doc.user_data.as_ref(), expected.user_data)?;
+    assert_attestation_field("nonce", doc.nonce.as_ref(), expected.nonce)?;
+    assert_attestation_field("public_key", doc.public_key.as_ref(), expected.public_key)?;
     assert_pcr(doc, 0, expected.expected_pcr0)?;
     assert_pcr(doc, 1, expected.expected_pcr1)?;
     assert_pcr(doc, 2, expected.expected_pcr2)?;
@@ -186,10 +183,9 @@ pub fn validate_attestation_doc(
 
 fn assert_attestation_field(
     name: &'static str,
-    actual: Option<&[u8]>,
+    actual: &[u8],
     expected: &[u8],
 ) -> Result<(), AttestationError> {
-    let actual = actual.ok_or(AttestationError::MissingField(name))?;
     if actual != expected {
         return Err(AttestationError::FieldMismatch(name));
     }
@@ -222,9 +218,9 @@ mod tests {
         pcrs.insert(1, Bytes::from(vec![0xa1; 48]));
         pcrs.insert(2, Bytes::from(vec![0xa2; 48]));
         let doc = VerifiedAttestationDoc {
-            user_data: Some(Bytes::from(vec![4, 5, 6])),
-            nonce: Some(Bytes::from(vec![7, 8, 9])),
-            public_key: Some(Bytes::from(vec![10, 11, 12])),
+            user_data: Bytes::from(vec![4, 5, 6]),
+            nonce: Bytes::from(vec![7, 8, 9]),
+            public_key: Bytes::from(vec![10, 11, 12]),
             pcrs,
         };
 

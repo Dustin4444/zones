@@ -372,7 +372,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{BatchStateProof, BlobExcessGasAndPrice, TempoWitnessProvider, ZoneCfgEnv};
+    use crate::{BatchStateProof, TempoWitnessProvider, ZONE_NO_BLOB_GAS, ZoneCfgEnv};
 
     fn evm_env() -> ZoneEvmEnv {
         ZoneEvmEnv {
@@ -384,7 +384,7 @@ mod tests {
                 inner: revm::context::BlockEnv {
                     gas_limit: 30_000_000,
                     basefee: 0,
-                    blob_excess_gas_and_price: None::<BlobExcessGasAndPrice>,
+                    blob_excess_gas_and_price: Some(ZONE_NO_BLOB_GAS),
                     ..Default::default()
                 },
                 timestamp_millis_part: 0,

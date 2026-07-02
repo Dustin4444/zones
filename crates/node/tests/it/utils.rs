@@ -1,5 +1,5 @@
 use alloy::genesis::Genesis;
-use alloy_consensus::Header;
+use alloy_consensus::{BlockHeader as _, Header};
 use alloy_eips::NumHash;
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -40,6 +40,7 @@ use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
 };
 use zone_node::ZoneNode;
+use zone_primitives::{ZoneHeader, constants::ZONE_BLOCK_PROTOCOL_VERSION};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -397,17 +398,22 @@ impl ZoneTestNode {
         Self::launch(l1_ws_url, portal_address, None, next_unique_chain_id()).await
     }
 
-    /// Start a zone node connected to a real L1, generating genesis from the L1's
-    /// current block header.
+    /// Start a zone node connected to a real L1.
     ///
-    /// See [`build_l1_anchored_genesis`] for details on how the genesis is patched.
+    /// For a real portal, genesis is anchored to the portal's recorded
+    /// `genesisTempoBlockNumber` so the local zone genesis hash matches the
+    /// portal's `blockHash()`. Passing `Address::ZERO` preserves the standalone
+    /// behavior of anchoring to the current L1 tip.
     pub(crate) async fn start_from_l1(
         l1_http_url: &url::Url,
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
-        let (genesis, genesis_block_number) =
-            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+        let (genesis, genesis_block_number) = if portal_address.is_zero() {
+            build_l1_anchored_genesis(l1_http_url, portal_address).await?
+        } else {
+            build_l1_anchored_genesis_for_portal(l1_http_url, portal_address).await?
+        };
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
@@ -432,13 +438,8 @@ impl ZoneTestNode {
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
-        let l1_provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
-        let portal = tempo_zone_contracts::ZonePortal::new(portal_address, &l1_provider);
-        let genesis_block_number = portal.genesisTempoBlockNumber().call().await?;
         let (genesis, genesis_block_number) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
-                .await?;
+            build_l1_anchored_genesis_for_portal(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
@@ -1021,6 +1022,12 @@ impl L1TestNode {
         let genesis_tempo_block_hash = keccak256(&rlp_buf);
 
         let verifier_address = factory.verifier().call().await?;
+        let zone_count = factory.zoneCount().call().await?;
+        let predicted_portal = predicted_zone_portal_address(factory_address, zone_count);
+        let (genesis, _) = build_l1_anchored_genesis_from_header(l1_header, predicted_portal)
+            .wrap_err("failed to build predicted zone genesis for ZonePortal genesisBlockHash")?;
+        let genesis_block_hash = zone_genesis_block_hash(&genesis);
+
         let receipt = factory
             .createZone(ZoneFactory::CreateZoneParams {
                 admin: sequencer,
@@ -1028,7 +1035,7 @@ impl L1TestNode {
                 sequencer,
                 verifier: verifier_address,
                 zoneParams: ZoneFactory::ZoneParams {
-                    genesisBlockHash: B256::ZERO,
+                    genesisBlockHash: genesis_block_hash,
                     genesisTempoBlockHash: genesis_tempo_block_hash,
                     genesisTempoBlockNumber: l1_header.inner.number,
                 },
@@ -1046,6 +1053,20 @@ impl L1TestNode {
             .iter()
             .find_map(|log| ZoneFactory::ZoneCreated::decode_log(&log.inner).ok())
             .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
+        eyre::ensure!(
+            zone_created.portal == predicted_portal,
+            "predicted portal address mismatch: predicted {}, deployed {}",
+            predicted_portal,
+            zone_created.portal
+        );
+        let portal = tempo_zone_contracts::ZonePortal::new(zone_created.portal, &l1_provider);
+        let deployed_genesis_block_hash = portal.blockHash().call().await?;
+        eyre::ensure!(
+            deployed_genesis_block_hash == genesis_block_hash,
+            "ZonePortal genesis blockHash mismatch: expected {}, got {}",
+            genesis_block_hash,
+            deployed_genesis_block_hash
+        );
 
         let native_verifier = NativeSignatureVerifier::new(verifier_address, &l1_provider);
         let receipt = native_verifier
@@ -1627,6 +1648,28 @@ async fn build_l1_anchored_genesis_at_block(
     build_l1_anchored_genesis_from_header(l1_header, portal_address)
 }
 
+async fn build_l1_anchored_genesis_for_portal(
+    l1_http_url: &url::Url,
+    portal_address: Address,
+) -> eyre::Result<(Genesis, u64)> {
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
+    let portal = tempo_zone_contracts::ZonePortal::new(portal_address, &l1_provider);
+    let genesis_block_number = portal.genesisTempoBlockNumber().call().await?;
+    let (genesis, genesis_block_number) =
+        build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
+            .await?;
+    let portal_block_hash = portal.blockHash().call().await?;
+    let genesis_block_hash = zone_genesis_block_hash(&genesis);
+    eyre::ensure!(
+        portal_block_hash == genesis_block_hash,
+        "ZonePortal blockHash does not match local zone genesis hash: portal {}, local {}",
+        portal_block_hash,
+        genesis_block_hash
+    );
+    Ok((genesis, genesis_block_number))
+}
+
 fn build_l1_anchored_genesis_from_header(
     l1_header: &TempoHeader,
     portal_address: Address,
@@ -1700,6 +1743,27 @@ fn build_l1_anchored_genesis_from_header(
     }
 
     Ok((genesis, genesis_block_number))
+}
+
+fn predicted_zone_portal_address(factory_address: Address, zone_count: u32) -> Address {
+    let deployment_nonce = 2 + u64::from(zone_count) * 2;
+    factory_address.create(deployment_nonce + 1)
+}
+
+fn zone_genesis_block_hash(genesis: &Genesis) -> B256 {
+    let chain_spec = TempoChainSpec::from_genesis(genesis.clone());
+    let header = chain_spec.inner.genesis_header();
+    ZoneHeader {
+        parent_hash: header.parent_hash(),
+        beneficiary: header.beneficiary(),
+        state_root: header.state_root(),
+        transactions_root: header.transactions_root(),
+        receipts_root: header.receipts_root(),
+        number: header.number(),
+        timestamp: header.timestamp(),
+        protocol_version: ZONE_BLOCK_PROTOCOL_VERSION,
+    }
+    .hash()
 }
 
 /// Replace all non-overlapping occurrences of `needle` with `replacement` in `buf`.
@@ -2310,6 +2374,9 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         zone_poll_interval: Duration::from_millis(500),
         batch_interval: Duration::from_millis(500),
         batch_anchor_config,
+        prover_witness_source: Arc::new(zone_sequencer::UnavailableProverWitnessSource::new(
+            "integration helper witness generation is not wired into the sequencer yet",
+        )),
     };
 
     zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await

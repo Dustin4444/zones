@@ -8,7 +8,7 @@ use revm::{
 use tempo_chainspec::constants::gas::{SSTORE_CREATE_COST, SSTORE_SET_COST};
 use tempo_chainspec::hardfork::TempoHardfork;
 
-use crate::PreparedZoneBlock;
+use crate::{PreparedZoneBlock, ZONE_NO_BLOB_GAS};
 
 pub use revm::context_interface::block::BlobExcessGasAndPrice;
 
@@ -37,7 +37,7 @@ pub struct ZoneBlockExecutionContext {
 /// block gas limit and Tempo hardfork in [`ZoneCfgEnvConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ZoneBlockExecutionContextConfig {
-    pub parent_beacon_block_root: Option<B256>,
+    pub parent_beacon_block_root: B256,
     pub extra_data: Bytes,
 }
 
@@ -57,7 +57,7 @@ impl ZoneBlockExecutionContextConfig {
         ZoneBlockExecutionContext {
             inner: EthBlockExecutionCtx {
                 parent_hash: block.parent_hash,
-                parent_beacon_block_root: self.parent_beacon_block_root,
+                parent_beacon_block_root: Some(self.parent_beacon_block_root),
                 ommers: &[],
                 withdrawals: None,
                 extra_data: self.extra_data.clone(),
@@ -120,8 +120,7 @@ pub struct ZoneBlockEnvConfig {
     pub gas_limit: u64,
     pub basefee: u64,
     pub difficulty: U256,
-    pub prevrandao: Option<B256>,
-    pub blob_excess_gas_and_price: Option<BlobExcessGasAndPrice>,
+    pub prevrandao: B256,
     pub slot_num: u64,
     pub timestamp_millis_part: u64,
 }
@@ -147,8 +146,8 @@ impl ZoneBlockEnv {
                 gas_limit: config.gas_limit,
                 basefee: config.basefee,
                 difficulty: config.difficulty,
-                prevrandao: config.prevrandao,
-                blob_excess_gas_and_price: config.blob_excess_gas_and_price,
+                prevrandao: Some(config.prevrandao),
+                blob_excess_gas_and_price: Some(ZONE_NO_BLOB_GAS),
                 slot_num: config.slot_num,
             },
             timestamp_millis_part: config.timestamp_millis_part,
@@ -337,7 +336,7 @@ mod tests {
 
     fn execution_context_config() -> ZoneBlockExecutionContextConfig {
         ZoneBlockExecutionContextConfig {
-            parent_beacon_block_root: Some(B256::repeat_byte(0x33)),
+            parent_beacon_block_root: B256::repeat_byte(0x33),
             extra_data: Bytes::from_static(b"zone"),
         }
     }
@@ -361,8 +360,7 @@ mod tests {
             gas_limit: 30_000_000,
             basefee: 7,
             difficulty: U256::from(8_u64),
-            prevrandao: Some(B256::repeat_byte(0x22)),
-            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice::new(0, 1)),
+            prevrandao: B256::repeat_byte(0x22),
             slot_num: 3,
             timestamp_millis_part: 456,
         }
@@ -380,11 +378,8 @@ mod tests {
         assert_eq!(env.gas_limit(), config.gas_limit);
         assert_eq!(env.basefee(), config.basefee);
         assert_eq!(env.difficulty(), config.difficulty);
-        assert_eq!(env.prevrandao(), config.prevrandao);
-        assert_eq!(
-            env.blob_excess_gas_and_price(),
-            config.blob_excess_gas_and_price
-        );
+        assert_eq!(env.prevrandao(), Some(config.prevrandao));
+        assert_eq!(env.blob_excess_gas_and_price(), Some(ZONE_NO_BLOB_GAS));
         assert_eq!(env.slot_num(), config.slot_num);
         assert_eq!(env.timestamp_millis_part, config.timestamp_millis_part);
     }
@@ -446,7 +441,7 @@ mod tests {
         assert_eq!(context.inner.parent_hash, block.parent_hash);
         assert_eq!(
             context.inner.parent_beacon_block_root,
-            execution_context_config().parent_beacon_block_root
+            Some(execution_context_config().parent_beacon_block_root)
         );
         assert_eq!(context.inner.ommers.len(), 0);
         assert!(context.inner.withdrawals.is_none());

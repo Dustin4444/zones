@@ -708,6 +708,15 @@ Zone transactions specify which enabled TIP-20 token to use for gas fees via a `
 
 Zones do not admit EIP-4844 blob transactions. The zone node disables EIP-4844 transaction validation, and the prover pins the revm blob environment to `excessBlobGas = 0` with the minimum blob gas price. Blob gas values are therefore not witness-controlled.
 
+User-submitted zone transactions are currently limited to TIP-20 transfer calls. Each call in a user transaction must have zero native value and target a TIP-20 token precompile with one of:
+
+- `transfer`;
+- `transferWithMemo`;
+- `transferFrom`;
+- `transferFromWithMemo`.
+
+Contract creation, EIP-7702 authorizations, TIP-20 non-transfer functions such as `approve`/`mint`/`burn`, direct TIP-403 proxy calls, and zone system selectors such as `advanceTempo`, `requestWithdrawal`, `claimRefund`, `enqueueDepositBounceBack`, and `finalizeWithdrawalBatch` are not user-admissible. Withdrawals, refund claims, privileged sequencer/admin operations, and gas-rate changes must be introduced as explicit block operations before the prover admits them; they are not admitted by arbitrary user calls into system contracts.
+
 ### Block Structure
 
 Each zone block contains system transactions and user transactions in a fixed order:
@@ -740,7 +749,7 @@ The block hash is `keccak256` of the RLP-encoded header. Batch proofs commit to 
 Zone execution differs from standard Tempo execution in three areas. These changes are enforced at the EVM level, not just at the RPC layer, so they apply to all code paths including user transactions, `eth_call` simulations, and prover re-execution.
 
 - **Balance and allowance access control.** `balanceOf(account)` reverts unless `msg.sender` is the account owner or the sequencer. `allowance(owner, spender)` reverts unless `msg.sender` is the owner, the spender, or the sequencer.
-- **Fixed gas for transfers.** All TIP-20 transfer and approve operations charge a fixed 100,000 gas regardless of storage layout. This eliminates a side channel where variable gas costs reveal whether a recipient has previously received tokens.
+- **Fixed gas for transfers.** All supported TIP-20 transfer operations charge a fixed 100,000 gas regardless of storage layout. This eliminates a side channel where variable gas costs reveal whether a recipient has previously received tokens.
 - **Contract creation disabled.** `CREATE` and `CREATE2` revert. The zone runs only predeploys and TIP-20 token precompiles. Arbitrary contract deployment would allow users to circumvent the execution-level privacy controls.
 
 <br>
@@ -946,7 +955,7 @@ The witness contains everything needed to re-execute the batch:
 
 - **PublicInputs**: `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
 - **BatchWitness**: the public inputs, the previous batch's block header, Zone ancestry headers for `BLOCKHASH`, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
-- **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `cfg_env`, `execution_context`, `block_env`, `tempo_header_rlp` (optional), `deposits`, `decryptions`, `enabled_tokens`, `finalize_withdrawal_batch_count` (optional), `finalize_withdrawal_encrypted_senders`, and user `transactions`.
+- **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `cfg_env`, `execution_context`, `block_env`, `tempo_import`, `withdrawal_finalization`, and user `transactions`.
 - **ZoneStateWitness**: the initial zone state root, a deduplicated pool of zone-state trie nodes, and decoded account / storage reads needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
 
 ### Input Schematic
@@ -964,7 +973,7 @@ flowchart TB
 
         subgraph ZBL["zone_blocks"]
             direction TB
-            ZB["ZoneBlock[i]<br/>number<br/>parent_hash<br/>timestamp<br/>beneficiary<br/>protocol_version<br/>cfg_env<br/>execution_context<br/>block_env<br/>tempo_header_rlp<br/>deposits<br/>decryptions<br/>enabled_tokens<br/>finalize_withdrawal_batch_count<br/>finalize_withdrawal_encrypted_senders<br/>transactions"]
+            ZB["ZoneBlock[i]<br/>number<br/>parent_hash<br/>timestamp<br/>beneficiary<br/>protocol_version<br/>cfg_env<br/>execution_context<br/>block_env<br/>tempo_import<br/>withdrawal_finalization<br/>transactions"]
             ZCE["ZoneCfgEnvWitness<br/>chain_id<br/>spec<br/>enable_amsterdam_eip8037"]
             ZBC["ZoneBlockExecutionContextWitness<br/>parent_beacon_block_root<br/>extra_data"]
             ZBE["ZoneBlockEnvWitness<br/>gas_limit<br/>basefee<br/>difficulty<br/>prevrandao<br/>slot_num<br/>timestamp_millis_part"]
@@ -1003,7 +1012,7 @@ flowchart TB
         subgraph ZSW["initial_zone_state"]
             direction TB
             ZSWBOX["ZoneStateWitness<br/>state_root<br/>node_pool"]
-            ZAR["ZoneAccountRead[k]<br/>account<br/>nonce<br/>balance<br/>code_hash<br/>code"]
+            ZAR["ZoneAccountRead[k]<br/>account<br/>nonce<br/>balance<br/>storage_root<br/>code_hash<br/>code"]
             ZSR["ZoneStorageRead[k]<br/>account<br/>slot<br/>value"]
             ZSWBOX ~~~ ZAR
             ZAR ~~~ ZSR
@@ -1122,34 +1131,58 @@ pub struct ZoneBlock {
     /// `timestamp_millis_part` must be less than 1000.
     pub block_env: ZoneBlockEnvWitness,
 
-    /// Tempo header RLP used by the call (ZoneInbox.advanceTempo).
-    /// If None, the block does not advance Tempo and the binding carries over.
-    pub tempo_header_rlp: Option<Vec<u8>>,
+    /// Explicit Tempo import. If this is `None`, the block does not call
+    /// `ZoneInbox.advanceTempo` and the Tempo binding carries over. If this is
+    /// `Advance`, all data needed by that system transaction is required inside
+    /// the variant.
+    pub tempo_import: ZoneTempoImport,
+
+    /// Explicit withdrawal finalization. Intermediate blocks must use `None`.
+    /// The final block in a submitted batch must use `Finalize`, with the
+    /// required count and sender payloads inside the variant.
+    pub withdrawal_finalization: ZoneWithdrawalFinalization,
+
+    /// User-submitted TIP-20 transfer transactions to execute.
+    /// Each call must have zero native value and target an allowed TIP-20
+    /// transfer selector. Blob transactions, contract creation, EIP-7702
+    /// authorizations, TIP-20 non-transfer selectors, direct TIP-403 calls,
+    /// and zone system selectors are invalid.
+    pub transactions: Vec<Transaction>,
+}
+
+pub enum ZoneTempoImport {
+    None,
+    Advance(ZoneAdvanceTempo),
+}
+
+pub struct ZoneAdvanceTempo {
+    /// Tempo header RLP used by `ZoneInbox.advanceTempo`.
+    pub header_rlp: Vec<u8>,
 
     /// Deposits processed by the system tx (oldest first, unified queue).
-    /// Must be empty if tempo_header_rlp is None.
     pub deposits: Vec<QueuedDeposit>,
 
     /// Decryption data for encrypted deposits in the system tx.
-    /// Must be empty if tempo_header_rlp is None.
     pub decryptions: Vec<DecryptionData>,
 
-    /// Enabled TIP-20 token metadata passed to ZoneInbox.advanceTempo.
-    /// Must be empty if tempo_header_rlp is None.
+    /// Enabled TIP-20 token metadata passed to `ZoneInbox.advanceTempo`.
     pub enabled_tokens: Vec<EnabledToken>,
+}
 
-    /// Sequencer-only: finalize a batch (only in final block, must be last)
-    /// Required for the final block in a batch; must be absent in intermediate blocks.
-    /// Uses U256 to match Solidity `finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] encryptedSenders)`.
-    pub finalize_withdrawal_batch_count: Option<U256>,
+pub enum ZoneWithdrawalFinalization {
+    None,
+    Finalize(ZoneWithdrawalBatchFinalization),
+}
 
-    /// Sender reveal ciphertexts passed to ZoneOutbox.finalizeWithdrawalBatch.
+pub struct ZoneWithdrawalBatchFinalization {
+    /// Uses U256 to match Solidity
+    /// `finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] encryptedSenders)`.
+    pub count: U256,
+
+    /// Sender reveal ciphertexts passed to `ZoneOutbox.finalizeWithdrawalBatch`.
     /// Contains one entry per finalized withdrawal. Entries are empty bytes for
     /// withdrawals that do not have an authenticated-withdrawal reveal target.
-    pub finalize_withdrawal_encrypted_senders: Vec<Vec<u8>>,
-
-    /// Transactions to execute
-    pub transactions: Vec<Transaction>,
+    pub encrypted_senders: Vec<Vec<u8>>,
 }
 
 pub struct ZoneCfgEnvWitness {
@@ -1165,12 +1198,14 @@ pub struct ZoneCfgEnvWitness {
 
 pub struct ZoneBlockExecutionContextWitness {
     /// EIP-4788 parent beacon block root supplied to the block executor.
-    pub parent_beacon_block_root: Option<B256>,
+    pub parent_beacon_block_root: B256,
 
     /// Ethereum header extra data supplied to the block executor.
     pub extra_data: Vec<u8>,
 }
 
+/// EIP-4844 blob gas fields are intentionally absent. Zones pin the revm blob
+/// environment to excessBlobGas = 0 and the minimum blob gas price.
 pub struct ZoneBlockEnvWitness {
     /// EVM block gas limit
     pub gas_limit: u64,
@@ -1181,9 +1216,9 @@ pub struct ZoneBlockEnvWitness {
     /// EVM difficulty field
     pub difficulty: U256,
 
-    /// EIP-4399 randomness value. Zones currently derive this from payload
-    /// attributes; the sequencer path uses zero when no randomness is supplied.
-    pub prevrandao: Option<B256>,
+    /// EIP-4399 randomness value. Zones derive this from payload attributes;
+    /// the sequencer path uses zero when no randomness is supplied.
+    pub prevrandao: B256,
 
     /// EIP-7843 slot number, if active for the configured fork.
     pub slot_num: u64,
@@ -1244,8 +1279,14 @@ pub struct ZoneAccountRead {
     pub account: Address,
     pub nonce: u64,
     pub balance: U256,
+    pub storage_root: B256,
     pub code_hash: B256,
-    pub code: Option<Vec<u8>>,
+    pub code: ZoneAccountCode,
+}
+
+pub enum ZoneAccountCode {
+    Empty,
+    Bytecode(Vec<u8>),
 }
 
 pub struct ZoneStorageRead {
@@ -1285,11 +1326,11 @@ pub struct L1StateRead {
 - `node_pool` is a deduplicated map from `keccak256(rlp(node))` to the node's raw RLP bytes. The prover validates each node once by recomputing the hash.
 - Each read descriptor (`ZoneAccountRead`, `ZoneStorageRead`, or `L1StateRead`) states which decoded account or storage value must be proven against a bound trie root.
 - Verification walks the account trie using `keccak256(account)` and, when needed, the storage trie using `keccak256(slot)`, fetching branch, extension, and leaf nodes from `node_pool`.
-- For `ZoneAccountRead`, the account leaf proves the committed `code_hash`, but not the bytecode preimage itself. If the witness supplies `code`, the prover must additionally require `keccak256(code) == code_hash` before materializing that account into the execution state.
+- For `ZoneAccountRead`, the account leaf proves the committed `code_hash`, but not the bytecode preimage itself. If `code` is `Bytecode(bytes)`, the prover must additionally require `keccak256(bytes) == code_hash` before materializing that account into the execution state. If `code` is `Empty`, the account must have the canonical empty code hash.
 - Missing leaves are represented by valid non-membership proofs. An absent account is interpreted as the canonical empty account: `nonce = 0`, `balance = 0`, `code = None`, `code_hash = KECCAK_EMPTY`, and an empty storage trie. An absent storage leaf is interpreted as zero.
 - Client databases may still retain historical trie nodes that are no longer reachable from the current root, but those stale nodes are irrelevant to proof verification because only nodes reachable from the bound root contribute to the proof.
 
-`ZoneStateWitness` applies this shared trie proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover checks that `ZoneStateWitness.state_root` is consistent with `prev_block_header.state_root`, validates `node_pool`, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks `keccak256(code) == code_hash` for every supplied account-code preimage, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
+`ZoneStateWitness` applies this shared trie proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover checks that `ZoneStateWitness.state_root` is consistent with `prev_block_header.state_root`, validates `node_pool`, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks `keccak256(code) == code_hash` for every bytecode preimage, rejects missing bytecode for non-empty code hashes, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
 
 ### Batch Output
 
@@ -1313,25 +1354,25 @@ The stateless execution function must reject the witness on any failed check, mi
    Decode each `zone_ancestry_headers` entry as an exact `ZoneHeader` RLP value. The entries are ordered newest-to-oldest, starting at `prev_block_header.number - 1`; each header hash must equal the child header's `parent_hash`, and block numbers must decrease by one. Including `prev_block_header`, the verified ancestry set must not exceed the EVM `BLOCKHASH` window of 256 ancestor blocks. The resulting `(block_number, block_hash)` map is the only source for `BLOCKHASH` during execution; missing entries fail closed.
 
 3. **Verify and materialize the initial zone state.**
-   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: validate every node in `initial_zone_state.node_pool`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every supplied account-code preimage, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
+   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: validate every node in `initial_zone_state.node_pool`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every bytecode preimage, reject `Empty` code for non-empty code hashes, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
 
 4. **Verify and index the Tempo proof pool.**
    Validate every node in `tempo_state_proofs.node_pool` once by recomputing `keccak256(rlp(node))` for each node.
 
 5. **For each `zone_blocks[i]`, verify the block witness before executing it.**
-   Require `block.parent_hash == prev_block_hash`. Require `block.number == prev_header.number + 1`. Require `block.timestamp >= prev_header.timestamp`. Require `block.beneficiary == public_inputs.sequencer`. Require `finalize_withdrawal_batch_count` to be absent in intermediate blocks and present in the final block of the batch. If `tempo_header_rlp` is absent, require `deposits`, `decryptions`, and `enabled_tokens` to be empty.
+   Require `block.parent_hash == prev_block_hash`. Require `block.number == prev_header.number + 1`. Require `block.timestamp >= prev_header.timestamp`. Require `block.beneficiary == public_inputs.sequencer`. Require `withdrawal_finalization` to be `None` in intermediate blocks and `Finalize` in the final block of the batch.
 
 6. **Execute `advanceTempo` if the block imports a Tempo header.**
-   If `tempo_header_rlp` is present, call `TempoState.finalizeTempo(header)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber`, `tempoBlockHash`, and `tempoStateRoot`, and make the new Tempo root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(tempo_header_rlp)`.
+   If `tempo_import` is `Advance(import)`, call `TempoState.finalizeTempo(import.header_rlp)` in the modeled execution environment. This validates header continuity, updates the bound `tempoBlockNumber`, `tempoBlockHash`, and `tempoStateRoot`, and make the new Tempo root available for subsequent `TempoState.readTempoStorageSlot` calls in this block. Require the finalized `tempoBlockHash` to equal `keccak256(import.header_rlp)`. If `tempo_import` is `None`, no advanceTempo payload data exists for that block.
 
 7. **Process deposits and encrypted deposit decryptions inside `advanceTempo`.**
-   Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Process the `deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits, verify the supplied `DecryptionData` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and enqueue a bounce-back when proof verification, AES-GCM authentication, plaintext length validation, or the decrypted-recipient mint fails as specified in [Onchain Decryption Verification](#onchain-decryption-verification).
+   Using the now-bound Tempo root for this block, verify the Tempo-side reads needed by `ZoneInbox` such as the portal's current deposit queue hash. Process `import.deposits` in witness order, enforcing the queue semantics specified in [Deposit Queue](#deposit-queue). For encrypted deposits, verify the supplied `import.decryptions` and Chaum-Pedersen proof, decode the recipient and memo when AES-GCM decryption succeeds, and enqueue a bounce-back when proof verification, AES-GCM authentication, plaintext length validation, or the decrypted-recipient mint fails as specified in [Onchain Decryption Verification](#onchain-decryption-verification).
 
 8. **Execute user transactions in order.**
    Run each user transaction against the materialized zone state using the current block environment. Whenever execution calls `TempoState.readTempoStorageSlot`, satisfy that call by locating the corresponding `L1StateRead`, proving it against the Tempo root currently bound for this block, and requiring the decoded value to match the witness entry. Any zone-state or Tempo-state access not covered by the witness is an error.
 
 9. **Execute `finalizeWithdrawalBatch` at the end of the final block.**
-   If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_encrypted_senders)` after all user transactions in that block. The `finalize_withdrawal_encrypted_senders` array must contain exactly one entry for each finalized withdrawal; withdrawals without an authenticated-withdrawal reveal target use empty bytes. This must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. Intermediate blocks must not execute this call.
+   In the final block, `withdrawal_finalization` must be `Finalize(finalization)`. Execute `ZoneOutbox.finalizeWithdrawalBatch(finalization.count, block.number, finalization.encrypted_senders)` after all user transactions in that block. The `encrypted_senders` array must contain exactly one entry for each finalized withdrawal; withdrawals without an authenticated-withdrawal reveal target use empty bytes. This must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. Intermediate blocks must not execute this call.
 
 10. **Compute the resulting block header and carry it forward.**
     After block execution, compute the `transactionsRoot` and `receiptsRoot` over the full ordered list of transactions and receipts for that block. Construct the simplified `ZoneHeader` from `parent_hash`, `beneficiary`, `state_root`, `transactions_root`, `receipts_root`, `number`, `timestamp`, and `protocol_version`, then compute `next_block_hash = keccak256(rlp(header))`. Set `prev_block_hash = next_block_hash` and `prev_header = header` before moving to the next block.
@@ -1442,7 +1483,7 @@ Zones have three categories of precompiles: TIP-20 token precompiles (one per en
 Each enabled TIP-20 token is deployed as a precompile at the same address as on Tempo. The precompile implements the standard TIP-20 interface with privacy modifications:
 
 - `balanceOf` and `allowance` are restricted to the account owner (or sequencer).
-- Transfer-family operations (`transfer`, `transferFrom`, `approve`) charge a fixed 100,000 gas.
+- Supported transfer-family operations (`transfer`, `transferWithMemo`, `transferFrom`, `transferFromWithMemo`) charge a fixed 100,000 gas.
 - `mint` is restricted to `ZoneInbox`, `burn` is restricted to `ZoneOutbox`.
 
 ### Chaum-Pedersen Verify

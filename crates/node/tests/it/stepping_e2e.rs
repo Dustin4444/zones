@@ -1,9 +1,10 @@
-//! Extended-gap batch submission E2E test.
+//! Extended-gap batch submission E2E tests.
 //!
 //! When a zone node goes down for long enough that even the first stepping
 //! boundary is outside the EIP-2935 history window, the sequencer must still
-//! submit batches successfully once it comes back. This exercises the
-//! long-downtime ancestry path instead of the simpler direct-mode case.
+//! split catch-up into EIP-2935-compatible ancestry submissions once a real
+//! prover witness source is wired in. Until then, the active fail-closed source
+//! must prevent the sequencer from submitting empty or mock proof bytes.
 
 use crate::utils::{
     L1TestNode, ZoneTestNode, poll_until, spawn_sequencer, spawn_sequencer_with_anchor_config,
@@ -35,6 +36,7 @@ const SHORT_MULTI_STEP_GAP_BLOCKS: u64 = SHORT_EIP2935_HISTORY_WINDOW
 const STEPPING_TIMEOUT: Duration = Duration::from_secs(300);
 const BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 const SHORT_STEPPING_TIMEOUT: Duration = Duration::from_secs(60);
+const FAIL_CLOSED_SETTLE_TIME: Duration = Duration::from_secs(3);
 
 async fn fetch_submit_batch_call(
     l1: &L1TestNode,
@@ -108,7 +110,7 @@ async fn fetch_submit_batch_call(
 /// 6. Spawn sequencer while the zone is still far behind L1.
 /// 7. Assert a `BatchSubmitted` event appears.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "slow: mines >16k L1 blocks and replays zone history, run with --ignored or in nightly CI"]
+#[ignore = "slow and requires a real prover witness source; mines >16k L1 blocks and replays zone history"]
 async fn test_batch_submission_after_extended_l1_gap() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -213,9 +215,12 @@ async fn test_batch_submission_after_extended_l1_gap() -> eyre::Result<()> {
 }
 
 /// Same stepping scenario as the ignored long-gap test, but with a 10-block
-/// configured EIP-2935 window so it runs in regular integration test time.
+/// configured EIP-2935 window. The default integration helper intentionally
+/// wires an unavailable prover witness source, so the sequencer must fail
+/// closed before submitting any `submitBatch` transaction instead of falling
+/// back to empty proof bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<()> {
+async fn test_configured_short_l1_gap_refuses_empty_proof_without_witness() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let anchor_config =
@@ -273,32 +278,22 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
     )
     .await;
 
-    poll_until(
-        SHORT_STEPPING_TIMEOUT,
-        Duration::from_millis(250),
-        "BatchSubmitted event after configured short L1 gap",
-        || {
-            let portal = &portal;
-            let seq = &seq;
-            async move {
-                if seq.monitor_handle.is_finished() {
-                    eyre::bail!("monitor task exited before submitting a batch");
-                }
+    tokio::time::sleep(FAIL_CLOSED_SETTLE_TIME).await;
 
-                if seq.withdrawal_handle.is_finished() {
-                    eyre::bail!("withdrawal processor exited before batch submission completed");
-                }
+    eyre::ensure!(
+        !seq.monitor_handle.is_finished(),
+        "monitor task should stay alive and retry after witness-source failure"
+    );
+    eyre::ensure!(
+        !seq.withdrawal_handle.is_finished(),
+        "withdrawal processor should stay alive after witness-source failure"
+    );
 
-                let events = portal.BatchSubmitted_filter().from_block(0).query().await?;
-                if events.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(events.len()))
-                }
-            }
-        },
-    )
-    .await?;
+    let events = portal.BatchSubmitted_filter().from_block(0).query().await?;
+    eyre::ensure!(
+        events.is_empty(),
+        "sequencer submitted a batch without a prover witness source"
+    );
 
     Ok(())
 }
@@ -306,6 +301,7 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
 /// Verifies that a larger configured-window gap is split into multiple
 /// `submitBatch` L1 transactions before the sequencer catches up.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a real prover witness source; the default source fails closed before submission"]
 async fn test_configured_short_l1_gap_requires_multiple_stepping_batches() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -431,19 +427,13 @@ async fn test_configured_short_l1_gap_requires_multiple_stepping_batches() -> ey
             .all(|call| call.recentTempoBlockNumber > call.tempoBlockNumber),
         "stepping catch-up submissions should use ancestry anchors: {tempo_block_numbers:?}"
     );
-    // Proof bytes stay empty until real proof generation is wired in.
-    eyre::ensure!(
-        calls.iter().all(|call| call.proof.is_empty()),
-        "stepping catch-up submissions should keep proof bytes empty for now"
-    );
-
     Ok(())
 }
 
 /// Verifies that the fast configured-window stepping path submits ancestry-mode
-/// calldata, not a direct `tempoBlockNumber` lookup, while proof bytes remain
-/// empty until real proof generation is implemented.
+/// calldata, not a direct `tempoBlockNumber` lookup.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a real prover witness source; the default source fails closed before submission"]
 async fn test_stepping_ancestry_submission_uses_recent_anchor() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -546,10 +536,5 @@ async fn test_stepping_ancestry_submission_uses_recent_anchor() -> eyre::Result<
         "test did not submit an out-of-config-window tempo block: tempo={}, included_at={inclusion_block}",
         call.tempoBlockNumber,
     );
-    eyre::ensure!(
-        call.proof.is_empty(),
-        "ancestry submission should keep proof bytes empty until proof generation is implemented"
-    );
-
     Ok(())
 }
