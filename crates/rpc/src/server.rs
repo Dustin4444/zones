@@ -32,7 +32,7 @@ use crate::{
     error::{AuthError, AuthenticateError},
     handlers::{self, ZoneRpcApi},
     metrics::{PrivateRpcAuthMetrics, PrivateRpcCallMetrics},
-    types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
+    types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, classify_method},
     ws::handle_ws_upgrade,
 };
 
@@ -156,6 +156,7 @@ pub(crate) async fn dispatch_request(
 
     metrics.started_total.increment(1);
     let response = handlers::dispatch(req, auth, api).await;
+    enforce_timing_side_channel_floor(&req.method, started_at).await;
     metrics
         .time_seconds
         .record(started_at.elapsed().as_secs_f64());
@@ -167,6 +168,17 @@ pub(crate) async fn dispatch_request(
     }
 
     response
+}
+
+/// Ensure methods that have `MethodTimingFloor::Required` take the minimum amount of time
+/// to prevent timing attacks
+async fn enforce_timing_side_channel_floor(method: &str, started_at: Instant) {
+    if let Some(timing_floor) =
+        classify_method(method).and_then(|policy| policy.timing_floor.required_duration())
+        && let Some(remaining) = timing_floor.checked_sub(started_at.elapsed())
+    {
+        tokio::time::sleep(remaining).await;
+    }
 }
 
 /// Main HTTP RPC handler — authenticates, dispatches, returns response.
@@ -298,20 +310,26 @@ pub(crate) fn now_unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::authenticate_token;
+    use super::{authenticate_token, dispatch_request};
     use crate::{
         PrivateRpcConfig,
-        auth::build_token_fields,
+        auth::{AuthContext, build_token_fields},
         error::AuthenticateError,
         handlers::ZoneRpcApi,
-        types::{BoxEyreFut, BoxFut, JsonRpcError},
+        types::{
+            BoxEyreFut, BoxFut, JsonRpcError, JsonRpcRequest, MethodTimingFloor, classify_method,
+        },
     };
-    use alloy_primitives::{Address, Bytes};
+    use alloy_primitives::{Address, B256, Bytes};
     use axum::http::StatusCode;
     use p256::ecdsa::SigningKey as P256SigningKey;
     use parking_lot::Mutex;
     use rand::thread_rng;
-    use std::collections::HashMap;
+    use serde_json::{Value, json};
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
     use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
         KeyInfo, SignatureType as KeyInfoSignatureType,
     };
@@ -329,6 +347,13 @@ mod tests {
     const ZONE_ID: u32 = 7;
     const CHAIN_ID: u64 = 99;
     const PORTAL: Address = Address::repeat_byte(0x22);
+    const TIMING_SIDE_CHANNEL_FLOOR_METHODS: &[&str] = &[
+        "eth_getTransactionByHash",
+        "eth_getTransactionReceipt",
+        "eth_getLogs",
+        "eth_getFilterLogs",
+        "eth_getFilterChanges",
+    ];
 
     struct TestApi {
         key_infos: Mutex<HashMap<(Address, Address), KeyInfo>>,
@@ -345,6 +370,11 @@ mod tests {
     }
 
     macro_rules! stub {
+        ($method:ident => $result:expr $(, $arg:ident : $ty:ty)*) => {
+            fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
+                Box::pin(async { $result })
+            }
+        };
         ($method:ident $(, $arg:ident : $ty:ty)*) => {
             fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
                 Box::pin(async { Err(JsonRpcError::internal("not implemented")) })
@@ -381,17 +411,17 @@ mod tests {
         stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
         stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: crate::auth::AuthContext);
         stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: crate::auth::AuthContext);
-        stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(transaction_receipt, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
+        stub!(transaction_by_hash => Ok(crate::types::raw_null()), _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
+        stub!(transaction_receipt => Ok(crate::types::raw_null()), _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
         stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
         stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
         stub!(send_raw_transaction, _a: Bytes, _c: crate::auth::AuthContext);
         stub!(send_raw_transaction_sync, _a: Bytes, _c: crate::auth::AuthContext);
         stub!(fill_transaction, _a: tempo_alloy::rpc::TempoTransactionRequest, _c: crate::auth::AuthContext);
-        stub!(get_logs, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
+        stub!(get_logs => crate::types::to_raw(&Vec::<Value>::new()), _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
         stub!(new_filter, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
-        stub!(get_filter_logs, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(get_filter_changes, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
+        stub!(get_filter_logs => crate::types::to_raw(&Vec::<Value>::new()), _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
+        stub!(get_filter_changes => crate::types::to_raw(&Vec::<Value>::new()), _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
         stub!(new_block_filter, _c: crate::auth::AuthContext);
         stub!(uninstall_filter, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
         stub!(zone_get_authorization_token_info, _c: crate::auth::AuthContext);
@@ -412,6 +442,100 @@ mod tests {
         }
     }
 
+    fn test_api() -> TestApi {
+        TestApi {
+            key_infos: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn test_auth() -> AuthContext {
+        AuthContext {
+            caller: Address::repeat_byte(0x11),
+            expires_at: now_secs() + 600,
+            keychain_key_id: None,
+        }
+    }
+
+    fn request(method: &str, params: Value) -> JsonRpcRequest {
+        serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }))
+        .expect("valid JSON-RPC request")
+    }
+
+    fn timing_sensitive_request(method: &str) -> JsonRpcRequest {
+        let hash = format!("{:#x}", B256::ZERO);
+        let params = match method {
+            "eth_getTransactionByHash" | "eth_getTransactionReceipt" => json!([hash]),
+            "eth_getLogs" => json!([{}]),
+            "eth_getFilterLogs" | "eth_getFilterChanges" => json!(["0x1"]),
+            method => panic!("missing timing-sensitive params for {method}"),
+        };
+        request(method, params)
+    }
+
+    #[test]
+    fn timing_side_channel_floor_matches_spec_methods() {
+        for method in TIMING_SIDE_CHANNEL_FLOOR_METHODS {
+            assert_eq!(
+                classify_method(method)
+                    .expect("timing-sensitive method should be classified")
+                    .timing_floor,
+                MethodTimingFloor::Required(Duration::from_millis(100)),
+                "{method} should have the 100ms response floor"
+            );
+        }
+
+        for method in [
+            "eth_getBalance",
+            "eth_call",
+            "eth_sendRawTransaction",
+            "eth_newFilter",
+        ] {
+            assert_eq!(
+                classify_method(method)
+                    .expect("non-timing-floor method should be classified")
+                    .timing_floor,
+                MethodTimingFloor::NotRequired,
+                "{method} should not have the timing floor"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_sensitive_methods_have_minimum_response_time() {
+        let api = test_api();
+        let auth = test_auth();
+
+        for method in TIMING_SIDE_CHANNEL_FLOOR_METHODS {
+            let minimum = classify_method(method)
+                .expect("timing-sensitive method should be classified")
+                .timing_floor
+                .required_duration()
+                .expect("timing-sensitive method should require a floor")
+                - Duration::from_millis(10); // safety margin for tests
+            let req = timing_sensitive_request(method);
+            let started_at = Instant::now();
+            let response = dispatch_request(&req, &auth, &api).await;
+            let elapsed = started_at.elapsed();
+
+            assert!(
+                response.error.is_none(),
+                "{} should succeed, got {:?}",
+                req.method,
+                response.error
+            );
+            assert!(
+                elapsed >= minimum,
+                "{} returned in {elapsed:?}, below the 100ms response floor",
+                req.method
+            );
+        }
+    }
+
     #[tokio::test]
     async fn configured_auth_token_validity_limit_is_enforced() {
         let mut config = test_config();
@@ -422,9 +546,7 @@ mod tests {
         let mut blob = vec![0u8; 65];
         blob.extend_from_slice(&fields);
         let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
+        let api = test_api();
 
         let err = authenticate_token(&token, &config, &api)
             .await
@@ -452,9 +574,7 @@ mod tests {
         let mut blob = vec![0u8; 65];
         blob.extend_from_slice(&fields);
         let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
+        let api = test_api();
 
         let err = authenticate_token(&token, &config, &api)
             .await

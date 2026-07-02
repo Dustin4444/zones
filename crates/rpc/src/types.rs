@@ -1,6 +1,6 @@
 //! JSON-RPC types for the private zone RPC.
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use alloy_primitives::{Address, B256, U64, U256};
 use serde::{Deserialize, Serialize};
@@ -252,10 +252,54 @@ pub enum MethodTier {
     Disabled,
 }
 
-/// Classify a JSON-RPC method into its access tier.
+/// Timing-floor policy for a JSON-RPC method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodTimingFloor {
+    /// The method must take at least this duration before it returns.
+    Required(Duration),
+    /// The method can return as soon as dispatch completes.
+    NotRequired,
+}
+
+impl MethodTimingFloor {
+    /// The required timing floor, if any.
+    pub fn required_duration(self) -> Option<Duration> {
+        match self {
+            Self::Required(duration) => Some(duration),
+            Self::NotRequired => None,
+        }
+    }
+}
+
+/// Complete private RPC policy for a JSON-RPC method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodPolicy {
+    /// Access tier enforced before dispatch.
+    pub tier: MethodTier,
+    /// Timing-floor behavior enforced after dispatch.
+    pub timing_floor: MethodTimingFloor,
+}
+
+impl MethodPolicy {
+    const fn new(tier: MethodTier) -> Self {
+        Self {
+            tier,
+            timing_floor: MethodTimingFloor::NotRequired,
+        }
+    }
+
+    const fn new_with_timing_floor(tier: MethodTier, timing_floor: Duration) -> Self {
+        Self {
+            tier,
+            timing_floor: MethodTimingFloor::Required(timing_floor),
+        }
+    }
+}
+
+/// Classify a JSON-RPC method into its private RPC policy.
 ///
 /// Returns `None` if the method is unknown.
-pub fn classify_method(method: &str) -> Option<MethodTier> {
+pub fn classify_method(method: &str) -> Option<MethodPolicy> {
     match method {
         // Public read methods — no privacy redaction needed
         "eth_blockNumber"
@@ -277,23 +321,33 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "web3_sha3"
         | "zone_getAuthorizationTokenInfo"
         | "zone_getZoneInfo"
-        | "zone_getDepositStatus" => Some(MethodTier::Public),
+        | "zone_getDepositStatus" => Some(MethodPolicy::new(MethodTier::Public)),
 
         // Fetch-then-check: public but redacted based on caller identity
         "eth_getTransactionByHash"
         | "eth_getTransactionReceipt"
         | "eth_getLogs"
         | "eth_getFilterLogs"
-        | "eth_getFilterChanges"
-        | "eth_newFilter"
-        | "eth_newBlockFilter"
-        | "eth_uninstallFilter" => Some(MethodTier::Public),
+        | "eth_getFilterChanges" => {
+            // These methods will take a minimum of 100ms to return, to prevent timing attacks
+            Some(MethodPolicy::new_with_timing_floor(
+                MethodTier::Public,
+                Duration::from_millis(100),
+            ))
+        }
+
+        // Filter lifecycle methods are scoped but do not fetch before auth checks.
+        "eth_newFilter" | "eth_newBlockFilter" | "eth_uninstallFilter" => {
+            Some(MethodPolicy::new(MethodTier::Public))
+        }
 
         // Transaction preparation: public (scoped to caller's account)
-        "eth_fillTransaction" => Some(MethodTier::Public),
+        "eth_fillTransaction" => Some(MethodPolicy::new(MethodTier::Public)),
 
         // Transaction submission: public (caller sends their own txs)
-        "eth_sendRawTransaction" | "eth_sendRawTransactionSync" => Some(MethodTier::Public),
+        "eth_sendRawTransaction" | "eth_sendRawTransactionSync" => {
+            Some(MethodPolicy::new(MethodTier::Public))
+        }
 
         // Sequencer-only — raw state inspection and full block data bypass privacy scoping
         "eth_getCode"
@@ -306,7 +360,7 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "eth_getTransactionByBlockNumberAndIndex"
         | "eth_getTransactionByBlockHashAndIndex"
         | "eth_getUncleCountByBlockNumber"
-        | "eth_getUncleCountByBlockHash" => Some(MethodTier::Restricted),
+        | "eth_getUncleCountByBlockHash" => Some(MethodPolicy::new(MethodTier::Restricted)),
 
         // Disabled (mempool observation, mining, subscriptions not supported via HTTP)
         "eth_getProof"
@@ -319,11 +373,11 @@ pub fn classify_method(method: &str) -> Option<MethodTier> {
         | "eth_submitWork"
         | "eth_submitHashrate"
         | "eth_subscribe"
-        | "eth_unsubscribe" => Some(MethodTier::Disabled),
+        | "eth_unsubscribe" => Some(MethodPolicy::new(MethodTier::Disabled)),
 
-        _ if method.starts_with("admin_") => Some(MethodTier::Restricted),
-        _ if method.starts_with("debug_") => Some(MethodTier::Restricted),
-        _ if method.starts_with("txpool_") => Some(MethodTier::Restricted),
+        _ if method.starts_with("admin_") => Some(MethodPolicy::new(MethodTier::Restricted)),
+        _ if method.starts_with("debug_") => Some(MethodPolicy::new(MethodTier::Restricted)),
+        _ if method.starts_with("txpool_") => Some(MethodPolicy::new(MethodTier::Restricted)),
         _ => None,
     }
 }

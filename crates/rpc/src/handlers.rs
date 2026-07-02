@@ -260,12 +260,11 @@ pub async fn dispatch(
 ) -> JsonRpcResponse {
     let id = req.id.clone();
 
-    let tier = match classify_method(&req.method) {
-        Some(tier) => tier,
-        None => return JsonRpcResponse::error(id, JsonRpcError::method_not_found()),
+    let Some(policy) = classify_method(&req.method) else {
+        return JsonRpcResponse::error(id, JsonRpcError::method_not_found());
     };
 
-    match tier {
+    match policy.tier {
         MethodTier::Disabled => {
             return JsonRpcResponse::error(id, JsonRpcError::method_disabled());
         }

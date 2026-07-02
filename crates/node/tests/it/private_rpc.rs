@@ -315,7 +315,7 @@ fn classify_public_methods() {
         "zone_getDepositStatus",
     ] {
         assert_eq!(
-            classify_method(method),
+            classify_method(method).map(|policy| policy.tier),
             Some(MethodTier::Public),
             "expected {method} to be Public"
         );
@@ -344,7 +344,7 @@ fn classify_restricted_methods() {
         "txpool_inspect",
     ] {
         assert_eq!(
-            classify_method(method),
+            classify_method(method).map(|policy| policy.tier),
             Some(MethodTier::Restricted),
             "expected {method} to be Restricted"
         );
@@ -363,7 +363,7 @@ fn classify_disabled_methods() {
         "eth_unsubscribe",
     ] {
         assert_eq!(
-            classify_method(method),
+            classify_method(method).map(|policy| policy.tier),
             Some(MethodTier::Disabled),
             "expected {method} to be Disabled"
         );
@@ -379,7 +379,7 @@ fn classify_admin_wildcard() {
         "admin_peers",
     ] {
         assert_eq!(
-            classify_method(method),
+            classify_method(method).map(|policy| policy.tier),
             Some(MethodTier::Restricted),
             "expected {method} to be Restricted (admin_* wildcard)"
         );
