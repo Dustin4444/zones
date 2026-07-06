@@ -155,7 +155,7 @@ contract SwapAndDepositRouterTest is BaseTest {
         vm.stopPrank();
 
         // Make admin a token1 issuer so the liquidity-seeding helper can mint.
-        vm.prank(admin);
+        vm.prank(sequencer);
         token1.grantRole(_ISSUER_ROLE, admin);
 
         // Seed a fragmented book so every swap test runs against real per-order
