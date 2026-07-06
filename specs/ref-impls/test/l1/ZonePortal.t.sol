@@ -3127,6 +3127,129 @@ contract ZonePortalTest is BaseTest {
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + w.amount);
     }
 
+    /// @dev Park a refund of `amount` for `to` via a failed deposit bounce-back (zero
+    ///      bounceback fee), leaving `refunds[pathUSD][to] == amount`.
+    function _parkRefund(address to, uint128 amount) internal {
+        vm.fee(0); // bouncebackFee == 0, so the full amount is parked
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), amount);
+        portal.deposit(address(pathUSD), alice, amount, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        Withdrawal memory w =
+            _withdrawal(address(pathUSD), alice, to, amount, bytes32(0), 0, address(0), "");
+        _enqueueSingleWithdrawal(w);
+        vm.mockCall(
+            address(pathUSD),
+            abi.encodeWithSelector(ITIP20.transfer.selector, to, amount),
+            abi.encode(false)
+        );
+        portal.processWithdrawal(w, bytes32(0));
+        vm.clearMockedCalls();
+        require(portal.refunds(address(pathUSD), to) == amount, "park failed");
+    }
+
+    /// @notice A refund whose payout transfer returns false reverts with CallbackRejected, and
+    ///         the CEI zeroing is rolled back so the refund stays claimable.
+    function test_claimRefund_revertsWhenTransferReturnsFalse() public {
+        uint128 amount = 250e6;
+        _parkRefund(bob, amount);
+
+        vm.mockCall(
+            address(pathUSD),
+            abi.encodeWithSelector(ITIP20.transfer.selector, bob, amount),
+            abi.encode(false)
+        );
+        vm.prank(bob);
+        vm.expectRevert(IZonePortal.CallbackRejected.selector);
+        portal.claimRefund(address(pathUSD));
+        vm.clearMockedCalls();
+
+        // Revert rolled back the `refunds = 0` write, so the refund is preserved.
+        assertEq(portal.refunds(address(pathUSD), bob), amount);
+    }
+
+    /// @notice A refund whose payout transfer reverts is caught and surfaced as
+    ///         CallbackRejected, again preserving the parked refund.
+    function test_claimRefund_revertsWhenTransferReverts() public {
+        uint128 amount = 250e6;
+        _parkRefund(bob, amount);
+
+        vm.mockCallRevert(
+            address(pathUSD), abi.encodeWithSelector(ITIP20.transfer.selector, bob, amount), "boom"
+        );
+        vm.prank(bob);
+        vm.expectRevert(IZonePortal.CallbackRejected.selector);
+        portal.claimRefund(address(pathUSD));
+        vm.clearMockedCalls();
+
+        assertEq(portal.refunds(address(pathUSD), bob), amount);
+    }
+
+    /// @notice When the bounceback fee exceeds a dust withdrawal, it is capped at the amount:
+    ///         the sequencer takes the whole amount and nothing is parked as a refund.
+    function test_processWithdrawal_bounceBackFeeCappedAtAmount() public {
+        // Fund the portal.
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        // Dust bounce-back withdrawal (fallbackRecipient == 0 routes to the bounce-back path).
+        uint128 dust = 1;
+        Withdrawal memory w =
+            _withdrawal(address(pathUSD), alice, bob, dust, bytes32(0), 0, address(0), "");
+        _enqueueSingleWithdrawal(w);
+
+        // High basefee makes bouncebackFee (300k * basefee / 1e12) exceed the dust amount.
+        vm.fee(1e12);
+        assertGt(portal.calculateBouncebackFee(), dust, "setup: fee must exceed dust amount");
+
+        uint256 seqBefore = pathUSD.balanceOf(sequencer);
+        vm.expectEmit(true, true, false, true, address(portal));
+        emit IZonePortal.DepositBounceBack(bob, address(pathUSD), 0, dust);
+        portal.processWithdrawal(w, bytes32(0));
+
+        // Fee capped at the amount: sequencer got the whole dust, refund is zero.
+        assertEq(pathUSD.balanceOf(sequencer) - seqBefore, dust);
+        assertEq(portal.refunds(address(pathUSD), bob), 0);
+    }
+
+    /// @notice Enabling an already-enabled token reverts (the enabled latch is irreversible).
+    function test_enableToken_revertsIfAlreadyEnabled() public {
+        // pathUSD is enabled at zone creation.
+        vm.prank(admin);
+        vm.expectRevert(IZonePortal.TokenAlreadyEnabled.selector);
+        portal.enableToken(address(pathUSD));
+    }
+
+    /// @notice Enabling a non-TIP-20 address reverts.
+    function test_enableToken_revertsIfNotTIP20() public {
+        vm.prank(admin);
+        vm.expectRevert(IZonePortal.TokenNotEnabled.selector);
+        portal.enableToken(address(0xDEAD));
+    }
+
+    /// @notice submitBatch rejects a deposit transition whose prevDepositNumber does not match
+    ///         the portal's last processed deposit number (contiguity assertion).
+    function test_submitBatch_revertsOnInvalidDepositTransition() public {
+        vm.roll(block.number + 1);
+        // Precompute args (incl. portal view calls) before expectRevert, so the only call it
+        // measures is submitBatch itself.
+        BlockTransition memory bt =
+            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("x") });
+        DepositQueueTransition memory dt = DepositQueueTransition({
+            prevProcessedHash: bytes32(0),
+            nextProcessedHash: portal.currentDepositQueueHash(),
+            prevDepositNumber: 5, // != lastProcessedDepositNumber (0)
+            nextDepositNumber: 5
+        });
+        uint64 anchor = uint64(block.number - 1);
+
+        vm.expectRevert(IZonePortal.InvalidDepositTransition.selector);
+        portal.submitBatch(anchor, 0, bt, dt, bytes32(0), "", "");
+    }
+
     /// @notice Submitting a batch reverts once the withdrawal queue is full.
     function test_withdrawalQueue_revertsWhenFull() public {
         vm.roll(genesisTempoBlockNumber + 1);
