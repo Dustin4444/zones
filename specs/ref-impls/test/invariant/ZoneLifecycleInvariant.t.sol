@@ -355,6 +355,10 @@ contract ZoneLifecycleHandler is Test {
 ///         bounds (I-12), L1/zone batch-index lockstep (I-5) and counter monotonicity
 ///         (I-5/I-6). These properties have no on-chain enforcement (they are gated by the
 ///         stub verifier) and were previously untested by any stateful fuzzing.
+/// @dev Raise the per-run call depth above the default: the `afterInvariant` guard requires the
+///      fuzzer to organically complete the full deposit -> advance -> request -> finalize ->
+///      process chain, and the deep withdrawal legs are not reliably reached within 50 calls.
+/// forge-config: default.invariant.depth = 200
 contract ZoneLifecycleInvariantTest is BaseTest {
 
     ZoneFactory internal zoneFactory;
