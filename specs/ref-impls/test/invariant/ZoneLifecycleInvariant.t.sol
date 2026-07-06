@@ -85,7 +85,7 @@ contract ZoneLifecycleHandler is Test {
     uint256 public numFinalizes;
     uint256 public numWithdrawalsProcessed;
 
-    // High-water marks for monotonic counters (I-5, I-6).
+    // High-water marks for monotonic counters (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX, TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC).
     uint64 internal prevDepositCount;
     uint64 internal prevNextWithdrawalIndex;
     uint64 internal prevPortalBatchIndex;
@@ -132,24 +132,35 @@ contract ZoneLifecycleHandler is Test {
         return actors[seed % 3];
     }
 
-    /// @notice Assert the protocol's lifecycle counters never decrease (I-5, I-6).
+    /// @notice Assert the protocol's lifecycle counters never decrease (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX, TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC).
     /// @dev Called at the end of every mutating action; a decrement reverts and (under
     ///      fail_on_revert) breaks the run.
     function _recordMonotonicCounters() internal {
         uint64 dc = portal.depositCount();
-        require(dc >= prevDepositCount, "I-6: depositCount decreased");
+        require(
+            dc >= prevDepositCount, "TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC: depositCount decreased"
+        );
         prevDepositCount = dc;
 
         uint64 nwi = outbox.nextWithdrawalIndex();
-        require(nwi >= prevNextWithdrawalIndex, "I-6: nextWithdrawalIndex decreased");
+        require(
+            nwi >= prevNextWithdrawalIndex,
+            "TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC: nextWithdrawalIndex decreased"
+        );
         prevNextWithdrawalIndex = nwi;
 
         uint64 pbi = portal.withdrawalBatchIndex();
-        require(pbi >= prevPortalBatchIndex, "I-5: portal withdrawalBatchIndex decreased");
+        require(
+            pbi >= prevPortalBatchIndex,
+            "TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX: portal withdrawalBatchIndex decreased"
+        );
         prevPortalBatchIndex = pbi;
 
         uint64 obi = outbox.withdrawalBatchIndex();
-        require(obi >= prevOutboxBatchIndex, "I-5: outbox withdrawalBatchIndex decreased");
+        require(
+            obi >= prevOutboxBatchIndex,
+            "TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX: outbox withdrawalBatchIndex decreased"
+        );
         prevOutboxBatchIndex = obi;
     }
 
@@ -351,9 +362,9 @@ contract ZoneLifecycleHandler is Test {
 
 /// @title ZoneLifecycleInvariantTest
 /// @notice Stateful invariants over the honest-sequencer deposit/withdrawal lifecycle:
-///         bridge solvency (escrow covers outstanding supply, I-19/E-2), withdrawal queue
-///         bounds (I-12), L1/zone batch-index lockstep (I-5) and counter monotonicity
-///         (I-5/I-6). These properties have no on-chain enforcement (they are gated by the
+///         bridge solvency (escrow covers outstanding supply, TEMPO-ZONE-PORTAL-SOLVENCY), withdrawal queue
+///         bounds (TEMPO-ZONE-WITHDRAWAL-QUEUE-RING), L1/zone batch-index lockstep (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX) and counter monotonicity
+///         (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX/TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC). These properties have no on-chain enforcement (they are gated by the
 ///         stub verifier) and were previously untested by any stateful fuzzing.
 /// @dev Raise the per-run call depth above the default: the `afterInvariant` guard requires the
 ///      fuzzer to organically complete the full deposit -> advance -> request -> finalize ->
@@ -428,7 +439,7 @@ contract ZoneLifecycleInvariantTest is BaseTest {
 
     /// @notice Bridge solvency under an honest sequencer.
     /// @dev Two checks:
-    ///      1. I-19/E-2 core property: portal escrow >= outstanding zone-token supply, compared
+    ///      1. TEMPO-ZONE-PORTAL-SOLVENCY core property: portal escrow >= outstanding zone-token supply, compared
     ///         against live on-chain quantities (totalSupply - initialSupply), so an over-mint or
     ///         under-collateralized release is caught regardless of the ghost ledger.
     ///      2. Live state exactly matches the honest-sequencer ledger, guarding against a vacuous
@@ -439,7 +450,7 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         assertGe(
             escrow,
             token.totalSupply() - handler.initialSupply(),
-            "I-19/E-2: escrow does not cover outstanding zone supply"
+            "TEMPO-ZONE-PORTAL-SOLVENCY: escrow does not cover outstanding zone supply"
         );
 
         assertEq(
@@ -454,36 +465,40 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         );
     }
 
-    /// @notice Withdrawal ring buffer stays well-formed (I-12) and the L1/zone withdrawal
-    ///         batch indices advance in lockstep (I-5).
+    /// @notice Withdrawal ring buffer stays well-formed (TEMPO-ZONE-WITHDRAWAL-QUEUE-RING) and the L1/zone withdrawal
+    ///         batch indices advance in lockstep (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX).
     function invariant_zoneQueueAndBatchIndices() public view {
         uint256 head = portal.withdrawalQueueHead();
         uint256 tail = portal.withdrawalQueueTail();
-        assertGe(tail, head, "I-12: withdrawal queue tail < head");
-        assertLe(tail - head, WITHDRAWAL_QUEUE_CAPACITY, "I-12: withdrawal queue exceeds capacity");
+        assertGe(tail, head, "TEMPO-ZONE-WITHDRAWAL-QUEUE-RING: withdrawal queue tail < head");
+        assertLe(
+            tail - head,
+            WITHDRAWAL_QUEUE_CAPACITY,
+            "TEMPO-ZONE-WITHDRAWAL-QUEUE-RING: withdrawal queue exceeds capacity"
+        );
         assertEq(
             portal.withdrawalBatchIndex(),
             outbox.withdrawalBatchIndex(),
-            "I-5: L1 and zone withdrawal batch indices out of lockstep"
+            "TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX: L1 and zone withdrawal batch indices out of lockstep"
         );
     }
 
-    /// @notice Deposit processing stays contiguous under an honest sequencer (I-17 / I-18).
-    /// @dev Neither property is enforced on-chain (both gated by the stub verifier, X-4); this
+    /// @notice Deposit processing stays contiguous under an honest sequencer (TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC / TEMPO-ZONE-DEPOSIT-PROCESSED-PREFIX).
+    /// @dev Neither property is enforced on-chain (both gated by the stub verifier); this
     ///      pins the reference honest-sequencer behaviour:
-    ///      1. I-17: the zone never marks more deposits processed than were enqueued on L1.
-    ///      2. I-18: the zone's processed deposit-queue hash equals the contiguous-prefix hash
+    ///      1. TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC: the zone never marks more deposits processed than were enqueued on L1.
+    ///      2. TEMPO-ZONE-DEPOSIT-PROCESSED-PREFIX: the zone's processed deposit-queue hash equals the contiguous-prefix hash
     ///         chain (no skipped or duplicated deposits).
     function invariant_zoneDepositContiguity() public view {
         assertLe(
             inbox.processedDepositNumber(),
             portal.depositCount(),
-            "I-17: processed deposit number exceeds enqueued count"
+            "TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC: processed deposit number exceeds enqueued count"
         );
         assertEq(
             inbox.processedDepositQueueHash(),
             handler.processedHashMirror(),
-            "I-18: processed deposit hash diverged from contiguous chain"
+            "TEMPO-ZONE-DEPOSIT-PROCESSED-PREFIX: processed deposit hash diverged from contiguous chain"
         );
     }
 

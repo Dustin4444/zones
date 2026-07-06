@@ -11,7 +11,7 @@ import { Test } from "forge-std/Test.sol";
 
 /// @title ZoneOutboxHarness
 /// @notice Exposes the outbox's stored pending-withdrawal array so invariants can assert the
-///         per-item bounds (I-3 gas limit, I-4 callback data size) that are otherwise internal.
+///         per-item bounds (TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: gas limit and callback data size) that are otherwise internal.
 contract ZoneOutboxHarness is ZoneOutbox {
 
     constructor(address _config) ZoneOutbox(_config) { }
@@ -37,8 +37,8 @@ contract ZoneOutboxHarness is ZoneOutbox {
 /// @title ZoneWithdrawalLimitsHandler
 /// @notice Drives withdrawal requests with random gas limits and callback-data sizes (some
 ///         deliberately over the cap), so the invariant test can confirm the outbox never
-///         stores an out-of-bounds withdrawal (I-3/I-4) and never accepts more than
-///         `maxWithdrawalsPerBlock` requests per block (I-21).
+///         stores an out-of-bounds withdrawal (TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS) and never accepts more than
+///         `maxWithdrawalsPerBlock` requests per block.
 /// @dev Foundry keeps `block.number` constant across invariant calls (it never auto-advances),
 ///      so successful in-bounds requests accumulate toward the per-block cap across separate
 ///      `request` calls; once the cap is reached further in-bounds requests revert. Block
@@ -166,8 +166,8 @@ contract ZoneWithdrawalLimitsHandler is Test {
 }
 
 /// @title ZoneWithdrawalLimitsInvariantTest
-/// @notice Stateful invariants for stored-withdrawal bounds (I-3 gas limit, I-4 callback data
-///         size) and the per-block withdrawal cap (I-21).
+/// @notice Stateful invariants for stored-withdrawal bounds (TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS:
+///         gas limit and callback data size) and the per-block withdrawal cap.
 contract ZoneWithdrawalLimitsInvariantTest is Test {
 
     ZoneConfig internal config;
@@ -213,7 +213,7 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// @notice I-3 / I-4: every stored pending withdrawal respects the gas-limit and
+    /// @notice TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: every stored pending withdrawal respects the gas-limit and
     ///         callback-data-size caps; an over-bounds request can never enter the queue.
     function invariant_storedWithdrawalBounds() public view {
         uint256 len = outbox.rawLength();
@@ -221,22 +221,20 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
             assertLe(
                 outbox.gasLimitAt(i),
                 handler.maxGas(),
-                "I-3: stored withdrawal exceeds MAX_WITHDRAWAL_GAS_LIMIT"
+                "TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: stored withdrawal exceeds MAX_WITHDRAWAL_GAS_LIMIT"
             );
             assertLe(
                 outbox.callbackLenAt(i),
                 handler.maxData(),
-                "I-4: stored withdrawal exceeds MAX_CALLBACK_DATA_SIZE"
+                "TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: stored withdrawal exceeds MAX_CALLBACK_DATA_SIZE"
             );
         }
     }
 
-    /// @notice I-21: no more than `maxWithdrawalsPerBlock` user requests are accepted per block.
+    /// @notice Per-block withdrawal cap: no more than `maxWithdrawalsPerBlock` user requests are accepted per block.
     function invariant_perBlockWithdrawalCap() public view {
         assertLe(
-            handler.successesThisBlock(),
-            CAP,
-            "I-21: accepted more withdrawals than the per-block cap"
+            handler.successesThisBlock(), CAP, "accepted more withdrawals than the per-block cap"
         );
     }
 
@@ -244,8 +242,12 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
     ///         storage must all have been exercised.
     function afterInvariant() public view {
         assertGt(handler.stored(), 0, "no withdrawals were ever stored");
-        assertGt(handler.boundRejects(), 0, "I-3/I-4: over-bounds requests never exercised");
-        assertGt(handler.capHits(), 0, "I-21: per-block cap was never hit");
+        assertGt(
+            handler.boundRejects(),
+            0,
+            "TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: over-bounds requests never exercised"
+        );
+        assertGt(handler.capHits(), 0, "per-block cap was never hit");
     }
 
 }

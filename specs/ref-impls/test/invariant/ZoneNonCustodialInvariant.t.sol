@@ -25,9 +25,9 @@ import { Test } from "forge-std/Test.sol";
 
 /// @title ZoneNonCustodialHandler
 /// @notice Drives token pause/resume against deposits and withdrawals to exercise two
-///         guarantees: the token-enabled latch (I-7) and the non-custodial property that
+///         guarantees: the token-enabled latch (TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY) and the non-custodial property that
 ///         withdrawals are never blocked for an enabled token even while deposits are paused
-///         (I-8). Withdrawals fire regardless of pause state; under fail_on_revert any
+///         (TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY). Withdrawals fire regardless of pause state; under fail_on_revert any
 ///         withdrawal that a (buggy) pause would block breaks the run.
 contract ZoneNonCustodialHandler is Test {
 
@@ -46,7 +46,7 @@ contract ZoneNonCustodialHandler is Test {
     bytes32 internal mirrorDepositHash;
     bytes32 internal mirrorProcessedHash;
 
-    uint256 public withdrawalsWhilePaused; // coverage: proves I-8 is actually exercised
+    uint256 public withdrawalsWhilePaused; // coverage: proves TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY is actually exercised
 
     constructor(
         ZonePortal _portal,
@@ -138,7 +138,7 @@ contract ZoneNonCustodialHandler is Test {
     }
 
     /// @notice Request a withdrawal regardless of the deposit pause state. The non-custodial
-    ///         guarantee (I-8) requires this to succeed for an enabled token even when paused.
+    ///         guarantee (TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY) requires this to succeed for an enabled token even when paused.
     ///         Holders carry zone-token balance from genesis, so withdrawals never depend on
     ///         prior deposits being processed.
     function requestWithdrawal(uint256 actorSeed, uint256 amountSeed) external {
@@ -155,7 +155,7 @@ contract ZoneNonCustodialHandler is Test {
         if (paused) withdrawalsWhilePaused++;
     }
 
-    /// @notice Force the deposits-paused state and then withdraw, so I-8 is exercised
+    /// @notice Force the deposits-paused state and then withdraw, so TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY is exercised
     ///         deterministically rather than only by chance interleaving.
     function pauseThenWithdraw(uint256 actorSeed, uint256 amountSeed) external {
         address holder = _actor(actorSeed);
@@ -171,7 +171,7 @@ contract ZoneNonCustodialHandler is Test {
 
         vm.startPrank(holder);
         token.approve(address(outbox), amount);
-        // Must not revert: withdrawals are non-custodial for an enabled token (I-8).
+        // Must not revert: withdrawals are non-custodial for an enabled token (TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY).
         outbox.requestWithdrawal(address(token), holder, amount, bytes32(0), 0, holder, "");
         vm.stopPrank();
         withdrawalsWhilePaused++;
@@ -180,8 +180,8 @@ contract ZoneNonCustodialHandler is Test {
 }
 
 /// @title ZoneNonCustodialInvariantTest
-/// @notice Stateful invariants for the token-enabled latch (I-7) and the non-custodial
-///         withdrawal guarantee (I-8) under random pause/resume interleavings.
+/// @notice Stateful invariants for the token-enabled latch (TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY) and the non-custodial
+///         withdrawal guarantee (TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY) under random pause/resume interleavings.
 contract ZoneNonCustodialInvariantTest is BaseTest {
 
     ZoneFactory internal zoneFactory;
@@ -247,32 +247,38 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
         targetContract(address(handler));
     }
 
-    /// @notice I-7: once enabled, a token never becomes disabled (pause/resume must only
+    /// @notice TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: once enabled, a token never becomes disabled (pause/resume must only
     ///         toggle depositsActive, never the enabled latch).
     function invariant_tokenEnabledLatch() public view {
-        assertTrue(portal.isTokenEnabled(address(token)), "I-7: token became disabled on L1");
-        assertTrue(config.isEnabledToken(address(token)), "I-7: token became disabled on zone");
+        assertTrue(
+            portal.isTokenEnabled(address(token)),
+            "TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: token became disabled on L1"
+        );
+        assertTrue(
+            config.isEnabledToken(address(token)),
+            "TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: token became disabled on zone"
+        );
     }
 
-    /// @notice X-3: the portal keeps the messenger at max escrow allowance for an enabled
+    /// @notice TEMPO-ZONE-MESSENGER-APPROVAL: the portal keeps the messenger at max escrow allowance for an enabled
     ///         token. Enabling grants `type(uint256).max`; nothing in this suite relays
     ///         (which would spend it), so it must stay max — escrow can always be released.
     function invariant_messengerAllowanceMax() public view {
         assertEq(
             token.allowance(address(portal), address(messenger)),
             type(uint256).max,
-            "X-3: messenger lost max escrow allowance"
+            "TEMPO-ZONE-MESSENGER-APPROVAL: messenger lost max escrow allowance"
         );
     }
 
-    /// @notice I-8 is enforced inside the handler: every withdrawal-while-paused must not
+    /// @notice TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY is enforced inside the handler: every withdrawal-while-paused must not
     ///         revert under fail_on_revert. This hook guards against a vacuous pass by
     ///         requiring the paused-withdrawal path to have actually executed.
     function afterInvariant() public view {
         assertGt(
             handler.withdrawalsWhilePaused(),
             0,
-            "I-8: non-custodial withdrawal-while-paused path never exercised"
+            "TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY: non-custodial withdrawal-while-paused path never exercised"
         );
     }
 

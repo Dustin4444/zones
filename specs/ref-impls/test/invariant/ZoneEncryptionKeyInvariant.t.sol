@@ -11,7 +11,7 @@ import { Vm } from "forge-std/Vm.sol";
 /// @title ZoneEncryptionKeyHandler
 /// @notice Registers real secp256k1 encryption keys (with valid proof-of-possession) and rolls
 ///         the block number forward, mirroring each key's activation block. Drives the temporal
-///         key-rotation behaviour (I-16) so the invariant test can compare on-chain validity
+///         key-rotation behaviour (TEMPO-ZONE-ENCRYPTION-KEY-GRACE) so the invariant test can compare on-chain validity
 ///         against the reference grace-period rule.
 contract ZoneEncryptionKeyHandler is Test {
 
@@ -57,7 +57,7 @@ contract ZoneEncryptionKeyHandler is Test {
 }
 
 /// @title ZoneEncryptionKeyInvariantTest
-/// @notice Stateful invariant for encryption-key rotation (I-16): the latest key never expires,
+/// @notice Stateful invariant for encryption-key rotation (TEMPO-ZONE-ENCRYPTION-KEY-GRACE): the latest key never expires,
 ///         and an older key is valid for new deposits exactly while
 ///         `block.number < nextKey.activationBlock + ENCRYPTION_KEY_GRACE_PERIOD`.
 contract ZoneEncryptionKeyInvariantTest is Test {
@@ -99,26 +99,44 @@ contract ZoneEncryptionKeyInvariantTest is Test {
 
         // Latest key never expires.
         (bool latestValid, uint64 latestExpiry) = portal.isEncryptionKeyValid(count - 1);
-        assertTrue(latestValid, "I-16: latest key reported invalid");
-        assertEq(latestExpiry, 0, "I-16: latest key reported a non-zero expiry");
+        assertTrue(latestValid, "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: latest key reported invalid");
+        assertEq(
+            latestExpiry,
+            0,
+            "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: latest key reported a non-zero expiry"
+        );
 
         // Each older key is valid iff still inside its successor's grace window.
         for (uint256 i = 0; i + 1 < count; i++) {
             uint64 expectedExpiry = handler.activationAt(i + 1) + ENCRYPTION_KEY_GRACE_PERIOD;
             bool expectedValid = block.number < expectedExpiry;
             (bool valid, uint64 expiry) = portal.isEncryptionKeyValid(i);
-            assertEq(expiry, expectedExpiry, "I-16: old-key expiry diverged from grace rule");
-            assertEq(valid, expectedValid, "I-16: old-key validity diverged from grace rule");
+            assertEq(
+                expiry,
+                expectedExpiry,
+                "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: old-key expiry diverged from grace rule"
+            );
+            assertEq(
+                valid,
+                expectedValid,
+                "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: old-key validity diverged from grace rule"
+            );
         }
 
         // Out-of-range index is always invalid.
         (bool oobValid,) = portal.isEncryptionKeyValid(count);
-        assertFalse(oobValid, "I-16: out-of-range key index reported valid");
+        assertFalse(
+            oobValid, "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: out-of-range key index reported valid"
+        );
     }
 
     /// @notice Guard against a vacuous pass: the old-key branch needs at least two keys.
     function afterInvariant() public view {
-        assertGe(handler.keyCount(), 2, "I-16: rotation path (>=2 keys) never exercised");
+        assertGe(
+            handler.keyCount(),
+            2,
+            "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: rotation path (>=2 keys) never exercised"
+        );
     }
 
 }

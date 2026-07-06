@@ -10,7 +10,7 @@ import { Test } from "forge-std/Test.sol";
 /// @notice Drives the two-step sequencer handover (`transferSequencer` / `acceptSequencer`)
 ///         while mirroring the expected `(sequencer, pendingSequencer)` state. Every action is
 ///         a legal operation replayed against a ghost model, so the invariant test can assert
-///         the on-chain state machine never diverges from the reference (I-20).
+///         the on-chain state machine never diverges from the reference (TEMPO-ZONE-SEQUENCER-TWO-STEP).
 contract ZoneSequencerHandler is Test {
 
     ZonePortal internal immutable portal;
@@ -64,7 +64,7 @@ contract ZoneSequencerHandler is Test {
 }
 
 /// @title ZoneSequencerInvariantTest
-/// @notice Stateful invariant for the two-step sequencer transfer (I-20): `pendingSequencer`
+/// @notice Stateful invariant for the two-step sequencer transfer (TEMPO-ZONE-SEQUENCER-TWO-STEP): `pendingSequencer`
 ///         is set by the current sequencer, consumed exactly once by `acceptSequencer`, then
 ///         reset to zero — so block production can never be seized by an unintended address.
 contract ZoneSequencerInvariantTest is Test {
@@ -108,19 +108,26 @@ contract ZoneSequencerInvariantTest is Test {
         assertEq(
             portal.sequencer(),
             handler.expectedSequencer(),
-            "I-20: sequencer diverged from two-step handover model"
+            "TEMPO-ZONE-SEQUENCER-TWO-STEP: sequencer diverged from two-step handover model"
         );
         assertEq(
             portal.pendingSequencer(),
             handler.expectedPending(),
-            "I-20: pendingSequencer diverged from two-step handover model"
+            "TEMPO-ZONE-SEQUENCER-TWO-STEP: pendingSequencer diverged from two-step handover model"
         );
-        assertTrue(portal.sequencer() != address(0), "I-20: sequencer became the zero address");
+        assertTrue(
+            portal.sequencer() != address(0),
+            "TEMPO-ZONE-SEQUENCER-TWO-STEP: sequencer became the zero address"
+        );
     }
 
     /// @notice Guard against a vacuous pass: at least one full handover must have completed.
     function afterInvariant() public view {
-        assertGt(handler.handoverCount(), 0, "I-20: handover path never exercised");
+        assertGt(
+            handler.handoverCount(),
+            0,
+            "TEMPO-ZONE-SEQUENCER-TWO-STEP: handover path never exercised"
+        );
     }
 
 }
