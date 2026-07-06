@@ -455,6 +455,33 @@ impl ZoneTestNode {
         .await
     }
 
+    /// Start a zone node connected to a real L1, anchoring genesis to a specific
+    /// L1 block and optionally overriding the initial token list used for
+    /// startup policy cache seeding.
+    pub(crate) async fn start_from_l1_at_block_with_initial_tokens(
+        l1_http_url: &url::Url,
+        l1_ws_url: &url::Url,
+        portal_address: Address,
+        block_number: u64,
+        initial_tokens: Option<Vec<Address>>,
+    ) -> eyre::Result<Self> {
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, block_number).await?;
+
+        let signer = l1_dev_signer();
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            l1_ws_url.to_string(),
+            portal_address,
+            Some(genesis_block_number),
+            next_unique_chain_id(),
+            Some(genesis),
+            signer,
+            Duration::from_secs(4),
+            initial_tokens,
+        )
+        .await
+    }
+
     pub(crate) async fn start_from_l1_with_withdrawal_batch_interval(
         l1_http_url: &url::Url,
         l1_ws_url: &url::Url,
@@ -473,6 +500,7 @@ impl ZoneTestNode {
             Some(genesis),
             signer,
             withdrawal_batch_interval,
+            Some(vec![]),
         )
         .await
     }
@@ -568,10 +596,12 @@ impl ZoneTestNode {
             custom_genesis,
             sequencer_signer,
             Duration::from_secs(4),
+            Some(vec![]),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn launch_with_genesis_and_withdrawal_batch_interval(
         l1_ws_url: String,
         portal_address: Address,
@@ -580,6 +610,7 @@ impl ZoneTestNode {
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
         withdrawal_batch_interval: Duration,
+        initial_tokens: Option<Vec<Address>>,
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
@@ -592,15 +623,17 @@ impl ZoneTestNode {
         genesis.config.chain_id = chain_id;
         let chain_spec = TempoChainSpec::from_genesis(genesis);
 
-        let zone_node = ZoneNode::new(
+        let mut zone_node = ZoneNode::new(
             l1_ws_url,
             portal_address,
             genesis_tempo_block_number,
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_withdrawal_batch_interval(withdrawal_batch_interval)
-        .with_initial_tokens(vec![]);
+        .with_withdrawal_batch_interval(withdrawal_batch_interval);
+        if let Some(initial_tokens) = initial_tokens {
+            zone_node = zone_node.with_initial_tokens(initial_tokens);
+        }
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
@@ -748,6 +781,21 @@ impl L1TestNode {
         self.dev_signer().address()
     }
 
+    /// Returns the signer used as the ZonePortal admin (mnemonic index 2).
+    ///
+    /// Distinct from the dev account (which acts as the sequencer) so the test
+    /// suite exercises the admin/sequencer role separation. This account is NOT
+    /// pre-funded; [`create_zone`](Self::create_zone) funds it with pathUSD for
+    /// gas so it can make admin-only portal calls.
+    pub(crate) fn admin_signer(&self) -> alloy_signer_local::PrivateKeySigner {
+        self.signer_at(2)
+    }
+
+    /// Returns the address of the ZonePortal admin account.
+    pub(crate) fn admin_address(&self) -> Address {
+        self.admin_signer().address()
+    }
+
     /// Returns a signer for the second test account (mnemonic index 1).
     ///
     /// This account is NOT pre-funded — use [`fund_user`](Self::fund_user) to
@@ -888,6 +936,17 @@ impl L1TestNode {
     pub(crate) fn dev_provider(&self) -> alloy_provider::DynProvider {
         ProviderBuilder::new()
             .wallet(self.dev_signer())
+            .connect_http(self.http_url.clone())
+            .erased()
+    }
+
+    /// Returns an HTTP provider with the admin account wallet attached.
+    ///
+    /// Used for `onlyAdmin` portal calls so they are signed by the admin key
+    /// rather than the dev (sequencer) key.
+    pub(crate) fn admin_provider(&self) -> alloy_provider::DynProvider {
+        ProviderBuilder::new()
+            .wallet(self.admin_signer())
             .connect_http(self.http_url.clone())
             .erased()
     }
@@ -1067,16 +1126,31 @@ impl L1TestNode {
     /// Create a zone on an existing ZoneFactory and return the portal address.
     ///
     /// Captures the current L1 header as the genesis anchor, then calls
-    /// `createZone()` with pathUSD as the token and the dev account as sequencer.
+    /// `createZone()` with pathUSD as the token, a distinct [`admin_address`] as
+    /// the portal admin, and the dev account as the sequencer. This exercises the
+    /// admin/sequencer role separation. The admin account is funded with pathUSD
+    /// for gas so admin-only portal calls (e.g. `enableToken`) can be made.
+    ///
+    /// [`admin_address`]: Self::admin_address
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
-        self.create_zone_with_sequencer(factory_address, self.dev_address())
-            .await
+        let portal = self
+            .create_zone_with_admin_and_sequencer(
+                factory_address,
+                self.admin_address(),
+                self.dev_address(),
+            )
+            .await?;
+        // The admin is not pre-funded; give it pathUSD to pay for gas on
+        // admin-only portal calls.
+        self.fund_user(self.admin_address(), 10_000_000).await?;
+        Ok(portal)
     }
 
-    /// Create a zone on an existing ZoneFactory with a custom sequencer address.
-    pub(crate) async fn create_zone_with_sequencer(
+    /// Create a zone on an existing ZoneFactory with explicit admin and sequencer addresses.
+    pub(crate) async fn create_zone_with_admin_and_sequencer(
         &self,
         factory_address: Address,
+        admin: Address,
         sequencer: Address,
     ) -> eyre::Result<Address> {
         use tempo_precompiles::PATH_USD_ADDRESS;
@@ -1101,7 +1175,7 @@ impl L1TestNode {
         let verifier_address = factory.verifier().call().await?;
         let receipt = factory
             .createZone(ZoneFactory::CreateZoneParams {
-                admin: sequencer,
+                admin,
                 initialToken: PATH_USD_ADDRESS,
                 sequencer,
                 verifier: verifier_address,
@@ -1178,10 +1252,18 @@ impl L1TestNode {
     ) -> eyre::Result<(Address, Address, Address)> {
         let factory = self.deploy_zone_factory().await?;
         let portal_a = self
-            .create_zone_with_sequencer(factory, sequencer_a.address())
+            .create_zone_with_admin_and_sequencer(
+                factory,
+                self.dev_address(),
+                sequencer_a.address(),
+            )
             .await?;
         let portal_b = self
-            .create_zone_with_sequencer(factory, sequencer_b.address())
+            .create_zone_with_admin_and_sequencer(
+                factory,
+                self.dev_address(),
+                sequencer_b.address(),
+            )
             .await?;
         let router = self.deploy_router(factory).await?;
         Ok((portal_a, portal_b, router))
@@ -1234,7 +1316,7 @@ impl L1TestNode {
         token: Address,
     ) -> eyre::Result<()> {
         use tempo_zone_contracts::ZonePortal;
-        let provider = self.dev_provider();
+        let provider = self.admin_provider();
         let portal = ZonePortal::new(portal_address, &provider);
         let receipt = portal
             .enableToken(token)
@@ -1252,7 +1334,7 @@ impl L1TestNode {
         portal_address: Address,
         token: Address,
     ) -> eyre::Result<()> {
-        let provider = self.dev_provider();
+        let provider = self.admin_provider();
         let portal = TestZonePortalAdmin::new(portal_address, &provider);
         let receipt = portal
             .pauseDeposits(token)
