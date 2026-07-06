@@ -76,6 +76,15 @@ contract ZoneLifecycleHandler is Test {
     uint256 internal batchHead;
     uint256 internal blockNonce;
 
+    // Coverage counters (proves each lifecycle leg actually executed real work, not just
+    // hit an early return). Guards the invariants against a vacuous pass.
+    uint256 public numDeposits;
+    uint256 public numAdvances; // advanceDeposits calls that processed >=1 deposit
+    uint256 public numDepositsProcessed; // total deposits minted on the zone
+    uint256 public numWithdrawalRequests;
+    uint256 public numFinalizes;
+    uint256 public numWithdrawalsProcessed;
+
     // High-water marks for monotonic counters (I-5, I-6).
     uint64 internal prevDepositCount;
     uint64 internal prevNextWithdrawalIndex;
@@ -171,6 +180,7 @@ contract ZoneLifecycleHandler is Test {
 
         depositMirror.push(d);
         escrowIn += net;
+        numDeposits++;
         _recordMonotonicCounters();
     }
 
@@ -209,6 +219,8 @@ contract ZoneLifecycleHandler is Test {
         }
         mirrorProcessedHash = expectedHash;
         depositHead += count;
+        numAdvances++;
+        numDepositsProcessed += count;
         _recordMonotonicCounters();
     }
 
@@ -243,6 +255,7 @@ contract ZoneLifecycleHandler is Test {
         pendingWithdrawals.push(w);
         burned += amount;
         zoneCredit[holder] -= amount;
+        numWithdrawalRequests++;
         _recordMonotonicCounters();
     }
 
@@ -297,6 +310,7 @@ contract ZoneLifecycleHandler is Test {
             b.ws.push(ws[i]);
         }
         withdrawalFinalizeHead += count;
+        numFinalizes++;
         _recordMonotonicCounters();
     }
 
@@ -329,6 +343,7 @@ contract ZoneLifecycleHandler is Test {
 
         b.head = idx + 1;
         escrowOut += w.amount + w.fee;
+        numWithdrawalsProcessed++;
         _recordMonotonicCounters();
     }
 
@@ -465,6 +480,26 @@ contract ZoneLifecycleInvariantTest is BaseTest {
             inbox.processedDepositQueueHash(),
             handler.processedHashMirror(),
             "I-18: processed deposit hash diverged from contiguous chain"
+        );
+    }
+
+    /// @notice Guard against a vacuous pass: every leg of the deposit/withdrawal lifecycle must
+    ///         have executed real work. In particular `numAdvances > 0` ensures the zone actually
+    ///         processed deposits, so `invariant_zoneDepositContiguity` compares a non-empty
+    ///         processed hash chain rather than passing trivially at `0 == 0`.
+    function afterInvariant() public view {
+        assertGt(handler.numDeposits(), 0, "lifecycle: no L1 deposits were made");
+        assertGt(handler.numAdvances(), 0, "lifecycle: no deposits were processed on the zone");
+        assertGt(handler.numDepositsProcessed(), 0, "lifecycle: zero deposits minted");
+        assertGt(handler.numWithdrawalRequests(), 0, "lifecycle: no withdrawals were requested");
+        assertGt(handler.numFinalizes(), 0, "lifecycle: no withdrawal batch was submitted");
+        assertGt(
+            handler.numWithdrawalsProcessed(), 0, "lifecycle: no withdrawal was processed on L1"
+        );
+        // The contiguity invariant must have compared a real (non-empty) processed hash chain.
+        assertTrue(
+            inbox.processedDepositQueueHash() != bytes32(0),
+            "lifecycle: processed deposit hash never advanced (contiguity would pass vacuously)"
         );
     }
 
