@@ -262,15 +262,17 @@ The portal gives the messenger max approval for each enabled token so that withd
 
 ### Zone Predeploys
 
-Each zone has five system contracts deployed at genesis at fixed addresses:
+Each zone has five system predeploys at genesis at fixed addresses. `TempoState`,
+`ZoneInbox`, and `ZoneTxContext` are native precompiles installed with marker
+bytecode; `ZoneOutbox` and `ZoneConfig` are Solidity contracts.
 
 | Predeploy | Address | Purpose |
 |-----------|---------|---------|
-| [`TempoState`](#itempostate) | `0x1c00...0000` | Stores the finalized Tempo checkpoint and provides storage read access to Tempo contracts. |
-| [`ZoneInbox`](#izoneinbox) | `0x1c00...0001` | Advances the zone's view of Tempo and processes incoming deposits. Sole mint authority. |
+| [`TempoState`](#itempostate) | `0x1c00...0000` | Native precompile that stores the finalized Tempo checkpoint and provides storage read access to Tempo contracts. |
+| [`ZoneInbox`](#izoneinbox) | `0x1c00...0001` | Native precompile that advances the zone's view of Tempo and processes incoming deposits. Sole mint authority. |
 | [`ZoneOutbox`](#izoneoutbox) | `0x1c00...0002` | Handles withdrawal requests and batch finalization. Sole burn authority. |
 | [`ZoneConfig`](#izoneconfig) | `0x1c00...0003` | Central configuration. Reads the sequencer address and token registry from Tempo via `TempoState`. |
-| `ZoneTxContext` | `0x1c00...0005` | Provides the current transaction hash to system contracts (used by `ZoneOutbox` for `senderTag` computation). |
+| `ZoneTxContext` | `0x1c00...0005` | Native precompile that provides the current transaction hash to system contracts (used by `ZoneOutbox` for `senderTag` computation). |
 
 `ZoneConfig` reads the sequencer address and token registry from the portal on Tempo via `TempoState` storage reads, making Tempo the single source of truth for zone configuration. See [Tempo State Reads](#tempo-state-reads) for details.
 
@@ -1409,7 +1411,10 @@ The proof must validate:
 
 ## Zone Precompiles
 
-Zones have three categories of precompiles: TIP-20 token precompiles (one per enabled token) and two cryptographic precompiles for encrypted deposit verification.
+Zones have system precompiles (`TempoState`, `ZoneInbox`, `ZoneTxContext`),
+TIP-20 token precompiles (one per enabled token), the zone TIP-20 factory and
+TIP-403 proxy precompiles, and two cryptographic precompiles for encrypted
+deposit verification.
 
 ### TIP-20 Token Precompile
 

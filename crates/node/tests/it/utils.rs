@@ -1746,7 +1746,7 @@ impl L1TestNode {
 ///
 /// The base `zone-test-genesis.json` is a standalone genesis with:
 /// - TempoState anchored at block 0 with a zero block hash
-/// - ZoneInbox compiled with `tempoPortal = Address::ZERO` (Solidity immutable)
+/// - ZoneInbox installed as native precompile marker bytecode
 ///
 /// When connecting to a real L1, two things must be patched:
 ///
@@ -1754,10 +1754,9 @@ impl L1TestNode {
 ///    in slot 7 must reflect the L1 block that serves as the zone's genesis anchor.
 ///    Without this, `finalizeTempo` rejects the first L1 block for parent hash mismatch.
 ///
-/// 2. **ZoneInbox bytecode** — the `tempoPortal` immutable (embedded in deployed bytecode
-///    as `PUSH32` instructions) must be replaced with the real portal address. Without this,
-///    `readTempoStorageSlot` reads L1 state from `Address::ZERO` instead of the portal,
-///    causing `_readEncryptionKey` to revert with `InvalidSharedSecretProof`.
+/// 2. **ZoneConfig bytecode** — the `tempoPortal` immutable (embedded in deployed bytecode
+///    as `PUSH32` instructions) must be replaced with the real portal address. ZoneInbox is
+///    native and gets the portal address from the zone EVM's L1 provider configuration.
 ///
 /// Returns `(genesis, genesis_block_number)`.
 async fn build_l1_anchored_genesis(
@@ -1827,18 +1826,17 @@ fn build_l1_anchored_genesis_from_header(
         B256::from(U256::from(l1_header.inner.number).to_be_bytes()),
     );
 
-    // --- Patch 2: Portal address immutables in ZoneInbox and ZoneConfig ---
+    // --- Patch 2: Portal address immutable in ZoneConfig ---
     // Solidity immutables are baked into deployed bytecode as `PUSH32 <value>`.
     // The default genesis has tempoPortal = Address::ZERO. We replace the 32-byte
-    // zero-padded needle at the byte level. Both ZoneInbox (0x...0001) and
-    // ZoneConfig (0x...0003) have `tempoPortal` as an immutable.
+    // zero-padded needle at the byte level. ZoneConfig (0x...0003) has
+    // `tempoPortal` as an immutable; ZoneInbox is native.
     if !portal_address.is_zero() {
         let needle = [0u8; 32]; // Address::ZERO left-padded to 32 bytes
         let mut replacement = [0u8; 32];
         replacement[12..].copy_from_slice(portal_address.as_slice());
 
         let contracts_to_patch: &[(Address, usize)] = &[
-            (address!("0x1c00000000000000000000000000000000000001"), 4), // ZoneInbox
             (address!("0x1c00000000000000000000000000000000000003"), 5), // ZoneConfig
         ];
 

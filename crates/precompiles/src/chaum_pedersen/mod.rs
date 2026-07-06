@@ -143,7 +143,7 @@ pub fn challenge_hash(
 /// Verify a Chaum-Pedersen DLOG equality proof on secp256k1.
 ///
 /// Proves knowledge of scalar `x` such that `pubSeq = x*G` AND `sharedSecret = x*ephemeralPub`.
-fn verify_chaum_pedersen(
+pub(crate) fn verify_chaum_pedersen(
     ephemeral_pub_x: &[u8; 32],
     ephemeral_pub_y_parity: u8,
     shared_secret_x: &[u8; 32],

@@ -42,7 +42,7 @@ pub struct ZoneSequencerConfig {
     pub withdrawal_poll_interval: Duration,
     /// ZoneOutbox contract address on Zone L2.
     pub outbox_address: Address,
-    /// ZoneInbox contract address on Zone L2.
+    /// ZoneInbox predeploy address on Zone L2.
     pub inbox_address: Address,
     /// TempoState predeploy address on Zone L2.
     pub tempo_state_address: Address,

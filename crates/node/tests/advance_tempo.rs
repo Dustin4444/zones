@@ -4,17 +4,25 @@
 
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::{SolCall, sol};
 use revm::{
     context::result::{ExecutionResult, Output},
     database::{CacheDB, EmptyDB},
     state::AccountInfo,
 };
+use std::collections::HashSet;
+use tempo_alloy::TempoNetwork;
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_evm::evm::{TempoEvm, TempoEvmFactory};
+use tempo_evm::evm::TempoEvm;
+use tempo_precompiles::storage::{StorageActions, StorageCtx};
 use tempo_revm::TempoBlockEnv;
+use zone_evm::ZoneEvmFactory;
+use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
+use zone_precompiles::{TempoState as NativeTempoState, ZoneInbox as NativeZoneInbox};
 use zone_primitives::constants::{
-    PORTAL_ADMIN_SLOT, PORTAL_PENDING_SEQUENCER_SLOT, PORTAL_SEQUENCER_SLOT, zone_chain_id,
+    PORTAL_ADMIN_SLOT, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, PORTAL_PENDING_SEQUENCER_SLOT,
+    PORTAL_SEQUENCER_SLOT, zone_chain_id,
 };
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
@@ -150,7 +158,29 @@ fn setup_zone_evm_with_contracts_for_portal(
     env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
     env.block_env.inner.gas_limit = gas_limit;
 
-    let factory = TempoEvmFactory::default();
+    let cache = L1StateCache::new(HashSet::from([tempo_portal]));
+    cache.write().set(
+        tempo_portal,
+        PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+        1,
+        B256::ZERO,
+    );
+    let runtime = Box::leak(Box::new(
+        tokio::runtime::Runtime::new().expect("test runtime"),
+    ));
+    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_http("http://127.0.0.1:1".parse().expect("valid fallback URL"))
+        .erased();
+    let l1_provider = L1StateProvider::new_raw(
+        L1StateProviderConfig {
+            portal_address: tempo_portal,
+            ..Default::default()
+        },
+        cache,
+        provider,
+        runtime.handle().clone(),
+    );
+    let factory = ZoneEvmFactory::new(l1_provider);
     let mut evm = factory.create_evm(db, env);
 
     // Fund the deployer
@@ -168,24 +198,12 @@ fn setup_zone_evm_with_contracts_for_portal(
     // For testing, use a simple valid RLP that TempoState will accept.
     let dummy_header_rlp = build_dummy_header_rlp();
 
+    initialize_tempo_state(&mut evm, &dummy_header_rlp);
+    initialize_zone_inbox(&mut evm);
+
     let mut nonce = 0u64;
 
-    // 1. TempoState(bytes headerRlp)
-    let tempo_state_bytecode = load_artifact("TempoState");
-    let tempo_state_args =
-        alloy_sol_types::SolValue::abi_encode_params(&(Bytes::from(dummy_header_rlp),));
-    deploy_contract(
-        &mut evm,
-        &tempo_state_bytecode,
-        &tempo_state_args,
-        TEMPO_STATE_ADDRESS,
-        "TempoState",
-        chain_id,
-        nonce,
-    );
-    nonce += 1;
-
-    // 2. ZoneConfig(address tempoPortal, address tempoState)
+    // 1. ZoneConfig(address tempoPortal, address tempoState)
     let zone_config_bytecode = load_artifact("ZoneConfig");
     let zone_config_args =
         alloy_sol_types::SolValue::abi_encode_params(&(tempo_portal, TEMPO_STATE_ADDRESS));
@@ -200,25 +218,7 @@ fn setup_zone_evm_with_contracts_for_portal(
     );
     nonce += 1;
 
-    // 3. ZoneInbox(address config, address tempoPortal, address tempoState)
-    let zone_inbox_bytecode = load_artifact("ZoneInbox");
-    let zone_inbox_args = alloy_sol_types::SolValue::abi_encode_params(&(
-        ZONE_CONFIG_ADDRESS,
-        tempo_portal,
-        TEMPO_STATE_ADDRESS,
-    ));
-    deploy_contract(
-        &mut evm,
-        &zone_inbox_bytecode,
-        &zone_inbox_args,
-        ZONE_INBOX_ADDRESS,
-        "ZoneInbox",
-        chain_id,
-        nonce,
-    );
-    nonce += 1;
-
-    // 4. ZoneOutbox(address config)
+    // 2. ZoneOutbox(address config)
     let zone_outbox_bytecode = load_artifact("ZoneOutbox");
     let zone_outbox_args = alloy_sol_types::SolValue::abi_encode_params(&(ZONE_CONFIG_ADDRESS,));
     deploy_contract(
@@ -233,6 +233,32 @@ fn setup_zone_evm_with_contracts_for_portal(
 
     println!("All zone contracts deployed successfully");
     evm
+}
+
+fn initialize_tempo_state(evm: &mut TempoEvm<CacheDB<EmptyDB>>, header_rlp: &[u8]) {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || NativeTempoState::new().initialize(header_rlp),
+    )
+    .expect("initialize native TempoState");
+}
+
+fn initialize_zone_inbox(evm: &mut TempoEvm<CacheDB<EmptyDB>>) {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || NativeZoneInbox::new().initialize(),
+    )
+    .expect("initialize native ZoneInbox");
 }
 
 fn genesis_predeploy_code(addr: Address) -> Vec<u8> {
@@ -306,10 +332,10 @@ fn metadata_footer_desc(metadata_footer_len: Option<usize>) -> String {
 #[test]
 fn zone_test_genesis_predeploy_bytecode_matches_foundry_artifacts() {
     // The L1 e2e tests boot the zone from this checked-in genesis fixture. If the
-    // fixture falls behind the Solidity artifacts, ABI-breaking contract changes
-    // can pass against old bytecode even though CI built the new artifacts. The
-    // comparison ignores Solidity's CBOR metadata footer because metadata hashes
-    // can differ across build environments while the executable bytecode matches.
+    // fixture falls behind the native precompile marker bytecode or Solidity
+    // artifacts, ABI-breaking changes can pass against old code. The comparison
+    // ignores Solidity's CBOR metadata footer because metadata hashes can differ
+    // across build environments while executable bytecode matches.
     let mut evm = setup_zone_evm_with_contracts_for_portal(1337, Address::ZERO);
 
     for (name, addr) in [

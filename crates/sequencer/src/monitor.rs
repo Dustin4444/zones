@@ -55,7 +55,7 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 pub struct ZoneMonitorConfig {
     /// ZoneOutbox contract address on Zone L2.
     pub outbox_address: Address,
-    /// ZoneInbox contract address on Zone L2.
+    /// ZoneInbox predeploy address on Zone L2.
     pub inbox_address: Address,
     /// TempoState predeploy address on Zone L2 (usually [`abi::TEMPO_STATE_ADDRESS`]).
     pub tempo_state_address: Address,
@@ -89,7 +89,7 @@ pub struct ZoneMonitor {
     /// ZoneOutbox contract on **Zone L2** — source of `WithdrawalRequested` and
     /// `BatchFinalized` events.
     outbox: ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
-    /// ZoneInbox contract on **Zone L2** — queried for the processed deposit queue hash.
+    /// ZoneInbox predeploy on **Zone L2** — queried for the processed deposit queue hash.
     inbox: ZoneInbox::ZoneInboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
     /// TempoState predeploy on **Zone L2** — provides the latest Tempo L1 block number
     /// as seen by the zone.

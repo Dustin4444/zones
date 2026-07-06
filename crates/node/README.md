@@ -85,17 +85,17 @@ Chain continuity is enforced: the L1 block number must equal
 
 Deposits can be encrypted using ECIES with the sequencer's public key. The
 sequencer decrypts them off-chain and provides `DecryptionData` (ECDH shared
-secret + Chaum-Pedersen proof) that the contract verifies on-chain via two
-precompiles before minting.
+secret + Chaum-Pedersen proof) that the native `ZoneInbox` verifies on-chain
+via two crypto precompiles before minting.
 
 ## Token Enablement
 
 TIP-20 tokens are enabled on the zone at runtime (not at genesis). When a new
 token is bridged via the L1 portal's `enableToken()`, the `L1Subscriber` picks
 up the `TokenEnabled` event and includes it in the next zone block's system
-transaction. The `ZoneInbox` contract calls the `ZoneTokenFactory` precompile,
-which initializes the token's storage and grants `ISSUER_ROLE` to the inbox
-(for minting on deposits) and outbox (for burning on withdrawals).
+transaction. The native `ZoneInbox` precompile calls the `ZoneTokenFactory`
+precompile, which initializes the token's storage and grants `ISSUER_ROLE` to
+the inbox (for minting on deposits) and outbox (for burning on withdrawals).
 
 ## Batch Submission
 
@@ -262,6 +262,8 @@ just set-transfer-policy $TOKEN <M>
 
 | Address | Precompile | Purpose |
 |---------|-----------|---------|
+| `0x1C00…0000` | `TempoState` | Finalized Tempo checkpoint and L1 storage reads |
+| `0x1C00…0001` | `ZoneInbox` | Advance Tempo and process deposits |
 | `0x1C00…0100` | `ChaumPedersenVerify` | Verify DLOG equality proofs for ECDH |
 | `0x1C00…0101` | `AesGcmDecrypt` | AES-256-GCM authenticated decryption |
 | `0x20FC…0000` | `ZoneTokenFactory` | Initialize TIP-20 tokens on the zone |

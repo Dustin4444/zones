@@ -91,7 +91,7 @@ impl TempoState {
             .revert_output(Error(message.into()).abi_encode().into()))
     }
 
-    fn apply_checkpoint(
+    pub(crate) fn apply_checkpoint(
         &mut self,
         sender: Address,
         call: TempoStateAbi::finalizeTempoCall,
@@ -141,6 +141,14 @@ impl TempoState {
         }
 
         Ok(self.storage.success_output(Bytes::new()))
+    }
+
+    pub(crate) fn tempo_block_hash(&self) -> tempo_precompiles::Result<B256> {
+        self.tempo_block_hash.read()
+    }
+
+    pub(crate) fn tempo_block_number(&self) -> tempo_precompiles::Result<u64> {
+        self.tempo_block_number.read()
     }
 
     fn read_tempo_storage_slot<P: L1StorageReader>(

@@ -248,6 +248,11 @@ impl L1StateProvider {
         &self.cache
     }
 
+    /// Return the configured ZonePortal address on Tempo L1.
+    pub fn portal_address(&self) -> Address {
+        self.portal_address
+    }
+
     /// Fetch a single storage slot from L1 at a specific block via the shared HTTP provider.
     async fn fetch_slot(&self, address: Address, slot: B256, block_number: u64) -> Result<B256> {
         let key = U256::from_be_bytes(slot.0);
