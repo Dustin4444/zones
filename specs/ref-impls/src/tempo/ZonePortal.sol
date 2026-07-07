@@ -528,6 +528,17 @@ contract ZonePortal is IZonePortal {
         _validateDepositPolicy(_token, address(this), fallbackRecipient, fallbackRecipient);
     }
 
+    function _canBounceBack(address _token, address fallbackRecipient)
+        internal
+        view
+        returns (bool)
+    {
+        uint64 policyId = ITIP20(_token).transferPolicyId();
+        return TIP403_REGISTRY.isAuthorizedSender(policyId, address(this))
+            && TIP403_REGISTRY.isAuthorizedRecipient(policyId, fallbackRecipient)
+            && TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, fallbackRecipient);
+    }
+
     function _isAuthorizedWithdrawalRecipient(
         address _token,
         address to
@@ -739,7 +750,7 @@ contract ZonePortal is IZonePortal {
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
-            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
+            _bounceBackOrParkRefund(_token, withdrawal.amount, withdrawal.fallbackRecipient);
             emit WithdrawalProcessed(
                 withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
             );
@@ -769,7 +780,7 @@ contract ZonePortal is IZonePortal {
 
         if (!success) {
             // Callback failed: bounce back to zone (only amount, not fee)
-            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
+            _bounceBackOrParkRefund(_token, withdrawal.amount, withdrawal.fallbackRecipient);
         }
         emit WithdrawalProcessed(
             withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, success
@@ -835,14 +846,18 @@ contract ZonePortal is IZonePortal {
     /// @param _token The token from the failed withdrawal
     /// @param amount The amount to bounce back
     /// @param fallbackRecipient The zone address to receive the bounce-back
-    function _enqueueBounceBack(
+    function _bounceBackOrParkRefund(
         address _token,
         uint128 amount,
         address fallbackRecipient
     )
         internal
     {
-        _validateBounceBackPolicy(_token, fallbackRecipient);
+        if (!_canBounceBack(_token, fallbackRecipient)) {
+            refunds[_token][fallbackRecipient] += amount;
+            emit WithdrawalBounceBackPending(fallbackRecipient, _token, amount);
+            return;
+        }
 
         Deposit memory depositData = Deposit({
             token: _token,

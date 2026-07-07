@@ -865,7 +865,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueHead(), 1);
     }
 
-    function test_withdrawalQueue_revertsWhenPolicyBlocksRecipientAndFallback() public {
+    function test_withdrawalQueue_parksRefundWhenPolicyBlocksRecipientAndFallback() public {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
@@ -905,13 +905,17 @@ contract ZonePortalTest is BaseTest {
             ""
         );
 
-        vm.expectRevert(ITIP20.PolicyForbids.selector);
+        vm.expectEmit(true, true, false, true);
+        emit IZonePortal.WithdrawalBounceBackPending(charlie, address(pathUSD), 500e6);
+        vm.expectEmit(true, true, true, true);
+        emit IZonePortal.WithdrawalProcessed(bob, _senderTag(alice), address(pathUSD), 500e6, false);
         portal.processWithdrawal(w, bytes32(0));
 
         assertEq(pathUSD.balanceOf(bob), 100_000e6);
         assertEq(portal.currentDepositQueueHash(), depositHashBefore);
-        assertEq(portal.withdrawalQueueSlot(0), wHash);
-        assertEq(portal.withdrawalQueueHead(), 0);
+        assertEq(portal.refunds(address(pathUSD), charlie), 500e6);
+        assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
+        assertEq(portal.withdrawalQueueHead(), 1);
     }
 
     function test_withdrawalQueue_multipleWithdrawalsInBatch() public {

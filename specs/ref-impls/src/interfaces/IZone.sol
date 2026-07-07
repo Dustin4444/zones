@@ -518,6 +518,10 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
+    event WithdrawalBounceBackPending(
+        address indexed fallbackRecipient, address indexed token, uint128 amount
+    );
+
     /// @notice Emitted when the current sequencer nominates a new sequencer (two-step transfer).
     /// @dev A `pendingSequencer` of address(0) signals cancellation of a pending transfer.
     event SequencerTransferStarted(
