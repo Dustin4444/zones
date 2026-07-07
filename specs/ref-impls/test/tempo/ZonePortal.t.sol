@@ -865,6 +865,55 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueHead(), 1);
     }
 
+    function test_withdrawalQueue_revertsWhenPolicyBlocksRecipientAndFallback() public {
+        uint128 depositAmount = 1000e6;
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        bytes32 depositHashBefore = portal.currentDepositQueueHash();
+
+        address[] memory accounts = new address[](2);
+        accounts[0] = alice;
+        accounts[1] = address(portal);
+        uint64 policyId = registry.createPolicyWithAccounts(
+            sequencer, ITIP403Registry.PolicyType.WHITELIST, accounts
+        );
+        vm.prank(pathUSDAdmin);
+        pathUSD.changeTransferPolicyId(policyId);
+
+        Withdrawal memory w =
+            _withdrawal(address(pathUSD), alice, bob, 500e6, bytes32(0), 0, charlie, "");
+        bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
+
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("state")
+            }),
+            DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: depositHashBefore,
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0
+                }),
+            wHash,
+            "",
+            ""
+        );
+
+        vm.expectRevert(ITIP20.PolicyForbids.selector);
+        portal.processWithdrawal(w, bytes32(0));
+
+        assertEq(pathUSD.balanceOf(bob), 100_000e6);
+        assertEq(portal.currentDepositQueueHash(), depositHashBefore);
+        assertEq(portal.withdrawalQueueSlot(0), wHash);
+        assertEq(portal.withdrawalQueueHead(), 0);
+    }
+
     function test_withdrawalQueue_multipleWithdrawalsInBatch() public {
         // Setup: deposit funds
         uint128 depositAmount = 2000e6;

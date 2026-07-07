@@ -524,6 +524,10 @@ contract ZonePortal is IZonePortal {
         }
     }
 
+    function _validateBounceBackPolicy(address _token, address fallbackRecipient) internal view {
+        _validateDepositPolicy(_token, address(this), fallbackRecipient, fallbackRecipient);
+    }
+
     function _isAuthorizedWithdrawalRecipient(
         address _token,
         address to
@@ -838,6 +842,8 @@ contract ZonePortal is IZonePortal {
     )
         internal
     {
+        _validateBounceBackPolicy(_token, fallbackRecipient);
+
         Deposit memory depositData = Deposit({
             token: _token,
             sender: address(this),
