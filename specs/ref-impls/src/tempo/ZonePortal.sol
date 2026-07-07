@@ -503,6 +503,18 @@ contract ZonePortal is IZonePortal {
         }
     }
 
+    function _isAuthorizedWithdrawalRecipient(
+        address _token,
+        address to
+    )
+        internal
+        view
+        returns (bool)
+    {
+        uint64 policyId = ITIP20(_token).transferPolicyId();
+        return TIP403_REGISTRY.isAuthorizedRecipient(policyId, to);
+    }
+
     function _collectDepositFunds(
         address _token,
         uint128 amount
@@ -714,7 +726,9 @@ contract ZonePortal is IZonePortal {
         }
 
         bool success;
-        if (withdrawal.gasLimit == 0) {
+        if (!_isAuthorizedWithdrawalRecipient(_token, withdrawal.to)) {
+            success = false;
+        } else if (withdrawal.gasLimit == 0) {
             success = _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
             try IZoneMessenger(messenger)
