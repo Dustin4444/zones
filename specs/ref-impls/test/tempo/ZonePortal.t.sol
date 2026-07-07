@@ -574,6 +574,35 @@ contract ZonePortalTest is BaseTest {
         vm.stopPrank();
     }
 
+    function test_deposit_revertsWhenSenderBlocked() public {
+        uint128 depositAmount = 1000e6;
+
+        address[] memory senderAccounts = new address[](2);
+        senderAccounts[0] = bob;
+        senderAccounts[1] = address(portal);
+        uint64 senderPolicyId = registry.createPolicyWithAccounts(
+            sequencer, ITIP403Registry.PolicyType.WHITELIST, senderAccounts
+        );
+
+        address[] memory recipientAccounts = new address[](2);
+        recipientAccounts[0] = alice;
+        recipientAccounts[1] = address(portal);
+        uint64 recipientPolicyId = registry.createPolicyWithAccounts(
+            sequencer, ITIP403Registry.PolicyType.WHITELIST, recipientAccounts
+        );
+
+        uint64 compoundPolicyId =
+            registry.createCompoundPolicy(senderPolicyId, recipientPolicyId, recipientPolicyId);
+        vm.prank(pathUSDAdmin);
+        pathUSD.changeTransferPolicyId(compoundPolicyId);
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        vm.expectRevert(ITIP20.PolicyForbids.selector);
+        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        vm.stopPrank();
+    }
+
     function test_deposit_allowsCompoundPolicyMintRecipient() public {
         uint128 depositAmount = 1000e6;
 
@@ -2647,6 +2676,37 @@ contract ZonePortalTest is BaseTest {
         pathUSD.approve(address(portal), depositAmount);
         vm.expectRevert(ITIP20.PolicyForbids.selector);
         portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), bob);
+        vm.stopPrank();
+    }
+
+    function test_depositEncrypted_revertsWhenSenderBlocked() public {
+        _setEncKeyWithPoP(ENC_KEY_1);
+
+        uint128 depositAmount = 1000e6;
+
+        address[] memory senderAccounts = new address[](2);
+        senderAccounts[0] = bob;
+        senderAccounts[1] = address(portal);
+        uint64 senderPolicyId = registry.createPolicyWithAccounts(
+            sequencer, ITIP403Registry.PolicyType.WHITELIST, senderAccounts
+        );
+
+        address[] memory recipientAccounts = new address[](2);
+        recipientAccounts[0] = alice;
+        recipientAccounts[1] = address(portal);
+        uint64 recipientPolicyId = registry.createPolicyWithAccounts(
+            sequencer, ITIP403Registry.PolicyType.WHITELIST, recipientAccounts
+        );
+
+        uint64 compoundPolicyId =
+            registry.createCompoundPolicy(senderPolicyId, recipientPolicyId, recipientPolicyId);
+        vm.prank(pathUSDAdmin);
+        pathUSD.changeTransferPolicyId(compoundPolicyId);
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        vm.expectRevert(ITIP20.PolicyForbids.selector);
+        portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice);
         vm.stopPrank();
     }
 

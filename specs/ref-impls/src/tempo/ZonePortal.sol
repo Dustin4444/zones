@@ -485,6 +485,7 @@ contract ZonePortal is IZonePortal {
 
     function _validateDepositPolicy(
         address _token,
+        address from,
         address to,
         address bouncebackRecipient
     )
@@ -492,10 +493,30 @@ contract ZonePortal is IZonePortal {
         view
     {
         uint64 policyId = ITIP20(_token).transferPolicyId();
+        if (!TIP403_REGISTRY.isAuthorizedSender(policyId, from)) {
+            revert ITIP20.PolicyForbids();
+        }
         if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, to)) {
             revert ITIP20.PolicyForbids();
         }
         if (!TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, to)) {
+            revert ITIP20.PolicyForbids();
+        }
+        if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, bouncebackRecipient)) {
+            revert ITIP20.PolicyForbids();
+        }
+    }
+
+    function _validateEncryptedDepositPolicy(
+        address _token,
+        address from,
+        address bouncebackRecipient
+    )
+        internal
+        view
+    {
+        uint64 policyId = ITIP20(_token).transferPolicyId();
+        if (!TIP403_REGISTRY.isAuthorizedSender(policyId, from)) {
             revert ITIP20.PolicyForbids();
         }
         if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, bouncebackRecipient)) {
@@ -563,7 +584,7 @@ contract ZonePortal is IZonePortal {
         if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
 
         _validateDepositsActive(_token);
-        _validateDepositPolicy(_token, to, bouncebackRecipient);
+        _validateDepositPolicy(_token, msg.sender, to, bouncebackRecipient);
         (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
 
         // Build deposit struct with net amount (fee already paid to sequencer on Tempo)
@@ -616,11 +637,7 @@ contract ZonePortal is IZonePortal {
         if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
 
         _validateDepositsActive(_token);
-
-        uint64 policyId = ITIP20(_token).transferPolicyId();
-        if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, bouncebackRecipient)) {
-            revert ITIP20.PolicyForbids();
-        }
+        _validateEncryptedDepositPolicy(_token, msg.sender, bouncebackRecipient);
 
         // Validate ephemeral public key is a valid secp256k1 point
         // Prevents griefing: invalid points make Chaum-Pedersen proofs impossible,
