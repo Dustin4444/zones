@@ -10,6 +10,7 @@ members = [
   "bin/tempo-zone",
   "crates/contracts",
   "crates/evm",
+  "crates/escape-hatch",
   "crates/l1",
   "crates/node",
   "crates/payload",
@@ -115,6 +116,7 @@ tempo-transaction-pool = { git = "https://github.com/tempoxyz/tempo", rev = "ac3
 # zones
 tempo-zone-contracts = { path = "crates/contracts", default-features = false }
 zone-evm = { path = "crates/evm" }
+zone-escape-hatch = { path = "crates/escape-hatch" }
 zone-l1 = { path = "crates/l1" }
 zone-node = { path = "crates/node" }
 zone-payload = { path = "crates/payload" }
