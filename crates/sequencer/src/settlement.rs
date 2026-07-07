@@ -38,7 +38,7 @@ use futures::{StreamExt, TryStreamExt};
 use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
 use tracing::{info, instrument, warn};
 
-use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
+use crate::nonce_keys::{ADMIN_OPS_NONCE_KEY, SUBMIT_BATCH_NONCE_KEY};
 
 /// EIP-2935 stores the last 8192 block hashes, so the usable window is 8191 blocks.
 const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
@@ -450,6 +450,48 @@ impl BatchSubmitter {
     /// Read the portal's `genesisTempoBlockNumber` from L1.
     pub async fn read_genesis_tempo_block_number(&self) -> Result<u64> {
         Ok(self.portal.genesisTempoBlockNumber().call().await?)
+    }
+
+    /// Return the shared L1 provider backing portal reads.
+    pub(crate) fn l1_provider(&self) -> &DynProvider<TempoNetwork> {
+        &self.l1_provider
+    }
+
+    /// Pause new deposits for `token` through the ZonePortal.
+    ///
+    /// The portal permits both admin and sequencer to close deposits; reopening
+    /// remains admin-only. The sequencer uses this as the runtime circuit
+    /// breaker's first containment action before settlement halts.
+    pub async fn pause_deposits(&self, token: Address) -> Result<B256> {
+        let pending = self
+            .portal
+            .pauseDeposits(token)
+            .nonce_key(ADMIN_OPS_NONCE_KEY)
+            .send()
+            .await?;
+
+        let tx_hash = *pending.tx_hash();
+        info!(
+            %tx_hash,
+            %token,
+            timeout_secs = 30,
+            required_confirmations = 1,
+            "pauseDeposits tx accepted by RPC; waiting for confirmation"
+        );
+
+        let receipt = pending
+            .with_required_confirmations(1)
+            .with_timeout(Some(std::time::Duration::from_secs(30)))
+            .get_receipt()
+            .await?;
+
+        if !receipt.status() {
+            return Err(eyre::eyre!(
+                "pauseDeposits tx {tx_hash} for token {token} was included but reverted on L1"
+            ));
+        }
+
+        Ok(tx_hash)
     }
 
     /// Read the current `blockHash` from the ZonePortal on L1.

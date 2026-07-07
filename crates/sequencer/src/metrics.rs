@@ -65,6 +65,18 @@ pub(crate) struct ZoneMonitorMetrics {
     /// Failed batch submissions after exhausting retries.
     pub batch_submit_failure_total: Counter,
 
+    /// Failed portal-accounted funds ledger checks before batch submission.
+    pub funds_ledger_check_failure_total: Counter,
+
+    /// Runtime solvency circuit breaker trips that halt settlement.
+    pub circuit_breaker_tripped_total: Counter,
+
+    /// Successful automatic deposit pauses after a circuit breaker trip.
+    pub auto_pause_success_total: Counter,
+
+    /// Failed automatic deposit pause attempts after a circuit breaker trip.
+    pub auto_pause_failure_total: Counter,
+
     /// Retry attempts for batch submissions.
     pub batch_submit_retry_total: Counter,
 

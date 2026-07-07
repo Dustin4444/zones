@@ -21,9 +21,9 @@
 //! number that IS within the EIP-2935 window, and the proof must include a
 //! block header chain linking that anchor back to `tempoBlockNumber`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
@@ -38,8 +38,8 @@ use crate::{
     abi::{self, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
-        fetch_finalized_batch_boundaries, log_query_ranges,
+        BatchAnchorConfig, BatchData, BatchSubmitter, LOG_QUERY_BLOCK_CHUNK, ZoneBlockSnapshot,
+        fetch_finalized_batch, fetch_finalized_batch_boundaries, log_query_ranges,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -49,6 +49,115 @@ const MAX_RETRIES: u32 = 3;
 
 /// Initial delay between retries (doubles on each attempt).
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Default)]
+struct FundsLedger {
+    tokens: BTreeMap<Address, TokenFunds>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TokenFunds {
+    unprocessed_deposits: U256,
+    pending_refunds: U256,
+    pending_withdrawals: U256,
+}
+
+#[derive(Debug, Clone)]
+struct FundsInvariantViolation {
+    token: Address,
+    accounted_balance: U256,
+    required_liability: U256,
+    funds: TokenFunds,
+}
+
+#[derive(Debug)]
+struct CircuitBreakerTripped {
+    reason: String,
+}
+
+impl fmt::Display for CircuitBreakerTripped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl Error for CircuitBreakerTripped {}
+
+impl FundsLedger {
+    fn add_unprocessed_deposit(&mut self, token: Address, amount: u128) -> Result<()> {
+        Self::add_amount(
+            &mut self.entry_mut(token).unprocessed_deposits,
+            U256::from(amount),
+            "unprocessed deposit liability overflow",
+        )
+    }
+
+    fn add_pending_refund(&mut self, token: Address, amount: u128) -> Result<()> {
+        Self::add_amount(
+            &mut self.entry_mut(token).pending_refunds,
+            U256::from(amount),
+            "pending refund liability overflow",
+        )
+    }
+
+    fn claim_refund(&mut self, token: Address, amount: u128) -> Result<()> {
+        let funds = self.entry_mut(token);
+        let amount = U256::from(amount);
+        let next = funds.pending_refunds.checked_sub(amount).ok_or_else(|| {
+            eyre::eyre!(
+                "portal refund claims exceed pending refunds for token {token}: claim={amount}, pending={}",
+                funds.pending_refunds
+            )
+        })?;
+        funds.pending_refunds = next;
+        Ok(())
+    }
+
+    fn add_withdrawals(&mut self, withdrawals: &[abi::Withdrawal]) -> Result<()> {
+        for withdrawal in withdrawals {
+            let amount = U256::from(withdrawal.amount);
+            let fee = U256::from(withdrawal.fee);
+            let liability = amount.checked_add(fee).ok_or_else(|| {
+                eyre::eyre!(
+                    "withdrawal liability overflow for token {}",
+                    withdrawal.token
+                )
+            })?;
+            Self::add_amount(
+                &mut self.entry_mut(withdrawal.token).pending_withdrawals,
+                liability,
+                "pending withdrawal liability overflow",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn liability(funds: &TokenFunds) -> Result<U256> {
+        let deposits_and_refunds = funds
+            .unprocessed_deposits
+            .checked_add(funds.pending_refunds)
+            .ok_or_else(|| eyre::eyre!("token funds liability overflow"))?;
+        deposits_and_refunds
+            .checked_add(funds.pending_withdrawals)
+            .ok_or_else(|| eyre::eyre!("token funds liability overflow"))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Address, &TokenFunds)> {
+        self.tokens.iter()
+    }
+
+    fn entry_mut(&mut self, token: Address) -> &mut TokenFunds {
+        self.tokens.entry(token).or_default()
+    }
+
+    fn add_amount(field: &mut U256, amount: U256, context: &'static str) -> Result<()> {
+        let next = (*field)
+            .checked_add(amount)
+            .ok_or_else(|| eyre::eyre!(context))?;
+        *field = next;
+        Ok(())
+    }
+}
 
 /// Configuration for the [`ZoneMonitor`].
 #[derive(Debug, Clone)]
@@ -310,6 +419,15 @@ impl ZoneMonitor {
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    if e.downcast_ref::<CircuitBreakerTripped>().is_some() {
+                        error!(
+                            from,
+                            to = latest_zone_block,
+                            error = %e,
+                            "Zone monitor halted by runtime solvency circuit breaker"
+                        );
+                        return Err(e);
+                    }
                     error!(from, to = latest_zone_block, error = %e, "Failed to process zone block range");
                     continue;
                 }
@@ -551,6 +669,219 @@ impl ZoneMonitor {
         })
     }
 
+    async fn verify_funds_ledger(
+        &self,
+        next_processed_deposit_number: u64,
+        current_batch_withdrawals: &[abi::Withdrawal],
+    ) -> Result<()> {
+        let violations = self
+            .funds_invariant_violations(next_processed_deposit_number, current_batch_withdrawals)
+            .await?;
+        if violations.is_empty() {
+            return Ok(());
+        }
+
+        self.trip_funds_circuit_breaker(violations).await
+    }
+
+    async fn funds_invariant_violations(
+        &self,
+        next_processed_deposit_number: u64,
+        current_batch_withdrawals: &[abi::Withdrawal],
+    ) -> Result<Vec<FundsInvariantViolation>> {
+        let ledger = self
+            .build_funds_ledger(next_processed_deposit_number, current_batch_withdrawals)
+            .await?;
+        let portal = ZonePortal::new(
+            self.config.portal_address,
+            self.batch_submitter.l1_provider().clone(),
+        );
+        let mut violations = Vec::new();
+
+        for (token, funds) in ledger.iter() {
+            let liability = FundsLedger::liability(funds)?;
+            if liability.is_zero() {
+                continue;
+            }
+
+            let accounted_balance = portal.accountedBalance(*token).call().await?;
+            if accounted_balance < liability {
+                violations.push(FundsInvariantViolation {
+                    token: *token,
+                    accounted_balance,
+                    required_liability: liability,
+                    funds: funds.clone(),
+                });
+                continue;
+            }
+
+            info!(
+                token = %token,
+                accounted_balance = %accounted_balance,
+                required_liability = %liability,
+                unprocessed_deposits = %funds.unprocessed_deposits,
+                pending_refunds = %funds.pending_refunds,
+                pending_withdrawals = %funds.pending_withdrawals,
+                "Portal accounted funds invariant passed"
+            );
+        }
+
+        Ok(violations)
+    }
+
+    async fn build_funds_ledger(
+        &self,
+        next_processed_deposit_number: u64,
+        current_batch_withdrawals: &[abi::Withdrawal],
+    ) -> Result<FundsLedger> {
+        let mut ledger = FundsLedger::default();
+
+        let pending = self
+            .batch_submitter
+            .fetch_pending_withdrawals(&self.provider, self.config.outbox_address)
+            .await?;
+        for withdrawals in pending.values() {
+            ledger.add_withdrawals(withdrawals)?;
+        }
+        ledger.add_withdrawals(current_batch_withdrawals)?;
+
+        let portal = ZonePortal::new(
+            self.config.portal_address,
+            self.batch_submitter.l1_provider().clone(),
+        );
+        let genesis_tempo_block_number = self
+            .batch_submitter
+            .read_genesis_tempo_block_number()
+            .await?;
+        let l1_tip = self
+            .batch_submitter
+            .l1_provider()
+            .get_block_number()
+            .await?;
+
+        let regular_deposits = portal
+            .DepositMade_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in regular_deposits {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.netAmount)?;
+            }
+        }
+
+        let encrypted_deposits = portal
+            .EncryptedDepositMade_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in encrypted_deposits {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.netAmount)?;
+            }
+        }
+
+        let withdrawal_bouncebacks = portal
+            .WithdrawalBounceBack_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in withdrawal_bouncebacks {
+            if event.depositNumber > next_processed_deposit_number {
+                ledger.add_unprocessed_deposit(event.token, event.amount)?;
+            }
+        }
+
+        let pending_refunds = portal
+            .DepositBounceBackPending_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in pending_refunds {
+            ledger.add_pending_refund(event.token, event.amount)?;
+        }
+
+        let claimed_refunds = portal
+            .RefundClaimed_filter()
+            .from_block(genesis_tempo_block_number)
+            .to_block(l1_tip)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .concurrent(2)
+            .query()
+            .await?;
+        for (event, _) in claimed_refunds {
+            ledger.claim_refund(event.token, event.amount)?;
+        }
+
+        Ok(ledger)
+    }
+
+    async fn trip_funds_circuit_breaker(
+        &self,
+        violations: Vec<FundsInvariantViolation>,
+    ) -> Result<()> {
+        self.metrics.funds_ledger_check_failure_total.increment(1);
+        self.metrics.circuit_breaker_tripped_total.increment(1);
+
+        let mut pause_failures = Vec::new();
+        for violation in &violations {
+            match self.batch_submitter.pause_deposits(violation.token).await {
+                Ok(tx_hash) => {
+                    self.metrics.auto_pause_success_total.increment(1);
+                    error!(
+                        token = %violation.token,
+                        %tx_hash,
+                        accounted_balance = %violation.accounted_balance,
+                        required_liability = %violation.required_liability,
+                        "Auto-paused deposits after portal solvency invariant failure"
+                    );
+                }
+                Err(err) => {
+                    self.metrics.auto_pause_failure_total.increment(1);
+                    let message = format!("{}: {err}", violation.token);
+                    pause_failures.push(message);
+                    error!(
+                        token = %violation.token,
+                        error = %err,
+                        "Failed to auto-pause deposits after portal solvency invariant failure"
+                    );
+                }
+            }
+        }
+
+        let summary = summarize_violations(&violations);
+        let reason = if pause_failures.is_empty() {
+            format!(
+                "runtime solvency circuit breaker tripped; deposits auto-paused and settlement halted: {summary}"
+            )
+        } else {
+            format!(
+                "runtime solvency circuit breaker tripped; settlement halted: {summary}; auto-pause failures: {}",
+                pause_failures.join(", ")
+            )
+        };
+
+        error!(reason = %reason, "Runtime solvency circuit breaker tripped");
+        Err(CircuitBreakerTripped { reason }.into())
+    }
+
     /// Submit a `submitBatch` transaction to the ZonePortal on L1 with exponential
     /// backoff retry.
     ///
@@ -587,6 +918,9 @@ impl ZoneMonitor {
             }
             _ => {}
         }
+
+        self.verify_funds_ledger(batch_data.next_deposit_number, &withdrawals)
+            .await?;
 
         let mut delay = INITIAL_RETRY_DELAY;
 
@@ -867,6 +1201,24 @@ impl ZoneMonitor {
     }
 }
 
+fn summarize_violations(violations: &[FundsInvariantViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "token {} accounted_balance={} required_liability={} unprocessed_deposits={} pending_refunds={} pending_withdrawals={}",
+                violation.token,
+                violation.accounted_balance,
+                violation.required_liability,
+                violation.funds.unprocessed_deposits,
+                violation.funds.pending_refunds,
+                violation.funds.pending_withdrawals,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Spawn the zone monitor as a background task.
 ///
 /// The monitor polls the Zone L2 for finalized batch boundaries and submits
@@ -902,6 +1254,13 @@ pub fn spawn_zone_monitor(
 
         loop {
             if let Err(e) = monitor.run().await {
+                if e.downcast_ref::<CircuitBreakerTripped>().is_some() {
+                    error!(
+                        error = %e,
+                        "Zone monitor halted by runtime solvency circuit breaker; not restarting"
+                    );
+                    return;
+                }
                 error!(error = %e, "Zone monitor failed, restarting in 5s");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
@@ -998,6 +1357,67 @@ mod tests {
             portal_withdrawal_queue_tail: 3,
             latest_observed_zone_block: 50,
         }
+    }
+
+    #[test]
+    fn funds_ledger_tracks_withdrawal_amount_and_fee() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+        ledger
+            .add_withdrawals(&[abi::Withdrawal {
+                token,
+                senderTag: B256::repeat_byte(0x11),
+                to: Address::repeat_byte(0x12),
+                amount: 100,
+                fee: 7,
+                memo: B256::ZERO,
+                gasLimit: 0,
+                fallbackRecipient: Address::repeat_byte(0x12),
+                callbackData: Default::default(),
+                encryptedSender: Default::default(),
+            }])
+            .unwrap();
+
+        let funds = ledger.tokens.get(&token).unwrap();
+        assert_eq!(funds.pending_withdrawals, U256::from(107));
+        assert_eq!(FundsLedger::liability(funds).unwrap(), U256::from(107));
+    }
+
+    #[test]
+    fn funds_ledger_sums_independent_liability_buckets() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+        ledger.add_unprocessed_deposit(token, 100).unwrap();
+        ledger.add_pending_refund(token, 25).unwrap();
+        ledger
+            .add_withdrawals(&[abi::Withdrawal {
+                token,
+                senderTag: B256::ZERO,
+                to: Address::repeat_byte(0x12),
+                amount: 50,
+                fee: 5,
+                memo: B256::ZERO,
+                gasLimit: 0,
+                fallbackRecipient: Address::repeat_byte(0x12),
+                callbackData: Default::default(),
+                encryptedSender: Default::default(),
+            }])
+            .unwrap();
+
+        let funds = ledger.tokens.get(&token).unwrap();
+        assert_eq!(FundsLedger::liability(funds).unwrap(), U256::from(180));
+    }
+
+    #[test]
+    fn funds_ledger_rejects_refund_claims_without_pending_refunds() {
+        let token = Address::repeat_byte(0x10);
+        let mut ledger = FundsLedger::default();
+
+        let err = ledger.claim_refund(token, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("portal refund claims exceed pending refunds")
+        );
     }
 
     #[tokio::test]

@@ -183,6 +183,7 @@ crate::sol! {
         function depositCount() external view returns (uint64);
         function lastProcessedDepositNumber() external view returns (uint64);
         function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
+        function accountedBalance(address token) external view returns (uint256);
 
         // -- State-changing functions --
 

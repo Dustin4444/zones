@@ -27,7 +27,7 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | ID | Assertion | Crit | Impact |
 |---|---|---|---|
 | `TEMPO-ZONE-ADMIN-NONZERO` | Portal `admin != address(0)` for every zone | 🟡 | Token governance can become permanently unavailable |
-| `TEMPO-ZONE-ADMIN-ONLY-GOVERNANCE` | Only `admin` can call `enableToken`, `pauseDeposits`, and `resumeDeposits` | 🟡 | A sequencer or user can enable malicious assets or reopen paused deposits |
+| `TEMPO-ZONE-ADMIN-ONLY-GOVERNANCE` | Only `admin` can call `enableToken` and `resumeDeposits`; only `admin` or `sequencer` can call `pauseDeposits` | 🟡 | A sequencer or user can enable malicious assets or reopen paused deposits |
 | `TEMPO-ZONE-SEQUENCER-ONLY-OPS` | Only the registered sequencer can set gas rates, set encryption keys, set RPC URL, submit batches, and process withdrawals | 🟡 | Unauthorized operators can censor, misprice, settle, or drain queued work |
 | `TEMPO-ZONE-SEQUENCER-TWO-STEP` | Sequencer changes only complete when `pendingSequencer` accepts, and acceptance clears `pendingSequencer` | 🟡 | Sequencer control can be accidentally or maliciously transferred |
 | `TEMPO-ZONE-GAS-RATE-BOUNDED` | `zoneGasRate` and `tempoGasRate` never exceed `MAX_GAS_FEE_RATE` | 🟢 | Deposit or withdrawal fee math may overflow or become economically unusable |
@@ -41,6 +41,7 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | `TEMPO-ZONE-MESSENGER-APPROVAL` | For every enabled token, the portal approves the zone messenger for callback withdrawals | 🟡 | Callback withdrawals can fail even when the portal holds enough funds |
 | `TEMPO-ZONE-SUPPLY-SOLVENCY` | For each token, zone-side total supply equals accepted deposits plus withdrawal bounce-backs minus requested withdrawals minus deposit bounce-backs | 🔴 | The zone can mint unbacked tokens or burn user funds without matching L1 release |
 | `TEMPO-ZONE-PORTAL-SOLVENCY` | Portal token balance plus paid-out/parked refunds is sufficient for all unwithdrawn zone supply and pending withdrawals | 🔴 | Portal cannot honor exits, causing direct loss or insolvency |
+| `TEMPO-ZONE-RUNTIME-CIRCUIT-BREAKER` | Sequencer halts settlement and pauses deposits for any token whose portal-accounted balance is below computed liabilities | 🔴 | A detected insolvency can keep accepting new deposits or continue settling unsafe batches |
 | `TEMPO-ZONE-MINT-BURN-AUTHORITY` | Only `ZoneInbox` can mint zone tokens and only `ZoneOutbox` can burn zone tokens | 🔴 | Unauthorized mint or burn breaks bridge accounting and can steal or destroy funds |
 
 ### Deposits

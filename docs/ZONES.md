@@ -84,7 +84,7 @@ export L1_RPC_URL="wss://rpc.devnet.tempoxyz.dev"
 
 ### 2. Generate Admin and Sequencer Keys
 
-The admin controls portal governance such as token enablement and deposit pause/resume. The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1. The same key may be used for both roles, but pass it explicitly as both `ADMIN_KEY` and `SEQUENCER_KEY` when that is intentional.
+The admin controls portal governance such as token enablement and deposit resume. The admin or sequencer can pause deposits as a one-way safety action. The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1. The same key may be used for both roles, but pass it explicitly as both `ADMIN_KEY` and `SEQUENCER_KEY` when that is intentional.
 
 ```bash
 cast wallet new
@@ -151,7 +151,7 @@ cargo run -p tempo-xtask -- create-zone \
   --private-key "$SEQUENCER_KEY"
 ```
 
-`create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
+`create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token` and `resume-deposits`. `pause-deposits` can be signed by either the admin or sequencer.
 
 ### 5. Start the Zone Node
 
@@ -384,7 +384,7 @@ just enable-token alphausd
 
 If `ZONE_RPC_URL` is set (defaults to `http://localhost:8546`), the command waits for the zone to process the L1 block and confirms the token is available on L2.
 
-The portal admin can also pause and resume deposits for an enabled token (withdrawals are unaffected). These calls are `onlyAdmin`, so they use the same `ADMIN_KEY` as `enable-token`:
+The portal admin can resume deposits for an enabled token, and either the admin or sequencer can pause them (withdrawals are unaffected):
 
 ```bash
 just pause-deposits <token-address>
@@ -619,7 +619,7 @@ Current deployment:
 | `just send-deposit [amount] [to] [token] [memo]` | Deposit tokens from L1 to zone (defaults to sender) |
 | `just send-deposit-encrypted [amount] [to] [memo] [token] [rpc]` | Encrypted deposit — hides recipient and memo on-chain |
 | `just enable-token <token>` | Enable a TIP-20 token on the portal for bridging (admin only) |
-| `just pause-deposits <token>` | Pause deposits for an enabled token on the portal (admin only) |
+| `just pause-deposits <token>` | Pause deposits for an enabled token on the portal (admin or sequencer) |
 | `just resume-deposits <token>` | Resume deposits for a paused token on the portal (admin only) |
 | `just list-enabled-tokens [portal]` | List TIP-20 token addresses enabled on a portal |
 | `just max-approve-outbox [token] [rpc]` | Approve outbox to spend tokens on zone |

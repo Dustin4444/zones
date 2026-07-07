@@ -258,8 +258,22 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.areDepositsActive(address(pathUSD)));
     }
 
-    function test_tokenGovernance_revertsIfNotAdmin() public {
+    function test_sequencerCanPauseButNotResumeOrEnableDeposits() public {
+        vm.prank(sequencer);
+        portal.pauseDeposits(address(pathUSD));
+        assertFalse(portal.areDepositsActive(address(pathUSD)));
+
         vm.startPrank(sequencer);
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.resumeDeposits(address(pathUSD));
+
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.enableToken(address(pathUSD));
+        vm.stopPrank();
+    }
+
+    function test_tokenGovernance_revertsIfCallerIsNeitherAdminNorSequencer() public {
+        vm.startPrank(alice);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
         portal.pauseDeposits(address(pathUSD));
 
@@ -783,6 +797,81 @@ contract ZonePortalTest is BaseTest {
         // Slot should be cleared (back to EMPTY_SENTINEL), head advanced to 1
         assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
         assertEq(portal.withdrawalQueueHead(), 1);
+    }
+
+
+    function test_accountedBalance_tracksDepositAndSuccessfulWithdrawal() public {
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        vm.stopPrank();
+
+        assertEq(portal.accountedBalance(address(pathUSD)), 1000e6);
+
+        Withdrawal memory w =
+            _withdrawal(address(pathUSD), alice, bob, 400e6, bytes32(0), 0, alice, "");
+        w.fee = 7e6;
+        bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
+
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("s1") }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: portal.currentDepositQueueHash(),
+                prevDepositNumber: 0,
+                nextDepositNumber: 1
+            }),
+            wHash,
+            "",
+            ""
+        );
+
+        portal.processWithdrawal(w, bytes32(0));
+
+        assertEq(portal.accountedBalance(address(pathUSD)), 593e6);
+    }
+
+    function test_accountedBalance_tracksFailedWithdrawalFeeOnly() public {
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        vm.stopPrank();
+
+        Withdrawal memory w = _withdrawal(
+            address(pathUSD),
+            alice,
+            address(gasConsumingReceiver),
+            400e6,
+            bytes32(0),
+            50_000,
+            bob,
+            ""
+        );
+        w.fee = 7e6;
+        bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
+
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("s2") }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: portal.currentDepositQueueHash(),
+                prevDepositNumber: 0,
+                nextDepositNumber: 1
+            }),
+            wHash,
+            "",
+            ""
+        );
+
+        portal.processWithdrawal(w, bytes32(0));
+
+        assertEq(portal.accountedBalance(address(pathUSD)), 993e6);
     }
 
     function test_withdrawalQueue_multipleWithdrawalsInBatch() public {
@@ -2712,6 +2801,7 @@ contract ZonePortalTest is BaseTest {
     ///        slot 5: currentDepositQueueHash (bytes32)
     ///        slot 6: deposit counters
     ///        slot 7: _encryptionKeys.length (EncryptionKeyEntry[])
+    ///        slot 16: accountedBalance (mapping(address => uint256))
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));
@@ -2772,6 +2862,19 @@ contract ZonePortalTest is BaseTest {
             address(uint160(uint256(slot15))),
             portal.pendingAdmin(),
             "slot 15: pendingAdmin mismatch"
+        );
+
+        // --- Slot 16: accountedBalance mapping ---
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("layout"), alice);
+        vm.stopPrank();
+        bytes32 accountedSlot = keccak256(abi.encode(address(pathUSD), uint256(16)));
+        bytes32 accountedFromSlot = vm.load(address(portal), accountedSlot);
+        assertEq(
+            uint256(accountedFromSlot),
+            portal.accountedBalance(address(pathUSD)),
+            "slot 16: accountedBalance mapping mismatch"
         );
     }
 

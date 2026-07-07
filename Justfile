@@ -379,9 +379,9 @@ enable-token token:
         sleep 0.5
     done
 
-# Shared implementation for admin-only portal calls that take a single token
-# argument (pauseDeposits / resumeDeposits). Resolves the token alias, signs with
-# ADMIN_KEY (SEQUENCER_KEY fallback only when it is the on-chain admin).
+# Shared implementation for privileged portal calls that take a single token
+# argument. pauseDeposits accepts admin or sequencer; resumeDeposits remains
+# admin-only.
 [private]
 _portal-admin-token-call action token:
     #!/bin/bash
@@ -394,12 +394,19 @@ _portal-admin-token-call action token:
     fi
     PORTAL="${L1_PORTAL_ADDRESS:?Set L1_PORTAL_ADDRESS env var}"
     HTTP_RPC=$(echo "$RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
-    # {{action}} is onlyAdmin: reject the sequencer fallback unless it is the admin.
     SIGNER_ADDR=$(cast wallet address "$PK" | tr '[:upper:]' '[:lower:]')
     ONCHAIN_ADMIN=$(cast call "$PORTAL" "admin()(address)" --rpc-url "$HTTP_RPC" | tr '[:upper:]' '[:lower:]')
-    if [[ "$SIGNER_ADDR" != "$ONCHAIN_ADMIN" ]]; then
-        echo "Signer $SIGNER_ADDR is not the portal admin $ONCHAIN_ADMIN. Set ADMIN_KEY for this zone (SEQUENCER_KEY only works when admin == sequencer)." >&2
-        exit 1
+    if [[ "{{action}}" == "pauseDeposits" ]]; then
+        ONCHAIN_SEQUENCER=$(cast call "$PORTAL" "sequencer()(address)" --rpc-url "$HTTP_RPC" | tr '[:upper:]' '[:lower:]')
+        if [[ "$SIGNER_ADDR" != "$ONCHAIN_ADMIN" && "$SIGNER_ADDR" != "$ONCHAIN_SEQUENCER" ]]; then
+            echo "Signer $SIGNER_ADDR is neither portal admin $ONCHAIN_ADMIN nor sequencer $ONCHAIN_SEQUENCER. Set ADMIN_KEY or SEQUENCER_KEY for this zone." >&2
+            exit 1
+        fi
+    else
+        if [[ "$SIGNER_ADDR" != "$ONCHAIN_ADMIN" ]]; then
+            echo "Signer $SIGNER_ADDR is not the portal admin $ONCHAIN_ADMIN. Set ADMIN_KEY for this zone (SEQUENCER_KEY only works when admin == sequencer)." >&2
+            exit 1
+        fi
     fi
     TOKEN="{{token}}"
     TOKEN_LOWER=$(echo "$TOKEN" | tr '[:upper:]' '[:lower:]')
@@ -419,7 +426,7 @@ _portal-admin-token-call action token:
     echo "Explorer: https://explore.moderato.tempo.xyz/tx/$TX_HASH"
 
 [group('zone')]
-[doc('Pauses deposits for an enabled TIP-20 on the ZonePortal (withdrawals unaffected). Token can be an address or alias. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and ADMIN_KEY env vars.')]
+[doc('Pauses deposits for an enabled TIP-20 on the ZonePortal (withdrawals unaffected). Token can be an address or alias. Requires L1_RPC_URL, L1_PORTAL_ADDRESS, and ADMIN_KEY or SEQUENCER_KEY env vars.')]
 pause-deposits token:
     just _portal-admin-token-call pauseDeposits {{token}}
 

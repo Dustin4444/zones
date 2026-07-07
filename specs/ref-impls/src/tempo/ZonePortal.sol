@@ -128,6 +128,13 @@ contract ZonePortal is IZonePortal {
     /// @notice Pending admin for two-step admin transfer
     address public pendingAdmin;
 
+    /// @notice Protocol-accounted escrow per token, excluding external donations.
+    /// @dev This records only funds that enter or leave through portal protocol
+    ///      paths. It backs zone supply, unprocessed deposits, pending withdrawals,
+    ///      and pending refunds; direct token transfers to this contract do not
+    ///      increase it.
+    mapping(address token => uint256 amount) public accountedBalance;
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -167,6 +174,11 @@ contract ZonePortal is IZonePortal {
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
+        _;
+    }
+
+    modifier onlyAdminOrSequencer() {
+        if (msg.sender != admin && msg.sender != sequencer) revert NotAdmin();
         _;
     }
 
@@ -289,9 +301,9 @@ contract ZonePortal is IZonePortal {
         _enableTokenInternal(_token);
     }
 
-    /// @notice Pause deposits for a token. Only callable by admin.
+    /// @notice Pause deposits for a token. Callable by admin or sequencer.
     /// @dev Does not affect withdrawal processing (non-custodial guarantee).
-    function pauseDeposits(address _token) external onlyAdmin {
+    function pauseDeposits(address _token) external onlyAdminOrSequencer {
         if (!_tokenConfigs[_token].enabled) revert TokenNotEnabled();
         _tokenConfigs[_token].depositsActive = false;
         emit DepositsPaused(_token);
@@ -520,6 +532,7 @@ contract ZonePortal is IZonePortal {
         if (fee > 0) {
             ITIP20(_token).transfer(sequencer, fee);
         }
+        accountedBalance[_token] += netAmount;
     }
 
     function _recordDeposit(bytes32 newCurrentDepositQueueHash)
@@ -706,6 +719,7 @@ contract ZonePortal is IZonePortal {
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
+            accountedBalance[_token] -= withdrawal.fee;
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
             emit WithdrawalProcessed(
                 withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
@@ -734,7 +748,10 @@ contract ZonePortal is IZonePortal {
 
         if (!success) {
             // Callback failed: bounce back to zone (only amount, not fee)
+            accountedBalance[_token] -= withdrawal.fee;
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
+        } else {
+            accountedBalance[_token] -= uint256(withdrawal.amount) + withdrawal.fee;
         }
         emit WithdrawalProcessed(
             withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, success
@@ -758,8 +775,10 @@ contract ZonePortal is IZonePortal {
         bool success = _tryTransfer(_token, withdrawal.to, refundAmount);
 
         if (success) {
+            accountedBalance[_token] -= withdrawal.amount;
             emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);
         } else {
+            accountedBalance[_token] -= bouncebackFee;
             refunds[_token][withdrawal.to] += refundAmount;
             emit DepositBounceBackPending(withdrawal.to, _token, refundAmount, bouncebackFee);
         }
@@ -770,6 +789,7 @@ contract ZonePortal is IZonePortal {
         refunds[token][msg.sender] = 0;
 
         if (!_tryTransfer(token, msg.sender, amount)) revert CallbackRejected();
+        accountedBalance[token] -= amount;
 
         emit RefundClaimed(msg.sender, token, amount);
     }

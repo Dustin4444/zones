@@ -347,6 +347,7 @@ interface IZoneTxContext {
 //   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
 //   slot 14: rpcUrl (string)
 //   slot 15: pendingAdmin (address)
+//   slot 16: accountedBalance (mapping(address => uint256))
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -796,6 +797,8 @@ interface IZonePortal {
     function processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) external;
 
     function refunds(address token, address owner) external view returns (uint128);
+
+    function accountedBalance(address token) external view returns (uint256);
 
     function claimRefund(address token) external returns (uint128 amount);
 

@@ -122,7 +122,7 @@ This document specifies the zone protocol: deployment, sequencer operations, dep
 
 ## System Overview
 
-Each zone is operated by a **sequencer** that collects transactions, produces blocks, generates proofs, and submits batches to Tempo. A single registered address controls sequencer operations for each zone. Each zone also has a separate **admin** role that holds governance powers (enabling tokens, configuring deposit pause/resume); see [Access Control](#access-control). **Users** deposit TIP-20 tokens from Tempo into the zone, transact privately, and withdraw back to Tempo.
+Each zone is operated by a **sequencer** that collects transactions, produces blocks, generates proofs, and submits batches to Tempo. A single registered address controls sequencer operations for each zone. Each zone also has a separate **admin** role that holds governance powers (enabling tokens and resuming deposits); both admin and sequencer may pause deposits as a one-way safety action; see [Access Control](#access-control). **Users** deposit TIP-20 tokens from Tempo into the zone, transact privately, and withdraw back to Tempo.
 
 On the Tempo side, an onchain **verifier** contract validates that each batch was executed correctly. The verifier is abstracted behind a minimal interface (`IVerifier`) and is proof-agnostic. Any proving backend (ZK, TEE, or otherwise) can implement the interface. The portal does not care how the proof was produced.
 
@@ -174,7 +174,7 @@ Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal
 
 **Admin.**
 
-- Holds governance powers over the zone (token enablement, deposit pause/resume).
+- Holds governance powers over the zone (token enablement and deposit resume; deposit pause is shared with the sequencer).
 - Expected to be a cold key, multisig, or governance contract.
 - Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
 - Rotatable via a two-step transfer (see [Admin Transfer](#admin-transfer)), so a lost or compromised admin key can be moved to a new cold key or multisig.
@@ -198,7 +198,7 @@ The following table lists every privileged action and the role authorized to inv
 | Action | Contract | Authorized caller |
 |---|---|---|
 | `enableToken(token)` | [`ZonePortal`](#izoneportal) | **admin** |
-| `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin or sequencer** |
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `transferAdmin(newAdmin)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `acceptAdmin()` | [`ZonePortal`](#izoneportal) | **pending admin** |
@@ -216,7 +216,7 @@ The following table lists every privileged action and the role authorized to inv
 
 Rationale notes:
 
-- **Token enablement and deposit pause/resume are admin-only** because they govern what the zone is and which deposit flows are open. A compromised sequencer hot key MUST NOT be able to enable arbitrary tokens or unilaterally re-open paused deposits.
+- **Token enablement and deposit resume are admin-only** because they govern what the zone is and which deposit flows are open. The sequencer may pause deposits to contain runtime solvency or invariant failures, but a compromised sequencer hot key MUST NOT be able to enable arbitrary tokens or unilaterally re-open paused deposits.
 - **Gas rates are sequencer-controlled** because the sequencer takes the economic risk on gas-price fluctuations and needs to react quickly to operational events without involving the cold key.
 - **Encryption key management is sequencer-only** because the proof of possession requires the encryption private key.
 - **Zone-side system calls** to `ZoneOutbox` may use `msg.sender == address(0)` so the block builder can inject protocol system transactions. Ordinary user transactions must come from the registered sequencer address for these calls.
@@ -231,7 +231,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | Parameter | Description |
 |-----------|-------------|
 | `initialToken` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
-| `admin` | The address that holds the admin role for the zone (token enablement, deposit pause/resume). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
+| `admin` | The address that holds the admin role for the zone (token enablement and deposit resume; pause is shared with the sequencer). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
 | `zoneParams` | Genesis configuration: genesis block hash, genesis Tempo block hash, and genesis Tempo block number. |
@@ -290,13 +290,25 @@ The zone-side supply of each token always equals net deposits minus net withdraw
 
 ### Token Management
 
-The admin manages which TIP-20 tokens are available on the zone (see [Access Control](#access-control)):
+The admin manages which TIP-20 tokens are available on the zone, while the admin or sequencer may close deposits for an enabled token (see [Access Control](#access-control)):
 
 - `enableToken(token)`: Enable a new TIP-20 for deposits and withdrawals. This is **irreversible**. Once enabled, a token can never be disabled.
-- `pauseDeposits(token)`: Pause new deposits for a token. Does not affect withdrawals.
+- `pauseDeposits(token)`: Pause new deposits for a token. Callable by the admin or sequencer. Does not affect withdrawals.
 - `resumeDeposits(token)`: Resume deposits for a previously paused token.
 
-The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The admin can halt deposits but cannot disable withdrawals for an enabled token. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
+The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The admin or sequencer can halt deposits but cannot disable withdrawals for an enabled token. Only the admin can resume deposits. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
+
+### Runtime Solvency Circuit Breaker
+
+The sequencer MUST verify portal-accounted funds before submitting each finalized batch. For every token with outstanding liabilities, the sequencer computes:
+
+- unprocessed deposit amounts with `depositNumber > nextProcessedDepositNumber`,
+- pending deposit-bounce-back refunds that have not been claimed,
+- pending withdrawal queue amounts and fees, including the batch about to be submitted.
+
+The portal exposes `accountedBalance(token)`, which tracks funds that entered through protocol deposit paths and have not been released, paid as protocol fees, or converted into unaccounted surplus. Direct token transfers to the portal do not increase this value.
+
+If `accountedBalance(token)` is lower than the computed liability for any token, the sequencer MUST NOT submit the batch. It MUST call `pauseDeposits(token)` for each failing token and then halt settlement until an operator investigates and restarts with a corrected state or upgraded binary. Withdrawals remain processable for already-submitted batches; `resumeDeposits(token)` remains admin-only.
 
 ### Gas Rate Configuration
 
@@ -1705,6 +1717,7 @@ interface IZonePortal {
     function tokenConfig(address token) external view returns (TokenConfig memory);
     function enabledTokenCount() external view returns (uint256);
     function enabledTokenAt(uint256 index) external view returns (address);
+    function accountedBalance(address token) external view returns (uint256);
 
     // Zone RPC endpoint. Published on-chain so clients can discover how to reach the zone.
     event RpcUrlUpdated(string rpcUrl);
