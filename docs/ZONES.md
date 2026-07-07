@@ -587,6 +587,8 @@ Current deployment:
 | `--sequencer-key` | (optional) | Sequencer private key used when `--sequencer` is enabled |
 | `--block.interval-ms` | 250 | Block building interval |
 | `--zone.batch-interval-secs` | 60 | Max seconds to accumulate zone blocks before submitting a batch to L1 |
+| `--zone.tempo-gas-rate` | unset | ZoneOutbox withdrawal gas rate, in zone token units per Tempo gas unit. Unset leaves the on-chain value untouched (`0` at genesis = free withdrawals). |
+| `--zone.max-withdrawals-per-block` | unset | Maximum withdrawal requests accepted per zone block (`0` = unlimited). Unset leaves the on-chain value untouched (`0` at genesis). |
 | `--zone.poll-interval-secs` | 1 | How often (seconds) the zone monitor polls for new L2 blocks |
 | `--withdrawal-poll-interval-secs` | 5 | How often (seconds) the withdrawal processor polls the L1 queue |
 | `--http.port` | 8546 | HTTP JSON-RPC port |
@@ -604,6 +606,8 @@ Current deployment:
 | `L1_PORTAL_ADDRESS` | For deposits | ZonePortal address (from `zone.json`) |
 | `ROUTER_BOUNCEBACK_RECIPIENT` | No | Optional controlled burner/stealth address for `demo-swap-and-deposit` routed deposit refunds |
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
+| `ZONE_TEMPO_GAS_RATE` | No | Sets `--zone.tempo-gas-rate`; unset leaves withdrawal fees unchanged. |
+| `ZONE_MAX_WITHDRAWALS_PER_BLOCK` | No | Sets `--zone.max-withdrawals-per-block`; unset leaves the on-chain per-block withdrawal cap unchanged. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 

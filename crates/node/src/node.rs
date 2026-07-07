@@ -66,7 +66,8 @@ use zone_l1::{
     },
 };
 use zone_payload::{
-    DEFAULT_WITHDRAWAL_BATCH_INTERVAL, ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes,
+    DEFAULT_WITHDRAWAL_BATCH_INTERVAL, OutboxFeeConfig, ZonePayloadAttributes, ZonePayloadFactory,
+    ZonePayloadTypes,
 };
 use zone_sequencer::{BatchAnchorConfig, ZoneSequencerConfig, spawn_zone_sequencer};
 
@@ -123,6 +124,8 @@ pub struct ZoneNode {
     initial_tokens: Option<Vec<Address>>,
     /// Maximum chain-time duration between withdrawal batch finalizations.
     withdrawal_batch_interval: Duration,
+    /// ZoneOutbox fee parameters the payload builder keeps synced on-chain.
+    outbox_fee_config: OutboxFeeConfig,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
@@ -168,6 +171,7 @@ impl ZoneNode {
             portal_address,
             initial_tokens: None,
             withdrawal_batch_interval: DEFAULT_WITHDRAWAL_BATCH_INTERVAL,
+            outbox_fee_config: OutboxFeeConfig::default(),
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
         }
@@ -197,6 +201,12 @@ impl ZoneNode {
     /// withdrawal batch finalization.
     pub fn with_withdrawal_batch_interval(mut self, interval: Duration) -> Self {
         self.withdrawal_batch_interval = interval;
+        self
+    }
+
+    /// Set the ZoneOutbox fee parameters the payload builder keeps synced on-chain.
+    pub fn with_outbox_fee_config(mut self, config: OutboxFeeConfig) -> Self {
+        self.outbox_fee_config = config;
         self
     }
 
@@ -722,7 +732,8 @@ where
             self.l1_state_cache.clone(),
             self.policy_cache.clone(),
         );
-        let payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval);
+        let payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval)
+            .with_outbox_fee_config(self.outbox_fee_config);
         Self::components_with_payload_factory(executor_builder, payload_factory)
     }
 

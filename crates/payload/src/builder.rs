@@ -53,18 +53,49 @@ use crate::{ZonePayloadAttributes, ZonePayloadTypes};
 
 pub const DEFAULT_WITHDRAWAL_BATCH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Sequencer-configured `ZoneOutbox` fee parameters, applied on-chain via
+/// system transactions during block building.
+///
+/// The outbox's `tempoGasRate` and `maxWithdrawalsPerBlock` are zero at zone
+/// genesis (withdrawals are free). When configured, the payload
+/// builder compares the on-chain values at the start of each block and injects
+/// setter system txs to ensure they match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxFeeConfig {
+    /// Desired `ZoneOutbox.tempoGasRate` (zone token units per Tempo gas unit).
+    /// `None` leaves the on-chain value untouched.
+    pub tempo_gas_rate: Option<u128>,
+    /// Desired `ZoneOutbox.maxWithdrawalsPerBlock` (`0` = unlimited).
+    /// `None` leaves the on-chain value untouched.
+    pub max_withdrawals_per_block: Option<u64>,
+}
+
+impl OutboxFeeConfig {
+    pub fn is_empty(&self) -> bool {
+        self.tempo_gas_rate.is_none() && self.max_withdrawals_per_block.is_none()
+    }
+}
+
 /// Factory for constructing the zone payload builder.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ZonePayloadFactory {
     withdrawal_batch_interval: Duration,
+    outbox_fee_config: OutboxFeeConfig,
 }
 
 impl ZonePayloadFactory {
     pub fn new(withdrawal_batch_interval: Duration) -> Self {
         Self {
             withdrawal_batch_interval,
+            outbox_fee_config: OutboxFeeConfig::default(),
         }
+    }
+
+    /// Set the `ZoneOutbox` fee parameters the builder keeps synced on-chain.
+    pub fn with_outbox_fee_config(mut self, config: OutboxFeeConfig) -> Self {
+        self.outbox_fee_config = config;
+        self
     }
 }
 
@@ -104,6 +135,7 @@ where
             provider: ctx.provider().clone(),
             evm_config,
             withdrawal_batch_interval: self.withdrawal_batch_interval,
+            outbox_fee_config: self.outbox_fee_config,
         })
     }
 }
@@ -119,6 +151,8 @@ pub struct ZonePayloadBuilder<Provider, EvmConfig> {
     evm_config: EvmConfig,
     /// Maximum chain-time duration between withdrawal batch finalizations.
     withdrawal_batch_interval: Duration,
+    /// Configured `ZoneOutbox` fee parameters to keep synced on-chain.
+    outbox_fee_config: OutboxFeeConfig,
 }
 
 impl<Provider, EvmConfig> PayloadBuilder for ZonePayloadBuilder<Provider, EvmConfig>
@@ -329,6 +363,10 @@ where
             }
         }
 
+        // Keep configured ZoneOutbox fee parameters synced on-chain before
+        // pool txs, so withdrawals in this block pay the configured fee.
+        self.sync_outbox_fee_config(&mut builder, block_gas_limit, block_number)?;
+
         // Execute pool transactions
         // TODO: Use gas accounting from TempoPayloadBuilder (payment vs non-payment limits, etc.)
         let mut best_txs = self
@@ -535,6 +573,154 @@ where
         ))?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
+    }
+}
+
+impl<Provider, EvmConfig> ZonePayloadBuilder<Provider, EvmConfig> {
+    /// Compare on-chain `ZoneOutbox` fee parameters with the configured values
+    /// and inject setter system txs for any that differ.
+    fn sync_outbox_fee_config<B>(
+        &self,
+        builder: &mut B,
+        gas_limit: u64,
+        block_number: u64,
+    ) -> Result<(), PayloadBuilderError>
+    where
+        B: BlockBuilder<Primitives = tempo_primitives::TempoPrimitives>,
+    {
+        if self.outbox_fee_config.is_empty() {
+            return Ok(());
+        }
+
+        // Sync `tempoGasRate` if needed
+        if let Some(tempo_gas_rate) = self.outbox_fee_config.tempo_gas_rate {
+            let calldata = abi::ZoneOutbox::tempoGasRateCall {}.abi_encode();
+            let output = execute_outbox_view_call(
+                builder,
+                calldata.into(),
+                gas_limit,
+                block_number,
+                "tempoGasRate",
+            )?;
+            let current =
+                abi::ZoneOutbox::tempoGasRateCall::abi_decode_returns(&output).map_err(|err| {
+                    PayloadBuilderError::Internal(reth_errors::RethError::msg(format!(
+                        "failed to decode tempoGasRate return data: {err}"
+                    )))
+                })?;
+
+            if current != tempo_gas_rate {
+                info!(
+                    target: "zone::payload",
+                    block_number,
+                    current_tempo_gas_rate = current,
+                    configured_tempo_gas_rate = tempo_gas_rate,
+                    "Injecting setTempoGasRate system tx"
+                );
+                let calldata = abi::ZoneOutbox::setTempoGasRateCall {
+                    tempoGasRate: tempo_gas_rate,
+                }
+                .abi_encode();
+                execute_outbox_system_tx(
+                    builder,
+                    calldata.into(),
+                    block_number,
+                    "setTempoGasRate",
+                )?;
+            }
+        }
+
+        // Sync `maxWithdrawalsPerBlock` if needed
+        if let Some(max_withdrawals) = self.outbox_fee_config.max_withdrawals_per_block {
+            let calldata = abi::ZoneOutbox::maxWithdrawalsPerBlockCall {}.abi_encode();
+            let output = execute_outbox_view_call(
+                builder,
+                calldata.into(),
+                gas_limit,
+                block_number,
+                "maxWithdrawalsPerBlock",
+            )?;
+            let current = abi::ZoneOutbox::maxWithdrawalsPerBlockCall::abi_decode_returns(&output)
+                .map_err(|err| {
+                    PayloadBuilderError::Internal(reth_errors::RethError::msg(format!(
+                        "failed to decode maxWithdrawalsPerBlock return data: {err}"
+                    )))
+                })?;
+
+            if current != U256::from(max_withdrawals) {
+                info!(
+                    target: "zone::payload",
+                    block_number,
+                    current_max_withdrawals_per_block = %current,
+                    configured_max_withdrawals_per_block = max_withdrawals,
+                    "Injecting setMaxWithdrawalsPerBlock system tx"
+                );
+                let calldata = abi::ZoneOutbox::setMaxWithdrawalsPerBlockCall {
+                    maxWithdrawalsPerBlock: U256::from(max_withdrawals),
+                }
+                .abi_encode();
+                execute_outbox_system_tx(
+                    builder,
+                    calldata.into(),
+                    block_number,
+                    "setMaxWithdrawalsPerBlock",
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Execute a `ZoneOutbox` system transaction from `address(0)`, treating a
+/// revert as a hard error.
+fn execute_outbox_system_tx<B>(
+    builder: &mut B,
+    calldata: Bytes,
+    block_number: u64,
+    label: &str,
+) -> Result<(), PayloadBuilderError>
+where
+    B: BlockBuilder<Primitives = tempo_primitives::TempoPrimitives>,
+{
+    let tx = TxLegacy {
+        chain_id: None,
+        nonce: 0,
+        gas_price: 0,
+        gas_limit: 0,
+        to: ZONE_OUTBOX_ADDRESS.into(),
+        value: U256::ZERO,
+        input: calldata,
+    };
+    let tx = Recovered::new_unchecked(
+        TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, TEMPO_SYSTEM_TX_SIGNATURE)),
+        TEMPO_SYSTEM_TX_SENDER,
+    );
+
+    let mut reverted = false;
+    match builder.execute_transaction_with_result_closure(tx, |result| {
+        let evm_result = result.result();
+        if !evm_result.result.is_success() {
+            let revert_data = evm_result.result.output().cloned().unwrap_or_default();
+            error!(
+                target: "zone::payload",
+                block_number,
+                label,
+                is_halt = evm_result.result.is_halt(),
+                revert_data = %revert_data,
+                "ZoneOutbox system tx reverted on-chain"
+            );
+            reverted = true;
+        }
+    }) {
+        Ok(_) if reverted => Err(PayloadBuilderError::Internal(reth_errors::RethError::msg(
+            format!("ZoneOutbox {label} system tx reverted at zone block {block_number}"),
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) => {
+            error!(?err, label, "ZoneOutbox system tx failed");
+            Err(PayloadBuilderError::evm(err))
+        }
     }
 }
 

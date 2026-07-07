@@ -23,6 +23,60 @@ use crate::utils::{
     local_dev_zone_account, poll_until, seed_fixture_for_zone, start_local_zone_with_fixture,
 };
 
+/// Verify the payload builder syncs configured ZoneOutbox fee parameters
+/// on-chain via system transactions.
+///
+/// The outbox's `tempoGasRate` and `maxWithdrawalsPerBlock` are zero at zone
+/// genesis. With an [`zone_payload::OutboxFeeConfig`] configured, the first
+/// built block must inject `setTempoGasRate` and `setMaxWithdrawalsPerBlock`
+/// system txs so withdrawal fees become live.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_outbox_fee_config_synced_via_system_txs() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let fee_config = zone_payload::OutboxFeeConfig {
+        tempo_gas_rate: Some(25),
+        max_withdrawals_per_block: Some(64),
+    };
+    let zone = ZoneTestNode::start_local_with_outbox_fee_config(fee_config).await?;
+    let mut fixture = L1Fixture::new();
+    seed_fixture_for_zone(&fixture, &zone, 10);
+
+    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, zone.provider());
+    assert_eq!(
+        outbox.tempoGasRate().call().await?,
+        0,
+        "genesis rate is zero"
+    );
+
+    // The first built block injects the setter system txs.
+    fixture.inject_empty_block(zone.deposit_queue());
+    poll_until(
+        DEFAULT_TIMEOUT,
+        DEFAULT_POLL,
+        "outbox fee config synced",
+        || {
+            let outbox = &outbox;
+            async move {
+                let rate = outbox.tempoGasRate().call().await?;
+                let cap = outbox.maxWithdrawalsPerBlock().call().await?;
+                if rate == 25 && cap == U256::from(64) {
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+    )
+    .await?;
+
+    // fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate.
+    let fee = outbox.calculateWithdrawalFee(0).call().await?;
+    assert_eq!(fee, 50_000u128 * 25);
+
+    Ok(())
+}
+
 /// Self-contained test: inject a deposit via the queue and verify the zone
 /// mints the corresponding pathUSD balance on L2.
 ///

@@ -70,6 +70,10 @@ impl ZoneCli {
                 Duration::from_millis(args.l1_retry_connection_interval_ms),
             )
             .with_withdrawal_batch_interval(Duration::from_secs(args.zone_batch_interval_secs))
+            .with_outbox_fee_config(zone_payload::OutboxFeeConfig {
+                tempo_gas_rate: args.tempo_gas_rate,
+                max_withdrawals_per_block: args.max_withdrawals_per_block,
+            })
             .with_private_rpc(ZonePrivateRpcConfig {
                 private_rpc_port: args.private_rpc_port,
                 zone_id: args.zone_id,
@@ -192,6 +196,22 @@ pub struct ZoneArgs {
     /// withdrawal batches.
     #[arg(long = "sequencer", env = "SEQUENCER")]
     pub enable_sequencer: bool,
+
+    /// ZoneOutbox withdrawal gas rate (zone token units per Tempo gas unit).
+    /// When set, the payload builder keeps the on-chain `tempoGasRate` synced
+    /// to this value via system transactions. Unset leaves the on-chain value
+    /// untouched (zero at genesis = free withdrawals).
+    #[arg(long = "zone.tempo-gas-rate", env = "ZONE_TEMPO_GAS_RATE")]
+    pub tempo_gas_rate: Option<u128>,
+
+    /// Maximum withdrawal requests per zone block (0 = unlimited). When set,
+    /// the payload builder keeps the on-chain `maxWithdrawalsPerBlock` synced
+    /// to this value via system transactions.
+    #[arg(
+        long = "zone.max-withdrawals-per-block",
+        env = "ZONE_MAX_WITHDRAWALS_PER_BLOCK"
+    )]
+    pub max_withdrawals_per_block: Option<u64>,
 }
 
 fn prepend_log_filter(filter: &mut String, directives: &str) {

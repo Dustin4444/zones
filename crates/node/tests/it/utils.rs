@@ -479,6 +479,7 @@ impl ZoneTestNode {
             signer,
             Duration::from_secs(4),
             initial_tokens,
+            Default::default(),
         )
         .await
     }
@@ -502,6 +503,7 @@ impl ZoneTestNode {
             signer,
             withdrawal_batch_interval,
             Some(vec![]),
+            Default::default(),
         )
         .await
     }
@@ -561,6 +563,26 @@ impl ZoneTestNode {
         Self::launch(DUMMY_L1_URL.to_string(), Address::ZERO, None, chain_id).await
     }
 
+    /// Start a self-contained zone node with configured ZoneOutbox fee.
+    pub(crate) async fn start_local_with_outbox_fee_config(
+        outbox_fee_config: zone_payload::OutboxFeeConfig,
+    ) -> eyre::Result<Self> {
+        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
+        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            DUMMY_L1_URL.to_string(),
+            Address::ZERO,
+            None,
+            next_unique_chain_id(),
+            None,
+            signer,
+            Duration::from_secs(4),
+            Some(vec![]),
+            outbox_fee_config,
+        )
+        .await
+    }
+
     async fn launch(
         l1_ws_url: String,
         portal_address: Address,
@@ -598,6 +620,7 @@ impl ZoneTestNode {
             sequencer_signer,
             Duration::from_secs(4),
             Some(vec![]),
+            Default::default(),
         )
         .await
     }
@@ -612,6 +635,7 @@ impl ZoneTestNode {
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
         withdrawal_batch_interval: Duration,
         initial_tokens: Option<Vec<Address>>,
+        outbox_fee_config: zone_payload::OutboxFeeConfig,
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
@@ -631,7 +655,8 @@ impl ZoneTestNode {
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_withdrawal_batch_interval(withdrawal_batch_interval);
+        .with_withdrawal_batch_interval(withdrawal_batch_interval)
+        .with_outbox_fee_config(outbox_fee_config);
         if let Some(initial_tokens) = initial_tokens {
             zone_node = zone_node.with_initial_tokens(initial_tokens);
         }
