@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { EncryptedDepositLib } from "../../src/zone/EncryptedDeposit.sol";
 import {
     AES_GCM_DECRYPT,
     CHAUM_PEDERSEN_VERIFY,
@@ -22,11 +21,12 @@ import {
     QueuedDeposit,
     TIP20_FACTORY_ADDRESS,
     ZONE_OUTBOX
-} from "../../src/zone/IZone.sol";
+} from "../../src/interfaces/IZone.sol";
+import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
-import { MockTempoState } from "./mocks/MockTempoState.sol";
-import { MockZoneToken } from "./mocks/MockZoneToken.sol";
+import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 
 /// @dev Exposes ZoneInbox's internal helpers for direct unit testing. The encrypted-deposit

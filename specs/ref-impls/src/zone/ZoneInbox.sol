@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE, EncryptedDepositLib } from "./EncryptedDeposit.sol";
 import {
     AES_GCM_DECRYPT,
     CHAUM_PEDERSEN_VERIFY,
@@ -23,8 +22,12 @@ import {
     QueuedDeposit,
     TIP20_FACTORY_ADDRESS,
     ZONE_OUTBOX
-} from "./IZone.sol";
-import { TempoState } from "./TempoState.sol";
+} from "../interfaces/IZone.sol";
+import {
+    ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
+    EncryptedDepositLib
+} from "../libraries/EncryptedDeposit.sol";
+import { TempoState } from "../tempo/TempoState.sol";
 
 /// @title ZoneInbox
 /// @notice Zone-side system contract for advancing Tempo state and processing deposits

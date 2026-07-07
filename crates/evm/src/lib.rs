@@ -1,8 +1,7 @@
 //! Zone-specific EVM configuration.
 //!
-//! Wraps [`TempoEvmConfig`] with a custom [`ZoneEvmFactory`] that registers the
-//! [`TempoStateReader`](zone_l1::state::TempoStateReader) precompile at
-//! [`TEMPO_STATE_READER_ADDRESS`](tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS).
+//! Wraps [`TempoEvmConfig`] with a custom [`ZoneEvmFactory`] that registers
+//! zone-specific native precompiles.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -16,8 +15,8 @@ use crate::{
     executor::ZoneBlockExecutor,
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
-        SequencerExt, ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneTip20Token,
-        ZoneTip403ProxyRegistry, ZoneTokenFactory,
+        SequencerExt, TempoState, ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS,
+        ZoneTip20Token, ZoneTip403ProxyRegistry, ZoneTokenFactory,
     },
     tx_context::ZoneTxContext,
 };
@@ -53,15 +52,13 @@ use tempo_precompiles::{
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
 };
-use tempo_zone_contracts::{TEMPO_STATE_READER_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
-use zone_l1::state::{
-    L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider, TempoStateReader,
-};
+use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
+use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider};
 
 type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 
 /// Zone EVM factory — wraps [`TempoEvmFactory`] and registers the
-/// [`TempoStateReader`] precompile for reading Tempo L1 storage from zone contracts.
+/// zone-native precompiles.
 #[derive(Debug, Clone)]
 pub struct ZoneEvmFactory {
     l1_provider: L1StateProvider,
@@ -89,14 +86,16 @@ impl ZoneEvmFactory {
     ) -> TempoEvm<DB, I> {
         let cfg = evm.ctx().cfg.clone();
         let (_, _, precompiles) = evm.components_mut();
-        precompiles.apply_precompile(&TEMPO_STATE_READER_ADDRESS, |_| {
-            Some(TempoStateReader::create(self.l1_provider.clone()))
+        precompiles.apply_precompile(&TEMPO_STATE_ADDRESS, |_| {
+            Some(TempoState::create(self.l1_provider.clone(), &cfg))
         });
         precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| Some(ZoneTxContext::create()));
         precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
-            Some(ChaumPedersenVerify.into())
+            Some(ChaumPedersenVerify::create(&cfg))
         });
-        precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| Some(AesGcmDecrypt.into()));
+        precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| {
+            Some(AesGcmDecrypt::create(&cfg))
+        });
         precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
             Some(ZoneTokenFactory::create(&cfg))
         });
@@ -108,7 +107,7 @@ impl ZoneEvmFactory {
 
         if let Some(provider) = self.policy_provider.clone() {
             precompiles.apply_precompile(&ZONE_TIP403_PROXY_ADDRESS, |_| {
-                Some(ZoneTip403ProxyRegistry::create(provider.clone()))
+                Some(ZoneTip403ProxyRegistry::create(provider.clone(), &cfg))
             });
         }
 
@@ -258,13 +257,11 @@ impl ZoneEvmConfig {
         }
     }
 
-    /// Create a zone EVM config **without** the TempoStateReader precompile.
+    /// Create a zone EVM config without a usable L1 provider.
     ///
     /// Intended for CLI subcommands (import, stage, re-execute) that need a type-compatible
-    /// EVM config but don't have access to an L1 RPC connection. Transactions calling the
-    /// TempoStateReader precompile will get a reverted / empty response. The
-    /// portal address defaults to the zero address in this mode, so sequencer
-    /// reads are treated as unavailable.
+    /// EVM config but don't have access to an L1 RPC connection. The portal address defaults to
+    /// the zero address in this mode, so sequencer reads are treated as unavailable.
     pub fn new_without_l1(chain_spec: Arc<TempoChainSpec>) -> Self {
         let cache = L1StateCache::default();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()

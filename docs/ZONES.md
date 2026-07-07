@@ -82,26 +82,30 @@ export L1_RPC_URL="wss://rpc.moderato.tempo.xyz"
 export L1_RPC_URL="wss://rpc.devnet.tempoxyz.dev"
 ```
 
-### 2. Generate a Sequencer Key
+### 2. Generate Admin and Sequencer Keys
 
-The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1.
+The admin controls portal governance such as token enablement and deposit pause/resume. The sequencer is the operator that builds zone blocks, processes deposits, and submits batch proofs back to L1. The same key may be used for both roles, but pass it explicitly as both `ADMIN_KEY` and `SEQUENCER_KEY` when that is intentional.
 
 ```bash
 cast wallet new
+cast wallet new
 ```
 
-Save both the **address** and **private key**.
+Save both **addresses** and **private keys**.
 
 ```bash
+export ADMIN_KEY="0x<admin-private-key>"
 export SEQUENCER_KEY="0x<your-private-key>"
+ADMIN_ADDR=$(cast wallet address "$ADMIN_KEY")
 SEQUENCER_ADDR=$(cast wallet address "$SEQUENCER_KEY")
 ```
 
-### 3. Fund the Sequencer on L1
+### 3. Fund the Admin and Sequencer on L1
 
-The sequencer needs pathUSD on L1 to pay for the `createZone` transaction and deposit fees.
+The sequencer needs pathUSD on L1 to pay for the `createZone` transaction and deposit fees. The admin needs funds for later governance calls.
 
 ```bash
+cast rpc tempo_fundAddress "$ADMIN_ADDR" --rpc-url "$L1_RPC_URL"
 cast rpc tempo_fundAddress "$SEQUENCER_ADDR" --rpc-url "$L1_RPC_URL"
 ```
 
@@ -142,11 +146,12 @@ You can also run the xtask directly for more control:
 cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
+  --admin "$ADMIN_ADDR" \
   --sequencer "$SEQUENCER_ADDR" \
   --private-key "$SEQUENCER_KEY"
 ```
 
-By default, `create-zone` sets the portal admin to the sequencer. To separate the cold admin role from the hot sequencer role, pass `--admin "$ADMIN_ADDR"` to the direct xtask command and keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
+`create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY` available for admin-only portal calls such as `enable-token`, `pause-deposits`, and `resume-deposits`.
 
 ### 5. Start the Zone Node
 
@@ -238,7 +243,7 @@ The sequencer includes the withdrawal in the next batch submission to L1 and pro
 
 #### Router Swap + Deposit Demo (Same Zone)
 
-This demo exercises the `SwapAndDepositRouter` flow against a running zone. It creates temporary `AlphaUSD` and `BetaUSD` tokens on L1, seeds matching StablecoinDEX liquidity, withdraws `AlphaUSD` from the zone to the router, swaps on L1, and deposits `BetaUSD` back into the same zone via an encrypted deposit. If the portal does not already have the current sequencer encryption key registered, the demo registers it automatically before building the routed callback payload.
+This demo exercises the `SwapAndDepositRouter` flow against a running zone. It creates temporary `AlphaUSD` and `BetaUSD` tokens on L1, seeds matching StablecoinDEX liquidity, withdraws `AlphaUSD` from the zone to the router, swaps on L1, and deposits `BetaUSD` back into the same zone via an encrypted deposit. The routed callback payload includes a public `bouncebackRecipient` for the downstream portal deposit; set `ROUTER_BOUNCEBACK_RECIPIENT` to a refund-specific burner or stealth address you control if you do not want a later refund to point at the encrypted zone recipient. If the portal does not already have the current sequencer encryption key registered, the demo registers it automatically before building the routed callback payload.
 
 Prerequisites:
 - A running zone with an active sequencer
@@ -259,6 +264,12 @@ Run the demo:
 
 ```bash
 just demo-swap-and-deposit my-zone
+```
+
+Run with a dedicated routed-deposit refund address:
+
+```bash
+ROUTER_BOUNCEBACK_RECIPIENT=0xYourControlledBurnerAddress just demo-swap-and-deposit my-zone
 ```
 
 Optional parameters:
@@ -524,7 +535,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 | Contract | Address |
 |----------|---------|
 | pathUSD (TIP-20) | `0x20C0000000000000000000000000000000000000` |
-| ZoneFactory (moderato) | `0x3F07435187fB4B4d4A562138A93C0397D0734F2b` |
+| ZoneFactory (moderato) | `0xC63EF0DbaB04b0242C2898AaF0BeF81f8f9cA7c5` |
 
 The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zone` and `zone-info` point at it automatically, and `deploy-router` uses `zoneFactory` from `zone.json` before falling back to this address. Pass `--zone-factory` or set `ZONE_FACTORY` to override it.
 
@@ -538,7 +549,7 @@ export ETH_RPC_URL=https://rpc.moderato.tempo.xyz
 export PRIVATE_KEY=<deployer_private_key>
 
 forge build
-forge create --broadcast --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" src/zone/ZoneFactory.sol:ZoneFactory
+forge create --broadcast --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" src/l1/ZoneFactory.sol:ZoneFactory
 ```
 
 The `--private-key "$PRIVATE_KEY"` form is useful for controlled non-interactive deployments. For manual deployments, prefer replacing it with `--interactive` and paste the key at Foundry's prompt so the key is not written into shell history or process arguments.
@@ -559,10 +570,10 @@ Current deployment:
 
 | Field | Value |
 |-------|-------|
-| Address | `0x3F07435187fB4B4d4A562138A93C0397D0734F2b` |
-| Transaction | `0x97037ae1ccec2ac6e9425f1499ae0d6c08deebe07054181d2e154987907480fd` |
-| Block | `23667934` |
-| Deployed | `2026-06-24 18:27:45 UTC` |
+| Address | `0xC63EF0DbaB04b0242C2898AaF0BeF81f8f9cA7c5` |
+| Transaction | `0x3d3f0f4ec21084d8fda0c315cfe19c92568df3320c20a56679a12935547c2c4c` |
+| Block | `25403236` |
+| Deployed | `2026-07-06 20:41:32 UTC` |
 
 ### Zone Node CLI Options
 
@@ -591,6 +602,7 @@ Current deployment:
 | `ADMIN_KEY` | For portal governance | Portal admin private key for `enableToken` / deposit pause controls. `SEQUENCER_KEY` only works for legacy zones where admin == sequencer. |
 | `PRIVATE_KEY` | For transactions | Key for L1 transactions (deposits, approvals) |
 | `L1_PORTAL_ADDRESS` | For deposits | ZonePortal address (from `zone.json`) |
+| `ROUTER_BOUNCEBACK_RECIPIENT` | No | Optional controlled burner/stealth address for `demo-swap-and-deposit` routed deposit refunds |
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
@@ -600,7 +612,7 @@ Current deployment:
 | Command | Description |
 |---------|-------------|
 | `just deploy-zone <name> [<tip20>]` | One-shot: keygen → fund → create → genesis → start node |
-| `just create-zone <name> [<tip20>]` | Create zone on L1 + generate genesis (requires `PRIVATE_KEY`, `SEQUENCER_KEY`) |
+| `just create-zone <name> [<tip20>]` | Create zone on L1 + generate genesis (requires `PRIVATE_KEY`, `SEQUENCER_KEY`, and `ADMIN_KEY` or `ADMIN_ADDR`) |
 | `just deploy-router <name> [dex]` | Deploy `SwapAndDepositRouter` on L1 for the zone and save it to `zone.json` |
 | `just zone-up <name> [reset] [profile]` | Start the zone node. `reset=true` wipes datadir. `profile=release` for production. |
 | `just max-approve-portal [token]` | Approve portal to spend tokens on L1 |
@@ -612,7 +624,7 @@ Current deployment:
 | `just list-enabled-tokens [portal]` | List TIP-20 token addresses enabled on a portal |
 | `just max-approve-outbox [token] [rpc]` | Approve outbox to spend tokens on zone |
 | `just send-withdrawal [amount] [to] [token] [memo] [gas-limit] [fallback-recipient] [data] [reveal-to] [rpc]` | Withdraw tokens from zone to L1 (defaults to sender) |
-| `just demo-swap-and-deposit <name> [amount] [tick] [rpc]` | Self-contained same-zone router demo: create tokens, seed DEX liquidity, swap on L1, deposit output back into the zone |
+| `just demo-swap-and-deposit <name> [amount] [tick] [rpc]` | Self-contained same-zone router demo: create tokens, seed DEX liquidity, swap on L1, deposit output back into the zone; set `ROUTER_BOUNCEBACK_RECIPIENT` for routed deposit refunds |
 | `just check-balance <addr> [token] [rpc]` | Check token balance on the zone |
 | `just zone-auth-token <name>` | Generate a signed private RPC auth token (10 min TTL) |
 | `just check-balance-private <name> [token] [rpc]` | Check balance via the private RPC (auto-generates auth token) |

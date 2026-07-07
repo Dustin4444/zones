@@ -14,17 +14,6 @@ pub const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
 /// TempoState predeploy address on Zone L2.
 pub const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 
-/// TempoState storage slot for `tempoBlockHash` (slot 0).
-pub const TEMPO_BLOCK_HASH_SLOT: B256 = B256::ZERO;
-
-/// TempoState storage slot for packed
-/// `(tempoBlockNumber, tempoGasLimit, tempoGasUsed, tempoTimestamp)` (slot 7).
-pub const TEMPO_PACKED_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 7;
-    B256::new(bytes)
-};
-
 /// ZoneInbox predeploy address on Zone L2.
 pub const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 
@@ -33,10 +22,6 @@ pub const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c0000000000000000000000000
 
 /// ZoneConfig predeploy address on Zone L2.
 pub const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
-
-/// TempoStateReader precompile address on Zone L2.
-pub const TEMPO_STATE_READER_ADDRESS: Address =
-    address!("0x1c00000000000000000000000000000000000004");
 
 /// ZoneTxContext precompile address on Zone L2.
 pub const ZONE_TX_CONTEXT_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000005");

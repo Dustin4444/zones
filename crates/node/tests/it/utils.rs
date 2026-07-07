@@ -2,7 +2,7 @@ use alloy::genesis::Genesis;
 use alloy_consensus::Header;
 use alloy_eips::NumHash;
 use alloy_primitives::{Address, B256, U256, address, keccak256};
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
@@ -27,19 +27,21 @@ use std::{
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::TempoChainSpec;
+use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TempoChainSpec};
 use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20,
     account_keychain::IAccountKeychain::{
         IAccountKeychainInstance, SignatureType as KeyInfoSignatureType,
     },
 };
 use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
+use tempo_zone_contracts::ZONE_OUTBOX_ADDRESS;
 use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
 };
 use zone_node::ZoneNode;
+use zone_precompiles::tempo_state::slots;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -81,6 +83,39 @@ pub(crate) const TEST_MNEMONIC: &str =
 
 pub(crate) const STABLECOIN_DEX_ADDRESS: Address =
     address!("0xDEc0000000000000000000000000000000000000");
+
+pub(crate) fn local_dev_zone_account(zone: &ZoneTestNode) -> eyre::Result<(DynProvider, Address)> {
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(dev_signer)
+        .connect_http(zone.http_url().clone())
+        .erased();
+    Ok((provider, dev_address))
+}
+
+pub(crate) async fn approve_outbox<P>(
+    fixture: &mut L1Fixture,
+    zone: &ZoneTestNode,
+    provider: P,
+) -> eyre::Result<()>
+where
+    P: Provider + Clone,
+{
+    let zone_token = ITIP20::new(PATH_USD_ADDRESS, provider);
+    let approve_pending = zone_token
+        .approve(ZONE_OUTBOX_ADDRESS, U256::MAX)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(150_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let approve_receipt = approve_pending.get_receipt().await?;
+    assert!(approve_receipt.status(), "approve should succeed");
+    Ok(())
+}
 
 fn portal_token_config_slot(token: Address) -> B256 {
     let portal_token_configs_slot = B256::with_last_byte(8);
@@ -201,7 +236,7 @@ where
 /// Wraps an in-process reth node configured as a Zone, providing:
 /// - An HTTP RPC endpoint for provider connections
 /// - A [`DepositQueue`] handle for injecting synthetic L1 blocks
-/// - A [`L1StateCache`] for seeding TempoStateReader precompile data
+/// - A [`L1StateCache`] for seeding TempoState storage-read data
 ///
 /// # Construction
 ///
@@ -421,6 +456,56 @@ impl ZoneTestNode {
         .await
     }
 
+    /// Start a zone node connected to a real L1, anchoring genesis to a specific
+    /// L1 block and optionally overriding the initial token list used for
+    /// startup policy cache seeding.
+    pub(crate) async fn start_from_l1_at_block_with_initial_tokens(
+        l1_http_url: &url::Url,
+        l1_ws_url: &url::Url,
+        portal_address: Address,
+        block_number: u64,
+        initial_tokens: Option<Vec<Address>>,
+    ) -> eyre::Result<Self> {
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, block_number).await?;
+
+        let signer = l1_dev_signer();
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            l1_ws_url.to_string(),
+            portal_address,
+            Some(genesis_block_number),
+            next_unique_chain_id(),
+            Some(genesis),
+            signer,
+            Duration::from_secs(4),
+            initial_tokens,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_from_l1_with_withdrawal_batch_interval(
+        l1_http_url: &url::Url,
+        l1_ws_url: &url::Url,
+        portal_address: Address,
+        withdrawal_batch_interval: Duration,
+    ) -> eyre::Result<Self> {
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+
+        let signer = l1_dev_signer();
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            l1_ws_url.to_string(),
+            portal_address,
+            Some(genesis_block_number),
+            next_unique_chain_id(),
+            Some(genesis),
+            signer,
+            withdrawal_batch_interval,
+            Some(vec![]),
+        )
+        .await
+    }
+
     /// Start a zone node connected to a real L1, anchoring genesis to the
     /// portal's on-chain `genesisTempoBlockNumber`.
     ///
@@ -457,7 +542,7 @@ impl ZoneTestNode {
     /// The L1Subscriber retries a dummy URL in the background, but the
     /// ZoneEngine is fully functional. Deposits and L1 headers are injected
     /// directly into the `deposit_queue`; the L1 state cache must be seeded
-    /// via [`L1Fixture::seed_l1_cache`] for TempoStateReader precompile reads.
+    /// via [`L1Fixture::seed_l1_cache`] for TempoState storage reads.
     pub(crate) async fn start_local() -> eyre::Result<Self> {
         Self::launch(
             DUMMY_L1_URL.to_string(),
@@ -504,6 +589,30 @@ impl ZoneTestNode {
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<Self> {
+        Self::launch_with_genesis_and_withdrawal_batch_interval(
+            l1_ws_url,
+            portal_address,
+            genesis_tempo_block_number,
+            chain_id,
+            custom_genesis,
+            sequencer_signer,
+            Duration::from_secs(4),
+            Some(vec![]),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_with_genesis_and_withdrawal_batch_interval(
+        l1_ws_url: String,
+        portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
+        chain_id: u64,
+        custom_genesis: Option<Genesis>,
+        sequencer_signer: alloy_signer_local::PrivateKeySigner,
+        withdrawal_batch_interval: Duration,
+        initial_tokens: Option<Vec<Address>>,
+    ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
         let l1_provider_url = l1_ws_url.clone();
@@ -515,14 +624,17 @@ impl ZoneTestNode {
         genesis.config.chain_id = chain_id;
         let chain_spec = TempoChainSpec::from_genesis(genesis);
 
-        let zone_node = ZoneNode::new(
+        let mut zone_node = ZoneNode::new(
             l1_ws_url,
             portal_address,
             genesis_tempo_block_number,
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_initial_tokens(vec![]);
+        .with_withdrawal_batch_interval(withdrawal_batch_interval);
+        if let Some(initial_tokens) = initial_tokens {
+            zone_node = zone_node.with_initial_tokens(initial_tokens);
+        }
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
@@ -670,6 +782,21 @@ impl L1TestNode {
         self.dev_signer().address()
     }
 
+    /// Returns the signer used as the ZonePortal admin (mnemonic index 2).
+    ///
+    /// Distinct from the dev account (which acts as the sequencer) so the test
+    /// suite exercises the admin/sequencer role separation. This account is NOT
+    /// pre-funded; [`create_zone`](Self::create_zone) funds it with pathUSD for
+    /// gas so it can make admin-only portal calls.
+    pub(crate) fn admin_signer(&self) -> alloy_signer_local::PrivateKeySigner {
+        self.signer_at(2)
+    }
+
+    /// Returns the address of the ZonePortal admin account.
+    pub(crate) fn admin_address(&self) -> Address {
+        self.admin_signer().address()
+    }
+
     /// Returns a signer for the second test account (mnemonic index 1).
     ///
     /// This account is NOT pre-funded — use [`fund_user`](Self::fund_user) to
@@ -810,6 +937,17 @@ impl L1TestNode {
     pub(crate) fn dev_provider(&self) -> alloy_provider::DynProvider {
         ProviderBuilder::new()
             .wallet(self.dev_signer())
+            .connect_http(self.http_url.clone())
+            .erased()
+    }
+
+    /// Returns an HTTP provider with the admin account wallet attached.
+    ///
+    /// Used for `onlyAdmin` portal calls so they are signed by the admin key
+    /// rather than the dev (sequencer) key.
+    pub(crate) fn admin_provider(&self) -> alloy_provider::DynProvider {
+        ProviderBuilder::new()
+            .wallet(self.admin_signer())
             .connect_http(self.http_url.clone())
             .erased()
     }
@@ -989,16 +1127,31 @@ impl L1TestNode {
     /// Create a zone on an existing ZoneFactory and return the portal address.
     ///
     /// Captures the current L1 header as the genesis anchor, then calls
-    /// `createZone()` with pathUSD as the token and the dev account as sequencer.
+    /// `createZone()` with pathUSD as the token, a distinct [`admin_address`] as
+    /// the portal admin, and the dev account as the sequencer. This exercises the
+    /// admin/sequencer role separation. The admin account is funded with pathUSD
+    /// for gas so admin-only portal calls (e.g. `enableToken`) can be made.
+    ///
+    /// [`admin_address`]: Self::admin_address
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
-        self.create_zone_with_sequencer(factory_address, self.dev_address())
-            .await
+        let portal = self
+            .create_zone_with_admin_and_sequencer(
+                factory_address,
+                self.admin_address(),
+                self.dev_address(),
+            )
+            .await?;
+        // The admin is not pre-funded; give it pathUSD to pay for gas on
+        // admin-only portal calls.
+        self.fund_user(self.admin_address(), 10_000_000).await?;
+        Ok(portal)
     }
 
-    /// Create a zone on an existing ZoneFactory with a custom sequencer address.
-    pub(crate) async fn create_zone_with_sequencer(
+    /// Create a zone on an existing ZoneFactory with explicit admin and sequencer addresses.
+    pub(crate) async fn create_zone_with_admin_and_sequencer(
         &self,
         factory_address: Address,
+        admin: Address,
         sequencer: Address,
     ) -> eyre::Result<Address> {
         use tempo_precompiles::PATH_USD_ADDRESS;
@@ -1023,7 +1176,7 @@ impl L1TestNode {
         let verifier_address = factory.verifier().call().await?;
         let receipt = factory
             .createZone(ZoneFactory::CreateZoneParams {
-                admin: sequencer,
+                admin,
                 initialToken: PATH_USD_ADDRESS,
                 sequencer,
                 verifier: verifier_address,
@@ -1100,10 +1253,18 @@ impl L1TestNode {
     ) -> eyre::Result<(Address, Address, Address)> {
         let factory = self.deploy_zone_factory().await?;
         let portal_a = self
-            .create_zone_with_sequencer(factory, sequencer_a.address())
+            .create_zone_with_admin_and_sequencer(
+                factory,
+                self.dev_address(),
+                sequencer_a.address(),
+            )
             .await?;
         let portal_b = self
-            .create_zone_with_sequencer(factory, sequencer_b.address())
+            .create_zone_with_admin_and_sequencer(
+                factory,
+                self.dev_address(),
+                sequencer_b.address(),
+            )
             .await?;
         let router = self.deploy_router(factory).await?;
         Ok((portal_a, portal_b, router))
@@ -1156,7 +1317,7 @@ impl L1TestNode {
         token: Address,
     ) -> eyre::Result<()> {
         use tempo_zone_contracts::ZonePortal;
-        let provider = self.dev_provider();
+        let provider = self.admin_provider();
         let portal = ZonePortal::new(portal_address, &provider);
         let receipt = portal
             .enableToken(token)
@@ -1174,7 +1335,7 @@ impl L1TestNode {
         portal_address: Address,
         token: Address,
     ) -> eyre::Result<()> {
-        let provider = self.dev_provider();
+        let provider = self.admin_provider();
         let portal = TestZonePortalAdmin::new(portal_address, &provider);
         let receipt = portal
             .pauseDeposits(token)
@@ -1198,6 +1359,21 @@ impl L1TestNode {
         &self,
         portal_address: Address,
         encryption_key: &k256::SecretKey,
+    ) -> eyre::Result<()> {
+        self.set_sequencer_encryption_key_with_signer(
+            portal_address,
+            encryption_key,
+            self.dev_signer(),
+        )
+        .await
+    }
+
+    /// Set the sequencer encryption key using an explicit portal sequencer signer.
+    pub(crate) async fn set_sequencer_encryption_key_with_signer(
+        &self,
+        portal_address: Address,
+        encryption_key: &k256::SecretKey,
+        sequencer_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<()> {
         use alloy_signer::SignerSync;
         use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::sec1::ToEncodedPoint};
@@ -1224,9 +1400,10 @@ impl L1TestNode {
         let pop_r = B256::from(sig.r().to_be_bytes::<32>());
         let pop_s = B256::from(sig.s().to_be_bytes::<32>());
 
-        // Call setSequencerEncryptionKey as the sequencer (dev account)
-        let dev_provider = self.dev_provider();
-        let portal = ZonePortal::new(portal_address, &dev_provider);
+        let sequencer_provider = ProviderBuilder::new()
+            .wallet(sequencer_signer)
+            .connect_http(self.http_url.clone());
+        let portal = ZonePortal::new(portal_address, &sequencer_provider);
         let receipt = portal
             .setSequencerEncryptionKey(x, y_parity, pop_v, pop_r, pop_s)
             .send()
@@ -1641,17 +1818,13 @@ fn build_l1_anchored_genesis_from_header(
         .storage
         .get_or_insert_with(Default::default);
 
-    // Slot 0 = tempoBlockHash
-    storage.insert(B256::ZERO, l1_genesis_hash);
-
-    // Slot 7 = packed (tempoBlockNumber:u64 | tempoGasLimit:u64 | tempoGasUsed:u64 | tempoTimestamp:u64)
-    let new_slot7: U256 = U256::from(l1_header.inner.number)
-        | (U256::from(l1_header.inner.gas_limit) << 64)
-        | (U256::from(l1_header.inner.gas_used) << 128)
-        | (U256::from(l1_header.inner.timestamp) << 192);
     storage.insert(
-        B256::from(U256::from(7).to_be_bytes()),
-        B256::from(new_slot7.to_be_bytes()),
+        B256::from(slots::TEMPO_BLOCK_HASH.to_be_bytes()),
+        l1_genesis_hash,
+    );
+    storage.insert(
+        B256::from(slots::TEMPO_BLOCK_NUMBER.to_be_bytes()),
+        B256::from(U256::from(l1_header.inner.number).to_be_bytes()),
     );
 
     // --- Patch 2: Portal address immutables in ZoneInbox and ZoneConfig ---
@@ -1747,6 +1920,28 @@ pub(crate) struct WithdrawalArgs {
     pub reveal_to: alloy_primitives::Bytes,
 }
 
+pub(crate) struct PlaintextRouterCallbackArgs {
+    pub amount: u128,
+    pub router: Address,
+    pub token_out: Address,
+    pub target_portal: Address,
+    pub recipient: Address,
+    pub bounceback_recipient: Address,
+    pub memo: B256,
+    pub min_amount_out: u128,
+}
+
+pub(crate) struct EncryptedRouterCallbackArgs {
+    pub amount: u128,
+    pub router: Address,
+    pub token_out: Address,
+    pub target_portal: Address,
+    pub key_index: U256,
+    pub encrypted: tempo_zone_contracts::EncryptedDepositPayload,
+    pub bounceback_recipient: Address,
+    pub min_amount_out: u128,
+}
+
 impl WithdrawalArgs {
     /// Simple withdrawal: send `amount` back to self with no callback.
     pub(crate) fn new(amount: u128) -> Self {
@@ -1762,30 +1957,23 @@ impl WithdrawalArgs {
     }
 
     /// Plaintext router callback: optionally swap, then deposit into `target_portal`.
-    pub(crate) fn swap_and_deposit_via_router(
-        amount: u128,
-        router: Address,
-        token_out: Address,
-        target_portal: Address,
-        recipient: Address,
-        memo: B256,
-        min_amount_out: u128,
-    ) -> Self {
+    pub(crate) fn swap_and_deposit_via_router(args: PlaintextRouterCallbackArgs) -> Self {
         use tempo_zone_contracts::SwapAndDepositRouterPlaintextCallback;
 
         let callback_data = SwapAndDepositRouterPlaintextCallback {
-            token_out,
-            target_portal,
-            recipient,
-            memo,
-            min_amount_out,
+            token_out: args.token_out,
+            target_portal: args.target_portal,
+            recipient: args.recipient,
+            bounceback_recipient: args.bounceback_recipient,
+            memo: args.memo,
+            min_amount_out: args.min_amount_out,
         }
         .abi_encode();
 
         Self {
-            amount,
-            to: Some(router),
-            memo,
+            amount: args.amount,
+            to: Some(args.router),
+            memo: args.memo,
             gas_limit: 2_000_000,
             fallback_recipient: None, // defaults to self
             data: alloy_primitives::Bytes::from(callback_data),
@@ -1794,27 +1982,20 @@ impl WithdrawalArgs {
     }
 
     /// Encrypted router callback: optionally swap, then deposit encrypted into `target_portal`.
-    pub(crate) fn swap_and_deposit_encrypted_via_router(
-        amount: u128,
-        router: Address,
-        token_out: Address,
-        target_portal: Address,
-        key_index: U256,
-        encrypted: tempo_zone_contracts::EncryptedDepositPayload,
-        min_amount_out: u128,
-    ) -> Self {
+    pub(crate) fn swap_and_deposit_encrypted_via_router(args: EncryptedRouterCallbackArgs) -> Self {
         let callback_data = tempo_zone_contracts::SwapAndDepositRouterEncryptedCallback {
-            token_out,
-            target_portal,
-            key_index,
-            encrypted,
-            min_amount_out,
+            token_out: args.token_out,
+            target_portal: args.target_portal,
+            key_index: args.key_index,
+            encrypted: args.encrypted,
+            bounceback_recipient: args.bounceback_recipient,
+            min_amount_out: args.min_amount_out,
         }
         .abi_encode();
 
         Self {
-            amount,
-            to: Some(router),
+            amount: args.amount,
+            to: Some(args.router),
             memo: B256::ZERO,
             gas_limit: 2_000_000,
             fallback_recipient: None, // defaults to self
@@ -1834,16 +2015,18 @@ impl WithdrawalArgs {
         target_portal: Address,
         token: Address,
         recipient: Address,
+        bounceback_recipient: Address,
     ) -> Self {
-        Self::swap_and_deposit_via_router(
+        Self::swap_and_deposit_via_router(PlaintextRouterCallbackArgs {
             amount,
             router,
-            token,
+            token_out: token,
             target_portal,
             recipient,
-            B256::ZERO,
-            0,
-        )
+            bounceback_recipient,
+            memo: B256::ZERO,
+            min_amount_out: 0,
+        })
     }
 }
 
@@ -2963,10 +3146,10 @@ impl L1Fixture {
     }
 
     /// Pre-populate the L1 state cache with values that `advanceTempo` will read
-    /// via the TempoStateReader precompile.
+    /// via the TempoState precompile.
     ///
     /// Without a real L1, the precompile would fail with a hard error on cache miss.
-    /// This seeds the cache so that `readStorageAt(portal, slot, blockNumber)` succeeds
+    /// This seeds the cache so that `readTempoStorageSlot(portal, slot)` succeeds
     /// for each block we plan to inject.
     pub(crate) fn seed_l1_cache(
         &self,

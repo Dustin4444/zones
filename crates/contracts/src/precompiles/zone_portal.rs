@@ -100,7 +100,13 @@ crate::sol! {
             uint64 lastProcessedDepositNumber
         );
 
-        event WithdrawalProcessed(address indexed to, address token, uint128 amount, bool callbackSuccess);
+        event WithdrawalProcessed(
+            address indexed to,
+            bytes32 indexed senderTag,
+            address token,
+            uint128 amount,
+            bool callbackSuccess
+        );
 
         event WithdrawalBounceBack(
             bytes32 indexed newCurrentDepositQueueHash,
@@ -136,10 +142,22 @@ crate::sol! {
             address indexed newSequencer
         );
 
+        event AdminTransferStarted(
+            address indexed currentAdmin,
+            address indexed pendingAdmin
+        );
+
+        event AdminTransferred(
+            address indexed previousAdmin,
+            address indexed newAdmin
+        );
+
         // -- Errors --
 
         error NotSequencer();
         error NotAdmin();
+        error NotPendingSequencer();
+        error NotPendingAdmin();
         error InvalidProof();
         error InvalidTempoBlockNumber();
         error PolicyForbids();
@@ -194,6 +212,12 @@ crate::sol! {
         function pauseDeposits(address token) external;
         function resumeDeposits(address token) external;
 
+        function transferSequencer(address newSequencer) external;
+        function acceptSequencer() external;
+
+        function transferAdmin(address newAdmin) external;
+        function acceptAdmin() external;
+
         function rpcUrl() external view returns (string memory);
         function setRpcUrl(string calldata rpcUrl) external;
 
@@ -220,6 +244,7 @@ crate::sol! {
         function enabledTokenAt(uint256 index) external view returns (address);
         function zoneGasRate() external view returns (uint128);
         function pendingSequencer() external view returns (address);
+        function pendingAdmin() external view returns (address);
         function refunds(address token, address owner) external view returns (uint128);
 
         function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity);
@@ -240,10 +265,24 @@ impl<P: alloy_provider::Provider<N>, N: alloy_network::Network>
     pub async fn enabled_tokens(
         &self,
     ) -> Result<alloc::vec::Vec<alloy_primitives::Address>, alloy_contract::Error> {
-        let count = self.enabledTokenCount().call().await?;
+        self.enabled_tokens_at(alloy_rpc_types_eth::BlockId::latest())
+            .await
+    }
+
+    /// Returns all token addresses enabled for bridging at `block_id`.
+    ///
+    /// Callers that pair the returned token list with other historical L1 reads
+    /// should use this instead of [`enabled_tokens`](Self::enabled_tokens), so
+    /// future `TokenEnabled` events are not mixed into older state snapshots.
+    pub async fn enabled_tokens_at(
+        &self,
+        block_id: alloy_rpc_types_eth::BlockId,
+    ) -> Result<alloc::vec::Vec<alloy_primitives::Address>, alloy_contract::Error> {
+        let count = self.enabledTokenCount().block(block_id).call().await?;
         let futs: alloc::vec::Vec<_> = (0..count.to::<u64>())
             .map(|i| async move {
                 self.enabledTokenAt(alloy_primitives::U256::from(i))
+                    .block(block_id)
                     .call()
                     .await
             })
@@ -291,6 +330,8 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
         match self {
             Self::NotSequencer(_) => f.write_str("NotSequencer"),
             Self::NotAdmin(_) => f.write_str("NotAdmin"),
+            Self::NotPendingSequencer(_) => f.write_str("NotPendingSequencer"),
+            Self::NotPendingAdmin(_) => f.write_str("NotPendingAdmin"),
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),

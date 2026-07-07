@@ -56,7 +56,7 @@ use tempo_transaction_pool::{
 use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
     DepositQueue, L1Subscriber, L1SubscriberConfig, PolicyCache, TempoStateExt,
@@ -65,7 +65,9 @@ use zone_l1::{
         spawn_policy_resolution_task, spawn_pool_prefetch_task,
     },
 };
-use zone_payload::{ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes};
+use zone_payload::{
+    DEFAULT_WITHDRAWAL_BATCH_INTERVAL, ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes,
+};
 use zone_sequencer::{BatchAnchorConfig, ZoneSequencerConfig, spawn_zone_sequencer};
 
 /// Network primitives for Zone Nodes
@@ -80,7 +82,7 @@ pub struct ZoneSequencerAddOnsConfig {
     pub zone_id: u32,
     /// How often the zone monitor polls for new L2 blocks.
     pub zone_poll_interval: Duration,
-    /// Maximum time to accumulate zone blocks before batch submission.
+    /// Maximum time between withdrawal batch boundaries/submissions.
     pub batch_interval: Duration,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
@@ -119,6 +121,8 @@ pub struct ZoneNode {
     /// Optional pre-configured list of enabled token addresses. When set, the
     /// startup L1 RPC query for `enabledTokenCount`/`enabledTokens` is skipped.
     initial_tokens: Option<Vec<Address>>,
+    /// Maximum chain-time duration between withdrawal batch finalizations.
+    withdrawal_batch_interval: Duration,
     /// Private RPC config.
     private_rpc_config: ZonePrivateRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
@@ -163,6 +167,7 @@ impl ZoneNode {
             policy_cache,
             portal_address,
             initial_tokens: None,
+            withdrawal_batch_interval: DEFAULT_WITHDRAWAL_BATCH_INTERVAL,
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
         }
@@ -185,6 +190,13 @@ impl ZoneNode {
     /// When set, the startup L1 RPC query for enabled tokens is skipped.
     pub fn with_initial_tokens(mut self, tokens: Vec<Address>) -> Self {
         self.initial_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the chain-time interval used by the payload builder for empty
+    /// withdrawal batch finalization.
+    pub fn with_withdrawal_batch_interval(mut self, interval: Duration) -> Self {
+        self.withdrawal_batch_interval = interval;
         self
     }
 
@@ -217,13 +229,28 @@ impl ZoneNode {
     where
         N: FullNodeTypes<Types = Self>,
     {
+        Self::components_with_payload_factory(executor_builder, ZonePayloadFactory::default())
+    }
+
+    fn components_with_payload_factory<N>(
+        executor_builder: ZoneExecutorBuilder,
+        payload_factory: ZonePayloadFactory,
+    ) -> ComponentsBuilder<
+        N,
+        ZonePoolBuilder,
+        BasicPayloadServiceBuilder<ZonePayloadFactory>,
+        NoopNetworkBuilder<ZoneNetworkPrimitives>,
+        ZoneExecutorBuilder,
+        NoopConsensusBuilder,
+    >
+    where
+        N: FullNodeTypes<Types = Self>,
+    {
         ComponentsBuilder::default()
             .node_types::<N>()
             .pool(ZonePoolBuilder)
             .executor(executor_builder)
-            .payload(BasicPayloadServiceBuilder::new(
-                ZonePayloadFactory::default(),
-            ))
+            .payload(BasicPayloadServiceBuilder::new(payload_factory))
             .network(NoopNetworkBuilder::<ZoneNetworkPrimitives>::default())
             .noop_consensus()
     }
@@ -411,16 +438,47 @@ where
             info!(target: "reth::cli", count = tokens.len(), ?tokens, "Using pre-configured initial tokens");
             tokens
         } else {
-            let tokens = ZonePortal::new(portal, l1_provider)
-                .enabled_tokens()
-                .await?;
-            info!(target: "reth::cli", count = tokens.len(), ?tokens, "Discovered enabled tokens from L1");
+            let block_number = self.policy_cache.last_l1_block();
+            let tokens = match ZonePortal::new(portal, l1_provider)
+                .enabled_tokens_at(alloy_rpc_types_eth::BlockId::number(block_number))
+                .await
+            {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    warn!(
+                        target: "reth::cli",
+                        %err,
+                        block_number,
+                        %portal,
+                        "Failed to discover enabled tokens from L1 for policy cache seeding; continuing without initial token policy seed"
+                    );
+                    return Ok(());
+                }
+            };
+            info!(
+                target: "reth::cli",
+                count = tokens.len(),
+                ?tokens,
+                block_number,
+                "Discovered enabled tokens from L1"
+            );
             tokens
         };
 
-        self.policy_cache
+        if let Err(err) = self
+            .policy_cache
             .seed_token_policies(portal, &tracked_tokens, l1_provider)
-            .await?;
+            .await
+        {
+            warn!(
+                target: "reth::cli",
+                %err,
+                count = tracked_tokens.len(),
+                %portal,
+                "Failed to seed token policies from L1; continuing with RPC fallback"
+            );
+            return Ok(());
+        }
         info!(target: "reth::cli", "Seeded token policies from L1");
         Ok(())
     }
@@ -664,7 +722,8 @@ where
             self.l1_state_cache.clone(),
             self.policy_cache.clone(),
         );
-        Self::components(executor_builder)
+        let payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval);
+        Self::components_with_payload_factory(executor_builder, payload_factory)
     }
 
     fn add_ons(&self) -> Self::AddOns {
@@ -767,7 +826,7 @@ where
 
         let policy_provider = PolicyProvider::new(self.policy_cache, policy_l1, runtime_handle);
         evm_config = evm_config.with_policy_provider(policy_provider);
-        info!(target: "reth::cli", "Zone EVM initialized with TempoStateReader + TIP-403 proxy precompiles");
+        info!(target: "reth::cli", "Zone EVM initialized with TempoState + TIP-403 proxy precompiles");
 
         Ok(evm_config)
     }
