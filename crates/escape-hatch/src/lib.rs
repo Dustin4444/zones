@@ -1,8 +1,4 @@
 //! Escape hatch data structures and batch commitments.
-//!
-//! This crate is intentionally not wired into the node yet. It exists as the
-//! implementation surface for the exit-note tree, nullifier tree, and batch
-//! commitments while those pieces are developed behind tests.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(dead_code)]

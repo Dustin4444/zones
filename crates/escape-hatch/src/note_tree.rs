@@ -204,26 +204,11 @@ impl ExitNoteTreeProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitNoteTreeError {
     /// Requested tree depth is not supported.
-    DepthTooLarge {
-        /// Requested depth.
-        depth: u8,
-        /// Maximum supported depth.
-        max: u8,
-    },
+    DepthTooLarge { depth: u8, max: u8 },
     /// The fixed-size tree has no remaining leaf slots.
-    TreeFull {
-        /// Fixed tree depth.
-        depth: u8,
-        /// Maximum leaf count.
-        capacity: u64,
-    },
+    TreeFull { depth: u8, capacity: u64 },
     /// Requested proof/leaf index has not been appended.
-    LeafIndexOutOfBounds {
-        /// Requested leaf index.
-        index: u64,
-        /// Number of appended leaves.
-        leaf_count: u64,
-    },
+    LeafIndexOutOfBounds { index: u64, leaf_count: u64 },
 }
 
 impl std::fmt::Display for ExitNoteTreeError {
@@ -262,6 +247,7 @@ fn build_zero_hashes(depth: u8) -> Vec<B256> {
     zero_hashes
 }
 
+/// Builds a Merkle root from the frontier, padding with zero hashes as needed.
 fn root_from_frontier(depth: u8, leaf_count: u64, branch: &[B256], zero_hashes: &[B256]) -> B256 {
     let mut node = B256::ZERO;
 
@@ -276,6 +262,7 @@ fn root_from_frontier(depth: u8, leaf_count: u64, branch: &[B256], zero_hashes: 
     node
 }
 
+/// For leaf inclusion proofs, compute the sibling hashes from the leaf level to the root level.
 fn proof_siblings(depth: u8, zero_hashes: &[B256], leaves: &[B256], index: u64) -> Vec<B256> {
     let mut siblings = Vec::with_capacity(depth as usize);
     let mut level_nodes = leaves.to_vec();
@@ -311,6 +298,7 @@ fn proof_siblings(depth: u8, zero_hashes: &[B256], leaves: &[B256], index: u64) 
     siblings
 }
 
+/// Use keccak256(left || right) to compute the parent node of two children.
 fn hash_pair(left: B256, right: B256) -> B256 {
     let mut preimage = [0u8; 64];
     preimage[..32].copy_from_slice(left.as_slice());
