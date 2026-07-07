@@ -55,6 +55,10 @@ contract ZonePortal is IZonePortal {
     /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
     uint256 internal constant TEMPO_BASE_FEE_SCALE = 1e12;
 
+    uint8 internal constant POLICY_ROLE_SENDER = 0;
+    uint8 internal constant POLICY_ROLE_RECIPIENT = 1;
+    uint8 internal constant POLICY_ROLE_MINT_RECIPIENT = 2;
+
     /// @notice Maximum gas a withdrawal callback may request
     /// @dev Over-cap legacy withdrawals are dequeued and bounced back in `processWithdrawal`.
     uint64 public constant MAX_WITHDRAWAL_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
@@ -493,9 +497,6 @@ contract ZonePortal is IZonePortal {
         view
     {
         uint64 policyId = ITIP20(_token).transferPolicyId();
-        if (!TIP403_REGISTRY.isAuthorizedSender(policyId, from)) {
-            revert ITIP20.PolicyForbids();
-        }
         if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, to)) {
             revert ITIP20.PolicyForbids();
         }
@@ -505,6 +506,11 @@ contract ZonePortal is IZonePortal {
         if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, bouncebackRecipient)) {
             revert ITIP20.PolicyForbids();
         }
+
+        _validateOtherEnabledTokenPolicies(_token, from, POLICY_ROLE_SENDER);
+        _validateOtherEnabledTokenPolicies(_token, to, POLICY_ROLE_RECIPIENT);
+        _validateOtherEnabledTokenPolicies(_token, to, POLICY_ROLE_MINT_RECIPIENT);
+        _validateOtherEnabledTokenPolicies(_token, bouncebackRecipient, POLICY_ROLE_RECIPIENT);
     }
 
     function _validateEncryptedDepositPolicy(
@@ -516,12 +522,12 @@ contract ZonePortal is IZonePortal {
         view
     {
         uint64 policyId = ITIP20(_token).transferPolicyId();
-        if (!TIP403_REGISTRY.isAuthorizedSender(policyId, from)) {
-            revert ITIP20.PolicyForbids();
-        }
         if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, bouncebackRecipient)) {
             revert ITIP20.PolicyForbids();
         }
+
+        _validateOtherEnabledTokenPolicies(_token, from, POLICY_ROLE_SENDER);
+        _validateOtherEnabledTokenPolicies(_token, bouncebackRecipient, POLICY_ROLE_RECIPIENT);
     }
 
     function _validateBounceBackPolicy(address _token, address fallbackRecipient) internal view {
@@ -536,7 +542,14 @@ contract ZonePortal is IZonePortal {
         uint64 policyId = ITIP20(_token).transferPolicyId();
         return TIP403_REGISTRY.isAuthorizedSender(policyId, address(this))
             && TIP403_REGISTRY.isAuthorizedRecipient(policyId, fallbackRecipient)
-            && TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, fallbackRecipient);
+            && TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, fallbackRecipient)
+            && _authorizedByOtherEnabledTokenPolicies(_token, address(this), POLICY_ROLE_SENDER)
+            && _authorizedByOtherEnabledTokenPolicies(
+            _token, fallbackRecipient, POLICY_ROLE_RECIPIENT
+        )
+            && _authorizedByOtherEnabledTokenPolicies(
+            _token, fallbackRecipient, POLICY_ROLE_MINT_RECIPIENT
+        );
     }
 
     function _isAuthorizedWithdrawalRecipient(
@@ -547,8 +560,79 @@ contract ZonePortal is IZonePortal {
         view
         returns (bool)
     {
-        uint64 policyId = ITIP20(_token).transferPolicyId();
-        return TIP403_REGISTRY.isAuthorizedRecipient(policyId, to);
+        return _authorizedByOtherEnabledTokenPolicies(_token, to, POLICY_ROLE_RECIPIENT);
+    }
+
+    function _validateOtherEnabledTokenPolicies(
+        address _token,
+        address account,
+        uint8 role
+    )
+        internal
+        view
+    {
+        if (!_authorizedByOtherEnabledTokenPolicies(_token, account, role)) {
+            revert ITIP20.PolicyForbids();
+        }
+    }
+
+    function _authorizedByOtherEnabledTokenPolicies(
+        address _token,
+        address account,
+        uint8 role
+    )
+        internal
+        view
+        returns (bool)
+    {
+        uint64 basePolicyId = ITIP20(_token).transferPolicyId();
+        uint64[] memory checkedPolicyIds = new uint64[](_enabledTokens.length);
+        uint256 checkedPolicyCount;
+
+        for (uint256 i = 0; i < _enabledTokens.length; i++) {
+            uint64 policyId = ITIP20(_enabledTokens[i]).transferPolicyId();
+            if (policyId == basePolicyId) continue;
+            if (_containsPolicyId(checkedPolicyIds, checkedPolicyCount, policyId)) continue;
+
+            if (!_isAuthorizedForRole(policyId, account, role)) return false;
+            checkedPolicyIds[checkedPolicyCount] = policyId;
+            checkedPolicyCount++;
+        }
+
+        return true;
+    }
+
+    function _containsPolicyId(
+        uint64[] memory policyIds,
+        uint256 policyCount,
+        uint64 policyId
+    )
+        internal
+        pure
+        returns (bool)
+    {
+        for (uint256 i = 0; i < policyCount; i++) {
+            if (policyIds[i] == policyId) return true;
+        }
+        return false;
+    }
+
+    function _isAuthorizedForRole(
+        uint64 policyId,
+        address account,
+        uint8 role
+    )
+        internal
+        view
+        returns (bool)
+    {
+        if (role == POLICY_ROLE_SENDER) {
+            return TIP403_REGISTRY.isAuthorizedSender(policyId, account);
+        }
+        if (role == POLICY_ROLE_RECIPIENT) {
+            return TIP403_REGISTRY.isAuthorizedRecipient(policyId, account);
+        }
+        return TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, account);
     }
 
     function _collectDepositFunds(
