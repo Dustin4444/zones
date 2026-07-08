@@ -14,7 +14,7 @@ use tempo_precompiles::{
     tip20::{ITIP20, TIP20Error, TIP20Token},
 };
 use tempo_precompiles_macros::{Storable, contract};
-use tempo_zone_contracts::{IZoneOutbox as ZoneOutboxAbi, StaticCallNotAllowed};
+use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
 use zone_primitives::constants::{
     EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_INBOX_ADDRESS,
     ZONE_OUTBOX_ADDRESS,
@@ -47,35 +47,10 @@ pub struct ZoneOutbox {
     last_finalized_timestamp: u64,
 }
 
-macro_rules! try_or_error {
-    ($self:expr, $expr:expr) => {
-        match $expr {
-            Ok(value) => value,
-            Err(err) => return $self.storage.error_result(err),
-        }
-    };
-}
-
 impl ZoneOutbox {
     /// Initializes the precompile account code.
     pub fn initialize(&mut self) -> TempoResult<()> {
         self.__initialize()
-    }
-
-    fn revert_error<E: SolError>(&self, error: E) -> PrecompileResult {
-        Ok(self.storage.revert_output(error.abi_encode().into()))
-    }
-
-    fn success_empty(&self) -> PrecompileResult {
-        Ok(self.storage.success_output(Bytes::new()))
-    }
-
-    fn static_revert(&self) -> Option<PrecompileResult> {
-        if self.storage.is_static() {
-            Some(self.revert_error(StaticCallNotAllowed {}))
-        } else {
-            None
-        }
     }
 
     fn current_tempo_block_number(&self) -> TempoResult<u64> {
@@ -122,14 +97,18 @@ impl ZoneOutbox {
         tempo_block_number: u64,
     ) -> PrecompileResult {
         if caller == Address::ZERO || caller == self.sequencer(provider, tempo_block_number)? {
-            return self.success_empty();
+            return Ok(self.storage.success_output(Bytes::new()));
         }
-        self.revert_error(ZoneOutboxAbi::OnlySequencer {})
+        Ok(self
+            .storage
+            .revert_output(ZoneOutboxAbi::OnlySequencer {}.abi_encode().into()))
     }
 
     fn validate_gas_limit(&self, gas_limit: u64) -> Option<PrecompileResult> {
         if gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
-            Some(self.revert_error(ZoneOutboxAbi::GasLimitTooHigh {}))
+            Some(Ok(self.storage.revert_output(
+                ZoneOutboxAbi::GasLimitTooHigh {}.abi_encode().into(),
+            )))
         } else {
             None
         }
@@ -147,7 +126,10 @@ impl ZoneOutbox {
         if let Some(revert) = self.validate_gas_limit(gas_limit) {
             return revert;
         }
-        let fee = try_or_error!(self, self.calculate_fee_unchecked(gas_limit));
+        let fee = match self.calculate_fee_unchecked(gas_limit) {
+            Ok(fee) => fee,
+            Err(err) => return self.storage.error_result(err),
+        };
         Ok(self.storage.success_output(
             ZoneOutboxAbi::calculateWithdrawalFeeCall::abi_encode_returns(&fee).into(),
         ))
@@ -158,16 +140,22 @@ impl ZoneOutbox {
             return None;
         }
         if reveal_to.len() != REVEAL_TO_KEY_LENGTH {
-            return Some(self.revert_error(ZoneOutboxAbi::InvalidRevealTo {}));
+            return Some(Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidRevealTo {}.abi_encode().into(),
+            )));
         }
         let y_parity = reveal_to[0];
         if !matches!(y_parity, 0x02 | 0x03) {
-            return Some(self.revert_error(ZoneOutboxAbi::InvalidRevealTo {}));
+            return Some(Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidRevealTo {}.abi_encode().into(),
+            )));
         }
         let mut x = [0u8; 32];
         x.copy_from_slice(&reveal_to[1..]);
         if recover_point(&x, y_parity).is_none() {
-            return Some(self.revert_error(ZoneOutboxAbi::InvalidRevealTo {}));
+            return Some(Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidRevealTo {}.abi_encode().into(),
+            )));
         }
         None
     }
@@ -183,12 +171,14 @@ impl ZoneOutbox {
             AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE
         };
         if encrypted_sender.len() != expected {
-            return Some(
-                self.revert_error(ZoneOutboxAbi::InvalidEncryptedSenderLength {
+            return Some(Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidEncryptedSenderLength {
                     actual: U256::from(encrypted_sender.len()),
                     expected: U256::from(expected),
-                }),
-            );
+                }
+                .abi_encode()
+                .into(),
+            )));
         }
         None
     }
@@ -223,30 +213,50 @@ impl ZoneOutbox {
     }
 
     fn enforce_withdrawal_block_cap(&mut self) -> PrecompileResult {
-        let max = try_or_error!(self, self.max_withdrawals_per_block.read());
+        let max = match self.max_withdrawals_per_block.read() {
+            Ok(max) => max,
+            Err(err) => return self.storage.error_result(err),
+        };
         if max.is_zero() {
-            return self.success_empty();
+            return Ok(self.storage.success_output(Bytes::new()));
         }
 
         let block_number = U256::from(self.storage.block_number());
-        let current_block = try_or_error!(self, self.current_block_number.read());
+        let current_block = match self.current_block_number.read() {
+            Ok(current_block) => current_block,
+            Err(err) => return self.storage.error_result(err),
+        };
         if block_number != current_block {
-            try_or_error!(self, self.current_block_number.write(block_number));
-            try_or_error!(self, self.withdrawals_this_block.write(U256::ZERO));
+            if let Err(err) = self.current_block_number.write(block_number) {
+                return self.storage.error_result(err);
+            }
+            if let Err(err) = self.withdrawals_this_block.write(U256::ZERO) {
+                return self.storage.error_result(err);
+            }
         }
 
-        let withdrawals = try_or_error!(self, self.withdrawals_this_block.read());
+        let withdrawals = match self.withdrawals_this_block.read() {
+            Ok(withdrawals) => withdrawals,
+            Err(err) => return self.storage.error_result(err),
+        };
         if withdrawals >= max {
-            return self.revert_error(ZoneOutboxAbi::TooManyWithdrawalsThisBlock {});
+            return Ok(self.storage.revert_output(
+                ZoneOutboxAbi::TooManyWithdrawalsThisBlock {}
+                    .abi_encode()
+                    .into(),
+            ));
         }
-        let next = withdrawals
+        let next = match withdrawals
             .checked_add(U256::ONE)
-            .ok_or_else(TempoPrecompileError::under_overflow);
-        try_or_error!(
-            self,
-            next.and_then(|value| self.withdrawals_this_block.write(value))
-        );
-        self.success_empty()
+            .ok_or_else(TempoPrecompileError::under_overflow)
+        {
+            Ok(next) => next,
+            Err(err) => return self.storage.error_result(err),
+        };
+        if let Err(err) = self.withdrawals_this_block.write(next) {
+            return self.storage.error_result(err);
+        }
+        Ok(self.storage.success_output(Bytes::new()))
     }
 
     fn request_withdrawal<P: ZonePortalReader, Q: PolicyCheck>(
@@ -257,22 +267,30 @@ impl ZoneOutbox {
         current_tx_hash: B256,
         args: RequestWithdrawalArgs,
     ) -> PrecompileResult {
-        if let Some(revert) = self.static_revert() {
-            return revert;
-        }
         if args.fallback_recipient == Address::ZERO {
-            return self.revert_error(ZoneOutboxAbi::InvalidFallbackRecipient {});
+            return Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidFallbackRecipient {}
+                    .abi_encode()
+                    .into(),
+            ));
         }
 
-        let tempo_block_number = try_or_error!(self, self.current_tempo_block_number());
+        let tempo_block_number = match self.current_tempo_block_number() {
+            Ok(tempo_block_number) => tempo_block_number,
+            Err(err) => return self.storage.error_result(err),
+        };
         if !self.token_enabled(provider, tempo_block_number, args.token)? {
-            return self.revert_error(ZoneOutboxAbi::TokenNotEnabled {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::TokenNotEnabled {}.abi_encode().into()));
         }
         if let Some(revert) = self.validate_gas_limit(args.gas_limit) {
             return revert;
         }
         if args.callback_data.len() > MAX_CALLBACK_DATA_SIZE {
-            return self.revert_error(ZoneOutboxAbi::CallbackDataTooLarge {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::CallbackDataTooLarge {}.abi_encode().into()));
         }
         if let Some(revert) = self.validate_reveal_to(&args.reveal_to) {
             return revert;
@@ -282,87 +300,103 @@ impl ZoneOutbox {
             return Ok(cap_check);
         }
 
-        let fee = try_or_error!(self, self.calculate_fee_unchecked(args.gas_limit));
-        let total_burn = try_or_error!(
-            self,
-            args.amount
-                .checked_add(fee)
-                .ok_or_else(TempoPrecompileError::under_overflow)
-        );
+        let fee = match self.calculate_fee_unchecked(args.gas_limit) {
+            Ok(fee) => fee,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let total_burn = match args
+            .amount
+            .checked_add(fee)
+            .ok_or_else(TempoPrecompileError::under_overflow)
+        {
+            Ok(total_burn) => total_burn,
+            Err(err) => return self.storage.error_result(err),
+        };
         if current_tx_hash.is_zero() {
-            return self.revert_error(ZoneOutboxAbi::InvalidCurrentTxHash {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::InvalidCurrentTxHash {}.abi_encode().into()));
         }
 
-        try_or_error!(
-            self,
+        if let Err(err) =
             self.enforce_transfer_policy(registry, args.token, caller, ZONE_OUTBOX_ADDRESS)
-        );
-
-        let mut zone_token = try_or_error!(self, TIP20Token::from_address(args.token));
-        let amount = U256::from(total_burn);
-        let transferred = try_or_error!(
-            self,
-            zone_token.transfer_from(
-                ZONE_OUTBOX_ADDRESS,
-                ITIP20::transferFromCall {
-                    from: caller,
-                    to: ZONE_OUTBOX_ADDRESS,
-                    amount,
-                },
-            )
-        );
-        if !transferred {
-            return self.revert_error(ZoneOutboxAbi::TransferFailed {});
+        {
+            return self.storage.error_result(err);
         }
-        try_or_error!(
-            self,
-            zone_token.burn(ZONE_OUTBOX_ADDRESS, ITIP20::burnCall { amount })
-        );
 
-        try_or_error!(
-            self,
-            self.pending_withdrawals.push(PendingWithdrawalStorage {
-                token: args.token,
-                sender: caller,
-                tx_hash: current_tx_hash,
-                to: args.to,
-                amount: args.amount,
-                fee,
-                memo: args.memo,
-                gas_limit: args.gas_limit,
-                fallback_recipient: args.fallback_recipient,
-                callback_data: args.callback_data.clone(),
-                reveal_to: args.reveal_to.clone(),
-            })
-        );
+        let mut zone_token = match TIP20Token::from_address(args.token) {
+            Ok(zone_token) => zone_token,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let amount = U256::from(total_burn);
+        let transferred = match zone_token.transfer_from(
+            ZONE_OUTBOX_ADDRESS,
+            ITIP20::transferFromCall {
+                from: caller,
+                to: ZONE_OUTBOX_ADDRESS,
+                amount,
+            },
+        ) {
+            Ok(transferred) => transferred,
+            Err(err) => return self.storage.error_result(err),
+        };
+        if !transferred {
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::TransferFailed {}.abi_encode().into()));
+        }
+        if let Err(err) = zone_token.burn(ZONE_OUTBOX_ADDRESS, ITIP20::burnCall { amount }) {
+            return self.storage.error_result(err);
+        }
 
-        let index = try_or_error!(self, self.next_withdrawal_index.read());
-        let next_index = try_or_error!(
-            self,
-            index
-                .checked_add(1)
-                .ok_or_else(TempoPrecompileError::under_overflow)
-        );
-        try_or_error!(self, self.next_withdrawal_index.write(next_index));
+        if let Err(err) = self.pending_withdrawals.push(PendingWithdrawalStorage {
+            token: args.token,
+            sender: caller,
+            tx_hash: current_tx_hash,
+            to: args.to,
+            amount: args.amount,
+            fee,
+            memo: args.memo,
+            gas_limit: args.gas_limit,
+            fallback_recipient: args.fallback_recipient,
+            callback_data: args.callback_data.clone(),
+            reveal_to: args.reveal_to.clone(),
+        }) {
+            return self.storage.error_result(err);
+        }
 
-        try_or_error!(
-            self,
-            self.emit_event(ZoneOutboxAbi::WithdrawalRequested {
-                withdrawalIndex: index,
-                sender: caller,
-                token: args.token,
-                to: args.to,
-                amount: args.amount,
-                fee,
-                memo: args.memo,
-                gasLimit: args.gas_limit,
-                fallbackRecipient: args.fallback_recipient,
-                data: args.callback_data,
-                revealTo: args.reveal_to,
-            })
-        );
+        let index = match self.next_withdrawal_index.read() {
+            Ok(index) => index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let next_index = match index
+            .checked_add(1)
+            .ok_or_else(TempoPrecompileError::under_overflow)
+        {
+            Ok(next_index) => next_index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        if let Err(err) = self.next_withdrawal_index.write(next_index) {
+            return self.storage.error_result(err);
+        }
 
-        self.success_empty()
+        if let Err(err) = self.emit_event(ZoneOutboxAbi::WithdrawalRequested {
+            withdrawalIndex: index,
+            sender: caller,
+            token: args.token,
+            to: args.to,
+            amount: args.amount,
+            fee,
+            memo: args.memo,
+            gasLimit: args.gas_limit,
+            fallbackRecipient: args.fallback_recipient,
+            data: args.callback_data,
+            revealTo: args.reveal_to,
+        }) {
+            return self.storage.error_result(err);
+        }
+
+        Ok(self.storage.success_output(Bytes::new()))
     }
 
     fn enqueue_deposit_bounce_back(
@@ -370,57 +404,60 @@ impl ZoneOutbox {
         caller: Address,
         call: ZoneOutboxAbi::enqueueDepositBounceBackCall,
     ) -> PrecompileResult {
-        if let Some(revert) = self.static_revert() {
-            return revert;
-        }
         if caller != ZONE_INBOX_ADDRESS {
-            return self.revert_error(ZoneOutboxAbi::OnlyZoneInbox {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::OnlyZoneInbox {}.abi_encode().into()));
         }
 
-        try_or_error!(
-            self,
-            self.pending_withdrawals.push(PendingWithdrawalStorage {
-                token: call.token,
-                sender: Address::ZERO,
-                tx_hash: B256::ZERO,
-                to: call.bouncebackRecipient,
-                amount: call.amount,
-                fee: 0,
-                memo: B256::ZERO,
-                gas_limit: 0,
-                fallback_recipient: Address::ZERO,
-                callback_data: Bytes::new(),
-                reveal_to: Bytes::new(),
-            })
-        );
+        if let Err(err) = self.pending_withdrawals.push(PendingWithdrawalStorage {
+            token: call.token,
+            sender: Address::ZERO,
+            tx_hash: B256::ZERO,
+            to: call.bouncebackRecipient,
+            amount: call.amount,
+            fee: 0,
+            memo: B256::ZERO,
+            gas_limit: 0,
+            fallback_recipient: Address::ZERO,
+            callback_data: Bytes::new(),
+            reveal_to: Bytes::new(),
+        }) {
+            return self.storage.error_result(err);
+        }
 
-        let index = try_or_error!(self, self.next_withdrawal_index.read());
-        let next_index = try_or_error!(
-            self,
-            index
-                .checked_add(1)
-                .ok_or_else(TempoPrecompileError::under_overflow)
-        );
-        try_or_error!(self, self.next_withdrawal_index.write(next_index));
+        let index = match self.next_withdrawal_index.read() {
+            Ok(index) => index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let next_index = match index
+            .checked_add(1)
+            .ok_or_else(TempoPrecompileError::under_overflow)
+        {
+            Ok(next_index) => next_index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        if let Err(err) = self.next_withdrawal_index.write(next_index) {
+            return self.storage.error_result(err);
+        }
 
-        try_or_error!(
-            self,
-            self.emit_event(ZoneOutboxAbi::WithdrawalRequested {
-                withdrawalIndex: index,
-                sender: Address::ZERO,
-                token: call.token,
-                to: call.bouncebackRecipient,
-                amount: call.amount,
-                fee: 0,
-                memo: B256::ZERO,
-                gasLimit: 0,
-                fallbackRecipient: Address::ZERO,
-                data: Bytes::new(),
-                revealTo: Bytes::new(),
-            })
-        );
+        if let Err(err) = self.emit_event(ZoneOutboxAbi::WithdrawalRequested {
+            withdrawalIndex: index,
+            sender: Address::ZERO,
+            token: call.token,
+            to: call.bouncebackRecipient,
+            amount: call.amount,
+            fee: 0,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: Address::ZERO,
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
+        }) {
+            return self.storage.error_result(err);
+        }
 
-        self.success_empty()
+        Ok(self.storage.success_output(Bytes::new()))
     }
 
     fn finalize_withdrawal_batch<P: ZonePortalReader>(
@@ -429,37 +466,58 @@ impl ZoneOutbox {
         caller: Address,
         call: ZoneOutboxAbi::finalizeWithdrawalBatchCall,
     ) -> PrecompileResult {
-        if let Some(revert) = self.static_revert() {
-            return revert;
-        }
-
-        let tempo_block_number = try_or_error!(self, self.current_tempo_block_number());
+        let tempo_block_number = match self.current_tempo_block_number() {
+            Ok(tempo_block_number) => tempo_block_number,
+            Err(err) => return self.storage.error_result(err),
+        };
         let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
         if sequencer_check.is_revert() {
             return Ok(sequencer_check);
         }
 
         if call.blockNumber != self.storage.block_number() {
-            return self.revert_error(ZoneOutboxAbi::InvalidBlockNumber {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::InvalidBlockNumber {}.abi_encode().into()));
         }
 
-        let len = try_or_error!(self, self.pending_withdrawals.len());
-        let head_u256 = try_or_error!(self, self.pending_withdrawals_head.read());
-        let head = try_or_error!(self, checked_usize(head_u256));
+        let len = match self.pending_withdrawals.len() {
+            Ok(len) => len,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let head_u256 = match self.pending_withdrawals_head.read() {
+            Ok(head_u256) => head_u256,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let head = match checked_usize(head_u256) {
+            Ok(head) => head,
+            Err(err) => return self.storage.error_result(err),
+        };
         let pending = len.saturating_sub(head);
-        let count = try_or_error!(self, checked_usize(call.count));
+        let count = match checked_usize(call.count) {
+            Ok(count) => count,
+            Err(err) => return self.storage.error_result(err),
+        };
 
         if count != pending {
-            return self.revert_error(ZoneOutboxAbi::InvalidWithdrawalCount {
-                actual: call.count,
-                expected: U256::from(pending),
-            });
+            return Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidWithdrawalCount {
+                    actual: call.count,
+                    expected: U256::from(pending),
+                }
+                .abi_encode()
+                .into(),
+            ));
         }
         if call.encryptedSenders.len() != count {
-            return self.revert_error(ZoneOutboxAbi::InvalidEncryptedSenderCount {
-                actual: U256::from(call.encryptedSenders.len()),
-                expected: U256::from(count),
-            });
+            return Ok(self.storage.revert_output(
+                ZoneOutboxAbi::InvalidEncryptedSenderCount {
+                    actual: U256::from(call.encryptedSenders.len()),
+                    expected: U256::from(count),
+                }
+                .abi_encode()
+                .into(),
+            ));
         }
 
         let mut withdrawal_queue_hash = B256::ZERO;
@@ -469,7 +527,10 @@ impl ZoneOutbox {
             let end = start + count;
 
             for i in (start..end).rev() {
-                let pending_withdrawal = try_or_error!(self, self.pending_withdrawals[i].read());
+                let pending_withdrawal = match self.pending_withdrawals[i].read() {
+                    Ok(pending_withdrawal) => pending_withdrawal,
+                    Err(err) => return self.storage.error_result(err),
+                };
                 let encrypted_sender = call.encryptedSenders[i - start].clone();
                 if let Some(revert) = self.validate_encrypted_sender(
                     &pending_withdrawal.reveal_to,
@@ -492,43 +553,56 @@ impl ZoneOutbox {
                     encryptedSender: encrypted_sender,
                 };
                 withdrawal_queue_hash = keccak256((withdrawal, withdrawal_queue_hash).abi_encode());
-                try_or_error!(self, self.pending_withdrawals[i].delete());
+                if let Err(err) = self.pending_withdrawals[i].delete() {
+                    return self.storage.error_result(err);
+                }
             }
 
-            try_or_error!(self, self.pending_withdrawals_head.write(U256::from(end)));
+            if let Err(err) = self.pending_withdrawals_head.write(U256::from(end)) {
+                return self.storage.error_result(err);
+            }
             if end == len {
-                try_or_error!(self, self.pending_withdrawals.delete());
-                try_or_error!(self, self.pending_withdrawals_head.write(U256::ZERO));
+                if let Err(err) = self.pending_withdrawals.delete() {
+                    return self.storage.error_result(err);
+                }
+                if let Err(err) = self.pending_withdrawals_head.write(U256::ZERO) {
+                    return self.storage.error_result(err);
+                }
             }
         }
 
-        let current_batch_index = try_or_error!(self, self.withdrawal_batch_index.read());
-        let next_batch_index = try_or_error!(
-            self,
-            current_batch_index
-                .checked_add(1)
-                .ok_or_else(TempoPrecompileError::under_overflow)
-        );
-        try_or_error!(self, self.withdrawal_batch_index.write(next_batch_index));
-        try_or_error!(
-            self,
-            self.last_batch.write(LastBatchStorage {
-                withdrawal_queue_hash,
-                withdrawal_batch_index: next_batch_index,
-            })
-        );
-        try_or_error!(
-            self,
-            self.last_finalized_timestamp
-                .write(self.storage.timestamp().to::<u64>())
-        );
-        try_or_error!(
-            self,
-            self.emit_event(ZoneOutboxAbi::BatchFinalized {
-                withdrawalQueueHash: withdrawal_queue_hash,
-                withdrawalBatchIndex: next_batch_index,
-            })
-        );
+        let current_batch_index = match self.withdrawal_batch_index.read() {
+            Ok(current_batch_index) => current_batch_index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        let next_batch_index = match current_batch_index
+            .checked_add(1)
+            .ok_or_else(TempoPrecompileError::under_overflow)
+        {
+            Ok(next_batch_index) => next_batch_index,
+            Err(err) => return self.storage.error_result(err),
+        };
+        if let Err(err) = self.withdrawal_batch_index.write(next_batch_index) {
+            return self.storage.error_result(err);
+        }
+        if let Err(err) = self.last_batch.write(LastBatchStorage {
+            withdrawal_queue_hash,
+            withdrawal_batch_index: next_batch_index,
+        }) {
+            return self.storage.error_result(err);
+        }
+        if let Err(err) = self
+            .last_finalized_timestamp
+            .write(self.storage.timestamp().to::<u64>())
+        {
+            return self.storage.error_result(err);
+        }
+        if let Err(err) = self.emit_event(ZoneOutboxAbi::BatchFinalized {
+            withdrawalQueueHash: withdrawal_queue_hash,
+            withdrawalBatchIndex: next_batch_index,
+        }) {
+            return self.storage.error_result(err);
+        }
 
         Ok(self.storage.success_output(
             ZoneOutboxAbi::finalizeWithdrawalBatchCall::abi_encode_returns(&withdrawal_queue_hash)
@@ -542,26 +616,29 @@ impl ZoneOutbox {
         caller: Address,
         call: ZoneOutboxAbi::setTempoGasRateCall,
     ) -> PrecompileResult {
-        if let Some(revert) = self.static_revert() {
-            return revert;
-        }
-        let tempo_block_number = try_or_error!(self, self.current_tempo_block_number());
+        let tempo_block_number = match self.current_tempo_block_number() {
+            Ok(tempo_block_number) => tempo_block_number,
+            Err(err) => return self.storage.error_result(err),
+        };
         let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
         if sequencer_check.is_revert() {
             return Ok(sequencer_check);
         }
 
         if call._tempoGasRate > MAX_GAS_FEE_RATE {
-            return self.revert_error(ZoneOutboxAbi::GasFeeRateTooHigh {});
+            return Ok(self
+                .storage
+                .revert_output(ZoneOutboxAbi::GasFeeRateTooHigh {}.abi_encode().into()));
         }
-        try_or_error!(self, self.tempo_gas_rate.write(call._tempoGasRate));
-        try_or_error!(
-            self,
-            self.emit_event(ZoneOutboxAbi::TempoGasRateUpdated {
-                tempoGasRate: call._tempoGasRate,
-            })
-        );
-        self.success_empty()
+        if let Err(err) = self.tempo_gas_rate.write(call._tempoGasRate) {
+            return self.storage.error_result(err);
+        }
+        if let Err(err) = self.emit_event(ZoneOutboxAbi::TempoGasRateUpdated {
+            tempoGasRate: call._tempoGasRate,
+        }) {
+            return self.storage.error_result(err);
+        }
+        Ok(self.storage.success_output(Bytes::new()))
     }
 
     fn set_max_withdrawals_per_block<P: ZonePortalReader>(
@@ -570,27 +647,27 @@ impl ZoneOutbox {
         caller: Address,
         call: ZoneOutboxAbi::setMaxWithdrawalsPerBlockCall,
     ) -> PrecompileResult {
-        if let Some(revert) = self.static_revert() {
-            return revert;
-        }
-        let tempo_block_number = try_or_error!(self, self.current_tempo_block_number());
+        let tempo_block_number = match self.current_tempo_block_number() {
+            Ok(tempo_block_number) => tempo_block_number,
+            Err(err) => return self.storage.error_result(err),
+        };
         let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
         if sequencer_check.is_revert() {
             return Ok(sequencer_check);
         }
 
-        try_or_error!(
-            self,
-            self.max_withdrawals_per_block
-                .write(call._maxWithdrawalsPerBlock)
-        );
-        try_or_error!(
-            self,
-            self.emit_event(ZoneOutboxAbi::MaxWithdrawalsPerBlockUpdated {
-                maxWithdrawalsPerBlock: call._maxWithdrawalsPerBlock,
-            })
-        );
-        self.success_empty()
+        if let Err(err) = self
+            .max_withdrawals_per_block
+            .write(call._maxWithdrawalsPerBlock)
+        {
+            return self.storage.error_result(err);
+        }
+        if let Err(err) = self.emit_event(ZoneOutboxAbi::MaxWithdrawalsPerBlockUpdated {
+            maxWithdrawalsPerBlock: call._maxWithdrawalsPerBlock,
+        }) {
+            return self.storage.error_result(err);
+        }
+        Ok(self.storage.success_output(Bytes::new()))
     }
 
     fn pending_withdrawals_count(&self) -> TempoResult<U256> {
