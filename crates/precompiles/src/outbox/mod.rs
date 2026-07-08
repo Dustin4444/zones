@@ -3,24 +3,24 @@
 //! Mirrors the Solidity ZoneOutbox predeploy at `0x1c00...0002` while keeping
 //! the proof-facing storage slots compatible with the Solidity layout.
 
+mod dispatch;
+
 use alloc::vec::Vec;
 
-use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolError, SolValue};
-use revm::precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult};
+use revm::precompile::{PrecompileError, PrecompileResult};
 use tempo_precompiles::{
-    DelegateCallNotAllowed, Result as TempoResult, charge_input_cost, dispatch,
+    Result as TempoResult,
     error::TempoPrecompileError,
-    storage::{Handler, StorageCtx, evm::EvmPrecompileStorageProvider},
+    storage::Handler,
     tip20::{ITIP20, TIP20Error, TIP20Token},
-    view,
 };
 use tempo_precompiles_macros::{Storable, contract};
 use tempo_zone_contracts::ZoneOutbox as ZoneOutboxAbi;
 use zone_primitives::constants::{
-    EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_CONFIG_ADDRESS,
-    ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS,
 };
 
 use crate::{
@@ -44,17 +44,6 @@ const PORTAL_TOKEN_CONFIGS_SLOT: B256 = {
 
 alloy_sol_types::sol! {
     error StaticCallNotAllowed();
-
-    function requestWithdrawal(
-        address token,
-        address to,
-        uint128 amount,
-        bytes32 memo,
-        uint64 gasLimit,
-        address fallbackRecipient,
-        bytes data
-    ) external;
-
 }
 
 /// L1 portal state needed by the native outbox.
@@ -673,171 +662,6 @@ impl ZoneOutbox {
 
     fn last_batch(&self) -> TempoResult<ZoneOutboxAbi::LastBatch> {
         Ok(self.last_batch.read()?.into_abi())
-    }
-
-    fn call_with_context<P, Q>(
-        &mut self,
-        provider: &P,
-        registry: Option<&ZoneTip403ProxyRegistry<Q>>,
-        current_tx_hash: B256,
-        calldata: &[u8],
-        msg_sender: Address,
-    ) -> PrecompileResult
-    where
-        P: ZonePortalReader,
-        Q: PolicyCheck,
-    {
-        if let Some(err) = charge_input_cost(&mut self.storage, calldata) {
-            return err;
-        }
-
-        if tempo_precompiles::dispatch::selector_from_calldata(calldata)
-            == Some(requestWithdrawalCall::SELECTOR)
-        {
-            let Ok(call) = requestWithdrawalCall::abi_decode_raw_validate(&calldata[4..]) else {
-                return Ok(self.storage.revert_output(Bytes::new()));
-            };
-            return self.request_withdrawal(
-                provider,
-                registry,
-                msg_sender,
-                current_tx_hash,
-                RequestWithdrawalArgs {
-                    token: call.token,
-                    to: call.to,
-                    amount: call.amount,
-                    memo: call.memo,
-                    gas_limit: call.gasLimit,
-                    fallback_recipient: call.fallbackRecipient,
-                    callback_data: call.data,
-                    reveal_to: Bytes::new(),
-                },
-            );
-        }
-
-        dispatch!(
-            calldata,
-            |call| match call {
-                ZoneOutboxAbi::ZoneOutboxCalls {
-                    config(call) => view(call, |_| Ok(ZONE_CONFIG_ADDRESS)),
-                    tempoGasRate(call) => view(call, |_| self.tempo_gas_rate.read()),
-                    maxWithdrawalsPerBlock(call) => {
-                        view(call, |_| self.max_withdrawals_per_block.read())
-                    },
-                    lastBatch(call) => view(call, |_| self.last_batch()),
-                    withdrawalBatchIndex(call) => {
-                        view(call, |_| self.withdrawal_batch_index.read())
-                    },
-                    lastFinalizedTimestamp(call) => {
-                        view(call, |_| self.last_finalized_timestamp.read())
-                    },
-                    nextWithdrawalIndex(call) => {
-                        view(call, |_| self.next_withdrawal_index.read())
-                    },
-                    pendingWithdrawalsCount(call) => {
-                        view(call, |_| self.pending_withdrawals_count())
-                    },
-                    getPendingWithdrawals(call) => {
-                        view(call, |_| self.get_pending_withdrawals())
-                    },
-                    calculateWithdrawalFee(call) => {
-                        self.calculate_withdrawal_fee(call.gasLimit)
-                    },
-                    MAX_CALLBACK_DATA_SIZE(call) => {
-                        view(call, |_| Ok(U256::from(MAX_CALLBACK_DATA_SIZE)))
-                    },
-                    MAX_WITHDRAWAL_GAS_LIMIT(call) => {
-                        view(call, |_| Ok(MAX_WITHDRAWAL_GAS_LIMIT))
-                    },
-                    MAX_GAS_FEE_RATE(call) => view(call, |_| Ok(MAX_GAS_FEE_RATE)),
-                    WITHDRAWAL_BASE_GAS(call) => view(call, |_| Ok(WITHDRAWAL_BASE_GAS)),
-                    REVEAL_TO_KEY_LENGTH(call) => {
-                        view(call, |_| Ok(U256::from(REVEAL_TO_KEY_LENGTH)))
-                    },
-                    AUTHENTICATED_WITHDRAWAL_CIPHERTEXT_LENGTH(call) => {
-                        view(call, |_| Ok(U256::from(AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE)))
-                    },
-                    setTempoGasRate(call) => self.set_tempo_gas_rate(provider, msg_sender, call),
-                    setMaxWithdrawalsPerBlock(call) => {
-                        self.set_max_withdrawals_per_block(provider, msg_sender, call)
-                    },
-                    requestWithdrawal(call) => {
-                        self.request_withdrawal(
-                            provider,
-                            registry,
-                            msg_sender,
-                            current_tx_hash,
-                            RequestWithdrawalArgs {
-                                token: call.token,
-                                to: call.to,
-                                amount: call.amount,
-                                memo: call.memo,
-                                gas_limit: call.gasLimit,
-                                fallback_recipient: call.fallbackRecipient,
-                                callback_data: call.data,
-                                reveal_to: call.revealTo,
-                            },
-                        )
-                    },
-                    enqueueDepositBounceBack(call) => {
-                        self.enqueue_deposit_bounce_back(msg_sender, call)
-                    },
-                    finalizeWithdrawalBatch(call) => {
-                        self.finalize_withdrawal_batch(provider, msg_sender, call)
-                    },
-                }
-            },
-        )
-    }
-
-    /// Wraps this precompile for registration in the zone EVM.
-    pub fn create<P, Q, F>(
-        provider: P,
-        registry: Option<ZoneTip403ProxyRegistry<Q>>,
-        tx_hash: F,
-        cfg: &revm::context::CfgEnv<tempo_chainspec::hardfork::TempoHardfork>,
-    ) -> DynPrecompile
-    where
-        P: ZonePortalReader + Clone + Send + Sync + 'static,
-        Q: PolicyCheck + Clone + Send + Sync + 'static,
-        F: for<'a> Fn(&PrecompileInput<'a>) -> B256 + Clone + Send + Sync + 'static,
-    {
-        let spec = cfg.spec;
-        let amsterdam_eip8037_enabled = cfg.enable_amsterdam_eip8037;
-        let gas_params = cfg.gas_params.clone();
-
-        DynPrecompile::new_stateful(PrecompileId::Custom("ZoneOutbox".into()), move |input| {
-            if !input.is_direct_call() {
-                return Ok(PrecompileOutput::revert(
-                    0,
-                    SolError::abi_encode(&DelegateCallNotAllowed {}).into(),
-                    input.reservoir,
-                ));
-            }
-
-            let current_tx_hash = tx_hash(&input);
-            let mut storage = EvmPrecompileStorageProvider::new(
-                input.internals,
-                input.gas,
-                input.reservoir,
-                spec,
-                amsterdam_eip8037_enabled,
-                input.is_static,
-                gas_params.clone(),
-            );
-            let provider = provider.clone();
-            let registry = registry.clone();
-
-            StorageCtx::enter(&mut storage, || {
-                Self::new().call_with_context(
-                    &provider,
-                    registry.as_ref(),
-                    current_tx_hash,
-                    input.data,
-                    input.caller,
-                )
-            })
-        })
     }
 }
 
