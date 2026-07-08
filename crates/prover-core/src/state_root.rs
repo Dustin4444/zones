@@ -15,9 +15,7 @@ use reth_trie_common::HashedPostState;
 #[cfg(feature = "std")]
 use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie};
 
-#[cfg(feature = "std")]
-use crate::validate_node_pool;
-use crate::{ProverError, ZoneStateWitness};
+use crate::{ProverError, ZoneExecutionWitness, ZoneStateWitness};
 
 /// State root computed by applying a reth hashed post-state to a verified sparse trie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,18 +45,29 @@ impl SparseStateRootCalculator {
         Self { trie }
     }
 
-    pub fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
-        validate_node_pool(&state.node_pool, ProverError::ZoneStateNodeHashMismatch)?;
+    pub fn from_zone_execution_witness(
+        witness: &ZoneExecutionWitness,
+    ) -> Result<Self, ProverError> {
+        Self::from_state_nodes(witness.pre_state_root(), &witness.state_nodes_by_hash())
+    }
 
-        let witness = state
-            .node_pool
+    pub fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
+        let witness = ZoneExecutionWitness::from_zone_state_witness(state)?;
+        Self::from_zone_execution_witness(&witness)
+    }
+
+    fn from_state_nodes(
+        state_root: B256,
+        state_nodes: &alloc::collections::BTreeMap<B256, alloy_primitives::Bytes>,
+    ) -> Result<Self, ProverError> {
+        let witness = state_nodes
             .iter()
             .map(|(hash, node)| (*hash, node.clone()))
             .collect::<B256Map<_>>();
-        let multiproof = DecodedMultiProofV2::from_witness(state.state_root, &witness)
-            .map_err(|_| ProverError::ZoneStateNodeHashMismatch(state.state_root))?;
+        let multiproof = DecodedMultiProofV2::from_witness(state_root, &witness)
+            .map_err(|_| ProverError::ZoneStateNodeHashMismatch(state_root))?;
         if multiproof.is_empty() {
-            if state.state_root != EMPTY_ROOT_HASH {
+            if state_root != EMPTY_ROOT_HASH {
                 return Err(ProverError::StateRootCalculationFailed);
             }
             return Ok(Self::revealed_empty());
@@ -70,7 +79,7 @@ impl SparseStateRootCalculator {
         let root = trie
             .root()
             .map_err(|_| ProverError::StateRootCalculationFailed)?;
-        if root != state.state_root {
+        if root != state_root {
             return Err(ProverError::StateRootCalculationFailed);
         }
 
@@ -103,6 +112,14 @@ pub struct SparseStateRootCalculator {
 
 #[cfg(not(feature = "std"))]
 impl SparseStateRootCalculator {
+    pub const fn from_zone_execution_witness(
+        witness: &ZoneExecutionWitness,
+    ) -> Result<Self, ProverError> {
+        Ok(Self {
+            root: witness.pre_state_root(),
+        })
+    }
+
     pub const fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
         Ok(Self {
             root: state.state_root,

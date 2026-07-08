@@ -26,6 +26,7 @@ alloy-evm = { workspace = true }
 alloy-hardforks = { workspace = true }
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
 alloy-sol-types = { workspace = true }
 alloy-trie = { workspace = true, features = ["ethereum"] }
 reth-trie-common = { workspace = true }

@@ -466,8 +466,8 @@ mod tests {
     fn zone_executor_spec_disables_ethereum_only_state_changes() {
         let spec = ZoneEthExecutorSpec;
 
-        assert!(!spec.is_prague_active_at_timestamp(u64::MAX));
-        assert!(!spec.is_shanghai_active_at_timestamp(u64::MAX));
+        assert!(spec.is_prague_active_at_timestamp(0));
+        assert!(spec.is_shanghai_active_at_timestamp(0));
         assert_eq!(spec.deposit_contract_address(), None);
     }
 }

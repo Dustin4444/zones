@@ -41,6 +41,7 @@ mod execution_precompiles;
 mod execution_receipt;
 mod execution_state;
 mod execution_tx;
+mod execution_witness;
 mod post_state;
 mod state_root;
 mod tempo;
@@ -81,6 +82,7 @@ pub use execution_state::{
     ZoneExecutionState, execution_post_state_from_state, zone_execution_state,
 };
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
+pub use execution_witness::{ExecutionWitness, ZoneExecutionWitness};
 pub use post_state::ExecutionPostState;
 #[cfg(feature = "std")]
 pub use state_root::calculate_state_root;
@@ -421,6 +423,7 @@ pub struct PreparedStatelessExecution {
     pub prev_block_header: ZoneHeader,
     pub zone_blocks: Vec<PreparedZoneBlock>,
     pub initial_zone_state: ZoneStateWitness,
+    pub initial_zone_execution_witness: ZoneExecutionWitness,
     pub execution_db: WitnessDatabase,
     pub execution_plan: ZoneExecutionPlan,
     pub tempo_witness_provider: TempoWitnessProvider,
@@ -437,7 +440,7 @@ impl PreparedStatelessExecution {
     }
 
     pub fn state_root_calculator(&self) -> Result<SparseStateRootCalculator, ProverError> {
-        SparseStateRootCalculator::from_zone_state_witness(&self.initial_zone_state)
+        SparseStateRootCalculator::from_zone_execution_witness(&self.initial_zone_execution_witness)
     }
 
     pub fn block_execution_input(
@@ -1375,7 +1378,8 @@ pub fn prepare_stateless_execution(
         &witness.prev_block_header,
         &witness.zone_ancestry_headers,
     )?;
-    let execution_db = WitnessDatabase::new(&witness.initial_zone_state, zone_block_hashes)?;
+    let initial_zone_execution_witness = ZoneExecutionWitness::from_batch_witness(witness)?;
+    let execution_db = WitnessDatabase::new(&initial_zone_execution_witness, zone_block_hashes)?;
     let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
 
     let (tempo_root_bindings, block_tempo_bindings, final_tempo_binding) =
@@ -1413,6 +1417,7 @@ pub fn prepare_stateless_execution(
         prev_block_header: witness.prev_block_header.clone(),
         zone_blocks: prepared_zone_blocks(&witness.zone_blocks, &block_tempo_bindings),
         initial_zone_state: witness.initial_zone_state.clone(),
+        initial_zone_execution_witness,
         execution_db,
         execution_plan,
         tempo_witness_provider,
@@ -1474,7 +1479,8 @@ pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, Prov
         &witness.zone_ancestry_headers,
     )?;
 
-    let _execution_db = WitnessDatabase::new(&witness.initial_zone_state, zone_block_hashes)?;
+    let _execution_db =
+        WitnessDatabase::from_zone_state_witness(&witness.initial_zone_state, zone_block_hashes)?;
     let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
     validate_node_pool(
         &witness.tempo_state_proofs.node_pool,
@@ -2193,6 +2199,7 @@ mod tests {
     const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
     const PENDING_WITHDRAWAL_STORAGE_SLOTS: u64 = 9;
     const TIP20_ROLES_SLOT: U256 = U256::ZERO;
+    const TIP20_CURRENCY_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
     const TIP20_TOTAL_SUPPLY_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
     const TIP20_BALANCES_SLOT: U256 = U256::from_limbs([9, 0, 0, 0]);
     const TIP20_PAUSED_SLOT: U256 = U256::from_limbs([12, 0, 0, 0]);
@@ -2254,6 +2261,18 @@ mod tests {
 
     fn address_word(address: Address) -> U256 {
         U256::from_be_bytes(B256::left_padding_from(address.as_slice()).0)
+    }
+
+    fn short_string_word(value: &[u8]) -> U256 {
+        let encoded_len = value
+            .len()
+            .checked_mul(2)
+            .and_then(|len| u8::try_from(len).ok())
+            .expect("test short string should fit Solidity storage encoding");
+        let mut word = [0u8; 32];
+        word[..value.len()].copy_from_slice(value);
+        word[31] = encoded_len;
+        U256::from_be_bytes(word)
     }
 
     fn pending_withdrawal_slot(index: u64, offset: u64) -> U256 {
@@ -2337,7 +2356,7 @@ mod tests {
         let mut tx = TxEip1559 {
             chain_id: USER_VALUE_TX_CHAIN_ID,
             nonce: 0,
-            gas_limit: 150_000,
+            gas_limit: 500_000,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
             to: PATH_USD_ADDRESS.into(),
@@ -2387,6 +2406,7 @@ mod tests {
         parts.extend(system_account_components_with_code(
             PATH_USD_ADDRESS,
             &[
+                (TIP20_CURRENCY_SLOT, short_string_word(b"USD")),
                 (TIP20_TRANSFER_POLICY_ID_SLOT, policy_word),
                 (TIP20_PAUSED_SLOT, U256::ZERO),
                 (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
@@ -2400,6 +2420,7 @@ mod tests {
                 (recipient_reward_slots[2], U256::ZERO),
             ],
             &[
+                TIP20_CURRENCY_SLOT,
                 TIP20_TRANSFER_POLICY_ID_SLOT,
                 TIP20_PAUSED_SLOT,
                 TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
@@ -3578,25 +3599,46 @@ mod tests {
         parts
             .account_reads
             .push(account_read(user_value_tx_sender(), sender_account));
+        let sender_balance_slot = tip20_balance_slot(user_value_tx_sender());
+        let recipient_balance_slot = tip20_balance_slot(user_value_tx_recipient());
+        let sender_reward_slots = tip20_user_reward_info_slots(user_value_tx_sender());
+        let recipient_reward_slots = tip20_user_reward_info_slots(user_value_tx_recipient());
         let token_code = Bytes::from_static(&[0xef]);
-        let token_account = TrieAccount {
-            nonce: 0,
-            balance: U256::ZERO,
-            storage_root: EMPTY_TRIE_ROOT,
-            code_hash: keccak256(token_code.as_ref()),
-        };
-        parts
-            .account_entries
-            .push((PATH_USD_ADDRESS, token_account));
-        parts.account_reads.push(ZoneAccountRead {
-            account: PATH_USD_ADDRESS,
-            nonce: token_account.nonce,
-            balance: token_account.balance,
-            storage_root: token_account.storage_root,
-            code_hash: token_account.code_hash,
-            code: ZoneAccountCode::bytecode(token_code),
-            proof_node_hashes: Vec::new(),
-        });
+        parts.extend(system_account_components_with_code(
+            PATH_USD_ADDRESS,
+            &[
+                (TIP20_CURRENCY_SLOT, short_string_word(b"USD")),
+                (
+                    TIP20_TRANSFER_POLICY_ID_SLOT,
+                    tip20_transfer_policy_word(ALLOW_ALL_POLICY_ID),
+                ),
+                (TIP20_PAUSED_SLOT, U256::ZERO),
+                (TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT, U256::ZERO),
+                (sender_balance_slot, USER_TIP20_INITIAL_BALANCE),
+                (recipient_balance_slot, U256::ZERO),
+                (sender_reward_slots[0], U256::ZERO),
+                (sender_reward_slots[1], U256::ZERO),
+                (sender_reward_slots[2], U256::ZERO),
+                (recipient_reward_slots[0], U256::ZERO),
+                (recipient_reward_slots[1], U256::ZERO),
+                (recipient_reward_slots[2], U256::ZERO),
+            ],
+            &[
+                TIP20_CURRENCY_SLOT,
+                TIP20_TRANSFER_POLICY_ID_SLOT,
+                TIP20_PAUSED_SLOT,
+                TIP20_GLOBAL_REWARD_PER_TOKEN_SLOT,
+                sender_balance_slot,
+                recipient_balance_slot,
+                sender_reward_slots[0],
+                sender_reward_slots[1],
+                sender_reward_slots[2],
+                recipient_reward_slots[0],
+                recipient_reward_slots[1],
+                recipient_reward_slots[2],
+            ],
+            ZoneAccountCode::bytecode(token_code),
+        ));
         parts
             .account_reads
             .push(absent_account_read(witness.public_inputs.sequencer));
@@ -4230,7 +4272,8 @@ mod tests {
             Some(witness.prev_block_header.hash())
         );
         assert_eq!(hashes.get(&parent.number).copied(), Some(parent.hash()));
-        let mut db = WitnessDatabase::new(&witness.initial_zone_state, hashes).unwrap();
+        let mut db =
+            WitnessDatabase::from_zone_state_witness(&witness.initial_zone_state, hashes).unwrap();
         assert_eq!(db.block_hash(parent.number).unwrap(), parent.hash());
         prove_empty_zone_batch(witness).unwrap();
     }
@@ -4289,7 +4332,9 @@ mod tests {
         let witness = fixture_witness();
         let mut block_hashes = BTreeMap::new();
         block_hashes.insert(6, B256::repeat_byte(0x06));
-        let mut db = WitnessDatabase::new(&witness.initial_zone_state, block_hashes).unwrap();
+        let mut db =
+            WitnessDatabase::from_zone_state_witness(&witness.initial_zone_state, block_hashes)
+                .unwrap();
 
         assert!(db.basic(TEMPO_STATE_ADDRESS).unwrap().is_some());
         assert_eq!(
@@ -4304,7 +4349,9 @@ mod tests {
     #[test]
     fn witness_database_serves_revealed_absences_and_rejects_missing_blockhashes() {
         let witness = fixture_witness();
-        let mut db = WitnessDatabase::new(&witness.initial_zone_state, BTreeMap::new()).unwrap();
+        let mut db =
+            WitnessDatabase::from_zone_state_witness(&witness.initial_zone_state, BTreeMap::new())
+                .unwrap();
         let missing = address!("0x0000000000000000000000000000000000009999");
 
         assert!(db.basic(missing).unwrap().is_none());
@@ -4335,7 +4382,7 @@ mod tests {
         );
 
         assert_eq!(
-            WitnessDatabase::new(&state, BTreeMap::new()).unwrap_err(),
+            WitnessDatabase::from_zone_state_witness(&state, BTreeMap::new()).unwrap_err(),
             ProverError::MissingAccountCode(account)
         );
     }

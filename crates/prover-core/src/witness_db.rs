@@ -19,9 +19,9 @@ use revm_database_interface::{
     state::{AccountInfo, Bytecode},
 };
 
-use crate::{ProverError, ZoneStateWitness, trie, validate_node_pool};
+use crate::{ProverError, ZoneExecutionWitness, ZoneStateWitness, trie};
 
-/// Strict revm database backed only by verified [`ZoneStateWitness`] reads.
+/// Strict revm database backed only by verified [`ZoneExecutionWitness`] reads.
 ///
 /// Missing state is an execution error unless the witness supplied a valid
 /// non-membership proof for that exact account or storage slot. This mirrors
@@ -43,11 +43,20 @@ pub struct WitnessDatabase {
 }
 
 impl WitnessDatabase {
-    pub fn new(
+    pub fn from_zone_state_witness(
         state: &ZoneStateWitness,
         block_hashes_by_number: BTreeMap<u64, B256>,
     ) -> Result<Self, ProverError> {
-        validate_node_pool(&state.node_pool, ProverError::ZoneStateNodeHashMismatch)?;
+        let witness = ZoneExecutionWitness::from_zone_state_witness(state)?;
+        Self::new(&witness, block_hashes_by_number)
+    }
+
+    pub fn new(
+        witness: &ZoneExecutionWitness,
+        block_hashes_by_number: BTreeMap<u64, B256>,
+    ) -> Result<Self, ProverError> {
+        let state_root = witness.pre_state_root();
+        let node_pool = witness.state_nodes_by_hash();
 
         let mut storage_roots = BTreeMap::new();
         let mut bytecode = BTreeMap::new();
@@ -57,7 +66,7 @@ impl WitnessDatabase {
         let mut storage = BTreeMap::new();
         bytecode.insert(KECCAK_EMPTY, Bytecode::new_raw(Bytes::new()));
 
-        for read in &state.account_reads {
+        for read in witness.account_reads() {
             match &read.code {
                 crate::ZoneAccountCode::Bytecode(code) => {
                     if keccak256(code.as_ref()) != read.code_hash {
@@ -71,25 +80,24 @@ impl WitnessDatabase {
                 crate::ZoneAccountCode::Empty => {}
             }
 
-            let proven_account =
-                trie::verify_account_read(state.state_root, &state.node_pool, read)?;
+            let proven_account = trie::verify_account_read(state_root, &node_pool, read)?;
             storage_roots.insert(read.account, proven_account.storage_root);
             #[cfg(not(feature = "std"))]
             accounts.insert(read.account, account_info_from_read(read));
         }
 
-        for read in &state.storage_reads {
+        for read in witness.storage_reads() {
             let storage_root = storage_roots
                 .get(&read.account)
                 .ok_or(ProverError::MissingAccountRead(read.account))?;
-            trie::verify_storage_read(*storage_root, &state.node_pool, read)?;
+            trie::verify_storage_read(*storage_root, &node_pool, read)?;
             #[cfg(not(feature = "std"))]
             storage.insert((read.account, read.slot), read.value);
         }
 
         #[cfg(feature = "std")]
         {
-            let trie = sparse_trie_from_witness_nodes(state.state_root, &state.node_pool)?;
+            let trie = sparse_trie_from_witness_nodes(state_root, &node_pool)?;
 
             Ok(Self {
                 trie: Rc::new(trie),
