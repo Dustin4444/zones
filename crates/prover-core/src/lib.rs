@@ -344,7 +344,6 @@ pub struct ZoneAccountRead {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
-    pub proof_node_hashes: Vec<B256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,7 +353,6 @@ pub struct ZoneStorageRead {
     pub account: Address,
     pub slot: U256,
     pub value: U256,
-    pub proof_node_hashes: Vec<B256>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1915,25 +1913,23 @@ impl TempoWitnessProvider {
 
             let account = trie::verify_account_proof(
                 state_root,
-                &proofs.node_pool,
                 trie::AccountProof {
                     account: read.account,
                     nonce: read.account_nonce,
                     balance: read.account_balance,
                     storage_root: read.account_storage_root,
                     code_hash: read.account_code_hash,
-                    proof_node_hashes: &read.account_proof_node_hashes,
+                    node_pool: &proofs.node_pool,
                 },
             )
             .map_err(|err| tempo_state_account_error(read_index, read, err))?;
 
             trie::verify_storage_proof(
                 account.storage_root,
-                &proofs.node_pool,
                 trie::StorageProof {
                     slot: read.slot,
                     value: read.value,
-                    proof_node_hashes: &read.storage_proof_node_hashes,
+                    node_pool: &proofs.node_pool,
                 },
             )
             .map_err(|err| tempo_state_storage_error(read_index, read, err))?;
@@ -4662,7 +4658,7 @@ mod tests {
 
     fn assemble_zone_state(
         account_entries: Vec<(Address, TrieAccount)>,
-        mut account_reads: Vec<ZoneAccountRead>,
+        account_reads: Vec<ZoneAccountRead>,
         storage_reads: Vec<ZoneStorageRead>,
         mut node_pool: BTreeMap<B256, Bytes>,
         codes: BTreeMap<B256, Bytes>,
@@ -4671,15 +4667,9 @@ mod tests {
             .iter()
             .map(|read| read.account)
             .collect::<Vec<_>>();
-        let (state_root, account_nodes, mut account_proofs) =
+        let (state_root, account_nodes, _) =
             account_trie_with_proofs(&account_entries, &proof_accounts);
         node_pool.extend(account_nodes);
-
-        for read in &mut account_reads {
-            read.proof_node_hashes = account_proofs
-                .remove(&read.account)
-                .expect("account proof was retained for every account read");
-        }
 
         ZoneStateWitness::from_node_pool(
             state_root,
@@ -4697,7 +4687,6 @@ mod tests {
             balance: trie_account.balance,
             storage_root: trie_account.storage_root,
             code_hash: trie_account.code_hash,
-            proof_node_hashes: Vec::new(),
         }
     }
 
@@ -4708,7 +4697,6 @@ mod tests {
             balance: U256::ZERO,
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: KECCAK_EMPTY,
-            proof_node_hashes: Vec::new(),
         }
     }
 
@@ -4800,7 +4788,7 @@ mod tests {
         let block_hash_value = storage_word(block_hash);
         let state_root_value = storage_word(tempo_state_root);
         let packed_value = U256::from(block_number);
-        let (storage_root, node_pool, mut storage_proofs) = storage_trie_with_entries_and_proofs(
+        let (storage_root, node_pool, _) = storage_trie_with_entries_and_proofs(
             &[
                 (block_hash_slot, block_hash_value),
                 (state_root_slot, state_root_value),
@@ -4819,25 +4807,16 @@ mod tests {
                 account: TEMPO_STATE_ADDRESS,
                 slot: block_hash_slot,
                 value: block_hash_value,
-                proof_node_hashes: storage_proofs
-                    .remove(&block_hash_slot)
-                    .expect("Tempo block hash proof was retained"),
             },
             ZoneStorageRead {
                 account: TEMPO_STATE_ADDRESS,
                 slot: state_root_slot,
                 value: state_root_value,
-                proof_node_hashes: storage_proofs
-                    .remove(&state_root_slot)
-                    .expect("Tempo state root proof was retained"),
             },
             ZoneStorageRead {
                 account: TEMPO_STATE_ADDRESS,
                 slot: packed_slot,
                 value: packed_value,
-                proof_node_hashes: storage_proofs
-                    .remove(&packed_slot)
-                    .expect("Tempo packed slot proof was retained"),
             },
         ];
 
@@ -4869,7 +4848,7 @@ mod tests {
         proof_slots: &[U256],
         code: ZoneAccountCode,
     ) -> ZoneStateParts {
-        let (storage_root, node_pool, mut storage_proofs) =
+        let (storage_root, node_pool, _) =
             storage_trie_with_entries_and_proofs(entries, proof_slots);
         let code_hash = match &code {
             ZoneAccountCode::Empty => KECCAK_EMPTY,
@@ -4895,9 +4874,6 @@ mod tests {
                     .iter()
                     .find(|(entry_slot, _)| *entry_slot == slot)
                     .map_or(U256::ZERO, |(_, value)| *value),
-                proof_node_hashes: storage_proofs
-                    .remove(&slot)
-                    .expect("system storage proof was retained"),
             })
             .collect();
 
@@ -4909,7 +4885,6 @@ mod tests {
                 balance: trie_account.balance,
                 storage_root: trie_account.storage_root,
                 code_hash: trie_account.code_hash,
-                proof_node_hashes: Vec::new(),
             }],
             storage_reads,
             node_pool,
@@ -5260,8 +5235,7 @@ mod tests {
         let slot = U256::from(7);
         let value = U256::from(9);
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
-        let (storage_root, storage_nodes, storage_proof) =
-            storage_trie_with_proof(slot, value, slot);
+        let (storage_root, storage_nodes, _) = storage_trie_with_proof(slot, value, slot);
         parts.node_pool.extend(storage_nodes);
         let trie_account = TrieAccount {
             nonce: 3,
@@ -5277,7 +5251,6 @@ mod tests {
             account,
             slot,
             value,
-            proof_node_hashes: storage_proof,
         });
 
         let mut witness = fixture_witness();
@@ -5424,8 +5397,7 @@ mod tests {
     #[test]
     fn sparse_state_root_calculator_rejects_missing_initial_witness_node() {
         let mut witness = fixture_witness();
-        let read = witness.initial_zone_state.account_reads[0].clone();
-        let missing = read.proof_node_hashes[0];
+        let missing = keccak256(witness.initial_zone_state.execution_witness.state[0].as_ref());
         witness
             .initial_zone_state
             .execution_witness
@@ -5435,10 +5407,7 @@ mod tests {
         assert_eq!(
             SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
                 .unwrap_err(),
-            ProverError::AccountProofMissing {
-                account: read.account,
-                node_hash: missing,
-            }
+            ProverError::StateRootCalculationFailed
         );
     }
 
@@ -5889,7 +5858,7 @@ mod tests {
         let stored_slot = U256::from(7);
         let absent_slot = U256::from(8);
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
-        let (storage_root, storage_nodes, storage_proof) =
+        let (storage_root, storage_nodes, _) =
             storage_trie_with_proof(stored_slot, U256::from(9), absent_slot);
         parts.node_pool.extend(storage_nodes);
         let trie_account = TrieAccount {
@@ -5906,7 +5875,6 @@ mod tests {
             account,
             slot: absent_slot,
             value: U256::ZERO,
-            proof_node_hashes: storage_proof,
         });
 
         let mut witness = fixture_witness();
@@ -5950,7 +5918,6 @@ mod tests {
                 account,
                 slot: U256::from(7),
                 value: U256::ZERO,
-                proof_node_hashes: Vec::new(),
             });
 
         assert_eq!(
@@ -5965,8 +5932,7 @@ mod tests {
         let slot = U256::from(7);
         let value = U256::from(9);
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
-        let (storage_root, _storage_nodes, storage_proof) =
-            storage_trie_with_proof(slot, value, slot);
+        let (storage_root, _storage_nodes, _) = storage_trie_with_proof(slot, value, slot);
         let trie_account = TrieAccount {
             nonce: 0,
             balance: U256::ZERO,
@@ -5981,7 +5947,6 @@ mod tests {
             account,
             slot,
             value,
-            proof_node_hashes: storage_proof,
         });
 
         let mut witness = fixture_witness();
@@ -6002,8 +5967,7 @@ mod tests {
         let account = address!("0x0000000000000000000000000000000000001000");
         let slot = U256::from(7);
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
-        let (storage_root, storage_nodes, storage_proof) =
-            storage_trie_with_proof(slot, U256::from(9), slot);
+        let (storage_root, storage_nodes, _) = storage_trie_with_proof(slot, U256::from(9), slot);
         parts.node_pool.extend(storage_nodes);
         let trie_account = TrieAccount {
             nonce: 0,
@@ -6019,7 +5983,6 @@ mod tests {
             account,
             slot,
             value: U256::from(10),
-            proof_node_hashes: storage_proof,
         });
 
         let mut witness = fixture_witness();
@@ -6043,7 +6006,6 @@ mod tests {
                 balance: U256::ZERO,
                 storage_root: EMPTY_TRIE_ROOT,
                 code_hash: B256::repeat_byte(0xaa),
-                proof_node_hashes: Vec::new(),
             });
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
@@ -6055,7 +6017,7 @@ mod tests {
     fn rejects_missing_zone_state_proof_node() {
         let mut witness = fixture_witness();
         let read = witness.initial_zone_state.account_reads[0].clone();
-        let missing = read.proof_node_hashes[0];
+        let missing = keccak256(witness.initial_zone_state.execution_witness.state[0].as_ref());
         witness
             .initial_zone_state
             .execution_witness

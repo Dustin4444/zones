@@ -110,7 +110,6 @@ fn absent_account_read(account: Address) -> ZoneAccountRead {
         balance: U256::ZERO,
         storage_root: EMPTY_TRIE_ROOT,
         code_hash: KECCAK_EMPTY,
-        proof_node_hashes: Vec::new(),
     }
 }
 
@@ -125,47 +124,44 @@ fn tempo_bound_zone_state(
     let block_hash_value = storage_word(block_hash);
     let state_root_value = storage_word(EMPTY_TRIE_ROOT);
     let packed_value = U256::from(block_number);
-    let (tempo_storage_root, mut node_pool, mut tempo_storage_proofs) =
-        storage_trie_with_entries_and_proofs(
-            &[
-                (block_hash_slot, block_hash_value),
-                (state_root_slot, state_root_value),
-                (packed_slot, packed_value),
-            ],
-            &[block_hash_slot, state_root_slot, packed_slot],
-        );
-    let (zone_inbox_storage_root, zone_inbox_nodes, mut zone_inbox_storage_proofs) =
-        storage_trie_with_entries_and_proofs(
-            &[
-                (
-                    ZONE_INBOX_PROCESSED_HASH_SLOT,
-                    storage_word(B256::repeat_byte(0x44)),
-                ),
-                (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
-            ],
-            &[
+    let (tempo_storage_root, mut node_pool, _) = storage_trie_with_entries_and_proofs(
+        &[
+            (block_hash_slot, block_hash_value),
+            (state_root_slot, state_root_value),
+            (packed_slot, packed_value),
+        ],
+        &[block_hash_slot, state_root_slot, packed_slot],
+    );
+    let (zone_inbox_storage_root, zone_inbox_nodes, _) = storage_trie_with_entries_and_proofs(
+        &[
+            (
                 ZONE_INBOX_PROCESSED_HASH_SLOT,
-                ZONE_INBOX_PROCESSED_NUMBER_SLOT,
-            ],
-        );
+                storage_word(B256::repeat_byte(0x44)),
+            ),
+            (ZONE_INBOX_PROCESSED_NUMBER_SLOT, U256::from(12)),
+        ],
+        &[
+            ZONE_INBOX_PROCESSED_HASH_SLOT,
+            ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+        ],
+    );
     node_pool.extend(zone_inbox_nodes);
-    let (zone_outbox_storage_root, zone_outbox_nodes, mut zone_outbox_storage_proofs) =
-        storage_trie_with_entries_and_proofs(
-            &[
-                (
-                    ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
-                    storage_word(B256::repeat_byte(0x55)),
-                ),
-                (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::ZERO),
-            ],
-            &[
-                ZONE_OUTBOX_PACKED_SLOT,
+    let (zone_outbox_storage_root, zone_outbox_nodes, _) = storage_trie_with_entries_and_proofs(
+        &[
+            (
                 ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
-                ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
-                ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
-                ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
-            ],
-        );
+                storage_word(B256::repeat_byte(0x55)),
+            ),
+            (ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, U256::ZERO),
+        ],
+        &[
+            ZONE_OUTBOX_PACKED_SLOT,
+            ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+            ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+        ],
+    );
     node_pool.extend(zone_outbox_nodes);
 
     let tempo_trie_account = TrieAccount {
@@ -195,7 +191,6 @@ fn tempo_bound_zone_state(
         balance: tempo_trie_account.balance,
         storage_root: tempo_trie_account.storage_root,
         code_hash: tempo_trie_account.code_hash,
-        proof_node_hashes: Vec::new(),
     };
     let zone_inbox_account_read = ZoneAccountRead {
         account: ZONE_INBOX_ADDRESS,
@@ -203,7 +198,6 @@ fn tempo_bound_zone_state(
         balance: zone_inbox_trie_account.balance,
         storage_root: zone_inbox_trie_account.storage_root,
         code_hash: zone_inbox_trie_account.code_hash,
-        proof_node_hashes: Vec::new(),
     };
     let zone_outbox_account_read = ZoneAccountRead {
         account: ZONE_OUTBOX_ADDRESS,
@@ -211,32 +205,22 @@ fn tempo_bound_zone_state(
         balance: zone_outbox_trie_account.balance,
         storage_root: zone_outbox_trie_account.storage_root,
         code_hash: zone_outbox_trie_account.code_hash,
-        proof_node_hashes: Vec::new(),
     };
     let mut storage_reads = vec![
         ZoneStorageRead {
             account: TEMPO_STATE_ADDRESS,
             slot: block_hash_slot,
             value: block_hash_value,
-            proof_node_hashes: tempo_storage_proofs
-                .remove(&block_hash_slot)
-                .expect("Tempo block hash proof was retained"),
         },
         ZoneStorageRead {
             account: TEMPO_STATE_ADDRESS,
             slot: state_root_slot,
             value: state_root_value,
-            proof_node_hashes: tempo_storage_proofs
-                .remove(&state_root_slot)
-                .expect("Tempo state root proof was retained"),
         },
         ZoneStorageRead {
             account: TEMPO_STATE_ADDRESS,
             slot: packed_slot,
             value: packed_value,
-            proof_node_hashes: tempo_storage_proofs
-                .remove(&packed_slot)
-                .expect("Tempo packed slot proof was retained"),
         },
     ];
     storage_reads.extend([
@@ -244,61 +228,40 @@ fn tempo_bound_zone_state(
             account: ZONE_INBOX_ADDRESS,
             slot: ZONE_INBOX_PROCESSED_HASH_SLOT,
             value: storage_word(B256::repeat_byte(0x44)),
-            proof_node_hashes: zone_inbox_storage_proofs
-                .remove(&ZONE_INBOX_PROCESSED_HASH_SLOT)
-                .expect("ZoneInbox processed hash proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_INBOX_ADDRESS,
             slot: ZONE_INBOX_PROCESSED_NUMBER_SLOT,
             value: U256::from(12),
-            proof_node_hashes: zone_inbox_storage_proofs
-                .remove(&ZONE_INBOX_PROCESSED_NUMBER_SLOT)
-                .expect("ZoneInbox processed number proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_PACKED_SLOT,
             value: U256::ZERO,
-            proof_node_hashes: zone_outbox_storage_proofs
-                .remove(&ZONE_OUTBOX_PACKED_SLOT)
-                .expect("ZoneOutbox packed slot proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
             value: storage_word(B256::repeat_byte(0x55)),
-            proof_node_hashes: zone_outbox_storage_proofs
-                .remove(&ZONE_OUTBOX_LAST_BATCH_HASH_SLOT)
-                .expect("ZoneOutbox last batch hash proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
             value: U256::ZERO,
-            proof_node_hashes: zone_outbox_storage_proofs
-                .remove(&ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
-                .expect("ZoneOutbox last batch index proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
             value: U256::ZERO,
-            proof_node_hashes: zone_outbox_storage_proofs
-                .remove(&ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT)
-                .expect("ZoneOutbox pending withdrawals proof was retained"),
         },
         ZoneStorageRead {
             account: ZONE_OUTBOX_ADDRESS,
             slot: ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
             value: U256::ZERO,
-            proof_node_hashes: zone_outbox_storage_proofs
-                .remove(&ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT)
-                .expect("ZoneOutbox pending withdrawals head proof was retained"),
         },
     ]);
 
-    let (state_root, account_nodes, mut account_proofs) = account_trie_with_proofs(
+    let (state_root, account_nodes, _) = account_trie_with_proofs(
         &[
             (TEMPO_STATE_ADDRESS, tempo_trie_account),
             (ZONE_INBOX_ADDRESS, zone_inbox_trie_account),
@@ -314,30 +277,10 @@ fn tempo_bound_zone_state(
     node_pool.extend(account_nodes);
 
     let account_reads = vec![
-        ZoneAccountRead {
-            proof_node_hashes: account_proofs
-                .remove(&TEMPO_STATE_ADDRESS)
-                .expect("Tempo account proof was retained"),
-            ..tempo_account_read
-        },
-        ZoneAccountRead {
-            proof_node_hashes: account_proofs
-                .remove(&ZONE_INBOX_ADDRESS)
-                .expect("ZoneInbox account proof was retained"),
-            ..zone_inbox_account_read
-        },
-        ZoneAccountRead {
-            proof_node_hashes: account_proofs
-                .remove(&ZONE_OUTBOX_ADDRESS)
-                .expect("ZoneOutbox account proof was retained"),
-            ..zone_outbox_account_read
-        },
-        ZoneAccountRead {
-            proof_node_hashes: account_proofs
-                .remove(&beneficiary)
-                .expect("beneficiary account proof was retained"),
-            ..absent_account_read(beneficiary)
-        },
+        tempo_account_read,
+        zone_inbox_account_read,
+        zone_outbox_account_read,
+        absent_account_read(beneficiary),
     ];
 
     ZoneStateWitness::from_node_pool(

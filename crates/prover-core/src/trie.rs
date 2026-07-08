@@ -22,14 +22,14 @@ pub(crate) struct AccountProof<'a> {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
-    pub proof_node_hashes: &'a [B256],
+    pub node_pool: &'a BTreeMap<B256, Bytes>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StorageProof<'a> {
     pub slot: U256,
     pub value: U256,
-    pub proof_node_hashes: &'a [B256],
+    pub node_pool: &'a BTreeMap<B256, Bytes>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,9 +50,9 @@ pub(crate) fn verify_account_read(
         balance: read.balance,
         storage_root: read.storage_root,
         code_hash: read.code_hash,
-        proof_node_hashes: &read.proof_node_hashes,
+        node_pool,
     };
-    verify_account_proof(state_root, node_pool, proof).map_err(|err| match err {
+    verify_account_proof(state_root, proof).map_err(|err| match err {
         TrieProofError::MissingNode(node_hash) => ProverError::AccountProofMissing {
             account: read.account,
             node_hash,
@@ -70,9 +70,9 @@ pub(crate) fn verify_storage_read(
     let proof = StorageProof {
         slot: read.slot,
         value: read.value,
-        proof_node_hashes: &read.proof_node_hashes,
+        node_pool,
     };
-    verify_storage_proof(storage_root, node_pool, proof).map_err(|err| match err {
+    verify_storage_proof(storage_root, proof).map_err(|err| match err {
         TrieProofError::MissingNode(node_hash) => ProverError::StorageProofMissing {
             account: read.account,
             slot: read.slot,
@@ -91,13 +91,11 @@ pub(crate) fn verify_storage_read(
 
 pub(crate) fn verify_account_proof(
     state_root: B256,
-    node_pool: &BTreeMap<B256, Bytes>,
     read: AccountProof<'_>,
 ) -> Result<ProvenAccount, TrieProofError> {
     let key = Nibbles::unpack(keccak256(read.account));
     let expected_value = expected_account_value(read);
-    let proof =
-        proof_nodes(read.proof_node_hashes, node_pool).map_err(TrieProofError::MissingNode)?;
+    let proof = proof_nodes_for_key(state_root, read.node_pool, &key)?;
 
     verify_proof(state_root, key, expected_value, proof)
         .map_err(|err| proof_verification_error(err, key))?;
@@ -108,89 +106,87 @@ pub(crate) fn verify_account_proof(
 
 pub(crate) fn verify_storage_proof(
     storage_root: B256,
-    node_pool: &BTreeMap<B256, Bytes>,
     read: StorageProof<'_>,
 ) -> Result<(), TrieProofError> {
     let key = Nibbles::unpack(keccak256(read.slot.to_be_bytes::<32>()));
     let expected_value = expected_storage_value(read.value);
-    let proof =
-        proof_nodes(read.proof_node_hashes, node_pool).map_err(TrieProofError::MissingNode)?;
+    let proof = proof_nodes_for_key(storage_root, read.node_pool, &key)?;
 
     verify_proof(storage_root, key, expected_value, proof)
         .map_err(|err| proof_verification_error(err, key))
 }
 
-fn proof_nodes<'a>(
-    proof_node_hashes: &[B256],
+fn proof_nodes_for_key<'a>(
+    root: B256,
     node_pool: &'a BTreeMap<B256, Bytes>,
-) -> Result<Vec<&'a Bytes>, B256> {
-    let mut proof = Vec::with_capacity(proof_node_hashes.len());
-    for hash in proof_node_hashes {
-        proof.push(node_pool.get(hash).ok_or(*hash)?);
+    key: &Nibbles,
+) -> Result<Vec<&'a Bytes>, TrieProofError> {
+    if root == EMPTY_ROOT_HASH {
+        return Ok(Vec::new());
     }
-    Ok(proof)
-}
 
-pub(crate) fn proof_subtrie_for_key(
-    key: Nibbles,
-    node_pool: &BTreeMap<B256, Bytes>,
-    proof_node_hashes: &[B256],
-) -> Result<alloy_trie::proof::ProofNodes, TrieProofError> {
-    let proof = proof_nodes(proof_node_hashes, node_pool).map_err(TrieProofError::MissingNode)?;
-    let mut subtrie = alloy_trie::proof::ProofNodes::default();
+    let mut proof = Vec::new();
+    let mut next_hash = root;
     let mut path = Nibbles::new();
 
-    for node in proof {
-        subtrie.insert(path, node.clone());
+    loop {
+        let node = node_pool
+            .get(&next_hash)
+            .ok_or(TrieProofError::MissingNode(next_hash))?;
+        proof.push(node);
         let node = TrieNode::decode(&mut &node[..]).map_err(|_| TrieProofError::Invalid)?;
-        advance_proof_path(node, &mut path, &key)?;
+        let Some(hash) = next_child_hash_for_key(node, &mut path, key)? else {
+            return Ok(proof);
+        };
+        next_hash = hash;
     }
-
-    Ok(subtrie)
 }
 
-fn advance_proof_path(
+fn next_child_hash_for_key(
     node: TrieNode,
     path: &mut Nibbles,
     key: &Nibbles,
-) -> Result<(), TrieProofError> {
+) -> Result<Option<B256>, TrieProofError> {
     match node {
-        TrieNode::Branch(mut branch) => {
+        TrieNode::Branch(branch) => {
             let Some(next) = key.get(path.len()) else {
-                return Ok(());
+                return Ok(None);
             };
             let mut stack_ptr = branch.as_ref().first_child_index();
             for index in CHILD_INDEX_RANGE {
                 if branch.state_mask.is_bit_set(index) {
                     if index == next {
                         path.push(next);
-                        let child = branch.stack.remove(stack_ptr);
+                        let child = branch.stack[stack_ptr].clone();
                         if child.is_hash() {
-                            return Ok(());
+                            return Ok(Some(B256::from_slice(&child[1..])));
                         }
                         let child = TrieNode::decode(&mut &child[..])
                             .map_err(|_| TrieProofError::Invalid)?;
-                        return advance_proof_path(child, path, key);
+                        return next_child_hash_for_key(child, path, key);
                     }
                     stack_ptr += 1;
                 }
             }
-            Ok(())
+            Ok(None)
         }
         TrieNode::Extension(extension) => {
             path.extend(&extension.key);
+            if !key.starts_with(path) {
+                return Ok(None);
+            }
             if extension.child.is_hash() {
-                return Ok(());
+                return Ok(Some(B256::from_slice(&extension.child[1..])));
             }
             let child =
                 TrieNode::decode(&mut &extension.child[..]).map_err(|_| TrieProofError::Invalid)?;
-            advance_proof_path(child, path, key)
+            next_child_hash_for_key(child, path, key)
         }
         TrieNode::Leaf(leaf) => {
             path.extend(&leaf.key);
-            Ok(())
+            Ok(None)
         }
-        TrieNode::EmptyRoot => Ok(()),
+        TrieNode::EmptyRoot => Ok(None),
     }
 }
 

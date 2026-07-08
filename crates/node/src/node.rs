@@ -2450,13 +2450,14 @@ fn zone_account_read_from_reth_proof(
         codes.entry(code_hash).or_insert(bytes);
     }
 
+    insert_witness_nodes(node_pool, &proof.proof);
+
     Ok(ZoneAccountRead {
         account: proof.address,
         nonce,
         balance,
         storage_root: proof.storage_root,
         code_hash,
-        proof_node_hashes: insert_witness_nodes(node_pool, &proof.proof),
     })
 }
 
@@ -2468,11 +2469,13 @@ fn zone_storage_reads_from_reth_proof(
     proof
         .storage_proofs
         .iter()
-        .map(|storage_proof| ZoneStorageRead {
-            account,
-            slot: storage_word_slot(storage_proof.key),
-            value: storage_proof.value,
-            proof_node_hashes: insert_witness_nodes(node_pool, &storage_proof.proof),
+        .map(|storage_proof| {
+            insert_witness_nodes(node_pool, &storage_proof.proof);
+            ZoneStorageRead {
+                account,
+                slot: storage_word_slot(storage_proof.key),
+                value: storage_proof.value,
+            }
         })
         .collect()
 }
