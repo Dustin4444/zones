@@ -24,6 +24,19 @@ Recovered goal, in short:
 - Nitro and native-signature paths call `prove_zone_batch` before signing proof material. The sequencer native path validates the prover output against the batch fields before submitting.
 - `specs/spec.md` now documents `tempo_import`, `withdrawal_finalization`, required block env fields, the admitted user transaction scope, enabled-token fee accounting, and the execution-derived commitment flow.
 
+## Spec audit summary
+
+This audit treats `specs/spec.md` as the target source of truth. A full "done" claim is still blocked by the open TODOs below.
+
+| Spec area | Current status | Evidence / gap |
+|-----------|----------------|----------------|
+| Access control, deployment, token management, deposits, withdrawals, bounce-backs | Implemented for the current immutable-verifier contract set | Reference contracts and focused Forge coverage exercise portal/inbox/outbox queue, fee, refund, encrypted-deposit failure, and withdrawal finalization behavior. |
+| Zone execution, Tempo reads, TIP-403, fee-token handling | Implemented for current settlement scope | Prover execution uses system transactions, generated witnesses, portal enabled-token proofs, and witness-backed TIP-403 policy reads. |
+| Private RPC | Implemented in current scope | RPC handlers expose the three `zone_` methods and private RPC integration/unit tests cover token info, zone info, deposit status, scoped logs, block redaction, and disabled pending-transaction subscriptions. |
+| Proving system witness shape | Open | The prover still uses the custom Zone witness containers rather than an upstream-style execution witness adapter. |
+| Production no-std prover | Open | The no-default build compiles, but non-empty post-state root calculation still needs a no-std sparse-trie backend or upstream reth export. |
+| Network upgrades | Open target design | `ZonePortal.verifier` is immutable today; verifier rotation, fork activation cutoffs, and protocol-version rotation remain future design. |
+
 ## TODO status before calling the original goal complete
 
 1. [ ] Replace the custom witness shape with an upstream-style execution witness adapter.
