@@ -4,7 +4,7 @@ pub use ZonePortal::{
     BlockTransition, DepositQueueTransition, EncryptedDeposit, EncryptedDepositPayload, Withdrawal,
 };
 
-use crate::ZoneOutbox;
+use crate::IZoneOutbox;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_sol_types::SolValue;
 use zone_primitives::constants::EMPTY_SENTINEL;

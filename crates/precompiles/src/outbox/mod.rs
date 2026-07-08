@@ -17,7 +17,7 @@ use tempo_precompiles::{
     tip20::{ITIP20, TIP20Error, TIP20Token},
 };
 use tempo_precompiles_macros::{Storable, contract};
-use tempo_zone_contracts::ZoneOutbox as ZoneOutboxAbi;
+use tempo_zone_contracts::{StaticCallNotAllowed, ZoneOutbox as ZoneOutboxAbi};
 use zone_primitives::constants::{
     EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_INBOX_ADDRESS,
     ZONE_OUTBOX_ADDRESS,
@@ -36,52 +36,12 @@ const MAX_GAS_FEE_RATE: u128 = 1_000_000_000_000_000_000;
 const WITHDRAWAL_BASE_GAS: u64 = 50_000;
 const REVEAL_TO_KEY_LENGTH: usize = 33;
 
-const PORTAL_TOKEN_CONFIGS_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 8;
-    B256::new(bytes)
-};
-
-alloy_sol_types::sol! {
-    error StaticCallNotAllowed();
-}
-
-/// L1 portal state needed by the native outbox.
-pub trait ZonePortalReader: L1StorageReader {
-    /// Zone portal address on Tempo L1.
-    fn portal_address(&self) -> Address;
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Storable)]
-struct LastBatchStorage {
-    withdrawal_queue_hash: B256,
-    withdrawal_batch_index: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Storable)]
-struct PendingWithdrawalStorage {
-    token: Address,
-    sender: Address,
-    tx_hash: B256,
-    to: Address,
-    amount: u128,
-    fee: u128,
-    memo: B256,
-    gas_limit: u64,
-    fallback_recipient: Address,
-    callback_data: Bytes,
-    reveal_to: Bytes,
-}
-
 #[contract(addr = ZONE_OUTBOX_ADDRESS)]
 pub struct ZoneOutbox {
-    // Slot 0: packed to match Solidity `(uint128,uint64,uint64)`.
     tempo_gas_rate: u128,
     next_withdrawal_index: u64,
     withdrawal_batch_index: u64,
-    // Slots 1-2: proof code reads these directly.
     last_batch: LastBatchStorage,
-    // Slot 3 onward: same dynamic-array layout as Solidity.
     pending_withdrawals: Vec<PendingWithdrawalStorage>,
     pending_withdrawals_head: U256,
     max_withdrawals_per_block: U256,
@@ -683,6 +643,39 @@ impl LastBatchStorage {
             withdrawalBatchIndex: self.withdrawal_batch_index,
         }
     }
+}
+
+const PORTAL_TOKEN_CONFIGS_SLOT: B256 = {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 8;
+    B256::new(bytes)
+};
+
+/// L1 portal state needed by the native outbox.
+pub trait ZonePortalReader: L1StorageReader {
+    /// Zone portal address on Tempo L1.
+    fn portal_address(&self) -> Address;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Storable)]
+struct LastBatchStorage {
+    withdrawal_queue_hash: B256,
+    withdrawal_batch_index: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Storable)]
+struct PendingWithdrawalStorage {
+    token: Address,
+    sender: Address,
+    tx_hash: B256,
+    to: Address,
+    amount: u128,
+    fee: u128,
+    memo: B256,
+    gas_limit: u64,
+    fallback_recipient: Address,
+    callback_data: Bytes,
+    reveal_to: Bytes,
 }
 
 impl PendingWithdrawalStorage {
