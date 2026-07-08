@@ -1,7 +1,7 @@
 //! Zone protocol fee manager.
 //!
-//! Zones do not use Tempo's FeeAMM path. Fees are collected in the transaction's
-//! fee token and paid directly to the block beneficiary.
+//! The fee manager collects fees directly in the transaction's fee token and
+//! pays them out to the block beneficiary.
 
 use alloy_primitives::{Address, U256};
 use revm::Database;
