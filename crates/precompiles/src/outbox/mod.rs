@@ -1,8 +1,5 @@
 //! Native `ZoneOutbox` precompile.
 //!
-//! Mirrors the Solidity ZoneOutbox predeploy at `0x1c00...0002` while keeping
-//! the proof-facing storage slots compatible with the Solidity layout.
-
 mod dispatch;
 
 use alloc::vec::Vec;
