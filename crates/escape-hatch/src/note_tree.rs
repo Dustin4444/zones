@@ -37,7 +37,7 @@ impl ExitNoteTree {
         Ok(Self {
             depth,
             leaf_count: 0,
-            branch: vec![B256::ZERO; depth as usize],
+            branch: vec![B256::ZERO; depth as usize + 1],
             zero_hashes,
             leaves: Vec::new(),
         })
@@ -74,7 +74,7 @@ impl ExitNoteTree {
         let mut node = commitment;
         let mut size = self.leaf_count;
 
-        for level in 0..self.depth as usize {
+        for level in 0..=self.depth as usize {
             if size & 1 == 0 {
                 self.branch[level] = node;
                 break;
@@ -98,20 +98,34 @@ impl ExitNoteTree {
     where
         I: IntoIterator<Item = B256>,
     {
-        let mut first_index = None;
-        let mut last_index = None;
-        let mut count = 0;
+        let commitments = commitments.into_iter().collect::<Vec<_>>();
 
-        for commitment in commitments {
-            let index = self.append(commitment)?;
-            first_index.get_or_insert(index);
-            last_index = Some(index);
-            count += 1;
+        // Check if tree is full
+        let count = u64::try_from(commitments.len()).map_err(|_| ExitNoteTreeError::TreeFull {
+            depth: self.depth,
+            capacity: self.capacity(),
+        })?;
+
+        if count == 0 {
+            return Ok(None);
         }
 
-        Ok(first_index.map(|first_index| AppendRange {
+        if count > self.capacity() - self.leaf_count {
+            return Err(ExitNoteTreeError::TreeFull {
+                depth: self.depth,
+                capacity: self.capacity(),
+            });
+        }
+
+        let first_index = self.leaf_count;
+
+        for commitment in commitments {
+            self.append(commitment)?;
+        }
+
+        Ok(Some(AppendRange {
             first_index,
-            last_index: last_index.expect("last index exists when first index exists"),
+            last_index: first_index + count - 1,
             count,
         }))
     }
@@ -249,6 +263,11 @@ fn build_zero_hashes(depth: u8) -> Vec<B256> {
 
 /// Builds a Merkle root from the frontier, padding with zero hashes as needed.
 fn root_from_frontier(depth: u8, leaf_count: u64, branch: &[B256], zero_hashes: &[B256]) -> B256 {
+    // if tree is full, return the completed merkle root
+    if leaf_count == (1u64 << depth) {
+        return branch[depth as usize];
+    }
+
     let mut node = B256::ZERO;
 
     for level in 0..depth as usize {
@@ -379,6 +398,33 @@ mod tests {
     }
 
     #[test]
+    fn root_matches_padded_tree_when_filled_to_capacity() {
+        let mut tree = ExitNoteTree::new(3).unwrap();
+        let leaves = [
+            leaf(1),
+            leaf(2),
+            leaf(3),
+            leaf(4),
+            leaf(5),
+            leaf(6),
+            leaf(7),
+            leaf(8),
+        ];
+
+        for commitment in leaves {
+            tree.append(commitment).unwrap();
+        }
+
+        let root = tree.root();
+        assert_eq!(tree.len(), tree.capacity());
+        assert_eq!(root, full_root(3, &leaves));
+
+        for index in 0..tree.len() {
+            assert!(tree.proof(index).unwrap().verify(root, tree.depth()));
+        }
+    }
+
+    #[test]
     fn append_many_returns_first_index() {
         let mut tree = ExitNoteTree::new(3).unwrap();
 
@@ -400,6 +446,27 @@ mod tests {
             })
         );
         assert_eq!(tree.len(), 4);
+    }
+
+    #[test]
+    fn append_many_is_atomic_when_batch_exceeds_remaining_capacity() {
+        let mut tree = ExitNoteTree::new(2).unwrap();
+        tree.append_many([leaf(1), leaf(2), leaf(3)]).unwrap();
+
+        let root_before = tree.root();
+        let leaves_before = tree.leaves.clone();
+
+        assert_eq!(
+            tree.append_many([leaf(4), leaf(5)]),
+            Err(ExitNoteTreeError::TreeFull {
+                depth: 2,
+                capacity: 4,
+            })
+        );
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.root(), root_before);
+        assert_eq!(tree.leaves, leaves_before);
+        assert_eq!(tree.leaf(3), None);
     }
 
     #[test]
