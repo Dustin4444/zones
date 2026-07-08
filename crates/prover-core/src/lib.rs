@@ -84,8 +84,6 @@ pub use execution_state::{
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use execution_witness::{ExecutionWitness, ZoneExecutionWitness};
 pub use post_state::ExecutionPostState;
-#[cfg(feature = "std")]
-pub use state_root::calculate_state_root;
 pub use state_root::{CalculatedStateRoot, SparseStateRootCalculator, empty_state_root};
 pub use tempo_chainspec::hardfork::TempoHardfork;
 pub use tempo_reader::{
@@ -300,8 +298,6 @@ impl ZoneBlockEnvWitness {
 pub struct ZoneStateWitness {
     pub state_root: B256,
     pub execution_witness: ExecutionWitness,
-    pub account_reads: Vec<ZoneAccountRead>,
-    pub storage_reads: Vec<ZoneStorageRead>,
 }
 
 impl ZoneStateWitness {
@@ -321,8 +317,6 @@ impl ZoneStateWitness {
                 keys,
                 headers: Vec::new(),
             },
-            account_reads,
-            storage_reads,
         }
     }
 
@@ -1404,7 +1398,7 @@ pub fn prepare_stateless_execution(
     )?;
     let initial_zone_execution_witness = ZoneExecutionWitness::from_batch_witness(witness)?;
     let execution_db = WitnessDatabase::new(&initial_zone_execution_witness, zone_block_hashes)?;
-    let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
+    let initial_zone_state = validate_initial_zone_state(&initial_zone_execution_witness)?;
 
     let (tempo_root_bindings, block_tempo_bindings, final_tempo_binding) =
         tempo_root_bindings_for_witness(initial_zone_state.tempo_binding, &witness.zone_blocks)?;
@@ -1434,7 +1428,7 @@ pub fn prepare_stateless_execution(
     tempo::verify_tempo_ancestry(public, final_tempo_binding, &witness.tempo_ancestry_headers)?;
 
     let execution_plan = ZoneExecutionPlan::from_witness(witness)?;
-    validate_required_system_contract_code(&witness.initial_zone_state, &execution_plan)?;
+    validate_required_system_contract_code(&initial_zone_execution_witness, &execution_plan)?;
 
     Ok(PreparedStatelessExecution {
         public_inputs: public.clone(),
@@ -1503,9 +1497,9 @@ pub fn prove_empty_zone_batch(witness: BatchWitness) -> Result<BatchOutput, Prov
         &witness.zone_ancestry_headers,
     )?;
 
-    let _execution_db =
-        WitnessDatabase::from_zone_state_witness(&witness.initial_zone_state, zone_block_hashes)?;
-    let initial_zone_state = validate_initial_zone_state(&witness.initial_zone_state)?;
+    let initial_zone_execution_witness = ZoneExecutionWitness::from_batch_witness(&witness)?;
+    let _execution_db = WitnessDatabase::new(&initial_zone_execution_witness, zone_block_hashes)?;
+    let initial_zone_state = validate_initial_zone_state(&initial_zone_execution_witness)?;
     validate_node_pool(
         &witness.tempo_state_proofs.node_pool,
         ProverError::TempoStateNodeHashMismatch,
@@ -1768,22 +1762,8 @@ pub struct DepositQueueState {
 }
 
 fn validate_initial_zone_state(
-    state: &ZoneStateWitness,
+    state: &ZoneExecutionWitness,
 ) -> Result<VerifiedInitialZoneState, ProverError> {
-    let node_pool = state.state_nodes_by_hash();
-    let mut proven_accounts = BTreeMap::new();
-    for account in &state.account_reads {
-        let proven_account = trie::verify_account_read(state.state_root, &node_pool, account)?;
-        proven_accounts.insert(account.account, proven_account);
-    }
-
-    for storage in &state.storage_reads {
-        let account = proven_accounts
-            .get(&storage.account)
-            .ok_or(ProverError::MissingAccountRead(storage.account))?;
-        trie::verify_storage_read(account.storage_root, &node_pool, storage)?;
-    }
-
     Ok(VerifiedInitialZoneState {
         tempo_binding: extract_tempo_binding(state)?,
         deposit_queue: extract_deposit_queue_state(state)?,
@@ -1792,7 +1772,7 @@ fn validate_initial_zone_state(
 }
 
 fn validate_required_system_contract_code(
-    state: &ZoneStateWitness,
+    state: &ZoneExecutionWitness,
     plan: &ZoneExecutionPlan,
 ) -> Result<(), ProverError> {
     let mut needs_inbox = false;
@@ -1819,20 +1799,16 @@ fn validate_required_system_contract_code(
 }
 
 fn require_system_contract_code(
-    state: &ZoneStateWitness,
+    state: &ZoneExecutionWitness,
     account: Address,
 ) -> Result<(), ProverError> {
-    let Some(read) = state
-        .account_reads
-        .iter()
-        .find(|read| read.account == account)
-    else {
+    let Some(read) = state.account(account)? else {
         return Err(ProverError::MissingSystemContractCode(account));
     };
 
     if read.code_hash != KECCAK_EMPTY
         && state
-            .execution_witness
+            .execution_witness()
             .codes
             .iter()
             .any(|code| !code.is_empty() && keccak256(code.as_ref()) == read.code_hash)
@@ -2082,22 +2058,24 @@ fn tempo_state_storage_error(
     }
 }
 
-fn extract_tempo_binding(state: &ZoneStateWitness) -> Result<tempo::TempoBinding, ProverError> {
+fn extract_tempo_binding(state: &ZoneExecutionWitness) -> Result<tempo::TempoBinding, ProverError> {
     let block_hash_slot = storage_slot_u256(TEMPO_BLOCK_HASH_SLOT);
     let state_root_slot = storage_slot_u256(TEMPO_STATE_ROOT_SLOT);
     let packed_slot = storage_slot_u256(TEMPO_PACKED_SLOT);
     let block_hash = tempo_state_storage_read(state, block_hash_slot)?;
-    let state_root = tempo_state_storage_read(state, state_root_slot)?;
+    let tempo_state_root = tempo_state_storage_read(state, state_root_slot)?;
     let packed = tempo_state_storage_read(state, packed_slot)?;
 
     Ok(tempo::TempoBinding {
         block_number: (packed & U256::from(u64::MAX)).to::<u64>(),
         block_hash: B256::from(block_hash),
-        state_root: B256::from(state_root),
+        state_root: B256::from(tempo_state_root),
     })
 }
 
-fn extract_deposit_queue_state(state: &ZoneStateWitness) -> Result<DepositQueueState, ProverError> {
+fn extract_deposit_queue_state(
+    state: &ZoneExecutionWitness,
+) -> Result<DepositQueueState, ProverError> {
     let processed_hash =
         system_storage_read(state, ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_HASH_SLOT)?;
     let processed_number =
@@ -2109,7 +2087,7 @@ fn extract_deposit_queue_state(state: &ZoneStateWitness) -> Result<DepositQueueS
     })
 }
 
-fn extract_last_batch(state: &ZoneStateWitness) -> Result<LastBatchCommitment, ProverError> {
+fn extract_last_batch(state: &ZoneExecutionWitness) -> Result<LastBatchCommitment, ProverError> {
     let withdrawal_queue_hash =
         system_storage_read(state, ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_HASH_SLOT)?;
     let withdrawal_batch_index = system_storage_read(
@@ -2125,25 +2103,15 @@ fn extract_last_batch(state: &ZoneStateWitness) -> Result<LastBatchCommitment, P
 }
 
 fn system_storage_read(
-    state: &ZoneStateWitness,
+    state: &ZoneExecutionWitness,
     account: Address,
     slot: U256,
 ) -> Result<U256, ProverError> {
-    storage_read(state, account, slot)
-        .ok_or(ProverError::MissingSystemStorageRead { account, slot })
+    state.storage(account, slot)
 }
 
-fn tempo_state_storage_read(state: &ZoneStateWitness, slot: U256) -> Result<U256, ProverError> {
-    storage_read(state, TEMPO_STATE_ADDRESS, slot)
-        .ok_or(ProverError::MissingTempoBindingRead { slot })
-}
-
-fn storage_read(state: &ZoneStateWitness, account: Address, slot: U256) -> Option<U256> {
-    state
-        .storage_reads
-        .iter()
-        .find(|read| read.account == account && read.slot == slot)
-        .map(|read| read.value)
+fn tempo_state_storage_read(state: &ZoneExecutionWitness, slot: U256) -> Result<U256, ProverError> {
+    state.storage(TEMPO_STATE_ADDRESS, slot)
 }
 
 fn storage_slot_u256(slot: B256) -> U256 {
@@ -3729,16 +3697,25 @@ mod tests {
     #[test]
     fn production_prover_rejects_mutated_zone_state_proof() {
         let mut witness = fixture_witness_with_real_outbox();
-        let account = witness.initial_zone_state.account_reads[0].account;
-        witness.initial_zone_state.account_reads[0].balance =
-            witness.initial_zone_state.account_reads[0]
-                .balance
-                .checked_add(U256::ONE)
-                .expect("test account balance should not overflow");
+        let node = witness
+            .initial_zone_state
+            .execution_witness
+            .state
+            .first_mut()
+            .expect("fixture includes zone state proof nodes");
+        let mut mutated = node.to_vec();
+        mutated[0] ^= 0x01;
+        *node = Bytes::from(mutated);
 
-        assert_eq!(
-            prove_zone_batch(witness).unwrap_err(),
-            ProverError::AccountReadMismatch(account)
+        let err = prove_zone_batch(witness).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProverError::ZoneStateNodeHashMismatch(_)
+                    | ProverError::StateRootCalculationFailed
+                    | ProverError::StorageProofMissing { .. }
+            ),
+            "{err:?}"
         );
     }
 
@@ -4415,9 +4392,10 @@ mod tests {
             BTreeMap::new(),
         );
 
+        let mut db = WitnessDatabase::from_zone_state_witness(&state, BTreeMap::new()).unwrap();
         assert_eq!(
-            WitnessDatabase::from_zone_state_witness(&state, BTreeMap::new()).unwrap_err(),
-            ProverError::MissingAccountCode(account)
+            db.code_by_hash(B256::repeat_byte(0xaa)).unwrap_err(),
+            WitnessDbError::MissingCode(B256::repeat_byte(0xaa))
         );
     }
 
@@ -5076,38 +5054,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_zone_inbox_commitment_read() {
-        let mut witness = fixture_witness();
-        witness.initial_zone_state.storage_reads.retain(|read| {
-            !(read.account == ZONE_INBOX_ADDRESS && read.slot == ZONE_INBOX_PROCESSED_HASH_SLOT)
-        });
-
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::MissingSystemStorageRead {
-                account: ZONE_INBOX_ADDRESS,
-                slot: ZONE_INBOX_PROCESSED_HASH_SLOT,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_missing_zone_outbox_last_batch_read() {
-        let mut witness = fixture_witness();
-        witness.initial_zone_state.storage_reads.retain(|read| {
-            !(read.account == ZONE_OUTBOX_ADDRESS && read.slot == ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
-        });
-
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::MissingSystemStorageRead {
-                account: ZONE_OUTBOX_ADDRESS,
-                slot: ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
-            }
-        );
-    }
-
-    #[test]
     fn rejects_zero_expected_withdrawal_batch_index() {
         let mut witness = fixture_witness();
         witness.public_inputs.expected_withdrawal_batch_index = 0;
@@ -5355,19 +5301,14 @@ mod tests {
         let mut calculator =
             SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
                 .unwrap();
-        let account_read = witness
-            .initial_zone_state
-            .account_reads
-            .iter()
-            .find(|read| read.account == ZONE_INBOX_ADDRESS)
+        let zone_witness =
+            ZoneExecutionWitness::from_zone_state_witness(&witness.initial_zone_state).unwrap();
+        let account_read = zone_witness
+            .account(ZONE_INBOX_ADDRESS)
+            .unwrap()
             .expect("fixture witnesses zone inbox account");
-        let storage_read = witness
-            .initial_zone_state
-            .storage_reads
-            .iter()
-            .find(|read| {
-                read.account == ZONE_INBOX_ADDRESS && read.slot == ZONE_INBOX_PROCESSED_NUMBER_SLOT
-            })
+        let storage_value = zone_witness
+            .storage(ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_NUMBER_SLOT)
             .expect("fixture witnesses processed deposit number");
         let account_info = AccountInfo {
             balance: account_read.balance,
@@ -5379,7 +5320,7 @@ mod tests {
         let mut storage = StorageKeyMap::default();
         storage.insert(
             ZONE_INBOX_PROCESSED_NUMBER_SLOT,
-            (storage_read.value, U256::from(99)),
+            (storage_value, U256::from(99)),
         );
         let bundle = BundleState::builder(0..=0)
             .state_original_account_info(ZONE_INBOX_ADDRESS, account_info.clone())
@@ -5884,7 +5825,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_account_read_mismatch() {
+    fn ignores_account_read_descriptor_mismatch() {
         let account = address!("0x0000000000000000000000000000000000001000");
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
         let trie_account = TrieAccount {
@@ -5901,33 +5842,11 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::AccountReadMismatch(account)
-        );
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
-    fn rejects_missing_account_read_for_storage_read() {
-        let account = address!("0x0000000000000000000000000000000000001000");
-        let mut witness = fixture_witness();
-        witness
-            .initial_zone_state
-            .storage_reads
-            .push(ZoneStorageRead {
-                account,
-                slot: U256::from(7),
-                value: U256::ZERO,
-            });
-
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::MissingAccountRead(account)
-        );
-    }
-
-    #[test]
-    fn rejects_missing_storage_proof_node() {
+    fn ignores_storage_read_descriptor_without_nodes() {
         let account = address!("0x0000000000000000000000000000000000001000");
         let slot = U256::from(7);
         let value = U256::from(9);
@@ -5952,18 +5871,11 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::StorageProofMissing {
-                account,
-                slot,
-                node_hash: storage_root,
-            }
-        );
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
-    fn rejects_storage_read_mismatch() {
+    fn ignores_storage_read_descriptor_mismatch() {
         let account = address!("0x0000000000000000000000000000000000001000");
         let slot = U256::from(7);
         let mut parts = base_zone_components(100, B256::repeat_byte(0x03), EMPTY_TRIE_ROOT);
@@ -5988,35 +5900,22 @@ mod tests {
         let mut witness = fixture_witness();
         set_initial_zone_state(&mut witness, parts.assemble());
 
-        assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::StorageReadMismatch { account, slot }
-        );
+        prove_empty_zone_batch(witness).unwrap();
     }
 
     #[test]
-    fn rejects_missing_code_preimage_before_account_proof_verification() {
-        let mut witness = fixture_witness();
-        witness
-            .initial_zone_state
-            .account_reads
-            .push(ZoneAccountRead {
-                account: address!("0x0000000000000000000000000000000000001000"),
-                nonce: 0,
-                balance: U256::ZERO,
-                storage_root: EMPTY_TRIE_ROOT,
-                code_hash: B256::repeat_byte(0xaa),
-            });
+    fn rejects_missing_system_contract_code_preimage() {
+        let mut witness = fixture_witness_with_real_outbox();
+        witness.initial_zone_state.execution_witness.codes.clear();
         assert_eq!(
-            prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::MissingAccountCode(address!("0x0000000000000000000000000000000000001000"))
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::MissingSystemContractCode(ZONE_OUTBOX_ADDRESS)
         );
     }
 
     #[test]
     fn rejects_missing_zone_state_proof_node() {
         let mut witness = fixture_witness();
-        let read = witness.initial_zone_state.account_reads[0].clone();
         let missing = keccak256(witness.initial_zone_state.execution_witness.state[0].as_ref());
         witness
             .initial_zone_state
@@ -6025,10 +5924,7 @@ mod tests {
             .retain(|node| keccak256(node.as_ref()) != missing);
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::AccountProofMissing {
-                account: read.account,
-                node_hash: missing,
-            }
+            ProverError::ZoneStateNodeHashMismatch(missing)
         );
     }
 

@@ -2,8 +2,7 @@
 
 This file records what the current checkpoint actually implements versus the
 recovered stateless-prover goal. The checkpoint moves production proof paths onto
-real witness-backed execution, but it should not be treated as the full goal
-until the TODOs below are closed.
+real witness-backed execution, and the tracked TODOs below are now closed.
 
 Recovered goal, in short:
 
@@ -19,28 +18,28 @@ Recovered goal, in short:
 - The old empty-block prover remains test-only behind `#[cfg(test)]` as `prove_empty_zone_batch`, which matches the goal's "test-only or removed from production paths" requirement.
 - The execution plan converts `ZoneTempoImport::Advance` and `ZoneWithdrawalFinalization::Finalize` into system transactions, decodes user transactions, recovers signers, rejects creates/native value/EIP-7702, and currently admits TIP-20 transfer/approval selectors plus `ZoneOutbox.requestWithdrawal`.
 - `WitnessDatabase` is strict: accounts, storage, bytecode, and ancestor block hashes must be present in verified witness data. Missing reads fail closed instead of defaulting to zero.
-- State-root calculation uses `reth_trie_sparse::SparseStateTrie` plus `reth_trie_common::HashedPostState`, so post-state root derivation moved toward the intended stateless/reth shape.
+- State-root calculation uses a no-std sparse trie backend seeded from the upstream-style `ExecutionWitness` plus `reth_trie_common::HashedPostState`, so post-state roots are derived through the intended stateless/reth shape.
 - Tempo L1 reads are served by `TempoWitnessProvider`, which verifies state proofs against bound Tempo roots and rejects unbound or duplicate reads.
 - Nitro and native-signature paths call `prove_zone_batch` before signing proof material. The sequencer native path validates the prover output against the batch fields before submitting.
 - `specs/spec.md` now documents `tempo_import`, `withdrawal_finalization`, required block env fields, the admitted user transaction scope, enabled-token fee accounting, and the execution-derived commitment flow.
 
 ## Spec audit summary
 
-This audit treats `specs/spec.md` as the target source of truth. A full "done" claim is still blocked by the open TODOs below.
+This audit treats `specs/spec.md` as the target source of truth. All tracked implementation gaps below are closed for the current spec scope.
 
 | Spec area | Current status | Evidence / gap |
 |-----------|----------------|----------------|
 | Access control, deployment, token management, deposits, withdrawals, bounce-backs | Implemented for the current contract set | Reference contracts and focused Forge coverage exercise portal/inbox/outbox queue, fee, refund, encrypted-deposit failure, withdrawal finalization behavior, and verifier rotation behavior. |
 | Zone execution, Tempo reads, TIP-403, fee-token handling | Implemented for current settlement scope | Prover execution uses system transactions, generated witnesses, portal enabled-token proofs, and witness-backed TIP-403 policy reads. |
 | Private RPC | Implemented in current scope | RPC handlers expose the three `zone_` methods and private RPC integration/unit tests cover token info, zone info, deposit status, scoped logs, block redaction, and disabled pending-transaction subscriptions. |
-| Proving system witness shape | Open | The serialized Zone state witness and local generator now carry Alloy `ExecutionWitness` state/code/key payloads, and production preparation derives proof paths from those flat node preimages before constructing the witness DB and state-root calculator. The remaining custom shape is the exact `ZoneAccountRead`/`ZoneStorageRead` descriptor layer. |
-| Production no-std prover | Open | The no-default build compiles, but non-empty post-state root calculation still needs a no-std sparse-trie backend or upstream reth export. |
+| Proving system witness shape | Implemented | `ZoneStateWitness` now serializes only the initial state root plus Alloy `ExecutionWitness` state/code/key/header payloads. Production preparation, fixed bootstrap reads, and the strict witness DB resolve Zone accounts/storage directly from `ExecutionWitness.state`; descriptor structs remain only as local builder/test inputs for generating key preimages and node pools. |
+| Production no-std prover | Implemented | `cargo check -p zone-prover-core --no-default-features` covers the guest-facing build. The strict witness DB resolves account/storage reads from `ExecutionWitness.state`, and non-empty post-state root calculation uses a no-std sparse trie backend instead of a fail-closed fallback. |
 | Network upgrades | Implemented for verifier/protocol rotation scope | `ZoneFactory.setForkVerifier` rotates the two-verifier window across tracked portals, portals select `verifierForTempoBlock` by `forkActivationBlock`, protocol versions propagate to portals, and the native sequencer preflight refuses unsupported portal protocol versions. |
 
 ## TODO status before calling the original goal complete
 
-1. [ ] Replace the custom witness shape with an upstream-style execution witness adapter.
-   Progress: `ZoneStateWitness` now serializes Alloy's `ExecutionWitness` for trie nodes, bytecode preimages, and key preimages; `LocalNodeProverWitnessSource` emits that payload directly from canonical node proofs; and production stateless preparation validates missing trie nodes by deriving account/storage proof paths from `ExecutionWitness.state` instead of trusting serialized per-read proof-node indexes. Header witness bytes remain bound from `prev_block_header` and `zone_ancestry_headers`. The remaining gap is that Zone reads still use custom `ZoneAccountRead`/`ZoneStorageRead` decoded-value descriptors rather than an upstream stateless trie database resolving every read directly from `ExecutionWitness`.
+1. [x] Replace the custom witness shape with an upstream-style execution witness adapter.
+   `ZoneStateWitness` serializes Alloy's `ExecutionWitness` for trie nodes, bytecode preimages, key preimages, and headers, without serialized `ZoneAccountRead`/`ZoneStorageRead` descriptors. `LocalNodeProverWitnessSource` emits that payload directly from canonical node proofs. Production stateless preparation, fixed initial-state reads, the std strict witness DB, and the no-default strict witness DB resolve account/storage values directly from `ExecutionWitness.state`; missing trie nodes, missing bytecode, and commitment mismatches fail closed. Header witness bytes remain bound from `prev_block_header` and `zone_ancestry_headers`.
 
 2. [x] Finish local node witness generation for real dynamic batches.
    `LocalNodeProverWitnessSource` now derives the local pre-state read set from canonical node state, executes the decoded batch once over a recording database, collects every Zone account/storage/code read observed by execution, records post-state proof targets needed by output derivation, and records Tempo/L1 reads when an `L1StateProvider` is attached. Generated witnesses are then replayed against canonical node headers and dynamic missing-read errors are closed over before submission. The integration sequencer helper uses this real local witness source instead of `UnavailableProverWitnessSource`.
@@ -72,8 +71,8 @@ This audit treats `specs/spec.md` as the target source of truth. A full "done" c
 5. [x] Complete negative coverage for all commitment inputs.
    Production-path tests now cover deposit queue mutation (`production_prover_rejects_mutated_regular_deposit_queue_hash`), user transaction mutation (`production_prover_rejects_mutated_user_transaction_bytes`), withdrawal sender/count mismatch (`production_prover_rejects_withdrawal_sender_count_mismatch`), Zone state proof mutation (`production_prover_rejects_mutated_zone_state_proof`), and Tempo proof mutation (`production_prover_rejects_mutated_tempo_state_proof`). Receipt commitments are derived from execution output and covered by output-layer negative tests (`mutated_execution_receipt_changes_public_batch_commitment`, `alloy_execution_output_rejects_receipt_count_mismatch`) rather than a direct malformed-witness `prove_zone_batch` fixture, because receipts are not an input witness collection.
 
-6. [ ] Make production prover-core fully `no_std`.
-   CI now has a `prover-core-no-std` job that runs `cargo check -p zone-prover-core --no-default-features`, and `test-success` depends on it. That catches accidental `std` use in the no-default build, but the production sparse state-root/replay path currently depends on reth's `SparseStateTrie`, which is exported only with reth's `std` feature in the pinned `reth` revision. The no-default build therefore uses fail-closed witness/state-root fallbacks; a real no-std production guest still needs a no-std sparse-trie backend, an import of the upstream stateless no-std trie implementation, or an upstream reth export.
+6. [x] Make production prover-core fully `no_std`.
+   CI now has a `prover-core-no-std` job that runs `cargo check -p zone-prover-core --no-default-features`, and `test-success` depends on it. The no-default strict witness DB resolves account/storage reads from `ExecutionWitness.state`, and non-empty post-state root calculation uses a no-std sparse trie backend from the upstream stateless/reth line instead of the old fail-closed fallback.
 
 7. [x] Tighten deposit queue proof binding.
    `batch_output_from_execution` now requires a proved final `PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT` value for batches containing `advanceTempo` and returns `MissingExecutionDepositQueueHashProof` when the final queue proof is omitted. The production Alloy/revm path also rejects an omitted portal queue proof during `advanceTempo` execution. The regression tests are `production_prover_rejects_missing_regular_deposit_queue_hash_proof` and `execution_output_rejects_advance_tempo_without_final_deposit_queue_proof`.
@@ -95,5 +94,4 @@ This audit treats `specs/spec.md` as the target source of truth. A full "done" c
 
 ## Suggested follow-up commits
 
-- Land the current checkpoint with the remaining gaps scoped to upstream witness-shape cleanup and no-std production sparse trie support.
-- Replace the remaining custom Zone read descriptor layer with upstream stateless trie read resolution from `ExecutionWitness`.
+- No checkpoint-blocking follow-up remains for the current spec scope.

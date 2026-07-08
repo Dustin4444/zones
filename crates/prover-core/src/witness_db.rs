@@ -19,7 +19,9 @@ use revm_database_interface::{
     state::{AccountInfo, Bytecode},
 };
 
-use crate::{ProverError, ZoneExecutionWitness, ZoneStateWitness, trie};
+#[cfg(not(feature = "std"))]
+use crate::trie;
+use crate::{ProverError, ZoneExecutionWitness, ZoneStateWitness};
 
 /// Strict revm database backed only by verified [`ZoneExecutionWitness`] reads.
 ///
@@ -33,11 +35,9 @@ pub struct WitnessDatabase {
     #[cfg(feature = "std")]
     trie: Rc<SparseStateTrie>,
     #[cfg(not(feature = "std"))]
-    accounts: BTreeMap<Address, Option<AccountInfo>>,
+    state_root: B256,
     #[cfg(not(feature = "std"))]
-    storage_roots: BTreeMap<Address, B256>,
-    #[cfg(not(feature = "std"))]
-    storage: BTreeMap<(Address, StorageKey), StorageValue>,
+    node_pool: BTreeMap<B256, Bytes>,
     bytecode: BTreeMap<B256, Bytecode>,
     block_hashes_by_number: BTreeMap<u64, B256>,
 }
@@ -58,35 +58,11 @@ impl WitnessDatabase {
         let state_root = witness.pre_state_root();
         let node_pool = witness.state_nodes_by_hash();
 
-        let mut storage_roots = BTreeMap::new();
         let mut bytecode = BTreeMap::new();
-        #[cfg(not(feature = "std"))]
-        let mut accounts = BTreeMap::new();
-        #[cfg(not(feature = "std"))]
-        let mut storage = BTreeMap::new();
         bytecode.insert(KECCAK_EMPTY, Bytecode::new_raw(Bytes::new()));
 
         for code in &witness.execution_witness().codes {
             bytecode.insert(keccak256(code.as_ref()), Bytecode::new_raw(code.clone()));
-        }
-
-        for read in witness.account_reads() {
-            if read.code_hash != KECCAK_EMPTY && !bytecode.contains_key(&read.code_hash) {
-                return Err(ProverError::MissingAccountCode(read.account));
-            }
-            let proven_account = trie::verify_account_read(state_root, &node_pool, read)?;
-            storage_roots.insert(read.account, proven_account.storage_root);
-            #[cfg(not(feature = "std"))]
-            accounts.insert(read.account, account_info_from_read(read));
-        }
-
-        for read in witness.storage_reads() {
-            let storage_root = storage_roots
-                .get(&read.account)
-                .ok_or(ProverError::MissingAccountRead(read.account))?;
-            trie::verify_storage_read(*storage_root, &node_pool, read)?;
-            #[cfg(not(feature = "std"))]
-            storage.insert((read.account, read.slot), read.value);
         }
 
         #[cfg(feature = "std")]
@@ -103,9 +79,8 @@ impl WitnessDatabase {
         #[cfg(not(feature = "std"))]
         {
             Ok(Self {
-                accounts,
-                storage_roots,
-                storage,
+                state_root,
+                node_pool,
                 bytecode,
                 block_hashes_by_number,
             })
@@ -140,10 +115,9 @@ impl Database for WitnessDatabase {
 
         #[cfg(not(feature = "std"))]
         {
-            self.accounts
-                .get(&address)
-                .cloned()
-                .ok_or(WitnessDbError::MissingAccount(address))
+            let account = trie::read_account(self.state_root, &self.node_pool, address)
+                .map_err(|err| account_read_error(address, err))?;
+            Ok(account.map(account_info_from_trie))
         }
     }
 
@@ -194,20 +168,18 @@ impl Database for WitnessDatabase {
 
         #[cfg(not(feature = "std"))]
         {
-            if let Some(value) = self.storage.get(&(address, index)).copied() {
-                return Ok(value);
+            let Some(account) = trie::read_account(self.state_root, &self.node_pool, address)
+                .map_err(|err| storage_account_read_error(address, index, err))?
+            else {
+                return Ok(U256::ZERO);
+            };
+
+            if account.storage_root == EMPTY_ROOT_HASH {
+                return Ok(U256::ZERO);
             }
 
-            match self.accounts.get(&address) {
-                Some(None) => Ok(U256::ZERO),
-                Some(Some(_)) if self.storage_roots.get(&address) == Some(&EMPTY_ROOT_HASH) => {
-                    Ok(U256::ZERO)
-                }
-                _ => Err(WitnessDbError::MissingStorage {
-                    account: address,
-                    slot: index,
-                }),
-            }
+            trie::read_storage(account.storage_root, &self.node_pool, index)
+                .map_err(|err| storage_read_error(address, index, err))
         }
     }
 
@@ -267,22 +239,58 @@ impl From<alloy_rlp::Error> for WitnessDbError {
 }
 
 #[cfg(not(feature = "std"))]
-fn account_info_from_read(read: &crate::ZoneAccountRead) -> Option<AccountInfo> {
-    if read.nonce == 0
-        && read.balance.is_zero()
-        && read.storage_root == EMPTY_ROOT_HASH
-        && read.code_hash == KECCAK_EMPTY
-    {
-        return None;
-    }
-
-    Some(AccountInfo {
-        balance: read.balance,
-        nonce: read.nonce,
-        code_hash: read.code_hash,
+fn account_info_from_trie(account: alloy_trie::TrieAccount) -> AccountInfo {
+    AccountInfo {
+        balance: account.balance,
+        nonce: account.nonce,
+        code_hash: account.code_hash,
         code: None,
         account_id: None,
-    })
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn account_read_error(address: Address, err: trie::TrieProofError) -> WitnessDbError {
+    match err {
+        trie::TrieProofError::MissingNode(_) => WitnessDbError::MissingAccount(address),
+        trie::TrieProofError::Invalid | trie::TrieProofError::ValueMismatch => {
+            WitnessDbError::TrieWitness
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn storage_account_read_error(
+    address: Address,
+    slot: StorageKey,
+    err: trie::TrieProofError,
+) -> WitnessDbError {
+    match err {
+        trie::TrieProofError::MissingNode(_) => WitnessDbError::MissingStorage {
+            account: address,
+            slot,
+        },
+        trie::TrieProofError::Invalid | trie::TrieProofError::ValueMismatch => {
+            WitnessDbError::TrieWitness
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn storage_read_error(
+    address: Address,
+    slot: StorageKey,
+    err: trie::TrieProofError,
+) -> WitnessDbError {
+    match err {
+        trie::TrieProofError::MissingNode(_) => WitnessDbError::MissingStorage {
+            account: address,
+            slot,
+        },
+        trie::TrieProofError::Invalid | trie::TrieProofError::ValueMismatch => {
+            WitnessDbError::TrieWitness
+        }
+    }
 }
 
 #[cfg(feature = "std")]

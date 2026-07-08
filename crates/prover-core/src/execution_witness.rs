@@ -6,24 +6,23 @@ use alloc::{
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Encodable;
 pub use alloy_rpc_types_debug::ExecutionWitness;
-use alloy_trie::KECCAK_EMPTY;
+use alloy_trie::TrieAccount;
 use zone_primitives::ZoneHeader;
 
-use crate::{BatchWitness, ProverError, ZoneAccountRead, ZoneStateWitness, ZoneStorageRead};
+use crate::{BatchWitness, ProverError, ZoneAccountRead, ZoneStateWitness, ZoneStorageRead, trie};
 
 /// Adapter from the current Zone witness payload to Alloy's upstream
 /// [`ExecutionWitness`] shape.
 ///
 /// `ExecutionWitness` carries flat trie-node, bytecode, key-preimage, and
-/// header payloads. Until the external Zone witness format is migrated fully,
-/// this adapter keeps the decoded read descriptors only as a compatibility
-/// layer for strict read validation and no-std fallback maps.
+/// header payloads. Zone account and storage reads are resolved on demand by
+/// walking the trie nodes committed under `pre_state_root`; decoded read
+/// descriptors are only local inputs used to derive key preimages while
+/// assembling an execution witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneExecutionWitness {
     pre_state_root: B256,
     execution_witness: ExecutionWitness,
-    account_reads: Vec<ZoneAccountRead>,
-    storage_reads: Vec<ZoneStorageRead>,
 }
 
 impl ZoneExecutionWitness {
@@ -42,17 +41,12 @@ impl ZoneExecutionWitness {
         state: &ZoneStateWitness,
         headers: Vec<Bytes>,
     ) -> Result<Self, ProverError> {
-        validate_code_preimages(state)?;
-        validate_key_preimages(state)?;
-
         let mut execution_witness = state.execution_witness.clone();
         execution_witness.headers = headers;
 
         Ok(Self {
             pre_state_root: state.state_root,
             execution_witness,
-            account_reads: state.account_reads.clone(),
-            storage_reads: state.storage_reads.clone(),
         })
     }
 
@@ -72,54 +66,45 @@ impl ZoneExecutionWitness {
             .collect()
     }
 
-    pub fn account_reads(&self) -> &[ZoneAccountRead] {
-        &self.account_reads
+    pub fn account(&self, account: Address) -> Result<Option<TrieAccount>, ProverError> {
+        let node_pool = self.state_nodes_by_hash();
+        trie::read_account(self.pre_state_root, &node_pool, account)
+            .map_err(|err| account_read_error(account, err))
     }
 
-    pub fn storage_reads(&self) -> &[ZoneStorageRead] {
-        &self.storage_reads
+    pub fn storage(&self, account: Address, slot: U256) -> Result<U256, ProverError> {
+        let Some(account_state) = self.account(account)? else {
+            return Ok(U256::ZERO);
+        };
+        if account_state.storage_root == alloy_trie::EMPTY_ROOT_HASH {
+            return Ok(U256::ZERO);
+        }
+        let node_pool = self.state_nodes_by_hash();
+        trie::read_storage(account_state.storage_root, &node_pool, slot)
+            .map_err(|err| storage_read_error(account, slot, err))
     }
 }
 
-fn validate_code_preimages(state: &ZoneStateWitness) -> Result<(), ProverError> {
-    let mut codes = BTreeSet::new();
-    for code in &state.execution_witness.codes {
-        codes.insert(keccak256(code.as_ref()));
-    }
-
-    for read in &state.account_reads {
-        if read.code_hash != KECCAK_EMPTY && !codes.contains(&read.code_hash) {
-            return Err(ProverError::MissingAccountCode(read.account));
+fn account_read_error(account: Address, err: trie::TrieProofError) -> ProverError {
+    match err {
+        trie::TrieProofError::MissingNode(node_hash) => {
+            ProverError::AccountProofMissing { account, node_hash }
         }
+        trie::TrieProofError::Invalid => ProverError::AccountProofInvalid(account),
+        trie::TrieProofError::ValueMismatch => ProverError::AccountReadMismatch(account),
     }
-
-    Ok(())
 }
 
-fn validate_key_preimages(state: &ZoneStateWitness) -> Result<(), ProverError> {
-    let keys = state
-        .execution_witness
-        .keys
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
-    for read in &state.account_reads {
-        if !keys.contains(&Bytes::copy_from_slice(read.account.as_slice())) {
-            return Err(ProverError::MissingExecutionWitnessAccountKey(read.account));
-        }
+fn storage_read_error(account: Address, slot: U256, err: trie::TrieProofError) -> ProverError {
+    match err {
+        trie::TrieProofError::MissingNode(node_hash) => ProverError::StorageProofMissing {
+            account,
+            slot,
+            node_hash,
+        },
+        trie::TrieProofError::Invalid => ProverError::StorageProofInvalid { account, slot },
+        trie::TrieProofError::ValueMismatch => ProverError::StorageReadMismatch { account, slot },
     }
-
-    for read in &state.storage_reads {
-        if !keys.contains(&Bytes::copy_from_slice(&read.slot.to_be_bytes::<32>())) {
-            return Err(ProverError::MissingExecutionWitnessStorageKey {
-                account: read.account,
-                slot: read.slot,
-            });
-        }
-    }
-
-    Ok(())
 }
 
 pub(crate) fn execution_witness_keys(
@@ -155,7 +140,7 @@ mod tests {
     use super::*;
 
     use alloy_primitives::address;
-    use alloy_trie::EMPTY_ROOT_HASH;
+    use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY};
 
     #[test]
     fn adapter_exports_upstream_execution_witness_payload() {
@@ -210,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_rejects_missing_execution_witness_key() {
+    fn adapter_does_not_trust_descriptor_key_lists() {
         let account = address!("0x00000000000000000000000000000000000000aa");
         let slot = U256::from(7);
         let mut state = ZoneStateWitness::from_node_pool(
@@ -235,9 +220,6 @@ mod tests {
             .keys
             .retain(|key| key.as_ref() != slot.to_be_bytes::<32>().as_slice());
 
-        assert_eq!(
-            ZoneExecutionWitness::from_zone_state_witness(&state).unwrap_err(),
-            ProverError::MissingExecutionWitnessStorageKey { account, slot }
-        );
+        ZoneExecutionWitness::from_zone_state_witness(&state).unwrap();
     }
 }

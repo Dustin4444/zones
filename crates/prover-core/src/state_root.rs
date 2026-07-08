@@ -1,19 +1,12 @@
-#[cfg(feature = "std")]
 use alloc::vec::Vec;
 
-use alloy_primitives::B256;
-#[cfg(feature = "std")]
-use alloy_primitives::map::B256Map;
-#[cfg(feature = "std")]
+use alloy_primitives::{B256, map::B256Map};
 use alloy_rlp::Decodable;
 use alloy_trie::EMPTY_ROOT_HASH;
-#[cfg(feature = "std")]
 use alloy_trie::TrieAccount;
-#[cfg(feature = "std")]
-use reth_trie_common::DecodedMultiProofV2;
 use reth_trie_common::HashedPostState;
-#[cfg(feature = "std")]
-use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie};
+use stateless_reth_trie_common::DecodedMultiProofV2;
+use stateless_reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie};
 
 use crate::{ProverError, ZoneExecutionWitness, ZoneStateWitness};
 
@@ -34,12 +27,10 @@ impl CalculatedStateRoot {
 
 /// Reth sparse-trie state root calculator for stateless Zone execution.
 #[derive(Debug, Default)]
-#[cfg(feature = "std")]
 pub struct SparseStateRootCalculator {
     trie: SparseStateTrie,
 }
 
-#[cfg(feature = "std")]
 impl SparseStateRootCalculator {
     pub const fn new(trie: SparseStateTrie) -> Self {
         Self { trie }
@@ -104,49 +95,7 @@ impl SparseStateRootCalculator {
     }
 }
 
-#[cfg(not(feature = "std"))]
-#[derive(Debug, Clone, Copy)]
-pub struct SparseStateRootCalculator {
-    root: B256,
-}
-
-#[cfg(not(feature = "std"))]
-impl SparseStateRootCalculator {
-    pub const fn from_zone_execution_witness(
-        witness: &ZoneExecutionWitness,
-    ) -> Result<Self, ProverError> {
-        Ok(Self {
-            root: witness.pre_state_root(),
-        })
-    }
-
-    pub const fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
-        Ok(Self {
-            root: state.state_root,
-        })
-    }
-
-    pub const fn revealed_empty() -> Self {
-        Self {
-            root: EMPTY_ROOT_HASH,
-        }
-    }
-
-    pub fn calculate(
-        &mut self,
-        post_state: HashedPostState,
-    ) -> Result<CalculatedStateRoot, ProverError> {
-        let HashedPostState { accounts, storages } = post_state;
-        if accounts.is_empty() && storages.is_empty() {
-            Ok(CalculatedStateRoot(self.root))
-        } else {
-            Err(ProverError::StateRootCalculationFailed)
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-pub fn calculate_state_root(
+pub(crate) fn calculate_state_root(
     trie: &mut SparseStateTrie,
     state: HashedPostState,
 ) -> Result<CalculatedStateRoot, ProverError> {
@@ -220,7 +169,6 @@ pub fn calculate_state_root(
         .map_err(|_| ProverError::StateRootCalculationFailed)
 }
 
-#[cfg(feature = "std")]
 fn take_storage_trie_for_update(
     trie: &mut SparseStateTrie,
     address: B256,
@@ -242,7 +190,6 @@ fn take_storage_trie_for_update(
     Ok(RevealableSparseTrie::revealed_empty())
 }
 
-#[cfg(feature = "std")]
 fn revealed_account_storage_root(
     trie: &SparseStateTrie,
     address: B256,

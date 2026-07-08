@@ -31,6 +31,8 @@ alloy-sol-types = { workspace = true }
 alloy-trie = { workspace = true, features = ["ethereum"] }
 reth-trie-common = { workspace = true }
 reth-trie-sparse = { workspace = true }
+stateless-reth-trie-common = { package = "reth-trie-common", git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+stateless-reth-trie-sparse = { package = "reth-trie-sparse", git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
 revm = { workspace = true }
 revm-database = { workspace = true }
 revm-database-interface = { workspace = true }

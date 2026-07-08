@@ -139,9 +139,10 @@ use zone_prover::types::{
     TEMPO_STATE_READER_PER_SLOT_GAS, TIP20_TRANSFER_POLICY_ID_SLOT,
     WitnessZoneBlockExecutorProvider, ZoneAccountRead, ZoneAlloyBlockExecutor, ZoneBlock,
     ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneBlockExecutionInput,
-    ZoneCfgEnvWitness, ZoneEthExecutorSpec, ZoneStateWitness, ZoneStorageRead, ZoneTempoImport,
-    ZoneWithdrawalFinalization, ZoneWitnessEvmFactory, batch_output_from_execution,
-    execute_prepared_blocks, prepare_stateless_execution, zone_witness_precompiles,
+    ZoneCfgEnvWitness, ZoneEthExecutorSpec, ZoneExecutionWitness, ZoneStateWitness,
+    ZoneStorageRead, ZoneTempoImport, ZoneWithdrawalFinalization, ZoneWitnessEvmFactory,
+    batch_output_from_execution, execute_prepared_blocks, prepare_stateless_execution,
+    zone_witness_precompiles,
 };
 use zone_sequencer::{
     BatchAnchorConfig, BatchWitness, ProverWitnessRequest, ProverWitnessSource,
@@ -2546,12 +2547,10 @@ fn required_storage_word(
     account: Address,
     slot: U256,
 ) -> eyre::Result<U256> {
-    state
-        .storage_reads
-        .iter()
-        .find(|read| read.account == account && read.slot == slot)
-        .map(|read| read.value)
-        .ok_or_else(|| eyre::eyre!("initial zone witness missing storage read {account}[{slot}]"))
+    let witness = ZoneExecutionWitness::from_zone_state_witness(state)?;
+    witness
+        .storage(account, slot)
+        .map_err(|err| eyre::eyre!("initial zone witness cannot prove {account}[{slot}]: {err}"))
 }
 
 fn low_u64(value: U256) -> u64 {
