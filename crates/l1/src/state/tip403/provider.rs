@@ -658,8 +658,8 @@ impl PolicyCheck for PolicyProvider {
         })
     }
 
-    fn policy_id_counter(&self) -> u64 {
+    fn policy_id_counter(&self) -> Result<u64, PrecompileError> {
         let cache = self.cache.read();
-        cache.policies().keys().max().map_or(2, |max| max + 1)
+        Ok(cache.policies().keys().max().map_or(2, |max| max + 1))
     }
 }

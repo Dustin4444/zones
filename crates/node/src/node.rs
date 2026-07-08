@@ -76,7 +76,7 @@ use std::{
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::hardfork::{TempoHardfork, TempoHardforks as _};
 use tempo_chainspec::spec::TempoChainSpec;
-use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+use tempo_contracts::precompiles::{ITIP403Registry::PolicyType, TIP403_REGISTRY_ADDRESS};
 use tempo_evm::{TempoBlockEnv, TempoEvmConfig, evm::TempoEvm};
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
@@ -128,6 +128,11 @@ use zone_primitives::{
         ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
     },
     policy::AuthRole,
+    tip403::{
+        POLICY_ID_COUNTER_SLOT, POLICY_TYPE_BLACKLIST, POLICY_TYPE_COMPOUND, POLICY_TYPE_WHITELIST,
+        Tip403PolicyData, decode_compound_policy_data, decode_policy_data, policy_record_base_slot,
+        policy_record_compound_slot, policy_set_account_slot, slot_b256,
+    },
 };
 use zone_prover::types::{
     AlloyZoneBlockExecutor, BatchStateProof, L1StateRead, TEMPO_STATE_READER_BASE_GAS,
@@ -1793,10 +1798,83 @@ impl RecordingPolicyProvider {
         }
     }
 
-    fn missing_policy(policy_id: u64) -> PrecompileError {
+    fn policy_not_found(policy_id: u64) -> PrecompileError {
         PrecompileError::Fatal(format!(
-            "missing witness-backed TIP-403 policy data for policy {policy_id}"
+            "witness-backed TIP-403 policy {policy_id} does not exist"
         ))
+    }
+
+    fn invalid_policy_type(policy_id: u64, policy_type: u8) -> PrecompileError {
+        PrecompileError::Fatal(format!(
+            "invalid witness-backed TIP-403 policy type {policy_type} for policy {policy_id}"
+        ))
+    }
+
+    fn incompatible_policy_type(policy_id: u64) -> PrecompileError {
+        PrecompileError::Fatal(format!(
+            "witness-backed TIP-403 policy {policy_id} has an incompatible policy type"
+        ))
+    }
+
+    fn read_registry_word(&self, slot: U256) -> Result<U256, PrecompileError> {
+        let word = self.tempo_state_reader.read_storage_word(
+            self.tempo_block_number,
+            TIP403_REGISTRY_ADDRESS,
+            slot_b256(slot),
+        )?;
+        Ok(U256::from_be_bytes(word.0))
+    }
+
+    fn read_policy_counter(&self) -> Result<u64, PrecompileError> {
+        Ok(self
+            .read_registry_word(POLICY_ID_COUNTER_SLOT)?
+            .to::<u64>()
+            .max(2))
+    }
+
+    fn read_policy_data(&self, policy_id: u64) -> Result<Tip403PolicyData, PrecompileError> {
+        let data = decode_policy_data(self.read_registry_word(policy_record_base_slot(policy_id))?);
+
+        if data.policy_type == POLICY_TYPE_WHITELIST
+            && data.admin.is_zero()
+            && policy_id >= self.read_policy_counter()?
+        {
+            return Err(Self::policy_not_found(policy_id));
+        }
+
+        Ok(data)
+    }
+
+    fn policy_type_from_raw(
+        policy_id: u64,
+        policy_type: u8,
+    ) -> Result<PolicyType, PrecompileError> {
+        match policy_type {
+            POLICY_TYPE_WHITELIST => Ok(PolicyType::WHITELIST),
+            POLICY_TYPE_BLACKLIST => Ok(PolicyType::BLACKLIST),
+            POLICY_TYPE_COMPOUND => Ok(PolicyType::COMPOUND),
+            _ => Err(Self::invalid_policy_type(policy_id, policy_type)),
+        }
+    }
+
+    fn is_authorized_simple(&self, policy_id: u64, user: Address) -> Result<bool, PrecompileError> {
+        match policy_id {
+            REJECT_ALL_POLICY_ID => return Ok(false),
+            ALLOW_ALL_POLICY_ID => return Ok(true),
+            _ => {}
+        }
+
+        let data = self.read_policy_data(policy_id)?;
+        let is_in_set = !self
+            .read_registry_word(policy_set_account_slot(policy_id, user))?
+            .is_zero();
+
+        match data.policy_type {
+            POLICY_TYPE_WHITELIST => Ok(is_in_set),
+            POLICY_TYPE_BLACKLIST => Ok(!is_in_set),
+            POLICY_TYPE_COMPOUND => Err(Self::incompatible_policy_type(policy_id)),
+            other => Err(Self::invalid_policy_type(policy_id, other)),
+        }
     }
 }
 
@@ -1804,13 +1882,39 @@ impl PolicyCheck for RecordingPolicyProvider {
     fn is_authorized(
         &self,
         policy_id: u64,
-        _user: Address,
-        _role: AuthRole,
+        user: Address,
+        role: AuthRole,
     ) -> Result<bool, PrecompileError> {
         match policy_id {
             REJECT_ALL_POLICY_ID => Ok(false),
             ALLOW_ALL_POLICY_ID => Ok(true),
-            _ => Err(Self::missing_policy(policy_id)),
+            _ => {
+                let data = self.read_policy_data(policy_id)?;
+                if data.policy_type != POLICY_TYPE_COMPOUND {
+                    return self.is_authorized_simple(policy_id, user);
+                }
+
+                let compound = decode_compound_policy_data(
+                    self.read_registry_word(policy_record_compound_slot(policy_id))?,
+                );
+                match role {
+                    AuthRole::Sender => self.is_authorized_simple(compound.sender_policy_id, user),
+                    AuthRole::Recipient => {
+                        self.is_authorized_simple(compound.recipient_policy_id, user)
+                    }
+                    AuthRole::MintRecipient => {
+                        self.is_authorized_simple(compound.mint_recipient_policy_id, user)
+                    }
+                    AuthRole::Transfer => {
+                        let sender_ok =
+                            self.is_authorized_simple(compound.sender_policy_id, user)?;
+                        if !sender_ok {
+                            return Ok(false);
+                        }
+                        self.is_authorized_simple(compound.recipient_policy_id, user)
+                    }
+                }
+            }
         }
     }
 
@@ -1836,23 +1940,38 @@ impl PolicyCheck for RecordingPolicyProvider {
         match policy_id {
             REJECT_ALL_POLICY_ID => Ok(PolicyType::WHITELIST),
             ALLOW_ALL_POLICY_ID => Ok(PolicyType::BLACKLIST),
-            _ => Err(Self::missing_policy(policy_id)),
+            _ => {
+                let data = self.read_policy_data(policy_id)?;
+                Self::policy_type_from_raw(policy_id, data.policy_type)
+            }
         }
     }
 
     fn compound_policy_data(&self, policy_id: u64) -> Result<(u64, u64, u64), PrecompileError> {
-        Err(Self::missing_policy(policy_id))
+        let data = self.read_policy_data(policy_id)?;
+        if data.policy_type != POLICY_TYPE_COMPOUND {
+            return Err(Self::incompatible_policy_type(policy_id));
+        }
+
+        let compound = decode_compound_policy_data(
+            self.read_registry_word(policy_record_compound_slot(policy_id))?,
+        );
+        Ok((
+            compound.sender_policy_id,
+            compound.recipient_policy_id,
+            compound.mint_recipient_policy_id,
+        ))
     }
 
     fn policy_exists(&self, policy_id: u64) -> Result<bool, PrecompileError> {
         match policy_id {
             REJECT_ALL_POLICY_ID | ALLOW_ALL_POLICY_ID => Ok(true),
-            _ => Err(Self::missing_policy(policy_id)),
+            _ => Ok(policy_id < self.read_policy_counter()?),
         }
     }
 
-    fn policy_id_counter(&self) -> u64 {
-        2
+    fn policy_id_counter(&self) -> Result<u64, PrecompileError> {
+        self.read_policy_counter()
     }
 }
 

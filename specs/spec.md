@@ -785,8 +785,9 @@ Current callers:
 
 - `ZoneInbox`: `currentDepositQueueHash` and encryption keys from the portal
 - `ZoneConfig`: sequencer address, token registry from the portal
+- `ZoneFeeManager`: portal enabled-token configuration for fee-token validation
 
-TIP-403 policy authorization on the zone is handled by a dedicated read-only proxy precompile (at the same address as the L1 `TIP403Registry`), which resolves policy queries via the zone node's policy provider rather than calling `readTempoStorageSlot` directly.
+TIP-403 policy authorization on the zone is handled by a dedicated read-only proxy precompile (at the same address as the L1 `TIP403Registry`). Live node execution resolves policy queries via the zone node's policy provider. Witness-backed execution resolves the same registry storage slots directly from Tempo state proofs bound to the currently finalized Tempo root.
 
 ### Staleness and Finality
 
@@ -802,7 +803,7 @@ Zones inherit compliance policies from Tempo automatically. Token issuers set tr
 
 ### Policy Enforcement on Zones
 
-The zone has a `TIP403Registry` deployed at the same address as on Tempo. This contract is read-only and does not support writing policies. Its `isAuthorized` function reads policy state from Tempo via `TempoState.readTempoStorageSlot()`.
+The zone has a `TIP403Registry` deployed at the same address as on Tempo. This contract is read-only and does not support writing policies. Its `isAuthorized` function resolves policy state from Tempo at the zone's currently finalized Tempo root; proof-backed settlement verifies the underlying registry account and storage slots against that root.
 
 Zone-side TIP-20 transfers check `isAuthorized(policyId, from)` and `isAuthorized(policyId, to)` before executing. If either check fails, the transfer reverts.
 
@@ -1979,7 +1980,7 @@ Reads the sequencer address, token registry, and encryption key from the portal 
 
 ### TIP-403 Registry
 
-Deployed at the same address as on Tempo. Read-only on the zone. Its `isAuthorized(policyId, account)` function reads policy state from Tempo via `TempoState.readTempoStorageSlot()`. Zone-side TIP-20 transfers call this automatically.
+Deployed at the same address as on Tempo. Read-only on the zone. Its `isAuthorized(policyId, account)` function resolves policy state from Tempo at the zone's currently finalized Tempo root; proof-backed settlement verifies the underlying registry account and storage slots against that root. Zone-side TIP-20 transfers call this automatically.
 
 <br>
 

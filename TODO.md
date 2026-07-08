@@ -71,15 +71,18 @@ Recovered goal, in short:
 9. [x] Keep verifier policy/state as the enforcement layer.
    The native sequencer path reads the portal's verifier address, checks `NativeSignatureVerifier.policies(portal)` for the expected signer and verifier version, signs the digest over the fresh `prove_zone_batch` output, and preflights `verify` before submit. The Solidity verifier keys policy by `msg.sender`/portal, requires matching chain id, protocol version, portal, enabled signer, and verifier version, so request-controlled verifier config or stale proof material cannot satisfy the policy path.
 
-10. [ ] Implement full witness-backed TIP-403 policy evaluation.
-    The current witness-backed policy providers resolve the TIP-20 `transferPolicyId` from Tempo storage and handle the builtin reject-all/allow-all policy ids, but non-builtin TIP-403 policy data fails closed. The node has cache/RPC-backed policy enforcement for live execution, and L1 e2e policy tests cover policy propagation, but settlement proofs for custom whitelist/blacklist/compound policies still need witness-backed reads for the TIP-403 registry layout.
+10. [x] Implement full witness-backed TIP-403 policy evaluation.
+    Witness-backed policy providers now resolve the TIP-20 `transferPolicyId`, `TIP403Registry.policy_id_counter`, `policy_records`, `policy_set`, and compound sub-policy storage directly from Tempo state proofs bound to the imported Tempo roots. Builtin reject-all/allow-all, whitelist, blacklist, and compound sender/recipient/mint-recipient checks all use the same fail-closed L1 read path during prover execution and local witness read collection. Unit coverage in `zone-prover-core execution_policy` exercises builtin, missing-proof, whitelist, blacklist, and compound policy behavior.
 
 11. [x] Align Zone fee-token semantics with the Zone fee manager direction.
     Zones use `ZoneFeeManager`: any USD TIP-20 token enabled on the L1 portal can pay fees, FeeAMM liquidity routing is disabled, and validator fees are credited directly in the user's fee token. pathUSD remains initialized in genesis as the default/reserved TIP-20 so Tempo fee-token storage expectations are valid at boot, but it is not the only runtime fee token.
 
+12. [ ] Implement the target network-upgrade verifier rotation semantics.
+    The spec's Network Upgrades section is still explicitly target design: the current `ZonePortal` keeps `verifier` immutable, while the target design needs active/fork verifier slots, fork activation cutoffs, and protocol-version rotation. Until that is implemented, the prover checkpoint can be complete for the current immutable-verifier contract set but not for every future-upgrade requirement in the spec.
+
 ## Suggested follow-up commits
 
-- Land the current checkpoint with the remaining gaps scoped to upstream witness-shape cleanup, non-builtin TIP-403 witness reads, no-std production sparse trie support, and the remaining live-contract semantics audit.
+- Land the current checkpoint with the remaining gaps scoped to upstream witness-shape cleanup, no-std production sparse trie support, network-upgrade verifier rotation, and the remaining live-contract semantics audit.
 - Replace hand-selected Zone proof collection with an upstream-style execution witness adapter.
-- Implement witness-backed TIP-403 policy evaluation for non-builtin policies.
 - Finish the remaining live-contract gas/accounting/log/receipt audit cases.
+- Implement the target fork verifier/protocol-version rotation path, or split it into a later network-upgrade milestone if immutable-verifier portals remain the current product scope.

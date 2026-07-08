@@ -291,7 +291,7 @@ impl<P: PolicyCheck> ZoneTip403ProxyRegistry<P> {
 
     /// Handle `policyIdCounter() → uint64`.
     fn handle_policy_id_counter(&self, reservoir: u64) -> PrecompileResult {
-        let counter = self.provider.policy_id_counter();
+        let counter = self.provider.policy_id_counter()?;
         let encoded = ITIP403Registry::policyIdCounterCall::abi_encode_returns(&counter);
         Ok(PrecompileOutput::new(
             POLICY_DATA_GAS,
