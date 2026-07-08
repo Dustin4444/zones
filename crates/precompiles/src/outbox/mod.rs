@@ -17,7 +17,7 @@ use tempo_precompiles::{
     tip20::{ITIP20, TIP20Error, TIP20Token},
 };
 use tempo_precompiles_macros::{Storable, contract};
-use tempo_zone_contracts::{StaticCallNotAllowed, ZoneOutbox as ZoneOutboxAbi};
+use tempo_zone_contracts::{IZoneOutbox as ZoneOutboxAbi, StaticCallNotAllowed};
 use zone_primitives::constants::{
     EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_INBOX_ADDRESS,
     ZONE_OUTBOX_ADDRESS,

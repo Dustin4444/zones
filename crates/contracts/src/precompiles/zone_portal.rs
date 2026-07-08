@@ -356,7 +356,7 @@ impl Withdrawal {
 
     /// Reconstruct the public L1-facing withdrawal from a zone-side withdrawal request event.
     pub fn from_requested_event(
-        event: &ZoneOutbox::WithdrawalRequested,
+        event: &IZoneOutbox::WithdrawalRequested,
         tx_hash: B256,
         encrypted_sender: Bytes,
     ) -> Self {

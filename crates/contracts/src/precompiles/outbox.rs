@@ -1,7 +1,6 @@
 //! `ZoneOutbox` — deployed on the Zone L2.
 
-pub use ZoneOutbox::{LastBatch, PendingWithdrawal, StaticCallNotAllowed};
-pub use ZoneOutboxLegacy::requestWithdrawalCall as LegacyRequestWithdrawalCall;
+pub use IZoneOutbox::{LastBatch, PendingWithdrawal, StaticCallNotAllowed};
 
 crate::sol! {
     #[derive(Debug)]
@@ -119,19 +118,5 @@ crate::sol! {
             address bouncebackRecipient
         ) external;
         function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
-    }
-
-    /// Legacy no-reveal overload kept separate so the main `ZoneOutbox` Rust binding
-    /// still exposes `requestWithdrawal(...)` without Alloy overload suffixes.
-    interface ZoneOutboxLegacy {
-        function requestWithdrawal(
-            address token,
-            address to,
-            uint128 amount,
-            bytes32 memo,
-            uint64 gasLimit,
-            address fallbackRecipient,
-            bytes calldata data
-        ) external;
     }
 }

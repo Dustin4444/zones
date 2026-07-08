@@ -3,7 +3,7 @@
 use alloy_primitives::Address;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{Precompile, charge_input_cost, dispatch};
-use tempo_zone_contracts::{IZoneOutbox, ZoneOutbox as ZoneOutboxAbi, ZoneOutboxLegacy};
+use tempo_zone_contracts::IZoneOutbox;
 
 use super::ZoneOutbox;
 
@@ -38,9 +38,6 @@ impl Precompile for ZoneOutbox {
                     requestWithdrawal(_) => todo!(),
                     enqueueDepositBounceBack(_) => todo!(),
                     finalizeWithdrawalBatch(_) => todo!(),
-                }
-                ZoneOutboxLegacy::ZoneOutboxLegacyCalls {
-                    requestWithdrawal(_) => todo!(),
                 }
             },
         )
