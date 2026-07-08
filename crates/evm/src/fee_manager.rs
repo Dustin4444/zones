@@ -21,12 +21,16 @@ impl ZoneFeeManager {
     pub(crate) const fn new() -> Self {
         Self
     }
+}
 
-    fn collect_fee_pre_tx_inner(
+impl<DB: Database> ProtocolFeeManager<DB> for ZoneFeeManager {
+    fn collect_fee_pre_tx(
         &self,
         fee_payer: Address,
         user_token: Address,
         max_amount: U256,
+        _beneficiary: Address,
+        _skip_liquidity_check: bool,
     ) -> TempoResult<Address> {
         let mut token = TIP20Token::from_address(user_token)?;
         token.ensure_transfer_authorized(fee_payer, TIP_FEE_MANAGER_ADDRESS)?;
@@ -34,7 +38,7 @@ impl ZoneFeeManager {
         Ok(user_token)
     }
 
-    fn collect_fee_post_tx_inner(
+    fn collect_fee_post_tx(
         &self,
         fee_payer: Address,
         actual_spending: U256,
@@ -59,27 +63,44 @@ impl ZoneFeeManager {
     }
 }
 
-impl<DB: Database> ProtocolFeeManager<DB> for ZoneFeeManager {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use revm::database_interface::EmptyDB;
+    use tempo_precompiles::{
+        storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
+        test_util::TIP20Setup,
+        tip_fee_manager::{TipFeeManager, amm::PoolKey},
+    };
+
     fn collect_fee_pre_tx(
-        &self,
+        manager: &ZoneFeeManager,
         fee_payer: Address,
         user_token: Address,
         max_amount: U256,
-        _beneficiary: Address,
-        _skip_liquidity_check: bool,
+        beneficiary: Address,
     ) -> TempoResult<Address> {
-        self.collect_fee_pre_tx_inner(fee_payer, user_token, max_amount)
+        <ZoneFeeManager as ProtocolFeeManager<EmptyDB>>::collect_fee_pre_tx(
+            manager,
+            fee_payer,
+            user_token,
+            max_amount,
+            beneficiary,
+            false,
+        )
     }
 
     fn collect_fee_post_tx(
-        &self,
+        manager: &ZoneFeeManager,
         fee_payer: Address,
         actual_spending: U256,
         refund_amount: U256,
         fee_token: Address,
         beneficiary: Address,
     ) -> TempoResult<U256> {
-        self.collect_fee_post_tx_inner(
+        <ZoneFeeManager as ProtocolFeeManager<EmptyDB>>::collect_fee_post_tx(
+            manager,
             fee_payer,
             actual_spending,
             refund_amount,
@@ -87,17 +108,6 @@ impl<DB: Database> ProtocolFeeManager<DB> for ZoneFeeManager {
             beneficiary,
         )
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use tempo_precompiles::{
-        storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
-        test_util::TIP20Setup,
-        tip_fee_manager::{TipFeeManager, amm::PoolKey},
-    };
 
     #[test]
     fn fees_are_paid_directly_to_beneficiary() -> eyre::Result<()> {
@@ -114,8 +124,15 @@ mod tests {
                 .apply()?;
 
             let manager = ZoneFeeManager::new();
-            manager.collect_fee_pre_tx_inner(user, token.address(), U256::from(5_000u64))?;
-            let credited = manager.collect_fee_post_tx_inner(
+            collect_fee_pre_tx(
+                &manager,
+                user,
+                token.address(),
+                U256::from(5_000u64),
+                beneficiary,
+            )?;
+            let credited = collect_fee_post_tx(
+                &manager,
                 user,
                 U256::from(3_000u64),
                 U256::from(2_000u64),
@@ -164,12 +181,16 @@ mod tests {
                 .apply()?;
             let other = TIP20Setup::create("Other USD", "oUSD", admin).apply()?;
 
-            ZoneFeeManager::new().collect_fee_pre_tx_inner(
+            let manager = ZoneFeeManager::new();
+            collect_fee_pre_tx(
+                &manager,
                 user,
                 token.address(),
                 U256::from(1_000u64),
+                beneficiary,
             )?;
-            ZoneFeeManager::new().collect_fee_post_tx_inner(
+            collect_fee_post_tx(
+                &manager,
                 user,
                 U256::from(1_000u64),
                 U256::ZERO,
