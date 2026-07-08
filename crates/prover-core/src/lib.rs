@@ -72,16 +72,19 @@ pub use execution_plan::{
 pub use execution_policy::{
     TIP20_TRANSFER_POLICY_ID_SLOT, WitnessPolicyProvider, WitnessSequencer,
 };
-pub use execution_precompiles::register_witness_zone_precompiles;
+pub use execution_precompiles::{
+    WitnessZonePortalReader, register_witness_zone_precompiles,
+    register_witness_zone_precompiles_with_fee_manager,
+};
 pub use execution_receipt::ZoneTempoReceiptBuilder;
 pub use execution_state::{
     ZoneExecutionState, execution_post_state_from_state, zone_execution_state,
 };
 pub use execution_tx::{ZoneBatchCallEnv, ZoneInvalidTransaction, ZoneTxEnv};
 pub use post_state::ExecutionPostState;
-pub use state_root::{
-    CalculatedStateRoot, SparseStateRootCalculator, calculate_state_root, empty_state_root,
-};
+#[cfg(feature = "std")]
+pub use state_root::calculate_state_root;
+pub use state_root::{CalculatedStateRoot, SparseStateRootCalculator, empty_state_root};
 pub use tempo_chainspec::hardfork::TempoHardfork;
 pub use tempo_reader::{
     OwnedWitnessTempoStateReader, TEMPO_STATE_READER_BASE_GAS, TEMPO_STATE_READER_PER_SLOT_GAS,
@@ -814,6 +817,9 @@ pub enum ProverError {
         expected: B256,
         actual: B256,
     },
+    MissingExecutionDepositQueueHashProof {
+        tempo_block_number: u64,
+    },
     ExecutionWithdrawalBatchIndexMismatch {
         expected: u64,
         actual: u64,
@@ -1322,6 +1328,10 @@ impl fmt::Display for ProverError {
             } => write!(
                 f,
                 "executed deposit queue hash {actual} does not match proved Tempo block {tempo_block_number} currentDepositQueueHash {expected}"
+            ),
+            Self::MissingExecutionDepositQueueHashProof { tempo_block_number } => write!(
+                f,
+                "advanceTempo batch is missing proved Tempo block {tempo_block_number} currentDepositQueueHash"
             ),
             Self::ExecutionWithdrawalBatchIndexMismatch { expected, actual } => write!(
                 f,
@@ -2770,13 +2780,16 @@ mod tests {
     }
 
     #[test]
-    fn production_prover_uses_witness_executor_and_fails_closed_on_execution_error() {
+    fn production_prover_uses_witness_executor_and_fails_closed_on_commitment_mismatch() {
         let witness = fixture_witness();
 
         let err = prove_zone_batch(witness).unwrap_err();
         assert!(matches!(
             err,
-            ProverError::ExecutionBlockFailed { index: 0, .. }
+            ProverError::ExecutionWithdrawalBatchIndexMismatch {
+                expected: 5,
+                actual: 4,
+            }
         ));
     }
 
@@ -3417,6 +3430,116 @@ mod tests {
     }
 
     #[test]
+    fn production_prover_rejects_missing_regular_deposit_queue_hash_proof() {
+        let deposit = regular_deposit();
+        let mut fixture = regular_deposit_witness(deposit.clone(), deposit);
+        let portal_current_deposit_queue_hash_slot =
+            storage_slot_u256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+        fixture
+            .witness
+            .tempo_state_proofs
+            .reads
+            .retain(|read| read.slot != portal_current_deposit_queue_hash_slot);
+
+        match prove_zone_batch(fixture.witness).unwrap_err() {
+            ProverError::ExecutionBlockFailed { index, reason } => {
+                assert_eq!(index, 0);
+                assert!(
+                    reason.contains("missing proved Tempo state read"),
+                    "unexpected execution failure: {reason}"
+                );
+                assert!(
+                    reason.contains(&portal_current_deposit_queue_hash_slot.to_string()),
+                    "missing slot should be reported in execution failure: {reason}"
+                );
+            }
+            err => panic!("expected execution failure for missing portal queue proof, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn execution_output_rejects_advance_tempo_without_final_deposit_queue_proof() {
+        let deposit = regular_deposit();
+        let mut fixture = regular_deposit_witness(deposit.clone(), deposit);
+        let portal_current_deposit_queue_hash_slot =
+            storage_slot_u256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
+        fixture
+            .witness
+            .tempo_state_proofs
+            .reads
+            .retain(|read| read.slot != portal_current_deposit_queue_hash_slot);
+        let prepared = prepare_stateless_execution(&fixture.witness).unwrap();
+        let mut execution = successful_execution_output(&prepared);
+
+        let mut tempo_storage = StorageKeyMap::default();
+        tempo_storage.insert(
+            storage_slot_u256(TEMPO_BLOCK_HASH_SLOT),
+            (
+                U256::from_be_bytes(prepared.commitments.initial_tempo_block_hash.0),
+                U256::from_be_bytes(prepared.commitments.final_tempo_block_hash.0),
+            ),
+        );
+        tempo_storage.insert(
+            storage_slot_u256(TEMPO_STATE_ROOT_SLOT),
+            (
+                U256::from_be_bytes(prepared.commitments.initial_tempo_state_root.0),
+                U256::from_be_bytes(prepared.commitments.final_tempo_state_root.0),
+            ),
+        );
+        tempo_storage.insert(
+            storage_slot_u256(TEMPO_PACKED_SLOT),
+            (
+                U256::from(prepared.commitments.initial_tempo_block_number),
+                U256::from(prepared.commitments.final_tempo_block_number),
+            ),
+        );
+
+        let mut inbox_storage = StorageKeyMap::default();
+        inbox_storage.insert(
+            ZONE_INBOX_PROCESSED_HASH_SLOT,
+            (
+                U256::from_be_bytes(prepared.commitments.initial_deposit_queue.processed_hash.0),
+                U256::from_be_bytes(fixture.proved_next_processed_hash.0),
+            ),
+        );
+        inbox_storage.insert(
+            ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+            (
+                U256::from(prepared.commitments.initial_deposit_queue.processed_number),
+                U256::from(13),
+            ),
+        );
+
+        let mut outbox_storage = StorageKeyMap::default();
+        outbox_storage.insert(
+            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            (
+                U256::from(
+                    prepared
+                        .commitments
+                        .previous_last_batch
+                        .withdrawal_batch_index,
+                ),
+                U256::from(prepared.public_inputs.expected_withdrawal_batch_index),
+            ),
+        );
+
+        let bundle_state = BundleState::builder(0..=0)
+            .state_storage(TEMPO_STATE_ADDRESS, tempo_storage)
+            .state_storage(ZONE_INBOX_ADDRESS, inbox_storage)
+            .state_storage(ZONE_OUTBOX_ADDRESS, outbox_storage)
+            .build();
+        execution.post_state = ExecutionPostState::from_bundle_state(&bundle_state);
+
+        assert_eq!(
+            batch_output_from_execution(&prepared, &execution).unwrap_err(),
+            ProverError::MissingExecutionDepositQueueHashProof {
+                tempo_block_number: prepared.commitments.final_tempo_block_number,
+            }
+        );
+    }
+
+    #[test]
     fn production_prover_rejects_signed_native_value_transfer() {
         let mut witness = fixture_witness();
         witness.zone_blocks[0].cfg_env.chain_id = USER_VALUE_TX_CHAIN_ID;
@@ -3524,6 +3647,47 @@ mod tests {
             ProverError::UserTransactionDecodeFailed {
                 block_index: 0,
                 transaction_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_mutated_zone_state_proof() {
+        let mut witness = fixture_witness_with_real_outbox();
+        let account = witness.initial_zone_state.account_reads[0].account;
+        witness.initial_zone_state.account_reads[0].balance =
+            witness.initial_zone_state.account_reads[0]
+                .balance
+                .checked_add(U256::ONE)
+                .expect("test account balance should not overflow");
+
+        assert_eq!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::AccountReadMismatch(account)
+        );
+    }
+
+    #[test]
+    fn production_prover_rejects_mutated_tempo_state_proof() {
+        let mut witness = signed_tip20_transfer_witness(signed_user_tip20_transfer_tx());
+        let read = witness
+            .tempo_state_proofs
+            .reads
+            .first_mut()
+            .expect("TIP-20 transfer fixture includes a Tempo policy proof");
+        let account = read.account;
+        let slot = read.slot;
+        read.value = read
+            .value
+            .checked_add(U256::ONE)
+            .expect("test Tempo proof value should not overflow");
+
+        assert_eq!(
+            prove_zone_batch(witness).unwrap_err(),
+            ProverError::TempoStateStorageReadMismatch {
+                read_index: 0,
+                account,
+                slot,
             }
         );
     }
@@ -3667,12 +3831,8 @@ mod tests {
         assert_eq!(
             state
                 .storage(TEMPO_STATE_ADDRESS, U256::from(0xfe))
-                .unwrap_err()
-                .into_external_error(),
-            WitnessDbError::MissingStorage {
-                account: TEMPO_STATE_ADDRESS,
-                slot: U256::from(0xfe),
-            }
+                .unwrap(),
+            U256::ZERO
         );
     }
 
@@ -4142,22 +4302,15 @@ mod tests {
     }
 
     #[test]
-    fn witness_database_rejects_unwitnessed_reads() {
+    fn witness_database_serves_revealed_absences_and_rejects_missing_blockhashes() {
         let witness = fixture_witness();
         let mut db = WitnessDatabase::new(&witness.initial_zone_state, BTreeMap::new()).unwrap();
         let missing = address!("0x0000000000000000000000000000000000009999");
 
+        assert!(db.basic(missing).unwrap().is_none());
         assert_eq!(
-            db.basic(missing).unwrap_err(),
-            WitnessDbError::MissingAccount(missing)
-        );
-        assert_eq!(
-            db.storage(TEMPO_STATE_ADDRESS, U256::from(0xfe))
-                .unwrap_err(),
-            WitnessDbError::MissingStorage {
-                account: TEMPO_STATE_ADDRESS,
-                slot: U256::from(0xfe),
-            }
+            db.storage(TEMPO_STATE_ADDRESS, U256::from(0xfe)).unwrap(),
+            U256::ZERO
         );
         assert_eq!(
             db.block_hash(9).unwrap_err(),

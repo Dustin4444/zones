@@ -209,6 +209,11 @@ impl ZoneEngine {
         // two chains stay in lockstep.
         let timestamp_secs = l1_block.header.timestamp();
         let timestamp_millis_part = l1_block.header.timestamp_millis_part;
+        let slot_number = self
+            .last_header
+            .number()
+            .checked_add(1)
+            .ok_or_eyre("zone block number overflow while building payload attributes")?;
 
         let l1_block = self.prepare_l1_block(l1_block).await?;
 
@@ -225,7 +230,7 @@ impl ZoneEngine {
                     .chain_spec
                     .is_cancun_active_at_timestamp(timestamp_secs)
                     .then_some(B256::ZERO),
-                slot_number: None,
+                slot_number: Some(slot_number),
                 target_gas_limit: None,
             },
             timestamp_millis_part,

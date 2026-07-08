@@ -42,10 +42,44 @@ fn main() -> io::Result<()> {
     let zone_portal_artifact = load_json(&zone_portal_artifact_path)?;
     let tempo_block_hash_slot =
         storage_key(&tempo_state_artifact, "tempoBlockHash", 0, "bytes32", "32")?;
+    let tempo_wrapper_gas_limits_slot =
+        storage_key(&tempo_state_artifact, "generalGasLimit", 0, "uint64", "8")?;
+    let tempo_parent_hash_slot =
+        storage_key(&tempo_state_artifact, "tempoParentHash", 0, "bytes32", "32")?;
+    let tempo_beneficiary_slot = storage_key(
+        &tempo_state_artifact,
+        "tempoBeneficiary",
+        0,
+        "address",
+        "20",
+    )?;
     let tempo_state_root_slot =
         storage_key(&tempo_state_artifact, "tempoStateRoot", 0, "bytes32", "32")?;
+    let tempo_transactions_root_slot = storage_key(
+        &tempo_state_artifact,
+        "tempoTransactionsRoot",
+        0,
+        "bytes32",
+        "32",
+    )?;
+    let tempo_receipts_root_slot = storage_key(
+        &tempo_state_artifact,
+        "tempoReceiptsRoot",
+        0,
+        "bytes32",
+        "32",
+    )?;
     let tempo_packed_slot =
         storage_key(&tempo_state_artifact, "tempoBlockNumber", 0, "uint64", "8")?;
+    let tempo_timestamp_millis_slot = storage_key(
+        &tempo_state_artifact,
+        "tempoTimestampMillis",
+        0,
+        "uint64",
+        "8",
+    )?;
+    let tempo_prev_randao_slot =
+        storage_key(&tempo_state_artifact, "tempoPrevRandao", 0, "bytes32", "32")?;
     let inbox_processed_hash_slot = storage_slot_u256(
         &zone_inbox_artifact,
         "processedDepositQueueHash",
@@ -90,12 +124,40 @@ fn main() -> io::Result<()> {
 pub const TEMPO_BLOCK_HASH_SLOT: ::alloy_primitives::StorageKey =
     ::alloy_primitives::b256!({});
 
+/// TempoState storage slot containing `generalGasLimit` and `sharedGasLimit`, generated from the Foundry storage layout.
+pub const TEMPO_WRAPPER_GAS_LIMITS_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
+/// TempoState storage slot for `tempoParentHash`, generated from the Foundry storage layout.
+pub const TEMPO_PARENT_HASH_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
+/// TempoState storage slot for `tempoBeneficiary`, generated from the Foundry storage layout.
+pub const TEMPO_BENEFICIARY_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
 /// TempoState storage slot for `tempoStateRoot`, generated from the Foundry storage layout.
 pub const TEMPO_STATE_ROOT_SLOT: ::alloy_primitives::StorageKey =
     ::alloy_primitives::b256!({});
 
+/// TempoState storage slot for `tempoTransactionsRoot`, generated from the Foundry storage layout.
+pub const TEMPO_TRANSACTIONS_ROOT_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
+/// TempoState storage slot for `tempoReceiptsRoot`, generated from the Foundry storage layout.
+pub const TEMPO_RECEIPTS_ROOT_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
 /// TempoState storage slot containing `tempoBlockNumber`, generated from the Foundry storage layout.
 pub const TEMPO_PACKED_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
+/// TempoState storage slot containing `tempoTimestampMillis`, generated from the Foundry storage layout.
+pub const TEMPO_TIMESTAMP_MILLIS_SLOT: ::alloy_primitives::StorageKey =
+    ::alloy_primitives::b256!({});
+
+/// TempoState storage slot for `tempoPrevRandao`, generated from the Foundry storage layout.
+pub const TEMPO_PREV_RANDAO_SLOT: ::alloy_primitives::StorageKey =
     ::alloy_primitives::b256!({});
 
 /// ZoneInbox storage slot for `processedDepositQueueHash`, generated from the Foundry storage layout.
@@ -119,8 +181,15 @@ pub const PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT: ::alloy_primitives::StorageKey
     ::alloy_primitives::b256!({});
 ",
         b256_literal(&tempo_block_hash_slot),
+        b256_literal(&tempo_wrapper_gas_limits_slot),
+        b256_literal(&tempo_parent_hash_slot),
+        b256_literal(&tempo_beneficiary_slot),
         b256_literal(&tempo_state_root_slot),
+        b256_literal(&tempo_transactions_root_slot),
+        b256_literal(&tempo_receipts_root_slot),
         b256_literal(&tempo_packed_slot),
+        b256_literal(&tempo_timestamp_millis_slot),
+        b256_literal(&tempo_prev_randao_slot),
         u256_literal(inbox_processed_hash_slot),
         u256_literal(inbox_processed_number_slot),
         u256_literal(outbox_last_batch_hash_slot),

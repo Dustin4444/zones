@@ -39,7 +39,7 @@ use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
 };
-use zone_node::ZoneNode;
+use zone_node::{LocalNodeProverWitnessSource, ZoneNode};
 use zone_primitives::{ZoneHeader, constants::ZONE_BLOCK_PROTOCOL_VERSION};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
@@ -222,6 +222,7 @@ pub(crate) struct ZoneTestNode {
     l1_state_cache: L1StateCache,
     policy_cache: zone_l1::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
+    prover_witness_source: Arc<dyn zone_sequencer::ProverWitnessSource>,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
 }
@@ -252,6 +253,11 @@ impl ZoneTestNode {
     /// Returns a handle to the policy cache for TIP-403 authorization.
     pub(crate) fn policy_cache(&self) -> &zone_l1::PolicyCache {
         &self.policy_cache
+    }
+
+    /// Returns the local node-backed prover witness source for sequencer tests.
+    pub(crate) fn prover_witness_source(&self) -> Arc<dyn zone_sequencer::ProverWitnessSource> {
+        Arc::clone(&self.prover_witness_source)
     }
 
     /// Builds the real private RPC API backed by the node's EthHandlers.
@@ -564,6 +570,23 @@ impl ZoneTestNode {
             tokio::runtime::Handle::current(),
         );
         let provider = node_handle.node.provider();
+        let mut local_witness_source = LocalNodeProverWitnessSource::new(provider.clone());
+        if !is_local_dummy_l1 {
+            let l1_state_provider = zone_l1::state::L1StateProvider::new(
+                zone_l1::state::L1StateProviderConfig {
+                    l1_rpc_url: l1_provider_url.to_string(),
+                    portal_address,
+                    retry_connection_interval: std::time::Duration::from_millis(100),
+                    ..Default::default()
+                },
+                l1_state_cache.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .await?;
+            local_witness_source = local_witness_source.with_l1_state_provider(l1_state_provider);
+        }
+        let prover_witness_source: Arc<dyn zone_sequencer::ProverWitnessSource> =
+            Arc::new(local_witness_source);
         let last_header = provider
             .sealed_header(provider.best_block_number()?)?
             .ok_or_else(|| eyre::eyre!("no latest block header"))?;
@@ -611,6 +634,7 @@ impl ZoneTestNode {
             l1_state_cache,
             policy_cache,
             rpc_api_factory,
+            prover_witness_source,
             node_handle: Box::new(node_handle),
             _tasks: tasks,
         })
@@ -1563,6 +1587,7 @@ impl L1TestNode {
             )
             .apply(|mut c| {
                 c.dev.block_time = Some(Duration::from_millis(500));
+                c.rpc.rpc_eth_proof_window = 10_000;
                 c
             });
 
@@ -1821,6 +1846,12 @@ pub(crate) struct WithdrawalArgs {
     pub fallback_recipient: Option<Address>,
     pub data: alloy_primitives::Bytes,
     pub reveal_to: alloy_primitives::Bytes,
+}
+
+/// Decoded result of a successful `ZoneOutbox.requestWithdrawal` transaction.
+pub(crate) struct WithdrawalRequestReceipt {
+    pub event: tempo_zone_contracts::ZoneOutbox::WithdrawalRequested,
+    pub tx_hash: B256,
 }
 
 impl WithdrawalArgs {
@@ -2268,7 +2299,10 @@ impl ZoneAccount {
     /// Approve the ZoneOutbox, then request a withdrawal on L2.
     ///
     /// Skips approval if already approved in this session.
-    pub(crate) async fn withdraw(&mut self, amount: u128) -> eyre::Result<()> {
+    pub(crate) async fn withdraw(
+        &mut self,
+        amount: u128,
+    ) -> eyre::Result<WithdrawalRequestReceipt> {
         self.withdraw_with(WithdrawalArgs::new(amount)).await
     }
 
@@ -2276,7 +2310,10 @@ impl ZoneAccount {
     ///
     /// Skips approval if already approved in this session.
     /// Uses the default zone token (pathUSD / `ZONE_TOKEN_ADDRESS`).
-    pub(crate) async fn withdraw_with(&mut self, args: WithdrawalArgs) -> eyre::Result<()> {
+    pub(crate) async fn withdraw_with(
+        &mut self,
+        args: WithdrawalArgs,
+    ) -> eyre::Result<WithdrawalRequestReceipt> {
         use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
         self.withdraw_token_with(ZONE_TOKEN_ADDRESS, args).await
     }
@@ -2286,7 +2323,7 @@ impl ZoneAccount {
         &mut self,
         token: Address,
         amount: u128,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<WithdrawalRequestReceipt> {
         self.withdraw_token_with(token, WithdrawalArgs::new(amount))
             .await
     }
@@ -2296,7 +2333,7 @@ impl ZoneAccount {
         &mut self,
         token: Address,
         args: WithdrawalArgs,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<WithdrawalRequestReceipt> {
         use tempo_contracts::precompiles::ITIP20;
         use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
@@ -2331,7 +2368,21 @@ impl ZoneAccount {
             .await?;
         eyre::ensure!(receipt.status(), "L2 withdrawal request failed");
 
-        Ok(())
+        let event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                ZoneOutbox::WithdrawalRequested::decode_log(&log.inner)
+                    .ok()
+                    .map(|decoded| decoded.data)
+            })
+            .ok_or_else(|| eyre::eyre!("WithdrawalRequested event not found"))?;
+
+        Ok(WithdrawalRequestReceipt {
+            event,
+            tx_hash: receipt.transaction_hash,
+        })
     }
 }
 
@@ -2374,9 +2425,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         zone_poll_interval: Duration::from_millis(500),
         batch_interval: Duration::from_millis(500),
         batch_anchor_config,
-        prover_witness_source: Arc::new(zone_sequencer::UnavailableProverWitnessSource::new(
-            "integration helper witness generation is not wired into the sequencer yet",
-        )),
+        prover_witness_source: zone.prover_witness_source(),
     };
 
     zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await

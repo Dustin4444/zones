@@ -9,6 +9,8 @@ use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy_eips::NumHash;
 use alloy_provider::ProviderBuilder;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
+use alloy_sol_types::{SolCall, SolEvent};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
@@ -16,11 +18,60 @@ use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox,
 };
 use zone_l1::ChainTempoStateExt;
+use zone_precompiles::ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE;
 
 use crate::utils::{
     DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, ZoneTestNode,
     poll_until, seed_fixture_for_zone, start_local_zone_with_fixture,
 };
+
+async fn fetch_zone_tx_calldata(
+    zone: &ZoneTestNode,
+    tx_hash: B256,
+    label: &str,
+) -> eyre::Result<Vec<u8>> {
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(zone.http_url().clone())
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionByHash",
+            "params": [format!("{tx_hash:#x}")],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if let Some(error) = response.get("error") {
+        eyre::bail!("eth_getTransactionByHash failed for {label} tx {tx_hash}: {error}");
+    }
+
+    let tx = response
+        .get("result")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| eyre::eyre!("{label} tx {tx_hash} not found"))?;
+
+    let input = tx
+        .get("input")
+        .and_then(|value| value.as_str())
+        .filter(|input| *input != "0x")
+        .or_else(|| {
+            tx.get("calls")
+                .and_then(|value| value.as_array())
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| call.get("input").and_then(|value| value.as_str()))
+                        .find(|input| *input != "0x")
+                })
+        })
+        .ok_or_else(|| eyre::eyre!("{label} tx {tx_hash} has no calldata input"))?;
+
+    const_hex::decode(input.strip_prefix("0x").unwrap_or(input))
+        .map_err(|err| eyre::eyre!("failed to hex-decode {label} tx {tx_hash}: {err}"))
+}
 
 /// Self-contained test: inject a deposit via the queue and verify the zone
 /// mints the corresponding pathUSD balance on L2.
@@ -417,6 +468,133 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
         B256::ZERO,
         "lastBatch.withdrawalQueueHash should be zero with no withdrawals"
     );
+
+    Ok(())
+}
+
+/// Submit a real signed withdrawal request with `revealTo` and verify the
+/// block builder finalizes it with a decryptable authenticated sender reveal.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_withdrawal_reveal_to_finalization_uses_real_l2_transactions() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
+
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+
+    let provider = ProviderBuilder::new()
+        .wallet(dev_signer)
+        .connect_http(zone.http_url().clone());
+    let zone_token = ITIP20::new(PATH_USD_ADDRESS, &provider);
+    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider);
+
+    let deposit_amount: u128 = 1_000_000;
+    let withdrawal_amount: u128 = 250_000;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
+
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(deposit_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let approve_pending = zone_token
+        .approve(ZONE_OUTBOX_ADDRESS, U256::MAX)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(150_000)
+        .send()
+        .await?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    let approve_receipt = approve_pending.get_receipt().await?;
+    assert!(approve_receipt.status(), "approve should succeed");
+
+    let reveal_secret = k256::SecretKey::from_slice(&[0x43; 32]).expect("valid reveal key");
+    let reveal_to =
+        Bytes::copy_from_slice(reveal_secret.public_key().to_encoded_point(true).as_bytes());
+
+    let withdrawal_pending = outbox
+        .requestWithdrawal(
+            PATH_USD_ADDRESS,
+            dev_address,
+            withdrawal_amount,
+            B256::ZERO,
+            0,
+            dev_address,
+            Bytes::new(),
+            reveal_to.clone(),
+        )
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(WITHDRAWAL_TX_GAS)
+        .send()
+        .await?;
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    let withdrawal_receipt = withdrawal_pending.get_receipt().await?;
+    assert!(
+        withdrawal_receipt.status(),
+        "withdrawal request should succeed"
+    );
+
+    let request_event = withdrawal_receipt
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| {
+            ZoneOutbox::WithdrawalRequested::decode_log(&log.inner)
+                .ok()
+                .map(|decoded| decoded.data)
+        })
+        .ok_or_else(|| eyre::eyre!("WithdrawalRequested event not found"))?;
+    assert_eq!(request_event.sender, dev_address);
+    assert_eq!(request_event.to, dev_address);
+    assert_eq!(request_event.amount, withdrawal_amount);
+    assert_eq!(request_event.revealTo, reveal_to);
+
+    let block_number = withdrawal_receipt
+        .block_number
+        .ok_or_else(|| eyre::eyre!("withdrawal receipt missing block number"))?;
+    let finalized_tx_hash = outbox
+        .BatchFinalized_filter()
+        .from_block(block_number)
+        .to_block(block_number)
+        .query()
+        .await?
+        .into_iter()
+        .find_map(|(event, log)| {
+            if event.withdrawalQueueHash != B256::ZERO {
+                log.transaction_hash
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| eyre::eyre!("non-empty BatchFinalized event not found"))?;
+
+    let calldata =
+        fetch_zone_tx_calldata(&zone, finalized_tx_hash, "finalizeWithdrawalBatch").await?;
+    let finalization = ZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(&calldata)
+        .map_err(|err| eyre::eyre!("failed to decode finalizeWithdrawalBatch calldata: {err}"))?;
+    assert_eq!(finalization.count, U256::ONE);
+    assert_eq!(finalization.encryptedSenders.len(), 1);
+    let encrypted_sender = &finalization.encryptedSenders[0];
+    assert_eq!(
+        encrypted_sender.len(),
+        AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE
+    );
+
+    let (revealed_sender, revealed_tx_hash) =
+        zone_precompiles::ecies::decrypt_authenticated_withdrawal(
+            &reveal_secret,
+            encrypted_sender.as_ref(),
+        )
+        .ok_or_else(|| eyre::eyre!("failed to decrypt authenticated sender reveal"))?;
+    assert_eq!(revealed_sender, dev_address);
+    assert_eq!(revealed_tx_hash, withdrawal_receipt.transaction_hash);
 
     Ok(())
 }

@@ -1,11 +1,17 @@
 //! Transaction-hash execution context for authenticated withdrawals.
 //!
-//! The zone outbox needs the real hash of the currently executing user transaction so it can
-//! commit `senderTag = keccak256(sender || txHash)` on-chain. The block executor publishes that
-//! hash into a thread-local context before EVM execution, and this precompile exposes it to
-//! Solidity at a fixed system address.
+//! The zone outbox needs the real hash of the currently executing user
+//! transaction so it can commit `senderTag = keccak256(sender || txHash)`.
+//! Block executors publish that hash before EVM execution, and this precompile
+//! exposes it to Solidity at the fixed ZoneTxContext address.
 
+use alloc::vec::Vec;
+
+#[cfg(feature = "std")]
 use std::{cell::RefCell, thread_local};
+
+#[cfg(not(feature = "std"))]
+use core::cell::UnsafeCell;
 
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{B256, Bytes, keccak256};
@@ -18,12 +24,24 @@ alloy_sol_types::sol! {
     error DelegateCallNotAllowed();
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     static CURRENT_TX_HASH: RefCell<Option<B256>> = const { RefCell::new(None) };
 }
 
+#[cfg(not(feature = "std"))]
+struct CurrentTxHashCell(UnsafeCell<Option<B256>>);
+
+#[cfg(not(feature = "std"))]
+// The no_std prover guest executes this code single-threaded. Native node and
+// host builds use the std thread-local above.
+unsafe impl Sync for CurrentTxHashCell {}
+
+#[cfg(not(feature = "std"))]
+static CURRENT_TX_HASH: CurrentTxHashCell = CurrentTxHashCell(UnsafeCell::new(None));
+
 /// Guard that clears the current tx hash when dropped.
-pub(crate) struct TxHashGuard;
+pub struct TxHashGuard;
 
 impl Drop for TxHashGuard {
     fn drop(&mut self) {
@@ -32,21 +50,40 @@ impl Drop for TxHashGuard {
 }
 
 /// Publish the current executing transaction hash for the duration of EVM execution.
-pub(crate) fn set_current_tx_hash(tx_hash: B256) -> TxHashGuard {
-    CURRENT_TX_HASH.with(|slot| {
-        *slot.borrow_mut() = Some(tx_hash);
-    });
+pub fn set_current_tx_hash(tx_hash: B256) -> TxHashGuard {
+    set_current_tx_hash_inner(Some(tx_hash));
     TxHashGuard
 }
 
-fn clear_current_tx_hash() {
+#[cfg(feature = "std")]
+fn set_current_tx_hash_inner(tx_hash: Option<B256>) {
     CURRENT_TX_HASH.with(|slot| {
-        *slot.borrow_mut() = None;
+        *slot.borrow_mut() = tx_hash;
     });
 }
 
+#[cfg(not(feature = "std"))]
+fn set_current_tx_hash_inner(tx_hash: Option<B256>) {
+    // SAFETY: the no_std prover guest is single-threaded, and the guard clears
+    // this cell before execution returns to the caller.
+    unsafe {
+        *CURRENT_TX_HASH.0.get() = tx_hash;
+    }
+}
+
+fn clear_current_tx_hash() {
+    set_current_tx_hash_inner(None);
+}
+
+#[cfg(feature = "std")]
 fn current_tx_hash() -> Option<B256> {
     CURRENT_TX_HASH.with(|slot| *slot.borrow())
+}
+
+#[cfg(not(feature = "std"))]
+fn current_tx_hash() -> Option<B256> {
+    // SAFETY: the no_std prover guest is single-threaded.
+    unsafe { *CURRENT_TX_HASH.0.get() }
 }
 
 fn synthetic_tx_hash(input: &PrecompileInput<'_>) -> B256 {
@@ -62,15 +99,15 @@ fn synthetic_tx_hash(input: &PrecompileInput<'_>) -> B256 {
 }
 
 /// `DynPrecompile` implementation that returns the currently executing zone tx hash.
-pub(crate) struct ZoneTxContext;
+pub struct ZoneTxContext;
 
 impl ZoneTxContext {
-    pub(crate) fn create() -> DynPrecompile {
+    pub fn create() -> DynPrecompile {
         DynPrecompile::new_stateful(PrecompileId::Custom("ZoneTxContext".into()), move |input| {
             if !input.is_direct_call() {
                 warn!(
                     target: "zone::precompile",
-                    "ZoneTxContext called via DELEGATECALL — rejecting"
+                    "ZoneTxContext called via DELEGATECALL - rejecting"
                 );
                 return Ok(PrecompileOutput::revert(
                     0,

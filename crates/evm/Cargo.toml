@@ -35,14 +35,9 @@ alloy-consensus.workspace = true
 alloy-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-provider = { workspace = true, features = ["reqwest"] }
-alloy-sol-types.workspace = true
-
-# revm
-revm.workspace = true
 
 # misc
 tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

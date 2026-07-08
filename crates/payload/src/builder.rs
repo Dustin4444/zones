@@ -636,49 +636,24 @@ pub fn build_advance_tempo_tx(prepared: &PreparedL1Block) -> Recovered<TempoTxEn
 #[cfg(test)]
 mod tests {
     use alloy_consensus::Header;
-    use alloy_primitives::{B256, Bytes, Log, U256, address};
+    use alloy_eips::eip2718::Encodable2718 as _;
+    use alloy_primitives::{Address, B256, Bytes, Log, U256, address};
+    use alloy_rlp::Encodable as _;
     use alloy_sol_types::{SolCall, SolEvent};
+    use reth_primitives_traits::Recovered;
     use reth_primitives_traits::SealedHeader;
     use tempo_primitives::{TempoHeader, TempoReceipt, TempoTxType};
+    use zone_precompiles::ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE;
+    use zone_prover_core::{
+        PlannedZoneTransactionKind, RecoveredTempoTx, TempoHardfork, ZoneBlock,
+        ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneBlockExecutionPlan,
+        ZoneCfgEnvWitness, ZoneTempoImport, ZoneWithdrawalFinalization,
+    };
 
     use crate::abi::{self, DepositType, ZoneInbox};
     use zone_l1::PreparedL1Block;
 
-    fn make_withdrawal_requested_log(sender: alloy_primitives::Address) -> Log {
-        let event = abi::ZoneOutbox::WithdrawalRequested {
-            withdrawalIndex: 1,
-            sender,
-            token: address!("0x0000000000000000000000000000000000001000"),
-            to: address!("0x0000000000000000000000000000000000002000"),
-            amount: 500_000,
-            fee: 0,
-            memo: B256::ZERO,
-            gasLimit: 0,
-            fallbackRecipient: sender,
-            data: Bytes::new(),
-            revealTo: Bytes::new(),
-        };
-
-        Log {
-            address: super::ZONE_OUTBOX_ADDRESS,
-            data: event.encode_log_data(),
-        }
-    }
-
-    fn make_receipt(success: bool, logs: Vec<Log>) -> TempoReceipt {
-        TempoReceipt {
-            tx_type: TempoTxType::Legacy,
-            success,
-            cumulative_gas_used: 21_000,
-            logs,
-        }
-    }
-
-    /// Verify that `build_advance_tempo_tx` constructs valid calldata for mixed
-    /// deposit types. The calldata should include `QueuedDeposit` entries with the
-    /// correct `DepositType` discriminator and `DecryptionData` for encrypted deposits.
-    #[test]
-    fn test_build_advance_tempo_tx_with_encrypted_deposit() {
+    fn prepared_l1_block_with_mixed_deposits() -> PreparedL1Block {
         let token = address!("0x0000000000000000000000000000000000001000");
         let sender = address!("0x0000000000000000000000000000000000001234");
         let recipient = address!("0x0000000000000000000000000000000000005678");
@@ -691,9 +666,7 @@ mod tests {
             ..Default::default()
         };
 
-        // Build a PreparedL1Block directly — this test validates
-        // `build_advance_tempo_tx` calldata encoding, not `prepare`.
-        let prepared = PreparedL1Block {
+        PreparedL1Block {
             header: SealedHeader::seal_slow(header),
             queued_deposits: vec![
                 abi::QueuedDeposit {
@@ -740,8 +713,89 @@ mod tests {
                 },
             }],
             enabled_tokens: vec![],
+        }
+    }
+
+    fn prover_zone_block(
+        tempo_import: ZoneTempoImport,
+        withdrawal_finalization: ZoneWithdrawalFinalization,
+    ) -> ZoneBlock {
+        ZoneBlock {
+            number: 9,
+            parent_hash: B256::repeat_byte(0x11),
+            timestamp: 9,
+            beneficiary: Address::repeat_byte(0x42),
+            protocol_version: 1,
+            cfg_env: ZoneCfgEnvWitness {
+                chain_id: 421_700_001,
+                spec: TempoHardfork::T1,
+                enable_amsterdam_eip8037: false,
+            },
+            execution_context: ZoneBlockExecutionContextWitness {
+                parent_beacon_block_root: B256::repeat_byte(0x22),
+                extra_data: Bytes::new(),
+            },
+            block_env: ZoneBlockEnvWitness {
+                gas_limit: 30_000_000,
+                basefee: 0,
+                difficulty: U256::ZERO,
+                prevrandao: B256::repeat_byte(0x33),
+                slot_num: 9,
+                timestamp_millis_part: 0,
+            },
+            tempo_import,
+            withdrawal_finalization,
+            transactions: Vec::new(),
+        }
+    }
+
+    fn assert_same_recovered_tx(
+        payload_tx: &Recovered<tempo_primitives::TempoTxEnvelope>,
+        prover_tx: &RecoveredTempoTx,
+    ) {
+        assert_eq!(payload_tx.signer(), prover_tx.signer());
+        assert_eq!(
+            payload_tx.inner().encoded_2718(),
+            prover_tx.inner().encoded_2718()
+        );
+    }
+
+    fn make_withdrawal_requested_log(sender: alloy_primitives::Address) -> Log {
+        let event = abi::ZoneOutbox::WithdrawalRequested {
+            withdrawalIndex: 1,
+            sender,
+            token: address!("0x0000000000000000000000000000000000001000"),
+            to: address!("0x0000000000000000000000000000000000002000"),
+            amount: 500_000,
+            fee: 0,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: sender,
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
         };
 
+        Log {
+            address: super::ZONE_OUTBOX_ADDRESS,
+            data: event.encode_log_data(),
+        }
+    }
+
+    fn make_receipt(success: bool, logs: Vec<Log>) -> TempoReceipt {
+        TempoReceipt {
+            tx_type: TempoTxType::Legacy,
+            success,
+            cumulative_gas_used: 21_000,
+            logs,
+        }
+    }
+
+    /// Verify that `build_advance_tempo_tx` constructs valid calldata for mixed
+    /// deposit types. The calldata should include `QueuedDeposit` entries with the
+    /// correct `DepositType` discriminator and `DecryptionData` for encrypted deposits.
+    #[test]
+    fn test_build_advance_tempo_tx_with_encrypted_deposit() {
+        let prepared = prepared_l1_block_with_mixed_deposits();
         let recovered_tx = super::build_advance_tempo_tx(&prepared);
 
         // Decode the calldata to verify structure.
@@ -776,6 +830,42 @@ mod tests {
             1,
             "should have 1 DecryptionData for the encrypted deposit"
         );
+    }
+
+    #[test]
+    fn prover_system_transactions_match_payload_builder_for_dynamic_shapes() {
+        let prepared = prepared_l1_block_with_mixed_deposits();
+        let payload_advance_tx = super::build_advance_tempo_tx(&prepared);
+
+        let mut header_rlp = Vec::new();
+        prepared.header.header().encode(&mut header_rlp);
+        let encrypted_sender = Bytes::from(vec![0x7b; AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE]);
+        let payload_finalize_tx =
+            super::build_finalize_withdrawal_batch_tx(U256::ONE, 9, vec![encrypted_sender.clone()]);
+
+        let block = prover_zone_block(
+            ZoneTempoImport::advance(
+                Bytes::from(header_rlp),
+                prepared.queued_deposits,
+                prepared.decryptions,
+                prepared.enabled_tokens,
+            ),
+            ZoneWithdrawalFinalization::finalize(U256::ONE, vec![encrypted_sender]),
+        );
+        let plan = ZoneBlockExecutionPlan::from_block(0, &block)
+            .expect("prover should plan dynamic system transactions");
+
+        assert_eq!(plan.transactions.len(), 2);
+        assert_eq!(
+            plan.transactions[0].kind,
+            PlannedZoneTransactionKind::AdvanceTempo
+        );
+        assert_eq!(
+            plan.transactions[1].kind,
+            PlannedZoneTransactionKind::FinalizeWithdrawalBatch
+        );
+        assert_same_recovered_tx(&payload_advance_tx, &plan.transactions[0].tx);
+        assert_same_recovered_tx(&payload_finalize_tx, &plan.transactions[1].tx);
     }
 
     #[test]

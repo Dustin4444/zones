@@ -13,12 +13,12 @@
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types_eth::BlockId;
+use alloy_rpc_types_eth::{BlockId, EIP1186AccountProofResponse};
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
 use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
-use zone_precompiles::SequencerExt;
+use zone_precompiles::{L1StorageReader, SequencerExt, ZonePortalReader};
 
 use super::cache::L1StateCache;
 use crate::{abi::PORTAL_SEQUENCER_SLOT, rpc::rpc_connection_config};
@@ -212,6 +212,21 @@ impl L1StateProvider {
         self.get_storage(address, slot, block_number)
     }
 
+    /// Read an account/storage proof synchronously at a specific L1 block.
+    pub fn get_proof(
+        &self,
+        address: Address,
+        slots: Vec<B256>,
+        block_number: u64,
+    ) -> Result<EIP1186AccountProofResponse> {
+        let proof = tokio::task::block_in_place(|| {
+            self.runtime_handle
+                .block_on(self.fetch_proof(address, slots, block_number))
+        })?;
+        self.cache_proof_storage_values(&proof, block_number);
+        Ok(proof)
+    }
+
     /// Read the active sequencer address from the configured portal at the latest known L1 height.
     pub fn get_latest_sequencer(&self) -> Result<Address> {
         let value = self.get_latest_storage(self.portal_address, PORTAL_SEQUENCER_SLOT)?;
@@ -243,6 +258,18 @@ impl L1StateProvider {
         Ok(value)
     }
 
+    /// Read an account/storage proof asynchronously at a specific L1 block.
+    pub async fn get_proof_async(
+        &self,
+        address: Address,
+        slots: Vec<B256>,
+        block_number: u64,
+    ) -> Result<EIP1186AccountProofResponse> {
+        let proof = self.fetch_proof(address, slots, block_number).await?;
+        self.cache_proof_storage_values(&proof, block_number);
+        Ok(proof)
+    }
+
     /// Expose the shared cache handle for external use (e.g. the engine).
     pub fn cache(&self) -> &L1StateCache {
         &self.cache
@@ -261,10 +288,60 @@ impl L1StateProvider {
         debug!(%address, %slot, block_number, %result, "fetched L1 storage slot from RPC");
         Ok(result)
     }
+
+    async fn fetch_proof(
+        &self,
+        address: Address,
+        slots: Vec<B256>,
+        block_number: u64,
+    ) -> Result<EIP1186AccountProofResponse> {
+        let block_id = BlockId::number(block_number);
+        self.provider
+            .get_proof(address, slots)
+            .block_id(block_id)
+            .await
+            .map_err(|e| {
+                warn!(%address, block_number, %e, "eth_getProof RPC call failed");
+                eyre::eyre!("eth_getProof failed for address={address} block={block_number}: {e}")
+            })
+    }
+
+    fn cache_proof_storage_values(&self, proof: &EIP1186AccountProofResponse, block_number: u64) {
+        let mut cache = self.cache.write();
+        for storage in &proof.storage_proof {
+            cache.set(
+                proof.address,
+                storage.key.as_b256(),
+                block_number,
+                B256::from(storage.value.to_be_bytes()),
+            );
+        }
+    }
 }
 
 impl SequencerExt for L1StateProvider {
     fn latest_sequencer(&self) -> Option<Address> {
         self.get_latest_sequencer().ok()
+    }
+}
+
+impl L1StorageReader for L1StateProvider {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> std::result::Result<B256, revm::precompile::PrecompileError> {
+        self.get_storage(account, slot, block_number).map_err(|e| {
+            zone_precompiles::zone_rpc_error(format!(
+                "L1 storage unavailable for account={account} slot={slot} block={block_number}: {e}"
+            ))
+        })
+    }
+}
+
+impl ZonePortalReader for L1StateProvider {
+    fn portal_address(&self) -> Address {
+        self.portal_address
     }
 }

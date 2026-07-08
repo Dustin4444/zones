@@ -21,12 +21,17 @@ use revm::{
     precompile::{PrecompileSpecId, Precompiles},
 };
 use tempo_chainspec::hardfork::TempoHardfork;
+use tempo_evm::{TempoBlockEnv, evm::TempoEvm};
 use tempo_primitives::TempoReceipt;
 
 use crate::{
     AlloyZoneBlockExecutorProvider, OwnedWitnessTempoStateReader, WitnessTempoStateReader,
     ZoneAlloyBlockExecutor, ZoneBlockEnv, ZoneBlockExecutionInput, ZoneEvmEnv, ZoneExecutionState,
-    ZoneTxEnv, register_witness_zone_precompiles,
+    ZoneTxEnv,
+    execution_precompiles::{
+        WitnessZonePortalReader, register_witness_zone_precompiles_with_fee_manager,
+    },
+    register_witness_zone_precompiles,
 };
 
 pub type ZoneEvmContext<DB> = Context<ZoneBlockEnv, ZoneTxEnv, CfgEnv<TempoHardfork>, DB>;
@@ -291,8 +296,21 @@ impl EvmFactory for ZoneWitnessEvmFactory {
 pub struct ZoneEthExecutorSpec;
 
 impl EthereumHardforks for ZoneEthExecutorSpec {
-    fn ethereum_fork_activation(&self, _fork: EthereumHardfork) -> ForkCondition {
-        ForkCondition::Never
+    fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
+        match fork {
+            EthereumHardfork::Dao
+            | EthereumHardfork::Bpo1
+            | EthereumHardfork::Bpo2
+            | EthereumHardfork::Bpo3
+            | EthereumHardfork::Bpo4
+            | EthereumHardfork::Bpo5
+            | EthereumHardfork::Amsterdam => ForkCondition::Never,
+            EthereumHardfork::Shanghai
+            | EthereumHardfork::Cancun
+            | EthereumHardfork::Prague
+            | EthereumHardfork::Osaka => ForkCondition::Timestamp(0),
+            _ => ForkCondition::Block(0),
+        }
     }
 }
 
@@ -321,41 +339,63 @@ pub fn zone_witness_precompiles(
 
 #[derive(Debug, Clone, Default)]
 pub struct WitnessZoneBlockExecutorProvider {
-    evm_factory: ZoneWitnessEvmFactory,
     executor_spec: ZoneEthExecutorSpec,
+    portal_address: Address,
 }
 
 impl WitnessZoneBlockExecutorProvider {
     pub const fn new() -> Self {
         Self {
-            evm_factory: ZoneWitnessEvmFactory,
             executor_spec: ZoneEthExecutorSpec,
+            portal_address: Address::ZERO,
         }
+    }
+
+    pub const fn with_portal_address(mut self, portal_address: Address) -> Self {
+        self.portal_address = portal_address;
+        self
     }
 }
 
 impl AlloyZoneBlockExecutorProvider for WitnessZoneBlockExecutorProvider {
     type Receipt = TempoReceipt;
     type Executor<'a> =
-        ZoneAlloyBlockExecutor<'a, ZoneWitnessEvm<&'a mut ZoneExecutionState>, ZoneEthExecutorSpec>;
+        ZoneAlloyBlockExecutor<'a, TempoEvm<&'a mut ZoneExecutionState>, ZoneEthExecutorSpec>;
 
     fn create_executor<'a>(
         &'a mut self,
         state: &'a mut ZoneExecutionState,
         input: &ZoneBlockExecutionInput<'_>,
     ) -> Result<Self::Executor<'a>, crate::ProverError> {
-        let precompiles = zone_witness_precompiles(
-            &input.evm_env,
-            input.tempo_state_reader,
+        let tempo_state_reader =
+            OwnedWitnessTempoStateReader::from_reader(input.tempo_state_reader);
+        let fee_provider =
+            WitnessZonePortalReader::new(tempo_state_reader.clone(), self.portal_address);
+        let mut evm = TempoEvm::new(&mut *state, tempo_evm_env(input))
+            .with_fee_manager(zone_precompiles::ZoneFeeManager::new(fee_provider.clone()));
+        let (_, _, precompiles) = evm.components_mut();
+        register_witness_zone_precompiles_with_fee_manager(
+            precompiles,
+            &input.evm_env.cfg_env,
+            tempo_state_reader,
             input.block.beneficiary,
             input.block.tempo_block_number,
+            fee_provider,
         );
-        let evm =
-            self.evm_factory
-                .create_evm_with_precompiles(state, input.evm_env.clone(), precompiles);
         let ctx: EthBlockExecutionCtx<'a> = input.execution_context.inner.clone();
 
         Ok(ZoneAlloyBlockExecutor::new(evm, ctx, self.executor_spec))
+    }
+}
+
+fn tempo_evm_env(input: &ZoneBlockExecutionInput<'_>) -> EvmEnv<TempoHardfork, TempoBlockEnv> {
+    EvmEnv {
+        cfg_env: input.evm_env.cfg_env.clone(),
+        block_env: TempoBlockEnv {
+            inner: input.evm_env.block_env.inner.clone(),
+            timestamp_millis_part: input.evm_env.block_env.timestamp_millis_part,
+            ..Default::default()
+        },
     }
 }
 

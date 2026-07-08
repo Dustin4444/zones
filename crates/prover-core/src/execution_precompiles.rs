@@ -1,16 +1,23 @@
-use alloc::sync::Arc;
+use alloc::{format, rc::Rc, sync::Arc};
+use core::cell::RefCell;
 
 use alloy_evm::precompiles::PrecompilesMap;
-use alloy_primitives::Address;
-use tempo_precompiles::tip20::is_tip20_prefix;
-use tempo_zone_contracts::TEMPO_STATE_READER_ADDRESS;
+use alloy_primitives::{Address, B256, U256};
+use tempo_precompiles::{
+    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv, STABLECOIN_DEX_ADDRESS,
+    TIP_FEE_MANAGER_ADDRESS, account_keychain::AccountKeychain, nonce::NonceManager,
+    storage::actions::StorageActions, storage_credits::NonCreditableSlots, tip20::is_tip20_prefix,
+};
+use tempo_zone_contracts::{TEMPO_STATE_READER_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
 use zone_precompiles::{
     AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
-    ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneTip20Token, ZoneTip403ProxyRegistry,
-    ZoneTokenFactory,
+    L1StorageReader, ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneFeeManager,
+    ZonePortalReader, ZoneTip20Token, ZoneTip403ProxyRegistry, ZoneTokenFactory, ZoneTxContext,
 };
 
-use crate::{OwnedWitnessTempoStateReader, WitnessPolicyProvider, WitnessSequencer, ZoneCfgEnv};
+use crate::{
+    OwnedWitnessTempoStateReader, ProverError, WitnessPolicyProvider, WitnessSequencer, ZoneCfgEnv,
+};
 
 /// Register Zone precompiles that can execute entirely inside prover-core.
 pub fn register_witness_zone_precompiles(
@@ -25,6 +32,7 @@ pub fn register_witness_zone_precompiles(
     precompiles.apply_precompile(&TEMPO_STATE_READER_ADDRESS, |_| {
         Some(tempo_state_reader.into_dyn())
     });
+    precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| Some(ZoneTxContext::create()));
     precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
         Some(ChaumPedersenVerify.into())
     });
@@ -51,6 +59,112 @@ pub fn register_witness_zone_precompiles(
             None
         }
     });
+}
+
+/// Register Zone precompiles for the TempoEVM-backed witness executor.
+///
+/// `TempoEvm` installs Tempo's dynamic precompile lookup by default. Zone
+/// execution replaces the TIP-20, fee-manager, and selected protocol entries,
+/// so the witness executor must install the same lookup shape instead of using
+/// the smaller legacy witness lookup.
+pub fn register_witness_zone_precompiles_with_fee_manager<P>(
+    precompiles: &mut PrecompilesMap,
+    cfg: &ZoneCfgEnv,
+    tempo_state_reader: OwnedWitnessTempoStateReader,
+    sequencer: Address,
+    tempo_block_number: u64,
+    fee_provider: P,
+) where
+    P: ZonePortalReader + Clone + Send + Sync + 'static,
+{
+    let policy_provider =
+        WitnessPolicyProvider::new(tempo_state_reader.clone(), tempo_block_number);
+    precompiles.apply_precompile(&TEMPO_STATE_READER_ADDRESS, |_| {
+        Some(tempo_state_reader.into_dyn())
+    });
+    precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| Some(ZoneTxContext::create()));
+    precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
+        Some(ChaumPedersenVerify.into())
+    });
+    precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| Some(AesGcmDecrypt.into()));
+    precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
+        Some(ZoneTokenFactory::create(cfg))
+    });
+    precompiles.apply_precompile(&ZONE_TIP403_PROXY_ADDRESS, |_| {
+        Some(ZoneTip403ProxyRegistry::create(policy_provider.clone()))
+    });
+
+    let registry = Some(ZoneTip403ProxyRegistry::new(policy_provider));
+    let sequencer: Arc<dyn zone_precompiles::SequencerExt> =
+        Arc::new(WitnessSequencer::new(sequencer));
+    let zone_cfg = cfg.clone();
+    let zone_env = PrecompileEnv::new(
+        cfg,
+        StorageActions::disabled(),
+        Rc::new(RefCell::new(NonCreditableSlots::empty())),
+    );
+    precompiles.set_precompile_lookup(move |address: &Address| {
+        if is_tip20_prefix(*address) {
+            Some(ZoneTip20Token::create(
+                *address,
+                &zone_cfg,
+                registry.clone(),
+                sequencer.clone(),
+            ))
+        } else if *address == TIP_FEE_MANAGER_ADDRESS {
+            Some(ZoneFeeManager::create(fee_provider.clone(), &zone_cfg))
+        } else if *address == STABLECOIN_DEX_ADDRESS {
+            None
+        } else if *address == NONCE_PRECOMPILE_ADDRESS {
+            Some(NonceManager::create_precompile(&zone_env))
+        } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
+            Some(AccountKeychain::create_precompile(&zone_env))
+        } else {
+            None
+        }
+    });
+}
+
+#[derive(Debug, Clone)]
+pub struct WitnessZonePortalReader {
+    tempo_state_reader: OwnedWitnessTempoStateReader,
+    portal_address: Address,
+}
+
+impl WitnessZonePortalReader {
+    pub const fn new(
+        tempo_state_reader: OwnedWitnessTempoStateReader,
+        portal_address: Address,
+    ) -> Self {
+        Self {
+            tempo_state_reader,
+            portal_address,
+        }
+    }
+
+    fn prover_error(err: ProverError) -> revm::precompile::PrecompileError {
+        revm::precompile::PrecompileError::Fatal(format!("{err}"))
+    }
+}
+
+impl L1StorageReader for WitnessZonePortalReader {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> Result<B256, revm::precompile::PrecompileError> {
+        self.tempo_state_reader
+            .read_storage_word(block_number, account, U256::from_be_bytes(slot.0))
+            .map(|value| B256::from(value.to_be_bytes::<32>()))
+            .map_err(Self::prover_error)
+    }
+}
+
+impl ZonePortalReader for WitnessZonePortalReader {
+    fn portal_address(&self) -> Address {
+        self.portal_address
+    }
 }
 
 #[cfg(test)]

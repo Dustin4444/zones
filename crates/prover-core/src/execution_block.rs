@@ -1,12 +1,14 @@
-use alloy_consensus::{Transaction, TransactionEnvelope};
+use alloy_consensus::{Transaction, TransactionEnvelope, transaction::TxHashRef};
 use alloy_eips::Encodable2718;
 use alloy_evm::{
-    Evm, FromRecoveredTx, FromTxWithEncoded,
+    Evm, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, ExecutableTx, GasOutput, StateDB,
     },
     eth::{EthBlockExecutionCtx, EthBlockExecutor, EthTxResult, spec::EthExecutorSpec},
 };
+use zone_precompiles::set_current_tx_hash;
+
 use alloy_primitives::Log;
 use tempo_primitives::{TempoReceipt, TempoTxEnvelope, TempoTxType};
 
@@ -64,7 +66,10 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
-        self.inner.execute_transaction_without_commit(tx)
+        let (tx_env, recovered) = tx.into_parts();
+        let _tx_hash_guard = set_current_tx_hash(*recovered.tx().tx_hash());
+        self.inner
+            .execute_transaction_without_commit((tx_env, recovered))
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {

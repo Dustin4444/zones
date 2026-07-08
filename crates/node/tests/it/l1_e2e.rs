@@ -8,12 +8,17 @@ use crate::utils::{
     L1TestNode, STABLECOIN_DEX_ADDRESS, WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
 };
 use alloy::{
-    primitives::{Address, B256, U256},
+    primitives::{Address, B256, Bytes, U256},
     providers::Provider,
 };
+use alloy_sol_types::SolCall;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
 use std::time::Duration;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, TempoState, Withdrawal as PortalWithdrawal, ZONE_TOKEN_ADDRESS, ZonePortal,
+};
+use zone_precompiles::ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE;
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
 /// 500ms and the L1Subscriber needs to connect, backfill, and subscribe.
@@ -31,6 +36,89 @@ struct SameZoneSwapFixture {
     beta: Address,
     account: ZoneAccount,
     swap_amount: u128,
+}
+
+async fn fetch_tx_calldata(l1: &L1TestNode, tx_hash: B256, label: &str) -> eyre::Result<Vec<u8>> {
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(l1.http_url().clone())
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionByHash",
+            "params": [format!("{tx_hash:#x}")],
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    if let Some(error) = response.get("error") {
+        eyre::bail!("eth_getTransactionByHash failed for {label} tx {tx_hash}: {error}");
+    }
+
+    let tx = response
+        .get("result")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| eyre::eyre!("{label} tx {tx_hash} not found"))?;
+
+    let input = tx
+        .get("input")
+        .and_then(|value| value.as_str())
+        .filter(|input| *input != "0x")
+        .or_else(|| {
+            tx.get("calls")
+                .and_then(|value| value.as_array())
+                .and_then(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| call.get("input").and_then(|value| value.as_str()))
+                        .find(|input| *input != "0x")
+                })
+        })
+        .ok_or_else(|| eyre::eyre!("{label} tx {tx_hash} has no calldata input"))?;
+
+    const_hex::decode(input.strip_prefix("0x").unwrap_or(input))
+        .map_err(|err| eyre::eyre!("failed to hex-decode {label} tx {tx_hash}: {err}"))
+}
+
+async fn fetch_withdrawal_processed_call(
+    l1: &L1TestNode,
+    portal_address: Address,
+    to: Address,
+    token: Address,
+    amount: u128,
+    callback_success: bool,
+) -> eyre::Result<ZonePortal::processWithdrawalCall> {
+    let portal = ZonePortal::new(portal_address, l1.provider());
+    let events = portal
+        .WithdrawalProcessed_filter()
+        .from_block(0)
+        .query()
+        .await?;
+    let tx_hash = events
+        .iter()
+        .rev()
+        .find_map(|(event, log)| {
+            if event.to == to
+                && event.token == token
+                && event.amount == amount
+                && event.callbackSuccess == callback_success
+            {
+                log.transaction_hash
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "expected WithdrawalProcessed event for {to} with token {token} amount {amount} and callbackSuccess={callback_success}"
+            )
+        })?;
+
+    let calldata = fetch_tx_calldata(l1, tx_hash, "processWithdrawal").await?;
+    ZonePortal::processWithdrawalCall::abi_decode(&calldata)
+        .map_err(|err| eyre::eyre!("failed to decode processWithdrawal calldata: {err}"))
 }
 
 async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
@@ -904,7 +992,28 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
         ZoneAccount::with_signer(recipient_signer, &l1, &zone, portal_address);
 
     let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
-    recipient_account.withdraw(withdrawal_amount).await?;
+    let reveal_secret = k256::SecretKey::from_slice(&[0x42; 32]).expect("valid reveal key");
+    let reveal_to =
+        Bytes::copy_from_slice(reveal_secret.public_key().to_encoded_point(true).as_bytes());
+    let mut withdrawal_args = WithdrawalArgs::new(withdrawal_amount);
+    withdrawal_args.reveal_to = reveal_to.clone();
+    let request = recipient_account.withdraw_with(withdrawal_args).await?;
+    assert_eq!(
+        request.event.sender, recipient,
+        "withdrawal request sender should be the encrypted-deposit recipient"
+    );
+    assert_eq!(
+        request.event.to, recipient,
+        "plain withdrawal should target the recipient on L1"
+    );
+    assert_eq!(
+        request.event.amount, withdrawal_amount,
+        "withdrawal request amount should match"
+    );
+    assert_eq!(
+        request.event.revealTo, reveal_to,
+        "withdrawal request should carry the reveal recipient key"
+    );
 
     // --- Step 6: Wait for the withdrawal to be fully processed on L1 ---
     let withdrawal_timeout = std::time::Duration::from_secs(60);
@@ -915,6 +1024,37 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
         withdrawal_timeout,
     )
     .await?;
+
+    let process_call = fetch_withdrawal_processed_call(
+        &l1,
+        portal_address,
+        recipient,
+        PATH_USD_ADDRESS,
+        withdrawal_amount,
+        true,
+    )
+    .await?;
+    assert_eq!(process_call.withdrawal.to, recipient);
+    assert_eq!(process_call.withdrawal.token, PATH_USD_ADDRESS);
+    assert_eq!(process_call.withdrawal.amount, withdrawal_amount);
+    assert_eq!(
+        process_call.withdrawal.senderTag,
+        PortalWithdrawal::sender_tag(recipient, request.tx_hash),
+        "processWithdrawal sender tag should bind the sender and L2 request tx hash"
+    );
+    assert_eq!(
+        process_call.withdrawal.encryptedSender.len(),
+        AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
+        "processWithdrawal should include an authenticated sender reveal ciphertext"
+    );
+    let (revealed_sender, revealed_tx_hash) =
+        zone_precompiles::ecies::decrypt_authenticated_withdrawal(
+            &reveal_secret,
+            process_call.withdrawal.encryptedSender.as_ref(),
+        )
+        .ok_or_else(|| eyre::eyre!("failed to decrypt authenticated sender reveal"))?;
+    assert_eq!(revealed_sender, recipient);
+    assert_eq!(revealed_tx_hash, request.tx_hash);
 
     Ok(())
 }

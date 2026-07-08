@@ -12,11 +12,17 @@ use alloy_consensus::{
     transaction::SignerRecoverable as _,
 };
 use alloy_eips::eip2718::Encodable2718 as _;
+use alloy_evm::{
+    Evm as _, EvmEnv,
+    block::BlockExecutor as _,
+    eth::EthBlockExecutionCtx,
+    precompiles::{DynPrecompile, PrecompilesMap},
+};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::Provider as _;
 use alloy_rlp::{Decodable as _, Encodable as _};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::SolCall as _;
+use alloy_sol_types::{SolCall as _, SolError as _};
 use eyre::WrapErr;
 use futures::future::BoxFuture;
 use k256::SecretKey;
@@ -42,25 +48,44 @@ use reth_rpc_builder::Identity;
 use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
     BlockNumReader, BlockReader, BlockSource, EmptyBodyStorage, HeaderProvider, StateProvider,
-    StateProviderFactory,
+    StateProviderFactory, StateReader,
 };
 use reth_transaction_pool::{
     Pool, TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
-use reth_trie_common::{AccountProof as RethAccountProof, EMPTY_ROOT_HASH, TrieInput};
+use reth_trie_common::{
+    AccountProof as RethAccountProof, EMPTY_ROOT_HASH, HashedPostState, KeccakKeyHasher,
+    KeyHasher as _, TrieInput,
+};
+use revm::{
+    database::{StateBuilder, states::BundleState, states::bundle_state::BundleRetention},
+    database_interface::{
+        DBErrorMarker, Database,
+        primitives::{StorageKey, StorageValue},
+        state::{AccountInfo, Bytecode as RevmBytecode},
+    },
+    precompile::{PrecompileError, PrecompileId, PrecompileOutput, PrecompileResult},
+};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::hardfork::{TempoHardfork, TempoHardforks as _};
 use tempo_chainspec::spec::TempoChainSpec;
-use tempo_evm::TempoEvmConfig;
+use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+use tempo_evm::{TempoBlockEnv, TempoEvmConfig, evm::TempoEvm};
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
+};
+use tempo_precompiles::{
+    TIP_FEE_MANAGER_ADDRESS,
+    storage::{StorageAction, StorageActions, packing::extract_from_word},
+    tip20::is_tip20_prefix,
+    tip403_registry::{ALLOW_ALL_POLICY_ID, REJECT_ALL_POLICY_ID},
 };
 use tempo_primitives::{
     self as primitives, TempoHeader, TempoPrimitives, TempoTxEnvelope, TempoTxType,
@@ -73,7 +98,8 @@ use tempo_transaction_pool::{
     validator::{DEFAULT_MAX_TEMPO_AUTHORIZATIONS, TempoTransactionValidator},
 };
 use tempo_zone_contracts::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
+    TEMPO_STATE_ADDRESS, TEMPO_STATE_READER_ADDRESS, TempoStateReader as TempoStateReaderAbi,
+    ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
 use tracing::{debug, info};
 use zone_evm::ZoneEvmConfig;
@@ -85,19 +111,32 @@ use zone_l1::{
     },
 };
 use zone_payload::{ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes};
+use zone_precompiles::{
+    AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
+    SequencerExt, ZONE_TIP20_FACTORY_ADDRESS, ZONE_TIP403_PROXY_ADDRESS, ZoneFeeManager,
+    ZonePortalReader, ZoneTip20Token, ZoneTip403ProxyRegistry, ZoneTokenFactory, ZoneTxContext,
+    policy::PolicyCheck,
+};
 use zone_primitives::{
     ZoneHeader,
     constants::{
-        TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_STATE_ROOT_SLOT,
+        TEMPO_BENEFICIARY_SLOT, TEMPO_BLOCK_HASH_SLOT, TEMPO_PACKED_SLOT, TEMPO_PARENT_HASH_SLOT,
+        TEMPO_PREV_RANDAO_SLOT, TEMPO_RECEIPTS_ROOT_SLOT, TEMPO_STATE_ROOT_SLOT,
+        TEMPO_TIMESTAMP_MILLIS_SLOT, TEMPO_TRANSACTIONS_ROOT_SLOT, TEMPO_WRAPPER_GAS_LIMITS_SLOT,
         ZONE_BLOCK_PROTOCOL_VERSION, ZONE_INBOX_PROCESSED_HASH_SLOT,
         ZONE_INBOX_PROCESSED_NUMBER_SLOT, ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
         ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
     },
+    policy::AuthRole,
 };
 use zone_prover::types::{
-    BatchStateProof, ZoneAccountCode, ZoneAccountRead, ZoneBlock, ZoneBlockEnvWitness,
-    ZoneBlockExecutionContextWitness, ZoneCfgEnvWitness, ZoneStateWitness, ZoneStorageRead,
-    ZoneTempoImport, ZoneWithdrawalFinalization, prepare_stateless_execution,
+    AlloyZoneBlockExecutor, BatchStateProof, L1StateRead, TEMPO_STATE_READER_BASE_GAS,
+    TEMPO_STATE_READER_PER_SLOT_GAS, TIP20_TRANSFER_POLICY_ID_SLOT,
+    WitnessZoneBlockExecutorProvider, ZoneAccountCode, ZoneAccountRead, ZoneAlloyBlockExecutor,
+    ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneBlockExecutionInput,
+    ZoneCfgEnvWitness, ZoneEthExecutorSpec, ZoneStateWitness, ZoneStorageRead, ZoneTempoImport,
+    ZoneWithdrawalFinalization, ZoneWitnessEvmFactory, batch_output_from_execution,
+    execute_prepared_blocks, prepare_stateless_execution, zone_witness_precompiles,
 };
 use zone_sequencer::{
     BatchAnchorConfig, BatchWitness, ProverWitnessRequest, ProverWitnessSource,
@@ -108,13 +147,40 @@ use zone_sequencer::{
 /// mirrored with prover-core's ancestry verifier until it is shared from a
 /// common protocol crate.
 const ZONE_BLOCKHASH_ANCESTOR_LIMIT: usize = 256;
+const MAX_DYNAMIC_WITNESS_READ_CLOSURE_ITERS: usize = 64;
+const ZONE_OUTBOX_PACKED_SLOT: U256 = U256::ZERO;
+const ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT: U256 = U256::from_limbs([3, 0, 0, 0]);
+const ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT: U256 = U256::from_limbs([4, 0, 0, 0]);
+const PENDING_WITHDRAWAL_STORAGE_SLOTS: u64 = 9;
+const PENDING_WITHDRAWAL_CALLBACK_DATA_OFFSET: u64 = 7;
+const PENDING_WITHDRAWAL_REVEAL_TO_OFFSET: u64 = 8;
+const TIP20_TRANSFER_POLICY_ID_OFFSET: usize = 20;
+const TIP20_TRANSFER_POLICY_ID_BYTES: usize = 8;
+const TEMPO_STATE_HEADER_SLOTS: [B256; 10] = [
+    TEMPO_BLOCK_HASH_SLOT,
+    TEMPO_WRAPPER_GAS_LIMITS_SLOT,
+    TEMPO_PARENT_HASH_SLOT,
+    TEMPO_BENEFICIARY_SLOT,
+    TEMPO_STATE_ROOT_SLOT,
+    TEMPO_TRANSACTIONS_ROOT_SLOT,
+    TEMPO_RECEIPTS_ROOT_SLOT,
+    TEMPO_PACKED_SLOT,
+    TEMPO_TIMESTAMP_MILLIS_SLOT,
+    TEMPO_PREV_RANDAO_SLOT,
+];
 
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
 
+/// Prover witness source backed by a local Zone node provider.
+///
+/// This is the production sequencer witness path: it derives the witness from
+/// canonical node state for the requested batch instead of accepting externally
+/// supplied storage data.
 #[derive(Clone)]
-struct LocalNodeProverWitnessSource<P> {
+pub struct LocalNodeProverWitnessSource<P> {
     provider: P,
+    l1_state_provider: Option<L1StateProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +234,7 @@ enum ZoneSystemTransactionKind {
 struct ValidatedZoneBatchData {
     range: ValidatedZoneHeaderRange,
     prev_block_header: ZoneHeader,
+    batch_headers: Vec<ZoneHeader>,
     first_block_number: u64,
     final_canonical_block_hash: B256,
     final_zone_header_hash: B256,
@@ -231,14 +298,23 @@ impl ValidatedZoneBatchData {
 }
 
 impl<P> LocalNodeProverWitnessSource<P> {
-    const fn new(provider: P) -> Self {
-        Self { provider }
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider,
+            l1_state_provider: None,
+        }
+    }
+
+    pub fn with_l1_state_provider(mut self, l1_state_provider: L1StateProvider) -> Self {
+        self.l1_state_provider = Some(l1_state_provider);
+        self
     }
 }
 
 impl<P> fmt::Debug for LocalNodeProverWitnessSource<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalNodeProverWitnessSource")
+            .field("has_l1_state_provider", &self.l1_state_provider.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -252,6 +328,7 @@ where
             Receipt = primitives::TempoReceipt,
         > + ChainSpecProvider<ChainSpec = TempoChainSpec>
         + StateProviderFactory
+        + StateReader<Receipt = primitives::TempoReceipt>
         + Clone
         + Send
         + Sync
@@ -269,36 +346,26 @@ where
                     batch_data.range.parent_number
                 ))
             })?;
-        let initial_zone_state =
-            initial_zone_state_witness(pre_state.as_ref(), batch_data.prev_block_header.state_root)
-                .wrap_err("failed to build initial zone state proof witness")?;
-        let initial_tempo_binding = initial_tempo_binding_from_state(&initial_zone_state)?;
-        let final_tempo_binding =
-            final_tempo_binding_from_blocks(initial_tempo_binding, &batch_data.blocks)?;
-        eyre::ensure!(
-            final_tempo_binding.block_number == request.public_inputs.tempo_block_number,
-            "zone witness final Tempo block mismatch: witness {}, batch {}",
-            final_tempo_binding.block_number,
-            request.public_inputs.tempo_block_number
-        );
-        if request.public_inputs.anchor_block_number == final_tempo_binding.block_number {
-            eyre::ensure!(
-                request.public_inputs.anchor_block_hash == final_tempo_binding.block_hash,
-                "zone witness direct Tempo anchor hash mismatch: witness {}, public {}",
-                final_tempo_binding.block_hash,
-                request.public_inputs.anchor_block_hash
-            );
-        }
-        let expected_withdrawal_batch_index = previous_withdrawal_batch_index(&initial_zone_state)?
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("withdrawal batch index overflows u64"))?;
-        eyre::ensure!(
-            expected_withdrawal_batch_index
-                == request.public_inputs.expected_withdrawal_batch_index,
-            "zone witness withdrawal batch index mismatch: local {}, public {}",
-            expected_withdrawal_batch_index,
-            request.public_inputs.expected_withdrawal_batch_index
-        );
+        let initial_reads = initial_zone_read_slots(pre_state.as_ref(), &batch_data.blocks)
+            .wrap_err("failed to derive initial zone state witness read set")?;
+        let zone_blocks = batch_data
+            .blocks
+            .iter()
+            .map(|block| block.witness_block.clone())
+            .collect::<Vec<_>>();
+        let execution_reads = collect_zone_execution_read_slots(
+            pre_state.as_ref(),
+            batch_data.prev_block_header.state_root,
+            initial_reads,
+            &request,
+            &batch_data.prev_block_header,
+            &batch_data.zone_ancestry_headers,
+            &zone_blocks,
+            self.provider.chain_spec().as_ref(),
+            self.l1_state_provider.as_ref(),
+        )
+        .wrap_err("failed to collect zone execution witness reads")?;
+        let mut initial_reads = execution_reads.zone_reads;
         let zone_from = batch_data.range.from_zone_block;
         let zone_to = batch_data.range.to_zone_block;
         let header_count = batch_data.range.header_count();
@@ -312,42 +379,149 @@ where
         let parent_zone_header_hash = batch_data.prev_block_header.hash();
         let final_canonical_block_hash = batch_data.last_canonical_block_hash();
         let final_zone_header_hash = batch_data.last_zone_header_hash();
+        let canonical_execution_bundle =
+            self.canonical_execution_bundle_state(zone_from, zone_to)?;
+        let portal_address = self
+            .l1_state_provider
+            .as_ref()
+            .map(ZonePortalReader::portal_address)
+            .unwrap_or_default();
 
-        let witness = BatchWitness {
-            public_inputs: request.public_inputs,
-            prev_block_header: batch_data.prev_block_header,
-            zone_ancestry_headers: batch_data.zone_ancestry_headers,
-            zone_blocks: batch_data
-                .blocks
-                .into_iter()
-                .map(|block| block.witness_block)
-                .collect(),
-            initial_zone_state,
-            tempo_state_proofs: BatchStateProof {
-                node_pool: BTreeMap::new(),
-                reads: Vec::new(),
-            },
-            tempo_ancestry_headers: request.tempo_ancestry_headers,
-        };
-        prepare_stateless_execution(&witness)
-            .wrap_err("local prover witness failed stateless pre-execution validation")?;
-        debug!(
-            zone_from,
-            zone_to,
-            headers = header_count,
-            bodies = block_count,
-            ancestry_headers = ancestry_header_count,
-            raw_txs = raw_transaction_count,
-            system_txs = system_transaction_count,
-            user_txs = user_transaction_count,
-            receipts = receipt_count,
-            first_body = first_block_number,
-            parent_zone_header_hash = %parent_zone_header_hash,
-            final_canonical_body_hash = %final_canonical_block_hash,
-            final_zone_header_hash = %final_zone_header_hash,
-            "Built local prover witness with initial zone state proofs"
-        );
-        Ok(witness)
+        for replay_attempt in 0..=MAX_DYNAMIC_WITNESS_READ_CLOSURE_ITERS {
+            let initial_zone_state = initial_zone_state_witness(
+                pre_state.as_ref(),
+                batch_data.prev_block_header.state_root,
+                &initial_reads,
+            )
+            .wrap_err("failed to build initial zone state proof witness")?;
+            let initial_tempo_binding = initial_tempo_binding_from_state(&initial_zone_state)?;
+            let final_tempo_binding =
+                final_tempo_binding_from_blocks(initial_tempo_binding, &batch_data.blocks)?;
+            eyre::ensure!(
+                final_tempo_binding.block_number == request.public_inputs.tempo_block_number,
+                "zone witness final Tempo block mismatch: witness {}, batch {}",
+                final_tempo_binding.block_number,
+                request.public_inputs.tempo_block_number
+            );
+            if request.public_inputs.anchor_block_number == final_tempo_binding.block_number {
+                eyre::ensure!(
+                    request.public_inputs.anchor_block_hash == final_tempo_binding.block_hash,
+                    "zone witness direct Tempo anchor hash mismatch: witness {}, public {}",
+                    final_tempo_binding.block_hash,
+                    request.public_inputs.anchor_block_hash
+                );
+            }
+            let expected_withdrawal_batch_index =
+                previous_withdrawal_batch_index(&initial_zone_state)?
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("withdrawal batch index overflows u64"))?;
+            eyre::ensure!(
+                expected_withdrawal_batch_index
+                    == request.public_inputs.expected_withdrawal_batch_index,
+                "zone witness withdrawal batch index mismatch: local {}, public {}",
+                expected_withdrawal_batch_index,
+                request.public_inputs.expected_withdrawal_batch_index
+            );
+
+            let witness = BatchWitness {
+                public_inputs: request.public_inputs.clone(),
+                prev_block_header: batch_data.prev_block_header.clone(),
+                zone_ancestry_headers: batch_data.zone_ancestry_headers.clone(),
+                zone_blocks: zone_blocks.clone(),
+                initial_zone_state,
+                tempo_state_proofs: execution_reads.tempo_state_proofs.clone(),
+                tempo_ancestry_headers: request.tempo_ancestry_headers.clone(),
+            };
+
+            let validation = validate_generated_witness_replays_to_canonical_headers(
+                &witness,
+                &batch_data.batch_headers,
+                pre_state.as_ref(),
+                Some(&canonical_execution_bundle),
+                portal_address,
+            );
+
+            match validation {
+                Ok(()) => {
+                    prepare_stateless_execution(&witness).wrap_err(
+                        "local prover witness failed stateless pre-execution validation",
+                    )?;
+                    debug!(
+                        zone_from,
+                        zone_to,
+                        headers = header_count,
+                        bodies = block_count,
+                        ancestry_headers = ancestry_header_count,
+                        raw_txs = raw_transaction_count,
+                        system_txs = system_transaction_count,
+                        user_txs = user_transaction_count,
+                        receipts = receipt_count,
+                        first_body = first_block_number,
+                        parent_zone_header_hash = %parent_zone_header_hash,
+                        final_canonical_body_hash = %final_canonical_block_hash,
+                        final_zone_header_hash = %final_zone_header_hash,
+                        dynamic_read_closure_attempts = replay_attempt,
+                        "Built local prover witness with initial zone state proofs"
+                    );
+                    return Ok(witness);
+                }
+                Err(err) => {
+                    if replay_attempt < MAX_DYNAMIC_WITNESS_READ_CLOSURE_ITERS
+                        && let Some(account) = missing_account_read_from_error(&err)
+                        && initial_reads.entry(account).or_default().is_empty()
+                    {
+                        debug!(
+                            zone_from,
+                            zone_to,
+                            replay_attempt,
+                            %account,
+                            "Added dynamic witness account read from stateless replay"
+                        );
+                        continue;
+                    }
+
+                    if replay_attempt < MAX_DYNAMIC_WITNESS_READ_CLOSURE_ITERS
+                        && let Some((account, slot)) = missing_storage_read_from_error(&err)
+                        && initial_reads.entry(account).or_default().insert(slot)
+                    {
+                        debug!(
+                            zone_from,
+                            zone_to,
+                            replay_attempt,
+                            %account,
+                            %slot,
+                            "Added dynamic witness storage read from stateless replay"
+                        );
+                        continue;
+                    }
+
+                    return Err(err).wrap_err(
+                        "local prover witness replay did not match canonical zone headers",
+                    );
+                }
+            }
+        }
+
+        unreachable!("bounded dynamic witness read closure loop always returns")
+    }
+
+    fn canonical_execution_bundle_state(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> eyre::Result<BundleState> {
+        let mut execution = self.provider.get_state(from_block)?.ok_or_else(|| {
+            eyre::eyre!("canonical execution outcome for zone block {from_block} not found")
+        })?;
+
+        for block_number in from_block.saturating_add(1)..=to_block {
+            let next = self.provider.get_state(block_number)?.ok_or_else(|| {
+                eyre::eyre!("canonical execution outcome for zone block {block_number} not found")
+            })?;
+            execution.extend(next);
+        }
+
+        Ok(execution.bundle)
     }
 
     fn load_validated_batch_data(
@@ -399,6 +573,7 @@ where
         Ok(ValidatedZoneBatchData {
             range,
             prev_block_header: zone_headers.prev_block_header,
+            batch_headers: zone_headers.batch_headers,
             first_block_number: request.from_zone_block,
             final_canonical_block_hash,
             final_zone_header_hash,
@@ -491,33 +666,7 @@ fn ensure_local_witness_source_coverage(blocks: &[ValidatedZoneBlockData]) -> ey
     Ok(())
 }
 
-fn ensure_local_witness_block_coverage(index: usize, block: &ZoneBlock) -> eyre::Result<()> {
-    // TODO(stateless-prover): collect dynamic proofs here instead of rejecting
-    // once local node witness generation covers real execution batches.
-    if let ZoneTempoImport::Advance(import) = &block.tempo_import {
-        eyre::ensure!(
-            import.deposits.is_empty()
-                && import.decryptions.is_empty()
-                && import.enabled_tokens.is_empty(),
-            "local prover witness source cannot yet collect dynamic advanceTempo proofs for zone block {} at batch index {index}",
-            block.number
-        );
-    }
-
-    eyre::ensure!(
-        block.transactions.is_empty(),
-        "local prover witness source cannot yet collect dynamic user transaction proofs for zone block {} at batch index {index}",
-        block.number
-    );
-
-    if let ZoneWithdrawalFinalization::Finalize(finalization) = &block.withdrawal_finalization {
-        eyre::ensure!(
-            finalization.count.is_zero() && finalization.encrypted_senders.is_empty(),
-            "local prover witness source cannot yet collect dynamic withdrawal finalization proofs for zone block {} at batch index {index}",
-            block.number
-        );
-    }
-
+fn ensure_local_witness_block_coverage(_index: usize, _block: &ZoneBlock) -> eyre::Result<()> {
     Ok(())
 }
 
@@ -820,21 +969,18 @@ fn classify_zone_system_transaction(
         return Ok(None);
     };
 
+    if !tx.is_system_tx() {
+        return Ok(None);
+    };
+
     let kind = if target == ZONE_INBOX_ADDRESS {
         ZoneSystemTransactionKind::AdvanceTempo
     } else if target == ZONE_OUTBOX_ADDRESS {
         ZoneSystemTransactionKind::FinalizeWithdrawalBatch
     } else {
-        if tx.is_system_tx() {
-            eyre::bail!("Tempo system transaction targets unexpected address {target}");
-        }
-        return Ok(None);
+        eyre::bail!("Tempo system transaction targets unexpected address {target}");
     };
 
-    eyre::ensure!(
-        tx.is_system_tx(),
-        "zone system contract transaction to {target} is not signed by the Tempo system sender"
-    );
     let signer = tx
         .recover_signer()
         .map_err(|err| eyre::eyre!("failed to recover zone system transaction signer: {err}"))?;
@@ -888,16 +1034,1246 @@ struct LocalTempoBinding {
     block_hash: B256,
 }
 
+fn initial_zone_read_slots(
+    state: &dyn StateProvider,
+    blocks: &[ValidatedZoneBlockData],
+) -> eyre::Result<BTreeMap<Address, BTreeSet<B256>>> {
+    let mut reads = required_initial_zone_reads();
+    add_withdrawal_finalization_reads(state, blocks, &mut reads)?;
+    Ok(reads)
+}
+
+fn collect_zone_execution_read_slots(
+    state: &dyn StateProvider,
+    state_root: B256,
+    initial_reads: BTreeMap<Address, BTreeSet<B256>>,
+    request: &ProverWitnessRequest,
+    prev_block_header: &ZoneHeader,
+    zone_ancestry_headers: &[Bytes],
+    zone_blocks: &[ZoneBlock],
+    chain_spec: &TempoChainSpec,
+    l1_state_provider: Option<&L1StateProvider>,
+) -> eyre::Result<ExecutionReadCollection> {
+    let initial_zone_state = initial_zone_state_witness(state, state_root, &initial_reads)
+        .wrap_err("failed to build static seed witness for execution read collection")?;
+    let witness = BatchWitness {
+        public_inputs: request.public_inputs.clone(),
+        prev_block_header: prev_block_header.clone(),
+        zone_ancestry_headers: zone_ancestry_headers.to_vec(),
+        zone_blocks: zone_blocks.to_vec(),
+        initial_zone_state,
+        tempo_state_proofs: BatchStateProof {
+            node_pool: BTreeMap::new(),
+            reads: Vec::new(),
+        },
+        tempo_ancestry_headers: request.tempo_ancestry_headers.clone(),
+    };
+    let prepared = prepare_stateless_execution(&witness)
+        .wrap_err("static seed witness failed stateless preparation")?;
+    let recording_db = RecordingStateProviderDb::new(state, initial_reads);
+    let mut execution_state = StateBuilder::new_with_database(recording_db)
+        .with_bundle_update()
+        .build();
+    let tempo_reads =
+        l1_state_provider.map(|_| Arc::new(Mutex::new(TempoExecutionReadSet::default())));
+    let tempo_collection =
+        l1_state_provider
+            .zip(tempo_reads.as_ref())
+            .map(|(l1_state_provider, reads)| TempoReadCollectionContext {
+                l1_state_provider,
+                reads: reads.clone(),
+            });
+    let mut post_state_targets = BTreeMap::new();
+
+    for block_index in 0..zone_blocks.len() {
+        let input = prepared
+            .block_execution_input(block_index)
+            .wrap_err_with(|| {
+                format!("failed to prepare block {block_index} for read collection")
+            })?;
+        execute_zone_block_for_read_collection(
+            &mut execution_state,
+            &input,
+            chain_spec,
+            tempo_collection.as_ref(),
+        )
+        .wrap_err_with(|| {
+            format!(
+                "zone block {} failed during execution read collection",
+                input.block.number
+            )
+        })?;
+        add_post_state_proof_targets(
+            execution_state.transition_state.as_ref(),
+            &mut post_state_targets,
+        );
+        execution_state.merge_transitions(BundleRetention::PlainState);
+    }
+
+    let tempo_state_proofs =
+        if let Some((l1_state_provider, reads)) = l1_state_provider.zip(tempo_reads.as_ref()) {
+            let reads = reads
+                .lock()
+                .map_err(|_| eyre::eyre!("Tempo read collection mutex was poisoned"))?
+                .clone();
+            tempo_state_proof_from_reads(l1_state_provider, reads)?
+        } else {
+            BatchStateProof {
+                node_pool: BTreeMap::new(),
+                reads: Vec::new(),
+            }
+        };
+
+    let mut zone_reads = execution_state.database.into_reads();
+    merge_read_sets(&mut zone_reads, post_state_targets);
+
+    Ok(ExecutionReadCollection {
+        zone_reads,
+        tempo_state_proofs,
+    })
+}
+
+fn merge_read_sets(
+    target: &mut BTreeMap<Address, BTreeSet<B256>>,
+    source: BTreeMap<Address, BTreeSet<B256>>,
+) {
+    for (account, slots) in source {
+        target.entry(account).or_default().extend(slots);
+    }
+}
+
+fn add_post_state_proof_targets(
+    transition_state: Option<&revm::database::TransitionState>,
+    reads: &mut BTreeMap<Address, BTreeSet<B256>>,
+) {
+    let Some(transition_state) = transition_state else {
+        return;
+    };
+
+    for (address, account) in &transition_state.transitions {
+        let slots = reads.entry(*address).or_default();
+        for slot in account.storage.keys() {
+            slots.insert(B256::from(*slot));
+        }
+    }
+}
+
+fn missing_account_read_from_error(err: &eyre::Report) -> Option<Address> {
+    err.chain().find_map(|cause| {
+        let message = cause.to_string();
+        parse_missing_account_read(&message)
+    })
+}
+
+fn parse_missing_account_read(message: &str) -> Option<Address> {
+    let (_, rest) = message.split_once("witness is missing account read for ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn missing_storage_read_from_error(err: &eyre::Report) -> Option<(Address, B256)> {
+    err.chain().find_map(|cause| {
+        let message = cause.to_string();
+        parse_missing_storage_read(&message)
+    })
+}
+
+fn parse_missing_storage_read(message: &str) -> Option<(Address, B256)> {
+    let (_, rest) = message.split_once("witness is missing storage read for account ")?;
+    let (account, rest) = rest.split_once(" slot ")?;
+    let account = account.split_whitespace().next()?.parse().ok()?;
+    let slot = rest.split_whitespace().next()?.parse::<U256>().ok()?;
+    Some((account, B256::from(slot)))
+}
+
+fn validate_generated_witness_replays_to_canonical_headers(
+    witness: &BatchWitness,
+    expected_headers: &[ZoneHeader],
+    pre_state: &dyn StateProvider,
+    canonical_execution_bundle: Option<&BundleState>,
+    portal_address: Address,
+) -> eyre::Result<()> {
+    let prepared = prepare_stateless_execution(witness)
+        .wrap_err("generated witness failed stateless preparation")?;
+    eyre::ensure!(
+        prepared.zone_blocks.len() == expected_headers.len(),
+        "generated witness block count {} does not match canonical header count {}",
+        prepared.zone_blocks.len(),
+        expected_headers.len()
+    );
+
+    let mut executor = AlloyZoneBlockExecutor::new(
+        WitnessZoneBlockExecutorProvider::new().with_portal_address(portal_address),
+    );
+    let execution = execute_prepared_blocks(&prepared, &mut executor)
+        .map_err(|err| eyre::eyre!(err.to_string()))
+        .wrap_err("generated witness failed stateless execution")?;
+    let provider_final_state_root = pre_state
+        .state_root(execution.post_state.hashed().clone())
+        .map_err(|err| {
+            eyre::Report::from(err)
+                .wrap_err("failed to calculate provider state root for replay post-state")
+        })?;
+    let expected_final_state_root = expected_headers
+        .last()
+        .map(|header| header.state_root)
+        .ok_or_else(|| eyre::eyre!("generated witness has no expected final zone header"))?;
+
+    let mut previous_hash = witness.public_inputs.prev_block_hash;
+    for (index, ((expected, executed), block)) in expected_headers
+        .iter()
+        .zip(&execution.blocks)
+        .zip(&prepared.zone_blocks)
+        .enumerate()
+    {
+        let actual = executed.header(previous_hash, block);
+        if &actual != expected {
+            let post_state_diff = canonical_replay_post_state_diff(
+                canonical_execution_bundle,
+                execution.post_state.hashed(),
+            );
+            eyre::bail!(
+                "zone block {} replay header mismatch: expected_hash={}, actual_hash={}, expected_parent={}, actual_parent={}, expected_state_root={}, actual_state_root={}, expected_tx_root={}, actual_tx_root={}, expected_receipts_root={}, actual_receipts_root={}, expected_beneficiary={}, actual_beneficiary={}, expected_timestamp={}, actual_timestamp={}, expected_protocol_version={}, actual_protocol_version={}, provider_final_state_root={}, expected_final_state_root={}, {}",
+                block.number,
+                expected.hash(),
+                actual.hash(),
+                expected.parent_hash,
+                actual.parent_hash,
+                expected.state_root,
+                actual.state_root,
+                expected.transactions_root,
+                actual.transactions_root,
+                expected.receipts_root,
+                actual.receipts_root,
+                expected.beneficiary,
+                actual.beneficiary,
+                expected.timestamp,
+                actual.timestamp,
+                expected.protocol_version,
+                actual.protocol_version,
+                provider_final_state_root,
+                expected_final_state_root,
+                post_state_diff
+            );
+        }
+        previous_hash = actual.hash();
+        if index + 1 == expected_headers.len() {
+            let output = batch_output_from_execution(&prepared, &execution)
+                .map_err(|err| eyre::eyre!(err.to_string()))
+                .wrap_err("generated witness failed output derivation")?;
+            eyre::ensure!(
+                output.block_transition.nextBlockHash == expected.hash(),
+                "generated witness output nextBlockHash {} does not match final canonical Zone hash {}",
+                output.block_transition.nextBlockHash,
+                expected.hash()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+const POST_STATE_DIFF_SAMPLE_LIMIT: usize = 12;
+
+fn canonical_replay_post_state_diff(
+    canonical: Option<&BundleState>,
+    replay: &HashedPostState,
+) -> String {
+    let Some(canonical) = canonical else {
+        return "canonical_post_state_diff=unavailable".to_string();
+    };
+
+    let canonical_hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(canonical.state());
+    let mut canonical_address_by_hash = BTreeMap::new();
+    let mut canonical_slot_by_hash = BTreeMap::new();
+    for (address, account) in canonical.state() {
+        let hashed_address = KeccakKeyHasher::hash_key(*address);
+        canonical_address_by_hash.insert(hashed_address, *address);
+        for slot in account.storage.keys() {
+            let raw_slot = B256::from(*slot);
+            canonical_slot_by_hash.insert(
+                (hashed_address, KeccakKeyHasher::hash_key(raw_slot)),
+                raw_slot,
+            );
+        }
+    }
+
+    let mut missing_accounts = DiffSamples::default();
+    let mut account_value_mismatches = DiffSamples::default();
+    let mut extra_accounts = DiffSamples::default();
+    let mut missing_storage = DiffSamples::default();
+    let mut storage_value_mismatches = DiffSamples::default();
+    let mut storage_wipe_mismatches = DiffSamples::default();
+    let mut extra_storage = DiffSamples::default();
+
+    for (hashed_address, canonical_account) in &canonical_hashed.accounts {
+        match replay.accounts.get(hashed_address) {
+            Some(replay_account) if replay_account == canonical_account => {}
+            Some(replay_account) => account_value_mismatches.push(format!(
+                "{} canonical={canonical_account:?} replay={replay_account:?}",
+                display_hashed_address(*hashed_address, &canonical_address_by_hash)
+            )),
+            None => missing_accounts.push(format!(
+                "{} canonical={canonical_account:?}",
+                display_hashed_address(*hashed_address, &canonical_address_by_hash)
+            )),
+        }
+    }
+
+    for (hashed_address, replay_account) in &replay.accounts {
+        if !canonical_hashed.accounts.contains_key(hashed_address) {
+            extra_accounts.push(format!("{hashed_address} replay={replay_account:?}"));
+        }
+    }
+
+    for (hashed_address, canonical_storage) in &canonical_hashed.storages {
+        let replay_storage = replay.storages.get(hashed_address);
+        if replay_storage.map(|storage| storage.wiped).unwrap_or(false) != canonical_storage.wiped {
+            storage_wipe_mismatches.push(format!(
+                "{} canonical_wiped={} replay_wiped={}",
+                display_hashed_address(*hashed_address, &canonical_address_by_hash),
+                canonical_storage.wiped,
+                replay_storage.map(|storage| storage.wiped).unwrap_or(false)
+            ));
+        }
+
+        for (hashed_slot, canonical_value) in &canonical_storage.storage {
+            match replay_storage.and_then(|storage| storage.storage.get(hashed_slot)) {
+                Some(replay_value) if replay_value == canonical_value => {}
+                Some(replay_value) => storage_value_mismatches.push(format!(
+                    "{}[{}] canonical={} replay={}",
+                    display_hashed_address(*hashed_address, &canonical_address_by_hash),
+                    display_hashed_slot(*hashed_address, *hashed_slot, &canonical_slot_by_hash),
+                    canonical_value,
+                    replay_value
+                )),
+                None => missing_storage.push(format!(
+                    "{}[{}] canonical={}",
+                    display_hashed_address(*hashed_address, &canonical_address_by_hash),
+                    display_hashed_slot(*hashed_address, *hashed_slot, &canonical_slot_by_hash),
+                    canonical_value
+                )),
+            }
+        }
+    }
+
+    for (hashed_address, replay_storage) in &replay.storages {
+        let canonical_storage = canonical_hashed.storages.get(hashed_address);
+        if replay_storage.wiped
+            && !canonical_storage
+                .map(|storage| storage.wiped)
+                .unwrap_or(false)
+        {
+            extra_storage.push(format!("{hashed_address} replay_wiped=true"));
+        }
+        for (hashed_slot, replay_value) in &replay_storage.storage {
+            if canonical_storage
+                .and_then(|storage| storage.storage.get(hashed_slot))
+                .is_none()
+            {
+                extra_storage.push(format!(
+                    "{hashed_address}[{hashed_slot}] replay={replay_value}"
+                ));
+            }
+        }
+    }
+
+    let mut out = format!(
+        "canonical_post_state_diff=canonical_accounts:{}, replay_accounts:{}, canonical_storages:{}, replay_storages:{}",
+        canonical_hashed.accounts.len(),
+        replay.accounts.len(),
+        canonical_hashed
+            .storages
+            .values()
+            .map(|storage| storage.storage.len())
+            .sum::<usize>(),
+        replay
+            .storages
+            .values()
+            .map(|storage| storage.storage.len())
+            .sum::<usize>(),
+    );
+    missing_accounts.append("missing_accounts", &mut out);
+    account_value_mismatches.append("account_value_mismatches", &mut out);
+    extra_accounts.append("extra_accounts", &mut out);
+    missing_storage.append("missing_storage", &mut out);
+    storage_value_mismatches.append("storage_value_mismatches", &mut out);
+    storage_wipe_mismatches.append("storage_wipe_mismatches", &mut out);
+    extra_storage.append("extra_storage", &mut out);
+    out
+}
+
+#[derive(Default)]
+struct DiffSamples {
+    count: usize,
+    samples: Vec<String>,
+}
+
+impl DiffSamples {
+    fn push(&mut self, sample: String) {
+        self.count += 1;
+        if self.samples.len() < POST_STATE_DIFF_SAMPLE_LIMIT {
+            self.samples.push(sample);
+        }
+    }
+
+    fn append(&self, label: &str, out: &mut String) {
+        use std::fmt::Write as _;
+
+        let _ = write!(out, ", {label}:{}", self.count);
+        if !self.samples.is_empty() {
+            let _ = write!(out, " [{}]", self.samples.join("; "));
+        }
+    }
+}
+
+fn display_hashed_address(address: B256, raw_addresses: &BTreeMap<B256, Address>) -> String {
+    raw_addresses
+        .get(&address)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| address.to_string())
+}
+
+fn display_hashed_slot(
+    address: B256,
+    slot: B256,
+    raw_slots: &BTreeMap<(B256, B256), B256>,
+) -> String {
+    raw_slots
+        .get(&(address, slot))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| slot.to_string())
+}
+
+fn execute_zone_block_for_read_collection(
+    state: &mut revm::database::State<RecordingStateProviderDb<'_>>,
+    input: &ZoneBlockExecutionInput<'_>,
+    chain_spec: &TempoChainSpec,
+    tempo_collection: Option<&TempoReadCollectionContext<'_>>,
+) -> eyre::Result<()> {
+    if let Some(tempo_collection) = tempo_collection {
+        return execute_zone_block_for_read_collection_with_tempo_fee_path(
+            state,
+            input,
+            chain_spec,
+            tempo_collection,
+        );
+    }
+
+    let evm_factory = ZoneWitnessEvmFactory;
+    let precompiles = zone_witness_precompiles(
+        &input.evm_env,
+        input.tempo_state_reader,
+        input.block.beneficiary,
+        input.block.tempo_block_number,
+    );
+    let evm =
+        evm_factory.create_evm_with_precompiles(&mut *state, input.evm_env.clone(), precompiles);
+    let ctx: EthBlockExecutionCtx<'_> = input.execution_context.inner.clone();
+    let executor = ZoneAlloyBlockExecutor::new(evm, ctx, ZoneEthExecutorSpec);
+    executor
+        .execute_block(input.recovered_transactions())
+        .map(|_| ())
+        .map_err(|err| eyre::eyre!(err.to_string()))
+}
+
+fn execute_zone_block_for_read_collection_with_tempo_fee_path(
+    state: &mut revm::database::State<RecordingStateProviderDb<'_>>,
+    input: &ZoneBlockExecutionInput<'_>,
+    chain_spec: &TempoChainSpec,
+    tempo_collection: &TempoReadCollectionContext<'_>,
+) -> eyre::Result<()> {
+    let mut evm = TempoEvm::new(&mut *state, tempo_evm_env(input)).with_actions();
+    let storage_actions = evm.inner_mut().actions().clone();
+    let fee_provider = RecordingZonePortalReader::new(
+        tempo_collection.l1_state_provider.clone(),
+        tempo_collection.reads.clone(),
+        u64::try_from(input.block_index).unwrap_or(u64::MAX),
+    );
+    evm = evm.with_fee_manager(ZoneFeeManager::new(fee_provider.clone()));
+    let (_, _, precompiles) = evm.components_mut();
+    register_zone_read_collection_precompiles(
+        input,
+        tempo_collection,
+        precompiles,
+        storage_actions.clone(),
+    );
+
+    let ctx: EthBlockExecutionCtx<'_> = input.execution_context.inner.clone();
+    let executor = ZoneAlloyBlockExecutor::new(evm, ctx, chain_spec);
+    let result = executor
+        .execute_block(input.recovered_transactions())
+        .map(|_| ())
+        .map_err(|err| eyre::eyre!(err.to_string()));
+    if result.is_ok() {
+        let actions = storage_actions.take().unwrap_or_default();
+        record_storage_action_vec(state, actions)?;
+    }
+    result.map(|_| ())
+}
+
+fn tempo_evm_env(input: &ZoneBlockExecutionInput<'_>) -> EvmEnv<TempoHardfork, TempoBlockEnv> {
+    EvmEnv {
+        cfg_env: input.evm_env.cfg_env.clone(),
+        block_env: TempoBlockEnv {
+            inner: input.evm_env.block_env.inner.clone(),
+            timestamp_millis_part: input.evm_env.block_env.timestamp_millis_part,
+            ..Default::default()
+        },
+    }
+}
+
+fn record_storage_action_vec(
+    state: &mut revm::database::State<RecordingStateProviderDb<'_>>,
+    actions: Vec<StorageAction>,
+) -> eyre::Result<()> {
+    for action in actions {
+        let (account, slot) = match action {
+            StorageAction::Sload(account, slot, _)
+            | StorageAction::Sstore(account, slot, _)
+            | StorageAction::Sinc(account, slot, _)
+            | StorageAction::Sdec(account, slot, _)
+            | StorageAction::FeeAmmSwap(account, slot, _) => (account, slot),
+        };
+        state.database.record_storage(account, B256::from(slot));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionReadCollection {
+    zone_reads: BTreeMap<Address, BTreeSet<B256>>,
+    tempo_state_proofs: BatchStateProof,
+}
+
+#[derive(Clone)]
+struct TempoReadCollectionContext<'a> {
+    l1_state_provider: &'a L1StateProvider,
+    reads: Arc<Mutex<TempoExecutionReadSet>>,
+}
+
+fn register_zone_read_collection_precompiles(
+    input: &ZoneBlockExecutionInput<'_>,
+    context: &TempoReadCollectionContext<'_>,
+    precompiles: &mut PrecompilesMap,
+    storage_actions: StorageActions,
+) {
+    let reader = RecordingTempoStateReader::new(
+        context.l1_state_provider.clone(),
+        context.reads.clone(),
+        u64::try_from(input.block_index).unwrap_or(u64::MAX),
+    );
+    precompiles.apply_precompile(&TEMPO_STATE_READER_ADDRESS, |_| {
+        Some(recording_tempo_state_reader_precompile(reader.clone()))
+    });
+    precompiles.apply_precompile(&tempo_zone_contracts::ZONE_TX_CONTEXT_ADDRESS, |_| {
+        Some(ZoneTxContext::create())
+    });
+    precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
+        Some(ChaumPedersenVerify.into())
+    });
+    precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| Some(AesGcmDecrypt.into()));
+    precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
+        Some(ZoneTokenFactory::create_with_actions(
+            &input.evm_env.cfg_env,
+            storage_actions.clone(),
+        ))
+    });
+
+    let policy_provider =
+        RecordingPolicyProvider::new(reader.clone(), input.block.tempo_block_number);
+    let registry = Some(ZoneTip403ProxyRegistry::new(policy_provider.clone()));
+    let sequencer: Arc<dyn SequencerExt> = Arc::new(context.l1_state_provider.clone());
+    let zone_cfg = input.evm_env.cfg_env.clone();
+    precompiles.apply_precompile(&ZONE_TIP403_PROXY_ADDRESS, |_| {
+        Some(ZoneTip403ProxyRegistry::create(policy_provider.clone()))
+    });
+    let fee_provider = RecordingZonePortalReader::new(
+        context.l1_state_provider.clone(),
+        context.reads.clone(),
+        u64::try_from(input.block_index).unwrap_or(u64::MAX),
+    );
+    let lookup_storage_actions = storage_actions.clone();
+    precompiles.set_precompile_lookup(move |address: &Address| {
+        if is_tip20_prefix(*address) {
+            Some(ZoneTip20Token::create_with_actions(
+                *address,
+                &zone_cfg,
+                registry.clone(),
+                sequencer.clone(),
+                lookup_storage_actions.clone(),
+            ))
+        } else if *address == TIP_FEE_MANAGER_ADDRESS {
+            Some(ZoneFeeManager::create(fee_provider.clone(), &zone_cfg))
+        } else {
+            None
+        }
+    });
+}
+
+fn recording_tempo_state_reader_precompile(reader: RecordingTempoStateReader) -> DynPrecompile {
+    DynPrecompile::new_stateful(
+        PrecompileId::Custom("RecordingTempoStateReader".into()),
+        move |input| {
+            if !input.is_direct_call() {
+                return Ok(PrecompileOutput::revert(
+                    0,
+                    TempoStateReaderAbi::DelegateCallNotAllowed {}
+                        .abi_encode()
+                        .into(),
+                    input.reservoir,
+                ));
+            }
+
+            if input.caller != TEMPO_STATE_ADDRESS {
+                return Ok(PrecompileOutput::revert(
+                    0,
+                    TempoStateReaderAbi::Unauthorized {}.abi_encode().into(),
+                    input.reservoir,
+                ));
+            }
+
+            if input.data.len() < 4 {
+                return Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir));
+            }
+
+            let selector: [u8; 4] = input.data[..4].try_into().expect("selector length checked");
+            if selector == TempoStateReaderAbi::readStorageAtCall::SELECTOR {
+                recording_tempo_read_storage_at(&reader, input.data, input.reservoir)
+            } else if selector == TempoStateReaderAbi::readStorageBatchAtCall::SELECTOR {
+                recording_tempo_read_storage_batch_at(&reader, input.data, input.reservoir)
+            } else {
+                Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir))
+            }
+        },
+    )
+}
+
+fn recording_tempo_read_storage_at(
+    reader: &RecordingTempoStateReader,
+    data: &[u8],
+    reservoir: u64,
+) -> PrecompileResult {
+    let call = match TempoStateReaderAbi::readStorageAtCall::abi_decode(data) {
+        Ok(call) => call,
+        Err(_) => return Ok(PrecompileOutput::revert(0, Bytes::new(), reservoir)),
+    };
+    let value = reader.read_storage_word(call.blockNumber, call.account, call.slot)?;
+    let output = TempoStateReaderAbi::readStorageAtCall::abi_encode_returns(&value);
+    Ok(PrecompileOutput::new(
+        TEMPO_STATE_READER_BASE_GAS + TEMPO_STATE_READER_PER_SLOT_GAS,
+        output.into(),
+        reservoir,
+    ))
+}
+
+fn recording_tempo_read_storage_batch_at(
+    reader: &RecordingTempoStateReader,
+    data: &[u8],
+    reservoir: u64,
+) -> PrecompileResult {
+    let call = match TempoStateReaderAbi::readStorageBatchAtCall::abi_decode(data) {
+        Ok(call) => call,
+        Err(_) => return Ok(PrecompileOutput::revert(0, Bytes::new(), reservoir)),
+    };
+    let slot_count = u64::try_from(call.slots.len()).map_err(|_| {
+        PrecompileError::Fatal("TempoStateReader slot count overflows u64".to_string())
+    })?;
+    let gas = TEMPO_STATE_READER_PER_SLOT_GAS
+        .checked_mul(slot_count)
+        .and_then(|slot_gas| TEMPO_STATE_READER_BASE_GAS.checked_add(slot_gas))
+        .ok_or_else(|| PrecompileError::Fatal("TempoStateReader gas overflow".to_string()))?;
+    let mut values = Vec::with_capacity(call.slots.len());
+    for slot in call.slots {
+        values.push(reader.read_storage_word(call.blockNumber, call.account, slot)?);
+    }
+    let output = TempoStateReaderAbi::readStorageBatchAtCall::abi_encode_returns(&values);
+    Ok(PrecompileOutput::new(gas, output.into(), reservoir))
+}
+
+#[derive(Debug, Clone)]
+struct RecordingTempoStateReader {
+    l1_state_provider: L1StateProvider,
+    reads: Arc<Mutex<TempoExecutionReadSet>>,
+    zone_block_index: u64,
+}
+
+impl RecordingTempoStateReader {
+    fn new(
+        l1_state_provider: L1StateProvider,
+        reads: Arc<Mutex<TempoExecutionReadSet>>,
+        zone_block_index: u64,
+    ) -> Self {
+        Self {
+            l1_state_provider,
+            reads,
+            zone_block_index,
+        }
+    }
+
+    fn read_storage_word(
+        &self,
+        tempo_block_number: u64,
+        account: Address,
+        slot: B256,
+    ) -> Result<B256, PrecompileError> {
+        self.reads
+            .lock()
+            .map_err(|_| PrecompileError::Fatal("Tempo read collection mutex poisoned".into()))?
+            .record(self.zone_block_index, tempo_block_number, account, slot);
+        self.l1_state_provider
+            .get_storage(account, slot, tempo_block_number)
+            .map_err(|err| {
+                zone_precompiles::zone_rpc_error(format!(
+                    "L1 storage unavailable for account={account} slot={slot} block={tempo_block_number}: {err}"
+                ))
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecordingZonePortalReader {
+    l1_state_provider: L1StateProvider,
+    reads: Arc<Mutex<TempoExecutionReadSet>>,
+    zone_block_index: u64,
+}
+
+impl RecordingZonePortalReader {
+    fn new(
+        l1_state_provider: L1StateProvider,
+        reads: Arc<Mutex<TempoExecutionReadSet>>,
+        zone_block_index: u64,
+    ) -> Self {
+        Self {
+            l1_state_provider,
+            reads,
+            zone_block_index,
+        }
+    }
+}
+
+impl zone_precompiles::L1StorageReader for RecordingZonePortalReader {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> Result<B256, PrecompileError> {
+        self.reads
+            .lock()
+            .map_err(|_| PrecompileError::Fatal("Tempo read collection mutex poisoned".into()))?
+            .record(self.zone_block_index, block_number, account, slot);
+        self.l1_state_provider
+            .get_storage(account, slot, block_number)
+            .map_err(|err| {
+                zone_precompiles::zone_rpc_error(format!(
+                    "L1 storage unavailable for account={account} slot={slot} block={block_number}: {err}"
+                ))
+            })
+    }
+}
+
+impl zone_precompiles::ZonePortalReader for RecordingZonePortalReader {
+    fn portal_address(&self) -> Address {
+        self.l1_state_provider.portal_address()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecordingPolicyProvider {
+    tempo_state_reader: RecordingTempoStateReader,
+    tempo_block_number: u64,
+}
+
+impl RecordingPolicyProvider {
+    fn new(tempo_state_reader: RecordingTempoStateReader, tempo_block_number: u64) -> Self {
+        Self {
+            tempo_state_reader,
+            tempo_block_number,
+        }
+    }
+
+    fn missing_policy(policy_id: u64) -> PrecompileError {
+        PrecompileError::Fatal(format!(
+            "missing witness-backed TIP-403 policy data for policy {policy_id}"
+        ))
+    }
+}
+
+impl PolicyCheck for RecordingPolicyProvider {
+    fn is_authorized(
+        &self,
+        policy_id: u64,
+        _user: Address,
+        _role: AuthRole,
+    ) -> Result<bool, PrecompileError> {
+        match policy_id {
+            REJECT_ALL_POLICY_ID => Ok(false),
+            ALLOW_ALL_POLICY_ID => Ok(true),
+            _ => Err(Self::missing_policy(policy_id)),
+        }
+    }
+
+    fn resolve_transfer_policy_id(&self, token: Address) -> Result<u64, PrecompileError> {
+        let word = self.tempo_state_reader.read_storage_word(
+            self.tempo_block_number,
+            token,
+            B256::from(TIP20_TRANSFER_POLICY_ID_SLOT),
+        )?;
+        extract_from_word::<u64>(
+            U256::from_be_bytes(word.0),
+            TIP20_TRANSFER_POLICY_ID_OFFSET,
+            TIP20_TRANSFER_POLICY_ID_BYTES,
+        )
+        .map_err(|err| {
+            PrecompileError::Fatal(format!(
+                "invalid packed TIP-20 transfer policy id for token {token}: {err}"
+            ))
+        })
+    }
+
+    fn policy_type_sync(&self, policy_id: u64) -> Result<PolicyType, PrecompileError> {
+        match policy_id {
+            REJECT_ALL_POLICY_ID => Ok(PolicyType::WHITELIST),
+            ALLOW_ALL_POLICY_ID => Ok(PolicyType::BLACKLIST),
+            _ => Err(Self::missing_policy(policy_id)),
+        }
+    }
+
+    fn compound_policy_data(&self, policy_id: u64) -> Result<(u64, u64, u64), PrecompileError> {
+        Err(Self::missing_policy(policy_id))
+    }
+
+    fn policy_exists(&self, policy_id: u64) -> Result<bool, PrecompileError> {
+        match policy_id {
+            REJECT_ALL_POLICY_ID | ALLOW_ALL_POLICY_ID => Ok(true),
+            _ => Err(Self::missing_policy(policy_id)),
+        }
+    }
+
+    fn policy_id_counter(&self) -> u64 {
+        2
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TempoExecutionReadSet {
+    reads: BTreeMap<TempoExecutionReadKey, BTreeSet<B256>>,
+}
+
+impl TempoExecutionReadSet {
+    fn record(
+        &mut self,
+        zone_block_index: u64,
+        tempo_block_number: u64,
+        account: Address,
+        slot: B256,
+    ) {
+        self.reads
+            .entry(TempoExecutionReadKey {
+                zone_block_index,
+                tempo_block_number,
+                account,
+            })
+            .or_default()
+            .insert(slot);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TempoExecutionReadKey {
+    zone_block_index: u64,
+    tempo_block_number: u64,
+    account: Address,
+}
+
+fn tempo_state_proof_from_reads(
+    l1_state_provider: &L1StateProvider,
+    reads: TempoExecutionReadSet,
+) -> eyre::Result<BatchStateProof> {
+    let mut node_pool = BTreeMap::new();
+    let mut state_reads = Vec::new();
+
+    for (key, slots) in reads.reads {
+        let slots = slots.into_iter().collect::<Vec<_>>();
+        let proof = l1_state_provider
+            .get_proof(key.account, slots.clone(), key.tempo_block_number)
+            .wrap_err_with(|| {
+                format!(
+                    "failed to fetch Tempo proof for account {} at block {}",
+                    key.account, key.tempo_block_number
+                )
+            })?;
+        eyre::ensure!(
+            proof.address == key.account,
+            "Tempo proof address mismatch: requested {}, got {}",
+            key.account,
+            proof.address
+        );
+        let account_proof_node_hashes = insert_witness_nodes(&mut node_pool, &proof.account_proof);
+        let mut storage_proofs = proof
+            .storage_proof
+            .into_iter()
+            .map(|proof| (proof.key.as_b256(), proof))
+            .collect::<BTreeMap<_, _>>();
+
+        for slot in slots {
+            let storage_proof = storage_proofs.remove(&slot).ok_or_else(|| {
+                eyre::eyre!(
+                    "Tempo proof for account {} at block {} omitted requested slot {}",
+                    key.account,
+                    key.tempo_block_number,
+                    slot
+                )
+            })?;
+            let storage_proof_node_hashes =
+                insert_witness_nodes(&mut node_pool, &storage_proof.proof);
+            state_reads.push(L1StateRead {
+                zone_block_index: key.zone_block_index,
+                tempo_block_number: key.tempo_block_number,
+                account: key.account,
+                account_nonce: proof.nonce,
+                account_balance: proof.balance,
+                account_storage_root: proof.storage_hash,
+                account_code_hash: proof.code_hash,
+                account_proof_node_hashes: account_proof_node_hashes.clone(),
+                slot: storage_word_slot(slot),
+                value: storage_proof.value,
+                storage_proof_node_hashes,
+            });
+        }
+    }
+
+    Ok(BatchStateProof {
+        node_pool,
+        reads: state_reads,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ZoneExecutionReadSet {
+    reads: BTreeMap<Address, BTreeSet<B256>>,
+}
+
+impl ZoneExecutionReadSet {
+    fn new(reads: BTreeMap<Address, BTreeSet<B256>>) -> Self {
+        Self { reads }
+    }
+
+    fn record_account(&mut self, account: Address) {
+        self.reads.entry(account).or_default();
+    }
+
+    fn record_storage(&mut self, account: Address, slot: B256) {
+        self.reads.entry(account).or_default().insert(slot);
+    }
+
+    fn into_reads(self) -> BTreeMap<Address, BTreeSet<B256>> {
+        self.reads
+    }
+}
+
+struct RecordingStateProviderDb<'a> {
+    state: &'a dyn StateProvider,
+    reads: ZoneExecutionReadSet,
+}
+
+impl fmt::Debug for RecordingStateProviderDb<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingStateProviderDb")
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> RecordingStateProviderDb<'a> {
+    fn new(state: &'a dyn StateProvider, reads: BTreeMap<Address, BTreeSet<B256>>) -> Self {
+        Self {
+            state,
+            reads: ZoneExecutionReadSet::new(reads),
+        }
+    }
+
+    fn into_reads(self) -> BTreeMap<Address, BTreeSet<B256>> {
+        self.reads.into_reads()
+    }
+
+    fn record_storage(&mut self, account: Address, slot: B256) {
+        self.reads.record_storage(account, slot);
+    }
+}
+
+impl Database for RecordingStateProviderDb<'_> {
+    type Error = RecordingStateProviderDbError;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.reads.record_account(address);
+        self.state
+            .basic_account(&address)
+            .map(|account| account.map(AccountInfo::from))
+            .map_err(|err| RecordingStateProviderDbError::provider("basic_account", err))
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<RevmBytecode, Self::Error> {
+        let bytecode = self
+            .state
+            .bytecode_by_hash(&code_hash)
+            .map_err(|err| RecordingStateProviderDbError::provider("bytecode_by_hash", err))?
+            .ok_or(RecordingStateProviderDbError::MissingCode(code_hash))?;
+        Ok(bytecode.0)
+    }
+
+    fn storage(
+        &mut self,
+        address: Address,
+        index: StorageKey,
+    ) -> Result<StorageValue, Self::Error> {
+        let slot = B256::from(index);
+        self.reads.record_storage(address, slot);
+        self.state
+            .storage(address, slot)
+            .map(|value| value.unwrap_or(U256::ZERO))
+            .map_err(|err| RecordingStateProviderDbError::provider("storage", err))
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.state
+            .block_hash(number)
+            .map_err(|err| RecordingStateProviderDbError::provider("block_hash", err))?
+            .ok_or(RecordingStateProviderDbError::MissingBlockHash(number))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordingStateProviderDbError {
+    Provider {
+        operation: &'static str,
+        error: String,
+    },
+    MissingCode(B256),
+    MissingBlockHash(u64),
+}
+
+impl RecordingStateProviderDbError {
+    fn provider(operation: &'static str, err: impl fmt::Display) -> Self {
+        Self::Provider {
+            operation,
+            error: err.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for RecordingStateProviderDbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Provider { operation, error } => {
+                write!(f, "local state provider {operation} failed: {error}")
+            }
+            Self::MissingCode(code_hash) => {
+                write!(f, "local state provider is missing bytecode {code_hash}")
+            }
+            Self::MissingBlockHash(number) => {
+                write!(f, "local state provider is missing block hash for {number}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecordingStateProviderDbError {}
+impl DBErrorMarker for RecordingStateProviderDbError {}
+
+fn required_initial_zone_reads() -> BTreeMap<Address, BTreeSet<B256>> {
+    let mut reads = BTreeMap::new();
+    add_slots(&mut reads, TEMPO_STATE_ADDRESS, TEMPO_STATE_HEADER_SLOTS);
+    add_slots(
+        &mut reads,
+        ZONE_INBOX_ADDRESS,
+        [
+            proof_slot(ZONE_INBOX_PROCESSED_HASH_SLOT),
+            proof_slot(ZONE_INBOX_PROCESSED_NUMBER_SLOT),
+        ],
+    );
+    add_slots(
+        &mut reads,
+        ZONE_OUTBOX_ADDRESS,
+        [
+            proof_slot(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT),
+            proof_slot(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT),
+        ],
+    );
+    reads
+}
+
+fn add_withdrawal_finalization_reads(
+    state: &dyn StateProvider,
+    blocks: &[ValidatedZoneBlockData],
+    reads: &mut BTreeMap<Address, BTreeSet<B256>>,
+) -> eyre::Result<()> {
+    let mut requested = U256::ZERO;
+    for block in blocks {
+        if let ZoneWithdrawalFinalization::Finalize(finalization) =
+            &block.witness_block.withdrawal_finalization
+        {
+            requested = requested.checked_add(finalization.count).ok_or_else(|| {
+                eyre::eyre!("local witness withdrawal finalization count overflowed")
+            })?;
+        }
+    }
+    if requested.is_zero() {
+        return Ok(());
+    }
+
+    add_slots(
+        reads,
+        ZONE_OUTBOX_ADDRESS,
+        [
+            proof_slot(ZONE_OUTBOX_PACKED_SLOT),
+            proof_slot(ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT),
+            proof_slot(ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT),
+        ],
+    );
+
+    let length = read_storage_u256(
+        state,
+        ZONE_OUTBOX_ADDRESS,
+        ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT,
+    )?;
+    let head = read_storage_u256(
+        state,
+        ZONE_OUTBOX_ADDRESS,
+        ZONE_OUTBOX_PENDING_WITHDRAWALS_HEAD_SLOT,
+    )?;
+    if head >= length {
+        return Ok(());
+    }
+
+    let pending = length - head;
+    let effective_count = if requested > pending {
+        pending
+    } else {
+        requested
+    };
+    let count = u64_from_u256(effective_count, "withdrawal finalization count")?;
+    let start = u64_from_u256(head, "pending withdrawal head")?;
+
+    for offset in 0..count {
+        let index = start
+            .checked_add(offset)
+            .ok_or_else(|| eyre::eyre!("pending withdrawal index overflowed"))?;
+        add_pending_withdrawal_reads(state, reads, index)?;
+    }
+
+    Ok(())
+}
+
+fn add_pending_withdrawal_reads(
+    state: &dyn StateProvider,
+    reads: &mut BTreeMap<Address, BTreeSet<B256>>,
+    index: u64,
+) -> eyre::Result<()> {
+    for offset in 0..PENDING_WITHDRAWAL_STORAGE_SLOTS {
+        add_slot(
+            reads,
+            ZONE_OUTBOX_ADDRESS,
+            proof_slot(pending_withdrawal_slot(index, offset)?),
+        );
+    }
+
+    add_dynamic_bytes_reads(
+        state,
+        reads,
+        pending_withdrawal_slot(index, PENDING_WITHDRAWAL_CALLBACK_DATA_OFFSET)?,
+    )?;
+    add_dynamic_bytes_reads(
+        state,
+        reads,
+        pending_withdrawal_slot(index, PENDING_WITHDRAWAL_REVEAL_TO_OFFSET)?,
+    )?;
+
+    Ok(())
+}
+
+fn add_dynamic_bytes_reads(
+    state: &dyn StateProvider,
+    reads: &mut BTreeMap<Address, BTreeSet<B256>>,
+    slot: U256,
+) -> eyre::Result<()> {
+    let marker = read_storage_u256(state, ZONE_OUTBOX_ADDRESS, slot)?;
+    if (marker & U256::ONE).is_zero() {
+        return Ok(());
+    }
+
+    let byte_len = u64_from_u256((marker - U256::ONE) >> 1, "dynamic bytes length")?;
+    let slot_count = byte_len.saturating_add(31) / 32;
+    let base = storage_data_base_slot(slot);
+    for offset in 0..slot_count {
+        let data_slot = base
+            .checked_add(U256::from(offset))
+            .ok_or_else(|| eyre::eyre!("dynamic bytes storage slot overflowed"))?;
+        add_slot(reads, ZONE_OUTBOX_ADDRESS, proof_slot(data_slot));
+    }
+
+    Ok(())
+}
+
+fn add_slots(
+    reads: &mut BTreeMap<Address, BTreeSet<B256>>,
+    account: Address,
+    slots: impl IntoIterator<Item = B256>,
+) {
+    for slot in slots {
+        add_slot(reads, account, slot);
+    }
+}
+
+fn add_slot(reads: &mut BTreeMap<Address, BTreeSet<B256>>, account: Address, slot: B256) {
+    reads.entry(account).or_default().insert(slot);
+}
+
+fn read_storage_u256(
+    state: &dyn StateProvider,
+    account: Address,
+    slot: U256,
+) -> eyre::Result<U256> {
+    Ok(state
+        .storage(account, proof_slot(slot))?
+        .unwrap_or_default())
+}
+
+fn u64_from_u256(value: U256, label: &str) -> eyre::Result<u64> {
+    eyre::ensure!(
+        value <= U256::from(u64::MAX),
+        "{label} does not fit in u64: {value}"
+    );
+    Ok(value.to::<u64>())
+}
+
+fn pending_withdrawal_slot(index: u64, offset: u64) -> eyre::Result<U256> {
+    let element_offset = U256::from(index)
+        .checked_mul(U256::from(PENDING_WITHDRAWAL_STORAGE_SLOTS))
+        .and_then(|value| value.checked_add(U256::from(offset)))
+        .ok_or_else(|| eyre::eyre!("pending withdrawal slot overflowed"))?;
+    storage_data_base_slot(ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT)
+        .checked_add(element_offset)
+        .ok_or_else(|| eyre::eyre!("pending withdrawal slot overflowed"))
+}
+
+fn storage_data_base_slot(slot: U256) -> U256 {
+    U256::from_be_bytes(keccak256(slot.to_be_bytes::<32>()).0)
+}
+
 fn initial_zone_state_witness(
     state: &dyn StateProvider,
     state_root: B256,
+    reads: &BTreeMap<Address, BTreeSet<B256>>,
 ) -> eyre::Result<ZoneStateWitness> {
     let mut node_pool = BTreeMap::new();
     let mut account_reads = Vec::new();
     let mut storage_reads = Vec::new();
 
-    for (account, slots) in required_initial_zone_reads() {
-        let proof = state.proof(TrieInput::default(), account, &slots)?;
+    for (account, slots) in reads {
+        let slots = slots.iter().copied().collect::<Vec<_>>();
+        let proof = state.proof(TrieInput::default(), *account, &slots)?;
         proof.verify(state_root).map_err(|err| {
             eyre::eyre!("reth state proof for account {account} is invalid: {err}")
         })?;
@@ -908,7 +2284,7 @@ fn initial_zone_state_witness(
         )?);
         storage_reads.extend(zone_storage_reads_from_reth_proof(
             &mut node_pool,
-            account,
+            *account,
             &proof,
         ));
     }
@@ -919,33 +2295,6 @@ fn initial_zone_state_witness(
         account_reads,
         storage_reads,
     })
-}
-
-fn required_initial_zone_reads() -> [(Address, Vec<B256>); 3] {
-    [
-        (
-            TEMPO_STATE_ADDRESS,
-            vec![
-                TEMPO_BLOCK_HASH_SLOT,
-                TEMPO_STATE_ROOT_SLOT,
-                TEMPO_PACKED_SLOT,
-            ],
-        ),
-        (
-            ZONE_INBOX_ADDRESS,
-            vec![
-                proof_slot(ZONE_INBOX_PROCESSED_HASH_SLOT),
-                proof_slot(ZONE_INBOX_PROCESSED_NUMBER_SLOT),
-            ],
-        ),
-        (
-            ZONE_OUTBOX_ADDRESS,
-            vec![
-                proof_slot(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT),
-                proof_slot(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT),
-            ],
-        ),
-    ]
 }
 
 fn zone_account_read_from_reth_proof(
@@ -1122,6 +2471,7 @@ where
             Receipt = primitives::TempoReceipt,
         > + ChainSpecProvider<ChainSpec = TempoChainSpec>
         + StateProviderFactory
+        + StateReader<Receipt = primitives::TempoReceipt>
         + Clone
         + Send
         + Sync
@@ -1342,41 +2692,44 @@ mod tests {
     fn initial_zone_reads_use_raw_storage_keys_for_reth_proofs() {
         let reads = required_initial_zone_reads();
 
-        assert_eq!(
-            reads[0],
-            (
-                TEMPO_STATE_ADDRESS,
-                vec![
-                    TEMPO_BLOCK_HASH_SLOT,
-                    TEMPO_STATE_ROOT_SLOT,
-                    TEMPO_PACKED_SLOT
-                ]
-            )
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_BLOCK_HASH_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_WRAPPER_GAS_LIMITS_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_PARENT_HASH_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_BENEFICIARY_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_STATE_ROOT_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_TRANSACTIONS_ROOT_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_RECEIPTS_ROOT_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_PACKED_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_TIMESTAMP_MILLIS_SLOT));
+        assert!(reads[&TEMPO_STATE_ADDRESS].contains(&TEMPO_PREV_RANDAO_SLOT));
+        assert!(reads[&ZONE_INBOX_ADDRESS].contains(&B256::from(ZONE_INBOX_PROCESSED_HASH_SLOT)));
+        assert!(reads[&ZONE_INBOX_ADDRESS].contains(&B256::from(ZONE_INBOX_PROCESSED_NUMBER_SLOT)));
+        assert!(
+            reads[&ZONE_OUTBOX_ADDRESS].contains(&B256::from(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT))
         );
-        assert_eq!(
-            reads[1],
-            (
-                ZONE_INBOX_ADDRESS,
-                vec![
-                    B256::from(ZONE_INBOX_PROCESSED_HASH_SLOT),
-                    B256::from(ZONE_INBOX_PROCESSED_NUMBER_SLOT)
-                ]
-            )
-        );
-        assert_eq!(
-            reads[2],
-            (
-                ZONE_OUTBOX_ADDRESS,
-                vec![
-                    B256::from(ZONE_OUTBOX_LAST_BATCH_HASH_SLOT),
-                    B256::from(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
-                ]
-            )
+        assert!(
+            reads[&ZONE_OUTBOX_ADDRESS].contains(&B256::from(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT))
         );
         assert_eq!(storage_word_slot(TEMPO_STATE_ROOT_SLOT), U256::from(4));
+        assert_eq!(storage_word_slot(TEMPO_PREV_RANDAO_SLOT), U256::from(9));
         assert_eq!(
             proof_slot(ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT),
             B256::from(U256::from(2))
+        );
+    }
+
+    #[test]
+    fn pending_withdrawal_slots_match_solidity_dynamic_array_layout() {
+        let base = storage_data_base_slot(ZONE_OUTBOX_PENDING_WITHDRAWALS_SLOT);
+        assert_eq!(pending_withdrawal_slot(0, 0).unwrap(), base);
+        assert_eq!(
+            pending_withdrawal_slot(1, 0).unwrap(),
+            base + U256::from(PENDING_WITHDRAWAL_STORAGE_SLOTS)
+        );
+        assert_eq!(
+            pending_withdrawal_slot(2, PENDING_WITHDRAWAL_REVEAL_TO_OFFSET).unwrap(),
+            base + U256::from(2 * PENDING_WITHDRAWAL_STORAGE_SLOTS)
+                + U256::from(PENDING_WITHDRAWAL_REVEAL_TO_OFFSET)
         );
     }
 
@@ -1486,7 +2839,7 @@ mod tests {
     }
 
     #[test]
-    fn local_witness_source_rejects_dynamic_paths_until_proofs_are_collected() {
+    fn local_witness_source_allows_dynamic_batches_for_execution_collection() {
         let header = sealed_header(10, B256::repeat_byte(0x09));
         let mut block = zone_block_witness_from_header(
             TEST_CHAIN_ID,
@@ -1501,11 +2854,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = ensure_local_witness_block_coverage(0, &block).unwrap_err();
-        assert!(
-            err.to_string().contains("user transaction proofs"),
-            "unexpected error: {err}"
-        );
+        ensure_local_witness_block_coverage(0, &block).unwrap();
 
         block.transactions.clear();
         block.tempo_import = ZoneTempoImport::advance(
@@ -1519,20 +2868,12 @@ mod tests {
                 currency: "TOK".into(),
             }],
         );
-        let err = ensure_local_witness_block_coverage(0, &block).unwrap_err();
-        assert!(
-            err.to_string().contains("advanceTempo proofs"),
-            "unexpected error: {err}"
-        );
+        ensure_local_witness_block_coverage(0, &block).unwrap();
 
         block.tempo_import = ZoneTempoImport::none();
         block.withdrawal_finalization =
             ZoneWithdrawalFinalization::finalize(U256::from(1), Vec::new());
-        let err = ensure_local_witness_block_coverage(0, &block).unwrap_err();
-        assert!(
-            err.to_string().contains("withdrawal finalization proofs"),
-            "unexpected error: {err}"
-        );
+        ensure_local_witness_block_coverage(0, &block).unwrap();
     }
 
     #[test]
@@ -1674,7 +3015,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_system_contract_transaction_without_system_signature() {
+    fn preserves_user_signed_system_contract_transaction_as_user_transaction() {
         let transactions = vec![TempoTxEnvelope::Legacy(Signed::new_unhashed(
             TxLegacy {
                 chain_id: None,
@@ -1696,12 +3037,13 @@ mod tests {
         ))];
         let raw_transactions = raw_transactions(&transactions);
 
-        let err = decode_zone_block_transactions(10, &transactions, &raw_transactions).unwrap_err();
+        let decoded = decode_zone_block_transactions(10, &transactions, &raw_transactions).unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("not signed by the Tempo system sender"),
-            "unexpected error: {err}"
+        assert_eq!(decoded.tempo_import, ZoneTempoImport::none());
+        assert_eq!(decoded.user_transactions, raw_transactions);
+        assert_eq!(
+            decoded.withdrawal_finalization,
+            ZoneWithdrawalFinalization::none()
         );
     }
 
@@ -1955,6 +3297,7 @@ where
 impl<N> ZoneAddOns<NodeAdapter<N>>
 where
     N: FullNodeTypes<Types = ZoneNode>,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
 {
     /// Creates a new ZoneAddOns instance.
     pub fn new(
@@ -1992,6 +3335,7 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
     TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     type Handle = <RpcAddOns<
@@ -2077,6 +3421,7 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
     TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     /// Resolve enabled tokens and seed the policy cache.
@@ -2247,6 +3592,21 @@ where
             .expect("HTTP RPC server must be enabled for sequencer mode");
 
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
+        let l1_state_provider = L1StateProvider::new(
+            L1StateProviderConfig {
+                l1_rpc_url: l1_rpc_url.clone(),
+                portal_address,
+                retry_connection_interval,
+                ..Default::default()
+            },
+            L1StateCache::new(HashSet::from([portal_address])),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .wrap_err("failed to initialize prover witness L1 state provider")?;
+        let prover_witness_source = LocalNodeProverWitnessSource::new(local_provider)
+            .with_l1_state_provider(l1_state_provider);
+
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
             l1_rpc_url,
@@ -2259,7 +3619,7 @@ where
             zone_poll_interval: config.zone_poll_interval,
             batch_interval: config.batch_interval,
             batch_anchor_config: config.batch_anchor_config,
-            prover_witness_source: Arc::new(LocalNodeProverWitnessSource::new(local_provider)),
+            prover_witness_source: Arc::new(prover_witness_source),
         };
         let seq_handle = spawn_zone_sequencer(sequencer_config, config.sequencer_signer).await;
         info!(target: "reth::cli", "Sequencer tasks spawned");
@@ -2299,6 +3659,7 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
     TempoEthApiBuilder<N>:
         EthApiBuilder<N, EthApi: reth_rpc_eth_api::EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
@@ -2327,6 +3688,7 @@ where
 impl<N> Node<N> for ZoneNode
 where
     N: FullNodeTypes<Types = Self>,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
@@ -2360,7 +3722,11 @@ where
     }
 }
 
-impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ZoneNode {
+impl<N> DebugNode<N> for ZoneNode
+where
+    N: FullNodeComponents<Types = Self>,
+    N::Provider: StateReader<Receipt = primitives::TempoReceipt>,
+{
     type RpcBlock =
         alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeader>;
 

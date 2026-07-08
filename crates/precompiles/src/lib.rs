@@ -28,15 +28,21 @@ pub(crate) use tempo_precompiles::{error, storage};
 pub mod aes_gcm;
 pub mod chaum_pedersen;
 pub mod ecies;
+pub mod fee_manager;
 pub mod policy;
 pub mod tip20_factory;
 pub mod tip403_proxy;
+pub mod tx_context;
 pub mod ztip20;
 
 pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
 pub use chaum_pedersen::{CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify};
+pub use fee_manager::{
+    L1StorageReader, ZoneFeeManager, ZonePortalReader, portal_token_config_slot,
+};
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};
 pub use tip403_proxy::{ZONE_TIP403_PROXY_ADDRESS, ZoneTip403ProxyRegistry};
+pub use tx_context::{ZoneTxContext, set_current_tx_hash};
 pub use ztip20::{SequencerExt, ZoneTip20Token};
 
 use revm::precompile::PrecompileError;

@@ -51,3 +51,6 @@ alloy-sol-types.workspace = true
 eyre.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true
+
+[dev-dependencies]
+zone-prover-core = { workspace = true, features = ["std"] }

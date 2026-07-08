@@ -409,23 +409,37 @@ fn validate_deposit_queue_matches_proved_tempo(
     let slot = word_from_b256(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
     let actual = final_deposit_queue.processed_hash;
     let actual_word = word_from_b256(actual);
+    let tempo_block_number = prepared.commitments.final_tempo_block_number;
+    let mut saw_final_queue_proof = false;
 
-    // TODO(stateless-prover): require this proof for batches that process
-    // advanceTempo deposits instead of only checking it when supplied.
     for (_, _, proved_word) in prepared
         .tempo_witness_provider
-        .proved_storage_words(prepared.commitments.final_tempo_block_number, slot)
+        .proved_storage_words(tempo_block_number, slot)
     {
+        saw_final_queue_proof = true;
         if proved_word != actual_word {
             return Err(ProverError::ExecutionDepositQueueHashMismatch {
-                tempo_block_number: prepared.commitments.final_tempo_block_number,
+                tempo_block_number,
                 expected: B256::from(proved_word),
                 actual,
             });
         }
     }
 
+    if requires_final_deposit_queue_proof(prepared) && !saw_final_queue_proof {
+        return Err(ProverError::MissingExecutionDepositQueueHashProof { tempo_block_number });
+    }
+
     Ok(())
+}
+
+fn requires_final_deposit_queue_proof(prepared: &PreparedStatelessExecution) -> bool {
+    prepared
+        .execution_plan
+        .blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter())
+        .any(|tx| tx.kind == PlannedZoneTransactionKind::AdvanceTempo)
 }
 
 pub fn execution_commitments_from_post_state(

@@ -84,6 +84,14 @@ impl ZoneTokenFactory {
     pub fn create(
         cfg: &revm::context::CfgEnv<tempo_chainspec::hardfork::TempoHardfork>,
     ) -> alloy_evm::precompiles::DynPrecompile {
+        Self::create_with_actions(cfg, tempo_precompiles::storage::StorageActions::disabled())
+    }
+
+    /// Wraps this precompile and records storage actions into `actions`.
+    pub fn create_with_actions(
+        cfg: &revm::context::CfgEnv<tempo_chainspec::hardfork::TempoHardfork>,
+        actions: tempo_precompiles::storage::StorageActions,
+    ) -> alloy_evm::precompiles::DynPrecompile {
         use revm::precompile::{PrecompileId, PrecompileOutput};
         use tempo_precompiles::{
             DelegateCallNotAllowed, Precompile as _,
@@ -93,6 +101,7 @@ impl ZoneTokenFactory {
         let spec = cfg.spec;
         let amsterdam_eip8037_enabled = cfg.enable_amsterdam_eip8037;
         let gas_params = cfg.gas_params.clone();
+        let actions = actions.clone();
         alloy_evm::precompiles::DynPrecompile::new_stateful(
             PrecompileId::Custom("ZoneTokenFactory".into()),
             move |input| {
@@ -112,7 +121,8 @@ impl ZoneTokenFactory {
                     amsterdam_eip8037_enabled,
                     input.is_static,
                     gas_params.clone(),
-                );
+                )
+                .with_actions(actions.clone());
 
                 StorageCtx::enter(&mut storage, || Self::new().call(input.data, input.caller))
             },

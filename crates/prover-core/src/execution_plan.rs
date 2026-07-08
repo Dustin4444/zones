@@ -157,16 +157,25 @@ fn validate_user_transaction(
 }
 
 fn is_allowed_user_call(target: Address, input: &[u8]) -> bool {
-    target.is_tip20() && call_selector(input).is_some_and(is_allowed_tip20_user_transfer_selector)
+    let Some(selector) = call_selector(input) else {
+        return false;
+    };
+
+    if target.is_tip20() {
+        return is_allowed_tip20_user_selector(selector);
+    }
+
+    target == ZONE_OUTBOX_ADDRESS && selector == ZoneOutbox::requestWithdrawalCall::SELECTOR
 }
 
-fn is_allowed_tip20_user_transfer_selector(selector: [u8; 4]) -> bool {
+fn is_allowed_tip20_user_selector(selector: [u8; 4]) -> bool {
     matches!(
         selector,
         ITIP20::transferCall::SELECTOR
             | ITIP20::transferWithMemoCall::SELECTOR
             | ITIP20::transferFromCall::SELECTOR
             | ITIP20::transferFromWithMemoCall::SELECTOR
+            | ITIP20::approveCall::SELECTOR
     )
 }
 
@@ -502,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_user_call_to_tip20_approve_selector() {
+    fn admits_user_call_to_tip20_approve_selector() {
         let mut block = sample_block();
         clear_system_transactions(&mut block);
         let token = address!("0x20c0000000000000000000000000000000000000");
@@ -516,14 +525,11 @@ mod tests {
             .transactions
             .push(signed_user_call(token, input, U256::ZERO));
 
-        let err = ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err();
+        let plan = ZoneBlockExecutionPlan::from_block(7, &block).unwrap();
         assert_eq!(
-            err,
-            ProverError::UserTransactionTargetUnsupported {
-                block_index: 7,
+            plan.transactions[0].kind,
+            PlannedZoneTransactionKind::User {
                 transaction_index: 0,
-                call_index: 0,
-                target: token,
             }
         );
     }
@@ -658,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_user_call_to_request_withdrawal_selector() {
+    fn admits_user_call_to_request_withdrawal_selector() {
         let mut block = sample_block();
         clear_system_transactions(&mut block);
         let input = ZoneOutbox::requestWithdrawalCall {
@@ -678,12 +684,12 @@ mod tests {
             .push(signed_user_call(ZONE_OUTBOX_ADDRESS, input, U256::ZERO));
 
         assert_eq!(
-            ZoneBlockExecutionPlan::from_block(7, &block).unwrap_err(),
-            ProverError::UserTransactionTargetUnsupported {
-                block_index: 7,
+            ZoneBlockExecutionPlan::from_block(7, &block)
+                .unwrap()
+                .transactions[0]
+                .kind,
+            PlannedZoneTransactionKind::User {
                 transaction_index: 0,
-                call_index: 0,
-                target: ZONE_OUTBOX_ADDRESS,
             }
         );
     }

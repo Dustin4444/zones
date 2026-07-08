@@ -1,13 +1,23 @@
-use alloc::{collections::BTreeMap, vec::Vec};
+#[cfg(feature = "std")]
+use alloc::vec::Vec;
 
-use alloy_primitives::{Address, B256, U256, keccak256, map::B256Map};
+use alloy_primitives::B256;
+#[cfg(feature = "std")]
+use alloy_primitives::map::B256Map;
+#[cfg(feature = "std")]
 use alloy_rlp::Decodable;
-use alloy_trie::{EMPTY_ROOT_HASH, TrieAccount, proof::ProofNodes};
-use reth_trie_common::{HashedPostState, Nibbles};
-use reth_trie_common::{KeccakKeyHasher, KeyHasher, MultiProof, StorageMultiProof};
-use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie};
+use alloy_trie::EMPTY_ROOT_HASH;
+#[cfg(feature = "std")]
+use alloy_trie::TrieAccount;
+#[cfg(feature = "std")]
+use reth_trie_common::DecodedMultiProofV2;
+use reth_trie_common::HashedPostState;
+#[cfg(feature = "std")]
+use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie};
 
-use crate::{ProverError, ZoneAccountCode, ZoneStateWitness, trie, validate_node_pool};
+#[cfg(feature = "std")]
+use crate::validate_node_pool;
+use crate::{ProverError, ZoneStateWitness};
 
 /// State root computed by applying a reth hashed post-state to a verified sparse trie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,10 +36,12 @@ impl CalculatedStateRoot {
 
 /// Reth sparse-trie state root calculator for stateless Zone execution.
 #[derive(Debug, Default)]
+#[cfg(feature = "std")]
 pub struct SparseStateRootCalculator {
     trie: SparseStateTrie,
 }
 
+#[cfg(feature = "std")]
 impl SparseStateRootCalculator {
     pub const fn new(trie: SparseStateTrie) -> Self {
         Self { trie }
@@ -38,7 +50,13 @@ impl SparseStateRootCalculator {
     pub fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
         validate_node_pool(&state.node_pool, ProverError::ZoneStateNodeHashMismatch)?;
 
-        let multiproof = zone_state_multiproof(state)?;
+        let witness = state
+            .node_pool
+            .iter()
+            .map(|(hash, node)| (*hash, node.clone()))
+            .collect::<B256Map<_>>();
+        let multiproof = DecodedMultiProofV2::from_witness(state.state_root, &witness)
+            .map_err(|_| ProverError::ZoneStateNodeHashMismatch(state.state_root))?;
         if multiproof.is_empty() {
             if state.state_root != EMPTY_ROOT_HASH {
                 return Err(ProverError::StateRootCalculationFailed);
@@ -47,7 +65,7 @@ impl SparseStateRootCalculator {
         }
 
         let mut trie = SparseStateTrie::new();
-        trie.reveal_multiproof(multiproof)
+        trie.reveal_decoded_multiproof_v2(multiproof)
             .map_err(|_| ProverError::StateRootCalculationFailed)?;
         let root = trie
             .root()
@@ -77,112 +95,40 @@ impl SparseStateRootCalculator {
     }
 }
 
-fn zone_state_multiproof(state: &ZoneStateWitness) -> Result<MultiProof, ProverError> {
-    let mut account_subtree = ProofNodes::default();
-    let mut storage_roots = BTreeMap::new();
-
-    for read in &state.account_reads {
-        match &read.code {
-            ZoneAccountCode::Bytecode(code) if keccak256(code.as_ref()) != read.code_hash => {
-                return Err(ProverError::AccountCodeHashMismatch(read.account));
-            }
-            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
-        }
-
-        let proven = trie::verify_account_read(state.state_root, &state.node_pool, read)?;
-        storage_roots.insert(read.account, proven.storage_root);
-        let key = Nibbles::unpack(KeccakKeyHasher::hash_key(read.account));
-        account_subtree.extend_from(account_proof_subtrie(state, read, key)?);
-    }
-
-    let storages = storage_multiproofs(state, &storage_roots)?;
-
-    Ok(MultiProof {
-        account_subtree,
-        branch_node_masks: Default::default(),
-        storages,
-    })
+#[cfg(not(feature = "std"))]
+#[derive(Debug, Clone, Copy)]
+pub struct SparseStateRootCalculator {
+    root: B256,
 }
 
-fn account_proof_subtrie(
-    state: &ZoneStateWitness,
-    read: &crate::ZoneAccountRead,
-    key: Nibbles,
-) -> Result<ProofNodes, ProverError> {
-    trie::proof_subtrie_for_key(key, &state.node_pool, &read.proof_node_hashes).map_err(|err| {
-        match err {
-            trie::TrieProofError::MissingNode(node_hash) => ProverError::AccountProofMissing {
-                account: read.account,
-                node_hash,
-            },
-            trie::TrieProofError::Invalid => ProverError::AccountProofInvalid(read.account),
-            trie::TrieProofError::ValueMismatch => ProverError::AccountReadMismatch(read.account),
-        }
-    })
-}
-
-fn storage_multiproofs(
-    state: &ZoneStateWitness,
-    storage_roots: &BTreeMap<Address, B256>,
-) -> Result<B256Map<StorageMultiProof>, ProverError> {
-    let mut storage_subtries = BTreeMap::<Address, (B256, ProofNodes)>::new();
-
-    for read in &state.storage_reads {
-        let storage_root = storage_roots
-            .get(&read.account)
-            .ok_or(ProverError::MissingAccountRead(read.account))?;
-        trie::verify_storage_read(*storage_root, &state.node_pool, read)?;
-        let key = Nibbles::unpack(hashed_storage_slot(read.slot));
-        let subtrie = storage_proof_subtrie(state, read, key)?;
-        storage_subtries
-            .entry(read.account)
-            .and_modify(|(_, existing)| existing.extend_from(subtrie.clone()))
-            .or_insert((*storage_root, subtrie));
-    }
-
-    Ok(storage_subtries
-        .into_iter()
-        .map(|(account, (root, subtree))| {
-            (
-                KeccakKeyHasher::hash_key(account),
-                StorageMultiProof {
-                    root,
-                    subtree,
-                    branch_node_masks: Default::default(),
-                },
-            )
+#[cfg(not(feature = "std"))]
+impl SparseStateRootCalculator {
+    pub const fn from_zone_state_witness(state: &ZoneStateWitness) -> Result<Self, ProverError> {
+        Ok(Self {
+            root: state.state_root,
         })
-        .collect())
-}
+    }
 
-fn storage_proof_subtrie(
-    state: &ZoneStateWitness,
-    read: &crate::ZoneStorageRead,
-    key: Nibbles,
-) -> Result<ProofNodes, ProverError> {
-    trie::proof_subtrie_for_key(key, &state.node_pool, &read.proof_node_hashes).map_err(|err| {
-        match err {
-            trie::TrieProofError::MissingNode(node_hash) => ProverError::StorageProofMissing {
-                account: read.account,
-                slot: read.slot,
-                node_hash,
-            },
-            trie::TrieProofError::Invalid => ProverError::StorageProofInvalid {
-                account: read.account,
-                slot: read.slot,
-            },
-            trie::TrieProofError::ValueMismatch => ProverError::StorageReadMismatch {
-                account: read.account,
-                slot: read.slot,
-            },
+    pub const fn revealed_empty() -> Self {
+        Self {
+            root: EMPTY_ROOT_HASH,
         }
-    })
+    }
+
+    pub fn calculate(
+        &mut self,
+        post_state: HashedPostState,
+    ) -> Result<CalculatedStateRoot, ProverError> {
+        let HashedPostState { accounts, storages } = post_state;
+        if accounts.is_empty() && storages.is_empty() {
+            Ok(CalculatedStateRoot(self.root))
+        } else {
+            Err(ProverError::StateRootCalculationFailed)
+        }
+    }
 }
 
-fn hashed_storage_slot(slot: U256) -> B256 {
-    KeccakKeyHasher::hash_key(B256::from(slot))
-}
-
+#[cfg(feature = "std")]
 pub fn calculate_state_root(
     trie: &mut SparseStateTrie,
     state: HashedPostState,
@@ -204,17 +150,20 @@ pub fn calculate_state_root(
         let mut slots = storage.storage.into_iter().collect::<Vec<_>>();
         slots.sort_unstable_by_key(|(slot, _)| *slot);
 
+        let mut slot_updates = B256Map::default();
         for (slot, value) in slots {
-            let path = Nibbles::unpack(slot);
-            if value.is_zero() {
-                storage_trie
-                    .remove_leaf(&path)
-                    .map_err(|_| ProverError::StateRootCalculationFailed)?;
+            let update = if value.is_zero() {
+                LeafUpdate::Changed(Vec::new())
             } else {
-                storage_trie
-                    .update_leaf(path, alloy_rlp::encode_fixed_size(&value).to_vec())
-                    .map_err(|_| ProverError::StateRootCalculationFailed)?;
-            }
+                LeafUpdate::Changed(alloy_rlp::encode_fixed_size(&value).to_vec())
+            };
+            slot_updates.insert(slot, update);
+        }
+        storage_trie
+            .update_leaves(&mut slot_updates, |_, _| {})
+            .map_err(|_| ProverError::StateRootCalculationFailed)?;
+        if !slot_updates.is_empty() {
+            return Err(ProverError::StateRootCalculationFailed);
         }
 
         storage_trie
@@ -226,9 +175,27 @@ pub fn calculate_state_root(
     let mut accounts = accounts.into_iter().collect::<Vec<_>>();
     accounts.sort_unstable_by_key(|(address, _)| *address);
 
+    let mut account_updates = B256Map::default();
     for (address, account) in accounts {
-        trie.update_account_stateless(address, account)
-            .map_err(|_| ProverError::StateRootCalculationFailed)?;
+        let storage_root = trie.storage_root(&address).unwrap_or_else(|| {
+            revealed_account_storage_root(trie, address)
+                .ok()
+                .flatten()
+                .unwrap_or(EMPTY_ROOT_HASH)
+        });
+        let update = match account {
+            Some(account) if !account.is_empty() || storage_root != EMPTY_ROOT_HASH => {
+                LeafUpdate::Changed(alloy_rlp::encode(account.into_trie_account(storage_root)))
+            }
+            _ => LeafUpdate::Changed(Vec::new()),
+        };
+        account_updates.insert(address, update);
+    }
+    trie.trie_mut()
+        .update_leaves(&mut account_updates, |_, _| {})
+        .map_err(|_| ProverError::StateRootCalculationFailed)?;
+    if !account_updates.is_empty() {
+        return Err(ProverError::StateRootCalculationFailed);
     }
 
     trie.root()
@@ -236,6 +203,7 @@ pub fn calculate_state_root(
         .map_err(|_| ProverError::StateRootCalculationFailed)
 }
 
+#[cfg(feature = "std")]
 fn take_storage_trie_for_update(
     trie: &mut SparseStateTrie,
     address: B256,
@@ -257,6 +225,7 @@ fn take_storage_trie_for_update(
     Ok(RevealableSparseTrie::revealed_empty())
 }
 
+#[cfg(feature = "std")]
 fn revealed_account_storage_root(
     trie: &SparseStateTrie,
     address: B256,
@@ -274,7 +243,7 @@ pub fn empty_state_root() -> CalculatedStateRoot {
     CalculatedStateRoot(EMPTY_ROOT_HASH)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -353,10 +322,14 @@ mod tests {
         account.encode(&mut encoded_account);
 
         let mut calculator = SparseStateRootCalculator::revealed_empty();
+        let mut account_updates = B256Map::default();
+        account_updates.insert(address, LeafUpdate::Changed(encoded_account));
         calculator
             .trie_mut()
-            .update_account_leaf(Nibbles::unpack(address), encoded_account)
+            .trie_mut()
+            .update_leaves(&mut account_updates, |_, _| {})
             .expect("account insertion into revealed trie should succeed");
+        assert!(account_updates.is_empty());
 
         let post_state = HashedPostState::default().with_storages([(
             address,

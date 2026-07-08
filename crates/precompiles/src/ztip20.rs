@@ -21,7 +21,9 @@ use revm::precompile::{
 use tempo_contracts::precompiles::TIP20Error;
 use tempo_precompiles::{
     DelegateCallNotAllowed, Precompile as TempoPrecompile, Result as TempoResult,
-    storage::{ContractStorage, StorageCtx, evm::EvmPrecompileStorageProvider},
+    storage::{
+        ContractStorage, StorageCtx, actions::StorageActions, evm::EvmPrecompileStorageProvider,
+    },
     tip20::{IRolesAuth, ITIP20, RolesAuthError, TIP20Token},
 };
 use tempo_zone_contracts::Unauthorized;
@@ -362,10 +364,28 @@ where
         registry: Option<ZoneTip403ProxyRegistry<P>>,
         sequencer: Arc<dyn SequencerExt>,
     ) -> DynPrecompile {
+        Self::create_with_actions(
+            address,
+            cfg,
+            registry,
+            sequencer,
+            StorageActions::disabled(),
+        )
+    }
+
+    /// Create a [`DynPrecompile`] and record storage actions into `actions`.
+    pub fn create_with_actions(
+        address: Address,
+        cfg: &revm::context::CfgEnv<tempo_chainspec::hardfork::TempoHardfork>,
+        registry: Option<ZoneTip403ProxyRegistry<P>>,
+        sequencer: Arc<dyn SequencerExt>,
+        actions: StorageActions,
+    ) -> DynPrecompile {
         let spec = cfg.spec;
         let amsterdam_eip8037_enabled = cfg.enable_amsterdam_eip8037;
         let gas_params = cfg.gas_params.clone();
         let token = Self::new(registry, sequencer);
+        let actions = actions.clone();
 
         DynPrecompile::new_stateful(
             PrecompileId::Custom("ZoneTip20Token".into()),
@@ -395,7 +415,8 @@ where
                     amsterdam_eip8037_enabled,
                     input.is_static,
                     gas_params.clone(),
-                );
+                )
+                .with_actions(actions.clone());
 
                 StorageCtx::enter(&mut storage, || {
                     let storage = StorageCtx::default();

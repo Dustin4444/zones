@@ -12,13 +12,11 @@
 //! | Gap | Mode | Description |
 //! |-----|------|-------------|
 //! | < configured effective window | Direct | Portal reads hash from EIP-2935. |
-//! | ≥ configured effective window | Stepping | Split into smaller submissions; each submission may still use ancestry if needed. |
+//! | ≥ configured effective window | Ancestry | Submit with a recent anchor block plus a locally validated parent-hash header chain. |
 //!
-//! [`AnchorGapKind`] classifies the gap in the zone monitor before
-//! `submit_batch` is called. Inside `submit_batch`, [`AnchorMode`] handles
-//! submissions whose `tempoBlockNumber` is still outside the configured direct
-//! window by falling back to ancestry mode — a recent anchor block plus a
-//! locally validated parent-hash header chain.
+//! Inside `submit_batch`, [`AnchorMode`] handles submissions whose
+//! `tempoBlockNumber` is outside the configured direct window by falling back to
+//! ancestry mode.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -443,10 +441,6 @@ impl BatchSubmitter {
     ///   recent anchor block is used and ancestry headers are collected (for
     ///   future prover integration).
     ///
-    /// Callers should use [`classify_anchor_gap`](Self::classify_anchor_gap)
-    /// first so large gaps can be split into stepping submissions before this
-    /// method performs ancestry header fetching.
-    ///
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
         tempo_block = batch.tempo_block_number,
@@ -604,39 +598,6 @@ impl BatchSubmitter {
         Ok(tx_hash)
     }
 
-    /// Classify whether `tempo_block_number` can be submitted directly or
-    /// requires stepping (splitting into sub-batches).
-    ///
-    /// Only performs a single `get_block_number` RPC call — no header fetching
-    /// or contract reads.
-    ///
-    /// Returns an error if `tempo_block_number` is not yet confirmed on L1
-    /// (i.e. it equals or exceeds the current L1 tip).
-    pub(crate) async fn classify_anchor_gap(
-        &self,
-        tempo_block_number: u64,
-    ) -> Result<AnchorGapKind> {
-        let current_l1_block = self.l1_provider.get_block_number().await?;
-
-        if tempo_block_number >= current_l1_block {
-            return Err(eyre::eyre!(
-                "tempo_block_number ({tempo_block_number}) is not yet confirmed on L1 (tip={current_l1_block}), \
-                 will retry after L1 advances"
-            ));
-        }
-
-        let gap = current_l1_block.saturating_sub(tempo_block_number);
-
-        let effective_window = self.anchor_config.effective_window();
-        if gap < effective_window {
-            Ok(AnchorGapKind::Direct)
-        } else {
-            Ok(AnchorGapKind::Ancestry {
-                step_size: effective_window,
-            })
-        }
-    }
-
     /// Resolve the anchor mode for the given `tempo_block_number`.
     ///
     /// - **Direct** (gap < configured effective window): the portal reads the
@@ -763,6 +724,7 @@ impl BatchSubmitter {
     /// ```
     ///
     /// Returns split points in ascending order, all within `[from_zone_block, max_zone_block]`.
+    #[cfg(test)]
     pub(crate) fn compute_step_points(
         from_zone_block: u64,
         from_tempo: u64,
@@ -806,11 +768,6 @@ impl BatchSubmitter {
     /// Returns a reference to the L1 provider.
     pub(crate) fn l1_provider(&self) -> &DynProvider<TempoNetwork> {
         &self.l1_provider
-    }
-
-    /// Return the configured EIP-2935 anchor limits.
-    pub(crate) const fn anchor_config(&self) -> BatchAnchorConfig {
-        self.anchor_config
     }
 
     /// Read the portal's `genesisTempoBlockNumber` from L1.
@@ -1641,28 +1598,11 @@ pub(crate) fn log_query_ranges(from: u64, to: u64) -> impl Iterator<Item = (u64,
     })
 }
 
-/// Classification of the EIP-2935 gap, returned by
-/// [`BatchSubmitter::classify_anchor_gap`].
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum AnchorGapKind {
-    /// Gap < configured effective window — the portal can read the block hash
-    /// directly from EIP-2935. No extra proof data needed.
-    Direct,
-    /// Gap ≥ configured effective window — `tempo_block_number` is too old
-    /// for a direct EIP-2935 lookup. The batch must be split into smaller
-    /// sub-range submissions (stepping).
-    Ancestry {
-        /// Each sub-batch covers at most this many L1 blocks.
-        step_size: u64,
-    },
-}
-
 /// How the batch submitter anchors `tempoBlockNumber` for EIP-2935 verification.
 ///
 /// Resolved by [`BatchSubmitter::resolve_anchor_mode`] inside `submit_batch`.
-/// Stepping is handled at a higher level by [`AnchorGapKind`]. `submit_batch`
-/// can still use ancestry mode when the original `tempoBlockNumber` has fallen
-/// outside the configured direct-submission window.
+/// `submit_batch` uses ancestry mode when the original `tempoBlockNumber` has
+/// fallen outside the configured direct-submission window.
 #[derive(Debug)]
 #[allow(dead_code)] // Ancestry::ancestry_headers is collected but not yet consumed — available for prover integration
 enum AnchorMode {
@@ -1713,8 +1653,8 @@ impl AnchorMode {
 
 /// A step split point for stepping mode: identifies a zone L2 block at which
 /// to cut an intermediate batch submission.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct StepPoint {
     /// Zone L2 block number at which to cut the intermediate batch.
     pub zone_block: u64,

@@ -1,7 +1,7 @@
 # Nitro Zone Prover
 
 This repo includes a minimal AWS Nitro backend for the zone batch prover in `crates/prover`.
-The backend calls the portable `no_std` prover core in `crates/prover-core`; Nitro code is responsible only for transport, attestation, signing, and host-side proof packaging.
+The backend calls the prover core in `crates/prover-core`; Nitro code is responsible only for transport, attestation, signing, and host-side proof packaging. The crate has a no-default compile check, but the current production sparse state-root path uses reth's std-gated sparse trie.
 
 The enclave binary exposes one operation over vsock:
 
@@ -10,7 +10,9 @@ The enclave binary exposes one operation over vsock:
 - sign only the resulting `BatchOutput`
 - return `verifierConfig`, `proof`, and `BatchOutput` material for `ZonePortal.submitBatch`
 
-The current `prove_zone_batch` implementation is intentionally fail-closed. It supports deterministic empty zone blocks with required final zero-withdrawal finalization and computes real successor zone block hashes. Full EVM execution, MPT proof materialization, Tempo imports, deposits, encrypted-deposit handling, and non-zero withdrawal batches remain rejected until their core adapters are implemented. Unsupported witness shapes are rejected instead of signing caller-supplied outputs.
+The current `prove_zone_batch` implementation is the production state transition entry point. It validates witness-backed Zone state proofs, verifies Tempo L1 state proofs against bound Tempo roots, executes prepared Zone blocks through Alloy/revm, and derives block, transaction, receipt, state, deposit-queue, Tempo-binding, and withdrawal-batch commitments from execution output. Production fixtures cover header imports, regular deposits, encrypted deposits, TIP-20 transfer-family user transactions, and non-zero withdrawal finalization. Unsupported or incomplete witness data is rejected instead of defaulting to zero state or signing caller-supplied outputs.
+
+Local node-generated witnesses are still narrower than the prover core. The local `LocalNodeProverWitnessSource` currently builds static/header-only witnesses, derives the needed pre-state reads for non-empty withdrawal finalization, and rejects dynamic deposit, enabled-token, and user-transaction batches until it can collect the corresponding Zone and Tempo proof material from the node. Integration sequencer tests now use this real local source rather than `UnavailableProverWitnessSource`; the current L1 settlement canary reaches the dynamic `advanceTempo` proof guard.
 
 ## Prover Core
 
@@ -126,8 +128,8 @@ Keep registration pinned to operator-reviewed PCR0/PCR1/PCR2 measurements from t
 
 ## Local Testing
 
-`ZonePortal.submitBatch` should not be tested against the fail-closed placeholder
-verifier or a Solidity MPT verifier. Local end-to-end tests use
+`ZonePortal.submitBatch` should not be tested against a placeholder verifier or
+a Solidity MPT verifier. Local end-to-end tests use
 `NativeSignatureVerifier`, which pins an approved signer per portal and verifies a
 canonical ABI-encoded signature over the exact public inputs and output
 commitments submitted to the portal. The Rust prover still verifies the witness

@@ -66,6 +66,13 @@ pub const PORTAL_PENDING_SEQUENCER_SLOT: B256 = {
     B256::new(bytes)
 };
 
+/// ZonePortal storage slot 8: `_tokenConfigs` mapping.
+pub const PORTAL_TOKEN_CONFIGS_SLOT: B256 = {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 8;
+    B256::new(bytes)
+};
+
 /// Base offset for deriving **mainnet** zone chain IDs.
 ///
 /// Each zone gets a unique EIP-155 chain ID derived from its on-chain zone ID
@@ -147,8 +154,15 @@ mod tests {
     #[test]
     fn tempo_state_slots_use_solidity_storage_key_endianness() {
         assert_eq!(TEMPO_BLOCK_HASH_SLOT, B256::from(U256::ZERO));
+        assert_eq!(TEMPO_WRAPPER_GAS_LIMITS_SLOT, B256::from(U256::from(1)));
+        assert_eq!(TEMPO_PARENT_HASH_SLOT, B256::from(U256::from(2)));
+        assert_eq!(TEMPO_BENEFICIARY_SLOT, B256::from(U256::from(3)));
         assert_eq!(TEMPO_STATE_ROOT_SLOT, B256::from(U256::from(4)));
+        assert_eq!(TEMPO_TRANSACTIONS_ROOT_SLOT, B256::from(U256::from(5)));
+        assert_eq!(TEMPO_RECEIPTS_ROOT_SLOT, B256::from(U256::from(6)));
         assert_eq!(TEMPO_PACKED_SLOT, B256::from(U256::from(7)));
+        assert_eq!(TEMPO_TIMESTAMP_MILLIS_SLOT, B256::from(U256::from(8)));
+        assert_eq!(TEMPO_PREV_RANDAO_SLOT, B256::from(U256::from(9)));
 
         let tempo_state_root_slot: U256 = TEMPO_STATE_ROOT_SLOT.into();
         let tempo_packed_slot: U256 = TEMPO_PACKED_SLOT.into();

@@ -20,6 +20,7 @@ tempo-chainspec = { workspace = true, default-features = false }
 tempo-contracts = { workspace = true, default-features = false }
 tempo-precompiles = { workspace = true, default-features = false }
 tempo-precompiles-macros.workspace = true
+tempo-revm = { workspace = true, default-features = false }
 
 # alloy
 alloy = { workspace = true, default-features = false }
@@ -37,6 +38,7 @@ sha2 = { version = "0.10.9", default-features = false }
 rand = { version = "0.8.5", default-features = false }
 
 # misc
+paste = "1.0"
 tracing = { version = "0.1.41", default-features = false }
 
 [dev-dependencies]

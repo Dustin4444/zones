@@ -1,18 +1,17 @@
 //! Zone L2 block monitor with integrated batch submission.
 //!
 //! Watches the **Zone L2** chain for new blocks, collecting withdrawal events and
-//! reading on-chain state to produce [`BatchData`]. Aggregates multiple zone blocks
-//! into a single L1 batch submission to minimize L1 transactions.
+//! reading on-chain state to produce [`BatchData`]. The current prover-backed
+//! path submits one canonical Zone block per L1 batch because the Zone payload
+//! builder finalizes withdrawals at the end of every block.
 //!
-//! ## Multi-block batching
+//! ## Batch granularity
 //!
-//! Instead of submitting one L1 transaction per zone block, the monitor scans all
-//! available zone blocks and submits a single `submitBatch` call covering the entire
-//! range. This dramatically reduces L1 transaction count during catch-up and keeps
-//! the monitor in sync with the zone tip.
-//!
-//! Withdrawals from all blocks in the range are combined into a single hash chain
-//! and stored under one portal queue slot.
+//! Each Zone block is submitted as its own `submitBatch` range. This matches the
+//! canonical block body, which already contains exactly one
+//! `ZoneOutbox.finalizeWithdrawalBatch` system transaction as the final
+//! transaction of that block. Reintroducing multi-block submissions requires the
+//! payload builder and prover to agree on where withdrawal finalization happens.
 //!
 //! ## EIP-2935 and ancestry mode
 //!
@@ -41,10 +40,10 @@ use crate::{
     abi::{self, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
-        AnchorGapKind, BatchAnchorConfig, BatchData, BatchProofSource, BatchSubmitter,
-        LOG_QUERY_BLOCK_CHUNK, PendingProverWitness, ProverWitnessSource, UnprovenBatchData,
-        ZoneBlockSnapshot, derive_zone_block_hash_for_range, fetch_slot_withdrawals,
-        log_query_ranges, resolve_zone_block_number_by_hash,
+        BatchAnchorConfig, BatchData, BatchProofSource, BatchSubmitter, LOG_QUERY_BLOCK_CHUNK,
+        PendingProverWitness, ProverWitnessSource, UnprovenBatchData, ZoneBlockSnapshot,
+        derive_zone_block_hash_for_range, fetch_slot_withdrawals, log_query_ranges,
+        resolve_zone_block_number_by_hash,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -549,30 +548,11 @@ impl ZoneMonitor {
         false
     }
 
-    /// Process a range of zone blocks as a single batch, or split into multiple
-    /// sub-range submissions if stepping mode is required.
+    /// Process pending zone blocks as one prover-backed batch per canonical block.
     ///
-    /// Scans all blocks in `[from, to]`, collects withdrawal events, reads end-of-range
-    /// state, and submits `submitBatch` calls to L1.
-    ///
-    /// ## Stepping mode
-    ///
-    /// When the zone's `tempoBlockNumber` has fallen outside the configured
-    /// direct-submission window, the monitor splits the range into multiple
-    /// submissions at intermediate zone blocks whose `tempoBlockNumber` reduces
-    /// the gap toward the current L1 tip.
-    ///
-    /// ## Withdrawal handling
-    ///
-    /// The `withdrawalQueueHash` submitted to the portal must match the hash chain
-    /// produced by `finalizeWithdrawalBatch` on L2. We collect all `WithdrawalRequested`
-    /// events across the range and build a combined hash chain. The L2 outbox finalizes
-    /// withdrawals per-block, but across a multi-block range we combine all withdrawals
-    /// into a single portal queue slot.
-    ///
-    /// The `BatchFinalized` event's `withdrawalQueueHash` is used as the authoritative
-    /// hash for single-block ranges (common case). For multi-block ranges with
-    /// withdrawals, we recompute the combined hash from the collected withdrawal structs.
+    /// The canonical payload builder appends `finalizeWithdrawalBatch` to every
+    /// block. Submitting multi-block ranges would therefore put finalization in
+    /// intermediate witness blocks, which prover-core correctly rejects.
     #[instrument(skip(self), fields(from, to))]
     async fn process_block_range(&mut self, from: u64, to: u64) -> Result<()> {
         let block_count = to
@@ -581,21 +561,18 @@ impl ZoneMonitor {
             .ok_or_else(|| eyre::eyre!("invalid zone block range {from}..={to}"))?;
         info!(from, to, block_count, "Processing zone block range");
 
-        // Read end-of-range state to check the anchor gap class.
-        let end_state = self.fetch_block_snapshot(from, to).await?;
-
-        // Lightweight gap check — no header fetching, just arithmetic.
-        let gap_kind = self
-            .batch_submitter
-            .classify_anchor_gap(end_state.tempo_block_number)
-            .await?;
-
-        match gap_kind {
-            AnchorGapKind::Direct => self.process_block_range_single(from, to, end_state).await,
-            AnchorGapKind::Ancestry { step_size } => {
-                self.process_block_range_stepping(from, to, step_size).await
-            }
+        let mut block = from;
+        while block <= to {
+            let block_state = self.fetch_block_snapshot(block, block).await?;
+            self.process_block_range_single(block, block, block_state)
+                .await?;
+            block = match block.checked_add(1) {
+                Some(next) => next,
+                None => break,
+            };
         }
+
+        Ok(())
     }
 
     /// Process a block range as a single batch submission (direct or ancestry mode).
@@ -633,100 +610,6 @@ impl ZoneMonitor {
 
         self.submit_batch_with_retry(&batch_data, to, all_withdrawals)
             .await?;
-
-        Ok(())
-    }
-
-    /// Process a block range using stepping mode: split into multiple sub-range
-    /// submissions.
-    async fn process_block_range_stepping(
-        &mut self,
-        from: u64,
-        to: u64,
-        step_size: u64,
-    ) -> Result<()> {
-        // Read the tempo_block_number from the start of the range — this is the
-        // oldest value that needs to be anchored.
-        let start_state = self.fetch_block_snapshot(from, from).await?;
-        let current_l1_block = self
-            .batch_submitter
-            .l1_provider()
-            .get_block_number()
-            .await?;
-
-        let step_points = BatchSubmitter::compute_step_points(
-            from,
-            start_state.tempo_block_number,
-            current_l1_block,
-            step_size,
-            to,
-            self.batch_submitter.anchor_config().safety_margin(),
-        );
-
-        if step_points.is_empty() {
-            return Err(eyre::eyre!(
-                "stepping mode required (tempo_block_number {} is outside EIP-2935 window) \
-                 but no valid step points found — zone may not have produced enough blocks yet",
-                start_state.tempo_block_number,
-            ));
-        }
-
-        // Collect all step zone block numbers, plus the final block.
-        // Sort + dedup defensively in case step points are not perfectly ordered.
-        let mut boundaries: Vec<u64> = step_points.iter().map(|sp| sp.zone_block).collect();
-        boundaries.push(to);
-        boundaries.sort_unstable();
-        boundaries.dedup();
-
-        let total_steps = boundaries.len();
-        info!(
-            total_steps,
-            from,
-            to,
-            first_step_zone_block = boundaries[0],
-            "Stepping mode: splitting batch into {} sub-range submissions",
-            total_steps
-        );
-
-        let mut range_start = from;
-
-        for (step_idx, &step_end) in boundaries.iter().enumerate() {
-            let step_state = self.fetch_block_snapshot(range_start, step_end).await?;
-
-            let step_withdrawals =
-                fetch_slot_withdrawals(&self.outbox, &self.provider, range_start, step_end).await?;
-            let withdrawal_queue_hash = abi::Withdrawal::queue_hash(&step_withdrawals);
-
-            let batch_data = UnprovenBatchData {
-                tempo_block_number: step_state.tempo_block_number,
-                prev_block_hash: self.prev_zone_block_hash,
-                next_block_hash: step_state.block_hash,
-                prev_processed_deposit_hash: self.prev_processed_deposit_hash,
-                next_processed_deposit_hash: step_state.processed_deposit_hash,
-                prev_deposit_number: self.prev_processed_deposit_number,
-                next_deposit_number: step_state.processed_deposit_number,
-                withdrawal_queue_hash,
-            };
-            let batch_data = self
-                .attach_prover_witness(batch_data, range_start, step_end)
-                .await?;
-
-            info!(
-                step = step_idx.checked_add(1).unwrap_or(total_steps),
-                total_steps,
-                zone_from = range_start,
-                zone_to = step_end,
-                tempo_block_number = step_state.tempo_block_number,
-                "Submitting stepping sub-batch"
-            );
-
-            self.submit_batch_with_retry(&batch_data, step_end, step_withdrawals)
-                .await?;
-
-            range_start = step_end
-                .checked_add(1)
-                .ok_or_else(|| eyre::eyre!("zone step range overflowed at {step_end}"))?;
-        }
 
         Ok(())
     }

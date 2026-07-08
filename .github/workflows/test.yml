@@ -51,6 +51,23 @@ jobs:
       - name: Run tests
         run: cargo nextest run --profile ci
 
+  prover-core-no-std:
+    name: prover core no_std
+    runs-on: depot-ubuntu-latest-4
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - name: Check zone-prover-core without std
+        run: cargo check -p zone-prover-core --no-default-features
+
   test-success:
     name: test success
     runs-on: ubuntu-latest
@@ -58,6 +75,7 @@ jobs:
     permissions: {}
     needs:
       - test
+      - prover-core-no-std
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
