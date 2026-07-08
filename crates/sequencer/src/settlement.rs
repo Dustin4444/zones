@@ -896,9 +896,13 @@ impl BatchSubmitter {
             portal_address: self.portal_address,
             verifier_version: NATIVE_VERIFIER_VERSION,
         };
-        self.check_native_verifier_policy(sequencer, config.verifier_version)
-            .await
-            .wrap_err("native verifier policy check failed")?;
+        self.check_native_verifier_policy(
+            sequencer,
+            config.verifier_version,
+            batch.tempo_block_number,
+        )
+        .await
+        .wrap_err("native verifier policy check failed")?;
 
         let public = PublicInputs {
             prev_block_hash: batch.prev_block_hash,
@@ -954,10 +958,25 @@ impl BatchSubmitter {
         &self,
         sequencer: Address,
         verifier_version: u64,
+        tempo_block_number: u64,
     ) -> Result<()> {
+        let portal_protocol_version = self
+            .portal
+            .protocolVersion()
+            .call()
+            .await
+            .wrap_err("failed to read ZonePortal protocolVersion for native policy check")?;
+        if portal_protocol_version > ZONE_BLOCK_PROTOCOL_VERSION {
+            return Err(eyre::eyre!(
+                "ZonePortal protocol version {} is newer than supported zone block protocol version {}",
+                portal_protocol_version,
+                ZONE_BLOCK_PROTOCOL_VERSION
+            ));
+        }
+
         let verifier_address = self
             .portal
-            .verifier()
+            .verifierForTempoBlock(tempo_block_number)
             .call()
             .await
             .wrap_err("failed to read ZonePortal verifier for native policy check")?;
@@ -1006,7 +1025,7 @@ impl BatchSubmitter {
     ) -> Result<()> {
         let verifier_address = self
             .portal
-            .verifier()
+            .verifierForTempoBlock(public.tempo_block_number)
             .call()
             .await
             .wrap_err("failed to read ZonePortal verifier for native proof preflight")?;

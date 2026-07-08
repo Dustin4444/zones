@@ -35,6 +35,9 @@ contract ZoneFactoryTest is BaseTest {
         NativeSignatureVerifier verifier = NativeSignatureVerifier(zoneFactory.verifier());
 
         assertTrue(zoneFactory.isValidVerifier(address(verifier)));
+        assertEq(zoneFactory.forkVerifier(), address(verifier));
+        assertEq(zoneFactory.forkActivationBlock(), 0);
+        assertEq(zoneFactory.protocolVersion(), 1);
         assertEq(verifier.verifierAdmin(), address(this));
         assertEq(verifier.PROTOCOL_VERSION(), 1);
     }
@@ -63,6 +66,8 @@ contract ZoneFactoryTest is BaseTest {
         assertTrue(portal != address(0));
         assertEq(zoneFactory.zoneCount(), 1);
         assertTrue(zoneFactory.isZonePortal(portal));
+        assertEq(zoneFactory.zonePortalCount(), 1);
+        assertEq(zoneFactory.zonePortalAt(0), portal);
 
         ZoneInfo memory info = zoneFactory.zones(zoneId);
         assertEq(info.zoneId, 1);
@@ -339,6 +344,7 @@ contract ZoneFactoryTest is BaseTest {
         zoneFactory.setVerifier(address(nextVerifier));
 
         assertEq(zoneFactory.verifier(), address(nextVerifier));
+        assertEq(zoneFactory.forkVerifier(), address(nextVerifier));
 
         IZoneFactory.CreateZoneParams memory params = _defaultParams();
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);
@@ -368,6 +374,123 @@ contract ZoneFactoryTest is BaseTest {
 
         vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
         zoneFactory.unregisterVerifier(currentVerifier);
+    }
+
+    function test_setForkVerifier_rotatesFactoryAndExistingPortals() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        (, address portalAddress) = zoneFactory.createZone(params);
+        ZonePortal portal = ZonePortal(portalAddress);
+
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+
+        address currentVerifier = zoneFactory.verifier();
+        uint64 activationBlock = uint64(block.number);
+
+        vm.expectEmit(true, false, false, true);
+        emit IZoneFactory.ForkVerifierUpdated(address(nextVerifier), activationBlock, 2);
+        zoneFactory.setForkVerifier(address(nextVerifier));
+
+        assertEq(zoneFactory.verifier(), currentVerifier);
+        assertEq(zoneFactory.forkVerifier(), address(nextVerifier));
+        assertEq(zoneFactory.forkActivationBlock(), activationBlock);
+        assertEq(zoneFactory.protocolVersion(), 2);
+
+        assertEq(portal.verifier(), currentVerifier);
+        assertEq(portal.forkVerifier(), address(nextVerifier));
+        assertEq(portal.forkActivationBlock(), activationBlock);
+        assertEq(portal.protocolVersion(), 2);
+        if (activationBlock > 0) {
+            assertEq(portal.verifierForTempoBlock(activationBlock - 1), currentVerifier);
+        }
+        assertEq(portal.verifierForTempoBlock(activationBlock), address(nextVerifier));
+    }
+
+    function test_setForkVerifier_secondRotationDeprecatesNMinusTwoVerifier() public {
+        (, address portalAddress) = zoneFactory.createZone(_defaultParams());
+        ZonePortal portal = ZonePortal(portalAddress);
+
+        address initialVerifier = zoneFactory.verifier();
+        TestVerifier secondVerifier = new TestVerifier();
+        TestVerifier thirdVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(secondVerifier));
+        zoneFactory.registerVerifier(address(thirdVerifier));
+
+        zoneFactory.setForkVerifier(address(secondVerifier));
+        uint64 firstActivation = uint64(block.number);
+
+        uint64 secondActivation = firstActivation + 10;
+        vm.roll(secondActivation);
+        zoneFactory.setForkVerifier(address(thirdVerifier));
+
+        assertEq(zoneFactory.verifier(), address(secondVerifier));
+        assertEq(zoneFactory.forkVerifier(), address(thirdVerifier));
+        assertEq(zoneFactory.forkActivationBlock(), secondActivation);
+        assertEq(zoneFactory.protocolVersion(), 3);
+
+        assertEq(portal.verifier(), address(secondVerifier));
+        assertEq(portal.forkVerifier(), address(thirdVerifier));
+        assertEq(portal.protocolVersion(), 3);
+        assertEq(portal.verifierForTempoBlock(firstActivation), address(secondVerifier));
+        assertEq(portal.verifierForTempoBlock(secondActivation), address(thirdVerifier));
+        assertFalse(portal.verifierForTempoBlock(firstActivation) == initialVerifier);
+    }
+
+    function test_createZone_afterForkInstallsFactoryForkState() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+        zoneFactory.setForkVerifier(address(nextVerifier));
+
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        (uint32 zoneId, address portalAddress) = zoneFactory.createZone(params);
+        ZonePortal portal = ZonePortal(portalAddress);
+
+        assertEq(zoneFactory.zonePortalAt(0), portalAddress);
+        assertEq(portal.verifier(), zoneFactory.verifier());
+        assertEq(portal.forkVerifier(), zoneFactory.forkVerifier());
+        assertEq(portal.forkActivationBlock(), zoneFactory.forkActivationBlock());
+        assertEq(portal.protocolVersion(), zoneFactory.protocolVersion());
+        assertEq(
+            portal.verifierForTempoBlock(params.zoneParams.genesisTempoBlockNumber),
+            address(nextVerifier)
+        );
+        assertEq(zoneFactory.zones(zoneId).verifier, params.verifier);
+    }
+
+    function test_setForkVerifier_revertsOnUnregisteredVerifier() public {
+        TestVerifier nextVerifier = new TestVerifier();
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.setForkVerifier(address(nextVerifier));
+    }
+
+    function test_setForkVerifier_revertsForNonAdmin() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+
+        vm.prank(alice);
+        vm.expectRevert(IZoneFactory.OnlyVerifierAdmin.selector);
+        zoneFactory.setForkVerifier(address(nextVerifier));
+    }
+
+    function test_unregisterVerifier_revertsForForkVerifier() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+        zoneFactory.setForkVerifier(address(nextVerifier));
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.unregisterVerifier(address(nextVerifier));
+    }
+
+    function test_setVerifier_revertsAfterForkRotation() public {
+        TestVerifier nextVerifier = new TestVerifier();
+        TestVerifier thirdVerifier = new TestVerifier();
+        zoneFactory.registerVerifier(address(nextVerifier));
+        zoneFactory.registerVerifier(address(thirdVerifier));
+        zoneFactory.setForkVerifier(address(nextVerifier));
+
+        vm.expectRevert(IZoneFactory.InvalidVerifier.selector);
+        zoneFactory.setVerifier(address(thirdVerifier));
     }
 
     /*//////////////////////////////////////////////////////////////

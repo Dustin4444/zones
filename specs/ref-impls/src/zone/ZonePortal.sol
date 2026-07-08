@@ -68,7 +68,7 @@ contract ZonePortal is IZonePortal {
 
     uint32 public immutable zoneId;
     address public immutable messenger;
-    address public immutable verifier;
+    address public immutable verifierManager;
     uint64 public immutable genesisTempoBlockNumber;
 
     /// @notice Current sequencer address
@@ -132,6 +132,18 @@ contract ZonePortal is IZonePortal {
     ///      increase it.
     mapping(address token => uint256 amount) public accountedBalance;
 
+    /// @notice Verifier for batches before `forkActivationBlock`.
+    address internal _verifier;
+
+    /// @notice Verifier for batches at or after `forkActivationBlock`.
+    address public forkVerifier;
+
+    /// @notice Tempo block number where `forkVerifier` becomes active.
+    uint64 public forkActivationBlock;
+
+    /// @notice Zone protocol version associated with the installed fork verifier.
+    uint64 public protocolVersion;
+
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -142,16 +154,19 @@ contract ZonePortal is IZonePortal {
         address _messenger,
         address _admin,
         address _sequencer,
-        address _verifier,
+        address initialVerifier,
         bytes32 _genesisBlockHash,
         uint64 _genesisTempoBlockNumber,
         string memory _rpcUrl
     ) {
         zoneId = _zoneId;
         messenger = _messenger;
+        verifierManager = msg.sender;
         admin = _admin;
         sequencer = _sequencer;
-        verifier = _verifier;
+        _verifier = initialVerifier;
+        forkVerifier = initialVerifier;
+        protocolVersion = 1;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
         rpcUrl = _rpcUrl;
@@ -172,6 +187,50 @@ contract ZonePortal is IZonePortal {
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
         _;
+    }
+
+    modifier onlyVerifierManager() {
+        if (msg.sender != verifierManager) revert NotVerifierManager();
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          VERIFIER MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    function verifier() external view returns (address) {
+        return _verifier;
+    }
+
+    function verifierForTempoBlock(uint64 tempoBlockNumber) public view returns (address) {
+        if (forkActivationBlock != 0 && tempoBlockNumber >= forkActivationBlock) {
+            return forkVerifier;
+        }
+        return _verifier;
+    }
+
+    function setForkVerifier(
+        address newForkVerifier,
+        uint64 activationBlock,
+        uint64 newProtocolVersion
+    )
+        external
+        onlyVerifierManager
+    {
+        if (newForkVerifier == address(0) || newForkVerifier.code.length == 0) {
+            revert InvalidVerifier();
+        }
+        if (activationBlock == 0) revert InvalidForkActivationBlock();
+        if (newProtocolVersion <= protocolVersion) revert InvalidProtocolVersion();
+
+        address previousVerifier = _verifier;
+        _verifier = forkVerifier;
+        forkVerifier = newForkVerifier;
+        forkActivationBlock = activationBlock;
+        protocolVersion = newProtocolVersion;
+
+        emit VerifierUpdated(previousVerifier, _verifier);
+        emit ForkVerifierUpdated(newForkVerifier, activationBlock, newProtocolVersion);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -864,7 +923,7 @@ contract ZonePortal is IZonePortal {
         if (anchorBlockHash == bytes32(0)) revert InvalidTempoBlockNumber();
 
         // Verify proof (handles both direct and ancestry modes)
-        bool valid = IVerifier(verifier)
+        bool valid = IVerifier(verifierForTempoBlock(tempoBlockNumber))
             .verify(
                 tempoBlockNumber,
                 anchorBlockNumber,

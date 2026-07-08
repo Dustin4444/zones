@@ -1631,11 +1631,13 @@ struct ZoneInfo {
     address portal;
     address messenger;
     address initialToken;
+    address admin;
     address sequencer;
     address verifier;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
+    string rpcUrl;
 }
 
 struct ZoneParams {
@@ -1656,18 +1658,27 @@ struct LastBatch {
 interface IZoneFactory {
     struct CreateZoneParams {
         address initialToken;
+        address admin;
         address sequencer;
         address verifier;
         ZoneParams zoneParams;
+        string rpcUrl;
     }
 
     event ZoneCreated(
         uint32 indexed zoneId, address indexed portal, address indexed messenger,
-        address initialToken, address sequencer, address verifier,
+        address initialToken, address admin, address sequencer, address verifier,
         bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
     );
 
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
+    function verifier() external view returns (address);
+    function forkVerifier() external view returns (address);
+    function forkActivationBlock() external view returns (uint64);
+    function protocolVersion() external view returns (uint64);
+    function setForkVerifier(address verifier) external;
+    function zonePortalCount() external view returns (uint256);
+    function zonePortalAt(uint256 index) external view returns (address);
     function zoneCount() external view returns (uint32);
     function zones(uint32 zoneId) external view returns (ZoneInfo memory);
     function isZonePortal(address portal) external view returns (bool);
@@ -1730,6 +1741,8 @@ interface IZonePortal {
     // Zone RPC endpoint 
     // Published on-chain so clients can discover how to reach the zone
     event RpcUrlUpdated(string rpcUrl);
+    event VerifierUpdated(address indexed previousVerifier, address indexed verifier);
+    event ForkVerifierUpdated(address indexed forkVerifier, uint64 forkActivationBlock, uint64 protocolVersion);
     function rpcUrl() external view returns (string memory);
     function setRpcUrl(string calldata rpcUrl) external; // sequencer-only
 
@@ -1788,6 +1801,11 @@ interface IZonePortal {
     // State
     function sequencer() external view returns (address);
     function verifier() external view returns (address);
+    function forkVerifier() external view returns (address);
+    function forkActivationBlock() external view returns (uint64);
+    function protocolVersion() external view returns (uint64);
+    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
+    function setForkVerifier(address newForkVerifier, uint64 activationBlock, uint64 newProtocolVersion) external;
     function blockHash() external view returns (bytes32);
     function currentDepositQueueHash() external view returns (bytes32);
     function withdrawalBatchIndex() external view returns (uint64);
@@ -1986,23 +2004,21 @@ Deployed at the same address as on Tempo. Read-only on the zone. Its `isAuthoriz
 
 ## Network Upgrades and Hard Fork Activation
 
-> **Note:** The verifier rotation and protocol version mechanisms described below are the target design. The current `ZonePortal` implementation declares `verifier` as `immutable`, so the rotation mechanism is not yet implemented. This section will be updated when the upgrade contracts are deployed.
-
 Zones activate hard fork upgrades in lockstep with Tempo using same-block activation. The trigger is the Tempo block number: the zone block whose `advanceTempo` imports the fork Tempo block uses the new execution rules for its entire scope.
 
-The portal will maintain two verifier slots (`verifier` and `forkVerifier`). At each fork, verifiers rotate: the previous fork verifier is promoted to `verifier`, and the new fork verifier takes the `forkVerifier` slot. At most two verifiers are active at any time. The `IVerifier` interface is unchanged across forks. New proof parameters are passed via the opaque `verifierConfig` bytes.
+The portal maintains two verifier slots (`verifier` and `forkVerifier`). At each fork, verifiers rotate: the previous fork verifier is promoted to `verifier`, and the new fork verifier takes the `forkVerifier` slot. At most two verifiers are active at any time. The portal resolves the effective verifier with `verifierForTempoBlock(tempoBlockNumber)`: batches with `tempoBlockNumber < forkActivationBlock` use `verifier`, and batches with `tempoBlockNumber >= forkActivationBlock` use `forkVerifier`. The `IVerifier` interface is unchanged across forks. New proof parameters are passed via the opaque `verifierConfig` bytes.
 
-`ZoneFactory` will maintain a `protocolVersion` counter incremented at each fork. Zone nodes embed the highest protocol version they support and halt cleanly if the imported Tempo block bumps `protocolVersion` beyond their supported version, preventing an outdated node from producing blocks under incorrect rules.
+`ZoneFactory` maintains a `protocolVersion` counter incremented at each fork and propagates the new version to every tracked portal. Zone nodes embed the highest protocol version they support and halt cleanly if the imported Tempo block bumps `protocolVersion` beyond their supported version, preventing an outdated node from producing blocks under incorrect rules.
 
 No onchain action is required from zone operators. The new verifier is deployed and rotated as part of the Tempo hard fork. Operators upgrade their zone node binary and prover program before the fork. When the fork Tempo block arrives, the node activates new rules automatically.
 
-The portal will enforce a `forkActivationBlock` cutoff where batches targeting the old `verifier` must have `tempoBlockNumber < forkActivationBlock`. This prevents post-fork batches from being submitted against old verification rules.
+The portal enforces the `forkActivationBlock` cutoff by selecting the verifier from the batch's `tempoBlockNumber` inside `submitBatch`. This prevents post-fork batches from being submitted against old verification rules.
 
 The Tempo hard fork block executes the following as system transactions:
 
 1. Deploy the new `IVerifier` contract.
 2. Call `ZoneFactory.setForkVerifier(forkVerifier)`, which for each registered portal promotes `forkVerifier` to `verifier`, installs the new verifier as `forkVerifier`, and sets `forkActivationBlock = block.number`.
-3. Increment `ZoneFactory.protocolVersion`.
+3. Increment `ZoneFactory.protocolVersion` and copy the new version to every registered portal.
 
 If the fork changes zone predeploy behavior, the zone node injects new bytecode at the predeploy addresses before `advanceTempo` executes in the first post-fork zone block.
 

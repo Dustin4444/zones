@@ -136,12 +136,24 @@ crate::sol! {
             address indexed newSequencer
         );
 
+        event VerifierUpdated(address indexed previousVerifier, address indexed verifier);
+
+        event ForkVerifierUpdated(
+            address indexed forkVerifier,
+            uint64 forkActivationBlock,
+            uint64 protocolVersion
+        );
+
         // -- Errors --
 
         error NotSequencer();
         error NotAdmin();
+        error NotVerifierManager();
         error InvalidProof();
         error InvalidTempoBlockNumber();
+        error InvalidVerifier();
+        error InvalidForkActivationBlock();
+        error InvalidProtocolVersion();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
         error AccountedBalanceUnderflow(address token, uint256 available, uint256 required);
@@ -152,6 +164,11 @@ crate::sol! {
         function admin() external view returns (address);
         function sequencer() external view returns (address);
         function verifier() external view returns (address);
+        function verifierManager() external view returns (address);
+        function forkVerifier() external view returns (address);
+        function forkActivationBlock() external view returns (uint64);
+        function protocolVersion() external view returns (uint64);
+        function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
         function sequencerPubkey() external view returns (bytes32);
         function withdrawalBatchIndex() external view returns (uint64);
         function blockHash() external view returns (bytes32);
@@ -195,6 +212,11 @@ crate::sol! {
         function enableToken(address token) external;
         function pauseDeposits(address token) external;
         function resumeDeposits(address token) external;
+        function setForkVerifier(
+            address newForkVerifier,
+            uint64 activationBlock,
+            uint64 newProtocolVersion
+        ) external;
 
         function rpcUrl() external view returns (string memory);
         function setRpcUrl(string calldata rpcUrl) external;
@@ -293,8 +315,12 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
         match self {
             Self::NotSequencer(_) => f.write_str("NotSequencer"),
             Self::NotAdmin(_) => f.write_str("NotAdmin"),
+            Self::NotVerifierManager(_) => f.write_str("NotVerifierManager"),
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
+            Self::InvalidVerifier(_) => f.write_str("InvalidVerifier"),
+            Self::InvalidForkActivationBlock(_) => f.write_str("InvalidForkActivationBlock"),
+            Self::InvalidProtocolVersion(_) => f.write_str("InvalidProtocolVersion"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
             Self::AccountedBalanceUnderflow(_) => f.write_str("AccountedBalanceUnderflow"),

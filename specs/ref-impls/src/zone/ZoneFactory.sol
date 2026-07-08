@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, ZoneInfo } from "./IZone.sol";
+import { IZoneFactory, IZonePortal, ZoneInfo } from "./IZone.sol";
 import { NativeSignatureVerifier } from "./NativeSignatureVerifier.sol";
 import { ZoneMessenger } from "./ZoneMessenger.sol";
 import { ZonePortal } from "./ZonePortal.sol";
@@ -29,6 +29,10 @@ contract ZoneFactory is IZoneFactory {
     mapping(address => bool) internal _isZoneMessenger;
     mapping(address => bool) internal _validVerifiers;
     address internal _verifier;
+    address internal _forkVerifier;
+    uint64 internal _forkActivationBlock;
+    uint64 internal _protocolVersion;
+    address[] internal _zonePortals;
     address public immutable verifierAdmin;
 
     /// @notice Tracks deployment count for CREATE address prediction
@@ -45,6 +49,8 @@ contract ZoneFactory is IZoneFactory {
         address v = address(new NativeSignatureVerifier(msg.sender));
         _validVerifiers[v] = true;
         _verifier = v;
+        _forkVerifier = v;
+        _protocolVersion = 1;
         emit VerifierRegistered(v);
         emit VerifierUpdated(address(0), v);
     }
@@ -108,6 +114,9 @@ contract ZoneFactory is IZoneFactory {
             params.zoneParams.genesisTempoBlockNumber,
             params.rpcUrl
         );
+        if (_protocolVersion > 1) {
+            portalContract.setForkVerifier(_forkVerifier, _forkActivationBlock, _protocolVersion);
+        }
         portal = address(portalContract);
 
         // Verify our prediction was correct
@@ -130,6 +139,7 @@ contract ZoneFactory is IZoneFactory {
 
         _isZonePortal[portal] = true;
         _isZoneMessenger[messengerAddress] = true;
+        _zonePortals.push(portal);
 
         emit ZoneCreated(
             zoneId,
@@ -198,6 +208,26 @@ contract ZoneFactory is IZoneFactory {
         return _validVerifiers[v];
     }
 
+    function forkVerifier() external view returns (address) {
+        return _forkVerifier;
+    }
+
+    function forkActivationBlock() external view returns (uint64) {
+        return _forkActivationBlock;
+    }
+
+    function protocolVersion() external view returns (uint64) {
+        return _protocolVersion;
+    }
+
+    function zonePortalCount() external view returns (uint256) {
+        return _zonePortals.length;
+    }
+
+    function zonePortalAt(uint256 index) external view returns (address) {
+        return _zonePortals[index];
+    }
+
     function registerVerifier(address v) external onlyVerifierAdmin {
         if (v == address(0) || v.code.length == 0) revert InvalidVerifier();
         _validVerifiers[v] = true;
@@ -205,16 +235,41 @@ contract ZoneFactory is IZoneFactory {
     }
 
     function unregisterVerifier(address v) external onlyVerifierAdmin {
-        if (v == _verifier) revert InvalidVerifier();
+        if (v == _verifier || v == _forkVerifier) revert InvalidVerifier();
         _validVerifiers[v] = false;
         emit VerifierUnregistered(v);
     }
 
     function setVerifier(address v) external onlyVerifierAdmin {
         if (!_validVerifiers[v]) revert InvalidVerifier();
+        if (_protocolVersion > 1) revert InvalidVerifier();
         address previousVerifier = _verifier;
         _verifier = v;
+        _forkVerifier = v;
         emit VerifierUpdated(previousVerifier, v);
+    }
+
+    function setForkVerifier(address v) external onlyVerifierAdmin {
+        if (!_validVerifiers[v]) revert InvalidVerifier();
+        if (_protocolVersion == type(uint64).max || block.number > type(uint64).max) {
+            revert InvalidProtocolVersion();
+        }
+
+        uint64 activationBlock = uint64(block.number);
+        uint64 newProtocolVersion = _protocolVersion + 1;
+        address previousVerifier = _verifier;
+
+        _verifier = _forkVerifier;
+        _forkVerifier = v;
+        _forkActivationBlock = activationBlock;
+        _protocolVersion = newProtocolVersion;
+
+        for (uint256 i = 0; i < _zonePortals.length; i++) {
+            IZonePortal(_zonePortals[i]).setForkVerifier(v, activationBlock, newProtocolVersion);
+        }
+
+        emit VerifierUpdated(previousVerifier, _verifier);
+        emit ForkVerifierUpdated(v, activationBlock, newProtocolVersion);
     }
 
     function verifier() external view returns (address) {

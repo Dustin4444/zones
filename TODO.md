@@ -30,12 +30,12 @@ This audit treats `specs/spec.md` as the target source of truth. A full "done" c
 
 | Spec area | Current status | Evidence / gap |
 |-----------|----------------|----------------|
-| Access control, deployment, token management, deposits, withdrawals, bounce-backs | Implemented for the current immutable-verifier contract set | Reference contracts and focused Forge coverage exercise portal/inbox/outbox queue, fee, refund, encrypted-deposit failure, and withdrawal finalization behavior. |
+| Access control, deployment, token management, deposits, withdrawals, bounce-backs | Implemented for the current contract set | Reference contracts and focused Forge coverage exercise portal/inbox/outbox queue, fee, refund, encrypted-deposit failure, withdrawal finalization behavior, and verifier rotation behavior. |
 | Zone execution, Tempo reads, TIP-403, fee-token handling | Implemented for current settlement scope | Prover execution uses system transactions, generated witnesses, portal enabled-token proofs, and witness-backed TIP-403 policy reads. |
 | Private RPC | Implemented in current scope | RPC handlers expose the three `zone_` methods and private RPC integration/unit tests cover token info, zone info, deposit status, scoped logs, block redaction, and disabled pending-transaction subscriptions. |
 | Proving system witness shape | Open | The prover still uses the custom Zone witness containers rather than an upstream-style execution witness adapter. |
 | Production no-std prover | Open | The no-default build compiles, but non-empty post-state root calculation still needs a no-std sparse-trie backend or upstream reth export. |
-| Network upgrades | Open target design | `ZonePortal.verifier` is immutable today; verifier rotation, fork activation cutoffs, and protocol-version rotation remain future design. |
+| Network upgrades | Implemented for verifier/protocol rotation scope | `ZoneFactory.setForkVerifier` rotates the two-verifier window across tracked portals, portals select `verifierForTempoBlock` by `forkActivationBlock`, protocol versions propagate to portals, and the native sequencer preflight refuses unsupported portal protocol versions. |
 
 ## TODO status before calling the original goal complete
 
@@ -90,11 +90,10 @@ This audit treats `specs/spec.md` as the target source of truth. A full "done" c
 11. [x] Align Zone fee-token semantics with the Zone fee manager direction.
     Zones use `ZoneFeeManager`: any USD TIP-20 token enabled on the L1 portal can pay fees, FeeAMM liquidity routing is disabled, and validator fees are credited directly in the user's fee token. pathUSD remains initialized in genesis as the default/reserved TIP-20 so Tempo fee-token storage expectations are valid at boot, but it is not the only runtime fee token.
 
-12. [ ] Implement the target network-upgrade verifier rotation semantics.
-    The spec's Network Upgrades section is still explicitly target design: the current `ZonePortal` keeps `verifier` immutable, while the target design needs active/fork verifier slots, fork activation cutoffs, and protocol-version rotation. Until that is implemented, the prover checkpoint can be complete for the current immutable-verifier contract set but not for every future-upgrade requirement in the spec.
+12. [x] Implement the target network-upgrade verifier rotation semantics.
+    `ZonePortal` now keeps mutable `verifier`/`forkVerifier` slots, exposes `verifierForTempoBlock(tempoBlockNumber)`, and enforces the `forkActivationBlock` cutoff inside `submitBatch`. `ZoneFactory.setForkVerifier` promotes the previous fork verifier, installs the new fork verifier across every tracked portal, and increments/propagates `protocolVersion`. The native sequencer proof preflight resolves the verifier through `verifierForTempoBlock` and fails closed if the portal protocol version is newer than the node's supported Zone block protocol version. Focused Forge coverage exercises first rotation, second-rotation N-2 verifier deprecation, post-fork zone creation, unauthorized portal rotation rejection, post-activation `submitBatch` verifier selection, and appended verifier storage slots.
 
 ## Suggested follow-up commits
 
-- Land the current checkpoint with the remaining gaps scoped to upstream witness-shape cleanup, no-std production sparse trie support, and network-upgrade verifier rotation.
+- Land the current checkpoint with the remaining gaps scoped to upstream witness-shape cleanup and no-std production sparse trie support.
 - Replace hand-selected Zone proof collection with an upstream-style execution witness adapter.
-- Implement the target fork verifier/protocol-version rotation path, or split it into a later network-upgrade milestone if immutable-verifier portals remain the current product scope.

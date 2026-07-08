@@ -385,6 +385,9 @@ interface IZoneTxContext {
 //   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
 //   slot 14: rpcUrl (string)
 //   slot 15: accountedBalance (mapping(address => uint256))
+//   slot 16: _verifier (address)
+//   slot 17: forkVerifier (address)
+//   slot 18: protocolVersion (uint64) + forkActivationBlock (uint64) [packed]
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -470,6 +473,7 @@ interface IZoneFactory {
     error InvalidAdmin();
     error InvalidSequencer();
     error InvalidVerifier();
+    error InvalidProtocolVersion();
     error OnlyVerifierAdmin();
     error InsufficientGas();
     error ZoneIdOverflow();
@@ -477,6 +481,9 @@ interface IZoneFactory {
     event VerifierRegistered(address indexed verifier);
     event VerifierUnregistered(address indexed verifier);
     event VerifierUpdated(address indexed previousVerifier, address indexed verifier);
+    event ForkVerifierUpdated(
+        address indexed forkVerifier, uint64 forkActivationBlock, uint64 protocolVersion
+    );
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
@@ -486,6 +493,27 @@ interface IZoneFactory {
     /// @notice Returns the verifier currently used for new zones.
     /// @return verifier The verifier contract address.
     function verifier() external view returns (address);
+
+    /// @notice Returns the verifier installed for post-fork batches.
+    /// @return verifier The fork verifier contract address.
+    function forkVerifier() external view returns (address);
+
+    /// @notice Returns the Tempo block where `forkVerifier` becomes active.
+    /// @return blockNumber The fork activation block number.
+    function forkActivationBlock() external view returns (uint64 blockNumber);
+
+    /// @notice Returns the current Zone protocol version.
+    /// @return version The Zone protocol version.
+    function protocolVersion() external view returns (uint64 version);
+
+    /// @notice Returns the number of portals deployed by this factory.
+    /// @return count Number of tracked portals.
+    function zonePortalCount() external view returns (uint256 count);
+
+    /// @notice Returns a portal deployed by this factory.
+    /// @param index The portal index.
+    /// @return portal The portal address.
+    function zonePortalAt(uint256 index) external view returns (address portal);
 
     /// @notice Registers a verifier contract that can be used for new zones.
     /// @param verifier The verifier contract to approve.
@@ -498,6 +526,10 @@ interface IZoneFactory {
     /// @notice Sets the verifier contract used for new zones.
     /// @param verifier The registered verifier contract to use.
     function setVerifier(address verifier) external;
+
+    /// @notice Rotates the fork verifier for the next Tempo protocol activation.
+    /// @param verifier The registered verifier contract for post-fork batches.
+    function setForkVerifier(address verifier) external;
 
     /// @notice Creates a new zone and deploys its portal and messenger contracts.
     /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
@@ -627,11 +659,20 @@ interface IZonePortal {
     /// @notice Emitted when the sequencer updates the zone's public RPC endpoint
     event RpcUrlUpdated(string rpcUrl);
 
+    event VerifierUpdated(address indexed previousVerifier, address indexed verifier);
+    event ForkVerifierUpdated(
+        address indexed forkVerifier, uint64 forkActivationBlock, uint64 protocolVersion
+    );
+
     error NotSequencer();
     error NotAdmin();
+    error NotVerifierManager();
     error NotPendingSequencer();
     error InvalidProof();
     error InvalidTempoBlockNumber();
+    error InvalidVerifier();
+    error InvalidForkActivationBlock();
+    error InvalidProtocolVersion();
     error CallbackRejected();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
     error InvalidEncryptionKeyIndex(uint256 keyIndex);
@@ -673,6 +714,23 @@ interface IZonePortal {
     function zoneGasRate() external view returns (uint128);
 
     function verifier() external view returns (address);
+
+    function verifierManager() external view returns (address);
+
+    function forkVerifier() external view returns (address);
+
+    function forkActivationBlock() external view returns (uint64);
+
+    function protocolVersion() external view returns (uint64);
+
+    function verifierForTempoBlock(uint64 tempoBlockNumber) external view returns (address);
+
+    function setForkVerifier(
+        address newForkVerifier,
+        uint64 activationBlock,
+        uint64 newProtocolVersion
+    )
+        external;
 
     function withdrawalBatchIndex() external view returns (uint64);
 

@@ -14,6 +14,7 @@ import {
     EncryptedDeposit,
     EncryptedDepositPayload,
     EncryptionKeyEntry,
+    IVerifier,
     IWithdrawalReceiver,
     IZoneFactory,
     IZoneMessenger,
@@ -121,6 +122,37 @@ contract SuccessfulReceiver is IWithdrawalReceiver {
     {
         callCount++;
         return IWithdrawalReceiver.onWithdrawalReceived.selector;
+    }
+
+}
+
+/// @notice Verifier that accepts batches at or after a configured Tempo block.
+contract MinTempoBlockVerifier is IVerifier {
+
+    uint64 public immutable minTempoBlock;
+
+    constructor(uint64 _minTempoBlock) {
+        minTempoBlock = _minTempoBlock;
+    }
+
+    function verify(
+        uint64 tempoBlockNumber,
+        uint64,
+        bytes32,
+        uint64,
+        address,
+        BlockTransition calldata,
+        DepositQueueTransition calldata,
+        bytes32,
+        bytes calldata,
+        bytes calldata
+    )
+        external
+        view
+        override
+        returns (bool)
+    {
+        return tempoBlockNumber >= minTempoBlock;
     }
 
 }
@@ -356,6 +388,10 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.sequencer(), admin);
         assertEq(portal.admin(), admin);
         assertEq(portal.verifier(), zoneFactory.verifier());
+        assertEq(portal.forkVerifier(), zoneFactory.forkVerifier());
+        assertEq(portal.forkActivationBlock(), zoneFactory.forkActivationBlock());
+        assertEq(portal.protocolVersion(), zoneFactory.protocolVersion());
+        assertEq(portal.verifierManager(), address(zoneFactory));
         assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
@@ -675,6 +711,45 @@ contract ZonePortalTest is BaseTest {
             _nativeVerifierConfig(),
             _invalidNativeProof()
         );
+    }
+
+    function test_submitBatch_usesForkVerifierAtActivationBlock() public {
+        uint64 activationBlock = uint64(block.number);
+        MinTempoBlockVerifier forkVerifier = new MinTempoBlockVerifier(activationBlock);
+        zoneFactory.registerVerifier(address(forkVerifier));
+        zoneFactory.setForkVerifier(address(forkVerifier));
+
+        assertEq(portal.verifierForTempoBlock(activationBlock), address(forkVerifier));
+
+        // Advance one block so EIP-2935 can return the activation block hash.
+        vm.roll(uint256(activationBlock) + 1);
+
+        bytes32 nextStateRoot = keccak256("fork-state");
+        _submitBatch(
+            activationBlock,
+            0,
+            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: nextStateRoot }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            bytes32(0),
+            hex"01",
+            hex"02"
+        );
+
+        assertEq(portal.blockHash(), nextStateRoot);
+        assertEq(portal.lastSyncedTempoBlockNumber(), activationBlock);
+    }
+
+    function test_portalSetForkVerifier_revertsIfNotVerifierManager() public {
+        MinTempoBlockVerifier forkVerifier = new MinTempoBlockVerifier(uint64(block.number));
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.NotVerifierManager.selector);
+        portal.setForkVerifier(address(forkVerifier), uint64(block.number), 2);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2723,6 +2798,9 @@ contract ZonePortalTest is BaseTest {
     ///        slot 5: currentDepositQueueHash (bytes32)
     ///        slot 6: deposit counters
     ///        slot 7: _encryptionKeys.length (EncryptionKeyEntry[])
+    ///        slot 16: verifier (address)
+    ///        slot 17: forkVerifier (address)
+    ///        slot 18: protocolVersion (uint64) + forkActivationBlock (uint64) [packed]
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));
@@ -2772,6 +2850,29 @@ contract ZonePortalTest is BaseTest {
         // Before adding keys, length should be 0
         bytes32 slot7keys = vm.load(address(portal), PORTAL_ENCRYPTION_KEYS_SLOT);
         assertEq(uint256(slot7keys), 0, "slot 7: _encryptionKeys length should be 0 initially");
+
+        // --- Slot 16: verifier ---
+        bytes32 slot16 = vm.load(address(portal), bytes32(uint256(16)));
+        assertEq(address(uint160(uint256(slot16))), portal.verifier(), "slot 16: verifier mismatch");
+
+        // --- Slot 17: forkVerifier ---
+        bytes32 slot17 = vm.load(address(portal), bytes32(uint256(17)));
+        assertEq(
+            address(uint160(uint256(slot17))),
+            portal.forkVerifier(),
+            "slot 17: forkVerifier mismatch"
+        );
+
+        // --- Slot 18: protocolVersion (uint64) + forkActivationBlock (uint64) packed ---
+        bytes32 slot18 = vm.load(address(portal), bytes32(uint256(18)));
+        assertEq(
+            uint64(uint256(slot18)), portal.protocolVersion(), "slot 18: protocolVersion mismatch"
+        );
+        assertEq(
+            uint64(uint256(slot18) >> 64),
+            portal.forkActivationBlock(),
+            "slot 18: forkActivationBlock mismatch"
+        );
     }
 
     /// @notice Verify that the _encryptionKeys dynamic array uses the expected slot layout.
