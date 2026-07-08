@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolError, SolValue};
-use revm::precompile::{PrecompileError, PrecompileResult};
+use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     Result as TempoResult,
     error::TempoPrecompileError,
@@ -16,16 +16,12 @@ use tempo_precompiles::{
 use tempo_precompiles_macros::{Storable, contract};
 use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
 use zone_primitives::constants::{
-    EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, PORTAL_SEQUENCER_SLOT, ZONE_INBOX_ADDRESS,
-    ZONE_OUTBOX_ADDRESS,
+    EMPTY_SENTINEL, MAX_WITHDRAWAL_GAS_LIMIT, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
 };
 
 use crate::{
-    chaum_pedersen::recover_point,
-    ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
-    policy::PolicyCheck,
-    tempo_state::{L1StorageReader, TempoState},
-    tip403_proxy::ZoneTip403ProxyRegistry,
+    chaum_pedersen::recover_point, ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
+    policy::PolicyCheck, tip403_proxy::ZoneTip403ProxyRegistry,
 };
 
 const MAX_CALLBACK_DATA_SIZE: usize = 1024;
@@ -51,57 +47,6 @@ impl ZoneOutbox {
     /// Initializes the precompile account code.
     pub fn initialize(&mut self) -> TempoResult<()> {
         self.__initialize()
-    }
-
-    fn current_tempo_block_number(&self) -> TempoResult<u64> {
-        TempoState::new().current_tempo_block_number()
-    }
-
-    fn portal_mapping_slot(token: Address) -> B256 {
-        keccak256((token, PORTAL_TOKEN_CONFIGS_SLOT).abi_encode())
-    }
-
-    fn portal_storage<P: ZonePortalReader>(
-        &self,
-        provider: &P,
-        slot: B256,
-        tempo_block_number: u64,
-    ) -> Result<B256, PrecompileError> {
-        provider.read_l1_storage(provider.portal_address(), slot, tempo_block_number)
-    }
-
-    fn sequencer<P: ZonePortalReader>(
-        &self,
-        provider: &P,
-        tempo_block_number: u64,
-    ) -> Result<Address, PrecompileError> {
-        let value = self.portal_storage(provider, PORTAL_SEQUENCER_SLOT, tempo_block_number)?;
-        Ok(Address::from_slice(&value.as_slice()[12..]))
-    }
-
-    fn token_enabled<P: ZonePortalReader>(
-        &self,
-        provider: &P,
-        tempo_block_number: u64,
-        token: Address,
-    ) -> Result<bool, PrecompileError> {
-        let slot = Self::portal_mapping_slot(token);
-        let value = self.portal_storage(provider, slot, tempo_block_number)?;
-        Ok(value.as_slice()[31] != 0)
-    }
-
-    fn ensure_sequencer<P: ZonePortalReader>(
-        &self,
-        provider: &P,
-        caller: Address,
-        tempo_block_number: u64,
-    ) -> PrecompileResult {
-        if caller == Address::ZERO || caller == self.sequencer(provider, tempo_block_number)? {
-            return Ok(self.storage.success_output(Bytes::new()));
-        }
-        Ok(self
-            .storage
-            .revert_output(ZoneOutboxAbi::OnlySequencer {}.abi_encode().into()))
     }
 
     fn validate_gas_limit(&self, gas_limit: u64) -> Option<PrecompileResult> {
@@ -259,9 +204,8 @@ impl ZoneOutbox {
         Ok(self.storage.success_output(Bytes::new()))
     }
 
-    fn request_withdrawal<P: ZonePortalReader, Q: PolicyCheck>(
+    fn request_withdrawal<Q: PolicyCheck>(
         &mut self,
-        provider: &P,
         registry: Option<&ZoneTip403ProxyRegistry<Q>>,
         caller: Address,
         current_tx_hash: B256,
@@ -273,16 +217,6 @@ impl ZoneOutbox {
                     .abi_encode()
                     .into(),
             ));
-        }
-
-        let tempo_block_number = match self.current_tempo_block_number() {
-            Ok(tempo_block_number) => tempo_block_number,
-            Err(err) => return self.storage.error_result(err),
-        };
-        if !self.token_enabled(provider, tempo_block_number, args.token)? {
-            return Ok(self
-                .storage
-                .revert_output(ZoneOutboxAbi::TokenNotEnabled {}.abi_encode().into()));
         }
         if let Some(revert) = self.validate_gas_limit(args.gas_limit) {
             return revert;
@@ -460,21 +394,10 @@ impl ZoneOutbox {
         Ok(self.storage.success_output(Bytes::new()))
     }
 
-    fn finalize_withdrawal_batch<P: ZonePortalReader>(
+    fn finalize_withdrawal_batch(
         &mut self,
-        provider: &P,
-        caller: Address,
         call: ZoneOutboxAbi::finalizeWithdrawalBatchCall,
     ) -> PrecompileResult {
-        let tempo_block_number = match self.current_tempo_block_number() {
-            Ok(tempo_block_number) => tempo_block_number,
-            Err(err) => return self.storage.error_result(err),
-        };
-        let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
-        if sequencer_check.is_revert() {
-            return Ok(sequencer_check);
-        }
-
         if call.blockNumber != self.storage.block_number() {
             return Ok(self
                 .storage
@@ -610,21 +533,7 @@ impl ZoneOutbox {
         ))
     }
 
-    fn set_tempo_gas_rate<P: ZonePortalReader>(
-        &mut self,
-        provider: &P,
-        caller: Address,
-        call: ZoneOutboxAbi::setTempoGasRateCall,
-    ) -> PrecompileResult {
-        let tempo_block_number = match self.current_tempo_block_number() {
-            Ok(tempo_block_number) => tempo_block_number,
-            Err(err) => return self.storage.error_result(err),
-        };
-        let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
-        if sequencer_check.is_revert() {
-            return Ok(sequencer_check);
-        }
-
+    fn set_tempo_gas_rate(&mut self, call: ZoneOutboxAbi::setTempoGasRateCall) -> PrecompileResult {
         if call._tempoGasRate > MAX_GAS_FEE_RATE {
             return Ok(self
                 .storage
@@ -641,21 +550,10 @@ impl ZoneOutbox {
         Ok(self.storage.success_output(Bytes::new()))
     }
 
-    fn set_max_withdrawals_per_block<P: ZonePortalReader>(
+    fn set_max_withdrawals_per_block(
         &mut self,
-        provider: &P,
-        caller: Address,
         call: ZoneOutboxAbi::setMaxWithdrawalsPerBlockCall,
     ) -> PrecompileResult {
-        let tempo_block_number = match self.current_tempo_block_number() {
-            Ok(tempo_block_number) => tempo_block_number,
-            Err(err) => return self.storage.error_result(err),
-        };
-        let sequencer_check = self.ensure_sequencer(provider, caller, tempo_block_number)?;
-        if sequencer_check.is_revert() {
-            return Ok(sequencer_check);
-        }
-
         if let Err(err) = self
             .max_withdrawals_per_block
             .write(call._maxWithdrawalsPerBlock)
@@ -719,18 +617,6 @@ impl LastBatchStorage {
     }
 }
 
-const PORTAL_TOKEN_CONFIGS_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 8;
-    B256::new(bytes)
-};
-
-/// L1 portal state needed by the native outbox.
-pub trait ZonePortalReader: L1StorageReader {
-    /// Zone portal address on Tempo L1.
-    fn portal_address(&self) -> Address;
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Storable)]
 struct LastBatchStorage {
     withdrawal_queue_hash: B256,
@@ -782,18 +668,4 @@ fn sender_tag(sender: Address, tx_hash: B256) -> B256 {
     preimage[..20].copy_from_slice(sender.as_slice());
     preimage[20..].copy_from_slice(tx_hash.as_slice());
     keccak256(preimage)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn portal_mapping_slot_matches_solidity_helper() {
-        let token = Address::repeat_byte(0x20);
-        assert_eq!(
-            ZoneOutbox::portal_mapping_slot(token),
-            keccak256((token, PORTAL_TOKEN_CONFIGS_SLOT).abi_encode())
-        );
-    }
 }
