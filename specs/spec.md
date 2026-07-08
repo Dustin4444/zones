@@ -708,14 +708,17 @@ Zone transactions specify which enabled TIP-20 token to use for gas fees via a `
 
 Zones do not admit EIP-4844 blob transactions. The zone node disables EIP-4844 transaction validation, and the prover pins the revm blob environment to `excessBlobGas = 0` with the minimum blob gas price. Blob gas values are therefore not witness-controlled.
 
-User-submitted zone transactions are currently limited to TIP-20 transfer calls. Each call in a user transaction must have zero native value and target a TIP-20 token precompile with one of:
+User-submitted zone transactions are currently limited to TIP-20 transfer/approval calls and withdrawal requests. Each call in a user transaction must have zero native value and either target a TIP-20 token precompile with one of:
 
 - `transfer`;
 - `transferWithMemo`;
 - `transferFrom`;
-- `transferFromWithMemo`.
+- `transferFromWithMemo`;
+- `approve`;
 
-Contract creation, EIP-7702 authorizations, TIP-20 non-transfer functions such as `approve`/`mint`/`burn`, direct TIP-403 proxy calls, and zone system selectors such as `advanceTempo`, `requestWithdrawal`, `claimRefund`, `enqueueDepositBounceBack`, and `finalizeWithdrawalBatch` are not user-admissible. Withdrawals, refund claims, privileged sequencer/admin operations, and gas-rate changes must be introduced as explicit block operations before the prover admits them; they are not admitted by arbitrary user calls into system contracts.
+or target `ZoneOutbox` with `requestWithdrawal`.
+
+Contract creation, EIP-7702 authorizations, TIP-20 non-admitted functions such as `mint`/`burn`, direct TIP-403 proxy calls, and zone system selectors such as `advanceTempo`, `claimRefund`, `enqueueDepositBounceBack`, and `finalizeWithdrawalBatch` are not user-admissible. Refund claims, privileged sequencer/admin operations, and gas-rate changes must be introduced as explicit block operations before the prover admits them; they are not admitted by arbitrary user calls into system contracts.
 
 ### Block Structure
 
@@ -1142,11 +1145,12 @@ pub struct ZoneBlock {
     /// required count and sender payloads inside the variant.
     pub withdrawal_finalization: ZoneWithdrawalFinalization,
 
-    /// User-submitted TIP-20 transfer transactions to execute.
-    /// Each call must have zero native value and target an allowed TIP-20
-    /// transfer selector. Blob transactions, contract creation, EIP-7702
-    /// authorizations, TIP-20 non-transfer selectors, direct TIP-403 calls,
-    /// and zone system selectors are invalid.
+    /// User-submitted transactions to execute.
+    /// Each call must have zero native value and target an admitted TIP-20
+    /// transfer/approval selector or `ZoneOutbox.requestWithdrawal`.
+    /// Blob transactions, contract creation, EIP-7702 authorizations,
+    /// TIP-20 non-admitted selectors, direct TIP-403 calls, and non-admitted
+    /// zone system selectors are invalid.
     pub transactions: Vec<Transaction>,
 }
 

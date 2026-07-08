@@ -134,7 +134,7 @@ This creates `generated/my-zone/` containing:
 - **`genesis.json`** — Zone L2 genesis state (system contracts, fee token, etc.)
 - **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, `zoneFactory`, public `admin` / `sequencer` addresses, and optional saved keys/router metadata)
 
-This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. The zone's fee token in genesis remains `pathUSD`.
+This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. pathUSD remains initialized in genesis as the default/reserved fee token, but at runtime zones accept any USD TIP-20 that is enabled on the L1 portal.
 
 You can also run the xtask directly for more control:
 
@@ -499,7 +499,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 | TIP-20 tokens | `0x20C0…` prefix | **Replaced** — routed through `ZoneTip20Token`, which adds privacy (caller-scoped reads), fixed gas for transfers, bridge-auth for mint/burn, and TIP-403 policy enforcement via the L1-synced cache. |
 | TIP20Factory | `0x20FC…0000` | **Replaced** — `ZoneTokenFactory` exposes only `enableToken(address, name, symbol, currency)`, called by ZoneInbox during `advanceTempo` to initialize bridged tokens. |
 | TIP403Registry | `0x403C…0000` | **Replaced** — read-only `ZoneTip403ProxyRegistry` serves authorization queries from a cache-first, L1-RPC-fallback provider. Mutating calls (`createPolicy`, `modifyPolicyWhitelist`, etc.) revert — policy state is managed on L1. |
-| TipFeeManager | `0xfeec…0000` | **Present** — the precompile is still registered, but its liquidity pools are not used by transactions. The zone executor overrides `validatorTokens` to match each transaction's fee token, so the FeeAMM swap path is bypassed and fees are collected directly in the user's token. |
+| TipFeeManager | `0xfeec…0000` | **Replaced** — `ZoneFeeManager` preserves the `IFeeManager` storage/API surface, validates fee tokens against the L1 portal's enabled-token set, disables FeeAMM swap calls, and credits fees directly in the user's fee token. |
 | StablecoinDEX | `0xdec0…0000` | **Disabled** — not registered on zones, so the address behaves like an empty account. Users on zones can trade on the StablecoinDEX on Tempo via the bridge. |
 | NonceManager | `0x4E4F…0000` | **Unchanged** — same implementation as L1, runs locally on zone state. |
 | ValidatorConfig (legacy) | `0xCCCC…0000` | **Not registered** — zones do not run validators, so the precompile is not loaded. |
