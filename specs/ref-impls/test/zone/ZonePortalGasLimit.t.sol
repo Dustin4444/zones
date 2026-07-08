@@ -41,6 +41,7 @@ contract ZonePortalGasLimitTest is Test {
 
     uint256 internal constant WITHDRAWAL_QUEUE_TAIL_SLOT = 12;
     uint256 internal constant WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT = 13;
+    uint256 internal constant ACCOUNTED_BALANCE_MAPPING_SLOT = 15;
 
     ZonePortal public portal;
     MockPortalToken public token;
@@ -95,7 +96,7 @@ contract ZonePortalGasLimitTest is Test {
     }
 
     function test_processWithdrawal_depositBounceBack_paysFeeAndRefundsNetAmount() public {
-        token.mint(address(portal), 1000e6);
+        _seedPortalEscrow(1000e6);
         uint128 bouncebackFee = portal.calculateBouncebackFee();
         uint128 refundAmount = 1000e6 - bouncebackFee;
 
@@ -108,12 +109,13 @@ contract ZonePortalGasLimitTest is Test {
 
         assertEq(token.balanceOf(address(this)), bouncebackFee);
         assertEq(token.balanceOf(recipient), refundAmount);
+        assertEq(portal.accountedBalance(address(token)), 0);
         assertEq(portal.withdrawalQueueHead(), 1);
         assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
     }
 
     function test_processWithdrawal_depositBounceBack_parksRefundWhenTransferFails() public {
-        token.mint(address(portal), 1000e6);
+        _seedPortalEscrow(1000e6);
         token.setBlockedRecipient(recipient, true);
         uint128 bouncebackFee = portal.calculateBouncebackFee();
         uint128 refundAmount = 1000e6 - bouncebackFee;
@@ -129,13 +131,24 @@ contract ZonePortalGasLimitTest is Test {
 
         assertEq(token.balanceOf(address(this)), bouncebackFee);
         assertEq(token.balanceOf(recipient), 0);
+        assertEq(portal.accountedBalance(address(token)), refundAmount);
         assertEq(portal.refunds(address(token), recipient), refundAmount);
 
         token.setBlockedRecipient(recipient, false);
         vm.prank(recipient);
         assertEq(portal.claimRefund(address(token)), refundAmount);
         assertEq(token.balanceOf(recipient), refundAmount);
+        assertEq(portal.accountedBalance(address(token)), 0);
         assertEq(portal.refunds(address(token), recipient), 0);
+    }
+
+    function _seedPortalEscrow(uint128 amount) internal {
+        token.mint(address(portal), amount);
+        vm.store(
+            address(portal),
+            keccak256(abi.encode(address(token), ACCOUNTED_BALANCE_MAPPING_SLOT)),
+            bytes32(uint256(amount))
+        );
     }
 
     function _withdrawalQueueSlot(uint256 slot) internal pure returns (bytes32) {

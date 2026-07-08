@@ -1069,10 +1069,9 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
 ///  5. Start zone node, verify it advances past the policy blocks.
 ///  6. Verify the policy state on L1 via the helpers.
 ///
-/// NOTE: Full on-chain TIP-403 enforcement on the zone (blocking transfers)
-/// requires the TIP403Registry shim precompile, which is not yet wired.
-/// This test validates the L1 infrastructure and that policy changes don't
-/// break zone block production.
+/// NOTE: Full zone-side TIP-403 transfer enforcement is covered by the policy
+/// transfer tests. This test validates the L1 infrastructure and that policy
+/// changes don't break zone block production.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_l1_policy_operations_and_zone_advancement() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
