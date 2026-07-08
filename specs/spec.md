@@ -960,7 +960,7 @@ The witness contains everything needed to re-execute the batch:
 - **PublicInputs**: `prev_block_hash`, `tempo_block_number`, `anchor_block_number`, `anchor_block_hash`, `expected_withdrawal_batch_index`, `sequencer`. These are the values the portal passes to the verifier and the proof must be consistent with.
 - **BatchWitness**: the public inputs, the previous batch's block header, Zone ancestry headers for `BLOCKHASH`, the zone blocks to execute, the initial zone state, Tempo state proofs, and Tempo ancestry headers (for ancestry validation).
 - **ZoneBlock**: `number`, `parent_hash`, `timestamp`, `beneficiary`, `protocol_version`, `cfg_env`, `execution_context`, `block_env`, `tempo_import`, `withdrawal_finalization`, and user `transactions`.
-- **ZoneStateWitness**: the initial zone state root, a deduplicated pool of zone-state trie nodes, and decoded account / storage reads needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
+- **ZoneStateWitness**: the initial zone state root, an upstream-style execution witness carrying zone-state trie-node preimages, bytecode preimages, and account/storage key preimages, plus decoded account / storage read descriptors needed to bootstrap execution. Only accounts and storage slots accessed during execution are included. Missing witness data must produce an error, not default to zero, to prevent the prover from omitting non-zero state.
 
 ### Input Schematic
 
@@ -1015,10 +1015,12 @@ flowchart TB
 
         subgraph ZSW["initial_zone_state"]
             direction TB
-            ZSWBOX["ZoneStateWitness<br/>state_root<br/>node_pool"]
-            ZAR["ZoneAccountRead[k]<br/>account<br/>nonce<br/>balance<br/>storage_root<br/>code_hash<br/>code"]
+            ZSWBOX["ZoneStateWitness<br/>state_root<br/>execution_witness"]
+            EW["ExecutionWitness<br/>state<br/>codes<br/>keys<br/>headers"]
+            ZAR["ZoneAccountRead[k]<br/>account<br/>nonce<br/>balance<br/>storage_root<br/>code_hash"]
             ZSR["ZoneStorageRead[k]<br/>account<br/>slot<br/>value"]
-            ZSWBOX ~~~ ZAR
+            ZSWBOX ~~~ EW
+            EW ~~~ ZAR
             ZAR ~~~ ZSR
         end
 
@@ -1270,8 +1272,9 @@ pub struct ZoneStateWitness {
     /// Zone state root at start of batch
     pub state_root: B256,
 
-    /// Deduplicated pool of all zone-state MPT nodes
-    pub node_pool: HashMap<B256, Vec<u8>>,
+    /// Upstream-style flat execution witness for Zone trie nodes, bytecode,
+    /// key preimages, and headers.
+    pub execution_witness: ExecutionWitness,
 
     /// Decoded account leaves needed to bootstrap execution
     pub account_reads: Vec<ZoneAccountRead>,
@@ -1286,12 +1289,13 @@ pub struct ZoneAccountRead {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
-    pub code: ZoneAccountCode,
 }
 
-pub enum ZoneAccountCode {
-    Empty,
-    Bytecode(Vec<u8>),
+pub struct ExecutionWitness {
+    pub state: Vec<Vec<u8>>,
+    pub codes: Vec<Vec<u8>>,
+    pub keys: Vec<Vec<u8>>,
+    pub headers: Vec<Vec<u8>>,
 }
 
 pub struct ZoneStorageRead {
@@ -1326,16 +1330,19 @@ pub struct L1StateRead {
 
 ### Shared Trie Proof Format
 
-`ZoneStateWitness` and `BatchStateProof` both use the same trie-proof encoding:
+`ZoneStateWitness` and `BatchStateProof` both use trie-node preimages, but the Zone and Tempo containers differ because the Zone execution path follows the upstream execution-witness shape:
 
-- `node_pool` is a deduplicated map from `keccak256(rlp(node))` to the node's raw RLP bytes. The prover validates each node once by recomputing the hash.
+- `ZoneStateWitness.execution_witness.state` is a flat list of raw zone-state MPT node RLP preimages. The prover hashes these nodes into an internal `keccak256(rlp(node)) -> node` map before proving the decoded reads.
+- `ZoneStateWitness.execution_witness.codes` carries bytecode preimages. For every non-empty `ZoneAccountRead.code_hash`, the prover must find a code preimage with `keccak256(code) == code_hash`.
+- `ZoneStateWitness.execution_witness.keys` carries unhashed account-address and storage-slot preimages used by the witnessed reads. Missing key preimages fail closed.
+- `BatchStateProof.node_pool` remains a deduplicated map from `keccak256(rlp(node))` to raw Tempo-side MPT node bytes. The prover validates each Tempo node once by recomputing the hash.
 - Each read descriptor (`ZoneAccountRead`, `ZoneStorageRead`, or `L1StateRead`) states which decoded account or storage value must be proven against a bound trie root.
-- Verification walks the account trie using `keccak256(account)` and, when needed, the storage trie using `keccak256(slot)`, fetching branch, extension, and leaf nodes from `node_pool`.
-- For `ZoneAccountRead`, the account leaf proves the committed `code_hash`, but not the bytecode preimage itself. If `code` is `Bytecode(bytes)`, the prover must additionally require `keccak256(bytes) == code_hash` before materializing that account into the execution state. If `code` is `Empty`, the account must have the canonical empty code hash.
+- Verification walks the account trie using `keccak256(account)` and, when needed, the storage trie using `keccak256(slot)`, fetching branch, extension, and leaf nodes from the Zone execution witness or Tempo node pool.
+- For `ZoneAccountRead`, the account leaf proves the committed `code_hash`, but not the bytecode preimage itself. The prover must separately require a matching `execution_witness.codes` entry for every non-empty code hash.
 - Missing leaves are represented by valid non-membership proofs. An absent account is interpreted as the canonical empty account: `nonce = 0`, `balance = 0`, `code = None`, `code_hash = KECCAK_EMPTY`, and an empty storage trie. An absent storage leaf is interpreted as zero.
 - Client databases may still retain historical trie nodes that are no longer reachable from the current root, but those stale nodes are irrelevant to proof verification because only nodes reachable from the bound root contribute to the proof.
 
-`ZoneStateWitness` applies this shared trie proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover checks that `ZoneStateWitness.state_root` is consistent with `prev_block_header.state_root`, validates `node_pool`, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks `keccak256(code) == code_hash` for every bytecode preimage, rejects missing bytecode for non-empty code hashes, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
+`ZoneStateWitness` applies this proof format to the initial zone-state root at batch start. `account_reads` and `storage_reads` describe the decoded account and storage values needed to bootstrap execution. To initialize execution, the prover checks that `ZoneStateWitness.state_root` is consistent with `prev_block_header.state_root`, hashes `execution_witness.state` into an internal node map, proves each `ZoneAccountRead` and `ZoneStorageRead` against that initial root, checks required bytecode and key preimages, materializes the resulting account and storage values into the execution state, and only then starts replaying blocks. Missing account or storage reads are errors; they must not silently default to zero.
 
 ### Batch Output
 
@@ -1359,7 +1366,7 @@ The stateless execution function must reject the witness on any failed check, mi
    Decode each `zone_ancestry_headers` entry as an exact `ZoneHeader` RLP value. The entries are ordered newest-to-oldest, starting at `prev_block_header.number - 1`; each header hash must equal the child header's `parent_hash`, and block numbers must decrease by one. Including `prev_block_header`, the verified ancestry set must not exceed the EVM `BLOCKHASH` window of 256 ancestor blocks. The resulting `(block_number, block_hash)` map is the only source for `BLOCKHASH` during execution; missing entries fail closed.
 
 3. **Verify and materialize the initial zone state.**
-   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: validate every node in `initial_zone_state.node_pool`, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require `keccak256(code) == code_hash` for every bytecode preimage, reject `Empty` code for non-empty code hashes, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
+   Apply the [shared trie proof format](#shared-trie-proof-format) to `initial_zone_state`: hash `initial_zone_state.execution_witness.state` into an internal node map, prove each `ZoneAccountRead` and `ZoneStorageRead` against `initial_zone_state.state_root`, require matching `execution_witness.codes` entries for non-empty code hashes, require the relevant `execution_witness.keys` account and storage key preimages, interpret non-membership as the canonical empty account or zero storage, and load the decoded results into the prover's in-memory execution state. After this step, ordinary zone-state reads during execution come from the materialized state, not from repeated Merkle-proof checks.
 
 4. **Verify and index the Tempo proof pool.**
    Validate every node in `tempo_state_proofs.node_pool` once by recomputing `keccak256(rlp(node))` for each node.
@@ -1398,7 +1405,7 @@ System contracts read Tempo state during execution (deposit queue hash, sequence
 - A deduplicated `node_pool` of MPT nodes, keyed by `keccak256(rlp(node))`. Each node is verified exactly once.
 - A list of `L1StateRead` entries, each specifying the zone block index, Tempo block number, account, storage slot, and expected value.
 
-Reads are indexed and verified on demand during execution. Each `L1StateRead` is additionally tagged with `zone_block_index` and `tempo_block_number` so the prover can bind that read to the correct in-batch `TempoState`. The proof shape is the same as `ZoneStateWitness`; the difference is timing. `ZoneStateWitness` is verified once against the initial zone-state root at batch start, while `BatchStateProof` reads are verified against the Tempo root currently bound in `TempoState` at the moment of each read.
+Reads are indexed and verified on demand during execution. Each `L1StateRead` is additionally tagged with `zone_block_index` and `tempo_block_number` so the prover can bind that read to the correct in-batch `TempoState`. `ZoneStateWitness` uses the upstream-style `ExecutionWitness` carrier and is verified once against the initial zone-state root at batch start, while `BatchStateProof` keeps the hash-keyed Tempo node pool and verifies reads against the Tempo root currently bound in `TempoState` at the moment of each read.
 
 Anchor validation ensures the zone's view of Tempo is correct. If `anchor_block_number` equals `tempo_block_number`, the zone's `tempoBlockHash` must match `anchor_block_hash` directly. If `anchor_block_number` is greater (for zones that have been offline longer than the EIP-2935 window), the proof verifies the parent-hash chain from `tempo_block_number` to `anchor_block_number` using the ancestry headers in the witness.
 

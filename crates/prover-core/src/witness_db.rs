@@ -66,20 +66,14 @@ impl WitnessDatabase {
         let mut storage = BTreeMap::new();
         bytecode.insert(KECCAK_EMPTY, Bytecode::new_raw(Bytes::new()));
 
-        for read in witness.account_reads() {
-            match &read.code {
-                crate::ZoneAccountCode::Bytecode(code) => {
-                    if keccak256(code.as_ref()) != read.code_hash {
-                        return Err(ProverError::AccountCodeHashMismatch(read.account));
-                    }
-                    bytecode.insert(read.code_hash, Bytecode::new_raw(code.clone()));
-                }
-                crate::ZoneAccountCode::Empty if read.code_hash != KECCAK_EMPTY => {
-                    return Err(ProverError::MissingAccountCode(read.account));
-                }
-                crate::ZoneAccountCode::Empty => {}
-            }
+        for code in &witness.execution_witness().codes {
+            bytecode.insert(keccak256(code.as_ref()), Bytecode::new_raw(code.clone()));
+        }
 
+        for read in witness.account_reads() {
+            if read.code_hash != KECCAK_EMPTY && !bytecode.contains_key(&read.code_hash) {
+                return Err(ProverError::MissingAccountCode(read.account));
+            }
             let proven_account = trie::verify_account_read(state_root, &node_pool, read)?;
             storage_roots.insert(read.account, proven_account.storage_root);
             #[cfg(not(feature = "std"))]

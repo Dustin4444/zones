@@ -9,10 +9,7 @@ pub use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_trie::KECCAK_EMPTY;
 use zone_primitives::ZoneHeader;
 
-use crate::{
-    BatchWitness, ProverError, ZoneAccountCode, ZoneAccountRead, ZoneStateWitness, ZoneStorageRead,
-    validate_node_pool,
-};
+use crate::{BatchWitness, ProverError, ZoneAccountRead, ZoneStateWitness, ZoneStorageRead};
 
 /// Adapter from the current Zone witness payload to Alloy's upstream
 /// [`ExecutionWitness`] shape.
@@ -45,33 +42,17 @@ impl ZoneExecutionWitness {
         state: &ZoneStateWitness,
         headers: Vec<Bytes>,
     ) -> Result<Self, ProverError> {
-        validate_node_pool(&state.node_pool, ProverError::ZoneStateNodeHashMismatch)?;
-        validate_read_node_refs(state)?;
+        let node_pool = state.state_nodes_by_hash();
+        validate_read_node_refs(state, &node_pool)?;
+        validate_code_preimages(state)?;
+        validate_key_preimages(state)?;
 
-        let mut codes = BTreeMap::new();
-        for read in &state.account_reads {
-            match &read.code {
-                ZoneAccountCode::Bytecode(code) => {
-                    if keccak256(code.as_ref()) != read.code_hash {
-                        return Err(ProverError::AccountCodeHashMismatch(read.account));
-                    }
-                    codes.insert(read.code_hash, code.clone());
-                }
-                ZoneAccountCode::Empty if read.code_hash != KECCAK_EMPTY => {
-                    return Err(ProverError::MissingAccountCode(read.account));
-                }
-                ZoneAccountCode::Empty => {}
-            }
-        }
+        let mut execution_witness = state.execution_witness.clone();
+        execution_witness.headers = headers;
 
         Ok(Self {
             pre_state_root: state.state_root,
-            execution_witness: ExecutionWitness {
-                state: state.node_pool.values().cloned().collect(),
-                codes: codes.into_values().collect(),
-                keys: execution_witness_keys(&state.account_reads, &state.storage_reads),
-                headers,
-            },
+            execution_witness,
             account_reads: state.account_reads.clone(),
             storage_reads: state.storage_reads.clone(),
         })
@@ -102,10 +83,13 @@ impl ZoneExecutionWitness {
     }
 }
 
-fn validate_read_node_refs(state: &ZoneStateWitness) -> Result<(), ProverError> {
+fn validate_read_node_refs(
+    state: &ZoneStateWitness,
+    node_pool: &BTreeMap<B256, Bytes>,
+) -> Result<(), ProverError> {
     for read in &state.account_reads {
         for node_hash in &read.proof_node_hashes {
-            if !state.node_pool.contains_key(node_hash) {
+            if !node_pool.contains_key(node_hash) {
                 return Err(ProverError::AccountProofMissing {
                     account: read.account,
                     node_hash: *node_hash,
@@ -116,7 +100,7 @@ fn validate_read_node_refs(state: &ZoneStateWitness) -> Result<(), ProverError> 
 
     for read in &state.storage_reads {
         for node_hash in &read.proof_node_hashes {
-            if !state.node_pool.contains_key(node_hash) {
+            if !node_pool.contains_key(node_hash) {
                 return Err(ProverError::StorageProofMissing {
                     account: read.account,
                     slot: read.slot,
@@ -129,7 +113,48 @@ fn validate_read_node_refs(state: &ZoneStateWitness) -> Result<(), ProverError> 
     Ok(())
 }
 
-fn execution_witness_keys(
+fn validate_code_preimages(state: &ZoneStateWitness) -> Result<(), ProverError> {
+    let mut codes = BTreeSet::new();
+    for code in &state.execution_witness.codes {
+        codes.insert(keccak256(code.as_ref()));
+    }
+
+    for read in &state.account_reads {
+        if read.code_hash != KECCAK_EMPTY && !codes.contains(&read.code_hash) {
+            return Err(ProverError::MissingAccountCode(read.account));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_key_preimages(state: &ZoneStateWitness) -> Result<(), ProverError> {
+    let keys = state
+        .execution_witness
+        .keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for read in &state.account_reads {
+        if !keys.contains(&Bytes::copy_from_slice(read.account.as_slice())) {
+            return Err(ProverError::MissingExecutionWitnessAccountKey(read.account));
+        }
+    }
+
+    for read in &state.storage_reads {
+        if !keys.contains(&Bytes::copy_from_slice(&read.slot.to_be_bytes::<32>())) {
+            return Err(ProverError::MissingExecutionWitnessStorageKey {
+                account: read.account,
+                slot: read.slot,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn execution_witness_keys(
     account_reads: &[ZoneAccountRead],
     storage_reads: &[ZoneStorageRead],
 ) -> Vec<Bytes> {
@@ -172,25 +197,27 @@ mod tests {
         let slot = U256::from(7);
         let header = Bytes::from_static(b"header");
 
-        let state = ZoneStateWitness {
-            state_root: EMPTY_ROOT_HASH,
-            node_pool: BTreeMap::new(),
-            account_reads: vec![ZoneAccountRead {
-                account,
-                nonce: 1,
-                balance: U256::from(2),
-                storage_root: EMPTY_ROOT_HASH,
-                code_hash,
-                code: ZoneAccountCode::Bytecode(code.clone()),
-                proof_node_hashes: Vec::new(),
-            }],
-            storage_reads: vec![ZoneStorageRead {
-                account,
-                slot,
-                value: U256::from(3),
-                proof_node_hashes: Vec::new(),
-            }],
-        };
+        let account_reads = vec![ZoneAccountRead {
+            account,
+            nonce: 1,
+            balance: U256::from(2),
+            storage_root: EMPTY_ROOT_HASH,
+            code_hash,
+            proof_node_hashes: Vec::new(),
+        }];
+        let storage_reads = vec![ZoneStorageRead {
+            account,
+            slot,
+            value: U256::from(3),
+            proof_node_hashes: Vec::new(),
+        }];
+        let state = ZoneStateWitness::from_node_pool(
+            EMPTY_ROOT_HASH,
+            BTreeMap::new(),
+            account_reads,
+            storage_reads,
+            vec![code.clone()],
+        );
 
         let witness = ZoneExecutionWitness::from_zone_state_witness_with_headers(
             &state,
@@ -220,20 +247,20 @@ mod tests {
     fn adapter_rejects_missing_proof_node_reference() {
         let account = address!("0x00000000000000000000000000000000000000aa");
         let missing = B256::repeat_byte(0x42);
-        let state = ZoneStateWitness {
-            state_root: EMPTY_ROOT_HASH,
-            node_pool: BTreeMap::new(),
-            account_reads: vec![ZoneAccountRead {
+        let state = ZoneStateWitness::from_node_pool(
+            EMPTY_ROOT_HASH,
+            BTreeMap::new(),
+            vec![ZoneAccountRead {
                 account,
                 nonce: 0,
                 balance: U256::ZERO,
                 storage_root: EMPTY_ROOT_HASH,
                 code_hash: KECCAK_EMPTY,
-                code: ZoneAccountCode::Empty,
                 proof_node_hashes: vec![missing],
             }],
-            storage_reads: Vec::new(),
-        };
+            Vec::new(),
+            Vec::new(),
+        );
 
         assert_eq!(
             ZoneExecutionWitness::from_zone_state_witness(&state).unwrap_err(),
@@ -241,6 +268,40 @@ mod tests {
                 account,
                 node_hash: missing,
             }
+        );
+    }
+
+    #[test]
+    fn adapter_rejects_missing_execution_witness_key() {
+        let account = address!("0x00000000000000000000000000000000000000aa");
+        let slot = U256::from(7);
+        let mut state = ZoneStateWitness::from_node_pool(
+            EMPTY_ROOT_HASH,
+            BTreeMap::new(),
+            vec![ZoneAccountRead {
+                account,
+                nonce: 0,
+                balance: U256::ZERO,
+                storage_root: EMPTY_ROOT_HASH,
+                code_hash: KECCAK_EMPTY,
+                proof_node_hashes: Vec::new(),
+            }],
+            vec![ZoneStorageRead {
+                account,
+                slot,
+                value: U256::ZERO,
+                proof_node_hashes: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        state
+            .execution_witness
+            .keys
+            .retain(|key| key.as_ref() != slot.to_be_bytes::<32>().as_slice());
+
+        assert_eq!(
+            ZoneExecutionWitness::from_zone_state_witness(&state).unwrap_err(),
+            ProverError::MissingExecutionWitnessStorageKey { account, slot }
         );
     }
 }

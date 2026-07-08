@@ -137,8 +137,8 @@ use zone_primitives::{
 use zone_prover::types::{
     AlloyZoneBlockExecutor, BatchStateProof, L1StateRead, TEMPO_STATE_READER_BASE_GAS,
     TEMPO_STATE_READER_PER_SLOT_GAS, TIP20_TRANSFER_POLICY_ID_SLOT,
-    WitnessZoneBlockExecutorProvider, ZoneAccountCode, ZoneAccountRead, ZoneAlloyBlockExecutor,
-    ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneBlockExecutionInput,
+    WitnessZoneBlockExecutorProvider, ZoneAccountRead, ZoneAlloyBlockExecutor, ZoneBlock,
+    ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneBlockExecutionInput,
     ZoneCfgEnvWitness, ZoneEthExecutorSpec, ZoneStateWitness, ZoneStorageRead, ZoneTempoImport,
     ZoneWithdrawalFinalization, ZoneWitnessEvmFactory, batch_output_from_execution,
     execute_prepared_blocks, prepare_stateless_execution, zone_witness_precompiles,
@@ -2387,6 +2387,7 @@ fn initial_zone_state_witness(
     reads: &BTreeMap<Address, BTreeSet<B256>>,
 ) -> eyre::Result<ZoneStateWitness> {
     let mut node_pool = BTreeMap::new();
+    let mut codes = BTreeMap::new();
     let mut account_reads = Vec::new();
     let mut storage_reads = Vec::new();
 
@@ -2399,6 +2400,7 @@ fn initial_zone_state_witness(
         account_reads.push(zone_account_read_from_reth_proof(
             state,
             &mut node_pool,
+            &mut codes,
             &proof,
         )?);
         storage_reads.extend(zone_storage_reads_from_reth_proof(
@@ -2408,17 +2410,19 @@ fn initial_zone_state_witness(
         ));
     }
 
-    Ok(ZoneStateWitness {
+    Ok(ZoneStateWitness::from_node_pool(
         state_root,
         node_pool,
         account_reads,
         storage_reads,
-    })
+        codes.into_values().collect(),
+    ))
 }
 
 fn zone_account_read_from_reth_proof(
     state: &dyn StateProvider,
     node_pool: &mut BTreeMap<B256, Bytes>,
+    codes: &mut BTreeMap<B256, Bytes>,
     proof: &RethAccountProof,
 ) -> eyre::Result<ZoneAccountRead> {
     let (nonce, balance, code_hash) = match proof.info {
@@ -2433,9 +2437,7 @@ fn zone_account_read_from_reth_proof(
             (0, U256::ZERO, KECCAK_EMPTY)
         }
     };
-    let code = if code_hash == KECCAK_EMPTY {
-        ZoneAccountCode::Empty
-    } else {
+    if code_hash != KECCAK_EMPTY {
         let bytecode = state.bytecode_by_hash(&code_hash)?.ok_or_else(|| {
             eyre::eyre!("missing bytecode preimage for account {}", proof.address)
         })?;
@@ -2445,8 +2447,8 @@ fn zone_account_read_from_reth_proof(
             "bytecode preimage hash mismatch for account {}",
             proof.address
         );
-        ZoneAccountCode::Bytecode(bytes)
-    };
+        codes.entry(code_hash).or_insert(bytes);
+    }
 
     Ok(ZoneAccountRead {
         account: proof.address,
@@ -2454,7 +2456,6 @@ fn zone_account_read_from_reth_proof(
         balance,
         storage_root: proof.storage_root,
         code_hash,
-        code,
         proof_node_hashes: insert_witness_nodes(node_pool, &proof.proof),
     })
 }

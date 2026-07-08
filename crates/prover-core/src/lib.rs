@@ -299,9 +299,40 @@ impl ZoneBlockEnvWitness {
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct ZoneStateWitness {
     pub state_root: B256,
-    pub node_pool: BTreeMap<B256, Bytes>,
+    pub execution_witness: ExecutionWitness,
     pub account_reads: Vec<ZoneAccountRead>,
     pub storage_reads: Vec<ZoneStorageRead>,
+}
+
+impl ZoneStateWitness {
+    pub fn from_node_pool(
+        state_root: B256,
+        node_pool: BTreeMap<B256, Bytes>,
+        account_reads: Vec<ZoneAccountRead>,
+        storage_reads: Vec<ZoneStorageRead>,
+        codes: Vec<Bytes>,
+    ) -> Self {
+        let keys = execution_witness::execution_witness_keys(&account_reads, &storage_reads);
+        Self {
+            state_root,
+            execution_witness: ExecutionWitness {
+                state: node_pool.into_values().collect(),
+                codes,
+                keys,
+                headers: Vec::new(),
+            },
+            account_reads,
+            storage_reads,
+        }
+    }
+
+    pub fn state_nodes_by_hash(&self) -> BTreeMap<B256, Bytes> {
+        self.execution_witness
+            .state
+            .iter()
+            .map(|node| (keccak256(node.as_ref()), node.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,29 +344,7 @@ pub struct ZoneAccountRead {
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
-    pub code: ZoneAccountCode,
     pub proof_node_hashes: Vec<B256>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "serde",
-    serde(tag = "kind", content = "data", rename_all = "camelCase")
-)]
-pub enum ZoneAccountCode {
-    Empty,
-    Bytecode(Bytes),
-}
-
-impl ZoneAccountCode {
-    pub fn empty() -> Self {
-        Self::Empty
-    }
-
-    pub fn bytecode(code: Bytes) -> Self {
-        Self::Bytecode(code)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +610,11 @@ pub enum ProverError {
     AccountCodeHashMismatch(Address),
     MissingAccountCode(Address),
     MissingSystemContractCode(Address),
+    MissingExecutionWitnessAccountKey(Address),
+    MissingExecutionWitnessStorageKey {
+        account: Address,
+        slot: U256,
+    },
     AccountProofMissing {
         account: Address,
         node_hash: B256,
@@ -974,6 +988,18 @@ impl fmt::Display for ProverError {
             }
             Self::MissingSystemContractCode(address) => {
                 write!(f, "required system contract code is missing for {address}")
+            }
+            Self::MissingExecutionWitnessAccountKey(address) => {
+                write!(
+                    f,
+                    "execution witness key preimage is missing for account {address}"
+                )
+            }
+            Self::MissingExecutionWitnessStorageKey { account, slot } => {
+                write!(
+                    f,
+                    "execution witness key preimage is missing for account {account} slot {slot}"
+                )
             }
             Self::AccountProofMissing { account, node_hash } => {
                 write!(
@@ -1746,17 +1772,10 @@ pub struct DepositQueueState {
 fn validate_initial_zone_state(
     state: &ZoneStateWitness,
 ) -> Result<VerifiedInitialZoneState, ProverError> {
+    let node_pool = state.state_nodes_by_hash();
     let mut proven_accounts = BTreeMap::new();
     for account in &state.account_reads {
-        match &account.code {
-            ZoneAccountCode::Bytecode(code) if keccak256(code.as_ref()) != account.code_hash => {
-                return Err(ProverError::AccountCodeHashMismatch(account.account));
-            }
-            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
-        }
-
-        let proven_account =
-            trie::verify_account_read(state.state_root, &state.node_pool, account)?;
+        let proven_account = trie::verify_account_read(state.state_root, &node_pool, account)?;
         proven_accounts.insert(account.account, proven_account);
     }
 
@@ -1764,7 +1783,7 @@ fn validate_initial_zone_state(
         let account = proven_accounts
             .get(&storage.account)
             .ok_or(ProverError::MissingAccountRead(storage.account))?;
-        trie::verify_storage_read(account.storage_root, &state.node_pool, storage)?;
+        trie::verify_storage_read(account.storage_root, &node_pool, storage)?;
     }
 
     Ok(VerifiedInitialZoneState {
@@ -1813,11 +1832,14 @@ fn require_system_contract_code(
         return Err(ProverError::MissingSystemContractCode(account));
     };
 
-    if read.code_hash != KECCAK_EMPTY {
-        match &read.code {
-            ZoneAccountCode::Bytecode(code) if !code.is_empty() => return Ok(()),
-            ZoneAccountCode::Bytecode(_) | ZoneAccountCode::Empty => {}
-        }
+    if read.code_hash != KECCAK_EMPTY
+        && state
+            .execution_witness
+            .codes
+            .iter()
+            .any(|code| !code.is_empty() && keccak256(code.as_ref()) == read.code_hash)
+    {
+        return Ok(());
     }
 
     Err(ProverError::MissingSystemContractCode(account))
@@ -2191,6 +2213,21 @@ mod tests {
         EncryptedDepositPayload, TempoStateReader, Withdrawal,
     };
     use zone_primitives::constants::{PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, ZONE_CONFIG_ADDRESS};
+
+    enum ZoneAccountCode {
+        Empty,
+        Bytecode(Bytes),
+    }
+
+    impl ZoneAccountCode {
+        fn empty() -> Self {
+            Self::Empty
+        }
+
+        fn bytecode(code: Bytes) -> Self {
+            Self::Bytecode(code)
+        }
+    }
 
     const TEST_SYSTEM_CONTRACT_CODE: &[u8] = &[0x00];
     const PORTAL_ENCRYPTION_KEYS_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
@@ -4379,6 +4416,7 @@ mod tests {
             vec![account_read(account, trie_account)],
             Vec::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
 
         assert_eq!(
@@ -4627,6 +4665,7 @@ mod tests {
         mut account_reads: Vec<ZoneAccountRead>,
         storage_reads: Vec<ZoneStorageRead>,
         mut node_pool: BTreeMap<B256, Bytes>,
+        codes: BTreeMap<B256, Bytes>,
     ) -> ZoneStateWitness {
         let proof_accounts = account_reads
             .iter()
@@ -4642,12 +4681,13 @@ mod tests {
                 .expect("account proof was retained for every account read");
         }
 
-        ZoneStateWitness {
+        ZoneStateWitness::from_node_pool(
             state_root,
             node_pool,
             account_reads,
             storage_reads,
-        }
+            codes.into_values().collect(),
+        )
     }
 
     fn account_read(account: Address, trie_account: TrieAccount) -> ZoneAccountRead {
@@ -4657,7 +4697,6 @@ mod tests {
             balance: trie_account.balance,
             storage_root: trie_account.storage_root,
             code_hash: trie_account.code_hash,
-            code: ZoneAccountCode::empty(),
             proof_node_hashes: Vec::new(),
         }
     }
@@ -4669,7 +4708,6 @@ mod tests {
             balance: U256::ZERO,
             storage_root: EMPTY_TRIE_ROOT,
             code_hash: KECCAK_EMPTY,
-            code: ZoneAccountCode::empty(),
             proof_node_hashes: Vec::new(),
         }
     }
@@ -4679,6 +4717,7 @@ mod tests {
         account_reads: Vec<ZoneAccountRead>,
         storage_reads: Vec<ZoneStorageRead>,
         node_pool: BTreeMap<B256, Bytes>,
+        codes: BTreeMap<B256, Bytes>,
     }
 
     impl ZoneStateParts {
@@ -4688,6 +4727,7 @@ mod tests {
                 self.account_reads,
                 self.storage_reads,
                 self.node_pool,
+                self.codes,
             )
         }
 
@@ -4696,6 +4736,7 @@ mod tests {
             self.account_reads.extend(other.account_reads);
             self.storage_reads.extend(other.storage_reads);
             self.node_pool.extend(other.node_pool);
+            self.codes.extend(other.codes);
         }
     }
 
@@ -4805,6 +4846,7 @@ mod tests {
             account_reads: vec![account_read(TEMPO_STATE_ADDRESS, trie_account)],
             storage_reads,
             node_pool,
+            codes: BTreeMap::new(),
         }
     }
 
@@ -4833,6 +4875,10 @@ mod tests {
             ZoneAccountCode::Empty => KECCAK_EMPTY,
             ZoneAccountCode::Bytecode(code) => keccak256(code.as_ref()),
         };
+        let mut codes = BTreeMap::new();
+        if let ZoneAccountCode::Bytecode(code) = code {
+            codes.insert(code_hash, code);
+        }
         let trie_account = TrieAccount {
             nonce: 0,
             balance: U256::ZERO,
@@ -4863,11 +4909,11 @@ mod tests {
                 balance: trie_account.balance,
                 storage_root: trie_account.storage_root,
                 code_hash: trie_account.code_hash,
-                code,
                 proof_node_hashes: Vec::new(),
             }],
             storage_reads,
             node_pool,
+            codes,
         }
     }
 
@@ -5380,7 +5426,11 @@ mod tests {
         let mut witness = fixture_witness();
         let read = witness.initial_zone_state.account_reads[0].clone();
         let missing = read.proof_node_hashes[0];
-        witness.initial_zone_state.node_pool.remove(&missing);
+        witness
+            .initial_zone_state
+            .execution_witness
+            .state
+            .retain(|node| keccak256(node.as_ref()) != missing);
 
         assert_eq!(
             SparseStateRootCalculator::from_zone_state_witness(&witness.initial_zone_state)
@@ -5982,7 +6032,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_code_preimage_before_account_proof_verification() {
+    fn rejects_missing_code_preimage_before_account_proof_verification() {
         let mut witness = fixture_witness();
         witness
             .initial_zone_state
@@ -5993,27 +6043,30 @@ mod tests {
                 balance: U256::ZERO,
                 storage_root: EMPTY_TRIE_ROOT,
                 code_hash: B256::repeat_byte(0xaa),
-                code: ZoneAccountCode::bytecode(Bytes::from_static(b"not matching")),
                 proof_node_hashes: Vec::new(),
             });
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::AccountCodeHashMismatch(address!(
-                "0x0000000000000000000000000000000000001000"
-            ))
+            ProverError::MissingAccountCode(address!("0x0000000000000000000000000000000000001000"))
         );
     }
 
     #[test]
-    fn rejects_bad_zone_state_node_hash() {
+    fn rejects_missing_zone_state_proof_node() {
         let mut witness = fixture_witness();
-        witness.initial_zone_state.node_pool.insert(
-            B256::repeat_byte(0xbb),
-            Bytes::from_static(b"bad proof node"),
-        );
+        let read = witness.initial_zone_state.account_reads[0].clone();
+        let missing = read.proof_node_hashes[0];
+        witness
+            .initial_zone_state
+            .execution_witness
+            .state
+            .retain(|node| keccak256(node.as_ref()) != missing);
         assert_eq!(
             prove_empty_zone_batch(witness).unwrap_err(),
-            ProverError::ZoneStateNodeHashMismatch(B256::repeat_byte(0xbb))
+            ProverError::AccountProofMissing {
+                account: read.account,
+                node_hash: missing,
+            }
         );
     }
 

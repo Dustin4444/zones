@@ -13,10 +13,9 @@ use zone_primitives::{
 };
 
 use crate::types::{
-    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, TempoHardfork, ZoneAccountCode,
-    ZoneAccountRead, ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness,
-    ZoneCfgEnvWitness, ZoneStateWitness, ZoneStorageRead, ZoneTempoImport,
-    ZoneWithdrawalFinalization,
+    BatchStateProof, BatchWitness, EMPTY_TRIE_ROOT, PublicInputs, TempoHardfork, ZoneAccountRead,
+    ZoneBlock, ZoneBlockEnvWitness, ZoneBlockExecutionContextWitness, ZoneCfgEnvWitness,
+    ZoneStateWitness, ZoneStorageRead, ZoneTempoImport, ZoneWithdrawalFinalization,
 };
 
 const TEST_INBOX_CONTRACT_CODE: &[u8] = &[0x00];
@@ -111,7 +110,6 @@ fn absent_account_read(account: Address) -> ZoneAccountRead {
         balance: U256::ZERO,
         storage_root: EMPTY_TRIE_ROOT,
         code_hash: KECCAK_EMPTY,
-        code: ZoneAccountCode::empty(),
         proof_node_hashes: Vec::new(),
     }
 }
@@ -197,7 +195,6 @@ fn tempo_bound_zone_state(
         balance: tempo_trie_account.balance,
         storage_root: tempo_trie_account.storage_root,
         code_hash: tempo_trie_account.code_hash,
-        code: ZoneAccountCode::empty(),
         proof_node_hashes: Vec::new(),
     };
     let zone_inbox_account_read = ZoneAccountRead {
@@ -206,7 +203,6 @@ fn tempo_bound_zone_state(
         balance: zone_inbox_trie_account.balance,
         storage_root: zone_inbox_trie_account.storage_root,
         code_hash: zone_inbox_trie_account.code_hash,
-        code: ZoneAccountCode::bytecode(Bytes::copy_from_slice(TEST_INBOX_CONTRACT_CODE)),
         proof_node_hashes: Vec::new(),
     };
     let zone_outbox_account_read = ZoneAccountRead {
@@ -215,7 +211,6 @@ fn tempo_bound_zone_state(
         balance: zone_outbox_trie_account.balance,
         storage_root: zone_outbox_trie_account.storage_root,
         code_hash: zone_outbox_trie_account.code_hash,
-        code: ZoneAccountCode::bytecode(outbox_code),
         proof_node_hashes: Vec::new(),
     };
     let mut storage_reads = vec![
@@ -345,12 +340,16 @@ fn tempo_bound_zone_state(
         },
     ];
 
-    ZoneStateWitness {
+    ZoneStateWitness::from_node_pool(
         state_root,
         node_pool,
         account_reads,
         storage_reads,
-    }
+        vec![
+            Bytes::copy_from_slice(TEST_INBOX_CONTRACT_CODE),
+            outbox_code,
+        ],
+    )
 }
 
 fn storage_trie_with_entries_and_proofs(
