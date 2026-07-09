@@ -2506,6 +2506,34 @@ pub(crate) async fn start_local_zone_with_fixture(
     Ok((zone, fixture))
 }
 
+pub(crate) async fn start_local_zone_with_genesis_and_fixture(
+    seed_blocks: u64,
+    genesis: Genesis,
+) -> eyre::Result<(ZoneTestNode, L1Fixture)> {
+    let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
+    let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
+    let zone = ZoneTestNode::launch_with_genesis(
+        DUMMY_L1_URL.to_string(),
+        Address::ZERO,
+        None,
+        next_unique_chain_id(),
+        Some(genesis),
+        signer,
+    )
+    .await?;
+    let fixture = L1Fixture::new();
+
+    seed_local_policy_cache(zone.policy_cache());
+
+    fixture.seed_l1_cache(
+        zone.l1_state_cache(),
+        Address::ZERO,
+        Address::ZERO,
+        seed_blocks,
+    );
+    Ok((zone, fixture))
+}
+
 /// Seed an existing L1Fixture's cache into a zone node's L1 state cache.
 ///
 /// Use when multiple zones share the same fixture timeline — call once per zone.

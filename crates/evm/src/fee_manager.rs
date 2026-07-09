@@ -5,11 +5,7 @@
 
 use alloy_primitives::{Address, U256};
 use revm::Database;
-use tempo_precompiles::{
-    TIP_FEE_MANAGER_ADDRESS,
-    error::Result as TempoResult,
-    tip20::{ITIP20, TIP20Token},
-};
+use tempo_precompiles::{TIP_FEE_MANAGER_ADDRESS, error::Result as TempoResult, tip20::TIP20Token};
 use tempo_revm::ProtocolFeeManager;
 
 /// Protocol fee manager for zone execution.
@@ -50,13 +46,8 @@ impl<DB: Database> ProtocolFeeManager<DB> for ZoneFeeManager {
         token.transfer_fee_post_tx(fee_payer, refund_amount, actual_spending)?;
 
         if !actual_spending.is_zero() {
-            token.transfer(
-                TIP_FEE_MANAGER_ADDRESS,
-                ITIP20::transferCall {
-                    to: beneficiary,
-                    amount: actual_spending,
-                },
-            )?;
+            let _ = beneficiary;
+            todo!("expose a pause-tolerant TIP20 fee payout helper")
         }
 
         Ok(actual_spending)
@@ -72,6 +63,7 @@ mod tests {
         storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
         tip_fee_manager::{TipFeeManager, amm::PoolKey},
+        tip20::{ITIP20, PAUSE_ROLE},
     };
 
     fn collect_fee_pre_tx(
@@ -203,6 +195,64 @@ mod tests {
             .read()?;
             assert_eq!(pool.reserve_user_token, 0);
             assert_eq!(pool.reserve_validator_token, 0);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn post_tx_fee_payout_succeeds_when_token_is_paused() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new(1);
+        let admin = Address::random();
+        let user = Address::random();
+        let beneficiary = Address::random();
+
+        StorageCtx::enter(&mut storage, || {
+            let mut token = TIP20Setup::create("Zone USD", "zUSD", admin)
+                .with_issuer(admin)
+                .with_role(admin, *PAUSE_ROLE)
+                .with_mint(user, U256::from(10_000u64))
+                .with_approval(user, TIP_FEE_MANAGER_ADDRESS, U256::MAX)
+                .apply()?;
+
+            let manager = ZoneFeeManager::new();
+            collect_fee_pre_tx(
+                &manager,
+                user,
+                token.address(),
+                U256::from(5_000u64),
+                beneficiary,
+            )?;
+
+            token.pause(admin, ITIP20::pauseCall {})?;
+            assert!(token.paused()?);
+
+            let credited = collect_fee_post_tx(
+                &manager,
+                user,
+                U256::from(3_000u64),
+                U256::from(2_000u64),
+                token.address(),
+                beneficiary,
+            )?;
+
+            assert_eq!(credited, U256::from(3_000u64));
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall { account: user })?,
+                U256::from(7_000u64)
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: beneficiary,
+                })?,
+                U256::from(3_000u64)
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: TIP_FEE_MANAGER_ADDRESS,
+                })?,
+                U256::ZERO
+            );
 
             Ok(())
         })
