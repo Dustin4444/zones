@@ -5,7 +5,11 @@
 
 use alloy_primitives::{Address, U256};
 use revm::Database;
-use tempo_precompiles::{TIP_FEE_MANAGER_ADDRESS, error::Result as TempoResult, tip20::TIP20Token};
+use tempo_precompiles::{
+    TIP_FEE_MANAGER_ADDRESS,
+    error::Result as TempoResult,
+    tip20::{Recipient, TIP20Token},
+};
 use tempo_revm::ProtocolFeeManager;
 
 /// Protocol fee manager for zone execution.
@@ -46,8 +50,11 @@ impl<DB: Database> ProtocolFeeManager<DB> for ZoneFeeManager {
         token.transfer_fee_post_tx(fee_payer, refund_amount, actual_spending)?;
 
         if !actual_spending.is_zero() {
-            let _ = beneficiary;
-            todo!("expose a pause-tolerant TIP20 fee payout helper")
+            token._transfer(
+                TIP_FEE_MANAGER_ADDRESS,
+                &Recipient::direct(beneficiary),
+                actual_spending,
+            )?;
         }
 
         Ok(actual_spending)
