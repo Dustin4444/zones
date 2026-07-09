@@ -197,7 +197,7 @@ contract ZoneOutboxSymbolic is ZoneOutboxTest {
 
         uint128 cap = outbox.MAX_GAS_FEE_RATE();
         vm.prank(sequencer);
-        outbox.setTempoGasRate(cap);
+        outbox.setTempoGasRate(cap, uint64(block.number));
 
         uint128 fee = outbox.calculateWithdrawalFee(gasLimit);
         assertLe(uint256(fee), uint256(type(uint128).max));
@@ -207,7 +207,7 @@ contract ZoneOutboxSymbolic is ZoneOutboxTest {
     ///         succeeds, for any input (over-cap inputs revert and are pruned).
     function check_tempoGasRateAlwaysWithinCap(uint128 rate) external {
         vm.prank(sequencer);
-        try outbox.setTempoGasRate(rate) {
+        try outbox.setTempoGasRate(rate, uint64(block.number)) {
             assertLe(uint256(outbox.tempoGasRate()), uint256(outbox.MAX_GAS_FEE_RATE()));
         } catch { }
     }

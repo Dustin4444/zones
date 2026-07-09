@@ -539,6 +539,7 @@ async fn submit_withdrawal(
             dev_address,
             Bytes::new(),
             Bytes::new(),
+            u128::MAX,
         )
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(WITHDRAWAL_TX_GAS)
@@ -952,6 +953,7 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
             dev_address,
             Bytes::from_static(b"callback"),
             Bytes::new(),
+            u128::MAX,
         )
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(WITHDRAWAL_TX_GAS)

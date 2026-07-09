@@ -619,6 +619,7 @@ impl<Provider, EvmConfig> ZonePayloadBuilder<Provider, EvmConfig> {
                 );
                 let calldata = abi::ZoneOutbox::setTempoGasRateCall {
                     tempoGasRate: tempo_gas_rate,
+                    blockNumber: block_number,
                 }
                 .abi_encode();
                 execute_outbox_system_tx(
@@ -657,6 +658,7 @@ impl<Provider, EvmConfig> ZonePayloadBuilder<Provider, EvmConfig> {
                 );
                 let calldata = abi::ZoneOutbox::setMaxWithdrawalsPerBlockCall {
                     maxWithdrawalsPerBlock: U256::from(max_withdrawals),
+                    blockNumber: block_number,
                 }
                 .abi_encode();
                 execute_outbox_system_tx(

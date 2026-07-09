@@ -1089,12 +1089,16 @@ interface IZoneOutbox {
 
     /// @notice Set Tempo gas rate. Only callable by sequencer.
     /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price fluctuations.
+    ///      `blockNumber` must equal the current zone block number.
     /// @param _tempoGasRate Zone token units per gas unit on Tempo
-    function setTempoGasRate(uint128 _tempoGasRate) external;
+    /// @param blockNumber Current zone block number
+    function setTempoGasRate(uint128 _tempoGasRate, uint64 blockNumber) external;
 
     /// @notice Set maximum withdrawal requests per zone block. Only callable by sequencer.
     /// @dev Set to 0 for unlimited. Provides rate-limiting in addition to the gas fee mechanism.
-    function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock) external;
+    ///      `blockNumber` must equal the current zone block number.
+    /// @param blockNumber Current zone block number
+    function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock, uint64 blockNumber) external;
 
     /// @notice Calculate the fee for a withdrawal with the given gasLimit
     /// @dev Fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
@@ -1105,6 +1109,9 @@ interface IZoneOutbox {
     ///      The token must be enabled on the portal. Withdrawals can never be disabled
     ///      for an enabled token (non-custodial guarantee).
     /// @param token The TIP-20 token to withdraw
+    /// @param maxFee Maximum withdrawal fee the caller will accept (slippage guard);
+    ///        reverts if the fee computed at execution time exceeds it. Pass
+    ///        `type(uint128).max` to opt out of the cap.
     function requestWithdrawal(
         address token,
         address to,
@@ -1113,7 +1120,8 @@ interface IZoneOutbox {
         uint64 gasLimit,
         address fallbackRecipient,
         bytes calldata data,
-        bytes calldata revealTo
+        bytes calldata revealTo,
+        uint128 maxFee
     )
         external;
 

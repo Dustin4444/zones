@@ -21,6 +21,9 @@ use zone_sequencer::BatchAnchorConfig;
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
 const MAX_BLOCKS_PER_FILTER: u64 = 1_000_000;
 
+/// Matches `ZoneOutbox.MAX_GAS_FEE_RATE` / `ZonePortal.MAX_GAS_FEE_RATE` (1e18).
+const MAX_GAS_FEE_RATE: u128 = 1_000_000_000_000_000_000;
+
 const ZONE_LOG_FILTER_DIRECTIVES: &str = concat!(
     "tungstenite=warn,",
     "alloy_pubsub=warn,",
@@ -56,6 +59,9 @@ impl ZoneCli {
 
         cli.run_with_components::<ZoneNode>(components, async move |mut builder, args| {
             info!(target: "reth::cli", "Launching Tempo Zone node");
+
+            // Validate CLI args
+            validate_outbox_fee_args(&args)?;
 
             builder.config_mut().network.discovery.disable_discovery = true;
             builder.config_mut().rpc.disable_auth_server = true;
@@ -199,7 +205,8 @@ pub struct ZoneArgs {
 
     /// ZoneOutbox withdrawal gas rate (zone token units per Tempo gas unit).
     /// When set, the payload builder keeps the on-chain `tempoGasRate` synced
-    /// to this value via system transactions. Unset leaves the on-chain value
+    /// to this value via system transactions. Must be <= `MAX_GAS_FEE_RATE`
+    /// (1e18). Unset leaves the on-chain value
     /// untouched (zero at genesis = free withdrawals).
     #[arg(long = "zone.tempo-gas-rate", env = "ZONE_TEMPO_GAS_RATE")]
     pub tempo_gas_rate: Option<u128>,
@@ -219,5 +226,61 @@ fn prepend_log_filter(filter: &mut String, directives: &str) {
         *filter = directives.to_owned();
     } else {
         *filter = format!("{directives},{filter}");
+    }
+}
+
+/// Reject outbox fee CLI values that would revert on-chain and halt block building.
+fn validate_outbox_fee_args(args: &ZoneArgs) -> eyre::Result<()> {
+    if let Some(rate) = args.tempo_gas_rate {
+        eyre::ensure!(
+            rate <= MAX_GAS_FEE_RATE,
+            "--zone.tempo-gas-rate ({rate}) exceeds ZoneOutbox MAX_GAS_FEE_RATE ({MAX_GAS_FEE_RATE})"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with_tempo_gas_rate(rate: Option<u128>) -> ZoneArgs {
+        ZoneArgs {
+            l1_rpc_url: String::new(),
+            portal_address: Address::ZERO,
+            block_interval_ms: 250,
+            sequencer_key: String::new(),
+            zone_poll_interval_secs: 1,
+            zone_batch_interval_secs: 60,
+            withdrawal_poll_interval_secs: 5,
+            l1_genesis_block_number: None,
+            l1_fetch_concurrency: 4,
+            l1_retry_connection_interval_ms: 100,
+            zone_id: 0,
+            private_rpc_port: 8544,
+            private_rpc_max_auth_token_validity_secs: DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
+            enable_sequencer: false,
+            tempo_gas_rate: rate,
+            max_withdrawals_per_block: None,
+        }
+    }
+
+    #[test]
+    fn accepts_unset_and_in_range_tempo_gas_rate() {
+        assert!(validate_outbox_fee_args(&args_with_tempo_gas_rate(None)).is_ok());
+        assert!(validate_outbox_fee_args(&args_with_tempo_gas_rate(Some(0))).is_ok());
+        assert!(
+            validate_outbox_fee_args(&args_with_tempo_gas_rate(Some(MAX_GAS_FEE_RATE))).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_tempo_gas_rate_above_max() {
+        let err = validate_outbox_fee_args(&args_with_tempo_gas_rate(Some(MAX_GAS_FEE_RATE + 1)))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("MAX_GAS_FEE_RATE"),
+            "unexpected error: {err}"
+        );
     }
 }

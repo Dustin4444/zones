@@ -451,7 +451,8 @@ contract ZoneBridgeTest is BaseTest {
             bytes32(0), // memo
             0, // no callback
             alice, // fallback to self
-            ""
+            "",
+            type(uint128).max
         );
         vm.stopPrank();
 
@@ -514,12 +515,12 @@ contract ZoneBridgeTest is BaseTest {
         // === Both request withdrawals ===
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 500e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        l2Outbox.requestWithdrawal(address(l2ZoneToken), alice, 500e6, bytes32(0), 0, alice, "", type(uint128).max);
         vm.stopPrank();
 
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 1000e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 1000e6, bytes32(0), 0, bob, "");
+        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 1000e6, bytes32(0), 0, bob, "", type(uint128).max);
         vm.stopPrank();
 
         // Sequencer observes withdrawals
@@ -570,7 +571,8 @@ contract ZoneBridgeTest is BaseTest {
             bytes32(0), // memo
             5_000_000, // gasLimit for callback
             alice, // fallbackRecipient on zone
-            "callback_data"
+            "callback_data",
+            type(uint128).max
         );
         vm.stopPrank();
 
@@ -630,7 +632,8 @@ contract ZoneBridgeTest is BaseTest {
             bytes32(0), // memo
             5_000_000,
             alice, // fallback recipient
-            ""
+            "",
+            type(uint128).max
         );
         vm.stopPrank();
 
@@ -677,7 +680,7 @@ contract ZoneBridgeTest is BaseTest {
         // Bob withdraws on zone
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 300e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 300e6, bytes32(0), 0, bob, "");
+        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 300e6, bytes32(0), 0, bob, "", type(uint128).max);
         vm.stopPrank();
 
         // Verify Bob's zone balance debited (100K + 300e6 received - 300e6 withdrawn)
@@ -700,7 +703,7 @@ contract ZoneBridgeTest is BaseTest {
         l2ZoneToken.approve(address(l2Outbox), type(uint256).max);
         vm.expectRevert(MockZoneToken.InsufficientBalance.selector);
         l2Outbox.requestWithdrawal(
-            address(l2ZoneToken), alice, uint128(100_001e6), bytes32(0), 0, alice, ""
+            address(l2ZoneToken), alice, uint128(100_001e6), bytes32(0), 0, alice, "", type(uint128).max
         );
         vm.stopPrank();
     }
@@ -766,7 +769,8 @@ contract ZoneBridgeTest is BaseTest {
             bytes32(0), // memo
             5_000_000, // gasLimit > 0
             address(0), // invalid fallback
-            ""
+            "",
+            type(uint128).max
         );
         vm.stopPrank();
     }

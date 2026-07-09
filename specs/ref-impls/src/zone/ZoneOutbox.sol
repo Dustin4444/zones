@@ -112,6 +112,7 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
     error GasLimitTooHigh();
     error OnlyZoneInbox();
+    error WithdrawalFeeTooHigh(uint128 fee, uint128 maxFee);
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -129,9 +130,13 @@ contract ZoneOutbox is IZoneOutbox {
     /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price fluctuations.
     ///      If actual Tempo gas is higher, sequencer covers the difference.
     ///      If actual Tempo gas is lower, sequencer keeps the surplus.
+    ///      `blockNumber` must equal the current zone block number so identical rate updates
+    ///      across blocks produce distinct system-tx hashes (reth tx-lookup uniqueness).
     /// @param _tempoGasRate Zone token units per gas unit on Tempo
-    function setTempoGasRate(uint128 _tempoGasRate) external {
+    /// @param blockNumber Current zone block number
+    function setTempoGasRate(uint128 _tempoGasRate, uint64 blockNumber) external {
         if (msg.sender != address(0) && msg.sender != config.sequencer()) revert OnlySequencer();
+        if (blockNumber != uint64(block.number)) revert InvalidBlockNumber();
         if (_tempoGasRate > MAX_GAS_FEE_RATE) revert GasFeeRateTooHigh();
         tempoGasRate = _tempoGasRate;
         emit TempoGasRateUpdated(_tempoGasRate);
@@ -139,9 +144,13 @@ contract ZoneOutbox is IZoneOutbox {
 
     /// @notice Set maximum withdrawal requests per zone block. Only callable by sequencer.
     /// @dev Set to 0 for unlimited. Provides rate-limiting in addition to the gas fee mechanism.
+    ///      `blockNumber` must equal the current zone block number so identical limit updates
+    ///      across blocks produce distinct system-tx hashes (reth tx-lookup uniqueness).
     /// @param _maxWithdrawalsPerBlock The maximum number of requestWithdrawal() calls per block
-    function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock) external {
+    /// @param blockNumber Current zone block number
+    function setMaxWithdrawalsPerBlock(uint256 _maxWithdrawalsPerBlock, uint64 blockNumber) external {
         if (msg.sender != address(0) && msg.sender != config.sequencer()) revert OnlySequencer();
+        if (blockNumber != uint64(block.number)) revert InvalidBlockNumber();
         maxWithdrawalsPerBlock = _maxWithdrawalsPerBlock;
         emit MaxWithdrawalsPerBlockUpdated(_maxWithdrawalsPerBlock);
     }
@@ -173,6 +182,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param gasLimit L1 callback gas limit (0 = no callback, capped by MAX_WITHDRAWAL_GAS_LIMIT)
     /// @param fallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
+    /// @param maxFee Maximum withdrawal fee the caller will accept (slippage guard).
+    ///        Reverts if the fee computed at execution time exceeds this value.
+    ///        Pass `type(uint128).max` to opt out of the cap.
     function requestWithdrawal(
         address token,
         address to,
@@ -180,11 +192,12 @@ contract ZoneOutbox is IZoneOutbox {
         bytes32 memo,
         uint64 gasLimit,
         address fallbackRecipient,
-        bytes calldata data
+        bytes calldata data,
+        uint128 maxFee
     )
         external
     {
-        _requestWithdrawal(token, to, amount, memo, gasLimit, fallbackRecipient, data, "");
+        _requestWithdrawal(token, to, amount, memo, gasLimit, fallbackRecipient, data, "", maxFee);
     }
 
     /// @notice Request a withdrawal from the zone back to Tempo
@@ -201,6 +214,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param fallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
     /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
+    /// @param maxFee Maximum withdrawal fee the caller will accept (slippage guard).
+    ///        Reverts if the fee computed at execution time exceeds this value.
+    ///        Pass `type(uint128).max` to opt out of the cap.
     function requestWithdrawal(
         address token,
         address to,
@@ -209,11 +225,12 @@ contract ZoneOutbox is IZoneOutbox {
         uint64 gasLimit,
         address fallbackRecipient,
         bytes calldata data,
-        bytes calldata revealTo
+        bytes calldata revealTo,
+        uint128 maxFee
     )
         external
     {
-        _requestWithdrawal(token, to, amount, memo, gasLimit, fallbackRecipient, data, revealTo);
+        _requestWithdrawal(token, to, amount, memo, gasLimit, fallbackRecipient, data, revealTo, maxFee);
     }
 
     /// @notice Shared implementation for withdrawal requests with optional sender reveal
@@ -228,6 +245,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param fallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
     /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
+    /// @param maxFee Maximum withdrawal fee the caller will accept (slippage guard)
     function _requestWithdrawal(
         address token,
         address to,
@@ -236,7 +254,8 @@ contract ZoneOutbox is IZoneOutbox {
         uint64 gasLimit,
         address fallbackRecipient,
         bytes memory data,
-        bytes memory revealTo
+        bytes memory revealTo,
+        uint128 maxFee
     )
         internal
     {
@@ -273,6 +292,10 @@ contract ZoneOutbox is IZoneOutbox {
         // Calculate processing fee (locked in at request time)
         // Fee is paid in the same token being withdrawn
         uint128 fee = _calculateWithdrawalFee(gasLimit);
+        // Slippage guard: the sequencer's fee-configuration system transaction runs at the top
+        // of the block, so a rate increase can land in the same block as this request. Reject if
+        // the fee exceeds what the caller signed off on.
+        if (fee > maxFee) revert WithdrawalFeeTooHigh(fee, maxFee);
         uint128 totalBurn = amount + fee;
         bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
         if (txHash == bytes32(0)) revert InvalidCurrentTxHash();

@@ -2455,6 +2455,8 @@ impl ZoneAccount {
                 fallback_recipient,
                 args.data,
                 args.reveal_to,
+                // No slippage cap in e2e tests; the maxFee guard is unit-tested in Solidity.
+                u128::MAX,
             )
             .gas(WITHDRAWAL_TX_GAS)
             .send()

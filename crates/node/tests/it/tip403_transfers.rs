@@ -159,6 +159,7 @@ async fn test_deposit_then_request_withdrawal() -> eyre::Result<()> {
             dev_address,
             alloy_primitives::Bytes::new(),
             alloy_primitives::Bytes::new(),
+            u128::MAX,
         )
         .gas_price(TEMPO_T0_BASE_FEE as u128)
         .gas(WITHDRAWAL_TX_GAS)

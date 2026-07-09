@@ -587,7 +587,7 @@ Current deployment:
 | `--sequencer-key` | (optional) | Sequencer private key used when `--sequencer` is enabled |
 | `--block.interval-ms` | 250 | Block building interval |
 | `--zone.batch-interval-secs` | 60 | Max seconds to accumulate zone blocks before submitting a batch to L1 |
-| `--zone.tempo-gas-rate` | unset | ZoneOutbox withdrawal gas rate, in zone token units per Tempo gas unit. Unset leaves the on-chain value untouched (`0` at genesis = free withdrawals). |
+| `--zone.tempo-gas-rate` | unset | ZoneOutbox withdrawal gas rate, in zone token units per Tempo gas unit. Must be ≤ `MAX_GAS_FEE_RATE` (`1e18`). Unset leaves the on-chain value untouched (`0` at genesis = free withdrawals). |
 | `--zone.max-withdrawals-per-block` | unset | Maximum withdrawal requests accepted per zone block (`0` = unlimited). Unset leaves the on-chain value untouched (`0` at genesis). |
 | `--zone.poll-interval-secs` | 1 | How often (seconds) the zone monitor polls for new L2 blocks |
 | `--withdrawal-poll-interval-secs` | 5 | How often (seconds) the withdrawal processor polls the L1 queue |

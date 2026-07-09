@@ -88,7 +88,8 @@ crate::sol! {
             uint64 gasLimit,
             address fallbackRecipient,
             bytes calldata data,
-            bytes calldata revealTo
+            bytes calldata revealTo,
+            uint128 maxFee
         ) external;
         function enqueueDepositBounceBack(
             address token,
@@ -96,7 +97,7 @@ crate::sol! {
             address bouncebackRecipient
         ) external;
         function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
-        function setTempoGasRate(uint128 tempoGasRate) external;
-        function setMaxWithdrawalsPerBlock(uint256 maxWithdrawalsPerBlock) external;
+        function setTempoGasRate(uint128 tempoGasRate, uint64 blockNumber) external;
+        function setMaxWithdrawalsPerBlock(uint256 maxWithdrawalsPerBlock, uint64 blockNumber) external;
     }
 }
