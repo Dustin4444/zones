@@ -23,7 +23,7 @@ use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, approve_outbox, local_dev_zone_account,
-    start_local_zone_with_fixture, start_local_zone_with_genesis_and_fixture,
+    start_local_zone_with_fixture, start_zone_with_genesis_and_l1_fixture,
 };
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
@@ -131,7 +131,7 @@ async fn test_pausing_fee_token_does_not_halt_block_production() -> eyre::Result
         B256::from(pause_role_slot.to_be_bytes::<32>()),
         B256::from(U256::ONE.to_be_bytes::<32>()),
     );
-    let (zone, mut fixture) = start_local_zone_with_genesis_and_fixture(10, genesis).await?;
+    let (zone, mut fixture) = start_zone_with_genesis_and_l1_fixture(10, genesis).await?;
     let provider = ProviderBuilder::new()
         .wallet(dev_signer)
         .connect_http(zone.http_url().clone());

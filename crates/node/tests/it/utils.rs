@@ -2506,7 +2506,7 @@ pub(crate) async fn start_local_zone_with_fixture(
     Ok((zone, fixture))
 }
 
-pub(crate) async fn start_local_zone_with_genesis_and_fixture(
+pub(crate) async fn start_zone_with_genesis_and_l1_fixture(
     seed_blocks: u64,
     genesis: Genesis,
 ) -> eyre::Result<(ZoneTestNode, L1Fixture)> {
