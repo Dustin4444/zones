@@ -18,7 +18,7 @@ use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_node::rpc::NATIVE_BALANCE_PLACEHOLDER;
-use tempo_precompiles::PATH_USD_ADDRESS;
+use tempo_precompiles::{PATH_USD_ADDRESS, storage::StorageKey, tip20::PAUSE_ROLE};
 use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
 use crate::utils::{
@@ -118,7 +118,19 @@ async fn test_pausing_fee_token_does_not_halt_block_production() -> eyre::Result
         .phrase(TEST_MNEMONIC)
         .build()?;
     let dev_address = dev_signer.address();
-    let genesis: Genesis = serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))?;
+    let mut genesis: Genesis =
+        serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))?;
+    let token_account = genesis
+        .alloc
+        .get_mut(&PATH_USD_ADDRESS)
+        .ok_or_else(|| eyre::eyre!("pathUSD not found in genesis alloc"))?;
+    let storage = token_account.storage.get_or_insert_with(Default::default);
+    let account_roles_slot = dev_address.mapping_slot(U256::ZERO);
+    let pause_role_slot = (*PAUSE_ROLE).mapping_slot(account_roles_slot);
+    storage.insert(
+        B256::from(pause_role_slot.to_be_bytes::<32>()),
+        B256::from(U256::ONE.to_be_bytes::<32>()),
+    );
     let (zone, mut fixture) = start_local_zone_with_genesis_and_fixture(10, genesis).await?;
     let provider = ProviderBuilder::new()
         .wallet(dev_signer)
