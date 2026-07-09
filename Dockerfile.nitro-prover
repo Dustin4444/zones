@@ -31,5 +31,6 @@ WORKDIR /data
 
 COPY --from=builder /app/target/release/zone-prover-enclave /usr/local/bin/zone-prover-enclave
 
-ENTRYPOINT ["/usr/local/bin/zone-prover-enclave"]
-CMD ["--vsock-port", "5005", "--attestation-provider", "nsm"]
+# nitro-cli's Docker-to-EIF conversion executes Config.Cmd directly and does not prepend
+# Config.Entrypoint, so keep the complete enclave command in CMD.
+CMD ["/usr/local/bin/zone-prover-enclave", "--vsock-port", "5005", "--attestation-provider", "nsm"]
