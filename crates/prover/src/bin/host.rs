@@ -88,9 +88,9 @@ enum Command {
         #[arg(long, value_parser = parse_b256_arg)]
         nonce: Option<B256>,
 
-        /// Expected enclave signer address.
+        /// Optional expected enclave signer address. Omit for first registration discovery.
         #[arg(long)]
-        expected_signer: Address,
+        expected_signer: Option<Address>,
 
         /// Expected Nitro PCR0 SHA-384 measurement.
         #[arg(long, value_parser = parse_nitro_pcr_arg)]
@@ -259,12 +259,14 @@ fn random_challenge_b256(label: &'static str) -> Result<B256> {
 
 fn verify_registration_pins(
     report: &RegistrationReport,
-    expected_signer: Address,
+    expected_signer: Option<Address>,
     expected_pcr0: &NitroPcr,
     expected_pcr1: &NitroPcr,
     expected_pcr2: &NitroPcr,
 ) -> Result<()> {
-    if report.signer != expected_signer {
+    if let Some(expected_signer) = expected_signer
+        && report.signer != expected_signer
+    {
         bail!(
             "registration signer mismatch: expected {expected_signer}, got {}",
             report.signer

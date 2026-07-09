@@ -72,6 +72,12 @@ cargo run -p zone-prover --bin zone-prover-host -- register \
   --out build/zone-prover-registration.json
 ```
 
+The first registration discovers the ephemeral signer from the AWS-attested public key while
+still requiring operator-reviewed PCR0/PCR1/PCR2 measurements. On later registrations, pass
+`--expected-signer <address>` to pin that signer as well. The host always verifies the AWS
+certificate chain, COSE signature, registration digest, nonce, attested public key, derived
+signer, and PCR measurements before writing the report.
+
 Send a witness and verifier config:
 
 ```bash
