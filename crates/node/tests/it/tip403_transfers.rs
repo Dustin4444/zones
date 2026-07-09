@@ -11,37 +11,20 @@
 
 use alloy::{
     genesis::Genesis,
-    primitives::{Address, B256, U256, address},
+    primitives::{B256, U256, address},
 };
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_node::rpc::NATIVE_BALANCE_PLACEHOLDER;
-use tempo_precompiles::{PATH_USD_ADDRESS, storage::StorageKey, tip20::PAUSE_ROLE};
+use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, approve_outbox, local_dev_zone_account,
     start_local_zone_with_fixture, start_local_zone_with_genesis_and_fixture,
 };
-
-fn genesis_with_pause_role(account: Address) -> eyre::Result<Genesis> {
-    let mut genesis: Genesis =
-        serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))?;
-    let token_account = genesis
-        .alloc
-        .get_mut(&PATH_USD_ADDRESS)
-        .ok_or_else(|| eyre::eyre!("pathUSD not found in genesis alloc"))?;
-    let storage = token_account.storage.get_or_insert_with(Default::default);
-    let account_roles_slot = account.mapping_slot(U256::ZERO);
-    let pause_role_slot = (*PAUSE_ROLE).mapping_slot(account_roles_slot);
-    storage.insert(
-        B256::from(pause_role_slot.to_be_bytes::<32>()),
-        B256::from(U256::ONE.to_be_bytes::<32>()),
-    );
-    Ok(genesis)
-}
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
 ///
@@ -135,7 +118,7 @@ async fn test_pausing_fee_token_does_not_halt_block_production() -> eyre::Result
         .phrase(TEST_MNEMONIC)
         .build()?;
     let dev_address = dev_signer.address();
-    let genesis = genesis_with_pause_role(dev_address)?;
+    let genesis: Genesis = serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))?;
     let (zone, mut fixture) = start_local_zone_with_genesis_and_fixture(10, genesis).await?;
     let provider = ProviderBuilder::new()
         .wallet(dev_signer)
