@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Evidence bundle for an AWS Nitro Enclave attestation verified by the TIP-1090 Tempo precompile."
+    />
+    <title>TIP-1090 Nitro Attestation Verification</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="site-header shell">
+      <a class="brand" href="#top" aria-label="Tempo attestation proof home">
+        <span class="brand-mark" aria-hidden="true">T</span>
+        <span>
+          <strong>Tempo</strong>
+          <small>Attestation proof</small>
+        </span>
+      </a>
+      <nav class="header-nav" aria-label="Evidence sections">
+        <a href="#chain">Chain</a>
+        <a href="#attestation">Attestation</a>
+        <a href="#provenance">Provenance</a>
+        <a href="#raw-evidence">Raw evidence</a>
+      </nav>
+      <div class="live-chip" id="dataset-chip">
+        <span class="signal-dot" aria-hidden="true"></span>
+        <span id="dataset-label">Loading evidence</span>
+      </div>
+    </header>
+
+    <div class="data-banner hidden" id="data-banner" role="status">
+      <div class="shell banner-inner">
+        <strong id="data-banner-title">Evidence unavailable</strong>
+        <span id="data-banner-message"></span>
+      </div>
+    </div>
+
+    <main id="top">
+      <section class="hero shell section-pad" aria-labelledby="page-title">
+        <div class="hero-copy">
+          <div class="eyebrow">
+            <span>TIP-1090</span>
+            <span class="eyebrow-rule" aria-hidden="true"></span>
+            <span>AWS Nitro Enclaves</span>
+          </div>
+
+          <div class="verdict-line">
+            <div class="verdict pending" id="verdict" role="status">
+              <span class="verdict-icon" id="verdict-icon" aria-hidden="true">…</span>
+              <span id="verdict-label">Loading verification</span>
+            </div>
+            <span class="muted" id="performed-at">Timestamp pending</span>
+          </div>
+
+          <h1 id="page-title">AWS Nitro attestation<br />verified on <em>Tempo</em></h1>
+          <p class="hero-summary" id="verification-summary">
+            Loading the captured onchain, enclave, and build evidence.
+          </p>
+
+          <div class="hero-actions">
+            <a class="button button-primary disabled" id="tx-primary-link" href="#chain">
+              Inspect transaction
+              <span aria-hidden="true">↗</span>
+            </a>
+            <a class="button button-secondary" href="#raw-evidence">View raw evidence</a>
+          </div>
+        </div>
+
+        <aside class="hero-proof" aria-label="Verification summary">
+          <div class="proof-topline">
+            <span>Verification receipt</span>
+            <span class="mono subtle" id="receipt-id">—</span>
+          </div>
+          <dl class="metric-grid">
+            <div>
+              <dt>Network</dt>
+              <dd id="metric-network">—</dd>
+            </div>
+            <div>
+              <dt>Chain ID</dt>
+              <dd class="mono" id="metric-chain-id">—</dd>
+            </div>
+            <div>
+              <dt>Block</dt>
+              <dd class="mono" id="metric-block">—</dd>
+            </div>
+            <div>
+              <dt>Gas used</dt>
+              <dd class="mono" id="metric-gas">—</dd>
+            </div>
+          </dl>
+          <div class="hash-panel">
+            <span class="label">Transaction hash</span>
+            <div class="hash-row">
+              <code id="hero-tx-hash">Not supplied</code>
+              <button class="copy-button" data-copy-source="hero-tx-hash" type="button">Copy</button>
+            </div>
+          </div>
+          <div class="proof-path" aria-label="Verification path">
+            <div class="path-node">
+              <span class="path-number">01</span>
+              <span><strong>NSM</strong><small>Signs attestation</small></span>
+            </div>
+            <div class="path-line" aria-hidden="true"></div>
+            <div class="path-node">
+              <span class="path-number">02</span>
+              <span><strong>TIP-1090</strong><small>Verifies COSE + X.509</small></span>
+            </div>
+            <div class="path-line" aria-hidden="true"></div>
+            <div class="path-node">
+              <span class="path-number">03</span>
+              <span><strong>Tempo</strong><small>Executes onchain</small></span>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="signal-strip" aria-label="Verification checks">
+        <div class="shell signal-grid">
+          <div class="signal-item" data-check="transaction">
+            <span class="check-mark">·</span>
+            <span><strong>Transaction</strong><small id="check-transaction">Pending</small></span>
+          </div>
+          <div class="signal-item" data-check="sameBlock">
+            <span class="check-mark">·</span>
+            <span><strong>Same-block call</strong><small id="check-same-block">Pending</small></span>
+          </div>
+          <div class="signal-item" data-check="pcrs">
+            <span class="check-mark">·</span>
+            <span><strong>PCR measurements</strong><small id="check-pcrs">Pending</small></span>
+          </div>
+          <div class="signal-item" data-check="document">
+            <span class="check-mark">·</span>
+            <span><strong>Document</strong><small id="check-document">Pending</small></span>
+          </div>
+          <div class="signal-item" data-check="bindings">
+            <span class="check-mark">·</span>
+            <span><strong>Registration binding</strong><small id="check-bindings">Pending</small></span>
+          </div>
+        </div>
+      </section>
+
+      <section class="scope-strip" aria-labelledby="scope-title">
+        <div class="shell scope-card">
+          <div>
+            <span class="section-index">Evidence scope</span>
+            <h2 id="scope-title">Acceptance is onchain. Return data is reproducible.</h2>
+            <p>
+              The successful receipt commits that TIP-1090 accepted the document. The decoded
+              fields are corroborated by a call trace and an <code>eth_call</code> at that mined
+              block; they are RPC evidence, not fields committed into the receipt.
+            </p>
+            <div class="scope-actions">
+              <a class="text-link" href="./verify-evidence.mjs">Inspect the verifier <span>↗</span></a>
+              <a class="text-link" href="./artifacts/evidence-verifier.txt">Read the verification report <span>↗</span></a>
+            </div>
+          </div>
+          <ul id="scope-limitations">
+            <li>Loading explicit scope limits from the evidence bundle.</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="shell section-pad" id="chain" aria-labelledby="chain-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">01 / Chain evidence</span>
+            <h2 id="chain-title">One block, reproducible result</h2>
+          </div>
+          <p>
+            The receipt proves successful execution on the devnet. A trace and read at that exact
+            block reproduce and decode the return data.
+          </p>
+        </div>
+
+        <div class="chain-grid">
+          <article class="evidence-card featured">
+            <div class="card-heading">
+              <div>
+                <span class="card-kicker">Onchain execution</span>
+                <h3>Transaction receipt</h3>
+              </div>
+              <span class="status-pill pending" id="receipt-status">Pending</span>
+            </div>
+            <div class="key-value-list">
+              <div class="wide">
+                <span>Transaction hash</span>
+                <code id="tx-hash">Not supplied</code>
+              </div>
+              <div>
+                <span>Block number</span>
+                <strong class="mono" id="tx-block">—</strong>
+              </div>
+              <div>
+                <span>Block hash</span>
+                <code id="tx-block-hash">Not supplied</code>
+              </div>
+              <div>
+                <span>From</span>
+                <code id="tx-from">Not supplied</code>
+              </div>
+              <div>
+                <span>To · TIP-1090</span>
+                <code id="tx-to">Not supplied</code>
+              </div>
+              <div>
+                <span>Gas used</span>
+                <strong class="mono" id="tx-gas">—</strong>
+              </div>
+              <div>
+                <span>Input SHA-256</span>
+                <code id="tx-input-hash">Not supplied</code>
+              </div>
+            </div>
+            <a class="text-link disabled" id="tx-link" href="#">Open in explorer <span>↗</span></a>
+          </article>
+
+          <article class="evidence-card">
+            <div class="card-heading">
+              <div>
+                <span class="card-kicker">Deterministic replay</span>
+                <h3>Same-block eth_call</h3>
+              </div>
+              <span class="status-pill pending" id="call-status">Pending</span>
+            </div>
+            <div class="call-block-lock" id="call-block-lock">
+              <span class="lock-icon" aria-hidden="true">◇</span>
+              <span>
+                <strong id="call-block-comparison">Block equality pending</strong>
+                <small>The call must use the transaction's mined block.</small>
+              </span>
+            </div>
+            <div class="key-value-list compact">
+              <div>
+                <span>Block tag</span>
+                <strong class="mono" id="call-block">—</strong>
+              </div>
+              <div>
+                <span>Method</span>
+                <strong class="mono">eth_call</strong>
+              </div>
+              <div>
+                <span>Function selector</span>
+                <code id="call-selector">Not supplied</code>
+              </div>
+              <div>
+                <span>Output SHA-256</span>
+                <code id="call-output-hash">Not supplied</code>
+              </div>
+            </div>
+            <button class="text-link button-link" id="show-call-output" type="button">
+              Show raw return data <span>↓</span>
+            </button>
+            <pre class="raw-call hidden" id="raw-call-output"><code>Not supplied</code></pre>
+          </article>
+        </div>
+
+        <article class="precompile-card">
+          <div class="precompile-label">
+            <span class="precompile-icon" aria-hidden="true">ƒ</span>
+            <span><strong>TIP-1090 precompile</strong><small>Native Nitro attestation verifier</small></span>
+          </div>
+          <div>
+            <span class="label">Address</span>
+            <code id="precompile-address">Not supplied</code>
+          </div>
+          <div>
+            <span class="label">ABI</span>
+            <code id="precompile-signature">Not supplied</code>
+          </div>
+        </article>
+      </section>
+
+      <section class="section-contrast" id="attestation" aria-labelledby="attestation-title">
+        <div class="shell section-pad">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">02 / Decoded attestation</span>
+              <h2 id="attestation-title">Inside the signed document</h2>
+            </div>
+            <p>
+              These fields are returned only after the AWS certificate chain, COSE signature,
+              and document structure pass native verification.
+            </p>
+          </div>
+
+          <div class="attestation-grid">
+            <article class="evidence-card attestation-core">
+              <div class="card-heading">
+                <div>
+                  <span class="card-kicker">AttestationDocument</span>
+                  <h3>Verified claims</h3>
+                </div>
+                <span class="status-pill neutral" id="module-id-chip">Module pending</span>
+              </div>
+              <dl class="claims-list">
+                <div>
+                  <dt>Module ID</dt>
+                  <dd class="mono" id="claim-module-id">—</dd>
+                </div>
+                <div>
+                  <dt>AWS timestamp</dt>
+                  <dd><strong id="claim-timestamp-iso">—</strong><small class="mono" id="claim-timestamp">—</small></dd>
+                </div>
+                <div>
+                  <dt>Digest</dt>
+                  <dd class="mono" id="claim-digest">—</dd>
+                </div>
+                <div>
+                  <dt>Certificate SHA-256</dt>
+                  <dd class="mono" id="claim-certificate-hash">—</dd>
+                </div>
+                <div>
+                  <dt>Document SHA-256</dt>
+                  <dd class="mono" id="claim-document-hash">—</dd>
+                </div>
+                <div>
+                  <dt>Document size</dt>
+                  <dd class="mono" id="claim-document-size">—</dd>
+                </div>
+              </dl>
+            </article>
+
+            <div class="payload-stack">
+              <article class="payload-card">
+                <span class="card-kicker">public_key</span>
+                <div class="hash-row">
+                  <code id="claim-public-key">Not supplied</code>
+                  <button class="copy-button" data-copy-source="claim-public-key" type="button">Copy</button>
+                </div>
+              </article>
+              <article class="payload-card">
+                <span class="card-kicker">user_data</span>
+                <div class="hash-row">
+                  <code id="claim-user-data">Not supplied</code>
+                  <button class="copy-button" data-copy-source="claim-user-data" type="button">Copy</button>
+                </div>
+              </article>
+              <article class="payload-card">
+                <span class="card-kicker">nonce</span>
+                <div class="hash-row">
+                  <code id="claim-nonce">Not supplied</code>
+                  <button class="copy-button" data-copy-source="claim-nonce" type="button">Copy</button>
+                </div>
+              </article>
+              <article class="binding-panel" aria-labelledby="binding-panel-title">
+                <div class="binding-heading">
+                  <div>
+                    <span class="card-kicker">Registration challenge</span>
+                    <h3 id="binding-panel-title">Binding checks</h3>
+                  </div>
+                  <span class="status-pill pending" id="binding-summary">Pending</span>
+                </div>
+                <div class="binding-list">
+                  <div class="binding-row" data-binding-row="public-key">
+                    <span>Public key ↔ registration</span>
+                    <span class="binding-result" id="binding-public-key">Pending</span>
+                  </div>
+                  <div class="binding-row" data-binding-row="nonce">
+                    <span>Nonce ↔ registration</span>
+                    <span class="binding-result" id="binding-nonce">Pending</span>
+                  </div>
+                  <div class="binding-row" data-binding-row="user-data">
+                    <span>User data ↔ challenge</span>
+                    <span class="binding-result" id="binding-user-data">Pending</span>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+
+          <div class="pcr-heading">
+            <div>
+              <span class="section-index">Measured boot</span>
+              <h3>PCR equality</h3>
+            </div>
+            <p>Operator-reviewed EIF measurements compared byte-for-byte with the attested values.</p>
+          </div>
+          <div class="pcr-grid" id="pcr-grid" aria-live="polite">
+            <article class="pcr-card placeholder-card">
+              <span>PCR data pending</span>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="shell section-pad" id="runtime" aria-labelledby="runtime-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">03 / Execution environment</span>
+            <h2 id="runtime-title">Enclave to devnet</h2>
+          </div>
+          <p>Cloud runtime, enclave image, and target chain identifiers captured with the proof.</p>
+        </div>
+
+        <div class="runtime-layout">
+          <article class="evidence-card aws-card">
+            <div class="card-heading">
+              <div>
+                <span class="card-kicker">AWS Nitro parent</span>
+                <h3>EC2 instance</h3>
+              </div>
+              <span class="aws-mark" aria-label="Amazon Web Services">AWS</span>
+            </div>
+            <dl class="runtime-list">
+              <div><dt>Account</dt><dd class="mono" id="aws-account">—</dd></div>
+              <div><dt>Region</dt><dd class="mono" id="aws-region">—</dd></div>
+              <div><dt>Availability zone</dt><dd class="mono" id="aws-az">—</dd></div>
+              <div><dt>Instance ID</dt><dd class="mono" id="aws-instance-id">—</dd></div>
+              <div><dt>Instance type</dt><dd class="mono" id="aws-instance-type">—</dd></div>
+              <div><dt>AMI ID</dt><dd class="mono" id="aws-ami">—</dd></div>
+              <div><dt>State</dt><dd id="aws-state">—</dd></div>
+            </dl>
+          </article>
+
+          <article class="evidence-card enclave-card">
+            <div class="card-heading">
+              <div>
+                <span class="card-kicker">Isolated compute</span>
+                <h3>Nitro enclave</h3>
+              </div>
+              <span class="enclave-glyph" aria-hidden="true">⬡</span>
+            </div>
+            <dl class="runtime-list">
+              <div><dt>Enclave ID</dt><dd class="mono" id="enclave-id">—</dd></div>
+              <div><dt>State</dt><dd id="enclave-state">—</dd></div>
+              <div><dt>CID</dt><dd class="mono" id="enclave-cid">—</dd></div>
+              <div><dt>vCPUs</dt><dd class="mono" id="enclave-cpus">—</dd></div>
+              <div><dt>Memory</dt><dd class="mono" id="enclave-memory">—</dd></div>
+              <div><dt>EIF name</dt><dd class="mono" id="enclave-eif-name">—</dd></div>
+              <div><dt>EIF SHA-384</dt><dd class="mono" id="enclave-eif-hash">—</dd></div>
+            </dl>
+          </article>
+
+          <article class="evidence-card devnet-card">
+            <div class="card-heading">
+              <div>
+                <span class="card-kicker">Tempo deployment</span>
+                <h3>Devnet</h3>
+              </div>
+              <span class="tempo-mark" aria-hidden="true">T</span>
+            </div>
+            <dl class="runtime-list">
+              <div><dt>Name</dt><dd class="mono" id="devnet-name">—</dd></div>
+              <div><dt>Namespace</dt><dd class="mono" id="devnet-namespace">—</dd></div>
+              <div><dt>RPC URL</dt><dd class="mono" id="devnet-rpc">—</dd></div>
+              <div><dt>Chain ID</dt><dd class="mono" id="devnet-chain-id">—</dd></div>
+              <div><dt>Client</dt><dd class="mono" id="devnet-client">—</dd></div>
+              <div><dt>Image digest</dt><dd class="mono" id="devnet-image-digest">—</dd></div>
+              <div><dt>Head at capture</dt><dd class="mono" id="devnet-head">—</dd></div>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-contrast" id="provenance" aria-labelledby="provenance-title">
+        <div class="shell section-pad">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">04 / Reproducibility</span>
+              <h2 id="provenance-title">Source to execution</h2>
+            </div>
+            <p>Every build input and orchestration step linked back to its immutable reference.</p>
+          </div>
+
+          <div class="timeline" id="provenance-timeline">
+            <article class="timeline-item">
+              <span class="timeline-node">1</span>
+              <div class="timeline-card">
+                <span class="card-kicker">Tempo verifier</span>
+                <h3 id="tempo-pr-title">PR pending</h3>
+                <code id="tempo-commit">Commit not supplied</code>
+                <div class="tag-row">
+                  <span class="tag" id="tempo-branch">Branch pending</span>
+                  <span class="tag" id="tempo-image">Image pending</span>
+                </div>
+                <a class="text-link disabled" id="tempo-pr-link" href="#">Open pull request <span>↗</span></a>
+              </div>
+            </article>
+
+            <article class="timeline-item">
+              <span class="timeline-node">2</span>
+              <div class="timeline-card">
+                <span class="card-kicker">Zones prover</span>
+                <h3 id="zones-repository">Repository pending</h3>
+                <code id="zones-commit">Commit not supplied</code>
+                <div class="tag-row">
+                  <span class="tag" id="zones-branch">Branch pending</span>
+                  <span class="tag" id="zones-image">Image pending</span>
+                </div>
+                <a class="text-link disabled" id="zones-commit-link" href="#">Open commit <span>↗</span></a>
+              </div>
+            </article>
+
+            <article class="timeline-item">
+              <span class="timeline-node">3</span>
+              <div class="timeline-card">
+                <span class="card-kicker">Devnet workflow</span>
+                <h3 id="workflow-name">Workflow pending</h3>
+                <code id="workflow-namespace">Namespace not supplied</code>
+                <div class="tag-row">
+                  <span class="tag" id="workflow-status">Status pending</span>
+                  <span class="tag" id="workflow-duration">Duration pending</span>
+                </div>
+                <a class="text-link disabled" id="workflow-link" href="#">Open workflow <span>↗</span></a>
+              </div>
+            </article>
+
+            <article class="timeline-item">
+              <span class="timeline-node">4</span>
+              <div class="timeline-card verification-timeline-card">
+                <span class="card-kicker">Onchain verification</span>
+                <h3 id="timeline-verdict">Verification pending</h3>
+                <code id="timeline-tx">Transaction not supplied</code>
+                <div class="tag-row">
+                  <span class="tag" id="timeline-block">Block pending</span>
+                  <span class="tag" id="timeline-time">Time pending</span>
+                </div>
+                <a class="text-link" href="#chain">Inspect chain evidence <span>↓</span></a>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="shell section-pad" id="raw-evidence" aria-labelledby="raw-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">05 / Evidence bundle</span>
+            <h2 id="raw-title">Inspect every byte</h2>
+          </div>
+          <p>Checksummed artifacts and unmodified JSON captured during deployment and verification.</p>
+        </div>
+
+        <div class="artifact-grid" id="artifact-grid">
+          <article class="artifact-card placeholder-card">
+            <span>Artifact manifest pending</span>
+          </article>
+        </div>
+
+        <article class="raw-viewer">
+          <div class="raw-toolbar">
+            <div>
+              <span class="card-kicker">Loaded dataset</span>
+              <strong id="raw-dataset-name">evidence.json</strong>
+            </div>
+            <div class="raw-actions">
+              <button class="button button-small" id="copy-json" type="button">Copy JSON</button>
+              <button class="button button-small" id="download-json" type="button">Download</button>
+            </div>
+          </div>
+          <pre id="raw-json"><code>Loading evidence.json…</code></pre>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell footer-inner">
+        <div>
+          <strong>TIP-1090 · Nitro Attestation Verifier</strong>
+          <span>Rendered directly from the captured evidence bundle.</span>
+        </div>
+        <span class="mono" id="footer-generated">Evidence timestamp pending</span>
+      </div>
+    </footer>
+  </body>
+</html>

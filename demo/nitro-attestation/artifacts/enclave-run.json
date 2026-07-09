@@ -1,0 +1,12 @@
+{
+  "EnclaveName": "zone-prover",
+  "EnclaveID": "i-0e0722508b1cf69ad-enc19f4882a561f1e7",
+  "ProcessID": 87160,
+  "EnclaveCID": 16,
+  "NumberOfCPUs": 2,
+  "CPUIDs": [
+    1,
+    3
+  ],
+  "MemoryMiB": 2048
+}

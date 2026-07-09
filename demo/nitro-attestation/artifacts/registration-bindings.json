@@ -1,0 +1,12 @@
+{
+  "domain": "tempo.zone.prover.registration.v1",
+  "expectedUserData": "0x1cfe3468cf97fce1f248ff32e04a7f2d822597a53b6c1a0ff4502aa4a0bfd87d",
+  "attestedUserData": "0x1cfe3468cf97fce1f248ff32e04a7f2d822597a53b6c1a0ff4502aa4a0bfd87d",
+  "userDataMatchesRegistrationChallenge": true,
+  "registrationPublicKey": "0x0496185ee663dfbeafb477fd296c28975ca41d64cd6412f9c41db89f7a4fcb57ceb8871a3b64c0c05a656a3db22292d7c1a336ea49f1c48c553f49507748d2f7c9",
+  "attestedPublicKey": "0x0496185ee663dfbeafb477fd296c28975ca41d64cd6412f9c41db89f7a4fcb57ceb8871a3b64c0c05a656a3db22292d7c1a336ea49f1c48c553f49507748d2f7c9",
+  "publicKeyMatchesRegistration": true,
+  "registrationNonce": "0xc14d80eb4f13aa6dacc867e19b657d6bdf6f912f3675b79ad2761fe00bbc152a",
+  "attestedNonce": "0xc14d80eb4f13aa6dacc867e19b657d6bdf6f912f3675b79ad2761fe00bbc152a",
+  "nonceMatchesRegistration": true
+}

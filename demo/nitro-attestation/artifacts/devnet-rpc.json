@@ -1,0 +1,89 @@
+{
+  "rpcUrl": "http://devnet-pr-6786-nodes-rpc-service.tail388b2e.ts.net:8545",
+  "clientVersion": "tempo/v1.10.1-5375004/x86_64-unknown-linux-gnu",
+  "chainId": "0x7a56",
+  "headBlock": "0x7b",
+  "forkSchedule": {
+    "schedule": [
+      {
+        "name": "T0",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T1",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T1A",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T1B",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T1C",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T2",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T3",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T4",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T5",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T6",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T7",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T8",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      },
+      {
+        "name": "T9",
+        "activationTime": 0,
+        "active": true,
+        "forkId": "0x085997d0"
+      }
+    ],
+    "active": "T9"
+  }
+}

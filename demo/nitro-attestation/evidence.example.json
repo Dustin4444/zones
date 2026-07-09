@@ -1,0 +1,159 @@
+{
+  "schemaVersion": "1.0",
+  "_instructions": {
+    "purpose": "Copy this file to evidence.json and replace null values with captured evidence. Do not mark verification.status as verified unless the receipt succeeded, the eth_call used the same block, every PCR matched, document hashes were recorded, and all registration binding checks passed.",
+    "hashes": "Use 0x-prefixed values for chain data and lowercase hexadecimal SHA-256 or SHA-384 values for artifact checksums.",
+    "timestamps": "Use ISO 8601 UTC strings for *At and *Iso fields. AWS attestation timestamps are milliseconds since the Unix epoch.",
+    "secrets": "Include public evidence only. Never add private keys, session credentials, authorization headers, or unredacted instance metadata tokens."
+  },
+  "verification": {
+    "status": "pending",
+    "performedAt": null,
+    "summary": null
+  },
+  "chain": {
+    "name": null,
+    "chainId": null,
+    "rpcUrl": null,
+    "explorerUrl": null,
+    "precompile": {
+      "tip": "TIP-1090",
+      "address": null,
+      "functionSelector": null,
+      "functionSignature": null
+    },
+    "transaction": {
+      "hash": null,
+      "url": null,
+      "status": null,
+      "blockNumber": null,
+      "blockHash": null,
+      "from": null,
+      "to": null,
+      "gasUsed": null,
+      "inputSha256": null,
+      "receiptArtifact": null
+    },
+    "ethCall": {
+      "method": "eth_call",
+      "blockNumber": null,
+      "functionSelector": null,
+      "resultSha256": null,
+      "rawResult": null,
+      "decoded": {
+        "moduleId": null,
+        "timestamp": null,
+        "pcrs": [],
+        "publicKey": null,
+        "userData": null,
+        "nonce": null,
+        "certificateSha256": null
+      },
+      "requestArtifact": null,
+      "responseArtifact": null
+    }
+  },
+  "attestation": {
+    "documentSha256": null,
+    "sizeBytes": null,
+    "moduleId": null,
+    "timestamp": null,
+    "timestampIso": null,
+    "digest": null,
+    "certificateSha256": null,
+    "publicKey": null,
+    "userData": null,
+    "nonce": null,
+    "bindings": {
+      "publicKeyMatchesRegistration": null,
+      "nonceMatchesRegistration": null,
+      "userDataMatchesRegistrationChallenge": null
+    },
+    "pcrs": [
+      {
+        "index": 0,
+        "expected": null,
+        "attested": null
+      },
+      {
+        "index": 1,
+        "expected": null,
+        "attested": null
+      },
+      {
+        "index": 2,
+        "expected": null,
+        "attested": null
+      }
+    ]
+  },
+  "aws": {
+    "accountId": null,
+    "region": null,
+    "availabilityZone": null,
+    "instanceId": null,
+    "instanceType": null,
+    "amiId": null,
+    "state": null,
+    "enclave": {
+      "id": null,
+      "state": null,
+      "cid": null,
+      "cpuCount": null,
+      "memoryMiB": null,
+      "eifName": null,
+      "eifSha384": null
+    }
+  },
+  "devnet": {
+    "name": null,
+    "namespace": null,
+    "rpcUrl": null,
+    "chainId": null,
+    "clientVersion": null,
+    "image": null,
+    "imageDigest": null,
+    "headBlockAtCapture": null
+  },
+  "provenance": {
+    "tempo": {
+      "prNumber": null,
+      "prTitle": null,
+      "prUrl": null,
+      "branch": null,
+      "commit": null,
+      "commitUrl": null,
+      "image": null,
+      "imageDigest": null
+    },
+    "zones": {
+      "repository": null,
+      "repositoryUrl": null,
+      "branch": null,
+      "commit": null,
+      "commitUrl": null,
+      "image": null,
+      "imageDigest": null
+    },
+    "workflow": {
+      "name": null,
+      "namespace": null,
+      "url": null,
+      "status": null,
+      "startedAt": null,
+      "finishedAt": null,
+      "duration": null
+    }
+  },
+  "artifacts": [],
+  "raw": {
+    "transactionReceipt": null,
+    "ethCallRequest": null,
+    "ethCallResponse": null,
+    "decodedPrecompileOutput": null,
+    "awsInstanceDescription": null,
+    "nitroEnclaveDescription": null,
+    "workflowSummary": null,
+    "commands": []
+  }
+}

@@ -1,0 +1,28 @@
+{
+    "InstanceType": "m6i.xlarge",
+    "VCpuInfo": {
+        "DefaultVCpus": 4,
+        "DefaultCores": 2,
+        "DefaultThreadsPerCore": 2,
+        "ValidCores": [
+            1,
+            2
+        ],
+        "ValidThreadsPerCore": [
+            1,
+            2
+        ]
+    },
+    "MemoryInfo": {
+        "SizeInMiB": 16384
+    },
+    "NitroEnclavesSupport": "supported",
+    "Hypervisor": "nitro",
+    "ProcessorInfo": {
+        "SupportedArchitectures": [
+            "x86_64"
+        ],
+        "SustainedClockSpeedInGhz": 3.5,
+        "Manufacturer": "Intel"
+    }
+}

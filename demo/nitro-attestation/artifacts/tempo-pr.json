@@ -1,0 +1,38 @@
+{
+  "number": 6786,
+  "title": "feat(precompiles): Add AWS Nitro Enclave verifier",
+  "url": "https://github.com/tempoxyz/tempo/pull/6786",
+  "headRefName": "feat/nitro-enclave-verifier",
+  "headRefOid": "53750048e8f21315af690ccc7a9266e54c96f9e7",
+  "baseRefName": "tip/1090",
+  "isDraft": true,
+  "devnetComments": [
+    {
+      "author": "Zygimantass",
+      "createdAt": "2026-07-09T19:28:37Z",
+      "body": "/build-devnet"
+    },
+    {
+      "author": "tempoxyz-bot",
+      "createdAt": "2026-07-09T19:43:59Z",
+      "body": "Devnet is being created, I will post a separate comment once it's done."
+    },
+    {
+      "author": "tempoxyz-bot",
+      "createdAt": "2026-07-09T20:10:54Z",
+      "body": "Failed to create devnet."
+    },
+    {
+      "author": "tempoxyz-bot",
+      "createdAt": "2026-07-09T20:17:43Z",
+      "body": "Devnet created successfully, use go/devnet-rpc/devnet-pr-6786 to retrieve RPC endpoint."
+    }
+  ],
+  "devnetStatus": [
+    {
+      "name": "Workflows / devnet-pr",
+      "state": "SUCCESS",
+      "targetUrl": "http://go/dev/tempo-workflows-ui"
+    }
+  ]
+}

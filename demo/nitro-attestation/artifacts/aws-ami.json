@@ -1,0 +1,10 @@
+{
+    "ImageId": "ami-07e88eae8fab7dd8a",
+    "Name": "al2023-ami-2023.12.20260706.1-kernel-6.1-x86_64",
+    "Architecture": "x86_64",
+    "CreationDate": "2026-07-02T21:55:48.000Z",
+    "OwnerId": "137112412989",
+    "State": "available",
+    "RootDeviceName": "/dev/xvda",
+    "VirtualizationType": "hvm"
+}

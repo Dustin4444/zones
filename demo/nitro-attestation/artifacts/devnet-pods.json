@@ -1,0 +1,76 @@
+{
+  "capturedAt": "2026-07-09T20:26:15Z",
+  "namespace": "devnet-pr-6786",
+  "pods": [
+    {
+      "name": "node1-0",
+      "phase": "Running",
+      "containers": [
+        {
+          "name": "tempo-node",
+          "image": "ghcr.io/tempoxyz/tempo:sha-5375004",
+          "imageID": "ghcr.io/tempoxyz/tempo@sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+          "ready": true,
+          "restartCount": 0,
+          "startedAt": "2026-07-09T20:14:47Z"
+        }
+      ]
+    },
+    {
+      "name": "val1-0",
+      "phase": "Running",
+      "containers": [
+        {
+          "name": "tempo-node",
+          "image": "ghcr.io/tempoxyz/tempo:sha-5375004",
+          "imageID": "ghcr.io/tempoxyz/tempo@sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+          "ready": true,
+          "restartCount": 0,
+          "startedAt": "2026-07-09T20:14:49Z"
+        }
+      ]
+    },
+    {
+      "name": "val2-0",
+      "phase": "Running",
+      "containers": [
+        {
+          "name": "tempo-node",
+          "image": "ghcr.io/tempoxyz/tempo:sha-5375004",
+          "imageID": "ghcr.io/tempoxyz/tempo@sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+          "ready": true,
+          "restartCount": 0,
+          "startedAt": "2026-07-09T20:14:47Z"
+        }
+      ]
+    },
+    {
+      "name": "val3-0",
+      "phase": "Running",
+      "containers": [
+        {
+          "name": "tempo-node",
+          "image": "ghcr.io/tempoxyz/tempo:sha-5375004",
+          "imageID": "ghcr.io/tempoxyz/tempo@sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+          "ready": true,
+          "restartCount": 0,
+          "startedAt": "2026-07-09T20:14:48Z"
+        }
+      ]
+    },
+    {
+      "name": "val4-0",
+      "phase": "Running",
+      "containers": [
+        {
+          "name": "tempo-node",
+          "image": "ghcr.io/tempoxyz/tempo:sha-5375004",
+          "imageID": "ghcr.io/tempoxyz/tempo@sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+          "ready": true,
+          "restartCount": 0,
+          "startedAt": "2026-07-09T20:14:49Z"
+        }
+      ]
+    }
+  ]
+}

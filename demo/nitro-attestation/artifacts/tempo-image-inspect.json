@@ -1,0 +1,191 @@
+{
+  "name": "ghcr.io/tempoxyz/tempo:sha-5375004",
+  "manifest": {
+    "schemaVersion": 2,
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "digest": "sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc",
+    "size": 1609,
+    "manifests": [
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:f6bf557bbd9c19044923f5d333f9fdbb872390c8c60decd2d0d41a20781dae7e",
+        "size": 1056,
+        "platform": {
+          "architecture": "arm64",
+          "os": "linux"
+        }
+      },
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:fab397ea0ce4239699d93e93524bf3b28f2951b3e407a4d1e5158455ef2ff041",
+        "size": 567,
+        "annotations": {
+          "vnd.docker.reference.digest": "sha256:f6bf557bbd9c19044923f5d333f9fdbb872390c8c60decd2d0d41a20781dae7e",
+          "vnd.docker.reference.type": "attestation-manifest"
+        },
+        "platform": {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      },
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:d96581115d807899d6eae3df690bec65be59c3dd560bf8ff87771903f3bd9aec",
+        "size": 1056,
+        "platform": {
+          "architecture": "amd64",
+          "os": "linux"
+        }
+      },
+      {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": "sha256:90a282d8bde55f7057103cccc07504d3d911ff17aef09bb54bd3109d60d051b1",
+        "size": 567,
+        "annotations": {
+          "vnd.docker.reference.digest": "sha256:d96581115d807899d6eae3df690bec65be59c3dd560bf8ff87771903f3bd9aec",
+          "vnd.docker.reference.type": "attestation-manifest"
+        },
+        "platform": {
+          "architecture": "unknown",
+          "os": "unknown"
+        }
+      }
+    ]
+  },
+  "image": {
+    "linux/amd64": {
+      "created": "2026-07-09T19:53:50.152467055Z",
+      "architecture": "amd64",
+      "os": "linux",
+      "config": {
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "Entrypoint": [
+          "/usr/local/bin/tempo"
+        ],
+        "WorkingDir": "/data",
+        "Labels": {
+          "org.opencontainers.image.created": "2026-07-09T19:45:38.868Z",
+          "org.opencontainers.image.description": "the blockchain for payments",
+          "org.opencontainers.image.licenses": "Apache-2.0",
+          "org.opencontainers.image.revision": "53750048e8f21315af690ccc7a9266e54c96f9e7",
+          "org.opencontainers.image.source": "https://github.com/tempoxyz/tempo",
+          "org.opencontainers.image.title": "tempo",
+          "org.opencontainers.image.url": "https://github.com/tempoxyz/tempo",
+          "org.opencontainers.image.version": "sha-5375004"
+        }
+      },
+      "rootfs": {
+        "type": "layers",
+        "diff_ids": [
+          "sha256:335fc45cf5e8eaa6d5b19a54b16db34311ce0d7a068eb2a9222eab4ddd3c216d",
+          "sha256:3ea0968d259617754ab97824bda2e84f09c9651bd0f786f7e48dcd81eb549df8",
+          "sha256:29e1f902a001d39a912ac8cf453a063d783c1434d23d4ab3737184885588505e",
+          "sha256:8aadc0b819f75cb96c97b39e174fe05be5b45c3042a01cefb1b16f40585b45a4"
+        ]
+      },
+      "history": [
+        {
+          "created": "2026-04-06T00:00:00Z",
+          "created_by": "# debian.sh --arch 'amd64' out/ 'bookworm' '@1775433600'",
+          "comment": "debuerreotype 0.17"
+        },
+        {
+          "created": "2026-07-09T19:46:48.416632304Z",
+          "created_by": "RUN /bin/sh -c apt-get update \u0026\u0026 apt-get install -y --no-install-recommends     ca-certificates     \u0026\u0026 rm -rf /var/lib/apt/lists/* # buildkit",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:46:48.498491181Z",
+          "created_by": "WORKDIR /data",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:53:50.152467055Z",
+          "created_by": "ARG RUST_PROFILE=profiling",
+          "comment": "buildkit.dockerfile.v0",
+          "empty_layer": true
+        },
+        {
+          "created": "2026-07-09T19:53:50.152467055Z",
+          "created_by": "COPY /app/target/profiling/tempo /usr/local/bin/tempo # buildkit",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:53:50.152467055Z",
+          "created_by": "ENTRYPOINT [\"/usr/local/bin/tempo\"]",
+          "comment": "buildkit.dockerfile.v0",
+          "empty_layer": true
+        }
+      ]
+    },
+    "linux/arm64": {
+      "created": "2026-07-09T19:57:07.024850178Z",
+      "architecture": "arm64",
+      "os": "linux",
+      "config": {
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "Entrypoint": [
+          "/usr/local/bin/tempo"
+        ],
+        "WorkingDir": "/data",
+        "Labels": {
+          "org.opencontainers.image.created": "2026-07-09T19:45:38.868Z",
+          "org.opencontainers.image.description": "the blockchain for payments",
+          "org.opencontainers.image.licenses": "Apache-2.0",
+          "org.opencontainers.image.revision": "53750048e8f21315af690ccc7a9266e54c96f9e7",
+          "org.opencontainers.image.source": "https://github.com/tempoxyz/tempo",
+          "org.opencontainers.image.title": "tempo",
+          "org.opencontainers.image.url": "https://github.com/tempoxyz/tempo",
+          "org.opencontainers.image.version": "sha-5375004"
+        }
+      },
+      "rootfs": {
+        "type": "layers",
+        "diff_ids": [
+          "sha256:dc784058f8e6004ced335186004e0488ff873f3aa83ca509cfd573f044d57134",
+          "sha256:66cfe32c74c503de727396f693ec1f23cf15ed835e570580570d9103fdbc1a97",
+          "sha256:4d83f1de25207e73ffce032d764e6158a3de81eed6db697b7753d0d39e35643a",
+          "sha256:0ff0ab796f12559cfa91914121c6e3211810a8a490b471dda49e4f175db7f0b4"
+        ]
+      },
+      "history": [
+        {
+          "created": "2026-04-06T00:00:00Z",
+          "created_by": "# debian.sh --arch 'arm64' out/ 'bookworm' '@1775433600'",
+          "comment": "debuerreotype 0.17"
+        },
+        {
+          "created": "2026-07-09T19:46:49.233244569Z",
+          "created_by": "RUN /bin/sh -c apt-get update \u0026\u0026 apt-get install -y --no-install-recommends     ca-certificates     \u0026\u0026 rm -rf /var/lib/apt/lists/* # buildkit",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:46:49.292596668Z",
+          "created_by": "WORKDIR /data",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:57:07.024850178Z",
+          "created_by": "ARG RUST_PROFILE=profiling",
+          "comment": "buildkit.dockerfile.v0",
+          "empty_layer": true
+        },
+        {
+          "created": "2026-07-09T19:57:07.024850178Z",
+          "created_by": "COPY /app/target/profiling/tempo /usr/local/bin/tempo # buildkit",
+          "comment": "buildkit.dockerfile.v0"
+        },
+        {
+          "created": "2026-07-09T19:57:07.024850178Z",
+          "created_by": "ENTRYPOINT [\"/usr/local/bin/tempo\"]",
+          "comment": "buildkit.dockerfile.v0",
+          "empty_layer": true
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+PASS Keccak-256 implementation
+PASS verification status
+PASS successful transaction to precompile — 0xd66b28854cff1076d7609f4b59be896ab8570bcd50486ef15164c484ac9ce905
+PASS transaction and eth_call block — block 89
+PASS verifyAttestation selector — 0x769d87e7
+PASS same-block eth_call request and response — block 89
+PASS ABI decode of raw precompile output — 16 PCRs and 4 bound fields
+PASS PCR0 match
+PASS PCR1 match
+PASS PCR2 match
+PASS non-debug enclave runtime — i-0e0722508b1cf69ad-enc19f4882a561f1e7, Flags=NONE
+PASS devnet pod image provenance — 5 running pods at sha256:c06bba48452b817935af6d0ba3fe43009acad1c034c8e82a032a79d51abfdacc
+PASS decoded module ID
+PASS decoded public key
+PASS decoded user data
+PASS decoded nonce
+PASS decoded certificate hash
+PASS registration bindings
+PASS registration challenge and report digest — challenge 0x1cfe3468cf97fce1f248ff32e04a7f2d822597a53b6c1a0ff4502aa4a0bfd87d
+PASS registration secp256k1 signature and signer — 0xa53ebf72b1866f74e67094a8e2ff76fe75aed91f
+PASS registration attestation document — 4591 bytes, d8530bee6872c3d51c06297e4f25c83d53487908aaa56cb5bc18f92e04e33d0d
+PASS transaction calldata document — 4591 document bytes
+PASS successful transaction trace — 553946 gas
+PASS transaction input SHA-256 — 77afb9f62a46af9c650272917ac8f6963b241406b0df997f0ec9a81f28235f13
+PASS eth_call result SHA-256 — cf8c9534638569d67c2151ec79410965386aed66ee3c316002e7c30c689f17c2
+PASS relative artifact hashes — 41 local files
+VERIFIED 26 checks passed; evidence is internally consistent

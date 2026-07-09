@@ -1,0 +1,46 @@
+{
+    "InstanceId": "i-0e0722508b1cf69ad",
+    "State": "running",
+    "ImageId": "ami-07e88eae8fab7dd8a",
+    "InstanceType": "m6i.xlarge",
+    "LaunchTime": "2026-07-09T19:48:14+00:00",
+    "Placement": {
+        "AvailabilityZoneId": "use1-az1",
+        "GroupName": "",
+        "Tenancy": "default",
+        "AvailabilityZone": "us-east-1a"
+    },
+    "EnclaveOptions": {
+        "Enabled": true
+    },
+    "MetadataOptions": {
+        "State": "applied",
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1,
+        "HttpEndpoint": "enabled",
+        "HttpProtocolIpv6": "disabled",
+        "InstanceMetadataTags": "disabled"
+    },
+    "Tags": [
+        {
+            "Key": "Project",
+            "Value": "tempo-tip1090-nitro-demo"
+        },
+        {
+            "Key": "TempoCommit",
+            "Value": "53750048e8f21315af690ccc7a9266e54c96f9e7"
+        },
+        {
+            "Key": "TempoPR",
+            "Value": "6786"
+        },
+        {
+            "Key": "ZonesCommit",
+            "Value": "2241a40b41ca62b52b1d471233afd308a6f4a5d5"
+        },
+        {
+            "Key": "Name",
+            "Value": "tempo-tip1090-nitro-demo"
+        }
+    ]
+}

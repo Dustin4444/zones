@@ -1,0 +1,522 @@
+{
+  "initialAttempt": {
+    "name": "devnet-pr-kb5wb",
+    "uid": "89b948dc-86a0-4250-8155-118063773bdd",
+    "resourceVersion": "92568792",
+    "phase": "Failed",
+    "startedAt": "2026-07-09T19:43:52Z",
+    "finishedAt": "2026-07-09T20:10:58Z",
+    "parameters": [
+      {
+        "name": "repository",
+        "value": "tempoxyz/tempo"
+      },
+      {
+        "name": "pr-number",
+        "value": "6786"
+      },
+      {
+        "name": "name",
+        "value": "devnet-pr-6786"
+      },
+      {
+        "name": "branch",
+        "value": "feat/nitro-enclave-verifier"
+      },
+      {
+        "name": "sha",
+        "value": "53750048e8f21315af690ccc7a9266e54c96f9e7"
+      },
+      {
+        "name": "set-status",
+        "value": "true"
+      }
+    ],
+    "nodes": [
+      {
+        "displayName": "devnet-pr-kb5wb",
+        "phase": "Failed",
+        "startedAt": "2026-07-09T19:43:52Z",
+        "finishedAt": "2026-07-09T20:10:48Z",
+        "message": null
+      },
+      {
+        "displayName": "comment-creating",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:43:52Z",
+        "finishedAt": "2026-07-09T19:44:00Z",
+        "message": null
+      },
+      {
+        "displayName": "set-pending-status",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:43:52Z",
+        "finishedAt": "2026-07-09T19:44:00Z",
+        "message": null
+      },
+      {
+        "displayName": "build-devnet",
+        "phase": "Failed",
+        "startedAt": "2026-07-09T19:44:12Z",
+        "finishedAt": "2026-07-09T20:10:48Z",
+        "message": null
+      },
+      {
+        "displayName": "validate-name",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:44:12Z",
+        "finishedAt": "2026-07-09T19:44:16Z",
+        "message": null
+      },
+      {
+        "displayName": "build-image",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:44:22Z",
+        "finishedAt": "2026-07-09T19:59:16Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-build",
+        "phase": "Failed",
+        "startedAt": "2026-07-09T19:59:23Z",
+        "finishedAt": "2026-07-09T20:10:48Z",
+        "message": null
+      },
+      {
+        "displayName": "prerequisites",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:23Z",
+        "finishedAt": "2026-07-09T19:59:30Z",
+        "message": null
+      },
+      {
+        "displayName": "generate-genesis",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:33Z",
+        "finishedAt": "2026-07-09T19:59:43Z",
+        "message": null
+      },
+      {
+        "displayName": "upload-and-deploy",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:53Z",
+        "finishedAt": "2026-07-09T20:00:12Z",
+        "message": null
+      },
+      {
+        "displayName": "wait-for-blocks",
+        "phase": "Failed",
+        "startedAt": "2026-07-09T20:00:24Z",
+        "finishedAt": "2026-07-09T20:10:38Z",
+        "message": "main: Error (exit code 1)"
+      },
+      {
+        "displayName": "devnet-pr-kb5wb.onExit",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:10:48Z",
+        "finishedAt": "2026-07-09T20:10:58Z",
+        "message": null
+      },
+      {
+        "displayName": "comment-created",
+        "phase": "Omitted",
+        "startedAt": "2026-07-09T20:10:48Z",
+        "finishedAt": "2026-07-09T20:10:48Z",
+        "message": "omitted: depends condition not met"
+      },
+      {
+        "displayName": "comment-failed",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:10:48Z",
+        "finishedAt": "2026-07-09T20:10:55Z",
+        "message": null
+      },
+      {
+        "displayName": "set-commit-status",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:10:48Z",
+        "finishedAt": "2026-07-09T20:10:55Z",
+        "message": null
+      },
+      {
+        "displayName": "setup-liquidity",
+        "phase": "Omitted",
+        "startedAt": "2026-07-09T20:10:48Z",
+        "finishedAt": "2026-07-09T20:10:48Z",
+        "message": "omitted: depends condition not met"
+      }
+    ]
+  },
+  "successfulRetry": {
+    "name": "devnet-pr-kb5wb",
+    "uid": "89b948dc-86a0-4250-8155-118063773bdd",
+    "resourceVersion": "92576317",
+    "phase": "Succeeded",
+    "startedAt": "2026-07-09T20:16:44Z",
+    "finishedAt": "2026-07-09T20:17:56Z",
+    "parameters": [
+      {
+        "name": "repository",
+        "value": "tempoxyz/tempo"
+      },
+      {
+        "name": "pr-number",
+        "value": "6786"
+      },
+      {
+        "name": "name",
+        "value": "devnet-pr-6786"
+      },
+      {
+        "name": "branch",
+        "value": "feat/nitro-enclave-verifier"
+      },
+      {
+        "name": "sha",
+        "value": "53750048e8f21315af690ccc7a9266e54c96f9e7"
+      },
+      {
+        "name": "set-status",
+        "value": "true"
+      }
+    ],
+    "nodes": [
+      {
+        "displayName": "comment-creating",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:43:52Z",
+        "finishedAt": "2026-07-09T19:44:00Z",
+        "message": null
+      },
+      {
+        "displayName": "set-pending-status",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:43:52Z",
+        "finishedAt": "2026-07-09T19:44:00Z",
+        "message": null
+      },
+      {
+        "displayName": "validate-name",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:44:12Z",
+        "finishedAt": "2026-07-09T19:44:16Z",
+        "message": null
+      },
+      {
+        "displayName": "build-image",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:44:22Z",
+        "finishedAt": "2026-07-09T19:59:16Z",
+        "message": null
+      },
+      {
+        "displayName": "prerequisites",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:23Z",
+        "finishedAt": "2026-07-09T19:59:30Z",
+        "message": null
+      },
+      {
+        "displayName": "generate-genesis",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:33Z",
+        "finishedAt": "2026-07-09T19:59:43Z",
+        "message": null
+      },
+      {
+        "displayName": "upload-and-deploy",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T19:59:53Z",
+        "finishedAt": "2026-07-09T20:00:12Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-pr-kb5wb",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:16:44Z",
+        "finishedAt": "2026-07-09T20:17:46Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-build",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:16:44Z",
+        "finishedAt": "2026-07-09T20:17:36Z",
+        "message": null
+      },
+      {
+        "displayName": "build-devnet",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:16:44Z",
+        "finishedAt": "2026-07-09T20:17:36Z",
+        "message": null
+      },
+      {
+        "displayName": "wait-for-blocks",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:16:44Z",
+        "finishedAt": "2026-07-09T20:16:52Z",
+        "message": null
+      },
+      {
+        "displayName": "setup-liquidity",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:16:54Z",
+        "finishedAt": "2026-07-09T20:17:27Z",
+        "message": null
+      },
+      {
+        "displayName": "comment-created",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:17:36Z",
+        "finishedAt": "2026-07-09T20:17:44Z",
+        "message": null
+      },
+      {
+        "displayName": "comment-failed",
+        "phase": "Skipped",
+        "startedAt": "2026-07-09T20:17:46Z",
+        "finishedAt": "2026-07-09T20:17:46Z",
+        "message": "when 'Succeeded != Succeeded' evaluated false"
+      },
+      {
+        "displayName": "set-commit-status",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:17:46Z",
+        "finishedAt": "2026-07-09T20:17:54Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-pr-kb5wb.onExit",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:17:46Z",
+        "finishedAt": "2026-07-09T20:17:56Z",
+        "message": null
+      }
+    ]
+  },
+  "regenesis": {
+    "name": "devnet-regenesis-8sw4r",
+    "uid": "c8a4b63b-bd5e-4edb-8671-cc6422a5ee28",
+    "resourceVersion": "92574263",
+    "phase": "Succeeded",
+    "startedAt": "2026-07-09T20:08:36Z",
+    "finishedAt": "2026-07-09T20:15:54Z",
+    "parameters": [
+      {
+        "name": "name",
+        "value": "devnet-pr-6786"
+      },
+      {
+        "name": "accounts",
+        "value": "50"
+      },
+      {
+        "name": "branch",
+        "value": "feat/nitro-enclave-verifier"
+      },
+      {
+        "name": "chain-id",
+        "value": "31318"
+      },
+      {
+        "name": "epoch-length",
+        "value": "1000"
+      },
+      {
+        "name": "gas-limit",
+        "value": "500000000"
+      },
+      {
+        "name": "image",
+        "value": "sha-5375004"
+      },
+      {
+        "name": "extra-args",
+        "value": "--t8-time=0 --t9-time=0"
+      },
+      {
+        "name": "t6-time",
+        "value": "0"
+      },
+      {
+        "name": "t7-time",
+        "value": "0"
+      },
+      {
+        "name": "seed",
+        "value": "0"
+      },
+      {
+        "name": "skip-liquidity",
+        "value": "true"
+      }
+    ],
+    "nodes": [
+      {
+        "displayName": "devnet-regenesis-8sw4r",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:08:36Z",
+        "finishedAt": "2026-07-09T20:15:34Z",
+        "message": null
+      },
+      {
+        "displayName": "pause-devnet",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:08:36Z",
+        "finishedAt": "2026-07-09T20:08:40Z",
+        "message": null
+      },
+      {
+        "displayName": "get-validators",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:08:46Z",
+        "finishedAt": "2026-07-09T20:08:57Z",
+        "message": null
+      },
+      {
+        "displayName": "prune-devnet",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:09:06Z",
+        "finishedAt": "2026-07-09T20:09:13Z",
+        "message": null
+      },
+      {
+        "displayName": "generate-genesis",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:09:16Z",
+        "finishedAt": "2026-07-09T20:09:27Z",
+        "message": null
+      },
+      {
+        "displayName": "upload-genesis",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:09:36Z",
+        "finishedAt": "2026-07-09T20:09:44Z",
+        "message": null
+      },
+      {
+        "displayName": "set-image",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:09:46Z",
+        "finishedAt": "2026-07-09T20:09:57Z",
+        "message": null
+      },
+      {
+        "displayName": "scale-statefulsets",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:10:07Z",
+        "finishedAt": "2026-07-09T20:10:14Z",
+        "message": null
+      },
+      {
+        "displayName": "wait-for-blocks",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:10:17Z",
+        "finishedAt": "2026-07-09T20:15:24Z",
+        "message": null
+      },
+      {
+        "displayName": "setup-liquidity",
+        "phase": "Skipped",
+        "startedAt": "2026-07-09T20:15:34Z",
+        "finishedAt": "2026-07-09T20:15:34Z",
+        "message": "when ''true' != 'true'' evaluated false"
+      },
+      {
+        "displayName": "unpause-devnet",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:15:34Z",
+        "finishedAt": "2026-07-09T20:15:38Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-regenesis-8sw4r.onExit",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:15:34Z",
+        "finishedAt": "2026-07-09T20:15:54Z",
+        "message": null
+      },
+      {
+        "displayName": "notify-slack",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:15:44Z",
+        "finishedAt": "2026-07-09T20:15:51Z",
+        "message": null
+      }
+    ]
+  },
+  "prune": {
+    "name": "devnet-prune-ljt74",
+    "uid": "813c3013-1a00-4935-aa10-7fd3ab9ebe11",
+    "resourceVersion": "92573990",
+    "phase": "Succeeded",
+    "startedAt": "2026-07-09T20:14:24Z",
+    "finishedAt": "2026-07-09T20:15:42Z",
+    "parameters": [
+      {
+        "name": "name",
+        "value": "devnet-pr-6786"
+      }
+    ],
+    "nodes": [
+      {
+        "displayName": "devnet-prune-ljt74",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:14:24Z",
+        "finishedAt": "2026-07-09T20:15:32Z",
+        "message": null
+      },
+      {
+        "displayName": "delete-pvcs",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:14:24Z",
+        "finishedAt": "2026-07-09T20:14:32Z",
+        "message": null
+      },
+      {
+        "displayName": "scale-down-statefulsets",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:14:34Z",
+        "finishedAt": "2026-07-09T20:14:42Z",
+        "message": null
+      },
+      {
+        "displayName": "start-statefulsets",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:14:45Z",
+        "finishedAt": "2026-07-09T20:14:52Z",
+        "message": null
+      },
+      {
+        "displayName": "wait-for-blocks",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:14:55Z",
+        "finishedAt": "2026-07-09T20:15:22Z",
+        "message": null
+      },
+      {
+        "displayName": "ensure-statefulsets-started",
+        "phase": "Skipped",
+        "startedAt": "2026-07-09T20:15:32Z",
+        "finishedAt": "2026-07-09T20:15:32Z",
+        "message": "when 'Succeeded != Succeeded' evaluated false"
+      },
+      {
+        "displayName": "notify-slack",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:15:32Z",
+        "finishedAt": "2026-07-09T20:15:39Z",
+        "message": null
+      },
+      {
+        "displayName": "devnet-prune-ljt74.onExit",
+        "phase": "Succeeded",
+        "startedAt": "2026-07-09T20:15:32Z",
+        "finishedAt": "2026-07-09T20:15:42Z",
+        "message": null
+      }
+    ]
+  },
+  "explanation": "Initial PR workflow exposed a non-monotonic T2-T9 schedule and timed out at block 0. Regenesis uploaded a monotonic genesis; prune recycled PVCs after the corrected R2 object existed; retry then completed wait-for-blocks, liquidity, PR comment, and commit status."
+}

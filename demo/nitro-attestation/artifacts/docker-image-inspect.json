@@ -1,0 +1,86 @@
+[
+    {
+        "Id": "sha256:f69c3a1482785f1c51273f5cd32816ad620b469b965f873e1a589bf8a577364a",
+        "RepoTags": [
+            "tempo-zone-prover:tip1090"
+        ],
+        "RepoDigests": [],
+        "Parent": "",
+        "Comment": "buildkit.dockerfile.v0",
+        "Created": "2026-07-09T19:59:09.691795491Z",
+        "Container": "",
+        "ContainerConfig": {
+            "Hostname": "",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": null,
+            "Cmd": null,
+            "Image": "",
+            "Volumes": null,
+            "WorkingDir": "",
+            "Entrypoint": null,
+            "OnBuild": null,
+            "Labels": null
+        },
+        "DockerVersion": "",
+        "Author": "",
+        "Config": {
+            "Hostname": "",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ],
+            "Cmd": [
+                "/usr/local/bin/zone-prover-enclave",
+                "--vsock-port",
+                "5005",
+                "--attestation-provider",
+                "nsm"
+            ],
+            "ArgsEscaped": true,
+            "Image": "",
+            "Volumes": null,
+            "WorkingDir": "/data",
+            "Entrypoint": null,
+            "OnBuild": null,
+            "Labels": null
+        },
+        "Architecture": "amd64",
+        "Os": "linux",
+        "Size": 96881288,
+        "GraphDriver": {
+            "Data": {
+                "LowerDir": "/var/lib/docker/overlay2/2cnyupxnk1kze0n2q7ipgyirg/diff:/var/lib/docker/overlay2/qqh1yk0tflv95hyk3yc1pvtm6/diff:/var/lib/docker/overlay2/13d032f87305508e4d633ed033233ef1994065695ea46cfbe215fb2b4ba73121/diff",
+                "MergedDir": "/var/lib/docker/overlay2/z536utz1h2zawfkh3ggpjjqsg/merged",
+                "UpperDir": "/var/lib/docker/overlay2/z536utz1h2zawfkh3ggpjjqsg/diff",
+                "WorkDir": "/var/lib/docker/overlay2/z536utz1h2zawfkh3ggpjjqsg/work"
+            },
+            "Name": "overlay2"
+        },
+        "RootFS": {
+            "Type": "layers",
+            "Layers": [
+                "sha256:b05a96227958df6091396f6fbd5aa4616df631a65626ac8688c91cfa70d1a7e6",
+                "sha256:0e3d47f69c8a83fb493466ff001e0fbf3e16f583526e7ee4a24af12d1597b10c",
+                "sha256:5d25db6c02644a32ee172070ec47fbcb36e29d876be46f30bd85d87857cadd73",
+                "sha256:a873d386032d3bfe3704c1ff0486ea212e13f34b9f4724d6ca0b0f6cd66060a1"
+            ]
+        },
+        "Metadata": {
+            "LastTagTime": "2026-07-09T20:12:11.228321463Z"
+        }
+    }
+]
