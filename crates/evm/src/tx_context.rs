@@ -11,11 +11,11 @@ use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
 use alloy_primitives::{B256, Bytes, keccak256};
 use alloy_sol_types::{SolCall, SolError};
 use revm::precompile::{PrecompileId, PrecompileOutput};
+use tempo_precompiles::{DelegateCallNotAllowed, dispatch::selector_from_calldata};
 use tracing::{debug, warn};
 
 alloy_sol_types::sol! {
     function currentTxHash() external returns (bytes32);
-    error DelegateCallNotAllowed();
 }
 
 thread_local! {
@@ -79,17 +79,15 @@ impl ZoneTxContext {
                 ));
             }
 
-            let data = input.data;
-            if data.len() < 4 {
+            let Some(selector) = selector_from_calldata(input.data) else {
                 warn!(
                     target: "zone::precompile",
-                    data_len = data.len(),
+                    data_len = input.data.len(),
                     "ZoneTxContext called with insufficient data"
                 );
                 return Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir));
-            }
+            };
 
-            let selector: [u8; 4] = data[..4].try_into().expect("len >= 4");
             if selector != currentTxHashCall::SELECTOR {
                 warn!(
                     target: "zone::precompile",

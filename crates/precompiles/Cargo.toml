@@ -44,7 +44,9 @@ paste = "1.0.15"
 tracing = { version = "0.1.41", default-features = false }
 
 [dev-dependencies]
+alloy-primitives = { workspace = true, features = ["rand"] }
 const-hex.workspace = true
+eyre.workspace = true
 tempo-precompiles = { workspace = true, features = ["test-utils"] }
 
 [features]

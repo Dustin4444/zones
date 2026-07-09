@@ -1,17 +1,236 @@
 //! Shared test utilities for precompile tests.
 
+use alloc::{rc::Rc, sync::Arc};
+use core::cell::RefCell;
+use std::{collections::HashMap, sync::Mutex};
+
+use alloy_evm::{
+    EvmInternals,
+    precompiles::{DynPrecompile, Precompile as AlloyEvmPrecompile, PrecompileInput},
+};
 use alloy_primitives::{Address, B256, U256};
 use k256::{
     AffinePoint, ProjectivePoint, Scalar,
     elliptic_curve::{ops::Reduce, sec1::ToEncodedPoint},
 };
+use revm::{
+    Context,
+    context::{BlockEnv, CfgEnv, TxEnv},
+    database::{CacheDB, EmptyDB},
+    precompile::{PrecompileError, PrecompileResult},
+};
+use tempo_chainspec::hardfork::TempoHardfork;
+use tempo_precompiles::{
+    storage::{
+        Handler, PrecompileStorageProvider, StorageCtx, actions::StorageActions,
+        evm::EvmPrecompileStorageProvider, hashmap::HashMapStorageProvider,
+    },
+    storage_credits::NonCreditableSlots,
+    tip20::tip20_slots,
+    tip403_registry::{PolicyData, TIP403Registry},
+};
 
 use crate::{
+    L1BackedPrecompileEnv, L1StorageReader,
     chaum_pedersen::{challenge_hash, recover_point},
     ecies::DecryptedDeposit,
 };
 
 pub(crate) use crate::ecies::{build_plaintext, compressed_x_and_parity, encrypt_plaintext};
+
+/// EVM context used by precompile tests.
+pub(crate) type TestCtx = Context<BlockEnv, TxEnv, CfgEnv<TempoHardfork>, CacheDB<EmptyDB>>;
+
+/// Create an empty EVM context for a precompile test.
+pub(crate) fn test_context() -> TestCtx {
+    Context::new(CacheDB::new(EmptyDB::new()), TempoHardfork::default())
+}
+
+/// Create a normal EVM storage provider over a test context.
+pub(crate) fn test_storage_provider(
+    ctx: &mut TestCtx,
+    gas_limit: u64,
+    is_static: bool,
+) -> EvmPrecompileStorageProvider<'_> {
+    let spec = ctx.cfg.spec;
+    let amsterdam_eip8037_enabled = ctx.cfg.enable_amsterdam_eip8037;
+    let gas_params = ctx.cfg.gas_params.clone();
+
+    EvmPrecompileStorageProvider::new(
+        EvmInternals::from_context(ctx),
+        gas_limit,
+        0,
+        spec,
+        amsterdam_eip8037_enabled,
+        is_static,
+        gas_params,
+    )
+}
+
+/// Create the shared environment for an L1-backed precompile test.
+pub(crate) fn test_l1_env<P: L1StorageReader>(
+    ctx: &TestCtx,
+    l1_reader: P,
+) -> L1BackedPrecompileEnv<P> {
+    L1BackedPrecompileEnv::new(
+        &ctx.cfg,
+        l1_reader,
+        StorageActions::disabled(),
+        Rc::new(RefCell::new(NonCreditableSlots::empty())),
+    )
+}
+
+/// In-memory L1 storage reader shared by precompile tests.
+#[derive(Clone)]
+pub(crate) struct MockL1Reader {
+    slots: Arc<Mutex<HashMap<(Address, B256), B256>>>,
+    storage: Arc<Mutex<HashMapStorageProvider>>,
+    fallback: B256,
+    fail: bool,
+    policy_id: u64,
+}
+
+impl Default for MockL1Reader {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+            storage: Arc::new(Mutex::new(HashMapStorageProvider::new(1))),
+            fallback: B256::ZERO,
+            fail: false,
+            policy_id: 0,
+        }
+    }
+}
+
+impl MockL1Reader {
+    pub(crate) fn allow_all() -> Self {
+        Self::with_policy_id(1)
+    }
+
+    pub(crate) fn failing() -> Self {
+        Self {
+            fail: true,
+            ..Self::allow_all()
+        }
+    }
+
+    pub(crate) fn with_policy_id(policy_id: u64) -> Self {
+        Self {
+            policy_id,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn returning(value: B256) -> Self {
+        Self {
+            fallback: value,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn set_u256(&self, address: Address, slot: U256, value: U256) {
+        self.slots.lock().unwrap().insert(
+            (address, B256::from(slot.to_be_bytes())),
+            B256::from(value.to_be_bytes()),
+        );
+    }
+
+    pub(crate) fn seed_transfer_policy_id(&self, token: Address) {
+        let packed = U256::from(self.policy_id) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8);
+        self.set_u256(token, tip20_slots::TRANSFER_POLICY_ID, packed);
+    }
+
+    pub(crate) fn seed_blacklist_policy(
+        &self,
+        policy_id: u64,
+        accounts: &[Address],
+    ) -> tempo_precompiles::Result<()> {
+        let mut storage = self.storage.lock().unwrap();
+        StorageCtx::enter(&mut *storage, || {
+            let mut registry = TIP403Registry::new();
+            registry.policy_id_counter.write(policy_id + 1)?;
+            registry.policy_records[policy_id].base.write(PolicyData {
+                policy_type: tempo_contracts::precompiles::ITIP403Registry::PolicyType::BLACKLIST
+                    as u8,
+                admin: Address::ZERO,
+            })?;
+            for account in accounts {
+                registry.policy_set[policy_id][*account].write(true)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl crate::L1StorageReader for MockL1Reader {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        _block_number: u64,
+    ) -> Result<B256, PrecompileError> {
+        if self.fail {
+            return Err(PrecompileError::Fatal("RPC unavailable".into()));
+        }
+        if let Some(value) = self.slots.lock().unwrap().get(&(account, slot)).copied() {
+            return Ok(value);
+        }
+
+        let key = U256::from_be_bytes(slot.0);
+        let value = self
+            .storage
+            .lock()
+            .unwrap()
+            .sload(account, key)
+            .map_err(|err| PrecompileError::Fatal(err.to_string()))?;
+        if value.is_zero() {
+            Ok(self.fallback)
+        } else {
+            Ok(B256::from(value.to_be_bytes()))
+        }
+    }
+}
+
+/// Call a dynamic precompile with test defaults for value and reservoir.
+pub(crate) fn call_precompile_with_gas(
+    ctx: &mut TestCtx,
+    precompile: &DynPrecompile,
+    caller: Address,
+    data: &[u8],
+    gas: u64,
+    is_static: bool,
+    target: Address,
+    code: Address,
+) -> PrecompileResult {
+    AlloyEvmPrecompile::call(
+        precompile,
+        PrecompileInput {
+            data,
+            gas,
+            reservoir: 0,
+            caller,
+            value: U256::ZERO,
+            target_address: target,
+            is_static,
+            bytecode_address: code,
+            internals: EvmInternals::from_context(ctx),
+        },
+    )
+}
+
+#[rustfmt::skip]
+/// Call a dynamic precompile with unlimited gas and test defaults.
+pub(crate) fn call_precompile(
+    ctx: &mut TestCtx,
+    precompile: &DynPrecompile,
+    caller: Address,
+    data: &[u8],
+    is_static: bool,
+    target: Address,
+    code: Address,
+) -> PrecompileResult {
+    call_precompile_with_gas(ctx, precompile, caller, data, u64::MAX, is_static, target, code)
+}
 
 /// Assert that the Chaum-Pedersen proof inside a [`DecryptedDeposit`] is valid.
 pub(crate) fn assert_cp_proof_valid(

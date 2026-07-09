@@ -1,91 +1,191 @@
-//! Zone-side TIP-403 registry proxy precompile.
+//! Zone pre-execution rules and L1-backed execution for Tempo's TIP403 registry.
 //!
-//! Deployed at the same address as the L1 [`TIP403Registry`] (`0x403C…0000`), this
-//! precompile intercepts external EVM calls to the registry and serves authorization
-//! queries from the zone's [`PolicyCheck`] provider (cache-first, L1 RPC fallback).
+//! The canonical registry address forwards allowed calls to
+//! [`tempo_precompiles::tip403_registry::TIP403Registry`], which remains the source of
+//! truth for registry behavior. [`TIP403Rules`] rejects mutations before forwarding
+//! because policy state is managed on Tempo L1.
 //!
-//! **Read-only calls** (`isAuthorized`, `isAuthorizedSender`, `isAuthorizedRecipient`,
-//! `isAuthorizedMintRecipient`, `policyData`, `compoundPolicyData`, `policyExists`)
-//! are resolved via the [`PolicyCheck`] trait.
-//!
-//! **Mutating calls** (`createPolicy`, `modifyPolicyWhitelist`, etc.) are reverted —
-//! policy state is managed on L1, not on the zone.
-
-mod dispatch;
+//! Forwarded reads run against the zone's L1-backed storage provider and therefore
+//! observe registry state at the finalized Tempo anchor.
 
 use alloy_primitives::Address;
-use revm::precompile::PrecompileError;
-use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
-use zone_primitives::policy::AuthRole;
+use alloy_sol_types::{SolCall, SolError};
+use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
+use tempo_precompiles::storage::StorageCtx;
 
-use crate::policy::PolicyCheck;
+use crate::execution::{CallCheck, CallRules, ZoneCall};
 
-/// The precompile address — same as the L1 TIP403Registry.
-pub const ZONE_TIP403_PROXY_ADDRESS: Address = TIP403_REGISTRY_ADDRESS;
+/// Canonical TIP403 registry address, shared with Tempo L1.
+pub const ZONE_TIP403_ADDRESS: Address = TIP403_REGISTRY_ADDRESS;
 
-/// Fixed gas cost for authorization checks.
-pub const AUTH_CHECK_GAS: u64 = 200;
-
-/// Fixed gas cost for policy data lookups.
-const POLICY_DATA_GAS: u64 = 200;
+const TIP403_MUTATING_SELECTORS: &[[u8; 4]] = &[
+    ITIP403Registry::createPolicyCall::SELECTOR,
+    ITIP403Registry::createPolicyWithAccountsCall::SELECTOR,
+    ITIP403Registry::setPolicyAdminCall::SELECTOR,
+    ITIP403Registry::modifyPolicyWhitelistCall::SELECTOR,
+    ITIP403Registry::modifyPolicyBlacklistCall::SELECTOR,
+    ITIP403Registry::createCompoundPolicyCall::SELECTOR,
+    ITIP403Registry::setReceivePolicyCall::SELECTOR,
+];
 
 alloy_sol_types::sol! {
-    /// Returned when a mutating call is attempted on the read-only zone registry.
+    /// Returned when a mutation is attempted on the zone's L1-backed TIP403 registry.
     error ReadOnlyRegistry();
 }
 
-/// Read-only zone-side proxy that mirrors the L1 TIP-403 registry.
-///
-/// Unlike the L1 [`TIP403Registry`] (which is a storage-backed `#[contract]`
-/// precompile), this proxy has **no on-chain storage**. It intercepts EVM calls
-/// at the same address (`0x403C…0000`) and resolves authorization queries via
-/// the [`PolicyCheck`] trait.
-///
-/// All mutating calls (`createPolicy`, `modifyPolicyWhitelist`, etc.) are
-/// rejected with `ReadOnlyRegistry` — policy state lives exclusively on L1.
-///
-/// The struct also exposes [`is_authorized`](Self::is_authorized) and
-/// [`is_transfer_authorized`](Self::is_transfer_authorized) for use by the
-/// [`ZoneTip20Token`](super::ZoneTip20Token) precompile, which needs the same
-/// authorization logic during transfer/mint pre-checks.
-#[derive(Debug, Clone)]
-pub struct ZoneTip403ProxyRegistry<P> {
-    provider: P,
+/// Rules that keep the zone registry read-only before upstream execution.
+pub(crate) struct TIP403Rules;
+
+impl CallRules for TIP403Rules {
+    fn check_call(&self, call: ZoneCall<'_>) -> CallCheck {
+        if call
+            .selector
+            .is_some_and(|selector| TIP403_MUTATING_SELECTORS.contains(&selector))
+        {
+            return CallCheck::Return(Ok(
+                StorageCtx::default().revert_output(ReadOnlyRegistry {}.abi_encode().into())
+            ));
+        }
+
+        CallCheck::Continue
+    }
 }
 
-impl<P: PolicyCheck> ZoneTip403ProxyRegistry<P> {
-    /// Create a new proxy registry backed by the given policy provider.
-    pub fn new(provider: P) -> Self {
-        Self { provider }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloy_evm::precompiles::DynPrecompile;
+    use alloy_primitives::{Address, Bytes, U256, address};
+    use alloy_sol_types::SolCall;
+    use revm::precompile::PrecompileResult;
+    use tempo_precompiles::storage::StorageCtx;
+
+    use crate::{
+        create_tip403_precompile,
+        test_utils::{
+            MockL1Reader, TestCtx, call_precompile_with_gas, test_context, test_l1_env,
+            test_storage_provider,
+        },
+    };
+
+    struct RegistryHarness {
+        ctx: TestCtx,
+        precompile: DynPrecompile,
+        caller: Address,
     }
 
-    /// Resolve the `transferPolicyId` for a token.
-    pub fn resolve_transfer_policy_id(&self, token: Address) -> Result<u64, PrecompileError> {
-        self.provider.resolve_transfer_policy_id(token)
-    }
+    impl RegistryHarness {
+        fn new(l1: MockL1Reader) -> eyre::Result<Self> {
+            let mut ctx = test_context();
+            {
+                let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
+                StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+                    StorageCtx::default().sstore(
+                        zone_primitives::constants::TEMPO_STATE_ADDRESS,
+                        crate::tempo_state::slots::TEMPO_BLOCK_NUMBER,
+                        U256::from(77u64),
+                    )?;
+                    Ok(())
+                })?;
+            }
 
-    /// Check whether `user` is authorized under `policy_id` for the given `role`.
-    pub fn is_authorized(
-        &self,
-        policy_id: u64,
-        user: Address,
-        role: AuthRole,
-    ) -> Result<bool, PrecompileError> {
-        self.provider.is_authorized(policy_id, user, role)
-    }
-
-    /// Check sender + recipient authorization for a transfer.
-    ///
-    /// Short-circuits on sender failure (matching L1 T2 behavior).
-    pub fn is_transfer_authorized(
-        &self,
-        policy_id: u64,
-        from: Address,
-        to: Address,
-    ) -> Result<bool, PrecompileError> {
-        if !self.is_authorized(policy_id, from, AuthRole::Sender)? {
-            return Ok(false);
+            let env = test_l1_env(&ctx, l1);
+            let precompile = create_tip403_precompile(&env);
+            Ok(Self {
+                ctx,
+                precompile,
+                caller: address!("0x0000000000000000000000000000000000000aaa"),
+            })
         }
-        self.is_authorized(policy_id, to, AuthRole::Recipient)
+
+        fn call(&mut self, calldata: Bytes, is_static: bool) -> PrecompileResult {
+            call_precompile_with_gas(
+                &mut self.ctx,
+                &self.precompile,
+                self.caller,
+                &calldata,
+                100_000,
+                is_static,
+                crate::tip403_proxy::ZONE_TIP403_ADDRESS,
+                crate::tip403_proxy::ZONE_TIP403_ADDRESS,
+            )
+        }
+    }
+
+    #[test]
+    fn registry_reads_l1_policy_storage_through_overlay() -> eyre::Result<()> {
+        let alice = address!("0x00000000000000000000000000000000000000a1");
+        let bob = address!("0x00000000000000000000000000000000000000b2");
+        let l1 = MockL1Reader::default();
+        l1.seed_blacklist_policy(5, &[alice])?;
+        let mut harness = RegistryHarness::new(l1)?;
+
+        let counter = harness.call(
+            ITIP403Registry::policyIdCounterCall {}.abi_encode().into(),
+            true,
+        )?;
+        assert!(counter.is_success());
+        assert_eq!(
+            ITIP403Registry::policyIdCounterCall::abi_decode_returns(&counter.bytes)?,
+            6
+        );
+
+        let policy_data = harness.call(
+            ITIP403Registry::policyDataCall { policyId: 5 }
+                .abi_encode()
+                .into(),
+            true,
+        )?;
+        assert!(policy_data.is_success());
+        let decoded = ITIP403Registry::policyDataCall::abi_decode_returns(&policy_data.bytes)?;
+        assert_eq!(decoded.policyType, ITIP403Registry::PolicyType::BLACKLIST);
+
+        let alice_auth = harness.call(
+            ITIP403Registry::isAuthorizedCall {
+                policyId: 5,
+                user: alice,
+            }
+            .abi_encode()
+            .into(),
+            true,
+        )?;
+        assert!(alice_auth.is_success());
+        assert!(!ITIP403Registry::isAuthorizedCall::abi_decode_returns(
+            &alice_auth.bytes
+        )?);
+
+        let bob_auth = harness.call(
+            ITIP403Registry::isAuthorizedCall {
+                policyId: 5,
+                user: bob,
+            }
+            .abi_encode()
+            .into(),
+            true,
+        )?;
+        assert!(bob_auth.is_success());
+        assert!(ITIP403Registry::isAuthorizedCall::abi_decode_returns(
+            &bob_auth.bytes
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_rejects_mutating_selectors() -> eyre::Result<()> {
+        let mut harness = RegistryHarness::new(MockL1Reader::default())?;
+        let result = harness.call(
+            ITIP403Registry::createPolicyCall {
+                admin: harness.caller,
+                policyType: ITIP403Registry::PolicyType::BLACKLIST,
+            }
+            .abi_encode()
+            .into(),
+            false,
+        )?;
+        assert!(result.is_revert());
+        assert_eq!(result.bytes, Bytes::from(ReadOnlyRegistry {}.abi_encode()));
+        Ok(())
     }
 }
