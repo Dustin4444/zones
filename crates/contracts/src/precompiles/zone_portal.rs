@@ -19,7 +19,6 @@ crate::sol! {
             bytes32 senderTag;
             address to;
             uint128 amount;
-            uint128 fee;
             bytes32 memo;
             uint64 gasLimit;
             address fallbackRecipient;
@@ -344,6 +343,9 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
+            Self::RestrictedAccountOnly(_) => f.write_str("RestrictedAccountOnly"),
+            Self::InvalidRestrictedRecipient(_) => f.write_str("InvalidRestrictedRecipient"),
+            Self::InvalidRestrictedWithdrawal(_) => f.write_str("InvalidRestrictedWithdrawal"),
         }
     }
 }
@@ -379,7 +381,6 @@ impl Withdrawal {
             senderTag: sender_tag,
             to: event.to,
             amount: event.amount,
-            fee: event.fee,
             memo: event.memo,
             gasLimit: event.gasLimit,
             fallbackRecipient: event.fallbackRecipient,

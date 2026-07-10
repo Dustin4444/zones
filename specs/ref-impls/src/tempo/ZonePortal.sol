@@ -689,9 +689,8 @@ contract ZonePortal is IZonePortal {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Process the next withdrawal from the queue. Only callable by the sequencer.
-    /// @dev Fee transfer to the sequencer is best-effort.
-    ///      On withdrawal failure, only the amount (not fee) is bounced back.
-    ///      The token to transfer is read from the withdrawal struct.
+    /// @dev Withdrawal processing fees are paid entirely on L2 and are not part of the
+    ///      L1 withdrawal payload. The token to transfer is read from the withdrawal struct.
     function processWithdrawal(
         Withdrawal calldata withdrawal,
         bytes32 remainingQueue
@@ -711,18 +710,9 @@ contract ZonePortal is IZonePortal {
 
         if (
             restrictedAccount != address(0)
-                && (withdrawal.to != restrictedAccount
-                    || withdrawal.gasLimit == 0
-                    || withdrawal.fee != 0)
+                && (withdrawal.to != restrictedAccount || withdrawal.gasLimit == 0)
         ) {
             revert InvalidRestrictedWithdrawal();
-        }
-
-        // Transfer fee to sequencer.
-        if (withdrawal.fee > 0) {
-            // Fee transfer can fail for e.g. TIP-403 blacklist. The sequencer
-            // forgoes the fee so the withdrawal itself does not stall.
-            _tryTransfer(_token, sequencer, withdrawal.fee);
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {

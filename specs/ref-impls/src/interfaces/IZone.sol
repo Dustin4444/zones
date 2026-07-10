@@ -275,8 +275,7 @@ struct Withdrawal {
     address token; // TIP-20 token being withdrawn
     bytes32 senderTag; // keccak256(abi.encodePacked(sender, txHash))
     address to; // Tempo recipient
-    uint128 amount; // amount to send to recipient (excludes fee)
-    uint128 fee; // legacy L1 processing fee; zero for L2-paid user withdrawals
+    uint128 amount; // amount to send to recipient
     bytes32 memo; // user-provided context
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     address fallbackRecipient; // zone address for bounce-back if call fails
@@ -289,8 +288,7 @@ struct PendingWithdrawal {
     address sender; // who initiated the withdrawal on the zone
     bytes32 txHash; // hash of the zone transaction that requested the withdrawal
     address to; // Tempo recipient
-    uint128 amount; // amount to send to recipient (excludes fee)
-    uint128 fee; // L1 processing fee; user withdrawals set this to zero
+    uint128 amount; // amount to send to recipient
     bytes32 memo; // user-provided context
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     address fallbackRecipient; // zone address for bounce-back if call fails

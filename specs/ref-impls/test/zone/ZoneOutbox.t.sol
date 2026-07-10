@@ -96,7 +96,6 @@ contract ZoneOutboxTest is Test {
             senderTag: _senderTag(sender, txSequence),
             to: to,
             amount: amount,
-            fee: 0,
             memo: memo,
             gasLimit: gasLimit,
             fallbackRecipient: fallbackRecipient,
@@ -137,7 +136,6 @@ contract ZoneOutboxTest is Test {
             senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
             to: bob,
             amount: amount,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
             fallbackRecipient: address(0),
@@ -570,9 +568,6 @@ contract ZoneOutboxTest is Test {
         assertEq(zoneToken.balanceOf(alice), aliceBefore - amount - expectedFee);
         assertEq(zoneToken.balanceOf(sequencer), sequencerBefore + expectedFee);
         assertEq(zoneToken.totalSupply(), supplyBefore - amount);
-
-        PendingWithdrawal[] memory pending = outbox.getPendingWithdrawals();
-        assertEq(pending[0].fee, 0);
     }
 
     /// @notice Callback data exactly at the maximum size is accepted (boundary is inclusive).

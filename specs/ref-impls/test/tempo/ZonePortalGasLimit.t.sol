@@ -84,7 +84,6 @@ contract ZonePortalGasLimitTest is Test {
             senderTag: keccak256("sender"),
             to: recipient,
             amount: 500e6,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: portal.MAX_WITHDRAWAL_GAS_LIMIT() + 1,
             fallbackRecipient: fallbackRecipient,
@@ -198,7 +197,6 @@ contract ZonePortalGasLimitTest is Test {
             senderTag: keccak256("sender"),
             to: recipient,
             amount: 500e6,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
             fallbackRecipient: fallbackRecipient,
@@ -215,36 +213,12 @@ contract ZonePortalGasLimitTest is Test {
         assertTrue(restrictedPortal.withdrawalQueueSlot(0) != EMPTY_SENTINEL);
     }
 
-    function test_restrictedPortal_revertsAndRetainsWithdrawalWithNonzeroL1Fee() public {
-        Withdrawal memory w = Withdrawal({
-            token: address(token),
-            senderTag: keccak256("sender"),
-            to: recipient,
-            amount: 500e6,
-            fee: 1,
-            memo: bytes32(0),
-            gasLimit: 50_000,
-            fallbackRecipient: fallbackRecipient,
-            callbackData: "",
-            encryptedSender: ""
-        });
-        _storeSingleWithdrawal(restrictedPortal, w);
-
-        vm.expectRevert(IZonePortal.InvalidRestrictedWithdrawal.selector);
-        restrictedPortal.processWithdrawal(w, bytes32(0));
-
-        assertEq(token.balanceOf(address(this)), 0);
-        assertEq(restrictedPortal.withdrawalQueueHead(), 0);
-        assertTrue(restrictedPortal.withdrawalQueueSlot(0) != EMPTY_SENTINEL);
-    }
-
     function test_restrictedPortal_revertsAndRetainsWithdrawalForWrongRecipient() public {
         Withdrawal memory w = Withdrawal({
             token: address(token),
             senderTag: keccak256("sender"),
             to: address(0xdead),
             amount: 500e6,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 50_000,
             fallbackRecipient: fallbackRecipient,
@@ -275,7 +249,6 @@ contract ZonePortalGasLimitTest is Test {
             senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
             to: recipient,
             amount: amount,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
             fallbackRecipient: address(0),
