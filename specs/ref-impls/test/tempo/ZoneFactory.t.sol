@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, ZoneInfo, ZoneParams } from "../../src/interfaces/IZone.sol";
+import {
+    IZoneFactory,
+    IZonePortal,
+    RestrictedFlowConfig,
+    ZoneInfo,
+    ZoneParams
+} from "../../src/interfaces/IZone.sol";
 import { ZoneFactory } from "../../src/tempo/ZoneFactory.sol";
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
@@ -86,6 +92,38 @@ contract ZoneFactoryTest is BaseTest {
         // Verify portal references the messenger
         ZonePortal portalContract = ZonePortal(portal);
         assertEq(portalContract.messenger(), messengerAddr);
+    }
+
+    function test_createRestrictedZone_enforcesSoleDepositorAndBouncebackRecipient() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        RestrictedFlowConfig memory restrictedFlow = RestrictedFlowConfig({
+            account: alice, vaultAsset: address(pathUSD), vaultReceipt: address(0x701)
+        });
+
+        (, address portalAddress) = zoneFactory.createRestrictedZone(params, restrictedFlow);
+        ZonePortal restrictedPortal = ZonePortal(portalAddress);
+        assertEq(restrictedPortal.restrictedAccount(), alice);
+        ZoneMessenger restrictedMessenger = ZoneMessenger(restrictedPortal.messenger());
+        assertEq(restrictedMessenger.restrictedTarget(), alice);
+        assertEq(restrictedMessenger.vaultAsset(), address(pathUSD));
+        assertEq(restrictedMessenger.vaultReceipt(), address(0x701));
+
+        vm.prank(bob);
+        vm.expectRevert(IZonePortal.RestrictedAccountOnly.selector);
+        restrictedPortal.deposit(address(pathUSD), bob, 1e6, bytes32(0), alice);
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.InvalidRestrictedRecipient.selector);
+        restrictedPortal.deposit(address(pathUSD), alice, 1e6, bytes32(0), bob);
+    }
+
+    function test_createRestrictedZone_revertsForPartialConfig() public {
+        RestrictedFlowConfig memory restrictedFlow = RestrictedFlowConfig({
+            account: alice, vaultAsset: address(pathUSD), vaultReceipt: address(0)
+        });
+
+        vm.expectRevert(IZoneFactory.InvalidRestrictedFlowConfig.selector);
+        zoneFactory.createRestrictedZone(_defaultParams(), restrictedFlow);
     }
 
     function test_createZone_multipleZones() public {

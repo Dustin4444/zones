@@ -20,8 +20,9 @@ import { EMPTY_SENTINEL } from "../libraries/WithdrawalQueueLib.sol";
 
 /// @title ZoneOutbox
 /// @notice Zone-side predeploy for requesting withdrawals back to Tempo
-/// @dev Burns zone tokens and stores pending withdrawals. Sequencer calls finalizeWithdrawalBatch()
-///      at the end of a block to construct withdrawal queue hash on-chain.
+/// @dev Burns withdrawn zone tokens, pays fees to the sequencer on L2, and stores pending
+///      withdrawals. Sequencer calls finalizeWithdrawalBatch() at the end of a block to construct
+///      withdrawal queue hash on-chain.
 contract ZoneOutbox is IZoneOutbox {
 
     /*//////////////////////////////////////////////////////////////
@@ -219,7 +220,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Shared implementation for withdrawal requests with optional sender reveal
     /// @dev Validates the callback gas cap before fee calculation and before storing
     ///      the withdrawal, so over-cap requests cannot enter the L2 withdrawal queue.
-    ///      Transfers and burns `amount + fee` before appending the pending withdrawal.
+    ///      Burns `amount` and pays `fee` to the sequencer on L2 before appending the withdrawal.
     /// @param token The TIP-20 token to withdraw
     /// @param to The Tempo recipient address
     /// @param amount Amount to send to recipient (fee is additional)
@@ -270,23 +271,22 @@ contract ZoneOutbox is IZoneOutbox {
             _withdrawalsThisBlock++;
         }
 
-        // Calculate processing fee (locked in at request time)
-        // Fee is paid in the same token being withdrawn
+        // Calculate and pay the processing fee on L2 in the token being withdrawn.
         uint128 fee = _calculateWithdrawalFee(gasLimit);
-        uint128 totalBurn = amount + fee;
+        uint128 totalDebit = amount + fee;
         bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
         if (txHash == bytes32(0)) revert InvalidCurrentTxHash();
 
-        // Transfer tokens from sender to this contract, then burn
+        // Transfer the withdrawal amount and fee from the sender.
         // (Using transferFrom so user must approve first)
         IZoneToken zoneToken = IZoneToken(token);
-        if (!zoneToken.transferFrom(msg.sender, address(this), totalBurn)) {
+        if (!zoneToken.transferFrom(msg.sender, address(this), totalDebit)) {
             revert TransferFailed();
         }
 
-        // Burn the tokens (they'll be released on Tempo when withdrawal is processed)
-        // Amount goes to recipient, fee goes to sequencer
-        zoneToken.burn(totalBurn);
+        // Burn only the bridged amount. The processing fee is paid to the sequencer on L2.
+        zoneToken.burn(amount);
+        if (fee > 0 && !zoneToken.transfer(config.sequencer(), fee)) revert TransferFailed();
 
         // Store withdrawal in pending array
         _pendingWithdrawals.push(
@@ -296,7 +296,7 @@ contract ZoneOutbox is IZoneOutbox {
                 txHash: txHash,
                 to: to,
                 amount: amount,
-                fee: fee,
+                fee: 0,
                 memo: memo,
                 gasLimit: gasLimit,
                 fallbackRecipient: fallbackRecipient,

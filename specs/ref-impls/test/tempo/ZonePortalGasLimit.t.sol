@@ -43,6 +43,7 @@ contract ZonePortalGasLimitTest is Test {
     uint256 internal constant WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT = 13;
 
     ZonePortal public portal;
+    ZonePortal public restrictedPortal;
     MockPortalToken public token;
 
     address public admin = address(0x500);
@@ -60,6 +61,19 @@ contract ZonePortalGasLimitTest is Test {
             address(0),
             keccak256("genesis"),
             uint64(block.number),
+            address(0),
+            ""
+        );
+        restrictedPortal = new ZonePortal(
+            2,
+            address(token),
+            address(0x401),
+            admin,
+            address(this),
+            address(0),
+            keccak256("restricted genesis"),
+            uint64(block.number),
+            recipient,
             ""
         );
     }
@@ -163,6 +177,63 @@ contract ZonePortalGasLimitTest is Test {
         assertEq(portal.refunds(address(token), recipient), 0);
     }
 
+    function test_restrictedPortal_depositBounceBackAlwaysPaysRestrictedAccount() public {
+        token.mint(address(restrictedPortal), 1000e6);
+        uint128 bouncebackFee = restrictedPortal.calculateBouncebackFee();
+        uint128 refundAmount = 1000e6 - bouncebackFee;
+
+        Withdrawal memory w = _depositBounceBackWithdrawal(1000e6);
+        w.to = address(0xdead);
+        _storeSingleWithdrawal(restrictedPortal, w);
+
+        restrictedPortal.processWithdrawal(w, bytes32(0));
+
+        assertEq(token.balanceOf(recipient), refundAmount);
+        assertEq(token.balanceOf(address(0xdead)), 0);
+    }
+
+    function test_restrictedPortal_bouncesWithdrawalWithoutCallback() public {
+        Withdrawal memory w = Withdrawal({
+            token: address(token),
+            senderTag: keccak256("sender"),
+            to: recipient,
+            amount: 500e6,
+            fee: 0,
+            memo: bytes32(0),
+            gasLimit: 0,
+            fallbackRecipient: fallbackRecipient,
+            callbackData: "",
+            encryptedSender: ""
+        });
+        _storeSingleWithdrawal(restrictedPortal, w);
+
+        restrictedPortal.processWithdrawal(w, bytes32(0));
+
+        assertEq(token.balanceOf(recipient), 0);
+        assertTrue(restrictedPortal.currentDepositQueueHash() != bytes32(0));
+    }
+
+    function test_restrictedPortal_bouncesWithdrawalWithNonzeroL1Fee() public {
+        Withdrawal memory w = Withdrawal({
+            token: address(token),
+            senderTag: keccak256("sender"),
+            to: recipient,
+            amount: 500e6,
+            fee: 1,
+            memo: bytes32(0),
+            gasLimit: 50_000,
+            fallbackRecipient: fallbackRecipient,
+            callbackData: "",
+            encryptedSender: ""
+        });
+        _storeSingleWithdrawal(restrictedPortal, w);
+
+        restrictedPortal.processWithdrawal(w, bytes32(0));
+
+        assertEq(token.balanceOf(address(this)), 0);
+        assertTrue(restrictedPortal.currentDepositQueueHash() != bytes32(0));
+    }
+
     function _withdrawalQueueSlot(uint256 slot) internal pure returns (bytes32) {
         return keccak256(abi.encode(slot, WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT));
     }
@@ -187,8 +258,14 @@ contract ZonePortalGasLimitTest is Test {
     }
 
     function _storeSingleWithdrawal(Withdrawal memory w) internal {
-        vm.store(address(portal), bytes32(WITHDRAWAL_QUEUE_TAIL_SLOT), bytes32(uint256(1)));
-        vm.store(address(portal), _withdrawalQueueSlot(0), keccak256(abi.encode(w, EMPTY_SENTINEL)));
+        _storeSingleWithdrawal(portal, w);
+    }
+
+    function _storeSingleWithdrawal(ZonePortal targetPortal, Withdrawal memory w) internal {
+        vm.store(address(targetPortal), bytes32(WITHDRAWAL_QUEUE_TAIL_SLOT), bytes32(uint256(1)));
+        vm.store(
+            address(targetPortal), _withdrawalQueueSlot(0), keccak256(abi.encode(w, EMPTY_SENTINEL))
+        );
     }
 
 }

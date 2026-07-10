@@ -70,6 +70,7 @@ contract ZonePortal is IZonePortal {
     address public immutable messenger;
     address public immutable verifier;
     uint64 public immutable genesisTempoBlockNumber;
+    address public immutable restrictedAccount;
 
     /// @notice Current sequencer address
     address public sequencer;
@@ -141,6 +142,7 @@ contract ZonePortal is IZonePortal {
         address _verifier,
         bytes32 _genesisBlockHash,
         uint64 _genesisTempoBlockNumber,
+        address _restrictedAccount,
         string memory _rpcUrl
     ) {
         zoneId = _zoneId;
@@ -150,6 +152,7 @@ contract ZonePortal is IZonePortal {
         verifier = _verifier;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
+        restrictedAccount = _restrictedAccount;
         rpcUrl = _rpcUrl;
 
         // Enable the initial token
@@ -483,6 +486,12 @@ contract ZonePortal is IZonePortal {
         if (!cfg.depositsActive) revert DepositsNotActive();
     }
 
+    function _validateRestrictedDeposit(address bouncebackRecipient) internal view {
+        if (restrictedAccount == address(0)) return;
+        if (msg.sender != restrictedAccount) revert RestrictedAccountOnly();
+        if (bouncebackRecipient != restrictedAccount) revert InvalidRestrictedRecipient();
+    }
+
     function _validateDepositPolicy(
         address _token,
         address to,
@@ -549,6 +558,7 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
+        _validateRestrictedDeposit(bouncebackRecipient);
 
         _validateDepositsActive(_token);
         _validateDepositPolicy(_token, to, bouncebackRecipient);
@@ -602,6 +612,7 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (bouncebackRecipient == address(0)) revert InvalidBouncebackRecipient();
+        _validateRestrictedDeposit(bouncebackRecipient);
 
         _validateDepositsActive(_token);
 
@@ -698,6 +709,19 @@ contract ZonePortal is IZonePortal {
             return;
         }
 
+        if (
+            restrictedAccount != address(0)
+                && (withdrawal.to != restrictedAccount
+                    || withdrawal.gasLimit == 0
+                    || withdrawal.fee != 0)
+        ) {
+            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
+            emit WithdrawalProcessed(
+                withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
+            );
+            return;
+        }
+
         // Transfer fee to sequencer.
         if (withdrawal.fee > 0) {
             // Fee transfer can fail for e.g. TIP-403 blacklist. The sequencer
@@ -743,6 +767,7 @@ contract ZonePortal is IZonePortal {
 
     function _processDepositBounceBack(Withdrawal calldata withdrawal) internal {
         address _token = withdrawal.token;
+        address recipient = restrictedAccount == address(0) ? withdrawal.to : restrictedAccount;
         uint128 bouncebackFee = calculateBouncebackFee();
         if (bouncebackFee > withdrawal.amount) {
             bouncebackFee = withdrawal.amount;
@@ -755,13 +780,13 @@ contract ZonePortal is IZonePortal {
             _tryTransfer(_token, sequencer, bouncebackFee); // ignore failure
         }
 
-        bool success = _tryTransfer(_token, withdrawal.to, refundAmount);
+        bool success = _tryTransfer(_token, recipient, refundAmount);
 
         if (success) {
-            emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);
+            emit DepositBounceBack(recipient, _token, refundAmount, bouncebackFee);
         } else {
-            refunds[_token][withdrawal.to] += refundAmount;
-            emit DepositBounceBackPending(withdrawal.to, _token, refundAmount, bouncebackFee);
+            refunds[_token][recipient] += refundAmount;
+            emit DepositBounceBackPending(recipient, _token, refundAmount, bouncebackFee);
         }
     }
 

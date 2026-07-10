@@ -41,6 +41,29 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
 
 }
 
+contract ConsumingWithdrawalReceiver is IWithdrawalReceiver {
+
+    address public immutable sink;
+
+    constructor(address _sink) {
+        sink = _sink;
+    }
+
+    function onWithdrawalReceived(
+        bytes32,
+        address token,
+        uint128 amount,
+        bytes calldata
+    )
+        external
+        returns (bytes4)
+    {
+        ITIP20(token).transfer(sink, amount);
+        return IWithdrawalReceiver.onWithdrawalReceived.selector;
+    }
+
+}
+
 contract ZoneMessengerTest is BaseTest {
 
     ZoneMessenger public messenger;
@@ -49,8 +72,7 @@ contract ZoneMessengerTest is BaseTest {
     address public token = address(0x701);
 
     function setUp() public override {
-        super.setUp();
-        messenger = new ZoneMessenger(portal);
+        messenger = new ZoneMessenger(portal, address(0), address(0), address(0));
         zoneToken = new MockZoneToken("Zone USD", "zUSD");
         zoneToken.setMinter(address(this), true);
     }
@@ -118,6 +140,58 @@ contract ZoneMessengerTest is BaseTest {
         );
 
         assertEq(zoneToken.balanceOf(address(receiver)), 123);
+    }
+
+    function test_restrictedRelay_revertsForWrongTarget() public {
+        AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
+        ZoneMessenger restricted =
+            new ZoneMessenger(portal, address(receiver), token, address(zoneToken));
+
+        vm.prank(portal);
+        vm.expectRevert(ZoneMessenger.InvalidRestrictedTarget.selector);
+        restricted.relayMessage(token, bytes32("sender"), alice, 1, 50_000, "");
+    }
+
+    function test_restrictedRelay_revertsForNonVaultToken() public {
+        AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
+        ZoneMessenger restricted =
+            new ZoneMessenger(portal, address(receiver), address(zoneToken), address(0x702));
+
+        vm.prank(portal);
+        vm.expectRevert(ZoneMessenger.InvalidVaultToken.selector);
+        restricted.relayMessage(token, bytes32("sender"), address(receiver), 1, 50_000, "");
+    }
+
+    function test_restrictedRelay_revertsUnlessVaultTokenBalanceDecreases() public {
+        AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
+        ZoneMessenger restricted =
+            new ZoneMessenger(portal, address(receiver), address(zoneToken), address(0x702));
+        zoneToken.mint(portal, 123);
+        vm.prank(portal);
+        zoneToken.approve(address(restricted), 123);
+
+        vm.prank(portal);
+        vm.expectRevert(ZoneMessenger.VaultTokenNotConsumed.selector);
+        restricted.relayMessage(
+            address(zoneToken), bytes32("sender"), address(receiver), 123, 1_000_000, ""
+        );
+    }
+
+    function test_restrictedRelay_succeedsWhenVaultTokenBalanceDecreases() public {
+        ConsumingWithdrawalReceiver receiver = new ConsumingWithdrawalReceiver(alice);
+        ZoneMessenger restricted =
+            new ZoneMessenger(portal, address(receiver), address(zoneToken), address(0x702));
+        zoneToken.mint(portal, 123);
+        vm.prank(portal);
+        zoneToken.approve(address(restricted), 123);
+
+        vm.prank(portal);
+        restricted.relayMessage(
+            address(zoneToken), bytes32("sender"), address(receiver), 123, 1_000_000, ""
+        );
+
+        assertEq(zoneToken.balanceOf(address(receiver)), 0);
+        assertEq(zoneToken.balanceOf(alice), 123);
     }
 
     /// @notice Verifies valid relays transfer any bounded amount to the receiver.

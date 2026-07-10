@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, ZoneInfo } from "../interfaces/IZone.sol";
+import { IZoneFactory, RestrictedFlowConfig, ZoneInfo } from "../interfaces/IZone.sol";
 import { Verifier } from "./Verifier.sol";
 import { ZoneMessenger } from "./ZoneMessenger.sol";
 import { ZonePortal } from "./ZonePortal.sol";
@@ -53,6 +53,36 @@ contract ZoneFactory is IZoneFactory {
         external
         returns (uint32 zoneId, address portal)
     {
+        return _createZone(
+            params,
+            RestrictedFlowConfig({
+                account: address(0), vaultAsset: address(0), vaultReceipt: address(0)
+            })
+        );
+    }
+
+    function createRestrictedZone(
+        CreateZoneParams calldata params,
+        RestrictedFlowConfig calldata restrictedFlow
+    )
+        external
+        returns (uint32 zoneId, address portal)
+    {
+        if (
+            restrictedFlow.account == address(0) || restrictedFlow.vaultAsset == address(0)
+                || restrictedFlow.vaultReceipt == address(0)
+                || restrictedFlow.vaultAsset == restrictedFlow.vaultReceipt
+        ) revert InvalidRestrictedFlowConfig();
+        return _createZone(params, restrictedFlow);
+    }
+
+    function _createZone(
+        CreateZoneParams calldata params,
+        RestrictedFlowConfig memory restrictedFlow
+    )
+        internal
+        returns (uint32 zoneId, address portal)
+    {
         // Validate initial token is a TIP-20
         if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(params.initialToken)) {
             revert InvalidToken();
@@ -83,7 +113,12 @@ contract ZoneFactory is IZoneFactory {
         address predictedPortal = _computeCreateAddress(address(this), currentNonce + 1);
 
         // Deploy messenger with predicted portal address (no token needed -- portal grants approval per-token)
-        ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
+        ZoneMessenger messengerContract = new ZoneMessenger(
+            predictedPortal,
+            restrictedFlow.account,
+            restrictedFlow.vaultAsset,
+            restrictedFlow.vaultReceipt
+        );
         address messengerAddress = address(messengerContract);
 
         // Deploy portal with messenger address and initial token
@@ -97,6 +132,7 @@ contract ZoneFactory is IZoneFactory {
             params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockNumber,
+            restrictedFlow.account,
             params.rpcUrl
         );
         portal = address(portalContract);

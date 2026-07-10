@@ -16,6 +16,9 @@ contract ZoneMessenger is IZoneMessenger {
 
     /// @notice The zone's portal address
     address public immutable portal;
+    address public immutable restrictedTarget;
+    address public immutable vaultAsset;
+    address public immutable vaultReceipt;
 
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
@@ -24,13 +27,31 @@ contract ZoneMessenger is IZoneMessenger {
     error OnlyPortal();
     error CallbackRejected();
     error TransferFailed();
+    error InvalidRestrictedConfig();
+    error InvalidRestrictedTarget();
+    error InvalidVaultToken();
+    error VaultTokenNotConsumed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    constructor(address _portal) {
+    constructor(
+        address _portal,
+        address _restrictedTarget,
+        address _vaultAsset,
+        address _vaultReceipt
+    ) {
+        bool unrestricted = _restrictedTarget == address(0) && _vaultAsset == address(0)
+            && _vaultReceipt == address(0);
+        bool restricted = _restrictedTarget != address(0) && _vaultAsset != address(0)
+            && _vaultReceipt != address(0) && _vaultAsset != _vaultReceipt;
+        if (!unrestricted && !restricted) revert InvalidRestrictedConfig();
+
         portal = _portal;
+        restrictedTarget = _restrictedTarget;
+        vaultAsset = _vaultAsset;
+        vaultReceipt = _vaultReceipt;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -65,19 +86,37 @@ contract ZoneMessenger is IZoneMessenger {
         external
         onlyPortal
     {
+        bool restricted = restrictedTarget != address(0);
+        if (restricted && target != restrictedTarget) revert InvalidRestrictedTarget();
+        if (restricted && token != vaultAsset && token != vaultReceipt) {
+            revert InvalidVaultToken();
+        }
+
         // Transfer tokens from portal to target
         if (!ITIP20(token).transferFrom(portal, target, amount)) {
             revert TransferFailed();
         }
 
-        // Call the receiver (includes token address for multi-asset awareness)
-        bytes4 selector = IWithdrawalReceiver(target).onWithdrawalReceived{ gas: gasLimit }(
-            senderTag, token, amount, data
+        uint256 balanceBeforeCallback;
+        if (restricted) balanceBeforeCallback = ITIP20(token).balanceOf(target);
+
+        // Call only the standardized withdrawal receiver entrypoint.
+        (bool callbackSuccess, bytes memory returnData) = target.call{ gas: gasLimit }(
+            abi.encodeCall(
+                IWithdrawalReceiver.onWithdrawalReceived, (senderTag, token, amount, data)
+            )
         );
 
         // Verify the callback returned the correct selector
-        if (selector != IWithdrawalReceiver.onWithdrawalReceived.selector) {
+        if (
+            !callbackSuccess || returnData.length != 32
+                || abi.decode(returnData, (bytes4))
+                    != IWithdrawalReceiver.onWithdrawalReceived.selector
+        ) {
             revert CallbackRejected();
+        }
+        if (restricted && ITIP20(token).balanceOf(target) >= balanceBeforeCallback) {
+            revert VaultTokenNotConsumed();
         }
     }
 

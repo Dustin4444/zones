@@ -31,6 +31,11 @@ crate::sol! {
             ZoneParams zoneParams;
             string rpcUrl;
         }
+        struct RestrictedFlowConfig {
+            address account;
+            address vaultAsset;
+            address vaultReceipt;
+        }
         event ZoneCreated(
             uint32 indexed zoneId,
             address indexed portal,
@@ -44,6 +49,10 @@ crate::sol! {
             uint64 genesisTempoBlockNumber
         );
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
+        function createRestrictedZone(
+            CreateZoneParams calldata params,
+            RestrictedFlowConfig calldata restrictedFlow
+        ) external returns (uint32 zoneId, address portal);
         function verifier() external view returns (address);
         function zones(uint32 zoneId) external view returns (ZoneInfo memory);
         function zoneCount() external view returns (uint32);

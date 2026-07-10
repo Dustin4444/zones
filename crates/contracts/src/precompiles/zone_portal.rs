@@ -166,11 +166,14 @@ crate::sol! {
         error InvalidTempoBlockNumber();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
+        error RestrictedAccountOnly();
+        error InvalidRestrictedRecipient();
 
         // -- View functions --
 
         function zoneId() external view returns (uint32);
         function admin() external view returns (address);
+        function restrictedAccount() external view returns (address);
         function sequencer() external view returns (address);
         function verifier() external view returns (address);
         function sequencerPubkey() external view returns (bytes32);

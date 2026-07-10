@@ -95,7 +95,8 @@ contract ZoneIntegrationTest is BaseTest {
         // Deploy messenger and portal directly (bypass factory TIP20 prefix check)
         uint256 currentNonce = vm.getNonce(address(this));
         address predictedPortal = vm.computeCreateAddress(address(this), currentNonce + 1);
-        ZoneMessenger messengerContract = new ZoneMessenger(predictedPortal);
+        ZoneMessenger messengerContract =
+            new ZoneMessenger(predictedPortal, address(0), address(0), address(0));
         l1Portal = new ZonePortal(
             1,
             address(l2ZoneToken),
@@ -105,6 +106,7 @@ contract ZoneIntegrationTest is BaseTest {
             l1Factory.verifier(),
             GENESIS_BLOCK_HASH,
             genesisTempoBlockNumber,
+            address(0),
             ""
         );
         zoneId = 1;

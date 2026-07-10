@@ -548,7 +548,7 @@ contract ZoneOutboxTest is Test {
     ///      the same as `amount`; a non-zero rate and gas limit make the fee observable.
     ///      The expected fee hardcodes WITHDRAWAL_BASE_GAS (50_000) so a mutated base-gas
     ///      constant is also caught.
-    function test_requestWithdrawal_burnsAmountPlusFee() public {
+    function test_requestWithdrawal_burnsAmountAndPaysFeeToSequencerOnL2() public {
         uint128 rate = 3;
         uint64 gasLimit = 100_000;
         vm.prank(sequencer);
@@ -559,6 +559,7 @@ contract ZoneOutboxTest is Test {
         assertGt(expectedFee, 0);
 
         uint256 aliceBefore = zoneToken.balanceOf(alice);
+        uint256 sequencerBefore = zoneToken.balanceOf(sequencer);
         uint256 supplyBefore = zoneToken.totalSupply();
 
         vm.startPrank(alice);
@@ -567,7 +568,11 @@ contract ZoneOutboxTest is Test {
         vm.stopPrank();
 
         assertEq(zoneToken.balanceOf(alice), aliceBefore - amount - expectedFee);
-        assertEq(zoneToken.totalSupply(), supplyBefore - amount - expectedFee);
+        assertEq(zoneToken.balanceOf(sequencer), sequencerBefore + expectedFee);
+        assertEq(zoneToken.totalSupply(), supplyBefore - amount);
+
+        PendingWithdrawal[] memory pending = outbox.getPendingWithdrawals();
+        assertEq(pending[0].fee, 0);
     }
 
     /// @notice Callback data exactly at the maximum size is accepted (boundary is inclusive).

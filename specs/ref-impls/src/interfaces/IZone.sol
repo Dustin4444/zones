@@ -276,7 +276,7 @@ struct Withdrawal {
     bytes32 senderTag; // keccak256(abi.encodePacked(sender, txHash))
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
-    uint128 fee; // processing fee for sequencer (calculated at request time)
+    uint128 fee; // legacy L1 processing fee; zero for L2-paid user withdrawals
     bytes32 memo; // user-provided context
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     address fallbackRecipient; // zone address for bounce-back if call fails
@@ -290,12 +290,18 @@ struct PendingWithdrawal {
     bytes32 txHash; // hash of the zone transaction that requested the withdrawal
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
-    uint128 fee; // processing fee for sequencer (calculated at request time)
+    uint128 fee; // L1 processing fee; user withdrawals set this to zero
     bytes32 memo; // user-provided context
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     address fallbackRecipient; // zone address for bounce-back if call fails
     bytes callbackData; // calldata for IWithdrawalReceiver (if gasLimit > 0)
     bytes revealTo; // optional compressed secp256k1 pubkey for sender reveal encryption
+}
+
+struct RestrictedFlowConfig {
+    address account; // sole depositor, withdrawal recipient, and callback target
+    address vaultAsset; // accepted vault asset for callbacks
+    address vaultReceipt; // accepted vault receipt token for callbacks
 }
 
 /*//////////////////////////////////////////////////////////////
@@ -437,6 +443,7 @@ interface IZoneFactory {
     error InvalidVerifier();
     error InsufficientGas();
     error ZoneIdOverflow();
+    error InvalidRestrictedFlowConfig();
 
     /// @notice Returns whether a verifier contract is approved for zone creation.
     /// @param verifier The verifier contract address to check.
@@ -448,6 +455,13 @@ interface IZoneFactory {
     /// @return zoneId The newly assigned zone ID.
     /// @return portal The deployed portal address for the new zone.
     function createZone(CreateZoneParams calldata params)
+        external
+        returns (uint32 zoneId, address portal);
+
+    function createRestrictedZone(
+        CreateZoneParams calldata params,
+        RestrictedFlowConfig calldata restrictedFlow
+    )
         external
         returns (uint32 zoneId, address portal);
 
@@ -611,6 +625,8 @@ interface IZonePortal {
     error TokenAlreadyEnabled();
     error InvalidBouncebackRecipient();
     error InvalidDepositTransition();
+    error RestrictedAccountOnly();
+    error InvalidRestrictedRecipient();
 
     /// @notice Fixed gas value for deposit fee calculation (100,000 gas)
     function FIXED_DEPOSIT_GAS() external view returns (uint64);
@@ -627,6 +643,8 @@ interface IZonePortal {
     function zoneId() external view returns (uint32);
 
     function messenger() external view returns (address);
+
+    function restrictedAccount() external view returns (address);
 
     function sequencer() external view returns (address);
 
