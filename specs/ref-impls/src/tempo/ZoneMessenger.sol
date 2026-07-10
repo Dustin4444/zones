@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IWithdrawalReceiver, IZoneMessenger } from "../interfaces/IZone.sol";
+import { IWithdrawalReceiver, IZoneMessenger, IZonePortal } from "../interfaces/IZone.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 /// @title ZoneMessenger
@@ -30,7 +30,7 @@ contract ZoneMessenger is IZoneMessenger {
     error InvalidRestrictedConfig();
     error InvalidRestrictedTarget();
     error InvalidVaultToken();
-    error VaultTokenNotConsumed();
+    error VaultSwapInvariantViolated();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -92,6 +92,15 @@ contract ZoneMessenger is IZoneMessenger {
             revert InvalidVaultToken();
         }
 
+        address outputToken;
+        uint256 outputPortalBalanceBefore;
+        bytes32 depositQueueHashBefore;
+        if (restricted) {
+            outputToken = token == vaultAsset ? vaultReceipt : vaultAsset;
+            outputPortalBalanceBefore = ITIP20(outputToken).balanceOf(portal);
+            depositQueueHashBefore = IZonePortal(portal).currentDepositQueueHash();
+        }
+
         // Transfer tokens from portal to target
         if (!ITIP20(token).transferFrom(portal, target, amount)) {
             revert TransferFailed();
@@ -115,8 +124,13 @@ contract ZoneMessenger is IZoneMessenger {
         ) {
             revert CallbackRejected();
         }
-        if (restricted && ITIP20(token).balanceOf(target) >= balanceBeforeCallback) {
-            revert VaultTokenNotConsumed();
+        if (
+            restricted
+                && (ITIP20(token).balanceOf(target) >= balanceBeforeCallback
+                    || ITIP20(outputToken).balanceOf(portal) <= outputPortalBalanceBefore
+                    || IZonePortal(portal).currentDepositQueueHash() == depositQueueHashBefore)
+        ) {
+            revert VaultSwapInvariantViolated();
         }
     }
 

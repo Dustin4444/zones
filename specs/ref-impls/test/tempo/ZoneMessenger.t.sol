@@ -41,11 +41,82 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
 
 }
 
-contract ConsumingWithdrawalReceiver is IWithdrawalReceiver {
+contract RestrictedPortalMock {
 
+    bytes32 public currentDepositQueueHash;
+
+    function approveToken(address token, address spender, uint256 amount) external {
+        require(ITIP20(token).approve(spender, amount));
+    }
+
+    function relay(
+        ZoneMessenger messenger,
+        address token,
+        address target,
+        uint128 amount,
+        bytes calldata data
+    )
+        external
+    {
+        messenger.relayMessage(token, bytes32("sender"), target, amount, 5_000_000, data);
+    }
+
+    function depositEncrypted(address token, uint128 amount) external returns (bytes32) {
+        require(ITIP20(token).transferFrom(msg.sender, address(this), amount));
+        currentDepositQueueHash =
+            keccak256(abi.encode(currentDepositQueueHash, token, amount, msg.sender));
+        return currentDepositQueueHash;
+    }
+
+}
+
+contract SwappingWithdrawalReceiver is IWithdrawalReceiver {
+
+    RestrictedPortalMock public immutable portal;
+    address public immutable outputToken;
+    address public immutable sink;
+    bool public immutable returnOutputToZone;
+
+    constructor(
+        RestrictedPortalMock _portal,
+        address _outputToken,
+        address _sink,
+        bool _returnOutputToZone
+    ) {
+        portal = _portal;
+        outputToken = _outputToken;
+        sink = _sink;
+        returnOutputToZone = _returnOutputToZone;
+    }
+
+    function onWithdrawalReceived(
+        bytes32,
+        address token,
+        uint128 amount,
+        bytes calldata
+    )
+        external
+        returns (bytes4)
+    {
+        require(ITIP20(token).transfer(sink, amount));
+        if (returnOutputToZone) {
+            require(ITIP20(outputToken).approve(address(portal), amount));
+            portal.depositEncrypted(outputToken, amount);
+        }
+        return IWithdrawalReceiver.onWithdrawalReceived.selector;
+    }
+
+}
+
+contract DirectReturnWithdrawalReceiver is IWithdrawalReceiver {
+
+    address public immutable portal;
+    address public immutable outputToken;
     address public immutable sink;
 
-    constructor(address _sink) {
+    constructor(address _portal, address _outputToken, address _sink) {
+        portal = _portal;
+        outputToken = _outputToken;
         sink = _sink;
     }
 
@@ -58,7 +129,8 @@ contract ConsumingWithdrawalReceiver is IWithdrawalReceiver {
         external
         returns (bytes4)
     {
-        ITIP20(token).transfer(sink, amount);
+        require(ITIP20(token).transfer(sink, amount));
+        require(ITIP20(outputToken).transfer(portal, amount));
         return IWithdrawalReceiver.onWithdrawalReceived.selector;
     }
 
@@ -162,36 +234,45 @@ contract ZoneMessengerTest is BaseTest {
         restricted.relayMessage(token, bytes32("sender"), address(receiver), 1, 50_000, "");
     }
 
-    function test_restrictedRelay_revertsUnlessVaultTokenBalanceDecreases() public {
-        AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
-        ZoneMessenger restricted =
-            new ZoneMessenger(portal, address(receiver), address(zoneToken), address(0x702));
-        zoneToken.mint(portal, 123);
-        vm.prank(portal);
-        zoneToken.approve(address(restricted), 123);
-
-        vm.prank(portal);
-        vm.expectRevert(ZoneMessenger.VaultTokenNotConsumed.selector);
-        restricted.relayMessage(
-            address(zoneToken), bytes32("sender"), address(receiver), 123, 1_000_000, ""
+    function test_restrictedRelay_revertsWhenOutputIsNotDepositedBackToZone() public {
+        MockZoneToken receiptToken = new MockZoneToken("Vault Receipt", "vUSD");
+        RestrictedPortalMock restrictedPortal = new RestrictedPortalMock();
+        SwappingWithdrawalReceiver receiver =
+            new SwappingWithdrawalReceiver(restrictedPortal, address(receiptToken), alice, false);
+        ZoneMessenger restricted = new ZoneMessenger(
+            address(restrictedPortal), address(receiver), address(zoneToken), address(receiptToken)
         );
+        zoneToken.mint(address(restrictedPortal), 123);
+        restrictedPortal.approveToken(address(zoneToken), address(restricted), 123);
+
+        vm.expectRevert(ZoneMessenger.VaultSwapInvariantViolated.selector);
+        restrictedPortal.relay(restricted, address(zoneToken), address(receiver), 123, "");
     }
 
-    function test_restrictedRelay_succeedsWhenVaultTokenBalanceDecreases() public {
-        ConsumingWithdrawalReceiver receiver = new ConsumingWithdrawalReceiver(alice);
-        ZoneMessenger restricted =
-            new ZoneMessenger(portal, address(receiver), address(zoneToken), address(0x702));
-        zoneToken.mint(portal, 123);
-        vm.prank(portal);
-        zoneToken.approve(address(restricted), 123);
-
-        vm.prank(portal);
-        restricted.relayMessage(
-            address(zoneToken), bytes32("sender"), address(receiver), 123, 1_000_000, ""
+    function test_restrictedRelay_revertsWhenOutputTransferDoesNotEnqueueZoneDeposit() public {
+        MockZoneToken receiptToken = new MockZoneToken("Vault Receipt", "vUSD");
+        receiptToken.setMinter(address(this), true);
+        RestrictedPortalMock restrictedPortal = new RestrictedPortalMock();
+        DirectReturnWithdrawalReceiver receiver = new DirectReturnWithdrawalReceiver(
+            address(restrictedPortal), address(receiptToken), alice
         );
+        ZoneMessenger restricted = new ZoneMessenger(
+            address(restrictedPortal), address(receiver), address(zoneToken), address(receiptToken)
+        );
+        zoneToken.mint(address(restrictedPortal), 123);
+        receiptToken.mint(address(receiver), 123);
+        restrictedPortal.approveToken(address(zoneToken), address(restricted), 123);
 
-        assertEq(zoneToken.balanceOf(address(receiver)), 0);
-        assertEq(zoneToken.balanceOf(alice), 123);
+        vm.expectRevert(ZoneMessenger.VaultSwapInvariantViolated.selector);
+        restrictedPortal.relay(restricted, address(zoneToken), address(receiver), 123, "");
+    }
+
+    function test_restrictedRelay_assetToReceiptDepositsOutputBackToZone() public {
+        _assertRestrictedSwap(true);
+    }
+
+    function test_restrictedRelay_receiptToAssetDepositsOutputBackToZone() public {
+        _assertRestrictedSwap(false);
     }
 
     /// @notice Verifies valid relays transfer any bounded amount to the receiver.
@@ -216,6 +297,28 @@ contract ZoneMessengerTest is BaseTest {
         );
 
         assertEq(zoneToken.balanceOf(address(receiver)), amount);
+    }
+
+    function _assertRestrictedSwap(bool assetToReceipt) internal {
+        MockZoneToken receiptToken = new MockZoneToken("Vault Receipt", "vUSD");
+        receiptToken.setMinter(address(this), true);
+        RestrictedPortalMock restrictedPortal = new RestrictedPortalMock();
+        address inputToken = assetToReceipt ? address(zoneToken) : address(receiptToken);
+        address outputToken = assetToReceipt ? address(receiptToken) : address(zoneToken);
+        SwappingWithdrawalReceiver receiver =
+            new SwappingWithdrawalReceiver(restrictedPortal, outputToken, alice, true);
+        ZoneMessenger restricted = new ZoneMessenger(
+            address(restrictedPortal), address(receiver), address(zoneToken), address(receiptToken)
+        );
+
+        MockZoneToken(inputToken).mint(address(restrictedPortal), 123);
+        MockZoneToken(outputToken).mint(address(receiver), 123);
+        restrictedPortal.approveToken(inputToken, address(restricted), 123);
+        restrictedPortal.relay(restricted, inputToken, address(receiver), 123, "");
+
+        assertEq(MockZoneToken(inputToken).balanceOf(address(receiver)), 0);
+        assertEq(MockZoneToken(outputToken).balanceOf(address(restrictedPortal)), 123);
+        assertTrue(restrictedPortal.currentDepositQueueHash() != bytes32(0));
     }
 
 }
