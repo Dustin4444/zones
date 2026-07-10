@@ -192,7 +192,7 @@ contract ZonePortalGasLimitTest is Test {
         assertEq(token.balanceOf(address(0xdead)), 0);
     }
 
-    function test_restrictedPortal_bouncesWithdrawalWithoutCallback() public {
+    function test_restrictedPortal_revertsAndRetainsWithdrawalWithoutCallback() public {
         Withdrawal memory w = Withdrawal({
             token: address(token),
             senderTag: keccak256("sender"),
@@ -207,13 +207,15 @@ contract ZonePortalGasLimitTest is Test {
         });
         _storeSingleWithdrawal(restrictedPortal, w);
 
+        vm.expectRevert(IZonePortal.InvalidRestrictedWithdrawal.selector);
         restrictedPortal.processWithdrawal(w, bytes32(0));
 
         assertEq(token.balanceOf(recipient), 0);
-        assertTrue(restrictedPortal.currentDepositQueueHash() != bytes32(0));
+        assertEq(restrictedPortal.withdrawalQueueHead(), 0);
+        assertTrue(restrictedPortal.withdrawalQueueSlot(0) != EMPTY_SENTINEL);
     }
 
-    function test_restrictedPortal_bouncesWithdrawalWithNonzeroL1Fee() public {
+    function test_restrictedPortal_revertsAndRetainsWithdrawalWithNonzeroL1Fee() public {
         Withdrawal memory w = Withdrawal({
             token: address(token),
             senderTag: keccak256("sender"),
@@ -228,10 +230,35 @@ contract ZonePortalGasLimitTest is Test {
         });
         _storeSingleWithdrawal(restrictedPortal, w);
 
+        vm.expectRevert(IZonePortal.InvalidRestrictedWithdrawal.selector);
         restrictedPortal.processWithdrawal(w, bytes32(0));
 
         assertEq(token.balanceOf(address(this)), 0);
-        assertTrue(restrictedPortal.currentDepositQueueHash() != bytes32(0));
+        assertEq(restrictedPortal.withdrawalQueueHead(), 0);
+        assertTrue(restrictedPortal.withdrawalQueueSlot(0) != EMPTY_SENTINEL);
+    }
+
+    function test_restrictedPortal_revertsAndRetainsWithdrawalForWrongRecipient() public {
+        Withdrawal memory w = Withdrawal({
+            token: address(token),
+            senderTag: keccak256("sender"),
+            to: address(0xdead),
+            amount: 500e6,
+            fee: 0,
+            memo: bytes32(0),
+            gasLimit: 50_000,
+            fallbackRecipient: fallbackRecipient,
+            callbackData: "",
+            encryptedSender: ""
+        });
+        _storeSingleWithdrawal(restrictedPortal, w);
+
+        vm.expectRevert(IZonePortal.InvalidRestrictedWithdrawal.selector);
+        restrictedPortal.processWithdrawal(w, bytes32(0));
+
+        assertEq(token.balanceOf(address(0xdead)), 0);
+        assertEq(restrictedPortal.withdrawalQueueHead(), 0);
+        assertTrue(restrictedPortal.withdrawalQueueSlot(0) != EMPTY_SENTINEL);
     }
 
     function _withdrawalQueueSlot(uint256 slot) internal pure returns (bytes32) {

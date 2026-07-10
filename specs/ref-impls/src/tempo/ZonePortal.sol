@@ -715,11 +715,7 @@ contract ZonePortal is IZonePortal {
                     || withdrawal.gasLimit == 0
                     || withdrawal.fee != 0)
         ) {
-            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackRecipient);
-            emit WithdrawalProcessed(
-                withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
-            );
-            return;
+            revert InvalidRestrictedWithdrawal();
         }
 
         // Transfer fee to sequencer.

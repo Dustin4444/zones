@@ -168,6 +168,7 @@ crate::sol! {
         error InvalidBouncebackRecipient();
         error RestrictedAccountOnly();
         error InvalidRestrictedRecipient();
+        error InvalidRestrictedWithdrawal();
 
         // -- View functions --
 
