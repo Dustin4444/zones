@@ -412,7 +412,14 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_state() {
 
     let old_header = make_test_header(10);
     let old_hash = header_hash(&old_header);
-    subscriber.update_l1_state_anchor(10, old_hash, old_header.inner.parent_hash);
+    subscriber.update_l1_state_anchor(
+        10,
+        old_hash,
+        old_header.inner.parent_hash,
+        4217,
+        old_header.timestamp(),
+        &HashSet::new(),
+    );
     {
         let mut cache = subscriber.config.policy_cache.write();
         cache.set_token_policy(token, 10, 2);
@@ -423,7 +430,14 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_state() {
 
     let replacement_parent = B256::with_last_byte(0x44);
     let replacement_header = make_chained_header(11, replacement_parent);
-    subscriber.update_l1_state_anchor(11, header_hash(&replacement_header), replacement_parent);
+    subscriber.update_l1_state_anchor(
+        11,
+        header_hash(&replacement_header),
+        replacement_parent,
+        4217,
+        replacement_header.timestamp(),
+        &HashSet::new(),
+    );
     subscriber.apply_policy_events(
         11,
         &[
@@ -1037,9 +1051,21 @@ fn test_enqueue_and_transition_consistency() {
 #[tokio::test]
 async fn test_prepare_rejects_unauthorized_encrypted_deposit_without_decryption_data() {
     use k256::{AffinePoint, ProjectivePoint, Scalar};
+    use revm::precompile::PrecompileError;
+    use std::sync::{Arc, Mutex};
+    use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+    use tempo_precompiles::{
+        PATH_USD_ADDRESS,
+        storage::{
+            Handler, PrecompileStorageProvider, StorageCtx, hashmap::HashMapStorageProvider,
+        },
+        tip20::tip20_slots,
+        tip403_registry::{PolicyData, TIP403Registry},
+    };
+    use zone_precompiles::L1StorageReader;
 
-    let token = address!("0x0000000000000000000000000000000000001000");
+    let token = PATH_USD_ADDRESS;
     let sender = address!("0x0000000000000000000000000000000000001234");
     let unauthorized_recipient = address!("0x000000000000000000000000000000000000BEEF");
     let portal = address!("0x0000000000000000000000000000000000000ABC");
@@ -1060,18 +1086,47 @@ async fn test_prepare_rejects_unauthorized_encrypted_deposit_without_decryption_
     )
     .expect("encrypted deposit should be valid");
 
-    let policy_cache = crate::PolicyCache::default();
-    {
-        let mut cache = policy_cache.write();
-        cache.set_token_policy(token, block_number, 2);
-        cache.set_policy_type(2, PolicyType::BLACKLIST);
-        cache.set_policy_status(2, unauthorized_recipient, block_number, true);
+    #[derive(Clone)]
+    struct TestL1Reader(Arc<Mutex<HashMapStorageProvider>>);
+
+    impl L1StorageReader for TestL1Reader {
+        fn read_l1_storage(
+            &self,
+            address: Address,
+            slot: B256,
+            _block_number: u64,
+        ) -> Result<B256, PrecompileError> {
+            self.0
+                .lock()
+                .unwrap()
+                .sload(address, U256::from_be_bytes(slot.0))
+                .map(|value| B256::from(value.to_be_bytes()))
+                .map_err(|err| PrecompileError::Fatal(err.to_string()))
+        }
+
+        fn hardfork_at(&self, _block_number: u64) -> Result<TempoHardfork, PrecompileError> {
+            Ok(TempoHardfork::T8)
+        }
     }
-    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_mocked_client(Asserter::new())
-        .erased();
-    let policy_provider =
-        crate::PolicyProvider::new(policy_cache, provider, tokio::runtime::Handle::current());
+
+    let mut raw_storage = HashMapStorageProvider::new_with_spec(0, TempoHardfork::T8);
+    let packed_policy = U256::from(2u64) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8);
+    raw_storage
+        .sstore(token, tip20_slots::TRANSFER_POLICY_ID, packed_policy)
+        .unwrap();
+    StorageCtx::enter(&mut raw_storage, || -> tempo_precompiles::Result<()> {
+        let mut registry = TIP403Registry::new();
+        registry.policy_id_counter.write(3)?;
+        registry.policy_records[2].base.write(PolicyData {
+            policy_type: PolicyType::BLACKLIST as u8,
+            admin: Address::ZERO,
+        })?;
+        registry.policy_set[2][unauthorized_recipient].write(true)?;
+        Ok(())
+    })
+    .unwrap();
+    let policy_evaluator =
+        crate::PolicyEvaluator::new(TestL1Reader(Arc::new(Mutex::new(raw_storage))));
 
     let block = L1BlockDeposits {
         header: seal(make_test_header(block_number)),
@@ -1094,7 +1149,7 @@ async fn test_prepare_rejects_unauthorized_encrypted_deposit_without_decryption_
     };
 
     let prepared = block
-        .prepare(&sequencer_key, portal, &policy_provider)
+        .prepare(&sequencer_key, portal, &policy_evaluator)
         .await
         .expect("cached policy check should prepare block");
 

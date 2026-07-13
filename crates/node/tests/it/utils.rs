@@ -21,20 +21,33 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TempoChainSpec};
+use tempo_chainspec::{
+    hardfork::TempoHardfork,
+    spec::{TEMPO_T0_BASE_FEE, TempoChainSpec},
+};
 use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20,
+    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, ITIP403Registry, TIP403_REGISTRY_ADDRESS,
     account_keychain::IAccountKeychain::{
         IAccountKeychainInstance, SignatureType as KeyInfoSignatureType,
     },
 };
-use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
+use tempo_precompiles::{
+    PATH_USD_ADDRESS,
+    storage::{
+        Handler, PrecompileStorageProvider, StorageCtx, StorageKey, hashmap::HashMapStorageProvider,
+    },
+    tip20::tip20_slots,
+    tip403_registry::{
+        ALLOW_ALL_POLICY_ID, CompoundPolicyData as RawCompoundPolicyData, PolicyData,
+        TIP403Registry, tip403_registry_slots,
+    },
+};
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::ZONE_OUTBOX_ADDRESS;
 use zone_l1::{
@@ -191,6 +204,68 @@ fn seed_local_policy_cache(policy_cache: &zone_l1::PolicyCache) {
         LOCAL_POLICY_CACHE_SEED_BLOCK,
         ALLOW_ALL_POLICY_ID,
     );
+}
+
+/// Materialize a TIP-403 policy into the raw L1 cache consumed by upstream precompiles.
+///
+/// Storage keys and values come from Tempo's canonical storage types rather than duplicated slot
+/// formulas. This is only a self-contained test fixture; production values come from L1 RPC.
+pub(crate) fn seed_raw_tip403_policy(
+    cache: &L1StateCache,
+    block_number: u64,
+    policy_id: u64,
+    policy_type: ITIP403Registry::PolicyType,
+    members: &[(Address, bool)],
+    compound: Option<(u64, u64, u64)>,
+) -> eyre::Result<()> {
+    let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T8);
+    let registry = TIP403Registry::new();
+    let mut slots = vec![
+        registry.policy_id_counter.slot(),
+        registry.policy_records[policy_id].base.base_slot(),
+    ];
+    if compound.is_some() {
+        slots.push(registry.policy_records[policy_id].compound.base_slot());
+    }
+    slots.extend(
+        members
+            .iter()
+            .map(|(account, _)| registry.policy_set[policy_id][*account].slot()),
+    );
+
+    StorageCtx::enter(&mut storage, || -> tempo_precompiles::Result<()> {
+        let mut registry = TIP403Registry::new();
+        registry.policy_id_counter.write(policy_id + 1)?;
+        registry.policy_records[policy_id].base.write(PolicyData {
+            policy_type: policy_type as u8,
+            admin: Address::ZERO,
+        })?;
+        if let Some((sender, recipient, mint_recipient)) = compound {
+            registry.policy_records[policy_id]
+                .compound
+                .write(RawCompoundPolicyData {
+                    sender_policy_id: sender,
+                    recipient_policy_id: recipient,
+                    mint_recipient_policy_id: mint_recipient,
+                })?;
+        }
+        for &(account, in_set) in members {
+            registry.policy_set[policy_id][account].write(in_set)?;
+        }
+        Ok(())
+    })?;
+
+    let mut cache = cache.write();
+    for slot in slots {
+        let value = storage.sload(TIP403_REGISTRY_ADDRESS, slot)?;
+        cache.set(
+            TIP403_REGISTRY_ADDRESS,
+            slot.into(),
+            block_number,
+            value.into(),
+        );
+    }
+    Ok(())
 }
 
 /// Compute the TIP-20 token address for a given sender and salt.
@@ -615,7 +690,6 @@ impl ZoneTestNode {
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
-        let l1_provider_url = l1_ws_url.clone();
 
         let mut genesis = custom_genesis.unwrap_or_else(|| {
             serde_json::from_str(include_str!("../assets/zone-test-genesis.json"))
@@ -657,6 +731,16 @@ impl ZoneTestNode {
         let policy_cache = zone_node.policy_cache();
         if is_local_dummy_l1 {
             seed_local_policy_cache(&policy_cache);
+            let mut cache = l1_state_cache.write();
+            let packed_allow_all =
+                U256::from(ALLOW_ALL_POLICY_ID) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8);
+            cache.set(
+                PATH_USD_ADDRESS,
+                B256::from(tip20_slots::TRANSFER_POLICY_ID.to_be_bytes()),
+                0,
+                B256::from(packed_allow_all.to_be_bytes()),
+            );
+            cache.extend_hardfork_schedule(u64::MAX, [(0, TempoHardfork::T8)]);
         }
 
         let node_handle = NodeBuilder::new(node_config)
@@ -665,15 +749,8 @@ impl ZoneTestNode {
             .launch_with_debug_capabilities()
             .await?;
 
-        let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect(&l1_provider_url)
-            .await?
-            .erased();
-        let policy_provider = zone_l1::PolicyProvider::new(
-            policy_cache.clone(),
-            l1_provider,
-            tokio::runtime::Handle::current(),
-        );
+        let policy_evaluator =
+            zone_l1::PolicyEvaluator::new(node_handle.node.evm_config().l1_state_provider());
         let provider = node_handle.node.provider();
         let last_header = provider
             .sealed_header(provider.best_block_number()?)?
@@ -687,7 +764,7 @@ impl ZoneTestNode {
             sequencer_signer.address(),
             SecretKey::from(sequencer_signer.credential()),
             portal_address,
-            policy_provider,
+            policy_evaluator,
         );
         node_handle
             .node
@@ -3127,6 +3204,8 @@ pub(crate) struct L1Fixture {
     next_block_number: u64,
     next_timestamp: u64,
     last_hash: B256,
+    /// Raw L1 caches seeded by this fixture, updated with state implied by injected deposits.
+    caches: Mutex<Vec<L1StateCache>>,
 }
 
 impl L1Fixture {
@@ -3142,6 +3221,7 @@ impl L1Fixture {
             next_block_number: 1,
             next_timestamp: 1_000_000,
             last_hash: genesis_hash,
+            caches: Mutex::new(Vec::new()),
         }
     }
 
@@ -3153,12 +3233,12 @@ impl L1Fixture {
     /// for each block we plan to inject.
     pub(crate) fn seed_l1_cache(
         &self,
-        cache: &L1StateCache,
+        cache_handle: &L1StateCache,
         portal_address: Address,
         sequencer: Address,
         num_blocks: u64,
     ) {
-        let mut cache = cache.write();
+        let mut cache = cache_handle.write();
         let deposit_queue_hash_slot = B256::with_last_byte(5);
         let refunds_slot = B256::with_last_byte(10);
         let path_usd_config_slot = portal_token_config_slot(PATH_USD_ADDRESS);
@@ -3189,10 +3269,45 @@ impl L1Fixture {
             );
         }
 
+        let packed_allow_all =
+            U256::from(ALLOW_ALL_POLICY_ID) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8);
+        cache.set(
+            PATH_USD_ADDRESS,
+            B256::from(tip20_slots::TRANSFER_POLICY_ID.to_be_bytes()),
+            0,
+            B256::from(packed_allow_all.to_be_bytes()),
+        );
+        cache.extend_hardfork_schedule(u64::MAX, [(0, TempoHardfork::T8)]);
         cache.update_anchor(NumHash {
             number: num_blocks,
             hash: B256::ZERO,
         });
+        drop(cache);
+        self.caches.lock().unwrap().push(cache_handle.clone());
+    }
+
+    /// Seed the absence of an address-level TIP-403 receive policy for the next fixture block.
+    pub(crate) fn seed_no_receive_policy(&self, recipient: Address) {
+        self.seed_no_receive_policy_at(self.next_block_number, recipient);
+    }
+
+    fn seed_no_receive_policy_at(&self, block_number: u64, recipient: Address) {
+        // TODO(rusowsky): make `ReceivePolicy` public upstream to use the handlers
+        let receive_policy_slot = recipient.mapping_slot(tip403_registry_slots::RECEIVE_POLICIES);
+        for cache in self.caches.lock().unwrap().iter() {
+            cache.write().set(
+                TIP403_REGISTRY_ADDRESS,
+                B256::from(receive_policy_slot.to_be_bytes()),
+                block_number,
+                B256::ZERO,
+            );
+        }
+    }
+
+    fn seed_regular_deposit_policy_state(&self, block_number: u64, deposits: &[Deposit]) {
+        for deposit in deposits {
+            self.seed_no_receive_policy_at(block_number, deposit.to);
+        }
     }
 
     /// Build a [`TempoHeader`] for the next L1 block.
@@ -3238,6 +3353,7 @@ impl L1Fixture {
         queue: &DepositQueue,
         deposits: Vec<Deposit>,
     ) {
+        self.seed_regular_deposit_policy_state(block.header.inner.number, &deposits);
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
         queue.enqueue(block.header.clone(), events, vec![]);
@@ -3302,6 +3418,7 @@ impl L1Fixture {
     /// Inject an L1 block with the given deposits into the queue.
     pub(crate) fn inject_deposits(&mut self, queue: &DepositQueue, deposits: Vec<Deposit>) {
         let header = self.next_header();
+        self.seed_regular_deposit_policy_state(header.inner.number, &deposits);
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
         queue.enqueue(header, events, vec![]);

@@ -51,7 +51,10 @@ use tempo_chainspec::spec::TempoChainSpec;
 use tempo_primitives::TempoHeader;
 use tracing::{error, warn};
 
-use zone_l1::{DepositQueue, L1BlockDeposits, PolicyProvider, PreparedL1Block};
+use zone_l1::{
+    DepositQueue, L1BlockDeposits, PreparedL1Block,
+    state::{L1StateProvider, PolicyEvaluator},
+};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 
 /// Engine that drives L2 block production from L1 events.
@@ -84,9 +87,8 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
-    /// Cache-first, RPC-fallback TIP-403 policy provider for authorization checks
-    /// on encrypted deposit recipients during preparation.
-    policy_provider: PolicyProvider,
+    /// Stateless TIP-403 evaluator over the EVM's shared raw L1 state provider.
+    policy_evaluator: PolicyEvaluator<L1StateProvider>,
 }
 
 impl ZoneEngine {
@@ -99,7 +101,7 @@ impl ZoneEngine {
         fee_recipient: Address,
         sequencer_key: k256::SecretKey,
         portal_address: Address,
-        policy_provider: PolicyProvider,
+        policy_evaluator: PolicyEvaluator<L1StateProvider>,
     ) -> Self {
         Self {
             chain_spec,
@@ -110,7 +112,7 @@ impl ZoneEngine {
             fee_recipient,
             sequencer_key,
             portal_address,
-            policy_provider,
+            policy_evaluator,
         }
     }
 
@@ -191,7 +193,7 @@ impl ZoneEngine {
             .prepare(
                 &self.sequencer_key,
                 self.portal_address,
-                &self.policy_provider,
+                &self.policy_evaluator,
             )
             .await
     }
@@ -270,12 +272,6 @@ impl ZoneEngine {
         if self.deposit_queue.confirm(l1_num_hash).is_none() {
             warn!(target: "zone::engine", ?l1_num_hash, "L1 block was purged from queue during build");
         }
-
-        // GC stale versioned entries from the policy cache. Only the engine
-        // drives this — the subscriber must not advance past blocks the engine
-        // hasn't processed yet, otherwise policy lookups for in-flight blocks
-        // could return wrong results.
-        self.policy_provider.cache().advance(l1_num_hash.number);
 
         self.last_header = header;
 

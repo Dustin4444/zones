@@ -173,6 +173,56 @@ mod tests {
     }
 
     #[test]
+    fn registry_supports_directional_policy_selectors_at_current_hardfork() -> eyre::Result<()> {
+        let blocked = address!("0x00000000000000000000000000000000000000a1");
+        let l1 = MockL1Reader::default();
+        l1.seed_blacklist_policy(5, &[blocked])?;
+        let mut harness = RegistryHarness::new(l1)?;
+
+        let sender = harness.call(
+            ITIP403Registry::isAuthorizedSenderCall {
+                policyId: 5,
+                user: blocked,
+            }
+            .abi_encode()
+            .into(),
+            true,
+        )?;
+        assert!(sender.is_success());
+        assert!(!ITIP403Registry::isAuthorizedSenderCall::abi_decode_returns(&sender.bytes)?);
+
+        let recipient = harness.call(
+            ITIP403Registry::isAuthorizedRecipientCall {
+                policyId: 5,
+                user: blocked,
+            }
+            .abi_encode()
+            .into(),
+            true,
+        )?;
+        assert!(recipient.is_success());
+        assert!(!ITIP403Registry::isAuthorizedRecipientCall::abi_decode_returns(&recipient.bytes)?);
+
+        let mint_recipient = harness.call(
+            ITIP403Registry::isAuthorizedMintRecipientCall {
+                policyId: 5,
+                user: blocked,
+            }
+            .abi_encode()
+            .into(),
+            true,
+        )?;
+        assert!(mint_recipient.is_success());
+        assert!(
+            !ITIP403Registry::isAuthorizedMintRecipientCall::abi_decode_returns(
+                &mint_recipient.bytes
+            )?
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn registry_rejects_mutating_selectors() -> eyre::Result<()> {
         let mut harness = RegistryHarness::new(MockL1Reader::default())?;
         let result = harness.call(

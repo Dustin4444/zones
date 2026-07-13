@@ -214,7 +214,7 @@ where
     Rules: CallRules,
     Execute: Fn(&[u8], Address) -> PrecompileResult + 'static,
 {
-    let spec = env.cfg.spec;
+    let zone_spec = env.cfg.spec;
     let amsterdam_eip8037_enabled = env.cfg.enable_amsterdam_eip8037;
     let gas_params = env.cfg.gas_params;
     let actions = env.actions;
@@ -245,7 +245,7 @@ where
             input.internals,
             fixed_gas_amount.map_or(input.gas, |_| u64::MAX),
             input.reservoir,
-            spec,
+            zone_spec,
             amsterdam_eip8037_enabled,
             input.is_static,
             gas_params.clone(),
@@ -257,8 +257,12 @@ where
             Ok(block_number) => block_number,
             Err(err) => return storage_error_result(err, &inner),
         };
+        let l1_spec = match l1_reader.hardfork_at(l1_block_number) {
+            Ok(spec) => spec,
+            Err(err) => return Err(err),
+        };
         let mut storage =
-            ZonePrecompileStorageProvider::new(inner, l1_reader.clone(), l1_block_number);
+            ZonePrecompileStorageProvider::new(inner, l1_reader.clone(), l1_block_number, l1_spec);
 
         StorageCtx::enter(&mut storage, || {
             let call = ZoneCall {

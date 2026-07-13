@@ -15,6 +15,5 @@ pub mod versioned;
 pub use cache::{L1StateCache, L1StateCacheInner};
 pub use provider::{L1StateProvider, L1StateProviderConfig};
 pub use tip403::{
-    AuthRole, PolicyCache, PolicyCacheInner, PolicyEvent, PolicyProvider, PolicyTaskHandle,
-    PolicyTaskMessage, Tip403Metrics, spawn_policy_resolution_task, spawn_pool_prefetch_task,
+    AuthRole, PolicyCache, PolicyCacheInner, PolicyEvaluator, PolicyEvent, Tip403Metrics,
 };

@@ -1,8 +1,8 @@
 //! E2E tests for the TIP-403 policy proxy precompile on the zone.
 //!
-//! These tests verify that the `ZoneTip403ProxyRegistry` precompile correctly
-//! serves authorization queries from the `PolicyCache` and rejects
-//! mutating calls. The cache is populated directly in tests (no L1 subscriber).
+//! These tests verify that the Zone TIP-403 precompile serves authorization queries from
+//! finalized raw L1 storage and rejects mutating calls. Self-contained tests materialize Tempo's
+//! canonical storage layout directly into `L1StateCache` (no L1 subscriber).
 
 use alloy::primitives::{U256, address};
 use alloy_provider::ProviderBuilder;
@@ -10,9 +10,11 @@ use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{ITIP20, ITIP403Registry};
 use tempo_precompiles::{PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS};
-use zone_l1::state::tip403::{CompoundData, PolicyEvent};
+use zone_l1::state::tip403::PolicyEvent;
 
-use crate::utils::{DEFAULT_TIMEOUT, TEST_MNEMONIC, start_local_zone_with_fixture};
+use crate::utils::{
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, seed_raw_tip403_policy, start_local_zone_with_fixture,
+};
 
 /// Deposit pathUSD to Alice, then transfer a portion to Bob on the zone.
 ///
@@ -58,7 +60,10 @@ async fn test_tip20_transfer_on_zone() -> eyre::Result<()> {
         .send()
         .await?;
 
-    // Inject an empty L1 block to trigger block production including the pool tx
+    // T6+ transfers also consult the recipient's address-level receive policy on L1.
+    fixture.seed_no_receive_policy(bob);
+
+    // Inject an empty L1 block to trigger block production including the pool tx.
     fixture.inject_empty_block(zone.deposit_queue());
 
     let receipt = pending.get_receipt().await?;
@@ -100,14 +105,15 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Populate the cache: policy 5 = WHITELIST, Alice is in the set, Bob is not
-    {
-        let cache = zone.policy_cache();
-        let mut w = cache.write();
-        w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_policy_status(5, alice, 1, true);
-        w.set_policy_status(5, bob, 1, false);
-    }
+    // Populate raw L1 state: policy 5 = WHITELIST, Alice is in the set, Bob is not.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(alice, true), (bob, false)],
+        None,
+    )?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -150,14 +156,15 @@ async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Populate the cache: policy 5 = BLACKLIST, Alice is blacklisted, Bob is not
-    {
-        let cache = zone.policy_cache();
-        let mut w = cache.write();
-        w.set_policy_type(5, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_policy_status(5, alice, 1, true);
-        w.set_policy_status(5, bob, 1, false);
-    }
+    // Populate raw L1 state: policy 5 = BLACKLIST, Alice is blacklisted, Bob is not.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::BLACKLIST,
+        &[(alice, true), (bob, false)],
+        None,
+    )?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -188,24 +195,32 @@ async fn test_policy_proxy_compound_policy() -> eyre::Result<()> {
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Policy 5 = sender whitelist, policy 6 = recipient blacklist
-    // Compound policy 10 references them
-    {
-        let cache = zone.policy_cache();
-        let mut w = cache.write();
-        w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_policy_status(5, alice, 1, true); // Alice whitelisted as sender
-        w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_policy_status(6, bob, 1, true); // Bob blacklisted as recipient
-        w.set_compound(
-            10,
-            CompoundData {
-                sender_policy_id: 5,
-                recipient_policy_id: 6,
-                mint_recipient_policy_id: 1, // builtin allow
-            },
-        );
-    }
+    // Policy 5 = sender whitelist, policy 6 = recipient blacklist; compound policy 10
+    // references them.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(alice, true)],
+        None,
+    )?;
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        6,
+        ITIP403Registry::PolicyType::BLACKLIST,
+        &[(bob, true)],
+        None,
+    )?;
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        10,
+        ITIP403Registry::PolicyType::COMPOUND,
+        &[],
+        Some((5, 6, 1)),
+    )?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -308,26 +323,32 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
     let bob = address!("0x0000000000000000000000000000000000000B0B");
     let carol = address!("0x000000000000000000000000000000000000CA01");
 
-    // Policy 5 = sender whitelist, policy 6 = recipient blacklist
-    // Compound policy 10 references them
-    {
-        let cache = zone.policy_cache();
-        let mut w = cache.write();
-        w.set_policy_type(5, ITIP403Registry::PolicyType::WHITELIST);
-        w.set_policy_status(5, alice, 1, true); // Alice whitelisted as sender
-        w.set_policy_status(5, bob, 1, false); // Bob not whitelisted as sender
-        w.set_policy_type(6, ITIP403Registry::PolicyType::BLACKLIST);
-        w.set_policy_status(6, alice, 1, false); // Alice not blacklisted as recipient
-        w.set_policy_status(6, bob, 1, true); // Bob blacklisted as recipient
-        w.set_compound(
-            10,
-            CompoundData {
-                sender_policy_id: 5,
-                recipient_policy_id: 6,
-                mint_recipient_policy_id: 1, // builtin allow
-            },
-        );
-    }
+    // Policy 5 = sender whitelist, policy 6 = recipient blacklist; compound policy 10
+    // references them.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(alice, true), (bob, false)],
+        None,
+    )?;
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        6,
+        ITIP403Registry::PolicyType::BLACKLIST,
+        &[(alice, false), (bob, true)],
+        None,
+    )?;
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        10,
+        ITIP403Registry::PolicyType::COMPOUND,
+        &[],
+        Some((5, 6, 1)),
+    )?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -345,13 +366,23 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
         "bob should NOT be authorized (not in sender whitelist)"
     );
 
-    // Carol: whitelisted as sender AND in recipient blacklist
-    {
-        let cache = zone.policy_cache();
-        let mut w = cache.write();
-        w.set_policy_status(5, carol, 1, true); // whitelisted as sender
-        w.set_policy_status(6, carol, 1, true); // blacklisted as recipient
-    }
+    // Carol: whitelisted as sender AND in recipient blacklist.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(carol, true)],
+        None,
+    )?;
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        6,
+        ITIP403Registry::PolicyType::BLACKLIST,
+        &[(carol, true)],
+        None,
+    )?;
 
     // Carol passes sender check but fails recipient → false
     let carol_auth = registry.isAuthorized(10, carol).call().await?;
@@ -363,7 +394,7 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
     Ok(())
 }
 
-/// Applying a sequence of `PolicyEvent`s correctly updates the proxy's responses.
+/// Block-versioned raw L1 policy writes update the proxy's responses.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_policy_type_change_via_events() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -376,59 +407,43 @@ async fn test_policy_type_change_via_events() -> eyre::Result<()> {
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
-    // Step 1: Create policy 5 as WHITELIST via event, add Alice
-    {
-        let cache = zone.policy_cache();
-        cache.write().apply_events(
-            1,
-            &[
-                PolicyEvent::PolicyCreated {
-                    policy_id: 5,
-                    policy_type: ITIP403Registry::PolicyType::WHITELIST,
-                },
-                PolicyEvent::MembershipChanged {
-                    policy_id: 5,
-                    account: alice,
-                    in_set: true,
-                },
-            ],
-        );
-    }
+    // Step 1: Create policy 5 as WHITELIST and add Alice at block 1.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        1,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(alice, true)],
+        None,
+    )?;
 
     // Alice should be authorized (whitelisted)
     let authorized = registry.isAuthorized(5, alice).call().await?;
     assert!(authorized, "alice should be authorized (whitelisted)");
 
-    // Step 2: Remove Alice via event at block 2
-    {
-        let cache = zone.policy_cache();
-        cache.write().apply_events(
-            2,
-            &[PolicyEvent::MembershipChanged {
-                policy_id: 5,
-                account: alice,
-                in_set: false,
-            }],
-        );
-    }
+    // Step 2: Remove Alice at block 2.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        2,
+        5,
+        ITIP403Registry::PolicyType::WHITELIST,
+        &[(alice, false)],
+        None,
+    )?;
 
     // Alice should no longer be authorized
     let authorized = registry.isAuthorized(5, alice).call().await?;
     assert!(!authorized, "alice should NOT be authorized after removal");
 
-    // Step 3: Create compound policy 10 via event
-    {
-        let cache = zone.policy_cache();
-        cache.write().apply_events(
-            3,
-            &[PolicyEvent::CompoundPolicyCreated {
-                policy_id: 10,
-                sender_policy_id: 5,
-                recipient_policy_id: 1, // allow all
-                mint_recipient_policy_id: 1,
-            }],
-        );
-    }
+    // Step 3: Create compound policy 10 at block 3.
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        3,
+        10,
+        ITIP403Registry::PolicyType::COMPOUND,
+        &[],
+        Some((5, 1, 1)),
+    )?;
 
     // Compound data should be queryable
     let compound = registry.compoundPolicyData(10).call().await?;

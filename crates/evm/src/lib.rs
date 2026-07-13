@@ -207,6 +207,11 @@ impl ZoneEvmConfig {
     pub fn chain_spec(&self) -> &Arc<TempoChainSpec> {
         self.inner.chain_spec()
     }
+
+    /// Returns the shared provider used by L1-backed EVM precompiles.
+    pub fn l1_state_provider(&self) -> L1StateProvider {
+        self.zone_factory.l1_provider.clone()
+    }
 }
 
 impl BlockExecutorFactory for ZoneEvmConfig {

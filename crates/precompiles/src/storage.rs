@@ -20,6 +20,8 @@
 
 use alloc::format;
 
+mod l1_read_only;
+
 use crate::tempo_state::slots as tempo_state_slots;
 use alloy_primitives::{Address, B256, LogData, U256};
 use revm::{
@@ -47,6 +49,40 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
         slot: B256,
         block_number: u64,
     ) -> core::result::Result<B256, PrecompileError>;
+
+    /// Resolve the Tempo hardfork active at `block_number` on L1.
+    fn hardfork_at(
+        &self,
+        block_number: u64,
+    ) -> core::result::Result<TempoHardfork, PrecompileError>;
+
+    /// Executes `f` with this reader installed as a standalone, read-only Tempo storage provider.
+    ///
+    /// Only supports persistent storage reads, which are pinned to `block_number`.
+    /// Storage writes, code changes, account access, and event emission fail with a fatal error.
+    ///
+    /// # SAFETY
+    ///
+    /// Since the method installs a [`StorageCtx`] for the duration of `f`, no other [`StorageCtx`]
+    /// can be active. Consumers already executing inside a storage context, including `TempoState`
+    /// and [`ZonePrecompileStorageProvider`], must call [`Self::read_l1_storage`] instead.
+    fn with_read_only_provider<T>(
+        &self,
+        block_number: u64,
+        f: impl FnOnce() -> tempo_precompiles::Result<T>,
+    ) -> tempo_precompiles::Result<T>
+    where
+        Self: Sized,
+    {
+        let spec = self
+            .hardfork_at(block_number)
+            .map_err(l1_read_only::reader_error)?;
+
+        let mut provider = l1_read_only::ReadOnlyL1Storage::new(self, block_number, spec);
+        // SAFETY: `provider` exclusively borrows `self` and remains alive for the entire scoped
+        // closure. The method contract prohibits nesting this inside another `StorageCtx`.
+        StorageCtx::enter(&mut provider, f)
+    }
 }
 
 /// Precompile storage that overlays finalized Tempo L1 policy state onto zone-local EVM state.
@@ -56,6 +92,7 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
 pub(crate) struct ZonePrecompileStorageProvider<'a, P> {
     inner: EvmPrecompileStorageProvider<'a>,
     l1_block_number: u64,
+    l1_spec: TempoHardfork,
     l1: P,
 }
 
@@ -65,11 +102,13 @@ impl<'a, P> ZonePrecompileStorageProvider<'a, P> {
         inner: EvmPrecompileStorageProvider<'a>,
         l1: P,
         l1_block_number: u64,
+        l1_spec: TempoHardfork,
     ) -> Self {
         Self {
             inner,
             l1,
             l1_block_number,
+            l1_spec,
         }
     }
 }
@@ -195,7 +234,7 @@ impl<P: L1StorageReader> PrecompileStorageProvider for ZonePrecompileStorageProv
     }
 
     fn spec(&self) -> TempoHardfork {
-        self.inner.spec()
+        self.l1_spec
     }
 
     fn storage_actions(&self) -> StorageActions {
@@ -299,7 +338,8 @@ mod tests {
             )
             .expect("anchor write succeeds");
         let l1_block_number = read_l1_anchor(&mut inner).expect("anchor read succeeds");
-        let mut provider = ZonePrecompileStorageProvider::new(inner, l1, l1_block_number);
+        let mut provider =
+            ZonePrecompileStorageProvider::new(inner, l1, l1_block_number, TempoHardfork::T8);
         f(&mut provider)
     }
 

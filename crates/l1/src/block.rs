@@ -22,11 +22,11 @@ impl L1BlockDeposits {
     /// and ABI-encodes everything into the types the `advanceTempo` call expects.
     /// The resulting [`PreparedL1Block`] is ready to be passed through payload
     /// attributes to the builder.
-    pub async fn prepare(
+    pub async fn prepare<R: zone_precompiles::L1StorageReader>(
         self,
         sequencer_key: &k256::SecretKey,
         portal_address: Address,
-        policy_provider: &crate::state::PolicyProvider,
+        policy_evaluator: &crate::state::PolicyEvaluator<R>,
     ) -> eyre::Result<PreparedL1Block> {
         use crate::precompiles::ecies;
 
@@ -99,10 +99,10 @@ impl L1BlockDeposits {
                             "Decrypted encrypted deposit, checking policy"
                         );
 
-                        // Check TIP-403 policy via the provider (cache-first, RPC fallback).
-                        // Errors are propagated so the engine retries rather than allowing
-                        // unauthorized deposits through.
-                        let authorized = policy_provider
+                        // Evaluate TIP-403 through upstream Tempo logic over anchored raw L1
+                        // storage. Errors are propagated so the engine retries rather than
+                        // allowing unauthorized deposits through.
+                        let authorized = policy_evaluator
                             .is_authorized_async(
                                 d.token,
                                 dec.to,

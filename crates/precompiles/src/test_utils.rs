@@ -41,9 +41,14 @@ pub(crate) use crate::ecies::{build_plaintext, compressed_x_and_parity, encrypt_
 /// EVM context used by precompile tests.
 pub(crate) type TestCtx = Context<BlockEnv, TxEnv, CfgEnv<TempoHardfork>, CacheDB<EmptyDB>>;
 
-/// Create an empty EVM context for a precompile test.
+/// Create an empty Zone EVM context at its default hardfork.
 pub(crate) fn test_context() -> TestCtx {
-    Context::new(CacheDB::new(EmptyDB::new()), TempoHardfork::default())
+    test_context_at(TempoHardfork::default())
+}
+
+/// Create an empty Zone EVM context at an explicitly selected hardfork.
+pub(crate) fn test_context_at(spec: TempoHardfork) -> TestCtx {
+    Context::new(CacheDB::new(EmptyDB::new()), spec)
 }
 
 /// Create a normal EVM storage provider over a test context.
@@ -188,6 +193,10 @@ impl crate::L1StorageReader for MockL1Reader {
         } else {
             Ok(B256::from(value.to_be_bytes()))
         }
+    }
+
+    fn hardfork_at(&self, _block_number: u64) -> Result<TempoHardfork, PrecompileError> {
+        Ok(TempoHardfork::T8)
     }
 }
 
