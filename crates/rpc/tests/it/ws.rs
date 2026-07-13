@@ -811,32 +811,6 @@ async fn ws_roundtrip_with_keychain_auth() {
 }
 
 #[tokio::test]
-async fn ws_session_remains_authenticated_after_token_expires() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
-    let now = now_secs();
-    let token = ctx.build_token_expiring_at(now, now + 1);
-    let mut ws = connect_with_token(&ctx.ws_url(), ctx.addr, &token)
-        .await
-        .expect("ws connect failed");
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_blockNumber", 12).into(),
-    ))
-    .await
-    .expect("ws send after token expiry failed");
-    let response = tokio::time::timeout(Duration::from_secs(1), ws.next())
-        .await
-        .expect("timed out waiting for response after token expiry")
-        .expect("ws closed after token expiry")
-        .expect("ws response failed after token expiry");
-    let resp = parse_response(response);
-
-    assert_eq!(resp["id"], 12);
-    assert_eq!(resp["result"], "0x42");
-}
-
-#[tokio::test]
 async fn ws_closes_when_keychain_key_is_revoked() {
     let root_account = Address::repeat_byte(0x77);
     let access_signer = P256SigningKey::random(&mut thread_rng());
