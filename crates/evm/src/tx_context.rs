@@ -56,13 +56,22 @@ impl ZoneTxContext {
 
             debug!(target: "zone::precompile", "ZoneTxContext: currentUniqueTxIdentifier");
 
+            // This downcast is guaranteed by ZoneEvmFactory: its context is TempoContext<DB>,
+            // whose transaction type is TempoTxEnv. EvmInternals only erases that concrete type
+            // when it constructs the precompile input.
             let tx_env = input
                 .internals
                 .tx_env_downcast_ref::<TempoTxEnv>()
                 .expect("ZoneTxContext requires TempoTxEnv");
-            let unique_tx_identifier = tx_env
-                .unique_tx_identifier()
-                .expect("unique transaction identifier must be set before EVM execution");
+            // Regular transaction execution always populates this while constructing TempoTxEnv;
+            // it can only be absent in manually constructed or synthetic environments.
+            let Some(unique_tx_identifier) = tx_env.unique_tx_identifier() else {
+                warn!(
+                    target: "zone::precompile",
+                    "ZoneTxContext: unique transaction identifier is not set"
+                );
+                return Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir));
+            };
             let encoded = currentUniqueTxIdentifierCall::abi_encode_returns(&unique_tx_identifier);
 
             Ok(PrecompileOutput::new(20, encoded.into(), input.reservoir))
@@ -122,8 +131,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unique transaction identifier must be set before EVM execution")]
-    fn requires_unique_transaction_identifier() {
-        call_with_identifier(None);
+    fn reverts_when_unique_transaction_identifier_is_not_set() {
+        let output = call_with_identifier(None);
+
+        assert!(output.is_revert());
+        assert!(output.bytes.is_empty());
     }
 }
