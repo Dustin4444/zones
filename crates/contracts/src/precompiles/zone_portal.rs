@@ -345,34 +345,23 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
 }
 
 impl Withdrawal {
-    /// Build the authenticated-withdrawal sender plaintext `[sender(20) | tx_hash(32)]`.
-    pub fn authenticated_sender_plaintext(sender: Address, tx_hash: B256) -> [u8; 52] {
+    /// Build the authenticated-withdrawal plaintext
+    /// `[sender(20) | unique_tx_identifier(32)]`.
+    pub fn authenticated_sender_plaintext(sender: Address, unique_tx_identifier: B256) -> [u8; 52] {
         let mut plaintext = [0u8; 52];
         plaintext[..20].copy_from_slice(sender.as_slice());
-        plaintext[20..].copy_from_slice(tx_hash.as_slice());
+        plaintext[20..].copy_from_slice(unique_tx_identifier.as_slice());
         plaintext
-    }
-
-    /// Compute the authenticated sender tag `keccak256(sender || tx_hash)`.
-    pub fn sender_tag(sender: Address, tx_hash: B256) -> B256 {
-        keccak256(Self::authenticated_sender_plaintext(sender, tx_hash))
     }
 
     /// Reconstruct the public L1-facing withdrawal from a zone-side withdrawal request event.
     pub fn from_requested_event(
         event: &ZoneOutbox::WithdrawalRequested,
-        tx_hash: B256,
         encrypted_sender: Bytes,
     ) -> Self {
-        let sender_tag = if event.sender.is_zero() && event.fallbackRecipient.is_zero() {
-            Self::sender_tag(Address::ZERO, B256::ZERO)
-        } else {
-            Self::sender_tag(event.sender, tx_hash)
-        };
-
         Self {
             token: event.token,
-            senderTag: sender_tag,
+            senderTag: event.uniqueTxIdentifier,
             to: event.to,
             amount: event.amount,
             fee: event.fee,

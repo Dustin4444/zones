@@ -194,8 +194,8 @@ contract ZoneBridgeTest is BaseTest {
         l2BlockHash = GENESIS_BLOCK_HASH;
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked(sender, zoneTxContext.txHashFor(txSequence)));
+    function _senderTag(address, uint256 txSequence) internal view returns (bytes32) {
+        return zoneTxContext.uniqueTxIdentifierFor(txSequence);
     }
 
     function _withdrawal(
@@ -1133,7 +1133,7 @@ contract ZoneBridgeTest is BaseTest {
 
         Withdrawal memory bounce = Withdrawal({
             token: address(l2ZoneToken),
-            senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
+            senderTag: bytes32(0),
             to: alice,
             amount: netAmount,
             fee: 0,

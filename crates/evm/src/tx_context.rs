@@ -1,67 +1,22 @@
-//! Transaction-hash execution context for authenticated withdrawals.
+//! Transaction execution context for authenticated withdrawals.
 //!
-//! The zone outbox needs the real hash of the currently executing user transaction so it can
-//! commit `senderTag = keccak256(sender || txHash)` on-chain. The block executor publishes that
-//! hash into a thread-local context before EVM execution, and this precompile exposes it to
-//! Solidity at a fixed system address.
+//! The zone outbox uses Tempo's sender-scoped unique transaction identifier as the public
+//! `senderTag`. This precompile reads the identifier directly from the concrete [`TempoTxEnv`]
+//! through [`EvmInternals`](alloy_evm::EvmInternals), avoiding any executor-side context.
 
-use std::{cell::RefCell, thread_local};
-
-use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
-use alloy_primitives::{B256, Bytes, keccak256};
+use alloy_evm::precompiles::DynPrecompile;
+use alloy_primitives::Bytes;
 use alloy_sol_types::{SolCall, SolError};
 use revm::precompile::{PrecompileId, PrecompileOutput};
+use tempo_revm::TempoTxEnv;
 use tracing::{debug, warn};
 
 alloy_sol_types::sol! {
-    function currentTxHash() external returns (bytes32);
+    function currentUniqueTxIdentifier() external returns (bytes32);
     error DelegateCallNotAllowed();
 }
 
-thread_local! {
-    static CURRENT_TX_HASH: RefCell<Option<B256>> = const { RefCell::new(None) };
-}
-
-/// Guard that clears the current tx hash when dropped.
-pub(crate) struct TxHashGuard;
-
-impl Drop for TxHashGuard {
-    fn drop(&mut self) {
-        clear_current_tx_hash();
-    }
-}
-
-/// Publish the current executing transaction hash for the duration of EVM execution.
-pub(crate) fn set_current_tx_hash(tx_hash: B256) -> TxHashGuard {
-    CURRENT_TX_HASH.with(|slot| {
-        *slot.borrow_mut() = Some(tx_hash);
-    });
-    TxHashGuard
-}
-
-fn clear_current_tx_hash() {
-    CURRENT_TX_HASH.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-}
-
-fn current_tx_hash() -> Option<B256> {
-    CURRENT_TX_HASH.with(|slot| *slot.borrow())
-}
-
-fn synthetic_tx_hash(input: &PrecompileInput<'_>) -> B256 {
-    let mut bytes = Vec::with_capacity(16 + 20 + 20 + 32 + 32 + 32 + input.data.len());
-    bytes.extend_from_slice(b"zone-tx-context");
-    bytes.extend_from_slice(input.caller.as_slice());
-    bytes.extend_from_slice(input.target_address.as_slice());
-    bytes.extend_from_slice(&input.value.to_be_bytes::<32>());
-    bytes.extend_from_slice(&input.internals.block_number().to_be_bytes::<32>());
-    bytes.extend_from_slice(&input.internals.block_timestamp().to_be_bytes::<32>());
-    bytes.extend_from_slice(input.data);
-    keccak256(bytes)
-}
-
-/// `DynPrecompile` implementation that returns the currently executing zone tx hash.
+/// `DynPrecompile` implementation that returns the current Tempo transaction's unique identifier.
 pub(crate) struct ZoneTxContext;
 
 impl ZoneTxContext {
@@ -90,7 +45,7 @@ impl ZoneTxContext {
             }
 
             let selector: [u8; 4] = data[..4].try_into().expect("len >= 4");
-            if selector != currentTxHashCall::SELECTOR {
+            if selector != currentUniqueTxIdentifierCall::SELECTOR {
                 warn!(
                     target: "zone::precompile",
                     ?selector,
@@ -99,11 +54,76 @@ impl ZoneTxContext {
                 return Ok(PrecompileOutput::revert(0, Bytes::new(), input.reservoir));
             }
 
-            debug!(target: "zone::precompile", "ZoneTxContext: currentTxHash");
+            debug!(target: "zone::precompile", "ZoneTxContext: currentUniqueTxIdentifier");
 
-            let tx_hash = current_tx_hash().unwrap_or_else(|| synthetic_tx_hash(&input));
-            let encoded = currentTxHashCall::abi_encode_returns(&tx_hash);
+            let tx_env = input
+                .internals
+                .tx_env_downcast_ref::<TempoTxEnv>()
+                .expect("ZoneTxContext requires TempoTxEnv");
+            let unique_tx_identifier = tx_env
+                .unique_tx_identifier()
+                .expect("unique transaction identifier must be set before EVM execution");
+            let encoded = currentUniqueTxIdentifierCall::abi_encode_returns(&unique_tx_identifier);
+
             Ok(PrecompileOutput::new(20, encoded.into(), input.reservoir))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_evm::{
+        EvmInternals,
+        precompiles::{Precompile, PrecompileInput},
+        revm::Context,
+    };
+    use alloy_primitives::{Address, B256, U256};
+    use revm::{MainContext, context::CfgEnv, database::EmptyDB};
+    use tempo_chainspec::hardfork::TempoHardfork;
+    use tempo_evm::TempoBlockEnv;
+
+    fn call_with_identifier(unique_tx_identifier: Option<B256>) -> PrecompileOutput {
+        let mut ctx = Context::mainnet()
+            .with_db(EmptyDB::default())
+            .with_block(TempoBlockEnv::default())
+            .with_cfg(CfgEnv::<TempoHardfork>::default())
+            .with_tx(TempoTxEnv {
+                unique_tx_identifier,
+                ..Default::default()
+            });
+        let calldata = currentUniqueTxIdentifierCall {}.abi_encode();
+        let precompile = ZoneTxContext::create();
+
+        precompile
+            .call(PrecompileInput {
+                data: &calldata,
+                gas: u64::MAX,
+                reservoir: 0,
+                caller: Address::ZERO,
+                value: U256::ZERO,
+                target_address: Address::ZERO,
+                is_static: false,
+                bytecode_address: Address::ZERO,
+                internals: EvmInternals::from_context(&mut ctx),
+            })
+            .expect("precompile call should not fail")
+    }
+
+    #[test]
+    fn returns_unique_transaction_identifier_from_tempo_tx_env() {
+        let unique_tx_identifier = B256::repeat_byte(0x42);
+        let output = call_with_identifier(Some(unique_tx_identifier));
+
+        assert_eq!(
+            output.bytes,
+            currentUniqueTxIdentifierCall::abi_encode_returns(&unique_tx_identifier)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unique transaction identifier must be set before EVM execution")]
+    fn requires_unique_transaction_identifier() {
+        call_with_identifier(None);
     }
 }

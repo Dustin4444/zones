@@ -21,7 +21,7 @@ import { Test } from "forge-std/Test.sol";
 
 contract ZeroTxContext {
 
-    function currentTxHash() external pure returns (bytes32) {
+    function currentUniqueTxIdentifier() external pure returns (bytes32) {
         return bytes32(0);
     }
 
@@ -73,8 +73,8 @@ contract ZoneOutboxTest is Test {
         zoneToken.mint(charlie, 10_000e6);
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked(sender, txContext.txHashFor(txSequence)));
+    function _senderTag(address, uint256 txSequence) internal view returns (bytes32) {
+        return txContext.uniqueTxIdentifierFor(txSequence);
     }
 
     function _withdrawal(
@@ -126,7 +126,18 @@ contract ZoneOutboxTest is Test {
 
         vm.expectEmit(true, true, false, true);
         emit IZoneOutbox.WithdrawalRequested(
-            0, address(0), address(zoneToken), bob, amount, 0, bytes32(0), 0, address(0), "", ""
+            0,
+            address(0),
+            bytes32(0),
+            address(zoneToken),
+            bob,
+            amount,
+            0,
+            bytes32(0),
+            0,
+            address(0),
+            "",
+            ""
         );
 
         vm.prank(ZONE_INBOX);
@@ -134,7 +145,7 @@ contract ZoneOutboxTest is Test {
 
         Withdrawal memory expected = Withdrawal({
             token: address(zoneToken),
-            senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
+            senderTag: bytes32(0),
             to: bob,
             amount: amount,
             fee: 0,
@@ -196,12 +207,12 @@ contract ZoneOutboxTest is Test {
         PendingWithdrawal[] memory pending = outbox.getPendingWithdrawals();
         assertEq(pending.length, 2);
         assertEq(pending[0].sender, alice);
-        assertEq(pending[0].txHash, txContext.txHashFor(1));
+        assertEq(pending[0].uniqueTxIdentifier, txContext.uniqueTxIdentifierFor(1));
         assertEq(pending[0].to, alice);
         assertEq(pending[0].amount, 500e6);
         assertEq(pending[0].memo, bytes32("first"));
         assertEq(pending[1].sender, alice);
-        assertEq(pending[1].txHash, txContext.txHashFor(2));
+        assertEq(pending[1].uniqueTxIdentifier, txContext.uniqueTxIdentifierFor(2));
         assertEq(pending[1].to, bob);
         assertEq(pending[1].amount, 300e6);
         assertEq(pending[1].memo, bytes32("second"));
@@ -223,13 +234,13 @@ contract ZoneOutboxTest is Test {
         assertEq(disabledToken.balanceOf(alice), 1000e6);
     }
 
-    function test_requestWithdrawal_revertsOnInvalidCurrentTxHash() public {
+    function test_requestWithdrawal_revertsOnInvalidCurrentUniqueTxIdentifier() public {
         ZeroTxContext zeroTxContext = new ZeroTxContext();
         vm.etch(ZONE_TX_CONTEXT, address(zeroTxContext).code);
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        vm.expectRevert(ZoneOutbox.InvalidCurrentTxHash.selector);
+        vm.expectRevert(ZoneOutbox.InvalidCurrentUniqueTxIdentifier.selector);
         outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
@@ -974,6 +985,7 @@ contract ZoneOutboxTest is Test {
         emit IZoneOutbox.WithdrawalRequested(
             0, // index
             alice, // sender
+            txContext.uniqueTxIdentifierFor(1),
             address(zoneToken), // token
             bob, // to
             500e6, // amount

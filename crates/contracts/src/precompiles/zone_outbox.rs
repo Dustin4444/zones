@@ -15,7 +15,7 @@ crate::sol! {
         struct PendingWithdrawal {
             address token;
             address sender;
-            bytes32 txHash;
+            bytes32 uniqueTxIdentifier;
             address to;
             uint128 amount;
             uint128 fee;
@@ -31,6 +31,7 @@ crate::sol! {
         event WithdrawalRequested(
             uint64 indexed withdrawalIndex,
             address indexed sender,
+            bytes32 uniqueTxIdentifier,
             address token,
             address to,
             uint128 amount,

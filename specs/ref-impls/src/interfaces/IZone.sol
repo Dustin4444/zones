@@ -273,7 +273,7 @@ uint64 constant MAX_WITHDRAWAL_CALLBACK_GAS = 10_000_000;
 
 struct Withdrawal {
     address token; // TIP-20 token being withdrawn
-    bytes32 senderTag; // keccak256(abi.encodePacked(sender, txHash))
+    bytes32 senderTag; // sender-scoped unique transaction identifier
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     uint128 fee; // processing fee for sequencer (calculated at request time)
@@ -281,13 +281,13 @@ struct Withdrawal {
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     address fallbackRecipient; // zone address for bounce-back if call fails
     bytes callbackData; // calldata for IWithdrawalReceiver (if gasLimit > 0)
-    bytes encryptedSender; // optional encrypted (sender, txHash) reveal payload
+    bytes encryptedSender; // optional encrypted (sender, uniqueTxIdentifier) reveal payload
 }
 
 struct PendingWithdrawal {
     address token; // TIP-20 token being withdrawn
     address sender; // who initiated the withdrawal on the zone
-    bytes32 txHash; // hash of the zone transaction that requested the withdrawal
+    bytes32 uniqueTxIdentifier; // sender-scoped identifier for the requesting zone transaction
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     uint128 fee; // processing fee for sequencer (calculated at request time)
@@ -318,11 +318,11 @@ address constant ZONE_CONFIG = 0x1c00000000000000000000000000000000000003;
 address constant ZONE_TX_CONTEXT = 0x1C00000000000000000000000000000000000005;
 
 /// @title IZoneTxContext
-/// @notice Interface for the zone precompile that exposes the currently executing tx hash
+/// @notice Interface for the zone precompile that exposes Tempo transaction context
 interface IZoneTxContext {
 
-    /// @notice Returns the hash of the currently executing zone transaction
-    function currentTxHash() external returns (bytes32);
+    /// @notice Returns the sender-scoped identifier of the currently executing zone transaction
+    function currentUniqueTxIdentifier() external returns (bytes32);
 
 }
 
@@ -1048,6 +1048,7 @@ interface IZoneOutbox {
     event WithdrawalRequested(
         uint64 indexed withdrawalIndex,
         address indexed sender,
+        bytes32 uniqueTxIdentifier,
         address token,
         address to,
         uint128 amount,

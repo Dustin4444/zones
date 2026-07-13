@@ -227,17 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_tag_matches_plaintext_hash() {
+    fn test_authenticated_sender_plaintext_contains_unique_identifier() {
         let sender = address!("0x0000000000000000000000000000000000000001");
-        let tx_hash = B256::repeat_byte(0x22);
-        let plaintext = Withdrawal::authenticated_sender_plaintext(sender, tx_hash);
+        let unique_tx_identifier = B256::repeat_byte(0x22);
+        let plaintext = Withdrawal::authenticated_sender_plaintext(sender, unique_tx_identifier);
 
         assert_eq!(&plaintext[..20], sender.as_slice());
-        assert_eq!(&plaintext[20..], tx_hash.as_slice());
-        assert_eq!(
-            Withdrawal::sender_tag(sender, tx_hash),
-            keccak256(plaintext)
-        );
+        assert_eq!(&plaintext[20..], unique_tx_identifier.as_slice());
     }
 
     #[test]

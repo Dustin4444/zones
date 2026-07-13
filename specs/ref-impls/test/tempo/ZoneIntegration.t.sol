@@ -145,8 +145,8 @@ contract ZoneIntegrationTest is BaseTest {
         );
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked(sender, zoneTxContext.txHashFor(txSequence)));
+    function _senderTag(address, uint256 txSequence) internal view returns (bytes32) {
+        return zoneTxContext.uniqueTxIdentifierFor(txSequence);
     }
 
     function _withdrawal(

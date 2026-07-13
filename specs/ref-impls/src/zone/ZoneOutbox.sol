@@ -106,7 +106,7 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidBlockNumber();
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
-    error InvalidCurrentTxHash();
+    error InvalidCurrentUniqueTxIdentifier();
     error InvalidWithdrawalCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
@@ -274,8 +274,8 @@ contract ZoneOutbox is IZoneOutbox {
         // Fee is paid in the same token being withdrawn
         uint128 fee = _calculateWithdrawalFee(gasLimit);
         uint128 totalBurn = amount + fee;
-        bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
-        if (txHash == bytes32(0)) revert InvalidCurrentTxHash();
+        bytes32 uniqueTxIdentifier = IZoneTxContext(ZONE_TX_CONTEXT).currentUniqueTxIdentifier();
+        if (uniqueTxIdentifier == bytes32(0)) revert InvalidCurrentUniqueTxIdentifier();
 
         // Transfer tokens from sender to this contract, then burn
         // (Using transferFrom so user must approve first)
@@ -293,7 +293,7 @@ contract ZoneOutbox is IZoneOutbox {
             PendingWithdrawal({
                 token: token,
                 sender: msg.sender,
-                txHash: txHash,
+                uniqueTxIdentifier: uniqueTxIdentifier,
                 to: to,
                 amount: amount,
                 fee: fee,
@@ -311,6 +311,7 @@ contract ZoneOutbox is IZoneOutbox {
         emit WithdrawalRequested(
             index,
             msg.sender,
+            uniqueTxIdentifier,
             token,
             to,
             amount,
@@ -338,7 +339,7 @@ contract ZoneOutbox is IZoneOutbox {
             PendingWithdrawal({
                 token: token,
                 sender: address(0),
-                txHash: bytes32(0),
+                uniqueTxIdentifier: bytes32(0),
                 to: bouncebackRecipient,
                 amount: amount,
                 fee: 0,
@@ -354,6 +355,7 @@ contract ZoneOutbox is IZoneOutbox {
         emit WithdrawalRequested(
             index,
             address(0),
+            bytes32(0),
             token,
             bouncebackRecipient,
             amount,
@@ -426,9 +428,7 @@ contract ZoneOutbox is IZoneOutbox {
 
                 Withdrawal memory w = Withdrawal({
                     token: pendingWithdrawal.token,
-                    senderTag: keccak256(
-                        abi.encodePacked(pendingWithdrawal.sender, pendingWithdrawal.txHash)
-                    ),
+                    senderTag: pendingWithdrawal.uniqueTxIdentifier,
                     to: pendingWithdrawal.to,
                     amount: pendingWithdrawal.amount,
                     fee: pendingWithdrawal.fee,

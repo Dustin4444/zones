@@ -4,9 +4,8 @@
 //! Unlike the Tempo L1 [`TempoBlockExecutor`], this executor does **not** enforce subblock
 //! ordering, shared-gas accounting, or the end-of-block subblock metadata system transaction.
 
-use alloy_consensus::transaction::TxHashRef;
 use alloy_evm::{
-    Database, Evm, RecoveredTx,
+    Database, Evm,
     block::{BlockExecutionError, BlockExecutionResult, BlockExecutor, ExecutableTx, GasOutput},
     eth::{EthBlockExecutor, EthTxResult},
 };
@@ -20,8 +19,6 @@ use tempo_precompiles::{
 };
 use tempo_primitives::{TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::{TempoStateAccess, evm::TempoContext};
-
-use crate::tx_context;
 
 /// Simplified block executor for zone nodes.
 ///
@@ -96,15 +93,11 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
-        let (tx_env, recovered) = tx.into_parts();
-
         // Override the validator's fee token preference to match this
         // transaction's resolved fee token, so the handler skips FeeAMM.
         self.override_validator_token();
 
-        let _tx_hash_guard = tx_context::set_current_tx_hash(*recovered.tx().tx_hash());
-        self.inner
-            .execute_transaction_without_commit((tx_env, recovered))
+        self.inner.execute_transaction_without_commit(tx)
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {

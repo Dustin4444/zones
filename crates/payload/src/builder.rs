@@ -404,13 +404,13 @@ where
                         zone_precompiles::ecies::encrypt_authenticated_withdrawal(
                             request.revealTo.as_ref(),
                             request.sender,
-                            request.txHash,
+                            request.uniqueTxIdentifier,
                         )
                         .map(Bytes::from)
                         .ok_or_else(|| {
                             PayloadBuilderError::Internal(reth_errors::RethError::msg(format!(
                                 "failed to encrypt authenticated sender reveal for tx {}",
-                                request.txHash
+                                request.uniqueTxIdentifier
                             )))
                         })
                     }

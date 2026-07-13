@@ -611,11 +611,8 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
         .query()
         .await?;
     assert_eq!(requested_logs.len(), 1);
-    let (requested, requested_log) = &requested_logs[0];
-    let withdrawal_tx_hash = requested_log
-        .transaction_hash
-        .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-    let withdrawal = Withdrawal::from_requested_event(requested, withdrawal_tx_hash, Bytes::new());
+    let (requested, _) = &requested_logs[0];
+    let withdrawal = Withdrawal::from_requested_event(requested, Bytes::new());
     let expected_hash = Withdrawal::queue_hash(&[withdrawal]);
 
     let finalized_logs = outbox
@@ -738,15 +735,8 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
     assert_eq!(requested_n1.len(), 1);
 
     let mut withdrawals = Vec::new();
-    for (requested, log) in requested_n.iter().chain(requested_n1.iter()) {
-        let tx_hash = log
-            .transaction_hash
-            .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-        withdrawals.push(Withdrawal::from_requested_event(
-            requested,
-            tx_hash,
-            Bytes::new(),
-        ));
+    for (requested, _) in requested_n.iter().chain(requested_n1.iter()) {
+        withdrawals.push(Withdrawal::from_requested_event(requested, Bytes::new()));
     }
     let expected_hash = Withdrawal::queue_hash(&withdrawals);
     let (finalized, log) = &finalized_logs[0];
@@ -889,11 +879,8 @@ async fn test_current_only_block_finalizes_at_batch_boundary() -> eyre::Result<(
         .to_block(withdrawal_block)
         .query()
         .await?;
-    let (requested, requested_log) = &requested_logs[0];
-    let withdrawal_tx_hash = requested_log
-        .transaction_hash
-        .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-    let withdrawal = Withdrawal::from_requested_event(requested, withdrawal_tx_hash, Bytes::new());
+    let (requested, _) = &requested_logs[0];
+    let withdrawal = Withdrawal::from_requested_event(requested, Bytes::new());
     assert_eq!(
         finalized_logs[0].0.withdrawalQueueHash,
         Withdrawal::queue_hash(&[withdrawal])

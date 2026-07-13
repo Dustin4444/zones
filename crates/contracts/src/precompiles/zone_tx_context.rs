@@ -3,6 +3,6 @@
 crate::sol! {
     #[derive(Debug)]
     contract ZoneTxContext {
-        function currentTxHash() external returns (bytes32);
+        function currentUniqueTxIdentifier() external returns (bytes32);
     }
 }

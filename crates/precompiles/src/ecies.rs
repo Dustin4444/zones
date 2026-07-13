@@ -21,7 +21,8 @@ use crate::{
 /// Plaintext size for encrypted deposits: 20 bytes (address) + 32 bytes (memo) + 12 bytes (padding).
 pub const ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE: usize = 64;
 
-/// Plaintext size for authenticated-withdrawal sender reveals: 20 bytes (sender) + 32 bytes (tx hash).
+/// Plaintext size for authenticated-withdrawal sender reveals: 20 bytes (sender) + 32 bytes
+/// (unique transaction identifier).
 pub const AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE: usize = 52;
 
 /// Total encoded size of `encryptedSender`.
@@ -153,14 +154,14 @@ pub struct EncryptedDepositArgs {
     pub tag: [u8; 16],
 }
 
-/// Encrypt `(sender, tx_hash)` for authenticated withdrawals.
+/// Encrypt `(sender, unique_tx_identifier)` for authenticated withdrawals.
 ///
 /// The output is:
 /// `compressed_ephemeral_pubkey(33) || nonce(12) || ciphertext(52) || tag(16)`.
 pub fn encrypt_authenticated_withdrawal(
     reveal_to: &[u8],
     sender: Address,
-    tx_hash: B256,
+    unique_tx_identifier: B256,
 ) -> Option<Vec<u8>> {
     if reveal_to.len() != 33 {
         return None;
@@ -187,7 +188,7 @@ pub fn encrypt_authenticated_withdrawal(
     let info = authenticated_withdrawal_hkdf_info(&eph_pubkey);
     let aes_key = hkdf_sha256(&shared_secret_x, b"authenticated-withdrawal-aes-key", &info);
 
-    let plaintext = build_authenticated_withdrawal_plaintext(&sender, &tx_hash);
+    let plaintext = build_authenticated_withdrawal_plaintext(&sender, &unique_tx_identifier);
     let cipher = Aes256Gcm::new((&aes_key).into());
     let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -241,8 +242,8 @@ pub fn decrypt_authenticated_withdrawal(
     }
 
     let sender = Address::from_slice(&plaintext[..20]);
-    let tx_hash = B256::from_slice(&plaintext[20..]);
-    Some((sender, tx_hash))
+    let unique_tx_identifier = B256::from_slice(&plaintext[20..]);
+    Some((sender, unique_tx_identifier))
 }
 
 /// Encrypt deposit data for `ZonePortal.depositEncrypted`.
@@ -390,14 +391,15 @@ pub fn build_plaintext(to: &Address, memo: &B256) -> [u8; ENCRYPTED_PAYLOAD_PLAI
     buf
 }
 
-/// Build authenticated-withdrawal sender plaintext: `[sender(20)|tx_hash(32)]`.
+/// Build authenticated-withdrawal sender plaintext:
+/// `[sender(20)|unique_tx_identifier(32)]`.
 pub fn build_authenticated_withdrawal_plaintext(
     sender: &Address,
-    tx_hash: &B256,
+    unique_tx_identifier: &B256,
 ) -> [u8; AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE] {
     let mut buf = [0u8; AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE];
     buf[..20].copy_from_slice(sender.as_slice());
-    buf[20..].copy_from_slice(tx_hash.as_slice());
+    buf[20..].copy_from_slice(unique_tx_identifier.as_slice());
     buf
 }
 
@@ -465,15 +467,16 @@ mod tests {
         let encoded = pubkey.to_encoded_point(true);
 
         let sender = Address::repeat_byte(0x11);
-        let tx_hash = B256::repeat_byte(0x22);
+        let unique_tx_identifier = B256::repeat_byte(0x22);
         let encrypted =
-            encrypt_authenticated_withdrawal(encoded.as_bytes(), sender, tx_hash).unwrap();
+            encrypt_authenticated_withdrawal(encoded.as_bytes(), sender, unique_tx_identifier)
+                .unwrap();
         assert_eq!(encrypted.len(), AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE);
 
-        let (decrypted_sender, decrypted_tx_hash) =
+        let (decrypted_sender, decrypted_unique_tx_identifier) =
             decrypt_authenticated_withdrawal(&privkey, &encrypted).unwrap();
         assert_eq!(decrypted_sender, sender);
-        assert_eq!(decrypted_tx_hash, tx_hash);
+        assert_eq!(decrypted_unique_tx_identifier, unique_tx_identifier);
     }
 
     #[test]

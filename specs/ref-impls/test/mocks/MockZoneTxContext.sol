@@ -2,19 +2,18 @@
 pragma solidity ^0.8.13;
 
 /// @notice Mock tx context precompile for Solidity-only tests.
-/// @dev Returns deterministic pseudo tx hashes in increasing sequence order so tests
-///      can reconstruct sender tags exactly.
+/// @dev Returns deterministic unique transaction identifiers in increasing sequence order.
 contract MockZoneTxContext {
 
     uint256 public sequence;
 
-    function currentTxHash() external returns (bytes32) {
+    function currentUniqueTxIdentifier() external returns (bytes32) {
         sequence++;
-        return txHashFor(sequence);
+        return uniqueTxIdentifierFor(sequence);
     }
 
-    function txHashFor(uint256 seq) public pure returns (bytes32) {
-        return keccak256(abi.encodePacked("mock-zone-tx-hash", seq));
+    function uniqueTxIdentifierFor(uint256 seq) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked("mock-zone-unique-tx-identifier", seq));
     }
 
 }

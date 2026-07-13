@@ -782,7 +782,6 @@ struct RequestedWithdrawalLog {
     block_number: u64,
     tx_index: u64,
     log_index: u64,
-    tx_hash: B256,
     event: abi::ZoneOutbox::WithdrawalRequested,
 }
 
@@ -912,7 +911,7 @@ pub(crate) async fn fetch_finalized_batch(
         .into_iter()
         .zip(encrypted_senders)
         .map(|(request, encrypted_sender)| {
-            abi::Withdrawal::from_requested_event(&request.event, request.tx_hash, encrypted_sender)
+            abi::Withdrawal::from_requested_event(&request.event, encrypted_sender)
         })
         .collect::<Vec<_>>();
 
@@ -965,9 +964,6 @@ async fn fetch_requested_withdrawal_logs(
                 block_number: log.block_number.unwrap_or(0),
                 tx_index: log.transaction_index.unwrap_or(0),
                 log_index: log.log_index.unwrap_or(0),
-                tx_hash: log.transaction_hash.ok_or_else(|| {
-                    eyre::eyre!("WithdrawalRequested log missing transaction hash")
-                })?,
                 event,
             })
         })

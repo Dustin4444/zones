@@ -174,7 +174,7 @@ contract ZonePortalGasLimitTest is Test {
     {
         return Withdrawal({
             token: address(token),
-            senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
+            senderTag: bytes32(0),
             to: recipient,
             amount: amount,
             fee: 0,
