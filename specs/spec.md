@@ -843,7 +843,7 @@ Zones expose a modified Ethereum JSON-RPC where every request is authenticated a
 
 ### Authorization Tokens
 
-Every RPC request must include an authorization token in the `X-Authorization-Token` HTTP header. The token proves the caller controls a Tempo account and scopes all responses to that account.
+Every HTTP RPC request must include an authorization token in the `X-Authorization-Token` HTTP header. The token proves the caller controls a Tempo account and scopes all responses to that account.
 
 The signed message is `keccak256` of a packed encoding containing a `"TempoZoneRPC"` magic prefix, a version byte (currently `0`), the `zoneId`, `chainId`, `issuedAt`, and `expiresAt` timestamps. The wire format concatenates the signature and the 29-byte token fields, with the token fields always at the end.
 
@@ -936,13 +936,13 @@ To avoid leaking how much activity occurred in a block, some fields of returned 
 
 ### WebSocket Subscriptions
 
-WebSocket connections follow the same authorization model. The authorization token is provided during the handshake and scopes all subscriptions for that connection.
+WebSocket connections are authenticated during the handshake. The authorization token is validated at handshake time and scopes all subscriptions for the lifetime of the connection. Token expiration prevents new connections but does not terminate an established connection. Reconnecting requires a currently valid token.
 
 - `eth_subscribe("newHeads")`: allowed, pushes block headers with the same header redaction as HTTP block responses for non-sequencer callers.
 - `eth_subscribe("logs")`: scoped to the authenticated account using the same event filtering rules.
 - `eth_subscribe("newPendingTransactions")`: disabled.
 
-The connection is terminated when the authorization token expires. For keychain-authenticated connections, the server must also terminate the connection within 1 second of importing a block that revokes the keychain key.
+For keychain-authenticated connections, the server must terminate the connection within 1 second of importing a block that revokes the keychain key.
 
 ### Zone-Specific Methods
 

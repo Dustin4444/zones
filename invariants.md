@@ -128,7 +128,7 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | ID | Assertion | Crit | Impact |
 |---|---|---|---|
 | `TEMPO-ZONE-RPC-TOKEN-DOMAIN` | Authorization tokens bind to `TempoZoneRPC`, version, zone ID or wildcard zero, chain ID, `issuedAt`, and `expiresAt` | 🟡 | Tokens can be replayed across zones, chains, or protocol versions |
-| `TEMPO-ZONE-RPC-TOKEN-LIFETIME` | Tokens expire, are not valid too far in the future, and never exceed the 30-day maximum validity window | 🟡 | Long-lived or future-dated tokens can preserve unauthorized access |
+| `TEMPO-ZONE-RPC-TOKEN-LIFETIME` | Tokens presented with HTTP requests or WebSocket handshakes expire, are not valid too far in the future, and never exceed the 30-day maximum validity window | 🟡 | Long-lived or future-dated tokens can preserve unauthorized access |
 | `TEMPO-ZONE-RPC-SENDER-SCOPING` | `eth_sendRawTransaction`, `eth_call`, and `eth_estimateGas` require the authenticated account to match the transaction or call sender | 🟡 | Users can simulate or submit transactions as other accounts |
 | `TEMPO-ZONE-RPC-ACCOUNT-QUERY-SCOPING` | `eth_getBalance`/`eth_getTransactionCount` return `0x0` for non-self queries and `eth_getTransactionByHash`/`eth_getTransactionReceipt` return `null` when the caller is not the sender | 🟡 | Users can read other accounts' balances, nonces, or transactions, or probe account existence |
 | `TEMPO-ZONE-RPC-RAW-STATE-SEQUENCER-ONLY` | Raw state, full transaction/block, debug/admin/txpool, proof, and pending-transaction methods are unavailable to non-sequencers | 🟡 | Private transaction, storage, and mempool data leaks |

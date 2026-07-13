@@ -22,11 +22,7 @@ use axum::{
 use futures::{SinkExt, stream::StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, value::RawValue};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -455,16 +451,6 @@ fn activate_pending_subscriptions(
     }
 }
 
-/// Time remaining until the given unix-second deadline, using the full system
-/// clock precision (not truncated to whole seconds) so the session closes as
-/// close as possible to the exact `expires_at` boundary.
-fn duration_until_unix_timestamp(timestamp: u64) -> Duration {
-    let deadline = UNIX_EPOCH + Duration::from_secs(timestamp);
-    deadline
-        .duration_since(SystemTime::now())
-        .unwrap_or_default()
-}
-
 /// Re-check keychain auth for long-lived WebSocket sessions.
 async fn keychain_auth_still_valid(auth: &AuthContext, state: &RpcState) -> bool {
     let Some(key_id) = auth.keychain_key_id else {
@@ -521,8 +507,6 @@ async fn handle_ws_session(
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (notifications, mut outbound) = mpsc::channel::<String>(MAX_WS_OUTBOUND_QUEUE);
     let (close_session, mut close_session_rx) = watch::channel(false);
-    let token_expiry = tokio::time::sleep(duration_until_unix_timestamp(auth.expires_at));
-    tokio::pin!(token_expiry);
     let mut keychain_recheck = tokio::time::interval(Duration::from_secs(1));
     let writer = tokio::spawn(async move {
         while let Some(message) = outbound.recv().await {
@@ -537,14 +521,12 @@ async fn handle_ws_session(
     loop {
         let msg = tokio::select! {
             biased;
-            _ = &mut token_expiry => break,
             _ = close_session_rx.changed() => break,
             _ = keychain_recheck.tick(), if auth.keychain_key_id.is_some() => {
-                // Revalidation may be slow; allow token expiry / forced close to
-                // interrupt it so those deadlines are not delayed by a hung RPC.
+                // Revalidation may be slow; allow a forced close to interrupt it
+                // so the close is not delayed by a hung RPC.
                 let still_valid = tokio::select! {
                     biased;
-                    _ = &mut token_expiry => false,
                     _ = close_session_rx.changed() => false,
                     valid = keychain_auth_still_valid(&auth, &state) => valid,
                 };
