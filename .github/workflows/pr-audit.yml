@@ -50,6 +50,7 @@ jobs:
           command-regex: '^(?:@decofe\s+)?(?:cyclops\s+audit|derek\s+audit)\b'
           permission-check-mode: association
           organization: tempoxyz
+          allow-same-repository-author: true
           events-key: ${{ secrets.EVENTS_KEY }}
           events-cert: ${{ secrets.EVENTS_CERT }}
           events-args: ${{ secrets.EVENTS_ARGS }}
