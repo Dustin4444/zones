@@ -364,6 +364,8 @@ where
     l1_config: L1SubscriberConfig,
     /// TIP-403 policy cache
     policy_cache: PolicyCache,
+    /// Block-versioned L1 storage cache shared with the subscriber and precompiles.
+    l1_state_cache: L1StateCache,
     /// ZonePortal address on L1.
     portal_address: Address,
     /// Pre-configured list of initial tokens.
@@ -393,6 +395,7 @@ where
         deposit_queue: DepositQueue,
         l1_config: L1SubscriberConfig,
         policy_cache: PolicyCache,
+        l1_state_cache: L1StateCache,
         portal_address: Address,
         initial_tokens: Option<Vec<Address>>,
         private_rpc_config: ZonePrivateRpcConfig,
@@ -410,6 +413,7 @@ where
             deposit_queue,
             l1_config,
             policy_cache,
+            l1_state_cache,
             portal_address,
             initial_tokens,
             private_rpc_config,
@@ -623,6 +627,7 @@ where
             sequencer_key,
             self.portal_address,
             policy_provider,
+            self.l1_state_cache.clone(),
         );
         ctx.node
             .task_executor()
@@ -815,6 +820,7 @@ where
             self.deposit_queue.clone(),
             self.l1_config.clone(),
             self.policy_cache.clone(),
+            self.l1_state_cache.clone(),
             self.portal_address,
             self.initial_tokens.clone(),
             self.private_rpc_config.clone(),
