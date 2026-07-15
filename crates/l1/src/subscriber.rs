@@ -561,6 +561,7 @@ impl L1Subscriber {
                 let addr = log.address();
 
                 if addr == portal_address {
+                    mutated_accounts.insert(addr);
                     let prev_len = portal_events.enabled_tokens.len();
                     if let Err(e) = portal_events.push_log(log, block_number) {
                         warn!(block_number, %e, "Failed to decode portal event from receipt");

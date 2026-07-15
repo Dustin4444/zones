@@ -504,6 +504,24 @@ fn make_portal_log<E: SolEvent>(portal_address: Address, event: E) -> Log {
 }
 
 #[test]
+fn extract_events_tracks_portal_mutations() {
+    let mut subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new([0])),
+        Some(0),
+    );
+    let portal = subscriber.config.portal_address;
+    let log = make_log(
+        portal,
+        LogData::new_unchecked(vec![B256::repeat_byte(0xff)], Bytes::new()),
+    );
+
+    let (_, _, mutated_accounts) =
+        subscriber.extract_events(1, &[make_test_receipt_with_logs(vec![log])]);
+
+    assert_eq!(mutated_accounts, HashSet::from([portal]));
+}
+
+#[test]
 fn extract_events_conservatively_tracks_policy_mutations() {
     use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
 
