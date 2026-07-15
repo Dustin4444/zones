@@ -47,6 +47,9 @@ where
     }
 }
 
+/// Events extracted from an L1 block: portal events, policy events, and tracked tokens.
+type SubscriberEventsOutput = (L1PortalEvents, Vec<PolicyEvent>, HashSet<Address>);
+
 /// L1 chain subscriber that listens for new blocks and extracts deposit events.
 #[derive(Clone)]
 pub struct L1Subscriber {
@@ -468,11 +471,7 @@ impl L1Subscriber {
         // A block is only flushed to the deposit queue once the NEXT block
         // arrives with a matching parent hash, proving the buffered block
         // is on the canonical chain.
-        #[allow(clippy::type_complexity)]
-        let mut unconfirmed_tip: Option<(
-            SealedHeader<TempoHeader>,
-            (L1PortalEvents, Vec<PolicyEvent>, HashSet<Address>),
-        )> = None;
+        let mut unconfirmed_tip: Option<(SealedHeader<TempoHeader>, SubscriberEventsOutput)> = None;
 
         loop {
             let stream_wait_start = std::time::Instant::now();
@@ -549,7 +548,7 @@ impl L1Subscriber {
         &mut self,
         block_number: u64,
         receipts: &[tempo_alloy::rpc::TempoTransactionReceipt],
-    ) -> (L1PortalEvents, Vec<PolicyEvent>, HashSet<Address>) {
+    ) -> SubscriberEventsOutput {
         use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
 
         let portal_address = self.config.portal_address;
