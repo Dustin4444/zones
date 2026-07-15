@@ -61,10 +61,8 @@ pub(crate) fn test_storage_provider(
 pub(crate) struct MockL1Reader {
     slots: Shared<HashMap<L1Slot, B256>>,
     storage_requests: Shared<Vec<L1Slot>>,
-    hardfork_requests: Shared<Vec<u64>>,
     fallback: B256,
     fail_storage: bool,
-    fail_hardfork: bool,
 }
 
 impl MockL1Reader {
@@ -82,13 +80,6 @@ impl MockL1Reader {
         }
     }
 
-    pub(crate) fn failing_hardfork() -> Self {
-        Self {
-            fail_hardfork: true,
-            ..Default::default()
-        }
-    }
-
     pub(crate) fn set_u256(&self, address: Address, slot: U256, block: u64, value: U256) {
         self.slots.lock().unwrap().insert(
             (address, B256::from(slot.to_be_bytes()), block),
@@ -98,10 +89,6 @@ impl MockL1Reader {
 
     pub(crate) fn storage_requests(&self) -> Vec<L1Slot> {
         self.storage_requests.lock().unwrap().clone()
-    }
-
-    pub(crate) fn hardfork_requests(&self) -> Vec<u64> {
-        self.hardfork_requests.lock().unwrap().clone()
     }
 }
 
@@ -126,15 +113,6 @@ impl L1StorageReader for MockL1Reader {
             .get(&(account, slot, block_number))
             .copied()
             .unwrap_or(self.fallback))
-    }
-
-    fn hardfork_at(&self, block_number: u64) -> Result<TempoHardfork, PrecompileError> {
-        self.hardfork_requests.lock().unwrap().push(block_number);
-        if self.fail_hardfork {
-            Err(PrecompileError::Fatal("hardfork unavailable".into()))
-        } else {
-            Ok(TempoHardfork::T8)
-        }
     }
 }
 

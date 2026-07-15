@@ -48,12 +48,6 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
         slot: B256,
         block_number: u64,
     ) -> core::result::Result<B256, PrecompileError>;
-
-    /// Resolve the Tempo hardfork active at `block_number` on L1.
-    fn hardfork_at(
-        &self,
-        block_number: u64,
-    ) -> core::result::Result<TempoHardfork, PrecompileError>;
 }
 
 /// Precompile storage that overlays finalized Tempo L1 policy state onto zone-local EVM state.
@@ -63,29 +57,17 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
 pub struct ZonePrecompileStorageProvider<'a, P> {
     inner: EvmPrecompileStorageProvider<'a>,
     l1_block_number: u64,
-    l1_spec: TempoHardfork,
     l1: P,
 }
 
 impl<'a, P: L1StorageReader> ZonePrecompileStorageProvider<'a, P> {
     /// Wrap `inner` with an L1 reader bound to `l1_block_number` for this precompile call.
-    ///
-    /// The L1 hardfork is resolved from the same block here so callers cannot accidentally pair
-    /// storage from one anchor with execution rules from another.
-    pub fn new(
-        inner: EvmPrecompileStorageProvider<'a>,
-        l1: P,
-        l1_block_number: u64,
-    ) -> Result<Self> {
-        let l1_spec = l1
-            .hardfork_at(l1_block_number)
-            .map_err(fatal_reader_error)?;
-        Ok(Self {
+    pub fn new(inner: EvmPrecompileStorageProvider<'a>, l1: P, l1_block_number: u64) -> Self {
+        Self {
             inner,
             l1,
             l1_block_number,
-            l1_spec,
-        })
+        }
     }
 }
 
@@ -209,7 +191,7 @@ impl<P: L1StorageReader> PrecompileStorageProvider for ZonePrecompileStorageProv
     }
 
     fn spec(&self) -> TempoHardfork {
-        self.l1_spec
+        self.inner.spec()
     }
 
     fn storage_actions(&self) -> StorageActions {
@@ -275,10 +257,6 @@ pub(super) fn trace_err(
     ))
 }
 
-fn fatal_reader_error(err: PrecompileError) -> TempoPrecompileError {
-    TempoPrecompileError::Fatal(precompile_error_message(err))
-}
-
 fn precompile_error_message(err: PrecompileError) -> alloc::string::String {
     match err {
         PrecompileError::Fatal(msg) => msg,
@@ -318,38 +296,21 @@ mod tests {
             )
             .expect("anchor write succeeds");
         let l1_block_number = read_l1_anchor(&mut inner).expect("anchor read succeeds");
-        let mut provider = ZonePrecompileStorageProvider::new(inner, l1, l1_block_number)
-            .expect("hardfork resolution succeeds");
+        let mut provider = ZonePrecompileStorageProvider::new(inner, l1, l1_block_number);
         f(&mut provider)
     }
 
     #[test]
-    fn provider_resolves_hardfork_at_storage_anchor_and_fails_closed() {
+    fn provider_uses_composed_evm_hardfork() {
         let mut ctx = test_context();
-        let l1 = MockL1Reader::default();
+        ctx.cfg.spec = TempoHardfork::T8;
         let provider = ZonePrecompileStorageProvider::new(
             test_storage_provider(&mut ctx, u64::MAX, false),
-            l1.clone(),
-            77,
-        )
-        .expect("anchored hardfork resolves");
-        assert_eq!(provider.spec(), TempoHardfork::T8);
-        assert_eq!(l1.hardfork_requests(), vec![77]);
-        drop(provider);
-
-        let result = ZonePrecompileStorageProvider::new(
-            test_storage_provider(&mut ctx, u64::MAX, false),
-            MockL1Reader::failing_hardfork(),
+            MockL1Reader::default(),
             77,
         );
-        let err = match result {
-            Err(err) => err,
-            Ok(_) => panic!("missing anchored hardfork must fail closed"),
-        };
-        assert!(matches!(
-            err,
-            TempoPrecompileError::Fatal(message) if message.contains("hardfork unavailable")
-        ));
+
+        assert_eq!(provider.spec(), TempoHardfork::T8);
     }
 
     #[test]
@@ -506,7 +467,6 @@ mod tests {
         );
         assert!(l1.storage_requests().iter().all(|request| request.2 == 123));
         assert_eq!(l1.storage_requests().len(), 3);
-        assert_eq!(l1.hardfork_requests(), vec![123]);
     }
 
     #[test]
