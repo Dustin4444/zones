@@ -31,14 +31,11 @@ use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_precompiles::{
     DelegateCallNotAllowed, charge_input_cost,
     dispatch::selector_from_calldata,
-    storage::{
-        PrecompileStorageProvider, StorageCtx, actions::StorageActions,
-        evm::EvmPrecompileStorageProvider,
-    },
+    storage::{StorageCtx, actions::StorageActions, evm::EvmPrecompileStorageProvider},
     storage_credits::NonCreditableSlots,
 };
 
-use crate::storage::{L1StorageReader, ZonePrecompileStorageProvider, read_l1_anchor};
+use crate::storage::{L1StorageReader, ZonePrecompileStorageProvider};
 
 /// Shared inputs for precompiles executing over finalized Tempo state.
 ///
@@ -261,18 +258,10 @@ pub(crate) fn create_l1_backed_precompile<P: L1StorageReader>(
             }
         }
 
-        let l1_block_number = match read_l1_anchor(&mut inner) {
-            Ok(block_number) => block_number,
-            Err(err) => {
-                return err.into_precompile_result(inner.gas_used(), inner.reservoir());
-            }
+        let mut storage = match ZonePrecompileStorageProvider::try_new(inner, l1_reader.clone()) {
+            Ok(storage) => storage,
+            Err(err) => return err.into_precompile_result(),
         };
-        let (gas_used, reservoir) = (inner.gas_used(), inner.reservoir());
-        let mut storage =
-            match ZonePrecompileStorageProvider::new(inner, l1_reader.clone(), l1_block_number) {
-                Ok(storage) => storage,
-                Err(err) => return err.into_precompile_result(gas_used, reservoir),
-            };
 
         if let Some(check_result) = StorageCtx::enter(&mut storage, || {
             match rules.check_with_l1_backed_state(call) {
@@ -324,6 +313,7 @@ mod tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+    use tempo_precompiles::storage::PrecompileStorageProvider;
 
     const FIXED_GAS: u64 = 123;
     type RuleRecord = Rc<RefCell<Option<(Bytes, Option<[u8; 4]>, Address)>>>;
@@ -408,7 +398,8 @@ mod tests {
         let reader = MockL1Reader::default();
         let observed_spec = Rc::new(Cell::new(None));
         let execute_spec = observed_spec.clone();
-        let cfg = revm::context::CfgEnv::<TempoHardfork>::default();
+        let mut cfg = revm::context::CfgEnv::<TempoHardfork>::default();
+        cfg.spec = TempoHardfork::T8;
         let env = L1BackedPrecompileEnv::new(
             &cfg,
             reader.clone(),
@@ -430,7 +421,6 @@ mod tests {
                 .is_revert()
         );
         assert!(checked.get());
-        assert!(reader.hardfork_requests().is_empty());
 
         let precompile =
             create_l1_backed_precompile("L1BackedTest", env, NoCallRules, move |_, _| {
@@ -449,7 +439,6 @@ mod tests {
             .call(input(&mut ctx, &[], Address::ZERO, u64::MAX))
             .unwrap();
 
-        assert_eq!(reader.hardfork_requests(), vec![anchor]);
         assert_eq!(observed_spec.get(), Some(TempoHardfork::T8));
     }
 
