@@ -11,7 +11,6 @@ use std::{
     time::Duration,
 };
 use tempo_alloy::rpc::TempoTransactionReceipt;
-use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_primitives::{TempoReceipt, TempoTxType};
 
 #[derive(Deserialize)]
@@ -418,7 +417,7 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_and_raw_l1_state() {
     let user = address!("0x0000000000000000000000000000000000000022");
 
     let old_header = seal(make_test_header(10));
-    subscriber.update_l1_state_anchor(&old_header, 4217, &HashSet::new());
+    subscriber.update_l1_state_anchor(&old_header, &HashSet::new());
     {
         let mut cache = subscriber.config.l1_state_cache.write();
         cache.set(
@@ -427,7 +426,6 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_and_raw_l1_state() {
             10,
             B256::with_last_byte(0xaa),
         );
-        cache.extend_hardfork_schedule(10, [(0, TempoHardfork::T0)]);
     }
     {
         let mut cache = subscriber.config.policy_cache.write();
@@ -439,7 +437,7 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_and_raw_l1_state() {
 
     let replacement_parent = B256::with_last_byte(0x44);
     let replacement_header = seal(make_chained_header(11, replacement_parent));
-    subscriber.update_l1_state_anchor(&replacement_header, 4217, &HashSet::new());
+    subscriber.update_l1_state_anchor(&replacement_header, &HashSet::new());
     assert_eq!(
         subscriber
             .config
@@ -448,11 +446,6 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_and_raw_l1_state() {
             .get(token, B256::with_last_byte(1), 10),
         None,
         "reorg must clear raw L1 state"
-    );
-    assert_eq!(
-        subscriber.config.l1_state_cache.read().hardfork_at(10),
-        None,
-        "reorg must clear hardfork metadata"
     );
     subscriber.apply_policy_events(
         11,

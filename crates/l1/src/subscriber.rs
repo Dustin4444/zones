@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::HashSet;
-use tempo_chainspec::hardfork::TempoHardfork;
 
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -285,7 +284,6 @@ impl L1Subscriber {
     async fn sync_to_l1_tip(
         &mut self,
         l1_provider: &impl Provider<TempoNetwork>,
-        chain_id: u64,
     ) -> eyre::Result<()> {
         let Some(mut from) = self.resolve_start_block(l1_provider).await? else {
             self.subscriber_metrics.current_l1_lag_blocks.set(0.0);
@@ -321,7 +319,7 @@ impl L1Subscriber {
             "Backfilling deposit events"
         );
         let start = std::time::Instant::now();
-        let result = self.backfill(l1_provider, chain_id, from, tip).await;
+        let result = self.backfill(l1_provider, from, tip).await;
         self.subscriber_metrics
             .backfill_duration_seconds
             .record(start.elapsed().as_secs_f64());
@@ -341,7 +339,6 @@ impl L1Subscriber {
     async fn backfill(
         &mut self,
         l1_provider: &impl Provider<TempoNetwork>,
-        chain_id: u64,
         from: u64,
         to: u64,
     ) -> eyre::Result<()> {
@@ -407,7 +404,7 @@ impl L1Subscriber {
             self.record_seen_block(block_number, to.saturating_sub(block_number));
 
             let sealed = SealedHeader::seal_slow(header);
-            self.update_l1_state_anchor(&sealed, chain_id, &mutated_accounts);
+            self.update_l1_state_anchor(&sealed, &mutated_accounts);
             self.apply_policy_events(block_number, &policy_events);
             self.apply_portal_state_events(block_number, &portal_events);
             self.deposit_queue
@@ -459,11 +456,10 @@ impl L1Subscriber {
         self.tracked_tokens = self.config.policy_cache.read().tracked_tokens();
 
         let provider = self.connect().await?;
-        let chain_id = provider.get_chain_id().await?;
 
         // Backfill to the current tip before subscribing.
         // Backfilled blocks are historical and considered confirmed.
-        self.sync_to_l1_tip(&provider, chain_id).await?;
+        self.sync_to_l1_tip(&provider).await?;
 
         info!(portal = %self.config.portal_address, "Listening for L1 blocks");
         let mut stream = self.l1_block_stream(&provider).await?;
@@ -500,7 +496,7 @@ impl L1Subscriber {
                     // Confirmed — update the L1 state anchor, apply events, and
                     // flush to the queue.
                     let tip_number = tip_header.number();
-                    self.update_l1_state_anchor(&tip_header, chain_id, &mutated_accounts);
+                    self.update_l1_state_anchor(&tip_header, &mutated_accounts);
                     self.apply_policy_events(tip_number, &policy_events);
                     self.apply_portal_state_events(tip_number, &portal_events);
                     match self
@@ -521,7 +517,7 @@ impl L1Subscriber {
                                 tip = tip_number,
                                 "Backfilling gap before confirmed tip"
                             );
-                            self.backfill(&provider, chain_id, from, tip_number).await?;
+                            self.backfill(&provider, from, tip_number).await?;
                         }
                     }
                 } else {
@@ -693,7 +689,6 @@ impl L1Subscriber {
     pub(crate) fn update_l1_state_anchor(
         &self,
         header: &SealedHeader<TempoHeader>,
-        chain_id: u64,
         mutated_accounts: &HashSet<Address>,
     ) {
         let mut guard = self.config.l1_state_cache.write();
@@ -711,11 +706,6 @@ impl L1Subscriber {
         }
         for &address in mutated_accounts {
             guard.invalidate(address, header.number());
-        }
-        if let Some(hardfork) =
-            TempoHardfork::from_chain_and_timestamp(chain_id, header.timestamp())
-        {
-            guard.observe_hardfork(header.number(), hardfork);
         }
         guard.update_anchor(header.num_hash());
     }

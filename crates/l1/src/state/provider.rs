@@ -10,19 +10,13 @@
 //! intended for use inside EVM precompiles where async is unavailable — it retries the RPC
 //! call indefinitely with exponential backoff to avoid bricking the chain on transient outages.
 
-use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag};
+use alloy_rpc_types_eth::BlockId;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
-use reth_chainspec::ForkCondition;
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::{
-    hardfork::TempoHardfork,
-    spec::{TempoHardforks, chainspec_from_chain_id},
-};
 use tracing::{debug, info, warn};
 use zone_precompiles::{L1StorageReader, SequencerExt};
 
@@ -264,82 +258,9 @@ impl L1StateProvider {
         Ok(value)
     }
 
-    /// Resolve the Tempo hardfork active at an exact L1 block, using cached metadata first.
-    pub fn get_hardfork(&self, block_number: u64) -> Result<TempoHardfork> {
-        if let Some(hardfork) = self.cache.read().hardfork_at(block_number) {
-            return Ok(hardfork);
-        }
-
-        let activations = tokio::task::block_in_place(|| {
-            self.runtime_handle
-                .block_on(self.fetch_hardfork_schedule(block_number))
-        })?;
-        let mut cache = self.cache.write();
-        cache.extend_hardfork_schedule(block_number, activations);
-        cache
-            .hardfork_at(block_number)
-            .ok_or_else(|| eyre::eyre!("no Tempo hardfork active at L1 block {block_number}"))
-    }
-
     /// Expose the shared cache handle for external use (e.g. the engine).
     pub fn cache(&self) -> &L1StateCache {
         &self.cache
-    }
-
-    async fn fetch_hardfork_schedule(
-        &self,
-        block_number: u64,
-    ) -> Result<Vec<(u64, TempoHardfork)>> {
-        let (chain_id, block) = tokio::try_join!(
-            self.provider.get_chain_id(),
-            self.provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number)),
-        )?;
-        let block = block.ok_or_else(|| eyre::eyre!("L1 block {block_number} not found"))?;
-        let chain_spec = chainspec_from_chain_id(chain_id)
-            .ok_or_else(|| eyre::eyre!("unsupported Tempo L1 chain ID {chain_id}"))?;
-        let block_ts = block.header.timestamp();
-        let mut activations = Vec::new();
-
-        for &hardfork in TempoHardfork::VARIANTS {
-            let ForkCondition::Timestamp(fork_ts) = chain_spec.tempo_fork_activation(hardfork)
-            else {
-                continue;
-            };
-            if fork_ts > block_ts {
-                continue;
-            }
-            let known_block = match chain_id {
-                4217 => hardfork.mainnet_activation_block(),
-                42431 => hardfork.moderato_activation_block(),
-                _ => None,
-            };
-            let activation_block = match known_block {
-                Some(block) => block,
-                None => self.first_block_at_or_after(fork_ts, block_number).await?,
-            };
-            activations.push((activation_block, hardfork));
-        }
-
-        Ok(activations)
-    }
-
-    async fn first_block_at_or_after(&self, timestamp: u64, mut high: u64) -> Result<u64> {
-        let mut low = 0u64;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let block = self
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Number(mid))
-                .await?
-                .ok_or_else(|| eyre::eyre!("L1 block {mid} not found"))?;
-            if block.header.timestamp() < timestamp {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        Ok(low)
     }
 
     /// Fetch a single storage slot from L1 at a specific block via the shared HTTP provider.
@@ -375,60 +296,5 @@ impl L1StorageReader for L1StateProvider {
 impl SequencerExt for L1StateProvider {
     fn latest_sequencer(&self) -> Option<Address> {
         self.get_latest_sequencer().ok()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_transport::mock::Asserter;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn get_hardfork_fetches_exact_block_writes_back_and_hits_cache() {
-        let asserter = Asserter::new();
-        asserter.push_success(&4217u64);
-        let consensus = tempo_primitives::TempoHeader {
-            inner: alloy_consensus::Header {
-                number: 0,
-                timestamp: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let header = tempo_alloy::rpc::TempoHeaderResponse {
-            inner: alloy_rpc_types_eth::Header::new(consensus),
-            timestamp_millis: 0,
-        };
-        let block: <TempoNetwork as alloy_network::Network>::BlockResponse =
-            alloy_rpc_types_eth::Block::empty(header);
-        asserter.push_success(&Some(block));
-
-        let cache = L1StateCache::default();
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_mocked_client(asserter)
-            .erased();
-        let provider = L1StateProvider::new_raw(
-            L1StateProviderConfig::default(),
-            cache.clone(),
-            provider,
-            tokio::runtime::Handle::current(),
-        );
-        let fetched = tokio::task::spawn_blocking({
-            let provider = provider.clone();
-            move || provider.get_hardfork(0)
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(fetched, TempoHardfork::T0);
-        assert_eq!(cache.read().hardfork_at(0), Some(TempoHardfork::T0));
-
-        // No further mock response is configured, so this can only succeed from the cache.
-        let cached = tokio::task::spawn_blocking(move || provider.get_hardfork(0))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cached, TempoHardfork::T0);
     }
 }

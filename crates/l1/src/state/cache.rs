@@ -31,7 +31,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
-use tempo_chainspec::hardfork::TempoHardfork;
 
 /// Thread-safe L1 state cache backed by an `Arc<RwLock<L1StateCacheInner>>`.
 #[derive(Debug, Clone, Deref, Default)]
@@ -56,11 +55,9 @@ impl L1StateCache {
 /// i.e. the value that was current at that height. This allows the zone to read L1 state at
 /// the `tempoBlockNumber` it committed to, even if the L1 chain has since advanced.
 ///
-/// To enable delegation to upstream Tempo precompiles, the cache also tracks contract mutation
-/// barriers and hardfork activations. Barriers prevent values from crossing blocks where logs
-/// signal a possible storage change without requiring slot-level decoding, while hardfork metadata
-/// selects the Tempo rules active at the same anchor. Reorgs clear all three atomically: slot
-/// values, mutation history, and protocol-version metadata.
+/// Contract mutation barriers prevent values from crossing blocks where logs signal a possible
+/// storage change without requiring slot-level decoding. Reorgs clear slot values and mutation
+/// history atomically.
 ///
 /// The anchor tracks the latest L1 block the cache has received data for, used by the
 /// [`L1Subscriber`](crate::l1::L1Subscriber) for reorg detection.
@@ -74,10 +71,6 @@ pub struct L1StateCacheInner {
     /// A slot value cached at block V may serve block N only when no barrier exists in `(V, N]`.
     /// The subscriber records barriers for contracts whose logs imply possible storage changes.
     invalidations: HashMap<Address, BTreeSet<u64>>,
-    /// First canonical L1 block where each observed Tempo hardfork is active.
-    hardfork_schedule: BTreeSet<(u64, TempoHardfork)>,
-    /// Highest block for which the activation schedule is known to be complete.
-    hardfork_schedule_head: Option<u64>,
     /// Latest L1 block the cache has received data for, used for reorg detection.
     anchor: NumHash,
 }
@@ -130,64 +123,6 @@ impl L1StateCacheInner {
             .insert(block_number, value);
     }
 
-    /// Returns the active Tempo hardfork when the cached schedule covers `block_number`.
-    pub fn hardfork_at(&self, block_number: u64) -> Option<TempoHardfork> {
-        if self.hardfork_schedule_head? < block_number {
-            return None;
-        }
-        self.latest_hardfork_activation_at(block_number)
-            .map(|(_, hardfork)| hardfork)
-    }
-
-    fn latest_hardfork_activation_at(&self, block_number: u64) -> Option<(u64, TempoHardfork)> {
-        let latest = TempoHardfork::VARIANTS.last().copied()?;
-        self.hardfork_schedule
-            .range(..=(block_number, latest))
-            .next_back()
-            .copied()
-    }
-
-    /// Extends the known Tempo activation schedule through `block_number`.
-    pub fn extend_hardfork_schedule(
-        &mut self,
-        block_number: u64,
-        activations: impl IntoIterator<Item = (u64, TempoHardfork)>,
-    ) {
-        self.hardfork_schedule.extend(activations);
-        self.hardfork_schedule_head = Some(
-            self.hardfork_schedule_head
-                .unwrap_or_default()
-                .max(block_number),
-        );
-    }
-
-    /// Extends an initialized schedule with the next confirmed L1 block.
-    ///
-    /// An observed active hardfork does not reveal its historical activation block, so it cannot
-    /// initialize the schedule. After provider initialization, a contiguous observation either
-    /// advances coverage or records a newly activated fork; gaps and downgrades are ignored.
-    pub fn observe_hardfork(&mut self, block_number: u64, hardfork: TempoHardfork) {
-        let Some(head) = self.hardfork_schedule_head else {
-            return;
-        };
-        if block_number != head.saturating_add(1) {
-            return;
-        }
-
-        let previous = self
-            .latest_hardfork_activation_at(head)
-            .map(|(_, hardfork)| hardfork);
-        let Some(previous) = previous else {
-            return;
-        };
-        if hardfork > previous {
-            self.hardfork_schedule.insert((block_number, hardfork));
-        } else if hardfork < previous {
-            return; // Tempo hardforks never downgrade.
-        }
-        self.hardfork_schedule_head = Some(block_number);
-    }
-
     /// Updates the anchor block that this cache has received data up to.
     pub fn update_anchor(&mut self, anchor: NumHash) {
         self.anchor = anchor;
@@ -207,8 +142,6 @@ impl L1StateCacheInner {
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
-        self.hardfork_schedule.clear();
-        self.hardfork_schedule_head = None;
         self.anchor = NumHash::default();
     }
 
@@ -236,13 +169,6 @@ impl L1StateCacheInner {
             blocks.retain(|block| *block >= min_block || Some(*block) == baseline);
         }
         self.invalidations.retain(|_, blocks| !blocks.is_empty());
-
-        // Keep the latest activation before the pruning boundary as the baseline, plus all newer
-        // activations. This preserves hardfork lookup for every retained block.
-        let baseline = self.latest_hardfork_activation_at(min_block);
-        self.hardfork_schedule.retain(|(block, hardfork)| {
-            *block >= min_block || Some((*block, *hardfork)) == baseline
-        });
     }
 }
 
@@ -310,7 +236,6 @@ mod tests {
 
         cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1));
         cache.invalidate(PORTAL, 101);
-        cache.extend_hardfork_schedule(101, [(0, TempoHardfork::T0)]);
         cache.update_anchor(NumHash {
             number: 100,
             hash: B256::with_last_byte(0xab),
@@ -320,8 +245,6 @@ mod tests {
 
         assert_eq!(cache.get(PORTAL, B256::ZERO, 100), None);
         assert!(cache.invalidations.is_empty());
-        assert_eq!(cache.hardfork_at(100), None);
-        assert_eq!(cache.hardfork_schedule_head, None);
         assert_eq!(cache.anchor(), NumHash::default());
     }
 
@@ -356,64 +279,6 @@ mod tests {
     fn anchor_defaults_to_zero() {
         let cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         assert_eq!(cache.anchor(), NumHash::default());
-    }
-
-    #[test]
-    fn hardfork_lookup_uses_bounded_activation_schedule() {
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
-        cache.extend_hardfork_schedule(20, [(10, TempoHardfork::T2), (20, TempoHardfork::T8)]);
-
-        assert_eq!(cache.hardfork_at(9), None);
-        assert_eq!(cache.hardfork_at(10), Some(TempoHardfork::T2));
-        assert_eq!(cache.hardfork_at(19), Some(TempoHardfork::T2));
-        assert_eq!(cache.hardfork_at(20), Some(TempoHardfork::T8));
-        assert_eq!(cache.hardfork_at(21), None);
-    }
-
-    #[test]
-    fn confirmed_headers_advance_initialized_hardfork_schedule() {
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
-        cache.extend_hardfork_schedule(10, [(0, TempoHardfork::T0)]);
-
-        cache.observe_hardfork(11, TempoHardfork::T0);
-        cache.observe_hardfork(12, TempoHardfork::T2);
-
-        assert_eq!(cache.hardfork_at(11), Some(TempoHardfork::T0));
-        assert_eq!(cache.hardfork_at(12), Some(TempoHardfork::T2));
-        assert_eq!(cache.hardfork_at(13), None);
-    }
-
-    #[test]
-    fn hardfork_observation_does_not_initialize_or_cross_a_gap() {
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
-        cache.observe_hardfork(10, TempoHardfork::T2);
-        assert_eq!(cache.hardfork_at(10), None);
-
-        cache.extend_hardfork_schedule(10, [(0, TempoHardfork::T0)]);
-        cache.observe_hardfork(12, TempoHardfork::T2);
-        assert_eq!(cache.hardfork_at(11), None);
-        assert_eq!(cache.hardfork_at(12), None);
-
-        cache.observe_hardfork(11, TempoHardfork::Genesis);
-        assert_eq!(cache.hardfork_at(11), None);
-    }
-
-    #[test]
-    fn prune_keeps_hardfork_activation_baseline() {
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
-        cache.extend_hardfork_schedule(
-            30,
-            [
-                (0, TempoHardfork::T0),
-                (10, TempoHardfork::T2),
-                (20, TempoHardfork::T8),
-            ],
-        );
-
-        cache.prune_before(15);
-
-        assert_eq!(cache.hardfork_at(15), Some(TempoHardfork::T2));
-        assert_eq!(cache.hardfork_at(20), Some(TempoHardfork::T8));
     }
 
     #[test]
