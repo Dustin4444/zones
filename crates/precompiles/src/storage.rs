@@ -26,7 +26,7 @@ use crate::tempo_state::slots as tempo_state_slots;
 use alloy_primitives::{Address, B256, LogData, U256};
 use revm::{
     context::journaled_state::JournalCheckpoint,
-    precompile::PrecompileError,
+    precompile::{PrecompileError, PrecompileResult},
     state::{AccountInfo, Bytecode},
 };
 use tempo_chainspec::hardfork::TempoHardfork;
@@ -60,9 +60,43 @@ pub struct ZonePrecompileStorageProvider<'a, P> {
     l1: P,
 }
 
+/// Failure to initialize L1-backed precompile storage at the finalized Tempo anchor.
+#[derive(Debug)]
+pub struct ZonePrecompileStorageProviderInitError {
+    pub(crate) error: TempoPrecompileError,
+    pub(crate) gas_used: u64,
+    pub(crate) reservoir: u64,
+}
+
+impl ZonePrecompileStorageProviderInitError {
+    /// Convert the initialization failure using the gas accounting of the anchor read.
+    pub fn into_precompile_result(self) -> PrecompileResult {
+        self.error
+            .into_precompile_result(self.gas_used, self.reservoir)
+    }
+}
+
 impl<'a, P: L1StorageReader> ZonePrecompileStorageProvider<'a, P> {
-    /// Wrap `inner` with an L1 reader bound to `l1_block_number` for this precompile call.
-    pub fn new(inner: EvmPrecompileStorageProvider<'a>, l1: P, l1_block_number: u64) -> Self {
+    /// Read the finalized Tempo anchor from `inner` and construct an L1-backed provider.
+    pub fn try_new(
+        mut inner: EvmPrecompileStorageProvider<'a>,
+        l1: P,
+    ) -> core::result::Result<Self, ZonePrecompileStorageProviderInitError> {
+        let l1_block_number =
+            read_l1_anchor(&mut inner).map_err(|error| ZonePrecompileStorageProviderInitError {
+                error,
+                gas_used: inner.gas_used(),
+                reservoir: inner.reservoir(),
+            })?;
+        Ok(Self::new_at_block(inner, l1, l1_block_number))
+    }
+
+    /// Construct a provider at an explicitly supplied, previously validated Tempo block.
+    pub fn new_at_block(
+        inner: EvmPrecompileStorageProvider<'a>,
+        l1: P,
+        l1_block_number: u64,
+    ) -> Self {
         Self {
             inner,
             l1,
@@ -72,7 +106,7 @@ impl<'a, P: L1StorageReader> ZonePrecompileStorageProvider<'a, P> {
 }
 
 /// Read the finalized Tempo/L1 block number once before constructing the zone provider.
-pub fn read_l1_anchor(inner: &mut EvmPrecompileStorageProvider<'_>) -> Result<u64> {
+fn read_l1_anchor(inner: &mut EvmPrecompileStorageProvider<'_>) -> Result<u64> {
     let value = inner.sload(TEMPO_STATE_ADDRESS, tempo_state_slots::TEMPO_BLOCK_NUMBER)?;
     value.try_into().map_err(|_| {
         TempoPrecompileError::Fatal(format!(
@@ -295,8 +329,8 @@ mod tests {
                 U256::from(123u64),
             )
             .expect("anchor write succeeds");
-        let l1_block_number = read_l1_anchor(&mut inner).expect("anchor read succeeds");
-        let mut provider = ZonePrecompileStorageProvider::new(inner, l1, l1_block_number);
+        let mut provider =
+            ZonePrecompileStorageProvider::try_new(inner, l1).expect("anchor read succeeds");
         f(&mut provider)
     }
 
@@ -304,7 +338,7 @@ mod tests {
     fn provider_uses_composed_evm_hardfork() {
         let mut ctx = test_context();
         ctx.cfg.spec = TempoHardfork::T8;
-        let provider = ZonePrecompileStorageProvider::new(
+        let provider = ZonePrecompileStorageProvider::new_at_block(
             test_storage_provider(&mut ctx, u64::MAX, false),
             MockL1Reader::default(),
             77,
@@ -326,10 +360,19 @@ mod tests {
             )
             .expect("anchor write succeeds");
 
-        let err = read_l1_anchor(&mut inner).expect_err("oversized anchor must be rejected");
+        let err = match ZonePrecompileStorageProvider::try_new(inner, MockL1Reader::default()) {
+            Ok(_) => panic!("oversized anchor must be rejected"),
+            Err(err) => err,
+        };
         assert!(
-            matches!(err, TempoPrecompileError::Fatal(ref msg) if msg.contains("does not fit in u64") && msg.contains(&oversized.to_string()))
+            matches!(&err.error, TempoPrecompileError::Fatal(msg) if msg.contains("does not fit in u64") && msg.contains(&oversized.to_string()))
         );
+        assert!(err.gas_used > 0);
+        assert_eq!(err.reservoir, 0);
+        assert!(matches!(
+            err.into_precompile_result(),
+            Err(PrecompileError::Fatal(msg)) if msg.contains("does not fit in u64")
+        ));
     }
 
     #[test]
