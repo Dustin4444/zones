@@ -13,8 +13,9 @@
 //!
 //! 1. L1-backed execution rejects delegate calls before storage access.
 //! 2. Decode the selector and reject calls that cannot cover a configured fixed gas charge.
-//! 3. Apply [`CallRules`] against local EVM storage. Rejected calls return without touching L1.
-//! 4. For admitted L1-backed calls, resolve the anchor, hardfork, and storage overlay.
+//! 3. Apply the local phase of [`CallRules`]. Rejected calls return without touching L1.
+//! 4. For admitted L1-backed calls, resolve the anchor, hardfork, and storage overlay, then apply
+//!    the L1-backed rules phase.
 //! 5. Forward the original calldata and caller, applying any configured fixed gas charge.
 //!
 //! Rule-level rejections include calldata input gas. Calls without a fixed charge retain normal
@@ -114,19 +115,31 @@ pub(crate) enum CallCheck {
     Return(PrecompileResult),
 }
 
-/// Selector- and caller-dependent pre-execution rules for a storage-backed precompile.
+/// Selector-, caller-, and call-context-dependent rules evaluated by centralized precompile
+/// execution before invoking the implementation.
+///
+/// The local phase runs against ordinary zone state before any optional finalized-L1 resolution.
+/// L1-backed execution then runs a second phase against the exact anchored overlay. Rules may
+/// enforce admission policy and duplicate cheap business checks as fail-fast preflight, but the
+/// precompile implementation remains responsible for its canonical business invariants.
 pub(crate) trait CallRules: 'static {
     /// Return the fixed gas charge for this selector, if one applies.
     fn fixed_gas(&self, _selector: Option<[u8; 4]>) -> Option<u64> {
         None
     }
 
-    /// Runs checks that only depend on ordinary zone-local state. Evaluated before any L1 access.
+    /// Apply rules using only calldata, caller, call context, and ordinary zone-local state.
+    ///
+    /// This phase always runs before optional L1 anchor resolution. It may reject invalid calls
+    /// early so they do not depend on L1 or RPC availability.
     fn check_with_local_state(&self, _call: ZoneCall<'_>) -> CallCheck {
         CallCheck::Continue
     }
 
-    /// Runs checks that depend on the finalized Tempo L1-backed state overlay.
+    /// Apply rules whose answer must come from the finalized Tempo L1-backed storage overlay.
+    ///
+    /// This phase runs only for L1-backed execution, after the anchor and overlay have been
+    /// resolved.
     fn check_with_l1_backed_state(&self, _call: ZoneCall<'_>) -> CallCheck {
         CallCheck::Continue
     }
