@@ -129,6 +129,7 @@ async fn test_l1_deposit_mints_on_zone() -> eyre::Result<()> {
             deposit_amount,
             B256::ZERO,
             depositor,
+            u128::MAX,
         )
         .send()
         .await?

@@ -113,9 +113,18 @@ impl EncryptedDeposit {
             tag: enc.tag.into(),
         };
 
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
+
         println!("Sending encrypted deposit of {} to {to}...", self.amount);
         let receipt = portal
-            .depositEncrypted(self.token, self.amount, key_index, payload, sender)
+            .depositEncrypted(
+                self.token,
+                self.amount,
+                key_index,
+                payload,
+                sender,
+                max_deposit_fee,
+            )
             .send_sync()
             .await
             .wrap_err("failed to send depositEncrypted transaction")?;

@@ -1368,6 +1368,7 @@ async fn test_zone_get_deposit_status_encrypted_bounceback_recipient() -> eyre::
                 tag: alloy::primitives::FixedBytes(encrypted.tag),
             },
             bounceback_recipient,
+            u128::MAX,
         )
         .send()
         .await?

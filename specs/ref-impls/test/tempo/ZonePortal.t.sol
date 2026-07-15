@@ -596,8 +596,9 @@ contract ZonePortalTest is BaseTest {
         // Approve and deposit
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        bytes32 hash1 =
-            portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo1"), alice);
+        bytes32 hash1 = portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo1"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Verify hash chain updated
@@ -608,6 +609,26 @@ contract ZonePortalTest is BaseTest {
         assertEq(pathUSD.balanceOf(address(portal)), depositAmount);
     }
 
+    function test_deposit_revertsWhenFeeExceedsLimit() public {
+        portal.setZoneGasRate(2);
+        uint128 fee = portal.calculateDepositFee();
+        uint128 maxDepositFee = fee - 1;
+        uint128 depositAmount = 1000e6;
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.DepositFeeExceedsLimit.selector, fee, maxDepositFee)
+        );
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, maxDepositFee
+        );
+        vm.stopPrank();
+
+        assertEq(portal.currentDepositQueueHash(), bytes32(0));
+        assertEq(pathUSD.balanceOf(address(portal)), 0);
+    }
+
     function test_deposit_multipleDepositsChain() public {
         uint128 amount1 = 1000e6;
         uint128 amount2 = 2000e6;
@@ -615,13 +636,17 @@ contract ZonePortalTest is BaseTest {
         // First deposit from alice
         vm.startPrank(alice);
         pathUSD.approve(address(portal), amount1);
-        bytes32 hash1 = portal.deposit(address(pathUSD), alice, amount1, bytes32("memo1"), alice);
+        bytes32 hash1 = portal.deposit(
+            address(pathUSD), alice, amount1, bytes32("memo1"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Second deposit from bob
         vm.startPrank(bob);
         pathUSD.approve(address(portal), amount2);
-        bytes32 hash2 = portal.deposit(address(pathUSD), bob, amount2, bytes32("memo2"), bob);
+        bytes32 hash2 = portal.deposit(
+            address(pathUSD), bob, amount2, bytes32("memo2"), bob, type(uint128).max
+        );
         vm.stopPrank();
 
         // Hash chain should have updated
@@ -644,15 +669,15 @@ contract ZonePortalTest is BaseTest {
         assertEq(initialHash, bytes32(0));
 
         // After deposit 1
-        portal.deposit(address(pathUSD), alice, amount, bytes32("d1"), alice);
+        portal.deposit(address(pathUSD), alice, amount, bytes32("d1"), alice, type(uint128).max);
         bytes32 hash1 = portal.currentDepositQueueHash();
 
         // After deposit 2: hash2 = keccak256(abi.encode(message2, hash1))
-        portal.deposit(address(pathUSD), alice, amount, bytes32("d2"), alice);
+        portal.deposit(address(pathUSD), alice, amount, bytes32("d2"), alice, type(uint128).max);
         bytes32 hash2 = portal.currentDepositQueueHash();
 
         // After deposit 3: hash3 = keccak256(abi.encode(message3, hash2))
-        portal.deposit(address(pathUSD), alice, amount, bytes32("d3"), alice);
+        portal.deposit(address(pathUSD), alice, amount, bytes32("d3"), alice, type(uint128).max);
         bytes32 hash3 = portal.currentDepositQueueHash();
 
         vm.stopPrank();
@@ -695,7 +720,9 @@ contract ZonePortalTest is BaseTest {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
         vm.expectRevert(ITIP20.PolicyForbids.selector);
-        portal.deposit(address(pathUSD), bob, depositAmount, bytes32("memo"), bob);
+        portal.deposit(
+            address(pathUSD), bob, depositAmount, bytes32("memo"), bob, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -714,7 +741,9 @@ contract ZonePortalTest is BaseTest {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
         vm.expectRevert(ITIP20.PolicyForbids.selector);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), bob);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), bob, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -749,8 +778,9 @@ contract ZonePortalTest is BaseTest {
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        bytes32 depositHash =
-            portal.deposit(address(pathUSD), bob, depositAmount, bytes32("memo"), bob);
+        bytes32 depositHash = portal.deposit(
+            address(pathUSD), bob, depositAmount, bytes32("memo"), bob, type(uint128).max
+        );
         vm.stopPrank();
 
         assertEq(portal.currentDepositQueueHash(), depositHash);
@@ -766,8 +796,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        bytes32 depositHash =
-            portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        bytes32 depositHash = portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Submit a batch (as sequencer)
@@ -994,7 +1025,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Create a withdrawal and add to queue via batch
@@ -1046,7 +1079,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 2000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Create two withdrawals in the same batch
@@ -1106,7 +1141,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 3000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Batch 1: withdrawal to bob
@@ -1175,7 +1212,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         uint256 tailBefore = portal.withdrawalQueueTail();
@@ -1211,7 +1250,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Create withdrawal with callback
@@ -1263,7 +1304,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
@@ -1320,7 +1363,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
@@ -1373,7 +1418,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
@@ -1424,7 +1471,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -1519,7 +1568,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         Withdrawal memory w =
@@ -1558,7 +1609,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         Withdrawal memory w =
@@ -1596,7 +1649,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         Withdrawal memory nested =
@@ -1667,8 +1722,12 @@ contract ZonePortalTest is BaseTest {
         // Make deposits
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 3000e6);
-        bytes32 h1 = portal.deposit(address(pathUSD), alice, 1000e6, bytes32("d1"), alice);
-        bytes32 h2 = portal.deposit(address(pathUSD), alice, 1000e6, bytes32("d2"), alice);
+        bytes32 h1 = portal.deposit(
+            address(pathUSD), alice, 1000e6, bytes32("d1"), alice, type(uint128).max
+        );
+        bytes32 h2 = portal.deposit(
+            address(pathUSD), alice, 1000e6, bytes32("d2"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // currentDepositQueueHash should be h2 (latest)
@@ -1701,7 +1760,9 @@ contract ZonePortalTest is BaseTest {
 
         // New deposit arrives
         vm.startPrank(alice);
-        bytes32 h3 = portal.deposit(address(pathUSD), alice, 1000e6, bytes32("d3"), alice);
+        bytes32 h3 = portal.deposit(
+            address(pathUSD), alice, 1000e6, bytes32("d3"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // currentDepositQueueHash updated
@@ -1884,7 +1945,7 @@ contract ZonePortalTest is BaseTest {
         // Make a deposit first
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32("memo"), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -1919,8 +1980,12 @@ contract ZonePortalTest is BaseTest {
         // Make deposits
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 3000e6);
-        bytes32 h1 = portal.deposit(address(pathUSD), alice, 1000e6, bytes32("d1"), alice);
-        bytes32 h2 = portal.deposit(address(pathUSD), alice, 1000e6, bytes32("d2"), alice);
+        bytes32 h1 = portal.deposit(
+            address(pathUSD), alice, 1000e6, bytes32("d1"), alice, type(uint128).max
+        );
+        bytes32 h2 = portal.deposit(
+            address(pathUSD), alice, 1000e6, bytes32("d2"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         vm.roll(block.number + 1);
@@ -1975,7 +2040,7 @@ contract ZonePortalTest is BaseTest {
     function test_withdrawalQueue_emptyBatchDoesNotIncreaseTail() public {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -2009,7 +2074,7 @@ contract ZonePortalTest is BaseTest {
         // Fund portal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 10_000e6);
-        portal.deposit(address(pathUSD), alice, 10_000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 10_000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -2074,7 +2139,7 @@ contract ZonePortalTest is BaseTest {
         // Fund portal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
@@ -2122,7 +2187,7 @@ contract ZonePortalTest is BaseTest {
         // Fund portal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -2164,7 +2229,7 @@ contract ZonePortalTest is BaseTest {
         // Fund portal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -2213,7 +2278,7 @@ contract ZonePortalTest is BaseTest {
         // Fund portal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
@@ -2275,7 +2340,7 @@ contract ZonePortalTest is BaseTest {
     function test_withdrawalBatchIndex_incrementsOnEachBatch() public {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 3000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         bytes32 depositHash = portal.currentDepositQueueHash();
@@ -2363,7 +2428,7 @@ contract ZonePortalTest is BaseTest {
             expectedHash, alice, address(pathUSD), bob, netAmount, fee, bytes32("test"), bob, 1
         );
 
-        portal.deposit(address(pathUSD), bob, 500e6, bytes32("test"), bob);
+        portal.deposit(address(pathUSD), bob, 500e6, bytes32("test"), bob, type(uint128).max);
         vm.stopPrank();
     }
 
@@ -2371,7 +2436,7 @@ contract ZonePortalTest is BaseTest {
         // Setup withdrawal
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         Withdrawal memory w =
@@ -2404,7 +2469,7 @@ contract ZonePortalTest is BaseTest {
         // Setup withdrawal with failing callback
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1000e6);
-        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        portal.deposit(address(pathUSD), alice, 1000e6, bytes32(""), alice, type(uint128).max);
         vm.stopPrank();
 
         Withdrawal memory w = _withdrawal(
@@ -2693,12 +2758,33 @@ contract ZonePortalTest is BaseTest {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
         bytes32 hash = portal.depositEncrypted(
-            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice, type(uint128).max
         );
         vm.stopPrank();
 
         assertEq(portal.currentDepositQueueHash(), hash);
         assertTrue(hash != bytes32(0));
+    }
+
+    function test_depositEncrypted_revertsWhenFeeExceedsLimit() public {
+        _setEncKeyWithPoP(ENC_KEY_1);
+        portal.setZoneGasRate(2);
+        uint128 fee = portal.calculateDepositFee();
+        uint128 maxDepositFee = fee - 1;
+        uint128 depositAmount = 1000e6;
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.DepositFeeExceedsLimit.selector, fee, maxDepositFee)
+        );
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice, maxDepositFee
+        );
+        vm.stopPrank();
+
+        assertEq(portal.currentDepositQueueHash(), bytes32(0));
+        assertEq(pathUSD.balanceOf(address(portal)), 0);
     }
 
     function test_depositEncrypted_hashChainMatchesLibrary() public {
@@ -2712,7 +2798,9 @@ contract ZonePortalTest is BaseTest {
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        bytes32 hash = portal.depositEncrypted(address(pathUSD), depositAmount, 0, encrypted, alice);
+        bytes32 hash = portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, encrypted, alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Reconstruct expected hash using the same encoding as DepositQueueLib
@@ -2736,11 +2824,14 @@ contract ZonePortalTest is BaseTest {
         // Regular deposit from alice
         vm.startPrank(alice);
         pathUSD.approve(address(portal), amount * 3);
-        bytes32 h1 = portal.deposit(address(pathUSD), alice, amount, bytes32("memo"), alice);
+        bytes32 h1 = portal.deposit(
+            address(pathUSD), alice, amount, bytes32("memo"), alice, type(uint128).max
+        );
 
         // Encrypted deposit from alice
-        bytes32 h2 =
-            portal.depositEncrypted(address(pathUSD), amount, 0, _makeEncryptedPayload(), alice);
+        bytes32 h2 = portal.depositEncrypted(
+            address(pathUSD), amount, 0, _makeEncryptedPayload(), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         // Both should update the same queue
@@ -2761,7 +2852,9 @@ contract ZonePortalTest is BaseTest {
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         assertEq(pathUSD.balanceOf(alice), aliceBefore - depositAmount);
@@ -2808,7 +2901,9 @@ contract ZonePortalTest is BaseTest {
             alice,
             1
         );
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, encrypted, alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, encrypted, alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2829,7 +2924,9 @@ contract ZonePortalTest is BaseTest {
 
         // Should revert with EncryptionKeyExpired for key index 0
         vm.expectRevert();
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2840,7 +2937,9 @@ contract ZonePortalTest is BaseTest {
 
         // No keys set, index 0 is invalid
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.InvalidEncryptionKeyIndex.selector, 0));
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2860,7 +2959,9 @@ contract ZonePortalTest is BaseTest {
         });
 
         vm.expectRevert(IZonePortal.InvalidEphemeralPubkey.selector);
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, encrypted, alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, encrypted, alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2880,7 +2981,9 @@ contract ZonePortalTest is BaseTest {
         });
 
         vm.expectRevert(IZonePortal.InvalidEphemeralPubkey.selector);
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, encrypted, alice);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, encrypted, alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2892,7 +2995,9 @@ contract ZonePortalTest is BaseTest {
         pathUSD.approve(address(portal), 99_999);
 
         vm.expectRevert(IZonePortal.DepositTooSmall.selector);
-        portal.depositEncrypted(address(pathUSD), 99_999, 0, _makeEncryptedPayload(), alice);
+        portal.depositEncrypted(
+            address(pathUSD), 99_999, 0, _makeEncryptedPayload(), alice, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2912,7 +3017,9 @@ contract ZonePortalTest is BaseTest {
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
         vm.expectRevert(ITIP20.PolicyForbids.selector);
-        portal.depositEncrypted(address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), bob);
+        portal.depositEncrypted(
+            address(pathUSD), depositAmount, 0, _makeEncryptedPayload(), bob, type(uint128).max
+        );
         vm.stopPrank();
     }
 
@@ -2928,7 +3035,7 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(
             abi.encodeWithSelector(IZonePortal.InvalidCiphertextLength.selector, 63, 64)
         );
-        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice);
+        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice, type(uint128).max);
         vm.stopPrank();
     }
 
@@ -2944,7 +3051,7 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(
             abi.encodeWithSelector(IZonePortal.InvalidCiphertextLength.selector, 65, 64)
         );
-        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice);
+        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice, type(uint128).max);
         vm.stopPrank();
     }
 
@@ -2958,7 +3065,7 @@ contract ZonePortalTest is BaseTest {
         pathUSD.approve(address(portal), 1000e6);
 
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.InvalidCiphertextLength.selector, 0, 64));
-        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice);
+        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice, type(uint128).max);
         vm.stopPrank();
     }
 
@@ -2974,7 +3081,7 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(
             abi.encodeWithSelector(IZonePortal.InvalidCiphertextLength.selector, 1024, 64)
         );
-        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice);
+        portal.depositEncrypted(address(pathUSD), 1000e6, 0, payload, alice, type(uint128).max);
         vm.stopPrank();
     }
 
@@ -3253,7 +3360,8 @@ contract ZonePortalTest is BaseTest {
 
         // Records current behavior: a false TIP-20 return value is not checked.
         vm.prank(alice);
-        bytes32 depositHash = portal.deposit(address(pathUSD), bob, amount, bytes32("memo"), bob);
+        bytes32 depositHash =
+            portal.deposit(address(pathUSD), bob, amount, bytes32("memo"), bob, type(uint128).max);
 
         assertEq(portal.depositCount(), 1);
         assertEq(portal.currentDepositQueueHash(), depositHash);
@@ -3312,7 +3420,9 @@ contract ZonePortalTest is BaseTest {
         uint128 depositAmount = 1000e6;
         vm.startPrank(alice);
         pathUSD.approve(address(portal), depositAmount);
-        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        portal.deposit(
+            address(pathUSD), alice, depositAmount, bytes32("memo"), alice, type(uint128).max
+        );
         vm.stopPrank();
 
         Withdrawal memory w =
@@ -3439,10 +3549,11 @@ contract ZonePortalTest is BaseTest {
         pathUSD.approve(address(portal), amount);
         if (amount < minimum) {
             vm.expectRevert(IZonePortal.DepositTooSmall.selector);
-            portal.deposit(address(pathUSD), bob, amount, bytes32("memo"), bob);
+            portal.deposit(address(pathUSD), bob, amount, bytes32("memo"), bob, type(uint128).max);
         } else {
-            bytes32 depositHash =
-                portal.deposit(address(pathUSD), bob, amount, bytes32("memo"), bob);
+            bytes32 depositHash = portal.deposit(
+                address(pathUSD), bob, amount, bytes32("memo"), bob, type(uint128).max
+            );
             Deposit memory depositData = Deposit({
                 token: address(pathUSD),
                 sender: alice,
@@ -3466,7 +3577,8 @@ contract ZonePortalTest is BaseTest {
         pathUSD.approve(address(portal), amount * iterations);
         for (uint256 i = 0; i < iterations; i++) {
             bytes32 memo = bytes32(i);
-            bytes32 actualHash = portal.deposit(address(pathUSD), bob, amount, memo, bob);
+            bytes32 actualHash =
+                portal.deposit(address(pathUSD), bob, amount, memo, bob, type(uint128).max);
             Deposit memory depositData = Deposit({
                 token: address(pathUSD),
                 sender: alice,

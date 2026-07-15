@@ -292,6 +292,7 @@ impl DemoSwapAndDeposit {
                 pathusd_gross_deposit,
                 B256::ZERO,
                 operator,
+                deposit_fee,
             )
             .send_sync()
             .await
@@ -307,7 +308,14 @@ impl DemoSwapAndDeposit {
             .await
             .wrap_err("failed to approve AlphaUSD for portal")?;
         let receipt = portal_contract
-            .deposit(alpha, operator, alpha_gross_deposit, B256::ZERO, operator)
+            .deposit(
+                alpha,
+                operator,
+                alpha_gross_deposit,
+                B256::ZERO,
+                operator,
+                deposit_fee,
+            )
             .send_sync()
             .await
             .wrap_err("failed to deposit AlphaUSD to the zone")?;

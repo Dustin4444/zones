@@ -330,6 +330,7 @@ impl DemoBlacklist {
         // ── Step 4: Deposit tokens into the zone ─────────────────────────
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         let deposit_amount = self.amount * 2;
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
         println!("Step 4: Deposit {deposit_amount} DUSD into the zone (to admin)");
         println!("  Plain deposit so admin has L2 funds for later encrypted deposits.");
         println!();
@@ -340,7 +341,14 @@ impl DemoBlacklist {
             let mut pending = None;
             for attempt in 0..5u32 {
                 match portal
-                    .deposit(token_addr, admin, deposit_amount, B256::ZERO, admin)
+                    .deposit(
+                        token_addr,
+                        admin,
+                        deposit_amount,
+                        B256::ZERO,
+                        admin,
+                        max_deposit_fee,
+                    )
                     .send()
                     .await
                 {
@@ -479,9 +487,17 @@ impl DemoBlacklist {
         check(&receipt, "approve pathUSD for portal")?;
 
         let gas_fund: u128 = 100_000;
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
         let receipt = portal
-            .deposit(PATH_USD_ADDRESS, target, gas_fund, B256::ZERO, admin)
+            .deposit(
+                PATH_USD_ADDRESS,
+                target,
+                gas_fund,
+                B256::ZERO,
+                admin,
+                max_deposit_fee,
+            )
             .send_sync()
             .await?;
         check(&receipt, "deposit pathUSD to target for gas")?;
@@ -703,8 +719,17 @@ async fn send_encrypted_deposit<P: Provider<TempoNetwork>>(
         tag: enc.tag.into(),
     };
 
+    let max_deposit_fee = portal.calculateDepositFee().call().await?;
+
     let receipt = portal
-        .depositEncrypted(token, amount, key_index, payload, bounceback_recipient)
+        .depositEncrypted(
+            token,
+            amount,
+            key_index,
+            payload,
+            bounceback_recipient,
+            max_deposit_fee,
+        )
         .send_sync()
         .await
         .wrap_err("depositEncrypted send failed")?;

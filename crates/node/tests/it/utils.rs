@@ -2177,6 +2177,7 @@ impl ZoneAccount {
         let balance_before = zone.balance_of(ZONE_TOKEN_ADDRESS, recipient).await?;
 
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
         let receipt = portal
             .deposit(
                 PATH_USD_ADDRESS,
@@ -2184,6 +2185,7 @@ impl ZoneAccount {
                 amount,
                 B256::ZERO,
                 self.address,
+                max_deposit_fee,
             )
             .send()
             .await?
@@ -2238,8 +2240,16 @@ impl ZoneAccount {
         let balance_before = zone.balance_of(l2_token, self.address).await?;
 
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
         let receipt = portal
-            .deposit(token, self.address, amount, B256::ZERO, self.address)
+            .deposit(
+                token,
+                self.address,
+                amount,
+                B256::ZERO,
+                self.address,
+                max_deposit_fee,
+            )
             .send()
             .await?
             .get_receipt()
@@ -2330,6 +2340,7 @@ impl ZoneAccount {
         let balance_before = zone.balance_of(ZONE_TOKEN_ADDRESS, recipient).await?;
 
         // Call depositEncrypted on portal
+        let max_deposit_fee = portal.calculateDepositFee().call().await?;
         let receipt = portal
             .depositEncrypted(
                 PATH_USD_ADDRESS,
@@ -2343,6 +2354,7 @@ impl ZoneAccount {
                     tag: alloy_primitives::FixedBytes(enc.tag),
                 },
                 self.address,
+                max_deposit_fee,
             )
             .send()
             .await?

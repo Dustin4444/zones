@@ -190,7 +190,8 @@ impl SpamDeposits {
             );
 
             // Build and sign all deposits (pure computation, no IO)
-            let calldata = self.build_deposit_calldata(whale_addr, enc_setup.as_ref())?;
+            let calldata =
+                self.build_deposit_calldata(whale_addr, enc_setup.as_ref(), deposit_fee)?;
             let mut encoded_txs = Vec::with_capacity(batch_size);
             for signer in signers.iter().take(batch_size) {
                 let nonce_key = U256::from(rand::random::<u128>());
@@ -298,6 +299,7 @@ impl SpamDeposits {
         &self,
         recipient: Address,
         enc_setup: Option<&(B256, u8, U256)>,
+        max_deposit_fee: u128,
     ) -> eyre::Result<Vec<u8>> {
         if let Some(&(pub_x, y_parity, key_index)) = enc_setup {
             let encrypted = encrypt_deposit(
@@ -324,6 +326,7 @@ impl SpamDeposits {
                 keyIndex: key_index,
                 encrypted: payload,
                 bouncebackRecipient: recipient,
+                maxDepositFee: max_deposit_fee,
             }
             .abi_encode())
         } else {
@@ -333,6 +336,7 @@ impl SpamDeposits {
                 amount: self.amount,
                 memo: B256::ZERO,
                 bouncebackRecipient: recipient,
+                maxDepositFee: max_deposit_fee,
             }
             .abi_encode())
         }

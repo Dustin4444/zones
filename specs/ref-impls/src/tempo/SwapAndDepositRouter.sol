@@ -58,8 +58,8 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     /// @param data ABI-encoded callbackData (see format below)
     /// @return selector The function selector to confirm successful handling
     ///
-    /// Plaintext format: (bool isEncrypted=false, address tokenOut, address targetPortal, address recipient, address bouncebackRecipient, bytes32 memo, uint128 minAmountOut)
-    /// Encrypted format: (bool isEncrypted=true, address tokenOut, address targetPortal, uint256 keyIndex, EncryptedDepositPayload encrypted, address bouncebackRecipient, uint128 minAmountOut)
+    /// Plaintext format: (bool isEncrypted=false, address tokenOut, address targetPortal, address recipient, address bouncebackRecipient, bytes32 memo, uint128 minAmountOut, uint128 maxDepositFee)
+    /// Encrypted format: (bool isEncrypted=true, address tokenOut, address targetPortal, uint256 keyIndex, EncryptedDepositPayload encrypted, address bouncebackRecipient, uint128 minAmountOut, uint128 maxDepositFee)
     ///
     /// Note: minAmountOut is ignored for same-token transfers (no swap)
     function onWithdrawalReceived(
@@ -91,9 +91,20 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
                 uint256 keyIndex,
                 EncryptedDepositPayload memory encrypted,
                 address bouncebackRecipient,
-                uint128 minAmountOut
+                uint128 minAmountOut,
+                uint128 maxDepositFee
             ) = abi.decode(
-                data, (bool, address, address, uint256, EncryptedDepositPayload, address, uint128)
+                data,
+                (
+                    bool,
+                    address,
+                    address,
+                    uint256,
+                    EncryptedDepositPayload,
+                    address,
+                    uint128,
+                    uint128
+                )
             );
 
             _validateTarget(targetPortal, tokenOut);
@@ -102,7 +113,9 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
 
             ITIP20(tokenOut).approve(targetPortal, amountOut);
             IZonePortal(targetPortal)
-                .depositEncrypted(tokenOut, amountOut, keyIndex, encrypted, bouncebackRecipient);
+                .depositEncrypted(
+                    tokenOut, amountOut, keyIndex, encrypted, bouncebackRecipient, maxDepositFee
+                );
         } else {
             (, // skip isEncrypted
                 address tokenOut,
@@ -110,8 +123,11 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
                 address recipient,
                 address bouncebackRecipient,
                 bytes32 memo,
-                uint128 minAmountOut
-            ) = abi.decode(data, (bool, address, address, address, address, bytes32, uint128));
+                uint128 minAmountOut,
+                uint128 maxDepositFee
+            ) = abi.decode(
+                data, (bool, address, address, address, address, bytes32, uint128, uint128)
+            );
 
             _validateTarget(targetPortal, tokenOut);
 
@@ -119,7 +135,7 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
 
             ITIP20(tokenOut).approve(targetPortal, amountOut);
             IZonePortal(targetPortal)
-                .deposit(tokenOut, recipient, amountOut, memo, bouncebackRecipient);
+                .deposit(tokenOut, recipient, amountOut, memo, bouncebackRecipient, maxDepositFee);
         }
 
         return IWithdrawalReceiver.onWithdrawalReceived.selector;

@@ -166,6 +166,7 @@ crate::sol! {
         error InvalidTempoBlockNumber();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
+        error DepositFeeExceedsLimit(uint128 fee, uint128 maxDepositFee);
 
         // -- View functions --
 
@@ -195,7 +196,8 @@ crate::sol! {
             address to,
             uint128 amount,
             bytes32 memo,
-            address bouncebackRecipient
+            address bouncebackRecipient,
+            uint128 maxDepositFee
         )
             external
             returns (bytes32 newCurrentDepositQueueHash);
@@ -230,7 +232,8 @@ crate::sol! {
             uint128 amount,
             uint256 keyIndex,
             EncryptedDepositPayload calldata encrypted,
-            address bouncebackRecipient
+            address bouncebackRecipient,
+            uint128 maxDepositFee
         ) external returns (bytes32 newCurrentDepositQueueHash);
 
         function setSequencerEncryptionKey(
@@ -340,6 +343,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
+            Self::DepositFeeExceedsLimit(_) => f.write_str("DepositFeeExceedsLimit"),
         }
     }
 }

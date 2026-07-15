@@ -347,7 +347,7 @@ Deposits move TIP-20 tokens from Tempo into a zone. The user deposits on Tempo, 
 
 ### Regular Deposits
 
-A user deposits by calling `deposit(token, to, amount, memo, bouncebackRecipient)` on the portal. The portal:
+A user deposits by calling `deposit(token, to, amount, memo, bouncebackRecipient, maxDepositFee)` on the portal. The portal:
 
 1. Validates the token is enabled and deposits are active.
 2. Requires `bouncebackRecipient != address(0)` (reverts `InvalidBouncebackRecipient` otherwise), validates `to` against the token's TIP-403 recipient and mint-recipient policies, and validates `bouncebackRecipient` against the token's TIP-403 recipient policy (reverts otherwise).
@@ -388,6 +388,8 @@ bouncebackFee = ceil(FIXED_BOUNCEBACK_GAS * block.basefee / 1e12)
 
 The deposit fee is charged on every deposit and paid immediately. The bounce-back fee is not stored on the deposit; it is recalculated from Tempo's current `block.basefee` only if the deposit actually bounces back.
 
+The caller supplies `maxDepositFee`. The portal reverts with `DepositFeeExceedsLimit` if the current deposit fee exceeds that bound, protecting the caller from a sequencer gas-rate update before inclusion.
+
 The two fees are conceptually independent because their work happens on different chains:
 
 - The **deposit fee** covers the sequencer's cost of processing the deposit on the zone (calling `advanceTempo`, performing the mint, advancing the queue) and is therefore priced at the zone's gas rate. It is charged on every deposit, success or failure, and paid to the sequencer immediately on Tempo.
@@ -416,7 +418,7 @@ The encryption scheme is ECIES with secp256k1:
 1. The user generates an ephemeral keypair and derives a shared secret via ECDH with the sequencer's published encryption key.
 2. The user derives an AES-256 key from the shared secret using HKDF-SHA256.
 3. The user encrypts `(to || memo || padding)` with AES-256-GCM, producing ciphertext, a nonce, and an authentication tag.
-4. The user calls `depositEncrypted(token, amount, keyIndex, encryptedPayload, bouncebackRecipient)` on the portal, where `keyIndex` references which encryption key they encrypted to (see [Encryption Key Management](#encryption-key-management)), and `bouncebackRecipient` is the Tempo address that receives a refund if zone-side processing fails (see [Deposit Failures and Bounce-Back](#deposit-failures-and-bounce-back)). Like `deposit()`, `depositEncrypted` requires `bouncebackRecipient != address(0)` (reverts `InvalidBouncebackRecipient` otherwise), requires it to be authorized by the token's TIP-403 recipient policy, and requires `amount >= depositFee + currentBouncebackFee` (reverts `DepositTooSmall` otherwise).
+4. The user calls `depositEncrypted(token, amount, keyIndex, encryptedPayload, bouncebackRecipient, maxDepositFee)` on the portal, where `keyIndex` references which encryption key they encrypted to (see [Encryption Key Management](#encryption-key-management)), and `bouncebackRecipient` is the Tempo address that receives a refund if zone-side processing fails (see [Deposit Failures and Bounce-Back](#deposit-failures-and-bounce-back)). Like `deposit()`, `depositEncrypted` requires `bouncebackRecipient != address(0)` (reverts `InvalidBouncebackRecipient` otherwise), requires it to be authorized by the token's TIP-403 recipient policy, requires the current deposit fee not to exceed `maxDepositFee`, and requires `amount >= depositFee + currentBouncebackFee` (reverts `DepositTooSmall` otherwise).
 
 Before queue insertion, the portal also validates encrypted-payload shape. `depositEncrypted` reverts `InvalidEphemeralPubkey` if the ephemeral public key parity is not `0x02` or `0x03`, or if the X coordinate is not a valid secp256k1 X coordinate. It reverts `InvalidCiphertextLength(actual, expected)` unless `ciphertext.length == 64`, the fixed plaintext size for `(to, memo, padding)`. These are Tempo-side deposit-time reverts: no queue entry is created and no zone-side bounce-back is needed.
 
@@ -662,10 +664,10 @@ This enables composable withdrawals where funds flow directly into Tempo contrac
 
 `SwapAndDepositRouter` callback data explicitly carries the refund target for the downstream zone deposit:
 
-- Plaintext: `abi.encode(false, tokenOut, targetPortal, recipient, bouncebackRecipient, memo, minAmountOut)`
-- Encrypted: `abi.encode(true, tokenOut, targetPortal, keyIndex, encryptedPayload, bouncebackRecipient, minAmountOut)`
+- Plaintext: `abi.encode(false, tokenOut, targetPortal, recipient, bouncebackRecipient, memo, minAmountOut, maxDepositFee)`
+- Encrypted: `abi.encode(true, tokenOut, targetPortal, keyIndex, encryptedPayload, bouncebackRecipient, minAmountOut, maxDepositFee)`
 
-The router validates the target portal and token, optionally swaps on Tempo, and then passes `bouncebackRecipient` through to `ZonePortal.deposit(...)` or `ZonePortal.depositEncrypted(...)`. For encrypted deposits this field is public, matching native `depositEncrypted`; callers that do not want a later Tempo-side refund to identify the encrypted zone recipient should use a controlled refund-specific or stealth address.
+The router validates the target portal and token, optionally swaps on Tempo, and then passes `bouncebackRecipient` and `maxDepositFee` through to `ZonePortal.deposit(...)` or `ZonePortal.depositEncrypted(...)`. For encrypted deposits the refund field is public, matching native `depositEncrypted`; callers that do not want a later Tempo-side refund to identify the encrypted zone recipient should use a controlled refund-specific or stealth address.
 
 ### Withdrawal Failures and Bounce-Back
 
@@ -1754,14 +1756,16 @@ interface IZonePortal {
     ///      per-recipient refund registry exposed via `refunds(token, owner)` /
     ///      `claimRefund(token)`.
     function deposit(
-        address token, address to, uint128 amount, bytes32 memo, address bouncebackRecipient
+        address token, address to, uint128 amount, bytes32 memo, address bouncebackRecipient,
+        uint128 maxDepositFee
     ) external returns (bytes32 newCurrentDepositQueueHash);
     /// @dev Reverts (`InvalidBouncebackRecipient`) if `bouncebackRecipient == address(0)`.
     ///      A ciphertext that fails onchain decryption verification has no well-defined
     ///      recipient on the zone, so the bounce-back target must always be set.
     function depositEncrypted(
         address token, uint128 amount, uint256 keyIndex,
-        EncryptedDepositPayload calldata encrypted, address bouncebackRecipient
+        EncryptedDepositPayload calldata encrypted, address bouncebackRecipient,
+        uint128 maxDepositFee
     ) external returns (bytes32 newCurrentDepositQueueHash);
     function calculateDepositFee() external view returns (uint128 fee);
     function calculateBouncebackFee() external view returns (uint128 fee);

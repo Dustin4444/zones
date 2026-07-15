@@ -530,12 +530,14 @@ contract ZonePortal is IZonePortal {
 
     function _collectDepositFunds(
         address _token,
-        uint128 amount
+        uint128 amount,
+        uint128 maxDepositFee
     )
         internal
         returns (uint128 fee, uint128 netAmount)
     {
         fee = calculateDepositFee();
+        if (fee > maxDepositFee) revert DepositFeeExceedsLimit(fee, maxDepositFee);
         uint128 bouncebackFee = calculateBouncebackFee();
         if (amount < fee + bouncebackFee) revert DepositTooSmall();
         netAmount = amount - fee;
@@ -562,13 +564,16 @@ contract ZonePortal is IZonePortal {
     /// @param to Recipient address on the zone
     /// @param amount Total amount to deposit (fee will be deducted)
     /// @param memo User-provided context
+    /// @param bouncebackRecipient Recipient of a failed-deposit refund
+    /// @param maxDepositFee Maximum sequencer fee the caller is willing to pay
     /// @return newCurrentDepositQueueHash The new deposit queue hash after this deposit
     function deposit(
         address _token,
         address to,
         uint128 amount,
         bytes32 memo,
-        address bouncebackRecipient
+        address bouncebackRecipient,
+        uint128 maxDepositFee
     )
         external
         returns (bytes32 newCurrentDepositQueueHash)
@@ -577,7 +582,7 @@ contract ZonePortal is IZonePortal {
 
         _validateDepositsActive(_token);
         _validateDepositPolicy(_token, to, bouncebackRecipient);
-        (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
+        (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount, maxDepositFee);
 
         // Build deposit struct with net amount (fee already paid to sequencer on Tempo)
         Deposit memory depositData = Deposit({
@@ -615,13 +620,16 @@ contract ZonePortal is IZonePortal {
     /// @param amount Amount to deposit (fee deducted from this amount)
     /// @param keyIndex Index of the encryption key used (from encryptionKeyAt)
     /// @param encrypted The encrypted payload (recipient and memo)
+    /// @param bouncebackRecipient Recipient of a failed-deposit refund
+    /// @param maxDepositFee Maximum sequencer fee the caller is willing to pay
     /// @return newCurrentDepositQueueHash The new deposit queue hash
     function depositEncrypted(
         address _token,
         uint128 amount,
         uint256 keyIndex,
         EncryptedDepositPayload calldata encrypted,
-        address bouncebackRecipient
+        address bouncebackRecipient,
+        uint128 maxDepositFee
     )
         external
         returns (bytes32 newCurrentDepositQueueHash)
@@ -664,7 +672,7 @@ contract ZonePortal is IZonePortal {
             revert EncryptionKeyExpired(keyIndex, key.activationBlock, nextKey.activationBlock);
         }
 
-        (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
+        (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount, maxDepositFee);
 
         // Build encrypted deposit struct
         EncryptedDeposit memory depositData = EncryptedDeposit({

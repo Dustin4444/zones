@@ -627,6 +627,7 @@ interface IZonePortal {
     error InvalidCiphertextLength(uint256 actual, uint256 expected);
     error InvalidProofOfPossession();
     error DepositTooSmall();
+    error DepositFeeExceedsLimit(uint128 fee, uint128 maxDepositFee);
     error GasFeeRateTooHigh();
     error TokenNotEnabled();
     error DepositsNotActive();
@@ -811,7 +812,8 @@ interface IZonePortal {
         address to,
         uint128 amount,
         bytes32 memo,
-        address bouncebackRecipient
+        address bouncebackRecipient,
+        uint128 maxDepositFee
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -831,7 +833,8 @@ interface IZonePortal {
         uint128 amount,
         uint256 keyIndex,
         EncryptedDepositPayload calldata encrypted,
-        address bouncebackRecipient
+        address bouncebackRecipient,
+        uint128 maxDepositFee
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
