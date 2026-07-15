@@ -281,10 +281,12 @@ impl ZoneEngine {
         // could return wrong results.
         self.policy_provider.cache().advance(l1_num_hash.number);
 
-        // The engine has committed this L1 height, so no subsequent zone block can query an
-        // earlier height while building. Preserve only the baseline needed at this boundary and
-        // discard older slot, invalidation, and hardfork history accumulated by the subscriber.
-        self.l1_state_cache.write().prune_before(l1_num_hash.number);
+        // The engine has committed this L1 height, so advance the forward-cache floor.
+        // Individual slot and mutation histories are compacted lazily when next touched, so
+        // RPC-created slots cannot amplify engine work.
+        self.l1_state_cache
+            .write()
+            .advance_floor(l1_num_hash.number);
 
         self.last_header = header;
 

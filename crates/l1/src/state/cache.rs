@@ -15,8 +15,9 @@
 //!
 //! - The [`L1Subscriber`](crate::l1::L1Subscriber) writes storage diffs for tracked contracts
 //!   as they arrive, tagged with the L1 tip block number.
-//! - The [`L1StateProvider`](super::provider::L1StateProvider) writes RPC-fetched values on
-//!   cache miss, tagged with the block number that was requested.
+//! - The [`L1StateProvider`](super::provider::L1StateProvider) writes eligible forward RPC
+//!   misses, tagged with the requested block number. Misses below the engine's consumed-block
+//!   floor are returned without being inserted.
 //!
 //! ## Reorg handling
 //!
@@ -59,8 +60,10 @@ impl L1StateCache {
 /// storage change without requiring slot-level decoding. Reorgs clear slot values and mutation
 /// history atomically.
 ///
-/// The anchor tracks the latest L1 block the cache has received data for, used by the
-/// [`L1Subscriber`](crate::l1::L1Subscriber) for reorg detection.
+/// The subscriber anchor and engine floor track independent progress. The anchor is the latest
+/// confirmed L1 block observed by the subscriber and may run ahead while blocks are queued. The
+/// floor is the latest L1 height consumed by the engine. It advances monotonically and drives
+/// lazy history compaction without scanning the cache on the block-production path.
 #[derive(Debug, Default)]
 pub struct L1StateCacheInner {
     tracked_contracts: HashSet<Address>,
@@ -71,7 +74,15 @@ pub struct L1StateCacheInner {
     /// A slot value cached at block V may serve block N only when no barrier exists in `(V, N]`.
     /// The subscriber records barriers for contracts whose logs imply possible storage changes.
     invalidations: HashMap<Address, BTreeSet<u64>>,
-    /// Latest L1 block the cache has received data for, used for reorg detection.
+    /// Latest L1 block height successfully consumed by the Zone engine.
+    ///
+    /// New fallback values below this floor are not admitted. Histories are compacted lazily
+    /// against it when their slot/address is next mutated, so older entries may remain physically
+    /// present until touched. This floor may lag the subscriber [`anchor`](Self::anchor).
+    block_floor: u64,
+    /// Latest confirmed L1 block observed by the subscriber, used for reorg detection.
+    ///
+    /// The anchor may run ahead of [`block_floor`](Self::block_floor) while L1 blocks are queued.
     anchor: NumHash,
 }
 
@@ -109,26 +120,35 @@ impl L1StateCacheInner {
     ///
     /// Values subsequently inserted at the same block are post-block state and remain valid.
     pub fn invalidate(&mut self, address: Address, block_number: u64) {
-        self.invalidations
-            .entry(address)
-            .or_default()
-            .insert(block_number);
+        let blocks = self.invalidations.entry(address).or_default();
+        blocks.insert(block_number);
+        prune_invalidation_history(blocks, self.block_floor);
     }
 
-    /// Sets a storage slot value in the cache at the given block number.
+    /// Sets a storage slot value in the forward cache at the given block number.
+    ///
+    /// Fallback results below the engine's consumed-block floor are deliberately not cached.
     pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) {
-        self.slots
-            .entry((address, slot))
-            .or_default()
-            .insert(block_number, value);
+        if block_number < self.block_floor {
+            return;
+        }
+
+        let history = self.slots.entry((address, slot)).or_default();
+        history.insert(block_number, value);
+        prune_slot_history(history, self.block_floor);
     }
 
-    /// Updates the anchor block that this cache has received data up to.
+    /// Advances the engine's consumed-block floor monotonically in O(1).
+    pub fn advance_floor(&mut self, block_number: u64) {
+        self.block_floor = self.block_floor.max(block_number);
+    }
+
+    /// Updates the latest confirmed L1 block observed by the subscriber.
     pub fn update_anchor(&mut self, anchor: NumHash) {
         self.anchor = anchor;
     }
 
-    /// Returns the current anchor block.
+    /// Returns the latest confirmed L1 block observed by the subscriber.
     pub fn anchor(&self) -> NumHash {
         self.anchor
     }
@@ -138,38 +158,38 @@ impl L1StateCacheInner {
         self.tracked_contracts.contains(address)
     }
 
-    /// Clears all cached slot values but retains the tracked-contract set.
+    /// Clears subscriber-derived chain data while retaining tracked contracts and the engine floor.
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
         self.anchor = NumHash::default();
     }
+}
 
-    /// Remove all entries with block numbers strictly less than `min_block`.
-    ///
-    /// Retains at most one entry per slot below the threshold — the latest one — so that
-    /// lookups at `min_block` still have a baseline value.
-    pub fn prune_before(&mut self, min_block: u64) {
-        for history in self.slots.values_mut() {
-            let keep_from = history.range(..min_block).next_back().map(|(k, _)| *k);
-
-            if let Some(keep) = keep_from {
-                let to_remove: Vec<u64> = history.range(..keep).map(|(k, _)| *k).collect();
-                for k in to_remove {
-                    history.remove(&k);
-                }
-            }
-        }
-
-        self.slots.retain(|_, history| !history.is_empty());
-
-        // Retain the latest pre-boundary invalidation so a pruned stale value cannot become valid.
-        for blocks in self.invalidations.values_mut() {
-            let baseline = blocks.range(..=min_block).next_back().copied();
-            blocks.retain(|block| *block >= min_block || Some(*block) == baseline);
-        }
-        self.invalidations.retain(|_, blocks| !blocks.is_empty());
+/// Retains the latest pre-floor entry as a baseline and every newer entry.
+fn prune_slot_history<V>(history: &mut BTreeMap<u64, V>, min_block: u64) {
+    if history.range(..min_block).nth(1).is_none() {
+        return;
     }
+
+    let mut retained = history.split_off(&min_block);
+    if let Some(baseline) = history.pop_last() {
+        retained.insert(baseline.0, baseline.1);
+    }
+    *history = retained;
+}
+
+/// Retains the latest pre-floor barrier and every newer barrier.
+fn prune_invalidation_history(history: &mut BTreeSet<u64>, min_block: u64) {
+    if history.range(..min_block).nth(1).is_none() {
+        return;
+    }
+
+    let mut retained = history.split_off(&min_block);
+    if let Some(baseline) = history.pop_last() {
+        retained.insert(baseline);
+    }
+    *history = retained;
 }
 
 #[cfg(test)]
@@ -231,11 +251,12 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_slots_invalidations_and_resets_anchor() {
+    fn clear_removes_chain_data_but_preserves_engine_floor() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
 
         cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1));
         cache.invalidate(PORTAL, 101);
+        cache.advance_floor(100);
         cache.update_anchor(NumHash {
             number: 100,
             hash: B256::with_last_byte(0xab),
@@ -245,6 +266,7 @@ mod tests {
 
         assert_eq!(cache.get(PORTAL, B256::ZERO, 100), None);
         assert!(cache.invalidations.is_empty());
+        assert_eq!(cache.block_floor, 100);
         assert_eq!(cache.anchor(), NumHash::default());
     }
 
@@ -321,19 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_baseline_entry_and_invalidation() {
+    fn advance_floor_is_lazy_and_touched_histories_keep_their_baselines() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
 
         cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05));
         cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a));
         cache.set(PORTAL, slot, 20, B256::with_last_byte(0x14));
+        cache.invalidate(PORTAL, 5);
         cache.invalidate(PORTAL, 12);
         cache.invalidate(PORTAL, 18);
 
-        cache.prune_before(15);
+        cache.advance_floor(15);
 
-        assert_eq!(cache.get(PORTAL, slot, 5), None);
+        // Advancing only moves the floor.
+        assert_eq!(
+            cache.slots[&(PORTAL, slot)]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![5, 10, 20]
+        );
         assert_eq!(
             cache.get(PORTAL, slot, 10),
             Some(B256::with_last_byte(0x0a))
@@ -344,12 +374,32 @@ mod tests {
             cache.get(PORTAL, slot, 20),
             Some(B256::with_last_byte(0x14))
         );
+
+        // A historical fallback cannot repopulate the forward cache.
+        cache.set(PORTAL, slot, 14, B256::with_last_byte(0xee));
+        assert!(!cache.slots[&(PORTAL, slot)].contains_key(&14));
+
+        // Touching one slot/address compacts only that history and preserves its baseline.
+        cache.set(PORTAL, slot, 15, B256::with_last_byte(0x0f));
+        cache.invalidate(PORTAL, 21);
+        assert_eq!(cache.get(PORTAL, slot, 5), None);
+        assert_eq!(
+            cache.slots[&(PORTAL, slot)]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![10, 15, 20]
+        );
         assert_eq!(
             cache.invalidations[&PORTAL]
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
-            vec![12, 18]
+            vec![12, 18, 21]
+        );
+        assert_eq!(
+            cache.get(PORTAL, slot, 15),
+            Some(B256::with_last_byte(0x0f))
         );
     }
 }
