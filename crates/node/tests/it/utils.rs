@@ -904,7 +904,6 @@ impl ZoneTestNode {
             seed_local_policy_cache(&policy_cache);
             let mut cache = l1_state_cache.write();
             seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
-            cache.extend_hardfork_schedule(u64::MAX, [(0, TempoHardfork::T8)]);
         }
 
         let node_handle = NodeBuilder::new(node_config)
@@ -3348,7 +3347,6 @@ impl L1Fixture {
         }
 
         seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
-        cache.extend_hardfork_schedule(u64::MAX, [(0, TempoHardfork::T8)]);
         cache.update_anchor(NumHash {
             number: num_blocks,
             hash: B256::ZERO,

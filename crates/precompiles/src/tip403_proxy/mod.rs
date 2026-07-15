@@ -56,6 +56,7 @@ mod tests {
     use alloy_evm::precompiles::DynPrecompile;
     use alloy_primitives::{Bytes, U256, address};
     use revm::precompile::{PrecompileError, PrecompileOutput};
+    use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_precompiles::{DelegateCallNotAllowed, storage::PrecompileStorageProvider};
 
     use crate::{
@@ -80,6 +81,7 @@ mod tests {
     impl RegistryHarness {
         fn new(l1: MockL1Reader) -> Self {
             let mut ctx = test_context();
+            ctx.cfg.spec = TempoHardfork::T8;
             test_storage_provider(&mut ctx, u64::MAX, false)
                 .sstore(
                     zone_primitives::constants::TEMPO_STATE_ADDRESS,
@@ -284,13 +286,12 @@ mod tests {
             output.bytes,
             Bytes::from(DelegateCallNotAllowed {}.abi_encode())
         );
-        assert!(reader.hardfork_requests().is_empty());
         assert!(reader.storage_requests().is_empty());
         Ok(())
     }
 
     #[test]
-    fn registry_reads_every_slot_and_hardfork_at_the_exact_tempo_anchor() -> eyre::Result<()> {
+    fn registry_reads_every_slot_at_the_exact_tempo_anchor() -> eyre::Result<()> {
         let reader = seeded_reader();
         let mut harness = RegistryHarness::new(reader.clone());
         let call = ITIP403Registry::isAuthorizedCall {
@@ -301,7 +302,6 @@ mod tests {
         let output = harness.call(&call, u64::MAX)?;
         assert!(output.is_success());
 
-        assert_eq!(reader.hardfork_requests(), vec![ANCHOR]);
         let requests = reader.storage_requests();
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|(_, _, block)| *block == ANCHOR));
@@ -309,21 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn anchored_hardfork_and_storage_failures_fail_closed() {
+    fn anchored_storage_failures_fail_closed() {
         let call = ITIP403Registry::isAuthorizedCall {
             policyId: 5,
             user: ALICE,
         }
         .abi_encode();
-
-        let hardfork_reader = MockL1Reader::failing_hardfork();
-        let mut harness = RegistryHarness::new(hardfork_reader.clone());
-        assert!(matches!(
-            harness.call(&call, u64::MAX),
-            Err(PrecompileError::Fatal(message)) if message.contains("hardfork unavailable")
-        ));
-        assert_eq!(hardfork_reader.hardfork_requests(), vec![ANCHOR]);
-        assert!(hardfork_reader.storage_requests().is_empty());
 
         let storage_reader = MockL1Reader::failing_storage();
         let mut harness = RegistryHarness::new(storage_reader.clone());
@@ -331,7 +322,6 @@ mod tests {
             harness.call(&call, u64::MAX),
             Err(PrecompileError::Fatal(message)) if message.contains("RPC unavailable")
         ));
-        assert_eq!(storage_reader.hardfork_requests(), vec![ANCHOR]);
         assert!(
             storage_reader
                 .storage_requests()
