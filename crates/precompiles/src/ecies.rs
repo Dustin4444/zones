@@ -12,6 +12,7 @@ use k256::{
     AffinePoint, ProjectivePoint, Scalar,
     elliptic_curve::{PrimeField, sec1::ToEncodedPoint},
 };
+use tempo_zone_contracts::Withdrawal;
 
 use crate::{
     aes_gcm::decrypt_aes_gcm,
@@ -24,14 +25,23 @@ pub const ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE: usize = 64;
 /// Plaintext size for authenticated-withdrawal sender reveals: 20 bytes (sender) + 32 bytes (tx hash).
 pub const AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE: usize = 52;
 
-/// Total encoded size of `encryptedSender`.
-pub const AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE: usize = 33 + 12 + 52 + 16;
+/// Encoded size of a compressed secp256k1 public key.
+pub const COMPRESSED_PUBLIC_KEY_SIZE: usize = 33;
 
-const AUTH_WITHDRAWAL_EPHEMERAL_DOMAIN: &[u8] = b"tempo-zone-authenticated-withdrawal-ephemeral-v1";
-const AUTH_WITHDRAWAL_NONCE_DOMAIN: &[u8] = b"tempo-zone-authenticated-withdrawal-nonce-v1";
-const AUTH_WITHDRAWAL_DERIVATION_KEY_DOMAIN: &[u8] =
-    b"tempo-zone-authenticated-withdrawal-derivation-key-v1";
-const CP_NONCE_DOMAIN: &[u8] = b"tempo-zone-chaum-pedersen-nonce-v1";
+/// Total encoded size of `encryptedSender`.
+pub const AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE: usize =
+    COMPRESSED_PUBLIC_KEY_SIZE + 12 + AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE + 16;
+
+/// Decode a SEC1-compressed secp256k1 public key.
+pub(crate) fn decode_compressed_public_key(encoded: &[u8]) -> Option<AffinePoint> {
+    let encoded: &[u8; COMPRESSED_PUBLIC_KEY_SIZE] = encoded.try_into().ok()?;
+    let parity = encoded[0];
+    if !matches!(parity, 0x02 | 0x03) {
+        return None;
+    }
+    let x: &[u8; 32] = encoded[1..].try_into().ok()?;
+    recover_point(x, parity)
+}
 
 /// Result of sequencer-side ECDH + Chaum-Pedersen proof derivation.
 ///
@@ -69,7 +79,7 @@ pub struct DecryptedDeposit {
 /// on-chain contract with a valid proof — enabling the refund path for deposits
 /// with garbage ciphertext instead of reverting.
 ///
-/// Returns `None` if the ephemeral public key cannot be recovered or proof generation fails.
+/// Returns `None` only if the ephemeral public key cannot be recovered (invalid point).
 pub fn compute_ecdh_proof(
     sequencer_privkey: &k256::SecretKey,
     ephemeral_pub_x: &B256,
@@ -94,7 +104,7 @@ pub fn compute_ecdh_proof(
         &ephemeral_pub,
         &shared_secret_affine,
         &sequencer_pub,
-    )?;
+    );
 
     Some(EcdhProofResult {
         shared_secret: B256::from(shared_secret_x),
@@ -168,83 +178,15 @@ pub fn encrypt_authenticated_withdrawal(
     sender: Address,
     tx_hash: B256,
 ) -> Option<Vec<u8>> {
+    let reveal_pub = decode_compressed_public_key(reveal_to)?;
+
     let eph_key = k256::SecretKey::random(&mut rand::thread_rng());
     let eph_scalar: Scalar = *eph_key.to_nonzero_scalar();
-    let nonce_bytes: [u8; 12] = rand::random();
-
-    encrypt_authenticated_withdrawal_with_material(
-        reveal_to,
-        sender,
-        tx_hash,
-        &eph_scalar,
-        nonce_bytes,
-    )
-}
-
-/// Deterministically encrypt `(sender, tx_hash)` for authenticated withdrawals.
-///
-/// This is the consensus-safe variant used by zone payload construction. It
-/// derives both the ECIES ephemeral scalar and AES-GCM nonce from the sequencer
-/// encryption key, zone id, reveal key, sender, and withdrawal transaction hash.
-pub fn encrypt_authenticated_withdrawal_deterministic(
-    encryption_privkey: &k256::SecretKey,
-    zone_id: u32,
-    reveal_to: &[u8],
-    sender: Address,
-    tx_hash: B256,
-) -> Option<Vec<u8>> {
-    let derivation_key = authenticated_withdrawal_derivation_key(encryption_privkey);
-    let eph_scalar = derive_authenticated_withdrawal_ephemeral_scalar(
-        &derivation_key,
-        zone_id,
-        reveal_to,
-        sender,
-        tx_hash,
-    )?;
     let eph_pub = AffinePoint::from(ProjectivePoint::GENERATOR * eph_scalar);
     let eph_encoded = eph_pub.to_encoded_point(true);
     let eph_pubkey: [u8; 33] = eph_encoded.as_bytes().try_into().ok()?;
-    let nonce_bytes = derive_authenticated_withdrawal_nonce(
-        &derivation_key,
-        zone_id,
-        reveal_to,
-        sender,
-        tx_hash,
-        &eph_pubkey,
-    );
 
-    encrypt_authenticated_withdrawal_with_material(
-        reveal_to,
-        sender,
-        tx_hash,
-        &eph_scalar,
-        nonce_bytes,
-    )
-}
-
-fn encrypt_authenticated_withdrawal_with_material(
-    reveal_to: &[u8],
-    sender: Address,
-    tx_hash: B256,
-    eph_scalar: &Scalar,
-    nonce_bytes: [u8; 12],
-) -> Option<Vec<u8>> {
-    if reveal_to.len() != 33 {
-        return None;
-    }
-    let parity = reveal_to[0];
-    if parity != 0x02 && parity != 0x03 {
-        return None;
-    }
-
-    let reveal_to_x = B256::from_slice(&reveal_to[1..]);
-    let reveal_pub = recover_point(&reveal_to_x.0, parity)?;
-
-    let eph_pub = AffinePoint::from(ProjectivePoint::GENERATOR * *eph_scalar);
-    let eph_encoded = eph_pub.to_encoded_point(true);
-    let eph_pubkey: [u8; 33] = eph_encoded.as_bytes().try_into().ok()?;
-
-    let shared_proj = ProjectivePoint::from(reveal_pub) * *eph_scalar;
+    let shared_proj = ProjectivePoint::from(reveal_pub) * eph_scalar;
     let shared_affine = AffinePoint::from(shared_proj);
     let ss_encoded = shared_affine.to_encoded_point(true);
     let shared_secret_x: [u8; 32] = ss_encoded.x()?.as_slice().try_into().ok()?;
@@ -254,6 +196,7 @@ fn encrypt_authenticated_withdrawal_with_material(
 
     let plaintext = build_authenticated_withdrawal_plaintext(&sender, &tx_hash);
     let cipher = Aes256Gcm::new((&aes_key).into());
+    let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let encrypted = cipher.encrypt(nonce, plaintext.as_ref()).ok()?;
     let ciphertext = &encrypted[..encrypted.len() - 16];
@@ -265,86 +208,6 @@ fn encrypt_authenticated_withdrawal_with_material(
     out.extend_from_slice(ciphertext);
     out.extend_from_slice(tag);
     Some(out)
-}
-
-fn derive_authenticated_withdrawal_ephemeral_scalar(
-    derivation_key: &[u8; 32],
-    zone_id: u32,
-    reveal_to: &[u8],
-    sender: Address,
-    tx_hash: B256,
-) -> Option<Scalar> {
-    for counter in 0u32.. {
-        let mut msg = authenticated_withdrawal_context(
-            AUTH_WITHDRAWAL_EPHEMERAL_DOMAIN,
-            zone_id,
-            reveal_to,
-            sender,
-            tx_hash,
-        );
-        msg.extend_from_slice(&counter.to_be_bytes());
-
-        let candidate = hmac_sha256(derivation_key, &msg);
-        if let Ok(key) = k256::SecretKey::from_slice(&candidate) {
-            return Some(*key.to_nonzero_scalar());
-        }
-    }
-
-    None
-}
-
-fn derive_authenticated_withdrawal_nonce(
-    derivation_key: &[u8; 32],
-    zone_id: u32,
-    reveal_to: &[u8],
-    sender: Address,
-    tx_hash: B256,
-    eph_pubkey: &[u8; 33],
-) -> [u8; 12] {
-    let mut msg = authenticated_withdrawal_context(
-        AUTH_WITHDRAWAL_NONCE_DOMAIN,
-        zone_id,
-        reveal_to,
-        sender,
-        tx_hash,
-    );
-    msg.extend_from_slice(eph_pubkey);
-
-    let digest = hmac_sha256(derivation_key, &msg);
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&digest[..12]);
-    nonce
-}
-
-fn authenticated_withdrawal_derivation_key(encryption_privkey: &k256::SecretKey) -> [u8; 32] {
-    let secret = secret_scalar_bytes(encryption_privkey);
-    // Derive a purpose-specific HMAC key first, so the raw ECIES private scalar
-    // is not reused directly across the ephemeral-scalar and nonce derivations.
-    hmac_sha256(&secret, AUTH_WITHDRAWAL_DERIVATION_KEY_DOMAIN)
-}
-
-fn authenticated_withdrawal_context(
-    domain: &[u8],
-    zone_id: u32,
-    reveal_to: &[u8],
-    sender: Address,
-    tx_hash: B256,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(domain.len() + 4 + 4 + reveal_to.len() + 20 + 32);
-    msg.extend_from_slice(domain);
-    msg.extend_from_slice(&zone_id.to_be_bytes());
-    msg.extend_from_slice(&(reveal_to.len() as u32).to_be_bytes());
-    msg.extend_from_slice(reveal_to);
-    msg.extend_from_slice(sender.as_slice());
-    msg.extend_from_slice(tx_hash.as_slice());
-    msg
-}
-
-fn secret_scalar_bytes(secret_key: &k256::SecretKey) -> [u8; 32] {
-    let repr = secret_key.to_nonzero_scalar().to_repr();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(repr.as_ref());
-    out
 }
 
 /// Decrypt an authenticated-withdrawal `encryptedSender` payload.
@@ -451,11 +314,13 @@ fn generate_chaum_pedersen_proof(
     ephemeral_pub: &AffinePoint,
     shared_secret: &AffinePoint,
     sequencer_pub: &AffinePoint,
-) -> Option<(Scalar, Scalar)> {
-    // The proof is included in advanceTempo calldata, so runtime randomness here
-    // would make otherwise identical zone blocks diverge. Derive the blinding
-    // scalar from the encryption key and the complete public statement instead.
-    let k = deterministic_cp_nonce(priv_seq, ephemeral_pub, sequencer_pub, shared_secret)?;
+) -> (Scalar, Scalar) {
+    use k256::elliptic_curve::Field;
+
+    let mut rng = rand::thread_rng();
+
+    // 1. Prover picks random k
+    let k = Scalar::random(&mut rng);
     let r1 = AffinePoint::from(ProjectivePoint::GENERATOR * k);
     let r2 = AffinePoint::from(ProjectivePoint::from(*ephemeral_pub) * k);
 
@@ -465,45 +330,7 @@ fn generate_chaum_pedersen_proof(
     // 3. Response: s = k + c * privSeq
     let s = k + c * priv_seq;
 
-    Some((s, c))
-}
-
-/// Domain-separated deterministic Chaum-Pedersen nonce derivation.
-///
-/// Invalid scalar candidates are retried with a counter.
-fn deterministic_cp_nonce(
-    priv_seq: &Scalar,
-    ephemeral_pub: &AffinePoint,
-    sequencer_pub: &AffinePoint,
-    shared_secret: &AffinePoint,
-) -> Option<Scalar> {
-    // Although the latter two points are derived from `priv_seq` and `ephemeral_pub`,
-    // include the complete public statement so every challenge input also binds the nonce.
-    let ephemeral_pub = ephemeral_pub.to_encoded_point(true);
-    let sequencer_pub = sequencer_pub.to_encoded_point(true);
-    let shared_secret = shared_secret.to_encoded_point(true);
-    let mut input = Vec::with_capacity(CP_NONCE_DOMAIN.len() + 33 * 3 + 4);
-    input.extend_from_slice(CP_NONCE_DOMAIN);
-    input.extend_from_slice(ephemeral_pub.as_bytes());
-    input.extend_from_slice(sequencer_pub.as_bytes());
-    input.extend_from_slice(shared_secret.as_bytes());
-
-    let secret = priv_seq.to_bytes();
-    for counter in 0..=u32::MAX {
-        input.extend_from_slice(&counter.to_be_bytes());
-        let candidate = hmac_sha256(secret.as_ref(), &input);
-
-        if let Ok(nonce) = k256::SecretKey::from_slice(&candidate) {
-            return Some(*nonce.to_nonzero_scalar());
-        }
-
-        // Reset to try another counter
-        input.truncate(input.len() - 4);
-    }
-
-    // Astronomically impossible that we didn't find a valid scalar, so if we're here, its a bug,
-    // return None
-    None
+    (s, c)
 }
 
 /// HMAC-SHA256 implementation matching ZoneInbox._hmacSha256.
@@ -575,10 +402,7 @@ pub fn build_authenticated_withdrawal_plaintext(
     sender: &Address,
     tx_hash: &B256,
 ) -> [u8; AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE] {
-    let mut buf = [0u8; AUTHENTICATED_WITHDRAWAL_PLAINTEXT_SIZE];
-    buf[..20].copy_from_slice(sender.as_slice());
-    buf[20..].copy_from_slice(tx_hash.as_slice());
-    buf
+    Withdrawal::authenticated_sender_plaintext(*sender, *tx_hash)
 }
 
 /// Build the 84-byte HKDF info parameter: `[portal(20) | key_index(32) | eph_pub_x(32)]`.
@@ -617,9 +441,9 @@ pub fn encrypt_plaintext(aes_key: &[u8; 32], plaintext: &[u8]) -> (Vec<u8>, [u8;
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, compressed_x_and_parity, compute_ecdh_proof,
+        AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, compressed_x_and_parity,
         decrypt_authenticated_withdrawal, decrypt_deposit, encrypt_authenticated_withdrawal,
-        encrypt_authenticated_withdrawal_deterministic, hkdf_sha256, hmac_sha256,
+        hkdf_sha256, hmac_sha256,
     };
     use crate::test_utils::{EncryptedDepositFixture, assert_cp_proof_valid};
     use alloy_primitives::{Address, B256, U256};
@@ -633,17 +457,6 @@ mod tests {
         assert_eq!(dec.to, f.to);
         assert_eq!(dec.memo, f.memo);
         assert_cp_proof_valid(&dec, &f.eph_pub, &f.seq_pub);
-    }
-
-    #[test]
-    fn test_cp_proof_is_deterministic() {
-        let f = EncryptedDepositFixture::new();
-
-        let proof_a = compute_ecdh_proof(&f.seq_key, &f.eph_pub_x, f.eph_pub_y_parity).unwrap();
-        let proof_b = compute_ecdh_proof(&f.seq_key, &f.eph_pub_x, f.eph_pub_y_parity).unwrap();
-
-        assert_eq!(proof_a.cp_proof_s, proof_b.cp_proof_s);
-        assert_eq!(proof_a.cp_proof_c, proof_b.cp_proof_c);
     }
 
     #[test]
@@ -665,85 +478,6 @@ mod tests {
             decrypt_authenticated_withdrawal(&privkey, &encrypted).unwrap();
         assert_eq!(decrypted_sender, sender);
         assert_eq!(decrypted_tx_hash, tx_hash);
-    }
-
-    #[test]
-    fn test_authenticated_withdrawal_deterministic_roundtrip() {
-        use sha2::{Digest, Sha256};
-
-        let reveal_key_bytes: [u8; 32] =
-            Sha256::digest(b"authenticated-withdrawal-reveal-key").into();
-        let reveal_key = k256::SecretKey::from_slice(&reveal_key_bytes).unwrap();
-        let reveal_pub = reveal_key.public_key();
-        let reveal_encoded = reveal_pub.to_encoded_point(true);
-
-        let encryption_key_bytes: [u8; 32] =
-            Sha256::digest(b"authenticated-withdrawal-encryption-key").into();
-        let encryption_key = k256::SecretKey::from_slice(&encryption_key_bytes).unwrap();
-
-        let zone_id = 17;
-        let sender = Address::repeat_byte(0x11);
-        let tx_hash = B256::repeat_byte(0x22);
-        let encrypted_a = encrypt_authenticated_withdrawal_deterministic(
-            &encryption_key,
-            zone_id,
-            reveal_encoded.as_bytes(),
-            sender,
-            tx_hash,
-        )
-        .unwrap();
-        let encrypted_b = encrypt_authenticated_withdrawal_deterministic(
-            &encryption_key,
-            zone_id,
-            reveal_encoded.as_bytes(),
-            sender,
-            tx_hash,
-        )
-        .unwrap();
-
-        assert_eq!(encrypted_a, encrypted_b);
-        assert_eq!(encrypted_a.len(), AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE);
-
-        let (decrypted_sender, decrypted_tx_hash) =
-            decrypt_authenticated_withdrawal(&reveal_key, &encrypted_a).unwrap();
-        assert_eq!(decrypted_sender, sender);
-        assert_eq!(decrypted_tx_hash, tx_hash);
-    }
-
-    #[test]
-    fn test_authenticated_withdrawal_deterministic_changes_by_zone() {
-        use sha2::{Digest, Sha256};
-
-        let reveal_key_bytes: [u8; 32] =
-            Sha256::digest(b"authenticated-withdrawal-zone-reveal-key").into();
-        let reveal_key = k256::SecretKey::from_slice(&reveal_key_bytes).unwrap();
-        let reveal_pub = reveal_key.public_key();
-        let reveal_encoded = reveal_pub.to_encoded_point(true);
-
-        let encryption_key_bytes: [u8; 32] =
-            Sha256::digest(b"authenticated-withdrawal-zone-encryption-key").into();
-        let encryption_key = k256::SecretKey::from_slice(&encryption_key_bytes).unwrap();
-
-        let sender = Address::repeat_byte(0x11);
-        let tx_hash = B256::repeat_byte(0x22);
-        let encrypted_a = encrypt_authenticated_withdrawal_deterministic(
-            &encryption_key,
-            17,
-            reveal_encoded.as_bytes(),
-            sender,
-            tx_hash,
-        )
-        .unwrap();
-        let encrypted_b = encrypt_authenticated_withdrawal_deterministic(
-            &encryption_key,
-            18,
-            reveal_encoded.as_bytes(),
-            sender,
-            tx_hash,
-        )
-        .unwrap();
-
-        assert_ne!(encrypted_a, encrypted_b);
     }
 
     #[test]
