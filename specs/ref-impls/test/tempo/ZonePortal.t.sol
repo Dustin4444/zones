@@ -48,6 +48,8 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
     bool public shouldRevert = false;
 
     bytes32 public lastSenderTag;
+    uint32 public lastZoneId;
+    address public lastSourcePortal;
     address public lastToken;
     uint128 public lastAmount;
     bytes public lastCallbackData;
@@ -66,6 +68,8 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
     }
 
     function onWithdrawalReceived(
+        uint32 zoneId,
+        address sourcePortal,
         bytes32 senderTag,
         address token,
         uint128 amount,
@@ -74,10 +78,16 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
         external
         returns (bytes4)
     {
+        lastZoneId = zoneId;
+        lastSourcePortal = sourcePortal;
         lastSenderTag = senderTag;
         lastToken = token;
         lastAmount = amount;
         lastCallbackData = callbackData;
+
+        if (expectedMessenger != address(0) && msg.sender != expectedMessenger) {
+            revert("MockWithdrawalReceiver: unexpected messenger");
+        }
 
         if (shouldRevert) {
             revert("MockWithdrawalReceiver: intentional revert");
@@ -96,6 +106,8 @@ contract MockWithdrawalReceiver is IWithdrawalReceiver {
 contract GasConsumingReceiver is IWithdrawalReceiver {
 
     function onWithdrawalReceived(
+        uint32,
+        address,
         bytes32,
         address,
         uint128,
@@ -117,6 +129,8 @@ contract SuccessfulReceiver is IWithdrawalReceiver {
     uint256 public callCount;
 
     function onWithdrawalReceived(
+        uint32,
+        address,
         bytes32,
         address,
         uint128,
@@ -126,6 +140,43 @@ contract SuccessfulReceiver is IWithdrawalReceiver {
         returns (bytes4)
     {
         callCount++;
+        return IWithdrawalReceiver.onWithdrawalReceived.selector;
+    }
+
+}
+
+/// @notice Sequencer-controlled receiver that attempts to process another withdrawal in callback.
+contract ReentrantWithdrawalReceiver is IWithdrawalReceiver {
+
+    bytes4 public nestedRevertSelector;
+    bool public nestedCallSucceeded;
+
+    function onWithdrawalReceived(
+        uint32,
+        address sourcePortal,
+        bytes32,
+        address,
+        uint128,
+        bytes calldata callbackData
+    )
+        external
+        returns (bytes4)
+    {
+        (Withdrawal memory withdrawal, bytes32 remainingQueue) =
+            abi.decode(callbackData, (Withdrawal, bytes32));
+
+        try IZonePortal(sourcePortal).processWithdrawal(withdrawal, remainingQueue) {
+            nestedCallSucceeded = true;
+        } catch (bytes memory reason) {
+            if (reason.length >= 4) {
+                bytes4 selector;
+                assembly ("memory-safe") {
+                    selector := mload(add(reason, 0x20))
+                }
+                nestedRevertSelector = selector;
+            }
+        }
+
         return IWithdrawalReceiver.onWithdrawalReceived.selector;
     }
 
@@ -184,9 +235,8 @@ contract ZonePortalTest is BaseTest {
         (testZoneId, portalAddr) = zoneFactory.createZone(params);
         portal = ZonePortal(portalAddr);
 
-        // Get the messenger
-        ZoneInfo memory info = zoneFactory.zones(testZoneId);
-        messenger = ZoneMessenger(info.messenger);
+        // Get the shared messenger
+        messenger = ZoneMessenger(zoneFactory.messenger());
 
         // Set expected messenger for withdrawal receiver
         withdrawalReceiver.setExpectedMessenger(address(messenger));
@@ -246,7 +296,6 @@ contract ZonePortalTest is BaseTest {
         ZoneInfo memory info = zoneFactory.zones(testZoneId);
         assertEq(info.zoneId, testZoneId);
         assertEq(info.portal, address(portal));
-        assertEq(info.messenger, address(messenger));
         assertEq(info.initialToken, address(pathUSD));
         assertEq(info.admin, admin);
         assertEq(info.sequencer, sequencer);
@@ -1448,6 +1497,67 @@ contract ZonePortalTest is BaseTest {
         vm.prank(alice); // Not sequencer
         vm.expectRevert(IZonePortal.NotSequencer.selector);
         portal.processWithdrawal(w, bytes32(0));
+    }
+
+    function test_processWithdrawal_revertsOnSequencerCallbackReentrancy() public {
+        ReentrantWithdrawalReceiver receiver = new ReentrantWithdrawalReceiver();
+
+        uint128 depositAmount = 1000e6;
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), depositAmount);
+        portal.deposit(address(pathUSD), alice, depositAmount, bytes32("memo"), alice);
+        vm.stopPrank();
+
+        Withdrawal memory nested =
+            _withdrawal(address(pathUSD), alice, bob, 200e6, bytes32(0), 0, alice, "");
+        Withdrawal memory outer = _withdrawal(
+            address(pathUSD),
+            alice,
+            address(receiver),
+            300e6,
+            bytes32(0),
+            500_000,
+            alice,
+            abi.encode(nested, bytes32(0))
+        );
+
+        bytes32 remainingQueue = keccak256(abi.encode(nested, EMPTY_SENTINEL));
+        bytes32 withdrawalQueue = keccak256(abi.encode(outer, remainingQueue));
+
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("reentrancy")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: portal.currentDepositQueueHash(),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            withdrawalQueue,
+            "",
+            ""
+        );
+
+        portal.transferSequencer(address(receiver));
+        vm.prank(address(receiver));
+        portal.acceptSequencer();
+
+        uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
+        vm.prank(address(receiver));
+        portal.processWithdrawal(outer, remainingQueue);
+
+        assertFalse(receiver.nestedCallSucceeded());
+        assertEq(receiver.nestedRevertSelector(), IZonePortal.ReentrantWithdrawal.selector);
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore);
+        assertEq(portal.withdrawalQueueSlot(0), remainingQueue);
+
+        vm.prank(address(receiver));
+        portal.processWithdrawal(nested, bytes32(0));
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + nested.amount);
     }
 
     /*//////////////////////////////////////////////////////////////
