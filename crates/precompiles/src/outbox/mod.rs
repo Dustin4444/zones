@@ -12,7 +12,7 @@ use revm::interpreter::instructions::utility::IntoAddress;
 use tempo_precompiles::{
     Result as TempoResult,
     error::TempoPrecompileError,
-    storage::{Handler, StorageCtx},
+    storage::{Handler, Mapping, StorageCtx},
     tip20::{ITIP20, TIP20Token},
 };
 use tempo_precompiles_macros::{Storable, contract};
@@ -66,7 +66,11 @@ impl CallRules for ZoneOutboxRules {
         if call.is_static
             && call.selector().is_some_and(|selector| {
                 self.requires_l1(Some(selector))
-                    || selector == ZoneOutboxAbi::enqueueDepositBounceBackCall::SELECTOR
+                    || matches!(
+                        selector,
+                        ZoneOutboxAbi::enqueueDepositBounceBackCall::SELECTOR
+                            | ZoneOutboxAbi::consumeFallbackRecipientCall::SELECTOR
+                    )
             })
         {
             return CallCheck::from_error(ZoneOutboxError::static_call_not_allowed());
@@ -119,6 +123,8 @@ pub struct ZoneOutbox {
     withdrawals_this_block: u32,
     current_block_number: u64,
     last_finalized_timestamp: u64,
+    last_fallback_nonce: u64,
+    fallback_recipients: Mapping<u64, Address>,
     pending_withdrawals: Vec<PendingWithdrawal>,
 }
 
@@ -212,10 +218,18 @@ impl ZoneOutbox {
         }
         zone_token.burn(self.address, ITIP20::burnCall { amount })?;
 
+        let fallback_nonce = self
+            .last_fallback_nonce
+            .read()?
+            .checked_add(1)
+            .ok_or_else(TempoPrecompileError::under_overflow)?;
+        self.last_fallback_nonce.write(fallback_nonce)?;
+        self.fallback_recipients[fallback_nonce].write(call.fallbackRecipient)?;
         self.enqueue(PendingWithdrawal::from_request(
             caller,
             current_tx_hash,
             fee,
+            fallback_nonce,
             call,
         ))
     }
@@ -230,6 +244,18 @@ impl ZoneOutbox {
         }
 
         self.enqueue(PendingWithdrawal::from_bounce_back(call))
+    }
+
+    fn consume_fallback_recipient(&mut self, caller: Address, nonce: u64) -> ZoneResult<Address> {
+        if caller != ZONE_INBOX_ADDRESS {
+            return Err(ZoneOutboxError::only_zone_inbox().into());
+        }
+        let recipient = self.fallback_recipients[nonce].read()?;
+        if recipient.is_zero() {
+            return Err(ZoneOutboxError::invalid_fallback_recipient().into());
+        }
+        self.fallback_recipients[nonce].delete()?;
+        Ok(recipient)
     }
 
     fn finalize_withdrawal_batch(
@@ -333,7 +359,7 @@ struct PendingWithdrawal {
     fee: u128,
     memo: B256,
     gas_limit: u64,
-    fallback_recipient: Address,
+    fallback_nonce: u64,
     callback_data: Bytes,
     reveal_to: Bytes,
 }
@@ -343,6 +369,7 @@ impl PendingWithdrawal {
         sender: Address,
         tx_hash: B256,
         fee: u128,
+        fallback_nonce: u64,
         call: ZoneOutboxAbi::requestWithdrawalCall,
     ) -> Self {
         Self {
@@ -354,7 +381,7 @@ impl PendingWithdrawal {
             fee,
             memo: call.memo,
             gas_limit: call.gasLimit,
-            fallback_recipient: call.fallbackRecipient,
+            fallback_nonce,
             callback_data: call.data,
             reveal_to: call.revealTo,
         }
@@ -379,7 +406,7 @@ impl PendingWithdrawal {
             self.fee,
             self.memo,
             self.gas_limit,
-            self.fallback_recipient,
+            self.fallback_nonce,
             self.callback_data.clone(),
             self.reveal_to.clone(),
         )
@@ -408,7 +435,7 @@ impl PendingWithdrawal {
             fee: self.fee,
             memo: self.memo,
             gasLimit: self.gas_limit,
-            fallbackRecipient: self.fallback_recipient,
+            fallbackNonce: self.fallback_nonce,
             callbackData: self.callback_data,
             encryptedSender: encrypted_sender,
         })
@@ -426,7 +453,7 @@ impl From<PendingWithdrawal> for ZoneOutboxAbi::PendingWithdrawal {
             fee: pending.fee,
             memo: pending.memo,
             gasLimit: pending.gas_limit,
-            fallbackRecipient: pending.fallback_recipient,
+            fallbackNonce: pending.fallback_nonce,
             callbackData: pending.callback_data,
             revealTo: pending.reveal_to,
         }

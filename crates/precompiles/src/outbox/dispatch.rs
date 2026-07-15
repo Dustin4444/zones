@@ -29,6 +29,7 @@ impl Precompile for ZoneOutbox {
                 withdrawalBatchIndex(_) => metadata::<IZoneOutbox::withdrawalBatchIndexCall>(|| self.withdrawal_batch_index.read()),
                 lastFinalizedTimestamp(_) => metadata::<IZoneOutbox::lastFinalizedTimestampCall>(|| self.last_finalized_timestamp.read()),
                 nextWithdrawalIndex(_) => metadata::<IZoneOutbox::nextWithdrawalIndexCall>(|| self.next_withdrawal_index.read()),
+                lastFallbackNonce(_) => metadata::<IZoneOutbox::lastFallbackNonceCall>(|| self.last_fallback_nonce.read()),
                 pendingWithdrawalsCount(_) => metadata::<IZoneOutbox::pendingWithdrawalsCountCall>(|| self.pending_withdrawals_count()),
                 getPendingWithdrawals(_) => metadata::<IZoneOutbox::getPendingWithdrawalsCall>(|| self.get_pending_withdrawals()),
                 calculateWithdrawalFee(call) => view(call, |call| self.calculate_withdrawal_fee(call.gasLimit)),
@@ -48,6 +49,7 @@ impl Precompile for ZoneOutbox {
                     )
                 }),
                 enqueueDepositBounceBack(call) => mutate_void(call, msg_sender, |sender, call| self.enqueue_deposit_bounce_back(sender, call)),
+                consumeFallbackRecipient(call) => mutate(call, msg_sender, |sender, call| self.consume_fallback_recipient(sender, call.fallbackNonce)),
                 finalizeWithdrawalBatch(call) => mutate(call, msg_sender, |_, call| self.finalize_withdrawal_batch(call)),
             }
             ILegacyZoneOutbox::ILegacyZoneOutboxCalls {

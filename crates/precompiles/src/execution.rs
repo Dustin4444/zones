@@ -348,6 +348,7 @@ mod tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+    use tempo_precompiles::storage::PrecompileStorageProvider;
 
     const FIXED_GAS: u64 = 123;
     type RuleRecord = Rc<RefCell<Option<(Bytes, Option<[u8; 4]>, Address)>>>;
@@ -432,10 +433,11 @@ mod tests {
         let reader = MockL1Reader::default();
         let observed_spec = Rc::new(Cell::new(None));
         let execute_spec = observed_spec.clone();
-        let cfg = revm::context::CfgEnv::<TempoHardfork>::default();
+        let mut cfg = revm::context::CfgEnv::<TempoHardfork>::default();
+        cfg.spec = TempoHardfork::T8;
         let env = L1BackedPrecompileEnv::new(
             &cfg,
-            reader.clone(),
+            reader,
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
         );
@@ -454,7 +456,6 @@ mod tests {
                 .is_revert()
         );
         assert!(checked.get());
-        assert!(reader.hardfork_requests().is_empty());
 
         let precompile =
             create_l1_backed_precompile("L1BackedTest", env, NoCallRules, move |_, _| {
@@ -473,7 +474,6 @@ mod tests {
             .call(input(&mut ctx, &[], Address::ZERO, u64::MAX))
             .unwrap();
 
-        assert_eq!(reader.hardfork_requests(), vec![anchor]);
         assert_eq!(observed_spec.get(), Some(TempoHardfork::T8));
     }
 

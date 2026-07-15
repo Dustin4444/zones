@@ -308,7 +308,7 @@ fn finalize_single_and_multiple_withdrawals_match_canonical_queue_hash() -> eyre
             fee: pending.fee,
             memo: pending.memo,
             gasLimit: pending.gasLimit,
-            fallbackRecipient: pending.fallbackRecipient,
+            fallbackNonce: pending.fallbackNonce,
             callbackData: pending.callbackData.clone(),
             encryptedSender: Bytes::new(),
         })
@@ -588,7 +588,11 @@ fn legacy_withdrawal_matches_current_overload_and_defaults_reveal_to() -> eyre::
 
     let pending = harness.pending()?;
     assert_eq!(pending.len(), 2);
-    assert_eq!(pending[0], pending[1]);
+    assert_eq!(pending[0].fallbackNonce, 1);
+    assert_eq!(pending[1].fallbackNonce, 2);
+    let mut legacy = pending[1].clone();
+    legacy.fallbackNonce = pending[0].fallbackNonce;
+    assert_eq!(pending[0], legacy);
     assert!(pending[1].revealTo.is_empty());
     Ok(())
 }
@@ -625,5 +629,32 @@ fn static_mutation_reverts_with_static_call_not_allowed() -> eyre::Result<()> {
         ZoneOutboxError::static_call_not_allowed(),
     );
     assert!(harness.pending()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn fallback_recipient_nonce_is_private_and_consumed_once_by_inbox() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    harness.request(1, BOB, B256::ZERO)?;
+    let nonce = harness.pending()?[0].fallbackNonce;
+    assert_eq!(nonce, 1);
+
+    let calldata = ZoneOutboxAbi::consumeFallbackRecipientCall {
+        fallbackNonce: nonce,
+    }
+    .abi_encode();
+    assert_revert(
+        harness.call(ALICE, &calldata),
+        ZoneOutboxError::only_zone_inbox(),
+    );
+    let output = harness.call(ZONE_INBOX_ADDRESS, &calldata)?;
+    assert_eq!(
+        ZoneOutboxAbi::consumeFallbackRecipientCall::abi_decode_returns(&output.bytes)?,
+        ALICE
+    );
+    assert_revert(
+        harness.call(ZONE_INBOX_ADDRESS, calldata),
+        ZoneOutboxError::invalid_fallback_recipient(),
+    );
     Ok(())
 }
