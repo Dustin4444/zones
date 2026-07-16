@@ -31,15 +31,15 @@ contract WithdrawalQueueHarness {
         return queue.hasWithdrawals();
     }
 
-    function length() external view returns (uint256) {
+    function length() external view returns (uint64) {
         return queue.length();
     }
 
-    function head() external view returns (uint256) {
+    function head() external view returns (uint64) {
         return queue.head;
     }
 
-    function tail() external view returns (uint256) {
+    function tail() external view returns (uint64) {
         return queue.tail;
     }
 
@@ -47,10 +47,16 @@ contract WithdrawalQueueHarness {
         return queue.slots[index];
     }
 
-    function setRawState(uint256 head, uint256 tail, uint256 slot, bytes32 value) external {
-        queue.head = head;
-        queue.tail = tail;
+    function setRawState(uint64 _head, uint64 _tail, uint256 slot, bytes32 value) external {
+        queue.head = _head;
+        queue.tail = _tail;
         queue.slots[slot] = value;
+    }
+
+    function packedBoundsWord() external view returns (bytes32 word) {
+        assembly {
+            word := sload(queue.slot)
+        }
     }
 
 }
@@ -78,6 +84,14 @@ contract WithdrawalQueueLibTest is Test {
         assertEq(harness.tail(), 0);
         assertFalse(harness.hasWithdrawals());
         assertEq(harness.length(), 0);
+    }
+
+    function test_headAndTailShareOneStorageWord() public {
+        harness.setRawState(7, 19, 0, bytes32(0));
+
+        uint256 packed = uint256(harness.packedBoundsWord());
+        assertEq(uint64(packed), 7);
+        assertEq(uint64(packed >> 64), 19);
     }
 
     /*//////////////////////////////////////////////////////////////

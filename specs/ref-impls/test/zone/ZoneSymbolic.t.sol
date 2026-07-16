@@ -61,20 +61,20 @@ contract WithdrawalQueueHarness {
 
     WithdrawalQueue internal q;
 
-    function setHeadTail(uint256 _head, uint256 _tail) external {
+    function setHeadTail(uint64 _head, uint64 _tail) external {
         q.head = _head;
         q.tail = _tail;
     }
 
-    function head() external view returns (uint256) {
+    function head() external view returns (uint64) {
         return q.head;
     }
 
-    function tail() external view returns (uint256) {
+    function tail() external view returns (uint64) {
         return q.tail;
     }
 
-    function length() external view returns (uint256) {
+    function length() external view returns (uint64) {
         return q.length();
     }
 
@@ -90,7 +90,7 @@ contract WithdrawalQueueHarness {
         q.enqueue(h);
     }
 
-    function capacity() external pure returns (uint256) {
+    function capacity() external pure returns (uint64) {
         return WITHDRAWAL_QUEUE_CAPACITY;
     }
 
@@ -110,7 +110,7 @@ contract WithdrawalQueueSymbolic is Test {
 
     /// @notice For any valid queue state (head <= tail, length <= capacity),
     ///         isFull() <=> length() == capacity.
-    function check_isFullIffLengthEqualsCapacity(uint256 _head, uint256 _tail) external {
+    function check_isFullIffLengthEqualsCapacity(uint64 _head, uint64 _tail) external {
         vm.assume(_tail >= _head);
         vm.assume(_tail - _head <= qh.capacity());
 
@@ -120,7 +120,7 @@ contract WithdrawalQueueSymbolic is Test {
     }
 
     /// @notice For any valid queue state, hasWithdrawals() <=> length() != 0.
-    function check_hasWithdrawalsIffNonEmpty(uint256 _head, uint256 _tail) external {
+    function check_hasWithdrawalsIffNonEmpty(uint64 _head, uint64 _tail) external {
         vm.assume(_tail >= _head);
         vm.assume(_tail - _head <= qh.capacity());
 
@@ -132,8 +132,8 @@ contract WithdrawalQueueSymbolic is Test {
     /// @notice A non-empty enqueue on a non-full queue advances tail by exactly one and never
     ///         pushes length past capacity.
     function check_enqueueAdvancesTailAndRespectsCapacity(
-        uint256 _head,
-        uint256 _tail,
+        uint64 _head,
+        uint64 _tail,
         bytes32 h
     )
         external
@@ -141,10 +141,10 @@ contract WithdrawalQueueSymbolic is Test {
         vm.assume(h != bytes32(0));
         vm.assume(_tail >= _head);
         vm.assume(_tail - _head < qh.capacity()); // not full
-        vm.assume(_tail < type(uint256).max); // tail + 1 cannot overflow
+        vm.assume(_tail < type(uint64).max); // tail + 1 cannot overflow
 
         qh.setHeadTail(_head, _tail);
-        uint256 lenBefore = qh.length();
+        uint64 lenBefore = qh.length();
 
         qh.enqueue(h);
 
@@ -155,7 +155,7 @@ contract WithdrawalQueueSymbolic is Test {
 
     /// @notice Enqueuing the zero hash (a batch with no withdrawals) is a no-op: head and tail
     ///         are unchanged, for any starting state.
-    function check_enqueueZeroIsNoop(uint256 _head, uint256 _tail) external {
+    function check_enqueueZeroIsNoop(uint64 _head, uint64 _tail) external {
         qh.setHeadTail(_head, _tail);
 
         qh.enqueue(bytes32(0));
@@ -165,7 +165,7 @@ contract WithdrawalQueueSymbolic is Test {
     }
 
     /// @notice A non-empty enqueue on a full queue always reverts, for any full state.
-    function check_enqueueRevertsWhenFull(uint256 _head, uint256 _tail, bytes32 h) external {
+    function check_enqueueRevertsWhenFull(uint64 _head, uint64 _tail, bytes32 h) external {
         vm.assume(h != bytes32(0));
         vm.assume(_tail >= _head);
         vm.assume(_tail - _head == qh.capacity()); // full

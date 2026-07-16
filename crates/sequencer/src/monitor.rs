@@ -938,6 +938,7 @@ mod tests {
     use alloy_network::Network;
     use alloy_primitives::{Bytes, U256};
     use alloy_rpc_types_eth::{Block, Header};
+    use alloy_sol_types::SolValue;
     use alloy_transport::mock::Asserter;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
@@ -965,8 +966,8 @@ mod tests {
         Bytes::copy_from_slice(value.as_slice())
     }
 
-    fn abi_encode_u64(value: u64) -> Bytes {
-        Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+    fn abi_encode_queue_bounds(head: u64, tail: u64) -> Bytes {
+        Bytes::from((head, tail).abi_encode_params())
     }
 
     fn mock_block(hash: B256, number: u64) -> <TempoNetwork as Network>::BlockResponse {
@@ -1072,8 +1073,7 @@ mod tests {
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
-        l1.push_success(&abi_encode_u64(7));
-        l1.push_success(&abi_encode_u64(7));
+        l1.push_success(&abi_encode_queue_bounds(7, 7));
 
         zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
@@ -1098,8 +1098,7 @@ mod tests {
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
-        l1.push_success(&abi_encode_u64(7));
-        l1.push_success(&abi_encode_u64(7));
+        l1.push_success(&abi_encode_queue_bounds(7, 7));
 
         zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
@@ -1141,8 +1140,7 @@ mod tests {
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
-        l1.push_failure_msg("head read failed");
-        l1.push_failure_msg("tail read failed");
+        l1.push_failure_msg("queue bounds read failed");
 
         zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
@@ -1185,8 +1183,7 @@ mod tests {
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_b256(portal_hash));
-        l1.push_success(&abi_encode_u64(7));
-        l1.push_success(&abi_encode_u64(7));
+        l1.push_success(&abi_encode_queue_bounds(7, 7));
 
         zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));

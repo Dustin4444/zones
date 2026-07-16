@@ -485,11 +485,7 @@ impl BatchSubmitter {
 
     /// Read the current logical withdrawal queue tail from the ZonePortal on L1.
     pub async fn read_portal_withdrawal_queue_tail(&self) -> Result<u64> {
-        let tail = self.portal.withdrawalQueueTail().call().await?;
-        let tail: u64 = tail
-            .try_into()
-            .map_err(|_| eyre::eyre!("withdrawal queue tail overflow"))?;
-        Ok(tail)
+        Ok(self.portal.withdrawalQueueTail().call().await?)
     }
 
     /// Read the current withdrawal batch index from the ZonePortal on L1.
@@ -499,11 +495,13 @@ impl BatchSubmitter {
 
     /// Read the current withdrawal queue head from the ZonePortal on L1.
     pub async fn read_portal_withdrawal_queue_head(&self) -> Result<u64> {
-        let head = self.portal.withdrawalQueueHead().call().await?;
-        let head: u64 = head
-            .try_into()
-            .map_err(|_| eyre::eyre!("withdrawal queue head overflow"))?;
-        Ok(head)
+        Ok(self.portal.withdrawalQueueHead().call().await?)
+    }
+
+    /// Read the portal's withdrawal queue bounds from one L1 state snapshot.
+    async fn read_portal_withdrawal_queue_bounds(&self) -> Result<(u64, u64)> {
+        let bounds = self.portal.withdrawalQueueBounds().call().await?;
+        Ok((bounds.head, bounds.tail))
     }
 
     /// Check if the withdrawal queue has capacity for another batch.
@@ -511,10 +509,7 @@ impl BatchSubmitter {
     /// The portal uses a ring buffer with 100 slots. Returns an error if the
     /// queue is full (`tail - head >= 100`).
     pub async fn check_withdrawal_queue_capacity(&self) -> Result<()> {
-        let (head, tail) = tokio::try_join!(
-            self.read_portal_withdrawal_queue_head(),
-            self.read_portal_withdrawal_queue_tail(),
-        )?;
+        let (head, tail) = self.read_portal_withdrawal_queue_bounds().await?;
         if tail.saturating_sub(head) >= WITHDRAWAL_QUEUE_CAPACITY {
             return Err(eyre::eyre!(
                 "withdrawal queue full ({} pending slots, capacity {})",
@@ -551,10 +546,7 @@ impl BatchSubmitter {
         outbox_address: Address,
     ) -> Result<BTreeMap<u64, Vec<abi::Withdrawal>>> {
         // Step 1: read pending slot range from the L1 portal.
-        let (head, tail) = tokio::try_join!(
-            self.read_portal_withdrawal_queue_head(),
-            self.read_portal_withdrawal_queue_tail(),
-        )?;
+        let (head, tail) = self.read_portal_withdrawal_queue_bounds().await?;
 
         if head >= tail {
             info!(head, tail, "No pending withdrawals to restore");
@@ -622,10 +614,7 @@ impl BatchSubmitter {
             .await?;
 
         // Guard: verify the queue didn't change during the multi-RPC replay.
-        let (head2, tail2) = tokio::try_join!(
-            self.read_portal_withdrawal_queue_head(),
-            self.read_portal_withdrawal_queue_tail(),
-        )?;
+        let (head2, tail2) = self.read_portal_withdrawal_queue_bounds().await?;
 
         if head2 != head || tail2 != tail {
             eyre::bail!(
@@ -1079,7 +1068,10 @@ pub(crate) struct ZoneBlockSnapshot {
 mod tests {
     use super::*;
     use crate::abi;
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::{B256, Bytes, address};
+    use alloy_provider::ProviderBuilder;
+    use alloy_sol_types::SolValue;
+    use alloy_transport::mock::Asserter;
 
     fn test_withdrawal(to: Address, amount: u128) -> abi::Withdrawal {
         abi::Withdrawal {
@@ -1096,6 +1088,10 @@ mod tests {
         }
     }
 
+    fn abi_encode_queue_bounds(head: u64, tail: u64) -> Bytes {
+        Bytes::from((head, tail).abi_encode_params())
+    }
+
     #[test]
     fn batch_anchor_config_validates_effective_window() {
         let config = BatchAnchorConfig::new(10, 4).unwrap();
@@ -1106,6 +1102,24 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    #[tokio::test]
+    async fn withdrawal_queue_bounds_use_one_contract_call() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::ZERO, provider, 0);
+
+        asserter.push_success(&abi_encode_queue_bounds(7, 19));
+        let bounds = submitter
+            .read_portal_withdrawal_queue_bounds()
+            .await
+            .unwrap();
+
+        assert_eq!(bounds, (7, 19));
+        assert!(asserter.read_q().is_empty());
     }
 
     #[test]

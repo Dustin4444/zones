@@ -339,19 +339,18 @@ interface IZoneTxContext {
 //   slot 3: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
 //   slot 4: blockHash (bytes32)
 //   slot 5: currentDepositQueueHash (bytes32)
-//   slot 6: depositCount (uint64) + lastProcessedDepositNumber (uint64) + lastSyncedTempoBlockNumber (uint64) [packed]
+//   slot 6: depositCount (uint64) + lastProcessedDepositNumber (uint64) + lastSyncedTempoBlockNumber (uint64) + bouncebackGas (uint64) [packed]
 //   slot 7: _encryptionKeys (EncryptionKeyEntry[])
 //   slot 8: _tokenConfigs (mapping(address => TokenConfig))
 //   slot 9: _enabledTokens (address[])
 //   slot 10: refunds (mapping(address => mapping(address => uint128)))
-//   slot 11: _withdrawalQueue.head
-//   slot 12: _withdrawalQueue.tail
-//   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
-//   slot 14: rpcUrl (string)
-//   slot 15: pendingAdmin (address)
-//   slot 16: _withdrawalReentrancyStatus (uint256)
-//   slot 17: zoneId (uint32) + messenger (address) [packed]
-//   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
+//   slot 11: _withdrawalQueue.head (uint64) + _withdrawalQueue.tail (uint64) [packed]
+//   slot 12: _withdrawalQueue.slots (mapping(uint256 => bytes32))
+//   slot 13: rpcUrl (string)
+//   slot 14: pendingAdmin (address)
+//   slot 15: _withdrawalReentrancyStatus (uint256)
+//   slot 16: zoneId (uint32) + messenger (address) [packed]
+//   slot 17: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -364,7 +363,7 @@ bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(5));
 bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(7));
 bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(8));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(9));
-bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(15));
+bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(14));
 
 /// @title IVerifier
 /// @notice Interface for zone proof/attestation verification
@@ -683,9 +682,11 @@ interface IZonePortal {
 
     function lastSyncedTempoBlockNumber() external view returns (uint64);
 
-    function withdrawalQueueHead() external view returns (uint256);
+    function withdrawalQueueHead() external view returns (uint64);
 
-    function withdrawalQueueTail() external view returns (uint256);
+    function withdrawalQueueTail() external view returns (uint64);
+
+    function withdrawalQueueBounds() external view returns (uint64 head, uint64 tail);
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
 

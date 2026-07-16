@@ -29,9 +29,8 @@ async fn portal_block_hash(
 /// Read the portal's withdrawal queue head and tail.
 async fn portal_queue_state(l1: &L1TestNode, portal_address: Address) -> eyre::Result<(u64, u64)> {
     let portal = ZonePortal::new(portal_address, l1.provider());
-    let head: U256 = portal.withdrawalQueueHead().call().await?;
-    let tail: U256 = portal.withdrawalQueueTail().call().await?;
-    Ok((head.to::<u64>(), tail.to::<u64>()))
+    let bounds = portal.withdrawalQueueBounds().call().await?;
+    Ok((bounds.head, bounds.tail))
 }
 
 /// Count `BatchSubmitted` events on the portal.

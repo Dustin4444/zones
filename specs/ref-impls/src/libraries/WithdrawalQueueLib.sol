@@ -13,7 +13,7 @@ bytes32 constant EMPTY_SENTINEL = bytes32(type(uint256).max);
 uint256 constant NO_QUEUE_INDEX = type(uint256).max;
 
 /// @dev Fixed capacity for the withdrawal ring buffer (number of batch slots).
-uint256 constant WITHDRAWAL_QUEUE_CAPACITY = 100;
+uint64 constant WITHDRAWAL_QUEUE_CAPACITY = 100;
 
 /// @title WithdrawalQueue
 /// @notice Fixed-size ring buffer for zone→Tempo withdrawals
@@ -21,12 +21,12 @@ uint256 constant WITHDRAWAL_QUEUE_CAPACITY = 100;
 ///      batches (withdrawalQueueHash == 0) advance the batch index but do not consume
 ///      a slot. Head points to the oldest unprocessed batch,
 ///      tail points to where the next batch will write. Slots contain hash chains
-///      of withdrawals for that batch. Head and tail are raw uint256 values that
+///      of withdrawals for that batch. Head and tail are raw uint64 values that
 ///      never wrap; modular arithmetic (head % WITHDRAWAL_QUEUE_CAPACITY) is used
 ///      only for slot indexing.
 struct WithdrawalQueue {
-    uint256 head; // logical index of oldest unprocessed batch
-    uint256 tail; // logical index where next batch will write
+    uint64 head; // logical index of oldest unprocessed batch
+    uint64 tail; // logical index where next batch will write
     mapping(uint256 => bytes32) slots; // hash chains per batch (EMPTY_SENTINEL = empty)
 }
 
@@ -65,7 +65,7 @@ library WithdrawalQueueLib {
             return NO_QUEUE_INDEX;
         }
 
-        uint256 tail = queue.tail;
+        uint64 tail = queue.tail;
 
         if (tail - queue.head >= WITHDRAWAL_QUEUE_CAPACITY) {
             revert WithdrawalQueueFull();
@@ -91,7 +91,7 @@ library WithdrawalQueueLib {
     )
         internal
     {
-        uint256 head = queue.head;
+        uint64 head = queue.head;
 
         if (head == queue.tail) {
             revert NoWithdrawalsInQueue();
@@ -128,7 +128,7 @@ library WithdrawalQueueLib {
     /// @notice Get current queue length
     /// @param queue The withdrawal queue
     /// @return The number of batch slots with pending withdrawals
-    function length(WithdrawalQueue storage queue) internal view returns (uint256) {
+    function length(WithdrawalQueue storage queue) internal view returns (uint64) {
         return queue.tail - queue.head;
     }
 

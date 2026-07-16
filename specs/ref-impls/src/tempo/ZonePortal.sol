@@ -268,12 +268,16 @@ contract ZonePortal is IZonePortal {
                            QUEUE ACCESSORS
     //////////////////////////////////////////////////////////////*/
 
-    function withdrawalQueueHead() external view returns (uint256) {
+    function withdrawalQueueHead() external view returns (uint64) {
         return _withdrawalQueue.head;
     }
 
-    function withdrawalQueueTail() external view returns (uint256) {
+    function withdrawalQueueTail() external view returns (uint64) {
         return _withdrawalQueue.tail;
+    }
+
+    function withdrawalQueueBounds() external view returns (uint64 head, uint64 tail) {
+        return (_withdrawalQueue.head, _withdrawalQueue.tail);
     }
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32) {

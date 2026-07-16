@@ -311,6 +311,12 @@ impl WithdrawalProcessor {
         }
     }
 
+    /// Read the portal's withdrawal queue bounds from one L1 state snapshot.
+    async fn read_queue_bounds(&self) -> eyre::Result<(u64, u64)> {
+        let bounds = self.portal.withdrawalQueueBounds().call().await?;
+        Ok((bounds.head, bounds.tail))
+    }
+
     /// Run the processor loop. This method never returns under normal operation.
     ///
     /// Waits for a notification from the batch submitter (or a fallback timeout) before
@@ -346,12 +352,8 @@ impl WithdrawalProcessor {
     async fn process_queue(&mut self) -> eyre::Result<()> {
         // loop through all the slots
         loop {
-            let head_call = self.portal.withdrawalQueueHead();
-            let tail_call = self.portal.withdrawalQueueTail();
-            let (head, tail): (U256, U256) = tokio::try_join!(head_call.call(), tail_call.call())?;
+            let (head, tail) = self.read_queue_bounds().await?;
 
-            let head_val: u64 = head.try_into().map_err(|_| eyre::eyre!("head overflow"))?;
-            let tail_val: u64 = tail.try_into().map_err(|_| eyre::eyre!("tail overflow"))?;
             let StoreSnapshot {
                 batch_count: store_batch_count,
                 first_slot: store_first_slot,
@@ -359,20 +361,18 @@ impl WithdrawalProcessor {
                 prev_slot: prev_store_slot,
                 next_slot: next_store_slot,
                 withdrawals,
-            } = self.capture_store_snapshot(head_val);
-            self.record_queue_metrics(head_val, tail_val, store_batch_count);
+            } = self.capture_store_snapshot(head);
+            self.record_queue_metrics(head, tail, store_batch_count);
 
-            if head_val == tail_val {
+            if head == tail {
                 debug!("Withdrawal queue empty, nothing to process");
                 return Ok(());
             }
 
-            let pending_slots = tail_val - head_val;
+            let pending_slots = tail - head;
             info!(
-                head = head_val,
-                tail = tail_val,
-                pending_slots,
-                "Withdrawal queue has pending slots"
+                head,
+                tail, pending_slots, "Withdrawal queue has pending slots"
             );
 
             let withdrawals = match withdrawals {
@@ -380,8 +380,8 @@ impl WithdrawalProcessor {
                 _ => {
                     self.repair_notify.notify_one();
                     warn!(
-                        slot = head_val,
-                        tail = tail_val,
+                        slot = head,
+                        tail,
                         pending_slots,
                         store_batches = store_batch_count,
                         store_first_slot,
@@ -398,23 +398,20 @@ impl WithdrawalProcessor {
             // withdrawals the portal has already consumed.
             let slot_hash = self
                 .portal
-                .withdrawalQueueSlot(U256::from(head_val % WITHDRAWAL_QUEUE_CAPACITY))
+                .withdrawalQueueSlot(U256::from(head % WITHDRAWAL_QUEUE_CAPACITY))
                 .call()
                 .await?;
 
             if slot_hash == EMPTY_SENTINEL {
                 // The slot was fully consumed and head advanced between our reads.
                 // Re-check on the next cycle.
-                debug!(
-                    slot = head_val,
-                    "Head slot already consumed; skipping cycle"
-                );
+                debug!(slot = head, "Head slot already consumed; skipping cycle");
                 return Ok(());
             }
 
             let Some(offset) = find_processed_offset(&withdrawals, slot_hash) else {
                 error!(
-                    slot = head_val,
+                    slot = head,
                     on_chain_slot_hash = %slot_hash,
                     store_queue_hash = %abi::Withdrawal::queue_hash(&withdrawals),
                     "Store data does not match the head slot's on-chain hash; requesting repair"
@@ -425,7 +422,7 @@ impl WithdrawalProcessor {
 
             if offset > 0 {
                 info!(
-                    slot = head_val,
+                    slot = head,
                     processed = offset,
                     remaining = withdrawals.len() - offset,
                     "Trimmed withdrawals already consumed by the portal"
@@ -437,15 +434,15 @@ impl WithdrawalProcessor {
                 // Defensive: queue_hash never produces B256::ZERO for a pending head
                 // slot, but if it happens drop the stale batch and wait for the portal.
                 warn!(
-                    slot = head_val,
+                    slot = head,
                     "Head slot fully processed but head not advanced"
                 );
-                self.store.lock().remove_batch(head_val);
+                self.store.lock().remove_batch(head);
                 return Ok(());
             }
 
             info!(
-                slot = head_val,
+                slot = head,
                 count = remaining.len(),
                 "Processing withdrawal batch"
             );
@@ -455,7 +452,7 @@ impl WithdrawalProcessor {
                 let remaining_queue = compute_remaining_queue(remaining, i + 1);
                 let outcome = self
                     .submit_and_confirm(
-                        head_val,
+                        head,
                         offset + i,
                         remaining.len(),
                         withdrawal,
@@ -482,10 +479,10 @@ impl WithdrawalProcessor {
 
             // All withdrawals in this slot confirmed — safe to remove. Continue
             // the loop to drain any further pending slots.
-            self.store.lock().remove_batch(head_val);
+            self.store.lock().remove_batch(head);
 
             info!(
-                slot = head_val,
+                slot = head,
                 count = remaining.len(),
                 "Batch fully processed and removed from store"
             );
@@ -676,7 +673,7 @@ pub fn spawn_withdrawal_processor(
 mod tests {
     use super::*;
     use crate::abi::EMPTY_SENTINEL;
-    use alloy_primitives::{Bytes, U256, address, keccak256};
+    use alloy_primitives::{Bytes, address, keccak256};
     use alloy_provider::{Provider, ProviderBuilder};
     use alloy_sol_types::SolValue;
     use alloy_transport::mock::Asserter;
@@ -689,8 +686,8 @@ mod tests {
             .erased()
     }
 
-    fn abi_encode_u64(value: u64) -> Bytes {
-        Bytes::copy_from_slice(&U256::from(value).to_be_bytes::<32>())
+    fn abi_encode_queue_bounds(head: u64, tail: u64) -> Bytes {
+        Bytes::from((head, tail).abi_encode_params())
     }
 
     fn test_withdrawal(to: Address, amount: u128) -> abi::Withdrawal {
@@ -912,8 +909,7 @@ mod tests {
     #[tokio::test]
     async fn process_queue_requests_monitor_resync_when_head_slot_missing() {
         let l1 = Asserter::new();
-        l1.push_success(&abi_encode_u64(51));
-        l1.push_success(&abi_encode_u64(71));
+        l1.push_success(&abi_encode_queue_bounds(51, 71));
 
         let repair_notify = Arc::new(Notify::new());
         let mut processor = test_processor(
@@ -934,8 +930,7 @@ mod tests {
     async fn process_queue_requests_repair_when_store_data_mismatches_slot_hash() {
         let l1 = Asserter::new();
         // head = 5, tail = 6, slot hash that matches no suffix of the stored batch.
-        l1.push_success(&abi_encode_u64(5));
-        l1.push_success(&abi_encode_u64(6));
+        l1.push_success(&abi_encode_queue_bounds(5, 6));
         l1.push_success(&abi_encode_b256(B256::repeat_byte(0xde)));
 
         let store = SharedWithdrawalStore::new();
@@ -963,8 +958,7 @@ mod tests {
         let l1 = Asserter::new();
         // head = 5, tail = 6, slot already contains EMPTY_SENTINEL (head advanced
         // between our head read and the slot read).
-        l1.push_success(&abi_encode_u64(5));
-        l1.push_success(&abi_encode_u64(6));
+        l1.push_success(&abi_encode_queue_bounds(5, 6));
         l1.push_success(&abi_encode_b256(EMPTY_SENTINEL));
 
         let store = SharedWithdrawalStore::new();

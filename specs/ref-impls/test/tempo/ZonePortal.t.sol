@@ -851,6 +851,9 @@ contract ZonePortalTest is BaseTest {
             ""
         );
         assertEq(portal.withdrawalQueueTail(), 1);
+        (uint64 head, uint64 tail) = portal.withdrawalQueueBounds();
+        assertEq(head, 0);
+        assertEq(tail, 1);
     }
 
     function test_submitBatch_emitsLogicalWithdrawalQueueIndexAfterWrap() public {
@@ -3034,8 +3037,8 @@ contract ZonePortalTest is BaseTest {
     ///        slot 5: currentDepositQueueHash (bytes32)
     ///        slot 6: deposit counters + bouncebackGas (uint64) [packed]
     ///        slot 7: _encryptionKeys.length (EncryptionKeyEntry[])
-    ///        slot 17: zoneId (uint32) + messenger (address) [packed]
-    ///        slot 18: verifier + genesisTempoBlockNumber + _initialized [packed]
+    ///        slot 16: zoneId (uint32) + messenger (address) [packed]
+    ///        slot 17: verifier + genesisTempoBlockNumber + _initialized [packed]
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));
@@ -3089,36 +3092,36 @@ contract ZonePortalTest is BaseTest {
         bytes32 slot7keys = vm.load(address(portal), PORTAL_ENCRYPTION_KEYS_SLOT);
         assertEq(uint256(slot7keys), 0, "slot 7: _encryptionKeys length should be 0 initially");
 
-        // --- Slot 15: pendingAdmin ---
-        // Nominate a new admin to get a non-zero pendingAdmin (rpcUrl at slot 14 is short,
+        // --- Slot 14: pendingAdmin ---
+        // Nominate a new admin to get a non-zero pendingAdmin (rpcUrl at slot 13 is short,
         // so it stays inline and pendingAdmin lands at the next slot).
         vm.prank(admin);
         portal.transferAdmin(bob);
-        bytes32 slot15 = vm.load(address(portal), PORTAL_PENDING_ADMIN_SLOT);
+        bytes32 slot14 = vm.load(address(portal), PORTAL_PENDING_ADMIN_SLOT);
         assertEq(
-            address(uint160(uint256(slot15))),
+            address(uint160(uint256(slot14))),
             portal.pendingAdmin(),
-            "slot 15: pendingAdmin mismatch"
+            "slot 14: pendingAdmin mismatch"
         );
 
-        // --- Slot 17: zoneId (uint32) + messenger (address) packed ---
-        bytes32 slot17 = vm.load(address(portal), bytes32(uint256(17)));
-        assertEq(uint32(uint256(slot17)), portal.zoneId(), "slot 17: zoneId mismatch");
+        // --- Slot 16: zoneId (uint32) + messenger (address) packed ---
+        bytes32 slot16 = vm.load(address(portal), bytes32(uint256(16)));
+        assertEq(uint32(uint256(slot16)), portal.zoneId(), "slot 16: zoneId mismatch");
         assertEq(
-            address(uint160(uint256(slot17) >> 32)),
+            address(uint160(uint256(slot16) >> 32)),
             portal.messenger(),
-            "slot 17: messenger mismatch"
+            "slot 16: messenger mismatch"
         );
 
-        // --- Slot 18: verifier (address) + genesisTempoBlockNumber (uint64) packed ---
-        bytes32 slot18 = vm.load(address(portal), bytes32(uint256(18)));
-        assertEq(address(uint160(uint256(slot18))), portal.verifier(), "slot 18: verifier mismatch");
+        // --- Slot 17: verifier (address) + genesisTempoBlockNumber (uint64) packed ---
+        bytes32 slot17 = vm.load(address(portal), bytes32(uint256(17)));
+        assertEq(address(uint160(uint256(slot17))), portal.verifier(), "slot 17: verifier mismatch");
         assertEq(
-            uint64(uint256(slot18) >> 160),
+            uint64(uint256(slot17) >> 160),
             portal.genesisTempoBlockNumber(),
-            "slot 18: genesisTempoBlockNumber mismatch"
+            "slot 17: genesisTempoBlockNumber mismatch"
         );
-        assertEq(uint8(uint256(slot18) >> 224), 1, "slot 18: initialized mismatch");
+        assertEq(uint8(uint256(slot17) >> 224), 1, "slot 17: initialized mismatch");
     }
 
     /// @notice Verify that the _encryptionKeys dynamic array uses the expected slot layout.

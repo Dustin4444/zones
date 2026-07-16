@@ -39,8 +39,8 @@ contract MockPortalToken {
 
 contract ZonePortalGasLimitTest is Test {
 
-    uint256 internal constant WITHDRAWAL_QUEUE_TAIL_SLOT = 12;
-    uint256 internal constant WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT = 13;
+    uint256 internal constant WITHDRAWAL_QUEUE_BOUNDS_SLOT = 11;
+    uint256 internal constant WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT = 12;
 
     ZonePortal public portal;
     MockPortalToken public token;
@@ -102,7 +102,7 @@ contract ZonePortalGasLimitTest is Test {
         });
         bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
 
-        vm.store(address(portal), bytes32(WITHDRAWAL_QUEUE_TAIL_SLOT), bytes32(uint256(1)));
+        _storeWithdrawalQueueTail(1);
         vm.store(address(portal), _withdrawalQueueSlot(0), wHash);
 
         vm.expectEmit(false, true, false, true, address(portal));
@@ -190,6 +190,12 @@ contract ZonePortalGasLimitTest is Test {
         return keccak256(abi.encode(slot, WITHDRAWAL_QUEUE_SLOTS_MAPPING_SLOT));
     }
 
+    function _storeWithdrawalQueueTail(uint64 tail) internal {
+        vm.store(
+            address(portal), bytes32(WITHDRAWAL_QUEUE_BOUNDS_SLOT), bytes32(uint256(tail) << 64)
+        );
+    }
+
     function _configureBouncebackFee() internal {
         portal.setBouncebackGas(300_000);
         vm.fee(1e12);
@@ -215,7 +221,7 @@ contract ZonePortalGasLimitTest is Test {
     }
 
     function _storeSingleWithdrawal(Withdrawal memory w) internal {
-        vm.store(address(portal), bytes32(WITHDRAWAL_QUEUE_TAIL_SLOT), bytes32(uint256(1)));
+        _storeWithdrawalQueueTail(1);
         vm.store(address(portal), _withdrawalQueueSlot(0), keccak256(abi.encode(w, EMPTY_SENTINEL)));
     }
 
