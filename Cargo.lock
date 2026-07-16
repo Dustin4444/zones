@@ -13409,7 +13409,6 @@ dependencies = [
  "tempo-precompiles",
  "tempo-primitives",
  "tempo-revm",
- "tempo-zone-contracts",
  "tokio",
  "zone-chainspec",
  "zone-l1",

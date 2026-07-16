@@ -117,6 +117,16 @@ impl Harness {
         Ok(ZoneOutboxAbi::getPendingWithdrawalsCall::abi_decode_returns(&output.bytes)?)
     }
 
+    fn last_fallback_nonce(&mut self) -> eyre::Result<u64> {
+        let output = self.call(
+            Address::ZERO,
+            ZoneOutboxAbi::lastFallbackNonceCall {}.abi_encode(),
+        )?;
+        Ok(ZoneOutboxAbi::lastFallbackNonceCall::abi_decode_returns(
+            &output.bytes,
+        )?)
+    }
+
     fn request(&mut self, amount: u128, to: Address, memo: B256) -> PrecompileResult {
         self.request_custom(ZoneOutboxAbi::requestWithdrawalCall {
             token: self.token,
@@ -254,6 +264,12 @@ fn enqueue_bounce_back_is_inbox_only() -> eyre::Result<()> {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].sender, Address::ZERO);
     assert_eq!(pending[0].fee, 0);
+    assert_eq!(pending[0].fallbackNonce, 0);
+    assert_eq!(harness.last_fallback_nonce()?, 0);
+
+    harness.request(1, BOB, B256::ZERO)?;
+    assert_eq!(harness.pending()?[1].fallbackNonce, 1);
+    assert_eq!(harness.last_fallback_nonce()?, 1);
     Ok(())
 }
 
@@ -623,6 +639,22 @@ fn fallback_recipient_nonce_is_private_and_consumed_once_by_inbox() -> eyre::Res
         harness.call(ALICE, &calldata),
         ZoneOutboxError::only_zone_inbox(),
     );
+    assert_revert(
+        harness.call(
+            ZONE_INBOX_ADDRESS,
+            ZoneOutboxAbi::consumeFallbackRecipientCall {
+                fallbackNonce: nonce + 1,
+            }
+            .abi_encode(),
+        ),
+        ZoneOutboxError::invalid_fallback_recipient(),
+    );
+    assert_revert(
+        harness.call_static(ZONE_INBOX_ADDRESS, &calldata),
+        ZoneOutboxError::static_call_not_allowed(),
+    );
+
+    // The failed static call must not consume the mapping entry.
     let output = harness.call(ZONE_INBOX_ADDRESS, &calldata)?;
     assert_eq!(
         ZoneOutboxAbi::consumeFallbackRecipientCall::abi_decode_returns(&output.bytes)?,

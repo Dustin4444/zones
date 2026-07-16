@@ -45,7 +45,6 @@ use tempo_precompiles::{storage::actions::StorageActions, storage_credits::NonCr
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
 };
-use tempo_zone_contracts::ZONE_TX_CONTEXT_ADDRESS;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
 
