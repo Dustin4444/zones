@@ -654,7 +654,7 @@ For withdrawals with `gasLimit > 0`, the portal uses a revertable self-call that
 
 If a legacy or otherwise invalid withdrawal reaches the Tempo queue with `gasLimit > MAX_WITHDRAWAL_GAS_LIMIT`, `processWithdrawal` treats it as a failed callback after dequeueing it and creates a bounce-back deposit. This ensures an over-limit withdrawal cannot permanently block the FIFO queue.
 
-Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking `msg.sender == zoneFactory.messenger()` and can use the `sourcePortal` callback argument to identify the originating portal.
+Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking `msg.sender == ZONE_MESSENGER_ADDRESS` and can use the `sourcePortal` callback argument to identify the originating portal.
 
 This enables composable withdrawals where funds flow directly into Tempo contracts (DEX swaps, staking, cross-zone deposits).
 
@@ -1578,16 +1578,22 @@ struct TokenConfig {
     bool depositsActive;
 }
 
+address constant ZONE_FACTORY_ADDRESS = 0x5aF2000000000000000000000000000000000000;
+bytes12 constant ZONE_PORTAL_PREFIX = 0x5AD000000000000000000000;
+address constant ZONE_PORTAL_IMPL_ADDRESS = 0x5AD1000000000000000000000000000000000000;
+address constant ZONE_VERIFIER_ADDRESS = 0x5a56000000000000000000000000000000000000;
+address constant ZONE_MESSENGER_ADDRESS = 0x5A4d000000000000000000000000000000000000;
+
 struct ZoneInfo {
     uint32 zoneId;
     address portal;
     address initialToken;
     address admin;
     address sequencer;
-    address verifier;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
     uint64 genesisTempoBlockNumber;
+    string rpcUrl;
 }
 
 struct ZoneParams {
@@ -1610,7 +1616,6 @@ interface IZoneFactory {
         address initialToken;
         address admin;
         address sequencer;
-        address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
     }
@@ -1621,13 +1626,12 @@ interface IZoneFactory {
         bytes32 genesisBlockHash, bytes32 genesisTempoBlockHash, uint64 genesisTempoBlockNumber
     );
 
+    function owner() external view returns (address);
+    function transferOwnership(address newOwner) external;
     function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
-    function zoneCount() external view returns (uint32);
+    function nextZoneId() external view returns (uint32);
     function zones(uint32 zoneId) external view returns (ZoneInfo memory);
     function isZonePortal(address portal) external view returns (bool);
-    function isValidVerifier(address verifier) external view returns (bool);
-    function verifier() external view returns (address);
-    function messenger() external view returns (address);
 }
 ```
 

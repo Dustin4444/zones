@@ -14,6 +14,7 @@ use eyre::{WrapErr as _, eyre};
 use std::path::PathBuf;
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_zone_contracts::ZONE_MESSENGER_ADDRESS;
 use zone_primitives::constants::zone_chain_id;
 
 use crate::zone_utils::MODERATO_ZONE_FACTORY;
@@ -29,7 +30,6 @@ sol! {
         address initialToken;
         address admin;
         address sequencer;
-        address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
     }
@@ -48,8 +48,6 @@ sol! {
             uint64 genesisTempoBlockNumber
         );
 
-        function verifier() external view returns (address);
-        function messenger() external view returns (address);
         function createZone(CreateZoneParams calldata params) external returns (uint32 zoneId, address portal);
     }
 }
@@ -118,12 +116,6 @@ impl CreateZone {
             .await?;
 
         let factory = ZoneFactory::new(self.zone_factory, &provider);
-        println!("Fetching verifier address from ZoneFactory...");
-        let verifier = Address::from(factory.verifier().call().await?.0);
-        println!("Verifier: {verifier}");
-        let messenger = Address::from(factory.messenger().call().await?.0);
-        println!("Messenger: {messenger}");
-
         // Anchor before createZone so the zone replays the creation block and its
         // initial TokenEnabled event during L1 backfill.
         let anchor_block_number = provider.get_block_number().await?;
@@ -144,7 +136,6 @@ impl CreateZone {
             initialToken: self.initial_token,
             admin: self.admin,
             sequencer: self.sequencer,
-            verifier,
             zoneParams: ZoneParams {
                 genesisBlockHash: B256::ZERO,
                 genesisTempoBlockHash: anchor_hash,
@@ -213,7 +204,7 @@ impl CreateZone {
             "zoneId": zone_id,
             "chainId": chain_id,
             "portal": format!("{portal}"),
-            "messenger": format!("{messenger}"),
+            "messenger": format!("{ZONE_MESSENGER_ADDRESS}"),
             "initialToken": format!("{}", self.initial_token),
             "admin": format!("{}", self.admin),
             "sequencer": format!("{}", self.sequencer),
@@ -232,7 +223,7 @@ impl CreateZone {
         println!("  Zone ID: {zone_id}");
         println!("  Chain ID: {chain_id}");
         println!("  Portal: {portal}");
-        println!("  Messenger: {messenger}");
+        println!("  Messenger: {ZONE_MESSENGER_ADDRESS}");
         println!("  Initial Token: {}", self.initial_token);
         println!("  Admin: {}", self.admin);
         println!("  Sequencer: {}", self.sequencer);
