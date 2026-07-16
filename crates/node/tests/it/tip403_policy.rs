@@ -141,10 +141,12 @@ async fn test_l1_blacklisted_sender_cannot_pay_for_empty_transaction() -> eyre::
     let alice_provider = ProviderBuilder::new()
         .wallet(alice_signer)
         .connect_http(zone.http_url().clone());
-    let mut request = TransactionRequest::default();
-    request.to = Some(TxKind::Call(alice));
-    request.gas = Some(TIP20_TX_GAS);
-    request.gas_price = Some(TEMPO_T0_BASE_FEE as u128);
+    let request = TransactionRequest {
+        to: Some(TxKind::Call(alice)),
+        gas: Some(TIP20_TX_GAS),
+        gas_price: Some(TEMPO_T0_BASE_FEE as u128),
+        ..Default::default()
+    };
 
     let nonce_before = alice_provider.get_transaction_count(alice).await?;
     let pending = alice_provider.send_transaction(request).await?;

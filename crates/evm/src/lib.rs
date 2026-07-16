@@ -13,12 +13,12 @@ pub mod precompiles;
 mod tx_context;
 mod zone_evm;
 
+pub use executor::ZoneBlockExecutor;
 pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
 
 use crate::{
-    executor::ZoneBlockExecutor,
     fee_manager::ZoneFeeManager,
-    precompiles::{SequencerExt, extend_zone_precompiles},
+    precompiles::{L1StorageReader, SequencerExt, extend_zone_precompiles},
     tx_context::ZoneTxContext,
 };
 use alloy_evm::{
@@ -58,14 +58,17 @@ type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 /// Zone EVM factory — wraps [`TempoEvmFactory`] and registers the
 /// zone-native precompiles.
 #[derive(Debug, Clone)]
-pub struct ZoneEvmFactory {
-    l1_provider: L1StateProvider,
+pub struct ZoneEvmFactory<L1 = L1StateProvider> {
+    l1_reader: L1,
 }
 
-impl ZoneEvmFactory {
-    /// Create a new factory with the given L1 state provider.
-    pub fn new(l1_provider: L1StateProvider) -> Self {
-        Self { l1_provider }
+impl<L1> ZoneEvmFactory<L1>
+where
+    L1: L1StorageReader + SequencerExt,
+{
+    /// Create a new factory with the given L1 state reader.
+    pub fn new(l1_reader: L1) -> Self {
+        Self { l1_reader }
     }
 
     fn register_precompiles<DB: Database, I: Inspector<TempoCtx<DB>>>(
@@ -73,13 +76,13 @@ impl ZoneEvmFactory {
         evm: TempoEvm<DB, I>,
     ) -> TempoEvm<DB, I> {
         let cfg = evm.ctx().cfg.clone();
-        let mut evm = evm.with_fee_manager(ZoneFeeManager::new(self.l1_provider.clone()));
+        let mut evm = evm.with_fee_manager(ZoneFeeManager::new(self.l1_reader.clone()));
         let (_, _, precompiles) = evm.components_mut();
-        let sequencer: Arc<dyn SequencerExt> = Arc::new(self.l1_provider.clone());
+        let sequencer: Arc<dyn SequencerExt> = Arc::new(self.l1_reader.clone());
         extend_zone_precompiles(
             precompiles,
             &cfg,
-            self.l1_provider.clone(),
+            self.l1_reader.clone(),
             sequencer,
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
@@ -89,7 +92,10 @@ impl ZoneEvmFactory {
     }
 }
 
-impl EvmFactory for ZoneEvmFactory {
+impl<L1> EvmFactory for ZoneEvmFactory<L1>
+where
+    L1: L1StorageReader + SequencerExt,
+{
     type Evm<DB: Database, I: Inspector<Self::Context<DB>>> = ZoneEvm<DB, I>;
     type Context<DB: Database> = TempoCtx<DB>;
     type Tx = <TempoEvmFactory as EvmFactory>::Tx;
