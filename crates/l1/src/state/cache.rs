@@ -97,9 +97,14 @@ impl L1StateCacheInner {
 
     /// Returns the cached value for a storage slot at the given block number.
     ///
-    /// Returns the most recent value at or before `block_number`, or `None` if no
-    /// value has been cached for this slot at or before the requested block.
+    /// Returns `None` below the engine floor because pruned mutation history cannot safely serve
+    /// historical inheritance. Otherwise returns the most recent valid value at or before
+    /// `block_number`.
     pub fn get(&self, address: Address, slot: B256, block_number: u64) -> Option<B256> {
+        if block_number < self.block_floor {
+            return None;
+        }
+
         let (value_block, value) = self
             .slots
             .get(&(address, slot))?
@@ -364,10 +369,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5, 10, 20]
         );
-        assert_eq!(
-            cache.get(PORTAL, slot, 10),
-            Some(B256::with_last_byte(0x0a))
-        );
+        assert_eq!(cache.get(PORTAL, slot, 10), None);
         assert_eq!(cache.get(PORTAL, slot, 15), None);
         assert_eq!(cache.get(PORTAL, slot, 19), None);
         assert_eq!(
@@ -401,5 +403,26 @@ mod tests {
             cache.get(PORTAL, slot, 15),
             Some(B256::with_last_byte(0x0f))
         );
+    }
+
+    #[test]
+    fn below_floor_lookup_misses_after_invalidation_pruning() {
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+        let slot = B256::with_last_byte(1);
+
+        cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05));
+        cache.invalidate(PORTAL, 10);
+        cache.invalidate(PORTAL, 20);
+        cache.advance_floor(30);
+        cache.invalidate(PORTAL, 40);
+
+        assert_eq!(
+            cache.invalidations[&PORTAL]
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![20, 40]
+        );
+        assert_eq!(cache.get(PORTAL, slot, 15), None);
     }
 }
