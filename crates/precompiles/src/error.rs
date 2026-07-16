@@ -3,7 +3,7 @@
 use alloy_sol_types::{SolError, SolInterface};
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 use tempo_precompiles::IntoPrecompileResult;
-use tempo_zone_contracts::ZoneOutboxError;
+use tempo_zone_contracts::{ZoneOutboxError, ZonePortalError};
 
 use crate::{tip20_factory::ZoneTokenFactoryError, tip403_proxy::ReadOnlyRegistry};
 
@@ -23,6 +23,9 @@ pub enum ZonePrecompileError {
     /// An error originating in the upstream Tempo precompiles crate.
     #[error(transparent)]
     Tempo(TempoPrecompileError),
+    /// Error from the ZonePortal.
+    #[error("ZonePortal error: {0:?}")]
+    Portal(ZonePortalError),
     /// Error from the ZoneOutbox.
     #[error("ZoneOutbox error: {0:?}")]
     Outbox(ZoneOutboxError),
@@ -38,6 +41,7 @@ impl IntoPrecompileResult for ZonePrecompileError {
     fn into_precompile_result(self, gas: u64, reservoir: u64) -> PrecompileResult {
         let data = match self {
             Self::Tempo(error) => return error.into_precompile_result(gas, reservoir),
+            Self::Portal(error) => error.abi_encode(),
             Self::Outbox(error) => error.abi_encode(),
             Self::ZoneTokenFactory(error) => error.abi_encode(),
             Self::Zone403Registry(error) => error.abi_encode(),

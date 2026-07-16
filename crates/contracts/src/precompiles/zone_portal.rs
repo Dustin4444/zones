@@ -2,6 +2,7 @@
 
 pub use ZonePortal::{
     BlockTransition, DepositQueueTransition, EncryptedDeposit, EncryptedDepositPayload, Withdrawal,
+    ZonePortalErrors as ZonePortalError,
 };
 
 use crate::IZoneOutbox;
@@ -10,7 +11,7 @@ use alloy_sol_types::SolValue;
 use zone_primitives::constants::{EMPTY_SENTINEL, PORTAL_TOKEN_CONFIGS_SLOT};
 
 crate::sol! {
-    #[derive(Debug)]
+    #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
     contract ZonePortal {
         // -- Shared types --
 
@@ -168,6 +169,7 @@ crate::sol! {
         error InvalidTempoBlockNumber();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
+        error TokenNotEnabled();
 
         // -- View functions --
 
@@ -344,6 +346,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
+            Self::TokenNotEnabled(_) => f.write_str("TokenNotEnabled"),
         }
     }
 }

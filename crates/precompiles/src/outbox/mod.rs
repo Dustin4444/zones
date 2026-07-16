@@ -17,7 +17,7 @@ use tempo_precompiles::{
 };
 use tempo_precompiles_macros::{Storable, contract};
 use tempo_zone_contracts::{
-    ILegacyZoneOutbox, IZoneOutbox as ZoneOutboxAbi, Withdrawal, ZoneOutboxError, ZoneOutboxEvent,
+    ILegacyZoneOutbox, IZoneOutbox, Withdrawal, ZoneOutboxError, ZoneOutboxEvent, ZonePortalError,
     portal_token_config_slot,
 };
 use zone_primitives::constants::{
@@ -35,12 +35,12 @@ const MAX_GAS_FEE_RATE: u128 = 1_000_000_000_000_000_000;
 const WITHDRAWAL_BASE_GAS: u64 = 50_000;
 
 const SEQUENCER_SELECTORS: &[[u8; 4]] = &[
-    ZoneOutboxAbi::setTempoGasRateCall::SELECTOR,
-    ZoneOutboxAbi::setMaxWithdrawalsPerBlockCall::SELECTOR,
-    ZoneOutboxAbi::finalizeWithdrawalBatchCall::SELECTOR,
+    IZoneOutbox::setTempoGasRateCall::SELECTOR,
+    IZoneOutbox::setMaxWithdrawalsPerBlockCall::SELECTOR,
+    IZoneOutbox::finalizeWithdrawalBatchCall::SELECTOR,
 ];
 const WITHDRAWAL_SELECTORS: &[[u8; 4]] = &[
-    ZoneOutboxAbi::requestWithdrawalCall::SELECTOR,
+    IZoneOutbox::requestWithdrawalCall::SELECTOR,
     ILegacyZoneOutbox::requestWithdrawalCall::SELECTOR,
 ];
 
@@ -68,8 +68,8 @@ impl CallRules for ZoneOutboxRules {
                 self.requires_l1(Some(selector))
                     || matches!(
                         selector,
-                        ZoneOutboxAbi::enqueueDepositBounceBackCall::SELECTOR
-                            | ZoneOutboxAbi::consumeFallbackRecipientCall::SELECTOR
+                        IZoneOutbox::enqueueDepositBounceBackCall::SELECTOR
+                            | IZoneOutbox::consumeFallbackRecipientCall::SELECTOR
                     )
             })
         {
@@ -104,7 +104,7 @@ impl CallRules for ZoneOutboxRules {
             let slot = portal_token_config_slot(withdrawal.token).into();
             match StorageCtx::default().sload(self.portal, slot) {
                 Ok(value) if value.byte(0) != 0 => {}
-                Ok(_) => return CallCheck::from_error(ZoneOutboxError::token_not_enabled()),
+                Ok(_) => return CallCheck::from_error(ZonePortalError::token_not_enabled()),
                 Err(err) => return CallCheck::from_error(err),
             }
         }
@@ -122,9 +122,9 @@ pub struct ZoneOutbox {
     withdrawals_this_block: u32,
     current_block_number: u64,
     last_finalized_timestamp: u64,
+    pending_withdrawals: Vec<PendingWithdrawal>,
     last_fallback_nonce: u64,
     fallback_recipients: Mapping<u64, Address>,
-    pending_withdrawals: Vec<PendingWithdrawal>,
 }
 
 impl ZoneOutbox {
@@ -185,7 +185,7 @@ impl ZoneOutbox {
         &mut self,
         caller: Address,
         current_tx_hash: B256,
-        call: ZoneOutboxAbi::requestWithdrawalCall,
+        call: IZoneOutbox::requestWithdrawalCall,
     ) -> ZoneResult<()> {
         if current_tx_hash.is_zero() {
             return Err(ZoneOutboxError::invalid_current_tx_hash().into());
@@ -236,7 +236,7 @@ impl ZoneOutbox {
     fn enqueue_deposit_bounce_back(
         &mut self,
         caller: Address,
-        call: ZoneOutboxAbi::enqueueDepositBounceBackCall,
+        call: IZoneOutbox::enqueueDepositBounceBackCall,
     ) -> ZoneResult<()> {
         if caller != ZONE_INBOX_ADDRESS {
             return Err(ZoneOutboxError::only_zone_inbox().into());
@@ -259,7 +259,7 @@ impl ZoneOutbox {
 
     fn finalize_withdrawal_batch(
         &mut self,
-        call: ZoneOutboxAbi::finalizeWithdrawalBatchCall,
+        call: IZoneOutbox::finalizeWithdrawalBatchCall,
     ) -> ZoneResult<B256> {
         if call.blockNumber != self.storage.block_number() {
             return Err(ZoneOutboxError::invalid_block_number().into());
@@ -306,7 +306,7 @@ impl ZoneOutbox {
         Ok(withdrawal_queue_hash)
     }
 
-    fn set_tempo_gas_rate(&mut self, call: ZoneOutboxAbi::setTempoGasRateCall) -> ZoneResult<()> {
+    fn set_tempo_gas_rate(&mut self, call: IZoneOutbox::setTempoGasRateCall) -> ZoneResult<()> {
         if call._tempoGasRate > MAX_GAS_FEE_RATE {
             return Err(ZoneOutboxError::gas_fee_rate_too_high().into());
         }
@@ -317,7 +317,7 @@ impl ZoneOutbox {
 
     fn set_max_withdrawals_per_block(
         &mut self,
-        call: ZoneOutboxAbi::setMaxWithdrawalsPerBlockCall,
+        call: IZoneOutbox::setMaxWithdrawalsPerBlockCall,
     ) -> TempoResult<()> {
         self.max_withdrawals_per_block
             .write(call._maxWithdrawalsPerBlock)?;
@@ -331,7 +331,7 @@ impl ZoneOutbox {
         self.pending_withdrawals.len().map(|val| U256::from(val))
     }
 
-    fn get_pending_withdrawals(&self) -> TempoResult<Vec<ZoneOutboxAbi::PendingWithdrawal>> {
+    fn get_pending_withdrawals(&self) -> TempoResult<Vec<IZoneOutbox::PendingWithdrawal>> {
         let len = self.pending_withdrawals.len()?;
         let mut pending = Vec::with_capacity(len);
         for index in 0..len {
@@ -340,8 +340,8 @@ impl ZoneOutbox {
         Ok(pending)
     }
 
-    fn last_batch(&self) -> TempoResult<ZoneOutboxAbi::LastBatch> {
-        Ok(ZoneOutboxAbi::LastBatch {
+    fn last_batch(&self) -> TempoResult<IZoneOutbox::LastBatch> {
+        Ok(IZoneOutbox::LastBatch {
             withdrawalQueueHash: self.withdrawal_queue_hash.read()?,
             withdrawalBatchIndex: self.withdrawal_batch_index.read()?,
         })
@@ -369,7 +369,7 @@ impl PendingWithdrawal {
         tx_hash: B256,
         fee: u128,
         fallback_nonce: u64,
-        call: ZoneOutboxAbi::requestWithdrawalCall,
+        call: IZoneOutbox::requestWithdrawalCall,
     ) -> Self {
         Self {
             token: call.token,
@@ -386,7 +386,7 @@ impl PendingWithdrawal {
         }
     }
 
-    fn from_bounce_back(call: ZoneOutboxAbi::enqueueDepositBounceBackCall) -> Self {
+    fn from_bounce_back(call: IZoneOutbox::enqueueDepositBounceBackCall) -> Self {
         Self {
             token: call.token,
             to: call.bouncebackRecipient,
@@ -441,7 +441,7 @@ impl PendingWithdrawal {
     }
 }
 
-impl From<PendingWithdrawal> for ZoneOutboxAbi::PendingWithdrawal {
+impl From<PendingWithdrawal> for IZoneOutbox::PendingWithdrawal {
     fn from(pending: PendingWithdrawal) -> Self {
         Self {
             token: pending.token,
@@ -459,10 +459,10 @@ impl From<PendingWithdrawal> for ZoneOutboxAbi::PendingWithdrawal {
     }
 }
 
-fn decode_withdrawal(call: ZoneCall<'_>) -> Option<ZoneOutboxAbi::requestWithdrawalCall> {
+fn decode_withdrawal(call: ZoneCall<'_>) -> Option<IZoneOutbox::requestWithdrawalCall> {
     match call.selector()? {
-        ZoneOutboxAbi::requestWithdrawalCall::SELECTOR => {
-            ZoneOutboxAbi::requestWithdrawalCall::abi_decode_raw_validate(&call.data[4..]).ok()
+        IZoneOutbox::requestWithdrawalCall::SELECTOR => {
+            IZoneOutbox::requestWithdrawalCall::abi_decode_raw_validate(&call.data[4..]).ok()
         }
         ILegacyZoneOutbox::requestWithdrawalCall::SELECTOR => {
             ILegacyZoneOutbox::requestWithdrawalCall::abi_decode_raw_validate(&call.data[4..])
@@ -480,7 +480,7 @@ fn validate_gas_limit(gas_limit: u64) -> ZoneResult<()> {
     Ok(())
 }
 
-fn check_withdrawal_request(call: &ZoneOutboxAbi::requestWithdrawalCall) -> ZoneResult<()> {
+fn check_withdrawal_request(call: &IZoneOutbox::requestWithdrawalCall) -> ZoneResult<()> {
     if call.fallbackRecipient.is_zero() {
         return Err(ZoneOutboxError::invalid_fallback_recipient().into());
     }

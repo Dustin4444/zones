@@ -5,7 +5,7 @@ use alloy_primitives::{Bytes, address};
 use alloy_sol_types::{SolCall, SolInterface};
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{Precompile as _, storage::FromWord, test_util::TIP20Setup};
-use tempo_zone_contracts::portal_token_config_slot;
+use tempo_zone_contracts::{IZoneOutbox as ZoneOutboxAbi, portal_token_config_slot};
 
 use crate::{
     L1StorageReader, TempoState, execution,
@@ -185,7 +185,7 @@ impl Harness {
     }
 }
 
-fn assert_revert(result: PrecompileResult, error: ZoneOutboxError) {
+fn assert_revert(result: PrecompileResult, error: impl SolInterface) {
     let output = result.expect("precompile error");
     assert!(output.is_revert());
     assert_eq!(output.bytes, error.abi_encode());
@@ -219,7 +219,7 @@ fn request_withdrawal_rejects_disabled_token() -> eyre::Result<()> {
         U256::ZERO,
     );
     let result = harness.request(1, BOB, B256::ZERO);
-    assert_revert(result, ZoneOutboxError::token_not_enabled());
+    assert_revert(result, ZonePortalError::token_not_enabled());
     Ok(())
 }
 

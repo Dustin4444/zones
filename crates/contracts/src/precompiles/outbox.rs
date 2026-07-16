@@ -8,7 +8,6 @@ pub use IZoneOutbox::{
 crate::sol! {
     #[derive(Debug, PartialEq, Eq)]
     contract IZoneOutbox {
-
         struct LastBatch {
             bytes32 withdrawalQueueHash;
             uint64 withdrawalBatchIndex;
@@ -64,7 +63,6 @@ crate::sol! {
         error TooManyWithdrawalsThisBlock();
         error InvalidRevealTo();
         error InvalidCurrentTxHash();
-        error TokenNotEnabled();
         error StaticCallNotAllowed();
 
         // -- View functions --
