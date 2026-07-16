@@ -99,6 +99,7 @@ contract ZoneMessengerTest is BaseTest {
         messengerFactory.setPortal(ZONE_ID, portal);
         messengerFactory.setPortal(OTHER_ZONE_ID, otherPortal);
 
+        vm.etch(ZONE_MESSENGER_ADDRESS, type(ZoneMessenger).runtimeCode);
         messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
         zoneToken = new MockZoneToken("Zone USD", "zUSD");
         zoneToken.setMinter(address(this), true);
