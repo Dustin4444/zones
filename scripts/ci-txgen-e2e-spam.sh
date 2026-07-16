@@ -13,10 +13,11 @@ lowercase() {
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-for name in RUNNER_TEMP ZONE_DATADIR TXGEN_DIR L1_HTTP_URL; do
+for name in RUNNER_TEMP TXGEN_DIR L1_HTTP_URL; do
   [ -n "${!name:-}" ] || die "$name is required"
 done
 
+ZONE_DATADIR="${ZONE_DATADIR:-$RUNNER_TEMP/tempo-zone-dev}"
 ARTIFACT_DIR="${TXGEN_E2E_ARTIFACT_DIR:-$RUNNER_TEMP/txgen-e2e}"
 REPORT_DIR="${TXGEN_REPORT_DIR:-$ARTIFACT_DIR/reports}"
 SUMMARY="$ARTIFACT_DIR/summary.md"
@@ -26,7 +27,7 @@ ANVIL_PID=""
 ZONE_PID=""
 
 mkdir -p "$ARTIFACT_DIR" "$REPORT_DIR"
-export TXGEN_REPORT_DIR="$REPORT_DIR"
+export TXGEN_REPORT_DIR="$REPORT_DIR" ZONE_DATADIR
 
 stop_process() {
   local pid="$1"
