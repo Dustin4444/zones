@@ -16,7 +16,7 @@
 //! - The [`L1Subscriber`](crate::l1::L1Subscriber) writes storage diffs for tracked contracts
 //!   as they arrive, tagged with the L1 tip block number.
 //! - The [`L1StateProvider`](super::provider::L1StateProvider) writes eligible forward RPC
-//!   misses, tagged with the requested block number. Misses below the engine's consumed-block
+//!   misses, tagged with the requested block number. Misses below the canonical Zone anchor
 //!   floor are returned without being inserted.
 //!
 //! ## Reorg handling
@@ -60,10 +60,10 @@ impl L1StateCache {
 /// storage change without requiring slot-level decoding. Reorgs clear slot values and mutation
 /// history atomically.
 ///
-/// The subscriber anchor and engine floor track independent progress. The anchor is the latest
+/// The subscriber anchor and canonical floor track independent progress. The anchor is the latest
 /// confirmed L1 block observed by the subscriber and may run ahead while blocks are queued. The
-/// floor is the latest L1 height consumed by the engine. It advances monotonically and drives
-/// lazy history compaction without scanning the cache on the block-production path.
+/// floor is the latest L1 height committed by canonical Zone execution. It advances monotonically
+/// and drives lazy history compaction without scanning the cache on the import path.
 #[derive(Debug, Default)]
 pub struct L1StateCacheInner {
     tracked_contracts: HashSet<Address>,
@@ -74,7 +74,7 @@ pub struct L1StateCacheInner {
     /// A slot value cached at block V may serve block N only when no barrier exists in `(V, N]`.
     /// The subscriber records barriers for contracts whose logs imply possible storage changes.
     invalidations: HashMap<Address, BTreeSet<u64>>,
-    /// Latest L1 block height successfully consumed by the Zone engine.
+    /// Latest L1 block height committed by canonical Zone execution.
     ///
     /// New fallback values below this floor are not admitted. Histories are compacted lazily
     /// against it when their slot/address is next mutated, so older entries may remain physically
@@ -97,7 +97,7 @@ impl L1StateCacheInner {
 
     /// Returns the cached value for a storage slot at the given block number.
     ///
-    /// Returns `None` below the engine floor because pruned mutation history cannot safely serve
+    /// Returns `None` below the canonical floor because pruned mutation history cannot safely serve
     /// historical inheritance. Otherwise returns the most recent valid value at or before
     /// `block_number`.
     pub fn get(&self, address: Address, slot: B256, block_number: u64) -> Option<B256> {
@@ -132,7 +132,7 @@ impl L1StateCacheInner {
 
     /// Sets a storage slot value in the forward cache at the given block number.
     ///
-    /// Returns `false` without inserting when `block_number` is below the engine's consumed-block
+    /// Returns `false` without inserting when `block_number` is below the canonical Zone anchor
     /// floor. Callers that materialize synthetic/test state should check the result so a rejected
     /// seed cannot turn into an unexpected RPC fallback.
     #[must_use = "check whether the cache write was admitted above the block floor"]
@@ -147,7 +147,7 @@ impl L1StateCacheInner {
         true
     }
 
-    /// Advances the engine's consumed-block floor monotonically in O(1).
+    /// Advances the canonical Zone anchor floor monotonically in O(1).
     pub fn advance_floor(&mut self, block_number: u64) {
         self.block_floor = self.block_floor.max(block_number);
     }
@@ -172,7 +172,7 @@ impl L1StateCacheInner {
         self.tracked_contracts.contains(address)
     }
 
-    /// Clears subscriber-derived chain data while retaining tracked contracts and the engine floor.
+    /// Clears subscriber-derived chain data while retaining tracked contracts and the canonical floor.
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_chain_data_but_preserves_engine_floor() {
+    fn clear_removes_chain_data_but_preserves_canonical_floor() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
 
         assert!(cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1)));

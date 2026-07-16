@@ -3,7 +3,7 @@
 //! [`L1StateProvider`] wraps a [`L1StateCache`] and a [`DynProvider<TempoNetwork>`] backed by an
 //! HTTP transport. Reads are served from the in-memory cache when possible. On cache miss the
 //! provider falls back to `eth_getStorageAt` via the shared HTTP provider, and forward reads are
-//! written back. Misses below the engine's consumed-block floor are returned without caching.
+//! written back. Misses below the canonical Zone anchor floor are returned without caching.
 //!
 //! Both a synchronous ([`L1StateProvider::get_storage`]) and an asynchronous
 //! ([`L1StateProvider::get_storage_async`]) entry point are provided. The synchronous variant is

@@ -51,7 +51,7 @@ use tempo_primitives::TempoHeader;
 use tracing::{error, warn};
 
 use zone_chainspec::ZoneChainSpec;
-use zone_l1::{DepositQueue, L1BlockDeposits, L1StateCache, PolicyProvider, PreparedL1Block};
+use zone_l1::{DepositQueue, L1BlockDeposits, PolicyProvider, PreparedL1Block};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 
 /// Engine that drives L2 block production from L1 events.
@@ -87,8 +87,6 @@ pub struct ZoneEngine {
     /// Cache-first, RPC-fallback TIP-403 policy provider for authorization checks
     /// on encrypted deposit recipients during preparation.
     policy_provider: PolicyProvider,
-    /// Block-versioned L1 storage cache shared with the subscriber and precompiles.
-    l1_state_cache: L1StateCache,
 }
 
 impl ZoneEngine {
@@ -102,7 +100,6 @@ impl ZoneEngine {
         sequencer_key: k256::SecretKey,
         portal_address: Address,
         policy_provider: PolicyProvider,
-        l1_state_cache: L1StateCache,
     ) -> Self {
         Self {
             chain_spec,
@@ -114,7 +111,6 @@ impl ZoneEngine {
             sequencer_key,
             portal_address,
             policy_provider,
-            l1_state_cache,
         }
     }
 
@@ -280,13 +276,6 @@ impl ZoneEngine {
         // hasn't processed yet, otherwise policy lookups for in-flight blocks
         // could return wrong results.
         self.policy_provider.cache().advance(l1_num_hash.number);
-
-        // The engine has committed this L1 height, so advance the forward-cache floor.
-        // Individual slot and mutation histories are compacted lazily when next touched, so
-        // RPC-created slots cannot amplify engine work.
-        self.l1_state_cache
-            .write()
-            .advance_floor(l1_num_hash.number);
 
         self.last_header = header;
 

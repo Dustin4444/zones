@@ -945,7 +945,6 @@ impl ZoneTestNode {
             SecretKey::from(sequencer_signer.credential()),
             portal_address,
             policy_provider,
-            l1_state_cache.clone(),
         );
         node_handle
             .node
