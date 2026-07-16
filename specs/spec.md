@@ -1288,6 +1288,26 @@ pub struct L1StateRead {
 
 The state transition function produces:
 
+```rust
+pub struct BatchOutput {
+    /// Zone block hash transition (previous -> final)
+    pub block_transition: BlockTransition,
+
+    /// Deposit queue processing
+    pub deposit_queue_transition: DepositQueueTransition,
+
+    /// Withdrawal queue hash chain for this batch (0 if no withdrawals)
+    pub withdrawal_queue_hash: B256,
+
+    /// Withdrawal batch index read from ZoneOutbox.lastBatch
+    pub last_batch_commitment: LastBatchCommitment,
+}
+
+pub struct LastBatchCommitment {
+    pub withdrawal_batch_index: u64,
+}
+```
+
 | Field | Description |
 |-------|-------------|
 | `block_transition` | `prev_block_hash` to `next_block_hash` covering all blocks in the batch |
