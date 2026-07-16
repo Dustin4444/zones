@@ -55,8 +55,7 @@ use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
 
 type TempoCtx<DB> = <TempoEvmFactory as EvmFactory>::Context<DB>;
 
-/// Zone EVM factory — wraps [`TempoEvmFactory`] and registers the
-/// zone-native precompiles.
+/// Zone EVM factory — wraps [`TempoEvmFactory`] and registers the zone-native precompiles.
 #[derive(Debug, Clone)]
 pub struct ZoneEvmFactory<L1 = L1StateProvider> {
     l1_reader: L1,
