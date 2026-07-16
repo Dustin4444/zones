@@ -56,6 +56,7 @@ jobs:
     outputs:
       comment_body: ${{ steps.spam.outputs.comment_body }}
     env:
+      RUSTC_WRAPPER: ""
       TXGEN_DIR: ${{ github.workspace }}/txgen
       L1_HTTP_URL: http://127.0.0.1:8545
       COUNT: "5000"
