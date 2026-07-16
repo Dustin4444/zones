@@ -220,7 +220,10 @@ impl ZoneEvmConfig {
             .connect_http("http://127.0.0.1:1".parse().expect("valid fallback URL"))
             .erased();
         let runtime_handle = tokio::runtime::Handle::current();
-        let config = L1StateProviderConfig::default();
+        let config = L1StateProviderConfig {
+            max_sync_attempts: Some(1),
+            ..Default::default()
+        };
         let l1_provider = L1StateProvider::new_raw(config, cache, provider, runtime_handle);
         Self::from_chain_spec(chain_spec, l1_provider)
     }
