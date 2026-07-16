@@ -4,11 +4,11 @@ use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::{Bytes, address};
 use alloy_sol_types::{SolCall, SolInterface};
 use revm::precompile::PrecompileResult;
-use tempo_precompiles::{Precompile as _, tip20::ISSUER_ROLE};
+use tempo_precompiles::{Precompile as _, storage::FromWord, test_util::TIP20Setup};
 use tempo_zone_contracts::portal_token_config_slot;
 
 use crate::{
-    L1StorageReader, execution,
+    L1StorageReader, TempoState, execution,
     test_utils::{
         MockL1Reader, TestContext, call_precompile, test_context, test_l1_env,
         test_storage_provider,
@@ -39,13 +39,13 @@ impl Harness {
 
         l1.set_u256(
             portal,
-            U256::from_be_bytes(PORTAL_SEQUENCER_SLOT.0),
+            PORTAL_SEQUENCER_SLOT.into(),
             ANCHOR,
-            U256::from_be_slice(SEQUENCER.as_slice()),
+            SEQUENCER.to_word(),
         );
         l1.set_u256(
             portal,
-            U256::from_be_bytes(portal_token_config_slot(token).0),
+            portal_token_config_slot(token).into(),
             ANCHOR,
             U256::ONE,
         );
@@ -54,39 +54,15 @@ impl Harness {
         {
             let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
             StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
-                StorageCtx::default().sstore(
-                    zone_primitives::constants::TEMPO_STATE_ADDRESS,
-                    crate::tempo_state::slots::TEMPO_BLOCK_NUMBER,
-                    U256::from(ANCHOR),
-                )?;
+                TempoState::new().tempo_block_number.write(ANCHOR)?;
 
                 ZoneOutbox::new().initialize()?;
-                let mut token_contract =
-                    TIP20Token::from_address(token).expect("PATH_USD is a valid TIP20 address");
-                token_contract.initialize(
-                    ALICE,
-                    "Zone USD",
-                    "zUSD",
-                    "USD",
-                    Address::ZERO,
-                    ALICE,
-                )?;
-                token_contract.grant_role_internal(ALICE, *ISSUER_ROLE)?;
-                token_contract.grant_role_internal(ZONE_OUTBOX_ADDRESS, *ISSUER_ROLE)?;
-                token_contract.mint(
-                    ALICE,
-                    ITIP20::mintCall {
-                        to: ALICE,
-                        amount: U256::from(1_000_000u64),
-                    },
-                )?;
-                token_contract.approve(
-                    ALICE,
-                    ITIP20::approveCall {
-                        spender: ZONE_OUTBOX_ADDRESS,
-                        amount: U256::MAX,
-                    },
-                )?;
+                TIP20Setup::path_usd(ALICE)
+                    .with_issuer(ALICE)
+                    .with_issuer(ZONE_OUTBOX_ADDRESS)
+                    .with_mint(ALICE, U256::from(1_000_000u64))
+                    .with_approval(ALICE, ZONE_OUTBOX_ADDRESS, U256::MAX)
+                    .apply()?;
                 Ok(())
             })?;
         }
@@ -228,7 +204,7 @@ fn request_withdrawal_rejects_disabled_token() -> eyre::Result<()> {
     let portal = harness.l1.portal_address();
     harness.l1.set_u256(
         portal,
-        U256::from_be_bytes(portal_token_config_slot(harness.token).0),
+        portal_token_config_slot(harness.token).into(),
         ANCHOR,
         U256::ZERO,
     );

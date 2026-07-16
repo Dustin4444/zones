@@ -90,12 +90,11 @@ impl CallRules for ZoneOutboxRules {
             return CallCheck::Continue;
         };
         if SEQUENCER_SELECTORS.contains(&selector) && call.caller != Address::ZERO {
-            let sequencer = match StorageCtx::default()
-                .sload(self.portal, U256::from_be_bytes(PORTAL_SEQUENCER_SLOT.0))
-            {
-                Ok(value) => value.into_address(),
-                Err(err) => return CallCheck::from_error(err),
-            };
+            let sequencer =
+                match StorageCtx::default().sload(self.portal, PORTAL_SEQUENCER_SLOT.into()) {
+                    Ok(value) => value.into_address(),
+                    Err(err) => return CallCheck::from_error(err),
+                };
             if sequencer != call.caller {
                 return CallCheck::from_error(ZoneOutboxError::only_sequencer());
             }

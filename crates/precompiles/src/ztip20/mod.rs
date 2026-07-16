@@ -173,14 +173,18 @@ mod tests {
     use tempo_contracts::precompiles::TIP20Error;
     use tempo_precompiles::{
         PATH_USD_ADDRESS,
-        storage::StorageCtx,
+        storage::{Handler, StorageCtx},
+        test_util::TIP20Setup,
         tip20::{IRolesAuth, ISSUER_ROLE, ITIP20, RolesAuthError, TIP20Token},
     };
     use tempo_zone_contracts::Unauthorized;
 
-    use crate::test_utils::{
-        MockL1Reader, TestContext, call_precompile, test_context, test_l1_env,
-        test_storage_provider,
+    use crate::{
+        TempoState,
+        test_utils::{
+            MockL1Reader, TestContext, call_precompile, test_context, test_l1_env,
+            test_storage_provider,
+        },
     };
 
     #[derive(Clone, Copy)]
@@ -222,46 +226,16 @@ mod tests {
             {
                 let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
                 StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
-                    StorageCtx::default().sstore(
-                        zone_primitives::constants::TEMPO_STATE_ADDRESS,
-                        crate::tempo_state::slots::TEMPO_BLOCK_NUMBER,
-                        U256::from(7u64),
-                    )?;
-                    let mut token_contract =
-                        TIP20Token::from_address(token).expect("PATH_USD must be valid");
-                    token_contract.initialize(
-                        admin,
-                        "Zone USD",
-                        "zUSD",
-                        "USD",
-                        Address::ZERO,
-                        admin,
-                    )?;
-                    token_contract.grant_role_internal(admin, *ISSUER_ROLE)?;
-                    token_contract.grant_role_internal(issuer, *ISSUER_ROLE)?;
-                    token_contract.grant_role_internal(ZONE_INBOX_ADDRESS, *ISSUER_ROLE)?;
-                    token_contract.grant_role_internal(ZONE_OUTBOX_ADDRESS, *ISSUER_ROLE)?;
-                    token_contract.mint(
-                        admin,
-                        ITIP20::mintCall {
-                            to: alice,
-                            amount: U256::from(1_000_000u64),
-                        },
-                    )?;
-                    token_contract.mint(
-                        admin,
-                        ITIP20::mintCall {
-                            to: ZONE_OUTBOX_ADDRESS,
-                            amount: U256::from(10_000u64),
-                        },
-                    )?;
-                    token_contract.approve(
-                        alice,
-                        ITIP20::approveCall {
-                            spender,
-                            amount: U256::from(300_000u64),
-                        },
-                    )?;
+                    TempoState::new().tempo_block_number.write(7)?;
+                    TIP20Setup::path_usd(admin)
+                        .with_issuer(admin)
+                        .with_issuer(issuer)
+                        .with_issuer(ZONE_INBOX_ADDRESS)
+                        .with_issuer(ZONE_OUTBOX_ADDRESS)
+                        .with_mint(alice, U256::from(1_000_000u64))
+                        .with_mint(ZONE_OUTBOX_ADDRESS, U256::from(10_000u64))
+                        .with_approval(alice, spender, U256::from(300_000u64))
+                        .apply()?;
                     Ok(())
                 })?;
             }

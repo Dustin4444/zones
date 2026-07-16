@@ -283,7 +283,7 @@ impl L1StorageReader for MockL1Reader {
             return Ok(value);
         }
 
-        let key = U256::from_be_bytes(slot.0);
+        let key = slot.into();
         let value = self
             .registry_storage
             .lock()
@@ -293,7 +293,7 @@ impl L1StorageReader for MockL1Reader {
         if value.is_zero() {
             Ok(self.fallback)
         } else {
-            Ok(B256::from(value.to_be_bytes()))
+            Ok(value.into())
         }
     }
 }
