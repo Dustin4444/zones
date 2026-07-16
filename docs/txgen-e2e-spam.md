@@ -124,9 +124,11 @@ last transfer block.
 
 ## CI Throughput Spam
 
-The `txgen e2e spam` job in `.github/workflows/test.yml` runs one single-rate
-throughput attempt rather than a sweep. It submits 5,000 TIP-20 transfers over
-five seconds at a target of 1,000 TPS using eight senders. The CI Zone raises
+The `txgen e2e spam` job in `.github/workflows/test.yml` first runs the
+`deposits`, `policies`, and `withdrawals` actions independently with two
+transactions per workload. It then runs one single-rate throughput attempt
+rather than a sweep: 5,000 TIP-20 transfers over five seconds at a target of
+1,000 TPS using eight senders. The CI Zone raises
 `--txpool.max-account-slots` to 1,024 so the benchmark measures Zone execution
 instead of stopping at the default 16 pending transactions per sender.
 

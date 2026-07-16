@@ -301,13 +301,14 @@ verify_transfer_receipts() {
       eth_getBlockByNumber "[\"$block_hex\",true]")"
     receipts_json="$(cast rpc --raw --rpc-url "$ZONE_RPC_URL" \
       eth_getBlockReceipts "[\"$block_hex\"]")"
-    counts="$(jq -cn \
-      --argjson block "$block_json" \
-      --argjson receipts "$receipts_json" \
+    counts="$(jq -c \
+      --slurpfile receipts <(printf '%s\n' "$receipts_json") \
       --argjson senders "$sender_json" \
       --arg to "$(printf '%s' "$token" | lowercase)" \
       --arg calldata "$(printf '%s' "$calldata" | lowercase)" '
-        [
+        . as $block
+        | $receipts[0] as $receipts
+        | [
           $block.transactions[]
           | select((.from // "" | ascii_downcase) as $sender | $senders | index($sender))
           | select(any(.calls[]?;
@@ -325,7 +326,7 @@ verify_transfer_receipts() {
             succeeded: map(select(. == "0x1")) | length,
             reverted: map(select(. == "0x0")) | length
           }
-      ')"
+      ' <<<"$block_json")"
     block_total="$(printf '%s' "$counts" | jq -er '.total')"
     block_succeeded="$(printf '%s' "$counts" | jq -er '.succeeded')"
     block_reverted="$(printf '%s' "$counts" | jq -er '.reverted')"

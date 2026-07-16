@@ -229,6 +229,19 @@ done
   cast block-number --rpc-url "$ZONE_RPC_URL" >/dev/null 2>&1 || \
   die "tempo-zone dev did not become ready"
 
+throughput_count="${COUNT:-5000}"
+throughput_tps="${TPS:-1000}"
+COUNT="${TXGEN_SMOKE_COUNT:-2}"
+TPS="${TXGEN_SMOKE_TPS:-10}"
+export COUNT TPS
+for action in deposits policies withdrawals; do
+  echo "Running standalone $action smoke action: count=$COUNT tps=$TPS"
+  scripts/txgen-e2e-spam.sh "$action"
+done
+
+COUNT="$throughput_count"
+TPS="$throughput_tps"
+export COUNT TPS
 scripts/txgen-e2e-spam.sh throughput
 
 shopt -s nullglob
