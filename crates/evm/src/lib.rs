@@ -9,7 +9,6 @@
 
 mod executor;
 pub mod precompiles;
-mod tx_context;
 mod zone_evm;
 
 pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
@@ -17,7 +16,6 @@ pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
 use crate::{
     executor::ZoneBlockExecutor,
     precompiles::{SequencerExt, extend_zone_precompiles},
-    tx_context::ZoneTxContext,
 };
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory,
@@ -81,7 +79,6 @@ impl ZoneEvmFactory {
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
         );
-        precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| Some(ZoneTxContext::create()));
         evm
     }
 }

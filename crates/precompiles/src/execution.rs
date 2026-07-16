@@ -14,9 +14,10 @@
 //! 1. L1-backed execution rejects delegate calls before storage access.
 //! 2. Decode the selector and reject calls that cannot cover a configured fixed gas charge.
 //! 3. Apply the local phase of [`CallRules`]. Rejected calls return without touching L1.
-//! 4. For admitted L1-backed calls, resolve the anchor, hardfork, and storage overlay, then apply
-//!    the L1-backed rules phase.
-//! 5. Forward the original calldata and caller, applying any configured fixed gas charge.
+//! 4. Calls that do not require L1 execute immediately against zone-local state.
+//! 5. For calls requiring L1, resolve the anchor, hardfork, and storage overlay, then apply the
+//!    L1-backed rules phase.
+//! 6. Forward the original calldata and caller, applying any configured fixed gas charge.
 //!
 //! Rule-level rejections include calldata input gas. Calls without a fixed charge retain normal
 //! provider metering, while successful fixed-price calls report exactly the configured charge.
@@ -86,6 +87,8 @@ pub(crate) struct ZoneCall<'a> {
     pub(crate) caller: Address,
     /// Whether target and bytecode addresses match.
     pub(crate) is_direct: bool,
+    /// Whether the EVM call is static.
+    pub(crate) is_static: bool,
 }
 
 impl<'a> ZoneCall<'a> {
@@ -94,6 +97,7 @@ impl<'a> ZoneCall<'a> {
             data: input.data,
             caller: input.caller,
             is_direct: input.is_direct_call(),
+            is_static: input.is_static,
         }
     }
 
@@ -115,17 +119,30 @@ pub(crate) enum CallCheck {
     Return(PrecompileResult),
 }
 
+impl CallCheck {
+    /// Reject a call with a typed Tempo or zone-native precompile error.
+    pub(crate) fn from_error(error: impl Into<crate::ZonePrecompileError>) -> Self {
+        Self::Return(StorageCtx::default().error_result(error.into()))
+    }
+}
+
 /// Selector-, caller-, and call-context-dependent rules evaluated by centralized precompile
 /// execution before invoking the implementation.
 ///
-/// The local phase runs against ordinary zone state before any optional finalized-L1 resolution.
-/// L1-backed execution then runs a second phase against the exact anchored overlay. Rules may
-/// enforce admission policy and duplicate cheap business checks as fail-fast preflight, but the
-/// precompile implementation remains responsible for its canonical business invariants.
+/// The local phase always runs before optional finalized-L1 state resolution. Calls selected for
+/// anchored execution then run the L1-backed phase against that exact overlay. Rules may enforce
+/// admission policy and duplicate cheap business checks as fail-fast preflight, but the precompile
+/// implementation remains responsible for its canonical business invariants.
 pub(crate) trait CallRules: 'static {
     /// Return the fixed gas charge for this selector, if one applies.
     fn fixed_gas(&self, _selector: Option<[u8; 4]>) -> Option<u64> {
         None
+    }
+
+    /// Return whether this selector requires execution against the finalized-L1 storage overlay.
+    /// Calls returning `false` remain entirely local and execute after the local rules phase.
+    fn requires_l1(&self, _selector: Option<[u8; 4]>) -> bool {
+        true
     }
 
     /// Apply rules using only calldata, caller, call context, and ordinary zone-local state.
@@ -138,8 +155,8 @@ pub(crate) trait CallRules: 'static {
 
     /// Apply rules whose answer must come from the finalized Tempo L1-backed storage overlay.
     ///
-    /// This phase runs only for L1-backed execution, after the anchor and overlay have been
-    /// resolved.
+    /// This phase runs only when [`Self::requires_l1`] returns `true`, after the anchor and overlay
+    /// have been resolved.
     fn check_with_l1_backed_state(&self, _call: ZoneCall<'_>) -> CallCheck {
         CallCheck::Continue
     }
@@ -210,16 +227,16 @@ pub(crate) fn create_local_precompile(
     })
 }
 
-/// Create a direct-call-only precompile backed by the finalized Tempo L1 anchor.
+/// Create a direct-call-only precompile with selector-dependent finalized-L1 backing.
 ///
-/// The helper rejects delegate calls before any storage access, reads the `TempoState` anchor once,
-/// and constructs [`ZonePrecompileStorageProvider`] with that exact block. Construction is
-/// fallible because the provider resolves the active hardfork from the same anchor. Any anchor,
-/// hardfork, or L1 storage failure is returned as a precompile error rather than falling back to
-/// local or latest state.
+/// The helper rejects delegate calls before storage access and applies the local rules phase.
+/// Selectors for which [`CallRules::requires_l1`] returns `false` execute immediately against local
+/// state. Other selectors read the `TempoState` anchor once and construct
+/// [`ZonePrecompileStorageProvider`] with that exact block. Construction is fallible because the
+/// provider resolves the active hardfork from the same anchor. Any anchor, hardfork, or L1 storage
+/// failure is returned as a precompile error rather than falling back to local or latest state.
 ///
-/// Calls admitted by `rules` are forwarded to `execute` with their original calldata and caller
-/// while the L1 overlay is active.
+/// Admitted calls retain their original calldata and caller in either execution mode.
 pub(crate) fn create_l1_backed_precompile<P: L1StorageReader>(
     id: &'static str,
     env: L1BackedPrecompileEnv<P>,
@@ -269,6 +286,11 @@ pub(crate) fn create_l1_backed_precompile<P: L1StorageReader>(
                 let result = StorageCtx::enter(&mut inner, || add_input_cost(call.data, result));
                 return apply_fixed_gas(result, fixed_gas);
             }
+        }
+
+        if !rules.requires_l1(call.selector()) {
+            let exec_result = StorageCtx::enter(&mut inner, || execute(call.data, call.caller));
+            return apply_fixed_gas(exec_result, fixed_gas);
         }
 
         let mut storage = match ZonePrecompileStorageProvider::try_new(inner, l1_reader.clone()) {
@@ -326,7 +348,6 @@ mod tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
-    use tempo_precompiles::storage::PrecompileStorageProvider;
 
     const FIXED_GAS: u64 = 123;
     type RuleRecord = Rc<RefCell<Option<(Bytes, Option<[u8; 4]>, Address)>>>;
@@ -411,8 +432,7 @@ mod tests {
         let reader = MockL1Reader::default();
         let observed_spec = Rc::new(Cell::new(None));
         let execute_spec = observed_spec.clone();
-        let mut cfg = revm::context::CfgEnv::<TempoHardfork>::default();
-        cfg.spec = TempoHardfork::T8;
+        let cfg = revm::context::CfgEnv::<TempoHardfork>::default();
         let env = L1BackedPrecompileEnv::new(
             &cfg,
             reader.clone(),
@@ -434,6 +454,7 @@ mod tests {
                 .is_revert()
         );
         assert!(checked.get());
+        assert!(reader.hardfork_requests().is_empty());
 
         let precompile =
             create_l1_backed_precompile("L1BackedTest", env, NoCallRules, move |_, _| {
@@ -452,6 +473,7 @@ mod tests {
             .call(input(&mut ctx, &[], Address::ZERO, u64::MAX))
             .unwrap();
 
+        assert_eq!(reader.hardfork_requests(), vec![anchor]);
         assert_eq!(observed_spec.get(), Some(TempoHardfork::T8));
     }
 
