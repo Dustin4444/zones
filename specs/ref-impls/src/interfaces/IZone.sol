@@ -640,7 +640,7 @@ interface IZonePortal {
     error InvalidBouncebackRecipient();
     error InvalidDepositTransition();
     error InvalidSequencerSet();
-    error SequencerSetUnchanged();
+    error SequencerConfigurationUnchanged();
     error InvalidQuorumCertificate();
     error LegacyBatchSubmissionDisabled();
 
