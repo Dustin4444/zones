@@ -69,6 +69,11 @@ pub struct ZonePrecompileStorageProviderInitError {
 }
 
 impl ZonePrecompileStorageProviderInitError {
+    /// Return the underlying Tempo error for protocol execution outside a metered precompile call.
+    pub fn into_error(self) -> TempoPrecompileError {
+        self.error
+    }
+
     /// Convert the initialization failure using the gas accounting of the anchor read.
     pub fn into_precompile_result(self) -> PrecompileResult {
         self.error

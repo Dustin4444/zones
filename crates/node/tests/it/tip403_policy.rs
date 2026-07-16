@@ -4,20 +4,21 @@
 //! finalized raw L1 storage via `L1StateCache` and rejects mutating calls. The cache is populated
 //! directly in tests (no L1 subscriber).
 
-use alloy::primitives::{U256, address};
-use alloy_provider::ProviderBuilder;
+use alloy::primitives::{TxKind, U256, address};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{
     ITIP20,
     ITIP403Registry::{self, PolicyType},
 };
-use tempo_precompiles::{PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS};
+use tempo_precompiles::{PATH_USD_ADDRESS, TIP_FEE_MANAGER_ADDRESS, TIP403_REGISTRY_ADDRESS};
 use zone_l1::state::tip403::PolicyEvent;
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, PolicySeed, TEST_MNEMONIC, TIP20_TX_GAS, seed_raw_tip403_policy,
-    start_local_zone_with_fixture,
+    DEFAULT_TIMEOUT, PolicySeed, TEST_MNEMONIC, TIP20_TX_GAS, seed_raw_tip20_policy_id,
+    seed_raw_tip403_policy, start_local_zone_with_fixture,
 };
 
 /// Deposit pathUSD to Alice, then transfer a portion to Bob on the zone.
@@ -91,6 +92,84 @@ async fn test_tip20_transfer_on_zone() -> eyre::Result<()> {
     assert!(
         alice_balance <= U256::from(expected_remaining),
         "alice should have at most {expected_remaining} (got {alice_balance})"
+    );
+
+    Ok(())
+}
+
+/// Protocol fee collection must use the finalized L1 policy even when the tx does not call TIP-20.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_l1_blacklisted_sender_cannot_pay_for_empty_transaction() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
+    let alice_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let alice = alice_signer.address();
+
+    let deposit_amount = 1_000_000u128;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
+    fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        alice,
+        U256::from(deposit_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    let anchor = zone.wait_for_tempo_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    const BLACKLIST_POLICY_ID: u64 = 42;
+    {
+        let mut cache = zone.l1_state_cache().write();
+        eyre::ensure!(
+            seed_raw_tip20_policy_id(&mut cache, anchor, PATH_USD_ADDRESS, BLACKLIST_POLICY_ID,),
+            "fee-token policy seed must be admitted at the current anchor"
+        );
+    }
+    seed_raw_tip403_policy(
+        zone.l1_state_cache(),
+        anchor,
+        &[PolicySeed::simple(
+            BLACKLIST_POLICY_ID,
+            PolicyType::BLACKLIST,
+            &[(alice, true), (TIP_FEE_MANAGER_ADDRESS, false)],
+        )],
+    )?;
+
+    let alice_provider = ProviderBuilder::new()
+        .wallet(alice_signer)
+        .connect_http(zone.http_url().clone());
+    let mut request = TransactionRequest::default();
+    request.to = Some(TxKind::Call(alice));
+    request.gas = Some(TIP20_TX_GAS);
+    request.gas_price = Some(TEMPO_T0_BASE_FEE as u128);
+
+    let nonce_before = alice_provider.get_transaction_count(alice).await?;
+    let pending = alice_provider.send_transaction(request).await?;
+    let tx_hash = *pending.tx_hash();
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    zone.wait_for_tempo_block_number(anchor + 1, DEFAULT_TIMEOUT)
+        .await?;
+
+    assert!(
+        alice_provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .is_none(),
+        "L1-blacklisted fee payer transaction must not be included"
+    );
+    assert_eq!(
+        alice_provider.get_transaction_count(alice).await?,
+        nonce_before,
+        "rejected fee payment must not consume the sender nonce"
+    );
+    assert_eq!(
+        zone.balance_of(PATH_USD_ADDRESS, alice).await?,
+        U256::from(deposit_amount),
+        "rejected fee payment must leave the sender balance unchanged"
     );
 
     Ok(())

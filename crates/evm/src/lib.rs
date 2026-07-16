@@ -8,6 +8,7 @@
 #![allow(unnameable_types)]
 
 mod executor;
+mod fee_manager;
 pub mod precompiles;
 mod tx_context;
 mod zone_evm;
@@ -16,6 +17,7 @@ pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
 
 use crate::{
     executor::ZoneBlockExecutor,
+    fee_manager::ZoneFeeManager,
     precompiles::{SequencerExt, extend_zone_precompiles},
     tx_context::ZoneTxContext,
 };
@@ -68,9 +70,10 @@ impl ZoneEvmFactory {
 
     fn register_precompiles<DB: Database, I: Inspector<TempoCtx<DB>>>(
         &self,
-        mut evm: TempoEvm<DB, I>,
+        evm: TempoEvm<DB, I>,
     ) -> TempoEvm<DB, I> {
         let cfg = evm.ctx().cfg.clone();
+        let mut evm = evm.with_fee_manager(ZoneFeeManager::new(self.l1_provider.clone()));
         let (_, _, precompiles) = evm.components_mut();
         let sequencer: Arc<dyn SequencerExt> = Arc::new(self.l1_provider.clone());
         extend_zone_precompiles(
