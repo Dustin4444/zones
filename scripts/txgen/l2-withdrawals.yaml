@@ -1,0 +1,72 @@
+# L2 half of the bridge workload. Each request is independent and uses one of
+# many Tempo nonce lanes so a single funded dev account can sustain load.
+chain_id: ${TXGEN_CHAIN_ID}
+
+gas:
+  max_fee_per_gas: ${TXGEN_MAX_FEE_PER_GAS}
+  max_priority_fee_per_gas: ${TXGEN_MAX_PRIORITY_FEE_PER_GAS}
+
+accounts:
+  dev:
+    mnemonic: "${TXGEN_MNEMONIC}"
+    index: 0
+
+artifacts:
+  tip20: abis/tip20.json
+  zone_outbox: abis/zone-outbox.json
+
+setup:
+  steps:
+    - id: approve_outbox
+      bindings:
+        user:
+          account: { pool: dev, select: { index: 0 } }
+      tx:
+        type: tempo
+        from: { var: user.ref }
+        gas_limit: 500000
+        call:
+          to: "${TXGEN_TOKEN}"
+          abi: tip20
+          function: approve
+          args:
+            - "${TXGEN_OUTBOX}"
+            - "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+templates:
+  request_withdrawal:
+    type: tempo
+    gas_limit: 3000000
+    nonce_key:
+      uniform:
+        - 1
+        - ${TXGEN_NONCE_LANES}
+    call:
+      to: "${TXGEN_OUTBOX}"
+      abi: zone_outbox
+      function: requestWithdrawal
+      args: []
+
+sequences:
+  withdraw_to_self:
+    bindings:
+      user:
+        account: { pool: dev, select: { index: 0 } }
+    steps:
+      - template: request_withdrawal
+        with:
+          from: { var: user.ref }
+          call:
+            args:
+              - "${TXGEN_TOKEN}"
+              - { var: user.address }
+              - ${TXGEN_WITHDRAWAL_AMOUNT}
+              - "0x0000000000000000000000000000000000000000000000000000000000000000"
+              - 0
+              - { var: user.address }
+              - "0x"
+              - "0x"
+
+mix:
+  - sequence: withdraw_to_self
+    weight: 1

@@ -47,6 +47,88 @@ jobs:
       - name: Run tests
         run: cargo nextest run --profile ci
 
+  txgen-e2e-spam:
+    name: txgen e2e spam
+    runs-on: depot-ubuntu-latest-16
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      comment_body: ${{ steps.spam.outputs.comment_body }}
+    env:
+      ZONE_DATADIR: ${{ runner.temp }}/tempo-zone-dev
+      TXGEN_DIR: ${{ github.workspace }}/txgen
+      L1_HTTP_URL: http://127.0.0.1:8545
+      COUNT: "5000"
+      TPS: "1000"
+      MAX_CONCURRENT: "2000"
+      DRAIN_TIMEOUT: "240"
+      SYNC_TIMEOUT: "300"
+      TXGEN_NONCE_LANES: "1000000"
+      TXGEN_TRANSFER_ACCOUNTS: "8"
+      TXGEN_DEPOSIT_AMOUNT: "5000000000"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Checkout txgen
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: tempoxyz/txgen
+          ref: b8776357c3a16d494d2d482b19d19adab1421235
+          path: txgen
+          persist-credentials: false
+
+      - uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
+        with:
+          toolchain: stable
+
+      - name: Install Foundry
+        uses: tempoxyz/gh-actions/actions/setup-foundry@98b1081dcf34361b576aca2ab3041772708582ef
+        with:
+          version: nightly
+
+      - name: Build and run txgen E2E spam
+        id: spam
+        run: scripts/ci-txgen-e2e-spam.sh
+
+      - name: Upload txgen reports and node logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: txgen-e2e-spam-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/txgen-e2e
+          if-no-files-found: warn
+          retention-days: 14
+
+  txgen-e2e-comment:
+    name: txgen e2e PR comment
+    runs-on: ubuntu-latest
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs:
+      - txgen-e2e-spam
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      COMMENT_BODY: ${{ needs.txgen-e2e-spam.outputs.comment_body }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Create or update txgen result comment
+        run: scripts/ci-txgen-e2e-comment.sh
+
   test-success:
     name: test success
     runs-on: ubuntu-latest
@@ -54,6 +136,7 @@ jobs:
     permissions: {}
     needs:
       - test
+      - txgen-e2e-spam
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed

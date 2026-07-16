@@ -1,0 +1,45 @@
+[
+  {
+    "type": "function",
+    "name": "createPolicy",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "admin", "type": "address" },
+      { "name": "policyType", "type": "uint8" }
+    ],
+    "outputs": [{ "name": "newPolicyId", "type": "uint64" }]
+  },
+  {
+    "type": "function",
+    "name": "modifyPolicyWhitelist",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "policyId", "type": "uint64" },
+      { "name": "account", "type": "address" },
+      { "name": "allowed", "type": "bool" }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "function",
+    "name": "modifyPolicyBlacklist",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "policyId", "type": "uint64" },
+      { "name": "account", "type": "address" },
+      { "name": "restricted", "type": "bool" }
+    ],
+    "outputs": []
+  },
+  {
+    "type": "function",
+    "name": "createCompoundPolicy",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      { "name": "senderPolicyId", "type": "uint64" },
+      { "name": "recipientPolicyId", "type": "uint64" },
+      { "name": "mintRecipientPolicyId", "type": "uint64" }
+    ],
+    "outputs": [{ "name": "newPolicyId", "type": "uint64" }]
+  }
+]

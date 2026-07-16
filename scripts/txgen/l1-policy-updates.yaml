@@ -1,0 +1,36 @@
+# The runner invokes this workload once for every token currently enabled on
+# the ZonePortal. By default, the runner first creates a fresh empty blacklist
+# policy, which emits real state changes without invalidating bridge traffic.
+chain_id: ${TXGEN_CHAIN_ID}
+
+gas:
+  max_fee_per_gas: ${TXGEN_MAX_FEE_PER_GAS}
+  max_priority_fee_per_gas: ${TXGEN_MAX_PRIORITY_FEE_PER_GAS}
+
+accounts:
+  dev:
+    mnemonic: "${TXGEN_MNEMONIC}"
+    index: 0
+
+artifacts:
+  tip20: abis/tip20.json
+
+templates:
+  change_transfer_policy:
+    type: tempo
+    from: { pool: dev, select: { index: 0 } }
+    gas_limit: 2000000
+    nonce_key:
+      uniform:
+        - 1
+        - ${TXGEN_NONCE_LANES}
+    call:
+      to: "${TXGEN_TOKEN}"
+      abi: tip20
+      function: changeTransferPolicyId
+      args:
+        - ${TXGEN_POLICY_ID}
+
+mix:
+  - template: change_transfer_policy
+    weight: 1

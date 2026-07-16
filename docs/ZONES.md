@@ -66,8 +66,11 @@ cargo run --release --bin tempo-zone -- dev \
   --l1.rpc-url ws://127.0.0.1:8545
 ```
 
-This provisions a new ZoneFactory and portal, writes the generated zone files to
-`/tmp/tempo-zone-dev`, and serves the zone HTTP RPC at `http://127.0.0.1:9545`.
+The L1 must already expose TIP-1091's ZoneFactory at its fixed protocol address.
+The dev command provisions a new portal, writes the generated zone files to
+the platform's temporary directory (`$TMPDIR/tempo-zone-dev` on macOS and
+`/tmp/tempo-zone-dev` on Linux), and serves the zone HTTP RPC at
+`http://127.0.0.1:9545`.
 
 Older Anvil builds are rejected because they mine Ethereum header hashes and only
 add Tempo fields to the RPC response. Zones require canonical Tempo header hashes
@@ -652,3 +655,4 @@ Current deployment:
 | `just zone-info <id-or-portal>` | Fetch zone metadata from ZoneFactory |
 | `just demo-blacklist [amount] [rpc] [zone-dir]` | End-to-end TIP-20 + TIP-403 blacklist lifecycle demo |
 | `just spam-deposits [total] [per-block] [amount] [encrypted] [token] [lead-time]` | Send many deposit transactions to measure portal throughput |
+| `just txgen-e2e-spam [action] [count] [tps]` | Spam and verify L1 deposits, L2 withdrawals, every TIP-403 policy mode, and policy-gated in-zone TIP-20 transfers with txgen; see `docs/txgen-e2e-spam.md` |

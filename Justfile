@@ -891,6 +891,11 @@ spam-deposits total="20" per-block="10" amount="1000000" encrypted="" token="0x2
     cargo run -p tempo-xtask -- spam-deposits --private-key "$PK" $ARGS
 
 [group('zone')]
+[doc('Run txgen E2E spam against tempo-zone dev: all, deposits, withdrawals, policies, or throughput. COUNT and TPS are forwarded through the environment.')]
+txgen-e2e-spam action="all" count="20" tps="10":
+    COUNT="{{count}}" TPS="{{tps}}" scripts/txgen-e2e-spam.sh "{{action}}"
+
+[group('zone')]
 [doc('Runs the full TIP-20 + TIP-403 blacklist demo: creates token, enables on zone, blacklists address, shows deposit bounce, unblacklists, shows deposit success, withdraws. Requires PRIVATE_KEY for the token admin/depositor, L1_PORTAL_ADDRESS, and portal admin authority via ADMIN_KEY or matching generated/<name>/zone.json adminKey.')]
 demo-blacklist amount="500000" rpc=zone_rpc zone-dir="":
     #!/bin/bash

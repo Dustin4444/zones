@@ -1,0 +1,36 @@
+# Creates an immutable TIP-403 compound policy from simple role policies.
+chain_id: ${TXGEN_CHAIN_ID}
+
+gas:
+  max_fee_per_gas: ${TXGEN_MAX_FEE_PER_GAS}
+  max_priority_fee_per_gas: ${TXGEN_MAX_PRIORITY_FEE_PER_GAS}
+
+accounts:
+  dev:
+    mnemonic: "${TXGEN_MNEMONIC}"
+    index: 0
+
+artifacts:
+  tip403_registry: abis/tip403-registry.json
+
+templates:
+  create_compound_policy:
+    type: tempo
+    from: { pool: dev, select: { index: 0 } }
+    gas_limit: 2000000
+    nonce_key:
+      uniform:
+        - 1
+        - ${TXGEN_NONCE_LANES}
+    call:
+      to: "0x403c000000000000000000000000000000000000"
+      abi: tip403_registry
+      function: createCompoundPolicy
+      args:
+        - ${TXGEN_SENDER_POLICY_ID}
+        - ${TXGEN_RECIPIENT_POLICY_ID}
+        - ${TXGEN_MINT_RECIPIENT_POLICY_ID}
+
+mix:
+  - template: create_compound_policy
+    weight: 1

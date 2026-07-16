@@ -1,0 +1,39 @@
+# L2 TIP-20 transfers used to prove both allowed and denied TIP-403 behavior.
+# The runner selects a recipient whose membership matches the active policy and
+# verifies the receipt outcome and the recipient's exact balance delta.
+chain_id: ${TXGEN_CHAIN_ID}
+
+gas:
+  max_fee_per_gas: ${TXGEN_MAX_FEE_PER_GAS}
+  max_priority_fee_per_gas: ${TXGEN_MAX_PRIORITY_FEE_PER_GAS}
+
+accounts:
+  dev:
+    mnemonic: "${TXGEN_MNEMONIC}"
+    range:
+      - 0
+      - ${TXGEN_ACTIVE_ACCOUNTS}
+
+artifacts:
+  tip20: abis/tip20.json
+
+templates:
+  transfer:
+    type: tempo
+    from: { pool: dev, select: random }
+    gas_limit: 1000000
+    nonce_key:
+      uniform:
+        - 1
+        - ${TXGEN_NONCE_LANES}
+    call:
+      to: "${TXGEN_TOKEN}"
+      abi: tip20
+      function: transfer
+      args:
+        - "${TXGEN_TRANSFER_RECIPIENT}"
+        - ${TXGEN_TRANSFER_AMOUNT}
+
+mix:
+  - template: transfer
+    weight: 1
