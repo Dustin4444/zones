@@ -1071,8 +1071,6 @@ pub(crate) struct ZoneBlockSnapshot {
     pub processed_deposit_hash: B256,
     /// Total number of deposits processed by the zone up to this block.
     pub processed_deposit_number: u64,
-    /// Zone L2 block hash.
-    pub block_hash: B256,
 }
 
 #[cfg(test)]

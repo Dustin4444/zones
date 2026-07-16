@@ -23,6 +23,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, B256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -31,6 +32,7 @@ use eyre::{Result, WrapErr};
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
+use zone_primitives::ZoneHeader;
 
 use alloy_sol_types::{ContractError, SolInterface as _};
 
@@ -49,6 +51,23 @@ const MAX_RETRIES: u32 = 3;
 
 /// Initial delay between retries (doubles on each attempt).
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Protocol version used by the current zone execution rules.
+const ZONE_PROTOCOL_VERSION: u64 = 0;
+
+fn zone_block_hash(header: &impl alloy_consensus::BlockHeader, parent_hash: B256) -> B256 {
+    ZoneHeader {
+        parent_hash,
+        beneficiary: header.beneficiary(),
+        state_root: header.state_root(),
+        transactions_root: header.transactions_root(),
+        receipts_root: header.receipts_root(),
+        number: header.number(),
+        timestamp: header.timestamp(),
+        protocol_version: ZONE_PROTOCOL_VERSION,
+    }
+    .hash()
+}
 
 /// Returns true when `(last_submitted, latest]` contains a block-number batch boundary.
 ///
@@ -126,6 +145,8 @@ pub struct ZoneMonitor {
     /// Previous zone block hash, used as `prev_block_hash` in [`BatchData`].
     /// Initialized from the portal's on-chain `blockHash()` at startup.
     prev_zone_block_hash: B256,
+    /// Genesis simplified zone hash, used to rebuild the hash chain after a restart.
+    genesis_zone_block_hash: B256,
     /// Most recent zone block observed from the L2 RPC.
     latest_observed_zone_block: u64,
 }
@@ -192,6 +213,13 @@ impl ZoneMonitor {
                 .await
                 .wrap_err("failed to read genesisTempoBlockNumber during zone monitor startup")?;
 
+        let genesis_zone_block_hash: B256 =
+            ZonePortal::new(config.portal_address, l1_provider.clone())
+                .genesisBlockHash()
+                .call()
+                .await
+                .wrap_err("failed to read genesisBlockHash during zone monitor startup")?;
+
         let batch_submitter = BatchSubmitter::with_anchor_config(
             config.portal_address,
             l1_provider,
@@ -203,9 +231,12 @@ impl ZoneMonitor {
             .read_portal_block_hash()
             .await
             .wrap_err("failed to read portal block hash during zone monitor startup")?;
-
-        let last_submitted_zone_block =
-            Self::resolve_zone_block_number(&provider, prev_zone_block_hash).await;
+        let last_submitted_zone_block = Self::resolve_zone_block_number(
+            &provider,
+            prev_zone_block_hash,
+            genesis_zone_block_hash,
+        )
+        .await;
         let prev_processed_deposit_hash = Self::read_processed_deposit_hash_at_block(
             &inbox,
             last_submitted_zone_block,
@@ -246,6 +277,7 @@ impl ZoneMonitor {
             prev_processed_deposit_hash,
             prev_processed_deposit_number,
             prev_zone_block_hash,
+            genesis_zone_block_hash,
             latest_observed_zone_block: last_submitted_zone_block,
         };
 
@@ -505,10 +537,14 @@ impl ZoneMonitor {
             );
         }
 
+        let next_block_hash = self
+            .compute_zone_block_hash(from, to, self.prev_zone_block_hash)
+            .await?;
+
         let batch_data = BatchData {
             tempo_block_number: end_state.tempo_block_number,
             prev_block_hash: self.prev_zone_block_hash,
-            next_block_hash: end_state.block_hash,
+            next_block_hash,
             prev_processed_deposit_hash: self.prev_processed_deposit_hash,
             next_processed_deposit_hash: end_state.processed_deposit_hash,
             prev_deposit_number: self.prev_processed_deposit_number,
@@ -521,35 +557,45 @@ impl ZoneMonitor {
     }
 
     /// Read the zone state at block `to`: tempo block number, processed deposit
-    /// queue hash, and block hash.
+    /// queue hash, and consensus block hash.
     async fn fetch_block_snapshot(&self, to: u64) -> Result<ZoneBlockSnapshot> {
         let tempo_call = self.tempo_state.tempoBlockNumber().block(to.into());
         let deposit_call = self.inbox.processedDepositQueueHash().block(to.into());
         let deposit_number_call = self.inbox.processedDepositNumber().block(to.into());
-        let block_fut = async {
-            self.provider
-                .get_block_by_number(to.into())
-                .await
-                .map_err(Into::into)
-        };
-        let (tempo_block_number, processed_deposit_hash, processed_deposit_number, block) = tokio::try_join!(
+        let (tempo_block_number, processed_deposit_hash, processed_deposit_number) = tokio::try_join!(
             tempo_call.call(),
             deposit_call.call(),
             deposit_number_call.call(),
-            block_fut,
         )?;
-
-        let block_hash = block
-            .ok_or_else(|| eyre::eyre!("zone block {to} not found"))?
-            .header
-            .hash;
 
         Ok(ZoneBlockSnapshot {
             tempo_block_number,
             processed_deposit_hash,
             processed_deposit_number,
-            block_hash,
         })
+    }
+
+    /// Compute the spec-defined hash chain over all blocks in a batch.
+    ///
+    /// This deliberately does not use the RPC header's consensus hash or parent hash: zone
+    /// batches commit to the simplified [`ZoneHeader`], whose parent is the previous simplified
+    /// zone hash.
+    async fn compute_zone_block_hash(
+        &self,
+        from: u64,
+        to: u64,
+        mut parent_hash: B256,
+    ) -> Result<B256> {
+        for number in from..=to {
+            let block = self
+                .provider
+                .get_block_by_number(number.into())
+                .await?
+                .ok_or_else(|| eyre::eyre!("zone block {number} not found"))?;
+            let header = &block.header;
+            parent_hash = zone_block_hash(header, parent_hash);
+        }
+        Ok(parent_hash)
     }
 
     /// Submit a `submitBatch` transaction to the ZonePortal on L1 with exponential
@@ -719,8 +765,12 @@ impl ZoneMonitor {
         };
         match self.batch_submitter.read_portal_block_hash().await {
             Ok(portal_hash) => {
-                let last_submitted_zone_block =
-                    Self::resolve_zone_block_number(&self.provider, portal_hash).await;
+                let last_submitted_zone_block = Self::resolve_zone_block_number(
+                    &self.provider,
+                    portal_hash,
+                    self.genesis_zone_block_hash,
+                )
+                .await;
                 let deposit_hash = Self::read_processed_deposit_hash_at_block(
                     &self.inbox,
                     last_submitted_zone_block,
@@ -781,30 +831,38 @@ impl ZoneMonitor {
     async fn resolve_zone_block_number(
         provider: &DynProvider<TempoNetwork>,
         zone_block_hash: B256,
+        genesis_zone_block_hash: B256,
     ) -> u64 {
-        if zone_block_hash.is_zero() {
+        if zone_block_hash == genesis_zone_block_hash {
             return 0;
         }
 
-        match provider.get_block_by_hash(zone_block_hash).await {
-            Ok(Some(block)) => block.number(),
-            Ok(None) => {
-                warn!(
-                    %zone_block_hash,
-                    "Portal blockHash not found on zone L2 — zone may have been reset. \
-                     Starting from genesis."
-                );
-                0
-            }
+        let latest = match provider.get_block_number().await {
+            Ok(latest) => latest,
             Err(e) => {
+                warn!(%zone_block_hash, error = %e, "Failed to read zone tip, starting from genesis");
+                return 0;
+            }
+        };
+        let mut hash = genesis_zone_block_hash;
+        // Rebuild from the portal's genesis commitment. A simplified zone hash is not an RPC
+        // consensus block hash, so eth_getBlockByHash cannot resolve it.
+        for number in 1..=latest {
+            let Ok(Some(block)) = provider.get_block_by_number(number.into()).await else {
                 warn!(
-                    %zone_block_hash,
-                    error = %e,
-                    "Failed to look up zone block by hash, starting from genesis"
+                    number,
+                    "Failed to read zone block while resolving portal hash"
                 );
-                0
+                return 0;
+            };
+            let header = &block.header;
+            hash = zone_block_hash(header, hash);
+            if hash == zone_block_hash {
+                return number;
             }
         }
+        warn!(%zone_block_hash, "Portal zone hash was not found in the local simplified hash chain");
+        0
     }
 
     async fn read_processed_deposit_hash_at_block(
@@ -986,6 +1044,29 @@ mod tests {
         Block::empty(header)
     }
 
+    #[test]
+    fn zone_hash_uses_simplified_header_and_previous_zone_hash() {
+        let consensus_hash = B256::repeat_byte(0xcc);
+        let parent_zone_hash = B256::repeat_byte(0xaa);
+        let block = mock_block(consensus_hash, 7);
+
+        let actual = zone_block_hash(&block.header, parent_zone_hash);
+        let expected = ZoneHeader {
+            parent_hash: parent_zone_hash,
+            beneficiary: block.header.beneficiary(),
+            state_root: block.header.state_root(),
+            transactions_root: block.header.transactions_root(),
+            receipts_root: block.header.receipts_root(),
+            number: 7,
+            timestamp: block.header.timestamp(),
+            protocol_version: ZONE_PROTOCOL_VERSION,
+        }
+        .hash();
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, consensus_hash);
+    }
+
     fn test_monitor(l1: Asserter, zone: Asserter) -> ZoneMonitor {
         let portal_address = Address::repeat_byte(0x11);
         let config = ZoneMonitorConfig {
@@ -1017,6 +1098,7 @@ mod tests {
             prev_processed_deposit_hash: B256::repeat_byte(0xaa),
             prev_processed_deposit_number: 0,
             prev_zone_block_hash: B256::repeat_byte(0xbb),
+            genesis_zone_block_hash: B256::ZERO,
             latest_observed_zone_block: 50,
         }
     }
@@ -1067,15 +1149,17 @@ mod tests {
         let l1 = Asserter::new();
         let zone = Asserter::new();
 
-        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
-        let confirmed_zone_block = 42;
+        let confirmed_zone_block = 1;
+        let block = mock_block(B256::repeat_byte(0xee), confirmed_zone_block);
+        let portal_hash = zone_block_hash(&block.header, B256::ZERO);
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_u64(7));
         l1.push_success(&abi_encode_u64(7));
 
-        zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
+        zone.push_success(&confirmed_zone_block);
+        zone.push_success(&Some(block));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
 
         let mut monitor = test_monitor(l1.clone(), zone.clone());
@@ -1093,15 +1177,17 @@ mod tests {
         let l1 = Asserter::new();
         let zone = Asserter::new();
 
-        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
-        let confirmed_zone_block = 42;
+        let confirmed_zone_block = 1;
+        let block = mock_block(B256::repeat_byte(0xee), confirmed_zone_block);
+        let portal_hash = zone_block_hash(&block.header, B256::ZERO);
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_u64(7));
         l1.push_success(&abi_encode_u64(7));
 
-        zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
+        zone.push_success(&confirmed_zone_block);
+        zone.push_success(&Some(block));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
 
         let mut monitor = test_monitor(l1.clone(), zone.clone());
@@ -1136,15 +1222,17 @@ mod tests {
         let l1 = Asserter::new();
         let zone = Asserter::new();
 
-        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
-        let confirmed_zone_block = 42;
+        let confirmed_zone_block = 1;
+        let block = mock_block(B256::repeat_byte(0xee), confirmed_zone_block);
+        let portal_hash = zone_block_hash(&block.header, B256::ZERO);
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_failure_msg("head read failed");
         l1.push_failure_msg("tail read failed");
 
-        zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
+        zone.push_success(&confirmed_zone_block);
+        zone.push_success(&Some(block));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
 
         let mut monitor = test_monitor(l1.clone(), zone.clone());
@@ -1179,8 +1267,9 @@ mod tests {
         let l1 = Asserter::new();
         let zone = Asserter::new();
 
-        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
-        let confirmed_zone_block = 42;
+        let confirmed_zone_block = 1;
+        let block = mock_block(B256::repeat_byte(0xee), confirmed_zone_block);
+        let portal_hash = zone_block_hash(&block.header, B256::ZERO);
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
 
         l1.push_success(&abi_encode_b256(portal_hash));
@@ -1188,7 +1277,8 @@ mod tests {
         l1.push_success(&abi_encode_u64(7));
         l1.push_success(&abi_encode_u64(7));
 
-        zone.push_success(&Some(mock_block(portal_hash, confirmed_zone_block)));
+        zone.push_success(&confirmed_zone_block);
+        zone.push_success(&Some(block));
         zone.push_success(&abi_encode_b256(confirmed_deposit_hash));
 
         let mut monitor = test_monitor(l1.clone(), zone.clone());
