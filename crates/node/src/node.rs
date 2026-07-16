@@ -286,6 +286,21 @@ impl ZoneNode {
         self
     }
 
+    /// Bound L1 state-provider retries for callers that must fail finitely on cache misses.
+    pub fn with_l1_state_provider_retry_limits(
+        mut self,
+        transport_retries: u32,
+        sync_attempts: u32,
+    ) -> Self {
+        assert!(
+            sync_attempts > 0,
+            "at least one synchronous attempt is required"
+        );
+        self.l1_state_provider_config.max_retries = transport_retries;
+        self.l1_state_provider_config.max_sync_attempts = Some(sync_attempts);
+        self
+    }
+
     /// Set the number of zone blocks between empty withdrawal batch
     /// finalization.
     pub fn with_withdrawal_batch_interval_blocks(mut self, interval_blocks: u64) -> Self {

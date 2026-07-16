@@ -132,20 +132,29 @@ impl L1StateCacheInner {
 
     /// Sets a storage slot value in the forward cache at the given block number.
     ///
-    /// Fallback results below the engine's consumed-block floor are deliberately not cached.
-    pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) {
+    /// Returns `false` without inserting when `block_number` is below the engine's consumed-block
+    /// floor. Callers that materialize synthetic/test state should check the result so a rejected
+    /// seed cannot turn into an unexpected RPC fallback.
+    #[must_use = "check whether the cache write was admitted above the block floor"]
+    pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) -> bool {
         if block_number < self.block_floor {
-            return;
+            return false;
         }
 
         let history = self.slots.entry((address, slot)).or_default();
         history.insert(block_number, value);
         prune_slot_history(history, self.block_floor);
+        true
     }
 
     /// Advances the engine's consumed-block floor monotonically in O(1).
     pub fn advance_floor(&mut self, block_number: u64) {
         self.block_floor = self.block_floor.max(block_number);
+    }
+
+    /// Returns the latest L1 height consumed by canonical Zone execution.
+    pub fn block_floor(&self) -> u64 {
+        self.block_floor
     }
 
     /// Updates the latest confirmed L1 block observed by the subscriber.
@@ -216,8 +225,18 @@ mod tests {
         let slot = B256::with_last_byte(1);
         let value = B256::with_last_byte(0xff);
 
-        cache.set(PORTAL, slot, 10, value);
+        assert!(cache.set(PORTAL, slot, 10, value));
         assert_eq!(cache.get(PORTAL, slot, 10), Some(value));
+    }
+
+    #[test]
+    fn set_reports_rejection_below_floor() {
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+        let slot = B256::with_last_byte(1);
+        cache.advance_floor(10);
+
+        assert!(!cache.set(PORTAL, slot, 9, B256::with_last_byte(0xff)));
+        assert_eq!(cache.get(PORTAL, slot, 10), None);
     }
 
     #[test]
@@ -225,8 +244,8 @@ mod tests {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
 
-        cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a));
-        cache.set(PORTAL, slot, 20, B256::with_last_byte(0x14));
+        assert!(cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a)));
+        assert!(cache.set(PORTAL, slot, 20, B256::with_last_byte(0x14)));
 
         assert_eq!(
             cache.get(PORTAL, slot, 10),
@@ -251,7 +270,7 @@ mod tests {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
 
-        cache.set(PORTAL, slot, 10, B256::with_last_byte(0xff));
+        assert!(cache.set(PORTAL, slot, 10, B256::with_last_byte(0xff)));
         assert_eq!(cache.get(PORTAL, slot, 9), None);
     }
 
@@ -259,7 +278,7 @@ mod tests {
     fn clear_removes_chain_data_but_preserves_engine_floor() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
 
-        cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1));
+        assert!(cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1)));
         cache.invalidate(PORTAL, 101);
         cache.advance_floor(100);
         cache.update_anchor(NumHash {
@@ -283,8 +302,8 @@ mod tests {
         let new = B256::with_last_byte(0x14);
         let other = Address::with_last_byte(0x43);
 
-        cache.set(PORTAL, slot, 10, old);
-        cache.set(other, slot, 10, old);
+        assert!(cache.set(PORTAL, slot, 10, old));
+        assert!(cache.set(other, slot, 10, old));
         cache.invalidate(PORTAL, 20);
         cache.invalidate(PORTAL, 20); // Multiple logs in one block deduplicate.
 
@@ -294,7 +313,7 @@ mod tests {
         assert_eq!(cache.get(other, slot, 30), Some(old));
         assert_eq!(cache.invalidations[&PORTAL].len(), 1);
 
-        cache.set(PORTAL, slot, 20, new);
+        assert!(cache.set(PORTAL, slot, 20, new));
         assert_eq!(cache.get(PORTAL, slot, 20), Some(new));
         assert_eq!(cache.get(PORTAL, slot, 30), Some(new));
 
@@ -334,8 +353,8 @@ mod tests {
         let addr_b = address!("0x0000000000000000000000000000000000004343");
         let slot = B256::with_last_byte(1);
 
-        cache.set(PORTAL, slot, 10, B256::with_last_byte(0xaa));
-        cache.set(addr_b, slot, 10, B256::with_last_byte(0xbb));
+        assert!(cache.set(PORTAL, slot, 10, B256::with_last_byte(0xaa)));
+        assert!(cache.set(addr_b, slot, 10, B256::with_last_byte(0xbb)));
 
         assert_eq!(
             cache.get(PORTAL, slot, 10),
@@ -352,9 +371,9 @@ mod tests {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
 
-        cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05));
-        cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a));
-        cache.set(PORTAL, slot, 20, B256::with_last_byte(0x14));
+        assert!(cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05)));
+        assert!(cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a)));
+        assert!(cache.set(PORTAL, slot, 20, B256::with_last_byte(0x14)));
         cache.invalidate(PORTAL, 5);
         cache.invalidate(PORTAL, 12);
         cache.invalidate(PORTAL, 18);
@@ -378,11 +397,11 @@ mod tests {
         );
 
         // A historical fallback cannot repopulate the forward cache.
-        cache.set(PORTAL, slot, 14, B256::with_last_byte(0xee));
+        assert!(!cache.set(PORTAL, slot, 14, B256::with_last_byte(0xee)));
         assert!(!cache.slots[&(PORTAL, slot)].contains_key(&14));
 
         // Touching one slot/address compacts only that history and preserves its baseline.
-        cache.set(PORTAL, slot, 15, B256::with_last_byte(0x0f));
+        assert!(cache.set(PORTAL, slot, 15, B256::with_last_byte(0x0f)));
         cache.invalidate(PORTAL, 21);
         assert_eq!(cache.get(PORTAL, slot, 5), None);
         assert_eq!(
@@ -410,7 +429,7 @@ mod tests {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
 
-        cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05));
+        assert!(cache.set(PORTAL, slot, 5, B256::with_last_byte(0x05)));
         cache.invalidate(PORTAL, 10);
         cache.invalidate(PORTAL, 20);
         cache.advance_floor(30);

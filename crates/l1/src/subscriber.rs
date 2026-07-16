@@ -775,48 +775,36 @@ pub(crate) fn apply_sequencer_events_to_cache(
     block_number: u64,
     sequencer_events: &[L1SequencerEvent],
 ) {
+    let mut set_cache_slot = |slot, value| {
+        if !cache.set(portal_address, slot, block_number, value) {
+            let floor = cache.block_floor();
+            debug!(
+                %portal_address,
+                %slot,
+                block_number,
+                floor,
+                "discarding sequencer cache update below canonical floor"
+            );
+        }
+    };
+
     for event in sequencer_events {
+        // Reorg/backfill may replay events below the monotonic floor; those writes stay rejected.
         match *event {
             L1SequencerEvent::TransferStarted {
                 current_sequencer,
                 pending_sequencer,
             } => {
-                cache.set(
-                    portal_address,
-                    PORTAL_SEQUENCER_SLOT,
-                    block_number,
-                    address_to_storage_value(current_sequencer),
-                );
-                cache.set(
-                    portal_address,
-                    PORTAL_PENDING_SEQUENCER_SLOT,
-                    block_number,
-                    address_to_storage_value(pending_sequencer),
-                );
+                set_cache_slot(PORTAL_SEQUENCER_SLOT, current_sequencer.into_word());
+                set_cache_slot(PORTAL_PENDING_SEQUENCER_SLOT, pending_sequencer.into_word());
             }
             L1SequencerEvent::Transferred {
                 previous_sequencer: _,
                 new_sequencer,
             } => {
-                cache.set(
-                    portal_address,
-                    PORTAL_SEQUENCER_SLOT,
-                    block_number,
-                    address_to_storage_value(new_sequencer),
-                );
-                cache.set(
-                    portal_address,
-                    PORTAL_PENDING_SEQUENCER_SLOT,
-                    block_number,
-                    B256::ZERO,
-                );
+                set_cache_slot(PORTAL_SEQUENCER_SLOT, new_sequencer.into_word());
+                set_cache_slot(PORTAL_PENDING_SEQUENCER_SLOT, B256::ZERO);
             }
         }
     }
-}
-
-pub(crate) fn address_to_storage_value(address: Address) -> B256 {
-    let mut bytes = [0u8; 32];
-    bytes[12..].copy_from_slice(address.as_slice());
-    B256::new(bytes)
 }

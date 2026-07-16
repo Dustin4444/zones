@@ -56,6 +56,10 @@ async fn test_tip20_transfer_on_zone() -> eyre::Result<()> {
         .wallet(alice_signer)
         .connect_http(zone.http_url().clone());
 
+    // T6+ transfers also consult the recipient's address-level receive policy on L1.
+    // Seed the anchor before pool validation; the next execution block inherits this baseline.
+    fixture.seed_no_receive_policy(bob)?;
+
     let tip20 = ITIP20::new(PATH_USD_ADDRESS, &alice_provider);
     let pending = tip20
         .transfer(bob, U256::from(transfer_amount))
@@ -63,9 +67,6 @@ async fn test_tip20_transfer_on_zone() -> eyre::Result<()> {
         .gas(TIP20_TX_GAS)
         .send()
         .await?;
-
-    // T6+ transfers also consult the recipient's address-level receive policy on L1.
-    fixture.seed_no_receive_policy(bob);
 
     // Inject an empty L1 block to trigger block production including the pool tx.
     fixture.inject_empty_block(zone.deposit_queue());
@@ -102,14 +103,10 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    // Inject a few empty L1 blocks so the zone is running
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
-    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
-
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Populate raw L1 state: policy 5 = WHITELIST, Alice is in the set, Bob is not.
+    // Populate raw L1 state before block 1 advances the cache floor.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         1,
@@ -118,6 +115,9 @@ async fn test_policy_proxy_whitelist_authorization() -> eyre::Result<()> {
             PolicySeed::simple(5, PolicyType::WHITELIST, &[(bob, false)]),
         ],
     )?;
+
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -154,13 +154,10 @@ async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
-    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
-
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // Populate raw L1 state: policy 5 = BLACKLIST, Alice is blacklisted, Bob is not.
+    // Populate raw L1 state before block 1 advances the cache floor.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         1,
@@ -169,6 +166,9 @@ async fn test_policy_proxy_blacklist_authorization() -> eyre::Result<()> {
             PolicySeed::simple(5, PolicyType::BLACKLIST, &[(bob, false)]),
         ],
     )?;
+
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -193,12 +193,10 @@ async fn test_policy_proxy_compound_policy() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
-    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
-
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
+    // Seed the compound policy graph before block 1 advances the cache floor.
     // Policy 5 = sender whitelist, policy 6 = recipient blacklist; compound policy 10
     // references them.
     seed_raw_tip403_policy(
@@ -210,6 +208,9 @@ async fn test_policy_proxy_compound_policy() -> eyre::Result<()> {
             PolicySeed::compound(10, 5, 6, 1),
         ],
     )?;
+
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -305,24 +306,31 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
-    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
-
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let bob = address!("0x0000000000000000000000000000000000000B0B");
     let carol = address!("0x000000000000000000000000000000000000CA01");
 
-    // Policy 5 = sender whitelist, policy 6 = recipient blacklist; compound policy 10
-    // references them.
+    // Seed the complete policy membership before block 1 advances the cache floor.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         1,
         &[
-            PolicySeed::simple(5, PolicyType::WHITELIST, &[(alice, true), (bob, false)]),
-            PolicySeed::simple(6, PolicyType::BLACKLIST, &[(alice, false), (bob, true)]),
+            PolicySeed::simple(
+                5,
+                PolicyType::WHITELIST,
+                &[(alice, true), (bob, false), (carol, true)],
+            ),
+            PolicySeed::simple(
+                6,
+                PolicyType::BLACKLIST,
+                &[(alice, false), (bob, true), (carol, true)],
+            ),
             PolicySeed::compound(10, 5, 6, 1),
         ],
     )?;
+
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
 
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
@@ -340,17 +348,7 @@ async fn test_compound_policy_transfer_role_authorization() -> eyre::Result<()> 
         "bob should NOT be authorized (not in sender whitelist)"
     );
 
-    // Carol: whitelisted as sender AND in recipient blacklist.
-    seed_raw_tip403_policy(
-        zone.l1_state_cache(),
-        1,
-        &[
-            PolicySeed::simple(5, PolicyType::WHITELIST, &[(carol, true)]),
-            PolicySeed::simple(6, PolicyType::BLACKLIST, &[(carol, true)]),
-        ],
-    )?;
-
-    // Carol passes sender check but fails recipient → false
+    // Carol is whitelisted as sender but blacklisted as recipient, so transfer auth fails.
     let carol_auth = registry.isAuthorized(10, carol).call().await?;
     assert!(
         !carol_auth,
@@ -367,13 +365,10 @@ async fn test_policy_proxy_uses_block_versioned_raw_state() -> eyre::Result<()> 
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
-    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
-
     let alice = address!("0x000000000000000000000000000000000000A11C");
     let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, zone.provider());
 
-    // Step 1: Create policy 5 as WHITELIST and add Alice at block 1.
+    // Step 1: materialize block-1 state before accepting block 1, then query at anchor 1.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         1,
@@ -383,12 +378,13 @@ async fn test_policy_proxy_uses_block_versioned_raw_state() -> eyre::Result<()> 
             &[(alice, true)],
         )],
     )?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    zone.wait_for_tempo_block_number(1, DEFAULT_TIMEOUT).await?;
 
-    // Alice should be authorized (whitelisted)
     let authorized = registry.isAuthorized(5, alice).call().await?;
-    assert!(authorized, "alice should be authorized (whitelisted)");
+    assert!(authorized, "alice should be authorized at block 1");
 
-    // Step 2: Remove Alice at block 2.
+    // Step 2: materialize block-2 state before accepting block 2, then query at anchor 2.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         2,
@@ -398,19 +394,22 @@ async fn test_policy_proxy_uses_block_versioned_raw_state() -> eyre::Result<()> 
             &[(alice, false)],
         )],
     )?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    zone.wait_for_tempo_block_number(2, DEFAULT_TIMEOUT).await?;
 
-    // Alice should no longer be authorized
     let authorized = registry.isAuthorized(5, alice).call().await?;
-    assert!(!authorized, "alice should NOT be authorized after removal");
+    assert!(!authorized, "alice should NOT be authorized at block 2");
 
-    // Step 3: Create compound policy 10 at block 3.
+    // Step 3: materialize the compound policy before accepting block 3.
     seed_raw_tip403_policy(
         zone.l1_state_cache(),
         3,
         &[PolicySeed::compound(10, 5, 1, 1)],
     )?;
+    fixture.inject_empty_block(zone.deposit_queue());
+    zone.wait_for_tempo_block_number(3, DEFAULT_TIMEOUT).await?;
 
-    // Compound data should be queryable
+    // Compound data should be queryable at anchor 3.
     let compound = registry.compoundPolicyData(10).call().await?;
     assert_eq!(compound.senderPolicyId, 5);
     assert_eq!(compound.recipientPolicyId, 1);

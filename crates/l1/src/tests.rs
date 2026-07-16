@@ -420,12 +420,12 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_and_raw_l1_state() {
     subscriber.update_l1_state_anchor(&old_header, &HashSet::new());
     {
         let mut cache = subscriber.config.l1_state_cache.write();
-        cache.set(
+        assert!(cache.set(
             token,
             B256::with_last_byte(1),
             10,
             B256::with_last_byte(0xaa),
-        );
+        ));
     }
     {
         let mut cache = subscriber.config.policy_cache.write();
@@ -717,11 +717,11 @@ fn test_apply_sequencer_events_to_cache_sets_pending_sequencer() {
 
     assert_eq!(
         cache.get(portal_address, PORTAL_SEQUENCER_SLOT, 42),
-        Some(address_to_storage_value(current_sequencer))
+        Some(current_sequencer.into_word())
     );
     assert_eq!(
         cache.get(portal_address, PORTAL_PENDING_SEQUENCER_SLOT, 42),
-        Some(address_to_storage_value(pending_sequencer))
+        Some(pending_sequencer.into_word())
     );
 }
 
@@ -744,7 +744,7 @@ fn test_apply_sequencer_events_to_cache_accept_clears_pending_sequencer() {
 
     assert_eq!(
         cache.get(portal_address, PORTAL_SEQUENCER_SLOT, 43),
-        Some(address_to_storage_value(new_sequencer))
+        Some(new_sequencer.into_word())
     );
     assert_eq!(
         cache.get(portal_address, PORTAL_PENDING_SEQUENCER_SLOT, 43),
@@ -782,11 +782,11 @@ fn test_apply_sequencer_events_to_cache_preserves_in_block_event_order() {
 
     assert_eq!(
         cache.get(portal_address, PORTAL_SEQUENCER_SLOT, 44),
-        Some(address_to_storage_value(sequencer_b))
+        Some(sequencer_b.into_word())
     );
     assert_eq!(
         cache.get(portal_address, PORTAL_PENDING_SEQUENCER_SLOT, 44),
-        Some(address_to_storage_value(sequencer_c))
+        Some(sequencer_c.into_word())
     );
 }
 

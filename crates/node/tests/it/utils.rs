@@ -324,19 +324,20 @@ fn pack_transfer_policy_id(policy_id: u64) -> U256 {
 }
 
 /// Seed a TIP-20 transfer policy ID in the canonical packed L1 storage slot.
+#[must_use = "check whether the policy seed was admitted above the cache floor"]
 pub(crate) fn seed_raw_tip20_policy_id(
     cache: &mut zone_l1::state::L1StateCacheInner,
     block_number: u64,
     token: Address,
     policy_id: u64,
-) {
+) -> bool {
     let packed = pack_transfer_policy_id(policy_id);
     cache.set(
         token,
         B256::from(tip20_slots::TRANSFER_POLICY_ID.to_be_bytes()),
         block_number,
         B256::from(packed.to_be_bytes()),
-    );
+    )
 }
 
 /// A TIP-403 policy write for [`seed_raw_tip403_policy`].
@@ -427,13 +428,17 @@ pub(crate) fn seed_raw_tip403_policy(
     })?;
 
     let mut cache = cache.write();
+    let block_floor = cache.block_floor();
     for slot in slots {
         let value = storage.sload(TIP403_REGISTRY_ADDRESS, slot)?;
-        cache.set(
-            TIP403_REGISTRY_ADDRESS,
-            slot.into(),
-            block_number,
-            value.into(),
+        eyre::ensure!(
+            cache.set(
+                TIP403_REGISTRY_ADDRESS,
+                slot.into(),
+                block_number,
+                value.into(),
+            ),
+            "TIP-403 seed rejected below cache floor: block={block_number} floor={block_floor} slot={slot}"
         );
     }
     Ok(())
@@ -875,7 +880,9 @@ impl ZoneTestNode {
         )
         .with_withdrawal_batch_interval_blocks(withdrawal_batch_interval_blocks);
         if is_local_dummy_l1 {
-            zone_node = zone_node.with_l1_chain_id(1337);
+            zone_node = zone_node
+                .with_l1_chain_id(1337)
+                .with_l1_state_provider_retry_limits(0, 1);
         }
         if let Some(initial_tokens) = initial_tokens {
             zone_node = zone_node.with_initial_tokens(initial_tokens);
@@ -903,7 +910,10 @@ impl ZoneTestNode {
         if is_local_dummy_l1 {
             seed_local_policy_cache(&policy_cache);
             let mut cache = l1_state_cache.write();
-            seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
+            assert!(
+                seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID),
+                "pathUSD policy seed must be admitted before node startup"
+            );
         }
 
         let node_handle = NodeBuilder::new(node_config)
@@ -3314,39 +3324,42 @@ impl L1Fixture {
 
         // Local fixtures have no RPC fallback. A withdrawal transfers to the outbox, so seed the
         // absence of its address-level receive policy as baseline raw L1 state.
-        cache.set(
+        assert!(cache.set(
             TIP403_REGISTRY_ADDRESS,
             B256::from(outbox_receive_policy_slot.to_be_bytes()),
             0,
             B256::ZERO,
-        );
+        ));
 
         for block in 0..=num_blocks {
             let mut sequencer_bytes = [0u8; 32];
             sequencer_bytes[12..].copy_from_slice(sequencer.as_slice());
-            cache.set(
+            assert!(cache.set(
                 portal_address,
                 B256::ZERO,
                 block,
                 B256::new(sequencer_bytes),
-            );
+            ));
             // Deposit queue hash slot (5) — read by ZoneInbox after finalizeTempo.
             // The initial value is B256::ZERO (empty queue).
-            cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO);
-            cache.set(portal_address, refunds_slot, block, B256::ZERO);
+            assert!(cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO));
+            assert!(cache.set(portal_address, refunds_slot, block, B256::ZERO));
             // Local fixtures treat pathUSD as the default enabled bridge token.
             // ZoneConfig reads the L1 ZonePortal TokenConfig mapping directly, so
             // seed the packed { enabled, depositsActive } value to avoid a dummy
             // RPC fallback on self-contained tests.
-            cache.set(
+            assert!(cache.set(
                 portal_address,
                 path_usd_config_slot,
                 block,
                 enabled_token_config,
-            );
+            ));
         }
 
-        seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
+        assert!(
+            seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID),
+            "pathUSD policy baseline must be admitted before the cache floor advances"
+        );
         cache.update_anchor(NumHash {
             number: num_blocks,
             hash: B256::ZERO,
@@ -3355,27 +3368,35 @@ impl L1Fixture {
         self.caches.lock().unwrap().push(cache_handle.clone());
     }
 
-    /// Seed the absence of an address-level TIP-403 receive policy for the next fixture block.
-    pub(crate) fn seed_no_receive_policy(&self, recipient: Address) {
-        self.seed_no_receive_policy_at(self.next_block_number, recipient);
+    /// Seed the absence of an address-level TIP-403 receive policy at the current Zone anchor.
+    pub(crate) fn seed_no_receive_policy(&self, recipient: Address) -> eyre::Result<()> {
+        let current_anchor = self.next_block_number.saturating_sub(1);
+        self.seed_no_receive_policy_at(current_anchor, recipient)
     }
 
-    fn seed_no_receive_policy_at(&self, block_number: u64, recipient: Address) {
+    fn seed_no_receive_policy_at(&self, block_number: u64, recipient: Address) -> eyre::Result<()> {
         // TODO(rusowsky): make `ReceivePolicy` public upstream to use the handlers
         let receive_policy_slot = recipient.mapping_slot(tip403_registry_slots::RECEIVE_POLICIES);
         for cache in self.caches.lock().unwrap().iter() {
-            cache.write().set(
-                TIP403_REGISTRY_ADDRESS,
-                B256::from(receive_policy_slot.to_be_bytes()),
-                block_number,
-                B256::ZERO,
+            let mut cache = cache.write();
+            let block_floor = cache.block_floor();
+            eyre::ensure!(
+                cache.set(
+                    TIP403_REGISTRY_ADDRESS,
+                    B256::from(receive_policy_slot.to_be_bytes()),
+                    block_number,
+                    B256::ZERO,
+                ),
+                "receive-policy seed rejected below cache floor: recipient={recipient} block={block_number} floor={block_floor} slot={receive_policy_slot}"
             );
         }
+        Ok(())
     }
 
     fn seed_regular_deposit_policy_state(&self, block_number: u64, deposits: &[Deposit]) {
         for deposit in deposits {
-            self.seed_no_receive_policy_at(block_number, deposit.to);
+            self.seed_no_receive_policy_at(block_number, deposit.to)
+                .expect("deposit receive-policy fixture seed must be admitted");
         }
     }
 
@@ -3383,11 +3404,14 @@ impl L1Fixture {
         for cache in self.caches.lock().unwrap().iter() {
             let mut cache = cache.write();
             for token in tokens {
-                seed_raw_tip20_policy_id(
-                    &mut cache,
-                    block_number,
-                    token.token,
-                    ALLOW_ALL_POLICY_ID,
+                assert!(
+                    seed_raw_tip20_policy_id(
+                        &mut cache,
+                        block_number,
+                        token.token,
+                        ALLOW_ALL_POLICY_ID,
+                    ),
+                    "enabled-token policy fixture seed must be admitted"
                 );
             }
         }
@@ -3453,7 +3477,8 @@ impl L1Fixture {
         self.seed_enabled_token_policy_state(block_number, &events.enabled_tokens);
         for deposit in &events.deposits {
             if let L1Deposit::Regular(deposit) = deposit {
-                self.seed_no_receive_policy_at(block_number, deposit.to);
+                self.seed_no_receive_policy_at(block_number, deposit.to)
+                    .expect("event receive-policy fixture seed must be admitted");
             }
         }
         queue.enqueue(block.header.clone(), events, vec![]);
