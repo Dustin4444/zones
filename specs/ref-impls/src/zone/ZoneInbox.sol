@@ -393,7 +393,9 @@ contract ZoneInbox is IZoneInbox {
         address zoneFallbackRecipient =
             IZoneOutbox(ZONE_OUTBOX).consumeFallbackRecipient(fallbackNonce);
         if (!config.isAllowedAccount(zoneFallbackRecipient)) {
-            revert IZonePortal.AccountNotAllowed(zoneFallbackRecipient);
+            refunds[d.token][zoneFallbackRecipient] += d.amount;
+            emit WithdrawalBounceBackPending(zoneFallbackRecipient, d.token, d.amount);
+            return;
         }
         try IZoneToken(d.token).mint(zoneFallbackRecipient, d.amount) {
             emit WithdrawalBounceBackProcessed(zoneFallbackRecipient, d.token, d.amount);
