@@ -1293,7 +1293,7 @@ The state transition function produces:
 | `block_transition` | `prev_block_hash` to `next_block_hash` covering all blocks in the batch |
 | `deposit_queue_transition` | Deposit queue progress from the previous `(processed_hash, deposit_number)` pair to the next `(processed_hash, deposit_number)` pair |
 | `withdrawal_queue_hash` | Hash chain of withdrawals finalized in this batch (`0` if none) |
-| `last_batch_commitment` | `withdrawal_batch_index` read from `ZoneOutbox.lastBatch` |
+| `withdrawal_batch_index` | Withdrawal batch index read from `ZoneOutbox.lastBatch` |
 
 ### Block Execution (Stateless prover execution function)
 
@@ -1333,7 +1333,7 @@ The stateless execution function must reject the witness on any failed check, mi
     Require `TempoState.tempoBlockNumber == public_inputs.tempo_block_number`. If `anchor_block_number == tempo_block_number`, require `TempoState.tempoBlockHash == anchor_block_hash`. Otherwise, verify the parent-hash chain from `tempo_block_number` to `anchor_block_number` using `tempo_ancestry_headers`, ending at `anchor_block_hash`.
 
 12. **Return the batch outputs.**
-    Set `block_transition.prev_block_hash = public_inputs.prev_block_hash` and `block_transition.next_block_hash = prev_block_hash` after the final block. Set `deposit_queue_transition.prev_processed_hash` and `deposit_queue_transition.prev_deposit_number` to the values captured before executing the batch, and set `deposit_queue_transition.next_processed_hash` and `deposit_queue_transition.next_deposit_number` to the final inbox processed hash and processed deposit number. Set `withdrawal_queue_hash` and `last_batch_commitment.withdrawal_batch_index` from the final `ZoneOutbox.lastBatch` state.
+    Set `block_transition.prev_block_hash = public_inputs.prev_block_hash` and `block_transition.next_block_hash = prev_block_hash` after the final block. Set `deposit_queue_transition.prev_processed_hash` and `deposit_queue_transition.prev_deposit_number` to the values captured before executing the batch, and set `deposit_queue_transition.next_processed_hash` and `deposit_queue_transition.next_deposit_number` to the final inbox processed hash and processed deposit number. Set `withdrawal_queue_hash` and `withdrawal_batch_index` from the final `ZoneOutbox.lastBatch` state.
 
 ### Tempo State Proofs
 
@@ -1577,10 +1577,6 @@ struct BatchOutput {
     BlockTransition blockTransition;
     DepositQueueTransition depositQueueTransition;
     bytes32 withdrawalQueueHash;
-    LastBatchCommitment lastBatchCommitment;
-}
-
-struct LastBatchCommitment {
     uint64 withdrawalBatchIndex;
 }
 
