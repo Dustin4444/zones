@@ -2,9 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {
-    CallbackData,
     EncryptedDepositPayload,
-    Flow,
     IZoneOutbox,
     IZonePortal,
     LastBatch,
@@ -19,6 +17,7 @@ import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { GatewayCallbackData, GatewayFlow } from "../mocks/MockZoneGateway.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
 import { Test } from "forge-std/Test.sol";
@@ -122,7 +121,7 @@ contract ZoneOutboxTest is Test {
     }
 
     function _callbackData(
-        Flow flow,
+        GatewayFlow flow,
         address tempoRefundRecipient
     )
         internal
@@ -130,7 +129,7 @@ contract ZoneOutboxTest is Test {
         returns (bytes memory)
     {
         return abi.encode(
-            CallbackData({
+            GatewayCallbackData({
                 flow: flow,
                 outputToken: address(zoneToken),
                 keyIndex: 0,
@@ -148,17 +147,6 @@ contract ZoneOutboxTest is Test {
                 tempoRefundRecipient: tempoRefundRecipient
             })
         );
-    }
-
-    function _unsupportedFlowCallback(address tempoRefundRecipient)
-        internal
-        view
-        returns (bytes memory data)
-    {
-        data = _callbackData(Flow.Deposit, tempoRefundRecipient);
-        assembly {
-            mstore(add(data, 0x40), 2)
-        }
     }
 
     function _emptyEncryptedSenders(uint256 count)
@@ -583,43 +571,17 @@ contract ZoneOutboxTest is Test {
         outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 1, alice, "");
     }
 
-    function test_requestWithdrawal_callbackRejectsMalformedPayloadBeforeBurn() public {
+    function test_requestWithdrawal_callbackDataIsOpaque() public {
         uint256 balanceBefore = zoneToken.balanceOf(alice);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        vm.expectRevert();
         outbox.requestWithdrawal(
             address(zoneToken), callbackTarget, 500e6, bytes32(0), 100_000, alice, hex"01"
         );
         vm.stopPrank();
 
-        assertEq(zoneToken.balanceOf(alice), balanceBefore);
-        assertEq(outbox.pendingWithdrawalsCount(), 0);
-    }
-
-    function test_requestWithdrawal_callbackRejectsUnsupportedFlowBeforeBurn() public {
-        bytes memory data = _unsupportedFlowCallback(alice);
-        uint256 balanceBefore = zoneToken.balanceOf(alice);
-        vm.startPrank(alice);
-        zoneToken.approve(address(outbox), 500e6);
-        vm.expectRevert();
-        outbox.requestWithdrawal(
-            address(zoneToken), callbackTarget, 500e6, bytes32(0), 100_000, alice, data
-        );
-        vm.stopPrank();
-
-        assertEq(zoneToken.balanceOf(alice), balanceBefore);
-        assertEq(outbox.pendingWithdrawalsCount(), 0);
-    }
-
-    function test_requestWithdrawal_callbackRejectsUnallowedPayloadBounceback() public {
-        address outsider = address(0x600);
-        bytes memory data = _callbackData(Flow.Deposit, outsider);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(IZonePortal.AccountNotAllowed.selector, outsider));
-        outbox.requestWithdrawal(
-            address(zoneToken), callbackTarget, 500e6, bytes32(0), 100_000, alice, data
-        );
+        assertEq(zoneToken.balanceOf(alice), balanceBefore - 500e6);
+        assertEq(outbox.pendingWithdrawalsCount(), 1);
     }
 
     function test_requestWithdrawal_rejectsUnallowedPlainRecipient() public {
@@ -642,7 +604,7 @@ contract ZoneOutboxTest is Test {
     }
 
     function test_finalizeWithdrawalBatch_withdrawalWithCallback_correctHash() public {
-        bytes memory callbackData = _callbackData(Flow.Deposit, alice);
+        bytes memory callbackData = _callbackData(GatewayFlow.Deposit, alice);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
         outbox.requestWithdrawal(
@@ -756,7 +718,7 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), amount + expectedFee);
-        bytes memory callbackData = _callbackData(Flow.Deposit, alice);
+        bytes memory callbackData = _callbackData(GatewayFlow.Deposit, alice);
         outbox.requestWithdrawal(
             address(zoneToken), callbackTarget, amount, bytes32(0), gasLimit, alice, callbackData
         );
@@ -873,7 +835,7 @@ contract ZoneOutboxTest is Test {
     }
 
     function test_requestWithdrawal_callbackWithValidFallback_ok() public {
-        bytes memory callbackData = _callbackData(Flow.Redeem, alice);
+        bytes memory callbackData = _callbackData(GatewayFlow.Redeem, alice);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
 
@@ -1113,7 +1075,7 @@ contract ZoneOutboxTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_requestWithdrawal_capturesAllFields() public {
-        bytes memory callbackData = _callbackData(Flow.Deposit, charlie);
+        bytes memory callbackData = _callbackData(GatewayFlow.Deposit, charlie);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
         outbox.requestWithdrawal(
@@ -1164,7 +1126,7 @@ contract ZoneOutboxTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_requestWithdrawal_emitsEvent() public {
-        bytes memory callbackData = _callbackData(Flow.Deposit, charlie);
+        bytes memory callbackData = _callbackData(GatewayFlow.Deposit, charlie);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
 

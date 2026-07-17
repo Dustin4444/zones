@@ -684,30 +684,11 @@ For withdrawals with `gasLimit > 0`, `to` must be present in the portal's `zoneG
 
 Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking `msg.sender == ZONE_MESSENGER_ADDRESS` and can use the `sourcePortal` callback argument to identify the originating portal.
 
+Callback data is opaque to the zone protocol. The configured ZoneGateway is trusted to allow only deposit and redeem flows and to synchronously deposit the result back into the source zone.
+
 An over-limit callback withdrawal also bounces back and advances the queue.
 
-The canonical callback payload is:
-
-```solidity
-enum Flow {
-    Deposit,
-    Redeem
-}
-
-struct CallbackData {
-    Flow flow;
-    address outputToken;
-    uint256 keyIndex;
-    EncryptedDepositPayload encrypted;
-    uint128 minVaultAssets;
-    uint128 minVaultShares;
-    uint128 minOutputAmount;
-    bytes32 actionId;
-    address tempoRefundRecipient;
-}
-```
-
-The zone protocol constrains callback gateway flows to synchronous vault deposit with encrypted receipt-token return and synchronous vault redeem with encrypted asset return. It defines no callback-based public settlement, asynchronous redeem request, queued-return recovery, or owner-directed managed-token rescue. The reference implementation contains only the callback ABI and a test mock; production gateway/vault token-conversion behavior is outside this repository. Assets may leave the closed loop only through a plain portal withdrawal to an allowed account, never through a callback.
+The configured gateway is expected to constrain callbacks to synchronous vault deposit with encrypted receipt-token return and synchronous vault redeem with encrypted asset return. The reference implementation contains only a test mock; production gateway/vault token-conversion behavior is outside this repository. Assets may leave the closed loop only through a plain portal withdrawal to an allowed account, never through a callback.
 
 ### Withdrawal Failures and Bounce-Back
 
@@ -1579,23 +1560,6 @@ struct EncryptedDepositPayload {
     bytes16 tag;
 }
 
-enum Flow {
-    Deposit,
-    Redeem
-}
-
-struct CallbackData {
-    Flow flow;
-    address outputToken;
-    uint256 keyIndex;
-    EncryptedDepositPayload encrypted;
-    uint128 minVaultAssets;
-    uint128 minVaultShares;
-    uint128 minOutputAmount;
-    bytes32 actionId;
-    address tempoRefundRecipient;
-}
-
 enum DepositType {
     Regular,
     Encrypted
@@ -1905,7 +1869,7 @@ interface IZoneMessenger {
 }
 ```
 
-The outbox and gateway decode `CallbackData`; `Flow` permits only `Deposit` and `Redeem`.
+The callback payload is opaque to the outbox and messenger and is interpreted by the configured ZoneGateway.
 
 ### IWithdrawalReceiver
 
