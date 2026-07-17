@@ -177,7 +177,7 @@ Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal
 
 **Admin.**
 
-- Holds governance powers over the zone (token enablement, deposit pause/resume, account and gateway membership, and messenger implementation selection).
+- Holds governance powers over the zone (token enablement, deposit pause/resume, and account and gateway membership).
 - Expected to be a cold key, multisig, or governance contract.
 - Set at zone creation via [`IZoneFactory.createZone`](#izonefactory).
 - Rotatable via a two-step transfer (see [Admin Transfer](#admin-transfer)), so a lost or compromised admin key can be moved to a new cold key or multisig.
@@ -203,7 +203,6 @@ The following table lists every privileged action and the role authorized to inv
 | `enableToken(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
-| `setMessenger(newMessenger)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setZoneGateway(gateway, enabled)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setAllowedAccount(account, enabled)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `transferAdmin(newAdmin)` | [`ZonePortal`](#izoneportal) | **admin** |
@@ -279,7 +278,7 @@ A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the
 |----------|---------|
 | [`ZonePortal`](#izoneportal) | Locks deposited tokens, accepts batch submissions, verifies proofs, and processes withdrawals. Manages the token registry and deposit/withdrawal queues. |
 
-The factory's shared `ZoneMessenger` is the initial callback relay for every new portal. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. The portal admin may select a newly deployed messenger implementation with `setMessenger`; callback operation policy belongs to messenger code, not to per-zone operation configuration. Gateway implementations are managed independently with `setZoneGateway(gateway, enabled)`, which permits a legacy and replacement gateway to coexist. Closed-loop membership is managed with `setAllowedAccount(account, enabled)`. An allowed account cannot also be an active ZoneGateway or messenger.
+The factory's shared `ZoneMessenger` is fixed when each portal is initialized. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. Gateway implementations are managed independently with `setZoneGateway(gateway, enabled)`, which permits a legacy and replacement gateway to coexist. Closed-loop membership is managed with `setAllowedAccount(account, enabled)`. An allowed account cannot also be an active ZoneGateway or the messenger.
 
 Account and gateway membership is evaluated when each portal or zone-side action executes. Revoked in-flight destinations and gateways bounce back, while revoked refund recipients have funds parked until membership is restored.
 
@@ -679,7 +678,7 @@ For a plain withdrawal (`gasLimit == 0`), the portal requires `to` to be an allo
 
 ### Withdrawal Callbacks
 
-For withdrawals with `gasLimit > 0`, `to` must be present in the portal's `zoneGateway[address]` mapping. The portal snapshots `currentDepositQueueHash`, transfers exactly `amount` to its configured `ZoneMessenger`, and asks the messenger to relay the callback. The messenger authenticates the source portal through `ZoneFactory`, independently confirms `to` against that portal's gateway mapping, decodes `callbackData` as `CallbackData`, transfers the funds to the gateway, invokes `onWithdrawalReceived`, and requires the expected selector.
+For withdrawals with `gasLimit > 0`, `to` must be present in the portal's `zoneGateway[address]` mapping. The withdrawal queue hash is verified and dequeued by `ZonePortal.processWithdrawal` before the callback reaches the messenger. The portal snapshots `currentDepositQueueHash`, transfers exactly `amount` to its fixed `ZoneMessenger`, and asks the messenger to relay the callback. The messenger authenticates the source portal through `ZoneFactory`, independently confirms `to` against that portal's gateway mapping, transfers the funds to the gateway, invokes `onWithdrawalReceived`, and requires the expected selector.
 
 `ZoneOutbox`, `ZoneMessenger`, and the ZoneGateway each decode the payload. `Flow` permits only `Deposit` and `Redeem`.
 
@@ -1762,7 +1761,6 @@ interface IZonePortal {
     event TokenEnabled(address indexed token, string name, string symbol, string currency);
     event DepositsPaused(address indexed token);
     event DepositsResumed(address indexed token);
-    event MessengerUpdated(address indexed previousMessenger, address indexed newMessenger);
     event ZoneGatewayUpdated(address indexed gateway, bool enabled);
     event AllowedAccountUpdated(address indexed account, bool enabled);
 
@@ -1809,7 +1807,6 @@ interface IZonePortal {
     function setAllowedAccount(address account, bool enabled) external; // admin-only
     function zoneGateway(address gateway) external view returns (bool);
     function setZoneGateway(address gateway, bool enabled) external; // admin-only
-    function setMessenger(address newMessenger) external; // admin-only
 
     // Zone RPC endpoint. Published on-chain so clients can discover how to reach the zone.
     event RpcUrlUpdated(string rpcUrl);
@@ -1908,7 +1905,7 @@ interface IZoneMessenger {
 }
 ```
 
-The outbox, messenger, and gateway each decode `CallbackData`; `Flow` permits only `Deposit` and `Redeem`.
+The outbox and gateway decode `CallbackData`; `Flow` permits only `Deposit` and `Redeem`.
 
 ### IWithdrawalReceiver
 

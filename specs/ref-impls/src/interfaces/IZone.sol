@@ -672,6 +672,7 @@ interface IZonePortal {
 
     function zoneId() external view returns (uint32);
 
+    /// @notice Fixed callback messenger assigned during portal initialization.
     function messenger() external view returns (address);
 
     function admin() external view returns (address);
