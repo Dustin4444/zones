@@ -843,7 +843,9 @@ contract ZonePortal is IZonePortal {
                 withdrawal.callbackData
             ) {
                 success = true;
-            } catch { }
+            } catch {
+                success = false;
+            }
         }
 
         if (!success) {
