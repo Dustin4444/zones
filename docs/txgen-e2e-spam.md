@@ -77,6 +77,13 @@ The `all` action is intentionally ordered:
    TIP-20 transfers.
 3. Restore allow-all and submit L2 withdrawal requests, then wait for the L1
    portal queue to drain.
+4. Run one measured allow-all TIP-20 transfer workload, verify every receipt,
+   and wait for its ending Zone block to settle on L1.
+
+The final workload uses `COUNT` and `TPS` unless
+`TXGEN_THROUGHPUT_COUNT` or `TXGEN_THROUGHPUT_TPS` overrides them. This lets CI
+keep the bridge and policy matrix small while measuring a larger transfer run
+from the same `all` invocation.
 
 The default policy matrix covers five behaviors:
 
@@ -124,11 +131,10 @@ last transfer block.
 
 ## CI Throughput Spam
 
-The `txgen e2e spam` job in `.github/workflows/test.yml` first runs the
-`deposits`, `policies`, and `withdrawals` actions independently with two
-transactions per workload. It then runs one single-rate throughput attempt
-rather than a sweep: 5,000 TIP-20 transfers over five seconds at a target of
-1,000 TPS using eight senders. The CI Zone raises
+The `txgen e2e spam` job in `.github/workflows/test.yml` invokes `all` once. It
+runs deposits, policies, and withdrawals with two transactions per workload,
+then one single-rate transfer attempt rather than a sweep: 5,000 TIP-20
+transfers at a target of 1,000 TPS using eight senders. The CI Zone raises
 `--txpool.max-account-slots` to 1,024 so the benchmark measures Zone execution
 instead of stopping at the default 16 pending transactions per sender.
 
@@ -153,6 +159,8 @@ The most useful environment variables are:
 | `L1_HTTP_URL` | `http://127.0.0.1:8545` | L1 endpoint used by txgen, bench, and checks |
 | `COUNT` | `20` | Transactions per bridge workload and per policy transfer outcome; policy assignments are also repeated this many times |
 | `TPS` | `10` | Bench submission rate; `0` means unlimited |
+| `TXGEN_THROUGHPUT_COUNT` | `COUNT` | Transfer count for the measured final workload in `all` |
+| `TXGEN_THROUGHPUT_TPS` | `TPS` | Submission target for the measured final workload in `all` |
 | `TXGEN_NONCE_LANES` | `100` | Number of reusable Tempo parallel nonce lanes |
 | `TXGEN_DEPOSIT_AMOUNT` | `1000000` | Gross amount per L1 deposit, including the portal fee |
 | `TXGEN_WITHDRAWAL_AMOUNT` | `1000` | Amount per L2 withdrawal request |

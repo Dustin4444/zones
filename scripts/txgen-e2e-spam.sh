@@ -12,6 +12,7 @@ Runs txgen workloads against an Anvil-backed `tempo-zone dev` deployment.
 The policies action covers allow-all, reject-all, whitelist, blacklist, and
 compound TIP-403 behavior with real L2 TIP-20 transfers.
 The throughput action runs one allow-all L2 transfer workload at the requested TPS.
+The all action runs every functional workload, then the measured transfer workload.
 
 Configuration is supplied through environment variables; see
 docs/txgen-e2e-spam.md for the complete list.
@@ -128,6 +129,8 @@ BENCH_BIN="${BENCH_BIN:-$TXGEN_DIR/target/release/bench}"
 
 COUNT="${COUNT:-20}"
 TPS="${TPS:-10}"
+TXGEN_THROUGHPUT_COUNT="${TXGEN_THROUGHPUT_COUNT:-$COUNT}"
+TXGEN_THROUGHPUT_TPS="${TXGEN_THROUGHPUT_TPS:-$TPS}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-100}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-120}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-180}"
@@ -149,6 +152,8 @@ TXGEN_REPORT_DIR="${TXGEN_REPORT_DIR:-$ZONE_DATADIR/txgen-reports}"
 for pair in \
   "COUNT:$COUNT" \
   "TPS:$TPS" \
+  "TXGEN_THROUGHPUT_COUNT:$TXGEN_THROUGHPUT_COUNT" \
+  "TXGEN_THROUGHPUT_TPS:$TXGEN_THROUGHPUT_TPS" \
   "MAX_CONCURRENT:$MAX_CONCURRENT" \
   "DRAIN_TIMEOUT:$DRAIN_TIMEOUT" \
   "SYNC_TIMEOUT:$SYNC_TIMEOUT" \
@@ -162,6 +167,7 @@ for pair in \
 done
 
 [ "$COUNT" -gt 0 ] || die "COUNT must be at least 1"
+[ "$TXGEN_THROUGHPUT_COUNT" -gt 0 ] || die "TXGEN_THROUGHPUT_COUNT must be at least 1"
 [ "$TXGEN_NONCE_LANES" -gt 1 ] || die "TXGEN_NONCE_LANES must be greater than 1"
 [ "$TXGEN_TRANSFER_AMOUNT" -gt 0 ] || die "TXGEN_TRANSFER_AMOUNT must be at least 1"
 [ "$TXGEN_TRANSFER_ACCOUNTS" -gt 0 ] || die "TXGEN_TRANSFER_ACCOUNTS must be at least 1"
@@ -945,6 +951,25 @@ run_throughput() {
   verify_l1_batch_settlement "$batch_before" "$started"
 }
 
+run_all() {
+  local functional_count="$COUNT"
+  local functional_tps="$TPS"
+
+  run_deposits
+  run_policies
+  run_withdrawals
+
+  COUNT="$TXGEN_THROUGHPUT_COUNT"
+  TPS="$TXGEN_THROUGHPUT_TPS"
+  export COUNT TPS
+  echo "Running measured TIP-20 transfers: count=$COUNT tps=$TPS"
+  run_throughput
+
+  COUNT="$functional_count"
+  TPS="$functional_tps"
+  export COUNT TPS
+}
+
 # Preserve the requested bridge token while policy workloads iterate all tokens.
 TXGEN_TOKEN_OVERRIDE="$TXGEN_TOKEN"
 
@@ -964,9 +989,5 @@ case "$ACTION" in
   withdrawals) run_withdrawals ;;
   policies) run_policies ;;
   throughput) run_throughput ;;
-  all)
-    run_deposits
-    run_policies
-    run_withdrawals
-    ;;
+  all) run_all ;;
 esac

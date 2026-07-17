@@ -141,7 +141,7 @@ write_summary() {
     printf '%s\n\n' '### Txgen E2E spam' >"$SUMMARY"
     if [ "$status" -eq 0 ]; then
       printf '✅ Passed — **%s/%s accepted at a %s TPS target**; verified TIP-20 execution: **%s TPS**; total Zone throughput: **%s TPS**.\n\n' \
-        "$accepted" "$sent" "${TPS:-unknown}" "$transfer_tps" "$zone_tps" >>"$SUMMARY"
+        "$accepted" "$sent" "${TXGEN_THROUGHPUT_TPS:-${TPS:-unknown}}" "$transfer_tps" "$zone_tps" >>"$SUMMARY"
       printf 'Receipts, the balance delta, and L1 batch settlement were verified.\n' >>"$SUMMARY"
     else
       printf '❌ Failed — the report recorded **%s/%s accepted** and **%s TPS**, but the run did not pass verification.\n\n' \
@@ -229,20 +229,7 @@ done
   cast block-number --rpc-url "$ZONE_RPC_URL" >/dev/null 2>&1 || \
   die "tempo-zone dev did not become ready"
 
-throughput_count="${COUNT:-5000}"
-throughput_tps="${TPS:-1000}"
-COUNT="${TXGEN_SMOKE_COUNT:-2}"
-TPS="${TXGEN_SMOKE_TPS:-10}"
-export COUNT TPS
-for action in deposits policies withdrawals; do
-  echo "Running standalone $action smoke action: count=$COUNT tps=$TPS"
-  scripts/txgen-e2e-spam.sh "$action"
-done
-
-COUNT="$throughput_count"
-TPS="$throughput_tps"
-export COUNT TPS
-scripts/txgen-e2e-spam.sh throughput
+scripts/txgen-e2e-spam.sh all
 
 shopt -s nullglob
 reports=("$REPORT_DIR"/l2-tip20-throughput-*.json)
