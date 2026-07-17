@@ -153,7 +153,11 @@ contract ZonePortal is IZonePortal {
     )
         external
     {
-        if (msg.sender != ZONE_FACTORY_ADDRESS) revert NotFactory();
+        // DRAFT — DO NOT MERGE: the TIP-1091 canonical factory check is disabled so a
+        // freshly deployed ZoneFactory can initialize portals on chains where the
+        // protocol-managed factory at ZONE_FACTORY_ADDRESS does not exist yet
+        // (e.g. Moderato). Restore before merging.
+        // if (msg.sender != ZONE_FACTORY_ADDRESS) revert NotFactory();
         if (_initialized) revert AlreadyInitialized();
 
         _initialized = true;
