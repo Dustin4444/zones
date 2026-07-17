@@ -264,7 +264,7 @@ A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the
 |----------|---------|
 | [`ZonePortal`](#izoneportal) | Locks deposited tokens, accepts batch submissions, verifies proofs, and processes withdrawals. Manages the token registry and deposit/withdrawal queues. |
 
-The factory's shared `ZoneMessenger` is fixed when each portal is initialized. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. Gateway implementations are managed independently with `setZoneGateway(gateway, enabled)`, which permits a legacy and replacement gateway to coexist. Closed-loop membership is managed with `setAllowedAccount(account, enabled)`. An allowed account cannot also be an active ZoneGateway or the messenger.
+The factory's shared `ZoneMessenger` is fixed when each portal is initialized. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. Gateway implementations are managed with `setZoneGateway(gateway, enabled)`. Closed-loop membership is managed with `setAllowedAccount(account, enabled)`. An allowed account cannot also be an active ZoneGateway or the messenger.
 
 Account and gateway membership is evaluated when each portal or zone-side action executes. Revoked in-flight destinations and gateways bounce back, while revoked refund recipients have funds parked until membership is restored.
 
