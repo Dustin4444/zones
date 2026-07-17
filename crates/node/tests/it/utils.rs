@@ -378,6 +378,7 @@ pub(crate) struct ZoneTestNode {
     deposit_queue: DepositQueue,
     l1_state_cache: L1StateCache,
     policy_cache: zone_l1::PolicyCache,
+    l1_block_observer: zone_l1::L1BlockObserver,
     rpc_api_factory: Arc<RpcApiFactory>,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
@@ -409,6 +410,14 @@ impl ZoneTestNode {
     /// Returns a handle to the policy cache for TIP-403 authorization.
     pub(crate) fn policy_cache(&self) -> &zone_l1::PolicyCache {
         &self.policy_cache
+    }
+
+    /// Returns the node's record of independently observed L1 anchors.
+    ///
+    /// Follower imports wait on it; fixtures without a real L1 record anchors
+    /// here in place of the L1 subscriber.
+    pub(crate) fn l1_block_observer(&self) -> &zone_l1::L1BlockObserver {
+        &self.l1_block_observer
     }
 
     /// Builds the real private RPC API backed by the node's EthHandlers.
@@ -847,6 +856,7 @@ impl ZoneTestNode {
         let deposit_queue = zone_node.deposit_queue();
         let l1_state_cache = zone_node.l1_state_cache();
         let policy_cache = zone_node.policy_cache();
+        let l1_block_observer = zone_node.l1_block_observer();
         if is_local_dummy_l1 {
             seed_local_policy_cache(&policy_cache);
         }
@@ -915,6 +925,7 @@ impl ZoneTestNode {
             http_url,
             l1_state_cache,
             policy_cache,
+            l1_block_observer,
             rpc_api_factory,
             node_handle: Box::new(node_handle),
             _tasks: tasks,
@@ -3655,9 +3666,11 @@ impl L1Fixture {
     }
 
     /// Inject an empty L1 block (no deposits) into the queue.
-    pub(crate) fn inject_empty_block(&mut self, queue: &DepositQueue) {
+    pub(crate) fn inject_empty_block(&mut self, queue: &DepositQueue) -> NumHash {
         let header = self.next_header();
+        let anchor = NumHash::new(header.inner.number, self.last_hash);
         queue.enqueue(header, L1PortalEvents::default(), vec![]);
+        anchor
     }
 
     /// Inject `n` empty L1 blocks (no deposits) into the queue.
@@ -3668,11 +3681,17 @@ impl L1Fixture {
     }
 
     /// Inject an L1 block with the given deposits into the queue.
-    pub(crate) fn inject_deposits(&mut self, queue: &DepositQueue, deposits: Vec<Deposit>) {
+    pub(crate) fn inject_deposits(
+        &mut self,
+        queue: &DepositQueue,
+        deposits: Vec<Deposit>,
+    ) -> NumHash {
         let header = self.next_header();
+        let anchor = NumHash::new(header.inner.number, self.last_hash);
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
         queue.enqueue(header, events, vec![]);
+        anchor
     }
 
     /// Inject an L1 block with mixed regular and encrypted deposits.

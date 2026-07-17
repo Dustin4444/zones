@@ -62,7 +62,7 @@ use tracing::{debug, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1Subscriber, L1SubscriberConfig, PolicyCache, TempoStateExt,
+    DepositQueue, L1BlockObserver, L1Subscriber, L1SubscriberConfig, PolicyCache, TempoStateExt,
     state::{
         L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider,
         spawn_policy_resolution_task, spawn_pool_prefetch_task,
@@ -214,6 +214,7 @@ impl ZoneNode {
             genesis_tempo_block_number,
             policy_cache: policy_cache.clone(),
             l1_state_cache: l1_state_cache.clone(),
+            block_observer: L1BlockObserver::default(),
             l1_fetch_concurrency,
             retry_connection_interval,
         };
@@ -307,6 +308,11 @@ impl ZoneNode {
     /// Returns the current TIP-403 policy cache
     pub fn policy_cache(&self) -> PolicyCache {
         self.policy_cache.clone()
+    }
+
+    /// Returns the shared record of independently observed L1 anchors.
+    pub fn l1_block_observer(&self) -> L1BlockObserver {
+        self.l1_config.block_observer.clone()
     }
 
     /// Returns a [`ComponentsBuilder`] configured for a Zone node.
@@ -467,17 +473,7 @@ where
             .erased();
 
         self.resolve_and_seed_tokens(&l1_provider).await?;
-        let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
-        if p2p_role == Some(Role::Follower) {
-            // TODO(multi-sequencer): Split L1 observation/cache updates from deposit
-            // enqueueing. Followers import complete blocks from the leader and do not consume
-            // DepositQueue; starting the unified subscriber here would grow that queue forever.
-            // On promotion/restart the subscriber resumes from the tempoBlockNumber persisted in
-            // the follower's imported zone state.
-            info!(target: "reth::cli", "Skipping L1 deposit subscriber on follower");
-        } else {
-            self.spawn_l1_subscriber(&ctx);
-        }
+        self.spawn_l1_subscriber(&ctx);
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
         let task_executor = ctx.node.task_executor().clone();
@@ -490,6 +486,8 @@ where
                 &task_executor,
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
+                self.l1_config.block_observer.clone(),
+                self.policy_cache.clone(),
             )?;
         }
 
@@ -546,6 +544,8 @@ where
         task_executor: &reth_tasks::TaskExecutor,
         provider: N::Provider,
         engine: reth_node_builder::ConsensusEngineHandle<ZonePayloadTypes>,
+        l1_observer: L1BlockObserver,
+        policy_cache: PolicyCache,
     ) -> eyre::Result<()> {
         let role = config.role();
         let handle = spawn_p2p(config, network_id)?;
@@ -572,7 +572,14 @@ where
                 // for later ACK/backfill commands even though followers send nothing in this PR.
                 task_executor.spawn_critical_task(
                     "zone-p2p-block-import",
-                    import_leader_blocks(provider, engine, events, commands),
+                    import_leader_blocks(
+                        provider,
+                        engine,
+                        events,
+                        commands,
+                        l1_observer,
+                        policy_cache,
+                    ),
                 );
             }
         }
@@ -671,13 +678,22 @@ where
 
     /// Spawn the L1 subscriber. Listens for new blocks and deposit events.
     fn spawn_l1_subscriber(&mut self, ctx: &AddOnsContext<'_, N>) {
-        L1Subscriber::spawn(
-            self.l1_config.clone(),
-            ctx.node.provider().clone(),
-            self.deposit_queue.clone(),
-            ctx.node.task_executor().clone(),
-        );
-        info!(target: "reth::cli", "Unified L1 subscriber started");
+        if self.p2p_config.as_ref().map(P2pConfig::role) == Some(Role::Follower) {
+            L1Subscriber::spawn_observer(
+                self.l1_config.clone(),
+                ctx.node.provider().clone(),
+                ctx.node.task_executor().clone(),
+            );
+            info!(target: "reth::cli", "L1 observer started without deposit enqueueing");
+        } else {
+            L1Subscriber::spawn(
+                self.l1_config.clone(),
+                ctx.node.provider().clone(),
+                self.deposit_queue.clone(),
+                ctx.node.task_executor().clone(),
+            );
+            info!(target: "reth::cli", "Leader L1 observer and deposit sink started");
+        }
     }
 
     /// Spawn TIP-403 policy resolution and pool prefetch tasks.

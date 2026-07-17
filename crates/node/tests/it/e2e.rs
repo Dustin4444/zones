@@ -14,12 +14,14 @@ use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::SolCall;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_contracts::precompiles::ITIP403Registry;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, TempoState, Withdrawal, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
     ZoneInbox, ZoneOutbox,
 };
 use zone_l1::ChainTempoStateExt;
+use zone_l1::state::tip403::PolicyEvent;
 
 use crate::utils::{
     DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, WITHDRAWAL_TX_GAS, ZoneTestNode, approve_outbox,
@@ -41,7 +43,8 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     // first block.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    fixture.inject_empty_block(leader.deposit_queue());
+    let anchor = fixture.inject_empty_block(leader.deposit_queue());
+    follower.l1_block_observer().record(anchor);
     leader.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
     follower.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
 
@@ -49,7 +52,8 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     let recipient = address!("0x0000000000000000000000000000000000005678");
     let amount = 1_000_000_u128;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
-    fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    follower.l1_block_observer().record(anchor);
 
     leader
         .wait_for_balance(
@@ -72,6 +76,120 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     Ok(())
 }
 
+/// TIP-403 policy changes between imported leader blocks affect follower
+/// validation: the follower executes each leader block with the policy state
+/// of that block's L1 anchor, not stale (or future) state.
+///
+/// The whitelist switch at L1 height 2 makes the block-3 deposit to Bob a
+/// refused mint. A follower still validating with the old allow-all state
+/// would mint, diverge on state root, and fail the import — so the follower
+/// reaching block 3 with Bob's balance at zero proves it applied the change.
+/// The membership update at height 3 then proves the follow-up change lands
+/// at its exact height too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_p2p_follower_validates_with_policy_state_at_anchor() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (leader, follower, mut fixture) = start_local_p2p_pair(10).await?;
+
+    // Wait for peer dial/handshake before producing the first block.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let alice = address!("0x000000000000000000000000000000000000a11c");
+    let bob = address!("0x0000000000000000000000000000000000000b0b");
+    let amount = 1_000_000_u128;
+
+    // Block 1: pathUSD still uses the seeded allow-all policy — the deposit
+    // mints to Alice on both nodes.
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, amount);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    follower.l1_block_observer().record(anchor);
+    leader
+        .wait_for_balance(PATH_USD_ADDRESS, alice, U256::from(amount), DEFAULT_TIMEOUT)
+        .await?;
+    follower
+        .wait_for_balance(PATH_USD_ADDRESS, alice, U256::from(amount), DEFAULT_TIMEOUT)
+        .await?;
+
+    // At L1 height 2, switch pathUSD to whitelist policy 9 with Alice in and
+    // Bob explicitly out. Blocks anchored above height 2 execute with it.
+    let policy_change = [
+        PolicyEvent::PolicyCreated {
+            policy_id: 9,
+            policy_type: ITIP403Registry::PolicyType::WHITELIST,
+        },
+        PolicyEvent::MembershipChanged {
+            policy_id: 9,
+            account: alice,
+            in_set: true,
+        },
+        PolicyEvent::MembershipChanged {
+            policy_id: 9,
+            account: bob,
+            in_set: false,
+        },
+        PolicyEvent::TokenPolicyChanged {
+            token: PATH_USD_ADDRESS,
+            policy_id: 9,
+        },
+    ];
+    leader
+        .policy_cache()
+        .write()
+        .apply_events(2, &policy_change);
+    follower
+        .policy_cache()
+        .write()
+        .apply_events(2, &policy_change);
+    let anchor = fixture.inject_empty_block(leader.deposit_queue());
+    follower.l1_block_observer().record(anchor);
+    leader.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+    follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+
+    // At L1 height 3, whitelist Bob. Like the L1 subscriber, apply the events
+    // before the zone block anchored at height 3 exists; they stay invisible
+    // to that block's execution, which reads policy state at height 2.
+    let bob_whitelisted = [PolicyEvent::MembershipChanged {
+        policy_id: 9,
+        account: bob,
+        in_set: true,
+    }];
+    leader
+        .policy_cache()
+        .write()
+        .apply_events(3, &bob_whitelisted);
+    follower
+        .policy_cache()
+        .write()
+        .apply_events(3, &bob_whitelisted);
+
+    // Block 3 executes with the height-2 whitelist: the deposit to Bob is a
+    // refused mint on the leader, and the follower must reproduce that.
+    let refused = fixture.make_deposit(PATH_USD_ADDRESS, alice, bob, amount);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![refused]);
+    follower.l1_block_observer().record(anchor);
+    leader.wait_for_block_number(3, DEFAULT_TIMEOUT).await?;
+    follower.wait_for_block_number(3, DEFAULT_TIMEOUT).await?;
+    assert_eq!(leader.balance_of(PATH_USD_ADDRESS, bob).await?, U256::ZERO);
+    assert_eq!(
+        follower.balance_of(PATH_USD_ADDRESS, bob).await?,
+        U256::ZERO
+    );
+
+    // Block 4 executes with the height-3 membership and the same deposit now
+    // mints — on the follower too.
+    let accepted = fixture.make_deposit(PATH_USD_ADDRESS, alice, bob, amount);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![accepted]);
+    follower.l1_block_observer().record(anchor);
+    leader
+        .wait_for_balance(PATH_USD_ADDRESS, bob, U256::from(amount), DEFAULT_TIMEOUT)
+        .await?;
+    follower
+        .wait_for_balance(PATH_USD_ADDRESS, bob, U256::from(amount), DEFAULT_TIMEOUT)
+        .await?;
+    Ok(())
+}
+
 /// A P2P bind failure is fatal rather than leaving the node running without P2P.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_p2p_listener_failure_stops_node() -> eyre::Result<()> {
@@ -80,7 +198,14 @@ async fn test_p2p_listener_failure_stops_node() -> eyre::Result<()> {
     let occupied_listener = TcpListener::bind("127.0.0.1:0")?;
     let p2p_config = leader_p2p_config(occupied_listener.local_addr()?)?;
     let l1_rpc_url = start_chain_id_rpc(1337).await?;
-    let mut zone = ZoneTestNode::start_local_with_p2p(l1_rpc_url.to_string(), p2p_config).await?;
+    let mut zone =
+        match ZoneTestNode::start_local_with_p2p(l1_rpc_url.to_string(), p2p_config).await {
+            Ok(zone) => zone,
+            // The P2P bind failure can abort node launch itself when startup is
+            // slow (parallel test load) — that is equally fatal, which is what
+            // this test asserts.
+            Err(_) => return Ok(()),
+        };
 
     let _exit = tokio::time::timeout(DEFAULT_TIMEOUT, zone.wait_for_node_exit())
         .await

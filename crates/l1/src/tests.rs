@@ -149,11 +149,12 @@ fn test_subscriber(
             genesis_tempo_block_number,
             policy_cache: crate::PolicyCache::default(),
             l1_state_cache: crate::L1StateCache::new(HashSet::from([portal_address])),
+            block_observer: L1BlockObserver::default(),
             l1_fetch_concurrency: 1,
             retry_connection_interval: Duration::from_secs(1),
         },
         local_state,
-        deposit_queue: DepositQueue::default(),
+        deposit_queue: Some(DepositQueue::default()),
         tracked_tokens: vec![],
         tip403_metrics: Default::default(),
         subscriber_metrics: Default::default(),
@@ -445,6 +446,118 @@ fn update_l1_state_anchor_reorg_clears_stale_policy_state() {
 
     let cache = subscriber.config.policy_cache.read();
     assert!(cache.policies().get(&2).is_none());
+    assert_eq!(
+        cache.is_authorized(token, user, 11, AuthRole::Transfer),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn l1_block_observer_waits_for_exact_hash_and_invalidates_descendants() {
+    let observer = L1BlockObserver::default();
+    let hash_10 = B256::with_last_byte(0x10);
+    let hash_11 = B256::with_last_byte(0x11);
+    observer.record(NumHash::new(10, hash_10));
+    observer.record(NumHash::new(11, hash_11));
+
+    observer.wait_for(NumHash::new(11, hash_11)).await.unwrap();
+    assert!(
+        observer
+            .wait_for(NumHash::new(11, B256::with_last_byte(0xff)))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("observed different L1 hash")
+    );
+
+    let replacement_10 = B256::with_last_byte(0xa0);
+    observer.record(NumHash::new(10, replacement_10));
+    assert_eq!(observer.observed_hash(10), Some(replacement_10));
+    assert_eq!(observer.observed_hash(11), None);
+}
+
+#[tokio::test]
+async fn l1_block_observer_prune_drops_consumed_anchors() {
+    let observer = L1BlockObserver::default();
+    for number in 10..=14 {
+        observer.record(NumHash::new(number, B256::with_last_byte(number as u8)));
+    }
+
+    observer.prune_below(12);
+    assert_eq!(observer.observed_hash(11), None);
+    assert_eq!(observer.observed_hash(12), Some(B256::with_last_byte(12)));
+    assert_eq!(
+        observer.latest(),
+        Some(NumHash::new(14, B256::with_last_byte(14)))
+    );
+
+    // Waiting on a pruned height fails instead of hanging.
+    assert!(
+        observer
+            .wait_for(NumHash::new(11, B256::with_last_byte(11)))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("below the observer's retained range")
+    );
+}
+
+#[tokio::test]
+async fn observed_policy_change_is_visible_at_its_exact_l1_height() {
+    use crate::state::tip403::AuthRole;
+    use tempo_contracts::precompiles::ITIP403Registry::PolicyType;
+
+    let subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new([0])),
+        Some(0),
+    );
+    let token = address!("0x0000000000000000000000000000000000000011");
+    let user = address!("0x0000000000000000000000000000000000000022");
+    {
+        let mut cache = subscriber.config.policy_cache.write();
+        cache.set_policy_type(2, PolicyType::WHITELIST);
+        cache.set_token_policy(token, 10, 2);
+    }
+
+    subscriber.apply_policy_events(
+        10,
+        &[PolicyEvent::MembershipChanged {
+            policy_id: 2,
+            account: user,
+            in_set: true,
+        }],
+    );
+    let hash_10 = B256::with_last_byte(0x10);
+    subscriber
+        .config
+        .block_observer
+        .record(NumHash::new(10, hash_10));
+
+    subscriber.apply_policy_events(
+        11,
+        &[PolicyEvent::MembershipChanged {
+            policy_id: 2,
+            account: user,
+            in_set: false,
+        }],
+    );
+    let hash_11 = B256::with_last_byte(0x11);
+    subscriber
+        .config
+        .block_observer
+        .record(NumHash::new(11, hash_11));
+    subscriber
+        .config
+        .block_observer
+        .wait_for(NumHash::new(11, hash_11))
+        .await
+        .unwrap();
+
+    let cache = subscriber.config.policy_cache.read();
+    assert_eq!(
+        cache.is_authorized(token, user, 10, AuthRole::Transfer),
+        Some(true)
+    );
     assert_eq!(
         cache.is_authorized(token, user, 11, AuthRole::Transfer),
         Some(false)

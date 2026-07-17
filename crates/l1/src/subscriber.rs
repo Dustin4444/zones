@@ -1,5 +1,116 @@
 use super::*;
 
+use std::collections::BTreeMap;
+
+/// A handle to L1 blocks whose headers and receipts have been independently
+/// validated and whose L1-derived events have been applied to the local caches.
+///
+/// Followers use this handle to gate zone-block import on the exact L1 anchor
+/// embedded in `advanceTempo`. Recording happens only after cache updates, so a
+/// successful wait also establishes that execution-visible L1 data is ready.
+#[derive(Debug, Clone)]
+pub struct L1BlockObserver {
+    observed: Arc<parking_lot::RwLock<BTreeMap<u64, B256>>>,
+    changed: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for L1BlockObserver {
+    fn default() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self {
+            observed: Default::default(),
+            changed,
+        }
+    }
+}
+
+impl L1BlockObserver {
+    /// Return the independently observed hash at `number`, if available.
+    pub fn observed_hash(&self, number: u64) -> Option<B256> {
+        self.observed.read().get(&number).copied()
+    }
+
+    /// Return the highest independently observed L1 anchor.
+    pub fn latest(&self) -> Option<NumHash> {
+        self.observed
+            .read()
+            .last_key_value()
+            .map(|(&number, &hash)| NumHash::new(number, hash))
+    }
+
+    /// Wait until the exact L1 block has been validated and applied locally.
+    ///
+    /// Fails immediately if a different hash is observed at the requested
+    /// height (the requested block is not canonical in this observer) or if
+    /// the height has already been pruned below the retained range.
+    pub async fn wait_for(&self, block: NumHash) -> eyre::Result<()> {
+        let mut changed = self.changed.subscribe();
+        loop {
+            {
+                let observed = self.observed.read();
+                match observed.get(&block.number) {
+                    Some(&hash) if hash == block.hash => return Ok(()),
+                    Some(&hash) => {
+                        eyre::bail!(
+                            "observed different L1 hash at block {}: expected {}, got {}",
+                            block.number,
+                            block.hash,
+                            hash
+                        )
+                    }
+                    None => {
+                        if let Some((&earliest, _)) = observed.first_key_value()
+                            && earliest > block.number
+                        {
+                            eyre::bail!(
+                                "L1 block {} is below the observer's retained range \
+                                 (earliest {earliest})",
+                                block.number
+                            )
+                        }
+                    }
+                }
+            }
+            changed
+                .changed()
+                .await
+                .expect("observer sender is retained");
+        }
+    }
+
+    /// Record an independently validated and applied L1 anchor.
+    ///
+    /// Only the L1 subscriber should record anchors.
+    /// recording promises that all L1-derived cache updates through this block
+    /// are visible.
+    pub fn record(&self, block: NumHash) {
+        let mut observed = self.observed.write();
+        if observed.get(&block.number) == Some(&block.hash) {
+            return;
+        }
+
+        // Replacing an anchor invalidates all descendants recorded from the
+        // previous branch.
+        observed.split_off(&block.number);
+        observed.insert(block.number, block.hash);
+        drop(observed);
+        self.changed.send_replace(());
+    }
+
+    /// Drop anchors below `number`; imports have advanced past them so they
+    /// can no longer be waited on. Bounds the observer's memory.
+    pub fn prune_below(&self, number: u64) {
+        let mut observed = self.observed.write();
+        let retained = observed.split_off(&number);
+        *observed = retained;
+    }
+
+    fn clear(&self) {
+        self.observed.write().clear();
+        self.changed.send_replace(());
+    }
+}
+
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -21,6 +132,9 @@ pub struct L1SubscriberConfig {
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
     /// confirmed block and clears it on reorgs.
     pub l1_state_cache: crate::state::cache::L1StateCache,
+    /// Shared record of validated and applied L1 anchors. Followers gate
+    /// zone-block import on it; the subscriber records each processed block.
+    pub block_observer: L1BlockObserver,
     /// Maximum number of concurrent L1 RPC receipt fetches. Used directly for
     /// the live stream and halved for backfill (which sends 2 requests per block).
     pub l1_fetch_concurrency: usize,
@@ -51,7 +165,9 @@ where
 pub struct L1Subscriber {
     pub(crate) config: L1SubscriberConfig,
     pub(crate) local_state: Arc<dyn LocalTempoCheckpointReader>,
-    pub(crate) deposit_queue: DepositQueue,
+    /// Leader-only sink. Followers observe and apply L1 data without retaining
+    /// deposit payloads.
+    pub(crate) deposit_queue: Option<DepositQueue>,
     /// Mutable set of token addresses tracked for TIP-403 policy events.
     /// Initialized from config, grows dynamically when `TokenEnabled` events are seen.
     pub(crate) tracked_tokens: Vec<Address>,
@@ -75,6 +191,35 @@ impl L1Subscriber {
     ) where
         P: StateProviderFactory + Clone + Send + Sync + 'static,
     {
+        Self::spawn_inner(
+            config,
+            local_state_provider,
+            Some(deposit_queue),
+            task_executor,
+        );
+    }
+
+    /// Spawn the shared L1 observation path without the leader-only deposit
+    /// enqueueing sink. Followers gate zone-block import on the config's
+    /// [`L1BlockObserver`].
+    pub fn spawn_observer<P>(
+        config: L1SubscriberConfig,
+        local_state_provider: P,
+        task_executor: reth_tasks::Runtime,
+    ) where
+        P: StateProviderFactory + Clone + Send + Sync + 'static,
+    {
+        Self::spawn_inner(config, local_state_provider, None, task_executor)
+    }
+
+    fn spawn_inner<P>(
+        config: L1SubscriberConfig,
+        local_state_provider: P,
+        deposit_queue: Option<DepositQueue>,
+        task_executor: reth_tasks::Runtime,
+    ) where
+        P: StateProviderFactory + Clone + Send + Sync + 'static,
+    {
         let tracked_tokens = config.policy_cache.read().tracked_tokens();
         let subscriber = Self {
             config,
@@ -88,7 +233,7 @@ impl L1Subscriber {
         };
 
         task_executor.spawn_critical_task(
-            "l1-deposit-subscriber",
+            "l1-block-subscriber",
             Box::pin(async move {
                 loop {
                     if let Err(e) = subscriber.clone().run().await {
@@ -278,7 +423,7 @@ impl L1Subscriber {
         Ok(Some(on_chain + 1))
     }
 
-    /// Backfill deposit events from the starting block to the current L1 tip.
+    /// Backfill validated L1 data from the starting block to the current L1 tip.
     #[instrument(skip(self, l1_provider))]
     async fn sync_to_l1_tip(
         &mut self,
@@ -290,17 +435,21 @@ impl L1Subscriber {
         };
 
         // Skip past blocks already in the queue from a previous `run()`.
-        if let Some(last) = self.deposit_queue.last_enqueued() {
-            let adjusted = last.number + 1;
-            if adjusted > from {
-                info!(
-                    portal_from = from,
-                    queue_last = last.number,
-                    adjusted_from = adjusted,
-                    "Skipping blocks already in deposit queue"
-                );
+        if let Some(deposit_queue) = &self.deposit_queue {
+            if let Some(last) = deposit_queue.last_enqueued() {
+                let adjusted = last.number + 1;
+                if adjusted > from {
+                    info!(
+                        portal_from = from,
+                        queue_last = last.number,
+                        adjusted_from = adjusted,
+                        "Skipping blocks already in deposit queue"
+                    );
+                }
+                from = from.max(adjusted);
             }
-            from = from.max(adjusted);
+        } else if let Some(last) = self.config.block_observer.latest() {
+            from = from.max(last.number + 1);
         }
 
         let tip = l1_provider.get_block_number().await?;
@@ -311,12 +460,7 @@ impl L1Subscriber {
             return Ok(());
         }
 
-        info!(
-            from,
-            tip,
-            blocks = tip - from + 1,
-            "Backfilling deposit events"
-        );
+        info!(from, tip, blocks = tip - from + 1, "Backfilling L1 blocks");
         let start = std::time::Instant::now();
         let result = self.backfill(l1_provider, from, tip).await;
         self.subscriber_metrics
@@ -332,8 +476,9 @@ impl L1Subscriber {
     ///
     /// Fetches headers and receipts for up to `l1_fetch_concurrency` blocks in
     /// parallel, then processes them sequentially (event extraction, policy
-    /// application, enqueue). Receipts are fetched by the corresponding block
-    /// hash and validated against the header's receipts root before processing.
+    /// application, and optional leader enqueue). Receipts are fetched by the
+    /// corresponding block hash and validated against the header's receipts
+    /// root before processing.
     #[instrument(skip(self, l1_provider), fields(from, to))]
     async fn backfill(
         &mut self,
@@ -393,7 +538,7 @@ impl L1Subscriber {
             })
             .buffered(concurrency);
 
-        let mut enqueued = 0u64;
+        let mut processed = 0u64;
         let backfill_start = std::time::Instant::now();
 
         while let Some((header, receipts)) = fetched.try_next().await? {
@@ -405,16 +550,19 @@ impl L1Subscriber {
             self.update_l1_state_anchor(block_number, sealed.hash(), sealed.parent_hash());
             self.apply_policy_events(block_number, &policy_events);
             self.apply_portal_state_events(block_number, &events);
-            self.deposit_queue
-                .enqueue_sealed(sealed, events, policy_events);
-            enqueued += 1;
-            self.subscriber_metrics.blocks_enqueued.increment(1);
+            self.config.block_observer.record(sealed.num_hash());
+            processed += 1;
+            if let Some(deposit_queue) = &self.deposit_queue {
+                deposit_queue.enqueue_sealed(sealed, events, policy_events);
+                self.subscriber_metrics.blocks_enqueued.increment(1);
+            }
 
-            if enqueued.is_multiple_of(100) {
+            if processed.is_multiple_of(100) {
+                self.prune_observed_anchors();
                 let elapsed = backfill_start.elapsed();
-                let blocks_per_sec = enqueued as f64 / elapsed.as_secs_f64().max(0.001);
+                let blocks_per_sec = processed as f64 / elapsed.as_secs_f64().max(0.001);
                 info!(
-                    enqueued,
+                    processed,
                     current_block = block_number,
                     target = to,
                     remaining = to - block_number,
@@ -437,10 +585,10 @@ impl L1Subscriber {
 
     /// Run the L1 subscriber until the stream ends or an error occurs.
     ///
-    /// Connects to the L1 node (HTTP or WebSocket), backfills deposit events
-    /// to the current L1 tip, then listens for new block headers. Each block —
-    /// with or without deposits — is enqueued so the zone engine sees a strict
-    /// sequential chain.
+    /// Connects to the L1 node (HTTP or WebSocket), backfills validated L1 data
+    /// to the current tip, then listens for new block headers. Leaders enqueue
+    /// each block for the zone engine; observers only update L1-derived caches
+    /// and exact-hash anchors.
     ///
     /// Live-streamed blocks are buffered one block behind: a block is only
     /// flushed to the deposit queue once the next block arrives with a
@@ -492,35 +640,51 @@ impl L1Subscriber {
                     // Confirmed — update the L1 state anchor, apply events, and
                     // flush to the queue.
                     let tip_number = tip_header.number();
+                    if let Some(observed) = self.config.block_observer.latest()
+                        && tip_number > observed.number + 1
+                    {
+                        let from = observed.number + 1;
+                        warn!(
+                            from,
+                            to = tip_number,
+                            "Backfilling gap in independently observed L1 blocks"
+                        );
+                        self.backfill(&provider, from, tip_number).await?;
+                        unconfirmed_tip = Some((sealed, events, policy_events));
+                        continue;
+                    }
                     let tip_hash = tip_header.hash();
                     let tip_parent = tip_header.parent_hash();
                     self.update_l1_state_anchor(tip_number, tip_hash, tip_parent);
                     self.apply_policy_events(tip_number, &tip_policy_events);
                     self.apply_portal_state_events(tip_number, &tip_events);
-                    match self
-                        .deposit_queue
-                        .try_enqueue(tip_header, tip_events, tip_policy_events)
-                    {
-                        EnqueueOutcome::Accepted => {
-                            self.subscriber_metrics.blocks_enqueued.increment(1);
-                        }
-                        EnqueueOutcome::Duplicate => {}
-                        EnqueueOutcome::NeedBackfill { from, to } => {
-                            // Gap between queue head and confirmed tip — backfill
-                            // the missing range including the tip (re-fetched from
-                            // the provider since try_enqueue consumed ownership).
-                            warn!(
-                                from,
-                                to,
-                                tip = tip_number,
-                                "Backfilling gap before confirmed tip"
-                            );
-                            self.backfill(&provider, from, tip_number).await?;
+                    self.config.block_observer.record(tip_header.num_hash());
+                    self.prune_observed_anchors();
+                    if let Some(deposit_queue) = &self.deposit_queue {
+                        match deposit_queue.try_enqueue(tip_header, tip_events, tip_policy_events) {
+                            EnqueueOutcome::Accepted => {
+                                self.subscriber_metrics.blocks_enqueued.increment(1);
+                            }
+                            EnqueueOutcome::Duplicate => {}
+                            EnqueueOutcome::NeedBackfill { from, to } => {
+                                // Gap between queue head and confirmed tip — backfill
+                                // the missing range including the tip (re-fetched from
+                                // the provider since try_enqueue consumed ownership).
+                                warn!(
+                                    from,
+                                    to,
+                                    tip = tip_number,
+                                    "Backfilling gap before confirmed tip"
+                                );
+                                self.backfill(&provider, from, tip_number).await?;
+                            }
                         }
                     }
                 } else {
-                    // Reorg — discard the buffered tip and clear L1 state and
-                    // policy caches.
+                    // Reorg of the unconfirmed tip. None of that tip's events
+                    // were applied, so retain the confirmed caches/anchors. If
+                    // the replacement creates a height gap, the next confirmed
+                    // header takes the backfill path above.
                     self.subscriber_metrics.reorgs_detected.increment(1);
                     warn!(
                         discarded_block = tip_header.number(),
@@ -529,8 +693,6 @@ impl L1Subscriber {
                         new_parent = %sealed.parent_hash(),
                         "Discarding unconfirmed L1 block (reorg)"
                     );
-                    self.config.l1_state_cache.write().clear();
-                    self.config.policy_cache.write().clear();
                 }
             }
 
@@ -693,8 +855,23 @@ impl L1Subscriber {
             );
             guard.clear();
             self.config.policy_cache.write().clear();
+            self.config.block_observer.clear();
         }
         guard.update_anchor(NumHash::new(number, hash));
+    }
+
+    /// Drop observed anchors below the locally executed Tempo checkpoint.
+    ///
+    /// The zone's `tempoBlockNumber` only advances once the corresponding L1
+    /// anchor has been consumed (block production on leaders, block import on
+    /// followers), so anchors below it can no longer be waited on.
+    fn prune_observed_anchors(&self) {
+        match self.local_state.latest_tempo_block_number() {
+            Ok(checkpoint) => self.config.block_observer.prune_below(checkpoint),
+            Err(err) => {
+                debug!(%err, "Skipping observer pruning; local Tempo checkpoint unavailable")
+            }
+        }
     }
 }
 
