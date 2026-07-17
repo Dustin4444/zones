@@ -878,11 +878,9 @@ contract ZonePortal is IZonePortal {
 
         bool success;
         if (withdrawal.gasLimit == 0) {
-            if (zoneGateway[withdrawal.to]) revert InvalidCallbackTarget();
-            _requireAllowed(withdrawal.to);
-            success = _tryTransfer(_token, withdrawal.to, withdrawal.amount);
+            success = !zoneGateway[withdrawal.to] && allowedAccount[withdrawal.to]
+                && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
-            if (!zoneGateway[withdrawal.to]) revert InvalidCallbackTarget();
             // Keep this self-call so callback failure cannot revert the dequeue and block the FIFO.
             try this.deliverWithdrawal(
                 _token,
@@ -919,6 +917,7 @@ contract ZonePortal is IZonePortal {
         external
         onlySelf
     {
+        if (!zoneGateway[target]) revert InvalidCallbackTarget();
         bytes32 depositQueueHashBefore = currentDepositQueueHash;
 
         if (!ITIP20(token).transfer(messenger, amount)) {
@@ -935,7 +934,6 @@ contract ZonePortal is IZonePortal {
 
     function _processDepositBounceBack(Withdrawal calldata withdrawal) internal {
         address _token = withdrawal.token;
-        _requireAllowed(withdrawal.to);
         uint128 bouncebackFee = calculateBouncebackFee();
         if (bouncebackFee > withdrawal.amount) {
             bouncebackFee = withdrawal.amount;
@@ -947,7 +945,8 @@ contract ZonePortal is IZonePortal {
             _tryTransfer(_token, admin, bouncebackFee);
         }
 
-        bool success = _tryTransfer(_token, withdrawal.to, refundAmount);
+        bool success =
+            allowedAccount[withdrawal.to] && _tryTransfer(_token, withdrawal.to, refundAmount);
 
         if (success) {
             emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);

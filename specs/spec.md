@@ -281,7 +281,7 @@ A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the
 
 The factory's shared `ZoneMessenger` is the initial callback relay for every new portal. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. The portal admin may select a newly deployed messenger implementation with `setMessenger`; callback operation policy belongs to messenger code, not to per-zone operation configuration. Gateway implementations are managed independently with `setZoneGateway(gateway, enabled)`, which permits a legacy and replacement gateway to coexist. Closed-loop membership is managed with `setAllowedAccount(account, enabled)`. An allowed account cannot also be an active ZoneGateway or messenger.
 
-Account and gateway membership is evaluated when each portal or zone-side action executes. Disabling an account that is referenced by an outstanding deposit, refund, or withdrawal can make that item temporarily unprocessable; the admin must re-enable the account or otherwise restore a valid configuration before processing can continue.
+Account and gateway membership is evaluated when each portal or zone-side action executes. Revoked in-flight destinations and gateways bounce back, while revoked refund recipients have funds parked until membership is restored.
 
 ### Zone Predeploys
 
