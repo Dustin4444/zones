@@ -346,7 +346,7 @@ contract ZonePortalTest is BaseTest {
         uint128 amount,
         bytes32 memo,
         uint64 gasLimit,
-        address fallbackRecipient,
+        address zoneFallbackRecipient,
         bytes memory callbackData
     )
         internal
@@ -360,7 +360,7 @@ contract ZonePortalTest is BaseTest {
             amount: amount,
             memo: memo,
             gasLimit: gasLimit,
-            fallbackNonce: uint64(uint160(fallbackRecipient)),
+            fallbackNonce: uint64(uint160(zoneFallbackRecipient)),
             callbackData: callbackData,
             encryptedSender: ""
         });
@@ -2298,7 +2298,7 @@ contract ZonePortalTest is BaseTest {
             sender: address(portal),
             to: bob,
             amount: 500e6,
-            bouncebackRecipient: address(0),
+            tempoRefundRecipient: address(0),
             memo: bytes32(0)
         });
         bytes32 expectedHash =
@@ -2391,7 +2391,7 @@ contract ZonePortalTest is BaseTest {
                     sender: alice,
                     to: bob,
                     amount: netAmount,
-                    bouncebackRecipient: bob,
+                    tempoRefundRecipient: bob,
                     memo: bytes32("test")
                 }),
                 bytes32(0)
@@ -2758,7 +2758,7 @@ contract ZonePortalTest is BaseTest {
             token: address(pathUSD),
             sender: alice,
             amount: netAmount,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -2824,7 +2824,7 @@ contract ZonePortalTest is BaseTest {
             token: address(pathUSD),
             sender: alice,
             amount: netAmount,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             keyIndex: 0,
             encrypted: encrypted
         });
@@ -3509,7 +3509,7 @@ contract ZonePortalTest is BaseTest {
                 sender: alice,
                 to: bob,
                 amount: amount - portal.calculateDepositFee(),
-                bouncebackRecipient: bob,
+                tempoRefundRecipient: bob,
                 memo: bytes32("memo")
             });
             assertEq(depositHash, DepositQueueLib.enqueue(bytes32(0), depositData));
@@ -3533,7 +3533,7 @@ contract ZonePortalTest is BaseTest {
                 sender: alice,
                 to: bob,
                 amount: amount - portal.calculateDepositFee(),
-                bouncebackRecipient: bob,
+                tempoRefundRecipient: bob,
                 memo: memo
             });
             expectedHash = DepositQueueLib.enqueue(expectedHash, depositData);
