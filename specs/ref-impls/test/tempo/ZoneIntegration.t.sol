@@ -16,6 +16,7 @@ import {
     QueuedDeposit,
     Withdrawal,
     ZoneAccessMode,
+    ZoneGatewayMode,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -155,6 +156,7 @@ contract ZoneIntegrationTest is BaseTest {
             1,
             address(l2ZoneToken),
             ZoneAccessMode.Closed,
+            ZoneGatewayMode.Enforced,
             _closedLoopAccounts(),
             _zoneGateways(),
             address(messengerContract),

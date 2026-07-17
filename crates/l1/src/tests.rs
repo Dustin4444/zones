@@ -668,6 +668,51 @@ fn test_push_log_decodes_membership_updates() {
 }
 
 #[test]
+fn test_push_log_decodes_mode_updates() {
+    let portal_address = address!("0x0000000000000000000000000000000000000ABC");
+    let mut events = L1PortalEvents::default();
+
+    events
+        .push_log(
+            &make_portal_log(
+                portal_address,
+                EnforcementModesUpdated {
+                    accessMode: 1,
+                    gatewayMode: 1,
+                },
+            ),
+            123,
+        )
+        .expect("mode update should decode");
+    events
+        .push_log(
+            &make_portal_log(
+                portal_address,
+                EnforcementModesUpdated {
+                    accessMode: 1,
+                    gatewayMode: 0,
+                },
+            ),
+            123,
+        )
+        .expect("second mode update should decode");
+
+    assert_eq!(
+        events.mode_events,
+        vec![
+            L1ModeEvent::Updated {
+                access_mode: 1,
+                gateway_mode: 1,
+            },
+            L1ModeEvent::Updated {
+                access_mode: 1,
+                gateway_mode: 0,
+            },
+        ]
+    );
+}
+
+#[test]
 fn test_apply_sequencer_events_to_cache_sets_pending_sequencer() {
     let portal_address = address!("0x0000000000000000000000000000000000000ABC");
     let current_sequencer = address!("0x00000000000000000000000000000000000000A1");
@@ -809,6 +854,36 @@ fn test_apply_portal_state_events_overrides_cached_membership() {
     assert_eq!(
         cache.get(portal_address, account_slot, 43),
         Some(B256::ZERO)
+    );
+}
+
+#[test]
+fn test_apply_portal_state_events_updates_dedicated_mode_slot() {
+    let portal_address = address!("0x0000000000000000000000000000000000000ABC");
+    let subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::new())),
+        None,
+    );
+    subscriber.apply_portal_state_events(
+        42,
+        &L1PortalEvents {
+            mode_events: vec![L1ModeEvent::Updated {
+                access_mode: ZoneAccessMode::Closed as u8,
+                gateway_mode: ZoneGatewayMode::Enforced as u8,
+            }],
+            ..Default::default()
+        },
+    );
+
+    let updated = subscriber
+        .config
+        .l1_state_cache
+        .read()
+        .get(portal_address, PORTAL_ENFORCEMENT_FLAGS_SLOT, 42)
+        .expect("packed mode slot should be cached");
+    assert_eq!(
+        updated,
+        B256::with_last_byte(ACCOUNT_ALLOWLIST_ENFORCED_FLAG | GATEWAY_ALLOWLIST_ENFORCED_FLAG)
     );
 }
 

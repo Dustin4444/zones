@@ -26,6 +26,7 @@ import {
     ZONE_INBOX,
     ZONE_OUTBOX,
     ZoneAccessMode,
+    ZoneGatewayMode,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -191,6 +192,7 @@ contract ZoneBridgeTest is BaseTest {
             1, // zoneId
             address(l2ZoneToken), // initialToken = MockZoneToken (NOT pathUSD)
             ZoneAccessMode.Closed,
+            ZoneGatewayMode.Enforced,
             bridgeAccounts,
             _zoneGateways(),
             address(messengerContract),

@@ -21,6 +21,12 @@ pub enum L1MembershipEvent {
     RoleUpdated { account: Address, role: u8 },
 }
 
+/// An enforcement-mode update emitted by the L1 portal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum L1ModeEvent {
+    Updated { access_mode: u8, gateway_mode: u8 },
+}
+
 /// Result of attempting to enqueue an L1 block into the deposit queue.
 #[derive(Debug)]
 pub(crate) enum EnqueueOutcome {
@@ -44,6 +50,8 @@ pub struct L1PortalEvents {
     pub sequencer_events: Vec<L1SequencerEvent>,
     /// Closed-loop membership updates in the order they appeared in the block.
     pub membership_events: Vec<L1MembershipEvent>,
+    /// Enforcement-mode updates in the order they appeared in the block.
+    pub mode_events: Vec<L1ModeEvent>,
 }
 
 /// A token newly enabled for bridging, with metadata for L2 creation.
@@ -73,7 +81,7 @@ impl EnabledToken {
 
 impl L1PortalEvents {
     /// Event signature hashes that this container knows how to decode.
-    const SIGNATURE_HASHES: [B256; 7] = [
+    const SIGNATURE_HASHES: [B256; 8] = [
         DepositMade::SIGNATURE_HASH,
         EncryptedDepositMade::SIGNATURE_HASH,
         WithdrawalBounceBack::SIGNATURE_HASH,
@@ -81,6 +89,7 @@ impl L1PortalEvents {
         SequencerTransferStarted::SIGNATURE_HASH,
         SequencerTransferred::SIGNATURE_HASH,
         RoleUpdated::SIGNATURE_HASH,
+        EnforcementModesUpdated::SIGNATURE_HASH,
     ];
 
     /// Create portal events from deposits only.
@@ -193,6 +202,18 @@ impl L1PortalEvents {
                 self.membership_events.push(L1MembershipEvent::RoleUpdated {
                     account: event.account,
                     role: event.next.into(),
+                });
+            }
+            ZonePortalEvents::EnforcementModesUpdated(event) => {
+                info!(
+                    l1_block = block_number,
+                    access_mode = event.accessMode,
+                    gateway_mode = event.gatewayMode,
+                    "Enforcement modes updated on L1"
+                );
+                self.mode_events.push(L1ModeEvent::Updated {
+                    access_mode: event.accessMode,
+                    gateway_mode: event.gatewayMode,
                 });
             }
             _ => {}

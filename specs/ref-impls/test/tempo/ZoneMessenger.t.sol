@@ -6,6 +6,7 @@ import {
     IZonePortal,
     MAX_WITHDRAWAL_CALLBACK_GAS,
     Role,
+    ZoneGatewayMode,
     ZoneInfo
 } from "../../src/interfaces/IZone.sol";
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
@@ -99,6 +100,11 @@ contract ZoneMessengerTest is BaseTest {
         messengerFactory.setPortal(OTHER_ZONE_ID, otherPortal);
 
         messenger = new ZoneMessenger(address(messengerFactory));
+        vm.mockCall(
+            portal,
+            abi.encodeWithSelector(IZonePortal.gatewayMode.selector),
+            abi.encode(ZoneGatewayMode.Enforced)
+        );
         zoneToken = new MockZoneToken("Zone USD", "zUSD");
         zoneToken.setMinter(address(this), true);
     }

@@ -332,6 +332,18 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             .map_err(internal)
     }
 
+    async fn zone_gateway_mode(&self) -> Result<u8, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Ok(0);
+        }
+
+        ZoneConfig::new(ZONE_CONFIG_ADDRESS, &self.zone_provider)
+            .gatewayMode()
+            .call()
+            .await
+            .map_err(internal)
+    }
+
     async fn enforce_authorized(
         &self,
         request: &mut TempoTransactionRequest,
@@ -915,9 +927,11 @@ where
             let zone_tokens = self.zone_tokens().await?;
             let sequencer = self.zone_sequencer().await?;
             let access_mode = self.zone_access_mode().await?;
+            let gateway_mode = self.zone_gateway_mode().await?;
             to_raw(&ZoneInfoResponse {
                 zone_id: U64::from(self.config.zone_id),
                 access_mode: U64::from(access_mode),
+                gateway_mode: U64::from(gateway_mode),
                 zone_tokens,
                 sequencer,
                 chain_id: U64::from(self.config.chain_id),

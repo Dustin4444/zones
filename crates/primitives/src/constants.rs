@@ -72,12 +72,24 @@ pub const PORTAL_PENDING_SEQUENCER_SLOT: B256 = {
     B256::new(bytes)
 };
 
-/// ZonePortal packed metadata slot containing the immutable access mode at byte offset 29.
-pub const PORTAL_ACCESS_MODE_SLOT: B256 = {
+/// ZonePortal slot 20: dedicated packed account and gateway enforcement flags.
+pub const PORTAL_ENFORCEMENT_FLAGS_SLOT: B256 = {
     let mut bytes = [0u8; 32];
-    bytes[31] = 18;
+    bytes[31] = 20;
     B256::new(bytes)
 };
+
+/// Alias used by consumers reading account allowlist enforcement.
+pub const PORTAL_ACCESS_MODE_SLOT: B256 = PORTAL_ENFORCEMENT_FLAGS_SLOT;
+
+/// Alias used by consumers reading callback gateway enforcement.
+pub const PORTAL_GATEWAY_MODE_SLOT: B256 = PORTAL_ENFORCEMENT_FLAGS_SLOT;
+
+/// Bit set when account allowlist enforcement is closed.
+pub const ACCOUNT_ALLOWLIST_ENFORCED_FLAG: u8 = 1 << 0;
+
+/// Bit set when callback gateway registration is enforced.
+pub const GATEWAY_ALLOWLIST_ENFORCED_FLAG: u8 = 1 << 1;
 
 /// ZonePortal storage slot 19: `role` (mapping(address => Role)).
 pub const PORTAL_ROLE_SLOT: B256 = {

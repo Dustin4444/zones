@@ -67,10 +67,6 @@ contract ZoneFactory is IZoneFactory {
         if (params.accessMode == ZoneAccessMode.Closed && params.allowedAccounts.length == 0) {
             revert InvalidClosedLoopConfig();
         }
-        if (params.accessMode == ZoneAccessMode.Open && params.allowedAccounts.length != 0) {
-            revert InvalidOpenLoopConfig();
-        }
-
         for (uint256 i; i < params.allowedAccounts.length; ++i) {
             address account = params.allowedAccounts[i];
             if (account == _messenger) {
@@ -107,6 +103,7 @@ contract ZoneFactory is IZoneFactory {
             zoneId,
             params.initialToken,
             params.accessMode,
+            params.gatewayMode,
             params.allowedAccounts,
             params.zoneGateways,
             _messenger,
@@ -128,6 +125,7 @@ contract ZoneFactory is IZoneFactory {
             portal: portal,
             initialToken: params.initialToken,
             accessMode: params.accessMode,
+            gatewayMode: params.gatewayMode,
             admin: params.admin,
             sequencer: params.sequencer,
             verifier: params.verifier,
@@ -144,6 +142,7 @@ contract ZoneFactory is IZoneFactory {
             portal,
             params.initialToken,
             params.accessMode,
+            params.gatewayMode,
             params.admin,
             params.sequencer,
             params.verifier,

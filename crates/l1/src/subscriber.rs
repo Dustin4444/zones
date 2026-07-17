@@ -669,7 +669,10 @@ impl L1Subscriber {
         block_number: u64,
         portal_events: &L1PortalEvents,
     ) {
-        if portal_events.sequencer_events.is_empty() && portal_events.membership_events.is_empty() {
+        if portal_events.sequencer_events.is_empty()
+            && portal_events.membership_events.is_empty()
+            && portal_events.mode_events.is_empty()
+        {
             return;
         }
 
@@ -685,6 +688,12 @@ impl L1Subscriber {
             self.config.portal_address,
             block_number,
             &portal_events.membership_events,
+        );
+        apply_mode_events_to_cache(
+            &mut cache,
+            self.config.portal_address,
+            block_number,
+            &portal_events.mode_events,
         );
     }
 
@@ -828,6 +837,37 @@ pub(crate) fn apply_membership_events_to_cache(
             B256::with_last_byte(role),
         );
     }
+}
+
+pub(crate) fn apply_mode_events_to_cache(
+    cache: &mut L1StateCacheInner,
+    portal_address: Address,
+    block_number: u64,
+    mode_events: &[L1ModeEvent],
+) {
+    for event in mode_events {
+        let L1ModeEvent::Updated {
+            access_mode,
+            gateway_mode,
+        } = *event;
+        let mut flags = 0;
+        if access_mode == ZoneAccessMode::Closed as u8 {
+            flags |= ACCOUNT_ALLOWLIST_ENFORCED_FLAG;
+        }
+        if gateway_mode == ZoneGatewayMode::Enforced as u8 {
+            flags |= GATEWAY_ALLOWLIST_ENFORCED_FLAG;
+        }
+        cache.set(
+            portal_address,
+            PORTAL_ENFORCEMENT_FLAGS_SLOT,
+            block_number,
+            B256::with_last_byte(flags),
+        );
+    }
+}
+
+pub(crate) fn mapping_storage_slot(key: Address, base_slot: B256) -> B256 {
+    keccak256((key, U256::from_be_bytes(base_slot.0)).abi_encode())
 }
 
 pub(crate) fn address_to_storage_value(address: Address) -> B256 {
