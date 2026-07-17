@@ -12,6 +12,10 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey as Ed25519Private
 use eyre::WrapErr;
 use k256::SecretKey;
 use p256::ecdsa::SigningKey as P256SigningKey;
+use proptest::{
+    strategy::Strategy,
+    test_runner::{Config as ProptestConfig, TestCaseError, TestRunner},
+};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
 use reth_node_core::{args::RpcServerArgs, exit::NodeExitFuture};
@@ -20,6 +24,7 @@ use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
     collections::BTreeMap,
+    env,
     future::Future,
     net::{SocketAddr, TcpListener},
     ops::Deref,
@@ -766,6 +771,10 @@ impl ZoneTestNode {
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<Self> {
+        // Real-L1 tests must discover the portal's enabled tokens so the
+        // subscriber tracks their TIP-403 policy events. Dummy-L1 tests have
+        // no reachable portal and explicitly skip discovery.
+        let initial_tokens = (l1_ws_url == DUMMY_L1_URL).then(Vec::new);
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url,
             portal_address,
@@ -774,7 +783,7 @@ impl ZoneTestNode {
             custom_genesis,
             sequencer_signer,
             8,
-            Some(vec![]),
+            initial_tokens,
             None,
             true,
         )
@@ -1786,7 +1795,7 @@ impl L1TestNode {
         &self,
         token: Address,
         policy_id: u64,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<u64> {
         use tempo_contracts::precompiles::ITIP20;
 
         let provider = self.dev_provider();
@@ -1797,7 +1806,20 @@ impl L1TestNode {
             .get_receipt()
             .await?;
         eyre::ensure!(receipt.status(), "changeTransferPolicyId failed");
-        Ok(())
+        let event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| ITIP20::TransferPolicyUpdate::decode_log(&log.inner).ok())
+            .ok_or_else(|| eyre::eyre!("TransferPolicyUpdate event not found"))?;
+        eyre::ensure!(
+            event.newPolicyId == policy_id,
+            "TransferPolicyUpdate emitted policy {}, expected {policy_id}",
+            event.newPolicyId
+        );
+        receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("changeTransferPolicyId receipt has no block number"))
     }
 
     /// Create a COMPOUND policy on L1 that delegates to sub-policies by role.
@@ -1979,6 +2001,57 @@ where
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Run an expensive async E2E property through proptest.
+///
+/// Each generated value receives a fresh Tokio runtime so shrinking does not
+/// retain node tasks from the previous attempt. One case is the default because
+/// each value launches real L1/Zone nodes and covers a complete behavior matrix.
+/// Set `ZONE_E2E_PROPERTY_CASES` to increase it.
+pub(crate) fn run_e2e_proptest<S, F, Fut>(strategy: S, property: F)
+where
+    S: Strategy,
+    S::Value: std::fmt::Debug,
+    F: Fn(S::Value) -> Fut,
+    Fut: Future<Output = eyre::Result<()>>,
+{
+    let mut config = ProptestConfig::default();
+    // Source-file persistence is unavailable when driving TestRunner directly.
+    // The failing input and RNG seed are still printed for deterministic replay.
+    config.failure_persistence = None;
+    // A single shrink launches a complete L1 and Zone stack, so keep the
+    // default bounded while retaining proptest's shrinking behavior.
+    config.max_shrink_iters = match env::var("ZONE_E2E_PROPERTY_SHRINK_ITERS") {
+        Ok(iterations) => iterations
+            .parse()
+            .expect("ZONE_E2E_PROPERTY_SHRINK_ITERS must be an unsigned integer"),
+        Err(env::VarError::NotPresent) => 4,
+        Err(err) => panic!("failed to read ZONE_E2E_PROPERTY_SHRINK_ITERS: {err}"),
+    };
+    config.cases = match env::var("ZONE_E2E_PROPERTY_CASES") {
+        Ok(cases) => cases
+            .parse()
+            .expect("ZONE_E2E_PROPERTY_CASES must be an unsigned integer"),
+        Err(env::VarError::NotPresent) => 1,
+        Err(err) => panic!("failed to read ZONE_E2E_PROPERTY_CASES: {err}"),
+    };
+
+    let mut runner = TestRunner::new(config);
+    runner
+        .run(&strategy, |input| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(8)
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    TestCaseError::fail(format!("failed to build Tokio runtime: {err:#}"))
+                })?;
+            runtime
+                .block_on(property(input))
+                .map_err(|err| TestCaseError::fail(format!("{err:#}")))
+        })
+        .expect("E2E property failed");
 }
 
 /// Arguments for [`ZoneAccount::withdraw_with`].

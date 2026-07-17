@@ -3,6 +3,7 @@ mod demo_cross_zone;
 mod demo_shield_and_send;
 mod deposit;
 mod e2e;
+mod e2e_property;
 mod enable_token;
 mod l1_e2e;
 mod precompiles;

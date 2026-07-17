@@ -1,6 +1,5 @@
-# L2 TIP-20 transfers used to prove both allowed and denied TIP-403 behavior.
-# The runner selects a recipient whose membership matches the active policy and
-# verifies the receipt outcome and the recipient's exact balance delta.
+# Randomized multi-sender L2 TIP-20 transfer spam. Policy correctness belongs
+# to the Rust proptests; this primitive only measures sustained throughput.
 chain_id: ${TXGEN_CHAIN_ID}
 
 gas:
@@ -21,6 +20,7 @@ templates:
   transfer:
     type: tempo
     from: { pool: dev, select: random }
+    fee_token: "${TXGEN_FEE_TOKEN}"
     gas_limit: 1000000
     nonce_key:
       uniform:

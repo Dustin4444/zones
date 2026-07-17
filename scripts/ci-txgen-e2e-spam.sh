@@ -118,39 +118,30 @@ install_anvil_zone_factory() {
 write_summary() {
   local status="$1"
   local result="❌ Failed"
-  local report metrics sent accepted transfer_tps zone_tps
+  local report="$REPORT_DIR/l2-tip20-spam.json"
+  local metrics sent accepted submission_tps zone_tps
   local run_link=""
-  local -a reports
 
-  shopt -s nullglob
-  reports=("$REPORT_DIR"/l2-tip20-throughput-*.json)
   if [ "$status" -eq 0 ]; then
     result="✅ Passed"
   fi
 
-  if [ "${#reports[@]}" -eq 1 ] && \
+  printf '%s\n\n' '### Txgen L2 transfer spam' >"$SUMMARY"
+  if [ -f "$report" ] && \
     metrics="$(jq -er '
       [
         .sent,
         .success,
-        ((.sent * 100000 / .run_stats.duration_ms) | round / 100),
+        ((.tps * 100) | round / 100),
         ((.run_stats.avg_tps * 100) | round / 100)
       ] | @tsv
-    ' "${reports[0]}" 2>/dev/null)"; then
-    IFS=$'\t' read -r sent accepted transfer_tps zone_tps <<<"$metrics"
-    printf '%s\n\n' '### Txgen E2E spam' >"$SUMMARY"
-    if [ "$status" -eq 0 ]; then
-      printf '✅ Passed — **%s/%s accepted at a %s TPS target**; verified TIP-20 execution: **%s TPS**; total Zone throughput: **%s TPS**.\n\n' \
-        "$accepted" "$sent" "${TXGEN_THROUGHPUT_TPS:-${TPS:-unknown}}" "$transfer_tps" "$zone_tps" >>"$SUMMARY"
-      printf 'Receipts, the balance delta, and L1 batch settlement were verified.\n' >>"$SUMMARY"
-    else
-      printf '❌ Failed — the report recorded **%s/%s accepted** and **%s TPS**, but the run did not pass verification.\n\n' \
-        "$accepted" "$sent" "$transfer_tps" >>"$SUMMARY"
-      printf 'The throughput report completed, but a later verification failed; see the attached logs.\n' >>"$SUMMARY"
-    fi
+    ' "$report" 2>/dev/null)"; then
+    IFS=$'\t' read -r sent accepted submission_tps zone_tps <<<"$metrics"
+    printf '%s — **%s/%s accepted** at a **%s TPS** target; submission **%s TPS**; Zone **%s TPS**.\n' \
+      "$result" "$accepted" "$sent" "${TPS:-unknown}" "$submission_tps" "$zone_tps" >>"$SUMMARY"
   else
-    printf '%s\n\n%s — the run did not produce a complete throughput report.\n' \
-      '### Txgen E2E spam' "$result" >"$SUMMARY"
+    printf '%s — no complete spam report was produced; see the attached logs.\n' \
+      "$result" >>"$SUMMARY"
   fi
 
   if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
@@ -229,8 +220,5 @@ done
   cast block-number --rpc-url "$ZONE_RPC_URL" >/dev/null 2>&1 || \
   die "tempo-zone dev did not become ready"
 
-scripts/txgen-e2e-spam.sh all
-
-shopt -s nullglob
-reports=("$REPORT_DIR"/l2-tip20-throughput-*.json)
-[ "${#reports[@]}" -eq 1 ] || die "expected one throughput report, found ${#reports[@]}"
+scripts/txgen-e2e-spam.sh
+[ -f "$REPORT_DIR/l2-tip20-spam.json" ] || die "txgen spam report was not produced"

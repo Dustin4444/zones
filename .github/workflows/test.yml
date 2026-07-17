@@ -48,7 +48,7 @@ jobs:
         run: cargo nextest run --profile ci
 
   txgen-e2e-spam:
-    name: txgen e2e spam
+    name: txgen L2 transfer spam
     runs-on: depot-ubuntu-latest-16
     timeout-minutes: 45
     permissions:
@@ -59,10 +59,8 @@ jobs:
       RUSTC_WRAPPER: ""
       TXGEN_DIR: ${{ github.workspace }}/txgen
       L1_HTTP_URL: http://127.0.0.1:8545
-      COUNT: "2"
-      TPS: "10"
-      TXGEN_THROUGHPUT_COUNT: "5000"
-      TXGEN_THROUGHPUT_TPS: "1000"
+      COUNT: "5000"
+      TPS: "1000"
       MAX_CONCURRENT: "2000"
       DRAIN_TIMEOUT: "240"
       SYNC_TIMEOUT: "300"
@@ -93,7 +91,7 @@ jobs:
         with:
           version: nightly
 
-      - name: Build and run txgen E2E spam
+      - name: Build and run txgen L2 transfer spam
         id: spam
         run: scripts/ci-txgen-e2e-spam.sh
 
@@ -107,7 +105,7 @@ jobs:
           retention-days: 14
 
   txgen-e2e-comment:
-    name: txgen e2e PR comment
+    name: txgen spam PR comment
     runs-on: ubuntu-latest
     if: >-
       always() &&

@@ -13492,6 +13492,7 @@ dependencies = [
  "futures",
  "k256",
  "p256",
+ "proptest",
  "rand 0.8.7",
  "reqwest 0.13.4",
  "reth-chain-state",

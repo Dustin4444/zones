@@ -6,14 +6,14 @@
 
 use crate::utils::{
     EncryptedRouterCallbackArgs, L1TestNode, PlaintextRouterCallbackArgs, STABLECOIN_DEX_ADDRESS,
-    WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
+    WithdrawalArgs, ZoneAccount, ZoneTestNode, run_e2e_proptest, spawn_sequencer,
 };
 use alloy::{
     primitives::{Address, B256, U256},
     providers::Provider,
 };
 use std::time::Duration;
-use tempo_precompiles::PATH_USD_ADDRESS;
+use tempo_precompiles::{PATH_USD_ADDRESS, stablecoin_dex::MIN_ORDER_AMOUNT};
 use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
@@ -22,7 +22,6 @@ use zone_node::dev::{ProvisionConfig, provision_zone};
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ROUTER_SWAP_TICK: i16 = 0;
 const ROUTER_SWAP_AMOUNT: u128 = 100_000_000;
-const ROUTER_DEX_LIQUIDITY: u128 = 300_000_000;
 
 struct SameZoneSwapFixture {
     l1: L1TestNode,
@@ -35,7 +34,7 @@ struct SameZoneSwapFixture {
     swap_amount: u128,
 }
 
-async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
+async fn setup_same_zone_swap_fixture(swap_amount: u128) -> eyre::Result<SameZoneSwapFixture> {
     let l1 = L1TestNode::start().await?;
 
     let alpha = l1
@@ -45,7 +44,13 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
         .create_tip20("BetaUSD", "bUSD", B256::with_last_byte(0xB2))
         .await?;
 
-    let mint_amount = ROUTER_DEX_LIQUIDITY + ROUTER_SWAP_AMOUNT;
+    let dex_liquidity = swap_amount
+        .checked_mul(3)
+        .ok_or_else(|| eyre::eyre!("swap amount overflows DEX liquidity"))?
+        .max(MIN_ORDER_AMOUNT);
+    let mint_amount = dex_liquidity
+        .checked_add(swap_amount)
+        .ok_or_else(|| eyre::eyre!("swap amount overflows mint amount"))?;
     l1.mint_tip20(alpha, l1.dev_address(), mint_amount).await?;
     l1.mint_tip20(beta, l1.dev_address(), mint_amount).await?;
 
@@ -66,23 +71,23 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
 
     l1.create_dex_pair(alpha).await?;
     l1.create_dex_pair(beta).await?;
-    l1.place_dex_bid_order(alpha, ROUTER_DEX_LIQUIDITY, ROUTER_SWAP_TICK)
+    l1.place_dex_bid_order(alpha, dex_liquidity, ROUTER_SWAP_TICK)
         .await?;
-    l1.place_dex_ask_order(beta, ROUTER_DEX_LIQUIDITY, ROUTER_SWAP_TICK)
+    l1.place_dex_ask_order(beta, dex_liquidity, ROUTER_SWAP_TICK)
         .await?;
 
     let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     l1.fund_user(account.address(), 10_000_000).await?;
-    l1.fund_user_token(alpha, account.address(), ROUTER_SWAP_AMOUNT)
+    l1.fund_user_token(alpha, account.address(), swap_amount)
         .await?;
     account.deposit(5_000_000, L1_TIMEOUT, &zone).await?;
 
     let alpha_minted = account
-        .deposit_token(alpha, alpha, ROUTER_SWAP_AMOUNT, L1_TIMEOUT, &zone)
+        .deposit_token(alpha, alpha, swap_amount, L1_TIMEOUT, &zone)
         .await?;
     assert_eq!(
         alpha_minted,
-        U256::from(ROUTER_SWAP_AMOUNT),
+        U256::from(swap_amount),
         "AlphaUSD minted balance should equal the deposited amount"
     );
 
@@ -94,7 +99,7 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
         alpha,
         beta,
         account,
-        swap_amount: ROUTER_SWAP_AMOUNT,
+        swap_amount,
     })
 }
 
@@ -420,15 +425,27 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
 ///
 /// The refund must go to the bounceback recipient encoded in the router payload,
 /// not to the encrypted recipient and not to the router contract.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_cross_zone_encrypted_router_bounceback_recipient() -> eyre::Result<()> {
+#[test]
+fn test_cross_zone_encrypted_bounceback_recipient_property() {
+    run_e2e_proptest(
+        (500_000u128..=2_000_000, 5u32..=10),
+        |(cross_amount, refund_signer_index)| {
+            run_cross_zone_encrypted_bounceback_recipient(cross_amount, refund_signer_index)
+        },
+    );
+}
+
+async fn run_cross_zone_encrypted_bounceback_recipient(
+    cross_amount: u128,
+    refund_signer_index: u32,
+) -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let l1 = L1TestNode::start().await?;
     let seq_a_signer = l1.signer_at(2);
     let seq_b_signer = l1.signer_at(3);
     let blacklisted_recipient = l1.signer_at(4).address();
-    let refund_burner = l1.signer_at(5).address();
+    let refund_burner = l1.signer_at(refund_signer_index).address();
 
     let (portal_a, portal_b, router) = l1
         .deploy_two_zones_with_sequencers(seq_a_signer.clone(), seq_b_signer.clone())
@@ -467,8 +484,9 @@ async fn test_cross_zone_encrypted_router_bounceback_recipient() -> eyre::Result
     }
 
     let mut alice = ZoneAccount::from_l1_and_zone(&l1, &zone_a, portal_a);
-    let deposit_amount: u128 = 2_000_000;
-    let cross_amount: u128 = 1_000_000;
+    let deposit_amount = cross_amount
+        .checked_mul(2)
+        .ok_or_else(|| eyre::eyre!("cross amount overflows deposit amount"))?;
     l1.fund_user(alice.address(), deposit_amount * 2).await?;
     alice.deposit(deposit_amount, L1_TIMEOUT, &zone_a).await?;
 
@@ -545,7 +563,7 @@ async fn test_cross_zone_encrypted_router_bounceback_recipient() -> eyre::Result
 async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut fixture = setup_same_zone_swap_fixture().await?;
+    let mut fixture = setup_same_zone_swap_fixture(ROUTER_SWAP_AMOUNT).await?;
     let expected_beta = fixture
         .l1
         .quote_dex_swap_exact_amount_in(fixture.alpha, fixture.beta, fixture.swap_amount)
@@ -643,12 +661,17 @@ async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
 ///
 /// Deposits for BetaUSD are paused on the target portal so the router callback
 /// reverts and the original AlphaUSD withdrawal bounces back to the sender.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_failure()
--> eyre::Result<()> {
+#[test]
+fn test_swap_and_deposit_plaintext_bounceback_property() {
+    run_e2e_proptest(1_000_000u128..=100_000_000, |swap_amount| {
+        run_plaintext_deposit_failure_bounceback(swap_amount)
+    });
+}
+
+async fn run_plaintext_deposit_failure_bounceback(swap_amount: u128) -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut fixture = setup_same_zone_swap_fixture().await?;
+    let mut fixture = setup_same_zone_swap_fixture(swap_amount).await?;
     let expected_beta = fixture
         .l1
         .quote_dex_swap_exact_amount_in(fixture.alpha, fixture.beta, fixture.swap_amount)
@@ -742,14 +765,19 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
 /// This pins the callback behavior for `depositEncrypted`: even with a valid
 /// encrypted payload and key index, a target-portal deposit failure must revert
 /// the callback and bounce the original token back to the sender.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_swap_and_deposit_into_same_zone_bounces_back_on_encrypted_deposit_failure()
--> eyre::Result<()> {
+#[test]
+fn test_swap_and_deposit_encrypted_bounceback_property() {
+    run_e2e_proptest(1_000_000u128..=100_000_000, |swap_amount| {
+        run_encrypted_deposit_failure_bounceback(swap_amount)
+    });
+}
+
+async fn run_encrypted_deposit_failure_bounceback(swap_amount: u128) -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     use sha2::{Digest, Sha256};
 
-    let mut fixture = setup_same_zone_swap_fixture().await?;
+    let mut fixture = setup_same_zone_swap_fixture(swap_amount).await?;
     let expected_beta = fixture
         .l1
         .quote_dex_swap_exact_amount_in(fixture.alpha, fixture.beta, fixture.swap_amount)
@@ -1177,8 +1205,20 @@ async fn test_l1_policy_operations_and_zone_advancement() -> eyre::Result<()> {
 ///
 /// NOTE: This test validates the builder-level policy check in `build_encrypted_deposit`.
 /// The zone's policy cache must be pre-populated for the check to trigger.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
+#[test]
+fn test_encrypted_deposit_policy_bounceback_property() {
+    run_e2e_proptest(
+        (500_000u128..=2_000_000, 2u32..=10),
+        |(deposit_amount, recipient_signer_index)| {
+            run_encrypted_deposit_policy_bounceback(deposit_amount, recipient_signer_index)
+        },
+    );
+}
+
+async fn run_encrypted_deposit_policy_bounceback(
+    deposit_amount: u128,
+    recipient_signer_index: u32,
+) -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // --- Step 1: Start L1 + deploy zone ---
@@ -1192,7 +1232,7 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
     l1.change_transfer_policy_id(PATH_USD_ADDRESS, policy_id)
         .await?;
 
-    let blacklisted_recipient = l1.signer_at(2).address();
+    let blacklisted_recipient = l1.signer_at(recipient_signer_index).address();
     l1.blacklist_address(policy_id, blacklisted_recipient)
         .await?;
 
@@ -1228,7 +1268,6 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
 
     // --- Step 6: Make an encrypted deposit targeting the blacklisted recipient ---
     let depositor = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
-    let deposit_amount: u128 = 1_000_000;
     l1.fund_user(depositor.address(), deposit_amount).await?;
 
     // Make the encrypted deposit on L1 targeting the blacklisted recipient.

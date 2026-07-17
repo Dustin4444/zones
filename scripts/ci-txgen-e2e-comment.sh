@@ -4,7 +4,7 @@ set -euo pipefail
 marker='<!-- txgen-e2e-spam -->'
 body="${COMMENT_BODY:-}"
 if [ -z "$body" ]; then
-  body="### Txgen E2E spam
+  body="### Txgen L2 transfer spam
 
 ❌ The CI job ended before it produced a summary.
 

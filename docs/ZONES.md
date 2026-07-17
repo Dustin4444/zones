@@ -655,4 +655,4 @@ Current deployment:
 | `just zone-info <id-or-portal>` | Fetch zone metadata from ZoneFactory |
 | `just demo-blacklist [amount] [rpc] [zone-dir]` | End-to-end TIP-20 + TIP-403 blacklist lifecycle demo |
 | `just spam-deposits [total] [per-block] [amount] [encrypted] [token] [lead-time]` | Send many deposit transactions to measure portal throughput |
-| `just txgen-e2e-spam [action] [count] [tps]` | Spam and verify L1 deposits, L2 withdrawals, every TIP-403 policy mode, and policy-gated in-zone TIP-20 transfers with txgen; see `docs/txgen-e2e-spam.md` |
+| `just txgen-e2e-spam [count] [tps]` | Spam randomized multi-sender L2 TIP-20 transfers and report sustained TPS; see `docs/txgen-e2e-spam.md` |
