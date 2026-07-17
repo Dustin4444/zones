@@ -127,12 +127,18 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.None));
     }
 
-    function test_createZone_closedModeRejectsEmptyAccounts() public {
+    function test_createZone_closedModeAllowsEmptyAccounts() public {
         IZoneFactory.CreateZoneParams memory params = _defaultParams();
         params.allowedAccounts = new address[](0);
 
-        vm.expectRevert(IZoneFactory.InvalidClosedLoopConfig.selector);
-        zoneFactory.createZone(params);
+        (, address portal) = zoneFactory.createZone(params);
+
+        assertEq(uint8(ZonePortal(portal).accessMode()), uint8(ZoneAccessMode.Closed));
+        assertEq(uint8(ZonePortal(portal).role(alice)), uint8(Role.None));
+
+        vm.prank(admin);
+        ZonePortal(portal).setRole(alice, Role.Account);
+        assertEq(uint8(ZonePortal(portal).role(alice)), uint8(Role.Account));
     }
 
     function test_createZone_openModeRetainsConfiguredAccountsForLaterClosure() public {

@@ -238,10 +238,10 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 | Parameter | Description |
 |-----------|-------------|
 | `initialToken` | The first TIP-20 token to enable. The admin can enable additional tokens later. |
-| `accessMode` | Initial account enforcement mode: `Closed` checks `allowedAccounts`; `Open` skips account membership checks. The admin may change it later. |
-| `gatewayMode` | Initial callback enforcement mode: `Enforced` checks `zoneGateways`; `Open` accepts arbitrary callback targets. The admin may change it later. |
-| `allowedAccounts` | Initial membership. Closed mode requires at least one entry; open mode may pre-stage entries for a later close. Duplicate entries have the same effect as one entry. Members MUST NOT be the messenger. |
-| `zoneGateways` | Optional initial callback gateway set. Duplicate entries have the same effect as one entry. Gateways MUST NOT also be allowed accounts. Entries are retained while gateway mode is open. |
+| `accessMode` | Initial account enforcement mode: `Closed` requires the `Account` role; `Open` skips account membership checks. The admin may change it later. |
+| `gatewayMode` | Initial callback enforcement mode: `Enforced` requires the `CallbackGateway` role; `Open` accepts arbitrary callback targets. The admin may change it later. |
+| `allowedAccounts` | Optional addresses initially assigned the `Account` role. An empty closed configuration denies all accounts until the admin assigns one; open mode may pre-stage roles for a later close. Duplicate entries have the same effect as one entry. Members MUST NOT be the messenger. |
+| `zoneGateways` | Optional addresses initially assigned the `CallbackGateway` role. Duplicate entries have the same effect as one entry. Gateways MUST NOT also be allowed accounts. Roles are retained while gateway mode is open. |
 | `admin` | The address that holds the admin role for the zone (token enablement, deposit pause/resume). MUST NOT be the zero address. May be the same as `sequencer`. See [Access Control](#access-control). |
 | `sequencer` | The address that will operate the zone (block production, batch submission, withdrawal processing). |
 | `verifier` | The `IVerifier` contract used to validate batch proofs. |
@@ -663,19 +663,19 @@ The sequencer processes ordered withdrawals atomically on Tempo by calling `proc
 
 The portal dequeues before executing the withdrawal, then independently requires `withdrawal.token` to be enabled. Failed callbacks roll back in an external self-call and become bounce-backs, so the dequeue remains committed and cannot block the FIFO. If `remainingQueue` is zero (last item in the slot), processing sets the slot to `EMPTY_SENTINEL` and advances `head`; otherwise it updates the slot to `remainingQueue`.
 
-For a plain withdrawal (`gasLimit == 0`), the portal rechecks the current modes and their corresponding mappings before transferring directly. A failed transfer or a destination invalidated by a mode or membership change creates a withdrawal bounce-back deposit for the Zone-local `zoneFallbackRecipient`.
+For a plain withdrawal (`gasLimit == 0`), the portal rechecks the current modes and roles before transferring directly. A failed transfer or a destination invalidated by a mode or membership change creates a withdrawal bounce-back deposit for the Zone-local `zoneFallbackRecipient`.
 
 ### Withdrawal Callbacks
 
 For withdrawals with `gasLimit > 0`, enforced gateway mode requires `to` to have the portal's `CallbackGateway` role; open gateway mode accepts any target. The withdrawal queue hash is verified and dequeued by `ZonePortal.processWithdrawal` before the callback reaches the messenger. The portal snapshots `currentDepositQueueHash`, transfers exactly `amount` to its fixed `ZoneMessenger`, and asks the messenger to relay the callback. The messenger authenticates the source portal through `ZoneFactory`, independently applies the current gateway mode and role check, transfers the funds to the target, invokes `onWithdrawalReceived`, and requires the expected selector.
 
-Closed access mode requires `currentDepositQueueHash` to change, proving that a deposit was synchronously appended to the source zone. Open access mode permits open-loop callbacks, including cross-zone routing, and does not require source queue advancement. Any callback failure rolls back the self-call and enqueues a bounce-back while advancing the withdrawal FIFO.
+Closed access mode requires `currentDepositQueueHash` to change, proving only that some deposit was synchronously appended to the source zone. It does not bind that deposit to the callback's token, amount, or recipient; an enforced gateway is trusted to constrain the operation and return the intended result. Open access mode imposes no source-deposit invariant: callback value may enter another zone or leave the zone system entirely. Any callback failure rolls back the self-call and enqueues a bounce-back while advancing the withdrawal FIFO.
 
 Callback data is opaque to the zone protocol. In enforced gateway mode, accounts with the `CallbackGateway` role are trusted to constrain callback behavior. In open gateway mode, arbitrary callback targets are permitted and no gateway-specific trust assumption is imposed by the protocol.
 
 An over-limit callback withdrawal also bounces back and advances the queue.
 
-For closed access mode, a successful callback must still synchronously append a return deposit to the source zone. Open access mode deliberately permits open-loop routing, including a callback that deposits into a different zone. The reference implementation contains only test routing implementations; production gateway/vault token-conversion behavior is outside this repository.
+For closed access mode, a successful callback must synchronously append a deposit to the source zone, subject to the limitation above. Open access mode deliberately permits arbitrary open-loop routing, including callbacks that deposit into another zone or do not deposit into any zone. The reference implementation contains only test routing implementations; production gateway/vault token-conversion behavior is outside this repository.
 
 ### Withdrawal Failures and Bounce-Back
 
@@ -734,7 +734,7 @@ For callback withdrawals, `IWithdrawalReceiver.onWithdrawalReceived` receives th
 
 ### Zone-to-Zone Transfers
 
-Closed access mode requires callback value to return synchronously to the source portal. Open access mode permits direct callback-based zone-to-zone routing without source queue advancement. Gateway registration remains independently enforced unless the admin also selects open gateway mode.
+Closed access mode requires source queue advancement but cannot prove that the callback value itself returned. Open access mode permits direct callback-based routing without source queue advancement, whether into another zone or outside the zone system. Gateway registration remains independently enforced unless the admin also selects open gateway mode.
 
 <br>
 

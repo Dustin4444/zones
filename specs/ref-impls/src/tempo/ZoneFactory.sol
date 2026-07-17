@@ -64,9 +64,6 @@ contract ZoneFactory is IZoneFactory {
         if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(params.initialToken)) {
             revert InvalidToken();
         }
-        if (params.accessMode == ZoneAccessMode.Closed && params.allowedAccounts.length == 0) {
-            revert InvalidClosedLoopConfig();
-        }
         for (uint256 i; i < params.allowedAccounts.length; ++i) {
             address account = params.allowedAccounts[i];
             if (account == _messenger) {

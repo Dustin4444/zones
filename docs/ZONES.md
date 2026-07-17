@@ -148,17 +148,24 @@ export PRIVATE_KEY="$SEQUENCER_KEY"
 just create-zone my-zone
 ```
 
-The default is an open zone with no account allowlist, gateway list, or enforcement:
+The default is open account access and open callback targeting. No account or gateway
+addresses are required, and the admin and sequencer are not added implicitly.
+
+The two controls are independent and remain mutable after creation:
+
+| Control | Open (default) | Restricted mode |
+|---------|----------------|-----------------|
+| Account access | Does not enforce account membership | `closed` requires the `Account` role for deposits, refunds, and plain withdrawals; no assigned accounts denies all accounts |
+| Callback targets | Does not enforce callback roles | `enforced` requires callback targets to have the `CallbackGateway` role |
+
+Changing a mode does not clear the stored roles. To create and start a closed zone
+with enforced callback targets in one command:
 
 ```bash
-just create-zone my-open-zone
+export ZONE_ALLOWED_ACCOUNTS="0x<account>,0x<account>"
+export ZONE_GATEWAYS="0x<gateway>"
+just deploy-zone restricted-zone pathusd closed enforced
 ```
-
-For a closed zone, explicitly set a comma-separated `ZONE_ALLOWED_ACCOUNTS` and pass
-`closed` as the third argument. Admin and sequencer are not added implicitly. Optional
-callback implementations are supplied separately through `ZONE_GATEWAYS`; neither
-access mode requires a gateway at creation. Gateway registration is also open by default
-and can be configured independently.
 
 To choose the initial TIP-20 enabled on the portal, pass it as the second positional argument:
 
@@ -178,26 +185,14 @@ You can also run the xtask directly for more control:
 cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
-  --access-mode open \
   --admin "$ADMIN_ADDR" \
   --sequencer "$SEQUENCER_ADDR" \
   --private-key "$SEQUENCER_KEY"
 ```
 
-`create-zone` requires the admin address explicitly. Account access defaults to open;
-`--access-mode closed` requires at least one explicit `--allowed-account`. Open mode
-may retain staged membership for a later close. `--gateway-mode` independently defaults
-to `open`; `--zone-gateway` is repeatable but optional. Keep the matching `ADMIN_KEY`
-available for admin-only portal calls such as `setRole`, `enable-token`,
-`pause-deposits`, and `resume-deposits`.
-
-Cross-zone routing uses open zones. A callback withdrawal still requires its
-callback implementation to be registered as a zone gateway, but an open source
-zone does not require the callback to append a deposit back to that source
-portal. The gateway may route the value into another open zone instead. Closed
-zones retain the stricter callback invariant: a successful callback must append
-a return deposit to the source portal, while a reverting callback is bounced
-back into the source zone.
+`create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY`
+available for admin-only portal calls such as changing either mode or account roles,
+enabling tokens, and pausing or resuming deposits.
 
 ### 5. Start the Zone Node
 
@@ -654,8 +649,8 @@ Current deployment:
 | `ROUTER_BOUNCEBACK_RECIPIENT` | No | Optional controlled burner/stealth address for `demo-swap-and-deposit` routed deposit refunds |
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
-| `ZONE_ALLOWED_ACCOUNTS` | Closed zones | Comma-separated exact initial membership; no accounts are added implicitly |
-| `ZONE_GATEWAYS` | No | Comma-separated initial callback gateways; empty is valid in either mode |
+| `ZONE_ALLOWED_ACCOUNTS` | No | Comma-separated initial account membership |
+| `ZONE_GATEWAYS` | No | Comma-separated initial callback-target registrations |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 
 ## Justfile Commands Reference
