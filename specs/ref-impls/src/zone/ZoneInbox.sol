@@ -233,11 +233,6 @@ contract ZoneInbox is IZoneInbox {
                         d.amount,
                         d.bouncebackRecipient
                     );
-                } else if (!config.isAllowedAccount(d.to)) {
-                    _enqueueDepositBounceBack(d.token, d.amount, d.bouncebackRecipient);
-                    emit DepositFailed(
-                        currentHash, d.sender, d.to, d.token, d.amount, d.bouncebackRecipient
-                    );
                 } else {
                     try IZoneToken(d.token).mint(d.to, d.amount) {
                         emit DepositProcessed(
