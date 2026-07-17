@@ -247,7 +247,7 @@ contract ZoneBridgeTest is BaseTest {
         uint128 amount,
         bytes32 memo,
         uint64 gasLimit,
-        address fallbackRecipient,
+        address zoneFallbackRecipient,
         bytes memory callbackData
     )
         internal
@@ -308,7 +308,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: sender,
             to: to,
             amount: amount,
-            bouncebackRecipient: to,
+            tempoRefundRecipient: to,
             memo: memo
         });
 
@@ -377,7 +377,7 @@ contract ZoneBridgeTest is BaseTest {
         uint128 amount,
         bytes32 memo,
         uint64 gasLimit,
-        address fallbackRecipient,
+        address zoneFallbackRecipient,
         bytes memory data
     )
         internal
@@ -386,7 +386,14 @@ contract ZoneBridgeTest is BaseTest {
             ObservedWithdrawal({
                 index: index,
                 withdrawal: _withdrawal(
-                    uint256(index) + 1, sender, to, amount, memo, gasLimit, fallbackRecipient, data
+                    uint256(index) + 1,
+                    sender,
+                    to,
+                    amount,
+                    memo,
+                    gasLimit,
+                    zoneFallbackRecipient,
+                    data
                 )
             })
         );
@@ -613,7 +620,7 @@ contract ZoneBridgeTest is BaseTest {
             500e6,
             bytes32(0), // memo
             5_000_000, // gasLimit for callback
-            alice, // fallbackRecipient on zone
+            alice, // zoneFallbackRecipient on zone
             callbackData
         );
         vm.stopPrank();
@@ -903,7 +910,7 @@ contract ZoneBridgeTest is BaseTest {
                 minVaultShares: 0,
                 minOutputAmount: 0,
                 actionId: bytes32(0),
-                refundRecipient: alice
+                tempoRefundRecipient: alice
             })
         );
     }
@@ -922,7 +929,7 @@ contract ZoneBridgeTest is BaseTest {
             token: address(l2ZoneToken),
             sender: sender,
             amount: netAmount,
-            bouncebackRecipient: sender,
+            tempoRefundRecipient: sender,
             keyIndex: keyIndex,
             encrypted: encrypted
         });
@@ -1240,7 +1247,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: alice,
             to: alice,
             amount: depositAmount,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             memo: bytes32("regular")
         });
         bytes32 prevHash = l2Inbox.processedDepositQueueHash();
@@ -1252,7 +1259,7 @@ contract ZoneBridgeTest is BaseTest {
             token: address(l2ZoneToken),
             sender: bob,
             amount: netAmount,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             keyIndex: 0,
             encrypted: payload
         });
@@ -1265,7 +1272,7 @@ contract ZoneBridgeTest is BaseTest {
             sender: carol,
             to: carol,
             amount: depositAmount,
-            bouncebackRecipient: carol,
+            tempoRefundRecipient: carol,
             memo: bytes32("carol")
         });
         bytes32 hash3 = keccak256(abi.encode(DepositType.Regular, d3, hash2));
@@ -1372,7 +1379,7 @@ contract ZoneBridgeTest is BaseTest {
             token: address(l2ZoneToken),
             sender: alice,
             amount: netAmount,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             keyIndex: 0,
             encrypted: payload1
         });
@@ -1383,7 +1390,7 @@ contract ZoneBridgeTest is BaseTest {
             token: address(l2ZoneToken),
             sender: bob,
             amount: netAmount,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             keyIndex: 1,
             encrypted: payload2
         });

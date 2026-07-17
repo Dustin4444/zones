@@ -139,7 +139,7 @@ contract ZoneMessengerTest is BaseTest {
                 minVaultShares: 0,
                 minOutputAmount: 0,
                 actionId: bytes32(0),
-                refundRecipient: address(1)
+                tempoRefundRecipient: address(1)
             })
         );
     }

@@ -38,8 +38,8 @@ contract MockZoneGateway is IWithdrawalReceiver {
 
         CallbackData memory callback = abi.decode(callbackData, (CallbackData));
         if (callback.outputToken != token) revert InvalidOutputToken();
-        if (!portal.allowedAccount(callback.refundRecipient)) {
-            revert IZonePortal.AccountNotAllowed(callback.refundRecipient);
+        if (!portal.allowedAccount(callback.tempoRefundRecipient)) {
+            revert IZonePortal.AccountNotAllowed(callback.tempoRefundRecipient);
         }
         if (amount < callback.minOutputAmount) {
             revert InsufficientOutputAmount(amount, callback.minOutputAmount);
@@ -51,7 +51,7 @@ contract MockZoneGateway is IWithdrawalReceiver {
         if (!ITIP20(token).approve(sourcePortal, amount)) revert ApprovalFailed();
         IZonePortal(sourcePortal)
             .depositEncrypted(
-                token, amount, callback.keyIndex, callback.encrypted, callback.refundRecipient
+                token, amount, callback.keyIndex, callback.encrypted, callback.tempoRefundRecipient
             );
         if (!ITIP20(token).approve(sourcePortal, 0)) revert ApprovalFailed();
 

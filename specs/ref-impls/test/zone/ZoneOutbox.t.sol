@@ -94,7 +94,7 @@ contract ZoneOutboxTest is Test {
         bytes32 memo,
         uint64 gasLimit,
         address,
-        /* fallbackRecipient */
+        /* zoneFallbackRecipient */
         bytes memory callbackData
     )
         internal
@@ -119,7 +119,10 @@ contract ZoneOutboxTest is Test {
         return hex"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
     }
 
-    function _callbackData(Flow flow, address refundRecipient)
+    function _callbackData(
+        Flow flow,
+        address tempoRefundRecipient
+    )
         internal
         view
         returns (bytes memory)
@@ -140,17 +143,17 @@ contract ZoneOutboxTest is Test {
                 minVaultShares: 0,
                 minOutputAmount: 0,
                 actionId: bytes32(0),
-                refundRecipient: refundRecipient
+                tempoRefundRecipient: tempoRefundRecipient
             })
         );
     }
 
-    function _unsupportedFlowCallback(address refundRecipient)
+    function _unsupportedFlowCallback(address tempoRefundRecipient)
         internal
         view
         returns (bytes memory data)
     {
-        data = _callbackData(Flow.Deposit, refundRecipient);
+        data = _callbackData(Flow.Deposit, tempoRefundRecipient);
         assembly {
             mstore(add(data, 0x40), 2)
         }
@@ -617,7 +620,7 @@ contract ZoneOutboxTest is Test {
             500e6, // amount
             bytes32("pay"), // memo
             100_000, // gasLimit
-            alice, // fallbackRecipient
+            alice, // zoneFallbackRecipient
             callbackData
         );
         vm.stopPrank();
@@ -820,7 +823,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
 
-        // gasLimit = 0, fallbackRecipient = alice is fine
+        // gasLimit = 0, zoneFallbackRecipient = alice is fine
         outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
@@ -831,7 +834,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
 
-        // fallbackRecipient = address(0) reverts
+        // zoneFallbackRecipient = address(0) reverts
         vm.expectRevert(ZoneOutbox.InvalidFallbackRecipient.selector);
         outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, address(0), "");
         vm.stopPrank();
@@ -1087,7 +1090,7 @@ contract ZoneOutboxTest is Test {
             500e6, // amount
             bytes32("payment123"), // memo
             50_000, // gasLimit
-            charlie, // fallbackRecipient
+            charlie, // zoneFallbackRecipient
             callbackData // data
         );
         vm.stopPrank();

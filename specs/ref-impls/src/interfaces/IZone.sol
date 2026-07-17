@@ -74,7 +74,7 @@ struct Deposit {
     address sender;
     address to;
     uint128 amount;
-    address bouncebackRecipient;
+    address tempoRefundRecipient;
     bytes32 memo;
 }
 
@@ -101,7 +101,7 @@ struct EncryptedDeposit {
     address token; // TIP-20 token being deposited (public, for escrow accounting)
     address sender; // Depositor (public, for refunds)
     uint128 amount; // Amount (public, for accounting)
-    address bouncebackRecipient; // Tempo recipient for a failed-deposit refund
+    address tempoRefundRecipient; // Tempo recipient for a failed-deposit refund
     uint256 keyIndex; // Index of encryption key used (specified by depositor)
     EncryptedDepositPayload encrypted; // Encrypted (to, memo)
 }
@@ -112,6 +112,8 @@ enum Flow {
 }
 
 /// @notice Vault-adapter callback payload for an encrypted return to the source zone.
+/// @dev The encrypted recipient is Zone-local and needs no Tempo membership.
+///      `tempoRefundRecipient` is an allowed Tempo account paid if that return deposit fails.
 struct CallbackData {
     Flow flow;
     address outputToken;
@@ -121,7 +123,7 @@ struct CallbackData {
     uint128 minVaultShares;
     uint128 minOutputAmount;
     bytes32 actionId;
-    address refundRecipient;
+    address tempoRefundRecipient;
 }
 
 /// @notice Historical record of an encryption key with its activation block
@@ -536,7 +538,7 @@ interface IZonePortal {
         uint128 netAmount,
         uint128 fee,
         bytes32 memo,
-        address bouncebackRecipient,
+        address tempoRefundRecipient,
         uint64 depositNumber
     );
 
@@ -597,16 +599,16 @@ interface IZonePortal {
         bytes ciphertext,
         bytes12 nonce,
         bytes16 tag,
-        address bouncebackRecipient,
+        address tempoRefundRecipient,
         uint64 depositNumber
     );
 
     event DepositBounceBack(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+        address indexed tempoRefundRecipient, address token, uint128 amount, uint128 bouncebackFee
     );
 
     event DepositBounceBackPending(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+        address indexed tempoRefundRecipient, address token, uint128 amount, uint128 bouncebackFee
     );
 
     /// @notice Emitted when a recipient claims a previously-parked bounce-back refund.
@@ -870,7 +872,7 @@ interface IZonePortal {
         address to,
         uint128 amount,
         bytes32 memo,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -890,7 +892,7 @@ interface IZonePortal {
         uint128 amount,
         uint256 keyIndex,
         EncryptedDepositPayload calldata encrypted,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -1061,7 +1063,7 @@ interface IZoneInbox {
         address indexed to,
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     );
 
     event DepositRejected(
@@ -1070,15 +1072,15 @@ interface IZoneInbox {
         DepositType depositType,
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     );
 
     event WithdrawalBounceBackProcessed(
-        address indexed fallbackRecipient, address token, uint128 amount
+        address indexed zoneFallbackRecipient, address token, uint128 amount
     );
 
     event WithdrawalBounceBackPending(
-        address indexed fallbackRecipient, address token, uint128 amount
+        address indexed zoneFallbackRecipient, address token, uint128 amount
     );
 
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
@@ -1186,7 +1188,9 @@ interface IZoneOutbox {
     function lastFallbackNonce() external view returns (uint64);
 
     /// @notice Resolve and delete a fallback recipient. Only callable by ZoneInbox.
-    function consumeFallbackRecipient(uint64 fallbackNonce) external returns (address recipient);
+    function consumeFallbackRecipient(uint64 fallbackNonce)
+        external
+        returns (address zoneFallbackRecipient);
 
     /// @notice Last finalized batch parameters (for proof access via state root)
     function lastBatch() external view returns (LastBatch memory);
@@ -1227,7 +1231,7 @@ interface IZoneOutbox {
         uint128 amount,
         bytes32 memo,
         uint64 gasLimit,
-        address fallbackRecipient,
+        address zoneFallbackRecipient,
         bytes calldata data,
         bytes calldata revealTo
     )
@@ -1236,7 +1240,7 @@ interface IZoneOutbox {
     function enqueueDepositBounceBack(
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external;
 

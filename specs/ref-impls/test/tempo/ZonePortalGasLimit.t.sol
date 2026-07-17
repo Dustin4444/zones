@@ -46,7 +46,7 @@ contract ZonePortalGasLimitTest is Test {
     MockPortalToken public token;
 
     address public admin = address(0x500);
-    address public fallbackRecipient = address(0x200);
+    address public zoneFallbackRecipient = address(0x200);
     address public recipient = address(0x300);
 
     function setUp() public {
@@ -55,7 +55,7 @@ contract ZonePortalGasLimitTest is Test {
         address[] memory allowed = new address[](4);
         allowed[0] = address(this);
         allowed[1] = admin;
-        allowed[2] = fallbackRecipient;
+        allowed[2] = zoneFallbackRecipient;
         allowed[3] = recipient;
         address[] memory gateways = new address[](1);
         gateways[0] = address(0x301);
