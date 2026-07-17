@@ -148,7 +148,6 @@ crate::sol! {
             address indexed newAdmin
         );
 
-        event MessengerUpdated(address indexed previousMessenger, address indexed newMessenger);
         event ZoneGatewayUpdated(address indexed gateway, bool enabled);
         event AllowedAccountUpdated(address indexed account, bool enabled);
 
