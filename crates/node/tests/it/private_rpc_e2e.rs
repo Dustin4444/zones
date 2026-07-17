@@ -1121,6 +1121,7 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
         zone_info["result"]["zoneId"].as_str().unwrap(),
         format!("0x{:x}", ctx.config.zone_id),
     );
+    assert_eq!(zone_info["result"]["accessMode"], "0x0");
     assert_eq!(
         zone_info["result"]["zoneTokens"]
             .as_array()
@@ -1324,6 +1325,13 @@ async fn test_zone_get_deposit_status_encrypted_tempo_refund_recipient() -> eyre
     let recipient = l1.signer_at(2).address();
     let tempo_refund_signer = l1.signer_at(3);
     let tempo_refund_recipient = tempo_refund_signer.address();
+
+    let membership_block = l1
+        .set_allowed_account_on_portal(portal_address, tempo_refund_recipient, true)
+        .await?;
+    ctx.zone
+        .wait_for_l2_tempo_finalized(membership_block, DEFAULT_TIMEOUT)
+        .await?;
 
     let depositor =
         ZoneAccount::with_signer(depositor_signer.clone(), l1, &ctx.zone, portal_address);

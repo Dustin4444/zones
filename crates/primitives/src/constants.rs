@@ -72,7 +72,14 @@ pub const PORTAL_PENDING_SEQUENCER_SLOT: B256 = {
     B256::new(bytes)
 };
 
-/// ZonePortal storage slot 19: `portalRole` (mapping(address => Role)).
+/// ZonePortal packed metadata slot containing the immutable access mode at byte offset 29.
+pub const PORTAL_ACCESS_MODE_SLOT: B256 = {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 18;
+    B256::new(bytes)
+};
+
+/// ZonePortal storage slot 19: `role` (mapping(address => Role)).
 pub const PORTAL_ROLE_SLOT: B256 = {
     let mut bytes = [0u8; 32];
     bytes[31] = 19;

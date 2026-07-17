@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, ZoneInfo } from "../interfaces/IZone.sol";
+import { IZoneFactory, ZoneAccessMode, ZoneInfo } from "../interfaces/IZone.sol";
 import { Verifier } from "./Verifier.sol";
 import { ZoneMessenger } from "./ZoneMessenger.sol";
 import { ZonePortal } from "./ZonePortal.sol";
@@ -64,8 +64,11 @@ contract ZoneFactory is IZoneFactory {
         if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(params.initialToken)) {
             revert InvalidToken();
         }
-        if (params.zoneGateways.length == 0 || params.allowedAccounts.length == 0) {
+        if (params.accessMode == ZoneAccessMode.Closed && params.allowedAccounts.length == 0) {
             revert InvalidClosedLoopConfig();
+        }
+        if (params.accessMode == ZoneAccessMode.Open && params.allowedAccounts.length != 0) {
+            revert InvalidOpenLoopConfig();
         }
 
         for (uint256 i; i < params.allowedAccounts.length; ++i) {
@@ -103,6 +106,7 @@ contract ZoneFactory is IZoneFactory {
         portalContract.initialize(
             zoneId,
             params.initialToken,
+            params.accessMode,
             params.allowedAccounts,
             params.zoneGateways,
             _messenger,
@@ -123,6 +127,7 @@ contract ZoneFactory is IZoneFactory {
             zoneId: zoneId,
             portal: portal,
             initialToken: params.initialToken,
+            accessMode: params.accessMode,
             admin: params.admin,
             sequencer: params.sequencer,
             verifier: params.verifier,
@@ -138,6 +143,7 @@ contract ZoneFactory is IZoneFactory {
             zoneId,
             portal,
             params.initialToken,
+            params.accessMode,
             params.admin,
             params.sequencer,
             params.verifier,

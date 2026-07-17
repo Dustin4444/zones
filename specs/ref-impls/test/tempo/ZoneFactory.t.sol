@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { IZoneFactory, Role, ZoneInfo, ZoneParams } from "../../src/interfaces/IZone.sol";
+import {
+    IZoneFactory,
+    IZonePortal,
+    Role,
+    ZoneAccessMode,
+    ZoneInfo,
+    ZoneParams
+} from "../../src/interfaces/IZone.sol";
 import { ZoneFactory } from "../../src/tempo/ZoneFactory.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
@@ -28,6 +35,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_success() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -52,15 +60,13 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(info.zoneId, 1);
         assertEq(info.portal, portal);
         assertEq(info.initialToken, address(pathUSD));
+        assertEq(uint8(info.accessMode), uint8(ZoneAccessMode.Closed));
         assertEq(info.admin, admin);
         assertEq(info.sequencer, sequencer);
         assertEq(info.verifier, zoneFactory.verifier());
         assertEq(info.genesisBlockHash, GENESIS_BLOCK_HASH);
         assertEq(info.genesisTempoBlockHash, GENESIS_TEMPO_BLOCK_HASH);
-        assertEq(
-            uint8(ZonePortal(portal).role(address(zoneGateway))),
-            uint8(Role.CallbackGateway)
-        );
+        assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.CallbackGateway));
     }
 
     function test_createZone_supportsMultipleGateways() public {
@@ -70,6 +76,7 @@ contract ZoneFactoryTest is BaseTest {
         gateways[1] = replacement;
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: gateways,
             admin: admin,
@@ -84,13 +91,53 @@ contract ZoneFactoryTest is BaseTest {
         });
 
         (, address portal) = zoneFactory.createZone(params);
-        assertEq(
-            uint8(ZonePortal(portal).role(address(zoneGateway))),
-            uint8(Role.CallbackGateway)
-        );
-        assertEq(
-            uint8(ZonePortal(portal).role(replacement)), uint8(Role.CallbackGateway)
-        );
+        assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.CallbackGateway));
+        assertEq(uint8(ZonePortal(portal).role(replacement)), uint8(Role.CallbackGateway));
+    }
+
+    function test_createZone_openModeAllowsEmptyAccountsAndGateways() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        params.accessMode = ZoneAccessMode.Open;
+        params.allowedAccounts = new address[](0);
+        params.zoneGateways = new address[](0);
+
+        (uint32 zoneId, address portal) = zoneFactory.createZone(params);
+
+        assertEq(uint8(zoneFactory.zones(zoneId).accessMode), uint8(ZoneAccessMode.Open));
+        assertEq(uint8(ZonePortal(portal).accessMode()), uint8(ZoneAccessMode.Open));
+        assertEq(uint8(ZonePortal(portal).role(alice)), uint8(Role.None));
+        assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.None));
+
+        vm.prank(admin);
+        vm.expectRevert(IZonePortal.InvalidAllowedAccount.selector);
+        ZonePortal(portal).setRole(alice, Role.Account);
+    }
+
+    function test_createZone_closedModeAllowsEmptyGateways() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        params.zoneGateways = new address[](0);
+
+        (, address portal) = zoneFactory.createZone(params);
+
+        assertEq(uint8(ZonePortal(portal).accessMode()), uint8(ZoneAccessMode.Closed));
+        assertEq(uint8(ZonePortal(portal).role(alice)), uint8(Role.Account));
+        assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.None));
+    }
+
+    function test_createZone_closedModeRejectsEmptyAccounts() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        params.allowedAccounts = new address[](0);
+
+        vm.expectRevert(IZoneFactory.InvalidClosedLoopConfig.selector);
+        zoneFactory.createZone(params);
+    }
+
+    function test_createZone_openModeRejectsConfiguredAccounts() public {
+        IZoneFactory.CreateZoneParams memory params = _defaultParams();
+        params.accessMode = ZoneAccessMode.Open;
+
+        vm.expectRevert(IZoneFactory.InvalidOpenLoopConfig.selector);
+        zoneFactory.createZone(params);
     }
 
     function test_createZone_revertsWhenGatewayIsAllowedAccount() public {
@@ -99,6 +146,7 @@ contract ZoneFactoryTest is BaseTest {
         gateways[0] = accounts[0];
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: accounts,
             zoneGateways: gateways,
             admin: admin,
@@ -121,6 +169,7 @@ contract ZoneFactoryTest is BaseTest {
         accounts[0] = zoneFactory.messenger();
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: accounts,
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -147,6 +196,7 @@ contract ZoneFactoryTest is BaseTest {
         gateways[1] = address(zoneGateway);
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: accounts,
             zoneGateways: gateways,
             admin: admin,
@@ -163,10 +213,7 @@ contract ZoneFactoryTest is BaseTest {
         (, address portal) = zoneFactory.createZone(params);
 
         assertEq(uint8(ZonePortal(portal).role(alice)), uint8(Role.Account));
-        assertEq(
-            uint8(ZonePortal(portal).role(address(zoneGateway))),
-            uint8(Role.CallbackGateway)
-        );
+        assertEq(uint8(ZonePortal(portal).role(address(zoneGateway))), uint8(Role.CallbackGateway));
     }
 
     function test_createZone_acceptsZeroAllowedAccount() public {
@@ -174,6 +221,7 @@ contract ZoneFactoryTest is BaseTest {
         accounts[0] = address(0);
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: accounts,
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -200,6 +248,7 @@ contract ZoneFactoryTest is BaseTest {
         gateways[0] = address(0);
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: gateways,
             admin: admin,
@@ -215,9 +264,7 @@ contract ZoneFactoryTest is BaseTest {
 
         (, address portal) = zoneFactory.createZone(params);
 
-        assertEq(
-            uint8(ZonePortal(portal).role(address(0))), uint8(Role.CallbackGateway)
-        );
+        assertEq(uint8(ZonePortal(portal).role(address(0))), uint8(Role.CallbackGateway));
         vm.prank(admin);
         ZonePortal(portal).setRole(address(0), Role.None);
         assertEq(uint8(ZonePortal(portal).role(address(0))), uint8(Role.None));
@@ -226,6 +273,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsForNonOwner() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -267,6 +315,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_usesSharedMessenger() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -294,6 +343,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_multipleZones() public {
         IZoneFactory.CreateZoneParams memory params1 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -312,6 +362,7 @@ contract ZoneFactoryTest is BaseTest {
         address secondSequencer = alice;
         IZoneFactory.CreateZoneParams memory params2 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -345,6 +396,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_emitsEvent() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -369,7 +421,7 @@ contract ZoneFactoryTest is BaseTest {
             if (
                 logs[i].topics[0]
                     == keccak256(
-                        "ZoneCreated(uint32,address,address,address,address,address,bytes32,bytes32,uint64)"
+                        "ZoneCreated(uint32,address,address,uint8,address,address,address,bytes32,bytes32,uint64)"
                     )
             ) {
                 found = true;
@@ -393,6 +445,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsOnInvalidToken_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(0),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -416,6 +469,7 @@ contract ZoneFactoryTest is BaseTest {
 
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: notTip20,
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -436,6 +490,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsOnInvalidToken_eoa() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: alice, // EOA, not a contract
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -460,6 +515,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsOnInvalidAdmin_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: address(0),
@@ -484,6 +540,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsOnInvalidSequencer_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -508,6 +565,7 @@ contract ZoneFactoryTest is BaseTest {
     function test_createZone_revertsOnInvalidVerifier() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -553,6 +611,7 @@ contract ZoneFactoryTest is BaseTest {
     function _defaultParams() internal view returns (IZoneFactory.CreateZoneParams memory) {
         return IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -605,6 +664,7 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(pc.messenger(), zoneFactory.messenger());
         assertEq(pc.blockHash(), p.zoneParams.genesisBlockHash);
         assertEq(pc.genesisTempoBlockNumber(), p.zoneParams.genesisTempoBlockNumber);
+        assertEq(uint8(pc.accessMode()), uint8(p.accessMode));
         assertEq(pc.rpcUrl(), p.rpcUrl);
         assertTrue(pc.isTokenEnabled(address(pathUSD)));
     }

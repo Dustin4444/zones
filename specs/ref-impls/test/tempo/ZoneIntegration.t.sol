@@ -15,6 +15,7 @@ import {
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     QueuedDeposit,
     Withdrawal,
+    ZoneAccessMode,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -153,6 +154,7 @@ contract ZoneIntegrationTest is BaseTest {
         l1Portal.initialize(
             1,
             address(l2ZoneToken),
+            ZoneAccessMode.Closed,
             _closedLoopAccounts(),
             _zoneGateways(),
             address(messengerContract),

@@ -2,7 +2,7 @@
 
 use alloy_primitives::{Address, address};
 
-pub use ZoneFactory::ZoneInfo;
+pub use ZoneFactory::{ZoneAccessMode, ZoneInfo};
 
 /// Protocol-managed ZoneFactory address defined by TIP-1091.
 pub const ZONE_FACTORY_ADDRESS: Address = address!("0x5aF2000000000000000000000000000000000000");
@@ -10,10 +10,15 @@ pub const ZONE_FACTORY_ADDRESS: Address = address!("0x5aF20000000000000000000000
 crate::sol! {
     #[derive(Debug)]
     contract ZoneFactory {
+        enum ZoneAccessMode {
+            Closed,
+            Open,
+        }
         struct ZoneInfo {
             uint32 zoneId;
             address portal;
             address initialToken;
+            ZoneAccessMode accessMode;
             address admin;
             address sequencer;
             address verifier;
@@ -29,6 +34,7 @@ crate::sol! {
         }
         struct CreateZoneParams {
             address initialToken;
+            ZoneAccessMode accessMode;
             address[] allowedAccounts;
             address[] zoneGateways;
             address admin;
@@ -41,6 +47,7 @@ crate::sol! {
             uint32 indexed zoneId,
             address indexed portal,
             address initialToken,
+            ZoneAccessMode accessMode,
             address admin,
             address sequencer,
             address verifier,

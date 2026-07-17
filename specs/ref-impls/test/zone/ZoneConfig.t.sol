@@ -5,11 +5,13 @@ import {
     IZoneConfig,
     IZoneFactory,
     IZonePortal,
+    PORTAL_ACCESS_MODE_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_PENDING_SEQUENCER_SLOT,
     PORTAL_ROLE_SLOT,
     PORTAL_SEQUENCER_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT,
+    ZoneAccessMode,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
 import { ZoneFactory } from "../../src/tempo/ZoneFactory.sol";
@@ -38,6 +40,7 @@ contract ZoneConfigTest is BaseTest {
 
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -59,6 +62,7 @@ contract ZoneConfigTest is BaseTest {
 
         _syncPortalSlot(PORTAL_SEQUENCER_SLOT);
         _syncPortalSlot(PORTAL_PENDING_SEQUENCER_SLOT);
+        _syncPortalSlot(PORTAL_ACCESS_MODE_SLOT);
         _syncTokenConfig(address(pathUSD));
         _syncAllowedAccount(alice);
         _syncZoneGateway(address(zoneGateway));
@@ -132,10 +136,26 @@ contract ZoneConfigTest is BaseTest {
     }
 
     function test_closedLoopMembershipAndGatewayAreIndependent() public view {
+        assertEq(uint8(config.accessMode()), uint8(ZoneAccessMode.Closed));
         assertTrue(config.isAllowedAccount(alice));
         assertFalse(config.isZoneGateway(alice));
         assertTrue(config.isZoneGateway(address(zoneGateway)));
         assertFalse(config.isAllowedAccount(address(zoneGateway)));
+    }
+
+    function test_openModeBypassesAccountMembershipButNotGatewayState() public {
+        tempoState.setMockStorageValue(
+            address(portal),
+            PORTAL_ACCESS_MODE_SLOT,
+            bytes32(uint256(uint8(ZoneAccessMode.Open)) << 232)
+        );
+
+        address outsider = makeAddr("open mode outsider");
+        assertEq(uint8(config.accessMode()), uint8(ZoneAccessMode.Open));
+        assertTrue(config.isAllowedAccount(outsider));
+        assertTrue(config.isAllowedAccount(address(zoneGateway)));
+        assertTrue(config.isZoneGateway(address(zoneGateway)));
+        assertFalse(config.isZoneGateway(outsider));
     }
 
     /// @notice Verifies reading the sequencer encryption key reverts before any key is set.

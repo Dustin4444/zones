@@ -28,6 +28,7 @@ import {
     Role,
     Withdrawal,
     ZONE_FACTORY_ADDRESS,
+    ZoneAccessMode,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -223,6 +224,7 @@ contract ZonePortalProxyStorageTest is Test {
             .initialize(
                 1,
                 initialToken,
+                ZoneAccessMode.Closed,
                 _proxyAccounts(1),
                 _proxyGateways(messengerA),
                 messengerA,
@@ -273,6 +275,7 @@ contract ZonePortalProxyStorageTest is Test {
             .initialize(
                 id,
                 initialToken,
+                ZoneAccessMode.Closed,
                 _proxyAccounts(id),
                 _proxyGateways(portalMessenger),
                 portalMessenger,
@@ -336,6 +339,7 @@ contract ZonePortalTest is BaseTest {
         // Create a zone
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
+            accessMode: ZoneAccessMode.Closed,
             allowedAccounts: _closedLoopAccounts(),
             zoneGateways: _zoneGateways(),
             admin: admin,
@@ -675,9 +679,7 @@ contract ZonePortalTest is BaseTest {
 
     function test_setPortalRole_eventIncludesold() public {
         vm.expectEmit(true, false, false, true);
-        emit IZonePortal.RoleUpdated(
-            address(zoneGateway), Role.CallbackGateway, Role.Account
-        );
+        emit IZonePortal.RoleUpdated(address(zoneGateway), Role.CallbackGateway, Role.Account);
         vm.prank(admin);
         portal.setRole(address(zoneGateway), Role.Account);
     }
@@ -1556,7 +1558,7 @@ contract ZonePortalTest is BaseTest {
     function test_callbackWithdrawal_returnsFundsAndChangesDepositQueue() public {
         uint128 amount = 500e6;
         _fundCallbackWithdrawal(amount);
-        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.None));
+        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.CallbackGateway));
 
         Withdrawal memory withdrawal = _withdrawal(
             address(pathUSD),
@@ -3045,8 +3047,8 @@ contract ZonePortalTest is BaseTest {
     ///        slot 6: deposit counters + bouncebackGas (uint64) [packed]
     ///        slot 7: _encryptionKeys.length (EncryptionKeyEntry[])
     ///        slot 17: zoneId (uint32) + messenger (address) [packed]
-    ///        slot 18: verifier + genesisTempoBlockNumber + _initialized [packed]
-    ///        slot 19: portalRole mapping
+    ///        slot 18: verifier + genesisTempoBlockNumber + _initialized + accessMode [packed]
+    ///        slot 19: role mapping
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));
@@ -3121,7 +3123,7 @@ contract ZonePortalTest is BaseTest {
             "slot 17: messenger mismatch"
         );
 
-        // --- Slot 18: verifier (address) + genesisTempoBlockNumber (uint64) packed ---
+        // --- Slot 18: verifier + genesisTempoBlockNumber + initialized + accessMode packed ---
         bytes32 slot18 = vm.load(address(portal), bytes32(uint256(18)));
         assertEq(address(uint160(uint256(slot18))), portal.verifier(), "slot 18: verifier mismatch");
         assertEq(
@@ -3130,6 +3132,11 @@ contract ZonePortalTest is BaseTest {
             "slot 18: genesisTempoBlockNumber mismatch"
         );
         assertEq(uint8(uint256(slot18) >> 224), 1, "slot 18: initialized mismatch");
+        assertEq(
+            uint8(uint256(slot18) >> 232),
+            uint8(ZoneAccessMode.Closed),
+            "slot 18: accessMode mismatch"
+        );
 
         bytes32 gatewaySlot = keccak256(abi.encode(address(zoneGateway), uint256(PORTAL_ROLE_SLOT)));
         assertEq(

@@ -19,6 +19,11 @@ use zone_primitives::constants::zone_chain_id;
 use crate::zone_utils::MODERATO_ZONE_FACTORY;
 
 sol! {
+    enum ZoneAccessMode {
+        Closed,
+        Open,
+    }
+
     struct ZoneParams {
         bytes32 genesisBlockHash;
         bytes32 genesisTempoBlockHash;
@@ -27,6 +32,7 @@ sol! {
 
     struct CreateZoneParams {
         address initialToken;
+        ZoneAccessMode accessMode;
         address[] allowedAccounts;
         address[] zoneGateways;
         address admin;
@@ -42,6 +48,7 @@ sol! {
             uint32 indexed zoneId,
             address indexed portal,
             address initialToken,
+            ZoneAccessMode accessMode,
             address admin,
             address sequencer,
             address verifier,
@@ -77,6 +84,28 @@ const NATIVE_ZONE_VERIFIER: Address = address!("0x5A5600000000000000000000000000
 /// Messenger protocol constant baked into the native ZoneFactory precompile.
 const NATIVE_ZONE_MESSENGER: Address = address!("0x5A4D000000000000000000000000000000000000");
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ZoneAccessModeArg {
+    Closed,
+    Open,
+}
+
+impl ZoneAccessModeArg {
+    const fn contract_value(self) -> ZoneAccessMode {
+        match self {
+            Self::Closed => ZoneAccessMode::Closed,
+            Self::Open => ZoneAccessMode::Open,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+}
+
 #[derive(Debug, clap::Parser)]
 pub(crate) struct CreateZone {
     /// Output directory where genesis.json will be written.
@@ -95,13 +124,17 @@ pub(crate) struct CreateZone {
     #[arg(long, default_value_t = address!("0x20C0000000000000000000000000000000000000"))]
     initial_token: Address,
 
+    /// Immutable account authorization mode. Open zones do not use an account allowlist.
+    #[arg(long, value_enum, default_value_t = ZoneAccessModeArg::Closed)]
+    access_mode: ZoneAccessModeArg,
+
     /// Callback-only ZoneGateway implementation. Repeat to support legacy and replacement gateways.
-    #[arg(long = "zone-gateway", required = true)]
+    #[arg(long = "zone-gateway")]
     zone_gateways: Vec<Address>,
 
     /// Allowed plain-withdrawal/deposit account. Repeat for each member.
     /// Zone gateways are configured separately and must not be included.
-    #[arg(long = "allowed-account", required = true)]
+    #[arg(long = "allowed-account")]
     allowed_accounts: Vec<Address>,
 
     /// Sequencer address that will operate the zone.
@@ -137,6 +170,16 @@ pub(crate) struct CreateZone {
 
 impl CreateZone {
     pub(crate) async fn run(self) -> eyre::Result<()> {
+        match self.access_mode {
+            ZoneAccessModeArg::Closed if self.allowed_accounts.is_empty() => {
+                return Err(eyre!("closed mode requires at least one --allowed-account"));
+            }
+            ZoneAccessModeArg::Open if !self.allowed_accounts.is_empty() => {
+                return Err(eyre!("open mode does not accept --allowed-account"));
+            }
+            _ => {}
+        }
+
         let key_str = self
             .private_key
             .strip_prefix("0x")
@@ -212,6 +255,7 @@ impl CreateZone {
         } else {
             let params = CreateZoneParams {
                 initialToken: self.initial_token,
+                accessMode: self.access_mode.contract_value(),
                 allowedAccounts: self.allowed_accounts.clone(),
                 zoneGateways: self.zone_gateways.clone(),
                 admin: self.admin,
@@ -279,6 +323,7 @@ impl CreateZone {
             "portal": format!("{portal}"),
             "messenger": format!("{messenger}"),
             "initialToken": format!("{}", self.initial_token),
+            "accessMode": self.access_mode.label(),
             "zoneGateways": self.zone_gateways.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "allowedAccounts": self.allowed_accounts.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "admin": format!("{}", self.admin),
@@ -300,6 +345,7 @@ impl CreateZone {
         println!("  Portal: {portal}");
         println!("  Messenger: {messenger}");
         println!("  Initial Token: {}", self.initial_token);
+        println!("  Access Mode: {}", self.access_mode.label());
         println!("  Admin: {}", self.admin);
         println!("  Sequencer: {}", self.sequencer);
         println!("  ZoneFactory: {}", self.zone_factory);

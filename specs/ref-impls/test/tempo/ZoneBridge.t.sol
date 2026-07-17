@@ -25,6 +25,7 @@ import {
     Withdrawal,
     ZONE_INBOX,
     ZONE_OUTBOX,
+    ZoneAccessMode,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -189,6 +190,7 @@ contract ZoneBridgeTest is BaseTest {
         l1Portal.initialize(
             1, // zoneId
             address(l2ZoneToken), // initialToken = MockZoneToken (NOT pathUSD)
+            ZoneAccessMode.Closed,
             bridgeAccounts,
             _zoneGateways(),
             address(messengerContract),

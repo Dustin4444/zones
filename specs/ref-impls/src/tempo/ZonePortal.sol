@@ -18,7 +18,8 @@ import {
     Role,
     TokenConfig,
     Withdrawal,
-    ZONE_FACTORY_ADDRESS
+    ZONE_FACTORY_ADDRESS,
+    ZoneAccessMode
 } from "../interfaces/IZone.sol";
 import { getBlockHash } from "../libraries/BlockHashHistory.sol";
 import { DepositQueueLib } from "../libraries/DepositQueueLib.sol";
@@ -144,6 +145,7 @@ contract ZonePortal is IZonePortal {
     address public verifier;
     uint64 public genesisTempoBlockNumber;
     bool internal _initialized;
+    ZoneAccessMode public accessMode;
 
     /// @notice Mutually exclusive authorization role assigned to each Tempo account.
     mapping(address => Role) public role;
@@ -155,6 +157,7 @@ contract ZonePortal is IZonePortal {
     function initialize(
         uint32 _zoneId,
         address _initialToken,
+        ZoneAccessMode _accessMode,
         address[] calldata _allowedAccounts,
         address[] calldata _zoneGateways,
         address _messenger,
@@ -179,6 +182,7 @@ contract ZonePortal is IZonePortal {
         verifier = _verifier;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
+        accessMode = _accessMode;
         rpcUrl = _rpcUrl;
 
         for (uint256 i; i < _zoneGateways.length; ++i) {
@@ -297,7 +301,7 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Assign an account's role across portal flows.
     function setRole(address account, Role next) external onlyAdmin {
-        if (next == Role.Account && account == messenger) {
+        if (next == Role.Account && (accessMode != ZoneAccessMode.Closed || account == messenger)) {
             revert InvalidAllowedAccount();
         }
         Role prev = role[account];
@@ -555,7 +559,11 @@ contract ZonePortal is IZonePortal {
     }
 
     function _requireAllowed(address account) internal view {
-        if (role[account] != Role.Account) revert AccountNotAllowed(account);
+        if (!_isAllowed(account)) revert AccountNotAllowed(account);
+    }
+
+    function _isAllowed(address account) internal view returns (bool) {
+        return accessMode == ZoneAccessMode.Open || role[account] == Role.Account;
     }
 
     function _validateDepositPolicy(
@@ -624,7 +632,9 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
-        _requireAllowed(msg.sender);
+        // A registered gateway is independently authorized to return callback funds.
+        // Its role remains disjoint from accounts and cannot receive a plain withdrawal.
+        if (role[msg.sender] != Role.CallbackGateway) _requireAllowed(msg.sender);
         _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
@@ -805,9 +815,9 @@ contract ZonePortal is IZonePortal {
 
         bool success;
         if (withdrawal.gasLimit == 0) {
-            // Re-check current membership without reverting so an in-flight withdrawal to a
-            // revoked account bounces without blocking the FIFO.
-            success = role[withdrawal.to] == Role.Account
+            // Re-check current roles without reverting so an in-flight withdrawal to a revoked
+            // account or newly registered gateway bounces without blocking the FIFO.
+            success = role[withdrawal.to] != Role.CallbackGateway && _isAllowed(withdrawal.to)
                 && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
             // Isolate callback effects so failure can be caught without reverting the dequeue.
@@ -847,18 +857,22 @@ contract ZonePortal is IZonePortal {
         onlySelf
     {
         if (role[target] != Role.CallbackGateway) revert InvalidCallbackTarget();
-        bytes32 depositQueueHashBefore = currentDepositQueueHash;
-
         if (!ITIP20(token).transfer(messenger, amount)) {
             revert TransferFailed();
         }
 
+        bytes32 depositQueueHashBefore = currentDepositQueueHash;
+
         IZoneMessenger(messenger)
             .relayMessage(zoneId, token, senderTag, target, amount, gasLimit, data);
 
-        // This proves only that some deposit was appended. Callback data is opaque; the configured
-        // gateway is trusted to allow only deposit/redeem and deposit the result back into the zone.
-        if (currentDepositQueueHash == depositQueueHashBefore) revert CallbackDidNotReturnToZone();
+        // Closed loops require the gateway to return value to this portal. Open-loop gateways may
+        // route atomically to a different zone, so their source queue is not expected to change.
+        if (
+            accessMode == ZoneAccessMode.Closed && currentDepositQueueHash == depositQueueHashBefore
+        ) {
+            revert CallbackDidNotReturnToZone();
+        }
     }
 
     function _processDepositBounceBack(Withdrawal calldata withdrawal) internal {
@@ -875,8 +889,8 @@ contract ZonePortal is IZonePortal {
             _tryTransfer(_token, sequencer, bouncebackFee); // ignore failure
         }
 
-        bool success = role[withdrawal.to] == Role.Account
-            && _tryTransfer(_token, withdrawal.to, refundAmount);
+        bool success =
+            _isAllowed(withdrawal.to) && _tryTransfer(_token, withdrawal.to, refundAmount);
 
         if (success) {
             emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);
