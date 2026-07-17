@@ -386,12 +386,18 @@ contract ZonePortalTest is BaseTest {
         assertEq(zoneFactory.zoneCount(), 1);
         assertTrue(zoneFactory.isZonePortal(address(portal)));
 
-        ZoneInfo memory info = zoneFactory.zones(testZoneId);
-        assertEq(info.zoneId, testZoneId);
-        assertEq(info.portal, address(portal));
-        assertEq(info.initialToken, address(pathUSD));
-        assertEq(info.admin, admin);
-        assertEq(info.sequencer, sequencer);
+        (
+            uint32 zoneId,
+            address registeredPortal,
+            address initialToken,
+            address registeredAdmin,
+            address registeredSequencer,,,,
+        ) = zoneFactory.zones(testZoneId);
+        assertEq(zoneId, testZoneId);
+        assertEq(registeredPortal, address(portal));
+        assertEq(initialToken, address(pathUSD));
+        assertEq(registeredAdmin, admin);
+        assertEq(registeredSequencer, sequencer);
     }
 
     function test_adminCanPauseAndResumeDeposits() public {

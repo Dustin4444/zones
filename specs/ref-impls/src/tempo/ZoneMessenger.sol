@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {
-    IWithdrawalReceiver,
-    IZoneFactory,
-    IZoneMessenger,
-    ZoneInfo
-} from "../interfaces/IZone.sol";
+import { IWithdrawalReceiver, IZoneFactory, IZoneMessenger } from "../interfaces/IZone.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 /// @title ZoneMessenger
@@ -45,8 +40,8 @@ contract ZoneMessenger is IZoneMessenger {
         external
         nonReentrantRelay
     {
-        ZoneInfo memory zone = zoneFactory.zones(zoneId);
-        if (zone.portal != msg.sender) revert UnauthorizedPortal();
+        (, address portal,,,,,,,) = zoneFactory.zones(zoneId);
+        if (portal != msg.sender) revert UnauthorizedPortal();
 
         if (!ITIP20(token).transfer(target, amount)) {
             revert TransferFailed();

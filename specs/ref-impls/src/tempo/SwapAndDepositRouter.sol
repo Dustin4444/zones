@@ -5,8 +5,7 @@ import {
     EncryptedDepositPayload,
     IWithdrawalReceiver,
     IZoneFactory,
-    IZonePortal,
-    ZoneInfo
+    IZonePortal
 } from "../interfaces/IZone.sol";
 import { IStablecoinDEX } from "tempo-std/interfaces/IStablecoinDEX.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
@@ -77,8 +76,8 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
             revert UnauthorizedMessenger();
         }
 
-        ZoneInfo memory sourceZone = zoneFactory.zones(sourceZoneId);
-        if (sourceZone.portal != sourcePortal) {
+        (, address registeredPortal,,,,,,,) = zoneFactory.zones(sourceZoneId);
+        if (registeredPortal != sourcePortal) {
             revert InvalidSourcePortal();
         }
 

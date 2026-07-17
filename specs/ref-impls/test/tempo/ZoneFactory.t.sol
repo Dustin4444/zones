@@ -46,7 +46,7 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(zoneFactory.zoneCount(), 1);
         assertTrue(zoneFactory.isZonePortal(portal));
 
-        ZoneInfo memory info = zoneFactory.zones(zoneId);
+        ZoneInfo memory info = _zoneInfo(zoneId);
         assertEq(info.zoneId, 1);
         assertEq(info.portal, portal);
         assertEq(info.initialToken, address(pathUSD));
@@ -118,7 +118,7 @@ contract ZoneFactoryTest is BaseTest {
         // Verify portal references the messenger
         ZonePortal portalContract = ZonePortal(portal);
         assertEq(portalContract.messenger(), messengerAddr);
-        assertEq(zoneFactory.zones(zoneId).portal, portal);
+        assertEq(_zoneInfo(zoneId).portal, portal);
     }
 
     function test_createZone_multipleZones() public {
@@ -160,8 +160,8 @@ contract ZoneFactoryTest is BaseTest {
         assertTrue(zoneFactory.isZonePortal(portal1));
         assertTrue(zoneFactory.isZonePortal(portal2));
 
-        ZoneInfo memory info1 = zoneFactory.zones(zoneId1);
-        ZoneInfo memory info2 = zoneFactory.zones(zoneId2);
+        ZoneInfo memory info1 = _zoneInfo(zoneId1);
+        ZoneInfo memory info2 = _zoneInfo(zoneId2);
         assertEq(info1.sequencer, sequencer);
         assertEq(info2.sequencer, secondSequencer);
         assertEq(ZonePortal(portal1).messenger(), zoneFactory.messenger());
@@ -352,7 +352,7 @@ contract ZoneFactoryTest is BaseTest {
     }
 
     function test_zones_returnsEmptyForNonExistentZone() public view {
-        ZoneInfo memory info = zoneFactory.zones(999);
+        ZoneInfo memory info = _zoneInfo(999);
         assertEq(info.zoneId, 0);
         assertEq(info.portal, address(0));
         assertEq(info.initialToken, address(0));
@@ -375,6 +375,21 @@ contract ZoneFactoryTest is BaseTest {
             }),
             rpcUrl: ""
         });
+    }
+
+    function _zoneInfo(uint32 id) internal view returns (ZoneInfo memory info) {
+        (
+            info.zoneId,
+            info.portal,
+            info.initialToken,
+            info.admin,
+            info.sequencer,
+            info.genesisBlockHash,
+            info.genesisTempoBlockHash,
+            info.genesisTempoBlockNumber,
+            info.rpcUrl
+        ) = zoneFactory.zones(id);
+        info.verifier = zoneFactory.verifier();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -446,7 +461,7 @@ contract ZoneFactoryTest is BaseTest {
         ZonePortal(portal).acceptSequencer();
 
         assertEq(ZonePortal(portal).sequencer(), nextSequencer); // portal: current
-        assertEq(zoneFactory.zones(id).sequencer, sequencer); // factory: snapshot at creation
+        assertEq(_zoneInfo(id).sequencer, sequencer); // factory: snapshot at creation
     }
 
     // Factory ZoneInfo.admin is likewise a snapshot; the portal admin can rotate via the
@@ -459,7 +474,7 @@ contract ZoneFactoryTest is BaseTest {
         ZonePortal(portal).acceptAdmin();
 
         assertEq(ZonePortal(portal).admin(), alice); // portal: current
-        assertEq(zoneFactory.zones(id).admin, admin); // factory: snapshot at creation
+        assertEq(_zoneInfo(id).admin, admin); // factory: snapshot at creation
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -499,7 +514,7 @@ contract ZoneFactoryTest is BaseTest {
         p.zoneParams = ZoneParams(gh, tgh, tbn);
 
         (uint32 id, address portal) = zoneFactory.createZone(p);
-        ZoneInfo memory info = zoneFactory.zones(id);
+        ZoneInfo memory info = _zoneInfo(id);
 
         assertEq(info.admin, adminAddr);
         assertEq(info.sequencer, seqAddr);
