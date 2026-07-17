@@ -190,6 +190,7 @@ contract ZonePortal is IZonePortal {
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
         _enforcementFlags = _encodeEnforcementFlags(_accessMode, _gatewayMode);
         rpcUrl = _rpcUrl;
+        emit EnforcementModesUpdated(_accessMode, _gatewayMode);
 
         for (uint256 i; i < _zoneGateways.length; ++i) {
             role[_zoneGateways[i]] = Role.CallbackGateway;
@@ -934,6 +935,7 @@ contract ZonePortal is IZonePortal {
         // opaque, so an enforced gateway is trusted to constrain the operation and return the
         // intended result. Open access imposes no source-deposit invariant: callback value may go
         // to another zone or leave the zone system entirely.
+        // FIXME(closed-loop-fees): Fix sequencer fees to zero and enforce onchain.
         if (
             accessMode() == ZoneAccessMode.Closed
                 && currentDepositQueueHash == depositQueueHashBefore

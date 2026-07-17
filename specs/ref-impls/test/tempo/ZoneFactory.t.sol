@@ -431,6 +431,18 @@ contract ZoneFactoryTest is BaseTest {
             rpcUrl: ""
         });
 
+        address expectedPortal = vm.computeCreateAddress(address(zoneFactory), 3);
+        vm.expectEmit(false, false, false, true, expectedPortal);
+        emit IZonePortal.EnforcementModesUpdated(params.accessMode, params.gatewayMode);
+        for (uint256 i; i < params.zoneGateways.length; ++i) {
+            vm.expectEmit(true, false, false, true, expectedPortal);
+            emit IZonePortal.RoleUpdated(params.zoneGateways[i], Role.None, Role.CallbackGateway);
+        }
+        for (uint256 i; i < params.allowedAccounts.length; ++i) {
+            vm.expectEmit(true, false, false, true, expectedPortal);
+            emit IZonePortal.RoleUpdated(params.allowedAccounts[i], Role.None, Role.Account);
+        }
+
         // Record logs and verify ZoneCreated event was emitted
         vm.recordLogs();
         (uint32 zoneId, address portal) = zoneFactory.createZone(params);

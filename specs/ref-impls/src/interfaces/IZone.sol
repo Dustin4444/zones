@@ -644,10 +644,10 @@ interface IZonePortal {
     /// @notice Emitted when the sequencer updates the zone's public RPC endpoint
     event RpcUrlUpdated(string rpcUrl);
 
-    /// @notice Emitted when an account's portal role changes.
+    /// @notice Emitted when an account's portal role is initialized or updated.
     event RoleUpdated(address indexed account, Role prev, Role next);
 
-    /// @notice Emitted after either independently mutable enforcement mode changes.
+    /// @notice Emitted when the independently mutable enforcement modes are initialized or updated.
     event EnforcementModesUpdated(ZoneAccessMode accessMode, ZoneGatewayMode gatewayMode);
 
     error NotSequencer();
