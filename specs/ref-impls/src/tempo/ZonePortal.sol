@@ -299,7 +299,7 @@ contract ZonePortal is IZonePortal {
     /// @dev Gateways are deliberately separate from allowed accounts: they may receive only
     ///      withdrawal callbacks and may return funds through depositEncrypted.
     function setZoneGateway(address gateway, bool enabled) external onlyAdmin {
-        if (gateway == address(0) || (enabled && allowedAccount[gateway])) {
+        if (enabled && allowedAccount[gateway]) {
             revert InvalidCallbackTarget();
         }
         zoneGateway[gateway] = enabled;
@@ -309,7 +309,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Enable or disable an account across deposits, refunds, and plain withdrawals.
     /// @dev Accounts cannot be an active gateway or the fixed messenger.
     function setAllowedAccount(address account, bool enabled) external onlyAdmin {
-        if (account == address(0) || (enabled && (zoneGateway[account] || account == messenger))) {
+        if (enabled && (zoneGateway[account] || account == messenger)) {
             revert InvalidAllowedAccount();
         }
         allowedAccount[account] = enabled;
