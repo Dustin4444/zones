@@ -214,11 +214,6 @@ contract ZonePortal is IZonePortal {
         _;
     }
 
-    modifier onlySelf() {
-        if (msg.sender != address(this)) revert NotSelf();
-        _;
-    }
-
     modifier nonReentrantWithdrawal() {
         if (_withdrawalReentrancyStatus != 0) revert ReentrantWithdrawal();
         _withdrawalReentrancyStatus = 1;
@@ -648,7 +643,6 @@ contract ZonePortal is IZonePortal {
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
         _requireAllowed(msg.sender);
-        _requireAllowed(to);
         _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
@@ -838,7 +832,7 @@ contract ZonePortal is IZonePortal {
 
         if (!zoneGateway[withdrawal.to]) revert InvalidCallbackTarget();
         bytes32 depositQueueHashBefore = currentDepositQueueHash;
-        this.deliverWithdrawal(
+        _deliverWithdrawal(
             _token,
             withdrawal.to,
             withdrawal.amount,
@@ -854,12 +848,9 @@ contract ZonePortal is IZonePortal {
         );
     }
 
-    /// @notice Deliver a callback withdrawal in a revertable self-call frame.
-    /// @dev Only callable by this portal. It transfers only the current withdrawal amount to
-    ///      the configured messenger, then asks the messenger to call the target. If delivery
-    ///      fails, this call reverts and rolls back the transfer to the messenger. That revert
-    ///      propagates through processWithdrawals, retaining the queue item.
-    function deliverWithdrawal(
+    /// @dev Transfers only the current withdrawal amount to the configured messenger, then
+    ///      asks it to call the target. Any failure reverts withdrawal processing atomically.
+    function _deliverWithdrawal(
         address token,
         address target,
         uint128 amount,
@@ -867,8 +858,7 @@ contract ZonePortal is IZonePortal {
         uint64 gasLimit,
         bytes calldata data
     )
-        external
-        onlySelf
+        internal
     {
         if (!ITIP20(token).transfer(messenger, amount)) {
             revert TransferFailed();
