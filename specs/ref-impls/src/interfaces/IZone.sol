@@ -100,6 +100,24 @@ struct EncryptedDeposit {
     EncryptedDepositPayload encrypted; // Encrypted (to, memo)
 }
 
+enum Flow {
+    Deposit,
+    Redeem
+}
+
+/// @notice Vault-adapter callback payload for an encrypted return to the source zone.
+struct CallbackData {
+    Flow flow;
+    address outputToken;
+    uint256 keyIndex;
+    EncryptedDepositPayload encrypted;
+    uint128 minVaultAssets;
+    uint128 minVaultShares;
+    uint128 minOutputAmount;
+    bytes32 actionId;
+    address tempoRefundRecipient;
+}
+
 /// @notice Historical record of an encryption key with its activation block
 /// @dev Storage layout per entry (2 slots):
 ///      slot 0: x (bytes32) — full slot
@@ -408,7 +426,9 @@ interface IZoneFactory {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     struct CreateZoneParams {
-        address initialToken; // first TIP-20 to enable (sequencer can enable more later)
+        address initialToken; // first TIP-20 to enable (admin can enable more later)
+        address[] allowedAccounts; // initial closed-loop account allowlist
+        address[] zoneGateways; // initial withdrawal-and-call implementations
         address admin;
         address[] sequencers;
         uint8 threshold;
@@ -630,6 +650,8 @@ interface IZonePortal {
     function initialize(
         uint32 zoneId,
         address initialToken,
+        address[] calldata allowedAccounts,
+        address[] calldata zoneGateways,
         address messenger,
         address admin,
         address[] calldata sequencers,
@@ -713,9 +735,8 @@ interface IZonePortal {
     /// @notice Get an enabled token by index
     function enabledTokenAt(uint256 index) external view returns (address);
 
-    /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
+    /// @notice Enable another TIP-20 token for bridging. Only callable by admin.
     /// @dev Irreversible: once enabled, a token cannot be disabled.
-    ///      Validates the token is a TIP-20.
     function enableToken(address token) external;
 
     /// @notice Pause deposits for a token. Only callable by admin.
@@ -1228,5 +1249,11 @@ interface IZoneConfig {
 
     /// @notice Check if a token is enabled by reading from L1 ZonePortal
     function isEnabledToken(address token) external view returns (bool);
+
+    /// @notice Check closed-loop account membership by reading from L1 ZonePortal.
+    function isAllowedAccount(address account) external view returns (bool);
+
+    /// @notice Check whether an address is a registered callback-only ZoneGateway.
+    function isZoneGateway(address gateway) external view returns (bool);
 
 }

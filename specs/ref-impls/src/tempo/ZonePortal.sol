@@ -160,6 +160,8 @@ contract ZonePortal is IZonePortal {
     function initialize(
         uint32 _zoneId,
         address _initialToken,
+        address[] calldata _allowedAccounts,
+        address[] calldata _zoneGateways,
         address _messenger,
         address _admin,
         address[] calldata initialSequencers,
@@ -330,6 +332,40 @@ contract ZonePortal is IZonePortal {
         emit AdminTransferred(previousAdmin, admin);
     }
 
+    /// @notice Select a newly deployed messenger implementation for callback withdrawals.
+    /// @dev Operation policy belongs to messenger code, so changing the supported callback
+    ///      ABI is an implementation-address upgrade rather than per-zone operation config.
+    function setMessenger(address newMessenger) external onlyAdmin {
+        if (newMessenger == address(0) || allowedAccount[newMessenger]) {
+            revert InvalidMessenger();
+        }
+        address previousMessenger = messenger;
+        messenger = newMessenger;
+        emit MessengerUpdated(previousMessenger, newMessenger);
+    }
+
+    /// @notice Enable or disable a callback-only gateway implementation.
+    /// @dev Gateways are deliberately separate from allowed accounts: they may receive only
+    ///      withdrawal callbacks and may return funds through depositEncrypted.
+    function setZoneGateway(address gateway, bool enabled) external onlyAdmin {
+        if (gateway == address(0) || (enabled && allowedAccount[gateway])) {
+            revert InvalidCallbackTarget();
+        }
+        zoneGateway[gateway] = enabled;
+        emit ZoneGatewayUpdated(gateway, enabled);
+    }
+
+    /// @notice Enable or disable an account across deposits, refunds, and plain withdrawals.
+    /// @dev Accounts cannot be an active gateway or messenger. The admin must first replace
+    ///      or disable the infrastructure role before allowing the address.
+    function setAllowedAccount(address account, bool enabled) external onlyAdmin {
+        if (account == address(0) || (enabled && (zoneGateway[account] || account == messenger))) {
+            revert InvalidAllowedAccount();
+        }
+        allowedAccount[account] = enabled;
+        emit AllowedAccountUpdated(account, enabled);
+    }
+
     /*//////////////////////////////////////////////////////////////
                            QUEUE ACCESSORS
     //////////////////////////////////////////////////////////////*/
@@ -377,8 +413,7 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
-    /// @dev Irreversible: once enabled, a token cannot be disabled (non-custodial guarantee).
-    ///      Validates the token is a TIP-20.
+    /// @dev Irreversible: once enabled, a token cannot be disabled.
     function enableToken(address _token) external onlyAdmin {
         if (_tokenConfigs[_token].enabled) revert TokenAlreadyEnabled();
         if (!ITIP20Factory(StdPrecompiles.TIP20_FACTORY_ADDRESS).isTIP20(_token)) {
@@ -592,6 +627,10 @@ contract ZonePortal is IZonePortal {
         if (!cfg.depositsActive) revert DepositsNotActive();
     }
 
+    function _requireAllowed(address account) internal view {
+        if (!allowedAccount[account]) revert AccountNotAllowed(account);
+    }
+
     function _validateDepositPolicy(
         address _token,
         address to,
@@ -658,6 +697,9 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
+        _requireAllowed(msg.sender);
+        _requireAllowed(to);
+        _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
         _validateDepositPolicy(_token, to, tempoRefundRecipient);
@@ -711,6 +753,8 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
+        if (!zoneGateway[msg.sender]) _requireAllowed(msg.sender);
+        _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
 
@@ -789,6 +833,8 @@ contract ZonePortal is IZonePortal {
     /// @notice Process multiple withdrawals from the queue in a single transaction.
     /// @dev Withdrawals must be supplied in queue order. `remainingQueue` is the queue suffix
     ///      after the last supplied withdrawal, or zero if the batch exhausts the current slot.
+    ///      Plain-transfer failures bounce back; callback failures revert atomically.
+    // FIXME(closed-loop-fees): Fix sequencer fees to zero and enforce onchain.
     function processWithdrawals(
         Withdrawal[] calldata withdrawals,
         bytes32 remainingQueue
@@ -816,6 +862,7 @@ contract ZonePortal is IZonePortal {
         _withdrawalQueue.dequeue(withdrawal, remainingQueue);
 
         address _token = withdrawal.token;
+        if (!_tokenConfigs[_token].enabled) revert TokenNotEnabled();
 
         if (withdrawal.fallbackNonce == 0) {
             _processDepositBounceBack(withdrawal);
@@ -823,45 +870,45 @@ contract ZonePortal is IZonePortal {
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
-            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
+            revert InvalidCallbackTarget();
+        }
+
+        if (withdrawal.gasLimit == 0) {
+            if (zoneGateway[withdrawal.to]) revert InvalidCallbackTarget();
+            _requireAllowed(withdrawal.to);
+            bool success = _tryTransfer(_token, withdrawal.to, withdrawal.amount);
+            if (!success) {
+                _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
+            }
             emit WithdrawalProcessed(
-                withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
+                withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, success
             );
             return;
         }
 
-        bool success;
-        if (withdrawal.gasLimit == 0) {
-            success = _tryTransfer(_token, withdrawal.to, withdrawal.amount);
-        } else {
-            try this.deliverWithdrawal(
-                _token,
-                withdrawal.to,
-                withdrawal.amount,
-                withdrawal.senderTag,
-                withdrawal.gasLimit,
-                withdrawal.callbackData
-            ) {
-                success = true;
-            } catch {
-                success = false;
-            }
-        }
-
-        if (!success) {
-            // Callback failed: bounce back to zone (only amount, not fee)
-            _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
-        }
+        if (!zoneGateway[withdrawal.to]) revert InvalidCallbackTarget();
+        bytes32 depositQueueHashBefore = currentDepositQueueHash;
+        this.deliverWithdrawal(
+            _token,
+            withdrawal.to,
+            withdrawal.amount,
+            withdrawal.senderTag,
+            withdrawal.gasLimit,
+            withdrawal.callbackData
+        );
+        // This proves only that some deposit was appended. Token and amount conservation rests
+        // on the correctness of the admin-configured ZoneGateway implementation.
+        if (currentDepositQueueHash == depositQueueHashBefore) revert CallbackDidNotReturnToZone();
         emit WithdrawalProcessed(
-            withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, success
+            withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, true
         );
     }
 
     /// @notice Deliver a callback withdrawal in a revertable self-call frame.
     /// @dev Only callable by this portal. It transfers only the current withdrawal amount to
-    ///      the shared messenger, then asks the messenger to call the target. If delivery
-    ///      fails, this call reverts and rolls back the transfer to the messenger. The outer
-    ///      processWithdrawals catches the revert and records a bounce-back.
+    ///      the configured messenger, then asks the messenger to call the target. If delivery
+    ///      fails, this call reverts and rolls back the transfer to the messenger. That revert
+    ///      propagates through processWithdrawals, retaining the queue item.
     function deliverWithdrawal(
         address token,
         address target,
@@ -883,6 +930,7 @@ contract ZonePortal is IZonePortal {
 
     function _processDepositBounceBack(Withdrawal calldata withdrawal) internal {
         address _token = withdrawal.token;
+        _requireAllowed(withdrawal.to);
         uint128 bouncebackFee = calculateBouncebackFee();
         if (bouncebackFee > withdrawal.amount) {
             bouncebackFee = withdrawal.amount;
@@ -905,6 +953,7 @@ contract ZonePortal is IZonePortal {
     }
 
     function claimRefund(address token) external returns (uint128 amount) {
+        _requireAllowed(msg.sender);
         amount = refunds[token][msg.sender];
         refunds[token][msg.sender] = 0;
 

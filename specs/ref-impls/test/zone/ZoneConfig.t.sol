@@ -4,6 +4,7 @@ pragma solidity ^0.8.13;
 import {
     IZoneConfig,
     IZonePortal,
+    PORTAL_ALLOWED_ACCOUNT_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT
@@ -40,6 +41,8 @@ contract ZoneConfigTest is BaseTest {
 
         _syncSequencer(sequencer);
         _syncTokenConfig(address(pathUSD));
+        _syncAllowedAccount(alice);
+        _syncZoneGateway(address(zoneGateway));
     }
 
     function _syncPortalSlot(bytes32 slot) internal {
@@ -97,6 +100,13 @@ contract ZoneConfigTest is BaseTest {
     function test_isEnabledToken_trueAndFalse() public view {
         assertTrue(config.isEnabledToken(address(pathUSD)));
         assertFalse(config.isEnabledToken(address(token1)));
+    }
+
+    function test_closedLoopMembershipAndGatewayAreIndependent() public view {
+        assertTrue(config.isAllowedAccount(alice));
+        assertFalse(config.isZoneGateway(alice));
+        assertTrue(config.isZoneGateway(address(zoneGateway)));
+        assertFalse(config.isAllowedAccount(address(zoneGateway)));
     }
 
     /// @notice Verifies reading the sequencer encryption key reverts before any key is set.

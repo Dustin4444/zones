@@ -81,6 +81,7 @@ contract BaseTest is Test {
     ITIP20Token public token1;
     ITIP20Token public token2;
     MockZoneTxContext public zoneTxContext = MockZoneTxContext(_ZONE_TX_CONTEXT);
+    MockZoneGateway public zoneGateway;
 
     error MissingPrecompile(string name, address addr);
     error CallShouldHaveReverted();
