@@ -38,8 +38,8 @@ use crate::{
     abi::{self, NO_QUEUE_INDEX, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
-        fetch_finalized_batch_boundaries, log_query_ranges,
+        BatchAnchorConfig, BatchData, BatchSubmitter, FinalizedBatchLog, ZoneBlockSnapshot,
+        fetch_finalized_batch_from_log, fetch_finalized_batch_logs,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -302,13 +302,33 @@ impl ZoneMonitor {
                 latest_zone_block,
                 self.config.batch_interval_blocks,
             );
-            // Skip the eth_getLogs call when we'd submit anyway.
-            if !boundary_crossed && !self.has_pending_withdrawals(latest_zone_block).await {
+            let from = self.last_submitted_zone_block + 1;
+            let finalized_batches = match fetch_finalized_batch_logs(
+                &self.outbox,
+                from,
+                latest_zone_block,
+            )
+            .await
+            {
+                Ok(batches) => batches,
+                Err(error) => {
+                    warn!(from, to = latest_zone_block, %error, "Failed to fetch finalized batch boundaries");
+                    continue;
+                }
+            };
+
+            if finalized_batches.is_empty() {
                 continue;
             }
 
-            let from = self.last_submitted_zone_block + 1;
-            match self.process_block_range(from, latest_zone_block).await {
+            if !boundary_crossed && !Self::has_pending_withdrawals(&finalized_batches) {
+                continue;
+            }
+
+            match self
+                .process_block_range(from, latest_zone_block, finalized_batches)
+                .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     error!(from, to = latest_zone_block, error = %e, "Failed to process zone block range");
@@ -390,38 +410,10 @@ impl ZoneMonitor {
     /// Empty finalized batches still need to be submitted, but they are handled
     /// by the normal block-interval path. This signal only flushes user
     /// withdrawals early.
-    async fn has_pending_withdrawals(&self, latest_block: u64) -> bool {
-        let from = self.last_submitted_zone_block + 1;
-        for (chunk_from, chunk_to) in log_query_ranges(from, latest_block) {
-            match self
-                .outbox
-                .BatchFinalized_filter()
-                .from_block(chunk_from)
-                .to_block(chunk_to)
-                .query()
-                .await
-            {
-                Ok(events) => {
-                    if events
-                        .iter()
-                        .any(|(event, _)| !event.withdrawalQueueHash.is_zero())
-                    {
-                        return true;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        from = chunk_from,
-                        to = chunk_to,
-                        error = %e,
-                        "Failed to check for finalized withdrawal batches"
-                    );
-                    return false;
-                }
-            }
-        }
-
-        false
+    fn has_pending_withdrawals(finalized_batches: &[FinalizedBatchLog]) -> bool {
+        finalized_batches
+            .iter()
+            .any(|batch| !batch.withdrawal_queue_hash.is_zero())
     }
 
     /// Process finalized batch boundaries in `[from, to]`.
@@ -430,26 +422,26 @@ impl ZoneMonitor {
     /// The monitor must walk those boundaries one at a time so the L2 outbox
     /// index and L1 portal index advance in lockstep.
     #[instrument(skip(self), fields(from, to))]
-    async fn process_block_range(&mut self, from: u64, to: u64) -> Result<bool> {
+    async fn process_block_range(
+        &mut self,
+        from: u64,
+        to: u64,
+        finalized_batches: Vec<FinalizedBatchLog>,
+    ) -> Result<bool> {
         let block_count = to - from + 1;
         info!(from, to, block_count, "Processing zone block range");
 
-        let boundaries = fetch_finalized_batch_boundaries(&self.outbox, from, to).await?;
-        if boundaries.is_empty() {
-            info!(from, to, "No finalized batch boundaries ready to submit");
-            return Ok(false);
-        }
-
         info!(
-            boundary_count = boundaries.len(),
+            boundary_count = finalized_batches.len(),
             from,
             to,
-            first_boundary = boundaries[0],
-            last_boundary = boundaries[boundaries.len() - 1],
+            first_boundary = finalized_batches[0].block_number,
+            last_boundary = finalized_batches[finalized_batches.len() - 1].block_number,
             "Submitting finalized zone batches"
         );
 
-        for (idx, boundary) in boundaries.into_iter().enumerate() {
+        for (idx, finalized_batch) in finalized_batches.into_iter().enumerate() {
+            let boundary = finalized_batch.block_number;
             if boundary <= self.last_submitted_zone_block {
                 continue;
             }
@@ -461,7 +453,8 @@ impl ZoneMonitor {
                 "Submitting finalized zone batch"
             );
             let before_submit = self.last_submitted_zone_block;
-            self.process_finalized_batch(range_start, boundary).await?;
+            self.process_finalized_batch(range_start, &finalized_batch)
+                .await?;
             if self.last_submitted_zone_block <= before_submit {
                 warn!(
                     before_submit,
@@ -477,8 +470,15 @@ impl ZoneMonitor {
     }
 
     /// Process one boundary-aligned finalized batch.
-    async fn process_finalized_batch(&mut self, from: u64, to: u64) -> Result<()> {
-        let finalized_batch = fetch_finalized_batch(&self.outbox, &self.provider, from, to).await?;
+    async fn process_finalized_batch(
+        &mut self,
+        from: u64,
+        finalized_batch_log: &FinalizedBatchLog,
+    ) -> Result<()> {
+        let to = finalized_batch_log.block_number;
+        let finalized_batch =
+            fetch_finalized_batch_from_log(&self.outbox, &self.provider, from, finalized_batch_log)
+                .await?;
         let end_state = self.fetch_block_snapshot(to).await?;
 
         let expected_l2_index = self
@@ -953,6 +953,26 @@ mod tests {
         assert!(!crossed_batch_boundary(50, 119, 120));
         // Zero interval means every block.
         assert!(crossed_batch_boundary(7, 8, 0));
+    }
+
+    #[test]
+    fn pending_withdrawals_are_derived_from_already_fetched_boundaries() {
+        let empty = FinalizedBatchLog {
+            block_number: 12,
+            tx_index: 0,
+            log_index: 0,
+            tx_hash: B256::ZERO,
+            withdrawal_queue_hash: B256::ZERO,
+            withdrawal_batch_index: 1,
+        };
+        let non_empty = FinalizedBatchLog {
+            block_number: 13,
+            withdrawal_queue_hash: B256::repeat_byte(1),
+            ..empty.clone()
+        };
+
+        assert!(!ZoneMonitor::has_pending_withdrawals(&[empty]));
+        assert!(ZoneMonitor::has_pending_withdrawals(&[non_empty]));
     }
 
     fn mock_provider(asserter: Asserter) -> DynProvider<TempoNetwork> {

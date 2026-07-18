@@ -887,29 +887,29 @@ struct RequestedWithdrawalLog {
 }
 
 #[derive(Debug, Clone)]
-struct FinalizedBatchLog {
-    block_number: u64,
+pub(crate) struct FinalizedBatchLog {
+    pub(crate) block_number: u64,
     tx_index: u64,
     log_index: u64,
     tx_hash: B256,
-    withdrawal_queue_hash: B256,
-    withdrawal_batch_index: u64,
+    pub(crate) withdrawal_queue_hash: B256,
+    pub(crate) withdrawal_batch_index: u64,
 }
 
 /// Fetch all zone block numbers in `[from, to]` that finalized a withdrawal batch.
 ///
 /// This includes zero-withdrawal batches because they still advance the L2
 /// withdrawal batch index and therefore require a matching L1 `submitBatch`.
-pub(crate) async fn fetch_finalized_batch_boundaries(
+pub(crate) async fn fetch_finalized_batch_logs(
     outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
     from: u64,
     to: u64,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<FinalizedBatchLog>> {
     if from > to {
         return Ok(Vec::new());
     }
 
-    let mut boundaries: Vec<_> = outbox
+    let mut finalized_batches: Vec<_> = outbox
         .BatchFinalized_filter()
         .from_block(from)
         .to_block(to)
@@ -919,12 +919,22 @@ pub(crate) async fn fetch_finalized_batch_boundaries(
         .query()
         .await?
         .into_iter()
-        .map(|(_, log)| log.block_number.unwrap_or(0))
-        .collect();
+        .map(|(event, log)| -> Result<_> {
+            Ok(FinalizedBatchLog {
+                block_number: log.block_number.unwrap_or(0),
+                tx_index: log.transaction_index.unwrap_or(0),
+                log_index: log.log_index.unwrap_or(0),
+                tx_hash: log
+                    .transaction_hash
+                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?,
+                withdrawal_queue_hash: event.withdrawalQueueHash,
+                withdrawal_batch_index: event.withdrawalBatchIndex,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    Ok(boundaries)
+    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
+    Ok(finalized_batches)
 }
 
 /// Fetch one finalized L2 withdrawal batch for a range ending at `to`.
@@ -939,7 +949,7 @@ pub(crate) async fn fetch_finalized_batch(
     from: u64,
     to: u64,
 ) -> Result<FinalizedBatch> {
-    let mut finalized_batches = fetch_finalized_batch_logs(outbox, from, to).await?;
+    let finalized_batches = fetch_finalized_batch_logs(outbox, from, to).await?;
 
     if finalized_batches.is_empty() {
         return Err(eyre::eyre!(
@@ -947,7 +957,6 @@ pub(crate) async fn fetch_finalized_batch(
         ));
     }
 
-    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
     let target_position = finalized_batches
         .iter()
         .rposition(|batch| batch.block_number == to)
@@ -966,12 +975,31 @@ pub(crate) async fn fetch_finalized_batch(
         ));
     }
 
-    let target = finalized_batches[target_position].clone();
     let previous_boundary = finalized_batches[..target_position]
         .last()
         .map(|batch| batch.block_number)
         .unwrap_or(from.saturating_sub(1));
-    let request_from = previous_boundary.saturating_add(1);
+
+    fetch_finalized_batch_from_log(
+        outbox,
+        zone_provider,
+        previous_boundary.saturating_add(1),
+        &finalized_batches[target_position],
+    )
+    .await
+}
+
+/// Reconstruct a finalized withdrawal batch using a previously fetched
+/// `BatchFinalized` log. Callers processing one range can share that initial
+/// log query across both the early-flush check and every submission.
+pub(crate) async fn fetch_finalized_batch_from_log(
+    outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
+    zone_provider: &DynProvider<TempoNetwork>,
+    from: u64,
+    target: &FinalizedBatchLog,
+) -> Result<FinalizedBatch> {
+    let to = target.block_number;
+    let request_from = from;
 
     let requests = if request_from <= to {
         fetch_requested_withdrawal_logs(outbox, request_from, to).await?
@@ -1075,38 +1103,6 @@ async fn fetch_requested_withdrawal_logs(
     requests.sort_by_key(|request| (request.block_number, request.tx_index, request.log_index));
 
     Ok(requests)
-}
-
-async fn fetch_finalized_batch_logs(
-    outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
-    from: u64,
-    to: u64,
-) -> Result<Vec<FinalizedBatchLog>> {
-    let mut finalized_batches: Vec<_> = outbox
-        .BatchFinalized_filter()
-        .from_block(from)
-        .to_block(to)
-        .chunked()
-        .chunk_size(LOG_QUERY_BLOCK_CHUNK)
-        .concurrent(2)
-        .query()
-        .await?
-        .into_iter()
-        .map(|(event, log)| -> Result<_> {
-            Ok(FinalizedBatchLog {
-                block_number: log.block_number.unwrap_or(0),
-                tx_index: log.transaction_index.unwrap_or(0),
-                log_index: log.log_index.unwrap_or(0),
-                tx_hash: log
-                    .transaction_hash
-                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?,
-                withdrawal_queue_hash: event.withdrawalQueueHash,
-                withdrawal_batch_index: event.withdrawalBatchIndex,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
-    Ok(finalized_batches)
 }
 
 /// Lazily split an inclusive block range into bounded query windows.
