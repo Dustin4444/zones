@@ -486,7 +486,14 @@ impl BatchSubmitter {
             ));
         }
 
+        eyre::ensure!(
+            receipt.transaction_hash() == tx_hash,
+            "submitBatch receipt transaction hash mismatch: expected {tx_hash}, got {}",
+            receipt.transaction_hash(),
+        );
+
         let event = self.decode_batch_submitted(receipt.logs())?;
+        validate_batch_submitted_event(&event, batch)?;
 
         info!(
             %tx_hash,
@@ -567,13 +574,21 @@ impl BatchSubmitter {
         &self,
         logs: &[alloy_rpc_types_eth::Log],
     ) -> Result<ZonePortal::BatchSubmitted> {
-        logs.iter()
+        let events = logs
+            .iter()
             .filter(|log| log.address() == self.portal_address)
-            .find_map(|log| ZonePortal::BatchSubmitted::decode_log(&log.inner).ok())
+            .filter_map(|log| ZonePortal::BatchSubmitted::decode_log(&log.inner).ok())
             .map(|log| log.data)
-            .ok_or_else(|| {
-                eyre::eyre!("confirmed submitBatch receipt is missing the BatchSubmitted event")
-            })
+            .collect::<Vec<_>>();
+        match events.as_slice() {
+            [event] => Ok(event.clone()),
+            [] => Err(eyre::eyre!(
+                "confirmed submitBatch receipt is missing the BatchSubmitted event"
+            )),
+            _ => Err(eyre::eyre!(
+                "confirmed submitBatch receipt contains multiple BatchSubmitted events"
+            )),
+        }
     }
 
     /// Resolve the anchor mode for the given `tempo_block_number`.
@@ -950,6 +965,34 @@ impl BatchSubmitter {
 
         Ok(found)
     }
+}
+
+/// Bind the `BatchSubmitted` receipt event to the batch just submitted.
+///
+/// The Portal is authoritative for settlement, but this prevents an incorrect
+/// RPC receipt from advancing the sequencer's local bookkeeping with unrelated
+/// event data.
+fn validate_batch_submitted_event(
+    event: &ZonePortal::BatchSubmitted,
+    batch: &BatchData,
+) -> Result<()> {
+    eyre::ensure!(
+        event.nextBlockHash == batch.next_block_hash,
+        "BatchSubmitted next block hash mismatch"
+    );
+    eyre::ensure!(
+        event.nextProcessedDepositQueueHash == batch.next_processed_deposit_hash,
+        "BatchSubmitted processed deposit hash mismatch"
+    );
+    eyre::ensure!(
+        event.lastProcessedDepositNumber == batch.next_deposit_number,
+        "BatchSubmitted processed deposit number mismatch"
+    );
+    eyre::ensure!(
+        event.withdrawalQueueHash == batch.withdrawal_queue_hash,
+        "BatchSubmitted withdrawal queue hash mismatch"
+    );
+    Ok(())
 }
 
 /// Pure function that resolves pre-fetched data into verified withdrawal sets
@@ -1789,6 +1832,37 @@ mod tests {
         }
     }
 
+    fn test_batch_data() -> BatchData {
+        BatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::repeat_byte(0x01),
+            next_block_hash: B256::repeat_byte(0x02),
+            prev_processed_deposit_hash: B256::repeat_byte(0x03),
+            next_processed_deposit_hash: B256::repeat_byte(0x04),
+            prev_deposit_number: 5,
+            next_deposit_number: 6,
+            withdrawal_queue_hash: B256::repeat_byte(0x07),
+        }
+    }
+
+    #[test]
+    fn batch_submitted_event_must_match_submitted_batch() {
+        let batch = test_batch_data();
+        let event = abi::ZonePortal::BatchSubmitted {
+            withdrawalBatchIndex: 0,
+            withdrawalQueueIndex: U256::ZERO,
+            nextProcessedDepositQueueHash: batch.next_processed_deposit_hash,
+            nextBlockHash: batch.next_block_hash,
+            withdrawalQueueHash: batch.withdrawal_queue_hash,
+            lastProcessedDepositNumber: batch.next_deposit_number,
+        };
+        validate_batch_submitted_event(&event, &batch).unwrap();
+
+        let mut wrong = event;
+        wrong.withdrawalQueueHash = B256::repeat_byte(0xff);
+        assert!(validate_batch_submitted_event(&wrong, &batch).is_err());
+    }
+
     #[test]
     fn decode_batch_submitted_from_receipt_logs() {
         use alloy_provider::ProviderBuilder;
@@ -1824,13 +1898,18 @@ mod tests {
         };
 
         let decoded = submitter
-            .decode_batch_submitted(&[unrelated.clone(), log])
+            .decode_batch_submitted(&[unrelated.clone(), log.clone()])
             .unwrap();
         assert_eq!(decoded.withdrawalBatchIndex, 7);
         assert_eq!(decoded.withdrawalQueueIndex, U256::from(3));
         assert_eq!(decoded.nextBlockHash, B256::repeat_byte(0x22));
 
         assert!(submitter.decode_batch_submitted(&[unrelated]).is_err());
+        assert!(
+            submitter
+                .decode_batch_submitted(&[log.clone(), log])
+                .is_err()
+        );
     }
 
     #[tokio::test]
