@@ -700,7 +700,7 @@ impl L1Subscriber {
 
 /// Fetch receipts for the L1 header by block hash and verify they match the
 /// header's receipts root and logs bloom before returning them.
-async fn fetch_and_verify_receipts_for_header(
+pub async fn fetch_and_verify_receipts_for_header(
     provider: &impl Provider<TempoNetwork>,
     block: NumHash,
     expected_receipts_root: B256,
@@ -721,7 +721,7 @@ async fn fetch_and_verify_receipts_for_header(
     Ok(receipts)
 }
 
-pub(crate) fn verify_receipts(
+pub fn verify_receipts(
     block: NumHash,
     expected_receipts_root: B256,
     expected_logs_bloom: Bloom,

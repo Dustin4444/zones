@@ -94,7 +94,7 @@ pub use event::{EnabledToken, L1PortalEvents, L1SequencerEvent};
 pub use ext::{ChainTempoStateExt, TempoStateExt};
 pub use queue::DepositQueue;
 pub use state::{L1StateCache, PolicyCache, PolicyProvider};
-pub use subscriber::{L1Subscriber, L1SubscriberConfig};
+pub use subscriber::{L1Subscriber, L1SubscriberConfig, fetch_and_verify_receipts_for_header};
 
 pub(crate) use event::EnqueueOutcome;
 

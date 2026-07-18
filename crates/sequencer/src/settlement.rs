@@ -27,7 +27,8 @@ use std::collections::BTreeMap;
 
 use crate::abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal};
 use alloy_consensus::Transaction;
-use alloy_network::ReceiptResponse;
+use alloy_eips::NumHash;
+use alloy_network::{ReceiptResponse, primitives::HeaderResponse as _};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
@@ -723,10 +724,9 @@ impl BatchSubmitter {
     }
 
     /// Fetch `BatchSubmitted` events for logical queue indices `[first_index, tail)`
-    /// by walking L1 backwards in chunks while filtering by the indexed
-    /// `withdrawalQueueIndex` topic. Logical queue indices never repeat
-    /// (head/tail are non-wrapping counters), so the topic filter identifies
-    /// each batch exactly without positional counting.
+    /// from receipt-root-verified L1 blocks. We deliberately do not use
+    /// `eth_getLogs` here: the recovery result becomes input to local withdrawal
+    /// bookkeeping, so an RPC log response alone is not an adequate trust root.
     ///
     /// The caller passes `first_index = head - 1` so the predecessor batch is
     /// included (its `nextBlockHash` bounds the zone block range of the first
@@ -741,10 +741,7 @@ impl BatchSubmitter {
             return Ok(BTreeMap::new());
         }
 
-        let index_topics: Vec<B256> = (first_index..tail)
-            .map(|index| B256::from(U256::from(index)))
-            .collect();
-        let needed = index_topics.len();
+        let needed = (tail - first_index) as usize;
 
         let mut found = BTreeMap::new();
         let mut hi = self.l1_provider.get_block_number().await?;
@@ -752,21 +749,43 @@ impl BatchSubmitter {
         while hi >= self.genesis_tempo_block_number && found.len() < needed {
             let lo = backward_log_query_start(hi, self.genesis_tempo_block_number);
 
-            let events = self
-                .portal
-                .BatchSubmitted_filter()
-                .topic2(index_topics.clone())
-                .from_block(lo)
-                .to_block(hi)
-                .query()
+            for block_number in (lo..=hi).rev() {
+                let block = self
+                    .l1_provider
+                    .get_block_by_number(block_number.into())
+                    .await?
+                    .ok_or_else(|| {
+                        eyre::eyre!("L1 block {block_number} not found during withdrawal recovery")
+                    })?;
+                let header = &block.header;
+                let receipts = zone_l1::fetch_and_verify_receipts_for_header(
+                    &self.l1_provider,
+                    NumHash::new(block_number, header.hash()),
+                    header.receipts_root(),
+                    header.logs_bloom(),
+                )
                 .await?;
 
-            for (event, _) in events {
-                let index: u64 = event.withdrawalQueueIndex.try_into().map_err(|_| {
-                    eyre::eyre!("withdrawal queue index overflow in BatchSubmitted")
-                })?;
-                if found.insert(index, event).is_some() {
-                    eyre::bail!("duplicate BatchSubmitted event for portal queue index {index}");
+                for receipt in receipts {
+                    for log in receipt.logs() {
+                        if log.address() != self.portal_address {
+                            continue;
+                        }
+                        let Ok(event) = ZonePortal::BatchSubmitted::decode_log(&log.inner) else {
+                            continue;
+                        };
+                        let index: u64 = event.withdrawalQueueIndex.try_into().map_err(|_| {
+                            eyre::eyre!("withdrawal queue index overflow in BatchSubmitted")
+                        })?;
+                        if !(first_index..tail).contains(&index) {
+                            continue;
+                        }
+                        if found.insert(index, event).is_some() {
+                            eyre::bail!(
+                                "duplicate BatchSubmitted event for portal queue index {index}"
+                            );
+                        }
+                    }
                 }
             }
 
