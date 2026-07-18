@@ -593,14 +593,8 @@ impl ZoneMonitor {
         for attempt in 1..=MAX_RETRIES {
             let submit_started = std::time::Instant::now();
             match self.batch_submitter.submit_batch(batch_data).await {
-                Ok(event) => {
-                    let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
-                        None
-                    } else {
-                        Some(event.withdrawalQueueIndex.try_into().map_err(|_| {
-                            eyre::eyre!("withdrawal queue index overflow in BatchSubmitted")
-                        })?)
-                    };
+                Ok(submission) => {
+                    let portal_index = submission.withdrawal_queue_index();
 
                     self.metrics
                         .batch_submit_latency_seconds
@@ -610,8 +604,8 @@ impl ZoneMonitor {
                         last_zone_block,
                         blocks_in_batch,
                         tempo_block_number = batch_data.tempo_block_number,
-                        withdrawal_batch_index = event.withdrawalBatchIndex,
-                        withdrawal_queue_index = %event.withdrawalQueueIndex,
+                        withdrawal_batch_index = submission.withdrawal_batch_index(),
+                        withdrawal_queue_index = ?portal_index,
                         withdrawal_queue_hash = %batch_data.withdrawal_queue_hash,
                         "Batch successfully submitted to L1"
                     );

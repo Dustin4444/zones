@@ -1,6 +1,6 @@
 use super::*;
-use crate::abi::DepositType;
-use alloy_consensus::{Header, ReceiptWithBloom};
+use crate::abi::{DepositType, PORTAL_PENDING_SEQUENCER_SLOT, PORTAL_SEQUENCER_SLOT};
+use alloy_consensus::{Header, ReceiptWithBloom, TxReceipt};
 use alloy_primitives::{Bloom, FixedBytes, address};
 use alloy_rpc_types_eth::{Header as RpcHeader, TransactionReceipt};
 use alloy_sol_types::SolEvent;
@@ -383,7 +383,7 @@ fn verify_receipts_rejects_rpc_event_mutation_or_receipt_set_changes() {
         21_000,
         Bloom::ZERO,
     );
-    first.inner.inner.receipt.logs = vec![make_portal_log(portal, event).inner];
+    first.inner.inner.receipt.logs = vec![make_portal_log(portal, event)];
     first.inner.inner.logs_bloom = first.inner.inner.receipt.bloom();
     let second = make_test_receipt(
         block_number,
@@ -400,10 +400,10 @@ fn verify_receipts_rejects_rpc_event_mutation_or_receipt_set_changes() {
     });
 
     let mut changed_address = receipts.clone();
-    changed_address[0].inner.inner.receipt.logs[0].address = Address::repeat_byte(0xff);
+    changed_address[0].inner.inner.receipt.logs[0].inner.address = Address::repeat_byte(0xff);
 
     let mut changed_data = receipts.clone();
-    changed_data[0].inner.inner.receipt.logs[0].data = WithdrawalBounceBack {
+    changed_data[0].inner.inner.receipt.logs[0].inner.data = WithdrawalBounceBack {
         newCurrentDepositQueueHash: B256::with_last_byte(0x43),
         fallbackNonce: 1,
         token: Address::repeat_byte(0x11),
@@ -416,21 +416,18 @@ fn verify_receipts_rejects_rpc_event_mutation_or_receipt_set_changes() {
     removed[0].inner.inner.receipt.logs.clear();
 
     let mut injected = receipts.clone();
-    injected[0].inner.inner.receipt.logs.push(
-        make_portal_log(
-            portal,
-            WithdrawalBounceBack {
-                newCurrentDepositQueueHash: B256::with_last_byte(0x44),
-                fallbackNonce: 2,
-                token: Address::repeat_byte(0x22),
-                amount: 200,
-                depositNumber: 2,
-            },
-        )
-        .inner,
-    );
+    injected[0].inner.inner.receipt.logs.push(make_portal_log(
+        portal,
+        WithdrawalBounceBack {
+            newCurrentDepositQueueHash: B256::with_last_byte(0x44),
+            fallbackNonce: 2,
+            token: Address::repeat_byte(0x22),
+            amount: 200,
+            depositNumber: 2,
+        },
+    ));
 
-    let mut reordered = receipts.clone();
+    let mut reordered = receipts;
     reordered.reverse();
 
     for (name, candidate) in [
