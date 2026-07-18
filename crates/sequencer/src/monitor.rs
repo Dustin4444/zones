@@ -31,6 +31,7 @@ use eyre::{Result, WrapErr};
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
+use zone_l1::BatchSubmissionIndex;
 
 use alloy_sol_types::{ContractError, SolInterface as _};
 
@@ -83,6 +84,8 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Receipt-root-verified L1 batch observations for restart recovery.
+    pub batch_submission_index: BatchSubmissionIndex,
 }
 
 /// Monitors the Zone L2 chain for new finalized batch boundaries and submits
@@ -197,7 +200,8 @@ impl ZoneMonitor {
             l1_provider,
             genesis_tempo_block_number,
             config.batch_anchor_config,
-        );
+        )
+        .with_batch_submission_index(config.batch_submission_index.clone());
 
         let prev_zone_block_hash = batch_submitter
             .read_portal_block_hash()
@@ -1018,6 +1022,7 @@ mod tests {
             batch_interval_blocks: 1,
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            batch_submission_index: BatchSubmissionIndex::default(),
         };
         let zone_provider = mock_provider(zone);
         let l1_provider = mock_provider(l1);
@@ -1056,6 +1061,7 @@ mod tests {
             batch_interval_blocks: 1,
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            batch_submission_index: BatchSubmissionIndex::default(),
         };
 
         l1.push_failure_msg("boom");

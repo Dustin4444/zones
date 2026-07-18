@@ -62,7 +62,8 @@ use tracing::{debug, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1Subscriber, L1SubscriberConfig, PolicyCache, TempoStateExt,
+    BatchSubmissionIndex, DepositQueue, L1Subscriber, L1SubscriberConfig, PolicyCache,
+    TempoStateExt,
     state::{
         L1StateCache, L1StateProvider, L1StateProviderConfig, PolicyProvider,
         spawn_policy_resolution_task, spawn_pool_prefetch_task,
@@ -216,6 +217,7 @@ impl ZoneNode {
             l1_state_cache: l1_state_cache.clone(),
             l1_fetch_concurrency,
             retry_connection_interval,
+            batch_submission_index: BatchSubmissionIndex::default(),
         };
 
         let l1_state_provider_config = L1StateProviderConfig {
@@ -239,6 +241,12 @@ impl ZoneNode {
             sequencer_config: None,
             p2p_config: None,
         }
+    }
+
+    /// Use a durable, receipt-root-verified batch-submission observation index.
+    pub fn with_batch_submission_index(mut self, index: BatchSubmissionIndex) -> Self {
+        self.l1_config.batch_submission_index = index;
+        self
     }
 
     /// Set the private RPC configuration.
@@ -522,6 +530,7 @@ where
                 self.l1_config.l1_rpc_url,
                 self.l1_config.portal_address,
                 self.l1_config.retry_connection_interval,
+                self.l1_config.batch_submission_index.clone(),
                 sequencer_addr,
                 chain_id,
             )
@@ -790,6 +799,7 @@ where
         l1_rpc_url: String,
         portal_address: Address,
         retry_connection_interval: Duration,
+        batch_submission_index: BatchSubmissionIndex,
         sequencer_addr: Address,
         chain_id: u64,
     ) -> eyre::Result<()> {
@@ -824,6 +834,7 @@ where
             zone_poll_interval: config.zone_poll_interval,
             batch_interval_blocks: config.batch_interval_blocks,
             batch_anchor_config: config.batch_anchor_config,
+            batch_submission_index,
         };
         let seq_handle = spawn_zone_sequencer(sequencer_config, config.sequencer_signer).await;
         info!(target: "reth::cli", "Sequencer tasks spawned");

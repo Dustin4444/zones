@@ -151,6 +151,7 @@ fn test_subscriber(
             l1_state_cache: crate::L1StateCache::new(HashSet::from([portal_address])),
             l1_fetch_concurrency: 1,
             retry_connection_interval: Duration::from_secs(1),
+            batch_submission_index: BatchSubmissionIndex::default(),
         },
         local_state,
         deposit_queue: DepositQueue::default(),

@@ -2560,6 +2560,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         zone_poll_interval: Duration::from_millis(500),
         batch_interval_blocks: 1,
         batch_anchor_config,
+        batch_submission_index: zone_l1::BatchSubmissionIndex::default(),
     };
 
     zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await

@@ -79,6 +79,7 @@ use crate::{
     state::{cache::L1StateCacheInner, tip403::PolicyEvent},
 };
 
+mod batch_index;
 mod block;
 mod deposit;
 mod event;
@@ -88,6 +89,7 @@ mod subscriber;
 #[cfg(test)]
 mod tests;
 
+pub use batch_index::{BatchSubmissionIndex, BatchSubmissionObservation};
 pub use block::{L1BlockDeposits, PreparedL1Block};
 pub use deposit::{Deposit, EncryptedDeposit, L1Deposit};
 pub use event::{EnabledToken, L1PortalEvents, L1SequencerEvent};

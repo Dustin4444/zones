@@ -39,6 +39,7 @@ use parking_lot::RwLock;
 use schnellru::{ByLength, LruMap};
 use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
 use tracing::{info, instrument, warn};
+use zone_l1::BatchSubmissionIndex;
 
 use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
 
@@ -186,6 +187,7 @@ pub struct BatchSubmitter {
     /// requests. Settlement batches are submitted in order, so later requests
     /// can reuse almost the entire preceding range.
     ancestry_header_cache: RwLock<LruMap<u64, CachedAncestryHeader>>,
+    batch_submission_index: BatchSubmissionIndex,
 }
 
 /// One validated L1 header retained for ancestry proof construction.
@@ -231,7 +233,13 @@ impl BatchSubmitter {
             ancestry_header_cache: RwLock::new(LruMap::new(ByLength::new(
                 DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY,
             ))),
+            batch_submission_index: BatchSubmissionIndex::default(),
         }
+    }
+
+    pub fn with_batch_submission_index(mut self, index: BatchSubmissionIndex) -> Self {
+        self.batch_submission_index = index;
+        self
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -655,9 +663,16 @@ impl BatchSubmitter {
 
         // Step 2: query BatchSubmitted events for pending slots [head, tail)
         // plus the predecessor (head-1) by their indexed withdrawalQueueIndex.
-        let events = self
-            .find_batch_events_by_index(head.saturating_sub(1), tail)
-            .await?;
+        let first_index = head.saturating_sub(1);
+        let indexed_events = self.batch_submission_index.events(first_index, tail);
+        let events = if indexed_events.len() == (tail - first_index) as usize {
+            indexed_events
+        } else {
+            // A fresh index has no historical observations yet. Keep the
+            // receipt-root-verified scan from the previous recovery path as a
+            // one-time backfill rather than trusting raw `eth_getLogs`.
+            self.find_batch_events_by_index(first_index, tail).await?
+        };
 
         // Step 3: resolve each L1 event's nextBlockHash to a zone L2 block number.
         // Maps portal_slot → last zone L2 block in that batch.

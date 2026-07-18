@@ -10,6 +10,7 @@ use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use zone_chainspec::{ZoneChainSpec, ZoneChainSpecParser};
 use zone_evm::ZoneEvmConfig;
+use zone_l1::BatchSubmissionIndex;
 use zone_p2p::{P2pConfig, Role};
 use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 
@@ -156,6 +157,13 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             args.l1_fetch_concurrency,
             Duration::from_millis(args.l1_retry_connection_interval_ms),
         )
+        .with_batch_submission_index(BatchSubmissionIndex::open(
+            builder
+                .config()
+                .datadir()
+                .data_dir()
+                .join("batch-submissions.json"),
+        )?)
         .with_withdrawal_batch_interval_blocks(args.zone_batch_interval_blocks)
         .with_private_rpc(ZonePrivateRpcConfig {
             private_rpc_port: args.private_rpc_port,

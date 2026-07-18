@@ -36,6 +36,8 @@ pub struct L1PortalEvents {
     pub enabled_tokens: Vec<EnabledToken>,
     /// Sequencer transfer events in the order they appeared in the block.
     pub sequencer_events: Vec<L1SequencerEvent>,
+    /// Receipt-root-verified batch settlements in this block.
+    pub batch_submissions: Vec<crate::BatchSubmissionObservation>,
 }
 
 /// A token newly enabled for bridging, with metadata for L2 creation.
@@ -65,13 +67,14 @@ impl EnabledToken {
 
 impl L1PortalEvents {
     /// Event signature hashes that this container knows how to decode.
-    const SIGNATURE_HASHES: [B256; 6] = [
+    const SIGNATURE_HASHES: [B256; 7] = [
         DepositMade::SIGNATURE_HASH,
         EncryptedDepositMade::SIGNATURE_HASH,
         WithdrawalBounceBack::SIGNATURE_HASH,
         TokenEnabled::SIGNATURE_HASH,
         SequencerTransferStarted::SIGNATURE_HASH,
         SequencerTransferred::SIGNATURE_HASH,
+        crate::abi::ZonePortal::BatchSubmitted::SIGNATURE_HASH,
     ];
 
     /// Create portal events from deposits only.
@@ -173,6 +176,9 @@ impl L1PortalEvents {
                     previous_sequencer: event.previousSequencer,
                     new_sequencer: event.newSequencer,
                 });
+            }
+            ZonePortalEvents::BatchSubmitted(event) => {
+                self.batch_submissions.push(event.try_into()?);
             }
             _ => {}
         }

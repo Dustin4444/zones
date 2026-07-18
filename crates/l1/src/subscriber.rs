@@ -26,6 +26,8 @@ pub struct L1SubscriberConfig {
     pub l1_fetch_concurrency: usize,
     /// Interval between WebSocket reconnection attempts.
     pub retry_connection_interval: std::time::Duration,
+    /// Receipt-root-verified settlements retained for sequencer restart recovery.
+    pub batch_submission_index: crate::BatchSubmissionIndex,
 }
 
 pub(crate) trait LocalTempoCheckpointReader: Send + Sync {
@@ -405,6 +407,9 @@ impl L1Subscriber {
             self.update_l1_state_anchor(block_number, sealed.hash(), sealed.parent_hash());
             self.apply_policy_events(block_number, &policy_events);
             self.apply_portal_state_events(block_number, &events);
+            self.config
+                .batch_submission_index
+                .record_block(sealed.num_hash(), events.batch_submissions.clone())?;
             self.deposit_queue
                 .enqueue_sealed(sealed, events, policy_events);
             enqueued += 1;
@@ -497,6 +502,10 @@ impl L1Subscriber {
                     self.update_l1_state_anchor(tip_number, tip_hash, tip_parent);
                     self.apply_policy_events(tip_number, &tip_policy_events);
                     self.apply_portal_state_events(tip_number, &tip_events);
+                    self.config.batch_submission_index.record_block(
+                        tip_header.num_hash(),
+                        tip_events.batch_submissions.clone(),
+                    )?;
                     match self
                         .deposit_queue
                         .try_enqueue(tip_header, tip_events, tip_policy_events)

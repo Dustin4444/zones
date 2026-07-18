@@ -11,6 +11,7 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportResult;
 use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
 use tokio::sync::Notify;
+use zone_l1::BatchSubmissionIndex;
 
 pub mod abi {
     pub use tempo_zone_contracts::*;
@@ -56,6 +57,8 @@ pub struct ZoneSequencerConfig {
     pub batch_interval_blocks: u64,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Receipt-root-verified settlements retained by the L1 subscriber.
+    pub batch_submission_index: BatchSubmissionIndex,
 }
 
 /// Handles returned by [`spawn_zone_sequencer`] for managing background tasks.
@@ -109,6 +112,7 @@ pub async fn spawn_zone_sequencer(
         batch_interval_blocks: config.batch_interval_blocks,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
+        batch_submission_index: config.batch_submission_index,
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(
