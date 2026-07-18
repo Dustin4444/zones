@@ -49,6 +49,9 @@ const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
 /// the block falls out of the window between our check and on-chain execution.
 const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 
+/// Bound receipt-root verification requests during the rare recovery fallback.
+const WITHDRAWAL_RECOVERY_RECEIPT_CONCURRENCY: usize = 8;
+
 /// Maximum number of encoded L1 headers retained between ancestry submissions.
 ///
 /// At roughly 600 bytes per header, this caps payload storage near 150 MiB plus
@@ -749,23 +752,30 @@ impl BatchSubmitter {
         while hi >= self.genesis_tempo_block_number && found.len() < needed {
             let lo = backward_log_query_start(hi, self.genesis_tempo_block_number);
 
-            for block_number in (lo..=hi).rev() {
-                let block = self
-                    .l1_provider
-                    .get_block_by_number(block_number.into())
-                    .await?
-                    .ok_or_else(|| {
-                        eyre::eyre!("L1 block {block_number} not found during withdrawal recovery")
-                    })?;
-                let header = &block.header;
-                let receipts = zone_l1::fetch_and_verify_receipts_for_header(
-                    &self.l1_provider,
-                    NumHash::new(block_number, header.hash()),
-                    header.receipts_root(),
-                    header.logs_bloom(),
-                )
-                .await?;
+            let mut blocks = futures::stream::iter((lo..=hi).rev())
+                .map(|block_number| async move {
+                    let block = self
+                        .l1_provider
+                        .get_block_by_number(block_number.into())
+                        .await?
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "L1 block {block_number} not found during withdrawal recovery"
+                            )
+                        })?;
+                    let header = &block.header;
+                    let receipts = zone_l1::fetch_and_verify_receipts_for_header(
+                        &self.l1_provider,
+                        NumHash::new(block_number, header.hash()),
+                        header.receipts_root(),
+                        header.logs_bloom(),
+                    )
+                    .await?;
+                    Ok::<_, eyre::Report>(receipts)
+                })
+                .buffered(WITHDRAWAL_RECOVERY_RECEIPT_CONCURRENCY);
 
+            while let Some(receipts) = blocks.try_next().await? {
                 for receipt in receipts {
                     for log in receipt.logs() {
                         if log.address() != self.portal_address {
