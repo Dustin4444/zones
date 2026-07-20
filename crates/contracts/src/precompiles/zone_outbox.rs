@@ -43,6 +43,7 @@ crate::sol! {
         );
 
         event BatchFinalized(bytes32 indexed withdrawalQueueHash, uint64 withdrawalBatchIndex);
+        event TempoGasRateUpdated(uint128 tempoGasRate);
 
         // -- Errors --
 
@@ -63,6 +64,7 @@ crate::sol! {
         function getPendingWithdrawals() external view returns (PendingWithdrawal[] memory);
         function consumeFallbackRecipient(uint64 fallbackNonce) external returns (address recipient);
         function calculateWithdrawalFee(uint64 gasLimit) external view returns (uint128 fee);
+        function tempoGasRate() external view returns (uint128);
         function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
 
         // -- State-changing functions --
@@ -83,5 +85,6 @@ crate::sol! {
             address bouncebackRecipient
         ) external;
         function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
+        function setTempoGasRate(uint128 newTempoGasRate) external;
     }
 }
