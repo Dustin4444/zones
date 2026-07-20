@@ -11,7 +11,9 @@ use reth_tracing::tracing::info;
 use zone_chainspec::{ZoneChainSpec, ZoneChainSpecParser};
 use zone_evm::ZoneEvmConfig;
 use zone_p2p::{P2pConfig, Role};
-use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
+use zone_payload::{
+    DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK, DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+};
 
 use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
@@ -157,6 +159,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             Duration::from_millis(args.l1_retry_connection_interval_ms),
         )
         .with_withdrawal_batch_interval_blocks(args.zone_batch_interval_blocks)
+        .with_max_user_transactions_per_block(args.block_max_user_transactions)
         .with_private_rpc(ZonePrivateRpcConfig {
             private_rpc_port: args.private_rpc_port,
             zone_id: args.zone_id,
@@ -207,6 +210,14 @@ pub struct ZoneArgs {
         default_value_t = 250
     )]
     pub block_interval_ms: u64,
+
+    /// Maximum number of user transactions included in each zone block.
+    #[arg(
+        long = "block.max-user-transactions",
+        env = "BLOCK_MAX_USER_TRANSACTIONS",
+        default_value_t = DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK
+    )]
+    pub block_max_user_transactions: usize,
 
     /// Sequencer private key (hex, with or without 0x prefix).
     #[arg(long = "sequencer-key", env = "SEQUENCER_KEY")]
@@ -442,6 +453,30 @@ mod tests {
         .unwrap();
         assert!(parsed.zone.enable_sequencer);
         assert!(parsed.zone.sequencer_manifest.is_none());
+    }
+
+    #[test]
+    fn user_transaction_limit_defaults_to_five_and_accepts_override() {
+        let common = [
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key",
+            "0x01",
+        ];
+
+        let default = ZoneArgsParser::try_parse_from(common).unwrap();
+        assert_eq!(default.zone.block_max_user_transactions, 5);
+
+        let overridden = ZoneArgsParser::try_parse_from(
+            common
+                .into_iter()
+                .chain(["--block.max-user-transactions", "9"]),
+        )
+        .unwrap();
+        assert_eq!(overridden.zone.block_max_user_transactions, 9);
     }
 
     #[test]

@@ -709,6 +709,28 @@ impl ZoneTestNode {
         .await
     }
 
+    /// Start a self-contained zone node with a custom per-block user transaction limit.
+    pub(crate) async fn start_local_with_max_user_transactions_per_block(
+        max_user_transactions_per_block: usize,
+    ) -> eyre::Result<Self> {
+        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32])?;
+        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
+        Self::launch_with_limits(
+            DUMMY_L1_URL.to_string(),
+            Address::ZERO,
+            None,
+            next_unique_chain_id(),
+            None,
+            signer,
+            8,
+            max_user_transactions_per_block,
+            Some(vec![]),
+            None,
+            true,
+        )
+        .await
+    }
+
     /// Start a self-contained zone node with a custom chain ID.
     ///
     /// Useful for running multiple zone nodes in a single test — each needs
@@ -794,6 +816,36 @@ impl ZoneTestNode {
         p2p_config: Option<P2pConfig>,
         spawn_engine: bool,
     ) -> eyre::Result<Self> {
+        Self::launch_with_limits(
+            l1_ws_url,
+            portal_address,
+            genesis_tempo_block_number,
+            chain_id,
+            custom_genesis,
+            sequencer_signer,
+            withdrawal_batch_interval_blocks,
+            zone_payload::DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK,
+            initial_tokens,
+            p2p_config,
+            spawn_engine,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_with_limits(
+        l1_ws_url: String,
+        portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
+        chain_id: u64,
+        custom_genesis: Option<Genesis>,
+        sequencer_signer: alloy_signer_local::PrivateKeySigner,
+        withdrawal_batch_interval_blocks: u64,
+        max_user_transactions_per_block: usize,
+        initial_tokens: Option<Vec<Address>>,
+        p2p_config: Option<P2pConfig>,
+        spawn_engine: bool,
+    ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
         let l1_provider_url = l1_ws_url.clone();
@@ -812,7 +864,8 @@ impl ZoneTestNode {
             4,
             std::time::Duration::from_millis(100),
         )
-        .with_withdrawal_batch_interval_blocks(withdrawal_batch_interval_blocks);
+        .with_withdrawal_batch_interval_blocks(withdrawal_batch_interval_blocks)
+        .with_max_user_transactions_per_block(max_user_transactions_per_block);
         if is_local_dummy_l1 {
             zone_node = zone_node.with_l1_chain_id(1337);
         }
@@ -2576,6 +2629,27 @@ pub(crate) async fn start_local_zone_with_fixture(
     // fails. Seed pathUSD with the default allow-all policy (mirrors L1 default).
     seed_local_policy_cache(zone.policy_cache());
 
+    fixture.seed_l1_cache(
+        zone.l1_state_cache(),
+        Address::ZERO,
+        Address::ZERO,
+        seed_blocks,
+    );
+    Ok((zone, fixture))
+}
+
+/// Start a local zone node with a custom user transaction limit and seeded L1 fixture.
+pub(crate) async fn start_local_zone_with_fixture_and_max_user_transactions(
+    seed_blocks: u64,
+    max_user_transactions_per_block: usize,
+) -> eyre::Result<(ZoneTestNode, L1Fixture)> {
+    let zone = ZoneTestNode::start_local_with_max_user_transactions_per_block(
+        max_user_transactions_per_block,
+    )
+    .await?;
+    let fixture = L1Fixture::new();
+
+    seed_local_policy_cache(zone.policy_cache());
     fixture.seed_l1_cache(
         zone.l1_state_cache(),
         Address::ZERO,

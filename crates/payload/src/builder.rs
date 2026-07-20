@@ -54,11 +54,15 @@ use crate::{ZonePayloadAttributes, ZonePayloadTypes};
 /// Default empty-batch cadence: every 120 zone blocks (~60 sec at Tempo's 500 ms block time).
 pub const DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS: u64 = 120;
 
+/// Default maximum number of user transactions included in a zone block.
+pub const DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK: usize = 5;
+
 /// Factory for constructing the zone payload builder.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ZonePayloadFactory {
     withdrawal_batch_interval_blocks: u64,
+    max_user_transactions_per_block: usize,
     withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
 }
 
@@ -67,8 +71,18 @@ impl ZonePayloadFactory {
     pub fn new(withdrawal_batch_interval_blocks: u64) -> Self {
         Self {
             withdrawal_batch_interval_blocks: withdrawal_batch_interval_blocks.max(1),
+            max_user_transactions_per_block: DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK,
             withdrawal_reveal_encryptor: None,
         }
+    }
+
+    /// Set the maximum number of user transactions included in each zone block.
+    pub fn with_max_user_transactions_per_block(
+        mut self,
+        max_user_transactions_per_block: usize,
+    ) -> Self {
+        self.max_user_transactions_per_block = max_user_transactions_per_block;
+        self
     }
 
     pub fn with_withdrawal_reveal_encryptor(
@@ -116,6 +130,7 @@ where
             provider: ctx.provider().clone(),
             evm_config,
             withdrawal_batch_interval_blocks: self.withdrawal_batch_interval_blocks,
+            max_user_transactions_per_block: self.max_user_transactions_per_block,
             withdrawal_reveal_encryptor: self.withdrawal_reveal_encryptor.clone(),
         })
     }
@@ -132,6 +147,8 @@ pub struct ZonePayloadBuilder<Provider, EvmConfig> {
     evm_config: EvmConfig,
     /// Number of zone blocks between withdrawal batch boundaries.
     withdrawal_batch_interval_blocks: u64,
+    /// Maximum number of user transactions included in a zone block.
+    max_user_transactions_per_block: usize,
     /// Encrypts authenticated-withdrawal sender reveal data for batch finalization.
     withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
 }
@@ -252,8 +269,12 @@ where
         let mut best_txs = self
             .pool
             .best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
-        if execute_pool_transactions(&mut builder, &mut best_txs, &cancel)?
-            == PoolExecutionOutcome::Cancelled
+        if execute_pool_transactions(
+            &mut builder,
+            &mut best_txs,
+            &cancel,
+            self.max_user_transactions_per_block,
+        )? == PoolExecutionOutcome::Cancelled
         {
             return Ok(BuildOutcome::Cancelled);
         }
@@ -404,7 +425,8 @@ fn validate_l1_continuity(
     Ok(())
 }
 
-/// Execute the best pool transactions until the iterator is exhausted or the build is cancelled.
+/// Execute the best pool transactions until the user-transaction limit is reached, the iterator
+/// is exhausted, or the build is cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolExecutionOutcome {
     Complete,
@@ -415,6 +437,7 @@ fn execute_pool_transactions<B, T>(
     builder: &mut B,
     best_txs: &mut T,
     cancel: &CancelOnDrop,
+    max_user_transactions: usize,
 ) -> Result<PoolExecutionOutcome, PayloadBuilderError>
 where
     B: BlockBuilder<Primitives = tempo_primitives::TempoPrimitives>,
@@ -422,14 +445,19 @@ where
         alloy_evm::Evm<Tx = tempo_revm::TempoTxEnv>,
     T: BestTransactions<Item = Arc<ValidPoolTransaction<TempoPooledTransaction>>>,
 {
-    while let Some(pool_tx) = best_txs.next() {
+    let mut included_user_transactions = 0;
+    while included_user_transactions < max_user_transactions {
+        let Some(pool_tx) = best_txs.next() else {
+            break;
+        };
+
         if cancel.is_cancelled() {
             return Ok(PoolExecutionOutcome::Cancelled);
         }
 
         let tx_with_env = pool_tx.transaction.clone().into_with_tx_env();
         match builder.execute_transaction(tx_with_env) {
-            Ok(_) => {}
+            Ok(_) => included_user_transactions += 1,
             Err(reth_evm::block::BlockExecutionError::Validation(
                 reth_evm::block::BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                     transaction_gas_limit,
@@ -707,6 +735,21 @@ mod tests {
         assert_eq!(
             super::ZonePayloadFactory::new(0).withdrawal_batch_interval_blocks,
             1
+        );
+    }
+
+    #[test]
+    fn user_transaction_limit_defaults_to_five_and_allows_zero() {
+        assert_eq!(super::DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK, 5);
+        assert_eq!(
+            super::ZonePayloadFactory::default().max_user_transactions_per_block,
+            5
+        );
+        assert_eq!(
+            super::ZonePayloadFactory::default()
+                .with_max_user_transactions_per_block(0)
+                .max_user_transactions_per_block,
+            0
         );
     }
 

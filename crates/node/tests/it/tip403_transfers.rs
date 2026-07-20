@@ -21,6 +21,7 @@ use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, approve_outbox,
     local_dev_zone_account, start_local_zone_with_fixture,
+    start_local_zone_with_fixture_and_max_user_transactions,
 };
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
@@ -102,6 +103,72 @@ async fn test_deposit_then_transfer() -> eyre::Result<()> {
     assert!(
         dev_balance >= U256::from(expected_remaining.saturating_sub(gas_buffer)),
         "dev balance {dev_balance} too low — unexpected gas usage"
+    );
+
+    Ok(())
+}
+
+/// Verify that excess pool transactions remain pending for the next zone block.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_user_transaction_limit_is_enforced_per_block() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) =
+        start_local_zone_with_fixture_and_max_user_transactions(10, 1).await?;
+    let (provider, dev_address) = local_dev_zone_account(&zone)?;
+    let deposit_amount: u128 = 1_000_000;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(deposit_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let bob = address!("0x0000000000000000000000000000000000000B0B");
+    let carol = address!("0x000000000000000000000000000000000000CA01");
+    let nonce = provider.get_transaction_count(dev_address).await?;
+    let tip20 = ITIP20::new(PATH_USD_ADDRESS, &provider);
+
+    let first = tip20
+        .transfer(bob, U256::from(100))
+        .nonce(nonce)
+        .gas(TIP20_TX_GAS)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .send()
+        .await?;
+    let second = tip20
+        .transfer(carol, U256::from(200))
+        .nonce(nonce + 1)
+        .gas(TIP20_TX_GAS)
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .send()
+        .await?;
+    let second_hash = *second.tx_hash();
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    let first_receipt = first.get_receipt().await?;
+    assert!(first_receipt.status(), "first transfer should succeed");
+    assert!(
+        provider
+            .get_transaction_receipt(second_hash)
+            .await?
+            .is_none(),
+        "second transfer must remain pending after the first block"
+    );
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    let second_receipt = second.get_receipt().await?;
+    assert!(second_receipt.status(), "second transfer should succeed");
+    assert_eq!(
+        zone.balance_of(PATH_USD_ADDRESS, bob).await?,
+        U256::from(100)
+    );
+    assert_eq!(
+        zone.balance_of(PATH_USD_ADDRESS, carol).await?,
+        U256::from(200)
     );
 
     Ok(())

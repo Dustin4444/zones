@@ -13,7 +13,7 @@ mod withdrawal_reveal;
 
 pub use attrs::{ZonePayloadAttributes, ZonePayloadTypes};
 pub use builder::{
-    DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS, ZonePayloadBuilder, ZonePayloadFactory,
-    build_advance_tempo_tx,
+    DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK, DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+    ZonePayloadBuilder, ZonePayloadFactory, build_advance_tempo_tx,
 };
 pub use withdrawal_reveal::WithdrawalRevealEncryptor;

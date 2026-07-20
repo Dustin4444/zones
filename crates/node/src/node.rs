@@ -70,8 +70,8 @@ use zone_l1::{
 };
 use zone_p2p::{P2pConfig, P2pNetworkId, Role, spawn_p2p};
 use zone_payload::{
-    DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS, WithdrawalRevealEncryptor, ZonePayloadAttributes,
-    ZonePayloadFactory, ZonePayloadTypes,
+    DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK, DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+    WithdrawalRevealEncryptor, ZonePayloadAttributes, ZonePayloadFactory, ZonePayloadTypes,
 };
 use zone_sequencer::{BatchAnchorConfig, ZoneSequencerConfig, spawn_zone_sequencer};
 
@@ -193,6 +193,8 @@ pub struct ZoneNode {
     initial_tokens: Option<Vec<Address>>,
     /// Number of zone blocks between withdrawal batch boundaries.
     withdrawal_batch_interval_blocks: u64,
+    /// Maximum number of user transactions included in a zone block.
+    max_user_transactions_per_block: usize,
     /// Encrypts authenticated-withdrawal sender reveal data during payload construction.
     withdrawal_reveal_encryptor: Option<Arc<dyn WithdrawalRevealEncryptor>>,
     /// Private RPC config.
@@ -242,6 +244,7 @@ impl ZoneNode {
             portal_address,
             initial_tokens: None,
             withdrawal_batch_interval_blocks: DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+            max_user_transactions_per_block: DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK,
             withdrawal_reveal_encryptor: None,
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
@@ -299,6 +302,15 @@ impl ZoneNode {
     /// finalization.
     pub fn with_withdrawal_batch_interval_blocks(mut self, interval_blocks: u64) -> Self {
         self.withdrawal_batch_interval_blocks = interval_blocks.max(1);
+        self
+    }
+
+    /// Set the maximum number of user transactions included in each zone block.
+    pub fn with_max_user_transactions_per_block(
+        mut self,
+        max_user_transactions_per_block: usize,
+    ) -> Self {
+        self.max_user_transactions_per_block = max_user_transactions_per_block;
         self
     }
 
@@ -916,7 +928,8 @@ where
             self.l1_state_cache.clone(),
             self.policy_cache.clone(),
         );
-        let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks);
+        let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks)
+            .with_max_user_transactions_per_block(self.max_user_transactions_per_block);
         if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
             payload_factory = payload_factory.with_withdrawal_reveal_encryptor(encryptor);
         }
