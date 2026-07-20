@@ -166,8 +166,10 @@ contract ReentrantWithdrawalReceiver is IWithdrawalReceiver {
     {
         (Withdrawal memory withdrawal, bytes32 remainingQueue) =
             abi.decode(callbackData, (Withdrawal, bytes32));
+        Withdrawal[] memory withdrawals = new Withdrawal[](1);
+        withdrawals[0] = withdrawal;
 
-        try IZonePortal(sourcePortal).processWithdrawal(withdrawal, remainingQueue) {
+        try IZonePortal(sourcePortal).processWithdrawals(withdrawals, remainingQueue) {
             nestedCallSucceeded = true;
         } catch (bytes memory reason) {
             if (reason.length >= 4) {
@@ -462,7 +464,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         vm.expectRevert(IZonePortal.NotSequencer.selector);
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         vm.stopPrank();
     }
@@ -881,7 +883,7 @@ contract ZonePortalTest is BaseTest {
             previousState = nextState;
         }
 
-        portal.processWithdrawal(firstWithdrawal, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(firstWithdrawal), bytes32(0));
 
         bytes32 wrappedState = keccak256("wrapped-state");
         bytes32 wrappedHash = keccak256("wrapped-batch");
@@ -1037,7 +1039,7 @@ contract ZonePortalTest is BaseTest {
 
         // Process the withdrawal
         uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
-        portal.processWithdrawal(w, bytes32(0)); // 0 means last item in slot
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0)); // 0 means last item in slot
 
         // Bob should have received funds
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + 500e6);
@@ -1089,7 +1091,7 @@ contract ZonePortalTest is BaseTest {
 
         // Process w1 (oldest)
         uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
-        portal.processWithdrawal(w1, innerHash);
+        portal.processWithdrawals(_singleWithdrawal(w1), innerHash);
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + 300e6);
 
         // Slot 0 should now have w2's hash, head still at 0
@@ -1098,12 +1100,68 @@ contract ZonePortalTest is BaseTest {
 
         // Process w2 (last in slot)
         uint256 charlieBalanceBefore = pathUSD.balanceOf(charlie);
-        portal.processWithdrawal(w2, bytes32(0)); // 0 = last item
+        portal.processWithdrawals(_singleWithdrawal(w2), bytes32(0)); // 0 = last item
         assertEq(pathUSD.balanceOf(charlie), charlieBalanceBefore + 400e6);
 
         // Slot 0 cleared, head advanced
         assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
         assertEq(portal.withdrawalQueueHead(), 1);
+    }
+
+    function test_processWithdrawals_processesQueueInOrder() public {
+        Withdrawal memory w1 =
+            _withdrawal(address(pathUSD), alice, bob, 300e6, bytes32(0), 0, alice, "");
+        Withdrawal memory w2 =
+            _withdrawal(address(pathUSD), alice, charlie, 400e6, bytes32(0), 0, alice, "");
+        Withdrawal memory w3 =
+            _withdrawal(address(pathUSD), alice, bob, 500e6, bytes32(0), 0, alice, "");
+
+        bytes32 remainingQueue = keccak256(abi.encode(w3, EMPTY_SENTINEL));
+        bytes32 innerHash = keccak256(abi.encode(w2, remainingQueue));
+        bytes32 batchQueueHash = keccak256(abi.encode(w1, innerHash));
+
+        vm.roll(block.number + 1);
+        portal.submitBatch(
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("state1")
+            }),
+            DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: portal.currentDepositQueueHash(),
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0
+                }),
+            batchQueueHash,
+            "",
+            ""
+        );
+
+        Withdrawal[] memory withdrawals = new Withdrawal[](2);
+        withdrawals[0] = w1;
+        withdrawals[1] = w2;
+        uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
+        uint256 charlieBalanceBefore = pathUSD.balanceOf(charlie);
+        portal.processWithdrawals(withdrawals, remainingQueue);
+
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + 300e6);
+        assertEq(pathUSD.balanceOf(charlie), charlieBalanceBefore + 400e6);
+        assertEq(portal.withdrawalQueueSlot(0), remainingQueue);
+        assertEq(portal.withdrawalQueueHead(), 0);
+
+        portal.processWithdrawals(_singleWithdrawal(w3), bytes32(0));
+        assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + 800e6);
+        assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
+        assertEq(portal.withdrawalQueueHead(), 1);
+    }
+
+    function test_processWithdrawals_revertsIfNotSequencer() public {
+        Withdrawal[] memory withdrawals = new Withdrawal[](0);
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.NotSequencer.selector);
+        portal.processWithdrawals(withdrawals, bytes32(0));
     }
 
     function test_withdrawalQueue_multipleBatches() public {
@@ -1167,11 +1225,11 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueTail(), 2);
 
         // Process w1 from slot 0
-        portal.processWithdrawal(w1, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w1), bytes32(0));
         assertEq(portal.withdrawalQueueHead(), 1);
 
         // Process w2 from slot 1
-        portal.processWithdrawal(w2, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w2), bytes32(0));
         assertEq(portal.withdrawalQueueHead(), 2);
     }
 
@@ -1254,7 +1312,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         // Process withdrawal (0 = last item in slot)
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Receiver should have gotten funds and callback
         assertEq(pathUSD.balanceOf(address(withdrawalReceiver)), 500e6);
@@ -1311,7 +1369,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         // Process withdrawal - should bounce back
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Receiver should NOT have funds (they stayed in portal)
         assertEq(pathUSD.balanceOf(address(withdrawalReceiver)), 0);
@@ -1366,7 +1424,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         // Process withdrawal - should bounce back due to wrong selector
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Funds should still be in portal (bounce-back)
         assertEq(pathUSD.balanceOf(address(withdrawalReceiver)), 0);
@@ -1416,7 +1474,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         // Process withdrawal - should bounce back due to transfer revert
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // No transfer should have happened
         assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
@@ -1485,7 +1543,7 @@ contract ZonePortalTest is BaseTest {
 
         // Process w1. The fee is forgiven, bob receives the withdrawal amount, and no
         // bounce-back deposit is created
-        portal.processWithdrawal(w1, innerHash);
+        portal.processWithdrawals(_singleWithdrawal(w1), innerHash);
 
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + w1.amount);
         assertEq(pathUSD.balanceOf(sequencer), sequencerBalanceBefore);
@@ -1497,7 +1555,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueHead(), 0);
 
         // Process w2 to prove the failed fee transfer did not block later withdrawals.
-        portal.processWithdrawal(w2, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w2), bytes32(0));
 
         assertEq(pathUSD.balanceOf(charlie), charlieBalanceBefore + w2.amount);
         assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore - w1.amount - w2.amount);
@@ -1516,7 +1574,7 @@ contract ZonePortalTest is BaseTest {
             _withdrawal(address(pathUSD), alice, bob, 100e6, bytes32(0), 0, alice, "");
 
         vm.expectRevert(WithdrawalQueueLib.NoWithdrawalsInQueue.selector);
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
     }
 
     function test_processWithdrawal_revertsIfInvalid() public {
@@ -1556,7 +1614,7 @@ contract ZonePortalTest is BaseTest {
             _withdrawal(address(pathUSD), alice, charlie, 500e6, bytes32(0), 0, alice, "");
 
         vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
-        portal.processWithdrawal(wrongW, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(wrongW), bytes32(0));
     }
 
     function test_processWithdrawal_revertsIfNotSequencer() public {
@@ -1592,7 +1650,7 @@ contract ZonePortalTest is BaseTest {
 
         vm.prank(alice); // Not sequencer
         vm.expectRevert(IZonePortal.NotSequencer.selector);
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
     }
 
     function test_processWithdrawal_revertsOnSequencerCallbackReentrancy() public {
@@ -1644,7 +1702,7 @@ contract ZonePortalTest is BaseTest {
 
         uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
         vm.prank(address(receiver));
-        portal.processWithdrawal(outer, remainingQueue);
+        portal.processWithdrawals(_singleWithdrawal(outer), remainingQueue);
 
         assertFalse(receiver.nestedCallSucceeded());
         assertEq(receiver.nestedRevertSelector(), IZonePortal.ReentrantWithdrawal.selector);
@@ -1652,7 +1710,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueSlot(0), remainingQueue);
 
         vm.prank(address(receiver));
-        portal.processWithdrawal(nested, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(nested), bytes32(0));
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + nested.amount);
     }
 
@@ -2062,13 +2120,13 @@ contract ZonePortalTest is BaseTest {
 
         // Try to process w2 (slot 1) before w1 (slot 0) - should fail
         vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
-        portal.processWithdrawal(w2, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w2), bytes32(0));
 
         // Process w1 first
-        portal.processWithdrawal(w1, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w1), bytes32(0));
 
         // Now w2 should work
-        portal.processWithdrawal(w2, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w2), bytes32(0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2114,7 +2172,7 @@ contract ZonePortalTest is BaseTest {
         );
 
         // Process withdrawal - should bounce back
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Receiver should NOT have funds
         assertEq(pathUSD.balanceOf(address(gasConsumingReceiver)), 0);
@@ -2156,7 +2214,7 @@ contract ZonePortalTest is BaseTest {
 
         uint256 callCountBefore = successfulReceiver.callCount();
 
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Funds should be transferred
         assertEq(pathUSD.balanceOf(address(successfulReceiver)), 500e6);
@@ -2203,7 +2261,7 @@ contract ZonePortalTest is BaseTest {
             ""
         );
 
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Callback should have been called
         assertEq(successfulReceiver.callCount(), 1);
@@ -2252,7 +2310,7 @@ contract ZonePortalTest is BaseTest {
             ""
         );
 
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         // Verify bounce-back deposit was created
         bytes32 newDepositHash = portal.currentDepositQueueHash();
@@ -2402,7 +2460,7 @@ contract ZonePortalTest is BaseTest {
         vm.expectEmit(true, true, false, true);
         emit IZonePortal.WithdrawalProcessed(bob, w.senderTag, address(pathUSD), 500e6, true);
 
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
     }
 
     function test_processWithdrawal_emitsWithdrawalProcessedEvent_failure() public {
@@ -2445,7 +2503,7 @@ contract ZonePortalTest is BaseTest {
             address(gasConsumingReceiver), w.senderTag, address(pathUSD), 500e6, false
         );
 
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -3368,7 +3426,7 @@ contract ZonePortalTest is BaseTest {
             abi.encodeWithSelector(ITIP20.transfer.selector, bob, w.amount),
             abi.encode(false)
         );
-        portal.processWithdrawal(w, bytes32(0));
+        portal.processWithdrawals(_singleWithdrawal(w), bytes32(0));
 
         assertEq(portal.refunds(address(pathUSD), bob), w.amount);
 
