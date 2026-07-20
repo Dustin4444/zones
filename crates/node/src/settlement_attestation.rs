@@ -19,10 +19,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 use zone_p2p::P2pCommand;
 
-use crate::{
-    attestation::{SettlementAttestation, SignedSettlementAttestation},
-    replication::BlockAttestationContext,
-};
+use crate::replication::BlockAttestationContext;
+use zone_sequencer::attestation::{SettlementAttestation, SignedSettlementAttestation};
 
 #[derive(Debug, Clone, Copy)]
 struct BlockCommitments {
@@ -103,11 +101,9 @@ where
             ));
         }
     }
-    let genesis = provider
-        .sealed_header(0)?
-        .map(|header| header.hash())
-        .ok_or_else(|| eyre::eyre!("missing zone genesis header"))?;
-    Ok((genesis, B256::ZERO, 0))
+    // A fresh ZonePortal has not accepted any zone tip yet, so its blockHash is zero. The first
+    // batch must extend that on-chain value rather than the local zone genesis hash.
+    Ok((B256::ZERO, B256::ZERO, 0))
 }
 
 /// Build the settlement attestation at a batch boundary in the exact format ZonePortal expects.
@@ -134,13 +130,11 @@ where
     let portal = ZonePortal::new(context.domain.portal_address, context.l1_provider.clone());
     let set_version_call = portal.sequencerSetVersion();
     let portal_batch_index_call = portal.withdrawalBatchIndex();
-    let sequencer_call = portal.sequencer();
     let verifier_call = portal.verifier();
     let portal_tip_call = portal.blockHash();
-    let (set_version, portal_batch_index, sequencer, verifier, portal_tip) = tokio::try_join!(
+    let (set_version, portal_batch_index, verifier, portal_tip) = tokio::try_join!(
         set_version_call.call(),
         portal_batch_index_call.call(),
-        sequencer_call.call(),
         verifier_call.call(),
         portal_tip_call.call(),
     )?;
@@ -191,7 +185,6 @@ where
         sequencerSetVersion: set_version,
         zoneHeight: U256::from(number),
         withdrawalBatchIndex: U256::from(withdrawal_batch_index),
-        sequencer,
         verifier,
         tempoBlockNumber: commitments.tempo_block_number,
         anchorBlockNumber: anchor_block_number,
@@ -323,8 +316,33 @@ pub(crate) async fn collect_leader_settlements<P>(
             }
             _ = retry.tick(), if pending_boundary.is_some() => {
                 let number = pending_boundary.expect("guarded by is_some");
-                if let Err(err) = propose_settlement(&provider, number, &commands, &context).await {
-                    debug!(target: "zone::p2p", %err, height = number, "Settlement proposal retry is not currently valid");
+                match propose_settlement(&provider, number, &commands, &context).await {
+                    Ok(true) => {}
+                    Ok(false) => pending_boundary = None,
+                    Err(err) => {
+                        debug!(target: "zone::p2p", %err, height = number, "Settlement proposal retry is not currently valid");
+
+                        // A successful submitBatch makes the previously pending proposal stale.
+                        // Walk the already-persisted boundaries after it so the next batch can be
+                        // proposed even when the live tip is now far ahead of the portal tip.
+                        let head = match provider.best_block_number() {
+                            Ok(head) => head,
+                            Err(err) => {
+                                debug!(target: "zone::p2p", %err, "Failed reading head while advancing settlement proposal");
+                                continue;
+                            }
+                        };
+                        for candidate in number.saturating_add(1)..=head {
+                            match propose_settlement(&provider, candidate, &commands, &context).await {
+                                Ok(true) => {
+                                    pending_boundary = Some(candidate);
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(err) => debug!(target: "zone::p2p", %err, height = candidate, "Skipped non-current settlement boundary while advancing"),
+                            }
+                        }
+                    }
                 }
             }
         }

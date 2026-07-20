@@ -5,15 +5,17 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-const TEMPORARY_ATTESTATION_RETENTION_HEIGHTS: usize = 120;
-
-type SettlementSignatures =
-    BTreeMap<u64, BTreeMap<B256, BTreeMap<Address, SignedSettlementAttestation>>>;
-
 use alloy_primitives::{Address, B256, Bytes, Signature, U256};
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{Eip712Domain, SolStruct as _, SolValue as _, eip712_domain, sol};
+use tokio::sync::Notify;
+
+const TEMPORARY_ATTESTATION_RETENTION_HEIGHTS: usize = 120;
+
+type BlockAcks = BTreeMap<u64, BTreeMap<Address, SignedBlockAck>>;
+type SettlementSignatures =
+    BTreeMap<u64, BTreeMap<B256, BTreeMap<Address, SignedSettlementAttestation>>>;
 
 sol! {
     /// Off-chain acknowledgement signed after importing and persisting one zone block.
@@ -25,14 +27,13 @@ sol! {
         bytes32 zoneBlockHash;
     }
 
-    /// Exact settlement statement verified by ZonePortal in PR #669.
+    /// Exact settlement statement verified by ZonePortal.
     #[derive(Debug, PartialEq, Eq)]
     struct SettlementAttestation {
         uint32 zoneId;
         uint64 sequencerSetVersion;
         uint256 zoneHeight;
         uint256 withdrawalBatchIndex;
-        address sequencer;
         address verifier;
         uint64 tempoBlockNumber;
         uint64 anchorBlockNumber;
@@ -60,11 +61,11 @@ sol! {
 
 /// Immutable values that domain-separate one zone's attestations.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AttestationDomain {
-    pub(crate) l1_chain_id: u64,
-    pub(crate) portal_address: Address,
-    pub(crate) zone_id: u32,
-    pub(crate) sequencer_set_version: u64,
+pub struct AttestationDomain {
+    pub l1_chain_id: u64,
+    pub portal_address: Address,
+    pub zone_id: u32,
+    pub sequencer_set_version: u64,
 }
 
 impl AttestationDomain {
@@ -77,17 +78,17 @@ impl AttestationDomain {
         }
     }
 
-    pub(crate) fn block_ack_digest(self, ack: &BlockAck) -> B256 {
+    pub fn block_ack_digest(self, ack: &BlockAck) -> B256 {
         ack.eip712_signing_hash(&self.eip712())
     }
 
-    pub(crate) fn settlement_digest(self, attestation: &SettlementAttestation) -> B256 {
+    pub fn settlement_digest(self, attestation: &SettlementAttestation) -> B256 {
         attestation.eip712_signing_hash(&self.eip712())
     }
 }
 
 impl BlockAck {
-    pub(crate) fn new(domain: AttestationDomain, zone_height: u64, zone_block_hash: B256) -> Self {
+    pub fn new(domain: AttestationDomain, zone_height: u64, zone_block_hash: B256) -> Self {
         Self {
             zoneId: domain.zone_id,
             sequencerSetVersion: domain.sequencer_set_version,
@@ -98,18 +99,18 @@ impl BlockAck {
 }
 
 impl SettlementAttestation {
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         self.abi_encode()
     }
 
-    pub(crate) fn decode(encoded: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
         Self::abi_decode(encoded)
             .map_err(|err| eyre::eyre!("invalid settlement proposal encoding: {err}"))
     }
 }
 
 impl SignedBlockAck {
-    pub(crate) fn sign(
+    pub fn sign(
         ack: BlockAck,
         domain: AttestationDomain,
         signer: &PrivateKeySigner,
@@ -121,15 +122,15 @@ impl SignedBlockAck {
         })
     }
 
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         self.abi_encode()
     }
 
-    pub(crate) fn decode(encoded: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
         Self::abi_decode(encoded).map_err(|err| eyre::eyre!("invalid block ACK encoding: {err}"))
     }
 
-    pub(crate) fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
+    pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
         let signature = Signature::try_from(self.signature.as_ref())
             .map_err(|err| eyre::eyre!("invalid block ACK signature: {err}"))?;
         signature
@@ -139,7 +140,7 @@ impl SignedBlockAck {
 }
 
 impl SignedSettlementAttestation {
-    pub(crate) fn sign(
+    pub fn sign(
         attestation: SettlementAttestation,
         domain: AttestationDomain,
         signer: &PrivateKeySigner,
@@ -151,16 +152,16 @@ impl SignedSettlementAttestation {
         })
     }
 
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         self.abi_encode()
     }
 
-    pub(crate) fn decode(encoded: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
         Self::abi_decode(encoded)
             .map_err(|err| eyre::eyre!("invalid settlement signature encoding: {err}"))
     }
 
-    pub(crate) fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
+    pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
         let signature = Signature::try_from(self.signature.as_ref())
             .map_err(|err| eyre::eyre!("invalid settlement signature: {err}"))?;
         signature
@@ -169,18 +170,26 @@ impl SignedSettlementAttestation {
     }
 }
 
-/// Replication ACKs and settlement certificates retained by the leader.
+/// A settlement statement and its distinct signer signatures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementCertificate {
+    pub height: u64,
+    pub digest: B256,
+    pub attestation: SettlementAttestation,
+    pub signatures: Vec<Bytes>,
+}
+
+/// Replication ACKs and settlement certificates shared by P2P and batch submission.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct AttestationStore {
-    // TODO(multi-sequencer): Replace the temporary bounded retention with a
-    // consume-and-remove API when the leader starts attaching quorum certificates to submitBatch.
-    block_acks: Arc<RwLock<BTreeMap<u64, BTreeMap<Address, SignedBlockAck>>>>,
+pub struct AttestationStore {
+    block_acks: Arc<RwLock<BlockAcks>>,
     settlements: Arc<RwLock<SettlementSignatures>>,
+    settlement_changed: Arc<Notify>,
 }
 
 impl AttestationStore {
-    /// Inserts one replication ACK per recovered signer and block height.
-    pub(crate) fn insert_block_ack(
+    /// Insert one replication ACK per recovered signer and block height.
+    pub fn insert_block_ack(
         &self,
         signer: Address,
         signed: SignedBlockAck,
@@ -201,8 +210,7 @@ impl AttestationStore {
         };
 
         // Temporary memory-safety bound: retain only the newest 120 attested block heights.
-        // Once the leader submits certificates with submitBatch, that path should consume and
-        // remove every attestation covered by the submitted batch instead.
+        // Successful submitBatch calls remove all ACKs covered by the submitted batch.
         while all.len() > TEMPORARY_ATTESTATION_RETENTION_HEIGHTS {
             all.pop_first();
         }
@@ -210,8 +218,8 @@ impl AttestationStore {
         Ok((inserted, signature_count))
     }
 
-    /// Inserts one settlement signature per recovered signer and statement digest.
-    pub(crate) fn insert_settlement(
+    /// Insert one settlement signature per recovered signer and statement digest.
+    pub fn insert_settlement(
         &self,
         domain: AttestationDomain,
         signer: Address,
@@ -233,17 +241,79 @@ impl AttestationStore {
             (inserted, signatures.len())
         };
 
-        // Temporary memory-safety bound until submitBatch consumes and removes the signatures for
-        // each successfully settled batch.
+        // Temporary memory-safety bound until successful submitBatch calls consume certificates.
         while all.len() > TEMPORARY_ATTESTATION_RETENTION_HEIGHTS {
             all.pop_first();
         }
+        drop(all);
+        // There is one in-order batch submission waiter; notify_one retains a permit if insertion
+        // races between its store check and awaiting the notification.
+        self.settlement_changed.notify_one();
 
         (inserted, signature_count)
     }
 
+    /// Wait until any statement at `height` has at least `quorum` distinct signatures.
+    pub async fn wait_for_settlement(&self, height: u64, quorum: usize) -> SettlementCertificate {
+        loop {
+            let notified = self.settlement_changed.notified();
+            if let Some(certificate) = self.settlement_at(height, quorum) {
+                return certificate;
+            }
+            notified.await;
+        }
+    }
+
+    fn settlement_at(&self, height: u64, quorum: usize) -> Option<SettlementCertificate> {
+        let all = self
+            .settlements
+            .read()
+            .expect("attestation store lock poisoned");
+        let (digest, signatures) = all
+            .get(&height)?
+            .iter()
+            .find(|(_, signatures)| signatures.len() >= quorum)?;
+        let attestation = signatures.values().next()?.attestation.clone();
+        Some(SettlementCertificate {
+            height,
+            digest: *digest,
+            attestation,
+            // Signer-address ordering makes transaction calldata deterministic.
+            signatures: signatures
+                .values()
+                .map(|signed| signed.signature.clone())
+                .collect(),
+        })
+    }
+
+    /// Remove one unusable certificate without discarding ACKs or other anchor candidates.
+    pub fn remove_settlement(&self, height: u64, digest: B256) {
+        let mut settlements = self
+            .settlements
+            .write()
+            .expect("attestation store lock poisoned");
+        if let Some(by_digest) = settlements.get_mut(&height) {
+            by_digest.remove(&digest);
+            if by_digest.is_empty() {
+                settlements.remove(&height);
+            }
+        }
+    }
+
+    /// Remove all attestations covered by a confirmed batch submission.
+    pub fn remove_submitted(&self, height: u64) {
+        self.settlements
+            .write()
+            .expect("attestation store lock poisoned")
+            .retain(|settlement_height, _| *settlement_height > height);
+        self.block_acks
+            .write()
+            .expect("attestation store lock poisoned")
+            .retain(|block_height, _| *block_height > height);
+    }
+
     #[cfg(test)]
-    fn len_at(&self, height: u64) -> usize {
+    fn block_ack_len_at(&self, height: u64) -> usize {
         self.block_acks
             .read()
             .expect("attestation store lock poisoned")
@@ -258,10 +328,7 @@ mod tests {
     use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::{SolStruct as _, SolValue as _};
 
-    use super::{
-        AttestationDomain, AttestationStore, BlockAck, SettlementAttestation, SignedBlockAck,
-        SignedSettlementAttestation,
-    };
+    use super::*;
 
     fn domain() -> AttestationDomain {
         AttestationDomain {
@@ -298,12 +365,12 @@ mod tests {
             store.insert_block_ack(signer.address(), signed).unwrap(),
             (false, 1)
         );
-        assert_eq!(store.len_at(42), 1);
+        assert_eq!(store.block_ack_len_at(42), 1);
     }
 
     #[test]
     fn settlement_type_and_signature_match_zone_portal() {
-        const PORTAL_TYPE: &str = "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address sequencer,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)";
+        const PORTAL_TYPE: &str = "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)";
         assert_eq!(SettlementAttestation::eip712_encode_type(), PORTAL_TYPE);
 
         let attestation = SettlementAttestation {
@@ -311,7 +378,6 @@ mod tests {
             sequencerSetVersion: 3,
             zoneHeight: U256::from(120),
             withdrawalBatchIndex: U256::from(1),
-            sequencer: Address::repeat_byte(1),
             verifier: Address::repeat_byte(2),
             tempoBlockNumber: 100,
             anchorBlockNumber: 100,
@@ -328,7 +394,6 @@ mod tests {
                 attestation.sequencerSetVersion,
                 attestation.zoneHeight,
                 attestation.withdrawalBatchIndex,
-                attestation.sequencer,
                 attestation.verifier,
                 attestation.tempoBlockNumber,
                 attestation.anchorBlockNumber,
@@ -373,5 +438,61 @@ mod tests {
             store.insert_settlement(domain, signer.address(), signed),
             (true, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn waits_for_quorum_and_removes_confirmed_attestations() {
+        let store = AttestationStore::default();
+        let signer_a = PrivateKeySigner::random();
+        let signer_b = PrivateKeySigner::random();
+        let attestation = SettlementAttestation {
+            zoneId: 7,
+            sequencerSetVersion: 3,
+            zoneHeight: U256::from(10),
+            withdrawalBatchIndex: U256::from(1),
+            verifier: Address::repeat_byte(2),
+            tempoBlockNumber: 100,
+            anchorBlockNumber: 100,
+            anchorBlockHash: B256::repeat_byte(3),
+            blockTransitionHash: B256::repeat_byte(4),
+            depositQueueTransitionHash: B256::repeat_byte(5),
+            withdrawalQueueHash: B256::repeat_byte(6),
+            verifierConfigHash: B256::repeat_byte(7),
+        };
+        store
+            .insert_block_ack(
+                signer_a.address(),
+                SignedBlockAck::sign(
+                    BlockAck::new(domain(), 9, B256::repeat_byte(8)),
+                    domain(),
+                    &signer_a,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store.insert_settlement(
+            domain(),
+            signer_a.address(),
+            SignedSettlementAttestation::sign(attestation.clone(), domain(), &signer_a).unwrap(),
+        );
+
+        let waiting = {
+            let store = store.clone();
+            tokio::spawn(async move { store.wait_for_settlement(10, 2).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        store.insert_settlement(
+            domain(),
+            signer_b.address(),
+            SignedSettlementAttestation::sign(attestation, domain(), &signer_b).unwrap(),
+        );
+        let certificate = waiting.await.unwrap();
+        assert_eq!(certificate.signatures.len(), 2);
+
+        store.remove_submitted(10);
+        assert!(store.settlement_at(10, 1).is_none());
+        assert_eq!(store.block_ack_len_at(9), 0);
     }
 }

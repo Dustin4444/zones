@@ -24,12 +24,12 @@ use zone_p2p::{P2pCommand, P2pEvent};
 use zone_payload::ZonePayloadTypes;
 use zone_sequencer::BatchAnchorConfig;
 
-use crate::attestation::{
+use crate::settlement_attestation::build_settlement_attestation;
+use alloy_signer_local::PrivateKeySigner;
+use zone_sequencer::attestation::{
     AttestationDomain, AttestationStore, BlockAck, SettlementAttestation, SignedBlockAck,
     SignedSettlementAttestation,
 };
-use crate::settlement::build_settlement_attestation;
-use alloy_signer_local::PrivateKeySigner;
 
 #[derive(Clone)]
 pub(crate) struct BlockAttestationContext {
@@ -46,6 +46,7 @@ impl BlockAttestationContext {
         domain: AttestationDomain,
         signer: PrivateKeySigner,
         addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+        store: AttestationStore,
         l1_provider: DynProvider<TempoNetwork>,
         anchor_config: BatchAnchorConfig,
     ) -> Self {
@@ -53,7 +54,7 @@ impl BlockAttestationContext {
             domain,
             signer,
             addresses,
-            store: AttestationStore::default(),
+            store,
             l1_provider,
             anchor_config,
         }
