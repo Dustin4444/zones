@@ -125,8 +125,6 @@ contract ZoneIntegrationTest is BaseTest {
             admin,
             sequencer,
             verifier,
-            GENESIS_BLOCK_HASH,
-            genesisTempoBlockNumber,
             ""
         );
         zoneId = 1;

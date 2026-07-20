@@ -183,8 +183,6 @@ contract ZoneBridgeTest is BaseTest {
             admin, // admin
             sequencer, // sequencer
             verifier,
-            GENESIS_BLOCK_HASH,
-            genesisTempoBlockNumber,
             ""
         );
         zoneId = 1;

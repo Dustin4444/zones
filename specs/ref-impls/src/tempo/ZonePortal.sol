@@ -133,7 +133,6 @@ contract ZonePortal is IZonePortal {
     uint32 public zoneId;
     address public messenger;
     address public verifier;
-    uint64 public genesisTempoBlockNumber;
     bool internal _initialized;
 
     /*//////////////////////////////////////////////////////////////
@@ -147,8 +146,6 @@ contract ZonePortal is IZonePortal {
         address _admin,
         address _sequencer,
         address _verifier,
-        bytes32 _genesisBlockHash,
-        uint64 _genesisTempoBlockNumber,
         string calldata _rpcUrl
     )
         external
@@ -162,8 +159,6 @@ contract ZonePortal is IZonePortal {
         admin = _admin;
         sequencer = _sequencer;
         verifier = _verifier;
-        blockHash = _genesisBlockHash;
-        genesisTempoBlockNumber = _genesisTempoBlockNumber;
         rpcUrl = _rpcUrl;
 
         // Enable the initial token
@@ -888,11 +883,6 @@ contract ZonePortal is IZonePortal {
     {
         if (blockTransition.prevBlockHash != blockHash) {
             revert InvalidProof();
-        }
-
-        // Validate tempoBlockNumber is valid (applies to both direct and ancestry modes)
-        if (tempoBlockNumber < genesisTempoBlockNumber) {
-            revert InvalidTempoBlockNumber();
         }
 
         // Determine anchor block: either tempoBlockNumber (direct) or recentTempoBlockNumber (ancestry)

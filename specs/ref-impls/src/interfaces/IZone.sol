@@ -349,7 +349,7 @@ interface IZoneTxContext {
 //   slot 15: pendingAdmin (address)
 //   slot 16: _withdrawalReentrancyStatus (uint256)
 //   slot 17: zoneId (uint32) + messenger (address) [packed]
-//   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
+//   slot 18: verifier (address) + _initialized (bool) [packed]
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -640,8 +640,6 @@ interface IZonePortal {
         address admin,
         address sequencer,
         address verifier,
-        bytes32 genesisBlockHash,
-        uint64 genesisTempoBlockNumber,
         string calldata rpcUrl
     )
         external;
@@ -686,8 +684,6 @@ interface IZonePortal {
     function withdrawalQueueTail() external view returns (uint256);
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
-
-    function genesisTempoBlockNumber() external view returns (uint64);
 
     /*//////////////////////////////////////////////////////////////
                           TOKEN REGISTRY

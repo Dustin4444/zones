@@ -60,8 +60,6 @@ contract ZonePortalGasLimitTest is Test {
             admin,
             address(this),
             address(0),
-            keccak256("genesis"),
-            uint64(block.number),
             ""
         );
     }

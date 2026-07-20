@@ -88,8 +88,6 @@ contract ZoneFactory is IZoneFactory {
             params.admin,
             params.sequencer,
             params.verifier,
-            params.zoneParams.genesisBlockHash,
-            params.zoneParams.genesisTempoBlockNumber,
             params.rpcUrl
         );
         portal = address(portalContract);
