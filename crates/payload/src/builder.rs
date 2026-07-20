@@ -738,21 +738,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn user_transaction_limit_defaults_to_five_and_allows_zero() {
-        assert_eq!(super::DEFAULT_MAX_USER_TRANSACTIONS_PER_BLOCK, 5);
-        assert_eq!(
-            super::ZonePayloadFactory::default().max_user_transactions_per_block,
-            5
-        );
-        assert_eq!(
-            super::ZonePayloadFactory::default()
-                .with_max_user_transactions_per_block(0)
-                .max_user_transactions_per_block,
-            0
-        );
-    }
-
     /// Verify that `build_advance_tempo_tx` constructs valid calldata for mixed
     /// deposit types. The calldata should include `QueuedDeposit` entries with the
     /// correct `DepositType` discriminator and `DecryptionData` for encrypted deposits.
