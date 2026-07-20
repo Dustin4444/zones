@@ -134,7 +134,6 @@ reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" 
 reth-cli = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
@@ -159,7 +158,6 @@ reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
-reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", rev = "01d3400" }
 revm = { version = "41.0.0", features = [
