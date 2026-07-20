@@ -23,7 +23,7 @@
 //!                                │                       ▼
 //!                                │                  ZoneEngine
 //!                                │               5. resolve payload
-//!                                │               6. newPayload
+//!                                │               6. payload handed to fast path
 //!                                │               7. FCU (update head)
 //!                                │                       │
 //!                                ◄── confirm ◄───────────┘
@@ -31,8 +31,8 @@
 //!
 //! The deposit queue uses a **peek / confirm** pattern: the engine peeks at
 //! the next L1 block, wraps it into [`ZonePayloadAttributes`], and only
-//! confirms (removes) the block after `newPayload` succeeds. A failed build
-//! leaves the block in the queue for retry.
+//! confirms (removes) the block after resolving the locally executed payload.
+//! A failed build leaves the block in the queue for retry.
 //!
 //! The zone assumes **instant finality** — head, safe, and finalized all point
 //! to the same block.
@@ -44,7 +44,7 @@ use eyre::OptionExt;
 use reth_chainspec::EthereumHardforks;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
 use std::{sync::Arc, time::Duration};
 use tempo_primitives::TempoHeader;
@@ -61,7 +61,7 @@ use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 /// 2. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
 /// 3. Sends FCU with payload attributes to start a build
 /// 4. Resolves the built payload
-/// 5. Submits via `newPayload`
+/// 5. Lets reth fast-path insert the locally executed block
 /// 6. Confirms the L1 block in the queue (removes it)
 ///
 /// On failure the L1 block stays in the queue and is retried.
@@ -69,7 +69,7 @@ use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 pub struct ZoneEngine {
     /// Chain spec for hardfork checks when building attributes.
     chain_spec: Arc<ZoneChainSpec>,
-    /// Engine API handle for FCU and newPayload.
+    /// Engine API handle for forkchoice updates.
     to_engine: ConsensusEngineHandle<ZonePayloadTypes>,
     /// Payload builder handle.
     payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
@@ -189,9 +189,9 @@ impl ZoneEngine {
     /// Advance the chain by one block.
     ///
     /// Wraps the given L1 block into [`ZonePayloadAttributes`], sends FCU
-    /// with those attributes, waits for the payload to be built, then submits
-    /// via `newPayload`. Only confirms (removes) the L1 block from the
-    /// deposit queue after `newPayload` succeeds.
+    /// with those attributes, then waits for the payload to be built. Reth
+    /// fast-path inserts the locally executed payload into the engine tree.
+    /// The L1 block is then confirmed (removed) from the deposit queue.
     async fn advance(&mut self, l1_block: L1BlockDeposits) -> eyre::Result<()> {
         let l1_num_hash = l1_block.header.num_hash();
 
@@ -245,16 +245,9 @@ impl ZoneEngine {
         };
 
         let header = payload.block().sealed_header().clone();
-        let block_number = header.number();
-        let payload = ZonePayloadTypes::block_to_payload(payload.block().clone(), None);
-        let res = self.to_engine.new_payload(payload).await?;
 
-        if !res.is_valid() {
-            eyre::bail!("Invalid payload for block {block_number}");
-        }
-
-        // newPayload succeeded — confirm the L1 block in the queue so it is
-        // removed. If the queue was reorged between peek and confirm, the
+        // The locally executed payload was handed to reth's fast path. Confirm
+        // the L1 block in the queue so it is removed. If the queue was reorged between peek and confirm, the
         // block was already purged; log a warning but still update
         // last_header since the zone chain has advanced.
         if self.deposit_queue.confirm(l1_num_hash).is_none() {
@@ -267,7 +260,7 @@ impl ZoneEngine {
         // *previous* head as canonical; this bare FCU makes the just-built
         // block the EL's canonical head.
         if let Err(e) = self.update_forkchoice_state().await {
-            error!(target: "zone::engine", "Error sending post-newPayload FCU: {:?}", e);
+            error!(target: "zone::engine", "Error sending post-build FCU: {:?}", e);
         }
 
         Ok(())
