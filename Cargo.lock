@@ -13604,6 +13604,7 @@ dependencies = [
  "zone-chainspec",
  "zone-l1",
  "zone-precompiles",
+ "zone-primitives",
 ]
 
 [[package]]
