@@ -68,13 +68,14 @@ contract ZonePortal is IZonePortal {
     bytes32 internal constant NAME_HASH = keccak256("ZonePortal");
     bytes32 internal constant VERSION_HASH = keccak256("1");
     bytes32 internal constant SETTLEMENT_ATTESTATION_TYPEHASH = keccak256(
-        "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address sequencer,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)"
+        "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)"
     );
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Current sequencer address
+    /// @notice Legacy representative retained for storage and ABI compatibility.
+    /// @dev This address has no permissions distinct from the sequencer set.
     address public sequencer;
 
     /// @notice Governance admin address
@@ -147,11 +148,9 @@ contract ZonePortal is IZonePortal {
     uint64 public genesisTempoBlockNumber;
     bool internal _initialized;
 
-    /// @notice Versioned signer set used to authorize and attest batch settlement.
-    /// @dev Appended after the cross-domain storage layout. Version zero preserves legacy zones
-    ///      until their admin explicitly activates quorum settlement.
+    /// @notice Versioned set used for every sequencer-authorized operation and settlement.
     uint64 public sequencerSetVersion;
-    uint8 public sequencerQuorum;
+    uint8 public sequencerThreshold;
     uint256 public zoneHeight;
     address[] internal _sequencers;
     mapping(address => bool) public isSequencer;
@@ -165,7 +164,8 @@ contract ZonePortal is IZonePortal {
         address _initialToken,
         address _messenger,
         address _admin,
-        address _sequencer,
+        address[] calldata initialSequencers,
+        uint8 _threshold,
         address _verifier,
         bytes32 _genesisBlockHash,
         uint64 _genesisTempoBlockNumber,
@@ -180,11 +180,12 @@ contract ZonePortal is IZonePortal {
         zoneId = _zoneId;
         messenger = _messenger;
         admin = _admin;
-        sequencer = _sequencer;
         verifier = _verifier;
         blockHash = _genesisBlockHash;
         genesisTempoBlockNumber = _genesisTempoBlockNumber;
         rpcUrl = _rpcUrl;
+
+        _replaceSequencerSet(initialSequencers, _threshold, false);
 
         // Enable the initial token
         _enableTokenInternal(_initialToken);
@@ -195,11 +196,6 @@ contract ZonePortal is IZonePortal {
     //////////////////////////////////////////////////////////////*/
 
     modifier onlySequencer() {
-        if (msg.sender != sequencer) revert NotSequencer();
-        _;
-    }
-
-    modifier onlySettlementSequencer() {
         if (sequencerSetVersion == 0 ? msg.sender != sequencer : !isSequencer[msg.sender]) {
             revert NotSequencer();
         }
@@ -249,9 +245,25 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @inheritdoc IZonePortal
-    function setSequencerSet(address[] calldata newSequencers, uint8 newQuorum) external onlyAdmin {
+    function setSequencerSet(
+        address[] calldata newSequencers,
+        uint8 newThreshold
+    )
+        external
+        onlyAdmin
+    {
+        _replaceSequencerSet(newSequencers, newThreshold, true);
+    }
+
+    function _replaceSequencerSet(
+        address[] calldata newSequencers,
+        uint8 newThreshold,
+        bool rejectUnchanged
+    )
+        internal
+    {
         uint256 length = newSequencers.length;
-        if (length == 0 || length > MAX_SEQUENCERS || newQuorum == 0 || newQuorum > length) {
+        if (length == 0 || length > MAX_SEQUENCERS || newThreshold == 0 || newThreshold > length) {
             revert InvalidSequencerSet();
         }
 
@@ -273,7 +285,7 @@ contract ZonePortal is IZonePortal {
         }
         // Quorum is part of the versioned configuration: changing only the threshold is valid
         // and must invalidate certificates collected under the previous version.
-        if (membersUnchanged && newQuorum == sequencerQuorum) {
+        if (rejectUnchanged && membersUnchanged && newThreshold == sequencerThreshold) {
             revert SequencerConfigurationUnchanged();
         }
 
@@ -287,9 +299,11 @@ contract ZonePortal is IZonePortal {
             isSequencer[signer] = true;
         }
 
-        sequencerQuorum = newQuorum;
+        // Preserve the legacy getter without granting the first member distinct permissions.
+        sequencer = newSequencers[0];
+        sequencerThreshold = newThreshold;
         uint64 newVersion = ++sequencerSetVersion;
-        emit SequencerSetUpdated(newVersion, newQuorum, newSequencers);
+        emit SequencerSetUpdated(newVersion, newThreshold, newSequencers);
     }
 
     /// @inheritdoc IZonePortal
@@ -629,9 +643,7 @@ contract ZonePortal is IZonePortal {
 
         // TIP-20 transfers revert on failure, so no boolean check is needed here.
         ITIP20(_token).transferFrom(msg.sender, address(this), amount);
-        if (fee > 0) {
-            ITIP20(_token).transfer(sequencer, fee);
-        }
+        _distributeSequencerFee(_token, fee);
     }
 
     function _recordDeposit(bytes32 newCurrentDepositQueueHash)
@@ -797,7 +809,7 @@ contract ZonePortal is IZonePortal {
         bytes32 remainingQueue
     )
         external
-        onlySettlementSequencer
+        onlySequencer
         nonReentrantWithdrawal
     {
         // Pop from withdrawal queue (library handles swap and hash verification)
@@ -808,6 +820,11 @@ contract ZonePortal is IZonePortal {
         if (withdrawal.fallbackNonce == 0) {
             _processDepositBounceBack(withdrawal);
             return;
+        }
+
+        // Split the fee equally across the active sequencer set.
+        if (withdrawal.fee > 0) {
+            _distributeSequencerFee(_token, withdrawal.fee);
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
@@ -878,9 +895,7 @@ contract ZonePortal is IZonePortal {
         uint128 refundAmount = withdrawal.amount - bouncebackFee;
 
         if (bouncebackFee > 0) {
-            // If the fee transfer fails, (e.g. TIP-403 blacklist), the sequencer
-            // forgoes the fee so the bounce-back itself does not stall.
-            _tryTransfer(_token, sequencer, bouncebackFee); // ignore failure
+            _distributeSequencerFee(_token, bouncebackFee);
         }
 
         bool success = _tryTransfer(_token, withdrawal.to, refundAmount);
@@ -921,6 +936,24 @@ contract ZonePortal is IZonePortal {
             return ok;
         } catch {
             return false;
+        }
+    }
+
+    function _distributeSequencerFee(address token, uint128 fee) internal {
+        if (fee == 0) return;
+
+        uint256 length = _sequencers.length;
+        if (length == 0) {
+            // Compatibility for portals initialized before threshold sequencers.
+            _tryTransfer(token, sequencer, fee);
+            return;
+        }
+
+        uint128 share = fee / uint128(length);
+        if (share == 0) return;
+        for (uint256 i = 0; i < length; ++i) {
+            // A recipient-policy failure must not block deposits or withdrawals.
+            _tryTransfer(token, _sequencers[i], share);
         }
     }
 
@@ -965,7 +998,7 @@ contract ZonePortal is IZonePortal {
         bytes calldata proof
     )
         external
-        onlySettlementSequencer
+        onlySequencer
     {
         if (sequencerSetVersion != 0) revert LegacyBatchSubmissionDisabled();
         bytes[] memory signatures = new bytes[](0);
@@ -995,7 +1028,7 @@ contract ZonePortal is IZonePortal {
         bytes[] calldata signatures
     )
         external
-        onlySettlementSequencer
+        onlySequencer
     {
         if (sequencerSetVersion == 0) revert InvalidQuorumCertificate();
         _submitBatch(
@@ -1100,7 +1133,6 @@ contract ZonePortal is IZonePortal {
                 anchorBlockNumber,
                 anchorBlockHash,
                 withdrawalBatchIndex + 1,
-                sequencer,
                 blockTransition,
                 depositQueueTransition,
                 withdrawalQueueHash,
@@ -1144,10 +1176,10 @@ contract ZonePortal is IZonePortal {
         view
         returns (bool)
     {
-        uint256 quorum = sequencerQuorum;
+        uint256 threshold = sequencerThreshold;
         if (
-            sequencerSetVersion == 0 || nextZoneHeight <= zoneHeight || signatures.length < quorum
-                || signatures.length > _sequencers.length
+            sequencerSetVersion == 0 || nextZoneHeight <= zoneHeight
+                || signatures.length < threshold || signatures.length > _sequencers.length
         ) return false;
 
         bytes32 structHash = keccak256(
@@ -1157,7 +1189,6 @@ contract ZonePortal is IZonePortal {
                 sequencerSetVersion,
                 nextZoneHeight,
                 withdrawalBatchIndex + 1,
-                sequencer,
                 verifier,
                 tempoBlockNumber,
                 anchorBlockNumber,
@@ -1190,7 +1221,7 @@ contract ZonePortal is IZonePortal {
             recovered[i] = signer;
         }
 
-        return signatures.length >= quorum;
+        return signatures.length >= threshold;
     }
 
     function _domainSeparator() internal view returns (bytes32) {

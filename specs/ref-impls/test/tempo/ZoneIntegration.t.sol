@@ -117,13 +117,16 @@ contract ZoneIntegrationTest is BaseTest {
         ZoneMessenger messengerContract = new ZoneMessenger(address(messengerFactory));
         l1Portal = new ZonePortal();
         address verifier = l1Factory.verifier();
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = sequencer;
         vm.prank(_ZONE_FACTORY);
         l1Portal.initialize(
             1,
             address(l2ZoneToken),
             address(messengerContract),
             admin,
-            sequencer,
+            sequencers,
+            1,
             verifier,
             GENESIS_BLOCK_HASH,
             genesisTempoBlockNumber,

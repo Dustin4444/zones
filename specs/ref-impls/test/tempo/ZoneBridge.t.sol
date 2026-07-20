@@ -175,13 +175,16 @@ contract ZoneBridgeTest is BaseTest {
         ZoneMessenger messengerContract = new ZoneMessenger(address(messengerFactory));
         l1Portal = new ZonePortal();
         address verifier = l1Factory.verifier();
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = sequencer;
         vm.prank(_ZONE_FACTORY);
         l1Portal.initialize(
             1, // zoneId
             address(l2ZoneToken), // initialToken = MockZoneToken (NOT pathUSD)
             address(messengerContract),
             admin, // admin
-            sequencer, // sequencer
+            sequencers,
+            1,
             verifier,
             GENESIS_BLOCK_HASH,
             genesisTempoBlockNumber,
