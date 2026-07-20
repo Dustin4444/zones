@@ -17,3 +17,4 @@ pub mod rpc;
 
 pub use engine::ZoneEngine;
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};
+mod attestation;

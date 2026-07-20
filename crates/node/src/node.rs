@@ -5,7 +5,8 @@
 
 use crate::{
     ZoneEngine,
-    replication::{broadcast_persisted_blocks, import_leader_blocks},
+    attestation::AttestationDomain,
+    replication::{BlockAttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
 };
 use alloy_primitives::Address;
@@ -78,18 +79,10 @@ use zone_sequencer::{BatchAnchorConfig, ZoneSequencerConfig, spawn_zone_sequence
 /// Returns a known Tempo chain spec for an L1 chain ID.
 ///
 /// Tempo Anvil uses chain ID 31337 and the same hardfork schedule as Tempo DEV (1337).
-///
-/// Additional dev-schedule L1 chain IDs (devnets that activate all Tempo
-/// hardforks at genesis) can be allowed via the `ZONE_L1_DEV_CHAIN_IDS`
-/// environment variable as a comma-separated list.
 fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
     chainspec_from_chain_id(chain_id).or_else(|| match chain_id {
         1337 | 31337 => Some(DEV.clone()),
-        _ => std::env::var("ZONE_L1_DEV_CHAIN_IDS")
-            .ok()?
-            .split(',')
-            .any(|id| id.trim().parse() == Ok(chain_id))
-            .then(|| DEV.clone()),
+        _ => None,
     })
 }
 
@@ -412,7 +405,7 @@ where
     N: FullNodeTypes<Types = ZoneNode>,
 {
     /// Creates a new ZoneAddOns instance.
-    pub fn new(
+    pub(crate) fn new(
         deposit_queue: DepositQueue,
         l1_config: L1SubscriberConfig,
         policy_cache: PolicyCache,
@@ -490,11 +483,18 @@ where
 
         let task_executor = ctx.node.task_executor().clone();
         if let Some(config) = self.p2p_config.take() {
-            let network_id =
-                P2pNetworkId::new(l1_provider.get_chain_id().await?, self.portal_address);
+            let l1_chain_id = l1_provider.get_chain_id().await?;
+            let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
+            let attestation_domain = AttestationDomain {
+                l1_chain_id,
+                portal_address: self.portal_address,
+                zone_id: config.zone_id(),
+                sequencer_set_version: config.sequencer_set_version(),
+            };
             Self::launch_p2p(
                 config,
                 network_id,
+                attestation_domain,
                 &task_executor,
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
@@ -551,11 +551,17 @@ where
     fn launch_p2p(
         config: P2pConfig,
         network_id: P2pNetworkId,
+        attestation_domain: AttestationDomain,
         task_executor: &reth_tasks::TaskExecutor,
         provider: N::Provider,
         engine: reth_node_builder::ConsensusEngineHandle<ZonePayloadTypes>,
     ) -> eyre::Result<()> {
         let role = config.role();
+        let attestation = BlockAttestationContext::new(
+            attestation_domain,
+            config.block_attestation_signer(),
+            config.block_attestation_addresses(),
+        );
         let handle = spawn_p2p(config, network_id)?;
         let zone_p2p::P2pHandleParts {
             shutdown: shutdown_token,
@@ -565,25 +571,17 @@ where
             events,
         } = handle.into_parts();
 
-        match role {
-            Role::Leader => {
-                task_executor.spawn_critical_task(
-                    "zone-p2p-block-broadcast",
-                    broadcast_persisted_blocks(provider, commands),
-                );
-                // Leaders do not receive block messages. Dropping this receiver is harmless: the
-                // runtime only emits BlockReceived on followers.
-                drop(events);
-            }
-            Role::Follower => {
-                // Keep the command sender alive so the runtime's command loop remains available
-                // for later ACK/backfill commands even though followers send nothing in this PR.
-                task_executor.spawn_critical_task(
-                    "zone-p2p-block-import",
-                    import_leader_blocks(provider, engine, events, commands),
-                );
-            }
+        if role == Role::Leader {
+            // Only a leader can build + broadcast blocks
+            task_executor.spawn_critical_task(
+                "zone-p2p-block-broadcast",
+                broadcast_persisted_blocks(provider.clone(), commands.clone()),
+            );
         }
+        task_executor.spawn_critical_task(
+            "zone-p2p-block-sync",
+            run_block_sync(provider, engine, events, commands, role, attestation),
+        );
 
         task_executor.spawn_critical_with_graceful_shutdown_signal(
             "zone-p2p",
@@ -1178,13 +1176,6 @@ mod tests {
         assert_eq!(tempo_chain_spec_for_l1(1337).unwrap().chain().id(), 1337);
         assert_eq!(tempo_chain_spec_for_l1(31337).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
-
-        // SAFETY: test-only env mutation; no other test reads this variable.
-        unsafe { std::env::set_var("ZONE_L1_DEV_CHAIN_IDS", "31318, 31319") };
-        assert_eq!(tempo_chain_spec_for_l1(31318).unwrap().chain().id(), 1337);
-        assert_eq!(tempo_chain_spec_for_l1(31319).unwrap().chain().id(), 1337);
-        assert!(tempo_chain_spec_for_l1(999_999).is_none());
-        unsafe { std::env::remove_var("ZONE_L1_DEV_CHAIN_IDS") };
     }
 
     #[test]
