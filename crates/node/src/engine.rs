@@ -23,7 +23,7 @@
 //!                                │                       ▼
 //!                                │                  ZoneEngine
 //!                                │               5. resolve payload
-//!                                │               6. newPayload
+//!                                │               6. fast-path tree insertion
 //!                                │               7. FCU (update head)
 //!                                │                       │
 //!                                ◄── confirm ◄───────────┘
@@ -31,8 +31,8 @@
 //!
 //! The deposit queue uses a **peek / confirm** pattern: the engine peeks at
 //! the next L1 block, wraps it into [`ZonePayloadAttributes`], and only
-//! confirms (removes) the block after `newPayload` succeeds. A failed build
-//! leaves the block in the queue for retry.
+//! confirms (removes) the block after the engine tree inserts it. A failed
+//! build or insertion leaves the block in the queue for retry.
 //!
 //! The zone assumes **instant finality** — head, safe, and finalized all point
 //! to the same block.
@@ -41,18 +41,25 @@ use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadAttributes as EthPayloadAttributes};
 use eyre::OptionExt;
+use futures::StreamExt as _;
 use reth_chainspec::EthereumHardforks;
+use reth_engine_primitives::ConsensusEngineEvent;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
+use reth_tokio_util::EventStream;
 use std::{sync::Arc, time::Duration};
-use tempo_primitives::TempoHeader;
+use tempo_primitives::{TempoHeader, TempoPrimitives};
 use tracing::{error, warn};
 
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{DepositQueue, L1BlockDeposits, PolicyProvider, PreparedL1Block};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
+
+/// The engine tree normally receives a built payload immediately. Bound the wait so a failed
+/// tree insertion leaves the L1 block queued for retry instead of stalling the sequencer.
+const FAST_PATH_INSERT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Engine that drives L2 block production from L1 events.
 ///
@@ -61,7 +68,7 @@ use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 /// 2. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
 /// 3. Sends FCU with payload attributes to start a build
 /// 4. Resolves the built payload
-/// 5. Submits via `newPayload`
+/// 5. Waits for reth to fast-path insert the locally executed block
 /// 6. Confirms the L1 block in the queue (removes it)
 ///
 /// On failure the L1 block stays in the queue and is retried.
@@ -73,6 +80,8 @@ pub struct ZoneEngine {
     to_engine: ConsensusEngineHandle<ZonePayloadTypes>,
     /// Payload builder handle.
     payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
+    /// Engine tree events, used to await fast-path insertion of a locally built payload.
+    engine_events: EventStream<ConsensusEngineEvent<TempoPrimitives>>,
     /// Queue of L1 blocks with their deposits.
     deposit_queue: DepositQueue,
     /// Latest block header — used as parent for the next payload and as the
@@ -94,6 +103,7 @@ impl ZoneEngine {
         chain_spec: Arc<ZoneChainSpec>,
         to_engine: ConsensusEngineHandle<ZonePayloadTypes>,
         payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
+        engine_events: EventStream<ConsensusEngineEvent<TempoPrimitives>>,
         deposit_queue: DepositQueue,
         last_header: SealedHeader<TempoHeader>,
         fee_recipient: Address,
@@ -105,6 +115,7 @@ impl ZoneEngine {
             chain_spec,
             to_engine,
             payload_builder,
+            engine_events,
             deposit_queue,
             last_header,
             fee_recipient,
@@ -199,9 +210,9 @@ impl ZoneEngine {
     /// Advance the chain by one block.
     ///
     /// Wraps the given L1 block into [`ZonePayloadAttributes`], sends FCU
-    /// with those attributes, waits for the payload to be built, then submits
-    /// via `newPayload`. Only confirms (removes) the L1 block from the
-    /// deposit queue after `newPayload` succeeds.
+    /// with those attributes, waits for the payload to be built and fast-path
+    /// inserted into the engine tree. Only confirms (removes) the L1 block from
+    /// the deposit queue after insertion succeeds.
     async fn advance(&mut self, l1_block: L1BlockDeposits) -> eyre::Result<()> {
         let l1_num_hash = l1_block.header.num_hash();
 
@@ -255,16 +266,20 @@ impl ZoneEngine {
         };
 
         let header = payload.block().sealed_header().clone();
-        let block_number = header.number();
-        let payload = ZonePayloadTypes::block_to_payload(payload.block().clone(), None);
-        let res = self.to_engine.new_payload(payload).await?;
+        tokio::time::timeout(
+            FAST_PATH_INSERT_TIMEOUT,
+            self.wait_for_fast_path_insert(header.hash()),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "timed out waiting for engine tree to insert block {}",
+                header.hash()
+            )
+        })??;
 
-        if !res.is_valid() {
-            eyre::bail!("Invalid payload for block {block_number}")
-        }
-
-        // newPayload succeeded — confirm the L1 block in the queue so it is
-        // removed. If the queue was reorged between peek and confirm, the
+        // The tree accepted the locally executed block — confirm the L1 block
+        // in the queue so it is removed. If the queue was reorged between peek and confirm, the
         // block was already purged; log a warning but still update
         // last_header since the zone chain has advanced.
         if self.deposit_queue.confirm(l1_num_hash).is_none() {
@@ -287,5 +302,33 @@ impl ZoneEngine {
         }
 
         Ok(())
+    }
+
+    /// Wait for reth's built-payload listener to add the locally executed block to the tree.
+    ///
+    /// `TempoBuiltPayload` carries the execution output produced by the payload builder. Reth's
+    /// launcher consumes that output and emits one of these events after inserting it, avoiding
+    /// a second EVM execution through `newPayload`.
+    async fn wait_for_fast_path_insert(&mut self, expected_hash: B256) -> eyre::Result<()> {
+        while let Some(event) = self.engine_events.next().await {
+            match event {
+                ConsensusEngineEvent::CanonicalBlockAdded(block, _)
+                | ConsensusEngineEvent::ForkBlockAdded(block, _)
+                    if block.recovered_block().num_hash().hash == expected_hash =>
+                {
+                    return Ok(());
+                }
+                ConsensusEngineEvent::InvalidBlock { block, error }
+                    if block.num_hash().hash == expected_hash =>
+                {
+                    eyre::bail!("engine tree rejected locally built block {expected_hash}: {error}")
+                }
+                _ => {}
+            }
+        }
+
+        eyre::bail!(
+            "engine event stream closed before inserting locally built block {expected_hash}"
+        )
     }
 }

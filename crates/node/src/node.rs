@@ -726,6 +726,7 @@ where
             provider.chain_spec(),
             ctx.beacon_engine_handle.clone(),
             ctx.node.payload_builder_handle().clone(),
+            ctx.engine_events.new_listener(),
             self.deposit_queue.clone(),
             last_header,
             fee_recipient,
