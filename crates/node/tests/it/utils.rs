@@ -1012,6 +1012,7 @@ impl ZoneTestNode {
                 provider.chain_spec(),
                 node_handle.node.add_ons_handle.beacon_engine_handle.clone(),
                 node_handle.node.payload_builder_handle.clone(),
+                node_handle.node.add_ons_handle.engine_events.new_listener(),
                 deposit_queue.clone(),
                 last_header,
                 sequencer_signer.address(),
