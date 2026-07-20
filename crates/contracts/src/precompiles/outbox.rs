@@ -104,5 +104,6 @@ crate::sol! {
             address bouncebackRecipient
         ) external;
         function finalizeWithdrawalBatch(uint256 count, uint64 blockNumber, bytes[] calldata encryptedSenders) external returns (bytes32 withdrawalQueueHash);
+        function setTempoGasRate(uint128 newTempoGasRate) external;
     }
 }

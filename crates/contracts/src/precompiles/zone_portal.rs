@@ -136,6 +136,7 @@ crate::sol! {
 
         event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
 
+        event ZoneGasRateUpdated(uint128 zoneGasRate);
         event BouncebackGasUpdated(uint64 bouncebackGas);
 
         event AdminTransferStarted(
@@ -214,6 +215,7 @@ crate::sol! {
         function pauseDeposits(address token) external;
         function resumeDeposits(address token) external;
 
+        function setZoneGasRate(uint128 newZoneGasRate) external;
         function setBouncebackGas(uint64 newBouncebackGas) external;
 
         function transferAdmin(address newAdmin) external;
