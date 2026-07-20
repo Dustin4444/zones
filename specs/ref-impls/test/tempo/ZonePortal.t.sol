@@ -561,13 +561,14 @@ contract ZonePortalTest is BaseTest {
 
     function test_submitBatch_requiresQuorumAfterActivation() public {
         address[] memory signers = _activateSequencerSet(2);
+        bytes32 prevBlockHash = portal.blockHash();
 
         vm.prank(signers[0]);
         vm.expectRevert(IZonePortal.LegacyBatchSubmissionDisabled.selector);
         portal.submitBatch(
             uint64(block.number),
             0,
-            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("tip") }),
+            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: keccak256("tip") }),
             DepositQueueTransition({
                 prevProcessedHash: bytes32(0),
                 nextProcessedHash: bytes32(0),

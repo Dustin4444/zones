@@ -21,7 +21,8 @@ use crate::{
     identity::{Ed25519Identity, Secp256k1Identity},
     network::{
         self, BACKFILL_REQUEST_CHANNEL, BACKFILL_RESPONSE_CHANNEL, BLOCK_ACK_CHANNEL,
-        BLOCK_BACKLOG, BLOCK_CHANNEL, MAX_MESSAGE_SIZE,
+        BLOCK_BACKLOG, BLOCK_CHANNEL, MAX_MESSAGE_SIZE, SETTLEMENT_PROPOSAL_CHANNEL,
+        SETTLEMENT_SIGNATURE_CHANNEL,
     },
 };
 
@@ -115,6 +116,8 @@ impl BackfillJob {
 struct P2pSenders {
     blocks: CommonwareSender,
     block_acks: CommonwareSender,
+    settlement_proposals: CommonwareSender,
+    settlement_signatures: CommonwareSender,
     backfill_requests: CommonwareSender,
     backfill_responses: CommonwareSender,
 }
@@ -122,6 +125,8 @@ struct P2pSenders {
 struct P2pReceivers {
     blocks: CommonwareReceiver,
     block_acks: CommonwareReceiver,
+    settlement_proposals: CommonwareReceiver,
+    settlement_signatures: CommonwareReceiver,
     backfill_requests: CommonwareReceiver,
     backfill_responses: CommonwareReceiver,
 }
@@ -246,6 +251,10 @@ pub enum P2pCommand {
     BroadcastBlock(Vec<u8>),
     /// Send one ABI-encoded signed block attestation to the configured leader.
     SendBlockAck(Vec<u8>),
+    /// Broadcast one ABI-encoded settlement proposal to all followers.
+    BroadcastSettlementProposal(Vec<u8>),
+    /// Return one ABI-encoded settlement signature to the leader.
+    SendSettlementSignature(Vec<u8>),
     /// Ask the role-appropriate peers for canonical blocks beginning at `start`.
     RequestBackfill { start: u64 },
     /// Return one canonical block to the peer that requested it.
@@ -278,6 +287,16 @@ pub enum P2pEvent {
     },
     /// The leader received an encoded signed block attestation from a follower.
     BlockAckReceived { follower: PublicKey, ack: Vec<u8> },
+    /// A follower received a proposed settlement statement from the leader.
+    SettlementProposalReceived {
+        leader: PublicKey,
+        proposal: Vec<u8>,
+    },
+    /// The leader received a settlement signature from a follower.
+    SettlementSignatureReceived {
+        follower: PublicKey,
+        signature: Vec<u8>,
+    },
     /// An authenticated peer requested canonical blocks beginning at `start`.
     BackfillRequested {
         peer: PublicKey,
@@ -419,6 +438,16 @@ fn run(
             network::block_ack_quota(),
             BLOCK_BACKLOG,
         );
+        let (settlement_proposal_sender, settlement_proposal_receiver) = commonware.register(
+            SETTLEMENT_PROPOSAL_CHANNEL,
+            network::settlement_quota(),
+            BLOCK_BACKLOG,
+        );
+        let (settlement_signature_sender, settlement_signature_receiver) = commonware.register(
+            SETTLEMENT_SIGNATURE_CHANNEL,
+            network::settlement_quota(),
+            BLOCK_BACKLOG,
+        );
 
         // The backfill request and responses are on separate channels
         let (backfill_request_sender, backfill_request_receiver) = commonware.register(
@@ -485,6 +514,8 @@ fn run(
             P2pSenders {
                 blocks: block_sender,
                 block_acks: block_ack_sender,
+                settlement_proposals: settlement_proposal_sender,
+                settlement_signatures: settlement_signature_sender,
                 backfill_requests: backfill_request_sender,
                 backfill_responses: backfill_response_sender,
             },
@@ -498,6 +529,8 @@ fn run(
             P2pReceivers {
                 blocks: block_receiver,
                 block_acks: block_ack_receiver,
+                settlement_proposals: settlement_proposal_receiver,
+                settlement_signatures: settlement_signature_receiver,
                 backfill_requests: backfill_request_receiver,
                 backfill_responses: backfill_response_receiver,
             },
@@ -588,6 +621,30 @@ async fn run_commands(
                     .map_err(|err| eyre::eyre!("failed sending block ACK: {err}"))?;
             }
 
+            P2pCommand::BroadcastSettlementProposal(proposal) => {
+                if role != Role::Leader {
+                    warn!(target: "zone::p2p", "Ignoring settlement proposal command on follower");
+                    continue;
+                }
+                senders
+                    .settlement_proposals
+                    .send(Recipients::Some(followers.clone()), proposal, true)
+                    .await
+                    .map_err(|err| eyre::eyre!("failed broadcasting settlement proposal: {err}"))?;
+            }
+
+            P2pCommand::SendSettlementSignature(signature) => {
+                if role != Role::Follower {
+                    warn!(target: "zone::p2p", "Ignoring settlement signature command on leader");
+                    continue;
+                }
+                senders
+                    .settlement_signatures
+                    .send(Recipients::Some(vec![leader.clone()]), signature, true)
+                    .await
+                    .map_err(|err| eyre::eyre!("failed sending settlement signature: {err}"))?;
+            }
+
             P2pCommand::RequestBackfill { start } => {
                 let now = Instant::now();
                 let request = {
@@ -669,6 +726,8 @@ async fn run_receivers(
     let P2pReceivers {
         mut blocks,
         mut block_acks,
+        mut settlement_proposals,
+        mut settlement_signatures,
         mut backfill_requests,
         mut backfill_responses,
     } = receivers;
@@ -694,6 +753,24 @@ async fn run_receivers(
                     continue;
                 }
                 P2pEvent::BlockAckReceived { follower: peer, ack: bytes.into() }
+            }
+
+            result = settlement_proposals.recv() => {
+                let (peer, bytes) = result.map_err(|err| eyre::eyre!("settlement proposal channel receive failed: {err}"))?;
+                if role != Role::Follower || peer != leader {
+                    warn!(target: "zone::p2p", %peer, "Ignoring settlement proposal from ineligible peer");
+                    continue;
+                }
+                P2pEvent::SettlementProposalReceived { leader: peer, proposal: bytes.into() }
+            }
+
+            result = settlement_signatures.recv() => {
+                let (peer, bytes) = result.map_err(|err| eyre::eyre!("settlement signature channel receive failed: {err}"))?;
+                if role != Role::Leader || peer == leader {
+                    warn!(target: "zone::p2p", %peer, "Ignoring settlement signature from ineligible peer");
+                    continue;
+                }
+                P2pEvent::SettlementSignatureReceived { follower: peer, signature: bytes.into() }
             }
 
             // Got backfill request
@@ -999,6 +1076,50 @@ mod tests {
         })
         .await
         .expect("leader did not receive follower block ACK");
+
+        let proposal = vec![0x10, 0x20];
+        leader_commands
+            .send(P2pCommand::BroadcastSettlementProposal(proposal.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(P2pEvent::SettlementProposalReceived {
+                    leader,
+                    proposal: received,
+                }) = handles[1].events_mut().recv().await
+                {
+                    assert_eq!(leader, leader_peer);
+                    assert_eq!(received, proposal);
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("follower did not receive settlement proposal");
+
+        let settlement_signature = vec![0x30, 0x40];
+        follower_commands
+            .send(P2pCommand::SendSettlementSignature(
+                settlement_signature.clone(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(P2pEvent::SettlementSignatureReceived {
+                    follower,
+                    signature,
+                }) = handles[0].events_mut().recv().await
+                {
+                    assert_eq!(follower, first_follower_peer);
+                    assert_eq!(signature, settlement_signature);
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("leader did not receive settlement signature");
 
         leader_commands
             .send(P2pCommand::SendBackfillBlock {

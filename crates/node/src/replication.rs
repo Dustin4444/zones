@@ -1,11 +1,11 @@
 //! Node-side leader block replication and follower import.
 
-use alloy_consensus::{BlockHeader as _, TxReceipt as _};
+use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::B256;
+use alloy_provider::DynProvider;
 use alloy_rlp::Decodable as _;
 use alloy_rpc_types_engine::ForkchoiceState;
-use alloy_sol_types::SolEvent as _;
 use futures::{StreamExt as _, stream::BoxStream};
 use reth_chain_state::PersistedBlockSubscriptions;
 use reth_node_api::{ConsensusEngineHandle, PayloadTypes as _};
@@ -16,23 +16,29 @@ use std::{
     collections::{BTreeMap, HashMap},
     time::Duration,
 };
+use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoHeader};
-use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use zone_p2p::{P2pCommand, P2pEvent};
 use zone_payload::ZonePayloadTypes;
+use zone_sequencer::BatchAnchorConfig;
 
 use crate::attestation::{
-    AttestationDomain, AttestationStore, SignedZoneBlockAttestation, ZoneBlockAttestation,
+    AttestationDomain, AttestationStore, BlockAck, SettlementAttestation, SignedBlockAck,
+    SignedSettlementAttestation,
 };
+use crate::settlement::build_settlement_attestation;
 use alloy_signer_local::PrivateKeySigner;
 
+#[derive(Clone)]
 pub(crate) struct BlockAttestationContext {
-    domain: AttestationDomain,
-    signer: PrivateKeySigner,
-    addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-    store: AttestationStore,
+    pub(crate) domain: AttestationDomain,
+    pub(crate) signer: PrivateKeySigner,
+    pub(crate) addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+    pub(crate) store: AttestationStore,
+    pub(crate) l1_provider: DynProvider<TempoNetwork>,
+    pub(crate) anchor_config: BatchAnchorConfig,
 }
 
 impl BlockAttestationContext {
@@ -40,12 +46,16 @@ impl BlockAttestationContext {
         domain: AttestationDomain,
         signer: PrivateKeySigner,
         addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+        l1_provider: DynProvider<TempoNetwork>,
+        anchor_config: BatchAnchorConfig,
     ) -> Self {
         Self {
             domain,
             signer,
             addresses,
             store: AttestationStore::default(),
+            l1_provider,
+            anchor_config,
         }
     }
 }
@@ -386,6 +396,7 @@ pub(crate) async fn run_block_sync<P>(
     // This is capped to `MAX_PENDING_BLOCKS`.
     let mut pending = BTreeMap::<u64, Vec<u8>>::new();
     let mut backfill = BackfillProgress::new();
+    let mut backfilled_from: Option<u64> = None;
     let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
 
     // Serve backfill requests in a separate task to avoid competing the live blocks
@@ -429,16 +440,74 @@ pub(crate) async fn run_block_sync<P>(
                             &attestation.store,
                         ) {
                             Ok((signer, inserted, signatures)) => {
-                                let signed = SignedZoneBlockAttestation::decode(&ack)
+                                let signed = SignedBlockAck::decode(&ack)
                                     .expect("verified ACK decodes");
-                                let height = signed.attestation.zoneHeight;
+                                let height = signed.ack.zoneHeight;
                                 if inserted {
-                                    info!(target: "zone::p2p", %follower, %signer, %height, signatures, "Stored follower block attestation");
+                                    info!(target: "zone::p2p", %follower, %signer, %height, signatures, "Stored follower block ACK");
                                 } else {
-                                    debug!(target: "zone::p2p", %follower, %signer, %height, "Ignored duplicate follower block attestation");
+                                    debug!(target: "zone::p2p", %follower, %signer, %height, "Ignored duplicate follower block ACK");
                                 }
                             }
-                            Err(err) => tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower block attestation"),
+                            Err(err) => tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower block ACK"),
+                        }
+                    }
+                    P2pEvent::SettlementProposalReceived { leader, proposal } => {
+                        if role != zone_p2p::Role::Follower {
+                            continue;
+                        }
+                        let result = async {
+                            let proposal = SettlementAttestation::decode(&proposal)?;
+                            let height: u64 = proposal.zoneHeight.try_into()
+                                .map_err(|_| eyre::eyre!("settlement height does not fit in u64"))?;
+                            let expected = build_settlement_attestation(
+                                &provider,
+                                height,
+                                &attestation,
+                                Some((proposal.anchorBlockNumber, proposal.anchorBlockHash)),
+                            ).await?.ok_or_else(|| eyre::eyre!("proposed block is not a batch boundary"))?;
+                            eyre::ensure!(proposal == expected, "settlement proposal does not match follower state");
+                            let signed = SignedSettlementAttestation::sign(
+                                proposal,
+                                attestation.domain,
+                                &attestation.signer,
+                            )?;
+                            commands.send(P2pCommand::SendSettlementSignature(signed.encode()))
+                                .await
+                                .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
+                            Ok::<_, eyre::Report>(height)
+                        }.await;
+                        match result {
+                            Ok(height) => info!(target: "zone::p2p", %leader, height, "Signed settlement proposal"),
+                            Err(err) => tracing::warn!(target: "zone::p2p", %leader, %err, "Rejected settlement proposal"),
+                        }
+                    }
+                    P2pEvent::SettlementSignatureReceived { follower, signature } => {
+                        if role != zone_p2p::Role::Leader {
+                            continue;
+                        }
+                        let result = async {
+                            let signed = SignedSettlementAttestation::decode(&signature)?;
+                            let height: u64 = signed.attestation.zoneHeight.try_into()
+                                .map_err(|_| eyre::eyre!("settlement height does not fit in u64"))?;
+                            let expected = build_settlement_attestation(
+                                &provider,
+                                height,
+                                &attestation,
+                                Some((signed.attestation.anchorBlockNumber, signed.attestation.anchorBlockHash)),
+                            ).await?.ok_or_else(|| eyre::eyre!("signed block is not a batch boundary"))?;
+                            eyre::ensure!(signed.attestation == expected, "settlement signature does not match leader state");
+                            let signer = signed.recover_signer(attestation.domain)?;
+                            let expected_signer = attestation.addresses.get(&follower)
+                                .copied()
+                                .ok_or_else(|| eyre::eyre!("unknown follower identity"))?;
+                            eyre::ensure!(signer == expected_signer, "settlement signer does not match authenticated peer");
+                            let (_, signatures) = attestation.store.insert_settlement(attestation.domain, signer, signed);
+                            Ok::<_, eyre::Report>((height, signer, signatures))
+                        }.await;
+                        match result {
+                            Ok((height, signer, signatures)) => info!(target: "zone::p2p", %follower, %signer, height, signatures, "Stored follower settlement signature"),
+                            Err(err) => tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower settlement signature"),
                         }
                     }
                     P2pEvent::BackfillRequested { peer, request_id, start } => {
@@ -446,10 +515,17 @@ pub(crate) async fn run_block_sync<P>(
                             tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
                         }
                     }
-                    P2pEvent::BlockReceived { block, .. }
-                    | P2pEvent::BackfillBlockReceived { block, .. } => {
+                    event @ (P2pEvent::BlockReceived { .. } | P2pEvent::BackfillBlockReceived { .. }) => {
+                        let (block, from_backfill) = match event {
+                            P2pEvent::BlockReceived { block, .. } => (block, false),
+                            P2pEvent::BackfillBlockReceived { block, .. } => (block, true),
+                            _ => unreachable!(),
+                        };
                         match encoded_block_number(&block) {
                             Ok(number) => {
+                                if from_backfill {
+                                    backfilled_from = Some(backfilled_from.map_or(number, |first| first.min(number)));
+                                }
                                 inactivity
                                     .as_mut()
                                     .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
@@ -463,7 +539,7 @@ pub(crate) async fn run_block_sync<P>(
                                 if number <= best {
                                     if let Err(err) = import_peer_block(&provider, &engine, &block).await {
                                         tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
-                                    } else if role == zone_p2p::Role::Follower {
+                                    } else if role == zone_p2p::Role::Follower && !from_backfill {
                                         send_block_ack(
                                             &provider,
                                             number,
@@ -497,7 +573,10 @@ pub(crate) async fn run_block_sync<P>(
                                         new_best,
                                         pending.first_key_value().map(|(&number, _)| number),
                                     );
-                                    if role == zone_p2p::Role::Follower {
+                                    if role == zone_p2p::Role::Follower
+                                        && !from_backfill
+                                        && backfilled_from.is_none()
+                                    {
                                         for imported in best.saturating_add(1)..=new_best {
                                             send_block_ack(
                                                 &provider,
@@ -527,6 +606,21 @@ pub(crate) async fn run_block_sync<P>(
                             best,
                             pending.first_key_value().map(|(&number, _)| number),
                         );
+                        if role == zone_p2p::Role::Follower
+                            && let Some(first) = backfilled_from.take()
+                        {
+                            let recent_start = tip.saturating_sub(119).max(first);
+                            for imported in recent_start..=best.min(tip) {
+                                send_block_ack(
+                                    &provider,
+                                    imported,
+                                    attestation.domain,
+                                    &attestation.signer,
+                                    &commands,
+                                )
+                                .await;
+                            }
+                        }
                         debug!(target: "zone::p2p", %peer, best, tip, backfill_needed = backfill.needed, "Completed block backfill response page");
                     }
                 }
@@ -676,95 +770,28 @@ where
     Ok(())
 }
 
-fn build_attestation<P>(
+fn build_block_ack<P>(
     provider: &P,
     number: u64,
     domain: AttestationDomain,
-) -> eyre::Result<ZoneBlockAttestation>
+) -> eyre::Result<BlockAck>
 where
-    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
+    P: HeaderProvider<Header = TempoHeader>,
 {
     let header = provider
         .sealed_header(number)?
         .ok_or_else(|| eyre::eyre!("missing canonical header at attested height {number}"))?;
-    let (anchor_hash, next_deposit_hash, withdrawal_hash) = block_commitments(provider, number)?;
-    let prev_deposit_hash = if number <= 1 {
-        B256::ZERO
-    } else {
-        block_commitments(provider, number - 1)?.1
-    };
-    let parent_zone_block_hash = portal_parent_hash(provider, number)?;
-
-    Ok(ZoneBlockAttestation::new(
-        domain,
-        number,
-        parent_zone_block_hash,
-        header.hash(),
-        withdrawal_hash.unwrap_or(B256::ZERO),
-        prev_deposit_hash,
-        next_deposit_hash,
-        anchor_hash,
-    ))
+    Ok(BlockAck::new(domain, number, header.hash()))
 }
 
-/// Extract commitments produced by the deterministic system transactions in a zone block.
-fn block_commitments<P>(provider: &P, number: u64) -> eyre::Result<(B256, B256, Option<B256>)>
+fn ensure_block_receipts_persisted<P>(provider: &P, number: u64) -> eyre::Result<()>
 where
     P: ReceiptProvider,
 {
-    let receipts = provider
+    provider
         .receipts_by_block(BlockHashOrNumber::Number(number))?
         .ok_or_else(|| eyre::eyre!("receipts for canonical block {number} are not persisted"))?;
-    let mut anchor_hash = None;
-    let mut processed_deposit_hash = None;
-    let mut withdrawal_hash = None;
-
-    for receipt in receipts {
-        for log in receipt.logs() {
-            if log.address == ZONE_INBOX_ADDRESS
-                && log.topics().first() == Some(&ZoneInbox::TempoAdvanced::SIGNATURE_HASH)
-            {
-                let event = ZoneInbox::TempoAdvanced::decode_log(log).map_err(|err| {
-                    eyre::eyre!("invalid TempoAdvanced log in block {number}: {err}")
-                })?;
-                anchor_hash = Some(event.tempoBlockHash);
-                processed_deposit_hash = Some(event.newProcessedDepositQueueHash);
-            } else if log.address == ZONE_OUTBOX_ADDRESS
-                && log.topics().first() == Some(&ZoneOutbox::BatchFinalized::SIGNATURE_HASH)
-            {
-                let event = ZoneOutbox::BatchFinalized::decode_log(log).map_err(|err| {
-                    eyre::eyre!("invalid BatchFinalized log in block {number}: {err}")
-                })?;
-                withdrawal_hash = Some(event.withdrawalQueueHash);
-            }
-        }
-    }
-
-    Ok((
-        anchor_hash.ok_or_else(|| eyre::eyre!("block {number} is missing TempoAdvanced"))?,
-        processed_deposit_hash
-            .ok_or_else(|| eyre::eyre!("block {number} is missing its deposit commitment"))?,
-        withdrawal_hash,
-    ))
-}
-
-/// Reconstruct the portal's batch parent: the preceding batch-boundary block, or genesis.
-fn portal_parent_hash<P>(provider: &P, number: u64) -> eyre::Result<B256>
-where
-    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
-{
-    for candidate in (1..number).rev() {
-        if block_commitments(provider, candidate)?.2.is_some() {
-            return provider
-                .sealed_header(candidate)?
-                .map(|header| header.hash())
-                .ok_or_else(|| eyre::eyre!("missing prior batch-boundary header {candidate}"));
-        }
-    }
-    provider
-        .sealed_header(0)?
-        .map(|header| header.hash())
-        .ok_or_else(|| eyre::eyre!("missing zone genesis header"))
+    Ok(())
 }
 
 async fn send_block_ack<P>(
@@ -781,8 +808,9 @@ async fn send_block_ack<P>(
     // have crossed the persistence boundary configured for manifest mode.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let signed = loop {
-        let result = build_attestation(provider, number, domain)
-            .and_then(|statement| SignedZoneBlockAttestation::sign(statement, domain, signer));
+        let result = ensure_block_receipts_persisted(provider, number)
+            .and_then(|_| build_block_ack(provider, number, domain))
+            .and_then(|ack| SignedBlockAck::sign(ack, domain, signer));
         match result {
             Ok(signed) => break signed,
             Err(err) if tokio::time::Instant::now() < deadline => {
@@ -814,15 +842,15 @@ fn verify_and_store_ack<P>(
 where
     P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
 {
-    let signed = SignedZoneBlockAttestation::decode(encoded)?;
+    let signed = SignedBlockAck::decode(encoded)?;
     let height: u64 = signed
-        .attestation
+        .ack
         .zoneHeight
         .try_into()
         .map_err(|_| eyre::eyre!("attested zone height does not fit in u64"))?;
-    let expected = build_attestation(provider, height, domain)?;
+    let expected = build_block_ack(provider, height, domain)?;
     eyre::ensure!(
-        signed.attestation == expected,
+        signed.ack == expected,
         "block ACK statement does not match the leader's canonical block"
     );
     let signer = signed.recover_signer(domain)?;
@@ -830,7 +858,7 @@ where
         signer == expected_signer,
         "block ACK signer {signer} does not match authenticated peer address {expected_signer}"
     );
-    let (inserted, signatures) = store.insert(signer, signed)?;
+    let (inserted, signatures) = store.insert_block_ack(signer, signed)?;
     Ok((signer, inserted, signatures))
 }
 

@@ -8,6 +8,7 @@ use crate::{
     attestation::AttestationDomain,
     replication::{BlockAttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
+    settlement::collect_leader_settlements,
 };
 use alloy_primitives::Address;
 use alloy_provider::Provider as _;
@@ -491,10 +492,17 @@ where
                 zone_id: config.zone_id(),
                 sequencer_set_version: config.sequencer_set_version(),
             };
+            let anchor_config = self
+                .sequencer_config
+                .as_ref()
+                .map(|config| config.batch_anchor_config)
+                .unwrap_or_default();
             Self::launch_p2p(
                 config,
                 network_id,
                 attestation_domain,
+                l1_provider.clone(),
+                anchor_config,
                 &task_executor,
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
@@ -552,6 +560,8 @@ where
         config: P2pConfig,
         network_id: P2pNetworkId,
         attestation_domain: AttestationDomain,
+        l1_provider: alloy_provider::DynProvider<TempoNetwork>,
+        anchor_config: BatchAnchorConfig,
         task_executor: &reth_tasks::TaskExecutor,
         provider: N::Provider,
         engine: reth_node_builder::ConsensusEngineHandle<ZonePayloadTypes>,
@@ -561,6 +571,8 @@ where
             attestation_domain,
             config.block_attestation_signer(),
             config.block_attestation_addresses(),
+            l1_provider,
+            anchor_config,
         );
         let handle = spawn_p2p(config, network_id)?;
         let zone_p2p::P2pHandleParts {
@@ -576,6 +588,10 @@ where
             task_executor.spawn_critical_task(
                 "zone-p2p-block-broadcast",
                 broadcast_persisted_blocks(provider.clone(), commands.clone()),
+            );
+            task_executor.spawn_critical_task(
+                "zone-p2p-settlement-collection",
+                collect_leader_settlements(provider.clone(), commands.clone(), attestation.clone()),
             );
         }
         task_executor.spawn_critical_task(
