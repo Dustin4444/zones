@@ -119,13 +119,7 @@ contract ZoneIntegrationTest is BaseTest {
         address verifier = l1Factory.verifier();
         vm.prank(_ZONE_FACTORY);
         l1Portal.initialize(
-            1,
-            address(l2ZoneToken),
-            address(messengerContract),
-            admin,
-            sequencer,
-            verifier,
-            ""
+            1, address(l2ZoneToken), address(messengerContract), admin, sequencer, verifier, ""
         );
         zoneId = 1;
         messengerFactory.setPortal(zoneId, address(l1Portal));

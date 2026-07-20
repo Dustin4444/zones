@@ -53,15 +53,7 @@ contract ZonePortalGasLimitTest is Test {
         token = new MockPortalToken();
         portal = new ZonePortal();
         vm.prank(ZONE_FACTORY_ADDRESS);
-        portal.initialize(
-            1,
-            address(token),
-            address(0x400),
-            admin,
-            address(this),
-            address(0),
-            ""
-        );
+        portal.initialize(1, address(token), address(0x400), admin, address(this), address(0), "");
     }
 
     function test_bouncebackGas_defaultsToZero() public view {
