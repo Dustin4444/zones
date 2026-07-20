@@ -31,11 +31,6 @@ contract ZoneFactory is IZoneFactory {
     address internal _messenger;
     address public owner;
 
-    /// @notice Tracks deployment count for CREATE address prediction
-    /// @dev Contracts start with nonce 1, not 0. Nonce 1 is used by the Verifier deployment,
-    ///      nonce 2 by the shared ZoneMessenger, so zone deployments start at nonce 3.
-    uint256 internal _deploymentNonce = 3;
-
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
@@ -65,18 +60,12 @@ contract ZoneFactory is IZoneFactory {
             revert InvalidToken();
         }
         if (params.admin == address(0)) revert InvalidAdmin();
-        if (params.sequencer == address(0)) revert InvalidSequencer();
         if (!_validVerifiers[params.verifier]) revert InvalidVerifier();
         if (gasleft() < ZONE_CREATION_GAS) revert InsufficientGas();
 
         zoneId = _nextZoneId;
         if (zoneId == type(uint32).max) revert ZoneIdOverflow();
         _nextZoneId = zoneId + 1;
-
-        uint256 currentNonce = _deploymentNonce;
-        _deploymentNonce += 1; // We'll deploy 1 contract
-
-        address predictedPortal = _computeCreateAddress(address(this), currentNonce);
 
         // Deploy and atomically initialize the portal. TIP-1091 fixes this factory's address as
         // the portal's only initializer authority.
@@ -86,7 +75,8 @@ contract ZoneFactory is IZoneFactory {
             params.initialToken,
             _messenger,
             params.admin,
-            params.sequencer,
+            params.sequencers,
+            params.threshold,
             params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockNumber,
@@ -94,16 +84,14 @@ contract ZoneFactory is IZoneFactory {
         );
         portal = address(portalContract);
 
-        // Verify our prediction was correct
-        require(portal == predictedPortal, "Portal address mismatch - nonce tracking error");
-
         // Store zone info
         _zones[zoneId] = ZoneInfo({
             zoneId: zoneId,
             portal: portal,
             initialToken: params.initialToken,
             admin: params.admin,
-            sequencer: params.sequencer,
+            sequencers: params.sequencers,
+            threshold: params.threshold,
             verifier: params.verifier,
             genesisBlockHash: params.zoneParams.genesisBlockHash,
             genesisTempoBlockHash: params.zoneParams.genesisTempoBlockHash,
@@ -118,7 +106,8 @@ contract ZoneFactory is IZoneFactory {
             portal,
             params.initialToken,
             params.admin,
-            params.sequencer,
+            params.sequencers,
+            params.threshold,
             params.verifier,
             params.zoneParams.genesisBlockHash,
             params.zoneParams.genesisTempoBlockHash,
@@ -134,34 +123,6 @@ contract ZoneFactory is IZoneFactory {
         address previousOwner = owner;
         owner = newOwner;
         emit OwnershipTransferred(previousOwner, newOwner);
-    }
-
-    /// @notice Compute the address of a contract deployed with CREATE
-    /// @dev address = keccak256(rlp([sender, nonce]))[12:]
-    function _computeCreateAddress(address deployer, uint256 nonce)
-        internal
-        pure
-        returns (address)
-    {
-        bytes memory data;
-        if (nonce == 0x00) {
-            data = abi.encodePacked(bytes1(0xd6), bytes1(0x94), deployer, bytes1(0x80));
-        } else if (nonce <= 0x7f) {
-            data = abi.encodePacked(bytes1(0xd6), bytes1(0x94), deployer, uint8(nonce));
-        } else if (nonce <= 0xff) {
-            data =
-                abi.encodePacked(bytes1(0xd7), bytes1(0x94), deployer, bytes1(0x81), uint8(nonce));
-        } else if (nonce <= 0xffff) {
-            data =
-                abi.encodePacked(bytes1(0xd8), bytes1(0x94), deployer, bytes1(0x82), uint16(nonce));
-        } else if (nonce <= 0xffffff) {
-            data =
-                abi.encodePacked(bytes1(0xd9), bytes1(0x94), deployer, bytes1(0x83), uint24(nonce));
-        } else {
-            data =
-                abi.encodePacked(bytes1(0xda), bytes1(0x94), deployer, bytes1(0x84), uint32(nonce));
-        }
-        return address(uint160(uint256(keccak256(data))));
     }
 
     /*//////////////////////////////////////////////////////////////

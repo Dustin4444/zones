@@ -26,7 +26,8 @@ struct ZoneInfo {
     address portal;
     address initialToken; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
     address admin;
-    address sequencer;
+    address[] sequencers;
+    uint8 threshold;
     address verifier;
     bytes32 genesisBlockHash;
     bytes32 genesisTempoBlockHash;
@@ -352,7 +353,7 @@ interface IZoneTxContext {
 //   slot 16: _withdrawalReentrancyStatus (uint256)
 //   slot 17: zoneId (uint32) + messenger (address) [packed]
 //   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
-//   slot 19: sequencerSetVersion (uint64) + sequencerQuorum (uint8) [packed]
+//   slot 19: sequencerSetVersion (uint64) + sequencerThreshold (uint8) [packed]
 //   slot 20: zoneHeight (uint256)
 //   slot 21: _sequencers (address[])
 //   slot 22: isSequencer (mapping(address => bool))
@@ -382,14 +383,12 @@ interface IVerifier {
     ///      4. If anchorBlockNumber > tempoBlockNumber: ancestry chain from tempoBlockNumber to anchorBlockNumber
     ///      5. ZoneOutbox.lastBatch().withdrawalBatchIndex == expectedWithdrawalBatchIndex
     ///      6. ZoneOutbox.lastBatch().withdrawalQueueHash matches withdrawalQueueHash
-    ///      7. Zone block beneficiary matches sequencer
-    ///      8. Deposit processing is correct (validated via Tempo state read inside proof)
+    ///      7. Deposit processing is correct (validated via Tempo state read inside proof)
     /// @param zoneId Unique identifier of the zone whose batch is being verified
     /// @param tempoBlockNumber Block zone committed to (from TempoState)
     /// @param anchorBlockNumber Block whose hash is verified (tempoBlockNumber or recent block)
     /// @param anchorBlockHash Hash of anchorBlockNumber (from EIP-2935)
     /// @param expectedWithdrawalBatchIndex Expected batch index (portal.withdrawalBatchIndex + 1)
-    /// @param sequencer Sequencer address (zone block beneficiary must match)
     /// @param blockTransition Zone block hash transition
     /// @param depositQueueTransition Deposit queue processing transition
     /// @param withdrawalQueueHash Withdrawal queue hash chain for this batch (0 if none)
@@ -401,7 +400,6 @@ interface IVerifier {
         uint64 anchorBlockNumber,
         bytes32 anchorBlockHash,
         uint64 expectedWithdrawalBatchIndex,
-        address sequencer,
         BlockTransition calldata blockTransition,
         DepositQueueTransition calldata depositQueueTransition,
         bytes32 withdrawalQueueHash,
@@ -423,7 +421,8 @@ interface IZoneFactory {
     struct CreateZoneParams {
         address initialToken; // first TIP-20 to enable (sequencer can enable more later)
         address admin;
-        address sequencer;
+        address[] sequencers;
+        uint8 threshold;
         address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
@@ -434,7 +433,8 @@ interface IZoneFactory {
         address indexed portal,
         address initialToken,
         address admin,
-        address sequencer,
+        address[] sequencers,
+        uint8 threshold,
         address verifier,
         bytes32 genesisBlockHash,
         bytes32 genesisTempoBlockHash,
@@ -446,6 +446,7 @@ interface IZoneFactory {
     error NotOwner();
     error InvalidAdmin();
     error InvalidSequencer();
+    error InvalidSequencerSet();
     error InvalidVerifier();
     error InsufficientGas();
     error ZoneIdOverflow();
@@ -613,7 +614,7 @@ interface IZonePortal {
     event RpcUrlUpdated(string rpcUrl);
 
     /// @notice Emitted when the admin replaces the batch-attestation signer set.
-    event SequencerSetUpdated(uint64 indexed version, uint8 quorum, address[] sequencers);
+    event SequencerSetUpdated(uint64 indexed version, uint8 threshold, address[] sequencers);
 
     error NotSequencer();
     error NotAdmin();
@@ -651,7 +652,8 @@ interface IZonePortal {
         address initialToken,
         address messenger,
         address admin,
-        address sequencer,
+        address[] calldata sequencers,
+        uint8 threshold,
         address verifier,
         bytes32 genesisBlockHash,
         uint64 genesisTempoBlockNumber,
@@ -702,11 +704,11 @@ interface IZonePortal {
 
     function genesisTempoBlockNumber() external view returns (uint64);
 
-    /// @notice Version of the active batch-attestation signer set (zero means legacy mode).
+    /// @notice Version of the active sequencer configuration.
     function sequencerSetVersion() external view returns (uint64);
 
     /// @notice Number of distinct registered signatures required for batch settlement.
-    function sequencerQuorum() external view returns (uint8);
+    function sequencerThreshold() external view returns (uint8);
 
     /// @notice Highest zone block height accepted with a quorum certificate.
     function zoneHeight() external view returns (uint256);
@@ -766,9 +768,9 @@ interface IZonePortal {
     /// @notice Accept a pending sequencer transfer. Only callable by pending sequencer.
     function acceptSequencer() external;
 
-    /// @notice Atomically replace the settlement signer set and quorum. Only callable by admin.
+    /// @notice Atomically replace the sequencer set and settlement threshold. Only callable by admin.
     /// @dev Signers must be nonzero, unique, and sorted in strictly ascending address order.
-    function setSequencerSet(address[] calldata sequencers, uint8 quorum) external;
+    function setSequencerSet(address[] calldata sequencers, uint8 threshold) external;
 
     /// @notice Start an admin transfer. Only callable by the current admin.
     /// @param newAdmin The address that will become admin after accepting (address(0) cancels).

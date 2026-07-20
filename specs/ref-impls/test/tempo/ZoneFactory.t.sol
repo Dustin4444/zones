@@ -21,6 +21,11 @@ contract ZoneFactoryTest is BaseTest {
         zoneFactory = _deployZoneFactory();
     }
 
+    function _sequencers(address member) internal pure returns (address[] memory members) {
+        members = new address[](1);
+        members[0] = member;
+    }
+
     /*//////////////////////////////////////////////////////////////
                           VALID CREATION TESTS
     //////////////////////////////////////////////////////////////*/
@@ -29,7 +34,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -51,7 +57,9 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(info.portal, portal);
         assertEq(info.initialToken, address(pathUSD));
         assertEq(info.admin, admin);
-        assertEq(info.sequencer, sequencer);
+        assertEq(info.sequencers.length, 1);
+        assertEq(info.sequencers[0], sequencer);
+        assertEq(info.threshold, 1);
         assertEq(info.verifier, zoneFactory.verifier());
         assertEq(info.genesisBlockHash, GENESIS_BLOCK_HASH);
         assertEq(info.genesisTempoBlockHash, GENESIS_TEMPO_BLOCK_HASH);
@@ -61,7 +69,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -100,7 +109,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -125,7 +135,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params1 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -141,7 +152,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params2 = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: secondSequencer,
+            sequencers: _sequencers(secondSequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: keccak256("genesis2"),
@@ -162,8 +174,8 @@ contract ZoneFactoryTest is BaseTest {
 
         ZoneInfo memory info1 = zoneFactory.zones(zoneId1);
         ZoneInfo memory info2 = zoneFactory.zones(zoneId2);
-        assertEq(info1.sequencer, sequencer);
-        assertEq(info2.sequencer, secondSequencer);
+        assertEq(info1.sequencers[0], sequencer);
+        assertEq(info2.sequencers[0], secondSequencer);
         assertEq(ZonePortal(portal1).messenger(), zoneFactory.messenger());
         assertEq(ZonePortal(portal2).messenger(), zoneFactory.messenger());
     }
@@ -172,7 +184,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -193,7 +206,7 @@ contract ZoneFactoryTest is BaseTest {
             if (
                 logs[i].topics[0]
                     == keccak256(
-                        "ZoneCreated(uint32,address,address,address,address,address,bytes32,bytes32,uint64)"
+                        "ZoneCreated(uint32,address,address,address,address[],uint8,address,bytes32,bytes32,uint64)"
                     )
             ) {
                 found = true;
@@ -218,7 +231,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(0),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -239,7 +253,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: notTip20,
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -257,7 +272,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: alice, // EOA, not a contract
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -279,7 +295,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: address(0),
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -297,11 +314,12 @@ contract ZoneFactoryTest is BaseTest {
                        INVALID SEQUENCER TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_createZone_revertsOnInvalidSequencer_zeroAddress() public {
+    function test_createZone_revertsOnInvalidSequencerSet_zeroAddress() public {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: address(0),
+            sequencers: _sequencers(address(0)),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -311,7 +329,7 @@ contract ZoneFactoryTest is BaseTest {
             rpcUrl: ""
         });
 
-        vm.expectRevert(IZoneFactory.InvalidSequencer.selector);
+        vm.expectRevert(IZoneFactory.InvalidSequencerSet.selector);
         zoneFactory.createZone(params);
     }
 
@@ -323,7 +341,8 @@ contract ZoneFactoryTest is BaseTest {
         IZoneFactory.CreateZoneParams memory params = IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: address(0xdead),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -366,7 +385,8 @@ contract ZoneFactoryTest is BaseTest {
         return IZoneFactory.CreateZoneParams({
             initialToken: address(pathUSD),
             admin: admin,
-            sequencer: sequencer,
+            sequencers: _sequencers(sequencer),
+            threshold: 1,
             verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
@@ -410,7 +430,9 @@ contract ZoneFactoryTest is BaseTest {
 
         assertEq(pc.zoneId(), id);
         assertEq(pc.admin(), p.admin);
-        assertEq(pc.sequencer(), p.sequencer);
+        assertEq(pc.sequencerCount(), p.sequencers.length);
+        assertEq(pc.sequencerAt(0), p.sequencers[0]);
+        assertEq(pc.sequencerThreshold(), p.threshold);
         assertEq(pc.verifier(), p.verifier);
         assertEq(pc.messenger(), zoneFactory.messenger());
         assertEq(pc.blockHash(), p.zoneParams.genesisBlockHash);
@@ -434,19 +456,16 @@ contract ZoneFactoryTest is BaseTest {
                           METADATA ROTATION
     //////////////////////////////////////////////////////////////*/
 
-    // Factory ZoneInfo.sequencer is a snapshot taken at creation and does not track
-    // later portal rotation; the portal remains the source of truth.
-    function test_zones_sequencerIsSnapshot_afterRotation() public {
+    // Factory ZoneInfo is a creation-time snapshot; the portal remains the source of truth.
+    function test_zones_sequencerSetIsSnapshot_afterRotation() public {
         (uint32 id, address portal) = zoneFactory.createZone(_defaultParams());
-        address nextSequencer = alice;
+        address[] memory replacement = _sequencers(alice);
 
-        vm.prank(sequencer);
-        ZonePortal(portal).transferSequencer(nextSequencer);
-        vm.prank(nextSequencer);
-        ZonePortal(portal).acceptSequencer();
+        vm.prank(admin);
+        ZonePortal(portal).setSequencerSet(replacement, 1);
 
-        assertEq(ZonePortal(portal).sequencer(), nextSequencer); // portal: current
-        assertEq(zoneFactory.zones(id).sequencer, sequencer); // factory: snapshot at creation
+        assertEq(ZonePortal(portal).sequencerAt(0), alice); // portal: current
+        assertEq(zoneFactory.zones(id).sequencers[0], sequencer); // factory: snapshot
     }
 
     // Factory ZoneInfo.admin is likewise a snapshot; the portal admin can rotate via the
@@ -460,23 +479,6 @@ contract ZoneFactoryTest is BaseTest {
 
         assertEq(ZonePortal(portal).admin(), alice); // portal: current
         assertEq(zoneFactory.zones(id).admin, admin); // factory: snapshot at creation
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    CREATE-ADDRESS RLP BOUNDARIES
-    //////////////////////////////////////////////////////////////*/
-
-    function test_computeCreateAddress_matchesReference_atRlpBoundaries() public {
-        ZoneFactoryHarness h = new ZoneFactoryHarness();
-        uint256[10] memory nonces =
-            [uint256(0), 1, 0x7f, 0x80, 0xff, 0x100, 0xffff, 0x10000, 0xffffff, 0x1000000];
-        for (uint256 i; i < nonces.length; i++) {
-            assertEq(
-                h.computeCreateAddress_(address(h), nonces[i]),
-                vm.computeCreateAddress(address(h), nonces[i]),
-                "RLP nonce branch mismatch"
-            );
-        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -495,14 +497,14 @@ contract ZoneFactoryTest is BaseTest {
         vm.assume(adminAddr != address(0) && seqAddr != address(0));
         IZoneFactory.CreateZoneParams memory p = _defaultParams();
         p.admin = adminAddr;
-        p.sequencer = seqAddr;
+        p.sequencers = _sequencers(seqAddr);
         p.zoneParams = ZoneParams(gh, tgh, tbn);
 
         (uint32 id, address portal) = zoneFactory.createZone(p);
         ZoneInfo memory info = zoneFactory.zones(id);
 
         assertEq(info.admin, adminAddr);
-        assertEq(info.sequencer, seqAddr);
+        assertEq(info.sequencers[0], seqAddr);
         assertEq(info.genesisBlockHash, gh);
         assertEq(info.genesisTempoBlockHash, tgh);
         assertEq(info.genesisTempoBlockNumber, tbn);
@@ -517,15 +519,6 @@ contract NotATIP20 {
 
     function notATIP20Function() external pure returns (bool) {
         return true;
-    }
-
-}
-
-/// @notice Harness exposing the internal CREATE-address predictor for boundary testing.
-contract ZoneFactoryHarness is ZoneFactory {
-
-    function computeCreateAddress_(address d, uint256 n) external pure returns (address) {
-        return _computeCreateAddress(d, n);
     }
 
 }
