@@ -142,7 +142,7 @@ contract ZoneInbox is IZoneInbox {
     ///      from the input key material (shared secret).
     /// @param ikm Input key material (the ECDH shared secret)
     /// @param salt Salt value (use "ecies-aes-key" for ECIES)
-    /// @param info Context-specific info (typically empty for ECIES)
+    /// @param info Context-specific info (portal, key index, ephemeral key, and sender for deposits)
     /// @return okm Output key material (32 bytes for AES-256)
     function _hkdfSha256(
         bytes32 ikm,
@@ -287,12 +287,18 @@ contract ZoneInbox is IZoneInbox {
                 bool valid = proofValid;
                 bytes memory decryptedPlaintext;
                 if (valid) {
-                    // Step 2: Derive AES key from shared secret using HKDF-SHA256
-                    // This is done in Solidity using the SHA256 precompile (0x02)
+                    // Step 2: Derive an AES key bound to this portal, encryption key,
+                    // ephemeral key, and deposit sender. A cross-sender replay therefore
+                    // derives a different key and fails AES-GCM authentication.
                     bytes32 aesKey = _hkdfSha256(
                         dec.sharedSecret,
                         "ecies-aes-key",
-                        abi.encodePacked(tempoPortal, ed.keyIndex, ed.encrypted.ephemeralPubkeyX)
+                        abi.encodePacked(
+                            tempoPortal,
+                            ed.keyIndex,
+                            ed.encrypted.ephemeralPubkeyX,
+                            ed.sender
+                        )
                     );
 
                     // Step 3: Decrypt using AES-256-GCM precompile
