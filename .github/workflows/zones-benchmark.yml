@@ -164,7 +164,7 @@ jobs:
           INPUT_DRAIN_TIMEOUT: "300"
           INPUT_SEED: ""
           INPUT_TEMPO_REF: 436f6cf069a0c8aafa9a3a197ffa17488b5f1e81
-          INPUT_TXGEN_REF: 9dcf2a38f01e2d0e1197a439e995a78fd323e993
+          INPUT_TXGEN_REF: 234fa00c576035df59e50d12b1fc2ba9361f82ac
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -278,6 +278,7 @@ jobs:
       ZONES_BENCH_TEMPO_REF: ${{ needs.authorize.outputs.tempo-ref }}
       ZONES_BENCH_TXGEN_REF: ${{ needs.authorize.outputs.txgen-ref }}
       ZONES_BENCH_ZONES_REF: ${{ needs.authorize.outputs.sha }}
+      ZONES_BENCH_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
       ZONES_BENCH_BUILD_PROFILE: profiling
       ZONES_BENCH_L1_A_CPUS: 0-3,16-19
       ZONES_BENCH_L1_B_CPUS: 4-7,20-23
