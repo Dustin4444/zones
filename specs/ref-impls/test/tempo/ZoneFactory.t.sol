@@ -435,8 +435,7 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(pc.sequencerThreshold(), p.threshold);
         assertEq(pc.verifier(), p.verifier);
         assertEq(pc.messenger(), zoneFactory.messenger());
-        assertEq(pc.blockHash(), p.zoneParams.genesisBlockHash);
-        assertEq(pc.genesisTempoBlockNumber(), p.zoneParams.genesisTempoBlockNumber);
+        assertEq(pc.blockHash(), bytes32(0));
         assertEq(pc.rpcUrl(), p.rpcUrl);
         assertTrue(pc.isTokenEnabled(address(pathUSD)));
     }

@@ -227,28 +227,26 @@ contract ZonePortalProxyStorageTest is Test {
                 sequencersA,
                 1,
                 verifierA,
-                keccak256("genesis A"),
-                100,
                 ""
             );
 
         vm.startPrank(ZONE_FACTORY_ADDRESS);
-        _initializePortal(proxyA, initialToken, 1, messengerA, verifierA, 100);
-        _initializePortal(proxyB, initialToken, 2, messengerB, verifierB, 200);
+        _initializePortal(proxyA, initialToken, 1, messengerA, verifierA);
+        _initializePortal(proxyB, initialToken, 2, messengerB, verifierB);
 
         vm.expectRevert(IZonePortal.AlreadyInitialized.selector);
-        _initializePortal(proxyA, initialToken, 1, messengerA, verifierA, 100);
+        _initializePortal(proxyA, initialToken, 1, messengerA, verifierA);
         vm.stopPrank();
 
         assertEq(ZonePortal(proxyA).zoneId(), 1);
         assertEq(ZonePortal(proxyA).messenger(), messengerA);
         assertEq(ZonePortal(proxyA).verifier(), verifierA);
-        assertEq(ZonePortal(proxyA).genesisTempoBlockNumber(), 100);
+        assertEq(ZonePortal(proxyA).blockHash(), bytes32(0));
 
         assertEq(ZonePortal(proxyB).zoneId(), 2);
         assertEq(ZonePortal(proxyB).messenger(), messengerB);
         assertEq(ZonePortal(proxyB).verifier(), verifierB);
-        assertEq(ZonePortal(proxyB).genesisTempoBlockNumber(), 200);
+        assertEq(ZonePortal(proxyB).blockHash(), bytes32(0));
     }
 
     function _initializePortal(
@@ -256,8 +254,7 @@ contract ZonePortalProxyStorageTest is Test {
         address initialToken,
         uint32 id,
         address portalMessenger,
-        address portalVerifier,
-        uint64 genesisBlockNumber
+        address portalVerifier
     )
         internal
     {
@@ -272,8 +269,6 @@ contract ZonePortalProxyStorageTest is Test {
                 sequencers,
                 1,
                 portalVerifier,
-                keccak256(abi.encode("genesis", id)),
-                genesisBlockNumber,
                 ""
             );
     }
@@ -464,7 +459,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.sequencer(), sequencer);
         assertEq(portal.admin(), admin);
         assertEq(portal.verifier(), zoneFactory.verifier());
-        assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
+        assertEq(portal.blockHash(), bytes32(0));
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
         assertEq(portal.bouncebackGas(), 0);
@@ -1988,25 +1983,6 @@ contract ZonePortalTest is BaseTest {
                       BATCH SUBMISSION VALIDATION
     //////////////////////////////////////////////////////////////*/
 
-    function test_submitBatch_revertsIfTempoBlockNumberBeforeGenesis() public {
-        bytes32 prevBlockHash = portal.blockHash();
-        vm.expectRevert(IZonePortal.InvalidTempoBlockNumber.selector);
-        portal.submitBatch(
-            genesisTempoBlockNumber - 1, // Before genesis
-            0,
-            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: keccak256("state") }),
-            DepositQueueTransition({
-                prevProcessedHash: bytes32(0),
-                nextProcessedHash: bytes32(0),
-                prevDepositNumber: 0,
-                nextDepositNumber: 0
-            }),
-            bytes32(0),
-            "",
-            ""
-        );
-    }
-
     function test_submitBatch_revertsIfTempoBlockNumberInFuture() public {
         vm.roll(block.number + 10);
 
@@ -2727,7 +2703,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.zoneId(), testZoneId);
         assertEq(portal.sequencer(), sequencer);
         assertEq(portal.verifier(), zoneFactory.verifier());
-        assertEq(portal.genesisTempoBlockNumber(), genesisTempoBlockNumber);
+        assertEq(portal.blockHash(), bytes32(0));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -3306,7 +3282,7 @@ contract ZonePortalTest is BaseTest {
     ///        slot 6: deposit counters + bouncebackGas (uint64) [packed]
     ///        slot 7: _encryptionKeys.length (EncryptionKeyEntry[])
     ///        slot 17: zoneId (uint32) + messenger (address) [packed]
-    ///        slot 18: verifier + genesisTempoBlockNumber + _initialized [packed]
+    ///        slot 18: verifier + _initialized [packed]
     function test_storageLayout_slotPositions() public {
         // --- Slot 0: sequencer ---
         bytes32 slot0 = vm.load(address(portal), bytes32(uint256(0)));
@@ -3381,15 +3357,10 @@ contract ZonePortalTest is BaseTest {
             "slot 17: messenger mismatch"
         );
 
-        // --- Slot 18: verifier (address) + genesisTempoBlockNumber (uint64) packed ---
+        // --- Slot 18: verifier (address) + _initialized (bool) packed ---
         bytes32 slot18 = vm.load(address(portal), bytes32(uint256(18)));
         assertEq(address(uint160(uint256(slot18))), portal.verifier(), "slot 18: verifier mismatch");
-        assertEq(
-            uint64(uint256(slot18) >> 160),
-            portal.genesisTempoBlockNumber(),
-            "slot 18: genesisTempoBlockNumber mismatch"
-        );
-        assertEq(uint8(uint256(slot18) >> 224), 1, "slot 18: initialized mismatch");
+        assertEq(uint8(uint256(slot18) >> 160), 1, "slot 18: initialized mismatch");
     }
 
     /// @notice Verify that the _encryptionKeys dynamic array uses the expected slot layout.

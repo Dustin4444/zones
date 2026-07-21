@@ -1405,7 +1405,7 @@ If `recentTempoBlockNumber` is `0`, the portal looks up `tempoBlockNumber` direc
 
 If `recentTempoBlockNumber` is greater than `tempoBlockNumber`, the portal looks up `recentTempoBlockNumber` from EIP-2935 instead. The proof verifies the parent-hash chain from `tempoBlockNumber` to `recentTempoBlockNumber` internally, using Tempo headers included in the witness. This allows batch submission even when `tempoBlockNumber` has rotated out of the EIP-2935 window (roughly 8192 blocks), preventing the zone from being bricked after extended downtime.
 
-`recentTempoBlockNumber` must be strictly greater than `tempoBlockNumber` when non-zero. Both values must be at or after `genesisTempoBlockNumber`.
+`recentTempoBlockNumber` must be strictly greater than `tempoBlockNumber` when non-zero.
 
 ### Proof Requirements
 
@@ -1823,8 +1823,6 @@ interface IZonePortal {
     function withdrawalQueueHead() external view returns (uint256);
     function withdrawalQueueTail() external view returns (uint256);
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
-    function genesisTempoBlockNumber() external view returns (uint64);
-
 }
 ```
 
