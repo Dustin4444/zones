@@ -156,6 +156,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
           INPUT_PHASE: ${{ inputs.phase }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
           INPUT_COUNT: ${{ inputs.count || '1000' }}
@@ -182,6 +183,11 @@ jobs:
           phase="$INPUT_PHASE"
           if [ "$EVENT_NAME" = pull_request ]; then
             phase=neobank-e2e
+            # This draft isolates state-root diagnostics from the unfinished external
+            # fixture provisioning stack while exercising the same Zone execution path.
+            if [ "$HEAD_REF" = "dan/state-root-debugging" ]; then
+              phase=roundtrip
+            fi
           fi
           case "$phase" in
             neobank-e2e|roundtrip|deposit) ;;
