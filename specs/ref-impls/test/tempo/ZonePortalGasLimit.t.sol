@@ -63,8 +63,6 @@ contract ZonePortalGasLimitTest is Test {
             sequencers,
             1,
             address(0),
-            keccak256("genesis"),
-            uint64(block.number),
             ""
         );
     }

@@ -352,11 +352,11 @@ interface IZoneTxContext {
 //   slot 15: pendingAdmin (address)
 //   slot 16: _withdrawalReentrancyStatus (uint256)
 //   slot 17: zoneId (uint32) + messenger (address) [packed]
-//   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
-//   slot 19: sequencerSetVersion (uint64) + sequencerThreshold (uint8) [packed]
-//   slot 20: zoneHeight (uint256)
-//   slot 21: _sequencers (address[])
-//   slot 22: isSequencer (mapping(address => bool))
+//   slot 18: verifier (address) + _initialized (bool) + sequencerSetVersion (uint64)
+//            + sequencerThreshold (uint8) [packed]
+//   slot 19: zoneHeight (uint256)
+//   slot 20: _sequencers (address[])
+//   slot 21: isSequencer (mapping(address => bool))
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
@@ -655,8 +655,6 @@ interface IZonePortal {
         address[] calldata sequencers,
         uint8 threshold,
         address verifier,
-        bytes32 genesisBlockHash,
-        uint64 genesisTempoBlockNumber,
         string calldata rpcUrl
     )
         external;
@@ -701,8 +699,6 @@ interface IZonePortal {
     function withdrawalQueueTail() external view returns (uint256);
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
-
-    function genesisTempoBlockNumber() external view returns (uint64);
 
     /// @notice Version of the active sequencer configuration.
     function sequencerSetVersion() external view returns (uint64);
