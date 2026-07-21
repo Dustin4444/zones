@@ -39,6 +39,7 @@ impl ZoneFeeManager {
         max_amount: U256,
     ) -> Result<Address> {
         let mut token = TIP20Token::from_address(fee_token)?;
+        // TODO: Remove the pre-T8 authorization path once T8 activates.
         if self.storage.spec().is_t8() {
             token.ensure_authorized_as(&[(fee_payer, AuthRole::sender())])?;
         } else {

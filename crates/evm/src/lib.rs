@@ -120,7 +120,7 @@ where
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, sequencers.clone()))
-            } else if *address == TIP_FEE_MANAGER_ADDRESS || *address == STABLECOIN_DEX_ADDRESS {
+            } else if *address == STABLECOIN_DEX_ADDRESS {
                 None
             } else if *address == NONCE_PRECOMPILE_ADDRESS {
                 Some(NonceManager::create_precompile(&tempo_env))

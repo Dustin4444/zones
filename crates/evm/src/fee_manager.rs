@@ -4,7 +4,12 @@ use alloy_evm::{Database, revm::context::Journal};
 use alloy_primitives::{Address, U256};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::{ProtocolFeeContext, ProtocolFeeManager};
-use tempo_precompiles::{error::Result, storage::StorageActions, tip_fee_manager::FeeManagerError};
+use tempo_precompiles::{
+    error::Result,
+    storage::{ContractStorage, StorageActions},
+    tip_fee_manager::FeeManagerError,
+    tip20::TIP20Token,
+};
 use tempo_revm::{TempoTx, TempoTxEnv};
 use zone_precompiles::{L1StorageReader, ZoneFeeManager};
 
@@ -33,9 +38,6 @@ impl<L1: L1StorageReader> ZoneProtocolFeeManager<L1> {
         else {
             return Err(FeeManagerError::invalid_token().into());
         };
-        if !self.l1_reader.is_fee_token_enabled(token) {
-            return Err(FeeManagerError::invalid_token().into());
-        }
         Ok(token)
     }
 }
@@ -65,10 +67,13 @@ where
         _beneficiary: Address,
         _skip_liquidity_check: bool,
     ) -> Result<Address> {
-        if !self.l1_reader.is_fee_token_enabled(fee_token) {
-            return Err(FeeManagerError::invalid_token().into());
-        }
-        ctx.enter(|| ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount))
+        ctx.enter(|| {
+            if !TIP20Token::from_address(fee_token)?.is_initialized()? {
+                return Err(FeeManagerError::invalid_token().into());
+            }
+
+            ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount)
+        })
     }
 
     fn collect_fee_post_tx(
@@ -98,7 +103,7 @@ mod tests {
     use zone_precompiles::test_utils::MockL1Reader;
 
     #[test]
-    fn resolves_only_cached_enabled_tokens() {
+    fn resolves_default_and_explicit_fee_tokens() {
         let default = Address::repeat_byte(0x11);
         let explicit = Address::repeat_byte(0x22);
         let manager =
@@ -117,13 +122,14 @@ mod tests {
                 .unwrap(),
             explicit
         );
-        assert!(
+        assert_eq!(
             manager
                 .resolve_fee_token(&TempoTxEnv {
                     fee_token: Some(Address::repeat_byte(0x33)),
                     ..Default::default()
                 })
-                .is_err()
+                .unwrap(),
+            Address::repeat_byte(0x33)
         );
     }
 }

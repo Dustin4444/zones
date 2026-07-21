@@ -8,13 +8,15 @@ use alloy::primitives::{U256, address};
 use zone_l1::{EnabledToken, L1Deposit, L1PortalEvents};
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, local_dev_zone_account, start_local_zone_with_fixture,
+    DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, local_dev_tempo_zone_account,
+    start_local_zone_with_fixture,
 };
 
 // Imports for real-L1 tests
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::primitives::B256;
 use alloy_provider::Provider;
+use tempo_alloy::rpc::TempoCallBuilderExt;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 
@@ -121,7 +123,7 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     reth_tracing::init_test_tracing();
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
-    let (provider, sender) = local_dev_zone_account(&zone)?;
+    let (provider, sender) = local_dev_tempo_zone_account(&zone)?;
     let recipient = address!("0x000000000000000000000000000000000000B0B0");
     let token_address = address!("0x20C0000000000000000000000000000000CC0001");
     let deposit_amount = 1_000_000u128;
@@ -162,7 +164,9 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     // Stateful RPC simulation uses ZoneEvmConfig and therefore the L1 overlay.
     let simulated = token
         .transfer(recipient, U256::from(transfer_amount))
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .fee_token(token_address)
+        .max_fee_per_gas(TEMPO_T0_BASE_FEE as u128)
+        .max_priority_fee_per_gas(0)
         .gas(TIP20_TX_GAS)
         .call()
         .await?;
@@ -170,7 +174,9 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
 
     let error = token
         .transfer(recipient, U256::from(transfer_amount))
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .fee_token(token_address)
+        .max_fee_per_gas(TEMPO_T0_BASE_FEE as u128)
+        .max_priority_fee_per_gas(0)
         .gas(TIP20_TX_GAS)
         .send()
         .await

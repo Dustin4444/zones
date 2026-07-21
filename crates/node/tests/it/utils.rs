@@ -1,6 +1,7 @@
 use alloy::genesis::{Genesis, GenesisAccount};
 use alloy_consensus::Header;
 use alloy_eips::NumHash;
+use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rlp::Encodable;
@@ -114,6 +115,20 @@ pub(crate) fn local_dev_zone_account(zone: &ZoneTestNode) -> eyre::Result<(DynPr
     let dev_address = dev_signer.address();
     let provider = ProviderBuilder::new()
         .wallet(dev_signer)
+        .connect_http(zone.http_url().clone())
+        .erased();
+    Ok((provider, dev_address))
+}
+
+pub(crate) fn local_dev_tempo_zone_account(
+    zone: &ZoneTestNode,
+) -> eyre::Result<(DynProvider<TempoNetwork>, Address)> {
+    let dev_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let dev_address = dev_signer.address();
+    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .wallet(EthereumWallet::from(dev_signer))
         .connect_http(zone.http_url().clone())
         .erased();
     Ok((provider, dev_address))
@@ -552,7 +567,14 @@ impl ZoneTestNode {
             || {
                 let tempo_state = &tempo_state;
                 async move {
-                    let n = tempo_state.tempoBlockNumber().call().await?;
+                    // During a pre-creation replay the zone can advance before the initial
+                    // TokenEnabled event has populated the default fee-token cache. Treat the
+                    // resulting transient eth_call failure as "not ready" and keep polling.
+                    let n = match tempo_state.tempoBlockNumber().call().await {
+                        Ok(n) => n,
+                        Err(err) if err.to_string().contains("InvalidToken") => return Ok(None),
+                        Err(err) => return Err(err.into()),
+                    };
                     if n >= target { Ok(Some(n)) } else { Ok(None) }
                 }
             },
@@ -633,7 +655,13 @@ impl ZoneTestNode {
                             && ev.blockNumber > after_block
                         {
                             // Confirm on-chain state matches
-                            let on_chain = tempo_state.tempoBlockNumber().call().await?;
+                            let on_chain = match tempo_state.tempoBlockNumber().call().await {
+                                Ok(n) => n,
+                                Err(err) if err.to_string().contains("InvalidToken") => {
+                                    return Ok(None);
+                                }
+                                Err(err) => return Err(err.into()),
+                            };
                             if on_chain >= ev.blockNumber {
                                 return Ok(Some(on_chain));
                             }
@@ -899,7 +927,7 @@ impl ZoneTestNode {
 
         let deposit_queue = zone_node.deposit_queue();
         let l1_state_cache = zone_node.l1_state_cache();
-        if is_local_dummy_l1 {
+        if is_local_dummy_l1 || portal_address == Address::ZERO {
             let mut cache = l1_state_cache.write();
             cache.initialize_enabled_tokens([PATH_USD_ADDRESS]);
             seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
@@ -3603,6 +3631,7 @@ impl L1Fixture {
 
         // System transactions resolve their zero-address fee token before execution. Keep that
         // synthetic token permissive in RPC-free fixtures, matching the old policy-provider stub.
+        cache.initialize_enabled_tokens([PATH_USD_ADDRESS]);
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         cache.update_anchor(NumHash {

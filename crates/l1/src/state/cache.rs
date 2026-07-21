@@ -174,6 +174,7 @@ impl L1StateCacheInner {
 
     /// Records a token enabled by a canonical ZonePortal event.
     pub fn enable_token(&mut self, token: Address) {
+        self.default_fee_token.get_or_insert(token);
         self.enabled_tokens.insert(token);
         self.tracked_contracts.insert(token);
     }
@@ -386,7 +387,24 @@ mod tests {
         assert!(cache.is_tracked(&observed));
 
         cache.clear();
+        assert_eq!(cache.default_fee_token(), Some(initial));
         assert_eq!(cache.enabled_tokens(), &HashSet::from([initial]));
+    }
+
+    #[test]
+    fn first_replayed_enabled_token_becomes_default_fee_token() {
+        let initial = address!("0x20c0000000000000000000000000000000000001");
+        let additional = address!("0x20c0000000000000000000000000000000000002");
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+
+        cache.enable_token(initial);
+        cache.enable_token(additional);
+
+        assert_eq!(cache.default_fee_token(), Some(initial));
+
+        cache.clear();
+        assert_eq!(cache.default_fee_token(), Some(initial));
+        assert!(cache.enabled_tokens().is_empty());
     }
 
     #[test]
