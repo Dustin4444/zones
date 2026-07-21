@@ -561,14 +561,6 @@ impl L1Subscriber {
             }
         }
 
-        // Prevent values cached before TIP-20 deployment from being inherited.
-        invalidated.extend(
-            portal_events
-                .enabled_tokens
-                .iter()
-                .map(|enabled| enabled.token),
-        );
-
         self.record_portal_event_metrics(&portal_events);
         (portal_events, invalidated)
     }
