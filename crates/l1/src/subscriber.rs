@@ -554,7 +554,7 @@ impl L1Subscriber {
             }
         }
 
-        // Prevent pre-enablement TIP-20 values from being inherited.
+        // Prevent values cached before TIP-20 deployment from being inherited.
         invalidated.extend(
             portal_events
                 .enabled_tokens
