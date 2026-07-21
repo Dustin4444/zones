@@ -148,7 +148,10 @@ fn test_subscriber(
             l1_rpc_url: "http://127.0.0.1:8545".to_owned(),
             portal_address,
             genesis_tempo_block_number,
-            l1_state_cache: crate::L1StateCache::new(HashSet::from([portal_address])),
+            l1_state_cache: crate::L1StateCache::new(HashSet::from([
+                portal_address,
+                TIP403_REGISTRY_ADDRESS,
+            ])),
             l1_fetch_concurrency: 1,
             retry_connection_interval: Duration::from_secs(1),
         },
@@ -411,7 +414,7 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
         .set(TIP403_REGISTRY_ADDRESS, slot, 10, value);
 
     let hash_10 = B256::with_last_byte(10);
-    subscriber.update_l1_state_anchor(10, hash_10, B256::ZERO, &HashSet::new());
+    subscriber.update_l1_state_anchor(10, hash_10, B256::ZERO, &HashSet::new(), &[]);
     assert_eq!(
         subscriber
             .config
@@ -426,6 +429,7 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
         B256::with_last_byte(11),
         hash_10,
         &HashSet::from([TIP403_REGISTRY_ADDRESS]),
+        &[],
     );
     let cache = subscriber.config.l1_state_cache.read();
     assert_eq!(cache.anchor().number, 11);
@@ -443,7 +447,13 @@ fn update_l1_state_anchor_reorg_clears_raw_state_and_rebases_floor() {
 
     let old_header = make_test_header(10);
     let old_hash = header_hash(&old_header);
-    subscriber.update_l1_state_anchor(10, old_hash, old_header.inner.parent_hash, &HashSet::new());
+    subscriber.update_l1_state_anchor(
+        10,
+        old_hash,
+        old_header.inner.parent_hash,
+        &HashSet::new(),
+        &[],
+    );
     subscriber
         .config
         .l1_state_cache
@@ -457,6 +467,7 @@ fn update_l1_state_anchor_reorg_clears_raw_state_and_rebases_floor() {
         header_hash(&replacement_header),
         replacement_parent,
         &HashSet::new(),
+        &[],
     );
 
     let cache = subscriber.config.l1_state_cache.read();

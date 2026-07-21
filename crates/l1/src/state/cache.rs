@@ -64,6 +64,7 @@ impl L1StateCache {
 #[derive(Debug, Default)]
 pub struct L1StateCacheInner {
     tracked_contracts: HashSet<Address>,
+    enabled_tokens: HashSet<Address>,
     /// Per-slot value history: `(address, slot) → { block_number → value }`.
     /// The `BTreeMap` enables efficient range lookups for "latest value at or before block N".
     slots: HashMap<(Address, B256), BTreeMap<u64, B256>>,
@@ -110,10 +111,14 @@ impl L1StateCacheInner {
 
     /// Sets a storage slot value in the forward cache at the given block number.
     ///
-    /// Values below the initial canonical floor are deliberately not admitted, so historical
-    /// reads cannot later be inherited by canonical execution.
+    /// Only static tracked contracts and canonically enabled TIP-20s are admitted. Values below
+    /// the initial canonical floor are also rejected, so historical reads cannot later be
+    /// inherited by canonical execution.
     pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) {
-        if block_number < self.block_floor {
+        if block_number < self.block_floor
+            || !(self.tracked_contracts.contains(&address)
+                || self.enabled_tokens.contains(&address))
+        {
             return;
         }
         self.slots
@@ -156,10 +161,16 @@ impl L1StateCacheInner {
         self.tracked_contracts.contains(address)
     }
 
-    /// Clears chain-derived data while retaining the tracked-contract set and initial floor.
+    /// Allows cache admission for a canonically enabled TIP-20.
+    pub fn enable_token(&mut self, address: Address) {
+        self.enabled_tokens.insert(address);
+    }
+
+    /// Clears chain-derived data while retaining the static tracked-contract set and initial floor.
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
+        self.enabled_tokens.clear();
         self.anchor = NumHash::default();
     }
 
@@ -277,19 +288,17 @@ mod tests {
     }
 
     #[test]
-    fn token_enablement_invalidates_cached_token_state() {
+    fn cache_rejects_tokens_until_enabled() {
         let token = address!("0x20c0000000000000000000000000000000000042");
         let policy_slot = B256::with_last_byte(1);
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
 
-        // An RPC read can observe the deterministic address before token creation and cache the
-        // empty-account value.
+        // Ignore reads made before the deterministic token address is deployed and enabled.
         cache.set(token, policy_slot, 10, B256::ZERO);
         cover_through(&mut cache, 10);
-        assert_eq!(cache.get(token, policy_slot, 10), Some(B256::ZERO));
+        assert_eq!(cache.get(token, policy_slot, 10), None);
 
-        // TokenEnabled is emitted by the portal, so the subscriber must install a barrier for the
-        // token address rather than only for the portal emitter.
+        cache.enable_token(token);
         cache.invalidate(token, 11);
         cover_through(&mut cache, 11);
         assert_eq!(cache.get(token, policy_slot, 11), None);
@@ -318,8 +327,10 @@ mod tests {
     #[test]
     fn clear_removes_chain_data_and_preserves_floor() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+        let token = address!("0x20c0000000000000000000000000000000000042");
 
         cache.initialize_floor(90);
+        cache.enable_token(token);
         cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1));
         cache.invalidate(PORTAL, 101);
         cache.update_anchor(NumHash {
@@ -333,6 +344,8 @@ mod tests {
         assert!(cache.invalidations.is_empty());
         assert_eq!(cache.anchor(), NumHash::default());
         assert_eq!(cache.block_floor(), 90);
+        cache.set(token, B256::ZERO, 100, B256::with_last_byte(1));
+        assert_eq!(cache.get(token, B256::ZERO, 100), None);
     }
 
     #[test]

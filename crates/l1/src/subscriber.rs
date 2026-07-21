@@ -396,6 +396,7 @@ impl L1Subscriber {
                 sealed.hash(),
                 sealed.parent_hash(),
                 &invalidated,
+                &events.enabled_tokens,
             );
             self.apply_portal_state_events(block_number, &events);
             self.deposit_queue.enqueue_sealed(sealed, events);
@@ -478,7 +479,13 @@ impl L1Subscriber {
                     let tip_number = tip_header.number();
                     let tip_hash = tip_header.hash();
                     let tip_parent = tip_header.parent_hash();
-                    self.update_l1_state_anchor(tip_number, tip_hash, tip_parent, &tip_invalidated);
+                    self.update_l1_state_anchor(
+                        tip_number,
+                        tip_hash,
+                        tip_parent,
+                        &tip_invalidated,
+                        &tip_events.enabled_tokens,
+                    );
                     self.apply_portal_state_events(tip_number, &tip_events);
                     match self.deposit_queue.try_enqueue(tip_header, tip_events) {
                         EnqueueOutcome::Accepted => {
@@ -644,6 +651,7 @@ impl L1Subscriber {
         hash: B256,
         parent_hash: B256,
         invalidated_accounts: &HashSet<Address>,
+        enabled_tokens: &[EnabledToken],
     ) {
         let mut guard = self.config.l1_state_cache.write();
         let anchor = guard.anchor();
@@ -662,6 +670,9 @@ impl L1Subscriber {
         }
         for &address in invalidated_accounts {
             guard.invalidate(address, number);
+        }
+        for token in enabled_tokens {
+            guard.enable_token(token.token);
         }
         // Publish receipt coverage only after every mutation barrier from this block is visible.
         guard.update_anchor(NumHash::new(number, hash));

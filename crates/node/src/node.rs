@@ -202,7 +202,10 @@ impl ZoneNode {
     ) -> Self {
         let deposit_queue = DepositQueue::default();
 
-        let l1_state_cache = L1StateCache::new(HashSet::from([portal_address]));
+        let l1_state_cache = L1StateCache::new(HashSet::from([
+            portal_address,
+            tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS,
+        ]));
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
