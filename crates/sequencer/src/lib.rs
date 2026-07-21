@@ -5,12 +5,13 @@
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportResult;
 use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, oneshot};
 
 pub mod abi {
     pub use tempo_zone_contracts::*;
@@ -32,6 +33,60 @@ pub use settlement::{BatchAnchorConfig, BatchData, BatchSubmitter};
 pub use withdrawals::{SharedWithdrawalStore, WithdrawalProcessorConfig, WithdrawalStore};
 
 use crate::rpc::rpc_connection_config;
+
+const BATCH_SUBMISSION_DECISION_CAPACITY: usize = 64;
+
+/// Sender for exact-target batch-submission decisions.
+pub type BatchSubmissionDecisionSender = mpsc::Sender<BatchSubmissionDecisionRequest>;
+
+/// Node-side request to validate one exact batch submission target.
+#[derive(Debug)]
+pub struct BatchSubmissionDecisionRequest {
+    pub(crate) block: BlockNumHash,
+    pub(crate) response: oneshot::Sender<BatchSubmissionDecision>,
+}
+
+/// Fail-closed decision returned immediately before batch submission.
+#[derive(Debug)]
+pub enum BatchSubmissionDecision {
+    /// Continue preparing or submitting the batch.
+    Submit,
+    /// Retry after temporary validation lag.
+    Retry(eyre::Report),
+    /// Stop submission until explicit recovery.
+    Halt(eyre::Report),
+}
+
+/// Create the bounded decision channel used at the batch-submission boundary.
+pub fn batch_submission_decision_channel() -> (
+    BatchSubmissionDecisionSender,
+    mpsc::Receiver<BatchSubmissionDecisionRequest>,
+) {
+    mpsc::channel(BATCH_SUBMISSION_DECISION_CAPACITY)
+}
+
+impl BatchSubmissionDecisionRequest {
+    /// Exact canonical block requested for validation.
+    pub const fn block(&self) -> BlockNumHash {
+        self.block
+    }
+
+    /// Complete this request with the node's validation result.
+    pub fn respond(self, decision: BatchSubmissionDecision) {
+        let _ = self.response.send(decision);
+    }
+}
+
+pub(crate) fn unavailable_batch_submission_decision() -> BatchSubmissionDecision {
+    ::metrics::counter!(
+        "withdrawal_signature_withheld_total",
+        "reason" => "monitor_unavailable"
+    )
+    .increment(1);
+    BatchSubmissionDecision::Halt(eyre::eyre!(
+        "batch submission validation actor is unavailable"
+    ))
+}
 
 /// Configuration for all zone sequencer background tasks.
 #[derive(Debug, Clone)]
@@ -84,6 +139,7 @@ pub struct ZoneSequencerHandle {
 pub async fn spawn_zone_sequencer(
     config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
+    submission_decisions: BatchSubmissionDecisionSender,
 ) -> ZoneSequencerHandle {
     // Build a single shared L1 provider with the sequencer wallet.
     // Both the batch submitter (inside the zone monitor) and the withdrawal
@@ -129,6 +185,7 @@ pub async fn spawn_zone_sequencer(
         withdrawal_store,
         withdrawal_notify,
         withdrawal_repair_notify,
+        submission_decisions,
     );
 
     ZoneSequencerHandle {

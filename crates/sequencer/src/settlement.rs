@@ -23,13 +23,15 @@
 //! configured direct window by falling back to ancestry mode — a recent anchor
 //! block plus a locally validated parent-hash header chain.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
+    BatchSubmissionDecision, BatchSubmissionDecisionRequest, BatchSubmissionDecisionSender,
     abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal},
-    attestation::{AttestationStore, SettlementCertificate},
+    attestation::{AttestationStore, SettlementCertificate, SettlementWaitError},
 };
 use alloy_consensus::Transaction;
+use alloy_eips::BlockNumHash;
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider};
@@ -56,7 +58,7 @@ const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 /// At roughly 600 bytes per header, this caps payload storage near 150 MiB plus
 /// map overhead while covering more than the current Zone E recovery gap.
 const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
-
+const SETTLEMENT_TARGET_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// EIP-2935 anchor limits used by the batch submitter.
 ///
 /// Production uses the real 8191-block EIP-2935 history window with a safety
@@ -183,10 +185,33 @@ pub struct BatchSubmitter {
     anchor_config: BatchAnchorConfig,
     /// Signatures from followers attesting to the batch.
     attestation_store: Option<AttestationStore>,
+    /// Fail-closed decisions checked immediately before each L1 submission.
+    submission_decisions: BatchSubmissionDecisionSender,
     /// Validated, RLP-encoded L1 headers retained across overlapping ancestry
     /// requests. Settlement batches are submitted in order, so later requests
     /// can reuse almost the entire preceding range.
     ancestry_header_cache: RwLock<LruMap<u64, CachedAncestryHeader>>,
+}
+
+/// Result of attempting to cross the L1 batch-submission boundary.
+#[derive(Debug)]
+pub enum BatchSubmissionOutcome {
+    /// The transaction was confirmed and emitted this event.
+    Submitted(ZonePortal::BatchSubmitted),
+    /// Validation is temporarily behind and the batch should be retried.
+    Retry(eyre::Report),
+    /// The fail-closed validator halted submission.
+    Halt(eyre::Report),
+}
+
+impl BatchSubmissionOutcome {
+    fn from_decision(decision: BatchSubmissionDecision) -> Option<Self> {
+        match decision {
+            BatchSubmissionDecision::Submit => None,
+            BatchSubmissionDecision::Retry(error) => Some(Self::Retry(error)),
+            BatchSubmissionDecision::Halt(error) => Some(Self::Halt(error)),
+        }
+    }
 }
 
 /// One validated L1 header retained for ancestry proof construction.
@@ -198,6 +223,21 @@ struct CachedAncestryHeader {
 }
 
 impl BatchSubmitter {
+    async fn submission_decision(&self, block: BlockNumHash) -> BatchSubmissionDecision {
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        if self
+            .submission_decisions
+            .send(BatchSubmissionDecisionRequest { block, response })
+            .await
+            .is_err()
+        {
+            return crate::unavailable_batch_submission_decision();
+        }
+        receiver
+            .await
+            .unwrap_or_else(|_| crate::unavailable_batch_submission_decision())
+    }
+
     /// Create a new batch submitter from a shared L1 provider.
     ///
     /// The provider must already include the sequencer wallet for signing.
@@ -205,12 +245,14 @@ impl BatchSubmitter {
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
         genesis_tempo_block_number: u64,
+        submission_decisions: BatchSubmissionDecisionSender,
     ) -> Self {
         Self::with_anchor_config(
             portal_address,
             l1_provider,
             genesis_tempo_block_number,
             BatchAnchorConfig::default(),
+            submission_decisions,
         )
     }
 
@@ -220,6 +262,7 @@ impl BatchSubmitter {
         l1_provider: DynProvider<TempoNetwork>,
         genesis_tempo_block_number: u64,
         anchor_config: BatchAnchorConfig,
+        submission_decisions: BatchSubmissionDecisionSender,
     ) -> Self {
         let portal = ZonePortal::new(portal_address, l1_provider.clone());
         Self {
@@ -230,6 +273,7 @@ impl BatchSubmitter {
             l1_fetch_concurrency: 16,
             anchor_config,
             attestation_store: None,
+            submission_decisions,
             ancestry_header_cache: RwLock::new(LruMap::new(ByLength::new(
                 DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY,
             ))),
@@ -255,7 +299,8 @@ impl BatchSubmitter {
     /// `verifierConfig` and `proof` are empty until real proof generation is
     /// implemented.
     ///
-    /// Returns the `BatchSubmitted` event decoded from the confirmed receipt.
+    /// Returns the confirmed `BatchSubmitted` event, or a retry/halt decision from withdrawal
+    /// validation.
     // TODO: pass real proof bytes once proof generation is implemented.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
@@ -268,13 +313,25 @@ impl BatchSubmitter {
         &self,
         batch: &BatchData,
         zone_height: u64,
-    ) -> Result<ZonePortal::BatchSubmitted> {
+    ) -> Result<BatchSubmissionOutcome> {
         if batch.tempo_block_number < self.genesis_tempo_block_number {
             return Err(eyre::eyre!(
                 "tempo_block_number ({}) is below genesis ({})",
                 batch.tempo_block_number,
                 self.genesis_tempo_block_number
             ));
+        }
+
+        let submission_target = BlockNumHash {
+            number: zone_height,
+            hash: batch.next_block_hash,
+        };
+        // Reject before any L1 RPC or an unbounded quorum wait, then recheck immediately before
+        // the send below to cover a reorg while the batch is being prepared.
+        if let Some(outcome) =
+            BatchSubmissionOutcome::from_decision(self.submission_decision(submission_target).await)
+        {
+            return Ok(outcome);
         }
 
         if !batch.withdrawal_queue_hash.is_zero() {
@@ -310,11 +367,36 @@ impl BatchSubmitter {
                     "portal signer-set version {seq_set_version} requires P2P attestations, but no attestation store is configured"
                 )
             })?;
-            info!(
-                zone_height,
-                quorum, seq_set_version, "Waiting for settlement quorum"
-            );
-            Some(store.wait_for_settlement(zone_height, quorum).await)
+            let waiting = store.wait_for_settlement(submission_target, quorum);
+            tokio::pin!(waiting);
+            let mut recheck = tokio::time::interval(SETTLEMENT_TARGET_RECHECK_INTERVAL);
+            recheck.tick().await;
+            Some(loop {
+                tokio::select! {
+                    result = &mut waiting => match result {
+                        Ok(certificate) => break certificate,
+                        Err(error @ SettlementWaitError::QuorumRefused { .. }) => {
+                            return Ok(match self.submission_decision(submission_target).await {
+                                BatchSubmissionDecision::Submit => BatchSubmissionOutcome::Halt(error.into()),
+                                BatchSubmissionDecision::Retry(error) => BatchSubmissionOutcome::Retry(error),
+                                BatchSubmissionDecision::Halt(error) => BatchSubmissionOutcome::Halt(error),
+                            });
+                        }
+                        Err(error @ SettlementWaitError::TargetReplaced { .. }) => {
+                            return Ok(BatchSubmissionOutcome::Retry(error.into()));
+                        }
+                    },
+                    _ = recheck.tick() => match self.submission_decision(submission_target).await {
+                        BatchSubmissionDecision::Submit => {}
+                        BatchSubmissionDecision::Retry(error) => {
+                            return Ok(BatchSubmissionOutcome::Retry(error));
+                        }
+                        BatchSubmissionDecision::Halt(error) => {
+                            return Ok(BatchSubmissionOutcome::Halt(error));
+                        }
+                    }
+                }
+            })
         };
 
         let anchor_mode = if let Some(certificate) = certificate.as_ref() {
@@ -327,7 +409,7 @@ impl BatchSubmitter {
                     self.attestation_store
                         .as_ref()
                         .expect("certificate requires an attestation store")
-                        .remove_settlement(zone_height, certificate.digest);
+                        .remove_settlement(submission_target);
                     return Err(err);
                 }
             }
@@ -361,6 +443,12 @@ impl BatchSubmitter {
         }
 
         info!(?anchor_mode, "Submitting batch to ZonePortal on L1");
+
+        if let Some(outcome) =
+            BatchSubmissionOutcome::from_decision(self.submission_decision(submission_target).await)
+        {
+            return Ok(outcome);
+        }
 
         // verifierConfig and proof stay empty until real proof generation is wired in.
         let verifier_config = Bytes::new();
@@ -450,7 +538,7 @@ impl BatchSubmitter {
             "Batch submitted to L1"
         );
 
-        Ok(event)
+        Ok(BatchSubmissionOutcome::Submitted(event))
     }
 
     /// Decode the `BatchSubmitted` event from a confirmed `submitBatch` receipt's logs.
@@ -1382,6 +1470,74 @@ mod tests {
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
 
+    fn unused_submission_decisions() -> BatchSubmissionDecisionSender {
+        let (decisions, _requests) = crate::batch_submission_decision_channel();
+        decisions
+    }
+
+    fn reject_batch_submissions() -> BatchSubmissionDecisionSender {
+        let (decisions, mut requests) = crate::batch_submission_decision_channel();
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                request.respond(BatchSubmissionDecision::Halt(eyre::eyre!(
+                    "withdrawal check failed"
+                )));
+            }
+        });
+        decisions
+    }
+
+    fn halt_final_submission_decision() -> BatchSubmissionDecisionSender {
+        let (decisions, mut requests) = crate::batch_submission_decision_channel();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Some(request) = requests.recv().await {
+                if std::mem::take(&mut first) {
+                    request.respond(BatchSubmissionDecision::Submit);
+                } else {
+                    request.respond(BatchSubmissionDecision::Halt(eyre::eyre!(
+                        "canonical target changed"
+                    )));
+                }
+            }
+        });
+        decisions
+    }
+
+    fn submit_then_retry_decisions() -> BatchSubmissionDecisionSender {
+        let (decisions, mut requests) = crate::batch_submission_decision_channel();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Some(request) = requests.recv().await {
+                if std::mem::take(&mut first) {
+                    request.respond(BatchSubmissionDecision::Submit);
+                } else {
+                    request.respond(BatchSubmissionDecision::Retry(eyre::eyre!(
+                        "canonical target changed"
+                    )));
+                }
+            }
+        });
+        decisions
+    }
+
+    fn retry_then_submit_decisions() -> BatchSubmissionDecisionSender {
+        let (decisions, mut requests) = crate::batch_submission_decision_channel();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Some(request) = requests.recv().await {
+                if std::mem::take(&mut first) {
+                    request.respond(BatchSubmissionDecision::Retry(eyre::eyre!(
+                        "canonical state is catching up"
+                    )));
+                } else {
+                    request.respond(BatchSubmissionDecision::Submit);
+                }
+            }
+        });
+        decisions
+    }
+
     fn mock_l1_header(number: u64, parent_hash: B256) -> (TempoHeaderResponse, B256) {
         let header = TempoHeader {
             inner: ConsensusHeader {
@@ -1433,12 +1589,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_batch_stops_before_l1_calls() {
+        let batch = BatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::ZERO,
+            next_block_hash: B256::repeat_byte(1),
+            prev_processed_deposit_hash: B256::ZERO,
+            next_processed_deposit_hash: B256::ZERO,
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+        };
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::ZERO, provider, 0, reject_batch_submissions());
+
+        assert!(matches!(
+            submitter.submit_batch(&batch, 1).await.unwrap(),
+            BatchSubmissionOutcome::Halt(_)
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_decision_halts_before_l1_send() {
+        let batch = BatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::ZERO,
+            next_block_hash: B256::repeat_byte(1),
+            prev_processed_deposit_hash: B256::ZERO,
+            next_processed_deposit_hash: B256::ZERO,
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(vec![0; 32]));
+        asserter.push_success(&2_u64);
+        asserter.push_success(&2_u64);
+        asserter.push_success(&Bytes::from(vec![0; 32]));
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter =
+            BatchSubmitter::new(Address::ZERO, provider, 0, halt_final_submission_decision());
+
+        assert!(matches!(
+            submitter.submit_batch(&batch, 1).await.unwrap(),
+            BatchSubmissionOutcome::Halt(_)
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_quorum_stops_waiting_when_target_changes() {
+        let batch = BatchData {
+            tempo_block_number: 1,
+            prev_block_hash: B256::ZERO,
+            next_block_hash: B256::repeat_byte(1),
+            prev_processed_deposit_hash: B256::ZERO,
+            next_processed_deposit_hash: B256::ZERO,
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+        };
+        let asserter = Asserter::new();
+        let mut set_version = vec![0; 32];
+        set_version[31] = 1;
+        let mut quorum = vec![0; 32];
+        quorum[31] = 2;
+        asserter.push_success(&Bytes::from(set_version));
+        asserter.push_success(&Bytes::from(quorum));
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        let mut submitter =
+            BatchSubmitter::new(Address::ZERO, provider, 0, submit_then_retry_decisions());
+        submitter.set_attestation_store(Some(AttestationStore::new([
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+        ])));
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), submitter.submit_batch(&batch, 1))
+                .await
+                .expect("stale quorum wait did not stop")
+                .unwrap(),
+            BatchSubmissionOutcome::Retry(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_decision_does_not_poison_next_request() {
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+        let submitter =
+            BatchSubmitter::new(Address::ZERO, provider, 0, retry_then_submit_decisions());
+        let target = BlockNumHash {
+            number: 1,
+            hash: B256::repeat_byte(1),
+        };
+
+        assert!(matches!(
+            submitter.submission_decision(target).await,
+            BatchSubmissionDecision::Retry(_)
+        ));
+        assert!(matches!(
+            submitter.submission_decision(target).await,
+            BatchSubmissionDecision::Submit
+        ));
+    }
+
+    #[tokio::test]
     async fn ancestry_header_cache_fetches_only_new_suffix() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
             .erased();
-        let submitter = BatchSubmitter::new(Address::ZERO, provider, 0);
+        let submitter =
+            BatchSubmitter::new(Address::ZERO, provider, 0, unused_submission_decisions());
         *submitter.ancestry_header_cache.write() = LruMap::new(ByLength::new(4));
 
         let mut parent_hash = B256::ZERO;
@@ -1563,7 +1837,8 @@ mod tests {
         let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(Asserter::new())
             .erased();
-        let submitter = BatchSubmitter::new(portal_address, provider, 0);
+        let submitter =
+            BatchSubmitter::new(portal_address, provider, 0, unused_submission_decisions());
 
         let event = abi::ZonePortal::BatchSubmitted {
             withdrawalBatchIndex: 7,
@@ -1608,7 +1883,8 @@ mod tests {
         let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter.clone())
             .erased();
-        let submitter = BatchSubmitter::new(portal_address, provider, 0);
+        let submitter =
+            BatchSubmitter::new(portal_address, provider, 0, unused_submission_decisions());
 
         asserter.push_success(&10_000_u64);
         let logs: Vec<_> = [99_u64, 100, 101]

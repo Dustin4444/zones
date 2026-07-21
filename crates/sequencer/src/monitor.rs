@@ -35,12 +35,13 @@ use tracing::{error, info, instrument, warn};
 use alloy_sol_types::{ContractError, SolInterface as _};
 
 use crate::{
+    BatchSubmissionDecisionSender,
     abi::{self, NO_QUEUE_INDEX, TempoState, ZoneInbox, ZoneOutbox, ZonePortal},
     attestation::AttestationStore,
     rpc::rpc_connection_config,
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
-        fetch_finalized_batch_boundaries, log_query_ranges,
+        BatchAnchorConfig, BatchData, BatchSubmissionOutcome, BatchSubmitter, ZoneBlockSnapshot,
+        fetch_finalized_batch, fetch_finalized_batch_boundaries, log_query_ranges,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -50,6 +51,12 @@ const MAX_RETRIES: u32 = 3;
 
 /// Initial delay between retries (doubles on each attempt).
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+enum SettlementControl {
+    Continue,
+    Halt(eyre::Report),
+}
 
 /// Returns true when `(last_submitted, latest]` contains a block-number batch boundary.
 ///
@@ -141,6 +148,7 @@ impl ZoneMonitor {
     /// backed by the shared `l1_provider` for posting batches to the ZonePortal on L1.
     pub async fn new(
         config: ZoneMonitorConfig,
+        submission_decisions: BatchSubmissionDecisionSender,
         l1_provider: DynProvider<TempoNetwork>,
         withdrawal_store: SharedWithdrawalStore,
         withdrawal_notify: Arc<Notify>,
@@ -166,6 +174,7 @@ impl ZoneMonitor {
 
         Self::new_with_provider(
             config,
+            submission_decisions,
             provider,
             l1_provider,
             withdrawal_store,
@@ -177,6 +186,7 @@ impl ZoneMonitor {
 
     async fn new_with_provider(
         config: ZoneMonitorConfig,
+        submission_decisions: BatchSubmissionDecisionSender,
         provider: DynProvider<TempoNetwork>,
         l1_provider: DynProvider<TempoNetwork>,
         withdrawal_store: SharedWithdrawalStore,
@@ -200,6 +210,7 @@ impl ZoneMonitor {
             l1_provider,
             genesis_tempo_block_number,
             config.batch_anchor_config,
+            submission_decisions,
         );
         batch_submitter.set_attestation_store(config.attestation_store.clone());
 
@@ -313,7 +324,17 @@ impl ZoneMonitor {
 
             let from = self.last_submitted_zone_block + 1;
             match self.process_block_range(from, latest_zone_block).await {
-                Ok(_) => {}
+                Ok(SettlementControl::Continue) => {}
+                Ok(SettlementControl::Halt(error)) => {
+                    error!(
+                        from,
+                        to = latest_zone_block,
+                        %error,
+                        "Batch validation withheld settlement; waiting for operator restart"
+                    );
+                    futures::future::pending::<()>().await;
+                    unreachable!("pending future cannot complete");
+                }
                 Err(e) => {
                     error!(from, to = latest_zone_block, error = %e, "Failed to process zone block range");
                     continue;
@@ -434,14 +455,14 @@ impl ZoneMonitor {
     /// The monitor must walk those boundaries one at a time so the L2 outbox
     /// index and L1 portal index advance in lockstep.
     #[instrument(skip(self), fields(from, to))]
-    async fn process_block_range(&mut self, from: u64, to: u64) -> Result<bool> {
+    async fn process_block_range(&mut self, from: u64, to: u64) -> Result<SettlementControl> {
         let block_count = to - from + 1;
         info!(from, to, block_count, "Processing zone block range");
 
         let boundaries = fetch_finalized_batch_boundaries(&self.outbox, from, to).await?;
         if boundaries.is_empty() {
             info!(from, to, "No finalized batch boundaries ready to submit");
-            return Ok(false);
+            return Ok(SettlementControl::Continue);
         }
 
         info!(
@@ -465,7 +486,11 @@ impl ZoneMonitor {
                 "Submitting finalized zone batch"
             );
             let before_submit = self.last_submitted_zone_block;
-            self.process_finalized_batch(range_start, boundary).await?;
+            if let SettlementControl::Halt(error) =
+                self.process_finalized_batch(range_start, boundary).await?
+            {
+                return Ok(SettlementControl::Halt(error));
+            }
             if self.last_submitted_zone_block <= before_submit {
                 warn!(
                     before_submit,
@@ -477,11 +502,11 @@ impl ZoneMonitor {
             }
         }
 
-        Ok(true)
+        Ok(SettlementControl::Continue)
     }
 
     /// Process one boundary-aligned finalized batch.
-    async fn process_finalized_batch(&mut self, from: u64, to: u64) -> Result<()> {
+    async fn process_finalized_batch(&mut self, from: u64, to: u64) -> Result<SettlementControl> {
         let finalized_batch = fetch_finalized_batch(&self.outbox, &self.provider, from, to).await?;
         let end_state = self.fetch_block_snapshot(to).await?;
 
@@ -576,7 +601,7 @@ impl ZoneMonitor {
         batch_data: &BatchData,
         last_zone_block: u64,
         withdrawals: Vec<abi::Withdrawal>,
-    ) -> Result<()> {
+    ) -> Result<SettlementControl> {
         // Preflight: verify prev_zone_block_hash matches portal state.
         match self.batch_submitter.read_portal_block_hash().await {
             Ok(portal_hash) if portal_hash != batch_data.prev_block_hash => {
@@ -586,7 +611,7 @@ impl ZoneMonitor {
                     "prev_block_hash mismatch with portal, resyncing"
                 );
                 self.resync_from_portal().await;
-                return Ok(());
+                return Ok(SettlementControl::Continue);
             }
             Err(e) => {
                 warn!(error = %e, "Failed preflight portal hash check, continuing with submission");
@@ -603,7 +628,7 @@ impl ZoneMonitor {
                 .submit_batch(batch_data, last_zone_block)
                 .await
             {
-                Ok(event) => {
+                Ok(BatchSubmissionOutcome::Submitted(event)) => {
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None
                     } else {
@@ -666,12 +691,15 @@ impl ZoneMonitor {
 
                     self.withdrawal_notify.notify_one();
 
-                    return Ok(());
+                    return Ok(SettlementControl::Continue);
                 }
-                Err(e) => {
-                    self.metrics
-                        .batch_submit_latency_seconds
-                        .record(submit_started.elapsed().as_secs_f64());
+                Ok(BatchSubmissionOutcome::Halt(error)) => {
+                    return Ok(SettlementControl::Halt(error.wrap_err(format!(
+                        "batch submission withheld for unvalidated zone block {last_zone_block} ({})",
+                        batch_data.next_block_hash
+                    ))));
+                }
+                Ok(BatchSubmissionOutcome::Retry(e)) | Err(e) => {
                     if attempt < MAX_RETRIES {
                         self.metrics.batch_submit_retry_total.increment(1);
                         warn!(
@@ -897,11 +925,13 @@ pub fn spawn_zone_monitor(
     withdrawal_store: SharedWithdrawalStore,
     withdrawal_notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
+    submission_decisions: BatchSubmissionDecisionSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut monitor = loop {
             match ZoneMonitor::new(
                 config.clone(),
+                submission_decisions.clone(),
                 l1_provider.clone(),
                 withdrawal_store.clone(),
                 withdrawal_notify.clone(),
@@ -943,12 +973,28 @@ fn decode_portal_revert(err: &eyre::Report) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BatchSubmissionDecision;
     use alloy_network::Network;
     use alloy_primitives::{Bytes, U256};
     use alloy_rpc_types_eth::{Block, Header};
     use alloy_transport::mock::Asserter;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
+
+    fn validation_decisions(reject: bool) -> BatchSubmissionDecisionSender {
+        let (decisions, mut requests) = crate::batch_submission_decision_channel();
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let result = if reject {
+                    BatchSubmissionDecision::Halt(eyre::eyre!("withdrawal check failed"))
+                } else {
+                    BatchSubmissionDecision::Submit
+                };
+                request.respond(result);
+            }
+        });
+        decisions
+    }
 
     #[test]
     fn crossed_batch_boundary_matches_builder_modulo_boundaries() {
@@ -995,6 +1041,14 @@ mod tests {
     }
 
     fn test_monitor(l1: Asserter, zone: Asserter) -> ZoneMonitor {
+        test_monitor_with_decisions(l1, zone, validation_decisions(false))
+    }
+
+    fn test_monitor_with_decisions(
+        l1: Asserter,
+        zone: Asserter,
+        submission_decisions: BatchSubmissionDecisionSender,
+    ) -> ZoneMonitor {
         let portal_address = Address::repeat_byte(0x11);
         let config = ZoneMonitorConfig {
             outbox_address: Address::repeat_byte(0x22),
@@ -1019,7 +1073,12 @@ mod tests {
             inbox: ZoneInbox::new(Address::repeat_byte(0x33), zone_provider.clone()),
             tempo_state: TempoState::new(Address::repeat_byte(0x44), zone_provider),
             withdrawal_store: SharedWithdrawalStore::new(),
-            batch_submitter: BatchSubmitter::new(portal_address, l1_provider, 0),
+            batch_submitter: BatchSubmitter::new(
+                portal_address,
+                l1_provider,
+                0,
+                submission_decisions,
+            ),
             withdrawal_notify: Arc::new(Notify::new()),
             repair_notify: Arc::new(Notify::new()),
             last_submitted_zone_block: 10,
@@ -1052,6 +1111,7 @@ mod tests {
 
         let err = match ZoneMonitor::new_with_provider(
             config,
+            validation_decisions(false),
             mock_provider(zone.clone()),
             mock_provider(l1.clone()),
             SharedWithdrawalStore::new(),
@@ -1224,6 +1284,44 @@ mod tests {
             monitor.prev_processed_deposit_hash,
             batch_data.next_processed_deposit_hash
         );
+        assert!(l1.read_q().is_empty());
+        assert!(zone.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_validation_withholds_legacy_batch_submission() {
+        let l1 = Asserter::new();
+        let zone = Asserter::new();
+        let portal_hash = B256::repeat_byte(0xbb);
+        l1.push_success(&abi_encode_b256(portal_hash));
+
+        let mut monitor =
+            test_monitor_with_decisions(l1.clone(), zone.clone(), validation_decisions(true));
+        let batch_data = BatchData {
+            tempo_block_number: 123,
+            prev_block_hash: portal_hash,
+            next_block_hash: B256::repeat_byte(0x55),
+            prev_processed_deposit_hash: B256::repeat_byte(0x77),
+            next_processed_deposit_hash: B256::repeat_byte(0x66),
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+        };
+
+        let control = monitor
+            .submit_batch_with_retry(&batch_data, 20, Vec::new())
+            .await
+            .unwrap();
+        let SettlementControl::Halt(error) = control else {
+            panic!("expected settlement halt, got {control:?}");
+        };
+
+        assert!(
+            error.to_string().contains("batch submission withheld"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
+        assert_eq!(monitor.last_submitted_zone_block, 10);
         assert!(l1.read_q().is_empty());
         assert!(zone.read_q().is_empty());
     }

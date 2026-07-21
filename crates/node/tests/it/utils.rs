@@ -12,11 +12,21 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey as Ed25519Private
 use eyre::WrapErr;
 use k256::SecretKey;
 use p256::ecdsa::SigningKey as P256SigningKey;
+use reth_db::{
+    DatabaseEnv,
+    test_utils::{TempDatabase, create_test_rw_db_with_datadir, tempdir_path},
+};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
-use reth_node_core::{args::RpcServerArgs, exit::NodeExitFuture};
+use reth_node_core::{
+    args::{DatadirArgs, MetricArgs, RpcServerArgs},
+    dirs::{DataDirPath, MaybePlatformPath},
+    exit::NodeExitFuture,
+};
 use reth_primitives_traits::SealedHeader;
-use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
+use reth_provider::{
+    BlockNumReader, ChainSpecProvider, HeaderProvider, providers::RocksDBProvider,
+};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
@@ -24,6 +34,7 @@ use std::{
     future::Future,
     net::{SocketAddr, TcpListener},
     ops::Deref,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
@@ -39,7 +50,12 @@ use tempo_contracts::precompiles::{
         IAccountKeychainInstance, KeyRestrictions, SignatureType as KeyInfoSignatureType,
     },
 };
-use tempo_precompiles::{PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
+use tempo_precompiles::{
+    PATH_USD_ADDRESS,
+    storage::{PrecompileStorageProvider, StorageCtx, hashmap::HashMapStorageProvider},
+    tip20::{ISSUER_ROLE, TIP20Token},
+    tip403_registry::ALLOW_ALL_POLICY_ID,
+};
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::{ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -48,8 +64,9 @@ use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1BlockTracker, L1Deposit,
     L1PortalEvents, L1StateCache,
 };
-use zone_node::ZoneNode;
+use zone_node::{ZoneNode, ZoneSequencerAddOnsConfig, register_withdrawal_checker_tables};
 use zone_p2p::{P2pConfig, Role};
+use zone_sequencer::BatchAnchorConfig;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -64,6 +81,10 @@ static NEXT_CHAIN_ID: AtomicU64 = AtomicU64::new(71_000);
 
 fn next_unique_chain_id() -> u64 {
     NEXT_CHAIN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn unused_socket_addr() -> eyre::Result<SocketAddr> {
+    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
 }
 
 fn l1_dev_signer() -> alloy_signer_local::PrivateKeySigner {
@@ -375,6 +396,158 @@ type RpcApiFuture =
     Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>;
 type RpcApiFactory = dyn Fn(zone_node::rpc::PrivateRpcConfig) -> RpcApiFuture + Send + Sync;
 
+struct ZoneLaunchOptions {
+    p2p: Option<P2pConfig>,
+    spawn_test_engine: bool,
+    sequencer: Option<ZoneSequencerAddOnsConfig>,
+    datadir: Option<PathBuf>,
+    metrics_addr: Option<SocketAddr>,
+    owned_runtime: bool,
+}
+
+impl Default for ZoneLaunchOptions {
+    fn default() -> Self {
+        Self {
+            p2p: None,
+            spawn_test_engine: true,
+            sequencer: None,
+            datadir: None,
+            metrics_addr: None,
+            owned_runtime: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ZoneTestStorage {
+    datadir: PathBuf,
+    rocksdb: RocksDBProvider,
+    database: Arc<TempDatabase<DatabaseEnv>>,
+}
+
+#[derive(Debug, Default)]
+struct IsolatedRuntime(Option<tokio::runtime::Runtime>);
+
+impl IsolatedRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self(Some(runtime))
+    }
+
+    async fn shutdown(&mut self) -> eyre::Result<()> {
+        if let Some(runtime) = self.0.take() {
+            tokio::task::spawn_blocking(move || {
+                runtime.shutdown_timeout(Duration::from_secs(10));
+            })
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IsolatedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            let _ = std::thread::spawn(move || {
+                runtime.shutdown_timeout(Duration::from_secs(10));
+            })
+            .join();
+        }
+    }
+}
+
+/// Repeatable production-style launch configuration for withdrawal-checker E2E tests.
+#[derive(Clone)]
+pub(crate) struct WithdrawalCheckerTestConfig {
+    l1_ws_url: String,
+    portal_address: Address,
+    genesis_tempo_block_number: u64,
+    chain_id: u64,
+    genesis: Genesis,
+    sequencer_signer: PrivateKeySigner,
+    zone_id: u32,
+}
+
+impl WithdrawalCheckerTestConfig {
+    pub(crate) async fn from_l1(l1: &L1TestNode, portal_address: Address) -> eyre::Result<Self> {
+        let (mut genesis, genesis_tempo_block_number) =
+            build_l1_anchored_genesis(l1.http_url(), portal_address).await?;
+        let zone_id = tempo_zone_contracts::ZonePortal::new(portal_address, l1.provider())
+            .zoneId()
+            .call()
+            .await?;
+        let chain_id = zone_primitives::constants::zone_chain_id(zone_id);
+        genesis.config.chain_id = chain_id;
+        Ok(Self {
+            l1_ws_url: l1.ws_url().to_string(),
+            portal_address,
+            genesis_tempo_block_number,
+            chain_id,
+            genesis,
+            sequencer_signer: l1.dev_signer(),
+            zone_id,
+        })
+    }
+
+    pub(crate) fn grant_issuer_role(&mut self, issuer: Address) -> eyre::Result<()> {
+        let account = self
+            .genesis
+            .alloc
+            .get_mut(&PATH_USD_ADDRESS)
+            .ok_or_else(|| eyre::eyre!("pathUSD is missing from zone genesis"))?;
+        let storage = account.storage.get_or_insert_with(Default::default);
+        let mut provider = HashMapStorageProvider::new(self.chain_id);
+        for (slot, value) in storage.iter() {
+            provider.sstore(
+                PATH_USD_ADDRESS,
+                U256::from_be_slice(slot.as_slice()),
+                U256::from_be_slice(value.as_slice()),
+            )?;
+        }
+        StorageCtx::enter(&mut provider, || {
+            TIP20Token::from_address(PATH_USD_ADDRESS)?.grant_role_internal(issuer, *ISSUER_ROLE)
+        })?;
+        for (address, slot, value) in provider.into_storage() {
+            if address == PATH_USD_ADDRESS {
+                storage.insert(
+                    B256::from(slot.to_be_bytes::<32>()),
+                    B256::from(value.to_be_bytes::<32>()),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn launch(&self, datadir: Option<PathBuf>) -> eyre::Result<ZoneTestNode> {
+        let metrics_addr = unused_socket_addr()?;
+        ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
+            self.l1_ws_url.clone(),
+            self.portal_address,
+            Some(self.genesis_tempo_block_number),
+            self.chain_id,
+            Some(self.genesis.clone()),
+            self.sequencer_signer.clone(),
+            1,
+            Some(vec![]),
+            ZoneLaunchOptions {
+                spawn_test_engine: false,
+                sequencer: Some(ZoneSequencerAddOnsConfig {
+                    sequencer_signer: self.sequencer_signer.clone(),
+                    zone_id: self.zone_id,
+                    zone_poll_interval: Duration::from_millis(100),
+                    batch_interval_blocks: 1,
+                    batch_anchor_config: BatchAnchorConfig::default(),
+                    withdrawal_poll_interval: Duration::from_millis(100),
+                }),
+                datadir,
+                metrics_addr: Some(metrics_addr),
+                owned_runtime: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}
+
 pub(crate) struct ZoneTestNode {
     http_url: url::Url,
     deposit_queue: DepositQueue,
@@ -382,8 +555,11 @@ pub(crate) struct ZoneTestNode {
     l1_block_tracker: L1BlockTracker,
     policy_cache: zone_l1::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
+    isolated_runtime: IsolatedRuntime,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
+    storage: Option<ZoneTestStorage>,
+    metrics_url: Option<url::Url>,
 }
 
 impl ZoneTestNode {
@@ -435,6 +611,97 @@ impl ZoneTestNode {
 
     pub(crate) async fn wait_for_node_exit(&mut self) -> eyre::Result<()> {
         self.node_handle.node_exit_future_mut().await
+    }
+
+    pub(crate) async fn metric_counter(&self, name: &str, reason: &str) -> eyre::Result<f64> {
+        let metrics_url = self
+            .metrics_url
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("metrics are not enabled for this test node"))?;
+        let body = reqwest::get(metrics_url.clone()).await?.text().await?;
+        let metric = format!("reth_{name}");
+        let label = format!("reason=\"{reason}\"");
+        Ok(body
+            .lines()
+            .find(|line| line.starts_with(&metric) && line.contains(&label))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default())
+    }
+
+    async fn stop_tasks_for_reopen(&mut self) -> eyre::Result<()> {
+        let shutdown = self._tasks.initiate_graceful_shutdown()?;
+        let guard = tokio::time::timeout(Duration::from_secs(30), shutdown)
+            .await
+            .map_err(|_| eyre::eyre!("timed out initiating zone shutdown"))?;
+        drop(guard);
+        eyre::ensure!(
+            self._tasks
+                .graceful_shutdown_with_timeout(Duration::from_secs(30)),
+            "timed out stopping zone background tasks"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.node_handle.node_exit_future_mut(),
+        )
+        .await
+        .map_err(|_| eyre::eyre!("timed out stopping the zone node"))??;
+        Ok(())
+    }
+
+    pub(crate) async fn stop(mut self) -> eyre::Result<()> {
+        self.isolated_runtime.shutdown().await?;
+        drop(self);
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+
+    /// Stop the node, close its databases, and preserve the datadir for a fresh reopen.
+    pub(crate) async fn shutdown(mut self) -> eyre::Result<PathBuf> {
+        self.stop_tasks_for_reopen().await?;
+        let storage = self.storage.take().expect("zone storage must be present");
+        self.isolated_runtime.shutdown().await?;
+        drop(self);
+
+        let ZoneTestStorage {
+            datadir,
+            rocksdb,
+            mut database,
+        } = storage;
+        drop(rocksdb);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let database = loop {
+            match Arc::try_unwrap(database) {
+                Ok(database) => break database,
+                Err(still_shared) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    database = still_shared;
+                }
+                Err(_) => eyre::bail!("zone database still has live handles"),
+            }
+        };
+        drop(database.into_inner_db());
+
+        // Tokio aborts residual RPC tasks at the runtime boundary, but their RocksDB provider
+        // destructors can run just after shutdown returns. Do not report the datadir reusable
+        // until a fresh provider can acquire the lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match RocksDBProvider::builder(datadir.join("rocksdb"))
+                .with_default_tables()
+                .build()
+            {
+                Ok(rocksdb) => {
+                    drop(rocksdb);
+                    break;
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(datadir)
     }
 
     /// Wait for a TIP-20 token balance to reach at least `min_balance` on this zone.
@@ -653,8 +920,7 @@ impl ZoneTestNode {
             signer,
             8,
             initial_tokens,
-            None,
-            true,
+            ZoneLaunchOptions::default(),
         )
         .await
     }
@@ -678,8 +944,7 @@ impl ZoneTestNode {
             signer,
             withdrawal_batch_interval_blocks,
             Some(vec![]),
-            None,
-            true,
+            ZoneLaunchOptions::default(),
         )
         .await
     }
@@ -754,8 +1019,10 @@ impl ZoneTestNode {
             signer,
             8,
             Some(vec![]),
-            Some(p2p_config),
-            true,
+            ZoneLaunchOptions {
+                p2p: Some(p2p_config),
+                ..Default::default()
+            },
         )
         .await
     }
@@ -797,8 +1064,7 @@ impl ZoneTestNode {
             sequencer_signer,
             8,
             Some(vec![]),
-            None,
-            true,
+            ZoneLaunchOptions::default(),
         )
         .await
     }
@@ -813,10 +1079,9 @@ impl ZoneTestNode {
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
         withdrawal_batch_interval_blocks: u64,
         initial_tokens: Option<Vec<Address>>,
-        p2p_config: Option<P2pConfig>,
-        spawn_engine: bool,
+        options: ZoneLaunchOptions,
     ) -> eyre::Result<Self> {
-        let tasks = Runtime::test();
+        let owned_runtime = options.owned_runtime;
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
         let l1_provider_url = l1_ws_url.clone();
 
@@ -841,16 +1106,38 @@ impl ZoneTestNode {
         if let Some(initial_tokens) = initial_tokens {
             zone_node = zone_node.with_initial_tokens(initial_tokens);
         }
-        let p2p_enabled = p2p_config.is_some();
-        if let Some(p2p_config) = p2p_config {
+        if let Some(config) = options.sequencer.clone() {
+            zone_node = zone_node.with_sequencer(config);
+        }
+        let p2p_enabled = options.p2p.is_some();
+        if let Some(p2p_config) = options.p2p {
             zone_node = zone_node.with_p2p(p2p_config);
         }
+
+        let datadir = options.datadir.unwrap_or_else(tempdir_path);
+        let rocksdb = RocksDBProvider::builder(datadir.join("rocksdb"))
+            .with_default_tables()
+            .build()?;
+        let database = create_test_rw_db_with_datadir(&datadir);
+        let storage = ZoneTestStorage {
+            datadir,
+            rocksdb,
+            database,
+        };
 
         // Don't use .dev() — it spawns a LocalMiner that conflicts with ZoneEngine.
         // The ZoneEngine is the sole block producer; it advances the chain when L1
         // blocks arrive in the deposit queue.
         let node_config = NodeConfig::new(Arc::new(chain_spec))
             .with_unused_ports()
+            .with_datadir_args(DatadirArgs {
+                datadir: MaybePlatformPath::<DataDirPath>::from(storage.datadir.clone()),
+                ..Default::default()
+            })
+            .with_metrics(MetricArgs {
+                prometheus: options.metrics_addr,
+                ..Default::default()
+            })
             .with_rpc(
                 RpcServerArgs::default()
                     .with_unused_ports()
@@ -874,13 +1161,54 @@ impl ZoneTestNode {
             seed_local_policy_cache(&policy_cache);
         }
 
-        let node_handle = NodeBuilder::new(node_config)
-            .testing_node(tasks.clone())
-            .node(zone_node)
-            .launch_with_debug_capabilities()
-            .await?;
+        let withdrawal_checker_tables =
+            register_withdrawal_checker_tables(storage.database.db().clone())?;
+        let (tasks, mut isolated_runtime) = if owned_runtime {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("zone-test")
+                .build()?;
+            let tasks = {
+                let _guard = runtime.enter();
+                Runtime::test()
+            };
+            (tasks, IsolatedRuntime::new(runtime))
+        } else {
+            (Runtime::test(), IsolatedRuntime::default())
+        };
+        let builder = NodeBuilder::new(node_config)
+            .with_database(storage.database.clone())
+            .with_rocksdb_provider(storage.rocksdb.clone())
+            .with_launch_context(tasks.clone());
+        let launch = async move {
+            let node_handle = zone_node
+                .install(builder, withdrawal_checker_tables)?
+                .launch_with_debug_capabilities()
+                .await?;
+            Ok::<_, eyre::Report>(node_handle)
+        };
+        let launched = if owned_runtime {
+            tasks
+                .handle()
+                .spawn(launch)
+                .await
+                .map_err(eyre::Report::from)?
+        } else {
+            launch.await
+        };
+        let node_handle = match launched {
+            Ok(launched) => launched,
+            Err(error) => {
+                if owned_runtime {
+                    drop(tasks);
+                    isolated_runtime.shutdown().await?;
+                }
+                return Err(error);
+            }
+        };
 
-        if spawn_engine {
+        if options.spawn_test_engine {
             let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
                 .connect(&l1_provider_url)
                 .await?
@@ -940,8 +1268,15 @@ impl ZoneTestNode {
             l1_block_tracker,
             policy_cache,
             rpc_api_factory,
+            isolated_runtime,
             node_handle: Box::new(node_handle),
             _tasks: tasks,
+            storage: Some(storage),
+            metrics_url: options.metrics_addr.map(|address| {
+                format!("http://{address}")
+                    .parse()
+                    .expect("valid metrics URL")
+            }),
         })
     }
 }
@@ -1710,6 +2045,37 @@ impl L1TestNode {
         Ok(())
     }
 
+    /// Fault-injection helper: forcibly burn an account's L1 TIP-20 balance.
+    pub(crate) async fn burn_blocked_tip20(
+        &self,
+        token: Address,
+        account: Address,
+        amount: u128,
+    ) -> eyre::Result<u64> {
+        use tempo_contracts::precompiles::{IRolesAuth, ITIP20};
+        use tempo_precompiles::tip20::BURN_BLOCKED_ROLE;
+
+        let provider = self.dev_provider();
+        let receipt = IRolesAuth::new(token, &provider)
+            .grantRole(*BURN_BLOCKED_ROLE, self.dev_address())
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "grantRole BURN_BLOCKED failed on L1");
+
+        let receipt = ITIP20::new(token, &provider)
+            .burnBlocked(account, U256::from(amount))
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "burnBlocked failed on L1");
+        receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("burnBlocked receipt is missing its L1 block number"))
+    }
+
     /// Create a new BLACKLIST policy on L1. Returns the policy ID.
     pub(crate) async fn create_blacklist_policy(&self) -> eyre::Result<u64> {
         use tempo_contracts::precompiles::ITIP403Registry;
@@ -2216,6 +2582,19 @@ impl ZoneAccount {
         }
     }
 
+    /// Fault-injection helper: mint a zone token without a corresponding L1 deposit.
+    pub(crate) async fn mint_zone_token(&self, token: Address, amount: u128) -> eyre::Result<B256> {
+        let receipt = ITIP20::new(token, &self.l2_provider)
+            .mint(self.address, U256::from(amount))
+            .gas(TIP20_TX_GAS)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "fault-injection mint failed on zone");
+        Ok(receipt.transaction_hash)
+    }
+
     /// The account's address.
     pub(crate) fn address(&self) -> Address {
         self.address
@@ -2573,6 +2952,14 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
 ) -> zone_sequencer::ZoneSequencerHandle {
     use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
+    let (submission_decisions, mut decision_requests) =
+        zone_sequencer::batch_submission_decision_channel();
+    tokio::spawn(async move {
+        while let Some(request) = decision_requests.recv().await {
+            request.respond(zone_sequencer::BatchSubmissionDecision::Submit);
+        }
+    });
+
     let config = zone_sequencer::ZoneSequencerConfig {
         portal_address,
         l1_rpc_url: l1.http_url().to_string(),
@@ -2588,7 +2975,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         attestation_store: None,
     };
 
-    zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await
+    zone_sequencer::spawn_zone_sequencer(config, sequencer_signer, submission_decisions).await
 }
 
 /// Start a local zone node with an L1Fixture already seeded for `seed_blocks` blocks.
@@ -2734,8 +3121,10 @@ pub(crate) async fn start_local_p2p_pair(
         signer.clone(),
         8,
         Some(vec![]),
-        Some(configs.remove(0)),
-        true,
+        ZoneLaunchOptions {
+            p2p: Some(configs.remove(0)),
+            ..Default::default()
+        },
     )
     .await?;
     let follower = ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
@@ -2747,8 +3136,11 @@ pub(crate) async fn start_local_p2p_pair(
         signer,
         8,
         Some(vec![]),
-        Some(configs.remove(0)),
-        false,
+        ZoneLaunchOptions {
+            p2p: Some(configs.remove(0)),
+            spawn_test_engine: false,
+            ..Default::default()
+        },
     )
     .await?;
 

@@ -5,7 +5,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, CommandFactory, FromArgMatches};
+use reth_chainspec::EthChainSpec as _;
 use reth_consensus::noop::NoopConsensus;
+use reth_db::init_db;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use zone_chainspec::{ZoneChainSpec, ZoneChainSpecParser};
@@ -15,7 +17,7 @@ use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 
 use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
-    rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
+    register_withdrawal_checker_tables, rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 use zone_sequencer::BatchAnchorConfig;
 
@@ -88,6 +90,20 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
     prepend_log_filter(&mut cli.logs.log_stdout_filter, ZONE_LOG_FILTER_DIRECTIVES);
     prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
 
+    // Reth's public node builder cannot add MDBX tables after it opens and shares the environment.
+    // Register the node-wide withdrawal-checker schema before launching any node role.
+    let withdrawal_checker_tables = if let Some(command) = cli.as_node_command_mut() {
+        let db_path = command
+            .datadir
+            .clone()
+            .resolve_datadir(command.chain.chain())
+            .db();
+        let database = init_db(db_path, command.db.database_args())?;
+        Some(register_withdrawal_checker_tables(database)?)
+    } else {
+        None
+    };
+
     let components = |spec: Arc<ZoneChainSpec>| {
         (
             ZoneEvmConfig::new_without_l1(spec),
@@ -97,6 +113,8 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 
     cli.run_with_components::<ZoneNode>(components, async move |mut builder, args| {
         info!(target: "reth::cli", "Launching Tempo Zone node");
+        let withdrawal_checker_tables = withdrawal_checker_tables
+            .ok_or_else(|| eyre::eyre!("Reth invoked the node launcher without a node command"))?;
 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
 
@@ -135,13 +153,13 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 
         let manifest_mode = p2p_config.is_some();
         if manifest_mode {
-            // Replicate only durable blocks. Persist every block immediately so followers can
-            // acknowledge each block without waiting for Reth's in-memory buffer to fill.
+            // Replicate only durable blocks. Persist immediately so broadcasts, backfill proofs,
+            // and settlement attestations never depend on Reth's in-memory block buffer.
             builder.config_mut().engine.persistence_threshold = 0;
             builder.config_mut().engine.memory_block_buffer_target = 0;
         }
         let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, manifest_role);
-        let sequencer_signer = (should_sequence_blocks || manifest_mode)
+        let sequencer_signer = should_sequence_blocks
             .then(|| {
                 args.sequencer_key
                     .parse::<PrivateKeySigner>()
@@ -173,13 +191,8 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         if should_sequence_blocks {
             let sequencer_signer = sequencer_signer
                 .expect("sequencer signer is parsed whenever sequencing is enabled");
-            let l1_transaction_signer = p2p_config
-                .as_ref()
-                .filter(|config| config.role() == Role::Leader)
-                .map(P2pConfig::block_attestation_signer);
             node = node.with_sequencer(ZoneSequencerAddOnsConfig {
                 sequencer_signer,
-                l1_transaction_signer,
                 zone_id: args.zone_id,
                 zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
                 batch_interval_blocks: args.zone_batch_interval_blocks,
@@ -194,7 +207,10 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             node = node.with_p2p(config);
         }
 
-        let handle = builder.node(node).launch_with_debug_capabilities().await?;
+        let handle = node
+            .install(builder, withdrawal_checker_tables)?
+            .launch_with_debug_capabilities()
+            .await?;
         handle.wait_for_node_exit().await
     })
 }

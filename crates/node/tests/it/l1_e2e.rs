@@ -6,15 +6,20 @@
 
 use crate::utils::{
     EncryptedRouterCallbackArgs, L1TestNode, PlaintextRouterCallbackArgs, STABLECOIN_DEX_ADDRESS,
-    WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
+    WithdrawalArgs, WithdrawalCheckerTestConfig, ZoneAccount, ZoneTestNode, poll_until,
+    spawn_sequencer,
 };
 use alloy::{
     primitives::{Address, B256, U256},
     providers::Provider,
 };
 use std::time::Duration;
+use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
+    ZoneInbox, ZoneOutbox, ZonePortal,
+};
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
@@ -23,6 +28,7 @@ const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ROUTER_SWAP_TICK: i16 = 0;
 const ROUTER_SWAP_AMOUNT: u128 = 100_000_000;
 const ROUTER_DEX_LIQUIDITY: u128 = 300_000_000;
+static UNBACKED_E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct SameZoneSwapFixture {
     l1: L1TestNode,
@@ -194,15 +200,14 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
 /// 3. Start zone node connected to L1 with the portal address.
 /// 4. Deposit pathUSD on the ZonePortal to the dev account.
 /// 5. Verify the zone mints the corresponding pathUSD balance on L2.
-/// 6. Spawn zone sequencer background tasks (batch submitter + withdrawal processor).
-/// 7. Request a withdrawal on L2 (approve + requestWithdrawal on ZoneOutbox).
-/// 8. Wait for the batch to be submitted and the withdrawal to be processed on L1.
+/// 6. Request a withdrawal on L2 (approve + requestWithdrawal on ZoneOutbox).
+/// 7. Wait for the checked batch submission and L1 withdrawal processing.
 ///
 /// NOTE: This test requires the Foundry-compiled ZoneFactory artifact
 /// at `specs/ref-impls/out/ZoneFactory.sol/ZoneFactory.json`.
 /// Run `forge build` in `specs/ref-impls/` first.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_deposit_via_real_l1() -> eyre::Result<()> {
+async fn backed_withdrawal_submits_e2e() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     // Start real Tempo L1 in dev mode (500ms block time)
@@ -211,8 +216,9 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
     // Deploy L1 infrastructure and create a zone
     let portal_address = l1.deploy_zone().await?;
 
-    // Start zone node connected to L1 with the real portal
-    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
+    // Launch the production node assembly, including its real withdrawal checker and submitter.
+    let config = WithdrawalCheckerTestConfig::from_l1(&l1, portal_address).await?;
+    let zone = config.launch(None).await?;
 
     // Wait for the zone to advance past genesis
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
@@ -243,9 +249,6 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
         "minted balance should equal deposit amount (fee=0)"
     );
 
-    // Spawn zone sequencer (batch submitter + withdrawal processor)
-    let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
-
     // Request withdrawal on L2
     let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
     account.withdraw(withdrawal_amount).await?;
@@ -268,6 +271,338 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
         l2_balance_after <= U256::from(deposit_amount - withdrawal_amount),
         "L2 balance should decrease by at least the withdrawal amount (got {l2_balance_after})"
     );
+    zone.stop().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn portal_backing_shortfall_withholds_submission_e2e() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let _guard = UNBACKED_E2E_LOCK.lock().await;
+
+    let l1 = L1TestNode::start().await?;
+    let portal_address = l1.deploy_zone().await?;
+    let config = WithdrawalCheckerTestConfig::from_l1(&l1, portal_address).await?;
+    let zone = config.launch(None).await?;
+    zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
+
+    let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
+    let deposit_amount = 1_000_000;
+    l1.fund_user(account.address(), deposit_amount * 2).await?;
+    account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
+
+    let token = ITIP20::new(PATH_USD_ADDRESS, l1.provider());
+    assert_eq!(
+        token.balanceOf(portal_address).call().await?,
+        U256::from(deposit_amount)
+    );
+    let baseline = zone
+        .metric_counter(
+            "withdrawal_signature_withheld_total",
+            "portal_backing_shortfall",
+        )
+        .await?;
+
+    // Fault injection: make the Portal burnable, then remove one unit of real L1 custody
+    // without changing the canonical L2 deposit ledger.
+    let policy = l1.create_blacklist_policy().await?;
+    l1.change_transfer_policy_id(PATH_USD_ADDRESS, policy)
+        .await?;
+    l1.blacklist_address(policy, portal_address).await?;
+    let burn_block = l1
+        .burn_blocked_tip20(PATH_USD_ADDRESS, portal_address, 1)
+        .await?;
+    assert_eq!(
+        token.balanceOf(portal_address).call().await?,
+        U256::from(deposit_amount - 1)
+    );
+
+    zone.wait_for_l2_tempo_finalized(burn_block, L1_TIMEOUT)
+        .await?;
+    let target = poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(100),
+        "L2 block anchored to the L1 Portal shortfall",
+        || {
+            let provider = zone.provider();
+            async move {
+                let events = ZoneInbox::new(ZONE_INBOX_ADDRESS, &provider)
+                    .TempoAdvanced_filter()
+                    .from_block(0)
+                    .query()
+                    .await?;
+                Ok(events.into_iter().find_map(|(event, log)| {
+                    (event.tempoBlockNumber == burn_block)
+                        .then_some(log.block_hash)
+                        .flatten()
+                }))
+            }
+        },
+    )
+    .await?;
+
+    poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(100),
+        "Portal-backing shortfall withheld metric",
+        || async {
+            let count = zone
+                .metric_counter(
+                    "withdrawal_signature_withheld_total",
+                    "portal_backing_shortfall",
+                )
+                .await?;
+            Ok((count > baseline).then_some(()))
+        },
+    )
+    .await?;
+
+    let tip = ZonePortal::new(portal_address, l1.provider())
+        .blockHash()
+        .call()
+        .await?;
+    let batches = batch_submitted_count(&l1, portal_address).await?;
+    let zone_head = zone.provider().get_block_number().await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        ZonePortal::new(portal_address, l1.provider())
+            .blockHash()
+            .call()
+            .await?,
+        tip,
+        "portal tip advanced after its custody fell below L2 backing"
+    );
+    assert_eq!(
+        batch_submitted_count(&l1, portal_address).await?,
+        batches,
+        "a batch transaction was sent after the Portal-backing shortfall"
+    );
+    assert_target_not_submitted(&l1, portal_address, target).await?;
+    assert!(
+        zone.provider().get_block_number().await? > zone_head,
+        "the zone should continue producing blocks while settlement is withheld"
+    );
+    zone.stop().await?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnbackedWithdrawalTarget {
+    block: u64,
+    block_hash: B256,
+    tx_hash: B256,
+}
+
+struct UnbackedWithdrawalFixture {
+    l1: L1TestNode,
+    zone: ZoneTestNode,
+    config: WithdrawalCheckerTestConfig,
+    portal_address: Address,
+    zone_id: u32,
+    alice: Address,
+    backed_amount: u128,
+    amount: u128,
+    target: UnbackedWithdrawalTarget,
+}
+
+async fn unbacked_withdrawal_fixture() -> eyre::Result<UnbackedWithdrawalFixture> {
+    let l1 = L1TestNode::start().await?;
+    let portal_address = l1.deploy_zone().await?;
+    let alice = l1.user_signer().address();
+    let mut config = WithdrawalCheckerTestConfig::from_l1(&l1, portal_address).await?;
+    config.grant_issuer_role(alice)?;
+    let zone = config.launch(None).await?;
+    zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
+
+    let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
+    let backed_amount = 1_000_000;
+    l1.fund_user(alice, backed_amount * 2).await?;
+    account.deposit(backed_amount, L1_TIMEOUT, &zone).await?;
+
+    let baseline = zone
+        .metric_counter("withdrawal_signature_withheld_total", "unbacked_withdrawal")
+        .await?;
+
+    // Explicit fault injection: this mint is canonical L2 state but has no L1 deposit event.
+    account
+        .mint_zone_token(ZONE_TOKEN_ADDRESS, 10_000_000)
+        .await?;
+    let amount = 5_000_000;
+    account.withdraw(amount).await?;
+
+    let target = poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(100),
+        "canonical unbacked WithdrawalRequested event",
+        || {
+            let provider = zone.provider();
+            async move {
+                let events = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider)
+                    .WithdrawalRequested_filter()
+                    .from_block(0)
+                    .query()
+                    .await?;
+                Ok(events.into_iter().rev().find_map(|(event, log)| {
+                    if event.sender == alice && event.amount == amount {
+                        Some(UnbackedWithdrawalTarget {
+                            block: log.block_number?,
+                            block_hash: log.block_hash?,
+                            tx_hash: log.transaction_hash?,
+                        })
+                    } else {
+                        None
+                    }
+                }))
+            }
+        },
+    )
+    .await?;
+
+    poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(100),
+        "unbacked-withdrawal withheld metric",
+        || async {
+            let count = zone
+                .metric_counter("withdrawal_signature_withheld_total", "unbacked_withdrawal")
+                .await?;
+            Ok((count > baseline).then_some(()))
+        },
+    )
+    .await?;
+
+    let zone_id = ZonePortal::new(portal_address, l1.provider())
+        .zoneId()
+        .call()
+        .await?;
+    Ok(UnbackedWithdrawalFixture {
+        l1,
+        zone,
+        config,
+        portal_address,
+        zone_id,
+        alice,
+        backed_amount,
+        amount,
+        target,
+    })
+}
+
+async fn batch_submitted_count(l1: &L1TestNode, portal_address: Address) -> eyre::Result<usize> {
+    Ok(ZonePortal::new(portal_address, l1.provider())
+        .BatchSubmitted_filter()
+        .from_block(0)
+        .query()
+        .await?
+        .len())
+}
+
+async fn assert_target_not_submitted(
+    l1: &L1TestNode,
+    portal_address: Address,
+    target: B256,
+) -> eyre::Result<()> {
+    let events = ZonePortal::new(portal_address, l1.provider())
+        .BatchSubmitted_filter()
+        .from_block(0)
+        .query()
+        .await?;
+    eyre::ensure!(
+        events
+            .iter()
+            .all(|(event, _)| event.nextBlockHash != target),
+        "unbacked target {target} was submitted to L1"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unbacked_withdrawal_is_withheld_e2e() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let _guard = UNBACKED_E2E_LOCK.lock().await;
+    let fixture = unbacked_withdrawal_fixture().await?;
+    let portal = ZonePortal::new(fixture.portal_address, fixture.l1.provider());
+
+    let tip = portal.blockHash().call().await?;
+    let batches = batch_submitted_count(&fixture.l1, fixture.portal_address).await?;
+    let zone_head = fixture.zone.provider().get_block_number().await?;
+    assert_ne!(
+        tip, fixture.target.block_hash,
+        "unbacked target settled on L1"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        portal.blockHash().call().await?,
+        tip,
+        "portal tip advanced after halt"
+    );
+    assert_eq!(
+        batch_submitted_count(&fixture.l1, fixture.portal_address).await?,
+        batches,
+        "a batch transaction was sent after the unbacked withdrawal"
+    );
+    assert_target_not_submitted(
+        &fixture.l1,
+        fixture.portal_address,
+        fixture.target.block_hash,
+    )
+    .await?;
+    assert!(
+        fixture.zone.provider().get_block_number().await? > zone_head,
+        "the zone should continue producing blocks while settlement is withheld"
+    );
+    fixture.zone.stop().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unbacked_withdrawal_remains_withheld_after_restart() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let _guard = UNBACKED_E2E_LOCK.lock().await;
+    let fixture = unbacked_withdrawal_fixture().await?;
+    let tip_before = ZonePortal::new(fixture.portal_address, fixture.l1.provider())
+        .blockHash()
+        .call()
+        .await?;
+    let datadir = fixture.zone.shutdown().await?;
+
+    let error = match fixture.config.launch(Some(datadir)).await {
+        Ok(_) => eyre::bail!("restarted checker accepted the persisted unbacked withdrawal"),
+        Err(error) => error,
+    };
+    let diagnostic = format!("{error:#}");
+    for expected in [
+        format!("zone={}", fixture.zone_id),
+        format!("block={}", fixture.target.block),
+        format!("tx_hash={}", fixture.target.tx_hash),
+        format!("user={}", fixture.alice),
+        format!("token={ZONE_TOKEN_ADDRESS}"),
+        format!("requested_amount={}", fixture.amount),
+        format!("available_amount={}", fixture.backed_amount),
+    ] {
+        assert!(
+            diagnostic.contains(&expected),
+            "restart diagnostic is missing `{expected}`: {diagnostic}"
+        );
+    }
+    assert_eq!(
+        ZonePortal::new(fixture.portal_address, fixture.l1.provider())
+            .blockHash()
+            .call()
+            .await?,
+        tip_before,
+        "portal tip advanced while restart reconciliation rejected the target"
+    );
+    assert_target_not_submitted(
+        &fixture.l1,
+        fixture.portal_address,
+        fixture.target.block_hash,
+    )
+    .await?;
 
     Ok(())
 }

@@ -56,7 +56,7 @@ pub(crate) struct ZoneMonitorMetrics {
     /// Number of withdrawals included in a batch submission.
     pub withdrawals_per_batch: Histogram,
 
-    /// End-to-end latency of a batch submission attempt in seconds.
+    /// End-to-end latency of a successful batch submission in seconds.
     pub batch_submit_latency_seconds: Histogram,
 
     /// Successful batch submissions.

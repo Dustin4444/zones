@@ -8,19 +8,25 @@ use crate::{
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     settlement_attestation::collect_leader_settlements,
+    withdrawal_checker::{
+        RegisteredWithdrawalCheckerTables, WithdrawalChecker, launch_withdrawal_checker_exex,
+        withdrawal_checker_channel,
+    },
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
 use reth_chainspec::EthChainSpec;
+use reth_db::{database::Database, database_metrics::DatabaseMetrics};
 use reth_eth_wire_types::primitives::BasicNetworkPrimitives;
 use reth_node_api::{
     AddOnsContext, FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes,
     PayloadAttributesBuilder, PayloadTypes,
 };
 use reth_node_builder::{
-    BuilderContext, DebugNode, Node, NodeAdapter,
+    BuilderContext, DebugNode, Node, NodeAdapter, NodeBuilder, NodeBuilderWithComponents,
+    RethFullAdapter, WithLaunchContext,
     components::{
         BasicPayloadServiceBuilder, ComponentsBuilder, ExecutorBuilder, NoopConsensusBuilder,
         NoopNetworkBuilder, PoolBuilder, spawn_maintenance_tasks,
@@ -39,7 +45,11 @@ use reth_transaction_pool::{
     Pool, TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::TempoEvmConfig;
@@ -75,8 +85,8 @@ use zone_payload::{
     ZonePayloadFactory, ZonePayloadTypes,
 };
 use zone_sequencer::{
-    AttestationStore, BatchAnchorConfig, ZoneSequencerConfig, attestation::AttestationDomain,
-    spawn_zone_sequencer,
+    AttestationStore, BatchAnchorConfig, BatchSubmissionDecision, ZoneSequencerConfig,
+    attestation::AttestationDomain, batch_submission_decision_channel, spawn_zone_sequencer,
 };
 
 /// Returns a known Tempo chain spec for an L1 chain ID.
@@ -95,6 +105,33 @@ fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
             .any(|id| id.trim().parse() == Ok(chain_id))
             .then(|| DEV.clone()),
     })
+}
+
+fn validate_portal_sequencer_set(
+    manifest_version: u64,
+    manifest_members: &BTreeSet<Address>,
+    portal_version: u64,
+    portal_quorum: usize,
+    portal_members: &BTreeSet<Address>,
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        portal_quorum > 0,
+        "manifest mode requires a nonzero Portal quorum"
+    );
+    eyre::ensure!(
+        portal_version == manifest_version,
+        "manifest signer-set version {manifest_version} does not match Portal version {portal_version}"
+    );
+    eyre::ensure!(
+        portal_quorum <= portal_members.len(),
+        "Portal quorum {portal_quorum} exceeds its {} configured sequencers",
+        portal_members.len()
+    );
+    eyre::ensure!(
+        portal_members == manifest_members,
+        "manifest signer membership does not match the Portal signer set"
+    );
+    Ok(())
 }
 
 /// Network primitives for Zone Nodes
@@ -152,9 +189,6 @@ impl WithdrawalRevealEncryptor for SequencerWithdrawalRevealEncryptor {
 pub struct ZoneSequencerAddOnsConfig {
     /// Shared zone sequencer signer used for block production and encryption.
     pub sequencer_signer: PrivateKeySigner,
-    /// Individual node signer used for L1 settlement transactions in manifest mode.
-    /// Legacy single-sequencer mode falls back to `sequencer_signer`.
-    pub l1_transaction_signer: Option<PrivateKeySigner>,
     /// Zone ID for chain ID validation.
     pub zone_id: u32,
     /// How often the zone monitor polls for new L2 blocks.
@@ -210,6 +244,8 @@ pub struct ZoneNode {
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     /// Optional static Zone P2P networking config.
     p2p_config: Option<P2pConfig>,
+    /// Node-wide withdrawal check decision actor.
+    withdrawal_checker: WithdrawalChecker,
 }
 
 impl ZoneNode {
@@ -258,6 +294,7 @@ impl ZoneNode {
             private_rpc_config: ZonePrivateRpcConfig::default(),
             sequencer_config: None,
             p2p_config: None,
+            withdrawal_checker: WithdrawalChecker::unavailable(),
         }
     }
 
@@ -269,6 +306,9 @@ impl ZoneNode {
 
     /// Set the sequencer configuration. When set, batch submission and
     /// withdrawal processing tasks are spawned during node launch.
+    ///
+    /// Launch the configured node through [`ZoneNode::install`] so the mandatory
+    /// withdrawal checker is installed with it.
     pub fn with_sequencer(mut self, config: ZoneSequencerAddOnsConfig) -> Self {
         let encryption_key = SecretKey::from(config.sequencer_signer.credential());
         self.withdrawal_reveal_encryptor = Some(Arc::new(SequencerWithdrawalRevealEncryptor::new(
@@ -280,6 +320,9 @@ impl ZoneNode {
     }
 
     /// Enable static Zone P2P networking for this node.
+    ///
+    /// Launch the configured node through [`ZoneNode::install`] so block and
+    /// settlement signing cannot start without the mandatory withdrawal checker.
     pub fn with_p2p(mut self, config: P2pConfig) -> Self {
         self.p2p_config = Some(config);
         self
@@ -312,6 +355,59 @@ impl ZoneNode {
     pub fn with_withdrawal_batch_interval_blocks(mut self, interval_blocks: u64) -> Self {
         self.withdrawal_batch_interval_blocks = interval_blocks.max(1);
         self
+    }
+
+    fn withdrawal_checker_zone_id(&self) -> eyre::Result<u32> {
+        let sequencer_zone = self.sequencer_config.as_ref().map(|config| config.zone_id);
+        let p2p_zone = self.p2p_config.as_ref().map(P2pConfig::zone_id);
+        if let (Some(sequencer_zone), Some(p2p_zone)) = (sequencer_zone, p2p_zone) {
+            eyre::ensure!(
+                sequencer_zone == p2p_zone,
+                "sequencer zone ID {sequencer_zone} does not match P2P zone ID {p2p_zone}"
+            );
+        }
+        let signing_zone = sequencer_zone.or(p2p_zone);
+        if self.private_rpc_config.zone_id != 0
+            && let Some(signing_zone) = signing_zone
+        {
+            eyre::ensure!(
+                signing_zone == self.private_rpc_config.zone_id,
+                "signing zone ID {signing_zone} does not match private RPC zone ID {}",
+                self.private_rpc_config.zone_id
+            );
+        }
+        Ok(signing_zone.unwrap_or(self.private_rpc_config.zone_id))
+    }
+
+    /// Install this node and its mandatory withdrawal checker.
+    pub fn install<DB>(
+        mut self,
+        builder: WithLaunchContext<NodeBuilder<DB, ZoneChainSpec>>,
+        tables: RegisteredWithdrawalCheckerTables,
+    ) -> eyre::Result<InstalledZoneNode<DB>>
+    where
+        DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
+    {
+        let zone = self.withdrawal_checker_zone_id()?;
+        let (withdrawal_checker, requests) = withdrawal_checker_channel();
+        self.withdrawal_checker = withdrawal_checker;
+        let l1_rpc_url = self.l1_config.l1_rpc_url.clone();
+        let portal_address = self.portal_address;
+        let retry_connection_interval = self.l1_config.retry_connection_interval;
+
+        Ok(builder
+            .node(self)
+            .install_exex("withdrawal-checker", move |ctx| {
+                launch_withdrawal_checker_exex(
+                    ctx,
+                    zone,
+                    tables.tables_are_new,
+                    requests,
+                    l1_rpc_url,
+                    portal_address,
+                    retry_connection_interval,
+                )
+            }))
     }
 
     /// Returns the current deposit queue
@@ -375,6 +471,16 @@ impl ZoneNode {
     }
 }
 
+/// Reth builder with the Zone components and mandatory withdrawal checker installed.
+#[doc(hidden)]
+pub type InstalledZoneNode<DB> = WithLaunchContext<
+    NodeBuilderWithComponents<
+        RethFullAdapter<DB, ZoneNode>,
+        <ZoneNode as Node<RethFullAdapter<DB, ZoneNode>>>::ComponentsBuilder,
+        <ZoneNode as Node<RethFullAdapter<DB, ZoneNode>>>::AddOns,
+    >,
+>;
+
 impl NodeTypes for ZoneNode {
     type Primitives = TempoPrimitives;
     type ChainSpec = ZoneChainSpec;
@@ -412,6 +518,8 @@ where
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     /// Static Zone P2P networking configuration.
     p2p_config: Option<P2pConfig>,
+    /// Node-wide withdrawal check decision actor.
+    withdrawal_checker: WithdrawalChecker,
 }
 
 impl<N> std::fmt::Debug for ZoneAddOns<N>
@@ -438,6 +546,7 @@ where
         private_rpc_config: ZonePrivateRpcConfig,
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
         p2p_config: Option<P2pConfig>,
+        withdrawal_checker: WithdrawalChecker,
     ) -> Self {
         Self {
             inner: RpcAddOns::new(
@@ -456,6 +565,7 @@ where
             private_rpc_config,
             sequencer_config,
             p2p_config,
+            withdrawal_checker,
         }
     }
 }
@@ -493,22 +603,65 @@ where
 
         self.resolve_and_seed_tokens(&l1_provider).await?;
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
+        let l1_transaction_signer = self
+            .sequencer_config
+            .as_ref()
+            .map(|sequencer| match self.p2p_config.as_ref() {
+                Some(p2p) => {
+                    eyre::ensure!(
+                        p2p.role() == Role::Leader,
+                        "a manifest follower cannot launch sequencer tasks"
+                    );
+                    Ok(p2p.block_attestation_signer())
+                }
+                None => Ok(sequencer.sequencer_signer.clone()),
+            })
+            .transpose()?;
         self.spawn_l1_subscriber(&ctx, p2p_role == Some(Role::Follower));
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
         let task_executor = ctx.node.task_executor().clone();
-
-        // Only the leader sequencer will get an attestation_store. Followers don't need to track
-        // attestations, they only sign them as the leader builds blocks.
-        let attestation_store = self
-            .p2p_config
-            .as_ref()
-            .filter(|config| config.role() == Role::Leader)
-            .map(|_| AttestationStore::default());
-
-        // Set up multiple sequencers (if theres a p2p config)
+        let attestation_store = self.p2p_config.as_ref().map(|config| {
+            AttestationStore::new(config.block_attestation_addresses().into_values())
+        });
         if let Some(config) = self.p2p_config.take() {
+            // Sequencer-set rotation requires a coordinated restart of every node with the same
+            // updated manifest. Each rotation must increment the Portal's sequencerSetVersion,
+            // which is included in signed block ACKs and settlement attestations. Fail startup
+            // unless the manifest version and signer membership exactly match the Portal so
+            // stale or mixed manifests cannot participate in replication or leader recovery.
             let l1_chain_id = l1_provider.get_chain_id().await?;
+            let portal = ZonePortal::new(self.portal_address, l1_provider.clone());
+            let portal_version_call = portal.sequencerSetVersion();
+            let quorum_call = portal.sequencerQuorum();
+            let portal_member_count_call = portal.sequencerCount();
+            let (portal_version, quorum, portal_member_count) = tokio::try_join!(
+                portal_version_call.call(),
+                quorum_call.call(),
+                portal_member_count_call.call(),
+            )?;
+            let portal_member_count = usize::try_from(portal_member_count)
+                .map_err(|_| eyre::eyre!("Portal sequencer count does not fit in usize"))?;
+            let manifest_members = config
+                .block_attestation_addresses()
+                .into_values()
+                .collect::<BTreeSet<_>>();
+            eyre::ensure!(
+                portal_member_count == manifest_members.len(),
+                "manifest has {} signers, but the Portal has {portal_member_count}",
+                manifest_members.len()
+            );
+            let mut portal_members = BTreeSet::new();
+            for index in 0..portal_member_count {
+                portal_members.insert(portal.sequencerAt(U256::from(index)).call().await?);
+            }
+            validate_portal_sequencer_set(
+                config.sequencer_set_version(),
+                &manifest_members,
+                portal_version,
+                quorum as usize,
+                &portal_members,
+            )?;
             let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
 
             let attestation_domain = AttestationDomain {
@@ -522,14 +675,16 @@ where
                 .as_ref()
                 .map(|config| config.batch_anchor_config)
                 .unwrap_or_default();
-
             Self::launch_p2p(
                 config,
                 network_id,
                 attestation_domain,
-                attestation_store.clone(),
+                attestation_store
+                    .clone()
+                    .expect("P2P configuration creates an attestation store"),
                 l1_provider.clone(),
                 anchor_config,
+                self.withdrawal_checker.clone(),
                 &task_executor,
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
@@ -558,18 +713,19 @@ where
         .await?;
 
         if let Some(config) = self.sequencer_config.take() {
-            let sequencer_addr = config.sequencer_signer.address();
-
+            let l1_transaction_signer = l1_transaction_signer
+                .expect("sequencer configuration always resolves an L1 transaction signer");
             Self::launch_sequencer_tasks(
                 config,
+                l1_transaction_signer,
                 &handle,
                 &task_executor,
                 self.l1_config.l1_rpc_url,
                 self.l1_config.portal_address,
                 self.l1_config.retry_connection_interval,
-                sequencer_addr,
                 chain_id,
                 attestation_store,
+                self.withdrawal_checker,
             )
             .await?;
         }
@@ -590,9 +746,10 @@ where
         config: P2pConfig,
         network_id: P2pNetworkId,
         attestation_domain: AttestationDomain,
-        attestation_store: Option<AttestationStore>,
+        attestation_store: AttestationStore,
         l1_provider: alloy_provider::DynProvider<TempoNetwork>,
         anchor_config: BatchAnchorConfig,
+        withdrawal_checker: WithdrawalChecker,
         task_executor: &reth_tasks::TaskExecutor,
         provider: N::Provider,
         engine: reth_node_builder::ConsensusEngineHandle<ZonePayloadTypes>,
@@ -600,13 +757,15 @@ where
         policy_cache: PolicyCache,
     ) -> eyre::Result<()> {
         let role = config.role();
+        let addresses = config.block_attestation_addresses();
         let attestation = AttestationContext::new(
             attestation_domain,
             config.block_attestation_signer(),
-            config.block_attestation_addresses(),
+            addresses,
             attestation_store,
             l1_provider,
             anchor_config,
+            withdrawal_checker,
         );
 
         let handle = spawn_p2p(config, network_id)?;
@@ -620,15 +779,22 @@ where
 
         if role == Role::Leader {
             // Only a leader can build + broadcast blocks
-            task_executor.spawn_critical_task(
-                "zone-p2p-block-broadcast",
-                broadcast_persisted_blocks(provider.clone(), commands.clone()),
-            );
-            // Only a leader sends out settlement requests before submitting batches
-            task_executor.spawn_critical_task(
-                "zone-p2p-settlement-collection",
-                collect_leader_settlements(provider.clone(), commands.clone(), attestation.clone()),
-            );
+            let broadcast_provider = provider.clone();
+            let broadcast_commands = commands.clone();
+            task_executor.spawn_critical_task("zone-p2p-block-broadcast", async move {
+                broadcast_persisted_blocks(broadcast_provider, broadcast_commands).await;
+            });
+            let settlement_provider = provider.clone();
+            let settlement_commands = commands.clone();
+            let settlement_attestation = attestation.clone();
+            task_executor.spawn_critical_task("zone-p2p-settlement-collection", async move {
+                collect_leader_settlements(
+                    settlement_provider,
+                    settlement_commands,
+                    settlement_attestation,
+                )
+                .await;
+            });
         }
 
         // Send/Recieve blocks from live leaders + backfill
@@ -863,14 +1029,15 @@ where
     /// and engine shutdown hook.
     async fn launch_sequencer_tasks(
         config: ZoneSequencerAddOnsConfig,
+        l1_transaction_signer: PrivateKeySigner,
         handle: &<Self as NodeAddOns<N>>::Handle,
         task_executor: &reth_tasks::TaskExecutor,
         l1_rpc_url: String,
         portal_address: Address,
         retry_connection_interval: Duration,
-        sequencer_addr: Address,
         chain_id: u64,
         attestation_store: Option<zone_sequencer::AttestationStore>,
+        withdrawal_checker: WithdrawalChecker,
     ) -> eyre::Result<()> {
         if config.zone_id != 0 {
             let expected = zone_primitives::constants::zone_chain_id(config.zone_id);
@@ -890,7 +1057,28 @@ where
             .http_url()
             .expect("HTTP RPC server must be enabled for sequencer mode");
 
-        info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
+        let (submission_decisions, mut decision_requests) = batch_submission_decision_channel();
+        task_executor.spawn_critical_task("withdrawal-checker-batch-validation", async move {
+            while let Some(request) = decision_requests.recv().await {
+                let decision = withdrawal_checker.decide(request.block()).await;
+                let decision = match decision {
+                    crate::withdrawal_checker::WithdrawalCheckDecision::Submit => {
+                        BatchSubmissionDecision::Submit
+                    }
+                    crate::withdrawal_checker::WithdrawalCheckDecision::Retry(error) => {
+                        error.emit_withheld();
+                        BatchSubmissionDecision::Retry(eyre::Report::new(error))
+                    }
+                    crate::withdrawal_checker::WithdrawalCheckDecision::Halt(error) => {
+                        error.emit_withheld();
+                        BatchSubmissionDecision::Halt(eyre::Report::new(error))
+                    }
+                };
+                request.respond(decision);
+            }
+        });
+
+        info!(target: "reth::cli", signer = %l1_transaction_signer.address(), "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
             l1_rpc_url,
@@ -905,10 +1093,12 @@ where
             batch_anchor_config: config.batch_anchor_config,
             attestation_store,
         };
-        let l1_transaction_signer = config
-            .l1_transaction_signer
-            .unwrap_or(config.sequencer_signer);
-        let seq_handle = spawn_zone_sequencer(sequencer_config, l1_transaction_signer).await;
+        let seq_handle = spawn_zone_sequencer(
+            sequencer_config,
+            l1_transaction_signer,
+            submission_decisions,
+        )
+        .await;
         info!(target: "reth::cli", "Sequencer tasks spawned");
 
         // Critical task — node shuts down if either exits.
@@ -1008,6 +1198,7 @@ where
             self.private_rpc_config.clone(),
             self.sequencer_config.clone(),
             self.p2p_config.clone(),
+            self.withdrawal_checker.clone(),
         )
     }
 }
@@ -1260,6 +1451,25 @@ mod tests {
         assert_eq!(tempo_chain_spec_for_l1(31319).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
         unsafe { std::env::remove_var("ZONE_L1_DEV_CHAIN_IDS") };
+    }
+
+    #[test]
+    fn portal_sequencer_set_must_match_the_manifest() {
+        let members = BTreeSet::from([
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+        ]);
+        assert!(validate_portal_sequencer_set(2, &members, 2, 2, &members).is_ok());
+
+        let wrong_members = BTreeSet::from([
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(4),
+        ]);
+        assert!(validate_portal_sequencer_set(2, &members, 2, 2, &wrong_members).is_err());
+        assert!(validate_portal_sequencer_set(2, &members, 3, 2, &members).is_err());
+        assert!(validate_portal_sequencer_set(2, &members, 2, 4, &members).is_err());
     }
 
     #[test]

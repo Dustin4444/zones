@@ -33,12 +33,15 @@ zone-sequencer.workspace = true
 # reth
 reth-chain-state.workspace = true
 reth-chainspec.workspace = true
+reth-codecs.workspace = true
 reth-consensus = { workspace = true, optional = true }
+reth-db.workspace = true
 reth-eth-wire-types.workspace = true
 reth-ethereum = { workspace = true, features = [
   "node",
   "cli",
 ], optional = true }
+reth-exex.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-payload-builder.workspace = true
@@ -69,14 +72,19 @@ alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 
 # misc
+bytes.workspace = true
 clap = { workspace = true, optional = true }
 eyre.workspace = true
 futures.workspace = true
 k256.workspace = true
+metrics.workspace = true
+modular-bitfield.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-url = "2"
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 alloy = { workspace = true, features = [
@@ -98,11 +106,11 @@ commonware-cryptography.workspace = true
 p256.workspace = true
 rand.workspace = true
 reth-ethereum = { workspace = true, features = ["node", "test-utils"] }
+reth-db = { workspace = true, features = ["test-utils"] }
 reth-node-core.workspace = true
 reth-tracing.workspace = true
 reqwest.workspace = true
 revm.workspace = true
-serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempo-payload-types.workspace = true
 tempo-precompiles = { workspace = true, features = ["test-utils"] }
@@ -110,6 +118,7 @@ tempo-revm.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-tungstenite.workspace = true
+url = "2"
 
 [features]
 default = []
@@ -118,6 +127,7 @@ cli = [
   "dep:reth-consensus",
   "dep:reth-ethereum",
   "dep:reth-tracing",
+  "dep:url",
   "zone-chainspec/cli",
 ]
 jemalloc = ["reth-ethereum?/jemalloc"]

@@ -14,7 +14,11 @@ use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_provider::HeaderProvider;
 use reth_storage_api::{BlockNumReader, BlockReader, ReceiptProvider, StateProviderFactory};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
@@ -29,32 +33,44 @@ use zone_payload::{
 };
 use zone_sequencer::BatchAnchorConfig;
 
-use crate::settlement_attestation::build_settlement_attestation;
+use crate::{
+    settlement_attestation::build_settlement_attestation,
+    withdrawal_checker::{WithdrawalCheckDecision, WithdrawalChecker},
+};
 use alloy_signer_local::PrivateKeySigner;
 use zone_sequencer::attestation::{
     AttestationDomain, AttestationStore, BlockAck, SettlementAttestation, SignedBlockAck,
-    SignedSettlementAttestation,
+    SignedSettlementAttestation, SignedSigningRefusal, SigningRefusal,
 };
 
+type ValidatedL1Anchor = (u64, B256, u64, B256);
+
 #[derive(Clone)]
-/// Shared context for both per-block ACKs and batch-boundary settlement attestations.
+/// Shared context for signed backfill proofs and batch-boundary settlement attestations.
 pub(crate) struct AttestationContext {
     pub(crate) domain: AttestationDomain,
     pub(crate) signer: PrivateKeySigner,
     pub(crate) addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-    pub(crate) store: Option<AttestationStore>,
+    pub(crate) store: AttestationStore,
     pub(crate) l1_provider: DynProvider<TempoNetwork>,
     pub(crate) anchor_config: BatchAnchorConfig,
+    pub(crate) withdrawal_checker: WithdrawalChecker,
+    validated_l1_headers: Arc<Mutex<BTreeMap<u64, (B256, B256)>>>,
+    validated_l1_anchors: Arc<Mutex<BTreeSet<ValidatedL1Anchor>>>,
 }
+
+const MAX_VALIDATED_L1_HEADERS: usize = 16_384;
+const MAX_VALIDATED_L1_ANCHORS: usize = 120;
 
 impl AttestationContext {
     pub(crate) fn new(
         domain: AttestationDomain,
         signer: PrivateKeySigner,
         addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-        store: Option<AttestationStore>,
+        store: AttestationStore,
         l1_provider: DynProvider<TempoNetwork>,
         anchor_config: BatchAnchorConfig,
+        withdrawal_checker: WithdrawalChecker,
     ) -> Self {
         Self {
             domain,
@@ -63,6 +79,72 @@ impl AttestationContext {
             store,
             l1_provider,
             anchor_config,
+            withdrawal_checker,
+            validated_l1_headers: Arc::default(),
+            validated_l1_anchors: Arc::default(),
+        }
+    }
+
+    pub(crate) fn cached_l1_headers(&self, start: u64, end: u64) -> BTreeMap<u64, (B256, B256)> {
+        self.validated_l1_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .range(start..=end)
+            .map(|(&number, &header)| (number, header))
+            .collect()
+    }
+
+    pub(crate) fn cache_validated_l1_headers(
+        &self,
+        headers: impl IntoIterator<Item = (u64, B256, B256)>,
+    ) -> eyre::Result<()> {
+        let mut cache = self
+            .validated_l1_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (number, parent_hash, hash) in headers {
+            if let Some(existing) = cache.get(&number) {
+                eyre::ensure!(
+                    *existing == (parent_hash, hash),
+                    "L1 header {number} conflicts with the validated ancestry cache"
+                );
+            } else {
+                cache.insert(number, (parent_hash, hash));
+            }
+        }
+        while cache.len() > MAX_VALIDATED_L1_HEADERS {
+            cache.pop_first();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn l1_anchor_is_validated(
+        &self,
+        tempo_number: u64,
+        tempo_hash: B256,
+        anchor_number: u64,
+        anchor_hash: B256,
+    ) -> bool {
+        self.validated_l1_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(tempo_number, tempo_hash, anchor_number, anchor_hash))
+    }
+
+    pub(crate) fn cache_validated_l1_anchor(
+        &self,
+        tempo_number: u64,
+        tempo_hash: B256,
+        anchor_number: u64,
+        anchor_hash: B256,
+    ) {
+        let mut anchors = self
+            .validated_l1_anchors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        anchors.insert((tempo_number, tempo_hash, anchor_number, anchor_hash));
+        while anchors.len() > MAX_VALIDATED_L1_ANCHORS {
+            anchors.pop_first();
         }
     }
 }
@@ -210,8 +292,10 @@ where
 const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const BLOCK_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PENDING_BLOCKS: usize = 128;
+const MAX_PENDING_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 const BACKFILL_PAGE_SIZE: u64 = 64;
 const BACKFILL_SERVE_QUEUE_CAPACITY: usize = 8;
+const SETTLEMENT_SIGNING_QUEUE_CAPACITY: usize = 8;
 
 struct BackfillRequest {
     peer: zone_p2p::P2pPeerId,
@@ -225,6 +309,76 @@ impl Drop for BackfillServerTask {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+struct SigningWorkerTask(tokio::task::JoinHandle<()>);
+
+impl Drop for SigningWorkerTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct SettlementSigningRequest {
+    leader: zone_p2p::P2pPeerId,
+    proposal: Vec<u8>,
+}
+
+fn verify_member_ack(
+    peer: &zone_p2p::P2pPeerId,
+    encoded_ack: &[u8],
+    expected: BlockAck,
+    domain: AttestationDomain,
+    addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+) -> eyre::Result<()> {
+    let signed = SignedBlockAck::decode(encoded_ack)?;
+    eyre::ensure!(
+        signed.ack == expected,
+        "signed ACK does not match its target"
+    );
+    let signer = signed.recover_signer(domain)?;
+    let expected_signer = addresses
+        .get(peer)
+        .ok_or_else(|| eyre::eyre!("signed response came from an unknown peer"))?;
+    eyre::ensure!(
+        signer == *expected_signer,
+        "ACK signer {signer} does not match authenticated peer {expected_signer}"
+    );
+    Ok(())
+}
+
+fn verify_backfill_block(
+    peer: &zone_p2p::P2pPeerId,
+    encoded: &[u8],
+    encoded_ack: &[u8],
+    domain: AttestationDomain,
+    addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+) -> eyre::Result<(u64, B256)> {
+    let (number, hash) = encoded_block_identity(encoded)?;
+    verify_member_ack(
+        peer,
+        encoded_ack,
+        BlockAck::new(domain, number, hash),
+        domain,
+        addresses,
+    )?;
+    Ok((number, hash))
+}
+
+fn verify_backfill_tip(
+    peer: &zone_p2p::P2pPeerId,
+    target: alloy_eips::BlockNumHash,
+    encoded_ack: &[u8],
+    domain: AttestationDomain,
+    addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
+) -> eyre::Result<()> {
+    verify_member_ack(
+        peer,
+        encoded_ack,
+        BlockAck::new(domain, target.number, target.hash),
+        domain,
+        addresses,
+    )
 }
 
 /// Keep track of the backfill exactly. We'll buffer any live blocks received
@@ -280,31 +434,32 @@ impl BackfillProgress {
 
 fn buffer_pending_block(
     pending: &mut BTreeMap<u64, Vec<u8>>,
+    pending_bytes: &mut usize,
     number: u64,
     block: Vec<u8>,
 ) -> Option<u64> {
     if pending.contains_key(&number) {
         return None;
     }
-    if pending.len() < MAX_PENDING_BLOCKS {
-        pending.insert(number, block);
-        return None;
-    }
+    *pending_bytes = pending_bytes.saturating_add(block.len());
+    pending.insert(number, block);
 
-    let Some((&farthest, _)) = pending.last_key_value() else {
-        pending.insert(number, block);
-        return None;
-    };
-    if number < farthest {
-        pending.pop_last();
-        pending.insert(number, block);
-        Some(farthest)
-    } else {
-        Some(number)
+    let mut dropped = None;
+    while pending.len() > MAX_PENDING_BLOCKS || *pending_bytes > MAX_PENDING_BLOCK_BYTES {
+        let Some((dropped_number, dropped_block)) = pending.pop_last() else {
+            break;
+        };
+        *pending_bytes = pending_bytes.saturating_sub(dropped_block.len());
+        dropped = Some(dropped_number);
     }
+    dropped
 }
 
 fn encoded_block_number(encoded: &[u8]) -> eyre::Result<u64> {
+    encoded_block_identity(encoded).map(|(number, _)| number)
+}
+
+fn encoded_block_identity(encoded: &[u8]) -> eyre::Result<(u64, B256)> {
     let mut input = encoded;
     let block = Block::decode(&mut input)
         .map_err(|err| eyre::eyre!("invalid RLP-encoded zone block: {err}"))?;
@@ -313,49 +468,127 @@ fn encoded_block_number(encoded: &[u8]) -> eyre::Result<u64> {
         "encoded zone block has {} trailing bytes",
         input.len()
     );
-    Ok(block.header.number())
+    let block = SealedBlock::seal_slow(block);
+    Ok((block.number(), block.hash()))
 }
 
-fn serve_backfill_page<P>(
+async fn serve_backfill_page<P>(
     provider: &P,
     commands: &mpsc::Sender<P2pCommand>,
+    attestation: &AttestationContext,
     peer: zone_p2p::P2pPeerId,
     request_id: u64,
     start: u64,
+    signing_halted: &AtomicBool,
 ) -> eyre::Result<()>
 where
-    P: BlockNumReader + BlockReader<Block = Block>,
+    P: BlockNumReader
+        + BlockReader<Block = Block>
+        + HeaderProvider<Header = TempoHeader>
+        + ReceiptProvider,
 {
+    eyre::ensure!(
+        start != 0,
+        "cannot serve genesis as a signed backfill block"
+    );
     let tip = provider.best_block_number()?;
     let end = tip.min(start.saturating_add(BACKFILL_PAGE_SIZE.saturating_sub(1)));
+    let mut signed_tip = None;
     for number in start..=end {
         let block = provider.block_by_number(number)?.ok_or_else(|| {
             eyre::eyre!("canonical block {number} is missing while serving backfill")
         })?;
+        let signed =
+            validated_backfill_ack(provider, number, attestation, signing_halted, commands).await?;
+        let encoded_ack = signed.encode();
+        if number == tip {
+            signed_tip = Some((signed.ack.zoneBlockHash, encoded_ack.clone()));
+        }
         commands
-            .blocking_send(P2pCommand::SendBackfillBlock {
+            .send(P2pCommand::SendBackfillBlock {
                 peer: peer.clone(),
                 request_id,
                 block: alloy_rlp::encode(block),
+                block_ack: encoded_ack,
             })
+            .await
             .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     }
+    let (tip_hash, tip_ack) = match signed_tip {
+        Some(signed) => signed,
+        None => {
+            let signed =
+                validated_backfill_ack(provider, tip, attestation, signing_halted, commands)
+                    .await?;
+            (signed.ack.zoneBlockHash, signed.encode())
+        }
+    };
     commands
-        .blocking_send(P2pCommand::CompleteBackfill {
+        .send(P2pCommand::CompleteBackfill {
             peer,
             request_id,
             tip,
+            tip_hash,
+            tip_ack,
         })
+        .await
         .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     Ok(())
+}
+
+async fn validated_backfill_ack<P>(
+    provider: &P,
+    number: u64,
+    attestation: &AttestationContext,
+    signing_halted: &AtomicBool,
+    commands: &mpsc::Sender<P2pCommand>,
+) -> eyre::Result<SignedBlockAck>
+where
+    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
+{
+    ensure_block_receipts_persisted(provider, number)?;
+    let ack = build_backfill_ack(provider, number, attestation.domain)?;
+    let target = alloy_eips::BlockNumHash {
+        number,
+        hash: ack.zoneBlockHash,
+    };
+    match attestation.withdrawal_checker.decide(target).await {
+        WithdrawalCheckDecision::Submit => {
+            SignedBlockAck::sign(ack, attestation.domain, &attestation.signer)
+        }
+        WithdrawalCheckDecision::Retry(error) => {
+            error.emit_withheld();
+            eyre::bail!("withdrawal checker is not ready at block {number}")
+        }
+        WithdrawalCheckDecision::Halt(error) => {
+            error.emit_withheld();
+            signing_halted.store(true, Ordering::Release);
+            commands
+                .send(signing_refusal(target, attestation)?)
+                .await
+                .map_err(|_| {
+                    eyre::eyre!("P2P command channel closed before signing refusal could be sent")
+                })?;
+            eyre::bail!("withdrawal checker halted at block {number}")
+        }
+    }
 }
 
 async fn serve_backfill_requests<P>(
     provider: P,
     commands: mpsc::Sender<P2pCommand>,
+    attestation: AttestationContext,
     mut requests: mpsc::Receiver<BackfillRequest>,
+    signing_halted: Arc<AtomicBool>,
 ) where
-    P: BlockNumReader + BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+    P: BlockNumReader
+        + BlockReader<Block = Block>
+        + HeaderProvider<Header = TempoHeader>
+        + ReceiptProvider
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     // One worker deliberately serializes page construction and sending, bounding serving
     // concurrency independently of the block import loop.
@@ -365,18 +598,104 @@ async fn serve_backfill_requests<P>(
         start,
     }) = requests.recv().await
     {
-        let page_provider = provider.clone();
-        let page_commands = commands.clone();
-        let page = tokio::task::spawn_blocking(move || {
-            serve_backfill_page(&page_provider, &page_commands, peer, request_id, start)
-        })
+        if signing_halted.load(Ordering::Acquire) {
+            continue;
+        }
+        let result = serve_backfill_page(
+            &provider,
+            &commands,
+            &attestation,
+            peer,
+            request_id,
+            start,
+            &signing_halted,
+        )
         .await;
-        let result = match page {
-            Ok(result) => result,
-            Err(err) => Err(eyre::eyre!("backfill page worker failed: {err}")),
-        };
         if let Err(err) = result {
             tracing::error!(target: "zone::p2p", %err, start, "Failed serving block backfill");
+        }
+    }
+}
+
+async fn run_settlement_signer<P>(
+    provider: P,
+    commands: mpsc::Sender<P2pCommand>,
+    attestation: AttestationContext,
+    mut requests: mpsc::Receiver<SettlementSigningRequest>,
+    signing_halted: Arc<AtomicBool>,
+) where
+    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
+{
+    while let Some(SettlementSigningRequest { leader, proposal }) = requests.recv().await {
+        let validated = async {
+            let proposal = SettlementAttestation::decode(&proposal)?;
+            let height: u64 = proposal
+                .zoneHeight
+                .try_into()
+                .map_err(|_| eyre::eyre!("settlement height does not fit in u64"))?;
+            let expected = build_settlement_attestation(
+                &provider,
+                height,
+                &attestation,
+                Some((proposal.anchorBlockNumber, proposal.anchorBlockHash)),
+            )
+            .await?
+            .ok_or_else(|| eyre::eyre!("proposed block is not a batch boundary"))?;
+            eyre::ensure!(
+                proposal == expected.attestation,
+                "settlement proposal does not match follower state"
+            );
+            Ok::<_, eyre::Report>((height, proposal, expected.target))
+        }
+        .await;
+        let (height, proposal, target) = match validated {
+            Ok(validated) => validated,
+            Err(err) => {
+                tracing::warn!(target: "zone::p2p", %leader, %err, "Rejected settlement proposal");
+                continue;
+            }
+        };
+
+        let command = if signing_halted.load(Ordering::Acquire) {
+            signing_refusal(target, &attestation)
+        } else {
+            match attestation.withdrawal_checker.decide(target).await {
+                WithdrawalCheckDecision::Submit => {
+                    let signed = match SignedSettlementAttestation::sign(
+                        proposal,
+                        attestation.domain,
+                        &attestation.signer,
+                    ) {
+                        Ok(signed) => signed,
+                        Err(err) => {
+                            tracing::error!(target: "zone::p2p", %leader, %err, height, "Failed signing settlement proposal");
+                            continue;
+                        }
+                    };
+                    info!(target: "zone::p2p", %leader, height, "Signed settlement proposal");
+                    Ok(P2pCommand::SendSettlementSignature(signed.encode()))
+                }
+                WithdrawalCheckDecision::Retry(error) => {
+                    error.emit_withheld();
+                    continue;
+                }
+                WithdrawalCheckDecision::Halt(error) => {
+                    error.emit_withheld();
+                    signing_halted.store(true, Ordering::Release);
+                    signing_refusal(target, &attestation)
+                }
+            }
+        };
+        let command = match command {
+            Ok(command) => command,
+            Err(error) => {
+                tracing::error!(target: "zone::p2p", %error, height, "Failed signing terminal refusal");
+                continue;
+            }
+        };
+        if commands.send(command).await.is_err() {
+            debug!(target: "zone::p2p", "P2P command channel closed before signing response could be sent");
+            return;
         }
     }
 }
@@ -405,15 +724,27 @@ pub(crate) async fn run_block_sync<P>(
     // Keep track of all live blocks if we end up needing a backfill, so we can immediately catchup
     // This is capped to `MAX_PENDING_BLOCKS`.
     let mut pending = BTreeMap::<u64, Vec<u8>>::new();
+    let mut pending_bytes = 0;
     let mut backfill = BackfillProgress::new();
-    let mut backfilled_from: Option<u64> = None;
     let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
 
-    // Serve backfill requests in a separate task to avoid competing the live blocks
+    let signing_halted = Arc::new(AtomicBool::new(false));
+    // Serve backfill requests in a separate task to avoid competing with live block import.
     let mut backfill_server = BackfillServerTask(tokio::spawn(serve_backfill_requests(
         provider.clone(),
         commands.clone(),
+        attestation.clone(),
         backfill_request_rx,
+        signing_halted.clone(),
+    )));
+    let (settlement_signing, settlement_signing_rx) =
+        mpsc::channel(SETTLEMENT_SIGNING_QUEUE_CAPACITY);
+    let mut settlement_signer = SigningWorkerTask(tokio::spawn(run_settlement_signer(
+        provider.clone(),
+        commands.clone(),
+        attestation.clone(),
+        settlement_signing_rx,
+        signing_halted.clone(),
     )));
 
     // Always probe on startup to see if we're behind
@@ -434,65 +765,17 @@ pub(crate) async fn run_block_sync<P>(
                 match event {
                     P2pEvent::Started { .. } => {}
 
-                    // Leader received a Block Ack
-                    P2pEvent::BlockAckReceived { follower, ack } => {
-                        if role != zone_p2p::Role::Leader {
-                            tracing::warn!(target: "zone::p2p", %follower, "Ignoring block ACK event on follower");
-                            continue;
-                        }
-                        let Some(expected_signer) = attestation.addresses.get(&follower).copied() else {
-                            tracing::warn!(target: "zone::p2p", %follower, "Rejected block attestation from unknown follower");
-                            continue;
-                        };
-
-                        match verify_block_ack(
-                            &provider,
-                            &ack,
-                            attestation.domain,
-                            expected_signer,
-                        ) {
-                            Ok((signer, height)) => info!(target: "zone::p2p", %follower, %signer, height, "Verified follower block ACK"),
-                            Err(err) => tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower block ACK"),
-                        }
-                    }
-
                     // Followers receive SettlementProposals from the Leader and batch boundaries, which they verify
                     // and if everything is correct, sign and return back to the leader.
                     P2pEvent::SettlementProposalReceived { leader, proposal } => {
                         if role != zone_p2p::Role::Follower {
                             continue;
                         }
-
-                        let result = async {
-                            let proposal = SettlementAttestation::decode(&proposal)?;
-                            let height: u64 = proposal.zoneHeight.try_into()
-                                .map_err(|_| eyre::eyre!("settlement height does not fit in u64"))?;
-
-                            // 1. Build the attestation in the exact format ZonePortal expects
-                            let expected = build_settlement_attestation(
-                                &provider,
-                                height,
-                                &attestation,
-                                Some((proposal.anchorBlockNumber, proposal.anchorBlockHash)),
-                            ).await?.ok_or_else(|| eyre::eyre!("proposed block is not a batch boundary"))?;
-                            eyre::ensure!(proposal == expected, "settlement proposal does not match follower state");
-
-                            // 2. Sign it.
-                            let signed = SignedSettlementAttestation::sign(
-                                proposal,
-                                attestation.domain,
-                                &attestation.signer,
-                            )?;
-
-                            // 3. Send it back to leader
-                            commands.send(P2pCommand::SendSettlementSignature(signed.encode()))
-                                .await
-                                .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
-                            Ok::<_, eyre::Report>(height)
-                        }.await;
-                        match result {
-                            Ok(height) => info!(target: "zone::p2p", %leader, height, "Signed settlement proposal"),
-                            Err(err) => tracing::warn!(target: "zone::p2p", %leader, %err, "Rejected settlement proposal"),
+                        if let Err(error) = settlement_signing.try_send(SettlementSigningRequest {
+                            leader,
+                            proposal,
+                        }) {
+                            tracing::warn!(target: "zone::p2p", %error, "Dropped settlement signing request because the bounded queue is full");
                         }
                     }
 
@@ -507,35 +790,53 @@ pub(crate) async fn run_block_sync<P>(
                             let signed = SignedSettlementAttestation::decode(&signature)?;
                             let height: u64 = signed.attestation.zoneHeight.try_into()
                                 .map_err(|_| eyre::eyre!("settlement height does not fit in u64"))?;
-                            let expected = build_settlement_attestation(
-                                &provider,
-                                height,
-                                &attestation,
-                                Some((signed.attestation.anchorBlockNumber, signed.attestation.anchorBlockHash)),
-                            ).await?.ok_or_else(|| eyre::eyre!("signed block is not a batch boundary"))?;
-                            eyre::ensure!(signed.attestation == expected, "settlement signature does not match leader state");
-
                             let signer = signed.recover_signer(attestation.domain)?;
                             let expected_signer = attestation.addresses.get(&follower)
                                 .copied()
                                 .ok_or_else(|| eyre::eyre!("unknown follower identity"))?;
                             eyre::ensure!(signer == expected_signer, "settlement signer does not match authenticated peer");
-
-                            // Store away the signature, we'll need this to `submitBatch`
-                            let (_, signatures) = attestation
-                                .store
-                                .as_ref()
-                                .expect("leader must have an attestation store")
-                                .insert_settlement(attestation.domain, signer, signed);
-                            Ok::<_, eyre::Report>((height, signer, signatures))
+                            let (target, signatures) = attestation.store.insert_settlement_signature(
+                                attestation.domain,
+                                signer,
+                                signed,
+                            )?;
+                            Ok::<_, eyre::Report>((height, target.hash, signer, signatures))
                         }.await;
                         match result {
-                            Ok((height, signer, signatures)) => info!(target: "zone::p2p", %follower, %signer, height, signatures, "Stored follower settlement signature"),
+                            Ok((height, block_hash, signer, signatures)) => info!(target: "zone::p2p", %follower, %signer, height, %block_hash, signatures, "Stored follower settlement signature"),
                             Err(err) => tracing::warn!(target: "zone::p2p", %follower, %err, "Rejected follower settlement signature"),
                         }
                     }
-
-                    // Leaders and Followers can receive and serve block backfill requests
+                    P2pEvent::RefusedToSign { follower, refusal } => {
+                        if role != zone_p2p::Role::Leader {
+                            continue;
+                        }
+                        let Some(signer) = attestation.addresses.get(&follower).copied() else {
+                            tracing::warn!(target: "zone::p2p", %follower, "Rejected signing refusal from unknown follower");
+                            continue;
+                        };
+                        let target = match verify_signing_refusal(
+                            &refusal,
+                            attestation.domain,
+                            signer,
+                        ) {
+                            Ok(target) => target,
+                            Err(error) => {
+                                tracing::warn!(target: "zone::p2p", %follower, %error, "Rejected signing refusal");
+                                continue;
+                            }
+                        };
+                        let applied = attestation.store.refuse_to_sign(signer, target);
+                        tracing::warn!(
+                            target: "zone::p2p",
+                            %follower,
+                            %signer,
+                            block = target.number,
+                            block_hash = %target.hash,
+                            applied_to_quorum = applied,
+                            "Follower refused to sign after a terminal safety-check failure"
+                        );
+                    }
                     P2pEvent::BackfillRequested { peer, request_id, start } => {
                         if let Err(err) = backfill_requests.try_send(BackfillRequest { peer, request_id, start }) {
                             tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
@@ -544,16 +845,33 @@ pub(crate) async fn run_block_sync<P>(
 
                     // Received a live || backfilled block.
                     event @ (P2pEvent::BlockReceived { .. } | P2pEvent::BackfillBlockReceived { .. }) => {
-                        let (block, from_backfill) = match event {
-                            P2pEvent::BlockReceived { block, .. } => (block, false),
-                            P2pEvent::BackfillBlockReceived { block, .. } => (block, true),
+                        let (peer, block, block_ack, from_backfill) = match event {
+                            P2pEvent::BlockReceived { leader_ed25519_public_key, block } => (leader_ed25519_public_key, block, None, false),
+                            P2pEvent::BackfillBlockReceived { peer, block, block_ack } => (peer, block, Some(block_ack), true),
                             _ => unreachable!(),
                         };
-                        match encoded_block_number(&block) {
-                            Ok(number) => {
-                                if from_backfill {
-                                    backfilled_from = Some(backfilled_from.map_or(number, |first| first.min(number)));
+                        if from_backfill && role != zone_p2p::Role::Follower {
+                            continue;
+                        }
+                        let agreed_number = if from_backfill {
+                            match verify_backfill_block(
+                                &peer,
+                                &block,
+                                block_ack.as_deref().expect("backfill event includes an ACK"),
+                                attestation.domain,
+                                &attestation.addresses,
+                            ) {
+                                Ok((number, _)) => Some(number),
+                                Err(err) => {
+                                    tracing::warn!(target: "zone::p2p", %err, "Rejected backfill block without a valid member signature");
+                                    continue;
                                 }
+                            }
+                        } else {
+                            None
+                        };
+                        match agreed_number.map_or_else(|| encoded_block_number(&block), Ok) {
+                            Ok(number) => {
                                 inactivity
                                     .as_mut()
                                     .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
@@ -573,23 +891,12 @@ pub(crate) async fn run_block_sync<P>(
                                         &block,
                                     ).await {
                                         tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
-                                    } else if role == zone_p2p::Role::Follower && !from_backfill {
-                                        // For live blocks, ACK the block. The leader needs n-of-m quorum to sign
-                                        // a batch before it can call `submitBatch`
-                                        send_block_ack(
-                                            &provider,
-                                            number,
-                                            attestation.domain,
-                                            &attestation.signer,
-                                            &commands,
-                                        )
-                                        .await;
                                     }
                                     continue;
                                 }
                                 backfill.observe_block(number, best);
-                                if let Some(dropped) = buffer_pending_block(&mut pending, number, block) {
-                                    tracing::warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
+                                if let Some(dropped) = buffer_pending_block(&mut pending, &mut pending_bytes, number, block) {
+                                    tracing::warn!(target: "zone::p2p", dropped, pending_block_limit = MAX_PENDING_BLOCKS, pending_byte_limit = MAX_PENDING_BLOCK_BYTES, "Dropped far-future peer block because the pending block buffer is full");
                                 }
                                 if number > best.saturating_add(1) {
                                     info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
@@ -600,6 +907,7 @@ pub(crate) async fn run_block_sync<P>(
                                     &l1_block_tracker,
                                     &policy_cache,
                                     &mut pending,
+                                    &mut pending_bytes,
                                 ).await {
                                     tracing::error!(target: "zone::p2p", %err, "Rejected peer block while draining backfill");
                                     backfill.needed = true;
@@ -615,23 +923,6 @@ pub(crate) async fn run_block_sync<P>(
                                         new_best,
                                         pending.first_key_value().map(|(&number, _)| number),
                                     );
-                                    if role == zone_p2p::Role::Follower
-                                        && !from_backfill
-                                        && backfilled_from.is_none()
-                                    {
-                                        for imported in best.saturating_add(1)..=new_best {
-                                            // For live blocks, ACK the block. The leader needs n-of-m quorum to sign
-                                            // a batch before it can call `submitBatch`
-                                            send_block_ack(
-                                                &provider,
-                                                imported,
-                                                attestation.domain,
-                                                &attestation.signer,
-                                                &commands,
-                                            )
-                                            .await;
-                                        }
-                                    }
                                 }
                             }
                             Err(err) => tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block"),
@@ -639,7 +930,21 @@ pub(crate) async fn run_block_sync<P>(
                     }
 
                     // Backfill completed, flip to live blocks
-                    P2pEvent::BackfillCompleted { peer, tip } => {
+                    P2pEvent::BackfillCompleted { peer, tip, tip_hash, tip_ack } => {
+                        if role != zone_p2p::Role::Follower {
+                            continue;
+                        }
+                        let target = alloy_eips::BlockNumHash { number: tip, hash: tip_hash };
+                        if let Err(error) = verify_backfill_tip(
+                            &peer,
+                            target,
+                            &tip_ack,
+                            attestation.domain,
+                            &attestation.addresses,
+                        ) {
+                            tracing::warn!(target: "zone::p2p", %peer, %error, tip, %tip_hash, "Rejected backfill completion without a valid signed tip");
+                            continue;
+                        }
                         let best = match provider.best_block_number() {
                             Ok(best) => best,
                             Err(err) => {
@@ -647,31 +952,36 @@ pub(crate) async fn run_block_sync<P>(
                                 continue;
                             }
                         };
+                        if best >= target.number {
+                            match provider.sealed_header(target.number) {
+                                Ok(Some(header)) if header.hash() == target.hash => {}
+                                Ok(Some(header)) => {
+                                    tracing::error!(target: "zone::p2p", %peer, tip = target.number, expected = %target.hash, actual = %header.hash(), "Signed backfill tip conflicts with local canonical state");
+                                    backfill.needed = true;
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    tracing::error!(target: "zone::p2p", %peer, tip = target.number, "Signed backfill tip is missing locally");
+                                    backfill.needed = true;
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::error!(target: "zone::p2p", %peer, %error, tip = target.number, "Failed reading signed backfill tip locally");
+                                    backfill.needed = true;
+                                    continue;
+                                }
+                            }
+                        }
                         backfill.complete(
-                            tip,
+                            target.number,
                             best,
                             pending.first_key_value().map(|(&number, _)| number),
                         );
-                        if role == zone_p2p::Role::Follower
-                            && let Some(first) = backfilled_from.take()
-                        {
-                            let recent_start = tip.saturating_sub(119).max(first);
-                            for imported in recent_start..=best.min(tip) {
-                                send_block_ack(
-                                    &provider,
-                                    imported,
-                                    attestation.domain,
-                                    &attestation.signer,
-                                    &commands,
-                                )
-                                .await;
-                            }
-                        }
-                        debug!(target: "zone::p2p", %peer, best, tip, backfill_needed = backfill.needed, "Completed block backfill response page");
+                        debug!(target: "zone::p2p", %peer, best, tip = target.number, tip_hash = %target.hash, backfill_needed = backfill.needed, "Completed block backfill response page");
                     }
                 }
             }
-            _ = retry.tick(), if backfill.needed => {
+            _ = retry.tick(), if backfill.needed && role == zone_p2p::Role::Follower => {
                 let best = match provider.best_block_number() {
                     Ok(best) => best,
                     Err(err) => {
@@ -688,7 +998,7 @@ pub(crate) async fn run_block_sync<P>(
                     return;
                 }
             }
-            _ = &mut inactivity, if !backfill.needed => {
+            _ = &mut inactivity, if !backfill.needed && role == zone_p2p::Role::Follower => {
                 // Reset before reading the provider so a transient provider error cannot leave an
                 // elapsed sleep continuously ready and spin this loop.
                 inactivity
@@ -715,6 +1025,13 @@ pub(crate) async fn run_block_sync<P>(
                 }
                 return;
             }
+            result = &mut settlement_signer.0 => {
+                match result {
+                    Ok(()) => tracing::error!(target: "zone::p2p", "Settlement signing worker stopped unexpectedly"),
+                    Err(err) => tracing::error!(target: "zone::p2p", %err, "Settlement signing worker failed"),
+                }
+                return;
+            }
         }
     }
 }
@@ -725,6 +1042,7 @@ async fn drain_pending_blocks<P>(
     l1_block_tracker: &L1BlockTracker,
     policy_cache: &PolicyCache,
     pending: &mut BTreeMap<u64, Vec<u8>>,
+    pending_bytes: &mut usize,
 ) -> eyre::Result<()>
 where
     P: reth_storage_api::BlockNumReader
@@ -740,6 +1058,7 @@ where
         let Some(block) = pending.remove(&next) else {
             return Ok(());
         };
+        *pending_bytes = pending_bytes.saturating_sub(block.len());
         import_peer_block(provider, engine, l1_block_tracker, policy_cache, &block).await?;
     }
 }
@@ -909,8 +1228,8 @@ fn decode_advance_tempo_header(
     Ok(SealedHeader::seal_slow(header))
 }
 
-/// Followers ACK blocks received from a leader
-fn build_block_ack<P>(
+/// Build the signed statement returned only when serving an on-demand backfill page.
+fn build_backfill_ack<P>(
     provider: &P,
     number: u64,
     domain: AttestationDomain,
@@ -924,7 +1243,7 @@ where
     Ok(BlockAck::new(domain, number, header.hash()))
 }
 
-/// A follower needs to have persisted a block first before ACK-ing it.
+/// A node must have persisted a block before using it in a backfill proof.
 fn ensure_block_receipts_persisted<P>(provider: &P, number: u64) -> eyre::Result<()>
 where
     P: ReceiptProvider,
@@ -935,92 +1254,115 @@ where
     Ok(())
 }
 
-/// A follower will send a block ACK back to the leader after verifying and persisting it
-async fn send_block_ack<P>(
-    provider: &P,
-    number: u64,
-    domain: AttestationDomain,
-    signer: &PrivateKeySigner,
-    commands: &mpsc::Sender<P2pCommand>,
-) where
-    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
-{
-    // FCU makes the block canonical before Reth necessarily exposes its durable receipts.
-    // Wait for those receipts so an ACK is sent only after the block and its execution output
-    // have crossed the persistence boundary configured for manifest mode.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let signed = loop {
-        // save, build and sign a received live block
-        let result = ensure_block_receipts_persisted(provider, number)
-            .and_then(|_| build_block_ack(provider, number, domain))
-            .and_then(|ack| SignedBlockAck::sign(ack, domain, signer));
-
-        match result {
-            Ok(signed) => break signed,
-            Err(err) if tokio::time::Instant::now() < deadline => {
-                debug!(target: "zone::p2p", %err, number, "Waiting for imported block receipts before attesting");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(err) => {
-                tracing::error!(target: "zone::p2p", %err, number, "Failed building follower block attestation after persistence timeout");
-                return;
-            }
-        }
-    };
-
-    if commands
-        .send(P2pCommand::SendBlockAck(signed.encode()))
-        .await
-        .is_err()
-    {
-        debug!(target: "zone::p2p", "P2P command channel closed before block ACK could be sent");
-    }
+fn signing_refusal(
+    target: alloy_eips::BlockNumHash,
+    attestation: &AttestationContext,
+) -> eyre::Result<P2pCommand> {
+    let refusal = SigningRefusal::new(attestation.domain, target);
+    let signed = SignedSigningRefusal::sign(refusal, attestation.domain, &attestation.signer)?;
+    Ok(P2pCommand::RefuseToSign(signed.encode()))
 }
 
-/// Verify that a follower signed an ACK for the leader's canonical block at that height.
-fn verify_block_ack<P>(
-    provider: &P,
+fn verify_signing_refusal(
     encoded: &[u8],
     domain: AttestationDomain,
     expected_signer: alloy_primitives::Address,
-) -> eyre::Result<(alloy_primitives::Address, u64)>
-where
-    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
-{
-    let signed = SignedBlockAck::decode(encoded)?;
-    let height: u64 = signed
-        .ack
-        .zoneHeight
-        .try_into()
-        .map_err(|_| eyre::eyre!("attested zone height does not fit in u64"))?;
-    let expected = build_block_ack(provider, height, domain)?;
+) -> eyre::Result<alloy_eips::BlockNumHash> {
+    let signed = SignedSigningRefusal::decode(encoded)?;
     eyre::ensure!(
-        signed.ack == expected,
-        "block ACK statement does not match the leader's canonical block"
+        signed.recover_signer(domain)? == expected_signer,
+        "refusal signer does not match authenticated peer"
     );
-    let signer = signed.recover_signer(domain)?;
-    eyre::ensure!(
-        signer == expected_signer,
-        "block ACK signer {signer} does not match authenticated peer address {expected_signer}"
-    );
-    Ok((signer, height))
+    signed.refusal.target(domain)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use futures::{StreamExt as _, stream};
 
     use super::{
         BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS, PersistedBlockSource,
-        PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
+        PersistedTip, broadcast_persisted_blocks, buffer_pending_block, verify_backfill_tip,
+        verify_signing_refusal,
     };
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256};
+    use alloy_signer_local::PrivateKeySigner;
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use zone_p2p::P2pCommand;
+    use zone_sequencer::attestation::{
+        AttestationDomain, BlockAck, SignedBlockAck, SignedSigningRefusal, SigningRefusal,
+    };
+
+    fn attestation_domain() -> AttestationDomain {
+        AttestationDomain {
+            l1_chain_id: 1,
+            portal_address: Address::repeat_byte(0xee),
+            zone_id: 7,
+            sequencer_set_version: 1,
+        }
+    }
+
+    #[test]
+    fn backfill_tip_requires_an_exact_member_ack() {
+        let peer = PrivateKey::from_seed(1).public_key();
+        let signer = PrivateKeySigner::random();
+        let addresses = HashMap::from([(peer.clone(), signer.address())]);
+        let domain = attestation_domain();
+        let canonical_tip = alloy_eips::BlockNumHash {
+            number: 7,
+            hash: B256::repeat_byte(7),
+        };
+        let completion_ack = SignedBlockAck::sign(
+            BlockAck::new(domain, canonical_tip.number, canonical_tip.hash),
+            domain,
+            &signer,
+        )
+        .unwrap()
+        .encode();
+        verify_backfill_tip(&peer, canonical_tip, &completion_ack, domain, &addresses).unwrap();
+        assert!(
+            verify_backfill_tip(
+                &peer,
+                alloy_eips::BlockNumHash {
+                    number: 7,
+                    hash: B256::repeat_byte(0xff),
+                },
+                &completion_ack,
+                domain,
+                &addresses,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_refusal_requires_the_authenticated_members_signature() {
+        let signer = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random();
+        let domain = attestation_domain();
+        let target = alloy_eips::BlockNumHash {
+            number: 7,
+            hash: B256::repeat_byte(7),
+        };
+        let encoded =
+            SignedSigningRefusal::sign(SigningRefusal::new(domain, target), domain, &signer)
+                .unwrap()
+                .encode();
+
+        assert_eq!(
+            verify_signing_refusal(&encoded, domain, signer.address()).unwrap(),
+            target
+        );
+        assert!(verify_signing_refusal(&encoded, domain, other.address()).is_err());
+    }
 
     #[derive(Clone)]
     struct StartupRaceSource {
@@ -1127,9 +1469,10 @@ mod tests {
     #[test]
     fn pending_block_limit_keeps_blocks_closest_to_local_head() {
         let mut pending = std::collections::BTreeMap::new();
+        let mut pending_bytes = 0;
         for number in 100..100 + MAX_PENDING_BLOCKS as u64 {
             assert_eq!(
-                buffer_pending_block(&mut pending, number, vec![number as u8]),
+                buffer_pending_block(&mut pending, &mut pending_bytes, number, vec![number as u8],),
                 None
             );
         }
@@ -1137,7 +1480,7 @@ mod tests {
 
         let farthest = 100 + MAX_PENDING_BLOCKS as u64 - 1;
         assert_eq!(
-            buffer_pending_block(&mut pending, 99, vec![99]),
+            buffer_pending_block(&mut pending, &mut pending_bytes, 99, vec![99]),
             Some(farthest)
         );
         assert_eq!(pending.len(), MAX_PENDING_BLOCKS);
@@ -1146,7 +1489,12 @@ mod tests {
 
         let farther = farthest + 1;
         assert_eq!(
-            buffer_pending_block(&mut pending, farther, vec![farther as u8]),
+            buffer_pending_block(
+                &mut pending,
+                &mut pending_bytes,
+                farther,
+                vec![farther as u8],
+            ),
             Some(farther)
         );
         assert_eq!(pending.len(), MAX_PENDING_BLOCKS);

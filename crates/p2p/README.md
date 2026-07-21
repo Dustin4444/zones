@@ -96,12 +96,17 @@ Add these arguments to the node's normal command:
 --sequencer.role leader
 ```
 
-Use each node's own key files and listener address. Followers use their individual
-secp256k1 keys to sign zone-block attestations after importing and persisting blocks.
-This key is independent from the shared `--sequencer-key`; reusing that shared key
-would collapse several nodes into one recoverable quorum identity.
+Use each node's own key files and listener address. Nodes use their individual
+secp256k1 keys for settlement attestations, terminal refusals, and signed backfill
+proofs. This key is independent from the shared `--sequencer-key`; reusing that shared
+key would collapse several nodes into one quorum identity.
 The `--sequencer` flag conflicts with `--sequencer.manifest` because the
 manifest determines whether the node starts the sequencer tasks.
+
+Sequencer-set rotation requires a coordinated restart of every node with the same
+updated manifest and an incremented Portal `sequencerSetVersion`. Startup fails unless
+the manifest version and signer membership exactly match the Portal, preventing stale
+or mixed manifests from participating in replication or settlement.
 
 DNS peer addresses do not provide a stable egress IP for Commonware's inbound
 source-IP filter. A manifest containing any DNS peer therefore requires the
@@ -112,10 +117,10 @@ authentication remains enforced.
 
 ## Block catch-up
 
-Every node probes for missing blocks when P2P starts and retries while its eligible peers are
-offline or a gap remains. Followers request blocks from the statically configured leader. A
-recovering leader requests blocks from the configured followers. Both roles can serve bounded
-64-block response pages from their persisted canonical chain.
+Every follower probes for missing blocks when P2P starts and retries while the leader is offline
+or a gap remains. Followers request bounded 64-block response pages from the statically configured
+leader. The leader always resumes from its own persisted canonical head; it never imports a
+follower-provided branch.
 
 Backfilled blocks use the same RLP representation and import path as live replicated blocks. A
 node buffers out-of-order arrivals, then re-executes and canonicalizes only the next block after

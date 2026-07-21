@@ -134,10 +134,13 @@ reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" 
 reth-cli = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
+reth-codecs = "0.5.2"
+reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "1bf2384" }
@@ -195,6 +198,7 @@ commonware-utils = "=2026.4.0"
 # misc
 aes-gcm = "0.10.3"
 base64 = "0.22.1"
+bytes = { version = "1.11.1", default-features = false }
 clap = { version = "4.5.45", features = ["derive"] }
 const-hex = { version = "1.15.0" }
 derive_more = { version = "2.0.0" }
@@ -204,6 +208,7 @@ futures = "0.3.31"
 indicatif = "0.18"
 itertools = "0.14.0"
 metrics = "0.24.3"
+modular-bitfield = "0.13.1"
 k256 = { version = "0.13.4", features = ["arithmetic", "ecdh"] }
 parking_lot = "0.12.4"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }

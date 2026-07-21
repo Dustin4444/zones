@@ -15,6 +15,10 @@ pub mod node;
 mod replication;
 pub mod rpc;
 mod settlement_attestation;
+mod withdrawal_checker;
 
 pub use engine::ZoneEngine;
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};
+pub use withdrawal_checker::{
+    RegisteredWithdrawalCheckerTables, register_withdrawal_checker_tables,
+};
