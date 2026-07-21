@@ -251,20 +251,11 @@ struct StoreSnapshot {
     withdrawals: Option<Vec<abi::Withdrawal>>,
 }
 
-/// Return the extra outer-frame gas needed for EIP-150's 63/64 forwarding rule.
-///
-/// `ZonePortal.processWithdrawals` must keep enough gas in the caller frame for the
-/// callback CALL to receive at least `gas_limit`. The cushion is `ceil(gas_limit / 63)`,
-/// which compensates for the 1/64 of remaining gas that EIP-150 withholds from the call.
-const fn eip150_cushion(gas_limit: u64) -> u64 {
-    gas_limit / 63 + if gas_limit.is_multiple_of(63) { 0 } else { 1 }
-}
-
 /// Return the gas reserved for one withdrawal inside a `processWithdrawals` transaction.
 ///
 /// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
-/// per-item portal/messenger overhead and the EIP-150 cushion. This keeps legacy over-cap
-/// withdrawals submit-able while bounding the planner's gas accounting.
+/// per-item portal/messenger overhead. This keeps legacy over-cap withdrawals submit-able
+/// while bounding the planner's gas accounting.
 const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
     let bounded_callback_gas = if callback_gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
         MAX_WITHDRAWAL_GAS_LIMIT
@@ -272,9 +263,7 @@ const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
         callback_gas_limit
     };
 
-    bounded_callback_gas
-        + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
-        + eip150_cushion(bounded_callback_gas)
+    bounded_callback_gas + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
 }
 
 /// A gas-bounded `processWithdrawals` transaction planned from one portal queue slot.
@@ -868,7 +857,6 @@ mod tests {
             senderTag: B256::repeat_byte(0x11),
             to,
             amount,
-            fee: 0,
             memo: B256::ZERO,
             gasLimit: 0,
             fallbackNonce: 1,
@@ -910,7 +898,6 @@ mod tests {
             senderTag: B256::repeat_byte(0x22),
             to: address!("0x70997970c51812dc3a010c7d01b50e0d17dc79c8"),
             amount: 500_000,
-            fee: 0,
             memo: B256::ZERO,
             gasLimit: 0,
             fallbackNonce: 1,
@@ -969,7 +956,6 @@ mod tests {
             MAX_WITHDRAWAL_GAS_LIMIT
                 + PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
                 + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
-                + MAX_WITHDRAWAL_GAS_LIMIT.div_ceil(63)
         );
         assert!(at_cap < 30_000_000);
     }
