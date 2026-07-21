@@ -13,11 +13,11 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey as Ed25519Private
 use eyre::WrapErr;
 use k256::SecretKey;
 use p256::ecdsa::SigningKey as P256SigningKey;
-use reth_node_api::FullNodeComponents;
+use reth_node_api::{ConsensusEngineHandle, FullNodeComponents, PayloadTypes};
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
 use reth_node_core::{args::RpcServerArgs, exit::NodeExitFuture};
-use reth_primitives_traits::SealedHeader;
-use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
+use reth_primitives_traits::{SealedBlock, SealedHeader};
+use reth_provider::{BlockNumReader, BlockReader, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
@@ -54,7 +54,7 @@ use tempo_precompiles::{
         TIP403Registry, tip403_registry_slots,
     },
 };
-use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
+use tempo_primitives::{Block, TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::{
     PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT, ZONE_FACTORY_ADDRESS,
     ZONE_OUTBOX_ADDRESS,
@@ -70,6 +70,7 @@ use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
 use zone_primitives::constants::PORTAL_ACCESS_MODE_SLOT;
+use zone_payload::ZonePayloadTypes;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -430,6 +431,8 @@ pub(crate) trait TestNodeHandle: Send {
     ) -> reth_provider::CanonStateNotifications<tempo_primitives::TempoPrimitives>;
 
     fn node_exit_future_mut(&mut self) -> &mut NodeExitFuture;
+
+    fn block_by_number(&self, number: u64) -> eyre::Result<Option<Block>>;
 }
 
 impl<Node, AddOns> TestNodeHandle for NodeHandle<Node, AddOns>
@@ -448,6 +451,10 @@ where
 
     fn node_exit_future_mut(&mut self) -> &mut NodeExitFuture {
         &mut self.node_exit_future
+    }
+
+    fn block_by_number(&self, number: u64) -> eyre::Result<Option<Block>> {
+        Ok(self.node.provider().block_by_number(number)?)
     }
 }
 
@@ -469,6 +476,9 @@ where
 type RpcApiFuture =
     Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>;
 type RpcApiFactory = dyn Fn(zone_node::rpc::PrivateRpcConfig) -> RpcApiFuture + Send + Sync;
+type PayloadSubmitFuture =
+    Pin<Box<dyn Future<Output = eyre::Result<alloy_rpc_types_engine::PayloadStatus>> + Send>>;
+type PayloadSubmitter = dyn Fn(Block) -> PayloadSubmitFuture + Send + Sync;
 
 pub(crate) struct ZoneTestNode {
     http_url: url::Url,
@@ -476,6 +486,7 @@ pub(crate) struct ZoneTestNode {
     l1_state_cache: L1StateCache,
     l1_block_tracker: L1BlockTracker,
     rpc_api_factory: Arc<RpcApiFactory>,
+    payload_submitter: Arc<PayloadSubmitter>,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
 }
@@ -575,6 +586,17 @@ impl ZoneTestNode {
         &self,
     ) -> reth_provider::CanonStateNotifications<tempo_primitives::TempoPrimitives> {
         self.node_handle.subscribe_to_canonical_state()
+    }
+
+    pub(crate) fn block_by_number(&self, number: u64) -> eyre::Result<Option<Block>> {
+        self.node_handle.block_by_number(number)
+    }
+
+    pub(crate) async fn submit_payload(
+        &self,
+        block: Block,
+    ) -> eyre::Result<alloy_rpc_types_engine::PayloadStatus> {
+        (self.payload_submitter)(block).await
     }
 
     pub(crate) async fn wait_for_node_exit(&mut self) -> eyre::Result<()> {
@@ -1051,12 +1073,23 @@ impl ZoneTestNode {
                 as Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>
         });
 
+        let engine_handle = node_handle.node.add_ons_handle.beacon_engine_handle.clone();
+        let payload_submitter = Arc::new(move |block: Block| {
+            let engine_handle = engine_handle.clone();
+            Box::pin(async move {
+                let payload =
+                    ZonePayloadTypes::block_to_payload(SealedBlock::seal_slow(block), None);
+                Ok(engine_handle.new_payload(payload).await?)
+            }) as PayloadSubmitFuture
+        });
+
         Ok(Self {
             deposit_queue,
             http_url,
             l1_state_cache,
             l1_block_tracker,
             rpc_api_factory,
+            payload_submitter,
             node_handle: Box::new(node_handle),
             _tasks: tasks,
         })
