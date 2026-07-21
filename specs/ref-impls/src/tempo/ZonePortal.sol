@@ -17,7 +17,8 @@ import {
     QueuedDeposit,
     TokenConfig,
     Withdrawal,
-    ZONE_FACTORY_ADDRESS
+    ZONE_FACTORY_ADDRESS,
+    ZONE_PORTAL_IMPL_ADDRESS
 } from "../interfaces/IZone.sol";
 import { getBlockHash } from "../libraries/BlockHashHistory.sol";
 import { DepositQueueLib } from "../libraries/DepositQueueLib.sol";
@@ -174,6 +175,7 @@ contract ZonePortal is IZonePortal {
         string calldata _rpcUrl
     )
         external
+        onlyDelegateCall
     {
         if (msg.sender != ZONE_FACTORY_ADDRESS) revert NotFactory();
         if (_initialized) revert AlreadyInitialized();
@@ -194,6 +196,12 @@ contract ZonePortal is IZonePortal {
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev Initialization is valid only in a portal proxy's storage context.
+    modifier onlyDelegateCall() {
+        if (address(this) == ZONE_PORTAL_IMPL_ADDRESS) revert MustDelegateCall();
+        _;
+    }
 
     modifier onlySequencer() {
         if (sequencerSetVersion == 0 ? msg.sender != sequencer : !isSequencer[msg.sender]) {

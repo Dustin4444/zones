@@ -27,6 +27,7 @@ import {
     Withdrawal,
     ZONE_FACTORY_ADDRESS,
     ZONE_MESSENGER_ADDRESS,
+    ZONE_PORTAL_IMPL_ADDRESS,
     ZONE_VERIFIER_ADDRESS,
     ZoneInfo
 } from "../../src/interfaces/IZone.sol";
@@ -189,6 +190,28 @@ contract ReentrantWithdrawalReceiver is IWithdrawalReceiver {
 }
 
 contract ZonePortalProxyStorageTest is Test {
+
+    function test_initialize_revertsOnImplementationAddress() public {
+        ZonePortal implementation = new ZonePortal();
+        vm.etch(ZONE_PORTAL_IMPL_ADDRESS, address(implementation).code);
+
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = makeAddr("sequencer");
+
+        vm.prank(ZONE_FACTORY_ADDRESS);
+        vm.expectRevert(IZonePortal.MustDelegateCall.selector);
+        ZonePortal(ZONE_PORTAL_IMPL_ADDRESS)
+            .initialize(
+                1,
+                makeAddr("initial token"),
+                ZONE_MESSENGER_ADDRESS,
+                makeAddr("admin"),
+                sequencers,
+                1,
+                ZONE_VERIFIER_ADDRESS,
+                ""
+            );
+    }
 
     function test_proxyMetadataIsReadFromPortalStorage() public {
         address initialToken = makeAddr("initial token");
