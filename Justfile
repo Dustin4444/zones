@@ -28,7 +28,7 @@ regen-zone-dev-genesis:
     #!/bin/bash
     set -euo pipefail
     rm -rf {{zone_dev_genesis_tmp}}
-    forge build --root specs/ref-impls --no-lint
+    (cd specs/ref-impls && tempo-forge build)
     cargo run -p tempo-xtask -- generate-zone-genesis \
         --output {{zone_dev_genesis_tmp}} \
         --chain-id 1337 \

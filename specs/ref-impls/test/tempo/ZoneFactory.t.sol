@@ -432,7 +432,7 @@ contract ZoneFactoryTest is BaseTest {
         assertEq(pc.admin(), p.admin);
         assertEq(pc.sequencerCount(), p.sequencers.length);
         assertEq(pc.sequencerAt(0), p.sequencers[0]);
-        assertEq(pc.sequencerThreshold(), p.threshold);
+        assertEq(pc.sequencerQuorum(), p.threshold);
         assertEq(pc.verifier(), p.verifier);
         assertEq(pc.messenger(), zoneFactory.messenger());
         assertEq(pc.blockHash(), p.zoneParams.genesisBlockHash);

@@ -56,6 +56,18 @@ mod tests {
     use alloy_sol_types::{SolCall, SolValue};
 
     #[test]
+    fn submit_batch_overload_selectors_match_solidity() {
+        assert_eq!(
+            ZonePortal::submitBatch_0Call::SIGNATURE,
+            "submitBatch(uint64,uint64,(bytes32,bytes32),(bytes32,bytes32,uint64,uint64),bytes32,bytes,bytes)"
+        );
+        assert_eq!(
+            ZonePortal::submitBatch_1Call::SIGNATURE,
+            "submitBatch(uint64,uint64,(bytes32,bytes32),(bytes32,bytes32,uint64,uint64),bytes32,bytes,bytes,uint256,bytes[])"
+        );
+    }
+
+    #[test]
     fn test_deposit_abi_encode_vs_params() {
         let d = Deposit {
             token: address!("0x0000000000000000000000000000000000001000"),

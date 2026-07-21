@@ -41,15 +41,20 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     // first block.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    fixture.inject_empty_block(leader.deposit_queue());
+    let anchor = fixture.inject_empty_block(leader.deposit_queue());
     leader.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(follower.provider().get_block_number().await?, 0);
+    follower.l1_block_tracker().record(anchor)?;
     follower.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
 
     let depositor = address!("0x0000000000000000000000000000000000001234");
     let recipient = address!("0x0000000000000000000000000000000000005678");
     let amount = 1_000_000_u128;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
-    fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    follower.l1_block_tracker().record(anchor)?;
 
     leader
         .wait_for_balance(

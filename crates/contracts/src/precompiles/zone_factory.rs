@@ -15,7 +15,8 @@ crate::sol! {
             address portal;
             address initialToken;
             address admin;
-            address sequencer;
+            address[] sequencers;
+            uint8 threshold;
             address verifier;
             bytes32 genesisBlockHash;
             bytes32 genesisTempoBlockHash;
@@ -30,7 +31,8 @@ crate::sol! {
         struct CreateZoneParams {
             address initialToken;
             address admin;
-            address sequencer;
+            address[] sequencers;
+            uint8 threshold;
             address verifier;
             ZoneParams zoneParams;
             string rpcUrl;
@@ -40,7 +42,8 @@ crate::sol! {
             address indexed portal,
             address initialToken,
             address admin,
-            address sequencer,
+            address[] sequencers,
+            uint8 threshold,
             address verifier,
             bytes32 genesisBlockHash,
             bytes32 genesisTempoBlockHash,

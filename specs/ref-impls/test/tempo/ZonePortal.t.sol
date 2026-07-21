@@ -287,7 +287,7 @@ contract ZonePortalTest is BaseTest {
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
     );
     bytes32 internal constant SETTLEMENT_ATTESTATION_TYPEHASH = keccak256(
-        "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)"
+        "SettlementAttestation(uint32 zoneId,uint64 sequencerSetVersion,uint256 zoneHeight,uint256 withdrawalBatchIndex,address sequencer,address verifier,uint64 tempoBlockNumber,uint64 anchorBlockNumber,bytes32 anchorBlockHash,bytes32 blockTransitionHash,bytes32 depositQueueTransitionHash,bytes32 withdrawalQueueHash,bytes32 verifierConfigHash)"
     );
 
     uint256 internal constant SIGNER_A_KEY = 2;
@@ -402,6 +402,7 @@ contract ZonePortalTest is BaseTest {
                 portal.sequencerSetVersion(),
                 height,
                 portal.withdrawalBatchIndex() + 1,
+                portal.sequencer(),
                 portal.verifier(),
                 tempoBlockNumber,
                 anchorBlockNumber,
@@ -468,9 +469,6 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.messenger(), address(messenger));
         assertEq(portal.bouncebackGas(), 0);
         assertEq(portal.calculateBouncebackFee(), 0);
-        assertEq(portal.sequencerSetVersion(), 1);
-        assertEq(portal.sequencerThreshold(), 1);
-        assertTrue(portal.isSequencer(sequencer));
     }
 
     function test_zoneFactoryTracksZones() public view {
@@ -491,16 +489,16 @@ contract ZonePortalTest is BaseTest {
                          SEQUENCER QUORUM TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_setSequencerSet_configuresVersionedThreshold() public {
+    function test_setSequencerSet_configuresVersionedQuorum() public {
         address[] memory signers = _sequencerSet();
 
         vm.expectEmit(true, false, false, true);
-        emit IZonePortal.SequencerSetUpdated(2, 2, signers);
+        emit IZonePortal.SequencerSetUpdated(1, 2, signers);
         vm.prank(admin);
         portal.setSequencerSet(signers, 2);
 
-        assertEq(portal.sequencerSetVersion(), 2);
-        assertEq(portal.sequencerThreshold(), 2);
+        assertEq(portal.sequencerSetVersion(), 1);
+        assertEq(portal.sequencerQuorum(), 2);
         assertEq(portal.sequencerCount(), 3);
         for (uint256 i; i < signers.length; ++i) {
             assertEq(portal.sequencerAt(i), signers[i]);
@@ -539,34 +537,37 @@ contract ZonePortalTest is BaseTest {
         vm.prank(admin);
         portal.setSequencerSet(replacement, 2);
 
-        assertEq(portal.sequencerSetVersion(), 3);
+        assertEq(portal.sequencerSetVersion(), 2);
         assertFalse(portal.isSequencer(removed));
     }
 
-    function test_allSequencersCanCallConfigurationMethods() public {
+    function test_quorumSequencerCannotCallConfigurationMethods() public {
         address[] memory signers = _activateSequencerSet(2);
 
-        for (uint256 i = 0; i < signers.length; ++i) {
-            vm.startPrank(signers[i]);
-            portal.setZoneGasRate(uint128(i + 1));
-            portal.setRpcUrl(string.concat("https://sequencer-", vm.toString(i), ".example"));
-            vm.stopPrank();
-        }
+        vm.startPrank(signers[0]);
+        vm.expectRevert(IZonePortal.NotSequencer.selector);
+        portal.setZoneGasRate(1);
+        vm.expectRevert(IZonePortal.NotSequencer.selector);
+        portal.setRpcUrl("https://follower.invalid");
+        vm.stopPrank();
 
+        Withdrawal memory withdrawal =
+            _withdrawal(address(pathUSD), alice, bob, 1, bytes32(0), 0, alice, "");
         vm.prank(alice);
         vm.expectRevert(IZonePortal.NotSequencer.selector);
-        portal.setZoneGasRate(4);
+        portal.processWithdrawal(withdrawal, bytes32(0));
     }
 
     function test_submitBatch_requiresQuorumAfterActivation() public {
         address[] memory signers = _activateSequencerSet(2);
+        bytes32 prevBlockHash = portal.blockHash();
 
         vm.prank(signers[0]);
         vm.expectRevert(IZonePortal.LegacyBatchSubmissionDisabled.selector);
         portal.submitBatch(
             uint64(block.number),
             0,
-            BlockTransition({ prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("tip") }),
+            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: keccak256("tip") }),
             DepositQueueTransition({
                 prevProcessedHash: bytes32(0),
                 nextProcessedHash: bytes32(0),

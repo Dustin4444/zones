@@ -28,7 +28,8 @@ sol! {
     struct CreateZoneParams {
         address initialToken;
         address admin;
-        address sequencer;
+        address[] sequencers;
+        uint8 threshold;
         address verifier;
         ZoneParams zoneParams;
         string rpcUrl;
@@ -41,7 +42,8 @@ sol! {
             address indexed portal,
             address initialToken,
             address admin,
-            address sequencer,
+            address[] sequencers,
+            uint8 threshold,
             address verifier,
             bytes32 genesisBlockHash,
             bytes32 genesisTempoBlockHash,
@@ -203,7 +205,8 @@ impl CreateZone {
             let params = CreateZoneParams {
                 initialToken: self.initial_token,
                 admin: self.admin,
-                sequencer: self.sequencer,
+                sequencers: vec![self.sequencer],
+                threshold: 1,
                 verifier,
                 zoneParams: zone_params,
                 rpcUrl: self.rpc_url.clone(),

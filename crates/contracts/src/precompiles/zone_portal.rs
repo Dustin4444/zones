@@ -188,6 +188,12 @@ crate::sol! {
         function depositCount() external view returns (uint64);
         function lastProcessedDepositNumber() external view returns (uint64);
         function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
+        function sequencerSetVersion() external view returns (uint64);
+        function sequencerQuorum() external view returns (uint8);
+        function zoneHeight() external view returns (uint256);
+        function isSequencer(address account) external view returns (bool);
+        function sequencerCount() external view returns (uint256);
+        function sequencerAt(uint256 index) external view returns (address);
 
         // -- State-changing functions --
 
@@ -211,6 +217,18 @@ crate::sol! {
             bytes32 withdrawalQueueHash,
             bytes calldata verifierConfig,
             bytes calldata proof
+        ) external;
+
+        function submitBatch(
+            uint64 tempoBlockNumber,
+            uint64 recentTempoBlockNumber,
+            BlockTransition calldata blockTransition,
+            DepositQueueTransition calldata depositQueueTransition,
+            bytes32 withdrawalQueueHash,
+            bytes calldata verifierConfig,
+            bytes calldata proof,
+            uint256 zoneHeight,
+            bytes[] calldata signatures
         ) external;
 
         function enableToken(address token) external;

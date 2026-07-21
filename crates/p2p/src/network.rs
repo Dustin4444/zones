@@ -15,6 +15,12 @@ pub(crate) const BLOCK_CHANNEL: u64 = 0;
 pub(crate) const BACKFILL_REQUEST_CHANNEL: u64 = 1;
 /// Ordered block and completion frames returned for a catch-up request.
 pub(crate) const BACKFILL_RESPONSE_CHANNEL: u64 = 2;
+/// Follower-to-leader signed block acknowledgement channel.
+pub(crate) const BLOCK_ACK_CHANNEL: u64 = 3;
+/// Leader-to-follower proposed settlement statement channel.
+pub(crate) const SETTLEMENT_PROPOSAL_CHANNEL: u64 = 4;
+/// Follower-to-leader settlement signature channel.
+pub(crate) const SETTLEMENT_SIGNATURE_CHANNEL: u64 = 5;
 pub(crate) const BLOCK_BACKLOG: usize = 128;
 
 // At 30M gas, calldata is bounded below 7.5 MiB; leave headroom for block overhead.
@@ -132,6 +138,15 @@ pub(crate) fn backfill_request_quota() -> Quota {
 
 pub(crate) fn backfill_response_quota() -> Quota {
     Quota::per_second(NZU32!(128))
+}
+
+/// ACKs are small fixed-shape EIP-712 statements plus one secp256k1 signature.
+pub(crate) fn block_ack_quota() -> Quota {
+    Quota::per_second(NZU32!(128))
+}
+
+pub(crate) fn settlement_quota() -> Quota {
+    Quota::per_second(NZU32!(8))
 }
 
 #[cfg(test)]

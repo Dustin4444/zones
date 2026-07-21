@@ -15,6 +15,7 @@ use p256::ecdsa::SigningKey as P256SigningKey;
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
 use reth_node_core::{args::RpcServerArgs, exit::NodeExitFuture};
+use reth_primitives_traits::SealedHeader;
 use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
@@ -44,7 +45,8 @@ use tempo_zone_contracts::{ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{
-    Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
+    Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1BlockTracker, L1Deposit,
+    L1PortalEvents, L1StateCache,
 };
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
@@ -377,6 +379,7 @@ pub(crate) struct ZoneTestNode {
     http_url: url::Url,
     deposit_queue: DepositQueue,
     l1_state_cache: L1StateCache,
+    l1_block_tracker: L1BlockTracker,
     policy_cache: zone_l1::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
     node_handle: Box<dyn TestNodeHandle>,
@@ -404,6 +407,10 @@ impl ZoneTestNode {
     /// Returns a handle to the L1 state cache for seeding precompile data.
     pub(crate) fn l1_state_cache(&self) -> &L1StateCache {
         &self.l1_state_cache
+    }
+
+    pub(crate) fn l1_block_tracker(&self) -> &L1BlockTracker {
+        &self.l1_block_tracker
     }
 
     /// Returns a handle to the policy cache for TIP-403 authorization.
@@ -593,17 +600,32 @@ impl ZoneTestNode {
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
+        Self::start_from_l1_with_sequencer_signer(
+            l1_http_url,
+            l1_ws_url,
+            portal_address,
+            l1_dev_signer(),
+        )
+        .await
+    }
+
+    /// Start a zone node connected to a real L1 with an explicit block-production signer.
+    pub(crate) async fn start_from_l1_with_sequencer_signer(
+        l1_http_url: &url::Url,
+        l1_ws_url: &url::Url,
+        portal_address: Address,
+        sequencer_signer: alloy_signer_local::PrivateKeySigner,
+    ) -> eyre::Result<Self> {
         let (genesis, genesis_block_number) =
             build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
-        let signer = l1_dev_signer();
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
             Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
-            signer,
+            sequencer_signer,
         )
         .await
     }
@@ -846,6 +868,7 @@ impl ZoneTestNode {
 
         let deposit_queue = zone_node.deposit_queue();
         let l1_state_cache = zone_node.l1_state_cache();
+        let l1_block_tracker = zone_node.l1_block_tracker();
         let policy_cache = zone_node.policy_cache();
         if is_local_dummy_l1 {
             seed_local_policy_cache(&policy_cache);
@@ -914,6 +937,7 @@ impl ZoneTestNode {
             deposit_queue,
             http_url,
             l1_state_cache,
+            l1_block_tracker,
             policy_cache,
             rpc_api_factory,
             node_handle: Box::new(node_handle),
@@ -1355,7 +1379,8 @@ impl L1TestNode {
             .createZone(ZoneFactory::CreateZoneParams {
                 admin,
                 initialToken: PATH_USD_ADDRESS,
-                sequencer,
+                sequencers: vec![sequencer],
+                threshold: 1,
                 verifier: verifier_address,
                 zoneParams: ZoneFactory::ZoneParams {
                     genesisBlockHash: B256::ZERO,
@@ -2560,6 +2585,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         zone_poll_interval: Duration::from_millis(500),
         batch_interval_blocks: 1,
         batch_anchor_config,
+        attestation_store: None,
     };
 
     zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await
@@ -3681,9 +3707,11 @@ impl L1Fixture {
     }
 
     /// Inject an empty L1 block (no deposits) into the queue.
-    pub(crate) fn inject_empty_block(&mut self, queue: &DepositQueue) {
+    pub(crate) fn inject_empty_block(&mut self, queue: &DepositQueue) -> NumHash {
         let header = self.next_header();
+        let anchor = SealedHeader::seal_slow(header.clone()).num_hash();
         queue.enqueue(header, L1PortalEvents::default(), vec![]);
+        anchor
     }
 
     /// Inject `n` empty L1 blocks (no deposits) into the queue.
@@ -3694,11 +3722,17 @@ impl L1Fixture {
     }
 
     /// Inject an L1 block with the given deposits into the queue.
-    pub(crate) fn inject_deposits(&mut self, queue: &DepositQueue, deposits: Vec<Deposit>) {
+    pub(crate) fn inject_deposits(
+        &mut self,
+        queue: &DepositQueue,
+        deposits: Vec<Deposit>,
+    ) -> NumHash {
         let header = self.next_header();
+        let anchor = SealedHeader::seal_slow(header.clone()).num_hash();
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
         queue.enqueue(header, events, vec![]);
+        anchor
     }
 
     /// Inject an L1 block with mixed regular and encrypted deposits.

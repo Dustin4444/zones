@@ -57,7 +57,7 @@ impl ZoneInfoCmd {
         println!("  Portal:                {}", info.portal);
         println!("  Messenger:             {messenger}");
         println!("  Initial Token:         {}", info.initialToken);
-        println!("  Sequencer:             {}", info.sequencer);
+        println!("  Sequencers:          {:?}", info.sequencers);
         println!("  Verifier:              {}", info.verifier);
         println!("  Genesis Block Hash:    {}", info.genesisBlockHash);
         println!("  Genesis Tempo Hash:    {}", info.genesisTempoBlockHash);

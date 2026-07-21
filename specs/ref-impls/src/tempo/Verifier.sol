@@ -16,6 +16,7 @@ contract Verifier is IVerifier {
         uint64,
         bytes32,
         uint64,
+        address,
         BlockTransition calldata,
         DepositQueueTransition calldata,
         bytes32,

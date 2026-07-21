@@ -102,7 +102,8 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         .createZone(ZoneFactory::CreateZoneParams {
             initialToken: initial_token,
             admin: dev_address,
-            sequencer: dev_address,
+            sequencers: vec![dev_address],
+            threshold: 1,
             verifier,
             zoneParams: ZoneFactory::ZoneParams {
                 genesisBlockHash: B256::ZERO,

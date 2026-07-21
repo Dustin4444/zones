@@ -18,6 +18,7 @@ contract VerifierTest is Test {
             1,
             bytes32("anchor"),
             1,
+            address(0x1234),
             BlockTransition({ prevBlockHash: bytes32("prev"), nextBlockHash: bytes32("next") }),
             DepositQueueTransition({
                 prevProcessedHash: bytes32(0),
