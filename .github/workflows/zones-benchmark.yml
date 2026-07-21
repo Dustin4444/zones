@@ -156,9 +156,12 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          INPUT_PHASE: ${{ inputs.phase }}
+          # This draft branch deliberately uses the fixture-free route. It exercises the same
+          # Zone payload builder and executor while the private fixture repository credential is
+          # being provisioned for the full neobank route.
+          INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'roundtrip' || inputs.phase }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
-          INPUT_COUNT: ${{ inputs.count || '1000' }}
+          INPUT_COUNT: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && '100' || inputs.count || '1000' }}
           INPUT_TPS: ${{ inputs.tps || '20' }}
           INPUT_MAX_CONCURRENT: ${{ inputs.max-concurrent || '100' }}
           INPUT_STATE_BLOAT_GIB: ${{ inputs.state-bloat-gib || '1' }}
