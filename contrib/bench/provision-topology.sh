@@ -640,6 +640,7 @@ provision_up() {
         --private-rpc.port 8544 \
         --log.file.directory "$log_dir/zone" \
         --ipcdisable \
+        --engine.disable-sparse-trie-cache-pruning \
         --sequencer
     unset SEQUENCER_KEY sequencer_key owner_key admin_key
 
