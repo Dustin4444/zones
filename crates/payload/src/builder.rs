@@ -349,10 +349,19 @@ where
             changed_paths: None,
         };
 
+        // The historical sequencer submitted this payload through `newPayload`
+        // only. Keep the current fast path by default, but let the state-root
+        // diagnostic reproduce the former insertion topology exactly.
+        let executed_block = (std::env::var("ZONES_DEBUG_NEW_PAYLOAD_ONLY")
+            .ok()
+            .as_deref()
+            != Some("1"))
+        .then_some(executed_block);
+
         let payload = TempoBuiltPayload::new(
             eth_payload,
             None,
-            Some(executed_block),
+            executed_block,
             std::time::Duration::ZERO,
             std::time::Duration::ZERO,
             execution_block_size_estimate,
@@ -431,9 +440,6 @@ where
     let mut state = executor.into_state();
     let reexecuted_state = state.take_bundle();
     let bundle_states_match = builder_state == &reexecuted_state;
-    if !bundle_states_match {
-        dump_bundle_difference_if_enabled(block, builder_state, &reexecuted_state);
-    }
     let hashed_state = parent_state.hashed_post_state(&reexecuted_state);
     let (reexecuted_root, _) = parent_state
         .state_root_with_updates(hashed_state)
@@ -441,6 +447,7 @@ where
     let header_root = block.header().state_root();
 
     if reexecuted_root != header_root {
+        dump_bundle_comparison_if_enabled(block, builder_state, &reexecuted_state);
         error!(
             target: "zone::payload",
             block_number = block.number(),
@@ -452,21 +459,27 @@ where
             bundle_states_match,
             "locally built payload does not match fresh parent-state re-execution"
         );
-        return Err(PayloadBuilderError::other(reth_errors::RethError::msg(
-            format!(
-                "payload state root mismatch at block {}: header {header_root}, re-executed {reexecuted_root}",
-                block.number()
-            ),
-        )));
+        if std::env::var("ZONES_DEBUG_CONTINUE_AFTER_PAYLOAD_ROOT_MISMATCH")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Err(PayloadBuilderError::other(reth_errors::RethError::msg(
+                format!(
+                    "payload state root mismatch at block {}: header {header_root}, re-executed {reexecuted_root}",
+                    block.number()
+                ),
+            )));
+        }
+    } else {
+        info!(
+            target: "zone::payload",
+            block_number = block.number(),
+            block_hash = ?block.hash(),
+            state_root = ?header_root,
+            "verified locally built payload against fresh parent-state re-execution"
+        );
     }
-
-    info!(
-        target: "zone::payload",
-        block_number = block.number(),
-        block_hash = ?block.hash(),
-        state_root = ?header_root,
-        "verified locally built payload against fresh parent-state re-execution"
-    );
     Ok(())
 }
 
@@ -475,7 +488,7 @@ where
 /// The header/root comparison alone cannot tell whether a bad root came from EVM
 /// state writes or from trie construction. These files make that distinction
 /// inspectable without touching normal payload construction or benchmark runs.
-fn dump_bundle_difference_if_enabled(
+fn dump_bundle_comparison_if_enabled(
     block: &reth_primitives_traits::RecoveredBlock<tempo_primitives::Block>,
     builder_state: &BundleState,
     reexecuted_state: &BundleState,
@@ -507,7 +520,7 @@ fn dump_bundle_difference_if_enabled(
             block_number = block.number(),
             block_hash = ?block.hash(),
             output_dir = %output_dir.display(),
-            "builder and fresh re-execution bundle states differ"
+            "saved builder and fresh re-execution bundle states for root diagnosis"
         ),
         Err(err) => error!(
             block_number = block.number(),

@@ -295,6 +295,8 @@ jobs:
       ZONES_DEBUG_RACE_NEW_PAYLOAD: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
       ZONES_DEBUG_REENABLE_SPARSE_TRIE_PRUNING: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
       ZONES_DEBUG_BUILDER_STATE_DIR: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && format('{0}/target/zones-benchmark/builder-state-diagnostics', github.workspace) || '' }}
+      ZONES_DEBUG_NEW_PAYLOAD_ONLY: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
+      ZONES_DEBUG_CONTINUE_AFTER_PAYLOAD_ROOT_MISMATCH: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
       ZONES_BENCH_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.deposit-amount }}
       ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.bootstrap-deposit-amount }}
       ZONES_BENCH_ACTIVITY_AMOUNT: ${{ needs.authorize.outputs.activity-amount }}
