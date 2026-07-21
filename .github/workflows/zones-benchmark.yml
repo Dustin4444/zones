@@ -292,7 +292,7 @@ jobs:
       # Retire this branch once the witness has identified the divergent state.
       # It deliberately reintroduces the former newPayload path alongside
       # executed-payload insertion, solely to reproduce the historical fault.
-      ZONES_DEBUG_RACE_NEW_PAYLOAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging' && '1' || '0' }}
+      ZONES_DEBUG_RACE_NEW_PAYLOAD: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
       ZONES_BENCH_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.deposit-amount }}
       ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.bootstrap-deposit-amount }}
       ZONES_BENCH_ACTIVITY_AMOUNT: ${{ needs.authorize.outputs.activity-amount }}
