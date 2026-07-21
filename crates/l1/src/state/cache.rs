@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn token_enablement_blocks_pre_creation_value_inheritance() {
+    fn token_enablement_invalidates_cached_token_state() {
         let token = address!("0x20c0000000000000000000000000000000000042");
         let policy_slot = B256::with_last_byte(1);
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
