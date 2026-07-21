@@ -26,6 +26,8 @@ import {
     PORTAL_SEQUENCER_SLOT,
     Withdrawal,
     ZONE_FACTORY_ADDRESS,
+    ZONE_MESSENGER_ADDRESS,
+    ZONE_VERIFIER_ADDRESS,
     ZoneInfo,
     ZoneParams
 } from "../../src/interfaces/IZone.sol";
@@ -313,7 +315,6 @@ contract ZonePortalTest is BaseTest {
             initialToken: address(pathUSD),
             admin: admin,
             sequencer: sequencer,
-            verifier: zoneFactory.verifier(),
             zoneParams: ZoneParams({
                 genesisBlockHash: GENESIS_BLOCK_HASH,
                 genesisTempoBlockHash: GENESIS_TEMPO_BLOCK_HASH,
@@ -327,7 +328,7 @@ contract ZonePortalTest is BaseTest {
         portal = ZonePortal(portalAddr);
 
         // Get the shared messenger
-        messenger = ZoneMessenger(zoneFactory.messenger());
+        messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
 
         // Set expected messenger for withdrawal receiver
         withdrawalReceiver.setExpectedMessenger(address(messenger));
@@ -373,7 +374,7 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.isTokenEnabled(address(pathUSD)));
         assertEq(portal.sequencer(), sequencer);
         assertEq(portal.admin(), admin);
-        assertEq(portal.verifier(), zoneFactory.verifier());
+        assertEq(portal.verifier(), ZONE_VERIFIER_ADDRESS);
         assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
@@ -382,7 +383,7 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_zoneFactoryTracksZones() public view {
-        assertEq(zoneFactory.zoneCount(), 1);
+        assertEq(zoneFactory.nextZoneId(), 2);
         assertTrue(zoneFactory.isZonePortal(address(portal)));
 
         ZoneInfo memory info = zoneFactory.zones(testZoneId);
@@ -962,7 +963,7 @@ contract ZonePortalTest is BaseTest {
 
     function test_submitBatch_revertsOnInvalidProof() public {
         vm.mockCall(
-            zoneFactory.verifier(),
+            ZONE_VERIFIER_ADDRESS,
             abi.encodeWithSelector(IVerifier.verify.selector),
             abi.encode(false)
         );
@@ -2424,7 +2425,7 @@ contract ZonePortalTest is BaseTest {
     function test_metadataGetters() public view {
         assertEq(portal.zoneId(), testZoneId);
         assertEq(portal.sequencer(), sequencer);
-        assertEq(portal.verifier(), zoneFactory.verifier());
+        assertEq(portal.verifier(), ZONE_VERIFIER_ADDRESS);
         assertEq(portal.genesisTempoBlockNumber(), genesisTempoBlockNumber);
     }
 
