@@ -44,9 +44,7 @@ use tempo_primitives::{
     TempoHeader, TempoTxEnvelope,
     transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
 };
-use tempo_transaction_pool::{
-    TempoTransactionPool, transaction::TempoPooledTransaction, validator::ConfigureTempoPoolEvm,
-};
+use tempo_transaction_pool::{TempoTransactionPool, transaction::TempoPooledTransaction};
 use tracing::{error, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{PreparedL1Block, TempoStateExt};
@@ -104,8 +102,7 @@ impl Default for ZonePayloadFactory {
     }
 }
 
-impl<Node, EvmConfig>
-    PayloadBuilderBuilder<Node, TempoTransactionPool<Node::Provider, EvmConfig>, EvmConfig>
+impl<Node, EvmConfig> PayloadBuilderBuilder<Node, TempoTransactionPool<Node::Provider>, EvmConfig>
     for ZonePayloadFactory
 where
     Node: FullNodeTypes,
@@ -117,8 +114,7 @@ where
     EvmConfig: ConfigureEvm<
             Primitives = tempo_primitives::TempoPrimitives,
             NextBlockEnvCtx = TempoNextBlockEnvAttributes,
-        > + ConfigureTempoPoolEvm
-        + 'static,
+        > + 'static,
     <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
         EvmFactory<Tx = tempo_revm::TempoTxEnv>,
     BlockEnvFor<EvmConfig>: RevmBlock,
@@ -128,7 +124,7 @@ where
     async fn build_payload_builder(
         self,
         ctx: &BuilderContext<Node>,
-        pool: TempoTransactionPool<Node::Provider, EvmConfig>,
+        pool: TempoTransactionPool<Node::Provider>,
         evm_config: EvmConfig,
     ) -> eyre::Result<Self::PayloadBuilder> {
         Ok(ZonePayloadBuilder {
@@ -145,7 +141,7 @@ where
 #[derive(Debug, Clone)]
 pub struct ZonePayloadBuilder<Provider, EvmConfig> {
     /// Transaction pool for selecting pool txs to include in the block.
-    pool: TempoTransactionPool<Provider, EvmConfig>,
+    pool: TempoTransactionPool<Provider>,
     /// State provider for reading chain state during block building.
     provider: Provider,
     /// Zone-specific EVM configuration (precompiles, hardfork spec, gas params).
@@ -162,8 +158,7 @@ where
     EvmConfig: ConfigureEvm<
             Primitives = tempo_primitives::TempoPrimitives,
             NextBlockEnvCtx = TempoNextBlockEnvAttributes,
-        > + ConfigureTempoPoolEvm
-        + 'static,
+        > + 'static,
     <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
         EvmFactory<Tx = tempo_revm::TempoTxEnv>,
     BlockEnvFor<EvmConfig>: RevmBlock,
