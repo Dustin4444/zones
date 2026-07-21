@@ -266,7 +266,7 @@ async fn validate_settlement_anchor(
 /// Sign and broadcast settlement proposals for persisted batch boundaries.
 pub(crate) async fn collect_leader_settlements<P>(
     provider: P,
-    commands: mpsc::Sender<P2pCommand>,
+    commands: Option<mpsc::Sender<P2pCommand>>,
     context: BlockAttestationContext,
 ) where
     P: PersistedBlockSubscriptions
@@ -289,7 +289,7 @@ pub(crate) async fn collect_leader_settlements<P>(
     };
     let mut pending_boundary = None;
     for number in 1..=head {
-        match propose_settlement(&provider, number, &commands, &context).await {
+        match propose_settlement(&provider, number, commands.as_ref(), &context).await {
             Ok(true) => {
                 pending_boundary = Some(number);
                 break;
@@ -308,7 +308,7 @@ pub(crate) async fn collect_leader_settlements<P>(
         tokio::select! {
             tip = persisted.next() => {
                 let Some(tip) = tip else { return };
-                match propose_settlement(&provider, tip.number, &commands, &context).await {
+                match propose_settlement(&provider, tip.number, commands.as_ref(), &context).await {
                     Ok(true) => pending_boundary = Some(tip.number),
                     Ok(false) => {}
                     Err(err) => tracing::warn!(target: "zone::p2p", %err, height = tip.number, "Failed proposing settlement boundary"),
@@ -316,7 +316,7 @@ pub(crate) async fn collect_leader_settlements<P>(
             }
             _ = retry.tick(), if pending_boundary.is_some() => {
                 let number = pending_boundary.expect("guarded by is_some");
-                match propose_settlement(&provider, number, &commands, &context).await {
+                match propose_settlement(&provider, number, commands.as_ref(), &context).await {
                     Ok(true) => {}
                     Ok(false) => pending_boundary = None,
                     Err(err) => {
@@ -333,7 +333,7 @@ pub(crate) async fn collect_leader_settlements<P>(
                             }
                         };
                         for candidate in number.saturating_add(1)..=head {
-                            match propose_settlement(&provider, candidate, &commands, &context).await {
+                            match propose_settlement(&provider, candidate, commands.as_ref(), &context).await {
                                 Ok(true) => {
                                     pending_boundary = Some(candidate);
                                     break;
@@ -356,7 +356,7 @@ pub(crate) async fn collect_leader_settlements<P>(
 async fn propose_settlement<P>(
     provider: &P,
     number: u64,
-    commands: &mpsc::Sender<P2pCommand>,
+    commands: Option<&mpsc::Sender<P2pCommand>>,
     context: &BlockAttestationContext,
 ) -> eyre::Result<bool>
 where
@@ -372,12 +372,14 @@ where
     let (_, signatures) = context
         .store
         .insert_settlement(context.domain, signer, signed);
-    commands
-        .send(P2pCommand::BroadcastSettlementProposal(
-            attestation.encode(),
-        ))
-        .await
-        .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
-    info!(target: "zone::p2p", height = number, %signer, signatures, "Signed and broadcast settlement proposal");
+    if let Some(commands) = commands {
+        commands
+            .send(P2pCommand::BroadcastSettlementProposal(
+                attestation.encode(),
+            ))
+            .await
+            .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
+    }
+    info!(target: "zone::p2p", height = number, %signer, signatures, broadcast = commands.is_some(), "Signed settlement proposal");
     Ok(true)
 }

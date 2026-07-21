@@ -485,10 +485,9 @@ where
         self.spawn_policy_tasks(&l1_provider, &ctx);
 
         let task_executor = ctx.node.task_executor().clone();
-        let attestation_store = self
-            .p2p_config
-            .as_ref()
-            .map(|_| AttestationStore::default());
+        let p2p_enabled = self.p2p_config.is_some();
+        let attestation_store =
+            (p2p_enabled || self.sequencer_config.is_some()).then(AttestationStore::default);
         if let Some(config) = self.p2p_config.take() {
             let l1_chain_id = l1_provider.get_chain_id().await?;
             let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
@@ -516,6 +515,32 @@ where
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
             )?;
+        }
+
+        if !p2p_enabled && let Some(config) = self.sequencer_config.as_ref() {
+            let portal = ZonePortal::new(self.portal_address, l1_provider.clone());
+            let sequencer_set_version = portal.sequencerSetVersion().call().await?;
+            if sequencer_set_version != 0 {
+                let attestation = BlockAttestationContext::new(
+                    AttestationDomain {
+                        l1_chain_id: l1_provider.get_chain_id().await?,
+                        portal_address: self.portal_address,
+                        zone_id: config.zone_id,
+                        sequencer_set_version,
+                    },
+                    config.sequencer_signer.clone(),
+                    Default::default(),
+                    attestation_store
+                        .clone()
+                        .expect("sequencer configuration must create an attestation store"),
+                    l1_provider.clone(),
+                    config.batch_anchor_config,
+                );
+                task_executor.spawn_critical_task(
+                    "zone-settlement-collection",
+                    collect_leader_settlements(ctx.node.provider().clone(), None, attestation),
+                );
+            }
         }
 
         if let Some(ref config) = self.sequencer_config {
@@ -603,7 +628,11 @@ where
             );
             task_executor.spawn_critical_task(
                 "zone-p2p-settlement-collection",
-                collect_leader_settlements(provider.clone(), commands.clone(), attestation.clone()),
+                collect_leader_settlements(
+                    provider.clone(),
+                    Some(commands.clone()),
+                    attestation.clone(),
+                ),
             );
         }
         task_executor.spawn_critical_task(
