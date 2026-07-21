@@ -33,14 +33,13 @@ use tempo_precompiles::{
     nonce::NonceManager,
     stablecoin_dex::StablecoinDEX,
     storage::{StorageActions, StorageCtx},
-    tip_fee_manager::TipFeeManager,
     tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
     tip20_factory::TIP20Factory,
     tip403_registry::TIP403Registry,
 };
 use tempo_primitives::TempoHeader;
 use tempo_revm::{TempoBlockEnv, TempoTxEnv};
-use zone_precompiles::{TempoState as NativeTempoState, ZoneTokenFactory};
+use zone_precompiles::{TempoState as NativeTempoState, ZoneFeeManager, ZoneTokenFactory};
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
@@ -544,7 +543,7 @@ fn create_path_usd_token(evm: &mut TempoEvm<CacheDB<EmptyDB>>, admin: Address) -
     Ok(())
 }
 
-/// Initialize the TipFeeManager precompile.
+/// Initialize the Zone fee manager precompile.
 fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
     StorageCtx::enter_evm(
@@ -554,13 +553,13 @@ fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<
         &ctx.tx,
         StorageActions::disabled(),
         || {
-            let mut fee_manager = TipFeeManager::new();
+            let mut fee_manager = ZoneFeeManager::new();
             fee_manager
                 .initialize()
                 .expect("Could not init fee manager");
         },
     );
-    println!("Initialized TipFeeManager");
+    println!("Initialized ZoneFeeManager");
     Ok(())
 }
 

@@ -9,6 +9,7 @@
 
 mod database;
 mod executor;
+mod fee_manager;
 pub mod precompiles;
 mod tx_context;
 mod zone_evm;
@@ -18,11 +19,12 @@ pub use executor::ZoneBlockExecutor;
 pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
 
 use crate::{
+    fee_manager::ZoneProtocolFeeManager,
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
         L1State, L1StorageReader, SequencerSetExt, TIP403_REGISTRY_ADDRESS, TempoState,
         ZONE_TIP20_FACTORY_ADDRESS, ZonePrecompileEnv, ZoneTokenFactory, create_tip20_precompile,
-        create_tip403_precompile,
+        create_tip403_precompile, create_zone_fee_manager_precompile,
     },
     tx_context::ZoneTxContext,
 };
@@ -55,7 +57,7 @@ use tempo_precompiles::{
     RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
     account_keychain::AccountKeychain, nonce::NonceManager,
     receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
-    storage_credits::NonCreditableSlots, tip_fee_manager::TipFeeManager, tip20::is_tip20_prefix,
+    storage_credits::NonCreditableSlots, tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -83,9 +85,10 @@ where
 
     fn register_precompiles<DB: Database, I: Inspector<TempoCtx<L1OverlayDB<DB, L1>>>>(
         &self,
-        mut evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
+        evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
         l1: L1State<L1>,
     ) -> TempoEvm<L1OverlayDB<DB, L1>, I> {
+        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new(self.l1_reader.clone()));
         let cfg = evm.ctx().cfg.clone();
         let (_, _, precompiles) = evm.components_mut();
         let actions = StorageActions::disabled();
@@ -104,6 +107,10 @@ where
         precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
             Some(ZoneTokenFactory::create(&env))
         });
+        let fee_env = env.clone();
+        precompiles.apply_precompile(&TIP_FEE_MANAGER_ADDRESS, move |_| {
+            Some(create_zone_fee_manager_precompile(&fee_env))
+        });
         let tip403_env = env.clone();
         precompiles.apply_precompile(&TIP403_REGISTRY_ADDRESS, move |_| {
             Some(create_tip403_precompile(&tip403_env))
@@ -113,9 +120,7 @@ where
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, sequencers.clone()))
-            } else if *address == TIP_FEE_MANAGER_ADDRESS {
-                Some(TipFeeManager::create_precompile(&tempo_env))
-            } else if *address == STABLECOIN_DEX_ADDRESS {
+            } else if *address == TIP_FEE_MANAGER_ADDRESS || *address == STABLECOIN_DEX_ADDRESS {
                 None
             } else if *address == NONCE_PRECOMPILE_ADDRESS {
                 Some(NonceManager::create_precompile(&tempo_env))
@@ -277,8 +282,7 @@ impl ZoneEvmConfig {
     ///
     /// Intended for CLI subcommands (import, stage, re-execute) that need a type-compatible
     /// EVM config but don't have access to an L1 RPC connection. Tempo hardfork conditions come
-    /// from `chain_spec` because the parent L1 spec cannot be resolved in this mode. The portal
-    /// address defaults to zero, so sequencer reads are unavailable.
+    /// from `chain_spec` because the parent L1 spec cannot be resolved in this mode.
     pub fn new_without_l1(chain_spec: Arc<ZoneChainSpec>) -> Self {
         let cache = L1StateCache::default();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()

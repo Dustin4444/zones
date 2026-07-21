@@ -1,7 +1,7 @@
 //! Zone-native precompiles and shared execution for Tempo precompiles on a Zone.
 //!
 //! All implementations use ordinary EVM storage. The Zone EVM installs an anchored database below
-//! the revm journal, so upstream TIP-20, TIP-403, and fee-manager code transparently observe
+//! the revm journal, so TIP-20, TIP-403, and Zone fee-manager code transparently observe
 //! finalized Tempo policy state. Zone admission, delegate-call, fixed-gas, and privacy rules remain
 //! outside the forwarded business logic.
 //!
@@ -48,6 +48,7 @@ pub mod storage;
 pub mod tempo_state;
 pub mod tip20_factory;
 pub mod tip403_proxy;
+pub mod zone_fee_manager;
 pub mod ztip20;
 
 pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
@@ -56,12 +57,23 @@ pub use storage::{L1State, L1StateError, L1StorageReader};
 pub use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
 pub use tempo_state::TempoState;
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};
+pub use zone_fee_manager::ZoneFeeManager;
 pub use ztip20::SequencerSetExt;
 
 use alloc::sync::Arc;
 
 use alloy_evm::precompiles::DynPrecompile;
 use tempo_precompiles::{Precompile as _, tip20::TIP20Token, tip403_registry::TIP403Registry};
+
+/// Creates the zone-native fee manager precompile.
+pub fn create_zone_fee_manager_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {
+    execution::create_precompile(
+        "ZoneFeeManager",
+        env,
+        execution::NoCallRules,
+        |data, caller| ZoneFeeManager::new().call(data, caller),
+    )
+}
 
 /// Creates upstream TIP-403 execution with zone read-only rules and adapter-backed L1 reads.
 pub fn create_tip403_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {

@@ -901,6 +901,7 @@ impl ZoneTestNode {
         let l1_state_cache = zone_node.l1_state_cache();
         if is_local_dummy_l1 {
             let mut cache = l1_state_cache.write();
+            cache.initialize_enabled_tokens([PATH_USD_ADDRESS]);
             seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         }
 
@@ -3643,6 +3644,7 @@ impl L1Fixture {
         for cache in self.caches.lock().unwrap().iter() {
             let mut cache = cache.write();
             for token in tokens {
+                cache.enable_token(token.token);
                 seed_raw_tip403_token_policy(
                     &mut cache,
                     block_number,
