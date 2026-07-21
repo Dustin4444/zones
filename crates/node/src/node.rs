@@ -204,6 +204,7 @@ impl ZoneNode {
 
         let l1_state_cache = L1StateCache::new(HashSet::from([
             portal_address,
+            tempo_contracts::precompiles::PATH_USD_ADDRESS,
             tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS,
         ]));
         let l1_config = L1SubscriberConfig {

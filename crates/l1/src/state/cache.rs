@@ -376,8 +376,8 @@ mod tests {
 
     #[test]
     fn different_addresses_same_slot_are_independent() {
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let addr_b = address!("0x0000000000000000000000000000000000004343");
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL, addr_b]));
         let slot = B256::with_last_byte(1);
 
         cache.set(PORTAL, slot, 10, B256::with_last_byte(0xaa));
