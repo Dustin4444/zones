@@ -212,7 +212,7 @@ struct PortalBackingCheck {
 
 #[derive(Debug)]
 enum PreparedCheck {
-    Pending(Checkpoint),
+    Pending,
     Portal(PortalBackingCheck),
     Retry(WithdrawalCheckRetry),
 }
@@ -227,7 +227,7 @@ struct PortalCheckResult {
 
 #[derive(Debug)]
 enum PortalCheckOutcome {
-    Pending(Checkpoint),
+    Pending,
     Retry(WithdrawalCheckRetry),
     Decision {
         check: Arc<PortalBackingCheck>,
@@ -297,8 +297,29 @@ impl Default for PortalCheckCache {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PortalCheckState {
     Ready,
-    Running,
+    Running { checkpoint_changed: bool },
     WaitingForCheckpoint,
+}
+
+impl PortalCheckState {
+    const fn checkpoint_changed(self) -> Self {
+        match self {
+            Self::Ready => Self::Ready,
+            Self::Running { .. } => Self::Running {
+                checkpoint_changed: true,
+            },
+            Self::WaitingForCheckpoint => Self::Ready,
+        }
+    }
+
+    const fn pending_result(self) -> Self {
+        match self {
+            Self::Running {
+                checkpoint_changed: true,
+            } => Self::Ready,
+            _ => Self::WaitingForCheckpoint,
+        }
+    }
 }
 
 struct PendingPortalCheck {
@@ -345,6 +366,7 @@ impl PortalChecks {
         let key = (target.number, target.hash);
         if let Some(pending) = self.pending.get_mut(&key) {
             pending.requests.push(request);
+            self.start_available(ledger, provider);
             return Ok(());
         }
 
@@ -422,7 +444,9 @@ impl PortalChecks {
             self.pending
                 .get_mut(&key)
                 .expect("pending check exists")
-                .state = PortalCheckState::Running;
+                .state = PortalCheckState::Running {
+                checkpoint_changed: false,
+            };
             self.spawn(*ledger, provider.clone(), target, deadline, baseline);
         }
     }
@@ -455,8 +479,8 @@ impl PortalChecks {
                     ))
                 })?;
                 let check = match prepared? {
-                    PreparedCheck::Pending(checkpoint) => {
-                        return Ok(PortalCheckOutcome::Pending(checkpoint));
+                    PreparedCheck::Pending => {
+                        return Ok(PortalCheckOutcome::Pending);
                     }
                     PreparedCheck::Retry(error) => {
                         return Ok(PortalCheckOutcome::Retry(error));
@@ -495,17 +519,15 @@ impl PortalChecks {
         }
     }
 
-    fn retry(&mut self, key: PortalCheckKey) {
+    fn handle_pending_result(&mut self, key: PortalCheckKey) {
         if let Some(pending) = self.pending.get_mut(&key) {
-            pending.state = PortalCheckState::Ready;
+            pending.state = pending.state.pending_result();
         }
     }
 
-    fn wake_waiting(&mut self) {
+    fn checkpoint_changed(&mut self) {
         for pending in self.pending.values_mut() {
-            if pending.state == PortalCheckState::WaitingForCheckpoint {
-                pending.state = PortalCheckState::Ready;
-            }
+            pending.state = pending.state.checkpoint_changed();
         }
     }
 
@@ -549,7 +571,8 @@ impl PortalChecks {
                 .retain(|request| !request.response.is_closed());
         }
         self.pending.retain(|_, pending| {
-            !pending.requests.is_empty() || pending.state == PortalCheckState::Running
+            !pending.requests.is_empty()
+                || matches!(pending.state, PortalCheckState::Running { .. })
         });
     }
 
@@ -578,6 +601,7 @@ impl WithdrawalLedger {
         &self,
         provider: &P,
         tables_are_new: bool,
+        local_head: u64,
     ) -> Result<Checkpoint, WithdrawalCheckError>
     where
         P: HeaderProvider<Header = TempoHeader> + DatabaseProviderFactory,
@@ -642,9 +666,41 @@ impl WithdrawalLedger {
                 checkpoint.zone
             )));
         }
+        let checkpoint =
+            self.unwind_to_canonical_ancestor(tx, checkpoint, local_head, |number| {
+                provider
+                    .sealed_header(number)
+                    .map(|header| header.map(|header| header.hash()))
+                    .map_err(|error| self.storage(error))
+            })?;
         self.verify_token_backing(tx)?;
         provider_rw.commit().map_err(|err| self.storage(err))?;
         Ok(checkpoint)
+    }
+
+    /// Reth does not unwind an ExEx head above its startup head. Bring an ahead checkpoint back
+    /// to a canonical ancestor so its notification stream can safely backfill from there.
+    fn unwind_to_canonical_ancestor<T>(
+        &self,
+        tx: &T,
+        mut checkpoint: Checkpoint,
+        local_head: u64,
+        mut canonical_hash: impl FnMut(u64) -> Result<Option<B256>, WithdrawalCheckError>,
+    ) -> Result<Checkpoint, WithdrawalCheckError>
+    where
+        T: DbTx + DbTxMut,
+    {
+        if checkpoint.number <= local_head {
+            return Ok(checkpoint);
+        }
+        loop {
+            checkpoint = self.unwind_one(tx, checkpoint)?;
+            if checkpoint.number <= local_head
+                && canonical_hash(checkpoint.number)? == Some(checkpoint.hash)
+            {
+                return Ok(checkpoint);
+            }
+        }
     }
 
     fn process_notification<P>(
@@ -808,7 +864,7 @@ impl WithdrawalLedger {
             .map_err(|error| self.storage(error))?;
         let checkpoint = self.checkpoint_from_tx(provider_ro.tx_ref())?;
         if checkpoint.number < target.number {
-            return Ok(PreparedCheck::Pending(checkpoint));
+            return Ok(PreparedCheck::Pending);
         }
 
         let best = provider_ro
@@ -819,7 +875,7 @@ impl WithdrawalLedger {
             .map_err(|error| self.storage(error))?
         else {
             if checkpoint.number > best {
-                return Ok(PreparedCheck::Pending(checkpoint));
+                return Ok(PreparedCheck::Pending);
             }
             return Err(self.invalid_state(format!(
                 "canonical checkpoint header {} is missing below head {best}",
@@ -827,7 +883,7 @@ impl WithdrawalLedger {
             )));
         };
         if canonical_checkpoint.hash() != checkpoint.hash {
-            return Ok(PreparedCheck::Pending(checkpoint));
+            return Ok(PreparedCheck::Pending);
         }
 
         let Some(canonical) = provider_ro
@@ -1429,7 +1485,7 @@ where
     };
     let ledger = WithdrawalLedger::new(zone);
     let checkpoint = ledger
-        .initialize(ctx.provider(), tables_are_new)
+        .initialize(ctx.provider(), tables_are_new, ctx.head.number)
         .inspect_err(WithdrawalCheckError::emit_failure)?;
     let finished = BlockNumHash {
         number: checkpoint.number,
@@ -1518,13 +1574,7 @@ where
                         continue;
                     }
                     match outcome {
-                        PortalCheckOutcome::Pending(observed) => {
-                            if checkpoint == observed {
-                                portal_checks.park(key);
-                            } else {
-                                portal_checks.retry(key);
-                            }
-                        }
+                        PortalCheckOutcome::Pending => portal_checks.handle_pending_result(key),
                         PortalCheckOutcome::Retry(error) => {
                             let decision = WithdrawalCheckDecision::Retry(error);
                             portal_checks.respond(key, decision);
@@ -1576,7 +1626,7 @@ where
                                 let requests_to_halt = portal_checks.take_requests();
                                 return halt_requests(requests, requests_to_halt, error).await;
                             }
-                            portal_checks.wake_waiting();
+                            portal_checks.checkpoint_changed();
                             portal_checks.start_available(&ledger, ctx.provider());
                         }
                         Err(error) => {
@@ -2164,6 +2214,23 @@ mod tests {
     }
 
     #[test]
+    fn portal_check_does_not_miss_aba_checkpoint_changes() {
+        let running = PortalCheckState::Running {
+            checkpoint_changed: false,
+        };
+        let changed_twice = running
+            .checkpoint_changed()
+            .checkpoint_changed()
+            .pending_result();
+
+        assert!(matches!(changed_twice, PortalCheckState::Ready));
+        assert!(matches!(
+            running.pending_result(),
+            PortalCheckState::WaitingForCheckpoint
+        ));
+    }
+
+    #[test]
     fn multiple_deposits_and_prior_withdrawals_are_accounted_in_order() {
         let database = test_database();
         seed_genesis(&database, hash(0));
@@ -2500,6 +2567,47 @@ mod tests {
         );
         let tx = database.tx().unwrap();
         assert!(tx.get::<WithdrawalBlockDeltas>(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn ahead_restart_unwinds_to_canonical_ancestor() {
+        let database = test_database();
+        seed_genesis(&database, hash(0));
+        let ledger = WithdrawalLedger::new(ZONE);
+        let user = address(1);
+        let token = address(2);
+        let first = parsed_block(
+            &ledger,
+            1,
+            hash(1),
+            hash(0),
+            vec![(hash(0x91), vec![deposit(user, token, 10)])],
+        )
+        .unwrap();
+        apply(&database, &ledger, &first).unwrap();
+        let second = parsed_block(
+            &ledger,
+            2,
+            hash(2),
+            hash(1),
+            vec![(hash(0x92), vec![withdrawal(user, token, 3, 0, 1)])],
+        )
+        .unwrap();
+        apply(&database, &ledger, &second).unwrap();
+
+        let tx = database.tx_mut().unwrap();
+        let checkpoint = ledger.checkpoint_from_tx(&tx).unwrap();
+        let checkpoint = ledger
+            .unwind_to_canonical_ancestor(&tx, checkpoint, 1, |number| {
+                Ok(Some(if number == 0 { hash(0) } else { hash(3) }))
+            })
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(checkpoint.number, 0);
+        assert_eq!(checkpoint.hash, hash(0));
+        assert_eq!(balance(&database, &ledger, user, token), None);
+        assert_eq!(token_backing(&database, &ledger, token), None);
     }
 
     #[test]
