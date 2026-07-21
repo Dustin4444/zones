@@ -748,13 +748,6 @@ contract ZonePortal is IZonePortal {
             return;
         }
 
-        // Transfer fee to sequencer.
-        if (withdrawal.fee > 0) {
-            // Fee transfer can fail for e.g. TIP-403 blacklist. The sequencer
-            // forgoes the fee so the withdrawal itself does not stall.
-            _tryTransfer(_token, sequencer, withdrawal.fee);
-        }
-
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
             emit WithdrawalProcessed(
