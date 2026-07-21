@@ -941,13 +941,13 @@ contract ZonePortal is IZonePortal {
                 && _isAllowed(withdrawal.to)
                 && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
-            // Isolate callback effects so failure can be caught without reverting the dequeue.
-            try this.deliverWithdrawal(
+            // Isolate and bound callback effects so failure can be caught without reverting the
+            // dequeue.
+            try this.deliverWithdrawal{ gas: withdrawal.gasLimit }(
                 _token,
                 withdrawal.to,
                 withdrawal.amount,
                 withdrawal.senderTag,
-                withdrawal.gasLimit,
                 withdrawal.callbackData
             ) {
                 success = true;
@@ -971,7 +971,6 @@ contract ZonePortal is IZonePortal {
         address target,
         uint128 amount,
         bytes32 senderTag,
-        uint64 gasLimit,
         bytes calldata data
     )
         external
@@ -986,8 +985,7 @@ contract ZonePortal is IZonePortal {
 
         bytes32 depositQueueHashBefore = currentDepositQueueHash;
 
-        IZoneMessenger(messenger)
-            .relayMessage(zoneId, token, senderTag, target, amount, gasLimit, data);
+        IZoneMessenger(messenger).relayMessage(zoneId, token, senderTag, target, amount, data);
 
         // In closed access, this proves only that some deposit was appended to this portal; it does
         // not bind that deposit to the callback's token, amount, or recipient. Callback data is

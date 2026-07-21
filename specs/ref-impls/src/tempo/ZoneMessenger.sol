@@ -39,7 +39,6 @@ contract ZoneMessenger is IZoneMessenger {
         bytes32 senderTag,
         address target,
         uint128 amount,
-        uint64 gasLimit,
         bytes calldata data
     )
         external
@@ -59,11 +58,24 @@ contract ZoneMessenger is IZoneMessenger {
             revert TransferFailed();
         }
 
-        bytes4 selector = IWithdrawalReceiver(target).onWithdrawalReceived{ gas: gasLimit }(
-            zoneId, msg.sender, senderTag, token, amount, data
+        bytes memory callback = abi.encodeCall(
+            IWithdrawalReceiver.onWithdrawalReceived,
+            (zoneId, msg.sender, senderTag, token, amount, data)
         );
+        bool success;
+        bytes4 selector;
+        assembly ("memory-safe") {
+            success := call(gas(), target, 0, add(callback, 0x20), mload(callback), 0, 0)
+            if success {
+                if lt(returndatasize(), 4) { success := false }
+                if success {
+                    returndatacopy(0, 0, 4)
+                    selector := mload(0)
+                }
+            }
+        }
 
-        if (selector != IWithdrawalReceiver.onWithdrawalReceived.selector) {
+        if (!success || selector != IWithdrawalReceiver.onWithdrawalReceived.selector) {
             revert CallbackRejected();
         }
     }

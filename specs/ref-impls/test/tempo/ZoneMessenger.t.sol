@@ -4,7 +4,6 @@ pragma solidity ^0.8.13;
 import {
     IWithdrawalReceiver,
     IZonePortal,
-    MAX_WITHDRAWAL_CALLBACK_GAS,
     Role,
     ZONE_FACTORY_ADDRESS,
     ZONE_MESSENGER_ADDRESS,
@@ -80,12 +79,41 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
 
 }
 
+contract OversizedReturnWithdrawalReceiver is IWithdrawalReceiver {
+
+    bool internal immutable _succeeds;
+
+    constructor(bool succeeds) {
+        _succeeds = succeeds;
+    }
+
+    function onWithdrawalReceived(
+        uint32,
+        address,
+        bytes32,
+        address,
+        uint128,
+        bytes calldata
+    )
+        external
+        view
+        returns (bytes4)
+    {
+        bool succeeds = _succeeds;
+        bytes4 selector = IWithdrawalReceiver.onWithdrawalReceived.selector;
+        assembly ("memory-safe") {
+            mstore(0, selector)
+            if succeeds { return(0, 0x10000) }
+            revert(0, 0x10000)
+        }
+    }
+
+}
+
 contract ZoneMessengerTest is BaseTest {
 
     uint32 internal constant ZONE_ID = 1;
     uint32 internal constant OTHER_ZONE_ID = 2;
-    uint64 internal constant CALLBACK_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
-
     MockZoneFactoryForMessenger public messengerFactory;
     ZoneMessenger public messenger;
     MockZoneToken public zoneToken;
@@ -137,13 +165,13 @@ contract ZoneMessengerTest is BaseTest {
 
     function test_relayMessage_revertsUnauthorizedPortalForNonPortalCaller() public {
         vm.expectRevert(ZoneMessenger.UnauthorizedPortal.selector);
-        messenger.relayMessage(ZONE_ID, token, bytes32("sender"), alice, 1, 50_000, "");
+        messenger.relayMessage(ZONE_ID, token, bytes32("sender"), alice, 1, "");
     }
 
     function test_relayMessage_revertsUnauthorizedPortalForWrongZoneId() public {
         vm.prank(portal);
         vm.expectRevert(ZoneMessenger.UnauthorizedPortal.selector);
-        messenger.relayMessage(OTHER_ZONE_ID, token, bytes32("sender"), alice, 1, 50_000, "");
+        messenger.relayMessage(OTHER_ZONE_ID, token, bytes32("sender"), alice, 1, "");
     }
 
     function test_relayMessage_revertsTransferFailedWhenTransferReturnsFalse() public {
@@ -153,7 +181,7 @@ contract ZoneMessengerTest is BaseTest {
         vm.prank(portal);
         vm.expectRevert(ZoneMessenger.TransferFailed.selector);
         messenger.relayMessage(
-            ZONE_ID, token, bytes32("sender"), address(receiver), 1, 50_000, _callback()
+            ZONE_ID, token, bytes32("sender"), address(receiver), 1, _callback()
         );
     }
 
@@ -164,7 +192,7 @@ contract ZoneMessengerTest is BaseTest {
         vm.prank(portal);
         vm.expectRevert(ZoneMessenger.CallbackRejected.selector);
         messenger.relayMessage(
-            ZONE_ID, token, bytes32("sender"), address(receiver), 1, 50_000, _callback()
+            ZONE_ID, token, bytes32("sender"), address(receiver), 1, _callback()
         );
     }
 
@@ -173,7 +201,28 @@ contract ZoneMessengerTest is BaseTest {
 
         vm.prank(portal);
         vm.expectRevert();
-        messenger.relayMessage(ZONE_ID, token, bytes32("sender"), alice, 1, 50_000, _callback());
+        messenger.relayMessage(ZONE_ID, token, bytes32("sender"), alice, 1, _callback());
+    }
+
+    function test_relayMessage_revertsCallbackRejectedWithoutCopyingRevertData() public {
+        OversizedReturnWithdrawalReceiver receiver = new OversizedReturnWithdrawalReceiver(false);
+        _mockTransfer(address(receiver), 1, true);
+
+        vm.prank(portal);
+        vm.expectRevert(ZoneMessenger.CallbackRejected.selector);
+        messenger.relayMessage(
+            ZONE_ID, token, bytes32("sender"), address(receiver), 1, _callback()
+        );
+    }
+
+    function test_relayMessage_copiesOnlySelectorFromSuccessfulReturnData() public {
+        OversizedReturnWithdrawalReceiver receiver = new OversizedReturnWithdrawalReceiver(true);
+        _mockTransfer(address(receiver), 1, true);
+
+        vm.prank(portal);
+        messenger.relayMessage(
+            ZONE_ID, token, bytes32("sender"), address(receiver), 1, _callback()
+        );
     }
 
     function test_relayMessage_successWithFlattenedFactoryGetter() public {
@@ -184,9 +233,7 @@ contract ZoneMessengerTest is BaseTest {
         _allowGateway(address(receiver));
 
         vm.prank(portal);
-        messenger.relayMessage(
-            ZONE_ID, address(zoneToken), senderTag, address(receiver), 123, CALLBACK_GAS_LIMIT, data
-        );
+        messenger.relayMessage(ZONE_ID, address(zoneToken), senderTag, address(receiver), 123, data);
 
         assertEq(zoneToken.balanceOf(address(receiver)), 123);
         assertEq(receiver.lastZoneId(), ZONE_ID);
@@ -207,13 +254,7 @@ contract ZoneMessengerTest is BaseTest {
 
         vm.prank(portal);
         messenger.relayMessage(
-            ZONE_ID,
-            address(zoneToken),
-            senderTag,
-            address(receiver),
-            amount,
-            CALLBACK_GAS_LIMIT,
-            data
+            ZONE_ID, address(zoneToken), senderTag, address(receiver), amount, data
         );
 
         assertEq(zoneToken.balanceOf(address(receiver)), amount);
@@ -227,13 +268,7 @@ contract ZoneMessengerTest is BaseTest {
 
         vm.prank(portal);
         messenger.relayMessage(
-            ZONE_ID,
-            address(zoneToken),
-            bytes32("sender"),
-            address(receiver),
-            1,
-            CALLBACK_GAS_LIMIT,
-            data
+            ZONE_ID, address(zoneToken), bytes32("sender"), address(receiver), 1, data
         );
 
         assertEq(zoneToken.balanceOf(address(receiver)), 1);
@@ -251,13 +286,7 @@ contract ZoneMessengerTest is BaseTest {
         vm.prank(portal);
         vm.expectRevert(ZoneMessenger.InvalidCallbackTarget.selector);
         messenger.relayMessage(
-            ZONE_ID,
-            address(zoneToken),
-            bytes32("sender"),
-            address(receiver),
-            1,
-            50_000,
-            _callback()
+            ZONE_ID, address(zoneToken), bytes32("sender"), address(receiver), 1, _callback()
         );
     }
 

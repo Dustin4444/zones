@@ -270,7 +270,7 @@ interface IAesGcmDecrypt {
 
 }
 
-// Maximum callback gas a withdrawal may request.
+// Maximum delivery gas a callback withdrawal may request.
 // The processor adds fixed overhead, so this value keeps the outer
 // `processWithdrawals` transaction well below a 30M gas L1 block
 // limit.
@@ -282,7 +282,7 @@ struct Withdrawal {
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     bytes32 memo; // user-provided context
-    uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
+    uint64 gasLimit; // max gas for callback withdrawal delivery (0 = no callback)
     uint64 fallbackNonce; // resolves to the zone bounce-back recipient in ZoneOutbox
     bytes callbackData; // calldata for IWithdrawalReceiver (if gasLimit > 0)
     bytes encryptedSender; // optional encrypted (sender, txHash) reveal payload
@@ -295,7 +295,7 @@ struct PendingWithdrawal {
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     bytes32 memo; // user-provided context
-    uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
+    uint64 gasLimit; // max gas for callback withdrawal delivery (0 = no callback)
     uint64 fallbackNonce; // resolves to the zone bounce-back recipient in ZoneOutbox
     bytes callbackData; // calldata for IWithdrawalReceiver (if gasLimit > 0)
     bytes revealTo; // optional compressed secp256k1 pubkey for sender reveal encryption
@@ -659,7 +659,7 @@ interface IZonePortal {
     /// @notice Fixed gas value for deposit fee calculation (100,000 gas)
     function FIXED_DEPOSIT_GAS() external view returns (uint64);
 
-    /// @notice Maximum callback gas accepted for withdrawals
+    /// @notice Maximum delivery gas accepted for callback withdrawals
     function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
 
     /// @notice Maximum allowed gas fee rate (1e18)
@@ -894,7 +894,6 @@ interface IZonePortal {
         address target,
         uint128 amount,
         bytes32 senderTag,
-        uint64 gasLimit,
         bytes calldata data
     )
         external;
@@ -931,7 +930,6 @@ interface IZoneMessenger {
     /// @param senderTag The authenticated sender commitment from the zone
     /// @param target The Tempo recipient
     /// @param amount Tokens to transfer from portal to target
-    /// @param gasLimit Max gas for the callback
     /// @param data Calldata for the target
     function relayMessage(
         uint32 zoneId,
@@ -939,7 +937,6 @@ interface IZoneMessenger {
         bytes32 senderTag,
         address target,
         uint128 amount,
-        uint64 gasLimit,
         bytes calldata data
     )
         external;
@@ -1139,7 +1136,7 @@ interface IZoneOutbox {
     /// @notice Maximum callback data size (1KB)
     function MAX_CALLBACK_DATA_SIZE() external view returns (uint256);
 
-    /// @notice Maximum callback gas accepted for withdrawals
+    /// @notice Maximum delivery gas accepted for callback withdrawals
     function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
 
     /// @notice Base gas cost for processing a withdrawal on Tempo (excluding callback)
