@@ -2553,6 +2553,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         l1_rpc_url: l1.http_url().to_string(),
         retry_connection_interval: Duration::from_millis(100),
         withdrawal_poll_interval: Duration::from_millis(500),
+        withdrawal_batch_limits: zone_sequencer::WithdrawalBatchLimits::default(),
         outbox_address: ZONE_OUTBOX_ADDRESS,
         inbox_address: ZONE_INBOX_ADDRESS,
         tempo_state_address: TEMPO_STATE_ADDRESS,

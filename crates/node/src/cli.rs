@@ -17,7 +17,10 @@ use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
-use zone_sequencer::BatchAnchorConfig;
+use zone_sequencer::{
+    BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
+    DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
+};
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
 const MAX_BLOCKS_PER_FILTER: u64 = 1_000_000;
@@ -175,6 +178,11 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 batch_interval_blocks: args.zone_batch_interval_blocks,
                 batch_anchor_config: BatchAnchorConfig::default(),
                 withdrawal_poll_interval: Duration::from_secs(args.withdrawal_poll_interval_secs),
+                withdrawal_batch_limits: WithdrawalBatchLimits {
+                    max_batch_gas: args.withdrawal_max_batch_gas,
+                    max_in_flight_batches: args.withdrawal_max_in_flight_batches,
+                    max_in_flight_gas: args.withdrawal_max_in_flight_gas,
+                },
             });
         }
         if manifest_role == Some(Role::Follower) {
@@ -287,6 +295,30 @@ pub struct ZoneArgs {
         default_value_t = 5
     )]
     pub withdrawal_poll_interval_secs: u64,
+
+    /// Maximum gas reserved by one processWithdrawals transaction.
+    #[arg(
+        long = "withdrawal-max-batch-gas",
+        env = "WITHDRAWAL_MAX_BATCH_GAS",
+        default_value_t = DEFAULT_MAX_WITHDRAWAL_BATCH_GAS
+    )]
+    pub withdrawal_max_batch_gas: u64,
+
+    /// Maximum number of ordered processWithdrawals transactions kept in flight.
+    #[arg(
+        long = "withdrawal-max-in-flight-batches",
+        env = "WITHDRAWAL_MAX_IN_FLIGHT_BATCHES",
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES
+    )]
+    pub withdrawal_max_in_flight_batches: usize,
+
+    /// Maximum aggregate gas reserved across in-flight processWithdrawals transactions.
+    #[arg(
+        long = "withdrawal-max-in-flight-gas",
+        env = "WITHDRAWAL_MAX_IN_FLIGHT_GAS",
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS
+    )]
+    pub withdrawal_max_in_flight_gas: u64,
 
     /// Genesis Tempo L1 block number override.
     #[arg(long = "l1.genesis-block-number", env = "L1_GENESIS_BLOCK_NUMBER")]
@@ -442,6 +474,46 @@ mod tests {
         .unwrap();
         assert!(parsed.zone.enable_sequencer);
         assert!(parsed.zone.sequencer_manifest.is_none());
+    }
+
+    #[test]
+    fn withdrawal_batch_limits_have_defaults_and_cli_overrides() {
+        let common = [
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key",
+            "0x01",
+        ];
+        let defaults = ZoneArgsParser::try_parse_from(common).unwrap().zone;
+        assert_eq!(
+            defaults.withdrawal_max_batch_gas,
+            zone_sequencer::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS
+        );
+        assert_eq!(
+            defaults.withdrawal_max_in_flight_batches,
+            zone_sequencer::DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES
+        );
+        assert_eq!(
+            defaults.withdrawal_max_in_flight_gas,
+            zone_sequencer::DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS
+        );
+
+        let configured = ZoneArgsParser::try_parse_from(common.into_iter().chain([
+            "--withdrawal-max-batch-gas",
+            "7000000",
+            "--withdrawal-max-in-flight-batches",
+            "3",
+            "--withdrawal-max-in-flight-gas",
+            "15000000",
+        ]))
+        .unwrap()
+        .zone;
+        assert_eq!(configured.withdrawal_max_batch_gas, 7_000_000);
+        assert_eq!(configured.withdrawal_max_in_flight_batches, 3);
+        assert_eq!(configured.withdrawal_max_in_flight_gas, 15_000_000);
     }
 
     #[test]
