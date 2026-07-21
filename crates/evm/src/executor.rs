@@ -67,6 +67,18 @@ where
     /// Overrides `validatorTokens[beneficiary]` to match the resolved fee token
     /// so the handler skips FeeAMM.
     fn override_validator_token(&mut self) {
+        // Diagnostic-only switch: a payload-builder read-only call goes through
+        // this method before its `CommitChanges::No` decision.  This lets the
+        // historical reproduction prove whether that pre-execution mutation is
+        // the source of the invalid payload root.
+        if std::env::var("ZONES_DEBUG_DISABLE_FEE_MANAGER_OVERRIDE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return;
+        }
+
         let ctx = self.inner.evm.ctx_mut();
         let fee_payer = ctx.tx.fee_payer().unwrap_or(ctx.tx.caller());
         let spec = ctx.cfg.spec;

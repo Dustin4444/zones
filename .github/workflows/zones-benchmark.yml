@@ -293,6 +293,7 @@ jobs:
       # fresh-parent re-execution after an invalid payload.
       ZONES_DEBUG_BUILDER_STATE_DIR: ${{ github.workspace }}/target/zones-benchmark/builder-state-diagnostics
       ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION: "1"
+      ZONES_DEBUG_DISABLE_FEE_MANAGER_OVERRIDE: "1"
       TEMPO_ROOT: ${{ github.workspace }}/_benchmark-tempo
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
