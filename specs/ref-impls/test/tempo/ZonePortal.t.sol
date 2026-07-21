@@ -998,6 +998,17 @@ contract ZonePortalTest is BaseTest {
         assertEq(pathUSD.balanceOf(address(portal)), 1);
     }
 
+    function test_deposit_allowsCallbackGateway() public {
+        pathUSD.mint(address(zoneGateway), 1);
+
+        vm.startPrank(address(zoneGateway));
+        pathUSD.approve(address(portal), 1);
+        portal.deposit(address(pathUSD), alice, 1, bytes32(0), alice);
+        vm.stopPrank();
+
+        assertEq(pathUSD.balanceOf(address(portal)), 1);
+    }
+
     function test_deposit_revertsForUnallowedBouncebackRecipient() public {
         address outsider = makeAddr("outsider");
         vm.prank(alice);

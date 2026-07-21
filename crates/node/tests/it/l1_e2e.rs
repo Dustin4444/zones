@@ -54,6 +54,12 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
     let router = l1
         .deploy_router_with_dex(factory, STABLECOIN_DEX_ADDRESS)
         .await?;
+    l1.set_portal_role_as_admin(
+        portal_address,
+        router,
+        tempo_zone_contracts::ZonePortal::Role::CallbackGateway,
+    )
+    .await?;
 
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;

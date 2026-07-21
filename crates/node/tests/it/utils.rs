@@ -1463,6 +1463,26 @@ impl L1TestNode {
             .ok_or_else(|| eyre::eyre!("SwapAndDepositRouter deployment missing contract address"))
     }
 
+    /// Grant an account a role on a zone portal.
+    pub(crate) async fn set_portal_role_as_admin(
+        &self,
+        portal_address: Address,
+        account: Address,
+        role: tempo_zone_contracts::ZonePortal::Role,
+    ) -> eyre::Result<()> {
+        use tempo_zone_contracts::ZonePortal;
+
+        let provider = self.admin_provider();
+        let receipt = ZonePortal::new(portal_address, &provider)
+            .setRole(account, role)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "registering portal role failed");
+        Ok(())
+    }
+
     /// Deploy L1 infrastructure for a two-zone cross-zone test with separate sequencers.
     pub(crate) async fn deploy_two_zones_with_sequencers(
         &self,

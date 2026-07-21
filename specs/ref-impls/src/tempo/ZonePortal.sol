@@ -675,7 +675,8 @@ contract ZonePortal is IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
-        _requireAllowed(msg.sender);
+        // Gateways may deposit callback returns without also being allowed accounts.
+        if (role[msg.sender] != Role.CallbackGateway) _requireAllowed(msg.sender);
         _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
