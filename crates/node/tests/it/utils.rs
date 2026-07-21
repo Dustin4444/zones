@@ -1152,6 +1152,41 @@ impl L1TestNode {
         Ok(())
     }
 
+    /// Wait for a `WithdrawalProcessed` event with the expected callback result.
+    pub(crate) async fn wait_for_withdrawal_processed_with_status(
+        &self,
+        portal_address: Address,
+        to: Address,
+        token: Address,
+        amount: u128,
+        callback_success: bool,
+        timeout: Duration,
+    ) -> eyre::Result<()> {
+        use tempo_zone_contracts::ZonePortal;
+
+        let portal = ZonePortal::new(portal_address, self.provider());
+        poll_until(timeout, DEFAULT_POLL, "withdrawal processed", || {
+            let portal = &portal;
+            async move {
+                let events = portal
+                    .WithdrawalProcessed_filter()
+                    .from_block(0)
+                    .query()
+                    .await?;
+                Ok(events
+                    .iter()
+                    .any(|(event, _)| {
+                        event.to == to
+                            && event.token == token
+                            && event.amount == amount
+                            && event.callbackSuccess == callback_success
+                    })
+                    .then_some(()))
+            }
+        })
+        .await
+    }
+
     /// Returns an HTTP provider with the dev account wallet attached.
     pub(crate) fn dev_provider(&self) -> alloy_provider::DynProvider {
         ProviderBuilder::new()
@@ -1450,6 +1485,22 @@ impl L1TestNode {
             )
             .await?;
         let router = self.deploy_router(factory).await?;
+
+        use tempo_zone_contracts::{ZonePortal, ZonePortal::Role};
+        let provider = self.dev_provider();
+        for portal_address in [portal_a, portal_b] {
+            let receipt = ZonePortal::new(portal_address, &provider)
+                .setRole(router, Role::CallbackGateway)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+            eyre::ensure!(
+                receipt.status(),
+                "registering router as zone gateway failed"
+            );
+        }
+
         Ok((portal_a, portal_b, router))
     }
 
@@ -3548,6 +3599,10 @@ impl L1Fixture {
             keccak256((sequencer, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
         let path_usd_config_slot = portal_token_config_slot(PATH_USD_ADDRESS);
         let enabled_token_config = enabled_deposits_active_token_config();
+        let dev_account_role_slot: B256 = l1_dev_signer()
+            .address()
+            .mapping_slot(PORTAL_ROLE_SLOT.into())
+            .into();
         let outbox_receive_policy_slot =
             ZONE_OUTBOX_ADDRESS.mapping_slot(tip403_registry_slots::RECEIVE_POLICIES);
 
@@ -3580,6 +3635,12 @@ impl L1Fixture {
                 path_usd_config_slot,
                 block,
                 enabled_token_config,
+            );
+            cache.set(
+                portal_address,
+                dev_account_role_slot,
+                block,
+                B256::with_last_byte(1),
             );
         }
 
