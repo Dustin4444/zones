@@ -24,14 +24,14 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_errors::ProviderError;
 use reth_evm::{
     BlockEnvFor, ConfigureEvm, Database, NextBlockEnvAttributes,
-    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, WithTxEnv},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor, WithTxEnv},
 };
 use reth_node_api::{FullNodeTypes, NodeTypes};
 use reth_node_builder::{BuilderContext, components::PayloadBuilderBuilder};
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderError};
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadAttributes};
 use reth_primitives_traits::{AlloyBlockHeader as _, Recovered};
-use reth_revm::{State, cancelled::CancelOnDrop, database::StateProviderDatabase};
+use reth_revm::{State, cancelled::CancelOnDrop, database::StateProviderDatabase, db::BundleState};
 use reth_storage_api::{StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction as _, TransactionPool,
@@ -344,6 +344,13 @@ where
                 }
             }
         }
+        verify_payload_execution_if_enabled(
+            &self.evm_config,
+            &self.provider,
+            parent_header.hash(),
+            recovered_block.as_ref(),
+            &builder_state,
+        )?;
 
         let execution_output = BlockExecutionOutput {
             result: execution_result,
@@ -396,6 +403,85 @@ where
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
     }
+}
+
+/// Diagnostic-only direct comparison between the payload builder's execution bundle and a
+/// fresh execution from the parent database. This runs before engine insertion so it can prove
+/// whether an invalid header root originated in execution or after execution.
+fn verify_payload_execution_if_enabled<Provider, EvmConfig>(
+    evm_config: &EvmConfig,
+    provider: &Provider,
+    parent_hash: alloy_primitives::B256,
+    block: &reth_primitives_traits::RecoveredBlock<tempo_primitives::Block>,
+    builder_state: &BundleState,
+) -> Result<(), PayloadBuilderError>
+where
+    Provider: StateProviderFactory + Clone + 'static,
+    EvmConfig: ConfigureEvm<
+            Primitives = tempo_primitives::TempoPrimitives,
+            NextBlockEnvCtx = TempoNextBlockEnvAttributes,
+        >,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
+        EvmFactory<Tx = tempo_revm::TempoTxEnv>,
+    BlockEnvFor<EvmConfig>: RevmBlock,
+{
+    if std::env::var("ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Ok(());
+    }
+
+    let parent_state = provider.state_by_block_hash(parent_hash)?;
+    let mut executor = evm_config.batch_executor(StateProviderDatabase::new(parent_state.as_ref()));
+    executor
+        .execute_one(block)
+        .map_err(PayloadBuilderError::evm)?;
+    let mut state = executor.into_state();
+    let reexecuted_state = state.take_bundle();
+    let bundle_states_match = builder_state == &reexecuted_state;
+    let hashed_state = parent_state.hashed_post_state(&reexecuted_state);
+    let (reexecuted_root, _) = parent_state
+        .state_root_with_updates(hashed_state)
+        .map_err(PayloadBuilderError::other)?;
+    let header_root = block.header().state_root();
+
+    if reexecuted_root == header_root {
+        return Ok(());
+    }
+
+    if let Ok(directory) = std::env::var("ZONES_DEBUG_BUILDER_STATE_DIR") {
+        let directory = std::path::Path::new(&directory);
+        let prefix = format!("{}_{}", block.number(), block.hash());
+        if let Err(err) = fs::create_dir_all(directory)
+            .and_then(|()| serde_json::to_vec(&reexecuted_state).map_err(std::io::Error::other))
+            .and_then(|json| {
+                fs::write(
+                    directory.join(format!("{prefix}.bundle_state.reexecuted.json")),
+                    json,
+                )
+            })
+        {
+            warn!(%err, "failed to save fresh payload re-execution bundle state");
+        }
+    }
+
+    error!(
+        block_number = block.number(),
+        block_hash = ?block.hash(),
+        parent_hash = ?parent_hash,
+        header_root = ?header_root,
+        reexecuted_root = ?reexecuted_root,
+        bundle_states_match,
+        "locally built payload does not match fresh parent-state re-execution"
+    );
+    Err(PayloadBuilderError::other(reth_errors::RethError::msg(
+        format!(
+            "payload state root mismatch at block {}: header {header_root}, re-executed {reexecuted_root}",
+            block.number()
+        ),
+    )))
 }
 
 /// Validate that the prepared L1 block is the next block expected by TempoState.
