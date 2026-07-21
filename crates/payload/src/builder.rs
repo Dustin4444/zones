@@ -24,7 +24,7 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_errors::ProviderError;
 use reth_evm::{
     BlockEnvFor, ConfigureEvm, Database, NextBlockEnvAttributes,
-    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, WithTxEnv},
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor, WithTxEnv},
 };
 use reth_node_api::{FullNodeTypes, NodeTypes};
 use reth_node_builder::{BuilderContext, components::PayloadBuilderBuilder};
@@ -325,6 +325,13 @@ where
         );
 
         let recovered_block = Arc::new(block);
+        verify_payload_execution_if_enabled(
+            &self.evm_config,
+            &self.provider,
+            parent_header.hash(),
+            recovered_block.as_ref(),
+        )?;
+
         let eth_payload = EthBuiltPayload::new(recovered_block.clone(), U256::ZERO, requests, None);
 
         let execution_output = BlockExecutionOutput {
@@ -378,6 +385,81 @@ where
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
     }
+}
+
+/// Re-executes a locally built payload from its parent state when explicitly enabled for
+/// state-root investigation.
+///
+/// Reth normally inserts [`BuiltPayloadExecutedBlock`] through its local fast path, so it does
+/// not re-execute a block that this node just built. `ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION=1`
+/// makes that otherwise skipped comparison explicit. This is deliberately opt-in because it
+/// executes every zone block twice and is intended only to capture a build-versus-validation
+/// divergence before the engine tree accepts the payload.
+fn verify_payload_execution_if_enabled<Provider, EvmConfig>(
+    evm_config: &EvmConfig,
+    provider: &Provider,
+    parent_hash: alloy_primitives::B256,
+    block: &reth_primitives_traits::RecoveredBlock<tempo_primitives::Block>,
+) -> Result<(), PayloadBuilderError>
+where
+    Provider: StateProviderFactory + Clone + 'static,
+    EvmConfig: ConfigureEvm<
+            Primitives = tempo_primitives::TempoPrimitives,
+            NextBlockEnvCtx = TempoNextBlockEnvAttributes,
+        >,
+    <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
+        EvmFactory<Tx = tempo_revm::TempoTxEnv>,
+    BlockEnvFor<EvmConfig>: RevmBlock,
+{
+    if std::env::var("ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Ok(());
+    }
+
+    let parent_state = provider.state_by_block_hash(parent_hash)?;
+    let mut executor = evm_config.batch_executor(StateProviderDatabase::new(parent_state.as_ref()));
+    executor
+        .execute_one(block)
+        .map_err(PayloadBuilderError::evm)?;
+
+    let mut state = executor.into_state();
+    let bundle = state.take_bundle();
+    let hashed_state = parent_state.hashed_post_state(&bundle);
+    let (reexecuted_root, _) = parent_state
+        .state_root_with_updates(hashed_state)
+        .map_err(PayloadBuilderError::other)?;
+    let header_root = block.header().state_root();
+
+    if reexecuted_root != header_root {
+        error!(
+            target: "zone::payload",
+            block_number = block.number(),
+            block_hash = ?block.hash(),
+            parent_hash = ?parent_hash,
+            header_root = ?header_root,
+            reexecuted_root = ?reexecuted_root,
+            transactions = block.body().transactions.len(),
+            "locally built payload does not match fresh parent-state re-execution"
+        );
+        return Err(PayloadBuilderError::other(reth_errors::RethError::msg(
+            format!(
+                "payload state root mismatch at block {}: header {header_root}, re-executed {reexecuted_root}",
+                block.number()
+            ),
+        )));
+    }
+
+    info!(
+        target: "zone::payload",
+        block_number = block.number(),
+        block_hash = ?block.hash(),
+        state_root = ?header_root,
+        "verified locally built payload against fresh parent-state re-execution"
+    );
+    Ok(())
 }
 
 /// Validate that the prepared L1 block is the next block expected by TempoState.
