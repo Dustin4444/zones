@@ -78,11 +78,14 @@ contract ZonePortal is IZonePortal {
     /// @dev This address has no permissions distinct from the sequencer set.
     address public sequencer;
 
+    /// @notice Pending sequencer for two-step transfer
+    address public pendingSequencer;
+
     /// @notice Governance admin address
     address public admin;
 
-    /// @notice Pending sequencer for two-step transfer
-    address public pendingSequencer;
+    /// @notice Pending admin for two-step admin transfer
+    address public pendingAdmin;
 
     /// @notice Zone gas rate (zone token units per gas unit on the zone)
     /// @dev Sequencer publishes this rate and takes the risk on zone gas costs.
@@ -108,19 +111,19 @@ contract ZonePortal is IZonePortal {
     uint64 public lastSyncedTempoBlockNumber;
 
     /// @notice Gas amount used to price a failed-deposit bounce-back on Tempo.
-    /// @dev Packed into the unused bytes in slot 6. Defaults to zero.
+    /// @dev Packed into the unused bytes in slot 7. Defaults to zero.
     uint64 public bouncebackGas;
 
     /// @notice Historical encryption keys with activation blocks
     /// @dev Users specify which key they encrypted to (by index). Maintained for key rotation.
-    ///      Stored at slot 7 in the ZonePortal storage layout.
+    ///      Stored at slot 8 in the ZonePortal storage layout.
     EncryptionKeyEntry[] internal _encryptionKeys;
 
-    /// @notice Per-token configuration (stored at slot 8)
+    /// @notice Per-token configuration (stored at slot 9)
     /// @dev TokenConfig.enabled is permanent (write-once true); depositsActive can be toggled.
     mapping(address => TokenConfig) internal _tokenConfigs;
 
-    /// @notice Append-only list of enabled tokens (stored at slot 9)
+    /// @notice Append-only list of enabled tokens (stored at slot 10)
     /// @dev Tokens can never be removed from this list (non-custodial guarantee).
     address[] internal _enabledTokens;
 
@@ -132,9 +135,6 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Public RPC endpoint for the zone
     string public rpcUrl;
-
-    /// @notice Pending admin for two-step admin transfer
-    address public pendingAdmin;
 
     /// @notice Reentrancy guard for withdrawal delivery.
     uint256 internal _withdrawalReentrancyStatus;

@@ -832,12 +832,12 @@ contract ZoneInboxTest is Test {
 
     /// @notice Verify ZoneConfig.sequencerEncryptionKey() reads from the correct storage slot.
     /// @dev Regression test for the bug where ZoneConfig read the wrong slot
-    ///      instead of the _encryptionKeys dynamic array at slot 6.
+    ///      instead of the _encryptionKeys dynamic array at slot 8.
     function test_zoneConfig_sequencerEncryptionKey_readsCorrectSlot() public {
         bytes32 keyX = keccak256("config-test-key");
         uint8 keyYParity = 0x03;
 
-        // Simulate the _encryptionKeys array at slot 6:
+        // Simulate the _encryptionKeys array at slot 8:
         // Set array length = 1
         uint256 arraySlot = uint256(PORTAL_ENCRYPTION_KEYS_SLOT);
         tempoState.setMockStorageValue(mockPortal, bytes32(arraySlot), bytes32(uint256(1)));

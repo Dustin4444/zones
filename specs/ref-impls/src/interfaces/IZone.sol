@@ -335,21 +335,21 @@ interface IZoneTxContext {
 
 // ZonePortal storage layout:
 //   slot 0: sequencer (address)
-//   slot 1: admin (address)
-//   slot 2: pendingSequencer (address)
-//   slot 3: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
-//   slot 4: blockHash (bytes32)
-//   slot 5: currentDepositQueueHash (bytes32)
-//   slot 6: depositCount (uint64) + lastProcessedDepositNumber (uint64) + lastSyncedTempoBlockNumber (uint64) [packed]
-//   slot 7: _encryptionKeys (EncryptionKeyEntry[])
-//   slot 8: _tokenConfigs (mapping(address => TokenConfig))
-//   slot 9: _enabledTokens (address[])
-//   slot 10: refunds (mapping(address => mapping(address => uint128)))
-//   slot 11: _withdrawalQueue.head
-//   slot 12: _withdrawalQueue.tail
-//   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
-//   slot 14: rpcUrl (string)
-//   slot 15: pendingAdmin (address)
+//   slot 1: pendingSequencer (address)
+//   slot 2: admin (address)
+//   slot 3: pendingAdmin (address)
+//   slot 4: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
+//   slot 5: blockHash (bytes32)
+//   slot 6: currentDepositQueueHash (bytes32)
+//   slot 7: depositCount (uint64) + lastProcessedDepositNumber (uint64) + lastSyncedTempoBlockNumber (uint64) [packed]
+//   slot 8: _encryptionKeys (EncryptionKeyEntry[])
+//   slot 9: _tokenConfigs (mapping(address => TokenConfig))
+//   slot 10: _enabledTokens (address[])
+//   slot 11: refunds (mapping(address => mapping(address => uint128)))
+//   slot 12: _withdrawalQueue.head
+//   slot 13: _withdrawalQueue.tail
+//   slot 14: _withdrawalQueue.slots (mapping(uint256 => bytes32))
+//   slot 15: rpcUrl (string)
 //   slot 16: _withdrawalReentrancyStatus (uint256)
 //   slot 17: zoneId (uint32) + messenger (address) [packed]
 //   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
@@ -363,13 +363,13 @@ interface IZoneTxContext {
 // TempoState.readTempoStorageSlot(). If the portal layout changes,
 // update these constants and the vm.load regression tests will catch mismatches.
 bytes32 constant PORTAL_SEQUENCER_SLOT = bytes32(uint256(0));
-bytes32 constant PORTAL_ADMIN_SLOT = bytes32(uint256(1));
-bytes32 constant PORTAL_PENDING_SEQUENCER_SLOT = bytes32(uint256(2));
-bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(5));
-bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(7));
-bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(8));
-bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(9));
-bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(15));
+bytes32 constant PORTAL_PENDING_SEQUENCER_SLOT = bytes32(uint256(1));
+bytes32 constant PORTAL_ADMIN_SLOT = bytes32(uint256(2));
+bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(3));
+bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(6));
+bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(8));
+bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(9));
+bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(10));
 
 /// @title IVerifier
 /// @notice Interface for zone proof/attestation verification
