@@ -24,8 +24,17 @@ pub(crate) struct WithdrawalProcessorMetrics {
     /// Number of `processWithdrawals` attempts started.
     pub(crate) withdrawals_processed_total: Counter,
 
+    /// Number of gas-bounded `processWithdrawals` transactions broadcast.
+    pub(crate) batches_submitted_total: Counter,
+
+    /// Number of withdrawals packed into each `processWithdrawals` transaction.
+    pub(crate) withdrawals_per_batch: Histogram,
+
     /// Number of withdrawals confirmed on L1.
     pub(crate) withdrawals_confirmed_total: Counter,
+
+    /// Number of `processWithdrawals` transactions confirmed on L1.
+    pub(crate) batches_confirmed_total: Counter,
 
     /// Number of withdrawals that failed to send, confirm, or reverted after inclusion.
     pub(crate) withdrawals_failed_total: Counter,
