@@ -2104,6 +2104,15 @@ mod tests {
             );
         }
 
+        let l1: Value =
+            serde_yaml::from_str(&fs::read_to_string(output.join("l1-onramp.yml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            l1["artifacts"]["ZoneGateway"],
+            "abis/zone-gateway.json",
+            "the L1 EarnDeposit receipt boundary needs the gateway ABI"
+        );
+
         let zone: Value =
             serde_yaml::from_str(&fs::read_to_string(output.join("zone-flow.yml")).unwrap())
                 .unwrap();
@@ -2326,6 +2335,8 @@ mod tests {
         assert_eq!(setup.fee_payer(sender).unwrap(), config.sequencer);
         assert_workload_inclusion_keys(&zone_roundtrip);
 
+        validate_neobank_scenario(&txgen);
+
         fs::remove_dir_all(output).unwrap();
     }
 
@@ -2404,6 +2415,86 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn validate_neobank_scenario(txgen: &std::ffi::OsStr) {
+        let output = temp_output("neobank-scenario-validation");
+        let config = local_render_config();
+        let mut replacements = common_replacements(&config);
+        replacements.extend(HashMap::from([
+            (
+                "__DLUSD__".into(),
+                Value::from("0x2000000000000000000000000000000000000001"),
+            ),
+            (
+                "__PATHUSD__".into(),
+                Value::from("0x2000000000000000000000000000000000000002"),
+            ),
+            (
+                "__EARN_TOKEN__".into(),
+                Value::from("0x2000000000000000000000000000000000000003"),
+            ),
+            (
+                "__GATEWAY__".into(),
+                Value::from("0x3000000000000000000000000000000000000001"),
+            ),
+            (
+                "__BRIDGE_WALLET__".into(),
+                Value::from("0x3000000000000000000000000000000000000002"),
+            ),
+            ("__PRIVATE_TRANSFER_AMOUNT__".into(), Value::from(1_u64)),
+            ("__EARN_DEPOSIT_AMOUNT__".into(), Value::from(100_u64)),
+            ("__EARN_REDEEM_AMOUNT__".into(), Value::from(100_u64)),
+            ("__OFFRAMP_AMOUNT__".into(), Value::from(1_u64)),
+            ("__CALLBACK_GAS_LIMIT__".into(), Value::from(2_000_000_u64)),
+            ("__ONRAMP_AMOUNT__".into(), Value::from(1_000_u64)),
+            ("__ZONE_ID__".into(), Value::from(1_u64)),
+        ]));
+        for source in [
+            "../neobank/l1-onramp.yml",
+            "../neobank/zone-flow.yml",
+            "../neobank/private-flow-scenario.yml",
+        ] {
+            let destination = output.join(Path::new(source).file_name().unwrap());
+            render_document(source, &destination, &replacements, false).unwrap();
+        }
+
+        let txgen_abis = output.join("txgen/abis");
+        fs::create_dir_all(&txgen_abis).unwrap();
+        for name in ["tip20.json", "zone-outbox.json"] {
+            fs::copy(Path::new(SOURCE_DIR).join("abis").join(name), txgen_abis.join(name))
+                .unwrap();
+        }
+        let fixture_abis = output.join("abis");
+        fs::create_dir_all(&fixture_abis).unwrap();
+        for name in ["zone-gateway.json", "zone-inbox.json", "zone-portal.json"] {
+            fs::copy(
+                Path::new(SOURCE_DIR).join("../neobank/abis").join(name),
+                fixture_abis.join(name),
+            )
+            .unwrap();
+        }
+
+        let validation = Command::new(txgen)
+            .arg("scenario")
+            .arg("validate")
+            .arg("--scenario")
+            .arg(output.join("private-flow-scenario.yml"))
+            .env("ZONES_BENCH_MNEMONIC", TEST_MNEMONIC)
+            .env("L1_RPC_URL", "http://l1.invalid")
+            .env("ZONES_BENCH_L1_QUERY_RPC_URL", "http://l1-query.invalid")
+            .env("ZONE_PRIVATE_RPC_URL", "http://zone-private.invalid")
+            .env("ZONE_RPC_URL", "http://zone-query.invalid")
+            .env("ZONES_BENCH_ZONE_AUTH_MAP", output.join("zone-auth.json"))
+            .output()
+            .unwrap();
+        assert!(
+            validation.status.success(),
+            "txgen-tempo scenario validate failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&validation.stdout),
+            String::from_utf8_lossy(&validation.stderr)
+        );
+        fs::remove_dir_all(output).unwrap();
     }
 
     fn workload_envelopes(generated: &[serde_json::Value]) -> Vec<TempoTxEnvelope> {

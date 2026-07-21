@@ -164,7 +164,7 @@ jobs:
           INPUT_DRAIN_TIMEOUT: "300"
           INPUT_SEED: ""
           INPUT_TEMPO_REF: 436f6cf069a0c8aafa9a3a197ffa17488b5f1e81
-          INPUT_TXGEN_REF: b89a5daeee186b402d1853d0a338ccffa5d40f7e
+          INPUT_TXGEN_REF: 9dcf2a38f01e2d0e1197a439e995a78fd323e993
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
