@@ -13688,6 +13688,7 @@ name = "zone-sequencer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -13712,6 +13713,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tracing",
+ "zone-l1",
 ]
 
 [[package]]

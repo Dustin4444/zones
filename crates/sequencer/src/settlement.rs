@@ -29,8 +29,9 @@ use crate::{
     abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal},
     attestation::{AttestationStore, SettlementCertificate},
 };
-use alloy_consensus::Transaction;
-use alloy_network::ReceiptResponse;
+use alloy_consensus::{BlockHeader as _, Transaction};
+use alloy_eips::NumHash;
+use alloy_network::{ReceiptResponse, primitives::HeaderResponse as _};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
@@ -50,6 +51,9 @@ const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
 /// Safety margin (~3 min at 500ms block time) to avoid race conditions where
 /// the block falls out of the window between our check and on-chain execution.
 const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
+
+/// Bound receipt-root verification requests during the rare recovery fallback.
+const WITHDRAWAL_RECOVERY_RECEIPT_CONCURRENCY: usize = 8;
 
 /// Maximum number of encoded L1 headers retained between ancestry submissions.
 ///
@@ -437,7 +441,27 @@ impl BatchSubmitter {
             ));
         }
 
+        if receipt.transaction_hash() != tx_hash {
+            return Err(eyre::eyre!(
+                "submitBatch receipt transaction hash {} does not match submitted transaction {tx_hash}",
+                receipt.transaction_hash()
+            ));
+        }
+
         let event = self.decode_batch_submitted(receipt.logs())?;
+        Self::validate_batch_submitted_event(batch, &event)?;
+        if let Some(certificate) = certificate.as_ref() {
+            let certified_batch_index: u64 = certificate
+                .attestation
+                .withdrawalBatchIndex
+                .try_into()
+                .map_err(|_| eyre::eyre!("certified withdrawal batch index overflow"))?;
+            eyre::ensure!(
+                event.withdrawalBatchIndex == certified_batch_index,
+                "BatchSubmitted withdrawal batch index {} does not match certificate index {certified_batch_index}",
+                event.withdrawalBatchIndex
+            );
+        }
 
         if let (Some(store), Some(_)) = (&self.attestation_store, &certificate) {
             store.remove_submitted(zone_height);
@@ -465,6 +489,42 @@ impl BatchSubmitter {
             .ok_or_else(|| {
                 eyre::eyre!("confirmed submitBatch receipt is missing the BatchSubmitted event")
             })
+    }
+
+    /// Confirm the receipt event describes the exact state transition requested
+    /// by this submitter before local attestations are discarded.
+    fn validate_batch_submitted_event(
+        batch: &BatchData,
+        event: &ZonePortal::BatchSubmitted,
+    ) -> Result<()> {
+        eyre::ensure!(
+            event.nextProcessedDepositQueueHash == batch.next_processed_deposit_hash,
+            "BatchSubmitted processed deposit hash does not match submitted batch"
+        );
+        eyre::ensure!(
+            event.nextBlockHash == batch.next_block_hash,
+            "BatchSubmitted block hash does not match submitted batch"
+        );
+        eyre::ensure!(
+            event.withdrawalQueueHash == batch.withdrawal_queue_hash,
+            "BatchSubmitted withdrawal queue hash does not match submitted batch"
+        );
+        eyre::ensure!(
+            event.lastProcessedDepositNumber == batch.next_deposit_number,
+            "BatchSubmitted processed deposit number does not match submitted batch"
+        );
+        if batch.withdrawal_queue_hash.is_zero() {
+            eyre::ensure!(
+                event.withdrawalQueueIndex == abi::NO_QUEUE_INDEX,
+                "BatchSubmitted assigned a queue slot to an empty withdrawal batch"
+            );
+        } else {
+            eyre::ensure!(
+                event.withdrawalQueueIndex != abi::NO_QUEUE_INDEX,
+                "BatchSubmitted omitted the queue slot for a non-empty withdrawal batch"
+            );
+        }
+        Ok(())
     }
 
     /// Validate that a collected certificate commits to the exact calldata this submitter will
@@ -937,10 +997,9 @@ impl BatchSubmitter {
     }
 
     /// Fetch `BatchSubmitted` events for logical queue indices `[first_index, tail)`
-    /// by walking L1 backwards in chunks while filtering by the indexed
-    /// `withdrawalQueueIndex` topic. Logical queue indices never repeat
-    /// (head/tail are non-wrapping counters), so the topic filter identifies
-    /// each batch exactly without positional counting.
+    /// from receipt-root-verified L1 blocks. We deliberately do not use
+    /// `eth_getLogs` here: the recovery result becomes input to local withdrawal
+    /// bookkeeping, so an RPC log response alone is not an adequate trust root.
     ///
     /// The caller passes `first_index = head - 1` so the predecessor batch is
     /// included (its `nextBlockHash` bounds the zone block range of the first
@@ -955,10 +1014,7 @@ impl BatchSubmitter {
             return Ok(BTreeMap::new());
         }
 
-        let index_topics: Vec<B256> = (first_index..tail)
-            .map(|index| B256::from(U256::from(index)))
-            .collect();
-        let needed = index_topics.len();
+        let needed = (tail - first_index) as usize;
 
         let mut found = BTreeMap::new();
         let mut hi = self.l1_provider.get_block_number().await?;
@@ -966,21 +1022,41 @@ impl BatchSubmitter {
         while hi >= self.genesis_tempo_block_number && found.len() < needed {
             let lo = backward_log_query_start(hi, self.genesis_tempo_block_number);
 
-            let events = self
-                .portal
-                .BatchSubmitted_filter()
-                .topic2(index_topics.clone())
-                .from_block(lo)
-                .to_block(hi)
-                .query()
-                .await?;
+            let mut blocks = futures::stream::iter((lo..=hi).rev())
+                .map(|block_number| async move {
+                    let block = self
+                        .l1_provider
+                        .get_block_by_number(block_number.into())
+                        .await?
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "L1 block {block_number} not found during withdrawal recovery"
+                            )
+                        })?;
+                    let header = &block.header;
+                    let receipts = zone_l1::fetch_and_verify_receipts_for_header(
+                        &self.l1_provider,
+                        NumHash::new(block_number, header.hash()),
+                        header.receipts_root(),
+                        header.logs_bloom(),
+                    )
+                    .await?;
+                    Ok::<_, eyre::Report>(receipts)
+                })
+                .buffered(WITHDRAWAL_RECOVERY_RECEIPT_CONCURRENCY);
 
-            for (event, _) in events {
-                let index: u64 = event.withdrawalQueueIndex.try_into().map_err(|_| {
-                    eyre::eyre!("withdrawal queue index overflow in BatchSubmitted")
-                })?;
-                if found.insert(index, event).is_some() {
-                    eyre::bail!("duplicate BatchSubmitted event for portal queue index {index}");
+            while let Some(receipts) = blocks.try_next().await? {
+                for receipt in receipts {
+                    Self::record_batch_submitted_logs(
+                        self.portal_address,
+                        receipt.logs(),
+                        first_index,
+                        tail,
+                        &mut found,
+                    )?;
+                }
+                if found.len() == needed {
+                    break;
                 }
             }
 
@@ -991,6 +1067,34 @@ impl BatchSubmitter {
         }
 
         Ok(found)
+    }
+
+    fn record_batch_submitted_logs(
+        portal_address: Address,
+        logs: &[alloy_rpc_types_eth::Log],
+        first_index: u64,
+        tail: u64,
+        found: &mut BTreeMap<u64, abi::ZonePortal::BatchSubmitted>,
+    ) -> Result<()> {
+        for log in logs {
+            if log.address() != portal_address {
+                continue;
+            }
+            let Ok(event) = ZonePortal::BatchSubmitted::decode_log(&log.inner) else {
+                continue;
+            };
+            let index: u64 = event
+                .withdrawalQueueIndex
+                .try_into()
+                .map_err(|_| eyre::eyre!("withdrawal queue index overflow in BatchSubmitted"))?;
+            if !(first_index..tail).contains(&index) {
+                continue;
+            }
+            if found.insert(index, event.data).is_some() {
+                eyre::bail!("duplicate BatchSubmitted event for portal queue index {index}");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1082,29 +1186,29 @@ struct RequestedWithdrawalLog {
 }
 
 #[derive(Debug, Clone)]
-struct FinalizedBatchLog {
-    block_number: u64,
-    tx_index: u64,
-    log_index: u64,
-    tx_hash: B256,
-    withdrawal_queue_hash: B256,
-    withdrawal_batch_index: u64,
+pub(crate) struct FinalizedBatchLog {
+    pub(crate) block_number: u64,
+    pub(crate) tx_index: u64,
+    pub(crate) log_index: u64,
+    pub(crate) tx_hash: B256,
+    pub(crate) withdrawal_queue_hash: B256,
+    pub(crate) withdrawal_batch_index: u64,
 }
 
-/// Fetch all zone block numbers in `[from, to]` that finalized a withdrawal batch.
+/// Fetch all finalized withdrawal batch observations in `[from, to]`.
 ///
 /// This includes zero-withdrawal batches because they still advance the L2
 /// withdrawal batch index and therefore require a matching L1 `submitBatch`.
-pub(crate) async fn fetch_finalized_batch_boundaries(
+pub(crate) async fn fetch_finalized_batch_logs(
     outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
     from: u64,
     to: u64,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<FinalizedBatchLog>> {
     if from > to {
         return Ok(Vec::new());
     }
 
-    let mut boundaries: Vec<_> = outbox
+    let mut finalized_batches: Vec<_> = outbox
         .BatchFinalized_filter()
         .from_block(from)
         .to_block(to)
@@ -1114,12 +1218,22 @@ pub(crate) async fn fetch_finalized_batch_boundaries(
         .query()
         .await?
         .into_iter()
-        .map(|(_, log)| log.block_number.unwrap_or(0))
-        .collect();
+        .map(|(event, log)| -> Result<_> {
+            Ok(FinalizedBatchLog {
+                block_number: log.block_number.unwrap_or(0),
+                tx_index: log.transaction_index.unwrap_or(0),
+                log_index: log.log_index.unwrap_or(0),
+                tx_hash: log
+                    .transaction_hash
+                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?,
+                withdrawal_queue_hash: event.withdrawalQueueHash,
+                withdrawal_batch_index: event.withdrawalBatchIndex,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    Ok(boundaries)
+    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
+    Ok(finalized_batches)
 }
 
 /// Fetch one finalized L2 withdrawal batch for a range ending at `to`.
@@ -1134,7 +1248,7 @@ pub(crate) async fn fetch_finalized_batch(
     from: u64,
     to: u64,
 ) -> Result<FinalizedBatch> {
-    let mut finalized_batches = fetch_finalized_batch_logs(outbox, from, to).await?;
+    let finalized_batches = fetch_finalized_batch_logs(outbox, from, to).await?;
 
     if finalized_batches.is_empty() {
         return Err(eyre::eyre!(
@@ -1142,7 +1256,6 @@ pub(crate) async fn fetch_finalized_batch(
         ));
     }
 
-    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
     let target_position = finalized_batches
         .iter()
         .rposition(|batch| batch.block_number == to)
@@ -1161,12 +1274,30 @@ pub(crate) async fn fetch_finalized_batch(
         ));
     }
 
-    let target = finalized_batches[target_position].clone();
     let previous_boundary = finalized_batches[..target_position]
         .last()
         .map(|batch| batch.block_number)
         .unwrap_or(from.saturating_sub(1));
-    let request_from = previous_boundary.saturating_add(1);
+
+    fetch_finalized_batch_from_log(
+        outbox,
+        zone_provider,
+        previous_boundary.saturating_add(1),
+        &finalized_batches[target_position],
+    )
+    .await
+}
+
+/// Reconstruct a finalized withdrawal batch using an already-fetched
+/// `BatchFinalized` log.
+pub(crate) async fn fetch_finalized_batch_from_log(
+    outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
+    zone_provider: &DynProvider<TempoNetwork>,
+    from: u64,
+    target: &FinalizedBatchLog,
+) -> Result<FinalizedBatch> {
+    let to = target.block_number;
+    let request_from = from;
 
     let requests = if request_from <= to {
         fetch_requested_withdrawal_logs(outbox, request_from, to).await?
@@ -1270,52 +1401,6 @@ async fn fetch_requested_withdrawal_logs(
     requests.sort_by_key(|request| (request.block_number, request.tx_index, request.log_index));
 
     Ok(requests)
-}
-
-async fn fetch_finalized_batch_logs(
-    outbox: &ZoneOutbox::ZoneOutboxInstance<DynProvider<TempoNetwork>, TempoNetwork>,
-    from: u64,
-    to: u64,
-) -> Result<Vec<FinalizedBatchLog>> {
-    let mut finalized_batches: Vec<_> = outbox
-        .BatchFinalized_filter()
-        .from_block(from)
-        .to_block(to)
-        .chunked()
-        .chunk_size(LOG_QUERY_BLOCK_CHUNK)
-        .concurrent(2)
-        .query()
-        .await?
-        .into_iter()
-        .map(|(event, log)| -> Result<_> {
-            Ok(FinalizedBatchLog {
-                block_number: log.block_number.unwrap_or(0),
-                tx_index: log.transaction_index.unwrap_or(0),
-                log_index: log.log_index.unwrap_or(0),
-                tx_hash: log
-                    .transaction_hash
-                    .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?,
-                withdrawal_queue_hash: event.withdrawalQueueHash,
-                withdrawal_batch_index: event.withdrawalBatchIndex,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    finalized_batches.sort_by_key(|batch| (batch.block_number, batch.tx_index, batch.log_index));
-    Ok(finalized_batches)
-}
-
-/// Lazily split an inclusive block range into bounded query windows.
-pub(crate) fn log_query_ranges(from: u64, to: u64) -> impl Iterator<Item = (u64, u64)> {
-    std::iter::successors(Some(from), move |&start| {
-        let end = start.saturating_add(LOG_QUERY_BLOCK_CHUNK - 1).min(to);
-        if end >= to { None } else { end.checked_add(1) }
-    })
-    .map(move |start| {
-        (
-            start,
-            start.saturating_add(LOG_QUERY_BLOCK_CHUNK - 1).min(to),
-        )
-    })
 }
 
 fn backward_log_query_start(hi: u64, floor: u64) -> u64 {
@@ -1518,23 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn log_query_ranges_chunk_large_ranges() {
-        let end = 100 + (LOG_QUERY_BLOCK_CHUNK * 2) + 234;
-        let ranges: Vec<_> = log_query_ranges(100, end).collect();
-
-        assert_eq!(ranges.len(), 3);
-        assert_eq!(ranges[0], (100, 100 + LOG_QUERY_BLOCK_CHUNK - 1));
-        assert_eq!(
-            ranges[1],
-            (
-                100 + LOG_QUERY_BLOCK_CHUNK,
-                100 + (LOG_QUERY_BLOCK_CHUNK * 2) - 1
-            )
-        );
-        assert_eq!(ranges[2], (100 + (LOG_QUERY_BLOCK_CHUNK * 2), end));
-    }
-
-    #[test]
     fn backward_log_query_window_is_bounded() {
         let hi = 10_000;
         let lo = backward_log_query_start(hi, 0);
@@ -1552,6 +1620,61 @@ mod tests {
             withdrawalQueueHash: withdrawal_queue_hash,
             lastProcessedDepositNumber: 0,
         }
+    }
+
+    fn test_batch_data(withdrawal_queue_hash: B256) -> BatchData {
+        BatchData {
+            tempo_block_number: 9,
+            prev_block_hash: B256::repeat_byte(0x10),
+            next_block_hash: B256::repeat_byte(0x11),
+            prev_processed_deposit_hash: B256::repeat_byte(0x20),
+            next_processed_deposit_hash: B256::repeat_byte(0x21),
+            prev_deposit_number: 4,
+            next_deposit_number: 7,
+            withdrawal_queue_hash,
+        }
+    }
+
+    #[test]
+    fn validates_batch_submitted_event_before_discarding_attestations() {
+        let withdrawal_hash = B256::repeat_byte(0x31);
+        let batch = test_batch_data(withdrawal_hash);
+        let event = abi::ZonePortal::BatchSubmitted {
+            withdrawalBatchIndex: 3,
+            withdrawalQueueIndex: U256::from(8),
+            nextProcessedDepositQueueHash: batch.next_processed_deposit_hash,
+            nextBlockHash: batch.next_block_hash,
+            withdrawalQueueHash: batch.withdrawal_queue_hash,
+            lastProcessedDepositNumber: batch.next_deposit_number,
+        };
+
+        BatchSubmitter::validate_batch_submitted_event(&batch, &event).unwrap();
+
+        let mismatched = abi::ZonePortal::BatchSubmitted {
+            nextBlockHash: B256::repeat_byte(0xff),
+            ..event
+        };
+        assert!(BatchSubmitter::validate_batch_submitted_event(&batch, &mismatched).is_err());
+    }
+
+    #[test]
+    fn empty_batch_requires_no_queue_index() {
+        let batch = test_batch_data(B256::ZERO);
+        let valid = abi::ZonePortal::BatchSubmitted {
+            withdrawalBatchIndex: 3,
+            withdrawalQueueIndex: abi::NO_QUEUE_INDEX,
+            nextProcessedDepositQueueHash: batch.next_processed_deposit_hash,
+            nextBlockHash: batch.next_block_hash,
+            withdrawalQueueHash: B256::ZERO,
+            lastProcessedDepositNumber: batch.next_deposit_number,
+        };
+        BatchSubmitter::validate_batch_submitted_event(&batch, &valid).unwrap();
+
+        let invalid = abi::ZonePortal::BatchSubmitted {
+            withdrawalQueueIndex: U256::ZERO,
+            ..valid
+        };
+        assert!(BatchSubmitter::validate_batch_submitted_event(&batch, &invalid).is_err());
     }
 
     #[test]
@@ -1598,19 +1721,9 @@ mod tests {
         assert!(submitter.decode_batch_submitted(&[unrelated]).is_err());
     }
 
-    #[tokio::test]
-    async fn finds_batch_events_by_logical_index_across_ring_wrap() {
-        use alloy_provider::ProviderBuilder;
-        use alloy_transport::mock::Asserter;
-
+    #[test]
+    fn records_batch_events_by_logical_index_across_ring_wrap() {
         let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
-            .connect_mocked_client(asserter.clone())
-            .erased();
-        let submitter = BatchSubmitter::new(portal_address, provider, 0);
-
-        asserter.push_success(&10_000_u64);
         let logs: Vec<_> = [99_u64, 100, 101]
             .into_iter()
             .map(|index| {
@@ -1632,9 +1745,10 @@ mod tests {
                 }
             })
             .collect();
-        asserter.push_success(&logs);
 
-        let events = submitter.find_batch_events_by_index(99, 102).await.unwrap();
+        let mut events = BTreeMap::new();
+        BatchSubmitter::record_batch_submitted_logs(portal_address, &logs, 99, 102, &mut events)
+            .unwrap();
 
         assert_eq!(
             events.keys().copied().collect::<Vec<_>>(),
@@ -1643,7 +1757,6 @@ mod tests {
         assert_eq!(events[&99].withdrawalBatchIndex, 119);
         assert_eq!(events[&100].withdrawalQueueIndex, U256::from(100));
         assert_eq!(events[&101].withdrawalQueueIndex, U256::from(101));
-        assert!(asserter.read_q().is_empty());
     }
 
     #[test]

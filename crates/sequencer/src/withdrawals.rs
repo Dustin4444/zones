@@ -617,6 +617,55 @@ impl WithdrawalProcessor {
             return SubmitOutcome::Reverted;
         }
 
+        if receipt.transaction_hash() != tx_hash {
+            self.metrics.withdrawals_failed_total.increment(1);
+            error!(
+                slot,
+                index,
+                expected_tx_hash = %tx_hash,
+                receipt_tx_hash = %receipt.transaction_hash(),
+                "processWithdrawal receipt does not belong to the submitted transaction"
+            );
+            return SubmitOutcome::Unconfirmed;
+        }
+
+        // A successful receipt alone is not sufficient to remove local work: a
+        // faulty RPC could report success for an unrelated transaction. Confirm
+        // the Portal queue made the exact state transition requested by this call.
+        let queue_head_call = self.portal.withdrawalQueueHead();
+        let slot_hash_call = self
+            .portal
+            .withdrawalQueueSlot(U256::from(slot % WITHDRAWAL_QUEUE_CAPACITY));
+        let (queue_head, slot_hash) = match tokio::try_join!(
+            queue_head_call.call(),
+            slot_hash_call.call()
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                error!(slot, index, %tx_hash, %error, "failed to reconcile Portal withdrawal queue after receipt");
+                self.metrics.withdrawals_failed_total.increment(1);
+                return SubmitOutcome::Unconfirmed;
+            }
+        };
+        let queue_transition_matches = if remaining_queue == B256::ZERO {
+            queue_head > U256::from(slot)
+        } else {
+            queue_head == U256::from(slot) && slot_hash == remaining_queue
+        };
+        if !queue_transition_matches {
+            self.metrics.withdrawals_failed_total.increment(1);
+            error!(
+                slot,
+                index,
+                %tx_hash,
+                %queue_head,
+                %slot_hash,
+                expected_remaining_queue = %remaining_queue,
+                "Portal withdrawal queue did not reflect the submitted withdrawal"
+            );
+            return SubmitOutcome::Unconfirmed;
+        }
+
         self.metrics.withdrawals_confirmed_total.increment(1);
         info!(
             slot,
