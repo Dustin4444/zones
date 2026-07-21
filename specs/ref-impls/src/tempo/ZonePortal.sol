@@ -86,7 +86,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Governance admin address
     address public admin;
 
-    /// @notice Pending sequencer for two-step transfer
+    /// @notice Pending legacy representative retained for storage and ABI compatibility.
     address public pendingSequencer;
 
     /// @notice Zone gas rate (zone token units per gas unit on the zone)
@@ -223,14 +223,15 @@ contract ZonePortal is IZonePortal {
                            SEQUENCER MANAGEMENT
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Start a sequencer transfer. Only callable by current sequencer.
-    /// @param newSequencer The address that will become sequencer after accepting.
+    /// @notice Update the pending legacy representative. Only callable by an active sequencer.
+    /// @dev Retained for ABI compatibility. This does not change active-set membership.
     function transferSequencer(address newSequencer) external onlySequencer {
         pendingSequencer = newSequencer;
         emit SequencerTransferStarted(sequencer, newSequencer);
     }
 
-    /// @notice Accept a pending sequencer transfer. Only callable by pending sequencer.
+    /// @notice Accept an update to the legacy representative field.
+    /// @dev Retained for ABI compatibility. This does not change active-set membership.
     /// @dev The explicit `pendingSequencer == address(0)` check because it is technically
     ///      possible to make a system tx on L1 with msg.sender == 0.
     ///      The Sequencer key can only be rotated, never renounced.
