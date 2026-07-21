@@ -454,9 +454,13 @@ where
             .await?
             .erased();
 
-        let enabled_tokens = ZonePortal::new(self.portal_address, &l1_provider)
-            .enabled_tokens_at(alloy_rpc_types_eth::BlockId::number(tempo_block_number))
-            .await?;
+        let enabled_tokens = if self.portal_address.is_zero() {
+            Vec::new()
+        } else {
+            ZonePortal::new(self.portal_address, &l1_provider)
+                .enabled_tokens_at(alloy_rpc_types_eth::BlockId::number(tempo_block_number))
+                .await?
+        };
         self.l1_config
             .l1_state_cache
             .write()
