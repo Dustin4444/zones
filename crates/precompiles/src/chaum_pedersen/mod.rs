@@ -16,10 +16,7 @@ use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::{Address, address};
 use k256::{
     AffinePoint, ProjectivePoint, Scalar,
-    elliptic_curve::{
-        ops::Reduce,
-        sec1::{FromEncodedPoint, ToEncodedPoint},
-    },
+    elliptic_curve::{ops::Reduce, point::DecompressPoint, sec1::ToEncodedPoint},
 };
 use tempo_precompiles::Precompile as _;
 
@@ -82,12 +79,13 @@ impl ChaumPedersenVerify {
 ///
 /// `y_parity` follows SEC1: `0x02` for even y, `0x03` for odd y.
 pub fn recover_point(x_bytes: &[u8; 32], y_parity: u8) -> Option<AffinePoint> {
-    let mut encoded = [0u8; 33];
-    encoded[0] = y_parity;
-    encoded[1..].copy_from_slice(x_bytes);
+    let y_is_odd = match y_parity {
+        0x02 => 0,
+        0x03 => 1,
+        _ => return None,
+    };
 
-    let point = k256::EncodedPoint::from_bytes(encoded).ok()?;
-    Option::from(AffinePoint::from_encoded_point(&point))
+    AffinePoint::decompress(&(*x_bytes).into(), y_is_odd.into()).into()
 }
 
 /// Compute the Chaum-Pedersen challenge hash.
