@@ -369,7 +369,7 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.sequencer(), sequencer);
         assertEq(portal.admin(), admin);
         assertEq(portal.verifier(), zoneFactory.verifier());
-        assertEq(portal.blockHash(), GENESIS_BLOCK_HASH);
+        assertEq(portal.blockHash(), bytes32(0));
         assertEq(portal.withdrawalBatchIndex(), 0);
         assertEq(portal.messenger(), address(messenger));
         assertEq(portal.bouncebackGas(), 0);
