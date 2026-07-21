@@ -277,6 +277,30 @@ mod tests {
     }
 
     #[test]
+    fn token_enablement_blocks_pre_creation_value_inheritance() {
+        let token = address!("0x20c0000000000000000000000000000000000042");
+        let policy_slot = B256::with_last_byte(1);
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+
+        // An RPC read can observe the deterministic address before token creation and cache the
+        // empty-account value.
+        cache.set(token, policy_slot, 10, B256::ZERO);
+        cover_through(&mut cache, 10);
+        assert_eq!(cache.get(token, policy_slot, 10), Some(B256::ZERO));
+
+        // TokenEnabled is emitted by the portal, so the subscriber must install a barrier for the
+        // token address rather than only for the portal emitter.
+        cache.invalidate(token, 11);
+        cache.enable_token(token);
+        cover_through(&mut cache, 11);
+        assert_eq!(cache.get(token, policy_slot, 11), None);
+
+        let initialized_policy = B256::with_last_byte(1);
+        cache.set(token, policy_slot, 11, initialized_policy);
+        assert_eq!(cache.get(token, policy_slot, 11), Some(initialized_policy));
+    }
+
+    #[test]
     fn floor_rejects_historical_cache_admission() {
         let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         let slot = B256::with_last_byte(1);
