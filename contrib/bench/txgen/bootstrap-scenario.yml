@@ -84,6 +84,15 @@ scenario:
         max_block_range: 1000
       save: deposit_processed
 
-    # DepositProcessed is the terminal bootstrap condition: it proves the Zone
-    # credited the sequencer's sponsorship balance. The later L1 BatchSubmitted
-    # cadence is not needed before setup approvals can begin.
+    # DepositProcessed proves the Zone credited the bootstrap. BatchSubmitted
+    # proves L1 committed the same deposit number before ready preflight runs.
+    - wait_log:
+        chain: l1
+        from_block: { var: l1_before_deposit.block_number }
+        address: "__PORTAL__"
+        abi: ZonePortal
+        event: BatchSubmitted
+        where:
+          lastProcessedDepositNumber: { var: deposit_made.args.depositNumber }
+        max_block_range: 1000
+      save: batch_submitted
