@@ -3720,6 +3720,7 @@ impl L1Fixture {
         for cache in self.caches.lock().unwrap().iter() {
             let mut cache = cache.write();
             for token in tokens {
+                cache.enable_token(token.token);
                 seed_raw_tip20_policy_id(
                     &mut cache,
                     block_number,
