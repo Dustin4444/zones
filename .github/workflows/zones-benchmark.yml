@@ -289,6 +289,7 @@ jobs:
       ZONES_BENCH_BLOAT_GIB: ${{ needs.authorize.outputs.state-bloat-gib }}
       ZONES_BENCH_FORCE_BLOAT: ${{ needs.authorize.outputs.force-bloat }}
       ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION: ${{ needs.authorize.outputs.verify-payload-execution }}
+      ZONES_DEBUG_DISABLE_FEE_MANAGER_OVERRIDE: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') || (github.event_name == 'workflow_dispatch' && github.ref_name == 'dan/state-root-debugging')) && '1' || '0' }}
       # Retire this branch once the witness has identified the divergent state.
       # It deliberately reintroduces the former newPayload path alongside
       # executed-payload insertion, solely to reproduce the historical fault.
