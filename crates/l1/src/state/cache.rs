@@ -291,7 +291,6 @@ mod tests {
         // TokenEnabled is emitted by the portal, so the subscriber must install a barrier for the
         // token address rather than only for the portal emitter.
         cache.invalidate(token, 11);
-        cache.enable_token(token);
         cover_through(&mut cache, 11);
         assert_eq!(cache.get(token, policy_slot, 11), None);
 
