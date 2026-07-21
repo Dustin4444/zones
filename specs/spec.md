@@ -950,13 +950,29 @@ The connection is terminated when the authorization token expires. For keychain-
 
 ### Zone-Specific Methods
 
-The zone exposes three methods under the `zone_` namespace:
+The zone exposes four methods under the `zone_` namespace:
 
 | Method | Access | Description |
 |--------|--------|-------------|
 | `zone_getAuthorizationTokenInfo` | Any authenticated | Returns the authenticated account address and token expiry |
 | `zone_getZoneInfo` | Any authenticated | Returns `zoneId`, `zoneTokens`, `sequencer`, `chainId` |
+| `zone_getEncryptionKey` | Any authenticated | Returns the active sequencer encryption key at the current Tempo L1 head |
 | `zone_getDepositStatus(tempoBlockNumber)` | Scoped | Returns deposit processing status for the given Tempo block, filtered to deposits where the caller is the sender or recipient |
+
+`zone_getEncryptionKey` reads the active key directly from the portal at the current Tempo L1 head.
+Its response is:
+
+```ts
+{
+  x: Hex,
+  yParity: 2 | 3,
+  keyIndex: bigint,
+}
+```
+
+This is the portal's `encryptionKeyAtBlock` return value without additional wrapping. The key index
+uses JSON-RPC quantity encoding. Key rotation is visible immediately on L1 and does not wait for the
+Zone to process the corresponding Tempo block.
 
 There are no state-changing methods via authorization token. Withdrawals require a signed transaction submitted via `eth_sendRawTransaction`.
 
