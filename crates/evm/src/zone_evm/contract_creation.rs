@@ -53,6 +53,17 @@ pub fn validate_transaction(
     tx: &TempoTxEnv,
     allowlist: &[Address],
 ) -> Result<(), TempoInvalidTransaction> {
+    if tx.authorization_list_len() != 0
+        || tx
+            .tempo_tx_env
+            .as_ref()
+            .is_some_and(|aa| !aa.tempo_authorization_list.is_empty())
+    {
+        return Err(TempoInvalidTransaction::CallsValidation(
+            "EIP-7702 authorization lists are not supported",
+        ));
+    }
+
     if contract_creation_deployer(tx).is_some_and(|deployer| !allowlist.contains(&deployer)) {
         return Err(TempoInvalidTransaction::CallsValidation(
             "contract creation is not supported",
@@ -74,13 +85,16 @@ fn contract_creation_deployer(tx: &TempoTxEnv) -> Option<Address> {
 mod tests {
     use super::*;
     use crate::{L1OverlayDB, ZoneEvm};
+    use alloy_eips::eip7702::Authorization;
     use alloy_evm::{Evm, EvmEnv};
-    use alloy_primitives::{Address, Bytes, TxKind, U256, bytes};
+    use alloy_primitives::{Address, Bytes, Signature, TxKind, U256, bytes};
     use revm::{
         bytecode::Bytecode,
         context::{
             TxEnv,
+            either::Either,
             result::{EVMError, ExecutionResult},
+            transaction::SignedAuthorization,
         },
         database::{EmptyDB, in_memory_db::CacheDB},
         inspector::NoOpInspector,
@@ -197,6 +211,26 @@ mod tests {
 
         assert!(validate_transaction(&tx, &[]).is_err());
         assert!(validate_transaction(&tx, &[caller]).is_ok());
+    }
+
+    #[test]
+    fn authorization_lists_are_rejected() {
+        let mut tx = TempoTxEnv::default();
+        tx.inner.authorization_list = vec![Either::Left(SignedAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::ONE,
+                address: Address::repeat_byte(0x02),
+                nonce: 0,
+            },
+            Signature::test_signature(),
+        ))];
+
+        assert!(matches!(
+            validate_transaction(&tx, CONTRACT_DEPLOYER_ALLOWLIST),
+            Err(TempoInvalidTransaction::CallsValidation(
+                "EIP-7702 authorization lists are not supported"
+            ))
+        ));
     }
 
     #[test]
