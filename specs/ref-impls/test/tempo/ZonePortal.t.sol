@@ -26,6 +26,7 @@ import {
     PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
     PORTAL_PENDING_ADMIN_SLOT,
     PORTAL_ROLE_SLOT,
+    PORTAL_SEQUENCERS_SLOT,
     Role,
     Withdrawal,
     ZONE_FACTORY_ADDRESS,
@@ -4155,7 +4156,7 @@ contract ZonePortalTest is BaseTest {
         );
     }
 
-    /// @notice Verify that the slot constants used by ZoneInbox and ZoneConfig match
+    /// @notice Verify that the slot constants used across zone predeploys match
     ///         the actual ZonePortal storage layout.
     /// @dev This is the cross-contract consistency check. The test replicates the exact
     ///      slot computation logic used by ZoneInbox._readEncryptionKey() and
@@ -4171,6 +4172,13 @@ contract ZonePortalTest is BaseTest {
             uint256(vm.load(address(portal), membershipSlot)),
             1,
             "PORTAL_IS_SEQUENCER_SLOT reads wrong data"
+        );
+
+        // Verify sequencer array length slot (used by TempoState's first-import anchor proof)
+        assertEq(
+            uint256(vm.load(address(portal), PORTAL_SEQUENCERS_SLOT)),
+            portal.sequencerCount(),
+            "PORTAL_SEQUENCERS_SLOT reads wrong array length"
         );
 
         // Verify currentDepositQueueHash slot (used by ZoneInbox)

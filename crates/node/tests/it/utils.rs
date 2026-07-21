@@ -72,7 +72,9 @@ use zone_l1::{
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
-use zone_primitives::constants::{PORTAL_ACCESS_MODE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT};
+use zone_primitives::constants::{
+    PORTAL_ACCESS_MODE_SLOT, PORTAL_ADMIN_SLOT, PORTAL_TOKEN_CONFIGS_SLOT,
+};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -4064,6 +4066,12 @@ impl L1Fixture {
         for block in 0..=num_blocks {
             cache.set(
                 portal_address,
+                PORTAL_ADMIN_SLOT,
+                block,
+                B256::with_last_byte(1),
+            );
+            cache.set(
+                portal_address,
                 sequencer_membership_slot,
                 block,
                 B256::with_last_byte(1),
@@ -4100,6 +4108,7 @@ impl L1Fixture {
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         drop(cache);
+        enabled_tokens.write().insert(PATH_USD_ADDRESS);
         self.caches.lock().unwrap().push(cache_handle.clone());
         self.enabled_token_registries
             .lock()

@@ -7,14 +7,14 @@
 //!
 //! Both a synchronous ([`L1StateProvider::get_storage`]) and an asynchronous
 //! ([`L1StateProvider::get_storage_async`]) entry point are provided. The synchronous variant is
-//! intended for use inside EVM precompiles where async is unavailable — it retries the RPC
-//! call indefinitely with exponential backoff to avoid bricking the chain on transient outages.
+//! intended for use inside EVM precompiles where async is unavailable — it retries transient RPC
+//! failures with exponential backoff, while returning deterministic protocol failures immediately.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::BlockId;
-use alloy_transport::layers::RetryBackoffLayer;
+use alloy_transport::{TransportError, layers::RetryBackoffLayer};
 use eyre::Result;
 use std::num::NonZeroU32;
 use tempo_alloy::TempoNetwork;
@@ -163,10 +163,10 @@ impl L1StateProvider {
     /// Read a storage slot synchronously at a specific L1 block — cache first, RPC fallback.
     ///
     /// This method is designed for use inside EVM precompiles that run on a **blocking thread**.
-    /// On cache miss it retries the RPC call indefinitely until the value is fetched. The
-    /// transport layer handles backoff internally via [`RetryBackoffLayer`], so retries here
-    /// are immediate. This ensures a transient L1 RPC outage stalls block production rather
-    /// than bricking the chain with a hard precompile error.
+    /// On cache miss it retries transient RPC failures until the value is fetched. Deterministic
+    /// JSON-RPC and HTTP failures return immediately so an invalid block number cannot hang EVM
+    /// execution. The transport layer handles backoff internally via [`RetryBackoffLayer`], so
+    /// retries here are immediate.
     ///
     /// # Panics
     ///
@@ -203,6 +203,11 @@ impl L1StateProvider {
                     return Ok(value);
                 }
                 Err(rpc_err) => {
+                    if is_permanent_rpc_failure(&rpc_err) {
+                        return Err(eyre::eyre!(
+                            "L1 storage RPC fetch failed permanently for address={address} slot={slot} block={block_number}: {rpc_err}"
+                        ));
+                    }
                     if self
                         .max_sync_attempts
                         .is_some_and(|max_attempts| attempt >= max_attempts.get())
@@ -247,18 +252,44 @@ impl L1StateProvider {
     }
 
     /// Fetch a single storage slot from L1 at a specific block via the shared HTTP provider.
-    async fn fetch_slot(&self, address: Address, slot: B256, block_number: u64) -> Result<B256> {
+    async fn fetch_slot(
+        &self,
+        address: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> std::result::Result<B256, TransportError> {
         let key = U256::from_be_bytes(slot.0);
         let block_id = BlockId::number(block_number);
-        let value: U256 = self.provider.get_storage_at(address, key).block_id(block_id).await.map_err(|e| {
-            warn!(%address, %slot, block_number, %e, "eth_getStorageAt RPC call failed");
-            eyre::eyre!("eth_getStorageAt failed for address={address} slot={slot} block={block_number}: {e}")
-        })?;
+        let value: U256 = self
+            .provider
+            .get_storage_at(address, key)
+            .block_id(block_id)
+            .await
+            .inspect_err(
+                |error| warn!(%address, %slot, block_number, %error, "eth_getStorageAt RPC call failed"),
+            )?;
 
         let result = B256::from(value.to_be_bytes());
         debug!(%address, %slot, block_number, %result, "fetched L1 storage slot from RPC");
         Ok(result)
     }
+}
+
+fn is_permanent_rpc_failure(error: &TransportError) -> bool {
+    if let Some(response) = error.as_error_resp() {
+        return !response.is_retry_err();
+    }
+    if let Some(transport) = error.as_transport_err() {
+        if let Some(http) = transport.as_http_error() {
+            return !http.is_rate_limit_err() && !http.is_temporarily_unavailable();
+        }
+        return transport.is_non_retryable();
+    }
+
+    error.is_ser_error()
+        || error.is_deser_error()
+        || error.is_unsupported_feature()
+        || error.is_local_usage_error()
 }
 
 impl L1StorageReader for L1StateProvider {
@@ -281,6 +312,19 @@ impl L1StorageReader for L1StateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_transport::TransportErrorKind;
+
+    #[test]
+    fn permanent_rpc_failures_are_not_retried() {
+        let protocol_error = TransportErrorKind::non_retryable_str("invalid block number");
+        assert!(is_permanent_rpc_failure(&protocol_error));
+
+        let bad_request = TransportErrorKind::http_error(400, "bad request".into());
+        assert!(is_permanent_rpc_failure(&bad_request));
+
+        let rate_limit = TransportErrorKind::http_error(429, "rate limited".into());
+        assert!(!is_permanent_rpc_failure(&rate_limit));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn finite_sync_attempt_limit_returns_diagnostic_error() {

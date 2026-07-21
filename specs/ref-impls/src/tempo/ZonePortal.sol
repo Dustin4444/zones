@@ -1105,8 +1105,15 @@ contract ZonePortal is IZonePortal {
         // Determine anchor block: either tempoBlockNumber (direct) or recentTempoBlockNumber (ancestry)
         uint64 anchorBlockNumber;
         bytes32 anchorBlockHash;
+        bool isBootstrap =
+            blockHash == bytes32(0) && tempoBlockNumber == 0 && recentTempoBlockNumber == 0;
 
-        if (recentTempoBlockNumber == 0) {
+        if (isBootstrap) {
+            // Bootstrap mode: the first proof derives the canonical genesis block from zoneId and
+            // proves that TempoState still has an empty checkpoint.
+            anchorBlockNumber = 0;
+            anchorBlockHash = bytes32(0);
+        } else if (recentTempoBlockNumber == 0) {
             // Direct mode: read tempoBlockNumber hash from EIP-2935
             anchorBlockNumber = tempoBlockNumber;
             if (tempoBlockNumber > block.number) {
@@ -1127,7 +1134,9 @@ contract ZonePortal is IZonePortal {
             anchorBlockHash = getBlockHash(recentTempoBlockNumber);
         }
 
-        if (anchorBlockHash == bytes32(0)) revert InvalidTempoBlockNumber();
+        if (!isBootstrap && anchorBlockHash == bytes32(0)) {
+            revert InvalidTempoBlockNumber();
+        }
 
         // The certificate binds every value that affects settlement, rather than only the
         // zone block hash. A leader therefore cannot reuse signatures for this block with a
