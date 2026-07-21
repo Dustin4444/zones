@@ -27,6 +27,7 @@ import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE } from "../libraries/EncryptedDeposit.
 import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
 import {
     EMPTY_SENTINEL,
+    NO_QUEUE_INDEX,
     WithdrawalQueue,
     WithdrawalQueueLib
 } from "../libraries/WithdrawalQueueLib.sol";
@@ -1105,8 +1106,26 @@ contract ZonePortal is IZonePortal {
         // Determine anchor block: either tempoBlockNumber (direct) or recentTempoBlockNumber (ancestry)
         uint64 anchorBlockNumber;
         bytes32 anchorBlockHash;
+        bool isBootstrap = blockHash == bytes32(0);
 
-        if (recentTempoBlockNumber == 0) {
+        if (isBootstrap) {
+            // Bootstrap mode: the first proof derives the canonical genesis block from zoneId and
+            // proves that TempoState still has an empty checkpoint. Genesis executes no system
+            // transactions, so it cannot process deposits or finalize a withdrawal batch.
+            if (
+                tempoBlockNumber != 0 || recentTempoBlockNumber != 0 || nextZoneHeight != 0
+                    || blockTransition.nextBlockHash == bytes32(0)
+                    || depositQueueTransition.prevProcessedHash != bytes32(0)
+                    || depositQueueTransition.nextProcessedHash != bytes32(0)
+                    || depositQueueTransition.prevDepositNumber != 0
+                    || depositQueueTransition.nextDepositNumber != 0
+                    || withdrawalQueueHash != bytes32(0)
+            ) {
+                revert InvalidBootstrap();
+            }
+            anchorBlockNumber = 0;
+            anchorBlockHash = bytes32(0);
+        } else if (recentTempoBlockNumber == 0) {
             // Direct mode: read tempoBlockNumber hash from EIP-2935
             anchorBlockNumber = tempoBlockNumber;
             if (tempoBlockNumber > block.number) {
@@ -1127,12 +1146,17 @@ contract ZonePortal is IZonePortal {
             anchorBlockHash = getBlockHash(recentTempoBlockNumber);
         }
 
-        if (anchorBlockHash == bytes32(0)) revert InvalidTempoBlockNumber();
+        if (!isBootstrap && anchorBlockHash == bytes32(0)) {
+            revert InvalidTempoBlockNumber();
+        }
 
         // The certificate binds every value that affects settlement, rather than only the
         // zone block hash. A leader therefore cannot reuse signatures for this block with a
         // different withdrawal root, deposit transition, Tempo anchor, or verifier config.
+        uint64 expectedWithdrawalBatchIndex = isBootstrap ? 0 : withdrawalBatchIndex + 1;
         if (!_verifySettlement(
+                isBootstrap,
+                expectedWithdrawalBatchIndex,
                 nextZoneHeight,
                 tempoBlockNumber,
                 anchorBlockNumber,
@@ -1165,7 +1189,7 @@ contract ZonePortal is IZonePortal {
                 tempoBlockNumber,
                 anchorBlockNumber,
                 anchorBlockHash,
-                withdrawalBatchIndex + 1,
+                expectedWithdrawalBatchIndex,
                 blockTransition,
                 depositQueueTransition,
                 withdrawalQueueHash,
@@ -1174,13 +1198,19 @@ contract ZonePortal is IZonePortal {
             );
         if (!valid) revert InvalidProof();
 
-        // Update state
-        withdrawalBatchIndex++;
+        // Bootstrap only establishes the canonical genesis tip. It must not consume a withdrawal
+        // batch or queue slot because genesis executes no ZoneOutbox.finalizeWithdrawalBatch.
         blockHash = blockTransition.nextBlockHash;
+        zoneHeight = nextZoneHeight;
+        if (isBootstrap) {
+            emit BatchSubmitted(0, NO_QUEUE_INDEX, bytes32(0), blockHash, bytes32(0), 0);
+            return;
+        }
+
+        // Update ordinary batch state.
+        withdrawalBatchIndex = expectedWithdrawalBatchIndex;
         lastSyncedTempoBlockNumber = tempoBlockNumber;
         lastProcessedDepositNumber = depositQueueTransition.nextDepositNumber;
-        zoneHeight = nextZoneHeight;
-
         uint256 assignedQueueIndex = _withdrawalQueue.enqueue(withdrawalQueueHash);
 
         // Emit event after state updates
@@ -1195,6 +1225,8 @@ contract ZonePortal is IZonePortal {
     }
 
     function _verifySettlement(
+        bool isBootstrap,
+        uint64 expectedWithdrawalBatchIndex,
         uint256 nextZoneHeight,
         uint64 tempoBlockNumber,
         uint64 anchorBlockNumber,
@@ -1211,7 +1243,7 @@ contract ZonePortal is IZonePortal {
     {
         uint256 threshold = sequencerThreshold;
         if (
-            nextZoneHeight <= zoneHeight || signatures.length < threshold
+            (!isBootstrap && nextZoneHeight <= zoneHeight) || signatures.length < threshold
                 || signatures.length > _sequencers.length
         ) return false;
 
@@ -1221,7 +1253,7 @@ contract ZonePortal is IZonePortal {
                 zoneId,
                 sequencerSetVersion,
                 nextZoneHeight,
-                withdrawalBatchIndex + 1,
+                expectedWithdrawalBatchIndex,
                 verifier,
                 tempoBlockNumber,
                 anchorBlockNumber,

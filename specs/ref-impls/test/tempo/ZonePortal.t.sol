@@ -26,6 +26,7 @@ import {
     PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
     PORTAL_PENDING_ADMIN_SLOT,
     PORTAL_ROLE_SLOT,
+    PORTAL_SEQUENCERS_SLOT,
     Role,
     Withdrawal,
     ZONE_FACTORY_ADDRESS,
@@ -556,6 +557,7 @@ contract ZonePortalTest is BaseTest {
 
     function _attestationDigest(
         uint256 height,
+        uint256 expectedWithdrawalBatchIndex,
         uint64 tempoBlockNumber,
         uint64 anchorBlockNumber,
         bytes32 anchorBlockHash,
@@ -583,7 +585,7 @@ contract ZonePortalTest is BaseTest {
                 portal.zoneId(),
                 portal.sequencerSetVersion(),
                 height,
-                portal.withdrawalBatchIndex() + 1,
+                expectedWithdrawalBatchIndex,
                 portal.verifier(),
                 tempoBlockNumber,
                 anchorBlockNumber,
@@ -751,6 +753,7 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_submitBatch_acceptsQuorumCertificateFromRegisteredSequencer() public {
+        _bootstrapPortal(portal);
         address[] memory signers = _activateSequencerSet(2);
         bytes32 nextBlockHash = keccak256("certified-tip");
         uint256 nextZoneHeight = 10;
@@ -767,6 +770,7 @@ contract ZonePortalTest is BaseTest {
         bytes[] memory signatures = _quorumSignatures(
             _attestationDigest(
                 nextZoneHeight,
+                portal.withdrawalBatchIndex() + 1,
                 tempoBlockNumber,
                 tempoBlockNumber,
                 getBlockHash(tempoBlockNumber),
@@ -794,6 +798,7 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_submitBatch_rejectsCertificateForDifferentWithdrawalRoot() public {
+        _bootstrapPortal(portal);
         address[] memory signers = _activateSequencerSet(2);
         vm.roll(block.number + 1);
 
@@ -810,6 +815,7 @@ contract ZonePortalTest is BaseTest {
         bytes[] memory signatures = _quorumSignatures(
             _attestationDigest(
                 10,
+                portal.withdrawalBatchIndex() + 1,
                 tempoBlockNumber,
                 tempoBlockNumber,
                 getBlockHash(tempoBlockNumber),
@@ -1445,6 +1451,90 @@ contract ZonePortalTest is BaseTest {
     /*//////////////////////////////////////////////////////////////
                        BATCH SUBMISSION TESTS
     //////////////////////////////////////////////////////////////*/
+
+    function test_submitBatch_bootstrapUsesZeroAnchorAndDoesNotConsumeWithdrawalBatch() public {
+        address[] memory signers = _activateSequencerSet(2);
+        bytes32 genesisHash = keccak256("canonical genesis");
+        BlockTransition memory blockTransition =
+            BlockTransition({ prevBlockHash: bytes32(0), nextBlockHash: genesisHash });
+        DepositQueueTransition memory depositQueueTransition = DepositQueueTransition({
+            prevProcessedHash: bytes32(0),
+            nextProcessedHash: bytes32(0),
+            prevDepositNumber: 0,
+            nextDepositNumber: 0
+        });
+        bytes[] memory signatures = _quorumSignatures(
+            _attestationDigest(
+                0, 0, 0, 0, bytes32(0), blockTransition, depositQueueTransition, bytes32(0), ""
+            )
+        );
+
+        vm.expectEmit(true, true, false, true);
+        emit IZonePortal.BatchSubmitted(0, NO_QUEUE_INDEX, bytes32(0), genesisHash, bytes32(0), 0);
+        vm.prank(signers[0]);
+        portal.submitBatch(
+            0, 0, blockTransition, depositQueueTransition, bytes32(0), "", "", 0, signatures
+        );
+
+        assertEq(portal.blockHash(), genesisHash);
+        assertEq(portal.zoneHeight(), 0);
+        assertEq(portal.withdrawalBatchIndex(), 0);
+        assertEq(portal.withdrawalQueueHead(), 0);
+        assertEq(portal.withdrawalQueueTail(), 0);
+        assertEq(portal.lastSyncedTempoBlockNumber(), 0);
+        assertEq(portal.lastProcessedDepositNumber(), 0);
+    }
+
+    function test_submitBatch_bootstrapRejectsNonemptyOutputs() public {
+        bytes[] memory signatures = new bytes[](1);
+        signatures[0] = hex"01";
+
+        vm.expectRevert(IZonePortal.InvalidBootstrap.selector);
+        vm.prank(sequencer);
+        portal.submitBatch(
+            0,
+            0,
+            BlockTransition({
+                prevBlockHash: bytes32(0), nextBlockHash: keccak256("canonical genesis")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            keccak256("phantom withdrawal batch"),
+            "",
+            "",
+            0,
+            signatures
+        );
+    }
+
+    function test_submitBatch_firstOrdinaryBatchUsesWithdrawalIndexOne() public {
+        bytes32 genesisHash = _bootstrapPortal(portal);
+        vm.roll(block.number + 1);
+
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: genesisHash, nextBlockHash: keccak256("first ordinary batch")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            bytes32(0),
+            "",
+            ""
+        );
+
+        assertEq(portal.withdrawalBatchIndex(), 1);
+    }
 
     function test_submitBatch_updatesState() public {
         // Setup: make a deposit
@@ -4155,7 +4245,7 @@ contract ZonePortalTest is BaseTest {
         );
     }
 
-    /// @notice Verify that the slot constants used by ZoneInbox and ZoneConfig match
+    /// @notice Verify that the slot constants used across zone predeploys match
     ///         the actual ZonePortal storage layout.
     /// @dev This is the cross-contract consistency check. The test replicates the exact
     ///      slot computation logic used by ZoneInbox._readEncryptionKey() and
@@ -4171,6 +4261,13 @@ contract ZonePortalTest is BaseTest {
             uint256(vm.load(address(portal), membershipSlot)),
             1,
             "PORTAL_IS_SEQUENCER_SLOT reads wrong data"
+        );
+
+        // Verify sequencer array length slot (used by TempoState's first-import anchor proof)
+        assertEq(
+            uint256(vm.load(address(portal), PORTAL_SEQUENCERS_SLOT)),
+            portal.sequencerCount(),
+            "PORTAL_SEQUENCERS_SLOT reads wrong array length"
         );
 
         // Verify currentDepositQueueHash slot (used by ZoneInbox)

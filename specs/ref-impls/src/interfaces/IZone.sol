@@ -370,6 +370,7 @@ bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(5));
 bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(6));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(7));
 bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(13));
+bytes32 constant PORTAL_SEQUENCERS_SLOT = bytes32(uint256(18));
 bytes32 constant PORTAL_IS_SEQUENCER_SLOT = bytes32(uint256(19));
 bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(PORTAL_IS_SEQUENCER_SLOT) + 1);
 bytes32 constant PORTAL_ENFORCEMENT_MODES_SLOT = bytes32(uint256(PORTAL_ROLE_SLOT) + 1);
@@ -395,7 +396,8 @@ interface IVerifier {
     /// @param tempoBlockNumber Block zone committed to (from TempoState)
     /// @param anchorBlockNumber Block whose hash is verified (tempoBlockNumber or recent block)
     /// @param anchorBlockHash Hash of anchorBlockNumber (from EIP-2935)
-    /// @param expectedWithdrawalBatchIndex Expected batch index (portal.withdrawalBatchIndex + 1)
+    /// @param expectedWithdrawalBatchIndex Expected batch index
+    ///        (`0` for bootstrap, otherwise `portal.withdrawalBatchIndex + 1`)
     /// @param blockTransition Zone block hash transition
     /// @param depositQueueTransition Deposit queue processing transition
     /// @param withdrawalQueueHash Withdrawal queue hash chain for this batch (0 if none)
@@ -508,10 +510,12 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
-    /// @notice Emitted after a batch is accepted by `submitBatch`.
+    /// @notice Emitted after a bootstrap or ordinary batch is accepted by `submitBatch`.
     /// @dev `withdrawalQueueIndex` is the logical (non-wrapping) withdrawal queue index the
     ///      batch's hash chain was enqueued under, or `NO_QUEUE_INDEX` (`type(uint256).max`)
-    ///      when the batch carried no withdrawals. Indexed so off-chain recovery can query
+    ///      when the transition carried no withdrawals. Bootstrap emits withdrawal batch index
+    ///      `0` and `NO_QUEUE_INDEX` without advancing either withdrawal queue counter. Indexed so
+    ///      off-chain recovery can query
     ///      the event for a specific logical index instead of counting events positionally.
     event BatchSubmitted(
         uint64 indexed withdrawalBatchIndex,
@@ -610,6 +614,7 @@ interface IZonePortal {
     error MustDelegateCall();
     error NotPendingAdmin();
     error InvalidProof();
+    error InvalidBootstrap();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
     error TransferFailed();

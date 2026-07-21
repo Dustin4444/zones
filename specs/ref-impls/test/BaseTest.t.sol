@@ -37,6 +37,7 @@ import { IValidatorConfig } from "tempo-std/interfaces/IValidatorConfig.sol";
 contract BaseTest is Test {
 
     mapping(address portal => uint256 height) private _submittedZoneHeights;
+    bytes32 private constant _PORTAL_BLOCK_HASH_SLOT = bytes32(uint256(2));
 
     // Registry precompiles
     address internal constant _ACCOUNT_KEYCHAIN = StdPrecompiles.ACCOUNT_KEYCHAIN_ADDRESS;
@@ -249,6 +250,17 @@ contract BaseTest is Test {
         withdrawals[0] = withdrawal;
     }
 
+    /// @notice Seed the canonical test genesis without consuming a withdrawal batch.
+    /// @dev Dedicated bootstrap tests exercise submitBatch itself. Generic batch helpers write the
+    ///      resulting tip directly so they do not consume a caller's pending prank or expectation.
+    function _bootstrapPortal(IZonePortal portal) internal returns (bytes32 genesisHash) {
+        genesisHash = vm.load(address(portal), _PORTAL_BLOCK_HASH_SLOT);
+        if (genesisHash != bytes32(0)) return genesisHash;
+
+        genesisHash = keccak256(abi.encode("canonical test genesis", address(portal)));
+        vm.store(address(portal), _PORTAL_BLOCK_HASH_SLOT, genesisHash);
+    }
+
     /// @notice Submit through the TIP-1091 entrypoint while dedicated certificate tests exercise
     ///         the real signature precompile behavior independently.
     function _submitBatch(
@@ -263,6 +275,14 @@ contract BaseTest is Test {
     )
         internal
     {
+        if (vm.load(address(portal), _PORTAL_BLOCK_HASH_SLOT) == bytes32(0)) {
+            bytes32 suppliedPrevBlockHash = blockTransition.prevBlockHash;
+            bytes32 genesisHash = _bootstrapPortal(portal);
+            if (suppliedPrevBlockHash == bytes32(0)) {
+                blockTransition.prevBlockHash = genesisHash;
+            }
+        }
+
         bytes[] memory signatures = new bytes[](1);
         signatures[0] = hex"01";
         vm.mockCall(

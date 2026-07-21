@@ -72,7 +72,9 @@ use zone_l1::{
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
-use zone_primitives::constants::{PORTAL_ACCESS_MODE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT};
+use zone_primitives::constants::{
+    PORTAL_ACCESS_MODE_SLOT, PORTAL_ADMIN_SLOT, PORTAL_TOKEN_CONFIGS_SLOT,
+};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -1520,8 +1522,13 @@ impl L1TestNode {
     /// Combines [`native_zone_factory`](Self::native_zone_factory) and
     /// [`create_zone`](Self::create_zone). Returns the portal address.
     pub(crate) async fn deploy_zone(&self) -> eyre::Result<Address> {
+        Ok(self.deploy_zone_with_creation_block().await?.0)
+    }
+
+    /// Create a zone through the native ZoneFactory and return its portal and inclusion block.
+    pub(crate) async fn deploy_zone_with_creation_block(&self) -> eyre::Result<(Address, u64)> {
         let factory = self.native_zone_factory().await?;
-        self.create_zone(factory).await
+        self.create_zone_with_creation_block(factory).await
     }
 
     /// Wait for a withdrawal to be fully processed on L1 (pathUSD).
@@ -1680,13 +1687,24 @@ impl L1TestNode {
     ///
     /// [`admin_address`]: Self::admin_address
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
+        Ok(self
+            .create_zone_with_creation_block(factory_address)
+            .await?
+            .0)
+    }
+
+    /// Create a zone and return both its portal address and confirmed inclusion block.
+    pub(crate) async fn create_zone_with_creation_block(
+        &self,
+        factory_address: Address,
+    ) -> eyre::Result<(Address, u64)> {
         let config = ZoneCreationConfig::closed(vec![
             self.admin_address(),
             self.dev_address(),
             self.user_signer().address(),
         ]);
-        let portal = self
-            .create_zone_with_admin_sequencer_and_config(
+        let created = self
+            .create_zone_with_admin_sequencer_config_and_block(
                 factory_address,
                 self.admin_address(),
                 self.dev_address(),
@@ -1696,7 +1714,7 @@ impl L1TestNode {
         // The admin is not pre-funded; give it pathUSD to pay for gas on
         // admin-only portal calls.
         self.fund_user(self.admin_address(), 10_000_000).await?;
-        Ok(portal)
+        Ok(created)
     }
 
     /// Create a zone with an exact access-mode, membership, and gateway configuration.
@@ -1707,6 +1725,24 @@ impl L1TestNode {
         sequencer: Address,
         config: ZoneCreationConfig,
     ) -> eyre::Result<Address> {
+        Ok(self
+            .create_zone_with_admin_sequencer_config_and_block(
+                factory_address,
+                admin,
+                sequencer,
+                config,
+            )
+            .await?
+            .0)
+    }
+
+    async fn create_zone_with_admin_sequencer_config_and_block(
+        &self,
+        factory_address: Address,
+        admin: Address,
+        sequencer: Address,
+        config: ZoneCreationConfig,
+    ) -> eyre::Result<(Address, u64)> {
         use tempo_precompiles::PATH_USD_ADDRESS;
         use tempo_zone_contracts::ZoneFactory;
 
@@ -1734,6 +1770,9 @@ impl L1TestNode {
             .get_receipt()
             .await?;
         eyre::ensure!(receipt.status(), "createZone failed");
+        let creation_block_number = receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("createZone receipt missing block number"))?;
 
         let zone_created = receipt
             .inner
@@ -1742,7 +1781,7 @@ impl L1TestNode {
             .find_map(|log| ZoneFactory::ZoneCreated::decode_log(&log.inner).ok())
             .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
 
-        Ok(zone_created.portal)
+        Ok((zone_created.portal, creation_block_number))
     }
 
     /// Deploy the SwapAndDepositRouter contract on L1 from the Foundry artifact.
@@ -4046,6 +4085,12 @@ impl L1Fixture {
         for block in 0..=num_blocks {
             cache.set(
                 portal_address,
+                PORTAL_ADMIN_SLOT,
+                block,
+                B256::with_last_byte(1),
+            );
+            cache.set(
+                portal_address,
                 sequencer_membership_slot,
                 block,
                 B256::with_last_byte(1),
@@ -4082,6 +4127,7 @@ impl L1Fixture {
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         drop(cache);
+        enabled_tokens.write().insert(PATH_USD_ADDRESS);
         self.caches.lock().unwrap().push(cache_handle.clone());
         self.enabled_token_registries
             .lock()

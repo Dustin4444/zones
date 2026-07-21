@@ -121,12 +121,12 @@ pub struct SettlementCertificate {
 pub struct AttestationStore {
     settlements: Arc<RwLock<SettlementSignatures>>,
     settlement_changed: Arc<Notify>,
-    submitted_height: watch::Sender<u64>,
+    submitted_height: watch::Sender<Option<u64>>,
 }
 
 impl Default for AttestationStore {
     fn default() -> Self {
-        let (submitted_height, _) = watch::channel(0);
+        let (submitted_height, _) = watch::channel(None);
         Self {
             settlements: Arc::default(),
             settlement_changed: Arc::default(),
@@ -225,8 +225,8 @@ impl AttestationStore {
             .expect("attestation store lock poisoned")
             .retain(|settlement_height, _| *settlement_height > height);
         self.submitted_height.send_if_modified(|submitted| {
-            if height > *submitted {
-                *submitted = height;
+            if submitted.is_none_or(|submitted| height > submitted) {
+                *submitted = Some(height);
                 true
             } else {
                 false
@@ -235,7 +235,7 @@ impl AttestationStore {
     }
 
     /// Subscribe to the latest zone height confirmed by a batch submission or portal resync.
-    pub fn subscribe_submitted_height(&self) -> watch::Receiver<u64> {
+    pub fn subscribe_submitted_height(&self) -> watch::Receiver<Option<u64>> {
         self.submitted_height.subscribe()
     }
 }

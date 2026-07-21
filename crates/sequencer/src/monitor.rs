@@ -200,10 +200,41 @@ impl ZoneMonitor {
         );
         batch_submitter.set_attestation_store(config.attestation_store.clone());
 
-        let prev_zone_block_hash = batch_submitter
+        let mut prev_zone_block_hash = batch_submitter
             .read_portal_block_hash()
             .await
             .wrap_err("failed to read portal block hash during zone monitor startup")?;
+        if prev_zone_block_hash.is_zero() {
+            let genesis_block = provider
+                .get_block_by_number(0.into())
+                .await?
+                .ok_or_else(|| eyre::eyre!("canonical zone genesis block is unavailable"))?;
+            let genesis_hash = genesis_block.header.hash;
+            let bootstrap = BatchData {
+                zone_height: 0,
+                tempo_block_number: 0,
+                prev_block_hash: B256::ZERO,
+                next_block_hash: genesis_hash,
+                prev_processed_deposit_hash: B256::ZERO,
+                next_processed_deposit_hash: B256::ZERO,
+                prev_deposit_number: 0,
+                next_deposit_number: 0,
+                withdrawal_queue_hash: B256::ZERO,
+                withdrawal_batch_index: 0,
+            };
+            let event = batch_submitter
+                .submit_batch(&bootstrap)
+                .await
+                .wrap_err("failed to settle canonical zone genesis")?;
+            eyre::ensure!(
+                event.nextBlockHash == genesis_hash
+                    && event.withdrawalBatchIndex == 0
+                    && event.withdrawalQueueIndex == NO_QUEUE_INDEX,
+                "bootstrap settlement emitted inconsistent state"
+            );
+            prev_zone_block_hash = genesis_hash;
+            info!(%genesis_hash, "Settled canonical zone genesis on L1");
+        }
 
         let last_submitted_zone_block =
             Self::resolve_zone_block_number(&provider, prev_zone_block_hash).await;

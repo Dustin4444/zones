@@ -107,6 +107,11 @@ impl<P> L1State<P> {
 }
 
 impl<P: L1StorageReader> L1State<P> {
+    /// Returns the Zone portal associated with this execution context.
+    pub fn portal_address(&self) -> Address {
+        self.portal_address
+    }
+
     /// Reads L1 storage after selecting or validating `block_number` as this transaction's anchor.
     pub fn read_l1_storage(
         &self,

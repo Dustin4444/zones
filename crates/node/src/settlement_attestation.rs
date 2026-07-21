@@ -103,9 +103,13 @@ where
             ));
         }
     }
-    // A fresh ZonePortal has not accepted any zone tip yet, so its blockHash is zero. The first
-    // batch must extend that on-chain value rather than the local zone genesis hash.
-    Ok((B256::ZERO, B256::ZERO, 0))
+    // Bootstrap settles block zero separately, so the first ordinary batch extends the canonical
+    // genesis header even though there is no prior BatchFinalized event.
+    let genesis_hash = provider
+        .sealed_header(0)?
+        .ok_or_eyre("missing canonical zone genesis header")?
+        .hash();
+    Ok((genesis_hash, B256::ZERO, 0))
 }
 
 /// Build the settlement attestation at a batch boundary in the exact format ZonePortal expects.
@@ -118,6 +122,60 @@ pub(crate) async fn build_settlement_attestation<P>(
 where
     P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
 {
+    if number == 0 {
+        let next_tip = provider
+            .sealed_header(0)?
+            .ok_or_eyre("missing canonical zone genesis header")?
+            .hash();
+        let portal = ZonePortal::new(context.domain.portal_address, context.l1_provider.clone());
+        let set_version_call = portal.sequencerSetVersion();
+        let portal_batch_index_call = portal.withdrawalBatchIndex();
+        let verifier_call = portal.verifier();
+        let portal_tip_call = portal.blockHash();
+        let (set_version, portal_batch_index, verifier, portal_tip) = tokio::try_join!(
+            set_version_call.call(),
+            portal_batch_index_call.call(),
+            verifier_call.call(),
+            portal_tip_call.call(),
+        )?;
+        eyre::ensure!(
+            set_version == context.domain.sequencer_set_version,
+            "portal signer-set version {set_version} does not match manifest version {}",
+            context.domain.sequencer_set_version
+        );
+        eyre::ensure!(
+            portal_tip.is_zero(),
+            "canonical genesis is already settled on the portal"
+        );
+        eyre::ensure!(
+            portal_batch_index == 0,
+            "uninitialized portal has a non-zero withdrawal batch index"
+        );
+        if let Some((anchor_block_number, anchor_block_hash)) = proposed_anchor {
+            eyre::ensure!(
+                anchor_block_number == 0 && anchor_block_hash.is_zero(),
+                "bootstrap proposal must use the empty L1 anchor"
+            );
+        }
+
+        return Ok(Some(SettlementAttestation {
+            zoneId: context.domain.zone_id,
+            sequencerSetVersion: set_version,
+            zoneHeight: U256::ZERO,
+            withdrawalBatchIndex: U256::ZERO,
+            verifier,
+            tempoBlockNumber: 0,
+            anchorBlockNumber: 0,
+            anchorBlockHash: B256::ZERO,
+            blockTransitionHash: alloy_primitives::keccak256((B256::ZERO, next_tip).abi_encode()),
+            depositQueueTransitionHash: alloy_primitives::keccak256(
+                (B256::ZERO, B256::ZERO, 0_u64, 0_u64).abi_encode(),
+            ),
+            withdrawalQueueHash: B256::ZERO,
+            verifierConfigHash: alloy_primitives::keccak256(Bytes::new()),
+        }));
+    }
+
     let commitments = block_commitments(provider, number)?;
     let Some((withdrawal_queue_hash, withdrawal_batch_index)) = commitments.withdrawal else {
         return Ok(None);
@@ -295,7 +353,7 @@ pub(crate) async fn collect_leader_settlements<P>(
     };
 
     let mut pending_boundary = None;
-    for number in 1..=head {
+    for number in 0..=head {
         match propose_settlement(&provider, number, &commands, &context).await {
             Ok(true) => {
                 pending_boundary = Some(number);
@@ -396,12 +454,13 @@ pub(crate) async fn collect_leader_settlements<P>(
 
 /// Wait until the submitter or portal resync confirms at least `pending_height`.
 async fn wait_for_submitted_height(
-    submitted_heights: &mut watch::Receiver<u64>,
+    submitted_heights: &mut watch::Receiver<Option<u64>>,
     pending_height: u64,
 ) -> Result<u64, watch::error::RecvError> {
     loop {
         let submitted_height = *submitted_heights.borrow_and_update();
-        if submitted_height >= pending_height {
+        if submitted_height.is_some_and(|submitted| submitted >= pending_height) {
+            let submitted_height = submitted_height.expect("checked as present by is_some_and");
             return Ok(submitted_height);
         }
         submitted_heights.changed().await?;
@@ -474,6 +533,25 @@ where
 mod tests {
     use super::*;
     use zone_sequencer::attestation::AttestationStore;
+
+    #[tokio::test]
+    async fn bootstrap_submission_requires_explicit_height_zero_confirmation() {
+        let store = AttestationStore::default();
+        let mut submitted_heights = store.subscribe_submitted_height();
+        let waiting =
+            tokio::spawn(async move { wait_for_submitted_height(&mut submitted_heights, 0).await });
+
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        store.remove_submitted(0);
+        let submitted = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("bootstrap confirmation should wake the collector")
+            .expect("submission wait task should not panic")
+            .expect("submission notification channel should remain open");
+        assert_eq!(submitted, 0);
+    }
 
     #[tokio::test]
     async fn submission_confirmation_wakes_pending_boundary_without_retry_tick() {

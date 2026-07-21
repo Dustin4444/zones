@@ -165,6 +165,7 @@ crate::sol! {
         error NotAdmin();
         error NotPendingAdmin();
         error InvalidProof();
+        error InvalidBootstrap();
         error InvalidTempoBlockNumber();
         error PolicyForbids();
         error InvalidBouncebackRecipient();
@@ -361,6 +362,7 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::NotAdmin(_) => f.write_str("NotAdmin"),
             Self::NotPendingAdmin(_) => f.write_str("NotPendingAdmin"),
             Self::InvalidProof(_) => f.write_str("InvalidProof"),
+            Self::InvalidBootstrap(_) => f.write_str("InvalidBootstrap"),
             Self::InvalidTempoBlockNumber(_) => f.write_str("InvalidTempoBlockNumber"),
             Self::PolicyForbids(_) => f.write_str("PolicyForbids"),
             Self::InvalidBouncebackRecipient(_) => f.write_str("InvalidBouncebackRecipient"),
