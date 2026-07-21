@@ -156,10 +156,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          # This draft branch deliberately uses the fixture-free route. It exercises the same
-          # Zone payload builder and executor while the private fixture repository credential is
-          # being provisioned for the full neobank route.
-          INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'roundtrip' || inputs.phase }}
+          # This draft branch runs the full fixture flow with an expensive
+          # producer-versus-parent-state comparison on every Zone payload.
+          INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'neobank-e2e' || inputs.phase }}
           INPUT_STATE_ROOT_DIAGNOSTIC: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging' }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
           INPUT_COUNT: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && '100' || inputs.count || '1000' }}
