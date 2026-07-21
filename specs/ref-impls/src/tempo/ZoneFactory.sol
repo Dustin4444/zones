@@ -132,8 +132,33 @@ contract ZoneFactory is IZoneFactory {
         return _nextZoneId - 1;
     }
 
-    function zones(uint32 zoneId) external view returns (ZoneInfo memory) {
-        return _zones[zoneId];
+    function zones(uint32 id)
+        external
+        view
+        returns (
+            uint32 zoneId,
+            address portal,
+            address initialToken,
+            address admin,
+            address sequencer,
+            bytes32 genesisBlockHash,
+            bytes32 genesisTempoBlockHash,
+            uint64 genesisTempoBlockNumber,
+            string memory rpcUrl
+        )
+    {
+        ZoneInfo storage info = _zones[id];
+        return (
+            info.zoneId,
+            info.portal,
+            info.initialToken,
+            info.admin,
+            info.sequencer,
+            info.genesisBlockHash,
+            info.genesisTempoBlockHash,
+            info.genesisTempoBlockNumber,
+            info.rpcUrl
+        );
     }
 
     function isZonePortal(address portal) external view returns (bool) {
