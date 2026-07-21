@@ -522,6 +522,14 @@ contract ZonePortalTest is BaseTest {
         vm.expectRevert(IZonePortal.InvalidSequencerSet.selector);
         portal.setSequencerSet(signers, 4);
 
+        address[] memory tooMany = new address[](9);
+        for (uint256 i; i < tooMany.length; ++i) {
+            tooMany[i] = address(uint160(i + 1));
+        }
+        vm.prank(admin);
+        vm.expectRevert(IZonePortal.InvalidSequencerSet.selector);
+        portal.setSequencerSet(tooMany, 1);
+
         (signers[0], signers[1]) = (signers[1], signers[0]);
         vm.prank(admin);
         vm.expectRevert(IZonePortal.InvalidSequencerSet.selector);

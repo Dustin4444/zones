@@ -64,7 +64,8 @@ contract ZonePortal is IZonePortal {
     uint128 public constant MAX_GAS_FEE_RATE = 1e18;
 
     /// @notice Maximum number of independently countable settlement signers.
-    uint256 public constant MAX_SEQUENCERS = 32;
+    /// @dev Matches the creation and replacement bound fixed by TIP-1091.
+    uint256 public constant MAX_SEQUENCERS = 8;
 
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
