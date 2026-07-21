@@ -33,9 +33,10 @@ use std::{
 
 use alloy_network::ReceiptResponse;
 use alloy_primitives::{Address, B256, U256};
-use alloy_provider::DynProvider;
+use alloy_provider::{DynProvider, PendingTransactionBuilder};
+use futures::future::join_all;
 use parking_lot::Mutex;
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderExt};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -48,10 +49,21 @@ use crate::{
 use tempo_alloy::rpc::TempoCallBuilderExt;
 
 const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS: u64 = 2_000_000;
+const PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS: u64 = 100_000;
+const PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS: u64 = 2_000_000;
+const MAX_WITHDRAWALS_PER_PROCESS_BATCH: usize = 64;
+
+/// Default gas budget for one `processWithdrawals` transaction.
+pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
+
+/// Default maximum number of ordered withdrawal transactions kept in flight.
+pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 4;
+
+/// Default aggregate gas budget across concurrently in-flight withdrawal transactions.
+pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS: u64 = 20_000_000;
 #[cfg(test)]
 const MAX_PROCESS_WITHDRAWAL_TX_GAS: u64 =
-    process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT);
+    PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
 
 /// Shared handle to the withdrawal store.
 #[derive(Clone)]
@@ -82,6 +94,42 @@ pub struct WithdrawalProcessorConfig {
     pub l1_rpc_url: String,
     /// Fallback timeout for checking the withdrawal queue if no notification arrives.
     pub fallback_poll_interval: Duration,
+    /// Address whose lane-2 nonces order withdrawal processing transactions.
+    pub sequencer_address: Address,
+    /// Gas and concurrency limits for withdrawal transaction planning.
+    pub batch_limits: WithdrawalBatchLimits,
+}
+
+/// Limits applied while packing and pipelining `processWithdrawals` transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WithdrawalBatchLimits {
+    /// Maximum planned gas for one transaction. A single oversized withdrawal is still emitted
+    /// so that it cannot permanently block the queue.
+    pub max_batch_gas: u64,
+    /// Maximum number of transactions to keep concurrently in flight.
+    pub max_in_flight_batches: usize,
+    /// Maximum sum of planned gas across the in-flight transaction window.
+    pub max_in_flight_gas: u64,
+}
+
+impl WithdrawalBatchLimits {
+    fn normalized(self) -> Self {
+        Self {
+            max_batch_gas: self.max_batch_gas.max(1),
+            max_in_flight_batches: self.max_in_flight_batches.max(1),
+            max_in_flight_gas: self.max_in_flight_gas.max(1),
+        }
+    }
+}
+
+impl Default for WithdrawalBatchLimits {
+    fn default() -> Self {
+        Self {
+            max_batch_gas: DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+            max_in_flight_batches: DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
+            max_in_flight_gas: DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS,
+        }
+    }
 }
 
 /// In-memory store for withdrawal data grouped by batch index.
@@ -203,20 +251,111 @@ struct StoreSnapshot {
     withdrawals: Option<Vec<abi::Withdrawal>>,
 }
 
-/// Return the outer transaction gas limit for a callback withdrawal.
+/// Return the extra outer-frame gas needed for EIP-150's 63/64 forwarding rule.
+///
+/// `ZonePortal.processWithdrawals` must keep enough gas in the caller frame for the
+/// callback CALL to receive at least `gas_limit`. The cushion is `ceil(gas_limit / 63)`,
+/// which compensates for the 1/64 of remaining gas that EIP-150 withholds from the call.
+const fn eip150_cushion(gas_limit: u64) -> u64 {
+    gas_limit / 63 + if gas_limit.is_multiple_of(63) { 0 } else { 1 }
+}
+
+/// Return the gas reserved for one withdrawal inside a `processWithdrawals` transaction.
 ///
 /// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
-/// fixed portal/messenger overhead. This keeps legacy over-cap withdrawals submit-able
-/// so the portal can dequeue and bounce them instead of letting the RPC reject the
-/// transaction before it reaches L1 execution.
-const fn process_withdrawal_tx_gas_limit(callback_gas_limit: u64) -> u64 {
+/// per-item portal/messenger overhead and the EIP-150 cushion. This keeps legacy over-cap
+/// withdrawals submit-able while bounding the planner's gas accounting.
+const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
     let bounded_callback_gas = if callback_gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
         MAX_WITHDRAWAL_GAS_LIMIT
     } else {
         callback_gas_limit
     };
 
-    bounded_callback_gas + PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS
+    bounded_callback_gas
+        + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
+        + eip150_cushion(bounded_callback_gas)
+}
+
+/// A gas-bounded `processWithdrawals` transaction planned from one portal queue slot.
+#[derive(Debug, Clone)]
+pub struct PlannedWithdrawalBatch {
+    /// Index of the first withdrawal relative to the reconciled queue suffix.
+    pub start_index: usize,
+    /// FIFO-ordered withdrawals included in this transaction.
+    pub withdrawals: Vec<abi::Withdrawal>,
+    /// Queue hash expected after the transaction consumes all included withdrawals.
+    pub remaining_queue: B256,
+    /// Conservative outer transaction gas limit.
+    pub gas_limit: u64,
+}
+
+impl PlannedWithdrawalBatch {
+    fn end_index(&self) -> usize {
+        self.start_index + self.withdrawals.len()
+    }
+}
+
+/// Pure planner that packs queue-ordered withdrawals into a bounded in-flight window.
+///
+/// Keeping this component independent from RPC and storage makes the queue-hash, gas-budget, and
+/// concurrency rules directly unit testable.
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawalBatchPlanner {
+    limits: WithdrawalBatchLimits,
+}
+
+impl WithdrawalBatchPlanner {
+    pub fn new(limits: WithdrawalBatchLimits) -> Self {
+        Self {
+            limits: limits.normalized(),
+        }
+    }
+
+    /// Plan the next in-flight transaction window for a reconciled queue suffix.
+    pub fn plan(&self, withdrawals: &[abi::Withdrawal]) -> Vec<PlannedWithdrawalBatch> {
+        let mut batches = Vec::new();
+        let mut start = 0;
+        let mut in_flight_gas = 0u64;
+
+        while start < withdrawals.len() && batches.len() < self.limits.max_in_flight_batches {
+            let remaining_window_gas = self.limits.max_in_flight_gas.saturating_sub(in_flight_gas);
+            let batch_budget = self.limits.max_batch_gas.min(remaining_window_gas);
+            let first_item_gas = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+                .saturating_add(process_withdrawal_item_gas(withdrawals[start].gasLimit));
+
+            // A singleton may exceed the per-transaction limit so an expensive FIFO item cannot
+            // block progress. Only the first transaction may exceed the aggregate window limit;
+            // later expensive items wait until the next reconciled window.
+            if !batches.is_empty() && first_item_gas > remaining_window_gas {
+                break;
+            }
+
+            let mut end = start;
+            let mut gas_limit = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS;
+            while end < withdrawals.len() && end - start < MAX_WITHDRAWALS_PER_PROCESS_BATCH {
+                let next_gas = gas_limit
+                    .saturating_add(process_withdrawal_item_gas(withdrawals[end].gasLimit));
+                if end > start && next_gas > batch_budget {
+                    break;
+                }
+
+                gas_limit = next_gas;
+                end += 1;
+            }
+
+            batches.push(PlannedWithdrawalBatch {
+                start_index: start,
+                withdrawals: withdrawals[start..end].to_vec(),
+                remaining_queue: compute_remaining_queue(withdrawals, end),
+                gas_limit,
+            });
+            in_flight_gas = in_flight_gas.saturating_add(gas_limit);
+            start = end;
+        }
+
+        batches
+    }
 }
 
 /// Outcome of submitting and confirming one `processWithdrawals` transaction.
@@ -232,6 +371,12 @@ enum SubmitOutcome {
     Unconfirmed,
 }
 
+struct PendingWithdrawalBatch {
+    batch: PlannedWithdrawalBatch,
+    nonce: u64,
+    pending: PendingTransactionBuilder<TempoNetwork>,
+}
+
 /// Background task that processes withdrawals from the ZonePortal queue on Tempo L1.
 ///
 /// The processor waits for a [`Notify`] signal from the batch submitter (indicating a batch
@@ -243,14 +388,12 @@ enum SubmitOutcome {
 /// current on-chain hash and trims withdrawals the portal has already consumed,
 /// so it can safely run at any time from any state (crash, timeout, restart).
 ///
-/// ## POC limitations
-///
-/// - Transactions are submitted sequentially and the processor waits for each confirmation.
-///   On failure, processing stops and remaining withdrawals are retried on the next cycle.
-/// - The portal automatically pays the processing fee to the sequencer; this processor does not
-///   handle fee accounting.
+/// Withdrawals are gas-bounded into contract batches. Several consecutive-nonce transactions are
+/// broadcast without waiting for receipts, then confirmed concurrently. On any uncertain or
+/// reverted result, the next cycle reconciles the portal queue before planning more work.
 pub struct WithdrawalProcessor {
     config: WithdrawalProcessorConfig,
+    provider: DynProvider<TempoNetwork>,
     portal: ZonePortal::ZonePortalInstance<DynProvider<TempoNetwork>, TempoNetwork>,
     store: SharedWithdrawalStore,
     notify: Arc<Notify>,
@@ -269,10 +412,11 @@ impl WithdrawalProcessor {
         notify: Arc<Notify>,
         repair_notify: Arc<Notify>,
     ) -> Self {
-        let portal = ZonePortal::new(config.portal_address, provider);
+        let portal = ZonePortal::new(config.portal_address, provider.clone());
 
         Self {
             config,
+            provider,
             portal,
             store,
             notify,
@@ -433,186 +577,227 @@ impl WithdrawalProcessor {
                 return Ok(());
             }
 
+            let planner = WithdrawalBatchPlanner::new(self.config.batch_limits);
+            let planned_batches = planner.plan(remaining);
+            let planned_withdrawals = planned_batches
+                .last()
+                .map_or(0, PlannedWithdrawalBatch::end_index);
+            let planned_gas = planned_batches
+                .iter()
+                .fold(0u64, |total, batch| total.saturating_add(batch.gas_limit));
             info!(
                 slot = head_val,
-                count = remaining.len(),
-                "Processing withdrawal batch"
+                remaining_withdrawals = remaining.len(),
+                planned_withdrawals,
+                planned_transactions = planned_batches.len(),
+                planned_gas,
+                "Processing withdrawal window"
             );
             let slot_started_at = Instant::now();
-
-            for (i, withdrawal) in remaining.iter().enumerate() {
-                let remaining_queue = compute_remaining_queue(remaining, i + 1);
-                let outcome = self
-                    .submit_and_confirm(
-                        head_val,
-                        offset + i,
-                        remaining.len(),
-                        withdrawal,
-                        remaining_queue,
-                    )
-                    .await;
-
-                match outcome {
-                    SubmitOutcome::Confirmed => {}
-                    SubmitOutcome::Reverted => {
-                        self.record_slot_duration(slot_started_at.elapsed());
-                        self.repair_notify.notify_one();
-                        return Ok(());
-                    }
-                    SubmitOutcome::Unconfirmed => {
-                        // The next cycle re-reads the on-chain slot hash and resumes
-                        // from wherever the portal actually is.
-                        self.record_slot_duration(slot_started_at.elapsed());
-                        return Ok(());
-                    }
-                }
-            }
+            let outcome = self
+                .submit_and_confirm_batches(head_val, offset, remaining.len(), planned_batches)
+                .await?;
             self.record_slot_duration(slot_started_at.elapsed());
 
-            // All withdrawals in this slot confirmed — safe to remove. Continue
-            // the loop to drain any further pending slots.
-            self.store.lock().remove_batch(head_val);
-
-            info!(
-                slot = head_val,
-                count = remaining.len(),
-                "Batch fully processed and removed from store"
-            );
+            match outcome {
+                SubmitOutcome::Confirmed if planned_withdrawals == remaining.len() => {
+                    // The entire slot confirmed — safe to remove. Continue the loop to drain any
+                    // further pending slots.
+                    self.store.lock().remove_batch(head_val);
+                    info!(
+                        slot = head_val,
+                        count = remaining.len(),
+                        "Slot fully processed and removed from store"
+                    );
+                }
+                SubmitOutcome::Confirmed => {
+                    // The configured in-flight window was smaller than the slot. Re-read the
+                    // on-chain suffix before planning the next window.
+                    continue;
+                }
+                SubmitOutcome::Reverted => {
+                    self.repair_notify.notify_one();
+                    return Ok(());
+                }
+                SubmitOutcome::Unconfirmed => {
+                    // The next cycle re-reads the on-chain slot hash and resumes from wherever the
+                    // portal actually is.
+                    return Ok(());
+                }
+            }
         }
     }
 
-    /// Submit one `processWithdrawals` transaction and wait for its receipt.
-    async fn submit_and_confirm(
+    /// Broadcast a window of consecutive-nonce `processWithdrawals` transactions, then wait for
+    /// all broadcast receipts concurrently.
+    async fn submit_and_confirm_batches(
         &self,
         slot: u64,
-        index: usize,
+        offset: usize,
         total: usize,
-        withdrawal: &abi::Withdrawal,
-        remaining_queue: B256,
-    ) -> SubmitOutcome {
-        self.metrics.withdrawals_processed_total.increment(1);
+        batches: Vec<PlannedWithdrawalBatch>,
+    ) -> eyre::Result<SubmitOutcome> {
+        let first_nonce = self
+            .provider
+            .get_transaction_count_with_nonce_key(
+                self.config.sequencer_address,
+                PROCESS_WITHDRAWAL_NONCE_KEY,
+            )
+            .await?;
+        let mut pending_batches = Vec::with_capacity(batches.len());
+        let mut broadcast_failed = false;
 
-        info!(
-            slot,
-            index,
-            total,
-            token = %withdrawal.token,
-            to = %withdrawal.to,
-            amount = %withdrawal.amount,
-            has_callback = withdrawal.gasLimit > 0,
-            "📤 Submitting withdrawal to L1"
-        );
+        // Broadcast in nonce order without waiting for inclusion. Once accepted by the RPC, all
+        // transactions remain concurrently in flight and Tempo's lane-2 nonce ordering preserves
+        // the portal queue dependency between them.
+        for (batch_index, batch) in batches.into_iter().enumerate() {
+            let nonce = first_nonce
+                .checked_add(batch_index as u64)
+                .ok_or_else(|| eyre::eyre!("processWithdrawals nonce overflow at {first_nonce}"))?;
+            let absolute_start = offset + batch.start_index;
+            let withdrawal_count = batch.withdrawals.len();
+            let has_callback = batch.withdrawals.iter().any(|w| w.gasLimit > 0);
 
-        let call = self
-            .portal
-            .processWithdrawals(vec![withdrawal.clone()], remaining_queue)
-            .nonce_key(PROCESS_WITHDRAWAL_NONCE_KEY);
-
-        // When the withdrawal has a callback (`gasLimit > 0`), we must
-        // override `eth_estimateGas` because the estimate only covers the
-        // revert / bounce-back path, which is much cheaper than the happy
-        // path where the callback actually executes.
-        //
-        // The tx gas limit is composed of two parts:
-        //
-        //   txGas = min(gasLimit, MAX_WITHDRAWAL_GAS_LIMIT)
-        //         + CALLBACK_OVERHEAD
-        //
-        // 1. `gasLimit`          — gas the user requested for their callback.
-        // 2. `CALLBACK_OVERHEAD` — fixed cost for the portal + messenger
-        //    logic that runs *around* the callback: queue dequeue & hash
-        //    verification, TIP-20 transfers, messenger relay
-        //    setup, fee payment, event emission, and the bounce-back path
-        //    if the callback reverts.
-        //
-        // `MAX_WITHDRAWAL_GAS_LIMIT` mirrors the contract-level cap. It
-        // also bounds legacy over-cap withdrawals so RPC nodes do not
-        // reject the transaction before the portal can dequeue and
-        // bounce them back.
-        let call = if withdrawal.gasLimit > 0 {
-            let tx_gas_limit = process_withdrawal_tx_gas_limit(withdrawal.gasLimit);
-            if withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT {
-                warn!(
-                    slot,
-                    index,
-                    requested_gas_limit = withdrawal.gasLimit,
-                    max_gas_limit = MAX_WITHDRAWAL_GAS_LIMIT,
-                    tx_gas_limit,
-                    "withdrawal callback gas exceeds protocol cap; submitting bounded tx"
-                );
+            for (item_index, withdrawal) in batch.withdrawals.iter().enumerate() {
+                if withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT {
+                    warn!(
+                        slot,
+                        index = absolute_start + item_index,
+                        requested_gas_limit = withdrawal.gasLimit,
+                        max_gas_limit = MAX_WITHDRAWAL_GAS_LIMIT,
+                        "withdrawal callback gas exceeds protocol cap; reserving bounded gas"
+                    );
             }
-            call.gas(tx_gas_limit)
-        } else {
-            call
-        };
-
-        let pending = match call.send().await {
-            Ok(pending) => pending,
-            Err(e) => {
-                self.metrics.withdrawals_failed_total.increment(1);
-                error!(
-                    slot,
-                    index,
-                    expected_remaining_queue = %remaining_queue,
-                    to = %withdrawal.to,
-                    amount = %withdrawal.amount,
-                    error = %e,
-                    "processWithdrawals tx failed to send, stopping batch processing"
-                );
-                return SubmitOutcome::Unconfirmed;
             }
-        };
 
-        let tx_hash = *pending.tx_hash();
-        let receipt = match pending
-            .with_timeout(Some(PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT))
-            .get_receipt()
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => {
-                self.metrics.withdrawals_failed_total.increment(1);
-                error!(
-                    slot,
-                    index,
-                    %tx_hash,
-                    expected_remaining_queue = %remaining_queue,
-                    to = %withdrawal.to,
-                    amount = %withdrawal.amount,
-                    error = %e,
-                    "processWithdrawals tx not confirmed, stopping batch processing"
-                );
-                return SubmitOutcome::Unconfirmed;
-            }
-        };
-
-        if !receipt.status() {
-            self.metrics.withdrawals_failed_total.increment(1);
-            self.metrics.withdrawals_reverted_total.increment(1);
-            error!(
+            info!(
                 slot,
-                index,
-                %tx_hash,
-                to = %withdrawal.to,
-                amount = %withdrawal.amount,
-                expected_remaining_queue = %remaining_queue,
-                "processWithdrawals tx was included but reverted; keeping batch in store and requesting repair"
+                batch_index,
+                nonce,
+                start_index = absolute_start,
+                withdrawal_count,
+                total,
+                gas_limit = batch.gas_limit,
+                has_callback,
+                expected_remaining_queue = %batch.remaining_queue,
+                "📤 Broadcasting withdrawal batch to L1"
             );
-            return SubmitOutcome::Reverted;
+
+            let call = self
+                .portal
+                .processWithdrawals(batch.withdrawals.clone(), batch.remaining_queue)
+                .nonce_key(PROCESS_WITHDRAWAL_NONCE_KEY)
+                .nonce(nonce)
+                .gas(batch.gas_limit);
+
+            match call.send().await {
+                Ok(pending) => {
+                    self.metrics
+                        .withdrawals_processed_total
+                        .increment(withdrawal_count as u64);
+                    self.metrics.batches_submitted_total.increment(1);
+                    self.metrics
+                        .withdrawals_per_batch
+                        .record(withdrawal_count as f64);
+                    pending_batches.push(PendingWithdrawalBatch {
+                        batch,
+                        nonce,
+                        pending,
+                    });
+                }
+                Err(e) => {
+                    self.metrics
+                        .withdrawals_failed_total
+                        .increment(withdrawal_count as u64);
+                    error!(
+                        slot,
+                        batch_index,
+                        nonce,
+                        start_index = absolute_start,
+                        withdrawal_count,
+                        error = %e,
+                        "processWithdrawals tx failed to send; stopping at the first nonce gap"
+                    );
+                    broadcast_failed = true;
+                    break;
+                }
+            }
         }
 
-        self.metrics.withdrawals_confirmed_total.increment(1);
-        info!(
-            slot,
-            index,
-            %tx_hash,
-            token = %withdrawal.token,
-            to = %withdrawal.to,
-            amount = %withdrawal.amount,
-            gas_used = receipt.gas_used,
-            "✅ Withdrawal confirmed on L1"
-        );
-        SubmitOutcome::Confirmed
+        let receipt_results =
+            join_all(pending_batches.into_iter().map(|pending_batch| async move {
+                let tx_hash = *pending_batch.pending.tx_hash();
+                let receipt = pending_batch
+                    .pending
+                    .with_timeout(Some(PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT))
+                    .get_receipt()
+                    .await;
+                (pending_batch.batch, pending_batch.nonce, tx_hash, receipt)
+            }))
+            .await;
+
+        let mut outcome = if broadcast_failed {
+            SubmitOutcome::Unconfirmed
+        } else {
+            SubmitOutcome::Confirmed
+        };
+
+        // Interpret receipts in nonce order even though they were awaited concurrently.
+        for (batch, nonce, tx_hash, receipt) in receipt_results {
+            let withdrawal_count = batch.withdrawals.len();
+            match receipt {
+                Ok(receipt) if receipt.status() => {
+                    self.metrics
+                        .withdrawals_confirmed_total
+                        .increment(withdrawal_count as u64);
+                    self.metrics.batches_confirmed_total.increment(1);
+                    info!(
+                        slot,
+                        nonce,
+                        %tx_hash,
+                        start_index = offset + batch.start_index,
+                        withdrawal_count,
+                        "✅ Withdrawal batch confirmed on L1"
+                    );
+                }
+                Ok(_) => {
+                    self.metrics
+                        .withdrawals_failed_total
+                        .increment(withdrawal_count as u64);
+                    self.metrics.withdrawals_reverted_total.increment(1);
+                    error!(
+                        slot,
+                        nonce,
+                        %tx_hash,
+                        start_index = offset + batch.start_index,
+                        withdrawal_count,
+                        expected_remaining_queue = %batch.remaining_queue,
+                        "processWithdrawals tx reverted; later planned batches are invalid"
+                    );
+                    outcome = SubmitOutcome::Reverted;
+                    break;
+                }
+                Err(e) => {
+                    self.metrics
+                        .withdrawals_failed_total
+                        .increment(withdrawal_count as u64);
+                    error!(
+                        slot,
+                        nonce,
+                        %tx_hash,
+                        start_index = offset + batch.start_index,
+                        withdrawal_count,
+                        expected_remaining_queue = %batch.remaining_queue,
+                        error = %e,
+                        "processWithdrawals tx not confirmed; queue will be reconciled"
+                    );
+                    outcome = SubmitOutcome::Unconfirmed;
+                    break;
+                }
+            }
+        }
+
+        Ok(outcome)
     }
 
     fn record_queue_metrics(&mut self, head: u64, tail: u64, store_batch_count: usize) {
@@ -770,16 +955,150 @@ mod tests {
 
     #[test]
     fn callback_tx_gas_limit_is_capped_below_l1_block_limit() {
-        let at_cap = process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT);
-        let over_cap = process_withdrawal_tx_gas_limit(MAX_WITHDRAWAL_GAS_LIMIT + 1);
+        let at_cap = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
+        let over_cap = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT + 1);
 
         assert_eq!(over_cap, at_cap);
         assert_eq!(at_cap, MAX_PROCESS_WITHDRAWAL_TX_GAS);
         assert_eq!(
             at_cap,
-            MAX_WITHDRAWAL_GAS_LIMIT + PROCESS_WITHDRAWAL_CALLBACK_OVERHEAD_GAS
+            MAX_WITHDRAWAL_GAS_LIMIT
+                + PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+                + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
+                + MAX_WITHDRAWAL_GAS_LIMIT.div_ceil(63)
         );
         assert!(at_cap < 30_000_000);
+    }
+
+    fn planner(
+        max_batch_gas: u64,
+        max_in_flight_batches: usize,
+        max_in_flight_gas: u64,
+    ) -> WithdrawalBatchPlanner {
+        WithdrawalBatchPlanner::new(WithdrawalBatchLimits {
+            max_batch_gas,
+            max_in_flight_batches,
+            max_in_flight_gas,
+        })
+    }
+
+    fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
+        (0..count)
+            .map(|i| test_withdrawal(Address::with_last_byte((i + 1) as u8), (i + 1) as u128))
+            .collect()
+    }
+
+    #[test]
+    fn planner_packs_by_gas_and_preserves_full_queue_suffixes() {
+        let withdrawals = simple_withdrawals(3);
+        let one = PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+        let plans =
+            planner(PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one, 4, 10_000_000).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].start_index, 0);
+        assert_eq!(plans[0].withdrawals.len(), 2);
+        assert_eq!(plans[0].withdrawals[0].amount, withdrawals[0].amount);
+        assert_eq!(plans[0].withdrawals[1].amount, withdrawals[1].amount);
+        assert_eq!(
+            plans[0].remaining_queue,
+            abi::Withdrawal::queue_hash(&withdrawals[2..])
+        );
+        assert_eq!(plans[1].start_index, 2);
+        assert_eq!(plans[1].withdrawals.len(), 1);
+        assert_eq!(plans[1].withdrawals[0].amount, withdrawals[2].amount);
+        assert_eq!(plans[1].remaining_queue, B256::ZERO);
+    }
+
+    #[test]
+    fn planner_bounds_the_in_flight_gas_window() {
+        let withdrawals = simple_withdrawals(10);
+        let one_batch = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+        let plans = planner(one_batch, 10, one_batch * 2).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans.iter().map(|batch| batch.gas_limit).sum::<u64>(),
+            one_batch * 2
+        );
+        assert_eq!(
+            plans[1].remaining_queue,
+            abi::Withdrawal::queue_hash(&withdrawals[2..])
+        );
+    }
+
+    #[test]
+    fn planner_bounds_the_number_of_in_flight_transactions() {
+        let withdrawals = simple_withdrawals(5);
+        let one_batch = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+        let plans = planner(one_batch, 2, u64::MAX).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].start_index, 0);
+        assert_eq!(plans[1].start_index, 1);
+        assert_eq!(
+            plans[1].remaining_queue,
+            abi::Withdrawal::queue_hash(&withdrawals[2..])
+        );
+    }
+
+    #[test]
+    fn planner_emits_an_oversized_head_as_a_singleton() {
+        let mut withdrawals = simple_withdrawals(2);
+        withdrawals[0].gasLimit = MAX_WITHDRAWAL_GAS_LIMIT;
+        let plans = planner(1_000_000, 4, 20_000_000).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].withdrawals.len(), 1);
+        assert!(plans[0].gas_limit > 1_000_000);
+        assert_eq!(
+            plans[0].remaining_queue,
+            abi::Withdrawal::queue_hash(&withdrawals[1..])
+        );
+    }
+
+    #[test]
+    fn planner_defers_an_oversized_item_that_does_not_fit_the_current_window() {
+        let mut withdrawals = simple_withdrawals(2);
+        withdrawals[1].gasLimit = MAX_WITHDRAWAL_GAS_LIMIT;
+        let simple_gas = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+        let callback_gas = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
+        let planner = planner(simple_gas, 4, simple_gas + callback_gas - 1);
+
+        let first_window = planner.plan(&withdrawals);
+        assert_eq!(first_window.len(), 1);
+        assert_eq!(first_window[0].withdrawals[0].amount, withdrawals[0].amount);
+
+        let next_window = planner.plan(&withdrawals[1..]);
+        assert_eq!(next_window.len(), 1);
+        assert_eq!(next_window[0].gas_limit, callback_gas);
+    }
+
+    #[test]
+    fn planner_caps_calldata_even_when_gas_budget_is_large() {
+        let withdrawals = simple_withdrawals(MAX_WITHDRAWALS_PER_PROCESS_BATCH + 1);
+        let plans = planner(u64::MAX, 2, u64::MAX).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans[0].withdrawals.len(),
+            MAX_WITHDRAWALS_PER_PROCESS_BATCH
+        );
+        assert_eq!(plans[1].withdrawals.len(), 1);
+        assert_eq!(plans[1].remaining_queue, B256::ZERO);
+    }
+
+    #[test]
+    fn planner_normalizes_zero_limits_without_stalling() {
+        let withdrawals = simple_withdrawals(1);
+        let plans = planner(0, 0, 0).plan(&withdrawals);
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].withdrawals.len(), 1);
+        assert_eq!(plans[0].withdrawals[0].amount, withdrawals[0].amount);
     }
 
     #[test]
@@ -879,6 +1198,8 @@ mod tests {
             portal_address: address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23"),
             l1_rpc_url: "http://unused.test".to_string(),
             fallback_poll_interval: Duration::from_secs(1),
+            sequencer_address: Address::repeat_byte(0x77),
+            batch_limits: WithdrawalBatchLimits::default(),
         };
         WithdrawalProcessor::new(
             config,

@@ -658,6 +658,8 @@ When `submitBatch` includes a non-zero `withdrawalQueueHash`, the current `tail`
 
 The sequencer processes ordered withdrawals atomically on Tempo by calling `processWithdrawals(withdrawals, remainingQueue)` on the portal. `remainingQueue` is the queue suffix after the last supplied withdrawal, or `0x00` when the call exhausts the current slot. The portal derives each intermediate queue hash by folding the withdrawals backward from that suffix, then verifies and processes them in order.
 
+The sequencer packs withdrawals into transactions using a configurable gas budget rather than consuming the full L1 block gas limit. It may keep multiple batches in flight using consecutive nonces on its dedicated withdrawal nonce key. The nonce order preserves FIFO queue transitions even when the transactions are broadcast before earlier receipts arrive. An aggregate in-flight gas budget bounds how much block capacity the queued withdrawal transactions can reserve at once.
+
 The withdrawal is popped unconditionally, regardless of success or failure. If `remainingQueue` is zero (last item in the slot), the slot is set to `EMPTY_SENTINEL` and `head` advances. Otherwise, the slot is updated to `remainingQueue`.
 
 For simple withdrawals (`gasLimit == 0`), the portal transfers tokens directly to the recipient.
