@@ -55,7 +55,9 @@ use tempo_precompiles::{
     },
 };
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
-use tempo_zone_contracts::{PORTAL_IS_SEQUENCER_SLOT, ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS};
+use tempo_zone_contracts::{
+    PORTAL_IS_SEQUENCER_SLOT, ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{
@@ -927,7 +929,7 @@ impl ZoneTestNode {
 
         let deposit_queue = zone_node.deposit_queue();
         let l1_state_cache = zone_node.l1_state_cache();
-        if is_local_dummy_l1 || portal_address == Address::ZERO {
+        if is_local_dummy_l1 {
             let mut cache = l1_state_cache.write();
             cache.initialize_enabled_tokens([PATH_USD_ADDRESS]);
             seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
@@ -1991,7 +1993,15 @@ async fn build_l1_anchored_genesis(
         .await?
         .ok_or_else(|| eyre::eyre!("L1 latest block not found"))?;
     let l1_header: &TempoHeader = block.header.as_ref();
-    zone_node::genesis::l1_anchored_genesis(l1_header, portal_address)
+    let default_fee_token = if portal_address.is_zero() {
+        PATH_USD_ADDRESS
+    } else {
+        ZonePortal::new(portal_address, &l1_provider)
+            .enabledTokenAt(U256::ZERO)
+            .call()
+            .await?
+    };
+    zone_node::genesis::l1_anchored_genesis(l1_header, portal_address, default_fee_token)
 }
 
 /// Build a zone test genesis anchored to a specific L1 block number.
@@ -2008,7 +2018,15 @@ async fn build_l1_anchored_genesis_at_block(
         .await?
         .ok_or_else(|| eyre::eyre!("L1 block {block_number} not found"))?;
     let l1_header: &TempoHeader = block.header.as_ref();
-    zone_node::genesis::l1_anchored_genesis(l1_header, portal_address)
+    let default_fee_token = if portal_address.is_zero() {
+        PATH_USD_ADDRESS
+    } else {
+        ZonePortal::new(portal_address, &l1_provider)
+            .enabledTokenAt(U256::ZERO)
+            .call()
+            .await?
+    };
+    zone_node::genesis::l1_anchored_genesis(l1_header, portal_address, default_fee_token)
 }
 
 /// Poll an async condition until it returns `Some(T)` or the timeout expires.
@@ -3631,7 +3649,6 @@ impl L1Fixture {
 
         // System transactions resolve their zero-address fee token before execution. Keep that
         // synthetic token permissive in RPC-free fixtures, matching the old policy-provider stub.
-        cache.initialize_enabled_tokens([PATH_USD_ADDRESS]);
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         cache.update_anchor(NumHash {

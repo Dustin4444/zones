@@ -68,8 +68,6 @@ pub struct L1StateCacheInner {
     enabled_tokens: HashSet<Address>,
     /// Enabled tokens discovered at the persisted zone checkpoint.
     initial_enabled_tokens: HashSet<Address>,
-    /// First token enabled when the zone was created.
-    default_fee_token: Option<Address>,
     /// Per-slot value history: `(address, slot) → { block_number → value }`.
     /// The `BTreeMap` enables efficient range lookups for "latest value at or before block N".
     slots: HashMap<(Address, B256), BTreeMap<u64, B256>>,
@@ -165,7 +163,6 @@ impl L1StateCacheInner {
     /// Initializes enabled tokens from the persisted zone's L1 checkpoint.
     pub fn initialize_enabled_tokens(&mut self, tokens: impl IntoIterator<Item = Address>) {
         for token in tokens {
-            self.default_fee_token.get_or_insert(token);
             self.initial_enabled_tokens.insert(token);
             self.enabled_tokens.insert(token);
             self.tracked_contracts.insert(token);
@@ -174,7 +171,6 @@ impl L1StateCacheInner {
 
     /// Records a token enabled by a canonical ZonePortal event.
     pub fn enable_token(&mut self, token: Address) {
-        self.default_fee_token.get_or_insert(token);
         self.enabled_tokens.insert(token);
         self.tracked_contracts.insert(token);
     }
@@ -182,11 +178,6 @@ impl L1StateCacheInner {
     /// Returns the tokens enabled at the current canonical L1 anchor.
     pub fn enabled_tokens(&self) -> &HashSet<Address> {
         &self.enabled_tokens
-    }
-
-    /// Returns the immutable creation-time default fee token.
-    pub const fn default_fee_token(&self) -> Option<Address> {
-        self.default_fee_token
     }
 
     /// Clears chain-derived data while retaining the tracked-contract set and initial floor.
@@ -382,29 +373,11 @@ mod tests {
         cache.enable_token(observed);
 
         assert_eq!(cache.enabled_tokens(), &HashSet::from([initial, observed]));
-        assert_eq!(cache.default_fee_token(), Some(initial));
         assert!(cache.is_tracked(&initial));
         assert!(cache.is_tracked(&observed));
 
         cache.clear();
-        assert_eq!(cache.default_fee_token(), Some(initial));
         assert_eq!(cache.enabled_tokens(), &HashSet::from([initial]));
-    }
-
-    #[test]
-    fn first_replayed_enabled_token_becomes_default_fee_token() {
-        let initial = address!("0x20c0000000000000000000000000000000000001");
-        let additional = address!("0x20c0000000000000000000000000000000000002");
-        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
-
-        cache.enable_token(initial);
-        cache.enable_token(additional);
-
-        assert_eq!(cache.default_fee_token(), Some(initial));
-
-        cache.clear();
-        assert_eq!(cache.default_fee_token(), Some(initial));
-        assert!(cache.enabled_tokens().is_empty());
     }
 
     #[test]

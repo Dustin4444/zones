@@ -2,7 +2,7 @@
 use crate::{L1StateError, L1StorageReader, SequencerSetExt};
 use alloy_primitives::{Address, B256, U256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 use tempo_precompiles::{
@@ -19,8 +19,6 @@ pub struct MockL1Reader {
     slots: Shared<HashMap<L1Slot, B256>>,
     registry_storage: Shared<HashMapStorageProvider>,
     storage_requests: Shared<Vec<L1Slot>>,
-    enabled_tokens: Shared<HashSet<Address>>,
-    default_fee_token: Option<Address>,
     fallback: B256,
     policy_id: u64,
     fail_storage: bool,
@@ -32,8 +30,6 @@ impl Default for MockL1Reader {
             slots: Default::default(),
             registry_storage: Arc::new(Mutex::new(HashMapStorageProvider::new(1))),
             storage_requests: Default::default(),
-            enabled_tokens: Default::default(),
-            default_fee_token: None,
             fallback: B256::ZERO,
             policy_id: 0,
             fail_storage: false,
@@ -42,15 +38,6 @@ impl Default for MockL1Reader {
 }
 
 impl MockL1Reader {
-    pub fn with_enabled_tokens(tokens: impl IntoIterator<Item = Address>) -> Self {
-        let tokens: Vec<_> = tokens.into_iter().collect();
-        Self {
-            enabled_tokens: Arc::new(Mutex::new(tokens.iter().copied().collect())),
-            default_fee_token: tokens.first().copied(),
-            ..Default::default()
-        }
-    }
-
     pub fn insert(&self, address: Address, slot: U256, anchor: u64, value: U256) {
         self.set_u256(address, slot, anchor, value);
     }
@@ -224,13 +211,5 @@ impl L1StorageReader for MockL1Reader {
         } else {
             Ok(B256::from(value.to_be_bytes()))
         }
-    }
-
-    fn default_fee_token(&self) -> Option<Address> {
-        self.default_fee_token
-    }
-
-    fn is_fee_token_enabled(&self, token: Address) -> bool {
-        self.enabled_tokens.lock().unwrap().contains(&token)
     }
 }

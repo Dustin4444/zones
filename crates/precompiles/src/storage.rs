@@ -21,12 +21,6 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
         slot: B256,
         block_number: u64,
     ) -> core::result::Result<B256, L1StateError>;
-
-    /// Returns the first token enabled when the zone was created.
-    fn default_fee_token(&self) -> Option<Address>;
-
-    /// Returns whether `token` is enabled for the zone at the canonical L1 anchor.
-    fn is_fee_token_enabled(&self, token: Address) -> bool;
 }
 
 /// Execution-local access to Tempo L1 storage at a single finalized block number.

@@ -310,14 +310,6 @@ impl L1StorageReader for L1StateProvider {
                 reason: error.to_string(),
             })
     }
-
-    fn default_fee_token(&self) -> Option<Address> {
-        self.cache.read().default_fee_token()
-    }
-
-    fn is_fee_token_enabled(&self, token: Address) -> bool {
-        self.cache.read().enabled_tokens().contains(&token)
-    }
 }
 
 impl SequencerSetExt for L1StateProvider {

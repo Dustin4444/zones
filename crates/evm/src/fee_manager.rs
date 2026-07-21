@@ -10,52 +10,37 @@ use tempo_precompiles::{
     tip_fee_manager::FeeManagerError,
     tip20::TIP20Token,
 };
-use tempo_revm::{TempoTx, TempoTxEnv};
-use zone_precompiles::{L1StorageReader, ZoneFeeManager};
+use tempo_revm::{TempoStateAccess, TempoTx, TempoTxEnv};
+use zone_precompiles::ZoneFeeManager;
 
 /// Resolves and collects fees without Tempo token preferences or FeeAMM settlement.
-#[derive(Clone)]
-pub(crate) struct ZoneProtocolFeeManager<L1> {
-    l1_reader: L1,
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ZoneProtocolFeeManager;
 
-impl<L1> core::fmt::Debug for ZoneProtocolFeeManager<L1> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ZoneProtocolFeeManager")
-            .finish_non_exhaustive()
+impl ZoneProtocolFeeManager {
+    pub(crate) const fn new() -> Self {
+        Self
     }
 }
 
-impl<L1: L1StorageReader> ZoneProtocolFeeManager<L1> {
-    pub(crate) const fn new(l1_reader: L1) -> Self {
-        Self { l1_reader }
-    }
-
-    fn resolve_fee_token(&self, tx: &TempoTxEnv) -> Result<Address> {
-        let Some(token) = tx
-            .fee_token()
-            .or_else(|| self.l1_reader.default_fee_token())
-        else {
-            return Err(FeeManagerError::invalid_token().into());
-        };
-        Ok(token)
-    }
-}
-
-impl<DB, L1> ProtocolFeeManager<DB> for ZoneProtocolFeeManager<L1>
+impl<DB> ProtocolFeeManager<DB> for ZoneProtocolFeeManager
 where
     DB: Database,
-    L1: L1StorageReader,
 {
     fn get_fee_token(
         &self,
-        _journal: &mut Journal<DB>,
+        journal: &mut Journal<DB>,
         tx: &TempoTxEnv,
         _fee_payer: Address,
-        _spec: TempoHardfork,
-        _actions: StorageActions,
+        spec: TempoHardfork,
+        actions: StorageActions,
     ) -> Result<Address> {
-        self.resolve_fee_token(tx)
+        if let Some(token) = tx.fee_token() {
+            return Ok(token);
+        }
+
+        journal
+            .with_read_only_storage_ctx(spec, actions, || ZoneFeeManager::new().default_fee_token())
     }
 
     fn collect_fee_pre_tx(
@@ -94,42 +79,5 @@ where
                 beneficiary,
             )
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use zone_precompiles::test_utils::MockL1Reader;
-
-    #[test]
-    fn resolves_default_and_explicit_fee_tokens() {
-        let default = Address::repeat_byte(0x11);
-        let explicit = Address::repeat_byte(0x22);
-        let manager =
-            ZoneProtocolFeeManager::new(MockL1Reader::with_enabled_tokens([default, explicit]));
-
-        assert_eq!(
-            manager.resolve_fee_token(&TempoTxEnv::default()).unwrap(),
-            default
-        );
-        assert_eq!(
-            manager
-                .resolve_fee_token(&TempoTxEnv {
-                    fee_token: Some(explicit),
-                    ..Default::default()
-                })
-                .unwrap(),
-            explicit
-        );
-        assert_eq!(
-            manager
-                .resolve_fee_token(&TempoTxEnv {
-                    fee_token: Some(Address::repeat_byte(0x33)),
-                    ..Default::default()
-                })
-                .unwrap(),
-            Address::repeat_byte(0x33)
-        );
     }
 }

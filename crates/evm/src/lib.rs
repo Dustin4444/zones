@@ -88,7 +88,7 @@ where
         evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
         l1: L1State<L1>,
     ) -> TempoEvm<L1OverlayDB<DB, L1>, I> {
-        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new(self.l1_reader.clone()));
+        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new());
         let cfg = evm.ctx().cfg.clone();
         let (_, _, precompiles) = evm.components_mut();
         let actions = StorageActions::disabled();

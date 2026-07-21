@@ -65,6 +65,10 @@ pub(crate) struct GenerateZoneGenesis {
     #[arg(long)]
     pub(crate) tempo_portal: Address,
 
+    /// Canonical fee token used when a zone transaction omits `fee_token`.
+    #[arg(long, default_value_t = PATH_USD_ADDRESS)]
+    pub(crate) default_fee_token: Address,
+
     /// RLP-encoded Tempo genesis header. Defaults to `TempoHeader::default()`.
     #[arg(long)]
     pub(crate) tempo_genesis_header_rlp: Option<String>,
@@ -135,7 +139,7 @@ impl GenerateZoneGenesis {
         initialize_tip403_registry(&mut evm)?;
         initialize_tip20_factory(&mut evm)?;
         create_path_usd_token(&mut evm, self.admin)?;
-        initialize_fee_manager(&mut evm)?;
+        initialize_fee_manager(&mut evm, self.default_fee_token)?;
         initialize_stablecoin_dex(&mut evm)?;
         initialize_nonce_manager(&mut evm)?;
         initialize_account_keychain(&mut evm)?;
@@ -544,7 +548,10 @@ fn create_path_usd_token(evm: &mut TempoEvm<CacheDB<EmptyDB>>, admin: Address) -
 }
 
 /// Initialize the Zone fee manager precompile.
-fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+fn initialize_fee_manager(
+    evm: &mut TempoEvm<CacheDB<EmptyDB>>,
+    default_fee_token: Address,
+) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
     StorageCtx::enter_evm(
         &mut ctx.journaled_state,
@@ -555,11 +562,11 @@ fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<
         || {
             let mut fee_manager = ZoneFeeManager::new();
             fee_manager
-                .initialize()
+                .initialize(default_fee_token)
                 .expect("Could not init fee manager");
         },
     );
-    println!("Initialized ZoneFeeManager");
+    println!("Initialized ZoneFeeManager with default fee token {default_fee_token}");
     Ok(())
 }
 

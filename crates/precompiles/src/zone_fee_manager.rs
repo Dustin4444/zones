@@ -18,12 +18,19 @@ use tempo_zone_contracts::IZoneFeeManager;
 #[contract(addr = TIP_FEE_MANAGER_ADDRESS)]
 pub struct ZoneFeeManager {
     collected_fees: Mapping<Address, Mapping<Address, U256>>,
+    default_fee_token: Address,
 }
 
 impl ZoneFeeManager {
-    /// Initializes the precompile account marker in genesis.
-    pub fn initialize(&mut self) -> Result<()> {
-        self.__initialize()
+    /// Initializes the precompile account marker and canonical default fee token in genesis.
+    pub fn initialize(&mut self, default_fee_token: Address) -> Result<()> {
+        self.__initialize()?;
+        self.default_fee_token.write(default_fee_token)
+    }
+
+    /// Returns the canonical default token used when a transaction omits `fee_token`.
+    pub fn default_fee_token(&self) -> Result<Address> {
+        self.default_fee_token.read()
     }
 
     /// Returns fees accrued to `beneficiary` in `token`.
@@ -128,6 +135,8 @@ mod tests {
                 .with_mint(user, U256::from(10_000))
                 .apply()?;
             let mut manager = ZoneFeeManager::new();
+            manager.initialize(token.address())?;
+            assert_eq!(manager.default_fee_token()?, token.address());
             manager.collect_fee_pre_tx(user, token.address(), U256::from(5_000))?;
             manager.collect_fee_post_tx(
                 user,
