@@ -31,13 +31,13 @@ use reth_node_builder::{BuilderContext, components::PayloadBuilderBuilder};
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderError};
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadAttributes};
 use reth_primitives_traits::{AlloyBlockHeader as _, Recovered};
-use reth_revm::{State, cancelled::CancelOnDrop, database::StateProviderDatabase};
+use reth_revm::{State, cancelled::CancelOnDrop, database::StateProviderDatabase, db::BundleState};
 use reth_storage_api::{StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction as _, TransactionPool,
     ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
-use std::{sync::Arc, time::Instant};
+use std::{fs, sync::Arc, time::Instant};
 use tempo_evm::TempoNextBlockEnvAttributes;
 use tempo_payload_types::{EncodedBlock, TempoBuiltPayload};
 use tempo_primitives::{
@@ -325,18 +325,20 @@ where
         );
 
         let recovered_block = Arc::new(block);
+        let builder_state = db.take_bundle();
         verify_payload_execution_if_enabled(
             &self.evm_config,
             &self.provider,
             parent_header.hash(),
             recovered_block.as_ref(),
+            &builder_state,
         )?;
 
         let eth_payload = EthBuiltPayload::new(recovered_block.clone(), U256::ZERO, requests, None);
 
         let execution_output = BlockExecutionOutput {
             result: execution_result,
-            state: db.take_bundle(),
+            state: builder_state,
         };
 
         let executed_block = BuiltPayloadExecutedBlock {
@@ -400,6 +402,7 @@ fn verify_payload_execution_if_enabled<Provider, EvmConfig>(
     provider: &Provider,
     parent_hash: alloy_primitives::B256,
     block: &reth_primitives_traits::RecoveredBlock<tempo_primitives::Block>,
+    builder_state: &BundleState,
 ) -> Result<(), PayloadBuilderError>
 where
     Provider: StateProviderFactory + Clone + 'static,
@@ -426,8 +429,12 @@ where
         .map_err(PayloadBuilderError::evm)?;
 
     let mut state = executor.into_state();
-    let bundle = state.take_bundle();
-    let hashed_state = parent_state.hashed_post_state(&bundle);
+    let reexecuted_state = state.take_bundle();
+    let bundle_states_match = builder_state == &reexecuted_state;
+    if !bundle_states_match {
+        dump_bundle_difference_if_enabled(block, builder_state, &reexecuted_state);
+    }
+    let hashed_state = parent_state.hashed_post_state(&reexecuted_state);
     let (reexecuted_root, _) = parent_state
         .state_root_with_updates(hashed_state)
         .map_err(PayloadBuilderError::other)?;
@@ -442,6 +449,7 @@ where
             header_root = ?header_root,
             reexecuted_root = ?reexecuted_root,
             transactions = block.body().transactions.len(),
+            bundle_states_match,
             "locally built payload does not match fresh parent-state re-execution"
         );
         return Err(PayloadBuilderError::other(reth_errors::RethError::msg(
@@ -460,6 +468,54 @@ where
         "verified locally built payload against fresh parent-state re-execution"
     );
     Ok(())
+}
+
+/// Persist the two execution bundles only in the opt-in state-root diagnostic.
+///
+/// The header/root comparison alone cannot tell whether a bad root came from EVM
+/// state writes or from trie construction. These files make that distinction
+/// inspectable without touching normal payload construction or benchmark runs.
+fn dump_bundle_difference_if_enabled(
+    block: &reth_primitives_traits::RecoveredBlock<tempo_primitives::Block>,
+    builder_state: &BundleState,
+    reexecuted_state: &BundleState,
+) {
+    let Ok(output_dir) = std::env::var("ZONES_DEBUG_BUILDER_STATE_DIR") else {
+        return;
+    };
+    if output_dir.is_empty() {
+        return;
+    }
+
+    let block_prefix = format!("{}_{}", block.number(), block.hash());
+    let output_dir = std::path::Path::new(&output_dir);
+    let result = (|| -> std::io::Result<()> {
+        fs::create_dir_all(output_dir)?;
+        fs::write(
+            output_dir.join(format!("{block_prefix}.bundle_state.builder.json")),
+            serde_json::to_vec(builder_state).expect("bundle state is serializable"),
+        )?;
+        fs::write(
+            output_dir.join(format!("{block_prefix}.bundle_state.reexecuted.json")),
+            serde_json::to_vec(reexecuted_state).expect("bundle state is serializable"),
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => error!(
+            block_number = block.number(),
+            block_hash = ?block.hash(),
+            output_dir = %output_dir.display(),
+            "builder and fresh re-execution bundle states differ"
+        ),
+        Err(err) => error!(
+            block_number = block.number(),
+            block_hash = ?block.hash(),
+            %err,
+            "failed to persist state-root diagnostic bundle states"
+        ),
+    }
 }
 
 /// Validate that the prepared L1 block is the next block expected by TempoState.
