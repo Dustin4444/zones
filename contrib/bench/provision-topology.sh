@@ -640,6 +640,13 @@ provision_up() {
     # The pinned Reth revision predates the retained-branch pruning fix. Its
     # default sparse-trie pruning can make a multi-transaction Zone payload
     # disagree with the root obtained during final validation.
+    local -a zone_debug_args=()
+    if [[ "${ZONES_DEBUG_RACE_NEW_PAYLOAD:-}" == 1 ]]; then
+        # The witness hook saves the builder and validator bundles only when the
+        # diagnostic old dual-submission path detects an invalid payload.
+        zone_debug_args+=(--debug.invalid-block-hook witness)
+    fi
+
     start_process zone "$ZONE_BIN" "${ZONES_BENCH_ZONE_CPUS:-8-13,24-29}" "$log_dir/zone.log" \
         "$ZONE_BIN" node \
         --chain "$zone_genesis" --datadir "$zone_db" \
@@ -654,6 +661,7 @@ provision_up() {
         --log.file.directory "$log_dir/zone" \
         --ipcdisable \
         --engine.disable-sparse-trie-cache-pruning \
+        "${zone_debug_args[@]}" \
         --sequencer
     unset SEQUENCER_KEY sequencer_key owner_key admin_key
 

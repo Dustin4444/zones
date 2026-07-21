@@ -156,9 +156,10 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          # This draft branch runs the full fixture flow with an expensive
-          # producer-versus-parent-state comparison on every Zone payload.
-          INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'neobank-e2e' || inputs.phase }}
+          # This draft branch deliberately uses the fixture-free roundtrip
+          # route. It exercises the same Zone payload builder and executor
+          # without requiring the separate private-fixture checkout.
+          INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'roundtrip' || inputs.phase }}
           INPUT_STATE_ROOT_DIAGNOSTIC: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging' }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
           INPUT_COUNT: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && '100' || inputs.count || '1000' }}
@@ -288,6 +289,10 @@ jobs:
       ZONES_BENCH_BLOAT_GIB: ${{ needs.authorize.outputs.state-bloat-gib }}
       ZONES_BENCH_FORCE_BLOAT: ${{ needs.authorize.outputs.force-bloat }}
       ZONES_DEBUG_VERIFY_PAYLOAD_EXECUTION: ${{ needs.authorize.outputs.verify-payload-execution }}
+      # Retire this branch once the witness has identified the divergent state.
+      # It deliberately reintroduces the former newPayload path alongside
+      # executed-payload insertion, solely to reproduce the historical fault.
+      ZONES_DEBUG_RACE_NEW_PAYLOAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging' && '1' || '0' }}
       ZONES_BENCH_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.deposit-amount }}
       ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT: ${{ needs.authorize.outputs.bootstrap-deposit-amount }}
       ZONES_BENCH_ACTIVITY_AMOUNT: ${{ needs.authorize.outputs.activity-amount }}

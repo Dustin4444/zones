@@ -44,7 +44,7 @@ use eyre::OptionExt;
 use reth_chainspec::EthereumHardforks;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadKind};
+use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
 use reth_primitives_traits::SealedHeader;
 use std::{sync::Arc, time::Duration};
 use tempo_primitives::TempoHeader;
@@ -255,6 +255,24 @@ impl ZoneEngine {
         };
 
         let header = payload.block().sealed_header().clone();
+
+        // This deliberately restores the retired engine-API submission path for state-root
+        // investigations only. A locally built payload already carries its execution output and
+        // reth inserts that output through the fast path; submitting the same block through
+        // `newPayload` concurrently forces a second execution. Keeping this opt-in lets the
+        // invalid-block witness hook retain both bundles when investigating a disagreement.
+        if std::env::var("ZONES_DEBUG_RACE_NEW_PAYLOAD")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let block_number = header.number();
+            let engine_payload = ZonePayloadTypes::block_to_payload(payload.block().clone(), None);
+            let status = self.to_engine.new_payload(engine_payload).await?;
+            if !status.is_valid() {
+                eyre::bail!("diagnostic newPayload rejected block {block_number}")
+            }
+        }
 
         // The locally executed payload was handed to reth's fast path. Confirm
         // the L1 block in the queue so it is removed. If the queue was reorged between peek and confirm, the
