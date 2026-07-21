@@ -24,9 +24,10 @@ import {
     QueuedDeposit,
     Withdrawal,
     ZONE_INBOX,
+    ZONE_MESSENGER_ADDRESS,
     ZONE_OUTBOX,
-    ZoneInfo,
-    ZoneParams
+    ZONE_VERIFIER_ADDRESS,
+    ZoneInfo
 } from "../../src/interfaces/IZone.sol";
 import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
@@ -88,33 +89,8 @@ contract MockZoneFactoryForBridgeMessenger {
         _zones[zoneId].portal = portal;
     }
 
-    function zones(uint32 id)
-        external
-        view
-        returns (
-            uint32 zoneId,
-            address portal,
-            address initialToken,
-            address admin,
-            address sequencer,
-            bytes32 genesisBlockHash,
-            bytes32 genesisTempoBlockHash,
-            uint64 genesisTempoBlockNumber,
-            string memory rpcUrl
-        )
-    {
-        ZoneInfo storage info = _zones[id];
-        return (
-            info.zoneId,
-            info.portal,
-            info.initialToken,
-            info.admin,
-            info.sequencer,
-            info.genesisBlockHash,
-            info.genesisTempoBlockHash,
-            info.genesisTempoBlockNumber,
-            info.rpcUrl
-        );
+    function zones(uint32 id) external view returns (ZoneInfo memory) {
+        return _zones[id];
     }
 
 }
@@ -194,12 +170,9 @@ contract ZoneBridgeTest is BaseTest {
         // Record genesis block number for Tempo
         genesisTempoBlockNumber = uint64(block.number);
 
-        // Deploy portal directly (bypass factory to avoid TIP20 prefix check), but use a
-        // mock factory registry so the shared messenger can authenticate the source portal.
-        MockZoneFactoryForBridgeMessenger messengerFactory = new MockZoneFactoryForBridgeMessenger();
-        ZoneMessenger messengerContract = new ZoneMessenger(address(messengerFactory));
+        // Deploy portal directly (bypass factory to avoid TIP20 prefix check).
+        ZoneMessenger messengerContract = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
         l1Portal = new ZonePortal();
-        address verifier = l1Factory.verifier();
         address[] memory sequencers = new address[](1);
         sequencers[0] = sequencer;
         vm.prank(_ZONE_FACTORY);
@@ -210,11 +183,25 @@ contract ZoneBridgeTest is BaseTest {
             admin, // admin
             sequencers,
             1,
-            verifier,
+            ZONE_VERIFIER_ADDRESS,
             ""
         );
         zoneId = 1;
-        messengerFactory.setPortal(zoneId, address(l1Portal));
+        vm.mockCall(
+            _ZONE_FACTORY,
+            abi.encodeWithSelector(IZoneFactory.zones.selector, zoneId),
+            abi.encode(
+                ZoneInfo({
+                    zoneId: zoneId,
+                    portal: address(l1Portal),
+                    admin: admin,
+                    sequencers: sequencers,
+                    threshold: 1,
+                    verifier: ZONE_VERIFIER_ADDRESS,
+                    rpcUrl: ""
+                })
+            )
+        );
 
         // === Deploy zone contracts ===
         // TempoState mock for testing
@@ -268,7 +255,6 @@ contract ZoneBridgeTest is BaseTest {
             senderTag: _senderTag(sender, txSequence),
             to: to,
             amount: amount,
-            fee: 0,
             memo: memo,
             gasLimit: gasLimit,
             fallbackNonce: uint64(txSequence),
@@ -1187,7 +1173,6 @@ contract ZoneBridgeTest is BaseTest {
             senderTag: keccak256(abi.encodePacked(address(0), bytes32(0))),
             to: alice,
             amount: netAmount,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
             fallbackNonce: 0,

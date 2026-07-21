@@ -23,33 +23,8 @@ contract MockZoneFactoryForMessenger {
         _zones[zoneId].portal = portal;
     }
 
-    function zones(uint32 id)
-        external
-        view
-        returns (
-            uint32 zoneId,
-            address portal,
-            address initialToken,
-            address admin,
-            address sequencer,
-            bytes32 genesisBlockHash,
-            bytes32 genesisTempoBlockHash,
-            uint64 genesisTempoBlockNumber,
-            string memory rpcUrl
-        )
-    {
-        ZoneInfo storage info = _zones[id];
-        return (
-            info.zoneId,
-            info.portal,
-            info.initialToken,
-            info.admin,
-            info.sequencer,
-            info.genesisBlockHash,
-            info.genesisTempoBlockHash,
-            info.genesisTempoBlockNumber,
-            info.rpcUrl
-        );
+    function zones(uint32 id) external view returns (ZoneInfo memory) {
+        return _zones[id];
     }
 
 }
@@ -106,14 +81,16 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
 
 contract ZoneMessengerFactoryAbiTest is Test {
 
-    function test_relayMessage_decodesFlattenedFactoryGetter() public {
+    function test_relayMessage_decodesTip1091FactoryGetter() public {
         uint32 zoneId = 1;
         address portal = address(0x700);
         address token = address(0x701);
 
-        MockZoneFactoryForMessenger factory = new MockZoneFactoryForMessenger();
+        vm.etch(ZONE_FACTORY_ADDRESS, type(MockZoneFactoryForMessenger).runtimeCode);
+        MockZoneFactoryForMessenger factory = MockZoneFactoryForMessenger(ZONE_FACTORY_ADDRESS);
         factory.setPortal(zoneId, portal);
-        ZoneMessenger messenger = new ZoneMessenger(address(factory));
+        vm.etch(ZONE_MESSENGER_ADDRESS, type(ZoneMessenger).runtimeCode);
+        ZoneMessenger messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
         AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
 
         vm.mockCall(
