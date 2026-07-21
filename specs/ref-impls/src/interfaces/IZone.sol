@@ -479,9 +479,20 @@ interface IZoneFactory {
     function zoneCount() external view returns (uint32);
 
     /// @notice Returns the stored metadata for a zone.
-    /// @param zoneId The zone ID to query.
-    /// @return info The zone metadata recorded for `zoneId`.
-    function zones(uint32 zoneId) external view returns (ZoneInfo memory);
+    function zones(uint32 id)
+        external
+        view
+        returns (
+            uint32 zoneId,
+            address portal,
+            address initialToken,
+            address admin,
+            address sequencer,
+            bytes32 genesisBlockHash,
+            bytes32 genesisTempoBlockHash,
+            uint64 genesisTempoBlockNumber,
+            string memory rpcUrl
+        );
 
     /// @notice Returns whether an address is a portal deployed by this factory.
     /// @param portal The portal address to check.

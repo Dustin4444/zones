@@ -11,6 +11,7 @@ import {
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
+import { Test } from "forge-std/Test.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 contract MockZoneFactoryForMessenger {
@@ -22,8 +23,33 @@ contract MockZoneFactoryForMessenger {
         _zones[zoneId].portal = portal;
     }
 
-    function zones(uint32 zoneId) external view returns (ZoneInfo memory) {
-        return _zones[zoneId];
+    function zones(uint32 id)
+        external
+        view
+        returns (
+            uint32 zoneId,
+            address portal,
+            address initialToken,
+            address admin,
+            address sequencer,
+            bytes32 genesisBlockHash,
+            bytes32 genesisTempoBlockHash,
+            uint64 genesisTempoBlockNumber,
+            string memory rpcUrl
+        )
+    {
+        ZoneInfo storage info = _zones[id];
+        return (
+            info.zoneId,
+            info.portal,
+            info.initialToken,
+            info.admin,
+            info.sequencer,
+            info.genesisBlockHash,
+            info.genesisTempoBlockHash,
+            info.genesisTempoBlockNumber,
+            info.rpcUrl
+        );
     }
 
 }
@@ -74,6 +100,32 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
         returns (bytes4)
     {
         return bytes4(0xdeadbeef);
+    }
+
+}
+
+contract ZoneMessengerFactoryAbiTest is Test {
+
+    function test_relayMessage_decodesFlattenedFactoryGetter() public {
+        uint32 zoneId = 1;
+        address portal = address(0x700);
+        address token = address(0x701);
+
+        MockZoneFactoryForMessenger factory = new MockZoneFactoryForMessenger();
+        factory.setPortal(zoneId, portal);
+        ZoneMessenger messenger = new ZoneMessenger(address(factory));
+        AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
+
+        vm.mockCall(
+            token,
+            abi.encodeWithSelector(ITIP20.transfer.selector, address(receiver), 1),
+            abi.encode(true)
+        );
+        vm.prank(portal);
+        messenger.relayMessage(zoneId, token, bytes32("sender"), address(receiver), 1, 500_000, "");
+
+        assertEq(receiver.lastZoneId(), zoneId);
+        assertEq(receiver.lastSourcePortal(), portal);
     }
 
 }
@@ -154,7 +206,7 @@ contract ZoneMessengerTest is BaseTest {
         messenger.relayMessage(ZONE_ID, token, bytes32("sender"), alice, 1, 50_000, "");
     }
 
-    function test_relayMessage_success() public {
+    function test_relayMessage_successWithFlattenedFactoryGetter() public {
         AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
         bytes32 senderTag = keccak256("sender");
         bytes memory data = hex"1234";
