@@ -5,12 +5,7 @@
 //! Before authorizing a signature, the sum for each token must also fit within the L1 Portal's
 //! canonical TIP-20 balance.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
 use alloy_consensus::{BlockHeader as _, TxReceipt as _};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumHash};
@@ -24,11 +19,12 @@ use reth_db::{
     models::CompactU256,
     transaction::{DbTx, DbTxMut},
 };
-use reth_exex::{ExExContext, ExExHead, ExExNotification};
+use reth_exex::{ExExContext, ExExHead, ExExNotification, ExExNotificationsStream};
 use reth_node_api::FullNodeComponents;
 use reth_primitives_traits::BlockBody as _;
 use reth_provider::{DBProvider, DatabaseProviderFactory, HeaderProvider};
 use reth_storage_api::{BlockNumReader, BlockReader, ReceiptProvider};
+use schnellru::{ByLength, LruMap};
 use tempo_alloy::TempoNetwork;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt};
@@ -49,15 +45,15 @@ use schema::{
 };
 pub use schema::{RegisteredWithdrawalCheckerTables, register_withdrawal_checker_tables};
 
-/// Bound startup reconciliation memory and MDBX write transaction size.
-const RECONCILIATION_CHUNK_SIZE: u64 = 1_024;
+/// Bound Reth's ExEx backfill notification and our corresponding MDBX transaction size.
+const EXEX_BACKFILL_MAX_BLOCKS: u64 = 1_024;
 /// Retain enough undo history for 8,192 zone blocks (about 34 minutes at 4 blocks/second).
 const BLOCK_DELTA_RETENTION: u64 = 8_192;
 const DECISION_CHANNEL_CAPACITY: usize = 256;
 const DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 const PORTAL_CHECK_CONCURRENCY: usize = 4;
 const PORTAL_BALANCE_QUERY_CONCURRENCY: usize = 16;
-const PORTAL_DECISION_CACHE_CAPACITY: usize = 256;
+const PORTAL_DECISION_CACHE_CAPACITY: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) enum WithdrawalCheckDecision {
@@ -216,6 +212,7 @@ struct PortalBackingCheck {
 
 #[derive(Debug)]
 enum PreparedCheck {
+    Pending(Checkpoint),
     Portal(PortalBackingCheck),
     Retry(WithdrawalCheckRetry),
 }
@@ -223,42 +220,31 @@ enum PreparedCheck {
 type PortalCheckKey = (u64, B256);
 
 #[derive(Debug)]
-enum PortalCheckResult {
-    Pending(PortalCheckKey),
-    Retry {
-        key: PortalCheckKey,
-        error: WithdrawalCheckRetry,
-    },
+struct PortalCheckResult {
+    key: PortalCheckKey,
+    outcome: PortalCheckOutcome,
+}
+
+#[derive(Debug)]
+enum PortalCheckOutcome {
+    Pending(Checkpoint),
+    Retry(WithdrawalCheckRetry),
     Decision {
         check: Arc<PortalBackingCheck>,
         decision: WithdrawalCheckDecision,
     },
-    Fatal {
-        key: PortalCheckKey,
-        error: Box<WithdrawalCheckError>,
-    },
-}
-
-impl PortalCheckResult {
-    fn key(&self) -> PortalCheckKey {
-        match self {
-            Self::Pending(key) | Self::Retry { key, .. } | Self::Fatal { key, .. } => *key,
-            Self::Decision { check, .. } => (check.target.number, check.target.hash),
-        }
-    }
+    Fatal(Box<WithdrawalCheckError>),
 }
 
 #[derive(Debug)]
 struct CachedPortalCheck {
     check: Arc<PortalBackingCheck>,
     decision: Option<WithdrawalCheckDecision>,
-    last_used: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PortalCheckCache {
-    entries: BTreeMap<u64, CachedPortalCheck>,
-    clock: u64,
+    entries: LruMap<PortalCheckKey, CachedPortalCheck>,
 }
 
 enum CachedPortalCheckHit {
@@ -268,12 +254,7 @@ enum CachedPortalCheckHit {
 
 impl PortalCheckCache {
     fn get(&mut self, target: BlockNumHash) -> Option<CachedPortalCheckHit> {
-        self.clock = self.clock.wrapping_add(1);
-        let cached = self.entries.get_mut(&target.number)?;
-        if cached.check.target.hash != target.hash {
-            return None;
-        }
-        cached.last_used = self.clock;
+        let cached = self.entries.get(&(target.number, target.hash))?;
         match &cached.decision {
             Some(decision) => Some(CachedPortalCheckHit::Decision(decision.clone())),
             None => Some(CachedPortalCheckHit::Prepared(cached.check.clone())),
@@ -282,7 +263,8 @@ impl PortalCheckCache {
 
     fn closest(&self, target: BlockNumHash) -> Option<Arc<PortalBackingCheck>> {
         self.entries
-            .values()
+            .iter()
+            .map(|(_, cached)| cached)
             .filter(|cached| cached.check.target.number != target.number)
             .min_by_key(|cached| cached.check.target.number.abs_diff(target.number))
             .map(|cached| cached.check.clone())
@@ -293,48 +275,52 @@ impl PortalCheckCache {
         check: Arc<PortalBackingCheck>,
         decision: Option<WithdrawalCheckDecision>,
     ) {
-        self.clock = self.clock.wrapping_add(1);
         self.entries.insert(
-            check.target.number,
-            CachedPortalCheck {
-                check,
-                decision,
-                last_used: self.clock,
-            },
+            (check.target.number, check.target.hash),
+            CachedPortalCheck { check, decision },
         );
-        if self.entries.len() > PORTAL_DECISION_CACHE_CAPACITY
-            && let Some(block) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, cached)| cached.last_used)
-                .map(|(block, _)| *block)
-        {
-            self.entries.remove(&block);
+    }
+
+    fn remove(&mut self, target: BlockNumHash) {
+        self.entries.remove(&(target.number, target.hash));
+    }
+}
+
+impl Default for PortalCheckCache {
+    fn default() -> Self {
+        Self {
+            entries: LruMap::new(ByLength::new(PORTAL_DECISION_CACHE_CAPACITY)),
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortalCheckState {
+    Ready,
+    Running,
+    WaitingForCheckpoint,
+}
+
+struct PendingPortalCheck {
+    requests: Vec<WithdrawalCheckRequest>,
+    state: PortalCheckState,
+}
+
 struct PortalChecks {
     checker: PortalBackingChecker,
-    results: mpsc::Sender<PortalCheckResult>,
     cache: PortalCheckCache,
-    inflight: BTreeMap<PortalCheckKey, Vec<WithdrawalCheckRequest>>,
-    running: BTreeSet<PortalCheckKey>,
+    pending: BTreeMap<PortalCheckKey, PendingPortalCheck>,
+    tasks: tokio::task::JoinSet<PortalCheckResult>,
 }
 
 impl PortalChecks {
-    fn new(checker: PortalBackingChecker) -> (Self, mpsc::Receiver<PortalCheckResult>) {
-        let (results, receiver) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
-        (
-            Self {
-                checker,
-                results,
-                cache: PortalCheckCache::default(),
-                inflight: BTreeMap::new(),
-                running: BTreeSet::new(),
-            },
-            receiver,
-        )
+    fn new(checker: PortalBackingChecker) -> Self {
+        Self {
+            checker,
+            cache: PortalCheckCache::default(),
+            pending: BTreeMap::new(),
+            tasks: tokio::task::JoinSet::new(),
+        }
     }
 
     fn queue<P>(
@@ -342,7 +328,7 @@ impl PortalChecks {
         ledger: &WithdrawalLedger,
         provider: &P,
         request: WithdrawalCheckRequest,
-    ) -> Result<Option<WithdrawalCheckRequest>, (WithdrawalCheckRequest, Box<WithdrawalCheckError>)>
+    ) -> Result<(), WithdrawalCheckError>
     where
         P: Clone
             + DatabaseProviderFactory
@@ -357,40 +343,47 @@ impl PortalChecks {
     {
         let target = request.target;
         let key = (target.number, target.hash);
-        let cached = self.cache.get(target);
-        if cached.is_some() || self.inflight.contains_key(&key) {
-            let canonical = match provider.sealed_header(target.number) {
-                Ok(canonical) => canonical,
-                Err(error) => return Err((request, Box::new(ledger.storage(error)))),
-            };
-            let Some(canonical) = canonical else {
-                return Ok(Some(request));
-            };
-            if canonical.hash() != target.hash {
-                request.respond(WithdrawalCheckDecision::Retry(
-                    WithdrawalCheckRetry::CanonicalHashMismatch {
-                        block: target.number,
-                        canonical: canonical.hash(),
-                        target: target.hash,
-                    },
-                ));
-            } else if let Some(waiting) = self.inflight.get_mut(&key) {
-                waiting.push(request);
-            } else {
-                match cached.expect("cache or in-flight entry exists") {
-                    CachedPortalCheckHit::Decision(decision) => request.respond(decision),
-                    CachedPortalCheckHit::Prepared(_) => {
-                        self.inflight.insert(key, vec![request]);
-                        self.start_available(ledger, provider);
-                    }
-                }
-            }
-            return Ok(None);
+        if let Some(pending) = self.pending.get_mut(&key) {
+            pending.requests.push(request);
+            return Ok(());
         }
 
-        self.inflight.insert(key, vec![request]);
+        self.pending.insert(
+            key,
+            PendingPortalCheck {
+                requests: vec![request],
+                state: PortalCheckState::Ready,
+            },
+        );
+        let cached = self.cache.get(target);
+        if let Some(CachedPortalCheckHit::Decision(decision)) = cached {
+            let canonical = provider
+                .sealed_header(target.number)
+                .map_err(|error| ledger.storage(error))?;
+            match canonical {
+                Some(canonical) if canonical.hash() != target.hash => {
+                    self.respond(
+                        key,
+                        WithdrawalCheckDecision::Retry(
+                            WithdrawalCheckRetry::CanonicalHashMismatch {
+                                block: target.number,
+                                canonical: canonical.hash(),
+                                target: target.hash,
+                            },
+                        ),
+                    );
+                    return Ok(());
+                }
+                Some(_) => {
+                    self.respond(key, decision);
+                    return Ok(());
+                }
+                None => self.cache.remove(target),
+            }
+        }
+
         self.start_available(ledger, provider);
-        Ok(None)
+        Ok(())
     }
 
     fn start_available<P>(&mut self, ledger: &WithdrawalLedger, provider: &P)
@@ -401,14 +394,18 @@ impl PortalChecks {
             + HeaderProvider<Header = TempoHeader>
             + ReceiptProvider<Receipt = TempoReceipt>,
     {
-        while self.running.len() < PORTAL_CHECK_CONCURRENCY {
-            let Some((&key, requests)) = self.inflight.iter().find(|(key, requests)| {
-                !self.running.contains(key)
-                    && requests.iter().any(|request| !request.response.is_closed())
+        while self.tasks.len() < PORTAL_CHECK_CONCURRENCY {
+            let Some((&key, pending)) = self.pending.iter().find(|(_, pending)| {
+                pending.state == PortalCheckState::Ready
+                    && pending
+                        .requests
+                        .iter()
+                        .any(|request| !request.response.is_closed())
             }) else {
                 break;
             };
-            let request = requests
+            let request = pending
+                .requests
                 .iter()
                 .find(|request| !request.response.is_closed())
                 .expect("an open request was selected");
@@ -417,21 +414,21 @@ impl PortalChecks {
             let baseline = match self.cache.get(target) {
                 Some(CachedPortalCheckHit::Prepared(check)) => Some(check),
                 Some(CachedPortalCheckHit::Decision(decision)) => {
-                    let waiting = self.inflight.remove(&key).unwrap_or_default();
-                    for request in waiting {
-                        request.respond(decision.clone());
-                    }
+                    self.respond(key, decision);
                     continue;
                 }
                 None => self.cache.closest(target),
             };
-            self.running.insert(key);
+            self.pending
+                .get_mut(&key)
+                .expect("pending check exists")
+                .state = PortalCheckState::Running;
             self.spawn(*ledger, provider.clone(), target, deadline, baseline);
         }
     }
 
     fn spawn<P>(
-        &self,
+        &mut self,
         ledger: WithdrawalLedger,
         provider: P,
         target: BlockNumHash,
@@ -445,8 +442,7 @@ impl PortalChecks {
             + ReceiptProvider<Receipt = TempoReceipt>,
     {
         let checker = self.checker.clone();
-        let results = self.results.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let key = (target.number, target.hash);
             let result = async {
                 let prepared = tokio::task::spawn_blocking(move || {
@@ -458,12 +454,12 @@ impl PortalChecks {
                         "Portal-check reconstruction task failed: {error}"
                     ))
                 })?;
-                let Some(prepared) = prepared? else {
-                    return Ok(PortalCheckResult::Pending(key));
-                };
-                let check = match prepared {
+                let check = match prepared? {
+                    PreparedCheck::Pending(checkpoint) => {
+                        return Ok(PortalCheckOutcome::Pending(checkpoint));
+                    }
                     PreparedCheck::Retry(error) => {
-                        return Ok(PortalCheckResult::Retry { key, error });
+                        return Ok(PortalCheckOutcome::Retry(error));
                     }
                     PreparedCheck::Portal(check) => Arc::new(check),
                 };
@@ -474,64 +470,94 @@ impl PortalChecks {
                         block: target.number,
                     }),
                 };
-                Ok(PortalCheckResult::Decision { check, decision })
+                Ok(PortalCheckOutcome::Decision { check, decision })
             }
             .await;
-            let result = match result {
-                Ok(result) => result,
-                Err(error) => PortalCheckResult::Fatal {
-                    key,
-                    error: Box::new(error),
-                },
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => PortalCheckOutcome::Fatal(Box::new(error)),
             };
-            let _ = results.send(result).await;
+            PortalCheckResult { key, outcome }
         });
+    }
+
+    async fn join_next(&mut self) -> Option<Result<PortalCheckResult, tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    fn has_running(&self) -> bool {
+        !self.tasks.is_empty()
+    }
+
+    fn park(&mut self, key: PortalCheckKey) {
+        if let Some(pending) = self.pending.get_mut(&key) {
+            pending.state = PortalCheckState::WaitingForCheckpoint;
+        }
+    }
+
+    fn retry(&mut self, key: PortalCheckKey) {
+        if let Some(pending) = self.pending.get_mut(&key) {
+            pending.state = PortalCheckState::Ready;
+        }
+    }
+
+    fn wake_waiting(&mut self) {
+        for pending in self.pending.values_mut() {
+            if pending.state == PortalCheckState::WaitingForCheckpoint {
+                pending.state = PortalCheckState::Ready;
+            }
+        }
     }
 
     fn complete(&mut self, check: Arc<PortalBackingCheck>, decision: WithdrawalCheckDecision) {
         let key = (check.target.number, check.target.hash);
-        self.running.remove(&key);
-        let Some(waiting) = self.inflight.remove(&key) else {
+        let Some(pending) = self.pending.remove(&key) else {
             return;
         };
         let cached =
             (!matches!(&decision, WithdrawalCheckDecision::Retry(_))).then(|| decision.clone());
         self.cache.insert(check, cached);
-        for request in waiting {
+        for request in pending.requests {
             // Cloning the decision is cheap: fatal errors are already shared through `Arc`.
             request.respond(decision.clone());
         }
     }
 
-    fn remove(&mut self, key: PortalCheckKey) -> Option<Vec<WithdrawalCheckRequest>> {
-        self.running.remove(&key);
-        self.inflight.remove(&key)
+    fn respond(&mut self, key: PortalCheckKey, decision: WithdrawalCheckDecision) {
+        if let Some(pending) = self.pending.remove(&key) {
+            for request in pending.requests {
+                request.respond(decision.clone());
+            }
+        }
     }
 
     fn contains(&self, key: PortalCheckKey) -> bool {
-        self.inflight.contains_key(&key)
+        self.pending.contains_key(&key)
     }
 
     fn len(&self) -> usize {
-        self.inflight
+        self.pending
             .values()
-            .map(|waiting| waiting.len().max(1))
+            .map(|pending| pending.requests.len().max(1))
             .sum()
     }
 
     fn retain_open(&mut self) {
-        for waiting in self.inflight.values_mut() {
-            waiting.retain(|request| !request.response.is_closed());
+        for pending in self.pending.values_mut() {
+            pending
+                .requests
+                .retain(|request| !request.response.is_closed());
         }
-        self.inflight
-            .retain(|key, waiting| !waiting.is_empty() || self.running.contains(key));
+        self.pending.retain(|_, pending| {
+            !pending.requests.is_empty() || pending.state == PortalCheckState::Running
+        });
     }
 
     fn take_requests(&mut self) -> Vec<WithdrawalCheckRequest> {
-        self.running.clear();
-        std::mem::take(&mut self.inflight)
+        self.tasks.abort_all();
+        std::mem::take(&mut self.pending)
             .into_values()
-            .flatten()
+            .flat_map(|pending| pending.requests)
             .collect()
     }
 }
@@ -540,19 +566,19 @@ impl PortalChecks {
 #[derive(Debug, Clone, Copy)]
 struct WithdrawalLedger {
     zone: u32,
-    tables_are_new: bool,
 }
 
 impl WithdrawalLedger {
-    const fn new(zone: u32, tables_are_new: bool) -> Self {
-        Self {
-            zone,
-            tables_are_new,
-        }
+    const fn new(zone: u32) -> Self {
+        Self { zone }
     }
 
     /// Initialize a newly-created schema at genesis, or verify restoration of an existing schema.
-    fn initialize<P>(&self, provider: &P) -> Result<(), WithdrawalCheckError>
+    fn initialize<P>(
+        &self,
+        provider: &P,
+        tables_are_new: bool,
+    ) -> Result<Checkpoint, WithdrawalCheckError>
     where
         P: HeaderProvider<Header = TempoHeader> + DatabaseProviderFactory,
     {
@@ -569,7 +595,7 @@ impl WithdrawalLedger {
             .get::<WithdrawalCheckerState>(CHECKPOINT_KEY)
             .map_err(|err| self.storage(err))?;
 
-        if self.tables_are_new {
+        if tables_are_new {
             let backing = tx
                 .entries::<WithdrawalBacking>()
                 .map_err(|err| self.storage(err))?;
@@ -592,13 +618,11 @@ impl WithdrawalLedger {
                     "fresh withdrawal-checker tables are not empty".to_string(),
                 ));
             }
-            tx.put::<WithdrawalCheckerState>(
-                CHECKPOINT_KEY,
-                Checkpoint::new(self.zone, 0, genesis.hash()),
-            )
-            .map_err(|err| self.storage(err))?;
+            let checkpoint = Checkpoint::new(self.zone, 0, genesis.hash());
+            tx.put::<WithdrawalCheckerState>(CHECKPOINT_KEY, checkpoint)
+                .map_err(|err| self.storage(err))?;
             provider_rw.commit().map_err(|err| self.storage(err))?;
-            return Ok(());
+            return Ok(checkpoint);
         }
 
         let checkpoint =
@@ -620,122 +644,6 @@ impl WithdrawalLedger {
         }
         self.verify_token_backing(tx)?;
         provider_rw.commit().map_err(|err| self.storage(err))?;
-        Ok(())
-    }
-
-    /// Reconcile the durable ledger through `target` and reject any unbacked withdrawal.
-    fn validate_through<P>(
-        &self,
-        provider: &P,
-        target: u64,
-    ) -> Result<Checkpoint, WithdrawalCheckError>
-    where
-        P: BlockNumReader + HeaderProvider<Header = TempoHeader> + DatabaseProviderFactory,
-        P::Provider: BlockReader<Block = Block, Receipt = TempoReceipt>
-            + HeaderProvider<Header = TempoHeader>,
-    {
-        let original = self.load_checkpoint(provider)?;
-        let best = provider
-            .best_block_number()
-            .map_err(|err| self.storage(err))?;
-        if target > best {
-            return Err(self.invalid_state(format!(
-                "target block {target} is above canonical head {best}"
-            )));
-        }
-
-        let mut ancestor = original;
-        loop {
-            let canonical_hash = provider
-                .sealed_header(ancestor.number)
-                .map_err(|err| self.storage(err))?
-                .map(|header| header.hash());
-            if ancestor.number <= best && canonical_hash == Some(ancestor.hash) {
-                break;
-            }
-            if ancestor.number == 0 {
-                return Err(self.invalid_state(
-                    "withdrawal checkpoint cannot be reconciled with canonical genesis",
-                ));
-            }
-            let delta = self.load_delta(provider, ancestor.number)?;
-            if delta.hash != ancestor.hash {
-                return Err(self.invalid_state(format!(
-                    "undo record does not match checkpoint at block {}",
-                    ancestor.number
-                )));
-            }
-            ancestor = Checkpoint::new(self.zone, ancestor.number - 1, delta.parent_hash);
-        }
-
-        if target < ancestor.number {
-            return Err(self.invalid_state(format!(
-                "reconciliation target {target} is below canonical ancestor {}",
-                ancestor.number
-            )));
-        }
-
-        if original == ancestor && target == ancestor.number {
-            return Ok(original);
-        }
-
-        let mut checkpoint = original;
-        while checkpoint.number > ancestor.number {
-            let chunk_target = checkpoint
-                .number
-                .saturating_sub(RECONCILIATION_CHUNK_SIZE)
-                .max(ancestor.number);
-            let provider_rw = provider
-                .database_provider_rw()
-                .map_err(|err| self.storage(err))?;
-            let tx = provider_rw.tx_ref();
-            if self.checkpoint_from_tx(tx)? != checkpoint {
-                return Err(self
-                    .invalid_state("withdrawal checkpoint changed during reconciliation unwind"));
-            }
-            while checkpoint.number > chunk_target {
-                checkpoint = self.unwind_one(tx, checkpoint)?;
-            }
-            provider_rw.commit().map_err(|err| self.storage(err))?;
-        }
-
-        let mut first = checkpoint.number.checked_add(1).ok_or_else(|| {
-            WithdrawalCheckError::InvalidState(
-                "block number overflow during reconciliation".to_string(),
-            )
-        })?;
-        while first <= target {
-            let last = first
-                .saturating_add(RECONCILIATION_CHUNK_SIZE - 1)
-                .min(target);
-            let provider_ro = provider
-                .database_provider_ro()
-                .map_err(|err| self.storage(err))?;
-            let blocks = (first..=last)
-                .map(|number| self.load_canonical_block(&provider_ro, number))
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(provider_ro);
-            let provider_rw = provider
-                .database_provider_rw()
-                .map_err(|err| self.storage(err))?;
-            let tx = provider_rw.tx_ref();
-            if self.checkpoint_from_tx(tx)? != checkpoint {
-                return Err(self
-                    .invalid_state("withdrawal checkpoint changed during reconciliation replay"));
-            }
-            for block in &blocks {
-                checkpoint = self.apply_block(tx, checkpoint, block)?;
-            }
-            provider_rw.commit().map_err(|err| self.storage(err))?;
-            if last == target {
-                break;
-            }
-            first = last.checked_add(1).ok_or_else(|| {
-                WithdrawalCheckError::InvalidState(
-                    "block number overflow during reconciliation".to_string(),
-                )
-            })?;
-        }
         Ok(checkpoint)
     }
 
@@ -812,7 +720,6 @@ impl WithdrawalLedger {
                 events: Vec::new(),
             })
             .collect::<Vec<_>>();
-        self.validate_block_order(&blocks)?;
         Ok(blocks)
     }
 
@@ -820,6 +727,13 @@ impl WithdrawalLedger {
         &self,
         chain: &reth_provider::Chain<TempoPrimitives>,
     ) -> Result<Vec<CanonicalBlock>, WithdrawalCheckError> {
+        if chain.is_empty() {
+            return Err(WithdrawalCheckError::MalformedBlock {
+                zone: self.zone,
+                block: 0,
+                detail: "ExEx notification contains an empty chain".to_string(),
+            });
+        }
         if chain.blocks().len() != chain.execution_outcome().receipts().len() {
             return Err(WithdrawalCheckError::MalformedBlock {
                 zone: self.zone,
@@ -866,38 +780,7 @@ impl WithdrawalLedger {
                 events: parse_events(self.zone, number, &transactions)?,
             });
         }
-        self.validate_block_order(&blocks)?;
         Ok(blocks)
-    }
-
-    fn validate_block_order(&self, blocks: &[CanonicalBlock]) -> Result<(), WithdrawalCheckError> {
-        if blocks.is_empty() {
-            return Err(WithdrawalCheckError::MalformedBlock {
-                zone: self.zone,
-                block: 0,
-                detail: "ExEx notification contains an empty chain".to_string(),
-            });
-        }
-        for pair in blocks.windows(2) {
-            if pair[1].number
-                != pair[0].number.checked_add(1).ok_or_else(|| {
-                    WithdrawalCheckError::InvalidState(
-                        "block number overflow while validating ExEx notification".to_string(),
-                    )
-                })?
-                || pair[1].parent_hash != pair[0].hash
-            {
-                return Err(WithdrawalCheckError::MalformedBlock {
-                    zone: self.zone,
-                    block: pair[1].number,
-                    detail: format!(
-                        "non-canonical block order after block {} ({})",
-                        pair[0].number, pair[0].hash
-                    ),
-                });
-            }
-        }
-        Ok(())
     }
 
     /// Validate `target` once the durable checkpoint is on the current canonical branch.
@@ -910,7 +793,7 @@ impl WithdrawalLedger {
         provider: &P,
         target: BlockNumHash,
         baseline: Option<&PortalBackingCheck>,
-    ) -> Result<Option<PreparedCheck>, WithdrawalCheckError>
+    ) -> Result<PreparedCheck, WithdrawalCheckError>
     where
         P: DatabaseProviderFactory,
         P::Provider: BlockReader<Block = Block, Receipt = TempoReceipt>
@@ -925,7 +808,7 @@ impl WithdrawalLedger {
             .map_err(|error| self.storage(error))?;
         let checkpoint = self.checkpoint_from_tx(provider_ro.tx_ref())?;
         if checkpoint.number < target.number {
-            return Ok(None);
+            return Ok(PreparedCheck::Pending(checkpoint));
         }
 
         let best = provider_ro
@@ -936,7 +819,7 @@ impl WithdrawalLedger {
             .map_err(|error| self.storage(error))?
         else {
             if checkpoint.number > best {
-                return Ok(None);
+                return Ok(PreparedCheck::Pending(checkpoint));
             }
             return Err(self.invalid_state(format!(
                 "canonical checkpoint header {} is missing below head {best}",
@@ -944,7 +827,7 @@ impl WithdrawalLedger {
             )));
         };
         if canonical_checkpoint.hash() != checkpoint.hash {
-            return Ok(None);
+            return Ok(PreparedCheck::Pending(checkpoint));
         }
 
         let Some(canonical) = provider_ro
@@ -957,13 +840,13 @@ impl WithdrawalLedger {
             )));
         };
         if canonical.hash() != target.hash {
-            return Ok(Some(PreparedCheck::Retry(
+            return Ok(PreparedCheck::Retry(
                 WithdrawalCheckRetry::CanonicalHashMismatch {
                     block: target.number,
                     canonical: canonical.hash(),
                     target: target.hash,
                 },
-            )));
+            ));
         }
 
         let baseline = match baseline {
@@ -992,11 +875,11 @@ impl WithdrawalLedger {
             self.apply_token_backing(&mut required, &block)?;
         }
         let l1_anchor = self.l1_anchor(&provider_ro, target.number)?;
-        Ok(Some(PreparedCheck::Portal(PortalBackingCheck {
+        Ok(PreparedCheck::Portal(PortalBackingCheck {
             target,
             l1_anchor,
             required,
-        })))
+        }))
     }
 
     fn unwind_token_backing(
@@ -1127,16 +1010,6 @@ impl WithdrawalLedger {
         })
     }
 
-    fn load_checkpoint<P>(&self, provider: &P) -> Result<Checkpoint, WithdrawalCheckError>
-    where
-        P: DatabaseProviderFactory,
-    {
-        let provider_ro = provider
-            .database_provider_ro()
-            .map_err(|err| self.storage(err))?;
-        self.checkpoint_from_tx(provider_ro.tx_ref())
-    }
-
     fn checkpoint_from_tx<T: DbTx>(&self, tx: &T) -> Result<Checkpoint, WithdrawalCheckError> {
         let checkpoint = tx
             .get::<WithdrawalCheckerState>(CHECKPOINT_KEY)
@@ -1150,23 +1023,6 @@ impl WithdrawalLedger {
             )));
         }
         Ok(checkpoint)
-    }
-
-    fn load_delta<P>(&self, provider: &P, number: u64) -> Result<BlockDelta, WithdrawalCheckError>
-    where
-        P: DatabaseProviderFactory,
-    {
-        let provider_ro = provider
-            .database_provider_ro()
-            .map_err(|err| self.storage(err))?;
-        provider_ro
-            .tx_ref()
-            .get::<WithdrawalBlockDeltas>(number)
-            .map_err(|err| self.storage(err))?
-            .ok_or_else(|| {
-                self.invalid_state(format!("undo record for block {number} is missing"))
-            })?
-            .into_validated()
     }
 
     fn load_canonical_block<P>(
@@ -1571,18 +1427,19 @@ where
         portal: portal_address,
         provider: l1_provider,
     };
-    let ledger = WithdrawalLedger::new(zone, tables_are_new);
-    ledger
-        .initialize(ctx.provider())
-        .inspect_err(WithdrawalCheckError::emit_failure)?;
-    let mut checkpoint = ledger
-        .validate_through(ctx.provider(), ctx.head.number)
+    let ledger = WithdrawalLedger::new(zone);
+    let checkpoint = ledger
+        .initialize(ctx.provider(), tables_are_new)
         .inspect_err(WithdrawalCheckError::emit_failure)?;
     let finished = BlockNumHash {
         number: checkpoint.number,
         hash: checkpoint.hash,
     };
     ctx.set_notifications_with_head(ExExHead::new(finished));
+    let mut backfill_thresholds = ctx.reth_config.stages.execution;
+    backfill_thresholds.max_blocks = Some(EXEX_BACKFILL_MAX_BLOCKS);
+    ctx.notifications
+        .set_backfill_thresholds(backfill_thresholds.into());
     if ctx.send_finished_height(finished).is_err() {
         let error = WithdrawalCheckError::Unavailable {
             block: checkpoint.number,
@@ -1593,15 +1450,15 @@ where
     }
 
     Ok(async move {
-        let mut pending = Vec::<WithdrawalCheckRequest>::new();
-        let (mut portal_checks, mut portal_results) = PortalChecks::new(portal);
+        let mut checkpoint = checkpoint;
+        let mut portal_checks = PortalChecks::new(portal);
         let mut requests_open = true;
         let mut cleanup = tokio::time::interval(Duration::from_secs(1));
         cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
-                request = requests.recv(), if requests_open && pending.len() + portal_checks.len() < DECISION_CHANNEL_CAPACITY => {
+                request = requests.recv(), if requests_open && portal_checks.len() < DECISION_CHANNEL_CAPACITY => {
                     let Some(request) = request else {
                         requests_open = false;
                         continue;
@@ -1611,29 +1468,40 @@ where
                         ctx.provider(),
                         request,
                     ) {
-                        Ok(Some(request)) => pending.push(request),
-                        Ok(None) => {}
-                        Err((request, error)) => {
-                            pending.push(request);
-                            pending.extend(portal_checks.take_requests());
-                            return halt_requests(requests, pending, *error).await;
+                        Ok(()) => {}
+                        Err(error) => {
+                            let requests_to_halt = portal_checks.take_requests();
+                            return halt_requests(requests, requests_to_halt, error).await;
                         }
                     }
                 }
-                Some(result) = portal_results.recv() => {
-                    let key = result.key();
+                result = portal_checks.join_next(), if portal_checks.has_running() => {
+                    let result = match result {
+                        Some(Ok(result)) => result,
+                        Some(Err(error)) => {
+                            let requests_to_halt = portal_checks.take_requests();
+                            return halt_requests(
+                                requests,
+                                requests_to_halt,
+                                ledger.invalid_state(format!("Portal-check task failed: {error}")),
+                            ).await;
+                        }
+                        None => continue,
+                    };
+                    let PortalCheckResult { key, outcome } = result;
                     if !portal_checks.contains(key) {
+                        portal_checks.start_available(&ledger, ctx.provider());
                         continue;
                     }
                     let canonical = match ctx.provider().sealed_header(key.0) {
                         Ok(canonical) => canonical,
                         Err(error) => {
-                            pending.extend(portal_checks.take_requests());
-                            return halt_requests(requests, pending, ledger.storage(error)).await;
+                            let requests_to_halt = portal_checks.take_requests();
+                            return halt_requests(requests, requests_to_halt, ledger.storage(error)).await;
                         }
                     };
                     let Some(canonical) = canonical else {
-                        pending.extend(portal_checks.remove(key).into_iter().flatten());
+                        portal_checks.park(key);
                         portal_checks.start_available(&ledger, ctx.provider());
                         continue;
                     };
@@ -1645,28 +1513,28 @@ where
                                 target: key.1,
                             },
                         );
-                        for request in portal_checks.remove(key).into_iter().flatten() {
-                            request.respond(decision.clone());
-                        }
+                        portal_checks.respond(key, decision);
                         portal_checks.start_available(&ledger, ctx.provider());
                         continue;
                     }
-                    match result {
-                        PortalCheckResult::Pending(_) => {
-                            pending.extend(portal_checks.remove(key).into_iter().flatten());
-                        }
-                        PortalCheckResult::Retry { error, .. } => {
-                            let decision = WithdrawalCheckDecision::Retry(error);
-                            for request in portal_checks.remove(key).into_iter().flatten() {
-                                request.respond(decision.clone());
+                    match outcome {
+                        PortalCheckOutcome::Pending(observed) => {
+                            if checkpoint == observed {
+                                portal_checks.park(key);
+                            } else {
+                                portal_checks.retry(key);
                             }
                         }
-                        PortalCheckResult::Decision { check, decision } => {
+                        PortalCheckOutcome::Retry(error) => {
+                            let decision = WithdrawalCheckDecision::Retry(error);
+                            portal_checks.respond(key, decision);
+                        }
+                        PortalCheckOutcome::Decision { check, decision } => {
                             portal_checks.complete(check, decision);
                         }
-                        PortalCheckResult::Fatal { error, .. } => {
-                            pending.extend(portal_checks.take_requests());
-                            return halt_requests(requests, pending, *error).await;
+                        PortalCheckOutcome::Fatal(error) => {
+                            let requests_to_halt = portal_checks.take_requests();
+                            return halt_requests(requests, requests_to_halt, *error).await;
                         }
                     }
                     portal_checks.start_available(&ledger, ctx.provider());
@@ -1705,41 +1573,19 @@ where
                                     block: checkpoint.number,
                                     detail: "ExEx event channel closed",
                                 };
-                                pending.extend(portal_checks.take_requests());
-                                return halt_requests(requests, pending, error).await;
+                                let requests_to_halt = portal_checks.take_requests();
+                                return halt_requests(requests, requests_to_halt, error).await;
                             }
-
-                            let mut waiting = Vec::new();
-                            let mut queued = std::mem::take(&mut pending).into_iter();
-                            while let Some(request) = queued.next() {
-                                if request.response.is_closed() {
-                                    continue;
-                                }
-                                match portal_checks.queue(
-                                    &ledger,
-                                    ctx.provider(),
-                                    request,
-                                ) {
-                                    Ok(Some(request)) => waiting.push(request),
-                                    Ok(None) => {}
-                                    Err((request, error)) => {
-                                        waiting.push(request);
-                                        waiting.extend(queued);
-                                        waiting.extend(portal_checks.take_requests());
-                                        return halt_requests(requests, waiting, *error).await;
-                                    }
-                                }
-                            }
-                            pending = waiting;
+                            portal_checks.wake_waiting();
+                            portal_checks.start_available(&ledger, ctx.provider());
                         }
                         Err(error) => {
-                            pending.extend(portal_checks.take_requests());
-                            return halt_requests(requests, pending, error).await;
+                            let requests_to_halt = portal_checks.take_requests();
+                            return halt_requests(requests, requests_to_halt, error).await;
                         }
                     }
                 }
-                _ = cleanup.tick(), if !pending.is_empty() || portal_checks.len() != 0 => {
-                    pending.retain(|request| !request.response.is_closed());
+                _ = cleanup.tick(), if portal_checks.len() != 0 => {
                     portal_checks.retain_open();
                 }
             }
@@ -2248,7 +2094,7 @@ mod tests {
 
     #[test]
     fn portal_backing_is_reconstructed_at_the_exact_target() {
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let token = address(2);
         let expected = BTreeMap::from([(token, U256::from(100))]);
         let mut backing = expected.clone();
@@ -2321,7 +2167,7 @@ mod tests {
     fn multiple_deposits_and_prior_withdrawals_are_accounted_in_order() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let first = parsed_block(
@@ -2359,7 +2205,7 @@ mod tests {
     fn balances_are_separate_by_user_and_token() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user_a = address(1);
         let user_b = address(2);
         let token_a = address(3);
@@ -2428,7 +2274,7 @@ mod tests {
         ] {
             let database = test_database();
             seed_genesis(&database, hash(0));
-            let ledger = WithdrawalLedger::new(ZONE, false);
+            let ledger = WithdrawalLedger::new(ZONE);
             let alice = address(1);
             let bob = address(2);
             let token = address(3);
@@ -2504,7 +2350,7 @@ mod tests {
     fn encrypted_deposits_bouncebacks_and_refund_claims_credit_the_recipient() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let block = parsed_block(
@@ -2535,7 +2381,7 @@ mod tests {
 
     #[test]
     fn protocol_deposit_bounceback_withdrawal_is_ignored() {
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let events = parse_events(
             ledger.zone,
             1,
@@ -2552,7 +2398,7 @@ mod tests {
     fn same_block_withdrawal_before_deposit_fails_closed() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let block = parsed_block(
@@ -2573,7 +2419,7 @@ mod tests {
 
     #[test]
     fn malformed_relevant_event_fails_closed() {
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let mut log = deposit(address(1), address(2), 1);
         log.data = LogData::new_unchecked(log.topics().to_vec(), Bytes::new());
         let error = parse_events(ledger.zone, 4, &[(hash(0x71), vec![log])]).unwrap_err();
@@ -2593,7 +2439,7 @@ mod tests {
     fn unbacked_withdrawal_error_contains_diagnostics() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let tx_hash = hash(0x81);
@@ -2623,7 +2469,7 @@ mod tests {
         let database = test_database();
         let path = database.path();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let block = parsed_block(
@@ -2660,7 +2506,7 @@ mod tests {
     fn mismatched_token_aggregate_fails_closed() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let block = parsed_block(
@@ -2687,7 +2533,7 @@ mod tests {
     fn block_delta_retention_is_bounded() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let parent_hash = hash(0xa0);
         let tx = database.tx_mut().unwrap();
         tx.put::<WithdrawalCheckerState>(
@@ -2724,7 +2570,7 @@ mod tests {
     fn reorg_unwind_restores_old_values_before_applying_new_branch() {
         let database = test_database();
         seed_genesis(&database, hash(0));
-        let ledger = WithdrawalLedger::new(ZONE, false);
+        let ledger = WithdrawalLedger::new(ZONE);
         let user = address(1);
         let token = address(2);
         let first = parsed_block(

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address as EthereumAddress, B256};
+use alloy_primitives::Address as EthereumAddress;
 use bytes::{Buf, BufMut};
 use commonware_codec::{
     DecodeExt as _, Encode as _, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt as _,
@@ -34,8 +34,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const BROADCAST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const BROADCAST_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKFILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const COMMAND_BACKLOG: usize = 8;
-const EVENT_BACKLOG: usize = 8;
+const COMMAND_BACKLOG: usize = 128;
+const EVENT_BACKLOG: usize = 128;
 const BACKFILL_BLOCK_FRAME: u8 = 0;
 const BACKFILL_COMPLETE_FRAME: u8 = 1;
 const SETTLEMENT_SIGNATURE_RESPONSE: u8 = 0;
@@ -321,8 +321,6 @@ pub enum P2pCommand {
     CompleteBackfill {
         peer: PublicKey,
         request_id: u64,
-        tip: u64,
-        tip_hash: B256,
         tip_ack: Vec<u8>,
     },
 }
@@ -369,12 +367,7 @@ pub enum P2pEvent {
         block_ack: Vec<u8>,
     },
     /// The responder sent all blocks available in this response page.
-    BackfillCompleted {
-        peer: PublicKey,
-        tip: u64,
-        tip_hash: B256,
-        tip_ack: Vec<u8>,
-    },
+    BackfillCompleted { peer: PublicKey, tip_ack: Vec<u8> },
 }
 
 /// Handle used to communicate with, supervise, and stop the dedicated P2P runtime.
@@ -768,15 +761,13 @@ async fn run_commands(
             P2pCommand::CompleteBackfill {
                 peer,
                 request_id,
-                tip,
-                tip_hash,
                 tip_ack,
             } => {
                 if role != Role::Leader {
                     warn!(target: "zone::p2p", "Ignoring block backfill completion command on follower");
                     continue;
                 }
-                let frame_len = tip_ack.len().saturating_add(49);
+                let frame_len = tip_ack.len().saturating_add(9);
                 if frame_len > MAX_MESSAGE_SIZE as usize {
                     error!(target: "zone::p2p", ack_size_bytes = tip_ack.len(), max_frame_size_bytes = MAX_MESSAGE_SIZE, "Backfill completion exceeds the P2P response frame size limit");
                     continue;
@@ -784,8 +775,6 @@ async fn run_commands(
                 let mut frame = Vec::with_capacity(frame_len);
                 frame.push(BACKFILL_COMPLETE_FRAME);
                 frame.extend_from_slice(&request_id.to_be_bytes());
-                frame.extend_from_slice(&tip.to_be_bytes());
-                frame.extend_from_slice(tip_hash.as_slice());
                 frame.extend_from_slice(&tip_ack);
                 senders
                     .backfill_responses
@@ -923,15 +912,7 @@ async fn run_receivers(
                         }
                     }
                     BACKFILL_COMPLETE_FRAME => {
-                        let Some((tip_bytes, payload)) = payload.split_at_checked(8) else {
-                            warn!(target: "zone::p2p", %peer, request_id, size = payload.len(), "Ignoring malformed backfill completion");
-                            continue;
-                        };
-                        let Some((tip_hash, tip_ack)) = payload.split_at_checked(32) else {
-                            warn!(target: "zone::p2p", %peer, request_id, size = payload.len(), "Ignoring backfill completion without a tip hash");
-                            continue;
-                        };
-                        if tip_ack.is_empty() {
+                        if payload.is_empty() {
                             warn!(target: "zone::p2p", %peer, request_id, "Ignoring backfill completion without a signed tip ACK");
                             continue;
                         }
@@ -941,9 +922,7 @@ async fn run_receivers(
                         }
                         P2pEvent::BackfillCompleted {
                             peer,
-                            tip: u64::from_be_bytes(tip_bytes.try_into().expect("fixed-size tip")),
-                            tip_hash: B256::from_slice(tip_hash),
-                            tip_ack: tip_ack.to_vec(),
+                            tip_ack: payload.to_vec(),
                         }
                     }
                     _ => {
@@ -968,7 +947,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::address;
     use commonware_codec::{DecodeExt as _, Encode as _};
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 
@@ -996,12 +975,10 @@ mod tests {
         Secp256k1Identity::from_hex(&format!("0x{seed:064x}")).unwrap()
     }
 
-    fn complete_backfill(peer: P2pPeerId, request_id: u64, tip: u64) -> P2pCommand {
+    fn complete_backfill(peer: P2pPeerId, request_id: u64) -> P2pCommand {
         P2pCommand::CompleteBackfill {
             peer,
             request_id,
-            tip,
-            tip_hash: B256::repeat_byte(tip as u8),
             tip_ack: vec![0xcc],
         }
     }
@@ -1273,7 +1250,7 @@ mod tests {
             .await
             .unwrap();
         leader_commands
-            .send(complete_backfill(first_follower_peer.clone(), 0, 99))
+            .send(complete_backfill(first_follower_peer.clone(), 0))
             .await
             .unwrap();
         assert_no_backfill_response_events(
@@ -1332,7 +1309,7 @@ mod tests {
             .await
             .unwrap();
         follower_commands
-            .send(complete_backfill(leader_peer.clone(), 0, 100))
+            .send(complete_backfill(leader_peer.clone(), 0))
             .await
             .unwrap();
         assert_no_backfill_response_events(
@@ -1362,7 +1339,7 @@ mod tests {
             .await
             .unwrap();
         leader_commands
-            .send(complete_backfill(requesting_peer, follower_request_id, 9))
+            .send(complete_backfill(requesting_peer, follower_request_id))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -1374,14 +1351,8 @@ mod tests {
                         assert_eq!(block, expected_blocks[received_blocks]);
                         received_blocks += 1;
                     }
-                    Some(P2pEvent::BackfillCompleted {
-                        tip: 9,
-                        tip_hash,
-                        tip_ack,
-                        ..
-                    }) => {
+                    Some(P2pEvent::BackfillCompleted { tip_ack, .. }) => {
                         assert_eq!(received_blocks, expected_blocks.len());
-                        assert_eq!(tip_hash, B256::repeat_byte(9));
                         assert_eq!(tip_ack, vec![0xcc]);
                         return;
                     }
@@ -1406,7 +1377,6 @@ mod tests {
             .send(complete_backfill(
                 first_follower_peer.clone(),
                 follower_request_id,
-                10,
             ))
             .await
             .unwrap();

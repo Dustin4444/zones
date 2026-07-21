@@ -79,6 +79,7 @@ futures.workspace = true
 k256.workspace = true
 metrics.workspace = true
 modular-bitfield.workspace = true
+schnellru.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

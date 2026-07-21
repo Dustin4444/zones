@@ -134,6 +134,21 @@ impl BlockAck {
             zoneBlockHash: zone_block_hash,
         }
     }
+
+    pub fn target(&self, domain: AttestationDomain) -> eyre::Result<BlockNumHash> {
+        eyre::ensure!(
+            self.zoneId == domain.zone_id
+                && self.sequencerSetVersion == domain.sequencer_set_version,
+            "block ACK does not match the active zone signer set"
+        );
+        Ok(BlockNumHash {
+            number: self
+                .zoneHeight
+                .try_into()
+                .map_err(|_| eyre::eyre!("block ACK zone height does not fit in u64"))?,
+            hash: self.zoneBlockHash,
+        })
+    }
 }
 
 impl SettlementAttestation {
@@ -647,11 +662,20 @@ mod tests {
     #[test]
     fn signed_attestation_round_trips_and_recovers() {
         let signer = PrivateKeySigner::random();
-        let ack = BlockAck::new(domain(), 42, B256::repeat_byte(1));
+        let target = BlockNumHash {
+            number: 42,
+            hash: B256::repeat_byte(1),
+        };
+        let ack = BlockAck::new(domain(), target.number, target.hash);
         let signed = SignedBlockAck::sign(ack, domain(), &signer).unwrap();
         let decoded = SignedBlockAck::decode(&signed.encode()).unwrap();
         assert_eq!(decoded, signed);
+        assert_eq!(decoded.ack.target(domain()).unwrap(), target);
         assert_eq!(decoded.recover_signer(domain()).unwrap(), signer.address());
+
+        let mut stale_domain = domain();
+        stale_domain.sequencer_set_version += 1;
+        assert!(decoded.ack.target(stale_domain).is_err());
     }
 
     #[test]

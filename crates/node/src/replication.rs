@@ -324,18 +324,13 @@ struct SettlementSigningRequest {
     proposal: Vec<u8>,
 }
 
-fn verify_member_ack(
+fn verified_member_ack(
     peer: &zone_p2p::P2pPeerId,
     encoded_ack: &[u8],
-    expected: BlockAck,
     domain: AttestationDomain,
     addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-) -> eyre::Result<()> {
+) -> eyre::Result<alloy_eips::BlockNumHash> {
     let signed = SignedBlockAck::decode(encoded_ack)?;
-    eyre::ensure!(
-        signed.ack == expected,
-        "signed ACK does not match its target"
-    );
     let signer = signed.recover_signer(domain)?;
     let expected_signer = addresses
         .get(peer)
@@ -344,7 +339,7 @@ fn verify_member_ack(
         signer == *expected_signer,
         "ACK signer {signer} does not match authenticated peer {expected_signer}"
     );
-    Ok(())
+    signed.ack.target(domain)
 }
 
 fn verify_backfill_block(
@@ -355,30 +350,21 @@ fn verify_backfill_block(
     addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
 ) -> eyre::Result<(u64, B256)> {
     let (number, hash) = encoded_block_identity(encoded)?;
-    verify_member_ack(
-        peer,
-        encoded_ack,
-        BlockAck::new(domain, number, hash),
-        domain,
-        addresses,
-    )?;
+    let target = verified_member_ack(peer, encoded_ack, domain, addresses)?;
+    eyre::ensure!(
+        target.number == number && target.hash == hash,
+        "signed ACK does not match its block"
+    );
     Ok((number, hash))
 }
 
-fn verify_backfill_tip(
+fn verified_backfill_tip(
     peer: &zone_p2p::P2pPeerId,
-    target: alloy_eips::BlockNumHash,
     encoded_ack: &[u8],
     domain: AttestationDomain,
     addresses: &HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-) -> eyre::Result<()> {
-    verify_member_ack(
-        peer,
-        encoded_ack,
-        BlockAck::new(domain, target.number, target.hash),
-        domain,
-        addresses,
-    )
+) -> eyre::Result<alloy_eips::BlockNumHash> {
+    verified_member_ack(peer, encoded_ack, domain, addresses)
 }
 
 /// Keep track of the backfill exactly. We'll buffer any live blocks received
@@ -502,7 +488,7 @@ where
             validated_backfill_ack(provider, number, attestation, signing_halted, commands).await?;
         let encoded_ack = signed.encode();
         if number == tip {
-            signed_tip = Some((signed.ack.zoneBlockHash, encoded_ack.clone()));
+            signed_tip = Some(encoded_ack.clone());
         }
         commands
             .send(P2pCommand::SendBackfillBlock {
@@ -514,21 +500,19 @@ where
             .await
             .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     }
-    let (tip_hash, tip_ack) = match signed_tip {
+    let tip_ack = match signed_tip {
         Some(signed) => signed,
         None => {
             let signed =
                 validated_backfill_ack(provider, tip, attestation, signing_halted, commands)
                     .await?;
-            (signed.ack.zoneBlockHash, signed.encode())
+            signed.encode()
         }
     };
     commands
         .send(P2pCommand::CompleteBackfill {
             peer,
             request_id,
-            tip,
-            tip_hash,
             tip_ack,
         })
         .await
@@ -930,21 +914,22 @@ pub(crate) async fn run_block_sync<P>(
                     }
 
                     // Backfill completed, flip to live blocks
-                    P2pEvent::BackfillCompleted { peer, tip, tip_hash, tip_ack } => {
+                    P2pEvent::BackfillCompleted { peer, tip_ack } => {
                         if role != zone_p2p::Role::Follower {
                             continue;
                         }
-                        let target = alloy_eips::BlockNumHash { number: tip, hash: tip_hash };
-                        if let Err(error) = verify_backfill_tip(
+                        let target = match verified_backfill_tip(
                             &peer,
-                            target,
                             &tip_ack,
                             attestation.domain,
                             &attestation.addresses,
                         ) {
-                            tracing::warn!(target: "zone::p2p", %peer, %error, tip, %tip_hash, "Rejected backfill completion without a valid signed tip");
-                            continue;
-                        }
+                            Ok(target) => target,
+                            Err(error) => {
+                                tracing::warn!(target: "zone::p2p", %peer, %error, "Rejected backfill completion without a valid signed tip");
+                                continue;
+                            }
+                        };
                         let best = match provider.best_block_number() {
                             Ok(best) => best,
                             Err(err) => {
@@ -1290,7 +1275,7 @@ mod tests {
 
     use super::{
         BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS, PersistedBlockSource,
-        PersistedTip, broadcast_persisted_blocks, buffer_pending_block, verify_backfill_tip,
+        PersistedTip, broadcast_persisted_blocks, buffer_pending_block, verified_backfill_tip,
         verify_signing_refusal,
     };
     use alloy_primitives::{Address, B256};
@@ -1311,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_tip_requires_an_exact_member_ack() {
+    fn backfill_tip_is_derived_from_an_authenticated_member_ack() {
         let peer = PrivateKey::from_seed(1).public_key();
         let signer = PrivateKeySigner::random();
         let addresses = HashMap::from([(peer.clone(), signer.address())]);
@@ -1327,20 +1312,13 @@ mod tests {
         )
         .unwrap()
         .encode();
-        verify_backfill_tip(&peer, canonical_tip, &completion_ack, domain, &addresses).unwrap();
-        assert!(
-            verify_backfill_tip(
-                &peer,
-                alloy_eips::BlockNumHash {
-                    number: 7,
-                    hash: B256::repeat_byte(0xff),
-                },
-                &completion_ack,
-                domain,
-                &addresses,
-            )
-            .is_err()
+        assert_eq!(
+            verified_backfill_tip(&peer, &completion_ack, domain, &addresses).unwrap(),
+            canonical_tip
         );
+
+        let other_peer = PrivateKey::from_seed(2).public_key();
+        assert!(verified_backfill_tip(&other_peer, &completion_ack, domain, &addresses).is_err());
     }
 
     #[test]

@@ -388,23 +388,12 @@ async fn portal_backing_shortfall_withholds_submission_e2e() -> eyre::Result<()>
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct UnbackedWithdrawalTarget {
-    block: u64,
-    block_hash: B256,
-    tx_hash: B256,
-}
-
 struct UnbackedWithdrawalFixture {
     l1: L1TestNode,
     zone: ZoneTestNode,
     config: WithdrawalCheckerTestConfig,
     portal_address: Address,
-    zone_id: u32,
-    alice: Address,
-    backed_amount: u128,
-    amount: u128,
-    target: UnbackedWithdrawalTarget,
+    target: B256,
 }
 
 async fn unbacked_withdrawal_fixture() -> eyre::Result<UnbackedWithdrawalFixture> {
@@ -446,11 +435,7 @@ async fn unbacked_withdrawal_fixture() -> eyre::Result<UnbackedWithdrawalFixture
                     .await?;
                 Ok(events.into_iter().rev().find_map(|(event, log)| {
                     if event.sender == alice && event.amount == amount {
-                        Some(UnbackedWithdrawalTarget {
-                            block: log.block_number?,
-                            block_hash: log.block_hash?,
-                            tx_hash: log.transaction_hash?,
-                        })
+                        log.block_hash
                     } else {
                         None
                     }
@@ -473,19 +458,11 @@ async fn unbacked_withdrawal_fixture() -> eyre::Result<UnbackedWithdrawalFixture
     )
     .await?;
 
-    let zone_id = ZonePortal::new(portal_address, l1.provider())
-        .zoneId()
-        .call()
-        .await?;
     Ok(UnbackedWithdrawalFixture {
         l1,
         zone,
         config,
         portal_address,
-        zone_id,
-        alice,
-        backed_amount,
-        amount,
         target,
     })
 }
@@ -528,10 +505,7 @@ async fn unbacked_withdrawal_is_withheld_e2e() -> eyre::Result<()> {
     let tip = portal.blockHash().call().await?;
     let batches = batch_submitted_count(&fixture.l1, fixture.portal_address).await?;
     let zone_head = fixture.zone.provider().get_block_number().await?;
-    assert_ne!(
-        tip, fixture.target.block_hash,
-        "unbacked target settled on L1"
-    );
+    assert_ne!(tip, fixture.target, "unbacked target settled on L1");
 
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
@@ -544,12 +518,7 @@ async fn unbacked_withdrawal_is_withheld_e2e() -> eyre::Result<()> {
         batches,
         "a batch transaction was sent after the unbacked withdrawal"
     );
-    assert_target_not_submitted(
-        &fixture.l1,
-        fixture.portal_address,
-        fixture.target.block_hash,
-    )
-    .await?;
+    assert_target_not_submitted(&fixture.l1, fixture.portal_address, fixture.target).await?;
     assert!(
         fixture.zone.provider().get_block_number().await? > zone_head,
         "the zone should continue producing blocks while settlement is withheld"
@@ -568,27 +537,25 @@ async fn unbacked_withdrawal_remains_withheld_after_restart() -> eyre::Result<()
         .blockHash()
         .call()
         .await?;
+    let withheld_before = fixture
+        .zone
+        .metric_counter("withdrawal_signature_withheld_total", "unbacked_withdrawal")
+        .await?;
     let datadir = fixture.zone.shutdown().await?;
 
-    let error = match fixture.config.launch(Some(datadir)).await {
-        Ok(_) => eyre::bail!("restarted checker accepted the persisted unbacked withdrawal"),
-        Err(error) => error,
-    };
-    let diagnostic = format!("{error:#}");
-    for expected in [
-        format!("zone={}", fixture.zone_id),
-        format!("block={}", fixture.target.block),
-        format!("tx_hash={}", fixture.target.tx_hash),
-        format!("user={}", fixture.alice),
-        format!("token={ZONE_TOKEN_ADDRESS}"),
-        format!("requested_amount={}", fixture.amount),
-        format!("available_amount={}", fixture.backed_amount),
-    ] {
-        assert!(
-            diagnostic.contains(&expected),
-            "restart diagnostic is missing `{expected}`: {diagnostic}"
-        );
-    }
+    let restarted = fixture.config.launch(Some(datadir)).await?;
+    poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(100),
+        "persisted unbacked withdrawal withheld after restart",
+        || async {
+            let count = restarted
+                .metric_counter("withdrawal_signature_withheld_total", "unbacked_withdrawal")
+                .await?;
+            Ok((count > withheld_before).then_some(()))
+        },
+    )
+    .await?;
     assert_eq!(
         ZonePortal::new(fixture.portal_address, fixture.l1.provider())
             .blockHash()
@@ -597,12 +564,8 @@ async fn unbacked_withdrawal_remains_withheld_after_restart() -> eyre::Result<()
         tip_before,
         "portal tip advanced while restart reconciliation rejected the target"
     );
-    assert_target_not_submitted(
-        &fixture.l1,
-        fixture.portal_address,
-        fixture.target.block_hash,
-    )
-    .await?;
+    assert_target_not_submitted(&fixture.l1, fixture.portal_address, fixture.target).await?;
+    restarted.stop().await?;
 
     Ok(())
 }
