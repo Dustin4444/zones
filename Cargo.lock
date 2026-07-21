@@ -13724,6 +13724,7 @@ dependencies = [
  "k256",
  "metrics",
  "parking_lot",
+ "proptest",
  "reth-metrics",
  "schnellru",
  "serde_json",
