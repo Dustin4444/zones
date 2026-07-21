@@ -614,11 +614,14 @@ impl L1Subscriber {
     /// Write decoded portal state changes into the shared L1 cache at the
     /// confirmed block height.
     fn apply_portal_state_events(&self, block_number: u64, portal_events: &L1PortalEvents) {
-        if portal_events.sequencer_events.is_empty() {
+        if portal_events.sequencer_events.is_empty() && portal_events.enabled_tokens.is_empty() {
             return;
         }
 
         let mut cache = self.config.l1_state_cache.write();
+        for enabled in &portal_events.enabled_tokens {
+            cache.enable_token(enabled.token);
+        }
         apply_sequencer_events_to_cache(
             &mut cache,
             self.config.portal_address,

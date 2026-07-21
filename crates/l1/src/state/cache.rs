@@ -64,6 +64,10 @@ impl L1StateCache {
 #[derive(Debug, Default)]
 pub struct L1StateCacheInner {
     tracked_contracts: HashSet<Address>,
+    /// Tokens enabled on the ZonePortal at the current canonical L1 anchor.
+    enabled_tokens: HashSet<Address>,
+    /// Enabled tokens discovered at the persisted zone checkpoint.
+    initial_enabled_tokens: HashSet<Address>,
     /// Per-slot value history: `(address, slot) → { block_number → value }`.
     /// The `BTreeMap` enables efficient range lookups for "latest value at or before block N".
     slots: HashMap<(Address, B256), BTreeMap<u64, B256>>,
@@ -156,10 +160,31 @@ impl L1StateCacheInner {
         self.tracked_contracts.contains(address)
     }
 
+    /// Initializes enabled tokens from the persisted zone's L1 checkpoint.
+    pub fn initialize_enabled_tokens(&mut self, tokens: impl IntoIterator<Item = Address>) {
+        self.initial_enabled_tokens.extend(tokens);
+        self.enabled_tokens
+            .extend(self.initial_enabled_tokens.iter().copied());
+        self.tracked_contracts
+            .extend(self.initial_enabled_tokens.iter().copied());
+    }
+
+    /// Records a token enabled by a canonical ZonePortal event.
+    pub fn enable_token(&mut self, token: Address) {
+        self.enabled_tokens.insert(token);
+        self.tracked_contracts.insert(token);
+    }
+
+    /// Returns the tokens enabled at the current canonical L1 anchor.
+    pub fn enabled_tokens(&self) -> &HashSet<Address> {
+        &self.enabled_tokens
+    }
+
     /// Clears chain-derived data while retaining the tracked-contract set and initial floor.
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
+        self.enabled_tokens = self.initial_enabled_tokens.clone();
         self.anchor = NumHash::default();
     }
 
@@ -336,6 +361,23 @@ mod tests {
     fn is_tracked_returns_false_for_unknown_address() {
         let cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
         assert!(!cache.is_tracked(&address!("0x0000000000000000000000000000000000000001")));
+    }
+
+    #[test]
+    fn enabled_tokens_are_tracked_and_reset_to_checkpoint_on_clear() {
+        let initial = address!("0x20c0000000000000000000000000000000000001");
+        let observed = address!("0x20c0000000000000000000000000000000000002");
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+
+        cache.initialize_enabled_tokens([initial]);
+        cache.enable_token(observed);
+
+        assert_eq!(cache.enabled_tokens(), &HashSet::from([initial, observed]));
+        assert!(cache.is_tracked(&initial));
+        assert!(cache.is_tracked(&observed));
+
+        cache.clear();
+        assert_eq!(cache.enabled_tokens(), &HashSet::from([initial]));
     }
 
     #[test]
