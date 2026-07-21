@@ -287,19 +287,8 @@ pub(crate) async fn collect_leader_settlements<P>(
             return;
         }
     };
-    let mut pending_boundary = None;
-    for number in 1..=head {
-        match propose_settlement(&provider, number, commands.as_ref(), &context).await {
-            Ok(true) => {
-                pending_boundary = Some(number);
-                break;
-            }
-            Ok(false) => {}
-            Err(err) => {
-                debug!(target: "zone::p2p", %err, number, "Skipped non-current settlement boundary during recovery")
-            }
-        }
-    }
+    let mut pending_boundary =
+        find_pending_boundary(&provider, 1, head, commands.as_ref(), &context).await;
 
     let mut persisted = provider.persisted_block_stream();
     let mut retry = tokio::time::interval(Duration::from_secs(5));
@@ -314,8 +303,24 @@ pub(crate) async fn collect_leader_settlements<P>(
                     Err(err) => tracing::warn!(target: "zone::p2p", %err, height = tip.number, "Failed proposing settlement boundary"),
                 }
             }
-            _ = retry.tick(), if pending_boundary.is_some() => {
-                let number = pending_boundary.expect("guarded by is_some");
+            _ = retry.tick() => {
+                let Some(number) = pending_boundary else {
+                    let head = match provider.best_block_number() {
+                        Ok(head) => head,
+                        Err(err) => {
+                            debug!(target: "zone::p2p", %err, "Failed reading head while recovering settlement proposal");
+                            continue;
+                        }
+                    };
+                    pending_boundary = find_pending_boundary(
+                        &provider,
+                        1,
+                        head,
+                        commands.as_ref(),
+                        &context,
+                    ).await;
+                    continue;
+                };
                 match propose_settlement(&provider, number, commands.as_ref(), &context).await {
                     Ok(true) => {}
                     Ok(false) => pending_boundary = None,
@@ -332,21 +337,42 @@ pub(crate) async fn collect_leader_settlements<P>(
                                 continue;
                             }
                         };
-                        for candidate in number.saturating_add(1)..=head {
-                            match propose_settlement(&provider, candidate, commands.as_ref(), &context).await {
-                                Ok(true) => {
-                                    pending_boundary = Some(candidate);
-                                    break;
-                                }
-                                Ok(false) => {}
-                                Err(err) => debug!(target: "zone::p2p", %err, height = candidate, "Skipped non-current settlement boundary while advancing"),
-                            }
+                        if let Some(candidate) = find_pending_boundary(
+                            &provider,
+                            number.saturating_add(1),
+                            head,
+                            commands.as_ref(),
+                            &context,
+                        ).await {
+                            pending_boundary = Some(candidate);
                         }
                     }
                 }
             }
         }
     }
+}
+
+async fn find_pending_boundary<P>(
+    provider: &P,
+    start: u64,
+    end: u64,
+    commands: Option<&mpsc::Sender<P2pCommand>>,
+    context: &BlockAttestationContext,
+) -> Option<u64>
+where
+    P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
+{
+    for number in start..=end {
+        match propose_settlement(provider, number, commands, context).await {
+            Ok(true) => return Some(number),
+            Ok(false) => {}
+            Err(err) => {
+                debug!(target: "zone::p2p", %err, number, "Skipped non-current settlement boundary during recovery")
+            }
+        }
+    }
+    None
 }
 
 /// Before we settle on L1 with `submitBatch`, we need to collect follower signatures for this
