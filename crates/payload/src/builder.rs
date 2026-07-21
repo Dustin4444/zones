@@ -37,7 +37,7 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction as _, TransactionPool,
     ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
-use std::{sync::Arc, time::Instant};
+use std::{fs, sync::Arc, time::Instant};
 use tempo_evm::TempoNextBlockEnvAttributes;
 use tempo_payload_types::{EncodedBlock, TempoBuiltPayload};
 use tempo_primitives::{
@@ -327,9 +327,27 @@ where
         let recovered_block = Arc::new(block);
         let eth_payload = EthBuiltPayload::new(recovered_block.clone(), U256::ZERO, requests, None);
 
+        let builder_state = db.take_bundle();
+        if let Ok(directory) = std::env::var("ZONES_DEBUG_BUILDER_STATE_DIR") {
+            let path = std::path::Path::new(&directory).join(format!(
+                "{}_{}.bundle_state.builder.json",
+                sealed_block.number(),
+                sealed_block.hash()
+            ));
+            match fs::create_dir_all(&directory)
+                .and_then(|()| serde_json::to_vec(&builder_state).map_err(std::io::Error::other))
+                .and_then(|json| fs::write(&path, json))
+            {
+                Ok(()) => info!(path = %path.display(), "saved payload-builder bundle state"),
+                Err(err) => {
+                    warn!(%err, path = %path.display(), "failed to save payload-builder bundle state")
+                }
+            }
+        }
+
         let execution_output = BlockExecutionOutput {
             result: execution_result,
-            state: db.take_bundle(),
+            state: builder_state,
         };
 
         let executed_block = BuiltPayloadExecutedBlock {

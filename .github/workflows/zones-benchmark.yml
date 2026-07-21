@@ -288,6 +288,10 @@ jobs:
       ZONES_BENCH_REPORT: target/zones-benchmark/report-${{ needs.authorize.outputs.phase }}.json
       ZONES_BENCH_TOPOLOGY_ENV: target/zones-benchmark/topology.env
       ZONES_BENCH_TOPOLOGY_DIR: target/zones-benchmark/topology
+      # Diagnostic-only historical replay: capture the payload builder's actual
+      # post-execution state so it can be diffed against the witness hook's
+      # fresh-parent re-execution after an invalid payload.
+      ZONES_DEBUG_BUILDER_STATE_DIR: ${{ github.workspace }}/target/zones-benchmark/builder-state-diagnostics
       TEMPO_ROOT: ${{ github.workspace }}/_benchmark-tempo
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -665,6 +669,7 @@ jobs:
             target/zones-benchmark/*.md
             target/zones-benchmark/node-logs/
             target/zones-benchmark/invalid-block-diagnostics/
+            target/zones-benchmark/builder-state-diagnostics/
           if-no-files-found: warn
           retention-days: 14
 
