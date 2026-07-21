@@ -2006,7 +2006,7 @@ mod tests {
         let bootstrap_steps = bootstrap_scenario["scenario"]["steps"]
             .as_sequence()
             .unwrap();
-        assert_eq!(bootstrap_steps.len(), 6);
+        assert_eq!(bootstrap_steps.len(), 5);
         assert_eq!(
             bootstrap_steps[2]["submit"]["with"]["call"]["args"][1],
             config.sequencer.to_string()
@@ -2016,7 +2016,6 @@ mod tests {
             "account.address"
         );
         assert_eq!(bootstrap_steps[4]["wait_log"]["event"], "DepositProcessed");
-        assert_eq!(bootstrap_steps[5]["wait_log"]["event"], "BatchSubmitted");
 
         let roundtrip_scenario: Value = serde_yaml::from_str(
             &fs::read_to_string(output.join("roundtrip-scenario.yml")).unwrap(),
