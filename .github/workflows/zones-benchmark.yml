@@ -160,6 +160,7 @@ jobs:
           # Zone payload builder and executor while the private fixture repository credential is
           # being provisioned for the full neobank route.
           INPUT_PHASE: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && 'roundtrip' || inputs.phase }}
+          INPUT_STATE_ROOT_DIAGNOSTIC: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging' }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
           INPUT_COUNT: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'dan/state-root-debugging') && '100' || inputs.count || '1000' }}
           INPUT_TPS: ${{ inputs.tps || '20' }}
@@ -181,7 +182,7 @@ jobs:
           set -euo pipefail
 
           phase="$INPUT_PHASE"
-          if [ "$EVENT_NAME" = pull_request ]; then
+          if [ "$EVENT_NAME" = pull_request ] && [ "$INPUT_STATE_ROOT_DIAGNOSTIC" != true ]; then
             phase=neobank-e2e
           fi
           case "$phase" in
