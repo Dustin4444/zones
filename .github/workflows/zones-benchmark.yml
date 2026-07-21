@@ -373,10 +373,12 @@ jobs:
 
       - name: Build pinned external Earn artifacts
         if: needs.authorize.outputs.phase == 'neobank-e2e'
+        env:
+          EARN_REV: ${{ steps.earn.outputs.revision }}
         run: |
           set -euo pipefail
           earn_root="$GITHUB_WORKSPACE/_benchmark-earn"
-          earn_rev='${{ steps.earn.outputs.revision }}'
+          earn_rev="$EARN_REV"
           [ "$(git -C "$earn_root" rev-parse HEAD)" = "$earn_rev" ]
           forge build --root "$earn_root"
           forge build --root "$earn_root" "$earn_root/localnet/foundry/src/LocalDirectSwap.sol"
