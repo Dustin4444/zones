@@ -581,9 +581,3 @@ pub(crate) fn apply_membership_events_to_cache(
         );
     }
 }
-
-pub(crate) fn address_to_storage_value(address: Address) -> B256 {
-    let mut bytes = [0u8; 32];
-    bytes[12..].copy_from_slice(address.as_slice());
-    B256::new(bytes)
-}

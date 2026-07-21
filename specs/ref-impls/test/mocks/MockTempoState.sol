@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {
-    PORTAL_ROLE_SLOT,
-    PORTAL_TOKEN_CONFIGS_SLOT,
-    Role
-} from "../../src/interfaces/IZone.sol";
+import { PORTAL_ROLE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT, Role } from "../../src/interfaces/IZone.sol";
 
 /// @title MockTempoState
 /// @notice Mock TempoState for testing ZoneInbox
@@ -48,8 +44,7 @@ contract MockTempoState {
 
     function setMockAccountAllowed(address portal, address account, bool allowed) external {
         bytes32 slot = keccak256(abi.encode(account, PORTAL_ROLE_SLOT));
-        mockStorageValues[portal][slot] =
-            allowed ? bytes32(uint256(Role.Account)) : bytes32(0);
+        mockStorageValues[portal][slot] = allowed ? bytes32(uint256(Role.Account)) : bytes32(0);
     }
 
     function setMockZoneGateway(address portal, address gateway, bool enabled) external {

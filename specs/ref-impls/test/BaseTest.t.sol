@@ -137,10 +137,16 @@ contract BaseTest is Test {
         );
         vm.store(_PATH_USD, tempoAdminRoleSlot, bytes32(uint256(1)));
 
-        token1 =
-            ITIP20Token(factory.createToken("TOKEN1", "T1", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token1")));
-        token2 =
-            ITIP20Token(factory.createToken("TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")));
+        token1 = ITIP20Token(
+            factory.createToken(
+                "TOKEN1", "T1", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token1")
+            )
+        );
+        token2 = ITIP20Token(
+            factory.createToken(
+                "TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")
+            )
+        );
 
         _mockTokenPolicyMigration(_PATH_USD, true);
     }
@@ -211,7 +217,11 @@ contract BaseTest is Test {
         );
     }
 
-    function _singleWithdrawal(Withdrawal memory withdrawal) internal pure returns (Withdrawal[] memory withdrawals) {
+    function _singleWithdrawal(Withdrawal memory withdrawal)
+        internal
+        pure
+        returns (Withdrawal[] memory withdrawals)
+    {
         withdrawals = new Withdrawal[](1);
         withdrawals[0] = withdrawal;
     }
