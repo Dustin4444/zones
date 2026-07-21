@@ -368,6 +368,8 @@ jobs:
           repository: tempoxyz/earn
           ref: ${{ steps.earn.outputs.revision }}
           path: _benchmark-earn
+          # Read-only credential with access to the pinned private contract repo.
+          token: ${{ secrets.ZONES_BENCH_EARN_READ_TOKEN }}
           persist-credentials: false
           submodules: recursive
 

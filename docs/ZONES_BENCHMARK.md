@@ -657,18 +657,18 @@ txgen-tempo generate \
 
 ## GitHub workflow
 
-`.github/workflows/zones-benchmark.yml` runs a self-provisioned roundtrip or an
-independent deposit workload on the private `bare-metal-dual-schelk` runner
-class used by Tempo's e2e benchmark. It does not use a GitHub Actions
-environment, a pre-existing Zone, or an externally configured write RPC. Each
-job:
+`.github/workflows/zones-benchmark.yml` runs self-provisioned `neobank-e2e`,
+roundtrip, or independent deposit workloads on the private
+`bare-metal-dual-schelk` runner class used by Tempo's e2e benchmark. It does
+not use a GitHub Actions environment, a pre-existing Zone, or an externally
+configured write RPC. Each job:
 
 1. loads the stable private mnemonic from a mode-0600 file under the runner tool
    cache, generating it once when that runner has no identity file yet, without
    putting the phrase in workflow arguments or artifacts;
 2. restores private writable copies of the two isolated Schelk virgin volumes;
-3. checks out the exact Tempo revision and txgen commit
-   `a2b149bccb16e7860eb51db1e95f6131821947ae`, then builds Tempo and Zone
+3. checks out the exact Tempo revision and txgen commit configured in the
+   workflow, then builds Tempo and Zone
    binaries with the e2e benchmark's `profiling` profile and
    `-C target-cpu=native`;
 4. applies the pinned Tempo benchmark host tuning and invokes its cleanup hook
@@ -683,8 +683,11 @@ job:
    the nonzero outbox fee, creates the short-lived sender-auth map, confirms
    sponsored user approvals, and runs the measured
    deposit -> wait -> activity -> withdrawal -> wait scenario;
-8. for `deposit`, runs the independent preflight/generate/bench pipeline; and
-9. renders the JSON report into a Markdown results page on the workflow
+8. for `neobank-e2e`, checks out the exact revision in `contrib/bench/earn.lock`,
+   verifies the detached SHA, builds the external contracts with their own
+   Foundry configuration, and runs the private fixture flow;
+9. for `deposit`, runs the independent preflight/generate/bench pipeline; and
+10. renders the JSON report into a Markdown results page on the workflow
    overview, then uploads that page with the rendered non-secret assets,
    host/storage metadata, JSON reports, and node logs before stopping the nodes
    and restoring the benchmark volumes.
@@ -699,8 +702,11 @@ the other. The Schelk cache contains initialized Tempo L1 state only; every run
 still creates a new Zone, portal, fee configuration, bootstrap fixture, and
 Zone state.
 
-Tempo and txgen are fetched from public repositories at exact commits, so no
-dependency-access secret is required. No mnemonic, portal, chain ID, token,
+Tempo and txgen are fetched from public repositories at exact commits. The
+`neobank-e2e` phase also requires the `ZONES_BENCH_EARN_READ_TOKEN` Actions
+secret: a read-only credential with access to the pinned private contract
+repository and its submodules. It is passed directly to checkout, never placed
+in argv, logs, or uploaded artifacts. No mnemonic, portal, chain ID, token,
 target ID, or RPC URL needs to be configured externally. A runner-local private
 mnemonic is generated once when its identity file does not exist. An operator
 may instead pre-provision the mode-0600
