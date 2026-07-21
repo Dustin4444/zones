@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alloy_consensus::crypto::secp256k1::recover_signer as recover_secp256k1_signer;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes, Signature, U256};
 use alloy_signer::SignerSync as _;
@@ -188,6 +189,13 @@ impl SigningRefusal {
     }
 }
 
+fn recover_attestation_signer(signature: &[u8], digest: B256, kind: &str) -> eyre::Result<Address> {
+    let signature = Signature::try_from(signature)
+        .map_err(|error| eyre::eyre!("invalid {kind} signature: {error}"))?;
+    recover_secp256k1_signer(&signature, digest)
+        .map_err(|error| eyre::eyre!("failed recovering {kind} signer: {error}"))
+}
+
 impl SignedBlockAck {
     pub fn sign(
         ack: BlockAck,
@@ -210,15 +218,11 @@ impl SignedBlockAck {
     }
 
     pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
-        let signature = Signature::try_from(self.signature.as_ref())
-            .map_err(|err| eyre::eyre!("invalid block ACK signature: {err}"))?;
-        eyre::ensure!(
-            signature.normalize_s().is_none(),
-            "block ACK signature has a non-canonical high-s value"
-        );
-        signature
-            .recover_address_from_prehash(&domain.block_ack_digest(&self.ack))
-            .map_err(|err| eyre::eyre!("failed recovering block ACK signer: {err}"))
+        recover_attestation_signer(
+            self.signature.as_ref(),
+            domain.block_ack_digest(&self.ack),
+            "block ACK",
+        )
     }
 }
 
@@ -245,15 +249,11 @@ impl SignedSettlementAttestation {
     }
 
     pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
-        let signature = Signature::try_from(self.signature.as_ref())
-            .map_err(|err| eyre::eyre!("invalid settlement signature: {err}"))?;
-        eyre::ensure!(
-            signature.normalize_s().is_none(),
-            "settlement signature has a non-canonical high-s value"
-        );
-        signature
-            .recover_address_from_prehash(&domain.settlement_digest(&self.attestation))
-            .map_err(|err| eyre::eyre!("failed recovering settlement signer: {err}"))
+        recover_attestation_signer(
+            self.signature.as_ref(),
+            domain.settlement_digest(&self.attestation),
+            "settlement",
+        )
     }
 }
 
@@ -280,15 +280,11 @@ impl SignedSigningRefusal {
     }
 
     pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
-        let signature = Signature::try_from(self.signature.as_ref())
-            .map_err(|err| eyre::eyre!("invalid signing refusal signature: {err}"))?;
-        eyre::ensure!(
-            signature.normalize_s().is_none(),
-            "signing refusal has a non-canonical high-s signature"
-        );
-        signature
-            .recover_address_from_prehash(&domain.signing_refusal_digest(&self.refusal))
-            .map_err(|err| eyre::eyre!("failed recovering signing refusal signer: {err}"))
+        recover_attestation_signer(
+            self.signature.as_ref(),
+            domain.signing_refusal_digest(&self.refusal),
+            "signing refusal",
+        )
     }
 }
 
