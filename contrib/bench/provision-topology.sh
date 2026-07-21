@@ -640,6 +640,14 @@ provision_up() {
     # The pinned Reth revision predates the retained-branch pruning fix. Its
     # default sparse-trie pruning can make a multi-transaction Zone payload
     # disagree with the root obtained during final validation.
+    local -a zone_engine_args=(--engine.disable-sparse-trie-cache-pruning)
+    if [[ "${ZONES_DEBUG_REENABLE_SPARSE_TRIE_PRUNING:-}" == 1 ]]; then
+        # Diagnostic-only: reproduce the historic root-cache condition. Never
+        # enable this in a benchmark or production topology.
+        zone_engine_args=()
+        echo "state-root diagnostic: sparse trie cache pruning intentionally enabled"
+    fi
+
     local -a zone_debug_args=()
     if [[ "${ZONES_DEBUG_RACE_NEW_PAYLOAD:-}" == 1 ]]; then
         # The witness hook saves the builder and validator bundles only when the
@@ -660,7 +668,7 @@ provision_up() {
         --private-rpc.port 8544 \
         --log.file.directory "$log_dir/zone" \
         --ipcdisable \
-        --engine.disable-sparse-trie-cache-pruning \
+        "${zone_engine_args[@]}" \
         "${zone_debug_args[@]}" \
         --sequencer
     unset SEQUENCER_KEY sequencer_key owner_key admin_key
