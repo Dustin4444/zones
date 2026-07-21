@@ -307,23 +307,6 @@ fn install_reference_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre
 /// without a running L1. The L1Subscriber will fail and retry in the background.
 const DUMMY_L1_URL: &str = "http://127.0.0.1:1";
 
-/// Seed the local test policy cache with the default pathUSD transfer policy.
-///
-/// Self-contained zone tests boot without a real L1, so startup can't resolve the
-/// token's `transferPolicyId` via RPC. pathUSD defaults to builtin policy `1`
-/// (allow all), and local tests rely on that behavior for outbox `transferFrom`
-/// flows.
-fn seed_local_policy_cache(policy_cache: &zone_l1::PolicyCache) {
-    const LOCAL_POLICY_CACHE_SEED_BLOCK: u64 = 1;
-
-    policy_cache.set_last_l1_block(LOCAL_POLICY_CACHE_SEED_BLOCK);
-    policy_cache.write().set_token_policy(
-        PATH_USD_ADDRESS,
-        LOCAL_POLICY_CACHE_SEED_BLOCK,
-        ALLOW_ALL_POLICY_ID,
-    );
-}
-
 // TODO(rusowsky): Remove once Tempo L1 stores transfer policy IDs in the TIP403 precompile.
 fn pack_transfer_policy_id(policy_id: u64) -> U256 {
     U256::from(policy_id) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8)
@@ -508,7 +491,6 @@ pub(crate) struct ZoneTestNode {
     http_url: url::Url,
     deposit_queue: DepositQueue,
     l1_state_cache: L1StateCache,
-    policy_cache: zone_l1::PolicyCache,
     rpc_api_factory: Arc<RpcApiFactory>,
     node_handle: Box<dyn TestNodeHandle>,
     _tasks: Runtime,
@@ -535,11 +517,6 @@ impl ZoneTestNode {
     /// Returns a handle to the L1 state cache for seeding precompile data.
     pub(crate) fn l1_state_cache(&self) -> &L1StateCache {
         &self.l1_state_cache
-    }
-
-    /// Returns a handle to the policy cache for TIP-403 authorization.
-    pub(crate) fn policy_cache(&self) -> &zone_l1::PolicyCache {
-        &self.policy_cache
     }
 
     /// Builds the real private RPC API backed by the node's EthHandlers.
@@ -739,15 +716,12 @@ impl ZoneTestNode {
         .await
     }
 
-    /// Start a zone node connected to a real L1, anchoring genesis to a specific
-    /// L1 block and optionally overriding the initial token list used for
-    /// startup policy cache seeding.
-    pub(crate) async fn start_from_l1_at_block_with_initial_tokens(
+    /// Start a zone node connected to a real L1, anchoring genesis to a specific L1 block.
+    pub(crate) async fn start_from_l1_at_block(
         l1_http_url: &url::Url,
         l1_ws_url: &url::Url,
         portal_address: Address,
         block_number: u64,
-        initial_tokens: Option<Vec<Address>>,
     ) -> eyre::Result<Self> {
         let (genesis, genesis_block_number) =
             build_l1_anchored_genesis_at_block(l1_http_url, portal_address, block_number).await?;
@@ -761,7 +735,6 @@ impl ZoneTestNode {
             Some(genesis),
             signer,
             8,
-            initial_tokens,
             None,
             true,
         )
@@ -786,7 +759,6 @@ impl ZoneTestNode {
             Some(genesis),
             signer,
             withdrawal_batch_interval_blocks,
-            Some(vec![]),
             None,
             true,
         )
@@ -862,7 +834,6 @@ impl ZoneTestNode {
             None,
             signer,
             8,
-            Some(vec![]),
             Some(p2p_config),
             true,
         )
@@ -905,7 +876,6 @@ impl ZoneTestNode {
             custom_genesis,
             sequencer_signer,
             8,
-            Some(vec![]),
             None,
             true,
         )
@@ -921,13 +891,11 @@ impl ZoneTestNode {
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
         withdrawal_batch_interval_blocks: u64,
-        initial_tokens: Option<Vec<Address>>,
         p2p_config: Option<P2pConfig>,
         spawn_engine: bool,
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
-        let l1_provider_url = l1_ws_url.clone();
 
         let mut genesis = custom_genesis.unwrap_or_else(|| {
             serde_json::from_str(zone_node::genesis::GENESIS_TEMPLATE_JSON)
@@ -948,9 +916,6 @@ impl ZoneTestNode {
             zone_node = zone_node
                 .with_l1_chain_id(1337)
                 .with_l1_state_provider_retry_limits(0, NonZeroU32::MIN);
-        }
-        if let Some(initial_tokens) = initial_tokens {
-            zone_node = zone_node.with_initial_tokens(initial_tokens);
         }
         let p2p_enabled = p2p_config.is_some();
         if let Some(p2p_config) = p2p_config {
@@ -979,9 +944,7 @@ impl ZoneTestNode {
 
         let deposit_queue = zone_node.deposit_queue();
         let l1_state_cache = zone_node.l1_state_cache();
-        let policy_cache = zone_node.policy_cache();
         if is_local_dummy_l1 {
-            seed_local_policy_cache(&policy_cache);
             let mut cache = l1_state_cache.write();
             seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         }
@@ -993,15 +956,6 @@ impl ZoneTestNode {
             .await?;
 
         if spawn_engine {
-            let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-                .connect(&l1_provider_url)
-                .await?
-                .erased();
-            let policy_provider = zone_l1::PolicyProvider::new(
-                policy_cache.clone(),
-                l1_provider,
-                tokio::runtime::Handle::current(),
-            );
             let provider = node_handle.node.provider();
             let last_header = provider
                 .sealed_header(provider.best_block_number()?)?
@@ -1015,7 +969,6 @@ impl ZoneTestNode {
                 sequencer_signer.address(),
                 SecretKey::from(sequencer_signer.credential()),
                 portal_address,
-                policy_provider,
             );
             node_handle
                 .node
@@ -1049,7 +1002,6 @@ impl ZoneTestNode {
             deposit_queue,
             http_url,
             l1_state_cache,
-            policy_cache,
             rpc_api_factory,
             node_handle: Box::new(node_handle),
             _tasks: tasks,
@@ -2707,10 +2659,6 @@ pub(crate) async fn start_local_zone_with_fixture(
     let zone = ZoneTestNode::start_local().await?;
     let fixture = L1Fixture::new();
 
-    // Local tests have no real L1, so the RPC fallback in resolve_transfer_policy_id
-    // fails. Seed pathUSD with the default allow-all policy (mirrors L1 default).
-    seed_local_policy_cache(zone.policy_cache());
-
     fixture.seed_l1_cache(
         zone.l1_state_cache(),
         Address::ZERO,
@@ -2842,7 +2790,6 @@ pub(crate) async fn start_local_p2p_pair(
         Some(genesis.clone()),
         signer.clone(),
         8,
-        Some(vec![]),
         Some(configs.remove(0)),
         true,
     )
@@ -2855,7 +2802,6 @@ pub(crate) async fn start_local_p2p_pair(
         Some(genesis),
         signer,
         8,
-        Some(vec![]),
         Some(configs.remove(0)),
         false,
     )
@@ -2863,7 +2809,6 @@ pub(crate) async fn start_local_p2p_pair(
 
     let fixture = L1Fixture::new();
     for zone in [&leader, &follower] {
-        seed_local_policy_cache(zone.policy_cache());
         fixture.seed_l1_cache(
             zone.l1_state_cache(),
             Address::ZERO,
@@ -3732,6 +3677,9 @@ impl L1Fixture {
             );
         }
 
+        // System transactions resolve their zero-address fee token before execution. Keep that
+        // synthetic token permissive in RPC-free fixtures, matching the old policy-provider stub.
+        seed_raw_tip20_policy_id(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip20_policy_id(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         cache.update_anchor(NumHash {
             number: num_blocks,
@@ -3824,6 +3772,14 @@ impl L1Fixture {
         self.next_timestamp += 1; // 1s per L1 block
         self.extend_cache_coverage(number);
 
+        // Synthetic injection bypasses the subscriber, so publish the same verified-receipt
+        // coverage the subscriber would publish before the engine consumes this block.
+        for cache in self.caches.lock().unwrap().iter() {
+            cache
+                .write()
+                .update_anchor(NumHash::new(number, self.last_hash));
+        }
+
         header
     }
 
@@ -3846,7 +3802,7 @@ impl L1Fixture {
         self.seed_regular_deposit_policy_state(block.header.inner.number, &deposits);
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
-        queue.enqueue(block.header.clone(), events, vec![]);
+        queue.enqueue(block.header.clone(), events);
     }
 
     /// Enqueue a pre-built block into a deposit queue with full portal events.
@@ -3864,7 +3820,7 @@ impl L1Fixture {
                     .expect("event receive-policy fixture seed must be admitted");
             }
         }
-        queue.enqueue(block.header.clone(), events, vec![]);
+        queue.enqueue(block.header.clone(), events);
     }
 
     /// Create a [`Deposit`] for a specific L1 block.
@@ -3898,13 +3854,13 @@ impl L1Fixture {
             enabled_tokens: tokens,
             ..Default::default()
         };
-        queue.enqueue(header, events, vec![]);
+        queue.enqueue(header, events);
     }
 
     /// Inject an empty L1 block (no deposits) into the queue.
     pub(crate) fn inject_empty_block(&mut self, queue: &DepositQueue) {
         let header = self.next_header();
-        queue.enqueue(header, L1PortalEvents::default(), vec![]);
+        queue.enqueue(header, L1PortalEvents::default());
     }
 
     /// Inject `n` empty L1 blocks (no deposits) into the queue.
@@ -3920,7 +3876,7 @@ impl L1Fixture {
         self.seed_regular_deposit_policy_state(header.inner.number, &deposits);
         let l1_deposits = deposits.into_iter().map(L1Deposit::Regular).collect();
         let events = L1PortalEvents::from_deposits(l1_deposits);
-        queue.enqueue(header, events, vec![]);
+        queue.enqueue(header, events);
     }
 
     /// Inject an L1 block with mixed regular and encrypted deposits.
@@ -3928,7 +3884,7 @@ impl L1Fixture {
     pub(crate) fn inject_l1_deposits(&mut self, queue: &DepositQueue, deposits: Vec<L1Deposit>) {
         let header = self.next_header();
         let events = L1PortalEvents::from_deposits(deposits);
-        queue.enqueue(header, events, vec![]);
+        queue.enqueue(header, events);
     }
 
     /// Create an [`EncryptedDeposit`] for testing with dummy ECIES parameters.
