@@ -554,6 +554,17 @@ impl L1Subscriber {
             }
         }
 
+        // TokenEnabled is emitted by the portal, but enabling a token changes which L1 TIP-20
+        // state is consensus-relevant to the zone. Invalidate the token address itself so a
+        // value cached before the deterministic TIP-20 address was created cannot be inherited
+        // past enablement.
+        invalidated.extend(
+            portal_events
+                .enabled_tokens
+                .iter()
+                .map(|enabled| enabled.token),
+        );
+
         self.record_portal_event_metrics(&portal_events);
         (portal_events, invalidated)
     }
