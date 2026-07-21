@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { Withdrawal, ZONE_FACTORY_ADDRESS, ZONE_TX_CONTEXT } from "../src/interfaces/IZone.sol";
-import { EIP2935 } from "../src/libraries/BlockHashHistory.sol";
-import { Verifier } from "../src/tempo/Verifier.sol";
-import { ZoneFactory } from "../src/tempo/ZoneFactory.sol";
-import { ZoneMessenger } from "../src/tempo/ZoneMessenger.sol";
-import { MockZoneGateway } from "./mocks/MockZoneGateway.sol";
-import { MockZoneTxContext } from "./mocks/MockZoneTxContext.sol";
-import { Test, console } from "forge-std/Test.sol";
-import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
-import { IAccountKeychain } from "tempo-std/interfaces/IAccountKeychain.sol";
-import { IFeeManager } from "tempo-std/interfaces/IFeeManager.sol";
-import { INonce } from "tempo-std/interfaces/INonce.sol";
-import { IStablecoinDEX } from "tempo-std/interfaces/IStablecoinDEX.sol";
-import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
-import { ITIP20Token } from "tempo-std/interfaces/ITIP20.sol";
-import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
-import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
-import { IValidatorConfig } from "tempo-std/interfaces/IValidatorConfig.sol";
+import {Role, Withdrawal, ZONE_FACTORY_ADDRESS, ZONE_TX_CONTEXT} from "../src/interfaces/IZone.sol";
+import {EIP2935} from "../src/libraries/BlockHashHistory.sol";
+import {Verifier} from "../src/tempo/Verifier.sol";
+import {ZoneFactory} from "../src/tempo/ZoneFactory.sol";
+import {ZoneMessenger} from "../src/tempo/ZoneMessenger.sol";
+import {MockZoneGateway} from "./mocks/MockZoneGateway.sol";
+import {MockZoneTxContext} from "./mocks/MockZoneTxContext.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {StdPrecompiles} from "tempo-std/StdPrecompiles.sol";
+import {IAccountKeychain} from "tempo-std/interfaces/IAccountKeychain.sol";
+import {IFeeManager} from "tempo-std/interfaces/IFeeManager.sol";
+import {INonce} from "tempo-std/interfaces/INonce.sol";
+import {IStablecoinDEX} from "tempo-std/interfaces/IStablecoinDEX.sol";
+import {ITIP20} from "tempo-std/interfaces/ITIP20.sol";
+import {ITIP20Token} from "tempo-std/interfaces/ITIP20.sol";
+import {ITIP20Factory} from "tempo-std/interfaces/ITIP20Factory.sol";
+import {ITIP403Registry} from "tempo-std/interfaces/ITIP403Registry.sol";
+import {IValidatorConfig} from "tempo-std/interfaces/IValidatorConfig.sol";
 
 /// @notice Base test framework for all spec tests
 /// pathUSD is just a TIP20 at a special address (0x20C0...) with token_id=0
 contract BaseTest is Test {
-
     // Registry precompiles
     address internal constant _ACCOUNT_KEYCHAIN = StdPrecompiles.ACCOUNT_KEYCHAIN_ADDRESS;
     address internal constant _TIP403REGISTRY = StdPrecompiles.TIP403_REGISTRY_ADDRESS;
@@ -124,16 +123,10 @@ contract BaseTest is Test {
         );
         vm.store(_PATH_USD, tempoAdminRoleSlot, bytes32(uint256(1)));
 
-        token1 = ITIP20Token(
-            factory.createToken(
-                "TOKEN1", "T1", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token1")
-            )
-        );
-        token2 = ITIP20Token(
-            factory.createToken(
-                "TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")
-            )
-        );
+        token1 =
+            ITIP20Token(factory.createToken("TOKEN1", "T1", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token1")));
+        token2 =
+            ITIP20Token(factory.createToken("TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")));
 
         zoneGateway = new MockZoneGateway();
     }
@@ -160,32 +153,17 @@ contract BaseTest is Test {
         vm.etch(ZONE_FACTORY_ADDRESS, type(ZoneFactory).runtimeCode);
         vm.setNonce(ZONE_FACTORY_ADDRESS, 3);
         vm.store(ZONE_FACTORY_ADDRESS, bytes32(uint256(0)), bytes32(uint256(1)));
-        vm.store(
-            ZONE_FACTORY_ADDRESS,
-            keccak256(abi.encode(address(verifier), uint256(3))),
-            bytes32(uint256(1))
-        );
-        vm.store(
-            ZONE_FACTORY_ADDRESS, bytes32(uint256(4)), bytes32(uint256(uint160(address(verifier))))
-        );
-        vm.store(
-            ZONE_FACTORY_ADDRESS, bytes32(uint256(5)), bytes32(uint256(uint160(address(messenger))))
-        );
-        vm.store(
-            ZONE_FACTORY_ADDRESS, bytes32(uint256(6)), bytes32(uint256(uint160(address(this))))
-        );
+        vm.store(ZONE_FACTORY_ADDRESS, keccak256(abi.encode(address(verifier), uint256(3))), bytes32(uint256(1)));
+        vm.store(ZONE_FACTORY_ADDRESS, bytes32(uint256(4)), bytes32(uint256(uint160(address(verifier)))));
+        vm.store(ZONE_FACTORY_ADDRESS, bytes32(uint256(5)), bytes32(uint256(uint160(address(messenger)))));
+        vm.store(ZONE_FACTORY_ADDRESS, bytes32(uint256(6)), bytes32(uint256(uint160(address(this)))));
         vm.store(ZONE_FACTORY_ADDRESS, bytes32(uint256(7)), bytes32(uint256(3)));
 
         zoneFactory = ZoneFactory(ZONE_FACTORY_ADDRESS);
     }
 
-    function _singleWithdrawal(Withdrawal memory withdrawal)
-        internal
-        pure
-        returns (Withdrawal[] memory withdrawals)
-    {
+    function _singleWithdrawal(Withdrawal memory withdrawal) internal pure returns (Withdrawal[] memory withdrawals) {
         withdrawals = new Withdrawal[](1);
         withdrawals[0] = withdrawal;
     }
-
 }
