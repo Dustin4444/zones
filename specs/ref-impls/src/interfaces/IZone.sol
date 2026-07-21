@@ -8,6 +8,13 @@ address constant ZONE_PORTAL_IMPL_ADDRESS = 0x5AD1000000000000000000000000000000
 address constant ZONE_VERIFIER_ADDRESS = 0x5a56000000000000000000000000000000000000;
 address constant ZONE_MESSENGER_ADDRESS = 0x5A4d000000000000000000000000000000000000;
 
+/// @notice Mutually exclusive authorization role assigned to a Tempo account.
+enum Role {
+    None,
+    Account,
+    CallbackGateway
+}
+
 /// @title IZoneToken
 /// @notice Interface for the zone's zone token (TIP-20 with mint/burn for system)
 interface IZoneToken {

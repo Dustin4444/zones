@@ -14,6 +14,11 @@ crate::sol! {
     #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
     contract ZonePortal {
         // -- Shared types --
+        enum Role {
+            None,
+            Account,
+            CallbackGateway
+        }
 
         struct Withdrawal {
             address token;
@@ -148,8 +153,7 @@ crate::sol! {
             address indexed newAdmin
         );
 
-        event ZoneGatewayUpdated(address indexed gateway, bool enabled);
-        event AllowedAccountUpdated(address indexed account, bool enabled);
+        event RoleUpdated(address indexed account, Role prev, Role next);
 
         // -- Errors --
 

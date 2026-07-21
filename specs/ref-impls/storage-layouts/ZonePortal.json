@@ -105,7 +105,7 @@
       "type": "t_mapping(t_address,t_mapping(t_address,t_uint128))"
     },
     {
-      "astId": 5102,
+      "astId": 5083,
       "contract": "src/tempo/ZonePortal.sol:ZonePortal",
       "label": "_withdrawalQueue",
       "offset": 0,
@@ -237,12 +237,17 @@
       "label": "bytes32",
       "numberOfBytes": "32"
     },
-    "t_mapping(t_address,t_bool)": {
+    "t_enum(Role)2466": {
+      "encoding": "inplace",
+      "label": "enum Role",
+      "numberOfBytes": "1"
+    },
+    "t_mapping(t_address,t_enum(Role)2466)": {
       "encoding": "mapping",
       "key": "t_address",
-      "label": "mapping(address => bool)",
+      "label": "mapping(address => enum Role)",
       "numberOfBytes": "32",
-      "value": "t_bool"
+      "value": "t_enum(Role)2466"
     },
     "t_mapping(t_address,t_mapping(t_address,t_uint128))": {
       "encoding": "mapping",

@@ -4,7 +4,6 @@ pragma solidity ^0.8.13;
 import {
     IZoneConfig,
     IZonePortal,
-    PORTAL_ALLOWED_ACCOUNT_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT

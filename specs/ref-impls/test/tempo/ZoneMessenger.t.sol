@@ -228,8 +228,8 @@ contract ZoneMessengerTest is BaseTest {
         AcceptingWithdrawalReceiver receiver = new AcceptingWithdrawalReceiver();
         vm.mockCall(
             portal,
-            abi.encodeWithSelector(IZonePortal.zoneGateway.selector, address(receiver)),
-            abi.encode(false)
+            abi.encodeWithSelector(IZonePortal.role.selector, address(receiver)),
+            abi.encode(Role.None)
         );
 
         vm.prank(portal);

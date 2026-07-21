@@ -19,7 +19,6 @@ import {
     IZoneMessenger,
     IZonePortal,
     PORTAL_ADMIN_SLOT,
-    PORTAL_ALLOWED_ACCOUNT_SLOT,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
@@ -989,7 +988,7 @@ contract ZonePortalTest is BaseTest {
 
     function test_deposit_allowsUnlistedZoneRecipient() public {
         address outsider = makeAddr("outsider");
-        assertFalse(portal.allowedAccount(outsider));
+        assertEq(uint8(portal.role(outsider)), uint8(Role.None));
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1);
@@ -1828,7 +1827,7 @@ contract ZonePortalTest is BaseTest {
 
     function test_zoneGateway_rejectsWhenNoLongerRegistered() public {
         vm.prank(admin);
-        portal.setZoneGateway(address(zoneGateway), false);
+        portal.setRole(address(zoneGateway), Role.None);
 
         vm.prank(address(messenger));
         vm.expectRevert(MockZoneGateway.UnregisteredGateway.selector);
@@ -1921,7 +1920,7 @@ contract ZonePortalTest is BaseTest {
     function test_callbackWithdrawal_returnsFundsAndChangesDepositQueue() public {
         uint128 amount = 500e6;
         _fundCallbackWithdrawal(amount);
-        assertFalse(portal.allowedAccount(address(zoneGateway)));
+        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.None));
 
         Withdrawal memory withdrawal = _withdrawal(
             address(pathUSD),
@@ -2018,7 +2017,7 @@ contract ZonePortalTest is BaseTest {
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
         uint256 bobBalanceBefore = pathUSD.balanceOf(bob);
         vm.prank(admin);
-        portal.setAllowedAccount(bob, false);
+        portal.setRole(bob, Role.None);
 
         portal.processWithdrawals(_singleWithdrawal(withdrawal), bytes32(0));
 
@@ -2044,7 +2043,7 @@ contract ZonePortalTest is BaseTest {
         _enqueueWithdrawal(withdrawal);
         bytes32 depositHashBefore = portal.currentDepositQueueHash();
         vm.prank(admin);
-        portal.setZoneGateway(address(zoneGateway), false);
+        portal.setRole(address(zoneGateway), Role.None);
 
         portal.processWithdrawals(_singleWithdrawal(withdrawal), bytes32(0));
 
@@ -2071,7 +2070,7 @@ contract ZonePortalTest is BaseTest {
         });
         _enqueueWithdrawal(withdrawal);
         vm.prank(admin);
-        portal.setAllowedAccount(alice, false);
+        portal.setRole(alice, Role.None);
 
         portal.processWithdrawals(_singleWithdrawal(withdrawal), bytes32(0));
 
@@ -2082,7 +2081,7 @@ contract ZonePortalTest is BaseTest {
         portal.claimRefund(address(pathUSD));
 
         vm.prank(admin);
-        portal.setAllowedAccount(alice, true);
+        portal.setRole(alice, Role.Account);
         vm.prank(alice);
         assertEq(portal.claimRefund(address(pathUSD)), amount);
     }
