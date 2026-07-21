@@ -646,11 +646,12 @@ jobs:
           if [ -d "$witness_dir" ]; then
             output_dir=target/zones-benchmark/invalid-block-diagnostics
             mkdir -p "$output_dir"
-            find "$witness_dir" -maxdepth 1 -type f \( \
-              -name '*.bundle_state.original.json' -o \
-              -name '*.bundle_state.re_executed.json' -o \
-              -name '*.bundle_state.diff' \
-            \) -exec cp --target-directory="$output_dir" -- {} +
+            # Preserve the hook's full, receipt-independent root evidence.  This
+            # diagnostic branch intentionally runs the historical implementation;
+            # the files are needed to compare the builder header, the fresh
+            # re-execution and the witness trie, not merely bundle-state output.
+            find "$witness_dir" -maxdepth 1 -type f -exec \
+              cp --target-directory="$output_dir" -- {} +
           fi
 
       - name: Upload specs, logs, and reports
