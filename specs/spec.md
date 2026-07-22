@@ -77,6 +77,7 @@
     - [Proof Requirements](#proof-requirements)
   - [Zone Precompiles](#zone-precompiles)
     - [TIP-20 Token Precompile](#tip-20-token-precompile)
+    - [Zone Fee Manager](#zone-fee-manager)
     - [Chaum-Pedersen Verify](#chaum-pedersen-verify)
     - [AES-GCM Decrypt](#aes-gcm-decrypt)
   - [Contracts and Interfaces](#contracts-and-interfaces)
@@ -239,7 +240,7 @@ A zone is created via `ZoneFactory.createZone(...)` on Tempo with the following 
 
 The factory assigns a unique `zoneId`, deploys a [`ZonePortal`](#izoneportal), initializes it with the shared [`ZoneMessenger`](#izonemessenger), and enables the initial token. The portal's `blockHash` is initialized to zero. Neither the zone genesis block hash nor an initial Tempo block hash or number is supplied at deployment: the zone genesis hash depends on the newly assigned `zoneId` through its chain ID, and anchoring zone creation to a Tempo block in the same transaction would create a circular dependency. The [`ZoneCreated`](#izonefactory) event emits the zone deployment parameters.
 
-The first accepted proof bootstraps the portal from `blockHash == 0` to the last block hash of the first batch, which must start with the zone genesis block. The state transition function constructs the predefined genesis block for the assigned `zoneId` and rejects any other first block. All genesis fields are identical across zones except the chain ID.
+The first accepted proof bootstraps the portal from `blockHash == 0` to the last block hash of the first batch, which must start with the zone genesis block. The state transition function constructs the predefined genesis block for the assigned `zoneId` and rejects any other first block. The genesis state stores `initialToken` as the zone's default fee token; genesis otherwise differs across zones only by chain ID.
 
 ### Chain ID
 
@@ -739,7 +740,11 @@ Sequencer encryption keys are already published (used for encrypted deposits), s
 
 ### Fee Accounting
 
-Zone transactions specify which enabled TIP-20 token to use for gas fees via a `feeToken` field. The sequencer accepts all enabled tokens as gas. Transactions use Tempo transaction semantics for fee payer, max fee per gas, and gas limit.
+Zone transactions may specify which enabled TIP-20 token to use for gas fees via a `feeToken` field. If the field is omitted, the [`ZoneFeeManager`](#zone-fee-manager) uses the portal's creation-time `initialToken`, stored in zone genesis state, as the default. The sequencer accepts all enabled tokens as gas. Transactions use Tempo transaction semantics for fee payer, max fee per gas, and gas limit.
+
+Before transaction execution, `ZoneFeeManager` transfers the maximum possible fee from the fee payer into escrow in the selected token. After execution, it refunds unused gas to the fee payer and records the actual fee under `(block beneficiary, fee token)`. The block beneficiary is the registered sequencer.
+
+Zones do not store user or validator fee-token preferences and do not route fees through the FeeAMM. Each transaction settles directly in its selected token. Accrued fees remain in `ZoneFeeManager` custody until the beneficiary calls `distributeFees(beneficiary, token)`, which transfers that beneficiary's full accrued balance for the token and resets the recorded balance to zero. Only the beneficiary may read or distribute its accrued fees.
 
 ### Block Structure
 
@@ -1425,7 +1430,7 @@ For the first proof, requirement 1 specifically means a transition from `prevBlo
 
 ## Zone Precompiles
 
-Zones have three categories of precompiles: TIP-20 token precompiles (one per enabled token) and two cryptographic precompiles for encrypted deposit verification.
+Zones have TIP-20 token precompiles (one per enabled token), a zone-native fee-manager precompile, and two cryptographic precompiles for encrypted deposit verification.
 
 ### TIP-20 Token Precompile
 
@@ -1434,6 +1439,31 @@ Each enabled TIP-20 token is deployed as a precompile at the same address as on 
 - `balanceOf` and `allowance` are restricted to the account owner (or sequencer).
 - Transfer-family operations (`transfer`, `transferFrom`, `approve`) charge a fixed 100,000 gas.
 - `mint` is restricted to `ZoneInbox`, `burn` is restricted to `ZoneOutbox`.
+
+### Zone Fee Manager
+
+| | |
+|---|---|
+| **Address** | `0xfeec000000000000000000000000000000000000` |
+
+```solidity
+interface IZoneFeeManager {
+    event FeesDistributed(
+        address indexed beneficiary,
+        address indexed token,
+        uint256 amount
+    );
+
+    function collectedFees(address beneficiary, address token)
+        external view returns (uint256);
+
+    function distributeFees(address beneficiary, address token) external;
+}
+```
+
+`ZoneFeeManager` replaces Tempo's `TipFeeManager` at the canonical fee-manager address. It escrows the selected TIP-20 fee token before execution, refunds unused gas afterward, and accrues the actual fee by beneficiary and token. It does not implement token preferences, liquidity pools, or FeeAMM routing.
+
+The default fee token is initialized in genesis from the portal's creation-time `initialToken` and is used only when a transaction omits `feeToken`. Both `collectedFees` and `distributeFees` require `msg.sender == beneficiary`; unauthorized calls revert. `distributeFees` transfers the beneficiary's entire accrued balance for the requested token, clears the balance, and emits `FeesDistributed`. A zero balance is a no-op.
 
 ### Chaum-Pedersen Verify
 
