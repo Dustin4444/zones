@@ -108,6 +108,11 @@ left `null` instead of guessed and the summary's receipt-coverage count exposes 
 gas price, allocation numerator/denominator, PATHUSD charges, transaction hashes, and block numbers
 remain in the ledger for audit.
 
+Artifacts produced before fee-reserve batch attribution and zero-address system-transaction
+filtering were added can be audited with `pnpm reconcile <artifact-directory>`. The command writes
+`cost-ledger-corrected.csv`, `detailed-summary.json`, and Markdown cost/latency tables without
+overwriting the raw ledger. New runs include those accounting rules directly in `cost-ledger.csv`.
+
 ## Prepare 1,000 distinct users
 
 The live EarnToken uses a TIP-403 compound policy whose recipient and mint-recipient component is a

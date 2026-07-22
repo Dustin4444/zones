@@ -8,6 +8,7 @@ import {
   getAddress,
   http,
   parseAbi,
+  zeroAddress,
   zeroHash,
   type Address,
   type Hex,
@@ -1183,6 +1184,17 @@ async function collectBatchLedger(
     }
   })
   const components = journeys.flatMap((journey) => [
+    ...(journey.feeFunding
+      ? [
+          {
+            userIndex: journey.userIndex,
+            address: journey.address,
+            useCase: 'setup',
+            kind: 'deposit',
+            value: BigInt(journey.feeFunding.depositNumber),
+          } as const,
+        ]
+      : []),
     { userIndex: journey.userIndex, address: journey.address, useCase: 'payout', kind: 'deposit', value: BigInt(journey.payout.depositNumber) },
     { userIndex: journey.userIndex, address: journey.address, useCase: 'earn', kind: 'zone', value: BigInt(journey.earn.zoneReceipt.blockNumber) },
     { userIndex: journey.userIndex, address: journey.address, useCase: 'earn', kind: 'deposit', value: BigInt(journey.earn.returnDeposit.number) },
@@ -1219,6 +1231,7 @@ async function collectBatchLedger(
       return (block.transactions as any[]).filter(
         (transaction) =>
           typeof transaction !== 'string' &&
+          String(transaction.from ?? '').toLowerCase() !== zeroAddress &&
           String(transaction.to ?? '').toLowerCase() !== ZONE_INBOX.toLowerCase(),
       ).length
     })
