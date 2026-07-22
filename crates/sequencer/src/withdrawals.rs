@@ -54,13 +54,13 @@ const PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS: u64 = 2_000_000;
 const MAX_WITHDRAWALS_PER_PROCESS_BATCH: usize = 64;
 
 /// Default gas budget for one `processWithdrawals` transaction.
-pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
+pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 30_000_000;
 
 /// Default maximum number of ordered withdrawal transactions kept in flight.
-pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 4;
+pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 12;
 
 /// Default aggregate gas budget across concurrently in-flight withdrawal transactions.
-pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS: u64 = 20_000_000;
+pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS: u64 = 60_000_000;
 #[cfg(test)]
 const MAX_PROCESS_WITHDRAWAL_TX_GAS: u64 =
     PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
