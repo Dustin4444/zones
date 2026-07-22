@@ -14,6 +14,7 @@ impl TempoPrecompile for ZoneFeeManager {
             return error;
         }
 
+        // Zone fee settlement is protocol-only, this precompile does not accept external calls.
         unknown_selector_result(calldata)
     }
 }
