@@ -10,11 +10,26 @@ use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, Bytes, TxKind};
 use alloy_sol_types::SolCall;
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::TempoTxEnvelope;
-use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZoneInbox};
+use tempo_contracts::precompiles::ITIP20;
+use tempo_primitives::{TempoTxEnvelope, is_tip20_prefix};
+use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox};
 use zone_primitives::constants::CONTRACT_DEPLOYER_ALLOWLIST;
 
 use crate::{auth::AuthContext, types::JsonRpcError};
+
+alloy_sol_types::sol! {
+    interface LegacyZoneOutboxWithdrawal {
+        function requestWithdrawal(
+            address token,
+            address to,
+            uint128 amount,
+            bytes32 memo,
+            uint64 gasLimit,
+            address fallbackRecipient,
+            bytes data
+        ) external;
+    }
+}
 
 /// Enforce all private RPC authorization rules for simulation-style requests.
 ///
@@ -140,10 +155,31 @@ fn zone_inbox_refunds_mismatched_owner(
     })
 }
 
-/// Decode a raw transaction and verify the recovered sender matches the
-/// authenticated caller. Returns `-32003 Transaction rejected` on mismatch.
-pub fn verify_raw_tx_sender(data: &[u8], auth: &AuthContext) -> Result<(), JsonRpcError> {
-    let tx = TempoTxEnvelope::decode_2718_exact(data)
+/// Raw transaction bytes that have passed private zone RPC authorization and call policy.
+///
+/// Construct with [`parse_authorized_raw_transaction`] so submission code cannot accidentally
+/// forward an unchecked transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedRawTransaction(Bytes);
+
+impl AuthorizedRawTransaction {
+    /// Recover the original encoded transaction after all RPC policy checks have passed.
+    pub fn into_inner(self) -> Bytes {
+        self.0
+    }
+}
+
+/// Decode and authorize a raw transaction for submission to a private zone.
+///
+/// The recovered sender must match the authenticated caller, every call in a Tempo AA batch is
+/// checked, and user transactions may not directly invoke protocol-only Inbox or Outbox methods.
+/// Direct TIP-20 calls are limited to `transferFrom` and `approve`; withdrawals remain available
+/// through both `ZoneOutbox.requestWithdrawal` overloads.
+pub fn parse_authorized_raw_transaction(
+    data: Bytes,
+    auth: &AuthContext,
+) -> Result<AuthorizedRawTransaction, JsonRpcError> {
+    let tx = TempoTxEnvelope::decode_2718_exact(&data)
         .map_err(|_| JsonRpcError::invalid_params("failed to decode transaction"))?;
 
     let sender = tx
@@ -154,22 +190,97 @@ pub fn verify_raw_tx_sender(data: &[u8], auth: &AuthContext) -> Result<(), JsonR
         return Err(JsonRpcError::transaction_rejected());
     }
 
-    Ok(())
+    parse_zone_user_transaction(&tx)?;
+
+    Ok(AuthorizedRawTransaction(data))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedZoneUserCall {
+    TransferFrom,
+    Approve,
+    RequestWithdrawal,
+    Other,
+}
+
+fn parse_zone_user_transaction(tx: &TempoTxEnvelope) -> Result<(), JsonRpcError> {
+    tx.calls()
+        .try_for_each(|(target, input)| parse_zone_user_call(target, input).map(drop))
+}
+
+fn parse_zone_user_call(target: TxKind, input: &Bytes) -> Result<ParsedZoneUserCall, JsonRpcError> {
+    let TxKind::Call(address) = target else {
+        return Ok(ParsedZoneUserCall::Other);
+    };
+
+    if address == ZONE_INBOX_ADDRESS && input.starts_with(&ZoneInbox::advanceTempoCall::SELECTOR) {
+        return Err(JsonRpcError::transaction_rejected());
+    }
+
+    if address == ZONE_OUTBOX_ADDRESS {
+        if input.starts_with(&LegacyZoneOutboxWithdrawal::requestWithdrawalCall::SELECTOR) {
+            LegacyZoneOutboxWithdrawal::requestWithdrawalCall::abi_decode(input)
+                .map_err(|_| JsonRpcError::transaction_rejected())?;
+            return Ok(ParsedZoneUserCall::RequestWithdrawal);
+        }
+
+        if input.starts_with(&ZoneOutbox::requestWithdrawalCall::SELECTOR) {
+            ZoneOutbox::requestWithdrawalCall::abi_decode(input)
+                .map_err(|_| JsonRpcError::transaction_rejected())?;
+            return Ok(ParsedZoneUserCall::RequestWithdrawal);
+        }
+
+        if input.starts_with(&ZoneOutbox::finalizeWithdrawalBatchCall::SELECTOR)
+            || input.starts_with(&ZoneOutbox::enqueueDepositBounceBackCall::SELECTOR)
+            || input.starts_with(&ZoneOutbox::consumeFallbackRecipientCall::SELECTOR)
+        {
+            return Err(JsonRpcError::transaction_rejected());
+        }
+
+        return Ok(ParsedZoneUserCall::Other);
+    }
+
+    if !is_tip20_prefix(address) {
+        return Ok(ParsedZoneUserCall::Other);
+    }
+
+    if input.starts_with(&ITIP20::transferFromCall::SELECTOR) {
+        ITIP20::transferFromCall::abi_decode(input)
+            .map_err(|_| JsonRpcError::transaction_rejected())?;
+        Ok(ParsedZoneUserCall::TransferFrom)
+    } else if input.starts_with(&ITIP20::approveCall::SELECTOR) {
+        ITIP20::approveCall::abi_decode(input).map_err(|_| JsonRpcError::transaction_rejected())?;
+        Ok(ParsedZoneUserCall::Approve)
+    } else {
+        Err(JsonRpcError::transaction_rejected())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, Bytes, TxKind, U256};
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_network::TxSignerSync;
+    use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256, address};
     use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
+    use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::SolCall;
     use tempo_alloy::rpc::TempoTransactionRequest;
-    use tempo_primitives::transaction::Call;
-    use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox};
+    use tempo_contracts::precompiles::ITIP20;
+    use tempo_primitives::transaction::{
+        AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
+    };
+    use tempo_zone_contracts::{
+        ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZoneOutbox,
+    };
 
     use super::{
-        enforce_contract_creation, enforce_contract_creation_with_allowlist,
-        zone_inbox_refunds_mismatched_owner,
+        AuthContext, LegacyZoneOutboxWithdrawal, ParsedZoneUserCall, enforce_contract_creation,
+        enforce_contract_creation_with_allowlist, parse_authorized_raw_transaction,
+        parse_zone_user_call, parse_zone_user_transaction, zone_inbox_refunds_mismatched_owner,
     };
+
+    const TOKEN: Address = address!("0x20C0000000000000000000000000000000000001");
 
     fn call_target(byte: u8) -> TxKind {
         TxKind::Call(Address::repeat_byte(byte))
@@ -201,6 +312,29 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    fn signed_raw_call(signer: &PrivateKeySigner, target: Address, input: Bytes) -> Bytes {
+        let mut tx = TxEip1559 {
+            chain_id: 1,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1,
+            to: target.into(),
+            input,
+            ..Default::default()
+        };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        TxEnvelope::Eip1559(tx.into_signed(signature))
+            .encoded_2718()
+            .into()
+    }
+
+    fn auth(caller: Address) -> AuthContext {
+        AuthContext {
+            caller,
+            expires_at: u64::MAX,
+            keychain_key_id: None,
         }
     }
 
@@ -316,5 +450,189 @@ mod tests {
         request.inner.to = Some(TxKind::Call(Address::repeat_byte(0x33)));
 
         assert_eq!(zone_inbox_refunds_mismatched_owner(&request, caller), None);
+    }
+
+    #[test]
+    fn parses_allowed_tip20_calls() {
+        let transfer = ITIP20::transferFromCall {
+            from: Address::repeat_byte(0x11),
+            to: Address::repeat_byte(0x22),
+            amount: U256::from(7),
+        };
+        let approve = ITIP20::approveCall {
+            spender: Address::repeat_byte(0x33),
+            amount: U256::from(9),
+        };
+
+        for (input, expected) in [
+            (
+                Bytes::from(transfer.abi_encode()),
+                ParsedZoneUserCall::TransferFrom,
+            ),
+            (
+                Bytes::from(approve.abi_encode()),
+                ParsedZoneUserCall::Approve,
+            ),
+        ] {
+            assert_eq!(
+                parse_zone_user_call(TxKind::Call(TOKEN), &input).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_disallowed_and_malformed_tip20_calls() {
+        let transfer = ITIP20::transferCall {
+            to: Address::repeat_byte(0x22),
+            amount: U256::from(7),
+        };
+
+        assert!(parse_zone_user_call(TxKind::Call(TOKEN), &transfer.abi_encode().into()).is_err());
+        assert!(
+            parse_zone_user_call(
+                TxKind::Call(TOKEN),
+                &ITIP20::approveCall::SELECTOR.to_vec().into(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_both_withdrawal_overloads() {
+        let seven_args = LegacyZoneOutboxWithdrawal::requestWithdrawalCall {
+            token: TOKEN,
+            to: Address::repeat_byte(0x22),
+            amount: 7,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: Address::repeat_byte(0x33),
+            data: Bytes::new(),
+        };
+        let eight_args = ZoneOutbox::requestWithdrawalCall {
+            token: TOKEN,
+            to: Address::repeat_byte(0x22),
+            amount: 7,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackRecipient: Address::repeat_byte(0x33),
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
+        };
+
+        for input in [seven_args.abi_encode(), eight_args.abi_encode()] {
+            assert_eq!(
+                parse_zone_user_call(TxKind::Call(ZONE_OUTBOX_ADDRESS), &input.into()).unwrap(),
+                ParsedZoneUserCall::RequestWithdrawal
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_protocol_only_inbox_and_outbox_calls() {
+        for (target, input) in [
+            (
+                ZONE_INBOX_ADDRESS,
+                ZoneInbox::advanceTempoCall::SELECTOR.to_vec(),
+            ),
+            (
+                ZONE_OUTBOX_ADDRESS,
+                ZoneOutbox::finalizeWithdrawalBatchCall::SELECTOR.to_vec(),
+            ),
+            (
+                ZONE_OUTBOX_ADDRESS,
+                ZoneOutbox::enqueueDepositBounceBackCall::SELECTOR.to_vec(),
+            ),
+            (
+                ZONE_OUTBOX_ADDRESS,
+                ZoneOutbox::consumeFallbackRecipientCall::SELECTOR.to_vec(),
+            ),
+        ] {
+            assert!(parse_zone_user_call(TxKind::Call(target), &input.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn allows_other_outbox_and_non_tip20_calls() {
+        assert_eq!(
+            parse_zone_user_call(
+                TxKind::Call(ZONE_OUTBOX_ADDRESS),
+                &ZoneOutbox::lastBatchCall::SELECTOR.to_vec().into(),
+            )
+            .unwrap(),
+            ParsedZoneUserCall::Other
+        );
+        assert_eq!(
+            parse_zone_user_call(TxKind::Call(Address::repeat_byte(0x1c)), &Bytes::new(),).unwrap(),
+            ParsedZoneUserCall::Other
+        );
+    }
+
+    #[test]
+    fn parses_every_call_in_an_aa_batch() {
+        let allowed = ITIP20::approveCall {
+            spender: Address::repeat_byte(0x33),
+            amount: U256::from(9),
+        };
+        let forbidden = ITIP20::mintCall {
+            to: Address::repeat_byte(0x44),
+            amount: U256::from(1),
+        };
+        let transaction = TempoTransaction {
+            calls: vec![
+                Call {
+                    to: TxKind::Call(TOKEN),
+                    value: U256::ZERO,
+                    input: allowed.abi_encode().into(),
+                },
+                Call {
+                    to: TxKind::Call(TOKEN),
+                    value: U256::ZERO,
+                    input: forbidden.abi_encode().into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let signature =
+            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(Signature::test_signature()));
+        let envelope = AASigned::new_unhashed(transaction, signature).into();
+
+        assert!(parse_zone_user_transaction(&envelope).is_err());
+    }
+
+    #[test]
+    fn parses_authorized_raw_transaction_once_for_submission() {
+        let signer = PrivateKeySigner::random();
+        let approve = ITIP20::approveCall {
+            spender: Address::repeat_byte(0x33),
+            amount: U256::from(9),
+        };
+        let raw = signed_raw_call(&signer, TOKEN, approve.abi_encode().into());
+
+        let authorized =
+            parse_authorized_raw_transaction(raw.clone(), &auth(signer.address())).unwrap();
+        assert_eq!(authorized.into_inner(), raw);
+    }
+
+    #[test]
+    fn raw_transaction_policy_rejects_sender_mismatch_and_disallowed_call() {
+        let signer = PrivateKeySigner::random();
+        let approve = ITIP20::approveCall {
+            spender: Address::repeat_byte(0x33),
+            amount: U256::from(9),
+        };
+        let raw = signed_raw_call(&signer, TOKEN, approve.abi_encode().into());
+        let error =
+            parse_authorized_raw_transaction(raw, &auth(PrivateKeySigner::random().address()))
+                .unwrap_err();
+        assert_eq!(error.code, -32003);
+
+        let transfer = ITIP20::transferCall {
+            to: Address::repeat_byte(0x22),
+            amount: U256::from(7),
+        };
+        let raw = signed_raw_call(&signer, TOKEN, transfer.abi_encode().into());
+        let error = parse_authorized_raw_transaction(raw, &auth(signer.address())).unwrap_err();
+        assert_eq!(error.code, -32003);
     }
 }

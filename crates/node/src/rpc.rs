@@ -131,9 +131,8 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
 ///   simulate from the authenticated account (`-32004` on mismatch,
 ///   auto-set when omitted); state overrides are rejected for
 ///   non-sequencer callers (`-32602`).
-/// - **Sender verification** — `eth_sendRawTransaction` checks that the
-///   recovered transaction sender matches the authenticated account
-///   (`-32003` on mismatch).
+/// - **Transaction authorization** — `eth_sendRawTransaction` checks that the recovered sender
+///   matches the authenticated account and rejects disallowed zone user calls (`-32003`).
 ///
 /// [`classify_method`]: zone_rpc::types::classify_method
 pub struct ZoneRpc<Api: EthApiTypes> {
@@ -661,7 +660,8 @@ where
 
     fn send_raw_transaction(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+            let data =
+                zone_rpc::policy::parse_authorized_raw_transaction(data, &auth)?.into_inner();
 
             let hash = EthTransactions::send_raw_transaction(&self.eth.api, data)
                 .await
@@ -672,7 +672,8 @@ where
 
     fn send_raw_transaction_sync(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+            let data =
+                zone_rpc::policy::parse_authorized_raw_transaction(data, &auth)?.into_inner();
 
             let mut receipt = EthTransactions::send_raw_transaction_sync(&self.eth.api, data, None)
                 .await

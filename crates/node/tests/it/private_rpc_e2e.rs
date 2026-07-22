@@ -13,9 +13,12 @@ use crate::utils::{
     start_zone_with_private_rpc_l1_with_encryption,
 };
 use alloy::{
-    primitives::{Address, B256, U256, address, hex},
+    primitives::{Address, B256, Bytes, U256, address, hex},
     signers::local::PrivateKeySigner,
 };
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_network::TxSignerSync;
 use alloy_provider::ProviderBuilder;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::SolCall;
@@ -48,6 +51,26 @@ fn corrupt_token_hex(token: &str) -> String {
 
 fn address_topic(address: Address) -> String {
     format!("{:#x}", B256::left_padding_from(address.as_slice()))
+}
+
+fn signed_raw_call(
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    target: Address,
+    input: Bytes,
+) -> Bytes {
+    let mut tx = TxEip1559 {
+        chain_id,
+        gas_limit: TIP20_TX_GAS,
+        max_fee_per_gas: TEMPO_T0_BASE_FEE as u128,
+        to: target.into(),
+        input,
+        ..Default::default()
+    };
+    let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+    TxEnvelope::Eip1559(tx.into_signed(signature))
+        .encoded_2718()
+        .into()
 }
 
 fn assert_filter_not_found_error(response: &serde_json::Value) {
@@ -381,6 +404,37 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
         403,
         "signature-type mismatch should return 403",
     );
+
+    Ok(())
+}
+
+/// Raw transaction submission enforces the zone user-call policy before entering the pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_raw_transaction_call_policy() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_private_rpc().await?;
+    let signer = PrivateKeySigner::random();
+    let transfer = ContractTip20::transferCall {
+        to: Address::repeat_byte(0x22),
+        amount: U256::from(7),
+    };
+    let raw = signed_raw_call(
+        &signer,
+        ctx.config.chain_id,
+        ZONE_TOKEN_ADDRESS,
+        transfer.abi_encode().into(),
+    );
+
+    let response = ctx
+        .call_as_user(
+            "eth_sendRawTransaction",
+            json!([format!("0x{}", hex::encode(raw))]),
+            &signer,
+        )
+        .await?;
+    assert_eq!(response["error"]["code"], -32003, "{response}");
+    assert_eq!(response["error"]["message"], "Transaction rejected");
 
     Ok(())
 }

@@ -130,14 +130,14 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
 
     /// `eth_sendRawTransaction(data)` — submits a signed transaction to the pool.
     ///
-    /// Verifies that the recovered tx sender matches the authenticated account;
-    /// rejects with `-32003` on mismatch.
+    /// Verifies that the recovered tx sender matches the authenticated account and that every
+    /// direct or batched call is permitted by zone user-transaction policy; rejects with `-32003`.
     fn send_raw_transaction(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_>;
 
     /// `eth_sendRawTransactionSync(data)` — submits a signed transaction and
     /// waits for inclusion, returning the receipt.
     ///
-    /// Same sender verification as [`send_raw_transaction`](Self::send_raw_transaction).
+    /// Same transaction authorization as [`send_raw_transaction`](Self::send_raw_transaction).
     fn send_raw_transaction_sync(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_>;
 
     /// `eth_fillTransaction(request)` — fills defaults on an unsigned transaction
