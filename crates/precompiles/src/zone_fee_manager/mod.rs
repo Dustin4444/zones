@@ -1,20 +1,17 @@
 //! Zone-native fee custody without token preferences or FeeAMM routing.
 
+mod dispatch;
+
 use alloy_primitives::{Address, IntoLogData, U256};
-use alloy_sol_types::SolError;
-use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     account_keychain::AccountKeychain,
-    charge_input_cost, dispatch,
     error::{Result, TempoPrecompileError},
-    mutate_void,
     storage::{Handler, Mapping, StorageCtx},
     tip20::{ITIP20, TIP20Event, TIP20Token},
     tip403_registry::AuthRole,
-    view,
 };
 use tempo_precompiles_macros::contract;
-use tempo_zone_contracts::{IZoneFeeManager, Unauthorized};
+use tempo_zone_contracts::IZoneFeeManager;
 pub use zone_primitives::constants::ZONE_FEE_MANAGER_ADDRESS;
 
 /// Zone-owned fee balances at the Zone-native fee-manager address.
@@ -135,47 +132,20 @@ impl ZoneFeeManager {
             amount,
         })
     }
-
-    pub(crate) fn call(&mut self, calldata: &[u8], sender: Address) -> PrecompileResult {
-        if let Some(error) = charge_input_cost(&mut self.storage, calldata) {
-            return error;
-        }
-        dispatch!(calldata, |call| match call {
-            IZoneFeeManager::IZoneFeeManagerCalls {
-                collectedFees(call) => {
-                    if sender != call.beneficiary {
-                        Ok(StorageCtx.revert_output(Unauthorized {}.abi_encode().into()))
-                    } else {
-                        view(call, |call| {
-                            self.collected_fees(call.beneficiary, call.token)
-                        })
-                    }
-                },
-                distributeFees(call) => {
-                    if sender != call.beneficiary {
-                        Ok(StorageCtx.revert_output(Unauthorized {}.abi_encode().into()))
-                    } else {
-                        mutate_void(call, sender, |_, call| {
-                            self.distribute_fees(call.beneficiary, call.token)
-                        })
-                    }
-                },
-            }
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
-    use alloy_sol_types::SolCall;
+    use alloy_sol_types::{SolCall, SolError};
     use tempo_precompiles::{
-        TIP_FEE_MANAGER_ADDRESS,
+        Precompile as _, TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
         tip20::ITIP20,
     };
+    use tempo_zone_contracts::Unauthorized;
 
     #[test]
     fn accrues_and_distributes_direct_fees() -> eyre::Result<()> {
