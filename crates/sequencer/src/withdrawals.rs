@@ -667,7 +667,7 @@ impl WithdrawalProcessor {
                         max_gas_limit = MAX_WITHDRAWAL_GAS_LIMIT,
                         "withdrawal callback gas exceeds protocol cap; reserving bounded gas"
                     );
-            }
+                }
             }
 
             info!(
