@@ -80,9 +80,10 @@ EARN_LOAD_TIMEOUT_MS
 EARN_LOAD_MAX_FAILURES
 ```
 
-The circuit breaker defaults to 1% failed journeys. If the Zone gas price is nonzero, the runner
-refuses to start unless `EARN_LOAD_USER_FEE_BUFFER` is set, so 1,000 accounts are not launched
-without enough Zone fee token.
+The circuit breaker defaults to 1% failed journeys. The runner funds each user with a 1 PATHUSD
+Zone fee reserve by default, even while the Zone reports a zero effective gas price, because live
+transaction admission still checks the request's maximum gas liability. Override
+`EARN_LOAD_USER_FEE_BUFFER` only after verifying the live admission policy.
 
 Each run writes an append-only `events.ndjson` stream plus `manifest.json`, `schedule.json`,
 `journeys.ndjson`, `latency.csv`, `cost-ledger.csv`, and `summary.json` under

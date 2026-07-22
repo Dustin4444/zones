@@ -134,7 +134,7 @@ function readConfig() {
     userFeeBuffer: bigintEnvironment(
       'EARN_LOAD_USER_FEE_BUFFER',
       process.env.EARN_LOAD_USER_FEE_BUFFER,
-      0n,
+      1_000_000n,
     ),
     l1FeeReserve: bigintEnvironment(
       'EARN_LOAD_L1_FEE_RESERVE',
