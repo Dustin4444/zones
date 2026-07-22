@@ -18,7 +18,7 @@ use reth_rpc_eth_api::{
         Call, EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, LoadBlock,
         LoadFee, LoadPendingBlock, LoadReceipt, LoadState, LoadTransaction, SpawnBlocking, Trace,
         bal::GetBlockAccessList, estimate::EstimateCall, pending_block::PendingEnvBuilder,
-        spec::SignersForRpc,
+        spec::SignersForRpc, subscriptions::EthSubscriptions,
     },
 };
 use reth_rpc_eth_types::{
@@ -223,6 +223,7 @@ impl<N> EthFees for ZoneEthApi<N> where N: TempoEthApiBounds {}
 impl<N> Trace for ZoneEthApi<N> where N: TempoEthApiBounds {}
 impl<N> EthCall for ZoneEthApi<N> where N: TempoEthApiBounds {}
 impl<N> GetBlockAccessList for ZoneEthApi<N> where N: TempoEthApiBounds {}
+impl<N> EthSubscriptions for ZoneEthApi<N> where N: TempoEthApiBounds {}
 
 impl<N> Call for ZoneEthApi<N>
 where

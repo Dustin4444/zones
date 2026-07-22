@@ -5,6 +5,7 @@
 //! tokens are correctly minted.
 
 use alloy::primitives::{U256, address};
+use alloy_network::ReceiptResponse;
 use zone_l1::{EnabledToken, L1Deposit, L1PortalEvents};
 
 use crate::utils::{
@@ -116,8 +117,8 @@ async fn test_enable_token_and_deposit_same_block() -> eyre::Result<()> {
 
 /// Pool validation must observe the same L1-anchored policy state as execution.
 ///
-/// The enabled token is used for fee collection. The regression assertion checks that validation
-/// reaches the independent FeeAMM guard instead of rejecting its anchored policy.
+/// The enabled token is used for direct fee collection. The regression assertion checks that pool
+/// admission accepts its anchored policy without requiring FeeAMM liquidity.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -172,21 +173,28 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
         .await?;
     assert!(simulated, "the anchored policy should allow execution");
 
-    let error = token
+    let pending = token
         .transfer(recipient, U256::from(transfer_amount))
         .fee_token(token_address)
         .max_fee_per_gas(TEMPO_T0_BASE_FEE as u128)
         .max_priority_fee_per_gas(0)
         .gas(TIP20_TX_GAS)
         .send()
-        .await
-        .expect_err("missing FeeAMM liquidity should reject admission");
-    let error = error.to_string();
+        .await?;
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    let receipt = pending.get_receipt().await?;
     assert!(
-        error.contains("insufficient liquidity in FeeAMM"),
-        "validation should pass the anchored policy check: {error}"
+        receipt.status(),
+        "transfer should succeed without FeeAMM liquidity"
     );
-    assert!(!error.contains("PolicyForbids"), "{error}");
+    zone.wait_for_balance(
+        token_address,
+        recipient,
+        U256::from(transfer_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
 
     Ok(())
 }
