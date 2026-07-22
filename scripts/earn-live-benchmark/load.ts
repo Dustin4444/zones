@@ -90,33 +90,6 @@ README.md for concurrency, payout-window, think-time, funding, and RPC overrides
   process.exit(0)
 }
 
-const config = readConfig()
-const schedule = createSchedule({
-  users: config.users,
-  payoutWindowMs: config.payoutWindowMs,
-  seed: config.seed,
-  earnThink: config.earnThink,
-  redeemThink: config.redeemThink,
-  offrampThink: config.offrampThink,
-})
-
-if (config.dryRun) {
-  console.log(
-    jsonStringify(
-      {
-        mode: 'dry-run',
-        network: config.network,
-        parameters: publicConfig(config),
-        schedule,
-      },
-      2,
-    ),
-  )
-  process.exit(0)
-}
-
-await runLive(config, schedule)
-
 type LoadConfig = ReturnType<typeof readConfig>
 type Runtime = Awaited<ReturnType<typeof createRuntime>>
 type CompleteJourney = Awaited<ReturnType<typeof runJourney>>
@@ -1758,4 +1731,30 @@ function formatBaseTokenCost(scaledBaseUnits: bigint, tokenDecimals: number) {
     .slice(0, 12)
     .replace(/0+$/, '')
   return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`
+}
+
+const config = readConfig()
+const schedule = createSchedule({
+  users: config.users,
+  payoutWindowMs: config.payoutWindowMs,
+  seed: config.seed,
+  earnThink: config.earnThink,
+  redeemThink: config.redeemThink,
+  offrampThink: config.offrampThink,
+})
+
+if (config.dryRun) {
+  console.log(
+    jsonStringify(
+      {
+        mode: 'dry-run',
+        network: config.network,
+        parameters: publicConfig(config),
+        schedule,
+      },
+      2,
+    ),
+  )
+} else {
+  await runLive(config, schedule)
 }
