@@ -4,12 +4,13 @@
 //! Unlike the Tempo L1 `TempoBlockExecutor`, this executor does **not** enforce subblock
 //! ordering, shared-gas accounting, or the end-of-block subblock metadata system transaction.
 
-use alloy_consensus::transaction::TxHashRef;
+use alloy_consensus::{Transaction as _, transaction::TxHashRef};
 use alloy_evm::{
     Database, Evm, RecoveredTx,
     block::{BlockExecutionError, BlockExecutionResult, BlockExecutor, ExecutableTx, GasOutput},
     eth::{EthBlockExecutor, EthTxResult},
 };
+use alloy_sol_types::SolCall;
 use reth_evm::block::StateDB;
 use reth_revm::Inspector;
 use revm::context::{ContextTr, JournalTr, Transaction};
@@ -19,11 +20,24 @@ use tempo_precompiles::{
 };
 use tempo_primitives::{TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::{TempoStateAccess, evm::TempoContext};
+use tempo_zone_contracts::ZoneOutbox;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::L1StateProvider;
 use zone_precompiles::L1StorageReader;
+use zone_primitives::constants::ZONE_OUTBOX_ADDRESS;
 
 use crate::{L1OverlayDB, ZoneEvm, tx_context};
+
+/// The payload builder simulates this exact system call with `CommitChanges::No`.
+///
+/// `override_validator_token` mutates the journal before the block-builder can decide not to
+/// commit a transaction. Excluding the simulation keeps that builder-only mutation out of the
+/// payload state; a real block never contains this synthetic view call.
+fn is_uncommitted_outbox_view(tx: &TempoTxEnvelope) -> bool {
+    tx.is_system_tx()
+        && tx.to() == Some(ZONE_OUTBOX_ADDRESS)
+        && tx.input().as_ref() == ZoneOutbox::getPendingWithdrawalsCall::SELECTOR
+}
 
 /// Simplified block executor for zone nodes.
 ///
@@ -108,9 +122,14 @@ where
             tempo_tx_env.expiring_nonce_idx = None;
         }
 
-        // Override the validator's fee token preference to match this
-        // transaction's resolved fee token, so the handler skips FeeAMM.
-        self.override_validator_token();
+        // The payload builder simulates `getPendingWithdrawals()` with
+        // `CommitChanges::No`. This override is a pre-execution journal write,
+        // so it is not covered by that transaction's rollback boundary.
+        if !is_uncommitted_outbox_view(recovered.tx()) {
+            // Override the validator's fee token preference to match this
+            // transaction's resolved fee token, so the handler skips FeeAMM.
+            self.override_validator_token();
+        }
 
         let _tx_hash_guard = tx_context::set_current_tx_hash(*recovered.tx().tx_hash());
         let result = self
@@ -146,14 +165,45 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{Address, U256};
+    use super::is_uncommitted_outbox_view;
+    use alloy_consensus::{Signed, TxLegacy};
+    use alloy_primitives::{Address, Bytes, TxKind, U256};
+    use alloy_sol_types::SolCall;
     use tempo_precompiles::{
         DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
         tip_fee_manager::{TipFeeManager, amm::PoolKey},
     };
+    use tempo_primitives::{TempoTxEnvelope, transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE};
     use tempo_revm::{TempoBatchCallEnv, TempoTxEnv};
+    use tempo_zone_contracts::ZoneOutbox;
+    use zone_primitives::constants::ZONE_OUTBOX_ADDRESS;
+
+    #[test]
+    fn identifies_only_the_uncommitted_outbox_view() {
+        let view = TempoTxEnvelope::Legacy(Signed::new_unhashed(
+            TxLegacy {
+                chain_id: None,
+                nonce: 0,
+                gas_price: 0,
+                gas_limit: 0,
+                to: TxKind::Call(ZONE_OUTBOX_ADDRESS),
+                value: U256::ZERO,
+                input: Bytes::copy_from_slice(&ZoneOutbox::getPendingWithdrawalsCall::SELECTOR),
+            },
+            TEMPO_SYSTEM_TX_SIGNATURE,
+        ));
+        assert!(is_uncommitted_outbox_view(&view));
+
+        let TempoTxEnvelope::Legacy(view) = view else {
+            unreachable!("the fixture constructs a legacy system transaction")
+        };
+        let mut tx = view.tx().clone();
+        tx.input = Bytes::from_static(&[0, 0, 0, 0]);
+        let non_view = TempoTxEnvelope::Legacy(Signed::new_unhashed(tx, TEMPO_SYSTEM_TX_SIGNATURE));
+        assert!(!is_uncommitted_outbox_view(&non_view));
+    }
 
     #[test]
     fn clears_only_prewarming_expiring_nonce_index() {
