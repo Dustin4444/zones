@@ -2,14 +2,15 @@ use super::*;
 use crate::abi::DepositType;
 use alloy_consensus::{Header, ReceiptWithBloom};
 use alloy_primitives::{Bloom, FixedBytes, address};
-use alloy_rpc_types_eth::TransactionReceipt;
+use alloy_rpc_types_eth::{Header as RpcHeader, TransactionReceipt};
 use alloy_sol_types::SolEvent;
+use alloy_transport::mock::Asserter;
 use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
     time::Duration,
 };
-use tempo_alloy::rpc::TempoTransactionReceipt;
+use tempo_alloy::rpc::{TempoHeaderResponse, TempoTransactionReceipt};
 use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
 use tempo_primitives::{TempoReceipt, TempoTxType};
 
@@ -185,6 +186,23 @@ fn seal(header: TempoHeader) -> SealedHeader<TempoHeader> {
 
 fn header_hash(header: &TempoHeader) -> B256 {
     keccak256(alloy_rlp::encode(header))
+}
+
+fn header_response(header: TempoHeader) -> TempoHeaderResponse {
+    TempoHeaderResponse {
+        inner: RpcHeader {
+            hash: header_hash(&header),
+            inner: header,
+            total_difficulty: None,
+            size: None,
+        },
+        timestamp_millis: 0,
+    }
+}
+
+fn push_header_and_empty_receipts(asserter: &Asserter, header: TempoHeader) {
+    asserter.push_success(&Some(header_response(header)));
+    asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
 }
 
 fn make_test_receipt(
@@ -410,7 +428,7 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
         .set(TIP403_REGISTRY_ADDRESS, slot, 10, value);
 
     let hash_10 = B256::with_last_byte(10);
-    subscriber.update_l1_state_anchor(10, hash_10, B256::ZERO, &HashSet::new());
+    subscriber.update_l1_state_anchor(10, hash_10, &HashSet::new());
     assert_eq!(
         subscriber
             .config
@@ -423,48 +441,11 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
     subscriber.update_l1_state_anchor(
         11,
         B256::with_last_byte(11),
-        hash_10,
         &HashSet::from([TIP403_REGISTRY_ADDRESS]),
     );
     let cache = subscriber.config.l1_state_cache.read();
     assert_eq!(cache.anchor().number, 11);
     assert_eq!(cache.get(TIP403_REGISTRY_ADDRESS, slot, 11), None);
-}
-
-#[test]
-fn update_l1_state_anchor_reorg_clears_raw_state_and_rebases_floor() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new([0])),
-        Some(0),
-    );
-    let token = address!("0x0000000000000000000000000000000000000011");
-    let slot = B256::with_last_byte(1);
-
-    let old_header = make_test_header(10);
-    let old_hash = header_hash(&old_header);
-    subscriber.update_l1_state_anchor(10, old_hash, old_header.inner.parent_hash, &HashSet::new());
-    subscriber
-        .config
-        .l1_state_cache
-        .write()
-        .set(token, slot, 10, B256::with_last_byte(0xaa));
-
-    let replacement_parent = B256::with_last_byte(0x44);
-    let replacement_header = make_chained_header(11, replacement_parent);
-    subscriber.update_l1_state_anchor(
-        11,
-        header_hash(&replacement_header),
-        replacement_parent,
-        &HashSet::new(),
-    );
-
-    let cache = subscriber.config.l1_state_cache.read();
-    assert_eq!(cache.block_floor(), 11);
-    assert_eq!(
-        cache.get(token, slot, 10),
-        None,
-        "reorg must clear raw L1 state"
-    );
 }
 
 /// Confirm the front of the queue, panicking if it fails.
@@ -508,6 +489,92 @@ async fn test_resolve_start_block_skips_backfill_without_checkpoint() {
     );
 
     assert_eq!(subscriber.resolve_start_block().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
+    let asserter = Asserter::new();
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
+
+    let header_10 = make_test_header(10);
+    let header_11 = make_chained_header(11, header_hash(&header_10));
+    let header_12 = make_chained_header(12, header_hash(&header_11));
+
+    // Initial sync through finalized block 10.
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    push_header_and_empty_receipts(&asserter, header_10);
+
+    // One newHeads notification wakes the subscriber. The finalized tag has
+    // advanced by two blocks, so both missing blocks must be ingested.
+    asserter.push_success(&Some(header_response(header_12.clone())));
+    push_header_and_empty_receipts(&asserter, header_11);
+    push_header_and_empty_receipts(&asserter, header_12);
+
+    let err = subscriber
+        .follow_finalized(
+            &l1_provider,
+            futures::stream::iter([Ok::<_, eyre::Report>(())]),
+        )
+        .await
+        .expect_err("finite trigger stream should end the subscriber");
+    assert!(err.to_string().contains("head notification stream ended"));
+
+    let blocks = subscriber.deposit_queue.drain();
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|block| block.header.number())
+            .collect::<Vec<_>>(),
+        vec![10, 11, 12]
+    );
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn test_head_triggers_falls_back_to_http_block_filter() {
+    let subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new([10])),
+        None,
+    );
+    let asserter = Asserter::new();
+    let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_mocked_client(asserter.clone())
+        .erased();
+
+    asserter.push_success(&U256::from(1));
+    asserter.push_success(&vec![B256::with_last_byte(1)]);
+
+    let mut triggers = subscriber.head_triggers(&l1_provider).await.unwrap();
+    let trigger = tokio::time::timeout(Duration::from_secs(2), triggers.next())
+        .await
+        .expect("HTTP block filter should emit a trigger")
+        .expect("HTTP block filter stream should remain open");
+
+    trigger.expect("HTTP block filter request should succeed");
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn test_sync_finalized_once_does_not_refetch_current_cursor() {
+    let subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new([10])),
+        None,
+    );
+    let asserter = Asserter::new();
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
+    asserter.push_success(&Some(header_response(make_test_header(10))));
+
+    let next = subscriber
+        .sync_finalized_once(&l1_provider, 11)
+        .await
+        .unwrap();
+
+    assert_eq!(next, 11);
+    assert!(subscriber.deposit_queue.drain().is_empty());
+    assert!(asserter.read_q().is_empty());
 }
 
 #[test]

@@ -1,9 +1,9 @@
 //! L1 chain subscription and deposit extraction.
 //!
-//! Subscribes to L1 block headers and extracts deposit events from the
-//! ZonePortal contract for each block. Supports both WebSocket (subscription)
-//! and HTTP (polling) transports — the transport is auto-detected from the URL
-//! scheme.
+//! Uses L1 block notifications to follow the finalized chain and extracts
+//! deposit events from the ZonePortal contract for each finalized block.
+//! WebSocket connections use `newHeads`; HTTP connections use block-filter
+//! polling.
 //!
 //! The module is split into:
 //! - [`subscriber`] — the [`L1Subscriber`] background task and its config.
@@ -17,7 +17,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use alloy_consensus::BlockHeader as _;
-use alloy_eips::NumHash;
+use alloy_eips::{BlockNumberOrTag, NumHash};
 use alloy_network::primitives::HeaderResponse as _;
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
