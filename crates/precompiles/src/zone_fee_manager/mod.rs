@@ -37,6 +37,7 @@ impl ZoneFeeManager {
         fee_payer: Address,
         fee_token: Address,
         max_amount: U256,
+        beneficiary: Address,
     ) -> Result<Address> {
         let mut token = TIP20Token::from_address(fee_token)?;
         token.ensure_authorized_as(&[(fee_payer, AuthRole::sender())])?;
@@ -44,7 +45,7 @@ impl ZoneFeeManager {
         token.check_and_update_spending_limit(fee_payer, max_amount)?;
 
         token.decrement_balance(fee_payer, max_amount)?;
-        token.increment_balance(self.address, max_amount)?;
+        token.increment_balance(beneficiary, max_amount)?;
         Ok(fee_token)
     }
 
@@ -53,28 +54,24 @@ impl ZoneFeeManager {
         &mut self,
         fee_payer: Address,
         actual_spending: U256,
-        refund_amount: U256,
+        refund: U256,
         fee_token: Address,
         beneficiary: Address,
     ) -> Result<U256> {
         let mut token = TIP20Token::from_address(fee_token)?;
         StorageCtx.set_tip1060_storage_credit_minting(false);
 
-        if !refund_amount.is_zero() {
+        if !refund.is_zero() {
             AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund_amount)?;
-            token._transfer(self.address, &Recipient::direct(fee_payer), refund_amount)?;
+
+            token.decrement_balance(beneficiary, refund)?;
+            token.increment_balance(fee_payer, refund)?;
         }
 
         if !actual_spending.is_zero() {
-            token._transfer(
-                self.address,
-                &Recipient::direct(beneficiary),
-                actual_spending,
-            )?;
-
             StorageCtx.emit_event(
                 fee_token,
-                TIP20Event::transfer(fee_payer, self.address, actual_spending).into_log_data(),
+                TIP20Event::transfer(fee_payer, beneficiary, actual_spending).into_log_data(),
             )?;
         }
 

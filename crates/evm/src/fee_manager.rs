@@ -61,10 +61,12 @@ where
         fee_payer: Address,
         fee_token: Address,
         max_amount: U256,
-        _beneficiary: Address,
+        beneficiary: Address,
         _skip_liquidity_check: bool,
     ) -> Result<Address> {
-        ctx.enter(|| ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount))
+        ctx.enter(|| {
+            ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount, beneficiary)
+        })
     }
 
     fn collect_fee_post_tx(
