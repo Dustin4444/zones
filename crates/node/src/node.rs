@@ -53,10 +53,8 @@ use tempo_transaction_pool::{
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
     validator::{DEFAULT_MAX_TEMPO_AUTHORIZATIONS, TempoTransactionValidator},
 };
-use tempo_zone_contracts::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
-};
-use tracing::{debug, info, warn};
+use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
+use tracing::{debug, info};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
@@ -452,22 +450,6 @@ where
             )
             .await?
             .erased();
-
-        match ZonePortal::new(self.portal_address, &l1_provider)
-            .enabled_tokens_at(alloy_rpc_types_eth::BlockId::number(tempo_block_number))
-            .await
-        {
-            Ok(tokens) => {
-                self.l1_config
-                    .l1_state_cache
-                    .write()
-                    .initialize_enabled_tokens(tokens.iter().copied());
-                info!(target: "reth::cli", count = tokens.len(), tempo_block_number, "Initialized enabled-token L1 cache");
-            }
-            Err(err) => {
-                warn!(target: "reth::cli", %err, tempo_block_number, "Failed to initialize enabled-token L1 cache")
-            }
-        }
 
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
         if p2p_role == Some(Role::Follower) {
