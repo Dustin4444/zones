@@ -12,7 +12,7 @@ use zone_precompiles::ZoneFeeManager;
 ///
 /// Both protocol execution and RPC gas allowance use this function so omitted fee tokens always
 /// resolve through the Zone fee manager at the state being executed or simulated.
-pub fn resolve_fee_token<S, M>(
+pub(crate) fn resolve_fee_token<S, M>(
     state: &mut S,
     tx: &TempoTxEnv,
     spec: TempoHardfork,
@@ -85,5 +85,50 @@ where
                 beneficiary,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{U256, address};
+    use revm::database::{CacheDB, EmptyDB};
+    use zone_precompiles::{ZONE_FEE_MANAGER_ADDRESS, zone_fee_manager};
+
+    #[test]
+    fn resolves_explicit_token_or_zone_default() {
+        let default_token = address!("0x20c00000000000000000000000000000000000d1");
+        let explicit_token = address!("0x20c00000000000000000000000000000000000e1");
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_storage(
+            ZONE_FEE_MANAGER_ADDRESS,
+            zone_fee_manager::slots::DEFAULT_FEE_TOKEN,
+            U256::from_be_slice(default_token.as_slice()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_fee_token(
+                &mut db,
+                &TempoTxEnv::default(),
+                TempoHardfork::T1,
+                StorageActions::disabled(),
+            )
+            .unwrap(),
+            default_token,
+        );
+        assert_eq!(
+            resolve_fee_token(
+                &mut db,
+                &TempoTxEnv {
+                    fee_token: Some(explicit_token),
+                    ..Default::default()
+                },
+                TempoHardfork::T1,
+                StorageActions::disabled(),
+            )
+            .unwrap(),
+            explicit_token,
+        );
     }
 }

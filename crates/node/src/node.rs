@@ -5,7 +5,6 @@
 
 use crate::{
     ZoneEngine,
-    eth_api::ZoneEthApiBuilder,
     replication::{broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
 };
@@ -42,7 +41,9 @@ use reth_transaction_pool::{
 use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
-use tempo_node::{DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator};
+use tempo_node::{
+    DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
+};
 use tempo_primitives::{
     self as primitives, TempoHeader, TempoPrimitives, TempoTxEnvelope, TempoTxType,
 };
@@ -355,7 +356,7 @@ where
 {
     inner: RpcAddOns<
         N,
-        ZoneEthApiBuilder<N>,
+        TempoEthApiBuilder<N>,
         ZoneEngineValidatorBuilder,
         NoopEngineApiBuilder,
         BasicEngineValidatorBuilder<ZoneEngineValidatorBuilder>,
@@ -400,7 +401,7 @@ where
     ) -> Self {
         Self {
             inner: RpcAddOns::new(
-                ZoneEthApiBuilder::default(),
+                TempoEthApiBuilder::default(),
                 ZoneEngineValidatorBuilder,
                 NoopEngineApiBuilder::default(),
                 BasicEngineValidatorBuilder::default(),
@@ -423,11 +424,11 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
-    ZoneEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
+    TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     type Handle = <RpcAddOns<
         N,
-        ZoneEthApiBuilder<N>,
+        TempoEthApiBuilder<N>,
         ZoneEngineValidatorBuilder,
         NoopEngineApiBuilder,
         BasicEngineValidatorBuilder<ZoneEngineValidatorBuilder>,
@@ -521,7 +522,7 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
-    ZoneEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
+    TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     fn launch_p2p(
         config: P2pConfig,
@@ -755,10 +756,10 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
-    ZoneEthApiBuilder<N>:
+    TempoEthApiBuilder<N>:
         EthApiBuilder<N, EthApi: reth_rpc_eth_api::EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
-    type EthApi = <ZoneEthApiBuilder<N> as EthApiBuilder<N>>::EthApi;
+    type EthApi = <TempoEthApiBuilder<N> as EthApiBuilder<N>>::EthApi;
 
     fn hooks_mut(&mut self) -> &mut reth_node_builder::rpc::RpcHooks<N, Self::EthApi> {
         self.inner.hooks_mut()
@@ -771,7 +772,7 @@ where
     N::Pool: reth_transaction_pool::TransactionPool<
             Transaction = tempo_transaction_pool::transaction::TempoPooledTransaction,
         >,
-    ZoneEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
+    TempoEthApiBuilder<N>: EthApiBuilder<N, EthApi: EthApiTypes<NetworkTypes = TempoNetwork>>,
 {
     type ValidatorBuilder = BasicEngineValidatorBuilder<ZoneEngineValidatorBuilder>;
 

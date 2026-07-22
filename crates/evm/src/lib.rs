@@ -10,7 +10,6 @@
 mod database;
 mod executor;
 mod fee_manager;
-pub use fee_manager::resolve_fee_token;
 pub mod precompiles;
 mod zone_evm;
 
@@ -46,23 +45,24 @@ use reth_evm::{
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Arc};
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::TempoChainSpec;
+use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 use tempo_evm::{
-    TempoBlockAssembler, TempoBlockEnv, TempoBlockExecutionCtx, TempoEvmConfig, TempoEvmError,
-    TempoHaltReason, TempoNextBlockEnvAttributes,
+    FeeTokenResolver, TempoBlockAssembler, TempoBlockEnv, TempoBlockExecutionCtx, TempoEvmConfig,
+    TempoEvmError, TempoHaltReason, TempoNextBlockEnvAttributes, TempoStateAccess,
     evm::{TempoEvm, TempoEvmFactory},
 };
 use tempo_payload_types::TempoExecutionData;
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv,
     RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    account_keychain::AccountKeychain, nonce::NonceManager,
+    account_keychain::AccountKeychain, error::Result as TempoResult, nonce::NonceManager,
     receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
     storage_credits::NonCreditableSlots, tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
 };
+use tempo_revm::TempoTxEnv;
 use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
@@ -254,6 +254,22 @@ pub struct ZoneEvmConfig<L1 = L1StateProvider> {
     chain_spec: Arc<ZoneChainSpec>,
     zone_factory: ZoneEvmFactory<L1>,
     block_assembler: ZoneBlockAssembler,
+}
+
+impl<L1> FeeTokenResolver for ZoneEvmConfig<L1> {
+    fn resolve_fee_token<S, M>(
+        &self,
+        state: &mut S,
+        tx: &TempoTxEnv,
+        _fee_payer: Address,
+        spec: TempoHardfork,
+        actions: StorageActions,
+    ) -> TempoResult<Address>
+    where
+        S: TempoStateAccess<M>,
+    {
+        fee_manager::resolve_fee_token(state, tx, spec, actions)
+    }
 }
 
 impl<L1> ZoneEvmConfig<L1>
