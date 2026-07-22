@@ -37,11 +37,6 @@ pub struct TempoState {
 pub const TEMPO_BLOCK_NUMBER_SLOT: alloy_primitives::U256 = slots::TEMPO_BLOCK_NUMBER;
 
 impl TempoState {
-    /// Returns the finalized Tempo block used for anchored L1 reads.
-    pub fn finalized_block_number(&self) -> tempo_precompiles::Result<u64> {
-        self.tempo_block_number.read()
-    }
-
     /// Creates the direct-call-only `TempoState` precompile with checkpoint storage.
     ///
     /// System-only arbitrary L1 storage reads are delegated through `l1` at the stored checkpoint.

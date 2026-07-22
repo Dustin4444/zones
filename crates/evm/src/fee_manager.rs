@@ -4,12 +4,7 @@ use alloy_evm::{Database, revm::context::Journal};
 use alloy_primitives::{Address, U256};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::{ProtocolFeeContext, ProtocolFeeManager};
-use tempo_precompiles::{
-    error::Result,
-    storage::{ContractStorage, StorageActions},
-    tip_fee_manager::FeeManagerError,
-    tip20::TIP20Token,
-};
+use tempo_precompiles::{error::Result, storage::StorageActions};
 use tempo_revm::{TempoStateAccess, TempoTx, TempoTxEnv};
 use zone_precompiles::ZoneFeeManager;
 
@@ -52,13 +47,7 @@ where
         _beneficiary: Address,
         _skip_liquidity_check: bool,
     ) -> Result<Address> {
-        ctx.enter(|| {
-            if !TIP20Token::from_address(fee_token)?.is_initialized()? {
-                return Err(FeeManagerError::invalid_token().into());
-            }
-
-            ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount)
-        })
+        ctx.enter(|| ZoneFeeManager::new().collect_fee_pre_tx(fee_payer, fee_token, max_amount))
     }
 
     fn collect_fee_post_tx(

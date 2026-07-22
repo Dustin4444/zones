@@ -33,7 +33,10 @@ impl ZoneFeeManager {
         self.default_fee_token.read()
     }
 
-    /// Returns fees accrued to `beneficiary` in `token`.
+    /// Returns aggregate fees accrued to `beneficiary` in `token`.
+    ///
+    /// This is public by design: it reveals no fee-payer state, and the same amount becomes public
+    /// when permissionless distribution emits [`IZoneFeeManager::FeesDistributed`].
     pub fn collected_fees(&self, beneficiary: Address, token: Address) -> Result<U256> {
         self.collected_fees[beneficiary][token].read()
     }
