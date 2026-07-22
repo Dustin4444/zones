@@ -11,6 +11,7 @@ pub mod cli;
 pub mod dev;
 pub mod engine;
 pub mod genesis;
+mod leader_election;
 pub mod node;
 mod replication;
 pub mod rpc;

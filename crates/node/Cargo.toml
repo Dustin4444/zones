@@ -73,7 +73,10 @@ clap = { workspace = true, optional = true }
 eyre.workspace = true
 futures.workspace = true
 k256.workspace = true
+protobuf.workspace = true
+raft.workspace = true
 serde_json.workspace = true
+slog.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url = "2"

@@ -5,6 +5,7 @@
 
 use crate::{
     ZoneEngine,
+    leader_election::spawn_leader_election,
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     settlement_attestation::collect_leader_settlements,
@@ -600,6 +601,8 @@ where
         policy_cache: PolicyCache,
     ) -> eyre::Result<()> {
         let role = config.role();
+        let raft_node_id = config.raft_node_id();
+        let raft_members = config.raft_members();
         let attestation = AttestationContext::new(
             attestation_domain,
             config.block_attestation_signer(),
@@ -616,7 +619,16 @@ where
             thread,
             commands,
             events,
+            raft_messages,
         } = handle.into_parts();
+
+        let _leadership = spawn_leader_election(
+            task_executor,
+            raft_node_id,
+            raft_members,
+            commands.clone(),
+            raft_messages,
+        );
 
         if role == Role::Leader {
             // Only a leader can build + broadcast blocks

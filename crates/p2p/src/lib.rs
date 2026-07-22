@@ -9,5 +9,5 @@ mod runtime;
 pub use manifest::{ManifestAddress, ManifestError, ManifestNode, Role, ZoneManifest};
 pub use network::P2pNetworkId;
 pub use runtime::{
-    P2pCommand, P2pConfig, P2pEvent, P2pHandle, P2pHandleParts, P2pPeerId, spawn_p2p,
+    P2pCommand, P2pConfig, P2pEvent, P2pHandle, P2pHandleParts, P2pPeerId, RaftMessage, spawn_p2p,
 };

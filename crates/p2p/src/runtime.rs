@@ -21,7 +21,7 @@ use crate::{
     identity::{Ed25519Identity, Secp256k1Identity},
     network::{
         self, BACKFILL_REQUEST_CHANNEL, BACKFILL_RESPONSE_CHANNEL, BLOCK_ACK_CHANNEL,
-        BLOCK_BACKLOG, BLOCK_CHANNEL, MAX_MESSAGE_SIZE, SETTLEMENT_PROPOSAL_CHANNEL,
+        BLOCK_BACKLOG, BLOCK_CHANNEL, MAX_MESSAGE_SIZE, RAFT_CHANNEL, SETTLEMENT_PROPOSAL_CHANNEL,
         SETTLEMENT_SIGNATURE_CHANNEL,
     },
 };
@@ -120,6 +120,7 @@ struct P2pSenders {
     settlement_signatures: CommonwareSender,
     backfill_requests: CommonwareSender,
     backfill_responses: CommonwareSender,
+    raft: CommonwareSender,
 }
 
 struct P2pReceivers {
@@ -129,6 +130,7 @@ struct P2pReceivers {
     settlement_signatures: CommonwareReceiver,
     backfill_requests: CommonwareReceiver,
     backfill_responses: CommonwareReceiver,
+    raft: CommonwareReceiver,
 }
 
 /// Fully validated configuration for one node's Zone P2P runtime.
@@ -218,6 +220,26 @@ impl P2pConfig {
     pub fn sequencer_set_version(&self) -> u64 {
         self.manifest.sequencer_set_version()
     }
+
+    /// Stable Raft node ID derived from the node's manifest position.
+    pub fn raft_node_id(&self) -> u64 {
+        self.manifest
+            .nodes()
+            .iter()
+            .position(|node| node.ed25519_public_key() == &self.ed25519_public_key())
+            .expect("validated local node must be present in manifest") as u64
+            + 1
+    }
+
+    /// Stable mapping between Raft IDs and authenticated Commonware identities.
+    pub fn raft_members(&self) -> Vec<(u64, PublicKey)> {
+        self.manifest
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (index as u64 + 1, node.ed25519_public_key().clone()))
+            .collect()
+    }
 }
 
 impl std::fmt::Debug for P2pConfig {
@@ -269,6 +291,15 @@ pub enum P2pCommand {
         request_id: u64,
         tip: u64,
     },
+    /// Send one protobuf-encoded Raft message to an authenticated member.
+    SendRaftMessage { peer: PublicKey, message: Vec<u8> },
+}
+
+/// One authenticated inbound Raft frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftMessage {
+    pub peer: PublicKey,
+    pub message: Vec<u8>,
 }
 
 /// Observable lifecycle and block events emitted by the P2P runtime.
@@ -326,6 +357,8 @@ pub struct P2pHandleParts {
     pub commands: mpsc::Sender<P2pCommand>,
     /// Bounded inbound event channel from the dedicated P2P runtime.
     pub events: mpsc::Receiver<P2pEvent>,
+    /// Dedicated receive path for Raft so block replication cannot consume election frames.
+    pub raft_messages: mpsc::Receiver<RaftMessage>,
 }
 
 impl P2pHandle {
@@ -346,12 +379,14 @@ impl P2pHandle {
             thread,
             commands,
             events,
+            raft_messages,
         } = self.parts.take().expect("P2P handle already consumed");
         shutdown.cancel();
 
         // Close the caller-side channels while the runtime is winding down.
         drop(commands);
         drop(events);
+        drop(raft_messages);
         let stopped_result = stopped.await;
 
         join_runtime_thread(thread).await?;
@@ -388,12 +423,20 @@ pub fn spawn_p2p(config: P2pConfig, network_id: P2pNetworkId) -> eyre::Result<P2
     let (stopped_tx, stopped) = oneshot::channel();
     let (commands, command_rx) = mpsc::channel(COMMAND_BACKLOG);
     let (events_tx, events) = mpsc::channel(EVENT_BACKLOG);
+    let (raft_tx, raft_messages) = mpsc::channel(EVENT_BACKLOG);
 
     let thread = std::thread::Builder::new()
         .name(format!("zone-p2p-{}", config.role()))
         .spawn(move || {
-            let result = run(config, network_id, thread_shutdown, command_rx, events_tx)
-                .map_err(|err| format!("{err:?}"));
+            let result = run(
+                config,
+                network_id,
+                thread_shutdown,
+                command_rx,
+                events_tx,
+                raft_tx,
+            )
+            .map_err(|err| format!("{err:?}"));
             let _ = stopped_tx.send(result);
         })
         .map_err(|err| eyre::eyre!("failed spawning P2P runtime thread: {err}"))?;
@@ -405,6 +448,7 @@ pub fn spawn_p2p(config: P2pConfig, network_id: P2pNetworkId) -> eyre::Result<P2
             thread,
             commands,
             events,
+            raft_messages,
         }),
     })
 }
@@ -415,6 +459,7 @@ fn run(
     shutdown: CancellationToken,
     command_rx: mpsc::Receiver<P2pCommand>,
     events: mpsc::Sender<P2pEvent>,
+    raft_events: mpsc::Sender<RaftMessage>,
 ) -> eyre::Result<()> {
     let runtime_config = commonware_runtime::tokio::Config::default()
         .with_tcp_nodelay(Some(true))
@@ -460,6 +505,8 @@ fn run(
             network::backfill_response_quota(),
             BLOCK_BACKLOG,
         );
+        let (raft_sender, raft_receiver) =
+            commonware.register(RAFT_CHANNEL, network::raft_quota(), BLOCK_BACKLOG);
         let mut network_task = commonware.start();
 
         if config.bypass_ip_check {
@@ -518,6 +565,7 @@ fn run(
                 settlement_signatures: settlement_signature_sender,
                 backfill_requests: backfill_request_sender,
                 backfill_responses: backfill_response_sender,
+                raft: raft_sender,
             },
             command_rx,
         );
@@ -533,9 +581,11 @@ fn run(
                 settlement_signatures: settlement_signature_receiver,
                 backfill_requests: backfill_request_receiver,
                 backfill_responses: backfill_response_receiver,
+                raft: raft_receiver,
             },
             backfill_lifecycle,
             events,
+            raft_events,
         );
         tokio::pin!(receive_loop);
 
@@ -710,6 +760,13 @@ async fn run_commands(
                     .await
                     .map_err(|err| eyre::eyre!("failed completing block backfill: {err}"))?;
             }
+            P2pCommand::SendRaftMessage { peer, message } => {
+                senders
+                    .raft
+                    .send(Recipients::Some(vec![peer]), message, true)
+                    .await
+                    .map_err(|err| eyre::eyre!("failed sending Raft message: {err}"))?;
+            }
         }
     }
 
@@ -722,6 +779,7 @@ async fn run_receivers(
     receivers: P2pReceivers,
     backfill_job: SharedBackfillLifecycle,
     events: mpsc::Sender<P2pEvent>,
+    raft_events: mpsc::Sender<RaftMessage>,
 ) -> eyre::Result<()> {
     let P2pReceivers {
         mut blocks,
@@ -730,11 +788,20 @@ async fn run_receivers(
         mut settlement_signatures,
         mut backfill_requests,
         mut backfill_responses,
+        mut raft,
     } = receivers;
 
     let leader = manifest.leader_ed25519_public_key().clone();
     loop {
         let event = tokio::select! {
+            result = raft.recv() => {
+                let (peer, bytes) = result.map_err(|err| eyre::eyre!("Raft channel receive failed: {err}"))?;
+                raft_events
+                    .send(RaftMessage { peer, message: bytes.into() })
+                    .await
+                    .map_err(|_| eyre::eyre!("Raft event channel closed unexpectedly"))?;
+                continue;
+            }
             // Got a block
             result = blocks.recv() => {
                 let (peer, bytes) = result.map_err(|err| eyre::eyre!("block channel receive failed: {err}"))?;

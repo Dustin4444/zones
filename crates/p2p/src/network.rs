@@ -21,6 +21,8 @@ pub(crate) const BLOCK_ACK_CHANNEL: u64 = 3;
 pub(crate) const SETTLEMENT_PROPOSAL_CHANNEL: u64 = 4;
 /// Follower-to-leader settlement signature channel.
 pub(crate) const SETTLEMENT_SIGNATURE_CHANNEL: u64 = 5;
+/// Raft leader-election protocol messages.
+pub(crate) const RAFT_CHANNEL: u64 = 6;
 pub(crate) const BLOCK_BACKLOG: usize = 128;
 
 // At 30M gas, calldata is bounded below 7.5 MiB; leave headroom for block overhead.
@@ -147,6 +149,10 @@ pub(crate) fn block_ack_quota() -> Quota {
 
 pub(crate) fn settlement_quota() -> Quota {
     Quota::per_second(NZU32!(8))
+}
+
+pub(crate) fn raft_quota() -> Quota {
+    Quota::per_second(NZU32!(64))
 }
 
 #[cfg(test)]
