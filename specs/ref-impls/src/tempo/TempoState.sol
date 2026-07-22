@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import {ITempoState} from "../interfaces/IZone.sol";
+import { ITempoState } from "../interfaces/IZone.sol";
 
 /// @title TempoState
 /// @notice Zone-side predeploy for Tempo state verification
@@ -9,6 +9,7 @@ import {ITempoState} from "../interfaces/IZone.sol";
 ///      Stores the latest finalized Tempo checkpoint. Sequencer submits Tempo headers
 ///      which are validated for chain continuity.
 contract TempoState is ITempoState {
+
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
     //////////////////////////////////////////////////////////////*/
@@ -26,7 +27,7 @@ contract TempoState is ITempoState {
     /// @notice Initialize with genesis Tempo block
     /// @param _genesisHeader RLP-encoded genesis Tempo header
     constructor(bytes memory _genesisHeader) {
-        (, , uint64 blockNumber) = _decodeHeader(_genesisHeader);
+        (,, uint64 blockNumber) = _decodeHeader(_genesisHeader);
         tempoBlockHash = keccak256(_genesisHeader);
         tempoBlockNumber = blockNumber;
     }
@@ -48,11 +49,7 @@ contract TempoState is ITempoState {
         bytes32 prevBlockHash = tempoBlockHash;
         uint64 prevBlockNumber = tempoBlockNumber;
 
-        (
-            bytes32 parentHash,
-            bytes32 stateRoot,
-            uint64 blockNumber
-        ) = _decodeHeader(header);
+        (bytes32 parentHash, bytes32 stateRoot, uint64 blockNumber) = _decodeHeader(header);
         // TODO: basically check if 0 and if so, then check if portal exists or something but not parent hash and
         // dont init with genesis parent hash
         if (parentHash != prevBlockHash) revert InvalidParentHash();
@@ -70,23 +67,14 @@ contract TempoState is ITempoState {
 
     /// @notice Zone system contract addresses that are allowed to read Tempo state
     /// @dev These contracts need access to read from ZonePortal and TIP-403 on Tempo
-    address private constant ZONE_INBOX =
-        0x1c00000000000000000000000000000000000001;
-    address private constant ZONE_OUTBOX =
-        0x1c00000000000000000000000000000000000002;
-    address private constant ZONE_CONFIG =
-        0x1c00000000000000000000000000000000000003;
+    address private constant ZONE_INBOX = 0x1c00000000000000000000000000000000000001;
+    address private constant ZONE_OUTBOX = 0x1c00000000000000000000000000000000000002;
+    address private constant ZONE_CONFIG = 0x1c00000000000000000000000000000000000003;
 
     /// @notice Check if caller is a zone system contract
     modifier onlySystemContract() {
-        if (
-            msg.sender != ZONE_INBOX &&
-            msg.sender != ZONE_OUTBOX &&
-            msg.sender != ZONE_CONFIG
-        ) {
-            revert(
-                "TempoState: only zone system contracts can read Tempo state"
-            );
+        if (msg.sender != ZONE_INBOX && msg.sender != ZONE_OUTBOX && msg.sender != ZONE_CONFIG) {
+            revert("TempoState: only zone system contracts can read Tempo state");
         }
         _;
     }
@@ -97,7 +85,12 @@ contract TempoState is ITempoState {
     function readTempoStorageSlot(
         address,
         bytes32
-    ) external view onlySystemContract returns (bytes32) {
+    )
+        external
+        view
+        onlySystemContract
+        returns (bytes32)
+    {
         revert("TempoState: native storage read");
     }
 
@@ -107,7 +100,12 @@ contract TempoState is ITempoState {
     function readTempoStorageSlots(
         address,
         bytes32[] calldata
-    ) external view onlySystemContract returns (bytes32[] memory) {
+    )
+        external
+        view
+        onlySystemContract
+        returns (bytes32[] memory)
+    {
         revert("TempoState: native storage read");
     }
 
@@ -122,9 +120,7 @@ contract TempoState is ITempoState {
     ///        4: transactionsRoot, 5: receiptsRoot, 6: logsBloom, 7: difficulty,
     ///        8: number, 9: gasLimit, 10: gasUsed, 11: timestamp, 12: extraData,
     ///        13: mixHash (prevRandao), 14: nonce, remaining fields are optional and ignored
-    function _decodeHeader(
-        bytes memory header
-    )
+    function _decodeHeader(bytes memory header)
         internal
         pure
         returns (bytes32 parentHash, bytes32 stateRoot, uint64 blockNumber)
@@ -132,10 +128,7 @@ contract TempoState is ITempoState {
         uint256 ptr = 0;
 
         // Decode outer list header
-        (uint256 outerListLen, uint256 outerListOffset) = _decodeListHeaderMem(
-            header,
-            ptr
-        );
+        (uint256 outerListLen, uint256 outerListOffset) = _decodeListHeaderMem(header, ptr);
         if (outerListOffset == 0) revert InvalidRlpData();
         uint256 outerListEnd = outerListOffset + outerListLen;
         if (outerListEnd != header.length) revert InvalidRlpData();
@@ -155,10 +148,7 @@ contract TempoState is ITempoState {
 
         // Field 3: inner Ethereum header (a list)
         if (ptr >= outerListEnd) revert InvalidRlpData();
-        (uint256 innerListLen, uint256 innerListOffset) = _decodeListHeaderMem(
-            header,
-            ptr
-        );
+        (uint256 innerListLen, uint256 innerListOffset) = _decodeListHeaderMem(header, ptr);
         if (innerListOffset == 0) revert InvalidRlpData();
         uint256 innerListEnd = innerListOffset + innerListLen;
         if (innerListEnd > outerListEnd) revert InvalidRlpData();
@@ -247,7 +237,11 @@ contract TempoState is ITempoState {
     function _decodeListHeaderMem(
         bytes memory data,
         uint256 ptr
-    ) internal pure returns (uint256 listLen, uint256 offset) {
+    )
+        internal
+        pure
+        returns (uint256 listLen, uint256 offset)
+    {
         if (ptr >= data.length) return (0, 0);
 
         uint8 prefix = uint8(data[ptr]);
@@ -273,7 +267,11 @@ contract TempoState is ITempoState {
         bytes memory data,
         uint256 ptr,
         uint256 listEnd
-    ) internal pure returns (uint256 nextPtr) {
+    )
+        internal
+        pure
+        returns (uint256 nextPtr)
+    {
         if (ptr >= listEnd) revert InvalidRlpData();
         (, nextPtr) = _skipRlpItemMem(data, ptr);
         if (nextPtr > listEnd) revert InvalidRlpData();
@@ -283,7 +281,11 @@ contract TempoState is ITempoState {
     function _skipRlpItemMem(
         bytes memory data,
         uint256 ptr
-    ) internal pure returns (uint256 itemLen, uint256 nextPtr) {
+    )
+        internal
+        pure
+        returns (uint256 itemLen, uint256 nextPtr)
+    {
         if (ptr >= data.length) revert InvalidRlpData();
 
         uint8 prefix = uint8(data[ptr]);
@@ -293,14 +295,16 @@ contract TempoState is ITempoState {
         } else if (prefix <= 0xb7) {
             uint256 strLen = prefix - 0x80;
             if (ptr + 1 + strLen > data.length) revert InvalidRlpData();
-            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80)
+            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80) {
                 revert InvalidRlpData();
+            }
             return (1 + strLen, ptr + 1 + strLen);
         } else if (prefix <= 0xbf) {
             uint256 lenLen = prefix - 0xb7;
             uint256 strLen = _decodeRlpLongPayloadLength(data, ptr, lenLen);
-            if (ptr + 1 + lenLen + strLen > data.length)
+            if (ptr + 1 + lenLen + strLen > data.length) {
                 revert InvalidRlpData();
+            }
             return (1 + lenLen + strLen, ptr + 1 + lenLen + strLen);
         } else if (prefix <= 0xf7) {
             uint256 listLen = prefix - 0xc0;
@@ -309,8 +313,9 @@ contract TempoState is ITempoState {
         } else {
             uint256 lenLen = prefix - 0xf7;
             uint256 listLen = _decodeRlpLongPayloadLength(data, ptr, lenLen);
-            if (ptr + 1 + lenLen + listLen > data.length)
+            if (ptr + 1 + lenLen + listLen > data.length) {
                 revert InvalidRlpData();
+            }
             return (1 + lenLen + listLen, ptr + 1 + lenLen + listLen);
         }
     }
@@ -319,7 +324,11 @@ contract TempoState is ITempoState {
         bytes memory data,
         uint256 ptr,
         uint256 lenLen
-    ) internal pure returns (uint256 payloadLen) {
+    )
+        internal
+        pure
+        returns (uint256 payloadLen)
+    {
         if (ptr + 1 + lenLen > data.length) revert InvalidRlpData();
         if (uint8(data[ptr + 1]) == 0) revert InvalidRlpData();
 
@@ -333,7 +342,11 @@ contract TempoState is ITempoState {
     function _decodeBytes32Mem(
         bytes memory data,
         uint256 ptr
-    ) internal pure returns (bytes32 value) {
+    )
+        internal
+        pure
+        returns (bytes32 value)
+    {
         if (ptr >= data.length) revert InvalidRlpData();
 
         uint8 prefix = uint8(data[ptr]);
@@ -350,10 +363,7 @@ contract TempoState is ITempoState {
     }
 
     /// @notice Decode a uint64 from RLP in memory
-    function _decodeUint64Mem(
-        bytes memory data,
-        uint256 ptr
-    ) internal pure returns (uint64 value) {
+    function _decodeUint64Mem(bytes memory data, uint256 ptr) internal pure returns (uint64 value) {
         if (ptr >= data.length) revert InvalidRlpData();
 
         uint8 prefix = uint8(data[ptr]);
@@ -366,8 +376,9 @@ contract TempoState is ITempoState {
             uint256 strLen = prefix - 0x80;
             if (ptr + 1 + strLen > data.length) revert InvalidRlpData();
             if (uint8(data[ptr + 1]) == 0) revert InvalidRlpData();
-            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80)
+            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80) {
                 revert InvalidRlpData();
+            }
 
             value = 0;
             for (uint256 i = 0; i < strLen; i++) {
@@ -382,7 +393,11 @@ contract TempoState is ITempoState {
     function _decodeUint256Mem(
         bytes memory data,
         uint256 ptr
-    ) internal pure returns (uint256 value) {
+    )
+        internal
+        pure
+        returns (uint256 value)
+    {
         if (ptr >= data.length) revert InvalidRlpData();
 
         uint8 prefix = uint8(data[ptr]);
@@ -395,8 +410,9 @@ contract TempoState is ITempoState {
             uint256 strLen = prefix - 0x80;
             if (ptr + 1 + strLen > data.length) revert InvalidRlpData();
             if (uint8(data[ptr + 1]) == 0) revert InvalidRlpData();
-            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80)
+            if (strLen == 1 && uint8(data[ptr + 1]) < 0x80) {
                 revert InvalidRlpData();
+            }
 
             value = 0;
             for (uint256 i = 0; i < strLen; i++) {
@@ -411,7 +427,11 @@ contract TempoState is ITempoState {
     function _decodeAddressMem(
         bytes memory data,
         uint256 ptr
-    ) internal pure returns (address value) {
+    )
+        internal
+        pure
+        returns (address value)
+    {
         if (ptr >= data.length) revert InvalidRlpData();
 
         uint8 prefix = uint8(data[ptr]);
@@ -426,4 +446,5 @@ contract TempoState is ITempoState {
             revert InvalidRlpData();
         }
     }
+
 }
