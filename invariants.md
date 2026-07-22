@@ -30,7 +30,6 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | `TEMPO-ZONE-ADMIN-NONZERO` | Portal `admin != address(0)` for every zone | 🟡 | Token governance can become permanently unavailable |
 | `TEMPO-ZONE-ADMIN-ONLY-GOVERNANCE` | Only `admin` can call `enableToken`, `pauseDeposits`, and `resumeDeposits` | 🟡 | A sequencer or user can enable malicious assets or reopen paused deposits |
 | `TEMPO-ZONE-SEQUENCER-ONLY-OPS` | Only the registered sequencer can set gas rates, set encryption keys, set RPC URL, submit batches, and process withdrawals | 🟡 | Unauthorized operators can censor, misprice, settle, or drain queued work |
-| `TEMPO-ZONE-SEQUENCER-TWO-STEP` | Sequencer changes only complete when `pendingSequencer` accepts, and acceptance clears `pendingSequencer` | 🟡 | Sequencer control can be accidentally or maliciously transferred |
 | `TEMPO-ZONE-GAS-RATE-BOUNDED` | `zoneGasRate` and `tempoGasRate` never exceed `MAX_GAS_FEE_RATE` | 🟢 | Deposit or withdrawal fee math may overflow or become economically unusable |
 
 ### Token Registry and Supply
@@ -49,7 +48,7 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | ID | Assertion | Crit | Impact |
 |---|---|---|---|
 | `TEMPO-ZONE-DEPOSIT-ENABLED-ACTIVE` | User deposits only enter the queue when the token is enabled and deposits are active | 🟡 | Users can deposit unsupported or paused assets that the zone may not process |
-| `TEMPO-ZONE-DEPOSIT-FEE-SNAPSHOT` | Deposit queue entries store `amount - FIXED_DEPOSIT_GAS * zoneGasRate`, and the fee is paid to the sequencer at enqueue time | 🟢 | Fee changes can retroactively change user value or underpay processing costs |
+| `TEMPO-ZONE-DEPOSIT-FEE-SNAPSHOT` | Deposit queue entries store `amount - FIXED_DEPOSIT_GAS * zoneGasRate`, and the fee is paid to the admin at enqueue time | 🟢 | Fee changes can retroactively change user value or underpay processing costs |
 | `TEMPO-ZONE-DEPOSIT-MIN-AMOUNT` | `deposit` and `depositEncrypted` revert (`DepositTooSmall`) unless `amount >= depositFee + currentBouncebackFee` | 🔴 | Dust deposits can enter the queue that cannot fund their own Tempo-side refund, stranding funds |
 | `TEMPO-ZONE-DEPOSIT-BOUNCEBACK-NONZERO` | Every user-initiated deposit has a non-zero, TIP-403-authorized `bouncebackRecipient` | 🔴 | Failed deposits can permanently block or strand funds without a refund target |
 | `TEMPO-ZONE-DEPOSIT-QUEUE-HASH` | Portal deposit queue hash updates as `keccak256(abi.encode(depositType, depositData, previousHash))` for every regular or encrypted deposit | 🔴 | The zone may process a different deposit sequence than the portal accepted |
@@ -87,8 +86,8 @@ for auditors, invariant/fuzz test authors, and production monitoring.
 | `TEMPO-ZONE-WITHDRAWAL-POP-ONCE` | Each processed withdrawal is popped exactly once, whether transfer/callback succeeds or bounces back | 🔴 | Failed withdrawals can block the queue or successful withdrawals can be replayed |
 | `TEMPO-ZONE-WITHDRAWAL-FAIL-BOUNCEBACK` | Any failed user-facing transfer or callback enqueues exactly one withdrawal bounce-back deposit for `amount`, excluding fee | 🔴 | Failed withdrawals can lose funds or duplicate refunds |
 | `TEMPO-ZONE-WITHDRAWAL-FEE-LOCAL` | User withdrawal data does not include the fee, and `processWithdrawals` never pays a user withdrawal fee from portal escrow | 🔴 | A compromised sequencer can encode or redeem arbitrary fees from protected escrow |
-| `TEMPO-ZONE-DEPOSIT-BOUNCEBACK-FEE-CAP` | Deposit bounce-back fee is computed from the configured `bouncebackGas` at processing time and capped at the bounced amount | 🟢 | Refund accounting can underflow or overpay the sequencer |
-| `TEMPO-ZONE-DEPOSIT-BOUNCEBACK-FEE-NONBLOCKING` | A failed deposit-bounce-back fee transfer never reverts `processWithdrawal`; processing completes and the sequencer keeps the fee only when its transfer succeeds | 🟡 | A fee-transfer failure can stall the withdrawal queue or block exits |
+| `TEMPO-ZONE-DEPOSIT-BOUNCEBACK-FEE-CAP` | Deposit bounce-back fee is computed from the configured `bouncebackGas` at processing time and capped at the bounced amount | 🟢 | Refund accounting can underflow or overpay the admin |
+| `TEMPO-ZONE-DEPOSIT-BOUNCEBACK-FEE-NONBLOCKING` | A failed deposit-bounce-back fee transfer never reverts `processWithdrawal`; processing completes and the admin keeps the fee only when its transfer succeeds | 🟡 | A fee-transfer failure can stall the withdrawal queue or block exits |
 | `TEMPO-ZONE-BOUNCEBACK-FUNDS-PRESERVED` | When a bounce-back's final transfer/mint reverts, funds are credited to `_refunds[token][recipient]` (portal-side for deposit bounce-backs, `ZoneInbox`-side for withdrawal bounce-backs) and `claimRefund` zeroes the balance before paying | 🔴 | Funds whose bounce-back fails can be lost, double-claimed, or stuck |
 | `TEMPO-ZONE-BOUNCEBACK-TERMINAL` | Internal bounce-backs are the only entries with `bouncebackRecipient == address(0)`, the `rejected` flag has no effect on them, and a failed bounce-back routes to the refund registry instead of re-bouncing | 🔴 | A bounce-back can re-bounce indefinitely, looping the deposit/withdrawal queues or stalling processing |
 

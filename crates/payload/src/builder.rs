@@ -113,11 +113,11 @@ where
             ChainSpec = ZoneChainSpec,
             Payload = ZonePayloadTypes,
         >,
-    EvmConfig: ConfigureEvm<
+    EvmConfig: ConfigureTempoPoolEvm
+        + ConfigureEvm<
             Primitives = tempo_primitives::TempoPrimitives,
             NextBlockEnvCtx = TempoNextBlockEnvAttributes,
-        > + ConfigureTempoPoolEvm
-        + 'static,
+        > + 'static,
     <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
         EvmFactory<Tx = tempo_revm::TempoTxEnv>,
     BlockEnvFor<EvmConfig>: RevmBlock,
@@ -158,11 +158,11 @@ pub struct ZonePayloadBuilder<Provider, EvmConfig> {
 impl<Provider, EvmConfig> PayloadBuilder for ZonePayloadBuilder<Provider, EvmConfig>
 where
     Provider: StateProviderFactory + ChainSpecProvider<ChainSpec = ZoneChainSpec> + Clone + 'static,
-    EvmConfig: ConfigureEvm<
+    EvmConfig: ConfigureTempoPoolEvm
+        + ConfigureEvm<
             Primitives = tempo_primitives::TempoPrimitives,
             NextBlockEnvCtx = TempoNextBlockEnvAttributes,
-        > + ConfigureTempoPoolEvm
-        + 'static,
+        > + 'static,
     <EvmConfig::BlockExecutorFactory as BlockExecutorFactory>::EvmFactory:
         EvmFactory<Tx = tempo_revm::TempoTxEnv>,
     BlockEnvFor<EvmConfig>: RevmBlock,
@@ -348,7 +348,6 @@ where
             execution_output: Arc::new(execution_output),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
-            changed_paths: None,
         };
 
         let payload = TempoBuiltPayload::new(

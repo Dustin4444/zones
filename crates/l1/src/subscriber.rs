@@ -14,9 +14,7 @@ pub struct L1SubscriberConfig {
     pub l1_rpc_url: String,
     /// ZonePortal contract address on L1.
     pub portal_address: Address,
-    /// Optional genesis Tempo block number override. When set, used instead of
-    /// the portal's on-chain `genesisTempoBlockNumber` (which may be 0 for
-    /// portals not created via ZoneFactory).
+    /// Optional genesis Tempo block number used to backfill a fresh zone.
     pub genesis_tempo_block_number: Option<u64>,
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
     /// confirmed block and clears it on reorgs.
@@ -236,12 +234,9 @@ impl L1Subscriber {
     ///
     /// Uses the zone's local `tempoBlockNumber` as the primary starting point —
     /// this is the authoritative source for where the zone left off. Falls back
-    /// to the CLI genesis override or the portal's `genesisTempoBlockNumber`
-    /// when the zone hasn't processed any blocks yet.
-    pub(crate) async fn resolve_start_block(
-        &self,
-        l1_provider: &impl Provider<TempoNetwork>,
-    ) -> eyre::Result<Option<u64>> {
+    /// to the CLI genesis override when the zone hasn't processed any blocks
+    /// yet. Without either checkpoint, live subscription starts at the L1 tip.
+    pub(crate) async fn resolve_start_block(&self) -> eyre::Result<Option<u64>> {
         // The zone's local state is the authoritative source for where to
         // resume. This avoids the bug where the portal's
         // lastSyncedTempoBlockNumber runs ahead of local zone state.
@@ -256,24 +251,17 @@ impl L1Subscriber {
             return Ok(Some(genesis + 1));
         }
 
-        let portal = ZonePortal::new(self.config.portal_address, l1_provider);
-        let on_chain = portal.genesisTempoBlockNumber().call().await?;
-        if on_chain == 0 {
-            warn!(
-                "Portal genesisTempoBlockNumber is 0 — skipping backfill. \
-                 Set --l1.genesis-block-number to backfill from the correct block."
-            );
-            return Ok(None);
-        }
-
-        info!(genesis = on_chain, "Using portal's genesisTempoBlockNumber");
-        Ok(Some(on_chain + 1))
+        warn!(
+            "No local Tempo checkpoint or genesis block override — skipping backfill. \
+             Set --l1.genesis-block-number to backfill from the correct block."
+        );
+        Ok(None)
     }
 
     /// Backfill deposit events from the starting block to the current L1 tip.
     #[instrument(skip(self, l1_provider))]
     async fn sync_to_l1_tip(&self, l1_provider: &impl Provider<TempoNetwork>) -> eyre::Result<()> {
-        let Some(mut from) = self.resolve_start_block(l1_provider).await? else {
+        let Some(mut from) = self.resolve_start_block().await? else {
             self.subscriber_metrics.current_l1_lag_blocks.set(0.0);
             return Ok(());
         };
@@ -397,7 +385,6 @@ impl L1Subscriber {
                 sealed.parent_hash(),
                 &invalidated,
             );
-            self.apply_portal_state_events(block_number, &events);
             self.deposit_queue.enqueue_sealed(sealed, events);
             enqueued += 1;
             self.subscriber_metrics.blocks_enqueued.increment(1);
@@ -473,13 +460,11 @@ impl L1Subscriber {
             // If we have a buffered tip, check if the new block confirms it.
             if let Some((tip_header, (tip_events, tip_invalidated))) = unconfirmed_tip.take() {
                 if sealed.parent_hash() == tip_header.hash() {
-                    // Confirmed — update the L1 state anchor, apply events, and
-                    // flush to the queue.
+                    // Confirmed — update the L1 state anchor and flush to the queue.
                     let tip_number = tip_header.number();
                     let tip_hash = tip_header.hash();
                     let tip_parent = tip_header.parent_hash();
                     self.update_l1_state_anchor(tip_number, tip_hash, tip_parent, &tip_invalidated);
-                    self.apply_portal_state_events(tip_number, &tip_events);
                     match self.deposit_queue.try_enqueue(tip_header, tip_events) {
                         EnqueueOutcome::Accepted => {
                             self.subscriber_metrics.blocks_enqueued.increment(1);
@@ -570,18 +555,10 @@ impl L1Subscriber {
     fn record_portal_event_metrics(&self, portal_events: &L1PortalEvents) {
         let mut regular = 0u64;
         let mut encrypted = 0u64;
-        let mut transfer_started = 0u64;
-        let mut transferred = 0u64;
         for deposit in &portal_events.deposits {
             match deposit {
                 L1Deposit::Regular(_) => regular += 1,
                 L1Deposit::Encrypted(_) => encrypted += 1,
-            }
-        }
-        for event in &portal_events.sequencer_events {
-            match event {
-                L1SequencerEvent::TransferStarted { .. } => transfer_started += 1,
-                L1SequencerEvent::Transferred { .. } => transferred += 1,
             }
         }
         if regular > 0 {
@@ -599,32 +576,6 @@ impl L1Subscriber {
                 .token_enabled_events
                 .increment(portal_events.enabled_tokens.len() as u64);
         }
-        if transfer_started > 0 {
-            self.subscriber_metrics
-                .sequencer_transfer_started_events
-                .increment(transfer_started);
-        }
-        if transferred > 0 {
-            self.subscriber_metrics
-                .sequencer_transferred_events
-                .increment(transferred);
-        }
-    }
-
-    /// Write decoded portal state changes into the shared L1 cache at the
-    /// confirmed block height.
-    fn apply_portal_state_events(&self, block_number: u64, portal_events: &L1PortalEvents) {
-        if portal_events.sequencer_events.is_empty() {
-            return;
-        }
-
-        let mut cache = self.config.l1_state_cache.write();
-        apply_sequencer_events_to_cache(
-            &mut cache,
-            self.config.portal_address,
-            block_number,
-            &portal_events.sequencer_events,
-        );
     }
 
     /// Update the L1 state cache anchor. Detects reorgs by comparing
@@ -716,32 +667,4 @@ pub(crate) fn verify_receipts(
         );
     }
     Ok(())
-}
-
-pub(crate) fn apply_sequencer_events_to_cache(
-    cache: &mut L1StateCacheInner,
-    portal_address: Address,
-    block_number: u64,
-    sequencer_events: &[L1SequencerEvent],
-) {
-    let mut set_cache_slot = |slot, value| cache.set(portal_address, slot, block_number, value);
-
-    for event in sequencer_events {
-        match *event {
-            L1SequencerEvent::TransferStarted {
-                current_sequencer,
-                pending_sequencer,
-            } => {
-                set_cache_slot(PORTAL_SEQUENCER_SLOT, current_sequencer.into_word());
-                set_cache_slot(PORTAL_PENDING_SEQUENCER_SLOT, pending_sequencer.into_word());
-            }
-            L1SequencerEvent::Transferred {
-                previous_sequencer: _,
-                new_sequencer,
-            } => {
-                set_cache_slot(PORTAL_SEQUENCER_SLOT, new_sequencer.into_word());
-                set_cache_slot(PORTAL_PENDING_SEQUENCER_SLOT, B256::ZERO);
-            }
-        }
-    }
 }
