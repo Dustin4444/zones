@@ -41,6 +41,23 @@ regen-zone-dev-genesis:
     mv {{zone_dev_genesis_tmp}}/genesis.json crates/node/assets/zone-dev-genesis.json
     rm -rf {{zone_dev_genesis_tmp}}
 
+[group('zone')]
+[doc('Regenerates the bundled native ZoneFactory runtimes from the current Solidity artifacts')]
+regen-native-zone-runtimes:
+    #!/bin/bash
+    set -euo pipefail
+    forge build --root specs/ref-impls --quiet
+    for spec in \
+        "ZonePortal:zone-portal" \
+        "ZoneMessenger:zone-messenger" \
+        "Verifier:verifier"
+    do
+        contract="${spec%%:*}"
+        asset="${spec#*:}"
+        runtime="$(forge inspect --root specs/ref-impls "$contract" deployedBytecode)"
+        printf '%s\n' "${runtime#0x}" > "crates/node/assets/${asset}-runtime.hex"
+    done
+
 [group('localnet')]
 [doc('Generates a genesis file')]
 genesis accounts="1000" output="./" profile="maxperf":

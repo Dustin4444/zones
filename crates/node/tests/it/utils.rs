@@ -209,10 +209,6 @@ fn forge_deployed_bytecode(contract: &str) -> eyre::Result<alloy_primitives::Byt
 }
 
 fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::Result<()> {
-    use tempo_zone_contracts::{
-        ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
-    };
-
     // Native TIP-1091 accounts use the non-empty 0xEF precompile marker. Slot 0 packs
     // `uint32 nextZoneId`, `address owner`, and the implementation lock flag.
     let packed_factory_config: U256 = U256::ONE | (U256::from_be_slice(owner.as_slice()) << 32);
@@ -226,6 +222,14 @@ fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::R
             .with_code(Some(vec![0xef].into()))
             .with_storage(Some(factory_storage)),
     );
+    Ok(())
+}
+
+fn install_native_zone_runtimes(genesis: &mut Genesis) -> eyre::Result<()> {
+    use tempo_zone_contracts::{
+        ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
+    };
+
     genesis.alloc.insert(
         ZONE_VERIFIER_ADDRESS,
         GenesisAccount::default()
@@ -1873,6 +1877,11 @@ impl L1TestNode {
         Self::start_with(|_| {}).await
     }
 
+    /// Start an L1 dev node with only the native ZoneFactory installed.
+    pub(crate) async fn start_without_zone_runtimes() -> eyre::Result<Self> {
+        Self::start_inner(false, |_| {}).await
+    }
+
     /// Start an L1 dev node, applying a closure to customise the [`NodeConfig`]
     /// before launch.
     ///
@@ -1888,12 +1897,22 @@ impl L1TestNode {
     pub(crate) async fn start_with(
         f: impl FnOnce(&mut NodeConfig<TempoChainSpec>),
     ) -> eyre::Result<Self> {
+        Self::start_inner(true, f).await
+    }
+
+    async fn start_inner(
+        install_runtimes: bool,
+        f: impl FnOnce(&mut NodeConfig<TempoChainSpec>),
+    ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
 
         let genesis: serde_json::Value =
             serde_json::from_str(include_str!("../assets/test-genesis.json"))?;
         let mut genesis = serde_json::from_value(genesis)?;
         install_native_zone_factory(&mut genesis, l1_dev_signer().address())?;
+        if install_runtimes {
+            install_native_zone_runtimes(&mut genesis)?;
+        }
         let chain_spec = TempoChainSpec::from_genesis(genesis);
 
         let mut node_config = NodeConfig::new(Arc::new(chain_spec))
