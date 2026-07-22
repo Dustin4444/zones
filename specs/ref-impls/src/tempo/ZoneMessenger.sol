@@ -5,6 +5,8 @@ import {
     IWithdrawalReceiver,
     IZoneFactory,
     IZoneMessenger,
+    IZonePortal,
+    Role,
     ZONE_FACTORY_ADDRESS,
     ZoneInfo
 } from "../interfaces/IZone.sol";

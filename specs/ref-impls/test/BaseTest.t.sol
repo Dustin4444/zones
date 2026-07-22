@@ -18,6 +18,7 @@ import { Verifier } from "../src/tempo/Verifier.sol";
 import { ZoneMessenger } from "../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../src/tempo/ZonePortal.sol";
 import { MockZoneTxContext } from "./mocks/MockZoneTxContext.sol";
+import { MockZoneGateway } from "./mocks/MockZoneGateway.sol";
 import { Test, console } from "forge-std/Test.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { IAccountKeychain } from "tempo-std/interfaces/IAccountKeychain.sol";
@@ -87,6 +88,8 @@ contract BaseTest is Test {
     error CallShouldHaveReverted();
 
     function setUp() public virtual {
+        zoneGateway = new MockZoneGateway();
+
         if (_ACCOUNT_KEYCHAIN.code.length == 0) {
             revert MissingPrecompile("AccountKeychain", _ACCOUNT_KEYCHAIN);
         }
@@ -166,6 +169,20 @@ contract BaseTest is Test {
         );
     }
 
+    function _zoneGateways() internal view returns (address[] memory gateways) {
+        gateways = new address[](1);
+        gateways[0] = address(zoneGateway);
+    }
+
+    function _closedLoopAccounts() internal view returns (address[] memory accounts) {
+        accounts = new address[](5);
+        accounts[0] = address(this);
+        accounts[1] = admin;
+        accounts[2] = alice;
+        accounts[3] = bob;
+        accounts[4] = charlie;
+    }
+
     /// @notice Installs the shared runtimes managed by the native TIP-1091 factory.
     function _installSharedZoneRuntimes() internal {
         vm.etch(ZONE_VERIFIER_ADDRESS, type(Verifier).runtimeCode);
@@ -192,6 +209,8 @@ contract BaseTest is Test {
         portal.initialize(
             zoneId,
             initialToken,
+            _closedLoopAccounts(),
+            _zoneGateways(),
             ZONE_MESSENGER_ADDRESS,
             portalAdmin,
             sequencers,

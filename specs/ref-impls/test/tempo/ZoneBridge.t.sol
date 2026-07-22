@@ -173,6 +173,16 @@ contract ZoneBridgeTest is BaseTest {
         genesisTempoBlockNumber = uint64(block.number);
 
         // Deploy portal directly (bypass factory to avoid TIP20 prefix check).
+        address[] memory bridgeAccounts = new address[](8);
+        bridgeAccounts[0] = address(this);
+        bridgeAccounts[1] = admin;
+        bridgeAccounts[2] = alice;
+        bridgeAccounts[3] = bob;
+        bridgeAccounts[4] = charlie;
+        bridgeAccounts[5] = address(0x600);
+        bridgeAccounts[6] = address(0x700);
+        bridgeAccounts[7] = address(0x800);
+
         ZoneMessenger messengerContract = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
         l1Portal = new ZonePortal();
         address[] memory sequencers = new address[](1);

@@ -154,6 +154,7 @@ contract ZonePortal is IZonePortal {
     uint256 public zoneHeight;
     address[] internal _sequencers;
     mapping(address => bool) public isSequencer;
+    mapping(address => Role) public role;
 
     /*//////////////////////////////////////////////////////////////
                              INITIALIZATION
@@ -185,6 +186,13 @@ contract ZonePortal is IZonePortal {
         rpcUrl = _rpcUrl;
 
         _replaceSequencerSet(initialSequencers, _threshold, false);
+
+        for (uint256 i; i < _zoneGateways.length; ++i) {
+            _setRole(_zoneGateways[i], Role.CallbackGateway);
+        }
+        for (uint256 i; i < _allowedAccounts.length; ++i) {
+            _setRole(_allowedAccounts[i], Role.Account);
+        }
 
         // Enable the initial token
         _enableTokenInternal(_initialToken);
@@ -334,8 +342,17 @@ contract ZonePortal is IZonePortal {
         emit AdminTransferred(previousAdmin, admin);
     }
 
-    /// @notice Assign an account's role across portal flows.
-    function setRole(address account, Role next) external onlyAdmin {
+    /// @notice Add or remove an account from closed-loop portal flows.
+    function setAllowedAccount(address account, bool allowed) external onlyAdmin {
+        _setRole(account, allowed ? Role.Account : Role.None);
+    }
+
+    /// @notice Add or remove a callback gateway.
+    function setGateway(address account, bool allowed) external onlyAdmin {
+        _setRole(account, allowed ? Role.CallbackGateway : Role.None);
+    }
+
+    function _setRole(address account, Role next) internal {
         if (next == Role.Account && account == messenger) {
             revert InvalidAllowedAccount();
         }

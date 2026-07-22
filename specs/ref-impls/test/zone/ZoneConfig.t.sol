@@ -6,6 +6,7 @@ import {
     IZonePortal,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_ROLE_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT
 } from "../../src/interfaces/IZone.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
@@ -45,6 +46,16 @@ contract ZoneConfigTest is BaseTest {
     }
 
     function _syncPortalSlot(bytes32 slot) internal {
+        tempoState.setMockStorageValue(address(portal), slot, vm.load(address(portal), slot));
+    }
+
+    function _syncAllowedAccount(address account) internal {
+        bytes32 slot = keccak256(abi.encode(account, PORTAL_ROLE_SLOT));
+        tempoState.setMockStorageValue(address(portal), slot, vm.load(address(portal), slot));
+    }
+
+    function _syncZoneGateway(address gateway) internal {
+        bytes32 slot = keccak256(abi.encode(gateway, PORTAL_ROLE_SLOT));
         tempoState.setMockStorageValue(address(portal), slot, vm.load(address(portal), slot));
     }
 

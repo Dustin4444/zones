@@ -6,6 +6,8 @@ import {
     IZoneConfig,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_ROLE_SLOT,
+    Role,
     PORTAL_TOKEN_CONFIGS_SLOT
 } from "../interfaces/IZone.sol";
 

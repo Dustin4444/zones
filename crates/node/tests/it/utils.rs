@@ -1463,18 +1463,17 @@ impl L1TestNode {
             .ok_or_else(|| eyre::eyre!("SwapAndDepositRouter deployment missing contract address"))
     }
 
-    /// Grant an account a role on a zone portal.
-    pub(crate) async fn set_portal_role_as_admin(
+    /// Register an account as a callback gateway on a zone portal.
+    pub(crate) async fn set_portal_gateway_as_admin(
         &self,
         portal_address: Address,
         account: Address,
-        role: tempo_zone_contracts::ZonePortal::Role,
     ) -> eyre::Result<()> {
         use tempo_zone_contracts::ZonePortal;
 
         let provider = self.admin_provider();
         let receipt = ZonePortal::new(portal_address, &provider)
-            .setRole(account, role)
+            .setGateway(account, true)
             .send()
             .await?
             .get_receipt()
@@ -1506,11 +1505,11 @@ impl L1TestNode {
             .await?;
         let router = self.deploy_router(factory).await?;
 
-        use tempo_zone_contracts::{ZonePortal, ZonePortal::Role};
+        use tempo_zone_contracts::ZonePortal;
         let provider = self.dev_provider();
         for portal_address in [portal_a, portal_b] {
             let receipt = ZonePortal::new(portal_address, &provider)
-                .setRole(router, Role::CallbackGateway)
+                .setGateway(router, true)
                 .send()
                 .await?
                 .get_receipt()

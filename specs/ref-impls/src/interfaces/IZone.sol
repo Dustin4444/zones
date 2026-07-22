@@ -366,6 +366,7 @@ bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(6));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(7));
 bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(13));
 bytes32 constant PORTAL_IS_SEQUENCER_SLOT = bytes32(uint256(19));
+bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(PORTAL_IS_SEQUENCER_SLOT) + 1);
 
 /// @title IVerifier
 /// @notice Interface for zone proof/attestation verification
@@ -635,6 +636,12 @@ interface IZonePortal {
     error InvalidSequencerSet();
     error SequencerConfigurationUnchanged();
     error InvalidQuorumCertificate();
+    error InvalidCallbackTarget();
+    error CallbackDidNotReturnToZone();
+    error InvalidAllowedAccount();
+    error AccountNotAllowed(address account);
+
+    event RoleUpdated(address indexed account, Role prev, Role next);
 
     function initialize(
         uint32 zoneId,
@@ -754,6 +761,15 @@ interface IZonePortal {
 
     /// @notice Accept a pending admin transfer. Only callable by the pending admin.
     function acceptAdmin() external;
+
+    /// @notice Return an account's closed-loop portal role.
+    function role(address account) external view returns (Role);
+
+    /// @notice Add or remove an account from closed-loop portal flows.
+    function setAllowedAccount(address account, bool allowed) external;
+
+    /// @notice Add or remove a callback gateway.
+    function setGateway(address account, bool allowed) external;
 
     /// @notice Get the sequencer's current encryption public key for encrypted deposits
     /// @return x The X coordinate of the secp256k1 public key

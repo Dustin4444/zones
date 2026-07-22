@@ -225,6 +225,9 @@ crate::sol! {
 
         function transferAdmin(address newAdmin) external;
         function acceptAdmin() external;
+        function role(address account) external view returns (Role);
+        function setAllowedAccount(address account, bool allowed) external;
+        function setGateway(address account, bool allowed) external;
 
         function rpcUrl() external view returns (string memory);
         function setRpcUrl(string calldata rpcUrl) external;

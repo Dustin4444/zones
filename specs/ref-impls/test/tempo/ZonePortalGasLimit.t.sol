@@ -71,7 +71,20 @@ contract ZonePortalGasLimitTest is Test {
         );
 
         vm.prank(ZONE_FACTORY_ADDRESS);
-        portal.initialize(1, address(token), address(0x400), admin, sequencers, 1, address(0), "");
+        address[] memory noAccounts = new address[](0);
+        address[] memory noGateways = new address[](0);
+        portal.initialize(
+            1,
+            address(token),
+            noAccounts,
+            noGateways,
+            address(0x400),
+            admin,
+            sequencers,
+            1,
+            address(0),
+            ""
+        );
     }
 
     function test_bouncebackGas_defaultsToZero() public view {

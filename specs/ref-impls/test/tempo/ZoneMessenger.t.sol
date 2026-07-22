@@ -5,6 +5,7 @@ import {
     IWithdrawalReceiver,
     IZonePortal,
     MAX_WITHDRAWAL_CALLBACK_GAS,
+    Role,
     ZONE_FACTORY_ADDRESS,
     ZONE_MESSENGER_ADDRESS,
     ZoneInfo
@@ -113,6 +114,18 @@ contract ZoneMessengerTest is BaseTest {
             abi.encodeWithSelector(ITIP20.transfer.selector, target, amount),
             abi.encode(result)
         );
+    }
+
+    function _allowGateway(address target) internal {
+        vm.mockCall(
+            portal,
+            abi.encodeWithSelector(IZonePortal.role.selector, target),
+            abi.encode(Role.CallbackGateway)
+        );
+    }
+
+    function _callback() internal pure returns (bytes memory) {
+        return hex"010203";
     }
 
     function test_zoneFactoryConstant() public view {
