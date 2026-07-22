@@ -14,6 +14,7 @@ import {
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
+    WITHDRAWAL_TRACKER,
     Withdrawal,
     ZONE_MESSENGER_ADDRESS,
     ZONE_VERIFIER_ADDRESS,
@@ -29,6 +30,7 @@ import { BaseTest } from "../BaseTest.t.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 
 import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockWithdrawalTracker } from "../mocks/MockWithdrawalTracker.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 
 /// @notice Mock receiver that tracks received amounts
@@ -157,6 +159,8 @@ contract ZoneIntegrationTest is BaseTest {
         l2TempoState.setMockTokenEnabled(address(l1Portal), address(l2ZoneToken), true);
         l2Inbox = new ZoneInbox(address(l2Config), address(l1Portal), address(l2TempoState));
         l2Outbox = new ZoneOutbox(address(l2Config));
+        MockWithdrawalTracker withdrawalTracker = new MockWithdrawalTracker();
+        vm.etch(WITHDRAWAL_TRACKER, address(withdrawalTracker).code);
 
         l2ZoneToken.setMinter(address(l2Inbox), true);
         l2ZoneToken.setBurner(address(l2Outbox), true);

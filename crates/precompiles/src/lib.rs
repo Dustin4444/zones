@@ -52,6 +52,7 @@ pub mod tip20_factory;
 pub mod tip403_proxy;
 #[cfg(feature = "std")]
 pub mod tx_context;
+pub mod withdrawal_tracker;
 pub mod ztip20;
 
 pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
@@ -62,6 +63,7 @@ pub use storage::{L1State, L1StateError, L1StorageReader};
 pub use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
 pub use tempo_state::TempoState;
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};
+pub use withdrawal_tracker::WithdrawalTracker;
 
 use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::Address;

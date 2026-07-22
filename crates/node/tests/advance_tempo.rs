@@ -310,10 +310,13 @@ fn zone_test_genesis_predeploy_bytecode_matches_foundry_artifacts() {
     // can differ across build environments while the executable bytecode matches.
     let mut evm = setup_zone_evm_with_contracts_for_portal(1337, Address::ZERO);
 
-    // TempoState and ZoneOutbox are native precompiles. The genesis generator intentionally uses
-    // the non-empty native-account marker instead of deploying their Solidity reference shims.
+    // Native precompiles use the non-empty account marker instead of Solidity reference shims.
     assert_eq!(genesis_predeploy_code(TEMPO_STATE_ADDRESS), [0xef]);
     assert_eq!(genesis_predeploy_code(ZONE_OUTBOX_ADDRESS), [0xef]);
+    assert_eq!(
+        genesis_predeploy_code(tempo_zone_contracts::WITHDRAWAL_TRACKER_ADDRESS),
+        [0xef]
+    );
 
     for (name, addr) in [
         ("ZoneConfig", ZONE_CONFIG_ADDRESS),

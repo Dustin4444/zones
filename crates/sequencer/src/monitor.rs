@@ -21,9 +21,9 @@
 //! number that IS within the EIP-2935 window, and the proof must include a
 //! block header chain linking that anchor back to `tempoBlockNumber`.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_signer_local::PrivateKeySigner;
@@ -36,7 +36,10 @@ use tracing::{error, info, instrument, warn};
 use alloy_sol_types::{ContractError, SolInterface as _};
 
 use crate::{
-    abi::{self, IZoneOutbox, NO_QUEUE_INDEX, TempoState, ZoneInbox, ZonePortal},
+    abi::{
+        self, IWithdrawalTracker, IZoneOutbox, NO_QUEUE_INDEX, TempoState,
+        WITHDRAWAL_TRACKER_ADDRESS, ZoneInbox, ZonePortal,
+    },
     rpc::rpc_connection_config,
     settlement::{
         BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
@@ -477,6 +480,9 @@ impl ZoneMonitor {
     async fn process_finalized_batch(&mut self, from: u64, to: u64) -> Result<()> {
         let finalized_batch = fetch_finalized_batch(&self.outbox, &self.provider, from, to).await?;
         let end_state = self.fetch_block_snapshot(to).await?;
+        let required_portal_backing = self
+            .required_portal_backing(to, &finalized_batch.withdrawal_totals)
+            .await?;
 
         let expected_l2_index = self
             .batch_submitter
@@ -512,10 +518,35 @@ impl ZoneMonitor {
             prev_deposit_number: self.prev_processed_deposit_number,
             next_deposit_number: end_state.processed_deposit_number,
             withdrawal_queue_hash: finalized_batch.finalized_hash,
+            required_portal_backing,
         };
 
         self.submit_batch_with_retry(&batch_data, to, finalized_batch.withdrawals)
             .await
+    }
+
+    /// Combine post-batch tracker totals with every amount and fee finalized in this batch.
+    async fn required_portal_backing(
+        &self,
+        block: u64,
+        withdrawal_totals: &BTreeMap<Address, U256>,
+    ) -> Result<BTreeMap<Address, U256>> {
+        let tracker = IWithdrawalTracker::new(WITHDRAWAL_TRACKER_ADDRESS, self.provider.clone());
+        let mut required = BTreeMap::new();
+        for (&token, &outgoing) in withdrawal_totals {
+            let remaining = tracker
+                .zoneTotalSupply(token)
+                .block(block.into())
+                .call()
+                .await?;
+            let required_for_token = remaining.checked_add(outgoing).ok_or_else(|| {
+                eyre::eyre!(
+                    "portal backing requirement overflow for token {token} at zone block {block}"
+                )
+            })?;
+            required.insert(token, required_for_token);
+        }
+        Ok(required)
     }
 
     /// Read the zone state at block `to`: tempo block number, processed deposit
@@ -1201,6 +1232,7 @@ mod tests {
             prev_deposit_number: 0,
             next_deposit_number: 0,
             withdrawal_queue_hash: B256::ZERO,
+            required_portal_backing: BTreeMap::new(),
         };
 
         monitor

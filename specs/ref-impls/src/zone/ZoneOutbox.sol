@@ -2,6 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {
+    IWithdrawalTracker,
     IZoneConfig,
     IZoneOutbox,
     IZonePortal,
@@ -10,6 +11,7 @@ import {
     LastBatch,
     MAX_WITHDRAWAL_CALLBACK_GAS,
     PendingWithdrawal,
+    WITHDRAWAL_TRACKER,
     Withdrawal,
     ZONE_INBOX,
     ZONE_TX_CONTEXT
@@ -280,6 +282,8 @@ contract ZoneOutbox is IZoneOutbox {
         uint128 totalBurn = amount + fee;
         bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
         if (txHash == bytes32(0)) revert InvalidCurrentTxHash();
+
+        IWithdrawalTracker(WITHDRAWAL_TRACKER).withdraw(msg.sender, token, amount, fee);
 
         // Transfer tokens from sender to this contract, then burn
         // (Using transferFrom so user must approve first)

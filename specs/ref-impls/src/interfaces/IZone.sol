@@ -308,8 +308,31 @@ address constant ZONE_OUTBOX = 0x1c00000000000000000000000000000000000002;
 // ZoneConfig system contract address (0x1c00...0003)
 address constant ZONE_CONFIG = 0x1c00000000000000000000000000000000000003;
 
+// WithdrawalTracker precompile address (0x1c00...0004)
+address constant WITHDRAWAL_TRACKER = 0x1c00000000000000000000000000000000000004;
+
 // ZoneTxContext precompile address (0x1c00...0005)
 address constant ZONE_TX_CONTEXT = 0x1C00000000000000000000000000000000000005;
+
+/// @title IWithdrawalTracker
+/// @notice Consensus Zone-balance ledger used to authorize user withdrawals independently of TIP-20.
+interface IWithdrawalTracker {
+
+    error OnlyZoneInbox();
+    error OnlyZoneOutbox();
+    error InsufficientZoneBalance(
+        address user, address token, uint256 requested, uint256 available
+    );
+
+    function zoneBalance(address user, address token) external view returns (uint256);
+
+    function zoneTotalSupply(address token) external view returns (uint256);
+
+    function deposit(address user, address token, uint256 amount) external;
+
+    function withdraw(address user, address token, uint256 amount, uint256 fee) external;
+
+}
 
 /// @title IZoneTxContext
 /// @notice Interface for the zone precompile that exposes the currently executing tx hash

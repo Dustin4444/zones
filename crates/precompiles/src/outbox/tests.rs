@@ -5,11 +5,11 @@ use alloy_primitives::{Bytes, address, keccak256};
 use alloy_sol_types::{SolCall, SolInterface, SolValue};
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{storage::StorageCtx, test_util::TIP20Setup};
-use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
+use tempo_zone_contracts::{IZoneOutbox as ZoneOutboxAbi, WithdrawalTrackerError};
 use zone_primitives::constants::TEMPO_STATE_ADDRESS;
 
 use crate::{
-    create_outbox_precompile,
+    WithdrawalTracker, create_outbox_precompile,
     tempo_state::TEMPO_BLOCK_NUMBER_SLOT,
     test_utils::{
         MockL1Reader, TestContext, call_precompile, test_context, test_env, test_storage_provider,
@@ -56,6 +56,7 @@ impl Harness {
                 )?;
 
                 ZoneOutbox::new().initialize()?;
+                WithdrawalTracker::new().record_deposit(ALICE, token, U256::from(1_000_000u64))?;
                 TIP20Setup::path_usd(ALICE)
                     .with_issuer(ALICE)
                     .with_issuer(ZONE_OUTBOX_ADDRESS)
@@ -487,6 +488,26 @@ fn request_burns_amount_plus_fee_and_rejects_insufficient_funds() -> eyre::Resul
 
     let result = harness.request(u128::MAX, BOB, B256::ZERO);
     assert!(result.expect("precompile result").is_revert());
+    Ok(())
+}
+
+#[test]
+fn request_rejects_tip20_balance_without_zone_balance() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    let before = harness.balance_of(ALICE)?;
+    let token = harness.token;
+
+    assert_revert(
+        harness.request(1_000_001, BOB, B256::ZERO),
+        WithdrawalTrackerError::insufficient_zone_balance(
+            ALICE,
+            token,
+            U256::from(1_000_001u64),
+            U256::from(1_000_000u64),
+        ),
+    );
+    assert_eq!(harness.balance_of(ALICE)?, before);
+    assert!(harness.pending()?.is_empty());
     Ok(())
 }
 

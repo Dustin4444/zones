@@ -16,6 +16,7 @@ import {
     IAesGcmDecrypt,
     IChaumPedersenVerify,
     IWithdrawalReceiver,
+    IWithdrawalTracker,
     IZoneFactory,
     IZoneInbox,
     IZonePortal,
@@ -23,6 +24,7 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
+    WITHDRAWAL_TRACKER,
     Withdrawal,
     ZONE_INBOX,
     ZONE_MESSENGER_ADDRESS,
@@ -39,6 +41,7 @@ import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockWithdrawalTracker } from "../mocks/MockWithdrawalTracker.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
@@ -230,6 +233,8 @@ contract ZoneBridgeTest is BaseTest {
         vm.etch(ZONE_OUTBOX, address(outboxImpl).code);
         l2Outbox = ZoneOutbox(ZONE_OUTBOX);
         l2ZoneToken.setBurner(address(l2Outbox), true);
+        MockWithdrawalTracker withdrawalTracker = new MockWithdrawalTracker();
+        vm.etch(WITHDRAWAL_TRACKER, address(withdrawalTracker).code);
 
         // Initialize zone block hash
         l2BlockHash = GENESIS_BLOCK_HASH;
@@ -704,7 +709,7 @@ contract ZoneBridgeTest is BaseTest {
         assertTrue(l1Portal.currentDepositQueueHash() != depositHashBefore);
     }
 
-    function test_fullFlow_transferOnL2() public {
+    function test_transferredTip20DoesNotCreateWithdrawalBalance() public {
         // Deposit to Alice
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l1Portal), 1000e6);
@@ -722,15 +727,23 @@ contract ZoneBridgeTest is BaseTest {
         assertEq(l2ZoneToken.balanceOf(alice), 100_000e6 - 300e6);
         assertEq(l2ZoneToken.balanceOf(bob), 100_000e6 + 300e6);
 
-        // Bob withdraws on zone
+        // A TIP-20 transfer does not create a Zone withdrawal balance for Bob.
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 300e6);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IWithdrawalTracker.InsufficientZoneBalance.selector,
+                bob,
+                address(l2ZoneToken),
+                300e6,
+                0
+            )
+        );
         l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 300e6, bytes32(0), 0, bob, "");
         vm.stopPrank();
 
-        // Verify Bob's zone balance debited (100K + 300e6 received - 300e6 withdrawn)
-        assertEq(l2ZoneToken.balanceOf(bob), 100_000e6);
-        assertEq(l2Outbox.nextWithdrawalIndex(), 1);
+        assertEq(l2ZoneToken.balanceOf(bob), 100_000e6 + 300e6);
+        assertEq(l2Outbox.nextWithdrawalIndex(), 0);
     }
 
     function test_l2_insufficientBalanceReverts() public {
@@ -743,7 +756,12 @@ contract ZoneBridgeTest is BaseTest {
         _sequencerObserveDeposit(alice, alice, 1000e6, bytes32(""));
         _sequencerRelayDepositsToL2();
 
-        // Alice tries to withdraw more than balance (net balance is 100_000e6 after deposit+mint)
+        // Overfund only the tracker so this test still reaches the TIP-20 balance check.
+        IWithdrawalTracker tracker = IWithdrawalTracker(WITHDRAWAL_TRACKER);
+        tracker.deposit(alice, address(l2ZoneToken), 99_001e6);
+        uint256 zoneBalanceBefore = tracker.zoneBalance(alice, address(l2ZoneToken));
+        uint256 supplyBefore = tracker.zoneTotalSupply(address(l2ZoneToken));
+
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), type(uint256).max);
         vm.expectRevert(MockZoneToken.InsufficientBalance.selector);
@@ -751,6 +769,9 @@ contract ZoneBridgeTest is BaseTest {
             address(l2ZoneToken), alice, uint128(100_001e6), bytes32(0), 0, alice, ""
         );
         vm.stopPrank();
+
+        assertEq(tracker.zoneBalance(alice, address(l2ZoneToken)), zoneBalanceBefore);
+        assertEq(tracker.zoneTotalSupply(address(l2ZoneToken)), supplyBefore);
     }
 
     function test_l2_transferInsufficientBalance() public {

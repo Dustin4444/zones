@@ -77,6 +77,7 @@
     - [Proof Requirements](#proof-requirements)
   - [Zone Precompiles](#zone-precompiles)
     - [TIP-20 Token Precompile](#tip-20-token-precompile)
+    - [Withdrawal Tracker](#withdrawal-tracker)
     - [Chaum-Pedersen Verify](#chaum-pedersen-verify)
     - [AES-GCM Decrypt](#aes-gcm-decrypt)
   - [Contracts and Interfaces](#contracts-and-interfaces)
@@ -278,7 +279,7 @@ The shared `ZoneMessenger` relays withdrawal callbacks for all zones created by 
 
 ### Zone Predeploys
 
-Each zone has five system contracts deployed at genesis at fixed addresses:
+Each zone has six system contracts deployed at genesis at fixed addresses:
 
 | Predeploy | Address | Purpose |
 |-----------|---------|---------|
@@ -286,6 +287,7 @@ Each zone has five system contracts deployed at genesis at fixed addresses:
 | [`ZoneInbox`](#izoneinbox) | `0x1c00...0001` | Advances the zone's view of Tempo and processes incoming deposits. Sole mint authority. |
 | [`ZoneOutbox`](#izoneoutbox) | `0x1c00...0002` | Handles withdrawal requests and batch finalization. Sole burn authority. |
 | [`ZoneConfig`](#izoneconfig) | `0x1c00...0003` | Central configuration. Reads the sequencer address and token registry from Tempo via `TempoState`. |
+| `WithdrawalTracker` | `0x1c00...0004` | Consensus Zone-balance ledger used to authorize withdrawals independently of TIP-20 storage. |
 | `ZoneTxContext` | `0x1c00...0005` | Provides the current transaction hash to system contracts (used by `ZoneOutbox` for `senderTag` computation). |
 
 `ZoneConfig` reads the sequencer address and token registry from the portal on Tempo via `TempoState` storage reads, making Tempo the single source of truth for zone configuration. See [Tempo State Reads](#tempo-state-reads) for details.
@@ -296,8 +298,8 @@ Contract creation is disabled on zones (`CREATE` and `CREATE2` revert). All TIP-
 
 Token supply on the zone is controlled exclusively by the system contracts:
 
-- `ZoneInbox` mints tokens when processing deposits from Tempo.
-- `ZoneOutbox` burns tokens when users request withdrawals.
+- `ZoneInbox` mints tokens when processing deposits from Tempo, then credits the same amount to `WithdrawalTracker`.
+- `ZoneOutbox` debits `amount + fee` from `WithdrawalTracker` before burning a user withdrawal.
 
 The zone-side supply of each token always equals net deposits minus net withdrawals. The corresponding tokens on Tempo are locked in the portal. No other actor can mint or burn zone tokens.
 
@@ -591,7 +593,9 @@ Withdrawal requests are bounded before they enter the pending queue. `gasLimit` 
 
 The sequencer can additionally configure `maxWithdrawalsPerBlock` on the outbox. A value of `0` means unlimited. When nonzero, only that many `requestWithdrawal` calls can be accepted in a single zone block; further requests in the same block revert with `TooManyWithdrawalsThisBlock` before any token transfer or burn. The outbox tracks the last block number counted and resets the per-block counter when `block.number` changes.
 
-The outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and stores the withdrawal in a pending array. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
+Before touching the token, the outbox calls `WithdrawalTracker.withdraw(user, token, amount, fee)`. The request reverts if `zoneBalance[user][token] < amount + fee`; otherwise the tracker subtracts the debit from both the user's Zone balance and `zoneTotalSupply[token]`. This is independent of TIP-20 storage, so tokens that were not created by a successful bridge credit cannot authorize an exit. Protocol refunds for deposits that never minted are not user withdrawals and do not debit the tracker.
+
+After the Zone-balance check, the outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and stores the withdrawal in a pending array. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
 
 Keeping the recipient in zone state prevents the L1-visible withdrawal and any later bounce-back from revealing the user's private zone address. A monotonic nonce is deterministic under the zone's canonical transaction ordering, including multi-sequencer execution, while remaining collision-free; it reveals only relative withdrawal order and count, not the mapped recipient.
 
@@ -1389,6 +1393,20 @@ withdrawal queue hash, and verifier configuration. Duplicate, malformed, unregis
 stale-version signatures are rejected. The transaction submitter has no distinguished authority
 beyond being an active sequencer.
 
+Immediately before posting `submitBatch`, the sequencer verifies Portal custody for every token
+withdrawn by the batch. It reads `WithdrawalTracker.zoneTotalSupply(token)` at the batch's final
+zone block and computes:
+
+```text
+requiredPortalBalance[token] = zoneTotalSupply[token]
+                             + sum(batch withdrawal amounts and fees for token)
+```
+
+The sum includes protocol refunds for deposits that never minted. Those refunds do not debit a
+user's tracker balance, but they still leave Portal custody when processed. The sequencer does not
+submit the batch when `TIP20.balanceOf(portal) < requiredPortalBalance[token]`; a later retry reads
+fresh Zone and Tempo state.
+
 On success, the portal:
 
 1. Updates `blockHash` to `nextBlockHash`.
@@ -1449,7 +1467,8 @@ For the first proof, requirement 1 specifically means a transition from `prevBlo
 
 ## Zone Precompiles
 
-Zones have three categories of precompiles: TIP-20 token precompiles (one per enabled token) and two cryptographic precompiles for encrypted deposit verification.
+Zone precompiles include TIP-20 token precompiles (one per enabled token), the withdrawal tracker,
+and two cryptographic precompiles for encrypted deposit verification.
 
 ### TIP-20 Token Precompile
 
@@ -1458,6 +1477,22 @@ Each enabled TIP-20 token is deployed as a precompile at the same address as on 
 - `balanceOf` and `allowance` are restricted to the account owner (or sequencer).
 - Transfer-family operations (`transfer`, `transferFrom`, `approve`) charge a fixed 100,000 gas.
 - `mint` is restricted to `ZoneInbox`, `burn` is restricted to `ZoneOutbox`.
+
+### Withdrawal Tracker
+
+| | |
+|---|---|
+| **Address** | `0x1c00000000000000000000000000000000000004` |
+
+`WithdrawalTracker` is a consensus-state ledger independent of TIP-20 storage. It maintains
+`zoneBalance[user][token]`, the amount a user may withdraw, and `zoneTotalSupply[token]`, the
+aggregate Portal-backed supply remaining on the zone. Only `ZoneInbox` may call `deposit`, and only
+`ZoneOutbox` may call `withdraw`.
+
+Successful regular deposits, encrypted deposits, withdrawal bounce-backs, and refund claims credit
+both values. A user withdrawal debits `amount + fee` from both values and reverts when the user's
+Zone balance is insufficient. Failed or rejected deposits and their protocol bounce-backs never debit
+the tracker because they never created zone supply.
 
 ### Chaum-Pedersen Verify
 

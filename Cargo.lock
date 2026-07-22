@@ -13695,6 +13695,7 @@ name = "zone-sequencer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-contract",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",

@@ -41,13 +41,15 @@ use tempo_precompiles::{
 use tempo_primitives::TempoHeader;
 use tempo_revm::{TempoBlockEnv, TempoTxEnv};
 use zone_precompiles::{
-    TempoState as NativeTempoState, ZoneOutbox as NativeZoneOutbox, ZoneTokenFactory,
+    TempoState as NativeTempoState, WithdrawalTracker, ZoneOutbox as NativeZoneOutbox,
+    ZoneTokenFactory,
 };
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
 const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
+const WITHDRAWAL_TRACKER_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000004");
 
 const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
@@ -147,6 +149,7 @@ impl GenerateZoneGenesis {
 
         initialize_tempo_state(&mut evm, &header_rlp)?;
         initialize_zone_outbox(&mut evm)?;
+        initialize_withdrawal_tracker(&mut evm)?;
 
         let zone_config_bytecode = load_artifact(&self.specs_out, "ZoneConfig")?;
         let zone_config_args = (self.tempo_portal, TEMPO_STATE_ADDRESS).abi_encode_params();
@@ -180,6 +183,7 @@ impl GenerateZoneGenesis {
             ("ZoneConfig", ZONE_CONFIG_ADDRESS),
             ("ZoneInbox", ZONE_INBOX_ADDRESS),
             ("ZoneOutbox", ZONE_OUTBOX_ADDRESS),
+            ("WithdrawalTracker", WITHDRAWAL_TRACKER_ADDRESS),
         ] {
             let account = db
                 .cache
@@ -468,6 +472,21 @@ fn initialize_zone_outbox(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<
         || NativeZoneOutbox::new().initialize(),
     )?;
     println!("Initialized native ZoneOutbox at {ZONE_OUTBOX_ADDRESS}");
+    Ok(())
+}
+
+/// Initialize the native WithdrawalTracker account marker and storage.
+fn initialize_withdrawal_tracker(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || WithdrawalTracker::new().initialize(),
+    )?;
+    println!("Initialized native WithdrawalTracker at {WITHDRAWAL_TRACKER_ADDRESS}");
     Ok(())
 }
 

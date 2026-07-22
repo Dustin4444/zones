@@ -3,6 +3,7 @@
 use alloy_sol_types::{SolError, SolInterface};
 use revm::precompile::{PrecompileOutput, PrecompileResult};
 use tempo_precompiles::IntoPrecompileResult;
+use tempo_zone_contracts::WithdrawalTrackerError;
 use tempo_zone_contracts::{ZoneOutboxError, ZonePortalError};
 
 use crate::{
@@ -37,6 +38,9 @@ pub enum ZonePrecompileError {
     /// Error from the zone TIP-20 factory.
     #[error("Zone TIP-20 factory error: {0:?}")]
     ZoneTokenFactory(ZoneTokenFactoryError),
+    /// Error from the Zone withdrawal-balance tracker.
+    #[error("Withdrawal tracker error: {0:?}")]
+    WithdrawalTracker(WithdrawalTrackerError),
     /// Error from the read-only zone TIP-403 registry.
     #[error("Zone TIP-403 registry error: {0:?}")]
     Zone403Registry(ReadOnlyRegistry),
@@ -50,6 +54,7 @@ impl IntoPrecompileResult for ZonePrecompileError {
             Self::Portal(error) => error.abi_encode(),
             Self::Outbox(error) => error.abi_encode(),
             Self::ZoneTokenFactory(error) => error.abi_encode(),
+            Self::WithdrawalTracker(error) => error.abi_encode(),
             Self::Zone403Registry(error) => error.abi_encode(),
         };
         Ok(PrecompileOutput::revert(gas, data.into(), reservoir))

@@ -20,7 +20,7 @@ use zone_primitives::constants::{
 };
 
 use crate::{
-    TempoState, ZoneResult,
+    TempoState, WithdrawalTracker, ZoneResult,
     ecies::{AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, decode_compressed_public_key},
     storage::{L1State, L1StorageReader},
 };
@@ -155,6 +155,12 @@ impl ZoneOutbox {
         }
 
         let fee = self.calculate_fee_unchecked(call.gasLimit)?;
+        WithdrawalTracker::new().record_withdrawal(
+            caller,
+            call.token,
+            U256::from(call.amount),
+            U256::from(fee),
+        )?;
         if caller == fee_payer {
             let total = call
                 .amount

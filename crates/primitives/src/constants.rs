@@ -33,6 +33,10 @@ pub const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c0000000000000000000000000
 /// ZoneConfig predeploy address on Zone L2.
 pub const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
 
+/// WithdrawalTracker precompile address on Zone L2.
+pub const WITHDRAWAL_TRACKER_ADDRESS: Address =
+    address!("0x1c00000000000000000000000000000000000004");
+
 /// Protocol-level contract deployers permitted to create contracts on Zones.
 ///
 /// WARNING: Updating this list is a consensus change.

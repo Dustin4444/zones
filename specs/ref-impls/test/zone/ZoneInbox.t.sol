@@ -14,6 +14,7 @@ import {
     IAesGcmDecrypt,
     IChaumPedersenVerify,
     ITIP20ZoneFactory,
+    IWithdrawalTracker,
     IZoneConfig,
     IZoneInbox,
     IZoneOutbox,
@@ -22,12 +23,14 @@ import {
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
     TIP20_FACTORY_ADDRESS,
+    WITHDRAWAL_TRACKER,
     ZONE_OUTBOX
 } from "../../src/interfaces/IZone.sol";
 import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockWithdrawalTracker } from "../mocks/MockWithdrawalTracker.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 
@@ -78,6 +81,8 @@ contract ZoneInboxTest is Test {
         );
         inbox = new ZoneInbox(address(config), mockPortal, address(tempoState));
         vm.etch(ZONE_OUTBOX, hex"00");
+        MockWithdrawalTracker withdrawalTracker = new MockWithdrawalTracker();
+        vm.etch(WITHDRAWAL_TRACKER, address(withdrawalTracker).code);
 
         zoneToken.setMinter(address(inbox), true);
     }
@@ -152,6 +157,10 @@ contract ZoneInboxTest is Test {
 
         assertEq(inbox.processedDepositQueueHash(), expectedHash);
         assertEq(zoneToken.balanceOf(bob), 1000e6);
+        assertEq(
+            IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneBalance(bob, address(zoneToken)), 1000e6
+        );
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), 1000e6);
     }
 
     function test_advanceTempo_multipleDeposits() public {
@@ -672,6 +681,11 @@ contract ZoneInboxTest is Test {
 
         // Verify minting to the decrypted recipient
         assertEq(zoneToken.balanceOf(recipient), amount);
+        assertEq(
+            IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneBalance(recipient, address(zoneToken)),
+            amount
+        );
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), amount);
         assertEq(inbox.processedDepositQueueHash(), expectedHash);
     }
 
@@ -724,6 +738,7 @@ contract ZoneInboxTest is Test {
         // Invalid encrypted deposits bounce to Tempo via the outbox; no zone mint is attempted.
         assertEq(zoneToken.balanceOf(alice), 0);
         assertEq(zoneToken.balanceOf(address(0x500)), 0);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), 0);
         assertEq(inbox.processedDepositQueueHash(), expectedHash);
     }
 
@@ -1158,6 +1173,38 @@ contract ZoneInboxTest is Test {
         assertEq(zoneToken.balanceOf(alice), 0);
     }
 
+    /// @notice A successful withdrawal bounce-back credits the resolved fallback recipient.
+    function test_advanceTempo_withdrawalBounceBack_creditsZoneBalance() public {
+        uint64 fallbackNonce = 1;
+        vm.mockCall(
+            ZONE_OUTBOX,
+            abi.encodeWithSelector(IZoneOutbox.consumeFallbackRecipient.selector, fallbackNonce),
+            abi.encode(bob)
+        );
+
+        Deposit[] memory deposits = new Deposit[](1);
+        deposits[0] = Deposit({
+            token: address(zoneToken),
+            sender: alice,
+            to: address(uint160(fallbackNonce)),
+            amount: 100e6,
+            tempoRefundRecipient: address(0),
+            memo: bytes32(0)
+        });
+        tempoState.setMockStorageValue(
+            mockPortal,
+            PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+            keccak256(abi.encode(DepositType.Regular, deposits[0], bytes32(0)))
+        );
+
+        vm.prank(sequencer);
+        _advanceTempo(deposits);
+
+        assertEq(zoneToken.balanceOf(bob), 100e6);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneBalance(bob, address(zoneToken)), 100e6);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), 100e6);
+    }
+
     /// @notice Claiming pays a parked withdrawal bounce-back refund and clears it.
     function test_claimRefund_success() public {
         uint64 fallbackNonce = 1;
@@ -1186,6 +1233,7 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         _advanceTempo(deposits);
         assertEq(inbox.refunds(address(zoneToken), bob), 100e6);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), 0);
 
         zoneToken.setMinter(address(inbox), true);
         vm.prank(bob);
@@ -1194,6 +1242,8 @@ contract ZoneInboxTest is Test {
         assertEq(amount, 100e6);
         assertEq(inbox.refunds(address(zoneToken), bob), 0);
         assertEq(zoneToken.balanceOf(bob), 100e6);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneBalance(bob, address(zoneToken)), 100e6);
+        assertEq(IWithdrawalTracker(WITHDRAWAL_TRACKER).zoneTotalSupply(address(zoneToken)), 100e6);
     }
 
     /// @notice Credited supply plus parked refunds equals processed deposit value.

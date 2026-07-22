@@ -148,6 +148,11 @@ pub struct BatchData {
     pub next_deposit_number: u64,
     /// Withdrawal queue hash for this batch (`B256::ZERO` if no withdrawals).
     pub withdrawal_queue_hash: B256,
+    /// Portal custody required per token before this batch may be submitted.
+    ///
+    /// Each value is the post-batch L2 `zoneTotalSupply(token)` plus every withdrawal amount and fee
+    /// finalized in this batch.
+    pub required_portal_backing: BTreeMap<Address, U256>,
 }
 
 struct SettlementAttestationInput<'a> {
@@ -160,6 +165,11 @@ struct SettlementAttestationInput<'a> {
 }
 
 sol! {
+    #[sol(rpc)]
+    interface ITIP20 {
+        function balanceOf(address account) external view returns (uint256);
+    }
+
     struct SettlementAttestation {
         uint32 zoneId;
         uint64 sequencerSetVersion;
@@ -185,6 +195,8 @@ pub(crate) struct FinalizedBatch {
     pub finalized_index: u64,
     /// Reconstructed withdrawal payloads for the off-chain processor store.
     pub withdrawals: Vec<abi::Withdrawal>,
+    /// Total amount plus fee finalized in this batch, grouped by token.
+    pub withdrawal_totals: BTreeMap<Address, U256>,
 }
 
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
@@ -380,6 +392,8 @@ impl BatchSubmitter {
         withdrawal_queue_hash = %batch.withdrawal_queue_hash,
     ))]
     pub async fn submit_batch(&self, batch: &BatchData) -> Result<ZonePortal::BatchSubmitted> {
+        self.check_portal_backing(&batch.required_portal_backing)
+            .await?;
         if !batch.withdrawal_queue_hash.is_zero() {
             self.check_withdrawal_queue_capacity().await?;
         }
@@ -495,6 +509,34 @@ impl BatchSubmitter {
         );
 
         Ok(event)
+    }
+
+    /// Verify that paying this batch cannot consume backing reserved for remaining Zone users.
+    async fn check_portal_backing(
+        &self,
+        required_by_token: &BTreeMap<Address, U256>,
+    ) -> Result<()> {
+        for (&token, &required) in required_by_token {
+            let available = ITIP20::new(token, self.l1_provider.clone())
+                .balanceOf(self.portal_address)
+                .call()
+                .await?;
+            if available < required {
+                warn!(
+                    %token,
+                    portal = %self.portal_address,
+                    portal_balance = %available,
+                    required_backing = %required,
+                    shortfall = %(required - available),
+                    "Withdrawal batch blocked because Portal is undercollateralized"
+                );
+                return Err(eyre::eyre!(
+                    "withdrawal batch would undercollateralize remaining users for token {token}: \
+                     portal balance {available}, required backing {required}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn sign_settlement_attestation(
@@ -1160,6 +1202,8 @@ pub(crate) async fn fetch_finalized_batch(
         ));
     }
 
+    let withdrawal_totals = sum_withdrawal_totals(requests.iter().map(|request| &request.event))?;
+
     let withdrawals = requests
         .into_iter()
         .zip(encrypted_senders)
@@ -1182,7 +1226,26 @@ pub(crate) async fn fetch_finalized_batch(
         finalized_hash: target.withdrawal_queue_hash,
         finalized_index: target.withdrawal_batch_index,
         withdrawals,
+        withdrawal_totals,
     })
+}
+
+fn sum_withdrawal_totals<'a>(
+    events: impl IntoIterator<Item = &'a abi::IZoneOutbox::WithdrawalRequested>,
+) -> Result<BTreeMap<Address, U256>> {
+    events.into_iter().try_fold(
+        BTreeMap::<Address, U256>::new(),
+        |mut totals, event| -> Result<_> {
+            let requested = U256::from(event.amount)
+                .checked_add(U256::from(event.fee))
+                .ok_or_else(|| eyre::eyre!("withdrawal amount plus fee overflow"))?;
+            let total = totals.entry(event.token).or_default();
+            *total = total
+                .checked_add(requested)
+                .ok_or_else(|| eyre::eyre!("withdrawal batch token total overflow"))?;
+            Ok(totals)
+        },
+    )
 }
 
 /// Fetch `WithdrawalRequested` events for one portal queue slot.
@@ -1567,6 +1630,87 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    #[test]
+    fn withdrawal_totals_include_amounts_and_fees_for_every_finalized_request() {
+        let token_a = address!("0x0000000000000000000000000000000000001000");
+        let token_b = address!("0x0000000000000000000000000000000000002000");
+        let event = |token, amount, fee| abi::IZoneOutbox::WithdrawalRequested {
+            withdrawalIndex: 0,
+            sender: Address::ZERO,
+            token,
+            to: Address::ZERO,
+            amount,
+            fee,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackNonce: 0,
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
+        };
+        let events = [
+            event(token_a, 10, 2),
+            event(token_a, 20, 3),
+            // Protocol refunds for deposits that never minted also leave portal custody, even
+            // though they do not debit a user's tracker balance.
+            event(token_b, 7, 0),
+        ];
+
+        let totals = sum_withdrawal_totals(&events).unwrap();
+        assert_eq!(totals[&token_a], U256::from(35));
+        assert_eq!(totals[&token_b], U256::from(7));
+    }
+
+    #[tokio::test]
+    async fn portal_backing_gate_accepts_coverage_and_rejects_shortfall() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::repeat_byte(0x22), provider);
+        let token = address!("0x20c0000000000000000000000000000000000000");
+        let required = BTreeMap::from([(token, U256::from(100))]);
+
+        asserter.push_success(&Bytes::copy_from_slice(
+            &U256::from(100).to_be_bytes::<32>(),
+        ));
+        submitter.check_portal_backing(&required).await.unwrap();
+
+        asserter.push_success(&Bytes::copy_from_slice(&U256::from(99).to_be_bytes::<32>()));
+        let error = submitter.check_portal_backing(&required).await.unwrap_err();
+        assert!(error.to_string().contains("undercollateralize"));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn portal_shortfall_stops_before_other_l1_submission_calls() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::repeat_byte(0x22), provider);
+        let token = address!("0x20c0000000000000000000000000000000000000");
+        let batch = BatchData {
+            zone_height: 1,
+            tempo_block_number: 1,
+            prev_block_hash: B256::ZERO,
+            next_block_hash: B256::repeat_byte(1),
+            prev_processed_deposit_hash: B256::ZERO,
+            next_processed_deposit_hash: B256::ZERO,
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::repeat_byte(2),
+            required_portal_backing: BTreeMap::from([(token, U256::from(100))]),
+        };
+
+        asserter.push_success(&Bytes::copy_from_slice(&U256::from(99).to_be_bytes::<32>()));
+        let error = submitter.submit_batch(&batch).await.unwrap_err();
+        assert!(error.to_string().contains("undercollateralize"));
+        assert!(
+            asserter.read_q().is_empty(),
+            "the backing rejection must happen before queue, anchor, signer, or send calls"
+        );
     }
 
     #[tokio::test]

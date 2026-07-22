@@ -13,6 +13,7 @@ import {
     IChaumPedersenVerify,
     ITIP20ZoneFactory,
     ITempoState,
+    IWithdrawalTracker,
     IZoneConfig,
     IZoneInbox,
     IZoneOutbox,
@@ -21,6 +22,7 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     QueuedDeposit,
     TIP20_FACTORY_ADDRESS,
+    WITHDRAWAL_TRACKER,
     ZONE_OUTBOX
 } from "../interfaces/IZone.sol";
 import {
@@ -234,6 +236,7 @@ contract ZoneInbox is IZoneInbox {
                     );
                 } else {
                     try IZoneToken(d.token).mint(d.to, d.amount) {
+                        IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(d.to, d.token, d.amount);
                         emit DepositProcessed(
                             currentHash, d.sender, d.to, d.token, d.amount, d.memo
                         );
@@ -318,6 +321,7 @@ contract ZoneInbox is IZoneInbox {
                     EncryptedDepositLib.decodePlaintext(decryptedPlaintext);
 
                 try IZoneToken(ed.token).mint(decryptedTo, ed.amount) {
+                    IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(decryptedTo, ed.token, ed.amount);
                     emit EncryptedDepositProcessed(
                         currentHash, ed.sender, decryptedTo, ed.token, ed.amount, decryptedMemo
                     );
@@ -392,6 +396,7 @@ contract ZoneInbox is IZoneInbox {
         address zoneFallbackRecipient =
             IZoneOutbox(ZONE_OUTBOX).consumeFallbackRecipient(fallbackNonce);
         try IZoneToken(d.token).mint(zoneFallbackRecipient, d.amount) {
+            IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(zoneFallbackRecipient, d.token, d.amount);
             emit WithdrawalBounceBackProcessed(zoneFallbackRecipient, d.token, d.amount);
         } catch {
             refunds[d.token][zoneFallbackRecipient] += d.amount;
@@ -404,6 +409,7 @@ contract ZoneInbox is IZoneInbox {
         refunds[token][msg.sender] = 0;
 
         IZoneToken(token).mint(msg.sender, amount);
+        IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(msg.sender, token, amount);
         emit RefundClaimed(msg.sender, token, amount);
     }
 

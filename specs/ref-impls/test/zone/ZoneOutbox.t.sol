@@ -2,11 +2,13 @@
 pragma solidity ^0.8.13;
 
 import {
+    IWithdrawalTracker,
     IZoneOutbox,
     IZonePortal,
     LastBatch,
     PORTAL_IS_SEQUENCER_SLOT,
     PendingWithdrawal,
+    WITHDRAWAL_TRACKER,
     Withdrawal,
     ZONE_INBOX,
     ZONE_TX_CONTEXT
@@ -16,6 +18,7 @@ import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
+import { MockWithdrawalTracker } from "../mocks/MockWithdrawalTracker.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
 import { Test } from "forge-std/Test.sol";
@@ -64,6 +67,8 @@ contract ZoneOutboxTest is Test {
         tempoState.setMockTokenEnabled(mockPortal, address(zoneToken), true);
         inbox = new ZoneInbox(address(config), mockPortal, address(tempoState));
         outbox = new ZoneOutbox(address(config));
+        MockWithdrawalTracker withdrawalTracker = new MockWithdrawalTracker();
+        vm.etch(WITHDRAWAL_TRACKER, address(withdrawalTracker).code);
 
         // Grant minter role to inbox and burner role to outbox
         zoneToken.setMinter(address(inbox), true);
@@ -74,6 +79,9 @@ contract ZoneOutboxTest is Test {
         zoneToken.mint(alice, 10_000e6);
         zoneToken.mint(bob, 10_000e6);
         zoneToken.mint(charlie, 10_000e6);
+        IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(alice, address(zoneToken), 10_000e6);
+        IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(bob, address(zoneToken), 10_000e6);
+        IWithdrawalTracker(WITHDRAWAL_TRACKER).deposit(charlie, address(zoneToken), 10_000e6);
     }
 
     function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
@@ -702,12 +710,20 @@ contract ZoneOutboxTest is Test {
     }
 
     function test_requestWithdrawal_revertsOnInsufficientBalance() public {
+        IWithdrawalTracker tracker = IWithdrawalTracker(WITHDRAWAL_TRACKER);
+        tracker.deposit(alice, address(zoneToken), 190_000e6);
+        uint256 zoneBalanceBefore = tracker.zoneBalance(alice, address(zoneToken));
+        uint256 supplyBefore = tracker.zoneTotalSupply(address(zoneToken));
+
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 200_000e6);
 
         vm.expectRevert(MockZoneToken.InsufficientBalance.selector);
         outbox.requestWithdrawal(address(zoneToken), bob, 200_000e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
+
+        assertEq(tracker.zoneBalance(alice, address(zoneToken)), zoneBalanceBefore);
+        assertEq(tracker.zoneTotalSupply(address(zoneToken)), supplyBefore);
     }
 
     function test_requestWithdrawal_revertsOnInsufficientAllowance() public {
