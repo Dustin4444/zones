@@ -10,6 +10,7 @@ use eyre as _;
 pub mod cli;
 pub mod dev;
 pub mod engine;
+pub mod eth_api;
 pub mod genesis;
 pub mod node;
 mod replication;

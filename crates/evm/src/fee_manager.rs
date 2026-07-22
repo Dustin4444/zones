@@ -8,6 +8,26 @@ use tempo_precompiles::{error::Result, storage::StorageActions};
 use tempo_revm::{TempoStateAccess, TempoTx, TempoTxEnv};
 use zone_precompiles::ZoneFeeManager;
 
+/// Resolves the fee token selected by a Zone transaction against the supplied state view.
+///
+/// Both protocol execution and RPC gas allowance use this function so omitted fee tokens always
+/// resolve through the Zone fee manager at the state being executed or simulated.
+pub fn resolve_fee_token<S, M>(
+    state: &mut S,
+    tx: &TempoTxEnv,
+    spec: TempoHardfork,
+    actions: StorageActions,
+) -> Result<Address>
+where
+    S: TempoStateAccess<M>,
+{
+    if let Some(token) = tx.fee_token() {
+        return Ok(token);
+    }
+
+    state.with_read_only_storage_ctx(spec, actions, || ZoneFeeManager::new().default_fee_token())
+}
+
 /// Resolves and collects fees without Tempo token preferences or FeeAMM settlement.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ZoneProtocolFeeManager;
@@ -30,12 +50,7 @@ where
         spec: TempoHardfork,
         actions: StorageActions,
     ) -> Result<Address> {
-        if let Some(token) = tx.fee_token() {
-            return Ok(token);
-        }
-
-        journal
-            .with_read_only_storage_ctx(spec, actions, || ZoneFeeManager::new().default_fee_token())
+        resolve_fee_token(journal, tx, spec, actions)
     }
 
     fn collect_fee_pre_tx(

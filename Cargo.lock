@@ -13508,6 +13508,7 @@ dependencies = [
  "reth-consensus",
  "reth-eth-wire-types",
  "reth-ethereum",
+ "reth-evm",
  "reth-node-api",
  "reth-node-builder",
  "reth-node-core",

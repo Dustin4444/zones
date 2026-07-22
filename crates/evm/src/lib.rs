@@ -10,6 +10,7 @@
 mod database;
 mod executor;
 mod fee_manager;
+pub use fee_manager::resolve_fee_token;
 pub mod precompiles;
 mod tx_context;
 mod zone_evm;
