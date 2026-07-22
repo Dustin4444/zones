@@ -143,6 +143,7 @@ fn patch_bytes(buf: &mut [u8], needle: &[u8], replacement: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempo_contracts::precompiles::PATH_USD_ADDRESS;
 
     #[test]
     fn patch_bytes_replaces_non_overlapping_occurrences() {
@@ -153,8 +154,17 @@ mod tests {
     }
 
     #[test]
-    fn template_parses() {
-        genesis_template().unwrap();
+    fn template_has_default_fee_token() {
+        let genesis = genesis_template().unwrap();
+        let fee_manager_storage = genesis.alloc[&ZONE_FEE_MANAGER_ADDRESS]
+            .storage
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            fee_manager_storage
+                [&B256::from(zone_fee_manager::slots::DEFAULT_FEE_TOKEN.to_be_bytes())],
+            B256::left_padding_from(PATH_USD_ADDRESS.as_slice()),
+        );
     }
 
     #[test]
