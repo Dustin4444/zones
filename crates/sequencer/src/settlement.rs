@@ -27,10 +27,11 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::abi::{self, BlockTransition, DepositQueueTransition, ZoneOutbox, ZonePortal};
 use alloy_consensus::Transaction;
-use alloy_network::ReceiptResponse;
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_network::{ReceiptResponse, TransactionBuilder};
+use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
+use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolStruct, SolValue, eip712_domain, sol};
@@ -49,6 +50,15 @@ const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
 /// Safety margin (~3 min at 500ms block time) to avoid race conditions where
 /// the block falls out of the window between our check and on-chain execution.
 const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
+
+/// EIP-2935 system contract address.
+const EIP2935_ADDRESS: Address = address!("0x0000F90827F1C53a10cb7A02335B175320002935");
+
+/// Native `BLOCKHASH` serves the 256 most recent completed blocks.
+const NATIVE_BLOCKHASH_HISTORY_WINDOW: u64 = 256;
+
+/// Leave 32 blocks for a direct anchor to be submitted before it leaves the native window.
+const NATIVE_BLOCKHASH_SAFETY_MARGIN: u64 = 32;
 
 /// Maximum number of encoded L1 headers retained between ancestry submissions.
 ///
@@ -104,6 +114,63 @@ impl BatchAnchorConfig {
     /// Effective direct-submission window after subtracting the safety margin.
     pub const fn effective_window(self) -> u64 {
         self.history_window - self.safety_margin
+    }
+
+    /// Select EIP-2935 or native `BLOCKHASH` anchoring based on a functional L1 probe.
+    ///
+    /// Code presence is insufficient because a deployed EIP-2935 contract may not be
+    /// populated by client system calls. Only an exact, nonzero hash response enables the
+    /// extended history window; every error or malformed response falls back conservatively.
+    pub async fn for_l1_provider(
+        provider: &DynProvider<TempoNetwork>,
+        eip2935_config: Self,
+    ) -> Self {
+        let probe = async {
+            let tip = provider.get_block_number().await?;
+            if tip == 0 {
+                return Ok::<_, eyre::Report>(false);
+            }
+
+            let request = TransactionRequest::default()
+                .with_to(EIP2935_ADDRESS)
+                .with_input(U256::from(tip - 1).to_be_bytes::<32>());
+            let response = provider.call(request.into()).await?;
+            Ok(response.len() == 32 && response.as_ref() != [0_u8; 32])
+        }
+        .await;
+
+        if matches!(probe, Ok(true)) {
+            info!(
+                history_mode = "eip2935",
+                history_window = eip2935_config.history_window(),
+                safety_margin = eip2935_config.safety_margin(),
+                "Selected L1 block-hash history mode"
+            );
+            return eip2935_config;
+        }
+
+        let config = Self::new(
+            NATIVE_BLOCKHASH_HISTORY_WINDOW,
+            NATIVE_BLOCKHASH_SAFETY_MARGIN,
+        )
+        .expect("native BLOCKHASH anchor config is valid");
+        match probe {
+            Ok(false) => warn!(
+                history_mode = "blockhash",
+                history_window = config.history_window(),
+                safety_margin = config.safety_margin(),
+                "EIP-2935 history unavailable; selected native L1 block-hash history mode"
+            ),
+            Err(error) => warn!(
+                %error,
+                history_mode = "blockhash",
+                history_window = config.history_window(),
+                safety_margin = config.safety_margin(),
+                "EIP-2935 history probe failed; selected native L1 block-hash history mode"
+            ),
+            Ok(true) => unreachable!(),
+        }
+        config
     }
 }
 
@@ -1567,6 +1634,75 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    #[tokio::test]
+    async fn anchor_config_probe_selects_eip2935_for_nonzero_hash() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let expected = BatchAnchorConfig::new(100, 10).unwrap();
+
+        asserter.push_success(&100_u64);
+        asserter.push_success(&Bytes::from(vec![0x11; 32]));
+
+        assert_eq!(
+            BatchAnchorConfig::for_l1_provider(&provider, expected).await,
+            expected
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anchor_config_probe_selects_native_window_for_zero_hash() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+
+        asserter.push_success(&100_u64);
+        asserter.push_success(&Bytes::from(vec![0; 32]));
+
+        let config =
+            BatchAnchorConfig::for_l1_provider(&provider, BatchAnchorConfig::default()).await;
+        assert_eq!(config.history_window(), NATIVE_BLOCKHASH_HISTORY_WINDOW);
+        assert_eq!(config.safety_margin(), NATIVE_BLOCKHASH_SAFETY_MARGIN);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anchor_config_probe_selects_native_window_for_malformed_response() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+
+        asserter.push_success(&100_u64);
+        asserter.push_success(&Bytes::from_static(&[0x11]));
+
+        let config =
+            BatchAnchorConfig::for_l1_provider(&provider, BatchAnchorConfig::default()).await;
+        assert_eq!(config.history_window(), NATIVE_BLOCKHASH_HISTORY_WINDOW);
+        assert_eq!(config.safety_margin(), NATIVE_BLOCKHASH_SAFETY_MARGIN);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anchor_config_probe_selects_native_window_on_call_error() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+
+        asserter.push_success(&100_u64);
+        asserter.push_failure_msg("EIP-2935 unavailable");
+
+        let config =
+            BatchAnchorConfig::for_l1_provider(&provider, BatchAnchorConfig::default()).await;
+        assert_eq!(config.history_window(), NATIVE_BLOCKHASH_HISTORY_WINDOW);
+        assert_eq!(config.safety_margin(), NATIVE_BLOCKHASH_SAFETY_MARGIN);
+        assert!(asserter.read_q().is_empty());
     }
 
     #[tokio::test]

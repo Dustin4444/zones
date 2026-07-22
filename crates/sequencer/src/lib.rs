@@ -78,7 +78,7 @@ pub struct ZoneSequencerHandle {
 /// Both tasks share a single L1 provider and nonce manager to prevent signing/nonce contention
 /// when submitting concurrent L1 transactions.
 pub async fn spawn_zone_sequencer(
-    config: ZoneSequencerConfig,
+    mut config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
 ) -> ZoneSequencerHandle {
     // Build a single shared L1 provider with the sequencer wallet.
@@ -91,6 +91,9 @@ pub async fn spawn_zone_sequencer(
     )
     .await
     .expect("valid L1 RPC URL");
+
+    config.batch_anchor_config =
+        BatchAnchorConfig::for_l1_provider(&l1_provider, config.batch_anchor_config).await;
 
     let withdrawal_store: SharedWithdrawalStore = Default::default();
     let withdrawal_notify = Arc::new(Notify::new());
