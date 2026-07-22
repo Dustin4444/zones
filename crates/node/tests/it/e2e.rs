@@ -10,24 +10,68 @@ use std::{net::TcpListener, time::Duration};
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_consensus::Transaction;
 use alloy_eips::NumHash;
-use alloy_provider::{DynProvider, Provider};
+use alloy_network::ReceiptResponse;
+use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
+use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::SolCall;
+use tempo_alloy::{
+    TempoNetwork,
+    rpc::{TempoCallBuilderExt, TempoTransactionRequest},
+};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{
     TEMPO_STATE_ADDRESS, TempoState, Withdrawal, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
     ZoneInbox, ZoneOutbox,
 };
-use zone_l1::ChainTempoStateExt;
+use zone_l1::{ChainTempoStateExt, EnabledToken};
 
 use crate::utils::{
-    DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, WITHDRAWAL_TX_GAS, ZoneTestNode, approve_outbox,
-    leader_p2p_config, local_dev_zone_account, poll_until, seed_fixture_for_zone,
-    start_chain_id_rpc, start_local_p2p_pair, start_local_zone_with_fixture,
+    DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TEST_MNEMONIC, TIP20_TX_GAS, WITHDRAWAL_TX_GAS,
+    ZoneTestNode, approve_outbox, leader_p2p_config, local_dev_zone_account, poll_until,
+    seed_fixture_for_zone, start_chain_id_rpc, start_local_p2p_pair, start_local_zone_with_fixture,
 };
 
 const CONTRACT_CREATION_TX_GAS: u64 = 1_000_000;
+const REGRESSION_FEE_TOKEN: Address = address!("0x20C0000000000000000000000000000000DD0001");
+const REGRESSION_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Enable and fund an alternate fee token without creating any FeeAMM state.
+///
+/// Zones admit zero-fee transactions and override the validator token per transaction, so the
+/// regression must not depend on a mechanism that Zones disable. This setup occupies blocks 1-2.
+async fn setup_regression_fee_token(
+    zone: &ZoneTestNode,
+    fixture: &mut L1Fixture,
+    owner: Address,
+) -> eyre::Result<()> {
+    fixture.inject_enabled_tokens(
+        zone.deposit_queue(),
+        vec![EnabledToken {
+            token: REGRESSION_FEE_TOKEN,
+            name: "RegressionUSD".to_string(),
+            symbol: "rUSD".to_string(),
+            currency: "USD".to_string(),
+        }],
+    );
+    zone.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    let deposit_amount = 20_000_000u128;
+    let alternate_deposit =
+        fixture.make_deposit(REGRESSION_FEE_TOKEN, owner, owner, deposit_amount);
+    fixture.inject_deposits(zone.deposit_queue(), vec![alternate_deposit]);
+    zone.wait_for_balance(
+        REGRESSION_FEE_TOKEN,
+        owner,
+        U256::from(deposit_amount),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    zone.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+    Ok(())
+}
 
 /// A follower imports the leader's executed block and exposes the resulting state over RPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -69,6 +113,174 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
         .await?;
     follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
     assert_eq!(follower_balance, U256::from(amount));
+    Ok(())
+}
+
+/// A builder-only outbox view must not change the state root of the payload it precedes.
+///
+/// PR #771 moved `getPendingWithdrawals` to `Evm::transact_system_call`. This regression drives
+/// that production path after an alternate-token transaction-pool candidate and before the boundary
+/// `finalizeWithdrawalBatch` transaction. A follower then imports the complete leader block and
+/// canonically re-executes its body, which excludes the builder-only view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_builder_only_outbox_view_preserves_payload_state_root() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    const BATCH_INTERVAL_BLOCKS: u64 = 8;
+    let (leader, follower, mut fixture) = start_local_p2p_pair(BATCH_INTERVAL_BLOCKS + 2).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (provider, sender) = local_dev_zone_account(&leader)?;
+    let recipient = address!("0x000000000000000000000000000000000000b0b0");
+    let transfer_amount = 100_000u128;
+
+    setup_regression_fee_token(&leader, &mut fixture, sender).await?;
+    follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+    fixture.seed_no_receive_policy(recipient)?;
+
+    fixture.inject_empty_blocks(leader.deposit_queue(), BATCH_INTERVAL_BLOCKS - 3);
+    leader
+        .wait_for_block_number(BATCH_INTERVAL_BLOCKS - 1, DEFAULT_TIMEOUT)
+        .await?;
+    follower
+        .wait_for_block_number(BATCH_INTERVAL_BLOCKS - 1, DEFAULT_TIMEOUT)
+        .await?;
+
+    let pending_transfer = ITIP20::new(REGRESSION_FEE_TOKEN, &provider)
+        .transfer(recipient, U256::from(transfer_amount))
+        .gas_price(0)
+        .gas(TIP20_TX_GAS)
+        .send()
+        .await?;
+
+    // Block 8 executes: advanceTempo, the pool transfer, #771's outbox view, then finalize.
+    // The final system transaction must see the pool transaction as its canonical predecessor.
+    fixture.inject_empty_block(leader.deposit_queue());
+    leader
+        .wait_for_block_number(BATCH_INTERVAL_BLOCKS, REGRESSION_BLOCK_TIMEOUT)
+        .await?;
+
+    let receipt = pending_transfer.get_receipt().await?;
+    assert!(
+        receipt.status(),
+        "alternate-fee-token transfer should be included"
+    );
+    assert_eq!(
+        leader.balance_of(REGRESSION_FEE_TOKEN, recipient).await?,
+        U256::from(transfer_amount)
+    );
+    follower
+        .wait_for_block_number(BATCH_INTERVAL_BLOCKS, DEFAULT_TIMEOUT)
+        .await?;
+    Ok(())
+}
+
+/// A pool candidate rejected during payload execution must not change the next included tx.
+///
+/// Alice's alternate-token transfer and Bob's empty pathUSD transaction are both admitted under
+/// the parent L1 state. At the next anchor, Alice's transfer encounters a deliberately unavailable
+/// L1 policy slot, so the payload builder takes its transient-storage continuation and includes
+/// Bob. A follower then imports the leader's block and canonically re-executes only its included
+/// transactions, so it must agree with the builder's state root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rejected_pool_candidate_preserves_payload_state_root() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (leader, follower, mut fixture) = start_local_p2p_pair(6).await?;
+    // Commonware drops messages for offline peers. Let the loopback P2P handshake complete before
+    // producing the first leader block so every setup block is independently imported.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let alice_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?;
+    let bob_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .index(1)?
+        .build()?;
+    let alice = alice_signer.address();
+    let bob = bob_signer.address();
+    let alice_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .wallet(alice_signer)
+        .connect_http(leader.http_url().clone());
+    let bob_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .wallet(bob_signer)
+        .connect_http(leader.http_url().clone());
+    let deposit_amount = 20_000_000u128;
+
+    setup_regression_fee_token(&leader, &mut fixture, alice).await?;
+    follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+
+    let bob_deposit = fixture.make_deposit(PATH_USD_ADDRESS, bob, bob, deposit_amount);
+    fixture.inject_deposits(leader.deposit_queue(), vec![bob_deposit]);
+    leader
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            bob,
+            U256::from(deposit_amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    follower.wait_for_block_number(3, DEFAULT_TIMEOUT).await?;
+    let rejected_recipient = address!("0x000000000000000000000000000000000000a11c");
+    let alice_nonce_before = leader.provider().get_transaction_count(alice).await?;
+
+    // Both zero-fee transactions complete against the parent state, proving pool admission
+    // without FeeAMM. Equal-priority protocol transactions preserve submission order, so Alice is
+    // attempted first and Bob is the transaction included after Alice's policy rejection.
+    let _rejected_pending = tokio::time::timeout(
+        DEFAULT_TIMEOUT,
+        ITIP20::new(REGRESSION_FEE_TOKEN, &alice_provider)
+            .transfer(rejected_recipient, U256::from(100_000u128))
+            .fee_token(REGRESSION_FEE_TOKEN)
+            .gas(TIP20_TX_GAS)
+            .max_fee_per_gas(0)
+            .max_priority_fee_per_gas(0)
+            .send(),
+    )
+    .await??;
+    let included_pending = tokio::time::timeout(
+        DEFAULT_TIMEOUT,
+        bob_provider.send_transaction(
+            TempoTransactionRequest::from(TransactionRequest {
+                to: Some(TxKind::Call(bob)),
+                gas: Some(TIP20_TX_GAS),
+                max_fee_per_gas: Some(0),
+                max_priority_fee_per_gas: Some(0),
+                ..Default::default()
+            })
+            .with_fee_token(PATH_USD_ADDRESS),
+        ),
+    )
+    .await??;
+
+    const NEXT_L1_BLOCK: u64 = 4;
+    // Simulate an L1 log that invalidated the token's inherited policy slot without a working RPC
+    // fallback. Alice's transfer reaches that slot during execution; Bob's empty transaction does
+    // not touch L1-backed token state.
+    leader
+        .l1_state_cache()
+        .write()
+        .invalidate(REGRESSION_FEE_TOKEN, NEXT_L1_BLOCK);
+
+    fixture.inject_empty_block(leader.deposit_queue());
+    leader
+        .wait_for_block_number(NEXT_L1_BLOCK, REGRESSION_BLOCK_TIMEOUT)
+        .await?;
+
+    let receipt = included_pending.get_receipt().await?;
+    assert!(receipt.status(), "Bob's transaction should be included");
+    assert_eq!(
+        leader.provider().get_transaction_count(alice).await?,
+        alice_nonce_before,
+        "the rejected candidate must not consume Alice's nonce"
+    );
+    assert_eq!(
+        leader.provider().get_transaction_count(bob).await?,
+        1,
+        "the builder must continue and include Bob's transaction"
+    );
+    follower
+        .wait_for_block_number(NEXT_L1_BLOCK, DEFAULT_TIMEOUT)
+        .await?;
     Ok(())
 }
 

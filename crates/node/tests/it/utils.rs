@@ -55,7 +55,6 @@ use tempo_precompiles::{
 };
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::{ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1Deposit, L1PortalEvents, L1StateCache,
@@ -896,6 +895,7 @@ impl ZoneTestNode {
     ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
+        let is_fixture_p2p = p2p_config.is_some() && portal_address.is_zero();
 
         let mut genesis = custom_genesis.unwrap_or_else(|| {
             serde_json::from_str(zone_node::genesis::GENESIS_TEMPLATE_JSON)
@@ -913,9 +913,10 @@ impl ZoneTestNode {
         )
         .with_withdrawal_batch_interval_blocks(withdrawal_batch_interval_blocks);
         if is_local_dummy_l1 {
-            zone_node = zone_node
-                .with_l1_chain_id(1337)
-                .with_l1_state_provider_retry_limits(0, NonZeroU32::MIN);
+            zone_node = zone_node.with_l1_chain_id(1337);
+        }
+        if is_local_dummy_l1 || is_fixture_p2p {
+            zone_node = zone_node.with_l1_state_provider_retry_limits(0, NonZeroU32::MIN);
         }
         let p2p_enabled = p2p_config.is_some();
         if let Some(p2p_config) = p2p_config {
@@ -2677,46 +2678,6 @@ pub(crate) async fn start_local_p2p_pair(
         Ok(listener.local_addr()?)
     }
 
-    async fn spawn_test_l1_rpc() -> eyre::Result<String> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    let mut request = vec![0_u8; 16 * 1024];
-                    let Ok(read) = stream.read(&mut request).await else {
-                        return;
-                    };
-                    let request = String::from_utf8_lossy(&request[..read]);
-                    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-                    let value: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-                    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                    let result = match value.get("method").and_then(|method| method.as_str()) {
-                        Some("eth_chainId") => serde_json::json!("0x539"),
-                        Some("eth_blockNumber") => serde_json::json!("0x0"),
-                        _ => serde_json::Value::Null,
-                    };
-                    let response_body = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": result,
-                    })
-                    .to_string();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        response_body.len(),
-                        response_body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        Ok(format!("http://{address}"))
-    }
-
     let addresses = [
         available_address()?,
         available_address()?,
@@ -2779,7 +2740,7 @@ pub(crate) async fn start_local_p2p_pair(
     let _ = std::fs::remove_dir_all(&config_dir);
 
     let chain_id = next_unique_chain_id();
-    let l1_rpc_url = spawn_test_l1_rpc().await?;
+    let l1_rpc_url = start_chain_id_rpc(1337).await?.to_string();
     let genesis: Genesis = serde_json::from_str(zone_node::genesis::GENESIS_TEMPLATE_JSON)?;
     let signer = l1_dev_signer();
     let leader = ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
