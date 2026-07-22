@@ -671,7 +671,7 @@ The sequencer processes ordered withdrawals atomically on Tempo by calling `proc
 
 The portal dequeues before executing the withdrawal, then independently requires `withdrawal.token` to be enabled. Failed callbacks roll back in an external self-call and become bounce-backs, so the dequeue remains committed and cannot block the FIFO. If `remainingQueue` is zero (last item in the slot), processing sets the slot to `EMPTY_SENTINEL` and advances `head`; otherwise it updates the slot to `remainingQueue`.
 
-The sequencer packs withdrawals into transactions using a configurable gas budget rather than consuming the full L1 block gas limit. It may keep multiple batches in flight using consecutive nonces on its dedicated withdrawal nonce key. The nonce order preserves FIFO queue transitions even when the transactions are broadcast before earlier receipts arrive.
+The sequencer first packs withdrawals into transactions using a configurable per-transaction gas budget, then submits them through a queue bounded by transaction count. Transactions use consecutive nonces on the dedicated withdrawal nonce key, preserving FIFO queue transitions even when later transactions are broadcast before earlier receipts arrive. If a submission reverts or cannot be confirmed, the sequencer stops admitting new transactions, drains those already submitted, then reconciles the on-chain queue and retries its unfinished suffix.
 
 For a plain withdrawal (`gasLimit == 0`), the portal requires `to` to be an allowed account and not a registered ZoneGateway, then transfers directly. A failed transfer creates a withdrawal bounce-back deposit for the Zone-local `zoneFallbackRecipient`.
 

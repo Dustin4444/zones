@@ -29,8 +29,8 @@ pub use monitor::{ZoneMonitorConfig, spawn_zone_monitor};
 pub use settlement::{BatchAnchorConfig, BatchData, BatchSubmitter};
 pub use withdrawals::{
     DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS,
-    DEFAULT_MAX_WITHDRAWAL_BATCH_GAS, PlannedWithdrawalBatch, SharedWithdrawalStore,
-    WithdrawalBatchLimits, WithdrawalBatchPlanner, WithdrawalProcessorConfig, WithdrawalStore,
+    DEFAULT_MAX_WITHDRAWAL_BATCH_GAS, SharedWithdrawalStore, WithdrawalBatchLimits,
+    WithdrawalProcessorConfig, WithdrawalStore,
 };
 
 use crate::rpc::rpc_connection_config;

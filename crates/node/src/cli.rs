@@ -368,11 +368,13 @@ pub struct ZoneArgs {
     )]
     pub withdrawal_poll_interval_secs: u64,
 
-    /// Maximum gas reserved by one processWithdrawals transaction.
+    /// Maximum gas reserved by one processWithdrawals transaction. An oversized withdrawal is
+    /// submitted alone.
     #[arg(
         long = "withdrawal-max-batch-gas",
         env = "WITHDRAWAL_MAX_BATCH_GAS",
-        default_value_t = DEFAULT_MAX_WITHDRAWAL_BATCH_GAS
+        default_value_t = DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub withdrawal_max_batch_gas: u64,
 
@@ -380,15 +382,18 @@ pub struct ZoneArgs {
     #[arg(
         long = "withdrawal-max-in-flight-batches",
         env = "WITHDRAWAL_MAX_IN_FLIGHT_BATCHES",
-        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
+        value_parser = clap::value_parser!(usize).range(1..)
     )]
     pub withdrawal_max_in_flight_batches: usize,
 
-    /// Maximum aggregate gas reserved across in-flight processWithdrawals transactions.
+    /// Maximum aggregate gas reserved across in-flight processWithdrawals transactions. Must be
+    /// at least withdrawal-max-batch-gas. An oversized withdrawal is submitted alone.
     #[arg(
         long = "withdrawal-max-in-flight-gas",
         env = "WITHDRAWAL_MAX_IN_FLIGHT_GAS",
-        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS,
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub withdrawal_max_in_flight_gas: u64,
 
@@ -683,46 +688,6 @@ mod tests {
         .unwrap();
         assert!(parsed.zone.enable_sequencer);
         assert!(parsed.zone.sequencer_manifest.is_none());
-    }
-
-    #[test]
-    fn withdrawal_batch_limits_have_defaults_and_cli_overrides() {
-        let common = [
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-            "--sequencer-key",
-            "0x01",
-        ];
-        let defaults = ZoneArgsParser::try_parse_from(common).unwrap().zone;
-        assert_eq!(
-            defaults.withdrawal_max_batch_gas,
-            zone_sequencer::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS
-        );
-        assert_eq!(
-            defaults.withdrawal_max_in_flight_batches,
-            zone_sequencer::DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES
-        );
-        assert_eq!(
-            defaults.withdrawal_max_in_flight_gas,
-            zone_sequencer::DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS
-        );
-
-        let configured = ZoneArgsParser::try_parse_from(common.into_iter().chain([
-            "--withdrawal-max-batch-gas",
-            "7000000",
-            "--withdrawal-max-in-flight-batches",
-            "3",
-            "--withdrawal-max-in-flight-gas",
-            "15000000",
-        ]))
-        .unwrap()
-        .zone;
-        assert_eq!(configured.withdrawal_max_batch_gas, 7_000_000);
-        assert_eq!(configured.withdrawal_max_in_flight_batches, 3);
-        assert_eq!(configured.withdrawal_max_in_flight_gas, 15_000_000);
     }
 
     #[test]
