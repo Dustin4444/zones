@@ -140,8 +140,8 @@ where
 }
 
 fn portal_token_config_slot(token: Address) -> B256 {
-    let portal_token_configs_slot = B256::with_last_byte(6);
-    keccak256((token, portal_token_configs_slot).abi_encode())
+    use tempo_precompiles::zone_factory::zone_portal_slots::TOKEN_CONFIGS;
+    keccak256((token, TOKEN_CONFIGS).abi_encode())
 }
 
 fn enabled_deposits_active_token_config() -> B256 {

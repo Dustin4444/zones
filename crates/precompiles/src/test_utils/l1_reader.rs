@@ -75,7 +75,7 @@ impl MockL1Reader {
         let slot = keccak256(
             (
                 account,
-                zone_primitives::constants::PORTAL_IS_SEQUENCER_SLOT,
+                tempo_precompiles::zone_factory::zone_portal_slots::IS_SEQUENCER,
             )
                 .abi_encode(),
         );

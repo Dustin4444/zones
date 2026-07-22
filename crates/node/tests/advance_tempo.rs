@@ -12,8 +12,9 @@ use revm::{
 };
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::evm::{TempoEvm, TempoEvmFactory};
+use tempo_precompiles::zone_factory::zone_portal_slots::{ADMIN, IS_SEQUENCER};
 use tempo_revm::TempoBlockEnv;
-use zone_primitives::constants::{PORTAL_ADMIN_SLOT, PORTAL_IS_SEQUENCER_SLOT, zone_chain_id};
+use zone_primitives::constants::zone_chain_id;
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
@@ -563,13 +564,9 @@ fn advance_tempo_repro() {
     println!("\n=== Test complete ===");
 }
 
-/// Pins the Rust portal storage-slot constants to the ZonePortal storage layout.
+/// The canonical Tempo layout exposes the slots consumed by Zones.
 #[test]
-fn zone_portal_storage_slot_constants_match_solidity() {
-    assert_eq!(PORTAL_ADMIN_SLOT, B256::ZERO, "admin is slot 0");
-    assert_eq!(
-        PORTAL_IS_SEQUENCER_SLOT,
-        B256::from(U256::from(19)),
-        "isSequencer is slot 19"
-    );
+fn zone_portal_storage_slots_are_exported() {
+    assert_eq!(ADMIN, U256::ZERO);
+    assert_eq!(IS_SEQUENCER, U256::from(19));
 }

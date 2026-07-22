@@ -8,7 +8,8 @@ pub use ZonePortal::{
 use crate::IZoneOutbox;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_sol_types::SolValue;
-use zone_primitives::constants::{EMPTY_SENTINEL, PORTAL_TOKEN_CONFIGS_SLOT};
+use tempo_precompiles::zone_factory::zone_portal_slots::TOKEN_CONFIGS;
+use zone_primitives::constants::EMPTY_SENTINEL;
 
 crate::sol! {
     #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -412,5 +413,5 @@ impl Withdrawal {
 
 /// Return the storage slot for `token` in the portal token-config mapping.
 pub fn portal_token_config_slot(token: Address) -> B256 {
-    keccak256((token, PORTAL_TOKEN_CONFIGS_SLOT).abi_encode())
+    keccak256((token, TOKEN_CONFIGS).abi_encode())
 }

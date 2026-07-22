@@ -7,8 +7,8 @@ use core::{cell::Cell, fmt};
 use alloy_primitives::{Address, B256, keccak256};
 use alloy_sol_types::SolValue;
 use revm::{context::result::AnyError, precompile::PrecompileError};
+use tempo_precompiles::zone_factory::zone_portal_slots::IS_SEQUENCER;
 use thiserror::Error;
-use zone_primitives::constants::PORTAL_IS_SEQUENCER_SLOT;
 
 pub(crate) use tempo_precompiles::storage::*;
 
@@ -124,7 +124,7 @@ impl<P: L1StorageReader> L1State<P> {
         account: Address,
         block_number: u64,
     ) -> Result<bool, L1StateError> {
-        let slot = keccak256((account, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
+        let slot = keccak256((account, IS_SEQUENCER).abi_encode());
         Ok(self.read_l1_storage(self.portal_address, slot, block_number)? != B256::ZERO)
     }
 }

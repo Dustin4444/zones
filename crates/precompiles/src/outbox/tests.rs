@@ -38,8 +38,7 @@ impl Harness {
         let mut ctx = test_context();
         let token = tempo_precompiles::PATH_USD_ADDRESS;
         let l1 = MockL1Reader::default();
-        let sequencer_membership_slot =
-            keccak256((SEQUENCER, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
+        let sequencer_membership_slot = keccak256((SEQUENCER, IS_SEQUENCER).abi_encode());
         l1.insert(
             PORTAL,
             sequencer_membership_slot.into(),
@@ -237,7 +236,7 @@ fn outbox_reads_injected_l1_state_at_tempo_checkpoint() -> eyre::Result<()> {
         harness.l1.storage_requests(),
         vec![(
             PORTAL,
-            keccak256((SEQUENCER, PORTAL_IS_SEQUENCER_SLOT).abi_encode()),
+            keccak256((SEQUENCER, IS_SEQUENCER).abi_encode()),
             ANCHOR
         ),]
     );
