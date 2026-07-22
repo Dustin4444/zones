@@ -85,6 +85,7 @@ if [[ -n "${ZONES_XTASK_BIN:-}" ]]; then preflight=("$ZONES_XTASK_BIN" benchmark
 mkdir -p "$ZONES_BENCH_OUTPUT" "$(dirname "$ZONES_BENCH_RENDERED_SCENARIO")"
 secret_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/zones-neobank-auth.XXXXXX")"
 chmod 700 "$secret_dir"
+export ZONES_BENCH_ZONE_AUTH_MAP="$secret_dir/zone-auth.json"
 auth_pid=""
 cleanup() {
     local status=$?
@@ -205,7 +206,7 @@ for source in l1-onramp.yml zone-flow.yml scenario-fragments.yml "$scenario_file
         -e "s|__ONRAMP_AMOUNT__|$ZONES_BENCH_DEPOSIT_AMOUNT|g" -e "s|__PRIVATE_TRANSFER_AMOUNT__|$ZONES_BENCH_ACTIVITY_AMOUNT|g" \
         -e "s|__EARN_DEPOSIT_AMOUNT__|$ZONES_BENCH_WITHDRAWAL_AMOUNT|g" -e "s|__EARN_REDEEM_AMOUNT__|$ZONES_BENCH_WITHDRAWAL_AMOUNT|g" \
         -e "s|__OFFRAMP_AMOUNT__|$ZONES_BENCH_ACTIVITY_AMOUNT|g" -e "s|__CALLBACK_GAS_LIMIT__|$ZONES_BENCH_CALLBACK_GAS_LIMIT|g" \
-        -e 's|__DEPOSIT_GAS_LIMIT__|2000000|g' -e 's|__ACTIVITY_GAS_LIMIT__|500000|g' -e 's|__GATEWAY_WITHDRAWAL_TX_GAS_LIMIT__|6500000|g' -e 's|__OFFRAMP_WITHDRAWAL_TX_GAS_LIMIT__|2200000|g' \
+        -e 's|__DEPOSIT_GAS_LIMIT__|2000000|g' -e 's|__ACTIVITY_GAS_LIMIT__|500000|g' -e 's|__WITHDRAWAL_TX_GAS_LIMIT__|10000000|g' \
         "$ZONES_BENCH_OUTPUT/neobank/$source" >"$ZONES_BENCH_OUTPUT/$destination"
 done
 if grep -En '__[A-Z0-9_]+__' \
@@ -224,8 +225,6 @@ fi
 [[ -s "$ZONES_BENCH_RENDERED_SCENARIO" ]] ||
     die "txgen did not render the composed private-flow scenario"
 stage_end render_scenario
-
-export ZONES_BENCH_ZONE_AUTH_MAP="$secret_dir/zone-auth.json"
 
 # The auth map is intentionally mode 0600 and is never copied to benchmark artifacts.
 stage_start auth_token_map
