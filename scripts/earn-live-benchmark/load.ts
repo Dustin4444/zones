@@ -1280,13 +1280,14 @@ function costRow(args: {
   chain: 'l1' | 'zone'
   component: string
   payer: 'user' | 'sequencer'
-  receipt: ReturnType<typeof receiptMetric>
+  receipt: ReturnType<typeof receiptMetric> | TransactionReceipt
   tokenChargeBaseUnits?: bigint
   useCase: string
   userIndex: number
 }) {
   const denominator = args.allocationDenominator ?? 1
-  const fee18 = BigInt(args.receipt.fee18)
+  const receipt = receiptMetric(args.receipt)
+  const fee18 = BigInt(receipt.fee18)
   return {
     userIndex: args.userIndex,
     address: args.address,
@@ -1294,20 +1295,20 @@ function costRow(args: {
     component: args.component,
     chain: args.chain,
     payer: args.payer,
-    transactionHash: args.receipt.transactionHash,
-    blockNumber: args.receipt.blockNumber,
-    gasUsed: args.receipt.gasUsed,
-    effectiveGasPrice: args.receipt.effectiveGasPrice,
-    fee18: args.receipt.fee18,
-    actualFeeTokenChargeBaseUnits: args.receipt.actualFeeTokenChargeBaseUnits,
+    transactionHash: receipt.transactionHash,
+    blockNumber: receipt.blockNumber,
+    gasUsed: receipt.gasUsed,
+    effectiveGasPrice: receipt.effectiveGasPrice,
+    fee18: receipt.fee18,
+    actualFeeTokenChargeBaseUnits: receipt.actualFeeTokenChargeBaseUnits,
     allocationNumerator: 1,
     allocationDenominator: denominator,
     allocatedFee18Scaled: allocateFee(fee18, 1, denominator).toString(),
     allocatedActualFeeTokenBaseUnitsScaled:
-      args.receipt.actualFeeTokenChargeBaseUnits === null
+      receipt.actualFeeTokenChargeBaseUnits === null
         ? null
         : allocateFee(
-            BigInt(args.receipt.actualFeeTokenChargeBaseUnits),
+            BigInt(receipt.actualFeeTokenChargeBaseUnits),
             1,
             denominator,
           ).toString(),
