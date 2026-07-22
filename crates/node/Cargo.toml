@@ -71,7 +71,6 @@ clap = { workspace = true, optional = true }
 eyre.workspace = true
 futures.workspace = true
 k256.workspace = true
-serde = { workspace = true, features = ["derive"], optional = true }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -121,7 +120,6 @@ cli = [
   "dep:reth-consensus",
   "dep:reth-ethereum",
   "dep:reth-tracing",
-  "dep:serde",
   "dep:url",
   "dep:zeroize",
   "zone-chainspec/cli",

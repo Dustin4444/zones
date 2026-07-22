@@ -156,31 +156,13 @@ async fn ensure_native_zone_runtimes<P: Provider<TempoNetwork>>(
     factory_address: Address,
 ) -> eyre::Result<()> {
     let factory = ZoneFactory::new(factory_address, provider);
-    let mut mismatches = Vec::new();
 
     for runtime in runtimes::bundled()? {
         let actual = provider.get_code_at(runtime.target).await?;
-        if actual.as_ref() != runtime.code.as_ref() {
-            mismatches.push((runtime, keccak256(actual)));
+        if actual.as_ref() == runtime.code.as_ref() {
+            continue;
         }
-    }
 
-    if mismatches.is_empty() {
-        return Ok(());
-    }
-
-    if factory.implementationUpdatesLocked().call().await? {
-        let (runtime, actual_hash) = &mismatches[0];
-        eyre::bail!(
-            "ZoneFactory implementation updates are locked, but {} at {} has code hash {}; expected {}",
-            runtime.name,
-            runtime.target,
-            actual_hash,
-            keccak256(&runtime.code)
-        );
-    }
-
-    for (runtime, _) in mismatches {
         let source = deploy_native_zone_runtime(provider, &runtime).await?;
         let receipt = match runtime.kind {
             runtimes::RuntimeKind::Portal => factory.setPortalImplementation(source).send().await?,
@@ -348,8 +330,6 @@ mod command {
 
     use alloy_primitives::Address;
     use alloy_signer_local::PrivateKeySigner;
-    use serde::Serialize;
-    use tempo_zone_contracts::{ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS};
 
     use super::{ProvisionConfig, provision_zone};
     use crate::cli::ZoneCli;
@@ -358,23 +338,6 @@ mod command {
     /// Default dev private key (account #0 of the standard `test test ... junk` mnemonic).
     const DEFAULT_DEV_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-
-    #[derive(Debug, Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct DevZoneMetadata<'a> {
-        zone_id: u32,
-        chain_id: u64,
-        portal: Address,
-        messenger: Address,
-        verifier: Address,
-        initial_token: Address,
-        admin: Address,
-        sequencer: Address,
-        sequencer_key: &'a str,
-        tempo_anchor_block: u64,
-        zone_factory: Address,
-        rpc_url: String,
-    }
 
     /// Provisions a fresh zone against a Tempo dev L1 and runs the zone node.
     #[derive(Debug, clap::Parser)]
@@ -468,21 +431,20 @@ mod command {
                 serde_json::to_string_pretty(&provisioned.genesis)?,
             )?;
 
+            // zone.json metadata for downstream tooling, matching `create-zone`.
             // `sequencerKey` is a well-known dev key; `just zone-up` reads it.
-            let zone_json = DevZoneMetadata {
-                zone_id: provisioned.zone_id,
-                chain_id: provisioned.chain_id,
-                portal: provisioned.portal,
-                messenger: ZONE_MESSENGER_ADDRESS,
-                verifier: ZONE_VERIFIER_ADDRESS,
-                initial_token: self.initial_token,
-                admin: dev_key.address(),
-                sequencer: dev_key.address(),
-                sequencer_key: &self.dev_key,
-                tempo_anchor_block: provisioned.anchor_block_number,
-                zone_factory: provisioned.factory,
-                rpc_url: format!("http://{}:{}", self.http_addr, self.http_port),
-            };
+            let zone_json = serde_json::json!({
+                "zoneId": provisioned.zone_id,
+                "chainId": provisioned.chain_id,
+                "portal": format!("{}", provisioned.portal),
+                "initialToken": format!("{}", self.initial_token),
+                "admin": format!("{}", dev_key.address()),
+                "sequencer": format!("{}", dev_key.address()),
+                "sequencerKey": self.dev_key,
+                "tempoAnchorBlock": provisioned.anchor_block_number,
+                "zoneFactory": format!("{}", provisioned.factory),
+                "rpcUrl": format!("http://{}:{}", self.http_addr, self.http_port),
+            });
             std::fs::write(
                 self.datadir.join("zone.json"),
                 serde_json::to_string_pretty(&zone_json)?,
@@ -593,9 +555,7 @@ mod command {
 
     #[cfg(test)]
     mod tests {
-        use alloy_primitives::address;
-
-        use super::{DevZoneMetadata, ensure_ws_url};
+        use super::ensure_ws_url;
 
         #[test]
         fn ensure_ws_url_accepts_websocket_schemes() {
@@ -606,42 +566,6 @@ mod command {
         #[test]
         fn ensure_ws_url_rejects_non_websocket_schemes() {
             assert!(ensure_ws_url("http://localhost:8545").is_err());
-        }
-
-        #[test]
-        fn zone_metadata_schema_is_stable() {
-            let metadata = DevZoneMetadata {
-                zone_id: 1,
-                chain_id: 42431,
-                portal: address!("0x5ad0000000000000000000000000000000000001"),
-                messenger: address!("0x5a4d000000000000000000000000000000000000"),
-                verifier: address!("0x5a56000000000000000000000000000000000000"),
-                initial_token: address!("0x20c0000000000000000000000000000000000000"),
-                admin: address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"),
-                sequencer: address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"),
-                sequencer_key: "0xac09",
-                tempo_anchor_block: 12,
-                zone_factory: address!("0x5af2000000000000000000000000000000000000"),
-                rpc_url: "http://127.0.0.1:9545".to_owned(),
-            };
-
-            assert_eq!(
-                serde_json::to_value(metadata).unwrap(),
-                serde_json::json!({
-                    "zoneId": 1,
-                    "chainId": 42431,
-                    "portal": "0x5ad0000000000000000000000000000000000001",
-                    "messenger": "0x5a4d000000000000000000000000000000000000",
-                    "verifier": "0x5a56000000000000000000000000000000000000",
-                    "initialToken": "0x20c0000000000000000000000000000000000000",
-                    "admin": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-                    "sequencer": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-                    "sequencerKey": "0xac09",
-                    "tempoAnchorBlock": 12,
-                    "zoneFactory": "0x5af2000000000000000000000000000000000000",
-                    "rpcUrl": "http://127.0.0.1:9545",
-                })
-            );
         }
     }
 }

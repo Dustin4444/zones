@@ -54,7 +54,7 @@ regen-native-zone-runtimes:
     do
         contract="${spec%%:*}"
         asset="${spec#*:}"
-        runtime="$(forge inspect --root specs/ref-impls "$contract" deployedBytecode)"
+        runtime="$(forge inspect --root specs/ref-impls "src/tempo/${contract}.sol:${contract}" deployedBytecode)"
         printf '%s\n' "${runtime#0x}" > "crates/node/assets/${asset}-runtime.hex"
     done
 

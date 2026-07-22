@@ -208,7 +208,7 @@ fn forge_deployed_bytecode(contract: &str) -> eyre::Result<alloy_primitives::Byt
     ))
 }
 
-fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::Result<()> {
+fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) {
     // Native TIP-1091 accounts use the non-empty 0xEF precompile marker. Slot 0 packs
     // `uint32 nextZoneId`, `address owner`, and the implementation lock flag.
     let packed_factory_config: U256 = U256::ONE | (U256::from_be_slice(owner.as_slice()) << 32);
@@ -222,7 +222,6 @@ fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::R
             .with_code(Some(vec![0xef].into()))
             .with_storage(Some(factory_storage)),
     );
-    Ok(())
 }
 
 fn install_native_zone_runtimes(genesis: &mut Genesis) -> eyre::Result<()> {
@@ -1909,7 +1908,7 @@ impl L1TestNode {
         let genesis: serde_json::Value =
             serde_json::from_str(include_str!("../assets/test-genesis.json"))?;
         let mut genesis = serde_json::from_value(genesis)?;
-        install_native_zone_factory(&mut genesis, l1_dev_signer().address())?;
+        install_native_zone_factory(&mut genesis, l1_dev_signer().address());
         if install_runtimes {
             install_native_zone_runtimes(&mut genesis)?;
         }

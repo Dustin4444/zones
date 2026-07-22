@@ -10,7 +10,7 @@ pub(super) enum RuntimeKind {
     Verifier,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct NativeRuntime {
     pub(super) kind: RuntimeKind,
     pub(super) name: &'static str,

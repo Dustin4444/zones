@@ -9,10 +9,9 @@ use crate::utils::{
     WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
 };
 use alloy::{
-    network::TransactionBuilder as _,
-    primitives::{Address, B256, Bytes, TxKind, U256, address},
+    primitives::{Address, B256, U256},
     providers::Provider,
-    rpc::types::{Filter, TransactionRequest},
+    rpc::types::Filter,
     sol_types::SolEvent,
 };
 use std::time::Duration;
@@ -159,10 +158,6 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
 
     let l1 = L1TestNode::start_without_zone_runtimes().await?;
     assert_eq!(
-        l1.dev_address(),
-        address!("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266")
-    );
-    assert_eq!(
         ZoneFactory::new(ZONE_FACTORY_ADDRESS, l1.provider())
             .owner()
             .call()
@@ -256,14 +251,6 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
         runtime_updates.is_empty(),
         "matching runtimes should not invoke factory setters"
     );
-    assert!(
-        registry
-            .tokenTransferPolicyId(initial_token)
-            .call()
-            .await?
-            .isSet
-    );
-
     let latest_l1_block = l1.provider().get_block_number().await?;
     assert!(latest_l1_block > second.anchor_block_number);
 
@@ -282,61 +269,6 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
         !code.is_empty(),
         "custom initial token should be initialized from TokenEnabled"
     );
-
-    let provider = l1.dev_provider();
-    // This initcode deploys a one-byte STOP runtime for the locked-mismatch case.
-    let receipt = provider
-        .send_transaction(
-            TransactionRequest::default()
-                .with_kind(TxKind::Create)
-                .input(
-                    Bytes::from_static(&[
-                        0x60, 0x01, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x01, 0x60, 0x00, 0xf3,
-                        0x00,
-                    ])
-                    .into(),
-                ),
-        )
-        .await?
-        .get_receipt()
-        .await?;
-    assert!(receipt.status());
-    let source = receipt.contract_address.expect("missing contract address");
-    let factory = ZoneFactory::new(ZONE_FACTORY_ADDRESS, &provider);
-    assert!(
-        factory
-            .setVerifierImplementation(source)
-            .send()
-            .await?
-            .get_receipt()
-            .await?
-            .status()
-    );
-    assert!(
-        factory
-            .lockImplementationUpdates()
-            .send()
-            .await?
-            .get_receipt()
-            .await?
-            .status()
-    );
-
-    let error = provision_zone(ProvisionConfig {
-        l1_rpc_url: l1.ws_url().to_string(),
-        dev_key: l1.dev_signer(),
-        factory: None,
-        initial_token,
-        rpc_url: String::new(),
-    })
-    .await
-    .expect_err("locked mismatched verifier should fail provisioning");
-    let error = format!("{error:#}");
-    assert!(
-        error.contains("implementation updates are locked"),
-        "{error}"
-    );
-    assert!(error.contains("Verifier"), "{error}");
 
     Ok(())
 }

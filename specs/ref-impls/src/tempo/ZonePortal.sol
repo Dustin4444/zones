@@ -404,16 +404,6 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Internal function to enable a token (used by initializer and enableToken)
     function _enableTokenInternal(address _token) internal {
-        address[] memory tokens = new address[](1);
-        tokens[0] = _token;
-
-        (bool isSet,) = TIP403_REGISTRY.tokenTransferPolicyId(_token);
-        if (!isSet) {
-            TIP403_REGISTRY.migrateTransferPolicyIds(tokens);
-            (isSet,) = TIP403_REGISTRY.tokenTransferPolicyId(_token);
-        }
-        if (!isSet) revert TokenTransferPolicyNotSet();
-
         _tokenConfigs[_token] = TokenConfig({ enabled: true, depositsActive: true });
         _enabledTokens.push(_token);
 

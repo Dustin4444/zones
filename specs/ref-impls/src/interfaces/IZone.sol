@@ -620,7 +620,6 @@ interface IZonePortal {
     error TokenNotEnabled();
     error DepositsNotActive();
     error TokenAlreadyEnabled();
-    error TokenTransferPolicyNotSet();
     error InvalidBouncebackRecipient();
     error InvalidDepositTransition();
     error InvalidSequencerSet();
