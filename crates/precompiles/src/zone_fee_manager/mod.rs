@@ -7,13 +7,13 @@ use tempo_precompiles::{
     account_keychain::AccountKeychain,
     error::Result,
     storage::{Handler, StorageCtx},
-    tip20::{Recipient, TIP20Event, TIP20Token},
+    tip20::{TIP20Event, TIP20Token},
     tip403_registry::AuthRole,
 };
 use tempo_precompiles_macros::contract;
 pub use zone_primitives::constants::ZONE_FEE_MANAGER_ADDRESS;
 
-/// Zone fee configuration and transaction-scoped fee escrow.
+/// Zone fee configuration and direct fee settlement.
 #[contract(addr = ZONE_FEE_MANAGER_ADDRESS)]
 pub struct ZoneFeeManager {
     default_fee_token: Address,
@@ -31,7 +31,7 @@ impl ZoneFeeManager {
         self.default_fee_token.read()
     }
 
-    /// Escrows the maximum fee directly in the selected token.
+    /// Debits the maximum fee and provisionally credits it to the block beneficiary.
     pub fn collect_fee_pre_tx(
         &mut self,
         fee_payer: Address,
@@ -49,7 +49,7 @@ impl ZoneFeeManager {
         Ok(fee_token)
     }
 
-    /// Refunds unused gas and pays the net fee directly to the block beneficiary.
+    /// Refunds unused gas from the beneficiary and emits the net fee transfer.
     pub fn collect_fee_post_tx(
         &mut self,
         fee_payer: Address,
@@ -62,7 +62,7 @@ impl ZoneFeeManager {
         StorageCtx.set_tip1060_storage_credit_minting(false);
 
         if !refund.is_zero() {
-            AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund_amount)?;
+            AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund)?;
 
             token.decrement_balance(beneficiary, refund)?;
             token.increment_balance(fee_payer, refund)?;
@@ -97,14 +97,16 @@ mod tests {
         StorageCtx::enter(&mut storage, || {
             let (user, beneficiary) = (Address::random(), Address::random());
             let admin = Address::random();
-            let token = TIP20Setup::create("USD", "USD", admin)
+            let mut token = TIP20Setup::create("USD", "USD", admin)
                 .with_issuer(admin)
                 .with_mint(user, U256::from(10_000))
                 .apply()?;
             let mut manager = ZoneFeeManager::new();
             manager.initialize(token.address())?;
             assert_eq!(manager.default_fee_token()?, token.address());
-            manager.collect_fee_pre_tx(user, token.address(), U256::from(5_000))?;
+            token.clear_emitted_events();
+            manager.collect_fee_pre_tx(user, token.address(), U256::from(5_000), beneficiary)?;
+            assert!(token.emitted_events().is_empty());
             manager.collect_fee_post_tx(
                 user,
                 U256::from(3_000),
@@ -112,6 +114,11 @@ mod tests {
                 token.address(),
                 beneficiary,
             )?;
+            token.assert_emitted_events(vec![TIP20Event::transfer(
+                user,
+                beneficiary,
+                U256::from(3_000),
+            )]);
             assert_eq!(
                 token.balance_of(ITIP20::balanceOfCall {
                     account: ZONE_FEE_MANAGER_ADDRESS,
