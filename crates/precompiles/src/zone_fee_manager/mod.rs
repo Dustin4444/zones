@@ -7,7 +7,7 @@ use tempo_precompiles::{
     account_keychain::AccountKeychain,
     error::{Result, TempoPrecompileError},
     storage::{Handler, Mapping, StorageCtx},
-    tip20::{ITIP20, TIP20Event, TIP20Token},
+    tip20::{ITIP20, Recipient, TIP20Event, TIP20Token},
     tip403_registry::AuthRole,
 };
 use tempo_precompiles_macros::contract;
@@ -87,20 +87,7 @@ impl ZoneFeeManager {
         if !refund_amount.is_zero() {
             AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund_amount)?;
 
-            let reward_recipient = token.update_rewards(fee_payer)?;
-            if !reward_recipient.is_zero() {
-                let opted_in_supply = U256::from(token.get_opted_in_supply()?)
-                    .checked_add(refund_amount)
-                    .ok_or_else(TempoPrecompileError::under_overflow)?;
-                token.set_opted_in_supply(
-                    opted_in_supply
-                        .try_into()
-                        .map_err(|_| TempoPrecompileError::under_overflow())?,
-                )?;
-            }
-
-            token.decrement_balance(self.address, refund_amount)?;
-            token.increment_balance(fee_payer, refund_amount)?;
+            token._transfer(self.address, &Recipient::direct(fee_payer), refund_amount)?;
         }
 
         if !actual_spending.is_zero() {
