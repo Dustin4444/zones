@@ -45,6 +45,7 @@ spec:
             git:
               repo: git@github.com:tempoxyz/zones.git
               revision: "{{workflow.parameters.zones-revision}}"
+              disableSubmodules: true
               sshPrivateKeySecret:
                 name: tempoxyz-bot-gh-token
                 key: private-key
