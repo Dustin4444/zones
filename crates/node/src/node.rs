@@ -59,7 +59,7 @@ use tracing::{debug, info};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1Subscriber, L1SubscriberConfig, TempoStateExt,
+    DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig, TempoStateExt,
     state::{L1StateCache, L1StateProvider, L1StateProviderConfig},
 };
 use zone_p2p::{P2pConfig, P2pNetworkId, Role, spawn_p2p};
@@ -177,6 +177,8 @@ pub struct ZoneNode {
     l1_state_provider_config: L1StateProviderConfig,
     /// Shared L1 state cache (enabled tokens, zone metadata, etc.).
     l1_state_cache: L1StateCache,
+    /// L1 anchors independently observed and applied by the subscriber.
+    l1_block_tracker: L1BlockTracker,
     /// Address of the L1 deposit portal contract.
     portal_address: Address,
     /// Number of zone blocks between withdrawal batch boundaries.
@@ -203,11 +205,13 @@ impl ZoneNode {
         let deposit_queue = DepositQueue::default();
 
         let l1_state_cache = L1StateCache::new(HashSet::from([portal_address]));
+        let l1_block_tracker = L1BlockTracker::default();
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
             genesis_tempo_block_number,
             l1_state_cache: l1_state_cache.clone(),
+            block_tracker: l1_block_tracker.clone(),
             l1_fetch_concurrency,
             retry_connection_interval,
         };
@@ -224,6 +228,7 @@ impl ZoneNode {
             l1_config,
             l1_state_provider_config,
             l1_state_cache,
+            l1_block_tracker,
             portal_address,
             withdrawal_batch_interval_blocks: DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
             withdrawal_reveal_encryptor: None,
@@ -300,6 +305,10 @@ impl ZoneNode {
         self.l1_state_cache.clone()
     }
 
+    /// Returns the L1 block observation tracker.
+    pub fn l1_block_tracker(&self) -> L1BlockTracker {
+        self.l1_block_tracker.clone()
+    }
     /// Returns a [`ComponentsBuilder`] configured for a Zone node.
     pub fn components<N>(
         executor_builder: ZoneExecutorBuilder,
@@ -453,16 +462,7 @@ where
             .erased();
 
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
-        if p2p_role == Some(Role::Follower) {
-            // TODO(multi-sequencer): Split L1 observation/cache updates from deposit
-            // enqueueing. Followers import complete blocks from the leader and do not consume
-            // DepositQueue; starting the unified subscriber here would grow that queue forever.
-            // On promotion/restart the subscriber resumes from the tempoBlockNumber persisted in
-            // the follower's imported zone state.
-            info!(target: "reth::cli", "Skipping L1 deposit subscriber on follower");
-        } else {
-            self.spawn_l1_subscriber(&ctx);
-        }
+        self.spawn_l1_subscriber(&ctx, p2p_role == Some(Role::Follower));
 
         let task_executor = ctx.node.task_executor().clone();
         if let Some(config) = self.p2p_config.take() {
@@ -474,6 +474,7 @@ where
                 &task_executor,
                 ctx.node.provider().clone(),
                 ctx.beacon_engine_handle.clone(),
+                self.l1_config.block_tracker.clone(),
             )?;
         }
 
@@ -530,6 +531,7 @@ where
         task_executor: &reth_tasks::TaskExecutor,
         provider: N::Provider,
         engine: ConsensusEngineHandle<ZonePayloadTypes>,
+        l1_block_tracker: L1BlockTracker,
     ) -> eyre::Result<()> {
         let role = config.role();
         let handle = spawn_p2p(config, network_id)?;
@@ -550,7 +552,7 @@ where
         }
         task_executor.spawn_critical_task(
             "zone-p2p-block-sync",
-            run_block_sync(role, provider, engine, events, commands),
+            run_block_sync(role, provider, engine, events, commands, l1_block_tracker),
         );
 
         task_executor.spawn_critical_with_graceful_shutdown_signal(
@@ -590,15 +592,24 @@ where
         Ok(())
     }
 
-    /// Spawn the L1 subscriber. Listens for new blocks and deposit events.
-    fn spawn_l1_subscriber(&mut self, ctx: &AddOnsContext<'_, N>) {
-        L1Subscriber::spawn(
-            self.l1_config.clone(),
-            ctx.node.provider().clone(),
-            self.deposit_queue.clone(),
-            ctx.node.task_executor().clone(),
-        );
-        info!(target: "reth::cli", "Unified L1 subscriber started");
+    /// Spawn shared L1 observation, with deposit enqueueing only on leaders.
+    fn spawn_l1_subscriber(&mut self, ctx: &AddOnsContext<'_, N>, observer_only: bool) {
+        if observer_only {
+            L1Subscriber::spawn_observer(
+                self.l1_config.clone(),
+                ctx.node.provider().clone(),
+                ctx.node.task_executor().clone(),
+            );
+            info!(target: "reth::cli", "L1 observer started for follower");
+        } else {
+            L1Subscriber::spawn(
+                self.l1_config.clone(),
+                ctx.node.provider().clone(),
+                self.deposit_queue.clone(),
+                ctx.node.task_executor().clone(),
+            );
+            info!(target: "reth::cli", "L1 subscriber started with deposit enqueueing");
+        }
     }
 
     /// Spawn the [`ZoneEngine`] for L1-event-driven block production.
