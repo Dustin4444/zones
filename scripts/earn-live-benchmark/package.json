@@ -4,7 +4,10 @@
   "type": "module",
   "packageManager": "pnpm@11.0.3",
   "scripts": {
-    "benchmark": "tsx benchmark.ts"
+    "benchmark": "tsx benchmark.ts",
+    "load": "tsx load.ts",
+    "load:plan": "tsx load.ts --dry-run",
+    "test": "tsx --test load-lib.test.ts"
   },
   "dependencies": {
     "ox": "https://pkg.pr.new/ox@310",

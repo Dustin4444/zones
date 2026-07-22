@@ -1,0 +1,101 @@
+# This manifest is intentionally not applied automatically. Before submitting it:
+#
+#   prior_suspend=$(kubectl -n argo-workflows get cronworkflow zone-txgen \
+#     -o jsonpath='{.spec.suspend}')
+#   prior_suspend=${prior_suspend:-false}
+#   kubectl -n argo-workflows patch cronworkflow zone-txgen --type merge \
+#     -p '{"spec":{"suspend":true}}'
+#
+# Wait for any active zone-txgen Workflow to finish. After this setup and the
+# benchmark complete, restore the exact prior suspend value:
+#
+#   kubectl -n argo-workflows patch cronworkflow zone-txgen --type merge \
+#     -p "{\"spec\":{\"suspend\":${prior_suspend}}}"
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: earn-1000-policy-setup-
+  namespace: argo-workflows
+  annotations:
+    benchmark.tempoxyz.dev/requires-zone-txgen-suspended: "true"
+spec:
+  activeDeadlineSeconds: 1800
+  archiveLogs: true
+  entrypoint: authorize
+  serviceAccountName: tempo-cluster-workflows
+  synchronization:
+    mutex:
+      name: earn-1000-policy-setup
+  arguments:
+    parameters:
+      - name: zones-revision
+        value: codex/earn-latest-devnet
+      - name: expected-share-token
+        value: "0x20C00000000000000000000041bBF73004B56336"
+      - name: expected-gateway
+        value: "0xf2aB1d1A20ED4F9A8fF37606dbA1f9822Fe4027F"
+      - name: expected-eligibility-policy-id
+        value: "21"
+  templates:
+    - name: authorize
+      inputs:
+        artifacts:
+          - name: zones
+            path: /tmp/zones
+            git:
+              repo: git@github.com:tempoxyz/zones.git
+              revision: "{{workflow.parameters.zones-revision}}"
+              sshPrivateKeySecret:
+                name: tempoxyz-bot-gh-token
+                key: private-key
+      outputs:
+        artifacts:
+          - name: policy-setup-report
+            path: /tmp/output/policy-setup.json
+      container:
+        image: node:22-bookworm
+        imagePullPolicy: IfNotPresent
+        workingDir: /tmp/zones/scripts/earn-live-benchmark
+        env:
+          - name: EARN_ACCESS_ADMIN_PRIVATE_KEY
+            valueFrom:
+              secretKeyRef:
+                name: zone-unstable-admin
+                key: private_key
+          - name: ARGO_API
+            value: https://dev-eu-argo-workflows.tail388b2e.ts.net
+          - name: ARGO_NAMESPACE
+            value: argo-workflows
+          - name: CRON_WORKFLOW
+            value: zone-txgen
+          - name: L1_RPC_URL
+            value: http://tempo-devnet-nextfork-nodes-rpc-service.tail388b2e.ts.net:8545
+          - name: ZONE_PUBLIC_RPC_URL
+            value: http://tempo-zone-unstable-zone-unstable-rpc.tail388b2e.ts.net:8545
+          - name: USER_COUNT
+            value: "1000"
+          - name: USER_INDEX_START
+            value: "1"
+          - name: POLICY_BATCH_SIZE
+            value: "32"
+          - name: EXPECTED_SHARE_TOKEN
+            value: "{{workflow.parameters.expected-share-token}}"
+          - name: EXPECTED_GATEWAY
+            value: "{{workflow.parameters.expected-gateway}}"
+          - name: EXPECTED_ELIGIBILITY_POLICY_ID
+            value: "{{workflow.parameters.expected-eligibility-policy-id}}"
+          - name: REPORT_PATH
+            value: /tmp/output/policy-setup.json
+        command: [bash, -c]
+        args:
+          - |
+            set -euo pipefail
+            npx --yes pnpm@11.0.3 install --frozen-lockfile
+            npx --yes pnpm@11.0.3 exec tsx policy-setup.ts
+        resources:
+          requests: { memory: 512Mi, cpu: 250m }
+          limits: { memory: 2Gi, cpu: 2000m }
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: { drop: [ALL] }
+          seccompProfile: { type: RuntimeDefault }
