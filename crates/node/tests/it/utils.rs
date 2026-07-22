@@ -1,7 +1,7 @@
 use alloy::genesis::{Genesis, GenesisAccount};
 use alloy_consensus::Header;
 use alloy_eips::NumHash;
-use alloy_network::EthereumWallet;
+use alloy_network::{EthereumWallet, ReceiptResponse};
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rlp::Encodable;
@@ -32,7 +32,7 @@ use std::{
     },
     time::Duration,
 };
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
 use tempo_chainspec::{
     hardfork::TempoHardfork,
     spec::{TEMPO_T0_BASE_FEE, TempoChainSpec},
@@ -1694,9 +1694,14 @@ impl L1TestNode {
         amount: u128,
     ) -> eyre::Result<()> {
         use tempo_contracts::precompiles::ITIP20;
-        let provider = self.dev_provider();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .wallet(EthereumWallet::from(self.dev_signer()))
+            .connect_http(self.http_url.clone());
         let receipt = ITIP20::new(token, &provider)
             .transfer(to, U256::from(amount))
+            // A transfer call would otherwise infer `token` as its L1 fee token. Newly created
+            // test tokens intentionally have no FeeAMM pool, so pay gas explicitly in pathUSD.
+            .fee_token(PATH_USD_ADDRESS)
             .send()
             .await?
             .get_receipt()
