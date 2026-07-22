@@ -38,7 +38,12 @@ use reth_transaction_pool::{
     Pool, TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
-use std::{collections::HashSet, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    sync::Arc,
+    time::Duration,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_node::{
@@ -456,26 +461,27 @@ where
             .await?
             .erased();
 
-        let finalized_l1_block_number = l1_provider.get_block_number().await?;
-        eyre::ensure!(
-            finalized_l1_block_number >= tempo_block_number,
-            "finalized L1 RPC head {finalized_l1_block_number} is behind local Tempo checkpoint {tempo_block_number}"
-        );
-
         // TODO: Persist finalized token activations keyed by chain and portal so restarts only
         // scan the suffix after the last persisted checkpoint.
-        let token_activations = rebuild_token_activations(
-            &l1_provider,
-            self.l1_config.portal_address,
-            finalized_l1_block_number,
-        )
-        .await?;
+        // At genesis there is no canonical history to rebuild. In addition to avoiding an
+        // unnecessary RPC request, this preserves the existing ability to start nodes that do not
+        // consume L1 deposits with a deliberately unreachable L1 endpoint.
+        let token_activations = if tempo_block_number == 0 {
+            HashMap::new()
+        } else {
+            rebuild_token_activations(
+                &l1_provider,
+                self.l1_config.portal_address,
+                tempo_block_number,
+            )
+            .await?
+        };
         let token_count = token_activations.len();
         self.l1_config
             .l1_state_cache
             .write()
             .replace_token_activations(token_activations);
-        info!(target: "reth::cli", token_count, finalized_l1_block_number, "Rebuilt finalized TIP-20 activation history");
+        info!(target: "reth::cli", token_count, finalized_l1_block_number = tempo_block_number, "Rebuilt finalized TIP-20 activation history");
 
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
         if p2p_role == Some(Role::Follower) {
