@@ -5,8 +5,10 @@ crate::sol! {
     contract IZoneFeeManager {
         event FeesDistributed(address indexed beneficiary, address indexed token, uint256 amount);
 
-        /// Aggregate beneficiary fees are public and do not expose fee-payer state.
+        /// Only the beneficiary may read its aggregate accrued fees.
         function collectedFees(address beneficiary, address token) external view returns (uint256);
+
+        /// Only the beneficiary may distribute its accrued fees.
         function distributeFees(address beneficiary, address token) external;
     }
 }

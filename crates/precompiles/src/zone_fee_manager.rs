@@ -1,6 +1,7 @@
 //! Zone-native fee custody without token preferences or FeeAMM routing.
 
 use alloy_primitives::{Address, U256};
+use alloy_sol_types::SolError;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     TIP_FEE_MANAGER_ADDRESS, charge_input_cost, dispatch,
@@ -12,7 +13,7 @@ use tempo_precompiles::{
     view,
 };
 use tempo_precompiles_macros::contract;
-use tempo_zone_contracts::IZoneFeeManager;
+use tempo_zone_contracts::{IZoneFeeManager, Unauthorized};
 
 /// Zone-owned fee balances at Tempo's canonical fee-manager address.
 #[contract(addr = TIP_FEE_MANAGER_ADDRESS)]
@@ -35,8 +36,7 @@ impl ZoneFeeManager {
 
     /// Returns aggregate fees accrued to `beneficiary` in `token`.
     ///
-    /// This is public by design: it reveals no fee-payer state, and the same amount becomes public
-    /// when permissionless distribution emits [`IZoneFeeManager::FeesDistributed`].
+    /// External dispatch restricts this read to the beneficiary.
     pub fn collected_fees(&self, beneficiary: Address, token: Address) -> Result<U256> {
         self.collected_fees[beneficiary][token].read()
     }
@@ -79,7 +79,9 @@ impl ZoneFeeManager {
         Ok(actual_spending)
     }
 
-    /// Pays a beneficiary's accrued balance. Anyone may trigger the payout.
+    /// Pays a beneficiary's accrued balance.
+    ///
+    /// External dispatch restricts this action to the beneficiary.
     pub fn distribute_fees(&mut self, beneficiary: Address, token: Address) -> Result<()> {
         StorageCtx.set_tip1060_storage_credit_minting(false);
         let amount = self.collected_fees(beneficiary, token)?;
@@ -107,12 +109,24 @@ impl ZoneFeeManager {
         }
         dispatch!(calldata, |call| match call {
             IZoneFeeManager::IZoneFeeManagerCalls {
-                collectedFees(call) => view(call, |call| {
-                    self.collected_fees(call.beneficiary, call.token)
-                }),
-                distributeFees(call) => mutate_void(call, sender, |_, call| {
-                    self.distribute_fees(call.beneficiary, call.token)
-                }),
+                collectedFees(call) => {
+                    if sender != call.beneficiary {
+                        Ok(StorageCtx.revert_output(Unauthorized {}.abi_encode().into()))
+                    } else {
+                        view(call, |call| {
+                            self.collected_fees(call.beneficiary, call.token)
+                        })
+                    }
+                },
+                distributeFees(call) => {
+                    if sender != call.beneficiary {
+                        Ok(StorageCtx.revert_output(Unauthorized {}.abi_encode().into()))
+                    } else {
+                        mutate_void(call, sender, |_, call| {
+                            self.distribute_fees(call.beneficiary, call.token)
+                        })
+                    }
+                },
             }
         })
     }
@@ -121,6 +135,8 @@ impl ZoneFeeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Bytes;
+    use alloy_sol_types::SolCall;
     use tempo_precompiles::{
         storage::{ContractStorage, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
@@ -148,13 +164,61 @@ mod tests {
                 token.address(),
                 beneficiary,
             )?;
-            manager.distribute_fees(beneficiary, token.address())?;
+            let output = manager.call(
+                &IZoneFeeManager::distributeFeesCall {
+                    beneficiary,
+                    token: token.address(),
+                }
+                .abi_encode(),
+                beneficiary,
+            )?;
+            assert!(output.is_success());
             assert_eq!(
                 token.balance_of(ITIP20::balanceOfCall {
                     account: beneficiary
                 })?,
                 U256::from(3_000)
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn only_beneficiary_can_read_or_distribute_fees() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new(1);
+        StorageCtx::enter(&mut storage, || {
+            let beneficiary = Address::random();
+            let outsider = Address::random();
+            let token = Address::random();
+            let amount = U256::from(3_000);
+            let mut manager = ZoneFeeManager::new();
+            manager.initialize(token)?;
+            manager.collected_fees[beneficiary][token].write(amount)?;
+
+            let read = IZoneFeeManager::collectedFeesCall { beneficiary, token };
+            let unauthorized_read = manager.call(&read.abi_encode(), outsider)?;
+            assert!(unauthorized_read.is_revert());
+            assert_eq!(
+                unauthorized_read.bytes,
+                Bytes::from(Unauthorized {}.abi_encode())
+            );
+
+            let authorized_read = manager.call(&read.abi_encode(), beneficiary)?;
+            assert!(authorized_read.is_success());
+            assert_eq!(
+                IZoneFeeManager::collectedFeesCall::abi_decode_returns(&authorized_read.bytes)?,
+                amount
+            );
+
+            let distribute = IZoneFeeManager::distributeFeesCall { beneficiary, token };
+            let unauthorized_distribution = manager.call(&distribute.abi_encode(), outsider)?;
+            assert!(unauthorized_distribution.is_revert());
+            assert_eq!(
+                unauthorized_distribution.bytes,
+                Bytes::from(Unauthorized {}.abi_encode())
+            );
+            assert_eq!(manager.collected_fees(beneficiary, token)?, amount);
+
             Ok(())
         })
     }
