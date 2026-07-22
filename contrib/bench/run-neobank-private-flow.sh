@@ -205,7 +205,7 @@ for source in l1-onramp.yml zone-flow.yml scenario-fragments.yml "$scenario_file
         -e "s|__ONRAMP_AMOUNT__|$ZONES_BENCH_DEPOSIT_AMOUNT|g" -e "s|__PRIVATE_TRANSFER_AMOUNT__|$ZONES_BENCH_ACTIVITY_AMOUNT|g" \
         -e "s|__EARN_DEPOSIT_AMOUNT__|$ZONES_BENCH_WITHDRAWAL_AMOUNT|g" -e "s|__EARN_REDEEM_AMOUNT__|$ZONES_BENCH_WITHDRAWAL_AMOUNT|g" \
         -e "s|__OFFRAMP_AMOUNT__|$ZONES_BENCH_ACTIVITY_AMOUNT|g" -e "s|__CALLBACK_GAS_LIMIT__|$ZONES_BENCH_CALLBACK_GAS_LIMIT|g" \
-        -e 's|__DEPOSIT_GAS_LIMIT__|2000000|g' -e 's|__ACTIVITY_GAS_LIMIT__|500000|g' -e 's|__WITHDRAWAL_TX_GAS_LIMIT__|10000000|g' \
+        -e 's|__DEPOSIT_GAS_LIMIT__|2000000|g' -e 's|__ACTIVITY_GAS_LIMIT__|500000|g' -e 's|__GATEWAY_WITHDRAWAL_TX_GAS_LIMIT__|6500000|g' -e 's|__OFFRAMP_WITHDRAWAL_TX_GAS_LIMIT__|2200000|g' \
         "$ZONES_BENCH_OUTPUT/neobank/$source" >"$ZONES_BENCH_OUTPUT/$destination"
 done
 if grep -En '__[A-Z0-9_]+__' \
