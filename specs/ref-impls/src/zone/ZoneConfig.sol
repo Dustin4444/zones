@@ -115,6 +115,11 @@ contract ZoneConfig is IZoneConfig {
 
     /// @notice Check account membership in the portal's admin-managed closed-loop allowlist.
     function isAllowedAccount(address account) external view returns (bool) {
+        bytes32 openLoopSlot = keccak256(abi.encode(address(0), PORTAL_ROLE_SLOT));
+        if (
+            uint256(tempoState.readTempoStorageSlot(tempoPortal, openLoopSlot))
+                == uint256(Role.Account)
+        ) return true;
         bytes32 accountSlot = keccak256(abi.encode(account, PORTAL_ROLE_SLOT));
         return
             uint256(tempoState.readTempoStorageSlot(tempoPortal, accountSlot))
@@ -123,6 +128,11 @@ contract ZoneConfig is IZoneConfig {
 
     /// @notice Check whether an address is a registered callback-only ZoneGateway.
     function isZoneGateway(address gateway) external view returns (bool) {
+        bytes32 openLoopSlot = keccak256(abi.encode(address(0), PORTAL_ROLE_SLOT));
+        if (
+            uint256(tempoState.readTempoStorageSlot(tempoPortal, openLoopSlot))
+                == uint256(Role.Account)
+        ) return true;
         bytes32 gatewaySlot = keccak256(abi.encode(gateway, PORTAL_ROLE_SLOT));
         return uint256(tempoState.readTempoStorageSlot(tempoPortal, gatewaySlot))
             == uint256(Role.CallbackGateway);
