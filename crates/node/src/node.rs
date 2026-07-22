@@ -59,7 +59,7 @@ use tracing::{debug, info};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1Subscriber, L1SubscriberConfig, TempoStateExt,
+    DepositQueue, L1Subscriber, L1SubscriberConfig, TempoStateExt, rebuild_token_activations,
     state::{L1StateCache, L1StateProvider, L1StateProviderConfig},
 };
 use zone_p2p::{P2pConfig, P2pNetworkId, Role, spawn_p2p};
@@ -455,6 +455,27 @@ where
             )
             .await?
             .erased();
+
+        let finalized_l1_block_number = l1_provider.get_block_number().await?;
+        eyre::ensure!(
+            finalized_l1_block_number >= tempo_block_number,
+            "finalized L1 RPC head {finalized_l1_block_number} is behind local Tempo checkpoint {tempo_block_number}"
+        );
+
+        // TODO: Persist finalized token activations keyed by chain and portal so restarts only
+        // scan the suffix after the last persisted checkpoint.
+        let token_activations = rebuild_token_activations(
+            &l1_provider,
+            self.l1_config.portal_address,
+            finalized_l1_block_number,
+        )
+        .await?;
+        let token_count = token_activations.len();
+        self.l1_config
+            .l1_state_cache
+            .write()
+            .replace_token_activations(token_activations);
+        info!(target: "reth::cli", token_count, finalized_l1_block_number, "Rebuilt finalized TIP-20 activation history");
 
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
         if p2p_role == Some(Role::Follower) {

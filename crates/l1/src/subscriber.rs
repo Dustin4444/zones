@@ -1,11 +1,65 @@
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tempo_primitives::is_tip20_prefix;
 
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Maximum block span for one historical `eth_getLogs` request.
+const TOKEN_ACTIVATION_LOG_CHUNK_SIZE: u64 = 10_000;
+
 type L1ProcessedEvents = (L1PortalEvents, HashSet<Address>);
+
+/// Rebuild canonical TIP-20 activation heights from portal event history through a finalized
+/// Zone L1 checkpoint.
+///
+/// The returned block number is the earliest observed `TokenEnabled` height for each token. Log
+/// queries are chunked to stay within common RPC range limits.
+pub async fn rebuild_token_activations(
+    l1_provider: &impl Provider<TempoNetwork>,
+    portal_address: Address,
+    finalized_through_block: u64,
+) -> eyre::Result<HashMap<Address, u64>> {
+    let mut activations: HashMap<Address, u64> = HashMap::new();
+    let mut from_block = 0u64;
+
+    loop {
+        let to_block = from_block
+            .saturating_add(TOKEN_ACTIVATION_LOG_CHUNK_SIZE - 1)
+            .min(finalized_through_block);
+        let filter = alloy_rpc_types_eth::Filter::new()
+            .address(portal_address)
+            .from_block(from_block)
+            .to_block(to_block)
+            .event_signature(TokenEnabled::SIGNATURE_HASH);
+
+        for log in l1_provider.get_logs(&filter).await? {
+            if log.address() != portal_address || log.removed {
+                eyre::bail!("invalid TokenEnabled log returned during activation rebuild");
+            }
+            let block_number = log.block_number.ok_or_else(|| {
+                eyre::eyre!("TokenEnabled log missing block number during activation rebuild")
+            })?;
+            if !(from_block..=to_block).contains(&block_number) {
+                eyre::bail!(
+                    "TokenEnabled log block {block_number} outside requested range {from_block}..={to_block}"
+                );
+            }
+            let event = TokenEnabled::decode_log(&log.inner)?.data;
+            activations
+                .entry(event.token)
+                .and_modify(|activation| *activation = (*activation).min(block_number))
+                .or_insert(block_number);
+        }
+
+        if to_block == finalized_through_block {
+            break;
+        }
+        from_block = to_block + 1;
+    }
+
+    Ok(activations)
+}
 
 /// Configuration for the L1 subscriber.
 #[derive(Debug, Clone)]
@@ -317,6 +371,26 @@ impl L1Subscriber {
         result
     }
 
+    async fn rebuild_cache_token_activations(
+        &self,
+        l1_provider: &impl Provider<TempoNetwork>,
+        through_block: u64,
+    ) -> eyre::Result<()> {
+        let activations =
+            rebuild_token_activations(l1_provider, self.config.portal_address, through_block)
+                .await?;
+        let token_count = activations.len();
+        self.config
+            .l1_state_cache
+            .write()
+            .replace_token_activations(activations);
+        info!(
+            token_count,
+            through_block, "Rebuilt TIP-20 activation history after cache reset"
+        );
+        Ok(())
+    }
+
     /// Backfill L1 blocks from `from..=to` with pipelined RPC fetching.
     ///
     /// Fetches headers and receipts for up to `l1_fetch_concurrency` blocks in
@@ -391,13 +465,17 @@ impl L1Subscriber {
             self.record_seen_block(block_number, to.saturating_sub(block_number));
 
             let sealed = SealedHeader::seal_slow(header);
-            self.update_l1_state_anchor(
+            let reorged = self.update_l1_state_anchor(
                 block_number,
                 sealed.hash(),
                 sealed.parent_hash(),
                 &invalidated,
                 &events.enabled_tokens,
             );
+            if reorged {
+                self.rebuild_cache_token_activations(l1_provider, block_number)
+                    .await?;
+            }
             self.apply_portal_state_events(block_number, &events);
             self.deposit_queue.enqueue_sealed(sealed, events);
             enqueued += 1;
@@ -479,13 +557,17 @@ impl L1Subscriber {
                     let tip_number = tip_header.number();
                     let tip_hash = tip_header.hash();
                     let tip_parent = tip_header.parent_hash();
-                    self.update_l1_state_anchor(
+                    let reorged = self.update_l1_state_anchor(
                         tip_number,
                         tip_hash,
                         tip_parent,
                         &tip_invalidated,
                         &tip_events.enabled_tokens,
                     );
+                    if reorged {
+                        self.rebuild_cache_token_activations(&provider, tip_number)
+                            .await?;
+                    }
                     self.apply_portal_state_events(tip_number, &tip_events);
                     match self.deposit_queue.try_enqueue(tip_header, tip_events) {
                         EnqueueOutcome::Accepted => {
@@ -515,11 +597,15 @@ impl L1Subscriber {
                         new_parent = %sealed.parent_hash(),
                         "Discarding unconfirmed L1 block (reorg)"
                     );
-                    let mut cache = self.config.l1_state_cache.write();
-                    let confirmed_anchor = cache.anchor().number;
-                    cache.clear();
-                    cache.initialize_floor(confirmed_anchor);
-                    drop(cache);
+                    let confirmed_anchor = {
+                        let mut cache = self.config.l1_state_cache.write();
+                        let confirmed_anchor = cache.anchor().number;
+                        cache.clear();
+                        cache.initialize_floor(confirmed_anchor);
+                        confirmed_anchor
+                    };
+                    self.rebuild_cache_token_activations(&provider, confirmed_anchor)
+                        .await?;
                 }
             }
 
@@ -644,10 +730,11 @@ impl L1Subscriber {
         parent_hash: B256,
         invalidated_accounts: &HashSet<Address>,
         enabled_tokens: &[EnabledToken],
-    ) {
+    ) -> bool {
         let mut guard = self.config.l1_state_cache.write();
         let anchor = guard.anchor();
-        if anchor.hash != B256::ZERO && parent_hash != anchor.hash {
+        let reorged = anchor.hash != B256::ZERO && parent_hash != anchor.hash;
+        if reorged {
             self.subscriber_metrics.reorgs_detected.increment(1);
             warn!(
                 old_anchor = %anchor.hash,
@@ -664,10 +751,12 @@ impl L1Subscriber {
             guard.invalidate(address, number);
         }
         for token in enabled_tokens {
-            guard.enable_token(token.token);
+            guard.enable_token_at(token.token, number);
+            guard.invalidate(token.token, number);
         }
         // Publish receipt coverage only after every mutation barrier from this block is visible.
         guard.update_anchor(NumHash::new(number, hash));
+        reorged
     }
 }
 

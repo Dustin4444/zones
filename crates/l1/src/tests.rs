@@ -507,6 +507,62 @@ fn make_portal_log<E: SolEvent>(portal_address: Address, event: E) -> Log {
     }
 }
 
+fn make_token_enabled_log(portal_address: Address, token: Address, block_number: u64) -> Log {
+    let mut log = make_portal_log(
+        portal_address,
+        TokenEnabled {
+            token,
+            name: "Test Token".to_owned(),
+            symbol: "TEST".to_owned(),
+            currency: "USD".to_owned(),
+        },
+    );
+    log.block_number = Some(block_number);
+    log
+}
+
+#[tokio::test]
+async fn rebuild_token_activations_scans_history_and_keeps_earliest_height() {
+    let portal_address = address!("0x0000000000000000000000000000000000000ABC");
+    let token_a = address!("0x20C00000000000000000000000000000000000A1");
+    let token_b = address!("0x20C00000000000000000000000000000000000B2");
+    let asserter = Asserter::new();
+
+    asserter.push_success(&vec![make_token_enabled_log(portal_address, token_a, 7)]);
+    asserter.push_success(&vec![
+        make_token_enabled_log(portal_address, token_a, 12_000),
+        make_token_enabled_log(portal_address, token_b, 15_000),
+    ]);
+    asserter.push_success(&Vec::<Log>::new());
+
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+    let activations = rebuild_token_activations(&provider, portal_address, 20_000)
+        .await
+        .unwrap();
+
+    assert_eq!(activations.get(&token_a), Some(&7));
+    assert_eq!(activations.get(&token_b), Some(&15_000));
+}
+
+#[tokio::test]
+async fn rebuild_token_activations_rejects_unanchored_logs() {
+    let portal_address = address!("0x0000000000000000000000000000000000000ABC");
+    let token = address!("0x20C00000000000000000000000000000000000A1");
+    let mut log = make_token_enabled_log(portal_address, token, 7);
+    log.block_number = None;
+    let asserter = Asserter::new();
+    asserter.push_success(&vec![log]);
+
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+    let error = rebuild_token_activations(&provider, portal_address, 7)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("missing block number"));
+}
+
 #[tokio::test]
 async fn test_resolve_start_block_reads_live_local_state_each_time() {
     let subscriber = test_subscriber(

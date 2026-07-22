@@ -64,7 +64,8 @@ impl L1StateCache {
 #[derive(Debug, Default)]
 pub struct L1StateCacheInner {
     tracked_contracts: HashSet<Address>,
-    enabled_tokens: HashSet<Address>,
+    /// Canonical `TokenEnabled` height for each dynamically tracked TIP-20.
+    token_activations: HashMap<Address, u64>,
     /// Per-slot value history: `(address, slot) → { block_number → value }`.
     /// The `BTreeMap` enables efficient range lookups for "latest value at or before block N".
     slots: HashMap<(Address, B256), BTreeMap<u64, B256>>,
@@ -111,13 +112,16 @@ impl L1StateCacheInner {
 
     /// Sets a storage slot value in the forward cache at the given block number.
     ///
-    /// Only static tracked contracts and canonically enabled TIP-20s are admitted. Values below
-    /// the initial canonical floor are also rejected, so historical reads cannot later be
-    /// inherited by canonical execution.
+    /// Only static tracked contracts and TIP-20s enabled at or before `block_number` are admitted.
+    /// Values below the initial canonical floor are also rejected, so historical reads cannot
+    /// later be inherited by canonical execution.
     pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) {
+        let token_is_active = self
+            .token_activations
+            .get(&address)
+            .is_some_and(|&activation_block| block_number >= activation_block);
         if block_number < self.block_floor
-            || !(self.tracked_contracts.contains(&address)
-                || self.enabled_tokens.contains(&address))
+            || !(self.tracked_contracts.contains(&address) || token_is_active)
         {
             return;
         }
@@ -161,16 +165,24 @@ impl L1StateCacheInner {
         self.tracked_contracts.contains(address)
     }
 
-    /// Allows cache admission for a canonically enabled TIP-20.
-    pub fn enable_token(&mut self, address: Address) {
-        self.enabled_tokens.insert(address);
+    /// Allows cache admission for a TIP-20 from its canonical activation block onward.
+    pub fn enable_token_at(&mut self, address: Address, block_number: u64) {
+        self.token_activations
+            .entry(address)
+            .and_modify(|activation| *activation = (*activation).min(block_number))
+            .or_insert(block_number);
+    }
+
+    /// Replaces dynamic TIP-20 admission state rebuilt from canonical `TokenEnabled` history.
+    pub fn replace_token_activations(&mut self, activations: HashMap<Address, u64>) {
+        self.token_activations = activations;
     }
 
     /// Clears chain-derived data while retaining the static tracked-contract set and initial floor.
     pub fn clear(&mut self) {
         self.slots.clear();
         self.invalidations.clear();
-        self.enabled_tokens.clear();
+        self.token_activations.clear();
         self.anchor = NumHash::default();
     }
 
@@ -298,7 +310,10 @@ mod tests {
         cover_through(&mut cache, 10);
         assert_eq!(cache.get(token, policy_slot, 10), None);
 
-        cache.enable_token(token);
+        cache.enable_token_at(token, 11);
+        // A delayed historical response must still be rejected after activation is known.
+        cache.set(token, policy_slot, 10, B256::ZERO);
+        assert_eq!(cache.get(token, policy_slot, 10), None);
         cache.invalidate(token, 11);
         cover_through(&mut cache, 11);
         assert_eq!(cache.get(token, policy_slot, 11), None);
@@ -306,6 +321,20 @@ mod tests {
         let initialized_policy = B256::with_last_byte(1);
         cache.set(token, policy_slot, 11, initialized_policy);
         assert_eq!(cache.get(token, policy_slot, 11), Some(initialized_policy));
+    }
+
+    #[test]
+    fn rebuilt_token_activations_gate_cache_by_height() {
+        let token = address!("0x20c0000000000000000000000000000000000042");
+        let slot = B256::with_last_byte(1);
+        let mut cache = L1StateCacheInner::new(HashSet::from([PORTAL]));
+        cache.replace_token_activations(HashMap::from([(token, 25)]));
+
+        cache.set(token, slot, 24, B256::with_last_byte(24));
+        cache.set(token, slot, 25, B256::with_last_byte(25));
+
+        assert_eq!(cache.get(token, slot, 24), None);
+        assert_eq!(cache.get(token, slot, 25), Some(B256::with_last_byte(25)));
     }
 
     #[test]
@@ -330,7 +359,7 @@ mod tests {
         let token = address!("0x20c0000000000000000000000000000000000042");
 
         cache.initialize_floor(90);
-        cache.enable_token(token);
+        cache.enable_token_at(token, 90);
         cache.set(PORTAL, B256::ZERO, 100, B256::with_last_byte(1));
         cache.invalidate(PORTAL, 101);
         cache.update_anchor(NumHash {
