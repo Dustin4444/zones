@@ -1,0 +1,20 @@
+{
+  "name": "tempo-zone-earn-live-benchmark",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.0.3",
+  "scripts": {
+    "benchmark": "tsx benchmark.ts"
+  },
+  "dependencies": {
+    "ox": "https://pkg.pr.new/ox@310",
+    "tsx": "^4.20.5",
+    "viem": "https://pkg.pr.new/viem@215d7e8b7"
+  },
+  "pnpm": {
+    "overrides": {
+      "ox": "https://pkg.pr.new/ox@310",
+      "viem>ox": "https://pkg.pr.new/ox@310"
+    }
+  }
+}

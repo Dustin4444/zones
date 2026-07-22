@@ -1,0 +1,10 @@
+packages:
+  - .
+
+blockExoticSubdeps: false
+
+allowBuilds:
+  esbuild: true
+
+overrides:
+  ox: https://pkg.pr.new/ox@310
