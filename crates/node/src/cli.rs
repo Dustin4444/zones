@@ -383,7 +383,7 @@ pub struct ZoneArgs {
         long = "withdrawal-max-in-flight-batches",
         env = "WITHDRAWAL_MAX_IN_FLIGHT_BATCHES",
         default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
-        value_parser = clap::value_parser!(usize).range(1..)
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub withdrawal_max_in_flight_batches: usize,
 
