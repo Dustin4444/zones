@@ -106,7 +106,7 @@ await main().catch((error: unknown) => {
 
 async function main() {
   await requireFrozenHourlyDeployment()
-  const deployment = await latestSuccessfulDeployment()
+  const deployment = await resolveDeployment()
   const shareToken = getAddress(deployment.shareToken)
   const gateway = getAddress(deployment.gateway)
   const expectedShareToken = optionalAddress('EXPECTED_SHARE_TOKEN')
@@ -333,6 +333,7 @@ async function main() {
 }
 
 async function requireFrozenHourlyDeployment() {
+  if (process.env.CRON_SUSPENDED_PRECHECK === 'true') return
   const cron = await json(
     `${ARGO_API}/api/v1/cron-workflows/${ARGO_NAMESPACE}/${CRON_WORKFLOW}`,
   )
@@ -341,6 +342,26 @@ async function requireFrozenHourlyDeployment() {
   }
   if ((cron.status?.active ?? []).length > 0) {
     throw new Error(`${CRON_WORKFLOW} still has an active workflow; wait for it to finish`)
+  }
+}
+
+async function resolveDeployment() {
+  const workflow = process.env.PINNED_DEPLOYMENT_WORKFLOW?.trim()
+  if (!workflow) return latestSuccessfulDeployment()
+  const gateway = optionalAddress('EXPECTED_GATEWAY')
+  const shareToken = optionalAddress('EXPECTED_SHARE_TOKEN')
+  const earnRevision = process.env.PINNED_EARN_REVISION?.trim()
+  if (!gateway || !shareToken || !earnRevision) {
+    throw new Error(
+      'Pinned deployment requires EXPECTED_GATEWAY, EXPECTED_SHARE_TOKEN, and PINNED_EARN_REVISION',
+    )
+  }
+  return {
+    completedAt: undefined,
+    earnRevision,
+    gateway,
+    shareToken,
+    workflow,
   }
 }
 

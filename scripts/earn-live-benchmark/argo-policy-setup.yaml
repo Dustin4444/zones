@@ -69,6 +69,12 @@ spec:
             value: argo-workflows
           - name: CRON_WORKFLOW
             value: zone-txgen
+          - name: CRON_SUSPENDED_PRECHECK
+            value: "true"
+          - name: PINNED_DEPLOYMENT_WORKFLOW
+            value: zone-txgen-1784757600
+          - name: PINNED_EARN_REVISION
+            value: 4fd9b5e997546d5435ee5f922e1e8ee2821bdb3d
           - name: L1_RPC_URL
             value: http://tempo-devnet-nextfork-nodes-rpc-service.tail388b2e.ts.net:8545
           - name: ZONE_PUBLIC_RPC_URL
