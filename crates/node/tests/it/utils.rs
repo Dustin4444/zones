@@ -19,7 +19,7 @@ use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{SocketAddr, TcpListener},
     num::NonZeroU32,
@@ -2144,6 +2144,8 @@ pub(crate) struct ZoneAccount {
     portal_address: Address,
     /// Whether we've already approved the portal to spend pathUSD on L1.
     l1_portal_approved: bool,
+    /// Tokens already approved for the ZoneOutbox on L2.
+    l2_outbox_approved_tokens: BTreeSet<Address>,
 }
 
 impl ZoneAccount {
@@ -2179,6 +2181,7 @@ impl ZoneAccount {
             l2_provider,
             portal_address,
             l1_portal_approved: false,
+            l2_outbox_approved_tokens: BTreeSet::new(),
         }
     }
 
@@ -2212,6 +2215,7 @@ impl ZoneAccount {
             l2_provider,
             portal_address,
             l1_portal_approved: false,
+            l2_outbox_approved_tokens: BTreeSet::new(),
         }
     }
 
@@ -2498,6 +2502,8 @@ impl ZoneAccount {
     }
 
     /// Approve the ZoneOutbox for a specific token, then request a withdrawal on L2 with custom args.
+    ///
+    /// Reuses a successful max approval for subsequent withdrawals of the same token.
     pub(crate) async fn withdraw_token_with(
         &mut self,
         token: Address,
@@ -2506,14 +2512,17 @@ impl ZoneAccount {
         use tempo_contracts::precompiles::ITIP20;
         use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
 
-        // Approve outbox for this token
-        ITIP20::new(token, &self.l2_provider)
-            .approve(ZONE_OUTBOX_ADDRESS, U256::MAX)
-            .gas(TIP20_TX_GAS)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+        if !self.l2_outbox_approved_tokens.contains(&token) {
+            let receipt = ITIP20::new(token, &self.l2_provider)
+                .approve(ZONE_OUTBOX_ADDRESS, U256::MAX)
+                .gas(TIP20_TX_GAS)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+            eyre::ensure!(receipt.status(), "L2 ZoneOutbox approval failed");
+            self.l2_outbox_approved_tokens.insert(token);
+        }
 
         let to = args.to.unwrap_or(self.address);
         let fallback_recipient = args.fallback_recipient.unwrap_or(self.address);
