@@ -72,6 +72,12 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       MIN_LINES: "88"
       MIN_BRANCHES: "60"
+      # The patched forge binary is a pure function of these two refs. Lockfile
+      # hashes cannot serve as a cache key here: the patch turns tempo crates
+      # into path dependencies, and path-dependency source changes never show
+      # up in Cargo.lock. Bump FOUNDRY_REF together with TEMPO_REF.
+      TEMPO_REF: 18a5d71d6ab621433145e5ea86dfe3dbace0763a
+      FOUNDRY_REF: 6902a96211da7bcc3d9c4d8e97910ac5c9d5d2c6 # master as of 2026-07-22
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -82,7 +88,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: tempoxyz/tempo
-          ref: 18a5d71d6ab621433145e5ea86dfe3dbace0763a
+          ref: ${{ env.TEMPO_REF }}
           path: tempo
           persist-credentials: false
 
@@ -90,29 +96,34 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: foundry-rs/foundry
-          ref: master
+          ref: ${{ env.FOUNDRY_REF }}
           path: foundry
           persist-credentials: false
 
-      - name: Setup Rust
-        uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          workspaces: foundry
-
-      - name: Patch foundry to use pinned Tempo crates
-        run: tempo/scripts/foundry-patch.sh "$GITHUB_WORKSPACE/tempo" "$GITHUB_WORKSPACE/foundry"
-
-      # rust-cache intentionally drops workspace binaries, which means the patched
-      # release build below otherwise relinks Forge from scratch on every run.
+      # rust-cache intentionally drops workspace binaries, which means the
+      # patched release build below otherwise relinks Forge from scratch on
+      # every run. On a cache hit the toolchain setup, dependency cache
+      # restore, patch, and build are all skipped.
       - name: Cache Tempo-capable forge
         id: tempo-forge-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: foundry/target/release/forge
-          key: tempo-forge-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('foundry/Cargo.lock', 'tempo/Cargo.lock', 'tempo/scripts/foundry-patch.sh') }}
+          key: tempo-forge-${{ runner.os }}-${{ runner.arch }}-${{ env.TEMPO_REF }}-${{ env.FOUNDRY_REF }}
+
+      - name: Setup Rust
+        if: steps.tempo-forge-cache.outputs.cache-hit != 'true'
+        uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.tempo-forge-cache.outputs.cache-hit != 'true'
+        with:
+          workspaces: foundry
+
+      - name: Patch foundry to use pinned Tempo crates
+        if: steps.tempo-forge-cache.outputs.cache-hit != 'true'
+        run: tempo/scripts/foundry-patch.sh "$GITHUB_WORKSPACE/tempo" "$GITHUB_WORKSPACE/foundry"
 
       - name: Build Tempo-capable forge
         if: steps.tempo-forge-cache.outputs.cache-hit != 'true'
