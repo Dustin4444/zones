@@ -333,9 +333,9 @@ mod tests {
         context::TxEnv,
         database::{CacheDB, EmptyDB},
     };
-    use tempo_precompiles::{TIP_FEE_MANAGER_ADDRESS, storage::StorageKey, tip20::tip20_slots};
+    use tempo_precompiles::{storage::StorageKey, tip20::tip20_slots};
     use tempo_revm::TempoTxEnv;
-    use zone_precompiles::zone_fee_manager;
+    use zone_precompiles::{ZONE_FEE_MANAGER_ADDRESS, zone_fee_manager};
 
     #[test]
     fn gas_allowance_uses_non_path_zone_default_when_fee_token_is_omitted() {
@@ -345,7 +345,7 @@ mod tests {
         let gas_price = 2_000_000_000u128;
         let mut db = CacheDB::new(EmptyDB::default());
         db.insert_account_storage(
-            TIP_FEE_MANAGER_ADDRESS,
+            ZONE_FEE_MANAGER_ADDRESS,
             zone_fee_manager::slots::DEFAULT_FEE_TOKEN,
             U256::from_be_slice(default_fee_token.as_slice()),
         )

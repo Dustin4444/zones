@@ -9,7 +9,7 @@ use alloy_consensus::Sealable;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256, address};
 use tempo_primitives::TempoHeader;
-use zone_precompiles::{tempo_state, zone_fee_manager};
+use zone_precompiles::{ZONE_FEE_MANAGER_ADDRESS, tempo_state, zone_fee_manager};
 
 /// Bundled zone dev genesis artifact.
 pub const GENESIS_TEMPLATE_JSON: &str = include_str!("../assets/zone-dev-genesis.json");
@@ -20,9 +20,6 @@ const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 /// ZoneConfig predeploy address.
 const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
-/// ZoneFeeManager precompile address.
-const ZONE_FEE_MANAGER_ADDRESS: Address = address!("0xfeec000000000000000000000000000000000000");
-
 /// `tempoPortal` immutable occurrences in ZoneInbox deployed bytecode.
 const ZONE_INBOX_PORTAL_IMMUTABLES: usize = 4;
 /// `tempoPortal` immutable occurrences in ZoneConfig deployed bytecode.

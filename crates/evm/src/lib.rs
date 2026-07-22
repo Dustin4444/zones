@@ -24,8 +24,8 @@ use crate::{
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
         L1State, L1StorageReader, SequencerSetExt, TIP403_REGISTRY_ADDRESS, TempoState,
-        ZONE_TIP20_FACTORY_ADDRESS, ZonePrecompileEnv, ZoneTokenFactory, create_tip20_precompile,
-        create_tip403_precompile, create_zone_fee_manager_precompile,
+        ZONE_FEE_MANAGER_ADDRESS, ZONE_TIP20_FACTORY_ADDRESS, ZonePrecompileEnv, ZoneTokenFactory,
+        create_tip20_precompile, create_tip403_precompile, create_zone_fee_manager_precompile,
     },
     tx_context::ZoneTxContext,
 };
@@ -108,8 +108,9 @@ where
         precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
             Some(ZoneTokenFactory::create(&env))
         });
+        precompiles.apply_precompile(&TIP_FEE_MANAGER_ADDRESS, |_| None);
         let fee_env = env.clone();
-        precompiles.apply_precompile(&TIP_FEE_MANAGER_ADDRESS, move |_| {
+        precompiles.apply_precompile(&ZONE_FEE_MANAGER_ADDRESS, move |_| {
             Some(create_zone_fee_manager_precompile(&fee_env))
         });
         let tip403_env = env.clone();

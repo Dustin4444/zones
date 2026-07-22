@@ -11,13 +11,15 @@
 use alloc::sync::Arc;
 
 use alloy_primitives::Address;
-use alloy_sol_types::{SolCall, SolError};
+use alloy_sol_types::{SolCall, SolError, SolInterface};
 use tempo_precompiles::{
     dispatch::selector_from_calldata,
-    tip20::{IRolesAuth, ITIP20},
+    tip20::{IRolesAuth, ITIP20, TIP20Error},
 };
 use tempo_zone_contracts::Unauthorized;
-use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
+use zone_primitives::constants::{
+    ZONE_FEE_MANAGER_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+};
 
 use crate::execution::{CallCheck, CallRules};
 
@@ -84,6 +86,15 @@ impl CallRules for TIP20Rules {
             }
             ITIP20::burnCall::SELECTOR | ITIP20::burnWithMemoCall::SELECTOR => {
                 self.check_auth(caller, &[ZONE_OUTBOX_ADDRESS])
+            }
+            ITIP20::burnBlockedCall::SELECTOR => {
+                decode_and_check::<ITIP20::burnBlockedCall>(args, |call| {
+                    if call.from == ZONE_FEE_MANAGER_ADDRESS {
+                        CallCheck::Revert(TIP20Error::protected_address().abi_encode().into())
+                    } else {
+                        CallCheck::Continue
+                    }
+                })
             }
             ITIP20::balanceOfCall::SELECTOR => {
                 decode_and_check::<ITIP20::balanceOfCall>(args, |call| {
@@ -479,6 +490,20 @@ mod tests {
         assert_eq!(harness.balance_of(ZONE_OUTBOX_ADDRESS)?, U256::ZERO);
 
         Ok(())
+    }
+
+    #[test]
+    fn zone_fee_manager_balance_is_protected_from_blocked_burns() {
+        let rules = rules(Address::ZERO);
+        let call = ITIP20::burnBlockedCall {
+            from: ZONE_FEE_MANAGER_ADDRESS,
+            amount: U256::ONE,
+        };
+        assert!(matches!(
+            rules.admit(&call.abi_encode(), Address::random()),
+            CallCheck::Revert(data)
+                if data == TIP20Error::protected_address().abi_encode()
+        ));
     }
 
     #[test]

@@ -1,22 +1,24 @@
 //! Zone-native fee custody without token preferences or FeeAMM routing.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, IntoLogData, U256};
 use alloy_sol_types::SolError;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
-    TIP_FEE_MANAGER_ADDRESS, charge_input_cost, dispatch,
-    error::Result,
+    account_keychain::AccountKeychain,
+    charge_input_cost, dispatch,
+    error::{Result, TempoPrecompileError},
     mutate_void,
-    storage::{Handler, Mapping, StorageCtx},
-    tip20::{ITIP20, TIP20Token},
+    storage::{Handler, Mapping, StorageCtx, StorageKey},
+    tip20::{ITIP20, TIP20Error, TIP20Event, TIP20Token, tip20_slots},
     tip403_registry::AuthRole,
     view,
 };
 use tempo_precompiles_macros::contract;
 use tempo_zone_contracts::{IZoneFeeManager, Unauthorized};
+pub use zone_primitives::constants::ZONE_FEE_MANAGER_ADDRESS;
 
-/// Zone-owned fee balances at Tempo's canonical fee-manager address.
-#[contract(addr = TIP_FEE_MANAGER_ADDRESS)]
+/// Zone-owned fee balances at the Zone-native fee-manager address.
+#[contract(addr = ZONE_FEE_MANAGER_ADDRESS)]
 pub struct ZoneFeeManager {
     collected_fees: Mapping<Address, Mapping<Address, U256>>,
     default_fee_token: Address,
@@ -49,13 +51,24 @@ impl ZoneFeeManager {
         max_amount: U256,
     ) -> Result<Address> {
         let mut token = TIP20Token::from_address(fee_token)?;
-        // TODO: Remove the pre-T8 authorization path once T8 activates.
-        if self.storage.spec().is_t8() {
-            token.ensure_authorized_as(&[(fee_payer, AuthRole::sender())])?;
-        } else {
-            token.ensure_transfer_authorized(fee_payer, self.address)?;
+        token.ensure_authorized_as(&[(fee_payer, AuthRole::sender())])?;
+        token.check_not_paused()?;
+        token.check_and_update_spending_limit(fee_payer, max_amount)?;
+
+        let reward_recipient = token.update_rewards(fee_payer)?;
+        if !reward_recipient.is_zero() {
+            let opted_in_supply = U256::from(token.get_opted_in_supply()?)
+                .checked_sub(max_amount)
+                .ok_or_else(TempoPrecompileError::under_overflow)?;
+            token.set_opted_in_supply(
+                opted_in_supply
+                    .try_into()
+                    .map_err(|_| TempoPrecompileError::under_overflow())?,
+            )?;
         }
-        token.transfer_fee_pre_tx(fee_payer, max_amount)?;
+
+        Self::decrement_balance(fee_token, fee_payer, max_amount)?;
+        Self::increment_balance(fee_token, self.address, max_amount)?;
         Ok(fee_token)
     }
 
@@ -68,15 +81,48 @@ impl ZoneFeeManager {
         fee_token: Address,
         beneficiary: Address,
     ) -> Result<U256> {
-        TIP20Token::from_address(fee_token)?.transfer_fee_post_tx(
-            fee_payer,
-            refund_amount,
-            actual_spending,
+        let mut token = TIP20Token::from_address(fee_token)?;
+        StorageCtx.emit_event(
+            fee_token,
+            TIP20Event::transfer(fee_payer, self.address, actual_spending).into_log_data(),
         )?;
+
+        if !refund_amount.is_zero() {
+            AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund_amount)?;
+
+            let reward_recipient = token.update_rewards(fee_payer)?;
+            if !reward_recipient.is_zero() {
+                let opted_in_supply = U256::from(token.get_opted_in_supply()?)
+                    .checked_add(refund_amount)
+                    .ok_or_else(TempoPrecompileError::under_overflow)?;
+                token.set_opted_in_supply(
+                    opted_in_supply
+                        .try_into()
+                        .map_err(|_| TempoPrecompileError::under_overflow())?,
+                )?;
+            }
+
+            Self::decrement_balance(fee_token, self.address, refund_amount)?;
+            Self::increment_balance(fee_token, fee_payer, refund_amount)?;
+        }
+
         if !actual_spending.is_zero() {
             self.collected_fees[beneficiary][fee_token].sinc(actual_spending)?;
         }
         Ok(actual_spending)
+    }
+
+    fn decrement_balance(token: Address, account: Address, amount: U256) -> Result<()> {
+        let slot = account.mapping_slot(tip20_slots::BALANCES);
+        let current = StorageCtx.sload(token, slot)?;
+        let balance = current
+            .checked_sub(amount)
+            .ok_or_else(|| TIP20Error::insufficient_balance(current, amount, token))?;
+        StorageCtx.sstore(token, slot, balance)
+    }
+
+    fn increment_balance(token: Address, account: Address, amount: U256) -> Result<()> {
+        StorageCtx.sinc(token, account.mapping_slot(tip20_slots::BALANCES), amount)
     }
 
     /// Pays a beneficiary's accrued balance.
@@ -138,6 +184,7 @@ mod tests {
     use alloy_primitives::Bytes;
     use alloy_sol_types::SolCall;
     use tempo_precompiles::{
+        TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, StorageCtx, hashmap::HashMapStorageProvider},
         test_util::TIP20Setup,
         tip20::ITIP20,
@@ -164,6 +211,18 @@ mod tests {
                 token.address(),
                 beneficiary,
             )?;
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: ZONE_FEE_MANAGER_ADDRESS,
+                })?,
+                U256::from(3_000),
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: TIP_FEE_MANAGER_ADDRESS,
+                })?,
+                U256::ZERO,
+            );
             let output = manager.call(
                 &IZoneFeeManager::distributeFeesCall {
                     beneficiary,
@@ -178,6 +237,12 @@ mod tests {
                     account: beneficiary
                 })?,
                 U256::from(3_000)
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: ZONE_FEE_MANAGER_ADDRESS,
+                })?,
+                U256::ZERO,
             );
             Ok(())
         })

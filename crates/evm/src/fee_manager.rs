@@ -50,6 +50,8 @@ where
         spec: TempoHardfork,
         actions: StorageActions,
     ) -> Result<Address> {
+        // Tempo's transaction handler calls this hook. The trait default reads the L1
+        // TipFeeManager, so Zones must override it to resolve their genesis-configured default.
         resolve_fee_token(journal, tx, spec, actions)
     }
 
