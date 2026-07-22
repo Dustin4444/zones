@@ -68,9 +68,9 @@ use zone_l1::{
 };
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
+use zone_payload::ZonePayloadTypes;
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
 use zone_primitives::constants::PORTAL_ACCESS_MODE_SLOT;
-use zone_payload::ZonePayloadTypes;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
