@@ -3,6 +3,7 @@
 mod dispatch;
 
 use alloy_primitives::{Address, IntoLogData, U256};
+use tempo_contracts::precompiles::IFeeManager;
 use tempo_precompiles::{
     account_keychain::AccountKeychain,
     error::{Result, TempoPrecompileError},
@@ -11,7 +12,6 @@ use tempo_precompiles::{
     tip403_registry::AuthRole,
 };
 use tempo_precompiles_macros::contract;
-use tempo_zone_contracts::IZoneFeeManager;
 pub use zone_primitives::constants::ZONE_FEE_MANAGER_ADDRESS;
 
 /// Zone-owned fee balances at the Zone-native fee-manager address.
@@ -113,8 +113,8 @@ impl ZoneFeeManager {
                 amount,
             },
         )?;
-        self.emit_event(IZoneFeeManager::FeesDistributed {
-            beneficiary,
+        self.emit_event(IFeeManager::FeesDistributed {
+            validator: beneficiary,
             token,
             amount,
         })
@@ -126,6 +126,7 @@ mod tests {
     use super::*;
     use alloy_primitives::Bytes;
     use alloy_sol_types::{SolCall, SolError};
+    use tempo_contracts::precompiles::UnknownFunctionSelector;
     use tempo_precompiles::{
         Precompile as _, TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, StorageCtx, hashmap::HashMapStorageProvider},
@@ -168,8 +169,8 @@ mod tests {
                 U256::ZERO,
             );
             let output = manager.call(
-                &IZoneFeeManager::distributeFeesCall {
-                    beneficiary,
+                &IFeeManager::distributeFeesCall {
+                    validator: beneficiary,
                     token: token.address(),
                 }
                 .abi_encode(),
@@ -204,7 +205,10 @@ mod tests {
             manager.initialize(token)?;
             manager.collected_fees[beneficiary][token].write(amount)?;
 
-            let read = IZoneFeeManager::collectedFeesCall { beneficiary, token };
+            let read = IFeeManager::collectedFeesCall {
+                validator: beneficiary,
+                token,
+            };
             let unauthorized_read = manager.call(&read.abi_encode(), outsider)?;
             assert!(unauthorized_read.is_revert());
             assert_eq!(
@@ -215,11 +219,14 @@ mod tests {
             let authorized_read = manager.call(&read.abi_encode(), beneficiary)?;
             assert!(authorized_read.is_success());
             assert_eq!(
-                IZoneFeeManager::collectedFeesCall::abi_decode_returns(&authorized_read.bytes)?,
+                IFeeManager::collectedFeesCall::abi_decode_returns(&authorized_read.bytes)?,
                 amount
             );
 
-            let distribute = IZoneFeeManager::distributeFeesCall { beneficiary, token };
+            let distribute = IFeeManager::distributeFeesCall {
+                validator: beneficiary,
+                token,
+            };
             let unauthorized_distribution = manager.call(&distribute.abi_encode(), outsider)?;
             assert!(unauthorized_distribution.is_revert());
             assert_eq!(
@@ -227,6 +234,30 @@ mod tests {
                 Bytes::from(Unauthorized {}.abi_encode())
             );
             assert_eq!(manager.collected_fees(beneficiary, token)?, amount);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn l1_only_fee_manager_selectors_are_unsupported() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new(1);
+        StorageCtx::enter(&mut storage, || {
+            let account = Address::random();
+            let token = Address::random();
+            let mut manager = ZoneFeeManager::new();
+
+            for calldata in [
+                IFeeManager::userTokensCall { user: account }.abi_encode(),
+                IFeeManager::validatorTokensCall { validator: account }.abi_encode(),
+                IFeeManager::setUserTokenCall { token }.abi_encode(),
+                IFeeManager::setValidatorTokenCall { token }.abi_encode(),
+            ] {
+                let output = manager.call(&calldata, account)?;
+                assert!(output.is_revert());
+                let error = UnknownFunctionSelector::abi_decode(&output.bytes)?;
+                assert_eq!(error.selector.as_slice(), &calldata[..4]);
+            }
 
             Ok(())
         })
