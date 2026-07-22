@@ -5,6 +5,7 @@ import {
   getAddress,
   http,
   parseAbi,
+  zeroHash,
   type Address,
   type TransactionReceipt,
 } from 'viem'
@@ -12,7 +13,7 @@ import { getGasPrice, getTransactionCount } from 'viem/actions'
 import { mnemonicToAccount } from 'viem/accounts'
 import { Abis, createClient, Storage } from 'viem/tempo'
 import { tempoModerato } from 'viem/tempo/chains'
-import { http as zoneHttp, zoneModerato } from 'viem/tempo/zones'
+import { Abis as ZoneAbis, http as zoneHttp, zoneModerato } from 'viem/tempo/zones'
 
 const ARGO_API = 'https://dev-eu-argo-workflows.tail388b2e.ts.net'
 const PLATFORM_API = 'https://dev-eu-tempo-dev-platform.tail388b2e.ts.net'
@@ -54,7 +55,11 @@ const zoneChain = defineChain({
   sourceId: L1_CHAIN_ID,
   rpcUrls: { default: { http: [ZONE_RPC] } },
 })
-const l1 = createClient({ chain: l1Chain, pollingInterval: 250, transport: http(L1_RPC) })
+const l1 = createClient({
+  chain: l1Chain,
+  pollingInterval: 250,
+  transport: http(L1_RPC),
+})
 const wallet = createClient({
   account,
   chain: l1Chain,
@@ -74,21 +79,48 @@ const gatewayAbi = parseAbi([
   'function shareToken() view returns (address)',
   'function depositSwapperFor(address) view returns (address)',
 ])
-const earnDepositEvent = getAbiItem({ abi: Abis.zoneGateway, name: 'EarnDeposit' })
+const earnDepositEvent = getAbiItem({
+  abi: Abis.zoneGateway,
+  name: 'EarnDeposit',
+})
+const earnRedeemEvent = getAbiItem({
+  abi: Abis.zoneGateway,
+  name: 'EarnRedeem',
+})
+const withdrawalProcessedEvent = getAbiItem({
+  abi: ZoneAbis.zonePortal,
+  name: 'WithdrawalProcessed',
+})
 
 await zone.zone.signAuthorizationToken({ zoneId: ZONE_ID, storage })
 
 const [vaultAsset, shareToken, route, inputName, inputSymbol, vaultName] = await Promise.all([
-  l1.readContract({ address: GATEWAY, abi: gatewayAbi, functionName: 'vaultAsset' }),
-  l1.readContract({ address: GATEWAY, abi: gatewayAbi, functionName: 'shareToken' }),
+  l1.readContract({
+    address: GATEWAY,
+    abi: gatewayAbi,
+    functionName: 'vaultAsset',
+  }),
+  l1.readContract({
+    address: GATEWAY,
+    abi: gatewayAbi,
+    functionName: 'shareToken',
+  }),
   l1.readContract({
     address: GATEWAY,
     abi: gatewayAbi,
     functionName: 'depositSwapperFor',
     args: [INPUT_TOKEN],
   }),
-  l1.readContract({ address: INPUT_TOKEN, abi: erc20Abi, functionName: 'name' }),
-  l1.readContract({ address: INPUT_TOKEN, abi: erc20Abi, functionName: 'symbol' }),
+  l1.readContract({
+    address: INPUT_TOKEN,
+    abi: erc20Abi,
+    functionName: 'name',
+  }),
+  l1.readContract({
+    address: INPUT_TOKEN,
+    abi: erc20Abi,
+    functionName: 'symbol',
+  }),
   readVaultName(),
 ])
 if (shareToken !== SHARE_TOKEN)
@@ -182,10 +214,91 @@ for (let index = 1; index <= JOURNEYS; index++) {
     toBlock: 'latest',
   })
   if (!depositLog) throw new Error(`No EarnDeposit log for ${prepared.actionId}`)
-  const settlementReceipt = await l1.getTransactionReceipt({ hash: depositLog.transactionHash })
+  const settlementReceipt = await l1.getTransactionReceipt({
+    hash: depositLog.transactionHash,
+  })
+
+  const redeemPrepared = await l1.earn.privateRedeem.prepare({
+    assetAmountMin: 1n,
+    assetToken: INPUT_TOKEN,
+    callbackGas: CALLBACK_GAS,
+    fallbackRecipient: account.address,
+    gateway: GATEWAY,
+    recipient: account.address,
+    recoveryRecipient: account.address,
+    shareAmount: zoneSharesAfter - zoneSharesBefore,
+  })
+  const [zoneInputBeforeRedeem, redeemMaxFeePerGas, redeemNonce] = await Promise.all([
+    balance(zone, INPUT_TOKEN),
+    getGasPrice(zone),
+    getTransactionCount(zone, { address: account.address }),
+  ])
+  const redeemStarted = performance.now()
+  const redeemRequest = await zone.zone.requestWithdrawalSync({
+    ...redeemPrepared,
+    chain: zoneChain,
+    gas: ZONE_TRANSACTION_GAS,
+    maxFeePerGas: redeemMaxFeePerGas,
+    maxPriorityFeePerGas: 0n,
+    nonce: redeemNonce,
+  })
+  const redeemZoneReceiptLatencyMs = performance.now() - redeemStarted
+  const redeemed = await l1.earn.waitForPrivateRedeem({
+    actionId: redeemPrepared.actionId,
+    fromBlock: redeemPrepared.fromBlock,
+    gateway: GATEWAY,
+    pollingInterval: 250,
+    timeout: 180_000,
+  })
+  const redeemL1SettlementLatencyMs = performance.now() - redeemStarted
+  await waitForZoneTempoBlock(redeemed.tempoBlockNumber)
+  const zoneInputAfterRedeem = await waitForBalanceIncrease(INPUT_TOKEN, zoneInputBeforeRedeem)
+  const redeemLatencyMs = performance.now() - redeemStarted
+  const [redeemLog] = await l1.getLogs({
+    address: GATEWAY,
+    args: { actionId: redeemPrepared.actionId },
+    event: earnRedeemEvent,
+    fromBlock: redeemPrepared.fromBlock,
+    strict: true,
+    toBlock: 'latest',
+  })
+  if (!redeemLog) throw new Error(`No EarnRedeem log for ${redeemPrepared.actionId}`)
+  const redeemSettlementReceipt = await l1.getTransactionReceipt({
+    hash: redeemLog.transactionHash,
+  })
+
+  const offrampAmount = zoneInputAfterRedeem - zoneInputBeforeRedeem
+  const [l1InputBeforeOfframp, offrampMaxFeePerGas, offrampNonce] = await Promise.all([
+    balance(l1, INPUT_TOKEN),
+    getGasPrice(zone),
+    getTransactionCount(zone, { address: account.address }),
+  ])
+  const offrampStarted = performance.now()
+  const offrampRequest = await zone.zone.requestWithdrawalSync({
+    amount: offrampAmount,
+    callbackGas: 0n,
+    chain: zoneChain,
+    data: '0x',
+    fallbackRecipient: account.address,
+    gas: ZONE_TRANSACTION_GAS,
+    maxFeePerGas: offrampMaxFeePerGas,
+    maxPriorityFeePerGas: 0n,
+    memo: zeroHash,
+    nonce: offrampNonce,
+    to: account.address,
+    token: INPUT_TOKEN,
+  })
+  const offrampZoneReceiptLatencyMs = performance.now() - offrampStarted
+  const offrampLog = await waitForWithdrawalProcessed(offrampRequest.senderTag)
+  const offrampL1ReceiptLatencyMs = performance.now() - offrampStarted
+  const l1InputAfterOfframp = await waitForL1BalanceIncrease(INPUT_TOKEN, l1InputBeforeOfframp)
+  const offrampLatencyMs = performance.now() - offrampStarted
+  const offrampSettlementReceipt = await l1.getTransactionReceipt({
+    hash: offrampLog.transactionHash,
+  })
   const result = {
     index,
-    input: {
+    payout: {
       latencyMs: inputLatencyMs,
       receipt: receiptMetric(input.receipt),
       userPathUsdFeeBaseUnits: (l1PathBefore - l1PathAfter).toString(),
@@ -204,11 +317,31 @@ for (let index = 1; index <= JOURNEYS; index++) {
       sharesBaseUnits: settled.shares.toString(),
       receivedSharesBaseUnits: (zoneSharesAfter - zoneSharesBefore).toString(),
     },
+    redeem: {
+      latencyMs: redeemLatencyMs,
+      zoneReceiptLatencyMs: redeemZoneReceiptLatencyMs,
+      l1SettlementLatencyMs: redeemL1SettlementLatencyMs,
+      zoneReturnLatencyMs: redeemLatencyMs - redeemL1SettlementLatencyMs,
+      zoneReceipt: receiptMetric(redeemRequest.receipt),
+      l1Receipt: receiptMetric(redeemSettlementReceipt),
+      sharesBaseUnits: redeemed.shares.toString(),
+      vaultAssetsBaseUnits: redeemed.vaultAssets.toString(),
+      outputBaseUnits: redeemed.outputAmount.toString(),
+      receivedOutputBaseUnits: offrampAmount.toString(),
+    },
+    offramp: {
+      latencyMs: offrampLatencyMs,
+      zoneReceiptLatencyMs: offrampZoneReceiptLatencyMs,
+      l1ReceiptLatencyMs: offrampL1ReceiptLatencyMs,
+      zoneReceipt: receiptMetric(offrampRequest.receipt),
+      l1Receipt: receiptMetric(offrampSettlementReceipt),
+      outputBaseUnits: (l1InputAfterOfframp - l1InputBeforeOfframp).toString(),
+    },
     totalLatencyMs: performance.now() - totalStarted,
   }
   journeys.push(result)
   console.error(
-    `journey ${index}/${JOURNEYS}: input=${seconds(inputLatencyMs)}s earn=${seconds(earnLatencyMs)}s total=${seconds(result.totalLatencyMs)}s`,
+    `journey ${index}/${JOURNEYS}: payout=${seconds(inputLatencyMs)}s earn=${seconds(earnLatencyMs)}s redeem=${seconds(redeemLatencyMs)}s offramp=${seconds(offrampLatencyMs)}s total=${seconds(result.totalLatencyMs)}s`,
   )
 }
 
@@ -226,13 +359,23 @@ console.log(
         gateway: GATEWAY,
         shareToken: SHARE_TOKEN,
       },
-      venue: { inputToken: INPUT_TOKEN, inputName, inputSymbol, route, vaultAsset, vaultName },
+      venue: {
+        inputToken: INPUT_TOKEN,
+        inputName,
+        inputSymbol,
+        route,
+        vaultAsset,
+        vaultName,
+      },
       setup: {
         feeFundingBaseUnits: FEE_BUFFER.toString(),
         latencyMs: setupLatencyMs,
         receipt: receiptMetric(feeFunding.receipt),
       },
-      parameters: { journeys: JOURNEYS, inputAssetBaseUnits: ASSET_AMOUNT.toString() },
+      parameters: {
+        journeys: JOURNEYS,
+        inputAssetBaseUnits: ASSET_AMOUNT.toString(),
+      },
       journeys,
       summary: summarize(journeys),
     },
@@ -285,6 +428,34 @@ async function waitForBalanceIncrease(token: Address, before: bigint) {
   throw new Error(`Timed out waiting for ${token} balance to increase`)
 }
 
+async function waitForL1BalanceIncrease(token: Address, before: bigint) {
+  const deadline = Date.now() + 180_000
+  while (Date.now() < deadline) {
+    const current = await balance(l1, token)
+    if (current > before) return current
+    await wait(250)
+  }
+  throw new Error(`Timed out waiting for L1 ${token} balance to increase`)
+}
+
+async function waitForWithdrawalProcessed(senderTag: `0x${string}`) {
+  const fromBlock = await l1.getBlockNumber({ cacheTime: 0 })
+  const deadline = Date.now() + 180_000
+  while (Date.now() < deadline) {
+    const [log] = await l1.getLogs({
+      address: PORTAL,
+      args: { senderTag },
+      event: withdrawalProcessedEvent,
+      fromBlock,
+      strict: true,
+      toBlock: 'latest',
+    })
+    if (log) return log
+    await wait(250)
+  }
+  throw new Error(`Timed out waiting for WithdrawalProcessed ${senderTag}`)
+}
+
 async function readVaultName() {
   const adapter = await l1.readContract({
     address: GATEWAY,
@@ -301,7 +472,11 @@ async function readVaultName() {
     abi: parseAbi(['function vault() view returns (address)']),
     functionName: 'vault',
   })
-  return l1.readContract({ address: vault, abi: erc20Abi, functionName: 'name' })
+  return l1.readContract({
+    address: vault,
+    abi: erc20Abi,
+    functionName: 'name',
+  })
 }
 
 async function latestDeployment() {
@@ -375,16 +550,24 @@ function metric(values: number[]) {
 
 function summarize(results: typeof journeys) {
   return {
-    inputLatencyMs: metric(results.map((result) => result.input.latencyMs)),
+    payoutLatencyMs: metric(results.map((result) => result.payout.latencyMs)),
     earnLatencyMs: metric(results.map((result) => result.earn.latencyMs)),
     totalLatencyMs: metric(results.map((result) => result.totalLatencyMs)),
-    inputGasUsed: metric(results.map((result) => Number(result.input.receipt.gasUsed))),
-    inputL1Fee18: metric(results.map((result) => Number(result.input.receipt.fee18))),
+    payoutGasUsed: metric(results.map((result) => Number(result.payout.receipt.gasUsed))),
+    payoutL1Fee18: metric(results.map((result) => Number(result.payout.receipt.fee18))),
     earnZoneGasUsed: metric(results.map((result) => Number(result.earn.zoneReceipt.gasUsed))),
     earnL1GasUsed: metric(results.map((result) => Number(result.earn.l1Receipt.gasUsed))),
     earnL1Fee18: metric(results.map((result) => Number(result.earn.l1Receipt.fee18))),
-    inputUserPathUsdFeeBaseUnits: metric(
-      results.map((result) => Number(result.input.userPathUsdFeeBaseUnits)),
+    redeemLatencyMs: metric(results.map((result) => result.redeem.latencyMs)),
+    redeemZoneGasUsed: metric(results.map((result) => Number(result.redeem.zoneReceipt.gasUsed))),
+    redeemL1GasUsed: metric(results.map((result) => Number(result.redeem.l1Receipt.gasUsed))),
+    redeemL1Fee18: metric(results.map((result) => Number(result.redeem.l1Receipt.fee18))),
+    offrampLatencyMs: metric(results.map((result) => result.offramp.latencyMs)),
+    offrampZoneGasUsed: metric(results.map((result) => Number(result.offramp.zoneReceipt.gasUsed))),
+    offrampL1GasUsed: metric(results.map((result) => Number(result.offramp.l1Receipt.gasUsed))),
+    offrampL1Fee18: metric(results.map((result) => Number(result.offramp.l1Receipt.fee18))),
+    payoutUserPathUsdFeeBaseUnits: metric(
+      results.map((result) => Number(result.payout.userPathUsdFeeBaseUnits)),
     ),
     earnZonePathUsdFeeBaseUnits: metric(
       results.map((result) => Number(result.earn.zonePathUsdFeeBaseUnits)),
