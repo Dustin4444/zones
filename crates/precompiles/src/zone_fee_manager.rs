@@ -8,8 +8,8 @@ use tempo_precompiles::{
     charge_input_cost, dispatch,
     error::{Result, TempoPrecompileError},
     mutate_void,
-    storage::{Handler, Mapping, StorageCtx, StorageKey},
-    tip20::{ITIP20, TIP20Error, TIP20Event, TIP20Token, tip20_slots},
+    storage::{Handler, Mapping, StorageCtx},
+    tip20::{ITIP20, TIP20Event, TIP20Token},
     tip403_registry::AuthRole,
     view,
 };
@@ -67,8 +67,8 @@ impl ZoneFeeManager {
             )?;
         }
 
-        Self::decrement_balance(fee_token, fee_payer, max_amount)?;
-        Self::increment_balance(fee_token, self.address, max_amount)?;
+        token.decrement_balance(fee_payer, max_amount)?;
+        token.increment_balance(self.address, max_amount)?;
         Ok(fee_token)
     }
 
@@ -102,27 +102,14 @@ impl ZoneFeeManager {
                 )?;
             }
 
-            Self::decrement_balance(fee_token, self.address, refund_amount)?;
-            Self::increment_balance(fee_token, fee_payer, refund_amount)?;
+            token.decrement_balance(self.address, refund_amount)?;
+            token.increment_balance(fee_payer, refund_amount)?;
         }
 
         if !actual_spending.is_zero() {
             self.collected_fees[beneficiary][fee_token].sinc(actual_spending)?;
         }
         Ok(actual_spending)
-    }
-
-    fn decrement_balance(token: Address, account: Address, amount: U256) -> Result<()> {
-        let slot = account.mapping_slot(tip20_slots::BALANCES);
-        let current = StorageCtx.sload(token, slot)?;
-        let balance = current
-            .checked_sub(amount)
-            .ok_or_else(|| TIP20Error::insufficient_balance(current, amount, token))?;
-        StorageCtx.sstore(token, slot, balance)
-    }
-
-    fn increment_balance(token: Address, account: Address, amount: U256) -> Result<()> {
-        StorageCtx.sinc(token, account.mapping_slot(tip20_slots::BALANCES), amount)
     }
 
     /// Pays a beneficiary's accrued balance.
