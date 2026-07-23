@@ -249,80 +249,6 @@ struct StoreSnapshot {
     withdrawals: Option<Vec<abi::Withdrawal>>,
 }
 
-/// Return the gas reserved for one withdrawal inside a `processWithdrawals` transaction.
-///
-/// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
-/// per-item portal/messenger overhead. This keeps legacy over-cap withdrawals submit-able
-/// while bounding the batcher's gas accounting.
-const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
-    let bounded_callback_gas = if callback_gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
-        MAX_WITHDRAWAL_GAS_LIMIT
-    } else {
-        callback_gas_limit
-    };
-
-    bounded_callback_gas + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
-}
-
-/// A contiguous, gas-bounded transaction within one withdrawal queue slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WithdrawalBatch {
-    start: usize,
-    end: usize,
-    gas_limit: u64,
-}
-
-impl WithdrawalBatch {
-    fn len(self) -> usize {
-        self.end - self.start
-    }
-}
-
-/// Split FIFO withdrawals by the configured per-transaction gas limit.
-///
-/// A withdrawal that exceeds the limit is kept as a singleton so it cannot block the queue.
-fn build_withdrawal_batches(
-    withdrawals: &[abi::Withdrawal],
-    max_batch_gas: u64,
-) -> Vec<WithdrawalBatch> {
-    let mut batches = Vec::new();
-    let mut start = 0;
-
-    while start < withdrawals.len() {
-        let mut end = start;
-        let mut gas_limit = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS;
-
-        while end < withdrawals.len() {
-            let next_gas =
-                gas_limit.saturating_add(process_withdrawal_item_gas(withdrawals[end].gasLimit));
-            if end > start && next_gas > max_batch_gas {
-                break;
-            }
-
-            gas_limit = next_gas;
-            end += 1;
-        }
-
-        batches.push(WithdrawalBatch {
-            start,
-            end,
-            gas_limit,
-        });
-        start = end;
-    }
-
-    batches
-}
-
-/// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
-enum SubmitOutcome {
-    /// Every transaction was included on L1 and succeeded.
-    Confirmed,
-    /// At least one transaction failed to send, reverted, or could not be confirmed. The next
-    /// cycle reconciles the on-chain queue and retries the unfinished suffix.
-    Retry,
-}
-
 /// Background task that processes withdrawals from the ZonePortal queue on Tempo L1.
 ///
 /// The processor waits for a [`Notify`] signal from the batch submitter (indicating a batch
@@ -799,6 +725,80 @@ pub fn spawn_withdrawal_processor(
             }
         }
     })
+}
+
+/// Return the gas reserved for one withdrawal inside a `processWithdrawals` transaction.
+///
+/// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
+/// per-item portal/messenger overhead. This keeps legacy over-cap withdrawals submit-able
+/// while bounding the batcher's gas accounting.
+const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
+    let bounded_callback_gas = if callback_gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
+        MAX_WITHDRAWAL_GAS_LIMIT
+    } else {
+        callback_gas_limit
+    };
+
+    bounded_callback_gas + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
+}
+
+/// A contiguous, gas-bounded transaction within one withdrawal queue slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WithdrawalBatch {
+    start: usize,
+    end: usize,
+    gas_limit: u64,
+}
+
+impl WithdrawalBatch {
+    fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
+/// Split FIFO withdrawals by the configured per-transaction gas limit.
+///
+/// A withdrawal that exceeds the limit is kept as a singleton so it cannot block the queue.
+fn build_withdrawal_batches(
+    withdrawals: &[abi::Withdrawal],
+    max_batch_gas: u64,
+) -> Vec<WithdrawalBatch> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+
+    while start < withdrawals.len() {
+        let mut end = start;
+        let mut gas_limit = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS;
+
+        while end < withdrawals.len() {
+            let next_gas =
+                gas_limit.saturating_add(process_withdrawal_item_gas(withdrawals[end].gasLimit));
+            if end > start && next_gas > max_batch_gas {
+                break;
+            }
+
+            gas_limit = next_gas;
+            end += 1;
+        }
+
+        batches.push(WithdrawalBatch {
+            start,
+            end,
+            gas_limit,
+        });
+        start = end;
+    }
+
+    batches
+}
+
+/// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
+enum SubmitOutcome {
+    /// Every transaction was included on L1 and succeeded.
+    Confirmed,
+    /// At least one transaction failed to send, reverted, or could not be confirmed. The next
+    /// cycle reconciles the on-chain queue and retries the unfinished suffix.
+    Retry,
 }
 
 #[cfg(test)]
