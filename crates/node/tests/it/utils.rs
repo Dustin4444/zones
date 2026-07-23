@@ -61,6 +61,7 @@ use zone_l1::{
 };
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
+use zone_primitives::constants::PORTAL_ROLE_SLOT;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -1404,6 +1405,8 @@ impl L1TestNode {
                 sequencers: vec![sequencer],
                 threshold: 1,
                 rpcUrl: String::new(),
+                allowedAccounts: Vec::new(),
+                zoneGateways: Vec::new(),
             })
             .send()
             .await?
