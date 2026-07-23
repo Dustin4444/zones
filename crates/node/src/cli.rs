@@ -33,7 +33,7 @@ const ZONE_LOG_FILTER_DIRECTIVES: &str = concat!(
 /// Tempo Zone CLI entry point.
 pub enum ZoneCli {
     Node(Box<Cli<ZoneChainSpecParser, ZoneArgs>>),
-    Dev(DevCommand),
+    Dev(Box<DevCommand>),
 }
 
 impl ZoneCli {
@@ -65,7 +65,9 @@ impl ZoneCli {
     {
         let matches = Self::command().try_get_matches_from(args)?;
         if let Some(("dev", dev_matches)) = matches.subcommand() {
-            return DevCommand::from_arg_matches(dev_matches).map(Self::Dev);
+            return DevCommand::from_arg_matches(dev_matches)
+                .map(Box::new)
+                .map(Self::Dev);
         }
         Cli::from_arg_matches(&matches)
             .map(Box::new)
@@ -79,7 +81,7 @@ impl ZoneCli {
     pub fn run(self) -> eyre::Result<()> {
         match self {
             Self::Node(cli) => run_node(*cli),
-            Self::Dev(command) => command.run(),
+            Self::Dev(command) => (*command).run(),
         }
     }
 }
@@ -472,7 +474,13 @@ mod tests {
 
     #[test]
     fn dev_is_parsed_by_the_top_level_cli() {
-        let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
+        let parsed = ZoneCli::try_parse_from([
+            "tempo-zone",
+            "dev",
+            "--dev.zone-gateway",
+            "0x0000000000000000000000000000000000000001",
+        ])
+        .unwrap();
         assert!(matches!(parsed, ZoneCli::Dev(_)));
     }
 

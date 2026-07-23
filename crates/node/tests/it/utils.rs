@@ -5,9 +5,9 @@ use alloy_network::{EthereumWallet, ReceiptResponse};
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_eth::{BlockNumberOrTag, Filter};
+use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, TransactionRequest};
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
-use alloy_sol_types::{SolEvent, SolValue};
+use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use commonware_codec::Encode as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey as Ed25519PrivateKey};
 use eyre::WrapErr;
@@ -38,7 +38,7 @@ use tempo_chainspec::{
     spec::{TEMPO_T0_BASE_FEE, TempoChainSpec},
 };
 use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, TIP403_REGISTRY_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, IZoneFactory as LegacyZoneFactory, TIP403_REGISTRY_ADDRESS,
     account_keychain::IAccountKeychain::{
         IAccountKeychainInstance, KeyRestrictions, SignatureType as KeyInfoSignatureType,
     },
@@ -48,7 +48,6 @@ use tempo_precompiles::{
     storage::{
         Handler, PrecompileStorageProvider, StorageCtx, StorageKey, hashmap::HashMapStorageProvider,
     },
-    tip20::tip20_slots,
     tip403_registry::{
         ALLOW_ALL_POLICY_ID, CompoundPolicyData as RawCompoundPolicyData, PolicyData, PolicyType,
         TIP403Registry, tip403_registry_slots,
@@ -66,6 +65,7 @@ use zone_l1::{
 use zone_node::ZoneNode;
 use zone_p2p::{P2pConfig, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
+use zone_primitives::constants::PORTAL_ROLE_SLOT;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -284,22 +284,6 @@ pub(crate) fn seed_raw_tip403_token_policy(
     cache.set(
         TIP403_REGISTRY_ADDRESS,
         slot,
-        block_number,
-        B256::from(packed.to_be_bytes()),
-    );
-}
-
-/// Seed the token-local transfer-policy field used by Tempo's TIP-1092 compatibility fallback.
-fn seed_raw_legacy_tip20_policy(
-    cache: &mut zone_l1::state::L1StateCacheInner,
-    block_number: u64,
-    token: Address,
-    policy_id: u64,
-) {
-    let packed = U256::from(policy_id) << (tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8);
-    cache.set(
-        token,
-        B256::from(tip20_slots::TRANSFER_POLICY_ID.to_be_bytes()),
         block_number,
         B256::from(packed.to_be_bytes()),
     );
@@ -1200,6 +1184,41 @@ impl L1TestNode {
         Ok(())
     }
 
+    /// Wait for a `WithdrawalProcessed` event with the expected callback result.
+    pub(crate) async fn wait_for_withdrawal_processed_with_status(
+        &self,
+        portal_address: Address,
+        to: Address,
+        token: Address,
+        amount: u128,
+        callback_success: bool,
+        timeout: Duration,
+    ) -> eyre::Result<()> {
+        use tempo_zone_contracts::ZonePortal;
+
+        let portal = ZonePortal::new(portal_address, self.provider());
+        poll_until(timeout, DEFAULT_POLL, "withdrawal processed", || {
+            let portal = &portal;
+            async move {
+                let events = portal
+                    .WithdrawalProcessed_filter()
+                    .from_block(0)
+                    .query()
+                    .await?;
+                Ok(events
+                    .iter()
+                    .any(|(event, _)| {
+                        event.to == to
+                            && event.token == token
+                            && event.amount == amount
+                            && event.callbackSuccess == callback_success
+                    })
+                    .then_some(()))
+            }
+        })
+        .await
+    }
+
     /// Returns an HTTP provider with the dev account wallet attached.
     pub(crate) fn dev_provider(&self) -> alloy_provider::DynProvider {
         ProviderBuilder::new()
@@ -1405,20 +1424,34 @@ impl L1TestNode {
         sequencer: Address,
     ) -> eyre::Result<Address> {
         use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::ZoneFactory;
+        use tempo_zone_contracts::{ZoneFactory, ZonePortal};
 
         let l1_provider = self.dev_provider();
-        let factory = ZoneFactory::new(factory_address, &l1_provider);
+        let mut allowed_accounts = vec![admin, sequencer];
+        for index in 0..10 {
+            allowed_accounts.push(self.signer_at(index).address());
+        }
+        allowed_accounts.sort_unstable();
+        allowed_accounts.dedup();
 
-        let receipt = factory
-            .createZone(ZoneFactory::CreateZoneParams {
+        // The pinned Tempo dev L1 exposes TIP-1091's legacy factory selector. The production
+        // binding also carries initial membership for upgraded networks, so use the legacy call
+        // here and apply the same membership immediately through the newly created portal.
+        let create_zone = LegacyZoneFactory::createZoneCall {
+            params: LegacyZoneFactory::CreateZoneParams {
                 admin,
                 initialToken: PATH_USD_ADDRESS,
                 sequencers: vec![sequencer],
                 threshold: 1,
                 rpcUrl: String::new(),
-            })
-            .send()
+            },
+        };
+        let receipt = l1_provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(factory_address)
+                    .input(create_zone.abi_encode().into()),
+            )
             .await?
             .get_receipt()
             .await?;
@@ -1431,7 +1464,28 @@ impl L1TestNode {
             .find_map(|log| ZoneFactory::ZoneCreated::decode_log(&log.inner).ok())
             .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
 
-        Ok(zone_created.portal)
+        let portal_address = zone_created.portal;
+        let admin_provider = if admin == self.dev_address() {
+            self.dev_provider()
+        } else if admin == self.admin_address() {
+            self.admin_provider()
+        } else {
+            return Err(eyre::eyre!(
+                "test helper cannot configure membership for unknown admin {admin}"
+            ));
+        };
+        let portal = ZonePortal::new(portal_address, &admin_provider);
+        for account in allowed_accounts {
+            let receipt = portal
+                .setAllowedAccount(account, true)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+            eyre::ensure!(receipt.status(), "setting initial portal member failed");
+        }
+
+        Ok(portal_address)
     }
 
     /// Deploy the SwapAndDepositRouter contract on L1 from the Foundry artifact.
@@ -1476,6 +1530,25 @@ impl L1TestNode {
             .ok_or_else(|| eyre::eyre!("SwapAndDepositRouter deployment missing contract address"))
     }
 
+    /// Register an account as a callback gateway on a zone portal.
+    pub(crate) async fn set_portal_gateway_as_admin(
+        &self,
+        portal_address: Address,
+        account: Address,
+    ) -> eyre::Result<()> {
+        use tempo_zone_contracts::ZonePortal;
+
+        let provider = self.admin_provider();
+        let receipt = ZonePortal::new(portal_address, &provider)
+            .setGateway(account, true)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "registering portal role failed");
+        Ok(())
+    }
+
     /// Deploy L1 infrastructure for a two-zone cross-zone test with separate sequencers.
     pub(crate) async fn deploy_two_zones_with_sequencers(
         &self,
@@ -1498,6 +1571,22 @@ impl L1TestNode {
             )
             .await?;
         let router = self.deploy_router(factory).await?;
+
+        use tempo_zone_contracts::ZonePortal;
+        let provider = self.dev_provider();
+        for portal_address in [portal_a, portal_b] {
+            let receipt = ZonePortal::new(portal_address, &provider)
+                .setGateway(router, true)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+            eyre::ensure!(
+                receipt.status(),
+                "registering router as zone gateway failed"
+            );
+        }
+
         Ok((portal_a, portal_b, router))
     }
 
@@ -2066,7 +2155,7 @@ pub(crate) struct WithdrawalArgs {
     pub to: Option<Address>,
     pub memo: B256,
     pub gas_limit: u64,
-    pub fallback_recipient: Option<Address>,
+    pub zone_fallback_recipient: Option<Address>,
     pub data: alloy_primitives::Bytes,
     pub reveal_to: alloy_primitives::Bytes,
 }
@@ -2077,7 +2166,7 @@ pub(crate) struct PlaintextRouterCallbackArgs {
     pub token_out: Address,
     pub target_portal: Address,
     pub recipient: Address,
-    pub bounceback_recipient: Address,
+    pub tempo_refund_recipient: Address,
     pub memo: B256,
     pub min_amount_out: u128,
 }
@@ -2089,7 +2178,7 @@ pub(crate) struct EncryptedRouterCallbackArgs {
     pub target_portal: Address,
     pub key_index: U256,
     pub encrypted: tempo_zone_contracts::EncryptedDepositPayload,
-    pub bounceback_recipient: Address,
+    pub tempo_refund_recipient: Address,
     pub min_amount_out: u128,
 }
 
@@ -2101,7 +2190,7 @@ impl WithdrawalArgs {
             to: None,
             memo: B256::ZERO,
             gas_limit: 0,
-            fallback_recipient: None,
+            zone_fallback_recipient: None,
             data: alloy_primitives::Bytes::new(),
             reveal_to: alloy_primitives::Bytes::new(),
         }
@@ -2115,7 +2204,7 @@ impl WithdrawalArgs {
             token_out: args.token_out,
             target_portal: args.target_portal,
             recipient: args.recipient,
-            bounceback_recipient: args.bounceback_recipient,
+            tempo_refund_recipient: args.tempo_refund_recipient,
             memo: args.memo,
             min_amount_out: args.min_amount_out,
         }
@@ -2126,7 +2215,7 @@ impl WithdrawalArgs {
             to: Some(args.router),
             memo: args.memo,
             gas_limit: 2_000_000,
-            fallback_recipient: None, // defaults to self
+            zone_fallback_recipient: None, // defaults to self
             data: alloy_primitives::Bytes::from(callback_data),
             reveal_to: alloy_primitives::Bytes::new(),
         }
@@ -2139,7 +2228,7 @@ impl WithdrawalArgs {
             target_portal: args.target_portal,
             key_index: args.key_index,
             encrypted: args.encrypted,
-            bounceback_recipient: args.bounceback_recipient,
+            tempo_refund_recipient: args.tempo_refund_recipient,
             min_amount_out: args.min_amount_out,
         }
         .abi_encode();
@@ -2149,7 +2238,7 @@ impl WithdrawalArgs {
             to: Some(args.router),
             memo: B256::ZERO,
             gas_limit: 2_000_000,
-            fallback_recipient: None, // defaults to self
+            zone_fallback_recipient: None, // defaults to self
             data: alloy_primitives::Bytes::from(callback_data),
             reveal_to: alloy_primitives::Bytes::new(),
         }
@@ -2166,7 +2255,7 @@ impl WithdrawalArgs {
         target_portal: Address,
         token: Address,
         recipient: Address,
-        bounceback_recipient: Address,
+        tempo_refund_recipient: Address,
     ) -> Self {
         Self::swap_and_deposit_via_router(PlaintextRouterCallbackArgs {
             amount,
@@ -2174,7 +2263,7 @@ impl WithdrawalArgs {
             token_out: token,
             target_portal,
             recipient,
-            bounceback_recipient,
+            tempo_refund_recipient,
             memo: B256::ZERO,
             min_amount_out: 0,
         })
@@ -2568,7 +2657,7 @@ impl ZoneAccount {
             .await?;
 
         let to = args.to.unwrap_or(self.address);
-        let fallback_recipient = args.fallback_recipient.unwrap_or(self.address);
+        let zone_fallback_recipient = args.zone_fallback_recipient.unwrap_or(self.address);
 
         let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &self.l2_provider);
         let receipt = outbox
@@ -2578,7 +2667,7 @@ impl ZoneAccount {
                 args.amount,
                 args.memo,
                 args.gas_limit,
-                fallback_recipient,
+                zone_fallback_recipient,
                 args.data,
                 args.reveal_to,
             )
@@ -3617,6 +3706,11 @@ impl L1Fixture {
             keccak256((sequencer, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
         let path_usd_config_slot = portal_token_config_slot(PATH_USD_ADDRESS);
         let enabled_token_config = enabled_deposits_active_token_config();
+        let dev_account_role_slot: B256 = l1_dev_signer()
+            .address()
+            .mapping_slot(PORTAL_ROLE_SLOT.into())
+            .into();
+
         // Local fixtures have no RPC fallback. Transfers to protocol accounts still consult their
         // address-level receive policies, so seed their absence as baseline raw L1 state.
         for recipient in [ZONE_OUTBOX_ADDRESS, ZONE_FEE_MANAGER_ADDRESS] {
@@ -3650,6 +3744,12 @@ impl L1Fixture {
                 path_usd_config_slot,
                 block,
                 enabled_token_config,
+            );
+            cache.set(
+                portal_address,
+                dev_account_role_slot,
+                block,
+                B256::with_last_byte(1),
             );
         }
 
@@ -3697,15 +3797,6 @@ impl L1Fixture {
             let mut cache = cache.write();
             for token in tokens {
                 seed_raw_tip403_token_policy(
-                    &mut cache,
-                    block_number,
-                    token.token,
-                    ALLOW_ALL_POLICY_ID,
-                );
-                // Synthetic enable-token events do not include the accompanying L1 state
-                // transition. Model both the TIP-1092 registry binding and its supported
-                // token-local fallback so same-block deposits remain self-contained.
-                seed_raw_legacy_tip20_policy(
                     &mut cache,
                     block_number,
                     token.token,
@@ -3803,7 +3894,7 @@ impl L1Fixture {
             to,
             amount,
             fee: 0,
-            bounceback_recipient: sender,
+            tempo_refund_recipient: sender,
             memo: B256::ZERO,
         }
     }
@@ -3866,7 +3957,7 @@ impl L1Fixture {
             sender,
             amount,
             fee: 0,
-            bounceback_recipient: sender,
+            tempo_refund_recipient: sender,
             key_index: alloy_primitives::U256::ZERO,
             ephemeral_pubkey_x: B256::ZERO,
             ephemeral_pubkey_y_parity: 0x02,
@@ -3890,7 +3981,7 @@ impl L1Fixture {
             to,
             amount,
             fee: 0,
-            bounceback_recipient: sender,
+            tempo_refund_recipient: sender,
             memo: B256::ZERO,
         }
     }
@@ -3947,7 +4038,7 @@ impl L1Fixture {
             sender,
             amount,
             fee: 0,
-            bounceback_recipient: sender,
+            tempo_refund_recipient: sender,
             key_index,
             ephemeral_pubkey_x: eph_pub_x,
             ephemeral_pubkey_y_parity: eph_pub_y_parity,
