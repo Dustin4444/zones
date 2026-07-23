@@ -1382,13 +1382,9 @@ impl L1TestNode {
         // The admin is not pre-funded; give it pathUSD to pay for gas on
         // admin-only portal calls.
         self.fund_user(self.admin_address(), 10_000_000).await?;
-        for account in [
-            self.dev_address(),
-            self.admin_address(),
-            self.user_signer().address(),
-            self.signer_at(3).address(),
-        ] {
-            self.set_portal_account_as_admin(portal, account).await?;
+        for index in 0..=5 {
+            self.set_portal_account_as_admin(portal, self.signer_at(index).address())
+                .await?;
         }
         Ok(portal)
     }
@@ -1536,6 +1532,15 @@ impl L1TestNode {
         use tempo_zone_contracts::ZonePortal;
         let provider = self.dev_provider();
         for portal_address in [portal_a, portal_b] {
+            for index in 0..=5 {
+                let receipt = ZonePortal::new(portal_address, &provider)
+                    .setAllowedAccount(self.signer_at(index).address(), true)
+                    .send()
+                    .await?
+                    .get_receipt()
+                    .await?;
+                eyre::ensure!(receipt.status(), "registering portal account failed");
+            }
             let receipt = ZonePortal::new(portal_address, &provider)
                 .setGateway(router, true)
                 .send()
