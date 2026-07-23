@@ -3,11 +3,12 @@
 #![allow(clippy::too_many_arguments)]
 
 use alloy::{
-    network::{EthereumWallet, primitives::ReceiptResponse},
-    primitives::{Address, address, keccak256},
+    network::{EthereumWallet, TransactionBuilder, primitives::ReceiptResponse},
+    primitives::{Address, Bytes, TxKind, address, keccak256},
     providers::{Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
-    sol_types::SolEvent,
+    sol_types::{SolCall, SolEvent},
 };
 use alloy_rlp::Encodable;
 use eyre::{WrapErr as _, eyre};
@@ -90,8 +91,6 @@ impl CreateZone {
             .connect(&self.l1_rpc_url)
             .await?;
 
-        let factory = ZoneFactory::new(self.zone_factory, &provider);
-
         println!("Verifier: {ZONE_VERIFIER_ADDRESS}");
         println!("Messenger: {ZONE_MESSENGER_ADDRESS}");
 
@@ -115,8 +114,8 @@ impl CreateZone {
             "Creating zone on L1 via ZoneFactory at {}...",
             self.zone_factory
         );
-        let receipt = factory
-            .createZone(ZoneFactory::CreateZoneParams {
+        let create_zone = ZoneFactory::createZoneCall {
+            params: ZoneFactory::CreateZoneParams {
                 initialToken: self.initial_token,
                 admin: self.admin,
                 sequencers: vec![self.sequencer],
@@ -124,8 +123,15 @@ impl CreateZone {
                 rpcUrl: self.rpc_url.clone(),
                 allowedAccounts: self.allowed_accounts.clone(),
                 zoneGateways: self.zone_gateways.clone(),
-            })
-            .send_sync()
+            },
+        };
+        let tx = TransactionRequest::default()
+            .with_kind(TxKind::Call(self.zone_factory))
+            .input(Bytes::from(create_zone.abi_encode()).into());
+        let receipt = provider
+            .send_transaction(tx.into())
+            .await?
+            .get_receipt()
             .await?;
         println!("Transaction confirmed in block {:?}", receipt.block_number);
         println!("Status: {}", receipt.status());
