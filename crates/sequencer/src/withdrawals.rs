@@ -49,17 +49,44 @@ use crate::{
 use tempo_alloy::rpc::TempoCallBuilderExt;
 
 const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS: u64 = 100_000;
-const PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS: u64 = 2_000_000;
 
-/// Default gas budget for one `processWithdrawals` transaction.
+// These planner allowances were calibrated against the current ZonePortal/ZoneMessenger bytecode.
+// Pre-refund T1 dev-L1 traces used 553,703, 1,068,088, and 1,348,063 gas for one, two, and four
+// successful simple items, and 1,347,339 gas around a callback. T3 Foundry traces used 1,026,857
+// gas for a failed simple transfer with a bounceback and at most 1,030,017 for deposit bouncebacks.
+// Re-run the traces when the contracts or Tempo gas accounting change.
+
+/// Planner-only gas reserved once per `processWithdrawals` transaction for batch-level portal
+/// work.
+const PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS: u64 = 500_000;
+
+/// Planner-only gas reserved for a simple withdrawal.
+const PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS: u64 = 1_000_000;
+
+/// Planner-only fixed allowance for a callback withdrawal, excluding its forwarded callback gas.
+const PROCESS_CALLBACK_WITHDRAWAL_ITEM_OVERHEAD_GAS: u64 = 1_750_000;
+
+/// Planner-only gas reserved for a failed-deposit bounceback withdrawal.
+const PROCESS_DEPOSIT_BOUNCEBACK_ITEM_OVERHEAD_GAS: u64 = 1_250_000;
+
+/// Default planned gas budget for one `processWithdrawals` transaction.
+///
+/// This is an operator-side batching limit, not the protocol callback cap. The planner charges the
+/// allowances above against this budget. It currently has the same numeric value as
+/// [`MAX_WITHDRAWAL_GAS_LIMIT`]; a single withdrawal may exceed the budget so it cannot block the
+/// queue.
 pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
 
+/// Largest supported planned gas budget for one `processWithdrawals` transaction.
+///
+/// Tempo L1 currently caps transaction gas at 30,000,000. Packed batches cannot exceed this
+/// 20,000,000 budget. Oversized singletons bypass the budget, but the protocol callback cap keeps
+/// their maximum planned gas at 12,250,000. Both remain below the L1 limit, avoiding repeated
+/// submission of a transaction that can never be mined.
+pub const MAX_WITHDRAWAL_BATCH_GAS: u64 = 20_000_000;
+
 /// Default maximum number of ordered withdrawal transactions kept in flight.
-pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 4;
-#[cfg(test)]
-const MAX_PROCESS_WITHDRAWAL_TX_GAS: u64 =
-    PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
+pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 8;
 
 /// Shared handle to the withdrawal store.
 #[derive(Clone)]
@@ -109,6 +136,10 @@ pub struct WithdrawalBatchLimits {
 impl WithdrawalBatchLimits {
     fn assert_valid(self) {
         assert!(self.max_batch_gas > 0, "max_batch_gas must be non-zero");
+        assert!(
+            self.max_batch_gas <= MAX_WITHDRAWAL_BATCH_GAS,
+            "max_batch_gas must not exceed {MAX_WITHDRAWAL_BATCH_GAS}"
+        );
         assert!(
             self.max_in_flight_batches > 0,
             "max_in_flight_batches must be non-zero"
@@ -729,17 +760,26 @@ pub fn spawn_withdrawal_processor(
 
 /// Return the gas reserved for one withdrawal inside a `processWithdrawals` transaction.
 ///
-/// The callback portion is capped at [`MAX_WITHDRAWAL_GAS_LIMIT`] before adding the
-/// per-item portal/messenger overhead. This keeps legacy over-cap withdrawals submit-able
-/// while bounding the batcher's gas accounting.
-const fn process_withdrawal_item_gas(callback_gas_limit: u64) -> u64 {
+/// Deposit bouncebacks and simple withdrawals use separate fixed allowances. Callback withdrawals
+/// add their requested callback gas directly. The callback portion is capped at
+/// [`MAX_WITHDRAWAL_GAS_LIMIT`], keeping legacy over-cap withdrawals submit-able while bounding
+/// the batcher's gas accounting.
+const fn process_withdrawal_item_gas(callback_gas_limit: u64, fallback_nonce: u64) -> u64 {
+    if fallback_nonce == 0 {
+        return PROCESS_DEPOSIT_BOUNCEBACK_ITEM_OVERHEAD_GAS;
+    }
+
+    if callback_gas_limit == 0 {
+        return PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+    }
+
     let bounded_callback_gas = if callback_gas_limit > MAX_WITHDRAWAL_GAS_LIMIT {
         MAX_WITHDRAWAL_GAS_LIMIT
     } else {
         callback_gas_limit
     };
 
-    bounded_callback_gas + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
+    PROCESS_CALLBACK_WITHDRAWAL_ITEM_OVERHEAD_GAS + bounded_callback_gas
 }
 
 /// A contiguous, gas-bounded transaction within one withdrawal queue slot.
@@ -771,8 +811,11 @@ fn build_withdrawal_batches(
         let mut gas_limit = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS;
 
         while end < withdrawals.len() {
-            let next_gas =
-                gas_limit.saturating_add(process_withdrawal_item_gas(withdrawals[end].gasLimit));
+            let withdrawal = &withdrawals[end];
+            let next_gas = gas_limit.saturating_add(process_withdrawal_item_gas(
+                withdrawal.gasLimit,
+                withdrawal.fallbackNonce,
+            ));
             if end > start && next_gas > max_batch_gas {
                 break;
             }
@@ -914,21 +957,32 @@ mod tests {
     }
 
     #[test]
-    fn callback_tx_gas_limit_is_capped_below_l1_block_limit() {
+    fn withdrawal_gas_limits_are_classified_and_bounded() {
         let at_cap = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
-            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
+            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT, 1);
         let over_cap = PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
-            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT + 1);
+            + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT + 1, 1);
 
         assert_eq!(over_cap, at_cap);
-        assert_eq!(at_cap, MAX_PROCESS_WITHDRAWAL_TX_GAS);
+        assert_eq!(
+            process_withdrawal_item_gas(0, 1),
+            PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS
+        );
+        assert_eq!(
+            process_withdrawal_item_gas(0, 0),
+            PROCESS_DEPOSIT_BOUNCEBACK_ITEM_OVERHEAD_GAS
+        );
+        assert_eq!(
+            process_withdrawal_item_gas(3_000_000, 1),
+            PROCESS_CALLBACK_WITHDRAWAL_ITEM_OVERHEAD_GAS + 3_000_000
+        );
         assert_eq!(
             at_cap,
-            MAX_WITHDRAWAL_GAS_LIMIT
-                + PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
-                + PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS
+            PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+                + PROCESS_CALLBACK_WITHDRAWAL_ITEM_OVERHEAD_GAS
+                + MAX_WITHDRAWAL_GAS_LIMIT
         );
-        assert!(at_cap < 30_000_000);
+        assert!(at_cap <= MAX_WITHDRAWAL_BATCH_GAS);
     }
 
     fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
@@ -940,7 +994,7 @@ mod tests {
     #[test]
     fn batches_withdrawals_by_transaction_gas() {
         let withdrawals = simple_withdrawals(3);
-        let one = PROCESS_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+        let one = PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
         let batches =
             build_withdrawal_batches(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one);
 

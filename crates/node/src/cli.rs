@@ -20,7 +20,7 @@ use crate::{
 };
 use zone_sequencer::{
     BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
-    WithdrawalBatchLimits,
+    MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
 };
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
@@ -367,13 +367,14 @@ pub struct ZoneArgs {
     )]
     pub withdrawal_poll_interval_secs: u64,
 
-    /// Maximum gas reserved by one processWithdrawals transaction. An oversized withdrawal is
-    /// submitted alone.
+    /// Maximum gas reserved by one processWithdrawals transaction, up to 20,000,000. An oversized
+    /// withdrawal is submitted alone.
     #[arg(
         long = "withdrawal-max-batch-gas",
         env = "WITHDRAWAL_MAX_BATCH_GAS",
         default_value_t = DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new()
+            .range(1..=MAX_WITHDRAWAL_BATCH_GAS)
     )]
     pub withdrawal_max_batch_gas: u64,
 
@@ -483,6 +484,7 @@ mod tests {
         validate_portal_address,
     };
     use zone_p2p::Role;
+    use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
     #[derive(Debug, clap::Parser)]
     struct ZoneArgsParser {
@@ -677,6 +679,24 @@ mod tests {
         .unwrap();
         assert!(parsed.zone.enable_sequencer);
         assert!(parsed.zone.sequencer_manifest.is_none());
+    }
+
+    #[test]
+    fn withdrawal_batch_gas_rejects_values_above_the_safe_limit() {
+        let above_limit = (MAX_WITHDRAWAL_BATCH_GAS + 1).to_string();
+        let error = ZoneArgsParser::try_parse_from([
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key",
+            "0x01",
+            "--withdrawal-max-batch-gas",
+            &above_limit,
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
