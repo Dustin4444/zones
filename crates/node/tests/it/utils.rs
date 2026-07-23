@@ -1386,6 +1386,7 @@ impl L1TestNode {
             self.dev_address(),
             self.admin_address(),
             self.user_signer().address(),
+            self.signer_at(3).address(),
         ] {
             self.set_portal_account_as_admin(portal, account).await?;
         }
