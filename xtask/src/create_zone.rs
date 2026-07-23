@@ -10,14 +10,33 @@ use alloy::{
     sol_types::SolEvent,
 };
 use alloy_rlp::Encodable;
-use eyre::{WrapErr as _, eyre};
+use eyre::{WrapErr as _, ensure, eyre};
 use std::path::PathBuf;
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt as _};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
-use tempo_zone_contracts::{ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory};
+use tempo_zone_contracts::{
+    ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
+};
 use zone_primitives::constants::zone_chain_id;
 
-use crate::zone_utils::MODERATO_ZONE_FACTORY;
+use crate::zone_utils::{MODERATO_ZONE_FACTORY, check};
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface LegacyZoneFactory {
+        struct CreateZoneParams {
+            address initialToken;
+            address admin;
+            address[] sequencers;
+            uint8 threshold;
+            string rpcUrl;
+        }
+
+        function createZone(CreateZoneParams calldata params)
+            external
+            returns (uint32 zoneId, address portal);
+    }
+}
 
 #[derive(Debug, clap::Parser)]
 pub(crate) struct CreateZone {
@@ -32,6 +51,10 @@ pub(crate) struct CreateZone {
     /// ZoneFactory contract address on Tempo L1.
     #[arg(long, env = "ZONE_FACTORY", default_value_t = MODERATO_ZONE_FACTORY)]
     zone_factory: Address,
+
+    /// Use the legacy ZoneFactory selector and configure roles through the created portal.
+    #[arg(long)]
+    legacy_factory: bool,
 
     /// Initial TIP-20 token address for the zone (additional tokens can be enabled later).
     #[arg(long, default_value_t = address!("0x20C0000000000000000000000000000000000000"))]
@@ -93,8 +116,6 @@ impl CreateZone {
             .connect(&self.l1_rpc_url)
             .await?;
 
-        let factory = ZoneFactory::new(self.zone_factory, &provider);
-
         println!("Verifier: {ZONE_VERIFIER_ADDRESS}");
         println!("Messenger: {ZONE_MESSENGER_ADDRESS}");
 
@@ -118,18 +139,31 @@ impl CreateZone {
             "Creating zone on L1 via ZoneFactory at {}...",
             self.zone_factory
         );
-        let receipt = factory
-            .createZone(ZoneFactory::CreateZoneParams {
-                initialToken: self.initial_token,
-                admin: self.admin,
-                sequencers: vec![self.sequencer],
-                threshold: 1,
-                rpcUrl: self.rpc_url.clone(),
-                allowedAccounts: self.allowed_accounts.clone(),
-                zoneGateways: self.zone_gateways.clone(),
-            })
-            .send_sync()
-            .await?;
+        let receipt = if self.legacy_factory {
+            LegacyZoneFactory::new(self.zone_factory, &provider)
+                .createZone(LegacyZoneFactory::CreateZoneParams {
+                    initialToken: self.initial_token,
+                    admin: self.admin,
+                    sequencers: vec![self.sequencer],
+                    threshold: 1,
+                    rpcUrl: self.rpc_url.clone(),
+                })
+                .send_sync()
+                .await?
+        } else {
+            ZoneFactory::new(self.zone_factory, &provider)
+                .createZone(ZoneFactory::CreateZoneParams {
+                    initialToken: self.initial_token,
+                    admin: self.admin,
+                    sequencers: vec![self.sequencer],
+                    threshold: 1,
+                    rpcUrl: self.rpc_url.clone(),
+                    allowedAccounts: self.allowed_accounts.clone(),
+                    zoneGateways: self.zone_gateways.clone(),
+                })
+                .send_sync()
+                .await?
+        };
         println!("Transaction confirmed in block {:?}", receipt.block_number);
         println!("Status: {}", receipt.status());
         println!("Gas used: {:?}", receipt.gas_used);
@@ -151,6 +185,10 @@ impl CreateZone {
         let zone_id = event.zoneId;
         let portal = event.portal;
         let chain_id = zone_chain_id(zone_id);
+
+        if self.legacy_factory {
+            self.configure_legacy_roles(portal).await?;
+        }
 
         println!(
             "Using pre-creation block {} (hash: {anchor_hash}) as genesis anchor",
@@ -217,5 +255,75 @@ impl CreateZone {
         println!("  Zone metadata written to: {}", zone_json_path.display());
 
         Ok(())
+    }
+
+    async fn configure_legacy_roles(&self, portal_address: Address) -> eyre::Result<()> {
+        let key = std::env::var("PORTAL_ADMIN_KEY")
+            .wrap_err("PORTAL_ADMIN_KEY must be set when --legacy-factory is used")?;
+        let signer: PrivateKeySigner = key
+            .strip_prefix("0x")
+            .unwrap_or(&key)
+            .parse()
+            .wrap_err("PORTAL_ADMIN_KEY is not a valid private key")?;
+        ensure!(
+            signer.address() == self.admin,
+            "PORTAL_ADMIN_KEY resolves to {}, not configured admin {}",
+            signer.address(),
+            self.admin
+        );
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .wallet(EthereumWallet::from(signer))
+            .connect(&self.l1_rpc_url)
+            .await
+            .wrap_err("failed connecting portal admin to Tempo L1")?;
+        let portal = ZonePortal::new(portal_address, &provider);
+
+        for gateway in &self.zone_gateways {
+            let receipt = portal
+                .setGateway(*gateway, true)
+                .fee_token(self.initial_token)
+                .send()
+                .await
+                .wrap_err_with(|| format!("failed registering ZoneGateway {gateway}"))?
+                .get_receipt()
+                .await
+                .wrap_err_with(|| {
+                    format!("failed waiting for ZoneGateway {gateway} registration")
+                })?;
+            check(&receipt, &format!("register ZoneGateway {gateway}"))?;
+        }
+        for account in &self.allowed_accounts {
+            let receipt = portal
+                .setAllowedAccount(*account, true)
+                .fee_token(self.initial_token)
+                .send()
+                .await
+                .wrap_err_with(|| format!("failed allowing Zone account {account}"))?
+                .get_receipt()
+                .await
+                .wrap_err_with(|| format!("failed waiting for Zone account {account} allowlist"))?;
+            check(&receipt, &format!("allow Zone account {account}"))?;
+        }
+
+        println!(
+            "Configured {} gateway(s) and {} allowed account(s) through the legacy ZonePortal",
+            self.zone_gateways.len(),
+            self.allowed_accounts.len()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LegacyZoneFactory;
+    use alloy::sol_types::SolCall;
+
+    #[test]
+    fn legacy_factory_selector_matches_pinned_tempo() {
+        assert_eq!(
+            LegacyZoneFactory::createZoneCall::SELECTOR,
+            [0xf2, 0xc5, 0x8f, 0x2b]
+        );
     }
 }

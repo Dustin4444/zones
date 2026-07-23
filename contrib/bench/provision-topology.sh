@@ -381,7 +381,7 @@ verify_neobank_fixture_topology() {
     bridge_wallet="$(jq -er '.bridgeWallet' "$metadata")"
     dlusd="$(jq -er '.dlusd' "$metadata")"
     reserve_ledger="$(jq -er '.reserveLedger' "$metadata")"
-    for field in vault engine adapter rewards direct_swap swap_adapter controller handler auth_registry gateway reserve_ledger; do
+    for field in vault engine adapter rewards direct_swap swap_adapter controller handler auth_registry gateway bridge_wallet reserve_ledger; do
         address="${!field}"
         code="$(rpc "$l1_rpc" eth_getCode "[\"$address\",\"latest\"]")"
         [[ "$code" != "0x" ]] || die "neobank $field fixture has no code at $address"
@@ -680,10 +680,12 @@ provision_up() {
     fi
 
     echo "creating a Zone through the canonical factory"
-    ZONE_FACTORY_OWNER_KEY="$owner_key" "$ZONES_XTASK_BIN" create-zone \
+    ZONE_FACTORY_OWNER_KEY="$owner_key" PORTAL_ADMIN_KEY="$admin_key" \
+        "$ZONES_XTASK_BIN" create-zone \
         --output "$zone_dir" \
         --l1-rpc-url "$l1_a_rpc" \
         --zone-factory "$ZONE_FACTORY" \
+        --legacy-factory \
         --initial-token "$zone_token" \
         --admin "$admin_address" \
         --sequencer "$sequencer_address" \
