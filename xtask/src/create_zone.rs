@@ -14,6 +14,8 @@ use eyre::{WrapErr as _, ensure, eyre};
 use std::path::PathBuf;
 use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt as _};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_contracts::precompiles::ITIP403Registry;
+use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
 use tempo_zone_contracts::{
     ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
 };
@@ -115,6 +117,33 @@ impl CreateZone {
             .wallet(wallet)
             .connect(&self.l1_rpc_url)
             .await?;
+
+        if self.legacy_factory {
+            let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
+            let binding = registry
+                .tokenTransferPolicyId(self.initial_token)
+                .call()
+                .await
+                .wrap_err("failed reading the initial token TIP-403 policy binding")?;
+            if !binding.isSet {
+                let receipt = registry
+                    .migrateTransferPolicyIds(vec![self.initial_token])
+                    .send_sync()
+                    .await
+                    .wrap_err("failed migrating the initial token TIP-403 policy binding")?;
+                check(&receipt, "migrate initial token TIP-403 policy")?;
+
+                let binding = registry
+                    .tokenTransferPolicyId(self.initial_token)
+                    .call()
+                    .await
+                    .wrap_err("failed verifying the initial token TIP-403 policy binding")?;
+                ensure!(
+                    binding.isSet,
+                    "initial token TIP-403 policy binding is still unset after migration"
+                );
+            }
+        }
 
         println!("Verifier: {ZONE_VERIFIER_ADDRESS}");
         println!("Messenger: {ZONE_MESSENGER_ADDRESS}");
