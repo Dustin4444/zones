@@ -296,6 +296,7 @@ impl EarnZoneFixture {
             (adapter, swapper, portal, messenger, owner).abi_encode(),
         )
         .await?;
+        l1.set_portal_gateway_as_admin(portal, gateway).await?;
         let rewards =
             deploy_contract(&l1, "VaultRewards", (adapter, user_address).abi_encode()).await?;
 
