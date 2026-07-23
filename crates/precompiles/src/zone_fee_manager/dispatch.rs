@@ -3,7 +3,8 @@
 use alloy_primitives::Address;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
-    Precompile as TempoPrecompile, charge_input_cost, dispatch::unknown_selector_result,
+    Precompile as TempoPrecompile, charge_input_cost,
+    dispatch::{missing_selector_result, selector_from_calldata, unknown_selector_result},
 };
 
 use super::ZoneFeeManager;
@@ -15,6 +16,9 @@ impl TempoPrecompile for ZoneFeeManager {
         }
 
         // Zone fee settlement is protocol-only, this precompile does not accept external calls.
+        if selector_from_calldata(calldata).is_none() {
+            return missing_selector_result();
+        }
         unknown_selector_result(calldata)
     }
 }

@@ -86,6 +86,7 @@ impl ZoneFeeManager {
 mod tests {
     use super::*;
     use alloy_sol_types::SolError;
+    use tempo_chainspec::hardfork::TempoHardfork;
     use tempo_contracts::precompiles::UnknownFunctionSelector;
     use tempo_precompiles::{
         Precompile as _, TIP_FEE_MANAGER_ADDRESS,
@@ -181,6 +182,20 @@ mod tests {
             let error = UnknownFunctionSelector::abi_decode(&output.bytes)?;
             assert_eq!(error.selector.as_slice(), calldata);
 
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn short_calldata_reverts_without_panicking() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T9);
+        StorageCtx::enter(&mut storage, || {
+            let mut manager = ZoneFeeManager::new();
+            for len in 0..4 {
+                let output = manager.call(&[0u8; 3][..len], Address::random())?;
+                assert!(output.is_revert());
+                assert!(output.bytes.is_empty());
+            }
             Ok(())
         })
     }
