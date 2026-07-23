@@ -36,7 +36,7 @@ use tracing::{error, info, instrument, warn};
 use alloy_sol_types::{ContractError, SolInterface as _};
 
 use crate::{
-    abi::{self, IZoneOutbox, NO_QUEUE_INDEX, TempoState, ZoneInbox, ZonePortal},
+    abi::{self, IZoneOutbox, TempoState, ZoneInbox, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
         BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
