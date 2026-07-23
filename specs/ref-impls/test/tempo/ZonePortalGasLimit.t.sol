@@ -77,6 +77,8 @@ contract ZonePortalGasLimitTest is Test {
         portal.initialize(
             1,
             address(token),
+            true,
+            true,
             allowedAccounts,
             noGateways,
             address(0x400),
