@@ -336,6 +336,14 @@ fn observer_mode_applies_state_and_records_without_a_deposit_sink() {
     let mut subscriber =
         test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
     subscriber.deposit_queue = None;
+    let cached_slot = B256::with_last_byte(1);
+    let cached_value = B256::with_last_byte(2);
+    subscriber.config.l1_state_cache.write().set(
+        subscriber.config.portal_address,
+        cached_slot,
+        9,
+        cached_value,
+    );
     let header = make_test_header(10);
     let sealed = seal(header);
     let anchor = sealed.num_hash();
@@ -343,7 +351,14 @@ fn observer_mode_applies_state_and_records_without_a_deposit_sink() {
     subscriber.update_l1_state_anchor(10, anchor.hash, &HashSet::new());
     subscriber.config.block_tracker.record(anchor).unwrap();
 
-    assert_eq!(subscriber.config.l1_state_cache.read().anchor(), anchor);
+    assert_eq!(
+        subscriber.config.l1_state_cache.read().get(
+            subscriber.config.portal_address,
+            cached_slot,
+            anchor.number,
+        ),
+        Some(cached_value)
+    );
     assert_eq!(
         subscriber.config.block_tracker.observed_hash(10),
         Some(anchor.hash)
