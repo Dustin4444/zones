@@ -19,8 +19,8 @@ use crate::{
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 use zone_sequencer::{
-    BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
-    DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
+    BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+    WithdrawalBatchLimits,
 };
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
@@ -191,7 +191,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 withdrawal_batch_limits: WithdrawalBatchLimits {
                     max_batch_gas: args.withdrawal_max_batch_gas,
                     max_in_flight_batches: args.withdrawal_max_in_flight_batches,
-                    max_in_flight_gas: args.withdrawal_max_in_flight_gas,
                 },
             });
         }
@@ -386,16 +385,6 @@ pub struct ZoneArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub withdrawal_max_in_flight_batches: usize,
-
-    /// Maximum aggregate gas reserved across in-flight processWithdrawals transactions. Must be
-    /// at least withdrawal-max-batch-gas. An oversized withdrawal is submitted alone.
-    #[arg(
-        long = "withdrawal-max-in-flight-gas",
-        env = "WITHDRAWAL_MAX_IN_FLIGHT_GAS",
-        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub withdrawal_max_in_flight_gas: u64,
 
     /// Genesis Tempo L1 block number override.
     #[arg(long = "l1.genesis-block-number", env = "L1_GENESIS_BLOCK_NUMBER")]

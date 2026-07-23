@@ -57,9 +57,6 @@ pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
 
 /// Default maximum number of ordered withdrawal transactions kept in flight.
 pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 4;
-
-/// Default aggregate gas budget across concurrently in-flight withdrawal transactions.
-pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS: u64 = 20_000_000;
 #[cfg(test)]
 const MAX_PROCESS_WITHDRAWAL_TX_GAS: u64 =
     PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + process_withdrawal_item_gas(MAX_WITHDRAWAL_GAS_LIMIT);
@@ -107,9 +104,6 @@ pub struct WithdrawalBatchLimits {
     pub max_batch_gas: u64,
     /// Maximum number of transactions to keep concurrently in flight.
     pub max_in_flight_batches: usize,
-    /// Maximum sum of gas across concurrently in-flight transactions. An oversized singleton is
-    /// admitted alone so it cannot permanently block the queue.
-    pub max_in_flight_gas: u64,
 }
 
 impl WithdrawalBatchLimits {
@@ -119,14 +113,6 @@ impl WithdrawalBatchLimits {
             self.max_in_flight_batches > 0,
             "max_in_flight_batches must be non-zero"
         );
-        assert!(
-            self.max_in_flight_gas > 0,
-            "max_in_flight_gas must be non-zero"
-        );
-        assert!(
-            self.max_in_flight_gas >= self.max_batch_gas,
-            "max_in_flight_gas must be at least max_batch_gas"
-        );
     }
 }
 
@@ -135,7 +121,6 @@ impl Default for WithdrawalBatchLimits {
         Self {
             max_batch_gas: DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
             max_in_flight_batches: DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
-            max_in_flight_gas: DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_GAS,
         }
     }
 }
@@ -327,20 +312,6 @@ fn build_withdrawal_batches(
     }
 
     batches
-}
-
-/// Whether the next transaction fits the configured in-flight queue.
-///
-/// The first transaction is always admitted so an oversized singleton can make progress.
-fn has_in_flight_capacity(
-    in_flight_count: usize,
-    in_flight_gas: u64,
-    next_gas: u64,
-    limits: WithdrawalBatchLimits,
-) -> bool {
-    in_flight_count == 0
-        || (in_flight_count < limits.max_in_flight_batches
-            && in_flight_gas.saturating_add(next_gas) <= limits.max_in_flight_gas)
 }
 
 /// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
@@ -630,21 +601,16 @@ impl WithdrawalProcessor {
 
         let limits = self.config.batch_limits;
         let batch_count = batches.len();
-        let mut batches = batches.into_iter().peekable();
+        let mut batches = batches.into_iter();
         let mut in_flight = FuturesUnordered::new();
-        let mut in_flight_gas = 0u64;
         let mut submitted = 0usize;
         let mut retry = false;
 
         loop {
-            while !retry {
-                let Some(batch) = batches.peek().copied() else {
+            while !retry && in_flight.len() < limits.max_in_flight_batches {
+                let Some(batch) = batches.next() else {
                     break;
                 };
-                if !has_in_flight_capacity(in_flight.len(), in_flight_gas, batch.gas_limit, limits)
-                {
-                    break;
-                }
 
                 let nonce = first_nonce + submitted as u64;
                 let absolute_start = offset + batch.start;
@@ -696,7 +662,6 @@ impl WithdrawalProcessor {
                             .withdrawals_per_batch
                             .record(batch.len() as f64);
 
-                        in_flight_gas = in_flight_gas.saturating_add(batch.gas_limit);
                         in_flight.push(async move {
                             let receipt = pending
                                 .with_timeout(Some(PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT))
@@ -704,7 +669,6 @@ impl WithdrawalProcessor {
                                 .await;
                             (batch, nonce, tx_hash, remaining_queue, receipt)
                         });
-                        batches.next();
                         submitted += 1;
                     }
                     Err(e) => {
@@ -728,7 +692,6 @@ impl WithdrawalProcessor {
             else {
                 break;
             };
-            in_flight_gas = in_flight_gas.saturating_sub(batch.gas_limit);
 
             match receipt {
                 Ok(receipt) if receipt.status() => {
@@ -1010,20 +973,6 @@ mod tests {
             compute_remaining_queue(&withdrawals, batches[0].end),
             abi::Withdrawal::queue_hash(&withdrawals[1..])
         );
-    }
-
-    #[test]
-    fn in_flight_capacity_applies_count_then_gas_limits() {
-        let limits = WithdrawalBatchLimits {
-            max_batch_gas: 10,
-            max_in_flight_batches: 2,
-            max_in_flight_gas: 20,
-        };
-
-        assert!(has_in_flight_capacity(0, 0, 25, limits));
-        assert!(has_in_flight_capacity(1, 10, 10, limits));
-        assert!(!has_in_flight_capacity(2, 10, 1, limits));
-        assert!(!has_in_flight_capacity(1, 15, 10, limits));
     }
 
     #[test]

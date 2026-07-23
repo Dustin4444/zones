@@ -599,7 +599,6 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | `--withdrawal-poll-interval-secs` | 5 | How often (seconds) the withdrawal processor polls the L1 queue |
 | `--withdrawal-max-batch-gas` | 10000000 | Maximum planned gas for one `processWithdrawals` transaction; an oversized FIFO head is still sent alone |
 | `--withdrawal-max-in-flight-batches` | 4 | Maximum ordered withdrawal transactions kept concurrently in flight |
-| `--withdrawal-max-in-flight-gas` | 20000000 | Maximum aggregate gas across in-flight withdrawal transactions; must be at least the per-transaction limit; an oversized singleton runs alone |
 | `--http.port` | 8546 | HTTP JSON-RPC port |
 | `--private-rpc.port` | 8544 | Private RPC server port |
 | `--private-rpc.max-auth-token-validity-secs` | 2592000 | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
@@ -618,7 +617,6 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | `PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS` | No | Maximum auth token validity the private RPC accepts, in seconds. The effective limit is capped at 30 days. |
 | `WITHDRAWAL_MAX_BATCH_GAS` | No | Override the per-transaction withdrawal gas budget |
 | `WITHDRAWAL_MAX_IN_FLIGHT_BATCHES` | No | Override the maximum number of ordered withdrawal transactions in flight |
-| `WITHDRAWAL_MAX_IN_FLIGHT_GAS` | No | Override the aggregate in-flight withdrawal gas budget |
 | `ZONE_TOKEN` | No | Default initial TIP-20 for `just create-zone` / `just deploy-zone`; defaults to `pathUSD` |
 | `ZONE_FACTORY` | No | Optional ZoneFactory override; xtasks default to the current Moderato shared deployment |
 
