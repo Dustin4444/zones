@@ -53,6 +53,12 @@ pub fn validate_transaction(
     tx: &TempoTxEnv,
     allowlist: &[Address],
 ) -> Result<(), TempoInvalidTransaction> {
+    if tx.effective_gas_price(0) != 0 {
+        return Err(TempoInvalidTransaction::CallsValidation(
+            "non-zero transaction fees are not supported",
+        ));
+    }
+
     if contract_creation_deployer(tx).is_some_and(|deployer| !allowlist.contains(&deployer)) {
         return Err(TempoInvalidTransaction::CallsValidation(
             "contract creation is not supported",
@@ -197,6 +203,20 @@ mod tests {
 
         assert!(validate_transaction(&tx, &[]).is_err());
         assert!(validate_transaction(&tx, &[caller]).is_ok());
+    }
+
+    #[test]
+    fn positive_transaction_fees_are_rejected() {
+        let mut tx = call_tx(Address::random(), Address::random());
+        tx.inner.gas_price = 1;
+        assert!(validate_transaction(&tx, &[]).is_err());
+
+        tx.inner.tx_type = 2;
+        tx.inner.gas_priority_fee = Some(0);
+        assert!(validate_transaction(&tx, &[]).is_ok());
+
+        tx.inner.gas_priority_fee = Some(1);
+        assert!(validate_transaction(&tx, &[]).is_err());
     }
 
     #[test]
