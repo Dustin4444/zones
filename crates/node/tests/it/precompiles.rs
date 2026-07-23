@@ -1,5 +1,7 @@
 //! Tests for zone-specific precompile availability.
 
+use alloy_primitives::Address;
+use tempo_contracts::precompiles::{IStorageCredits, STORAGE_CREDITS_ADDRESS};
 use tempo_precompiles::PATH_USD_ADDRESS;
 
 use crate::utils::{
@@ -26,6 +28,26 @@ async fn test_dex_disabled_on_zone() -> eyre::Result<()> {
     assert!(
         result.is_err(),
         "StablecoinDEX should be disabled on zones — createPair must revert"
+    );
+
+    Ok(())
+}
+
+/// The storage credits precompile should be available on zones.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_storage_credits_enabled_on_zone() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    zone.wait_for_tempo_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    let storage_credits = IStorageCredits::new(STORAGE_CREDITS_ADDRESS, zone.provider());
+    assert_eq!(
+        storage_credits.balanceOf(Address::ZERO).call().await?,
+        0,
+        "storage credits precompile should return an empty balance"
     );
 
     Ok(())
