@@ -7,10 +7,14 @@ on:
         description: Benchmark workload to run.
         type: choice
         required: true
-        default: neobank-swapped-lifecycle
+        default: neobank-full-journey
         options:
-          - neobank-swapped-lifecycle
           - neobank-full-journey
+          - neobank-rewards-redemption
+          - neobank-slippage-bounce
+          - neobank-third-party-recipient
+          - neobank-direct-lifecycle
+          - neobank-swapped-lifecycle
           - roundtrip
           - deposit
       accounts:
@@ -65,12 +69,13 @@ on:
         default: "1000000"
 
   # workflow_dispatch is unavailable until this file reaches the default branch.
-  # Until then, benchmark-harness changes run the private flow on PR updates.
+  # Until then, benchmark-harness changes run the complete neobank journey on PR updates.
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
       - ".github/workflows/zones-benchmark.yml"
       - "contrib/bench/**"
+      - "docs/NEOBANK_PRIVATE_ZONE_BENCHMARK.md"
       - "docs/ZONES_BENCHMARK.md"
       - "xtask/**"
 
@@ -90,7 +95,7 @@ env:
   SCCACHE_IDLE_TIMEOUT: "21600"
   ZONES_BENCH_ACCOUNT_START: "16"
   ZONES_BENCH_ACCOUNT_CAPACITY: "10000"
-  ZONES_BENCH_DEFAULT_NEOBANK_PRESET: full-journey
+  ZONES_BENCH_DEFAULT_PHASE: neobank-full-journey
   ZONES_BENCH_TOKEN: "0x20C0000000000000000000000000000000000000"
 
 jobs:
@@ -175,20 +180,43 @@ jobs:
 
           requested_phase="$INPUT_PHASE"
           if [ "$EVENT_NAME" = pull_request ]; then
-            requested_phase="neobank-$ZONES_BENCH_DEFAULT_NEOBANK_PRESET"
+            requested_phase="$ZONES_BENCH_DEFAULT_PHASE"
           fi
           case "$requested_phase" in
+            neobank-rewards-redemption)
+              phase=neobank-e2e
+              neobank_preset=rewards-redemption
+              leases_per_journey=1
+              ;;
+            neobank-slippage-bounce)
+              phase=neobank-e2e
+              neobank_preset=slippage-bounce
+              leases_per_journey=1
+              ;;
+            neobank-third-party-recipient)
+              phase=neobank-e2e
+              neobank_preset=third-party-recipient
+              leases_per_journey=2
+              ;;
+            neobank-direct-lifecycle)
+              phase=neobank-e2e
+              neobank_preset=direct-lifecycle
+              leases_per_journey=1
+              ;;
             neobank-full-journey)
               phase=neobank-e2e
               neobank_preset=full-journey
+              leases_per_journey=1
               ;;
             neobank-swapped-lifecycle)
               phase=neobank-e2e
               neobank_preset=swapped-lifecycle
+              leases_per_journey=1
               ;;
             roundtrip|deposit)
               phase="$requested_phase"
               neobank_preset=none
+              leases_per_journey=1
               ;;
             *) echo "::error::unsupported benchmark phase: $requested_phase"; exit 1 ;;
           esac
@@ -223,9 +251,10 @@ jobs:
               exit 1
             fi
           done
-          if [ "$phase" = roundtrip ] \
-            && (( 10#$INPUT_MAX_CONCURRENT > 10#$INPUT_ACCOUNTS )); then
-            echo "::error::max-concurrent cannot exceed accounts for roundtrip leases"
+          required_accounts=$((10#$INPUT_MAX_CONCURRENT * leases_per_journey))
+          if { [ "$phase" = roundtrip ] || [ "$phase" = neobank-e2e ]; } \
+            && (( required_accounts > 10#$INPUT_ACCOUNTS )); then
+            echo "::error::$requested_phase requires at least $required_accounts accounts for max-concurrent=$INPUT_MAX_CONCURRENT"
             exit 1
           fi
           case "$INPUT_STATE_BLOAT_GIB" in 0|1|10|100) ;; *) exit 1 ;; esac
@@ -294,7 +323,16 @@ jobs:
       ZONES_BENCH_TEMPO_REF: ${{ needs.authorize.outputs.tempo-ref }}
       ZONES_BENCH_TXGEN_REF: ${{ needs.authorize.outputs.txgen-ref }}
       ZONES_BENCH_ZONES_REF: ${{ needs.authorize.outputs.sha }}
+      ZONES_BENCH_GIT_REF: ${{ github.head_ref || github.ref_name }}
       ZONES_BENCH_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      ZONES_BENCH_GITHUB_REPOSITORY: ${{ github.repository }}
+      ZONES_BENCH_GITHUB_RUN_ID: ${{ github.run_id }}
+      ZONES_BENCH_GITHUB_WORKFLOW: zones-benchmark.yml
+      ZONES_BENCH_GITHUB_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+      ZONES_BENCH_REQUIRE_CLICKHOUSE: "1"
+      CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
       ZONES_BENCH_BUILD_PROFILE: profiling
       ZONES_BENCH_L1_A_CPUS: 0-3,16-19
       ZONES_BENCH_L1_B_CPUS: 4-7,20-23
@@ -326,8 +364,24 @@ jobs:
           set -euo pipefail
           contrib/bench/provision-topology.sh cleanup "$ZONES_BENCH_PID_FILE"
 
-      - name: Test L1 snapshot manifest handling
-        run: contrib/bench/tests/l1-snapshot.sh
+      - name: Configure ClickHouse scenario reporting
+        if: needs.authorize.outputs.phase == 'roundtrip' || needs.authorize.outputs.phase == 'neobank-e2e'
+        run: |
+          set -euo pipefail
+          for name in CLICKHOUSE_URL CLICKHOUSE_USER CLICKHOUSE_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not available to the Zones benchmark workflow"
+              exit 1
+            fi
+          done
+          echo "::add-mask::$CLICKHOUSE_URL"
+          echo "::add-mask::$CLICKHOUSE_USER"
+          echo "::add-mask::$CLICKHOUSE_PASSWORD"
+
+      - name: Test benchmark shell helpers
+        run: |
+          contrib/bench/tests/l1-snapshot.sh
+          contrib/bench/tests/scenario-reporting.sh
 
       - name: Check out pinned Tempo L1
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -438,6 +492,15 @@ jobs:
             echo "TEMPO_XTASK_BIN=$ZONES_BENCH_TEMPO_TARGET_DIR/profiling/tempo-xtask"
           } >> "$GITHUB_ENV"
 
+      - name: Build pinned neobank fixture contracts
+        if: needs.authorize.outputs.phase == 'neobank-e2e'
+        run: |
+          set -euo pipefail
+          forge build --root specs/ref-impls
+          test -s specs/ref-impls/out/ClosedLoopZoneGateway.sol/ClosedLoopZoneGateway.json
+          test -s specs/ref-impls/out/VaultAdapter.sol/VaultAdapter.json
+          test -s specs/ref-impls/out/VaultRewards.sol/VaultRewards.json
+
       - name: Prepare or restore persistent Tempo L1 baseline
         run: |
           set -euo pipefail
@@ -502,7 +565,7 @@ jobs:
           set +a
           for name in \
             L1_RPC_URL ZONES_BENCH_L1_QUERY_RPC_URL ZONES_BENCH_L1_SUBMIT_RPC_URLS \
-            ZONE_RPC_URL ZONE_PRIVATE_RPC_URL L1_PORTAL_ADDRESS \
+            ZONE_RPC_URL ZONE_PRIVATE_RPC_URL L1_PORTAL_ADDRESS ZONES_BENCH_TOKEN \
             ZONES_BENCH_EXPECTED_L1_CHAIN_ID ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID \
             ZONES_BENCH_EXPECTED_ZONE_ID ZONES_BENCH_TARGET_ID \
             ZONES_BENCH_L1_GAS_LIMIT ZONES_BENCH_L1_GENERAL_GAS_LIMIT \

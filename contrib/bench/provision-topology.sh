@@ -329,6 +329,66 @@ wait_for_zone_enabled_token() {
     die "timed out waiting for Zone to enable token $token"
 }
 
+verify_neobank_token_topology() {
+    local l1_rpc="$1"
+    local portal="$2"
+    local base_token="$3"
+    local earn_token="$4"
+    local count enabled active token token0 token1
+
+    for token in "$base_token" "$earn_token"; do
+        enabled="$(cast call "$portal" 'isTokenEnabled(address)(bool)' "$token" \
+            --rpc-url "$l1_rpc" | awk '{print $1}')"
+        active="$(cast call "$portal" 'areDepositsActive(address)(bool)' "$token" \
+            --rpc-url "$l1_rpc" | awk '{print $1}')"
+        [[ "$enabled" == "true" ]] || die "neobank Zone token $token is not enabled"
+        [[ "$active" == "true" ]] || die "neobank Zone deposits are inactive for token $token"
+    done
+
+    count="$(cast call "$portal" 'enabledTokenCount()(uint256)' \
+        --rpc-url "$l1_rpc" | awk '{print $1}')"
+    [[ "$count" == "2" ]] ||
+        die "neobank Zone must have exactly two enabled tokens; portal reports $count"
+    token0="$(cast call "$portal" 'enabledTokenAt(uint256)(address)' 0 \
+        --rpc-url "$l1_rpc" | awk '{print $1}')"
+    token1="$(cast call "$portal" 'enabledTokenAt(uint256)(address)' 1 \
+        --rpc-url "$l1_rpc" | awk '{print $1}')"
+    if [[ "${token0,,}" != "${base_token,,}" || "${token1,,}" != "${earn_token,,}" ]] \
+        && [[ "${token1,,}" != "${base_token,,}" || "${token0,,}" != "${earn_token,,}" ]]; then
+        die "neobank Zone enabled-token set does not match the preset base token and EarnToken"
+    fi
+}
+
+verify_neobank_fixture_topology() {
+    local l1_rpc="$1"
+    local metadata="$2"
+    local expected_owner="$3"
+    local expected_asset="$4"
+    local field address code vault engine adapter rewards
+    local observed_adapter observed_asset observed_owner observed_engine observed_vault
+
+    vault="$(jq -er '.vault' "$metadata")"
+    engine="$(jq -er '.engine' "$metadata")"
+    adapter="$(jq -er '.vaultAdapter' "$metadata")"
+    rewards="$(jq -er '.rewards' "$metadata")"
+    for field in vault engine adapter rewards; do
+        address="${!field}"
+        code="$(rpc "$l1_rpc" eth_getCode "[\"$address\",\"latest\"]")"
+        [[ "$code" != "0x" ]] || die "neobank $field fixture has no code at $address"
+    done
+
+    observed_engine="$(cast call "$adapter" 'engine()(address)' --rpc-url "$l1_rpc" | awk '{print $1}')"
+    observed_vault="$(cast call "$engine" 'vault()(address)' --rpc-url "$l1_rpc" | awk '{print $1}')"
+    observed_adapter="$(cast call "$rewards" 'adapter()(address)' --rpc-url "$l1_rpc" | awk '{print $1}')"
+    observed_asset="$(cast call "$rewards" 'asset()(address)' --rpc-url "$l1_rpc" | awk '{print $1}')"
+    observed_owner="$(cast call "$rewards" 'owner()(address)' --rpc-url "$l1_rpc" | awk '{print $1}')"
+    [[ "${observed_engine,,}" == "${engine,,}" ]] || die "VaultAdapter engine does not match fixture metadata"
+    [[ "${observed_vault,,}" == "${vault,,}" ]] || die "ERC4626Engine vault does not match fixture metadata"
+    [[ "${observed_adapter,,}" == "${adapter,,}" ]] || die "VaultRewards adapter does not match fixture metadata"
+    [[ "${observed_asset,,}" == "${expected_asset,,}" ]] || die "VaultRewards asset does not match PathUSD"
+    [[ "${observed_owner,,}" == "${expected_owner,,}" ]] || die "VaultRewards owner does not match the benchmark control account"
+}
+
 write_env() {
     local env_file="$1"
     shift
@@ -372,7 +432,7 @@ provision_up() {
     stop_stale_listener 8546 "$ZONE_BIN" "Zone"
 
     local account_start="${ZONES_BENCH_ACCOUNT_START:-16}"
-    local accounts="${ZONES_BENCH_ACCOUNTS:-200}"
+    local accounts="${ZONES_BENCH_ACCOUNTS:-100}"
     local account_capacity="${ZONES_BENCH_ACCOUNT_CAPACITY:-10000}"
     local l1_chain_id="${ZONES_BENCH_L1_CHAIN_ID:-1337}"
     local l1_gas_limit="${ZONES_BENCH_L1_GAS_LIMIT:-30000000}"
@@ -383,10 +443,17 @@ provision_up() {
     local zone_timeout="${ZONES_BENCH_ZONE_TIMEOUT_SECS:-300}"
     local run_key="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
     local profile="${ZONES_BENCH_PROFILE:-generic}"
+    local neobank_preset="${ZONES_BENCH_NEOBANK_PRESET:-full-journey}"
     case "$profile" in
         generic|neobank) ;;
         *) die "ZONES_BENCH_PROFILE must be generic or neobank" ;;
     esac
+    if [[ "$profile" == "neobank" ]]; then
+        case "$neobank_preset" in
+            direct-lifecycle|rewards-redemption|third-party-recipient|full-journey|slippage-bounce|swapped-lifecycle) ;;
+            *) die "unsupported neobank preset for provisioning: $neobank_preset" ;;
+        esac
+    fi
 
     ZONES_BENCH_ACCOUNT_START="$account_start"
     ZONES_BENCH_ACCOUNTS="$accounts"
@@ -569,7 +636,10 @@ provision_up() {
 
     local zone_token="$PATH_USD"
     if [[ "$profile" == "neobank" ]]; then
-        zone_token="$DLUSD"
+        case "$neobank_preset" in
+            direct-lifecycle|rewards-redemption|third-party-recipient) zone_token="$PATH_USD" ;;
+            full-journey|slippage-bounce|swapped-lifecycle) zone_token="$DLUSD" ;;
+        esac
     fi
 
     echo "creating a Zone through the canonical factory"
@@ -609,11 +679,15 @@ provision_up() {
                 --pathusd "$PATH_USD" \
                 --output "$fixture_metadata"
         require_file "$fixture_metadata"
+        verify_neobank_fixture_topology \
+            "$l1_a_rpc" "$fixture_metadata" "$owner_address" "$PATH_USD"
+        verify_neobank_token_topology \
+            "$l1_a_rpc" "$portal" "$zone_token" "$(jq -er '.earnToken' "$fixture_metadata")"
         echo "configuring zero user bridge and withdrawal protocol fees"
         SEQUENCER_KEY="$sequencer_key" "$ZONES_XTASK_BIN" configure-benchmark-fees \
             --l1-rpc-url "$l1_a_rpc" \
             --portal "$portal" \
-            --token "$DLUSD" \
+            --token "$zone_token" \
             --zone-gas-rate 0 \
             --bounceback-gas 0
     else
@@ -688,13 +762,17 @@ provision_up() {
     )
     if [[ "$profile" == "neobank" ]]; then
         env_pairs+=(
+            ZONES_BENCH_NEOBANK_PRESET "$neobank_preset"
             ZONES_BENCH_DLUSD "$DLUSD"
             ZONES_BENCH_PATHUSD "$PATH_USD"
             ZONES_BENCH_EARN_TOKEN "$(jq -er '.earnToken' "$fixture_metadata")"
             ZONES_BENCH_GATEWAY "$(jq -er '.gateway' "$fixture_metadata")"
             ZONES_BENCH_BRIDGE_WALLET "$(jq -er '.bridgeWallet' "$fixture_metadata")"
             ZONES_BENCH_DIRECT_SWAP "$(jq -er '.directSwap' "$fixture_metadata")"
+            ZONES_BENCH_VAULT "$(jq -er '.vault' "$fixture_metadata")"
+            ZONES_BENCH_ENGINE "$(jq -er '.engine' "$fixture_metadata")"
             ZONES_BENCH_VAULT_ADAPTER "$(jq -er '.vaultAdapter' "$fixture_metadata")"
+            ZONES_BENCH_REWARDS "$(jq -er '.rewards' "$fixture_metadata")"
             ZONES_BENCH_FIXTURE_METADATA "$fixture_metadata"
         )
     fi

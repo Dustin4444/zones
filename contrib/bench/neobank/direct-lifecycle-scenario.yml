@@ -24,7 +24,7 @@ chains:
     workload: ./zone-flow.yml
 
 scenario:
-  name: neobank-swapped-lifecycle
+  name: neobank-direct-lifecycle
   timeout: 10m
 
   bindings:
@@ -44,8 +44,8 @@ scenario:
         sender: { var: account.ref }
         sender_address: { var: account.address }
         recipient: { var: account.address }
-        token: "__DLUSD__"
-        fee_token: "__DLUSD__"
+        token: "__PATHUSD__"
+        fee_token: "__PATHUSD__"
         amount: __ONRAMP_AMOUNT__
         memo: { var: onramp_action_id }
 
@@ -55,8 +55,8 @@ scenario:
         sender: { var: account.ref }
         sender_address: { var: account.address }
         recipient: { var: account.address }
-        input_token: "__DLUSD__"
-        fee_token: "__DLUSD__"
+        input_token: "__PATHUSD__"
+        fee_token: "__PATHUSD__"
         amount: __EARN_DEPOSIT_AMOUNT__
         min_vault_assets: __EARN_DEPOSIT_AMOUNT__
         min_vault_shares: __EARN_DEPOSIT_AMOUNT__
@@ -70,8 +70,8 @@ scenario:
         sender: { var: account.ref }
         sender_address: { var: account.address }
         recipient: { var: account.address }
-        output_token: "__DLUSD__"
-        fee_token: "__DLUSD__"
+        output_token: "__PATHUSD__"
+        fee_token: "__PATHUSD__"
         amount: { var: earn_deposit.callback.args.shares }
         min_vault_assets: __EARN_REDEEM_AMOUNT__
         min_output_amount: __EARN_REDEEM_AMOUNT__

@@ -24,7 +24,7 @@ chains:
     workload: ./zone-flow.yml
 
 scenario:
-  name: neobank-swapped-lifecycle
+  name: neobank-rewards-position-setup
   timeout: 10m
 
   bindings:
@@ -34,8 +34,6 @@ scenario:
       bytes32: { random_bytes: 32 }
     earn_deposit_action_id:
       bytes32: { random_bytes: 32 }
-    earn_redeem_action_id:
-      bytes32: { random_bytes: 32 }
 
   steps:
     - use: encrypted-zone-entry
@@ -44,37 +42,32 @@ scenario:
         sender: { var: account.ref }
         sender_address: { var: account.address }
         recipient: { var: account.address }
-        token: "__DLUSD__"
-        fee_token: "__DLUSD__"
-        amount: __ONRAMP_AMOUNT__
-        memo: { var: onramp_action_id }
+        token: "__PATHUSD__"
+        fee_token: "__PATHUSD__"
+        amount: "__REWARD_ONRAMP_PER_ACCOUNT__"
+        memo:
+          keccak256_packed:
+            types: [bytes32, bytes32]
+            values:
+              - "0xbc4c20d3fa3c387b930ceb80d55defcffefcffc16669253e6e2eec1bbb0e4554"
+              - { var: onramp_action_id }
 
     - use: earn-deposit-and-return
-      as: earn_deposit
+      as: position
       with:
         sender: { var: account.ref }
         sender_address: { var: account.address }
         recipient: { var: account.address }
-        input_token: "__DLUSD__"
-        fee_token: "__DLUSD__"
-        amount: __EARN_DEPOSIT_AMOUNT__
-        min_vault_assets: __EARN_DEPOSIT_AMOUNT__
-        min_vault_shares: __EARN_DEPOSIT_AMOUNT__
-        action_id: { var: earn_deposit_action_id }
-        fallback_recipient: { var: account.address }
-        refund_recipient: { var: account.address }
-
-    - use: earn-redeem-and-return
-      as: earn_redeem
-      with:
-        sender: { var: account.ref }
-        sender_address: { var: account.address }
-        recipient: { var: account.address }
-        output_token: "__DLUSD__"
-        fee_token: "__DLUSD__"
-        amount: { var: earn_deposit.callback.args.shares }
-        min_vault_assets: __EARN_REDEEM_AMOUNT__
-        min_output_amount: __EARN_REDEEM_AMOUNT__
-        action_id: { var: earn_redeem_action_id }
+        input_token: "__PATHUSD__"
+        fee_token: "__PATHUSD__"
+        amount: "__REWARD_POSITION_PER_ACCOUNT__"
+        min_vault_assets: "__REWARD_POSITION_PER_ACCOUNT__"
+        min_vault_shares: "__REWARD_POSITION_PER_ACCOUNT__"
+        action_id:
+          keccak256_packed:
+            types: [bytes32, bytes32]
+            values:
+              - "0x0446cc2dded0c1a7b217321b88463b8bb4d7e5af31610b7c7203e763ceb7581e"
+              - { var: earn_deposit_action_id }
         fallback_recipient: { var: account.address }
         refund_recipient: { var: account.address }

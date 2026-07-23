@@ -24,7 +24,7 @@ chains:
     workload: ./zone-flow.yml
 
 scenario:
-  name: neobank-swapped-lifecycle
+  name: neobank-slippage-bounce
   timeout: 10m
 
   bindings:
@@ -33,8 +33,6 @@ scenario:
     onramp_action_id:
       bytes32: { random_bytes: 32 }
     earn_deposit_action_id:
-      bytes32: { random_bytes: 32 }
-    earn_redeem_action_id:
       bytes32: { random_bytes: 32 }
 
   steps:
@@ -49,8 +47,8 @@ scenario:
         amount: __ONRAMP_AMOUNT__
         memo: { var: onramp_action_id }
 
-    - use: earn-deposit-and-return
-      as: earn_deposit
+    - use: earn-deposit-expect-bounce
+      as: earn_deposit_bounce
       with:
         sender: { var: account.ref }
         sender_address: { var: account.address }
@@ -58,23 +56,6 @@ scenario:
         input_token: "__DLUSD__"
         fee_token: "__DLUSD__"
         amount: __EARN_DEPOSIT_AMOUNT__
-        min_vault_assets: __EARN_DEPOSIT_AMOUNT__
-        min_vault_shares: __EARN_DEPOSIT_AMOUNT__
         action_id: { var: earn_deposit_action_id }
-        fallback_recipient: { var: account.address }
-        refund_recipient: { var: account.address }
-
-    - use: earn-redeem-and-return
-      as: earn_redeem
-      with:
-        sender: { var: account.ref }
-        sender_address: { var: account.address }
-        recipient: { var: account.address }
-        output_token: "__DLUSD__"
-        fee_token: "__DLUSD__"
-        amount: { var: earn_deposit.callback.args.shares }
-        min_vault_assets: __EARN_REDEEM_AMOUNT__
-        min_output_amount: __EARN_REDEEM_AMOUNT__
-        action_id: { var: earn_redeem_action_id }
         fallback_recipient: { var: account.address }
         refund_recipient: { var: account.address }
