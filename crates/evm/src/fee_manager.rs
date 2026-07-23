@@ -1,11 +1,18 @@
 //! Adapter between Tempo's protocol fee hooks and the Zone fee manager.
 
-use alloy_evm::{Database, revm::context::Journal};
+use alloy_evm::{
+    Database,
+    revm::context::{Journal, result::EVMError},
+};
 use alloy_primitives::{Address, U256};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::{ProtocolFeeContext, ProtocolFeeManager};
-use tempo_precompiles::{error::Result, storage::StorageActions};
-use tempo_revm::{TempoStateAccess, TempoTx, TempoTxEnv};
+use tempo_precompiles::{
+    error::Result,
+    storage::{ContractStorage, StorageActions},
+    tip20::TIP20Token,
+};
+use tempo_revm::{TempoInvalidTransaction, TempoStateAccess, TempoTx, TempoTxEnv};
 use zone_precompiles::ZoneFeeManager;
 
 /// Resolves the fee token selected by a Zone transaction against the supplied state view.
@@ -55,6 +62,27 @@ where
         resolve_fee_token(journal, tx, spec, actions)
     }
 
+    fn validate_fee_token(
+        &self,
+        journal: &mut Journal<DB>,
+        fee_token: Address,
+        spec: TempoHardfork,
+        actions: StorageActions,
+    ) -> core::result::Result<(), EVMError<DB::Error, TempoInvalidTransaction>> {
+        let initialized = journal
+            .with_read_only_storage_ctx(spec, actions, || {
+                // The handler validates the TIP-20 prefix before entering this hook.
+                TIP20Token::from_address_unchecked(fee_token).is_initialized()
+            })
+            .map_err(|error| EVMError::Custom(error.to_string()))?;
+
+        if !initialized {
+            return Err(TempoInvalidTransaction::InvalidFeeToken(fee_token).into());
+        }
+
+        Ok(())
+    }
+
     fn collect_fee_pre_tx(
         &self,
         ctx: ProtocolFeeContext<'_, DB>,
@@ -93,8 +121,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{U256, address};
-    use revm::database::{CacheDB, EmptyDB};
+    use alloy_primitives::{Bytes, U256, address};
+    use revm::{
+        context::JournalTr,
+        database::{CacheDB, EmptyDB},
+        state::{AccountInfo, Bytecode},
+    };
     use zone_precompiles::{ZONE_FEE_MANAGER_ADDRESS, zone_fee_manager};
 
     #[test]
@@ -132,5 +164,39 @@ mod tests {
             .unwrap(),
             explicit_token,
         );
+    }
+
+    #[test]
+    fn accepts_any_initialized_zone_tip20_as_a_fee_token() {
+        let initialized_token = address!("0x20c00000000000000000000000000000000000e1");
+        let missing_token = address!("0x20c00000000000000000000000000000000000e2");
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            initialized_token,
+            AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[0xef]))),
+        );
+        let mut journal = Journal::new(db);
+        let manager = ZoneProtocolFeeManager::new();
+
+        assert!(
+            manager
+                .validate_fee_token(
+                    &mut journal,
+                    initialized_token,
+                    TempoHardfork::T9,
+                    StorageActions::disabled(),
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            manager.validate_fee_token(
+                &mut journal,
+                missing_token,
+                TempoHardfork::T9,
+                StorageActions::disabled(),
+            ),
+            Err(EVMError::Transaction(TempoInvalidTransaction::InvalidFeeToken(address)))
+                if address == missing_token
+        ));
     }
 }
