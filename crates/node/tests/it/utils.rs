@@ -1382,6 +1382,13 @@ impl L1TestNode {
         // The admin is not pre-funded; give it pathUSD to pay for gas on
         // admin-only portal calls.
         self.fund_user(self.admin_address(), 10_000_000).await?;
+        for account in [
+            self.dev_address(),
+            self.admin_address(),
+            self.user_address(),
+        ] {
+            self.set_portal_account_as_admin(portal, account).await?;
+        }
         Ok(portal)
     }
 
@@ -1480,6 +1487,25 @@ impl L1TestNode {
             .get_receipt()
             .await?;
         eyre::ensure!(receipt.status(), "registering portal role failed");
+        Ok(())
+    }
+
+    /// Register an account as a closed-loop member on a zone portal.
+    pub(crate) async fn set_portal_account_as_admin(
+        &self,
+        portal_address: Address,
+        account: Address,
+    ) -> eyre::Result<()> {
+        use tempo_zone_contracts::ZonePortal;
+
+        let provider = self.admin_provider();
+        let receipt = ZonePortal::new(portal_address, &provider)
+            .setAllowedAccount(account, true)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "registering portal account failed");
         Ok(())
     }
 
