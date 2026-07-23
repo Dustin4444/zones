@@ -2,6 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {
+    BatchSubmissionState,
     BlockTransition,
     Deposit,
     DepositQueueTransition,
@@ -409,6 +410,32 @@ contract ZonePortal is IZonePortal {
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32) {
         return _withdrawalQueue.slots[physicalSlot];
+    }
+
+    /// @inheritdoc IZonePortal
+    function batchSubmissionState(address candidate)
+        external
+        view
+        returns (BatchSubmissionState memory state)
+    {
+        state = BatchSubmissionState({
+            chainId: block.chainid,
+            l1BlockNumber: block.number,
+            domainSeparator: _domainSeparator(),
+            zoneId: zoneId,
+            zoneHeight: zoneHeight,
+            blockHash: blockHash,
+            sequencerSetVersion: sequencerSetVersion,
+            sequencerThreshold: sequencerThreshold,
+            candidateIsSequencer: isSequencer[candidate],
+            verifier: verifier,
+            withdrawalBatchIndex: withdrawalBatchIndex,
+            withdrawalQueueHead: _withdrawalQueue.head,
+            withdrawalQueueTail: _withdrawalQueue.tail,
+            lastSyncedTempoBlockNumber: lastSyncedTempoBlockNumber,
+            lastProcessedDepositNumber: lastProcessedDepositNumber,
+            depositCount: depositCount
+        });
     }
 
     /*//////////////////////////////////////////////////////////////

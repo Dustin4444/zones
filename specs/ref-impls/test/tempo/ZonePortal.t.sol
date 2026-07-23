@@ -6,6 +6,7 @@ import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
 import {
+    BatchSubmissionState,
     BlockTransition,
     Deposit,
     DepositQueueTransition,
@@ -651,6 +652,37 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.sequencerSetVersion(), 0);
         assertEq(portal.sequencerThreshold(), 1);
         assertTrue(portal.isSequencer(sequencer));
+    }
+
+    function test_batchSubmissionState_returnsCanonicalSnapshot() public view {
+        BatchSubmissionState memory state = portal.batchSubmissionState(sequencer);
+        assertEq(state.chainId, block.chainid);
+        assertEq(state.l1BlockNumber, block.number);
+        assertEq(
+            state.domainSeparator,
+            keccak256(
+                abi.encode(
+                    EIP712_DOMAIN_TYPEHASH,
+                    keccak256("ZonePortal"),
+                    keccak256("1"),
+                    block.chainid,
+                    address(portal)
+                )
+            )
+        );
+        assertEq(state.zoneId, portal.zoneId());
+        assertEq(state.zoneHeight, portal.zoneHeight());
+        assertEq(state.blockHash, portal.blockHash());
+        assertEq(state.sequencerSetVersion, portal.sequencerSetVersion());
+        assertEq(state.sequencerThreshold, portal.sequencerThreshold());
+        assertTrue(state.candidateIsSequencer);
+        assertEq(state.verifier, portal.verifier());
+        assertEq(state.withdrawalBatchIndex, portal.withdrawalBatchIndex());
+        assertEq(state.withdrawalQueueHead, portal.withdrawalQueueHead());
+        assertEq(state.withdrawalQueueTail, portal.withdrawalQueueTail());
+        assertEq(state.lastSyncedTempoBlockNumber, portal.lastSyncedTempoBlockNumber());
+        assertEq(state.lastProcessedDepositNumber, portal.lastProcessedDepositNumber());
+        assertEq(state.depositCount, portal.depositCount());
     }
 
     /*//////////////////////////////////////////////////////////////

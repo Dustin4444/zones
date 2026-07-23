@@ -40,8 +40,8 @@ use crate::{
     attestation::AttestationStore,
     rpc::rpc_connection_config,
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, ZoneBlockSnapshot, fetch_finalized_batch,
-        fetch_finalized_batch_boundaries, log_query_ranges,
+        BatchAnchorConfig, BatchData, BatchPlanReconciliation, BatchSubmitter, ZoneBlockSnapshot,
+        fetch_finalized_batch, fetch_finalized_batch_boundaries, log_query_ranges,
     },
     withdrawals::SharedWithdrawalStore,
 };
@@ -576,12 +576,23 @@ impl ZoneMonitor {
         withdrawals: Vec<abi::Withdrawal>,
     ) -> Result<()> {
         let mut delay = INITIAL_RETRY_DELAY;
+        let portal_hash = self.batch_submitter.read_portal_block_hash().await?;
+        if portal_hash != batch_data.prev_block_hash {
+            warn!(
+                local_prev = %batch_data.prev_block_hash,
+                %portal_hash,
+                "Batch does not extend the current Portal tip; resyncing before planning"
+            );
+            self.resync_from_portal().await;
+            return Ok(());
+        }
+        let mut plan = self.batch_submitter.build_batch_plan(batch_data).await?;
 
         for attempt in 1..=MAX_RETRIES {
             // Reconcile before every attempt. A prior submitBatch may have landed even when its
             // receipt timed out, in which case waiting for the old certificate can block forever.
-            let portal_hash = match self.batch_submitter.read_portal_block_hash().await {
-                Ok(portal_hash) => portal_hash,
+            let reconciliation = match self.batch_submitter.reconcile_plan(&plan).await {
+                Ok(reconciliation) => reconciliation,
                 Err(e) => {
                     if attempt < MAX_RETRIES {
                         self.metrics.batch_submit_retry_total.increment(1);
@@ -605,18 +616,39 @@ impl ZoneMonitor {
                     break;
                 }
             };
-            if portal_hash != batch_data.prev_block_hash {
-                warn!(
-                    local_prev = %batch_data.prev_block_hash,
-                    portal_hash = %portal_hash,
-                    "prev_block_hash mismatch with portal, resyncing"
-                );
-                self.resync_from_portal().await;
-                return Ok(());
+            match reconciliation {
+                BatchPlanReconciliation::Reusable => {}
+                BatchPlanReconciliation::AlreadySubmitted => {
+                    warn!(
+                        attestation_digest = %plan.attestation_digest,
+                        "Portal already contains the planned batch tip; reconciling landed submission"
+                    );
+                    self.resync_from_portal().await;
+                    return Ok(());
+                }
+                BatchPlanReconciliation::Rebuild => {
+                    warn!(
+                        attestation_digest = %plan.attestation_digest,
+                        "Pinned Portal inputs or anchor changed; invalidating and rebuilding batch plan"
+                    );
+                    self.batch_submitter.invalidate_plan(&plan);
+                    plan = self.batch_submitter.build_batch_plan(batch_data).await?;
+                    continue;
+                }
+                BatchPlanReconciliation::Diverged => {
+                    warn!(
+                        planned_prev = %plan.block_transition.prevBlockHash,
+                        planned_next = %plan.block_transition.nextBlockHash,
+                        "Portal tip diverged from the batch plan; resyncing"
+                    );
+                    self.batch_submitter.invalidate_plan(&plan);
+                    self.resync_from_portal().await;
+                    return Ok(());
+                }
             }
 
             let submit_started = std::time::Instant::now();
-            match self.batch_submitter.submit_batch(batch_data).await {
+            match self.batch_submitter.submit_plan(&plan).await {
                 Ok(event) => {
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None

@@ -61,7 +61,7 @@ use tracing::{debug, info};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig, TempoStateExt,
+    DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig,
     state::{L1StateCache, L1StateProvider, L1StateProviderConfig},
 };
 use zone_p2p::{P2pConfig, P2pNetworkId, Role, spawn_p2p};
@@ -71,7 +71,8 @@ use zone_payload::{
 };
 use zone_sequencer::{
     AttestationStore, BatchAnchorConfig, WithdrawalBatchLimits, ZoneSequencerConfig,
-    attestation::AttestationDomain, spawn_zone_sequencer,
+    attestation::{SettlementDomain, fetch_portal_snapshot},
+    spawn_zone_sequencer,
 };
 
 /// Returns a known Tempo chain spec for an L1 chain ID.
@@ -474,12 +475,26 @@ where
         if let Some(config) = self.p2p_config.take() {
             let l1_chain_id = l1_provider.get_chain_id().await?;
             let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
-            let attestation_domain = AttestationDomain {
-                l1_chain_id,
-                portal_address: self.portal_address,
-                zone_id: config.zone_id(),
-                sequencer_set_version: config.sequencer_set_version(),
-            };
+            let attestation_domain = SettlementDomain::new(l1_chain_id, self.portal_address);
+            let startup_snapshot = fetch_portal_snapshot(
+                &l1_provider,
+                self.portal_address,
+                config.block_attestation_signer().address(),
+                attestation_domain,
+            )
+            .await?;
+            eyre::ensure!(
+                startup_snapshot.state.zoneId == config.zone_id(),
+                "portal zone ID {} does not match P2P manifest zone ID {}",
+                startup_snapshot.state.zoneId,
+                config.zone_id()
+            );
+            eyre::ensure!(
+                startup_snapshot.state.sequencerSetVersion == config.sequencer_set_version(),
+                "portal signer-set version {} does not match P2P manifest version {}",
+                startup_snapshot.state.sequencerSetVersion,
+                config.sequencer_set_version()
+            );
             let anchor_config = self
                 .sequencer_config
                 .as_ref()
@@ -487,6 +502,8 @@ where
                 .unwrap_or_default();
             let attestation = AttestationContext::new(
                 attestation_domain,
+                config.zone_id(),
+                config.sequencer_set_version(),
                 config.block_attestation_signer(),
                 config.block_attestation_addresses(),
                 attestation_store.clone(),

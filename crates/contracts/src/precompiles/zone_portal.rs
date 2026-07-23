@@ -1,8 +1,8 @@
 //! `ZonePortal` — deployed on Tempo L1.
 
 pub use ZonePortal::{
-    BlockTransition, DepositQueueTransition, EncryptedDeposit, EncryptedDepositPayload, Withdrawal,
-    ZonePortalErrors as ZonePortalError,
+    BatchSubmissionState, BlockTransition, DepositQueueTransition, EncryptedDeposit,
+    EncryptedDepositPayload, Withdrawal, ZonePortalErrors as ZonePortalError,
 };
 
 use crate::IZoneOutbox;
@@ -61,6 +61,25 @@ crate::sol! {
             bytes32 nextProcessedHash;
             uint64 prevDepositNumber;
             uint64 nextDepositNumber;
+        }
+
+        struct BatchSubmissionState {
+            uint256 chainId;
+            uint256 l1BlockNumber;
+            bytes32 domainSeparator;
+            uint32 zoneId;
+            uint256 zoneHeight;
+            bytes32 blockHash;
+            uint64 sequencerSetVersion;
+            uint8 sequencerThreshold;
+            bool candidateIsSequencer;
+            address verifier;
+            uint64 withdrawalBatchIndex;
+            uint256 withdrawalQueueHead;
+            uint256 withdrawalQueueTail;
+            uint64 lastSyncedTempoBlockNumber;
+            uint64 lastProcessedDepositNumber;
+            uint64 depositCount;
         }
 
         // -- Events --
@@ -186,6 +205,10 @@ crate::sol! {
         function sequencerSetVersion() external view returns (uint64);
         function sequencerThreshold() external view returns (uint8);
         function zoneHeight() external view returns (uint256);
+        function batchSubmissionState(address candidate)
+            external
+            view
+            returns (BatchSubmissionState memory);
         function isSequencer(address account) external view returns (bool);
         function sequencerCount() external view returns (uint256);
         function sequencerAt(uint256 index) external view returns (address);

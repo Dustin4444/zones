@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use alloy_consensus::TxReceipt as _;
-use alloy_eips::BlockHashOrNumber;
+use alloy_eips::{BlockHashOrNumber, NumHash};
 use alloy_primitives::{B256, Bytes, Sealable as _, U256};
 use alloy_provider::Provider as _;
 use alloy_sol_types::{SolEvent as _, SolValue as _};
@@ -13,15 +13,16 @@ use reth_chain_state::PersistedBlockSubscriptions;
 use reth_provider::HeaderProvider;
 use reth_storage_api::{BlockNumReader, ReceiptProvider};
 use tempo_primitives::TempoHeader;
-use tempo_zone_contracts::{
-    IZoneOutbox, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZonePortal,
-};
+use tempo_zone_contracts::{IZoneOutbox, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 use zone_p2p::P2pCommand;
 
 use crate::replication::AttestationContext;
-use zone_sequencer::attestation::{SettlementAttestation, SignedSettlementAttestation};
+use zone_sequencer::attestation::{
+    PortalSnapshot, SettlementAttestation, SettlementProposal, SignedSettlementAttestation,
+    fetch_portal_snapshot, fetch_portal_snapshot_at,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct BlockCommitments {
@@ -30,6 +31,11 @@ struct BlockCommitments {
     processed_deposit_hash: B256,
     processed_deposit_number: u64,
     withdrawal: Option<(B256, u64)>,
+}
+
+pub(crate) struct BuiltSettlementPlan {
+    pub(crate) portal_snapshot: PortalSnapshot,
+    pub(crate) attestation: SettlementAttestation,
 }
 
 /// Extract commitments produced by the deterministic system transactions in a zone block.
@@ -114,7 +120,8 @@ pub(crate) async fn build_settlement_attestation<P>(
     number: u64,
     context: &AttestationContext,
     proposed_anchor: Option<(u64, B256)>,
-) -> eyre::Result<Option<SettlementAttestation>>
+    proposed_portal_block: Option<NumHash>,
+) -> eyre::Result<Option<BuiltSettlementPlan>>
 where
     P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
 {
@@ -129,35 +136,55 @@ where
     let (previous_tip, previous_deposit_hash, previous_deposit_number) =
         previous_batch(provider, number)?;
 
-    let portal = ZonePortal::new(context.domain.portal_address, context.l1_provider.clone());
-    let set_version_call = portal.sequencerSetVersion();
-    let portal_batch_index_call = portal.withdrawalBatchIndex();
-    let verifier_call = portal.verifier();
-    let portal_tip_call = portal.blockHash();
-    let (set_version, portal_batch_index, verifier, portal_tip) = tokio::try_join!(
-        set_version_call.call(),
-        portal_batch_index_call.call(),
-        verifier_call.call(),
-        portal_tip_call.call(),
-    )?;
+    let portal_snapshot = if let Some(block) = proposed_portal_block {
+        fetch_portal_snapshot_at(
+            &context.l1_provider,
+            context.domain.portal_address,
+            context.signer.address(),
+            context.domain,
+            block,
+        )
+        .await?
+    } else {
+        fetch_portal_snapshot(
+            &context.l1_provider,
+            context.domain.portal_address,
+            context.signer.address(),
+            context.domain,
+        )
+        .await?
+    };
+    let portal_state = &portal_snapshot.state;
     eyre::ensure!(
-        set_version == context.domain.sequencer_set_version,
-        "portal signer-set version {set_version} does not match manifest version {}",
-        context.domain.sequencer_set_version
+        portal_state.zoneId == context.expected_zone_id,
+        "portal zone ID {} does not match manifest zone ID {}",
+        portal_state.zoneId,
+        context.expected_zone_id
     );
     eyre::ensure!(
-        portal_tip == previous_tip,
+        portal_state.sequencerSetVersion == context.expected_sequencer_set_version,
+        "portal signer-set version {set_version} does not match manifest version {}",
+        context.expected_sequencer_set_version,
+        set_version = portal_state.sequencerSetVersion,
+    );
+    eyre::ensure!(
+        portal_state.candidateIsSequencer,
+        "local attestation signer is not active in the portal sequencer set"
+    );
+    eyre::ensure!(
+        portal_state.blockHash == previous_tip,
         "proposal does not extend the portal batch tip"
     );
     eyre::ensure!(
-        withdrawal_batch_index == portal_batch_index.saturating_add(1),
-        "zone withdrawal batch index {withdrawal_batch_index} does not follow portal index {portal_batch_index}"
+        withdrawal_batch_index == portal_state.withdrawalBatchIndex.saturating_add(1),
+        "zone withdrawal batch index {withdrawal_batch_index} does not follow portal index {}",
+        portal_state.withdrawalBatchIndex
     );
 
     let (anchor_block_number, anchor_block_hash) = if let Some(anchor) = proposed_anchor {
         anchor
     } else {
-        let l1_tip = context.l1_provider.get_block_number().await?;
+        let l1_tip = portal_snapshot.l1_block_number;
         let gap = l1_tip.saturating_sub(commitments.tempo_block_number);
         if gap < context.anchor_config.effective_window() {
             (commitments.tempo_block_number, commitments.tempo_block_hash)
@@ -179,15 +206,16 @@ where
         commitments.tempo_block_hash,
         anchor_block_number,
         anchor_block_hash,
+        portal_snapshot.l1_block_number,
     )
     .await?;
 
-    Ok(Some(SettlementAttestation {
-        zoneId: context.domain.zone_id,
-        sequencerSetVersion: set_version,
+    let attestation = SettlementAttestation {
+        zoneId: portal_state.zoneId,
+        sequencerSetVersion: portal_state.sequencerSetVersion,
         zoneHeight: U256::from(number),
         withdrawalBatchIndex: U256::from(withdrawal_batch_index),
-        verifier,
+        verifier: portal_state.verifier,
         tempoBlockNumber: commitments.tempo_block_number,
         anchorBlockNumber: anchor_block_number,
         anchorBlockHash: anchor_block_hash,
@@ -203,6 +231,10 @@ where
         ),
         withdrawalQueueHash: withdrawal_queue_hash,
         verifierConfigHash: alloy_primitives::keccak256(Bytes::new()),
+    };
+    Ok(Some(BuiltSettlementPlan {
+        portal_snapshot,
+        attestation,
     }))
 }
 
@@ -214,13 +246,13 @@ async fn validate_settlement_anchor(
     tempo_block_hash: B256,
     anchor_block_number: u64,
     anchor_block_hash: B256,
+    current_l1_block: u64,
 ) -> eyre::Result<()> {
     eyre::ensure!(
         anchor_block_number >= tempo_block_number,
         "proposed L1 anchor predates the zone batch's Tempo block"
     );
 
-    let current_l1_block = context.l1_provider.get_block_number().await?;
     eyre::ensure!(
         anchor_block_number < current_l1_block,
         "proposed L1 anchor is not yet available through EIP-2935"
@@ -448,12 +480,15 @@ async fn propose_settlement<P>(
 where
     P: HeaderProvider<Header = TempoHeader> + ReceiptProvider,
 {
-    let Some(attestation) = build_settlement_attestation(provider, number, context, None).await?
+    let Some(plan) = build_settlement_attestation(provider, number, context, None, None).await?
     else {
         return Ok(false);
     };
-    let signed =
-        SignedSettlementAttestation::sign(attestation.clone(), context.domain, &context.signer)?;
+    let signed = SignedSettlementAttestation::sign(
+        plan.attestation.clone(),
+        context.domain,
+        &context.signer,
+    )?;
     let signer = signed.recover_signer(context.domain)?;
     let (_, signatures) = context
         .store
@@ -462,7 +497,12 @@ where
         .insert_settlement(context.domain, signer, signed);
     commands
         .send(P2pCommand::BroadcastSettlementProposal(
-            attestation.encode(),
+            SettlementProposal {
+                portalBlockNumber: plan.portal_snapshot.l1_block_number,
+                portalBlockHash: plan.portal_snapshot.l1_block_hash,
+                attestation: plan.attestation,
+            }
+            .encode(),
         ))
         .await
         .wrap_err("P2P command channel closed")?;

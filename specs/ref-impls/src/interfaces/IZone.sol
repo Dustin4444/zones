@@ -65,6 +65,27 @@ struct DepositQueueTransition {
     uint64 nextDepositNumber; // deposit counter at nextProcessedHash
 }
 
+/// @notice Portal-owned inputs used to construct and validate one batch submission.
+/// @dev Callers should pin `eth_call` to a concrete L1 block and verify `l1BlockNumber`.
+struct BatchSubmissionState {
+    uint256 chainId;
+    uint256 l1BlockNumber;
+    bytes32 domainSeparator;
+    uint32 zoneId;
+    uint256 zoneHeight;
+    bytes32 blockHash;
+    uint64 sequencerSetVersion;
+    uint8 sequencerThreshold;
+    bool candidateIsSequencer;
+    address verifier;
+    uint64 withdrawalBatchIndex;
+    uint256 withdrawalQueueHead;
+    uint256 withdrawalQueueTail;
+    uint64 lastSyncedTempoBlockNumber;
+    uint64 lastProcessedDepositNumber;
+    uint64 depositCount;
+}
+
 /// @notice Deposit type discriminator for the unified deposit queue
 /// @dev Used in hash chain: keccak256(abi.encode(depositType, depositData, prevHash))
 enum DepositType {
@@ -746,6 +767,12 @@ interface IZonePortal {
 
     /// @notice Highest zone block height accepted with a quorum certificate.
     function zoneHeight() external view returns (uint256);
+
+    /// @notice Return every Portal-owned input needed to plan a batch submission.
+    function batchSubmissionState(address candidate)
+        external
+        view
+        returns (BatchSubmissionState memory);
 
     /// @notice Whether an account belongs to the active settlement signer set.
     function isSequencer(address account) external view returns (bool);

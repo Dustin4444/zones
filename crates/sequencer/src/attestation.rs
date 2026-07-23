@@ -5,12 +5,20 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use alloy_primitives::{Address, B256, Bytes, Signature};
+use alloy_consensus::BlockHeader as _;
+use alloy_eips::{BlockNumberOrTag, NumHash};
+use alloy_network::primitives::HeaderResponse as _;
+use alloy_primitives::{Address, B256, Bytes, Signature, U256};
+use alloy_provider::{DynProvider, Provider as _};
+use alloy_rpc_types_eth::BlockId;
 use alloy_signer::SignerSync as _;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{Eip712Domain, SolStruct as _, SolValue as _, eip712_domain, sol};
 use eyre::WrapErr as _;
+use tempo_alloy::TempoNetwork;
 use tokio::sync::{Notify, watch};
+
+use crate::abi::{BatchSubmissionState, ZonePortal};
 
 type SettlementSignatures =
     BTreeMap<u64, BTreeMap<B256, BTreeMap<Address, SignedSettlementAttestation>>>;
@@ -39,18 +47,39 @@ sol! {
         SettlementAttestation attestation;
         bytes signature;
     }
+
+    /// Off-chain proposal context needed to reproduce one immutable plan.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SettlementProposal {
+        uint64 portalBlockNumber;
+        bytes32 portalBlockHash;
+        SettlementAttestation attestation;
+    }
 }
 
-/// Immutable values that domain-separate one zone's attestations.
-#[derive(Debug, Clone, Copy)]
-pub struct AttestationDomain {
+/// Immutable EIP-712 domain shared by every settlement plan for one Portal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementDomain {
     pub l1_chain_id: u64,
     pub portal_address: Address,
-    pub zone_id: u32,
-    pub sequencer_set_version: u64,
+    pub separator: B256,
 }
 
-impl AttestationDomain {
+impl SettlementDomain {
+    pub fn new(l1_chain_id: u64, portal_address: Address) -> Self {
+        let eip712 = eip712_domain! {
+            name: "ZonePortal",
+            version: "1",
+            chain_id: l1_chain_id,
+            verifying_contract: portal_address,
+        };
+        Self {
+            l1_chain_id,
+            portal_address,
+            separator: eip712.separator(),
+        }
+    }
+
     fn eip712(self) -> Eip712Domain {
         eip712_domain! {
             name: "ZonePortal",
@@ -65,7 +94,107 @@ impl AttestationDomain {
     }
 }
 
+/// One internally consistent view of all Portal-owned batch submission inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalSnapshot {
+    pub l1_block_number: u64,
+    pub l1_block_hash: B256,
+    pub state: BatchSubmissionState,
+}
+
+/// Read the Portal snapshot at one concrete L1 block and verify its immutable domain identity.
+pub async fn fetch_portal_snapshot(
+    provider: &DynProvider<TempoNetwork>,
+    portal_address: Address,
+    candidate: Address,
+    domain: SettlementDomain,
+) -> eyre::Result<PortalSnapshot> {
+    eyre::ensure!(
+        portal_address == domain.portal_address,
+        "portal address does not match cached settlement domain"
+    );
+    let header = provider
+        .get_header_by_number(BlockNumberOrTag::Latest)
+        .await?
+        .ok_or_else(|| eyre::eyre!("latest L1 header is unavailable"))?;
+    let l1_block_number = header.number();
+    let l1_block_hash = header.hash();
+    fetch_portal_snapshot_unchecked(
+        provider,
+        portal_address,
+        candidate,
+        domain,
+        NumHash::new(l1_block_number, l1_block_hash),
+    )
+    .await
+}
+
+pub async fn fetch_portal_snapshot_at(
+    provider: &DynProvider<TempoNetwork>,
+    portal_address: Address,
+    candidate: Address,
+    domain: SettlementDomain,
+    block: NumHash,
+) -> eyre::Result<PortalSnapshot> {
+    eyre::ensure!(
+        portal_address == domain.portal_address,
+        "portal address does not match cached settlement domain"
+    );
+    let canonical = provider
+        .get_header_by_number(block.number.into())
+        .await?
+        .ok_or_else(|| eyre::eyre!("L1 snapshot header {} is unavailable", block.number))?;
+    eyre::ensure!(
+        canonical.hash() == block.hash,
+        "L1 snapshot block hash is not canonical"
+    );
+    fetch_portal_snapshot_unchecked(provider, portal_address, candidate, domain, block).await
+}
+
+async fn fetch_portal_snapshot_unchecked(
+    provider: &DynProvider<TempoNetwork>,
+    portal_address: Address,
+    candidate: Address,
+    domain: SettlementDomain,
+    block: NumHash,
+) -> eyre::Result<PortalSnapshot> {
+    let state = ZonePortal::new(portal_address, provider.clone())
+        .batchSubmissionState(candidate)
+        .block(BlockId::hash(block.hash))
+        .call()
+        .await?;
+
+    eyre::ensure!(
+        state.l1BlockNumber == U256::from(block.number),
+        "portal snapshot block number does not match pinned L1 block"
+    );
+    eyre::ensure!(
+        state.chainId == U256::from(domain.l1_chain_id),
+        "portal snapshot chain ID does not match cached settlement domain"
+    );
+    eyre::ensure!(
+        state.domainSeparator == domain.separator,
+        "portal snapshot domain separator does not match cached settlement domain"
+    );
+
+    Ok(PortalSnapshot {
+        l1_block_number: block.number,
+        l1_block_hash: block.hash,
+        state,
+    })
+}
+
 impl SettlementAttestation {
+    pub fn encode(&self) -> Vec<u8> {
+        self.abi_encode()
+    }
+
+    pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
+        Self::abi_decode(encoded).wrap_err("invalid settlement proposal encoding")
+    }
+}
+
+impl SettlementProposal {
     pub fn encode(&self) -> Vec<u8> {
         self.abi_encode()
     }
@@ -78,7 +207,7 @@ impl SettlementAttestation {
 impl SignedSettlementAttestation {
     pub fn sign(
         attestation: SettlementAttestation,
-        domain: AttestationDomain,
+        domain: SettlementDomain,
         signer: &PrivateKeySigner,
     ) -> eyre::Result<Self> {
         let signature = signer.sign_hash_sync(&domain.settlement_digest(&attestation))?;
@@ -96,7 +225,7 @@ impl SignedSettlementAttestation {
         Self::abi_decode(encoded).wrap_err("invalid settlement signature encoding")
     }
 
-    pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
+    pub fn recover_signer(&self, domain: SettlementDomain) -> eyre::Result<Address> {
         let signature = Signature::try_from(self.signature.as_ref())
             .wrap_err("invalid settlement signature")?;
         alloy_consensus::crypto::secp256k1::recover_signer(
@@ -139,7 +268,7 @@ impl AttestationStore {
     /// Insert one settlement signature per recovered signer and statement digest.
     pub fn insert_settlement(
         &self,
-        domain: AttestationDomain,
+        domain: SettlementDomain,
         signer: Address,
         signed: SignedSettlementAttestation,
     ) -> (bool, usize) {
@@ -178,6 +307,24 @@ impl AttestationStore {
             }
             notified.await;
         }
+    }
+
+    /// Return whether the leader already recorded this exact immutable proposal.
+    pub fn contains_settlement(
+        &self,
+        domain: SettlementDomain,
+        attestation: &SettlementAttestation,
+    ) -> bool {
+        let Ok(height) = u64::try_from(attestation.zoneHeight) else {
+            return false;
+        };
+        let digest = domain.settlement_digest(attestation);
+        self.settlements
+            .read()
+            .expect("attestation store lock poisoned")
+            .get(&height)
+            .and_then(|by_digest| by_digest.get(&digest))
+            .is_some()
     }
 
     /// Get the settlement certificate at the zone block height
@@ -248,13 +395,8 @@ mod tests {
 
     use super::*;
 
-    fn domain() -> AttestationDomain {
-        AttestationDomain {
-            l1_chain_id: 1337,
-            portal_address: Address::repeat_byte(0x11),
-            zone_id: 7,
-            sequencer_set_version: 3,
-        }
+    fn domain() -> SettlementDomain {
+        SettlementDomain::new(1337, Address::repeat_byte(0x11))
     }
 
     #[test]
@@ -307,6 +449,7 @@ mod tests {
             )
                 .abi_encode(),
         );
+        assert_eq!(domain.separator, domain_separator);
         let mut encoded_digest = Vec::with_capacity(66);
         encoded_digest.extend_from_slice(&[0x19, 0x01]);
         encoded_digest.extend_from_slice(domain_separator.as_slice());
@@ -314,6 +457,16 @@ mod tests {
         assert_eq!(
             domain.settlement_digest(&attestation),
             keccak256(encoded_digest)
+        );
+
+        let proposal = SettlementProposal {
+            portalBlockNumber: 123,
+            portalBlockHash: B256::repeat_byte(0x44),
+            attestation: attestation.clone(),
+        };
+        assert_eq!(
+            SettlementProposal::decode(&proposal.encode()).unwrap(),
+            proposal
         );
 
         let signer = PrivateKeySigner::random();

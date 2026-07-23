@@ -1,6 +1,7 @@
 //! Node-side leader block replication and follower import.
 
 use alloy_consensus::BlockHeader as _;
+use alloy_eips::NumHash;
 use alloy_primitives::B256;
 use alloy_provider::DynProvider;
 use alloy_rlp::Decodable as _;
@@ -29,7 +30,7 @@ use zone_payload::{
 use zone_sequencer::{
     BatchAnchorConfig,
     attestation::{
-        AttestationDomain, AttestationStore, SettlementAttestation, SignedSettlementAttestation,
+        AttestationStore, SettlementDomain, SettlementProposal, SignedSettlementAttestation,
     },
 };
 
@@ -41,7 +42,9 @@ use crate::settlement_attestation::build_settlement_attestation;
 /// Shared signing and L1-validation context for settlement attestations.
 #[derive(Clone)]
 pub(crate) struct AttestationContext {
-    pub(crate) domain: AttestationDomain,
+    pub(crate) domain: SettlementDomain,
+    pub(crate) expected_zone_id: u32,
+    pub(crate) expected_sequencer_set_version: u64,
     pub(crate) signer: PrivateKeySigner,
     pub(crate) addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
     pub(crate) store: Option<AttestationStore>,
@@ -51,7 +54,9 @@ pub(crate) struct AttestationContext {
 
 impl AttestationContext {
     pub(crate) fn new(
-        domain: AttestationDomain,
+        domain: SettlementDomain,
+        expected_zone_id: u32,
+        expected_sequencer_set_version: u64,
         signer: PrivateKeySigner,
         addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
         store: Option<AttestationStore>,
@@ -60,6 +65,8 @@ impl AttestationContext {
     ) -> Self {
         Self {
             domain,
+            expected_zone_id,
+            expected_sequencer_set_version,
             signer,
             addresses,
             store,
@@ -473,13 +480,12 @@ async fn run_leader_backfill_server<P>(
                                 .zoneHeight
                                 .try_into()
                                 .wrap_err("settlement height does not fit in u64")?;
-                            let expected = build_settlement_attestation(
-                                &provider,
-                                height,
-                                &attestation,
-                                Some((signed.attestation.anchorBlockNumber, signed.attestation.anchorBlockHash)),
-                            ).await?.ok_or_eyre("signed block is not a batch boundary")?;
-                            eyre::ensure!(signed.attestation == expected, "settlement signature does not match leader state");
+                            eyre::ensure!(
+                                attestation.store.as_ref()
+                                    .expect("leader must have an attestation store")
+                                    .contains_settlement(attestation.domain, &signed.attestation),
+                                "settlement signature does not match an active leader plan"
+                            );
                             let (_, signatures) = attestation.store.as_ref()
                                 .expect("leader must have an attestation store")
                                 .insert_settlement(attestation.domain, signer, signed);
@@ -563,8 +569,8 @@ async fn run_follower_block_sync<P>(
                     P2pEvent::Started { .. } => {}
                     P2pEvent::SettlementProposalReceived { leader, proposal } => {
                         let result = async {
-                            let proposal = SettlementAttestation::decode(&proposal)?;
-                            let height: u64 = proposal
+                            let proposal = SettlementProposal::decode(&proposal)?;
+                            let height: u64 = proposal.attestation
                                 .zoneHeight
                                 .try_into()
                                 .wrap_err("settlement height does not fit in u64")?;
@@ -572,12 +578,22 @@ async fn run_follower_block_sync<P>(
                                 &provider,
                                 height,
                                 &attestation,
-                                Some((proposal.anchorBlockNumber, proposal.anchorBlockHash)),
+                                Some((
+                                    proposal.attestation.anchorBlockNumber,
+                                    proposal.attestation.anchorBlockHash,
+                                )),
+                                Some(NumHash::new(
+                                    proposal.portalBlockNumber,
+                                    proposal.portalBlockHash,
+                                )),
                             ).await?.ok_or_eyre("proposed block is not a batch boundary")?;
-                            eyre::ensure!(proposal == expected, "settlement proposal does not match follower state");
+                            eyre::ensure!(
+                                proposal.attestation == expected.attestation,
+                                "settlement proposal does not match follower state"
+                            );
 
                             let signed = SignedSettlementAttestation::sign(
-                                proposal,
+                                proposal.attestation,
                                 attestation.domain,
                                 &attestation.signer,
                             )?;
