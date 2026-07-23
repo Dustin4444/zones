@@ -137,6 +137,32 @@ contract ZonePortalGasLimitTest is Test {
         assertTrue(portal.currentDepositQueueHash() != bytes32(0));
     }
 
+    function test_processWithdrawal_simpleTransferFailureBouncesBackWithinPlannerLimit() public {
+        token.mint(address(portal), 500e6);
+        token.setBlockedRecipient(recipient, true);
+
+        Withdrawal memory w = Withdrawal({
+            token: address(token),
+            senderTag: keccak256("sender"),
+            to: recipient,
+            amount: 500e6,
+            memo: bytes32(0),
+            gasLimit: 0,
+            fallbackNonce: 1,
+            callbackData: "",
+            encryptedSender: ""
+        });
+        _storeSingleWithdrawal(w);
+
+        (bool success,) = address(portal).call{ gas: 1_500_000 }(
+            abi.encodeCall(IZonePortal.processWithdrawals, (_singleWithdrawal(w), bytes32(0)))
+        );
+
+        assertTrue(success);
+        assertEq(portal.withdrawalQueueHead(), 1);
+        assertTrue(portal.currentDepositQueueHash() != bytes32(0));
+    }
+
     function test_processWithdrawal_depositBounceBack_paysFeeAndRefundsNetAmount() public {
         _configureBouncebackFee();
         token.mint(address(portal), 1000e6);
