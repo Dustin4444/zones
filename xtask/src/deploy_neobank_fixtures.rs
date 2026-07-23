@@ -194,7 +194,7 @@ impl DeployNeobankFixtures {
     pub(crate) async fn run(self) -> eyre::Result<()> {
         ensure!(self.liquidity > 0, "--liquidity must be greater than zero");
         ensure!(
-            self.liquidity <= (1_u128 << 96) - 1,
+            self.liquidity < (1_u128 << 96),
             "--liquidity exceeds the Bridge DirectSwap uint96 transaction limit"
         );
         let deployer = signer_from_env("FIXTURE_DEPLOYER_KEY")?;
@@ -559,6 +559,26 @@ impl DeployNeobankFixtures {
         check(&receipt, "configure DLUSD redeem route")?;
 
         let admin_portal = ZonePortal::new(self.portal, &admin_provider);
+        let receipt = admin_portal
+            .setGateway(gateway, true)
+            .fee_token(self.pathusd)
+            .send()
+            .await
+            .wrap_err("failed registering the benchmark ZoneGateway")?
+            .get_receipt()
+            .await
+            .wrap_err("failed waiting for benchmark ZoneGateway registration")?;
+        check(&receipt, "register benchmark ZoneGateway")?;
+        let receipt = admin_portal
+            .setAllowedAccount(bridge_wallet, true)
+            .fee_token(self.pathusd)
+            .send()
+            .await
+            .wrap_err("failed allowing the benchmark bridge wallet")?
+            .get_receipt()
+            .await
+            .wrap_err("failed waiting for benchmark bridge wallet allowlist")?;
+        check(&receipt, "allow benchmark bridge wallet")?;
         if !admin_portal
             .isTokenEnabled(earn_token)
             .call()

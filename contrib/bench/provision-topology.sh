@@ -364,9 +364,10 @@ verify_neobank_fixture_topology() {
     local metadata="$2"
     local expected_owner="$3"
     local expected_asset="$4"
-    local field address code vault engine adapter rewards direct_swap swap_adapter controller handler auth_registry gateway dlusd reserve_ledger
+    local field address code portal vault engine adapter rewards direct_swap swap_adapter controller handler auth_registry gateway bridge_wallet dlusd reserve_ledger
     local observed_adapter observed_asset observed_owner observed_engine observed_vault observed
 
+    portal="$(jq -er '.portal' "$metadata")"
     vault="$(jq -er '.vault' "$metadata")"
     engine="$(jq -er '.engine' "$metadata")"
     adapter="$(jq -er '.vaultAdapter' "$metadata")"
@@ -377,6 +378,7 @@ verify_neobank_fixture_topology() {
     handler="$(jq -er '.tip20Handler' "$metadata")"
     auth_registry="$(jq -er '.authRegistry' "$metadata")"
     gateway="$(jq -er '.gateway' "$metadata")"
+    bridge_wallet="$(jq -er '.bridgeWallet' "$metadata")"
     dlusd="$(jq -er '.dlusd' "$metadata")"
     reserve_ledger="$(jq -er '.reserveLedger' "$metadata")"
     for field in vault engine adapter rewards direct_swap swap_adapter controller handler auth_registry gateway reserve_ledger; do
@@ -408,6 +410,10 @@ verify_neobank_fixture_topology() {
     [[ "${observed,,}" == "${swap_adapter,,}" ]] || die "DLUSD deposit route does not use the Bridge swap adapter"
     observed="$(cast call "$gateway" 'redeemSwapperFor(address)(address)' "$dlusd" --rpc-url "$l1_rpc" | awk '{print $1}')"
     [[ "${observed,,}" == "${swap_adapter,,}" ]] || die "DLUSD redeem route does not use the Bridge swap adapter"
+    observed="$(cast call "$portal" 'role(address)(uint8)' "$gateway" --rpc-url "$l1_rpc" | awk '{print $1}')"
+    [[ "$observed" == "2" ]] || die "neobank gateway is not registered as a callback gateway"
+    observed="$(cast call "$portal" 'role(address)(uint8)' "$bridge_wallet" --rpc-url "$l1_rpc" | awk '{print $1}')"
+    [[ "$observed" == "1" ]] || die "neobank bridge wallet is not an allowed account"
 }
 
 write_env() {
@@ -563,6 +569,16 @@ provision_up() {
     owner_address="$(derive_address "$mnemonic_file" 0)"
     admin_address="$(derive_address "$mnemonic_file" 3)"
     sequencer_address="$(derive_address "$mnemonic_file" 4)"
+    local -a allowed_account_args=(
+        --allowed-account "$owner_address"
+        --allowed-account "$sequencer_address"
+    )
+    local account_index
+    for ((account_index = account_start; account_index < account_start + accounts; ++account_index)); do
+        allowed_account_args+=(
+            --allowed-account "$(derive_address "$mnemonic_file" "$account_index")"
+        )
+    done
 
     mkdir -p "$zone_db" "$zone_dir"
 
@@ -670,7 +686,8 @@ provision_up() {
         --zone-factory "$ZONE_FACTORY" \
         --initial-token "$zone_token" \
         --admin "$admin_address" \
-        --sequencer "$sequencer_address"
+        --sequencer "$sequencer_address" \
+        "${allowed_account_args[@]}"
 
     local zone_json="$zone_dir/zone.json"
     local zone_genesis="$zone_dir/genesis.json"

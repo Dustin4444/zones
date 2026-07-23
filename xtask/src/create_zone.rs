@@ -37,8 +37,9 @@ pub(crate) struct CreateZone {
     #[arg(long, default_value_t = address!("0x20C0000000000000000000000000000000000000"))]
     initial_token: Address,
 
-    /// Callback-only ZoneGateway implementation. Repeat to support legacy and replacement gateways.
-    #[arg(long = "zone-gateway", required = true)]
+    /// Initial callback-only ZoneGateway implementation. Repeat to support multiple gateways.
+    /// Gateways may also be registered after creation through the ZonePortal admin API.
+    #[arg(long = "zone-gateway")]
     zone_gateways: Vec<Address>,
 
     /// Allowed plain-withdrawal/deposit account. Repeat for each member.
