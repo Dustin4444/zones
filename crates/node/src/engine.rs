@@ -189,9 +189,10 @@ impl ZoneEngine {
     /// Advance the chain by one block.
     ///
     /// Wraps the given L1 block into [`ZonePayloadAttributes`], sends FCU
-    /// with those attributes, then waits for the payload to be built. Reth
-    /// fast-path inserts the locally executed payload into the engine tree.
-    /// The L1 block is then confirmed (removed) from the deposit queue.
+    /// with those attributes, then waits for the payload to be built. Resolving
+    /// the payload hands its execution artifacts to Reth's asynchronous
+    /// fast-path insertion, after which the L1 block is confirmed (removed)
+    /// from the deposit queue.
     async fn advance(&mut self, l1_block: L1BlockDeposits) -> eyre::Result<()> {
         let l1_num_hash = l1_block.header.num_hash();
 
@@ -236,6 +237,13 @@ impl ZoneEngine {
 
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
 
+        // Resolving has a non-obvious Reth side effect: the payload service
+        // publishes the successful build as `Events::BuiltPayload`. The
+        // launcher consumes that event asynchronously, extracts the
+        // `BuiltPayloadExecutedBlock` attached by `ZonePayloadBuilder`, and
+        // sends `InsertExecutedBlock` to the engine tree. Those execution
+        // artifacts include the output, hashed state, and trie updates, so no
+        // explicit `newPayload` call or second EVM execution is needed here.
         let Some(Ok(payload)) = self
             .payload_builder
             .resolve_kind(payload_id, PayloadKind::WaitForPending)
@@ -246,11 +254,10 @@ impl ZoneEngine {
 
         let header = payload.block().sealed_header().clone();
 
-        // The locally executed payload was handed to reth's fast path. Confirm
-        // the L1 block in the queue so it is removed. If the queue was reorged
-        // between peek and confirm, the
-        // block was already purged; log a warning but still update
-        // last_header since the zone chain has advanced.
+        // Reth's asynchronous event path now owns tree insertion. Confirm the
+        // L1 block in the queue so it is removed. If the queue was reorged
+        // between peek and confirm, the block was already purged; log a
+        // warning but still update last_header since the zone chain advanced.
         if self.deposit_queue.confirm(l1_num_hash).is_none() {
             warn!(target: "zone::engine", ?l1_num_hash, "L1 block was purged from queue during build");
         }
