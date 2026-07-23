@@ -36,7 +36,7 @@ use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolEvent, SolStruct, SolValue, eip712_domain, sol};
+use alloy_sol_types::{SolCall, SolEvent, SolStruct, SolValue, eip712_domain};
 use eyre::{OptionExt as _, Result};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;

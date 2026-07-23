@@ -115,7 +115,7 @@ impl L1Deposit {
                     sender: d.sender,
                     to: d.to,
                     amount: d.amount,
-                    bouncebackRecipient: d.bounceback_recipient,
+                    tempoRefundRecipient: d.tempo_refund_recipient,
                     memo: d.memo,
                 }
                 .abi_encode()
@@ -128,7 +128,7 @@ impl L1Deposit {
                     token: d.token,
                     sender: d.sender,
                     amount: d.amount,
-                    bouncebackRecipient: d.bounceback_recipient,
+                    tempoRefundRecipient: d.tempo_refund_recipient,
                     keyIndex: d.key_index,
                     encrypted: AbiEncryptedDepositPayload {
                         ephemeralPubkeyX: d.ephemeral_pubkey_x,
