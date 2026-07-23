@@ -42,7 +42,7 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
 };
 use reth_primitives_traits::{SealedBlock, SealedHeader};
-use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Arc};
+use std::{fmt, num::NonZeroU32, sync::Arc};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 use tempo_evm::{
@@ -56,7 +56,7 @@ use tempo_precompiles::{
     RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
     account_keychain::AccountKeychain, error::Result as TempoResult, nonce::NonceManager,
     receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
-    storage_credits::NonCreditableSlots, tip20::is_tip20_prefix,
+    tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -93,11 +93,13 @@ where
         evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
         l1: L1State<L1>,
     ) -> TempoEvm<L1OverlayDB<DB, L1>, I> {
-        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new());
+        let mut evm = evm
+            .with_storage_credits_enabled(false)
+            .with_fee_manager(ZoneProtocolFeeManager::new());
         let cfg = evm.ctx().cfg.clone();
-        let (_, _, precompiles) = evm.components_mut();
         let actions = StorageActions::disabled();
-        let non_creditable_slots = Rc::new(RefCell::new(NonCreditableSlots::empty()));
+        let non_creditable_slots = evm.non_creditable_slots();
+        let (_, _, precompiles) = evm.components_mut();
         let env = ZonePrecompileEnv::new(&cfg, actions.clone(), non_creditable_slots.clone());
         precompiles.apply_precompile(&TEMPO_STATE_ADDRESS, |_| {
             Some(TempoState::create(l1.clone(), &env))
@@ -132,7 +134,8 @@ where
             Some(create_tip403_precompile(&tip403_env))
         });
         let tip20_l1 = l1.clone();
-        let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots);
+        let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots)
+            .with_storage_credits_enabled(false);
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, tip20_l1.clone()))
