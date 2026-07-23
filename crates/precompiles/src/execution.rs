@@ -29,10 +29,7 @@ use tempo_precompiles::{
     DelegateCallNotAllowed, charge_input_cost,
     dispatch::selector_from_calldata,
     error::TempoPrecompileError,
-    storage::{
-        PrecompileStorageProvider, StorageCtx, actions::StorageActions,
-        evm::EvmPrecompileStorageProvider,
-    },
+    storage::{StorageCtx, actions::StorageActions, evm::EvmPrecompileStorageProvider},
     storage_credits::NonCreditableSlots,
 };
 
@@ -133,7 +130,6 @@ pub(crate) fn create_precompile(
         )
         .with_actions(env.actions.clone())
         .with_non_creditable_slots(env.non_creditable_slots.clone());
-        storage.set_tip1060_storage_credits(false);
 
         let mut result = StorageCtx::enter(&mut storage, || match rules.admit(data, caller) {
             CallCheck::Continue => execute(data, caller),

@@ -93,9 +93,7 @@ where
         evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
         l1: L1State<L1>,
     ) -> TempoEvm<L1OverlayDB<DB, L1>, I> {
-        let mut evm = evm
-            .with_storage_credits_enabled(false)
-            .with_fee_manager(ZoneProtocolFeeManager::new());
+        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new());
         let cfg = evm.ctx().cfg.clone();
         let actions = StorageActions::disabled();
         let non_creditable_slots = evm.non_creditable_slots();
@@ -134,8 +132,7 @@ where
             Some(create_tip403_precompile(&tip403_env))
         });
         let tip20_l1 = l1.clone();
-        let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots)
-            .with_storage_credits_enabled(false);
+        let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots);
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, tip20_l1.clone()))
