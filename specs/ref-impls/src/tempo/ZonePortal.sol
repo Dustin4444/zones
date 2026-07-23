@@ -343,7 +343,6 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Add or remove an account from closed-loop portal flows.
-    /// @dev Setting address(0) enables open-loop account and callback flows.
     function setAllowedAccount(address account, bool allowed) external onlyAdmin {
         _setRole(account, allowed ? Role.Account : Role.None);
     }
@@ -624,15 +623,7 @@ contract ZonePortal is IZonePortal {
     }
 
     function _requireAllowed(address account) internal view {
-        if (!_isAllowed(account)) revert AccountNotAllowed(account);
-    }
-
-    function _isAllowed(address account) internal view returns (bool) {
-        return role[address(0)] == Role.Account || role[account] == Role.Account;
-    }
-
-    function _isGateway(address account) internal view returns (bool) {
-        return role[address(0)] == Role.Account || role[account] == Role.CallbackGateway;
+        if (role[account] != Role.Account) revert AccountNotAllowed(account);
     }
 
     function _validateDepositPolicy(
@@ -702,7 +693,7 @@ contract ZonePortal is IZonePortal {
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
         // Gateways may deposit callback returns without also being allowed accounts.
-        if (!_isGateway(msg.sender)) _requireAllowed(msg.sender);
+        if (role[msg.sender] != Role.CallbackGateway) _requireAllowed(msg.sender);
         _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
@@ -758,7 +749,7 @@ contract ZonePortal is IZonePortal {
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
         // Gateways may deposit callback returns without also being allowed accounts.
-        if (!_isGateway(msg.sender)) _requireAllowed(msg.sender);
+        if (role[msg.sender] != Role.CallbackGateway) _requireAllowed(msg.sender);
         _requireAllowed(tempoRefundRecipient);
 
         _validateDepositsActive(_token);
@@ -885,8 +876,8 @@ contract ZonePortal is IZonePortal {
         if (withdrawal.gasLimit == 0) {
             // Re-check current membership without reverting so an in-flight withdrawal to a
             // revoked account bounces without blocking the FIFO.
-            success =
-                _isAllowed(withdrawal.to) && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
+            success = role[withdrawal.to] == Role.Account
+                && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
             // Isolate callback effects so failure can be caught without reverting the dequeue.
             try this.deliverWithdrawal(
@@ -924,7 +915,7 @@ contract ZonePortal is IZonePortal {
         external
         onlySelf
     {
-        if (!_isGateway(target)) revert InvalidCallbackTarget();
+        if (role[target] != Role.CallbackGateway) revert InvalidCallbackTarget();
         bytes32 depositQueueHashBefore = currentDepositQueueHash;
 
         if (!ITIP20(token).transfer(messenger, amount)) {
@@ -952,8 +943,8 @@ contract ZonePortal is IZonePortal {
             _tryTransfer(_token, admin, bouncebackFee);
         }
 
-        bool success =
-            _isAllowed(withdrawal.to) && _tryTransfer(_token, withdrawal.to, refundAmount);
+        bool success = role[withdrawal.to] == Role.Account
+            && _tryTransfer(_token, withdrawal.to, refundAmount);
 
         if (success) {
             emit DepositBounceBack(withdrawal.to, _token, refundAmount, bouncebackFee);

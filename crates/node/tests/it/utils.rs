@@ -1381,7 +1381,6 @@ impl L1TestNode {
         // The admin is not pre-funded; give it pathUSD to pay for gas on
         // admin-only portal calls.
         self.fund_user(self.admin_address(), 10_000_000).await?;
-        self.set_portal_open_loop_as_admin(portal).await?;
         Ok(portal)
     }
 
@@ -1464,21 +1463,22 @@ impl L1TestNode {
             .ok_or_else(|| eyre::eyre!("SwapAndDepositRouter deployment missing contract address"))
     }
 
-    /// Enable open-loop account and callback flows for legacy E2E fixtures.
-    pub(crate) async fn set_portal_open_loop_as_admin(
+    /// Register an account as a callback gateway on a zone portal.
+    pub(crate) async fn set_portal_gateway_as_admin(
         &self,
         portal_address: Address,
+        account: Address,
     ) -> eyre::Result<()> {
         use tempo_zone_contracts::ZonePortal;
 
         let provider = self.admin_provider();
         let receipt = ZonePortal::new(portal_address, &provider)
-            .setAllowedAccount(Address::ZERO, true)
+            .setGateway(account, true)
             .send()
             .await?
             .get_receipt()
             .await?;
-        eyre::ensure!(receipt.status(), "enabling portal open-loop mode failed");
+        eyre::ensure!(receipt.status(), "registering portal role failed");
         Ok(())
     }
 
@@ -1509,12 +1509,15 @@ impl L1TestNode {
         let provider = self.dev_provider();
         for portal_address in [portal_a, portal_b] {
             let receipt = ZonePortal::new(portal_address, &provider)
-                .setAllowedAccount(Address::ZERO, true)
+                .setGateway(router, true)
                 .send()
                 .await?
                 .get_receipt()
                 .await?;
-            eyre::ensure!(receipt.status(), "enabling portal open-loop mode failed");
+            eyre::ensure!(
+                receipt.status(),
+                "registering router as zone gateway failed"
+            );
         }
 
         Ok((portal_a, portal_b, router))
