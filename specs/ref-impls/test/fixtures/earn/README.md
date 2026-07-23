@@ -6,5 +6,9 @@ They live under `test/fixtures` so Foundry compiles their deployment artifacts w
 vendored contracts as production coverage targets.
 
 The production contracts are unchanged except that `VaultAdapter` and `FeeMath` import the local
-minimal `Math` library. `TestERC1967Proxy` is a test-only deployment helper that lets the copied,
-initializer-based `VaultAdapter` run without copying Earn's OpenZeppelin submodule.
+minimal `Math` library. `TestERC1967Proxy` is a test-only deployment helper for the copied,
+initializer-based `VaultAdapter` and Bridge controller.
+
+The benchmark also copies Bridge's `DirectSwapV2`, TIP-20 controller and handler, auth registry,
+and Earn's `BridgeStableSwapAdapter` from the same revision. The full-journey and swapped-lifecycle
+presets route DLUSD/pathUSD conversions through that stack; StablecoinDEX is not their swap path.
