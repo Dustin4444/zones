@@ -97,8 +97,10 @@ incremental = false
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "6a639b7cd452b6444c3cdbcdc8fac61bd18aee8e" }
 tempo-chainspec = { git = "https://github.com/tempoxyz/tempo", rev = "6a639b7cd452b6444c3cdbcdc8fac61bd18aee8e", default-features = false }
 tempo-consensus = { git = "https://github.com/tempoxyz/tempo", rev = "6a639b7cd452b6444c3cdbcdc8fac61bd18aee8e", default-features = false }
-tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "51cf2db1576a51d87281512c74228d4617ca7ff5", default-features = false, features = [
-  "rpc",
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "6a639b7cd452b6444c3cdbcdc8fac61bd18aee8e", default-features = false, features = [
+  "serde",
+] }
+tempo-zone-factory-contracts = { package = "tempo-contracts", git = "https://github.com/tempoxyz/tempo", rev = "51cf2db1576a51d87281512c74228d4617ca7ff5", default-features = false, features = [
   "serde",
 ] }
 tempo-evm = { git = "https://github.com/tempoxyz/tempo", rev = "6a639b7cd452b6444c3cdbcdc8fac61bd18aee8e", default-features = false }

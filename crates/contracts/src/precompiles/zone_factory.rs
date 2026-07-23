@@ -2,7 +2,7 @@
 
 use alloy_primitives::{FixedBytes, fixed_bytes};
 
-pub use tempo_contracts::precompiles::zone_factory::{
+pub use tempo_zone_factory_contracts::precompiles::zone_factory::{
     IZoneFactory as ZoneFactory, ZONE_FACTORY_ADDRESS, ZONE_MESSENGER_ADDRESS,
     ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneInfo,
 };

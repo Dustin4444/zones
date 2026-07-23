@@ -15,7 +15,7 @@ workspace = true
 zone-primitives = { workspace = true, default-features = false }
 
 # tempo
-tempo-contracts = { workspace = true, default-features = false }
+tempo-zone-factory-contracts = { workspace = true, default-features = false }
 
 # alloy
 alloy-primitives = { workspace = true, default-features = false }
@@ -37,7 +37,7 @@ std = [
     "alloy-primitives/std",
     "alloy-sol-types/std",
     "serde?/std",
-    "tempo-contracts/std",
+    "tempo-zone-factory-contracts/std",
     "zone-primitives/std",
 ]
 serde = ["dep:serde", "alloy-primitives/serde"]
