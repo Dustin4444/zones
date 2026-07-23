@@ -31,13 +31,13 @@ impl ZoneFeeManager {
         self.default_fee_token.read()
     }
 
-    /// Debits the maximum fee and provisionally credits it to the block beneficiary.
+    /// Debits the maximum fee into protocol-private escrow for post-transaction settlement.
     pub fn collect_fee_pre_tx(
         &mut self,
         fee_payer: Address,
         fee_token: Address,
         max_amount: U256,
-        beneficiary: Address,
+        _beneficiary: Address,
     ) -> Result<Address> {
         let mut token = TIP20Token::from_address(fee_token)?;
         token.ensure_authorized_as(&[(fee_payer, AuthRole::sender())])?;
@@ -45,11 +45,11 @@ impl ZoneFeeManager {
         token.check_and_update_spending_limit(fee_payer, max_amount)?;
 
         token.decrement_balance(fee_payer, max_amount)?;
-        token.increment_balance(beneficiary, max_amount)?;
+        token.increment_balance(self.address, max_amount)?;
         Ok(fee_token)
     }
 
-    /// Refunds unused gas from the beneficiary and emits the net fee transfer.
+    /// Refunds unused gas from escrow and settles the actual fee to the beneficiary.
     pub fn collect_fee_post_tx(
         &mut self,
         fee_payer: Address,
@@ -64,11 +64,14 @@ impl ZoneFeeManager {
         if !refund.is_zero() {
             AccountKeychain::new().refund_spending_limit(fee_payer, fee_token, refund)?;
 
-            token.decrement_balance(beneficiary, refund)?;
+            token.decrement_balance(self.address, refund)?;
             token.increment_balance(fee_payer, refund)?;
         }
 
         if !actual_spending.is_zero() {
+            token.ensure_authorized_as(&[(beneficiary, AuthRole::recipient())])?;
+            token.decrement_balance(self.address, actual_spending)?;
+            token.increment_balance(beneficiary, actual_spending)?;
             StorageCtx.emit_event(
                 fee_token,
                 TIP20Event::transfer(fee_payer, beneficiary, actual_spending).into_log_data(),
@@ -92,14 +95,16 @@ mod tests {
     };
 
     #[test]
-    fn settles_fees_directly_to_beneficiary() -> eyre::Result<()> {
+    fn settles_fees_from_escrow_to_beneficiary() -> eyre::Result<()> {
         let mut storage = HashMapStorageProvider::new(1);
         StorageCtx::enter(&mut storage, || {
-            let (user, beneficiary) = (Address::random(), Address::random());
+            let (user, beneficiary, recipient) =
+                (Address::random(), Address::random(), Address::random());
             let admin = Address::random();
             let mut token = TIP20Setup::create("USD", "USD", admin)
                 .with_issuer(admin)
                 .with_mint(user, U256::from(10_000))
+                .with_mint(beneficiary, U256::from(1_000))
                 .apply()?;
             let mut manager = ZoneFeeManager::new();
             manager.initialize(token.address())?;
@@ -107,6 +112,22 @@ mod tests {
             token.clear_emitted_events();
             manager.collect_fee_pre_tx(user, token.address(), U256::from(5_000), beneficiary)?;
             assert!(token.emitted_events().is_empty());
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: ZONE_FEE_MANAGER_ADDRESS,
+                })?,
+                U256::from(5_000),
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall {
+                    account: beneficiary,
+                })?,
+                U256::from(1_000),
+            );
+
+            // Beneficiary activity during user execution cannot touch the escrowed refund.
+            token.decrement_balance(beneficiary, U256::from(1_000))?;
+            token.increment_balance(recipient, U256::from(1_000))?;
             manager.collect_fee_post_tx(
                 user,
                 U256::from(3_000),
@@ -136,6 +157,10 @@ mod tests {
                     account: beneficiary
                 })?,
                 U256::from(3_000)
+            );
+            assert_eq!(
+                token.balance_of(ITIP20::balanceOfCall { account: recipient })?,
+                U256::from(1_000),
             );
             assert_eq!(
                 token.balance_of(ITIP20::balanceOfCall { account: user })?,
