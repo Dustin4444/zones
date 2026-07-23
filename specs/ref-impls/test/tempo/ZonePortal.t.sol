@@ -1600,6 +1600,29 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueSlot(0), wrappedHash);
     }
 
+    /// @notice The first batch must import Tempo: a zero Tempo checkpoint (the former
+    ///         anchorless bootstrap shape) is rejected even while `blockHash` is still zero.
+    function test_submitBatch_revertsOnZeroTempoBlockNumber() public {
+        assertEq(portal.blockHash(), bytes32(0));
+
+        vm.expectRevert(IZonePortal.InvalidTempoBlockNumber.selector);
+        _submitBatch(
+            portal,
+            0,
+            0,
+            BlockTransition({ prevBlockHash: bytes32(0), nextBlockHash: keccak256("genesis") }),
+            DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: bytes32(0),
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0
+                }),
+            bytes32(0),
+            "",
+            ""
+        );
+    }
+
     function test_submitBatch_revertsOnPrevBlockHashMismatch() public {
         // Advance a block so the history precompile can return a hash
         vm.roll(block.number + 1);
