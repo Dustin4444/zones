@@ -33,5 +33,5 @@ jobs:
       - name: Update changed runtimes
         env:
           RPC_URL: ${{ secrets.TEMPO_NEXTFORK_RPC_URL }}
-          FACTORY_OWNER_PRIVATE_KEY: ${{ secrets.ZONE_FACTORY_OWNER_PRIVATE_KEY }}
+          FACTORY_OWNER_PRIVATE_KEY: ${{ secrets.FACTORY_OWNER_PRIVATE_KEY }}
         run: scripts/update-nextfork-zone-runtimes.sh
