@@ -1,4 +1,4 @@
-name: Update nextfork Zone runtimes
+name: Update zone-unstable L1 Zone runtimes
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: update-nextfork-zone-runtimes
+  group: update-zone-unstable-l1-zone-runtimes
   cancel-in-progress: false
 
 jobs:
@@ -22,6 +22,13 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3.3.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
       - name: Install Foundry
         uses: tempoxyz/gh-actions/actions/setup-foundry@98b1081dcf34361b576aca2ab3041772708582ef
         with:
@@ -32,6 +39,6 @@ jobs:
 
       - name: Update changed runtimes
         env:
-          RPC_URL: ${{ secrets.TEMPO_NEXTFORK_RPC_URL }}
+          RPC_URL: http://zone-factory-hf-val-rpc-service.tail388b2e.ts.net:8545
           FACTORY_OWNER_PRIVATE_KEY: ${{ secrets.FACTORY_OWNER_PRIVATE_KEY }}
         run: scripts/update-nextfork-zone-runtimes.sh
