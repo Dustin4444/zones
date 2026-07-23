@@ -9,6 +9,7 @@
 
 mod database;
 mod executor;
+mod fee_manager;
 pub mod precompiles;
 mod zone_evm;
 
@@ -16,11 +17,14 @@ pub use database::{L1OverlayDB, ZoneDbError};
 pub use executor::ZoneBlockExecutor;
 pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
 
-use crate::precompiles::{
-    AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
-    L1State, L1StorageReader, TIP403_REGISTRY_ADDRESS, TempoState, ZONE_TIP20_FACTORY_ADDRESS,
-    ZonePrecompileEnv, ZoneTokenFactory, create_tip20_precompile, create_tip403_precompile,
-    tx_context::ZoneTxContext,
+use crate::{
+    fee_manager::ZoneProtocolFeeManager,
+    precompiles::{
+        AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
+        L1State, L1StorageReader, TIP403_REGISTRY_ADDRESS, TempoState, ZONE_FEE_MANAGER_ADDRESS,
+        ZONE_TIP20_FACTORY_ADDRESS, ZonePrecompileEnv, ZoneTokenFactory, create_tip20_precompile,
+        create_tip403_precompile, create_zone_fee_manager_precompile, tx_context::ZoneTxContext,
+    },
 };
 use alloy_evm::{
     Database, Evm, EvmEnv, EvmFactory,
@@ -38,25 +42,26 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
 };
 use reth_primitives_traits::{SealedBlock, SealedHeader};
-use std::{cell::RefCell, fmt, num::NonZeroU32, rc::Rc, sync::Arc};
+use std::{fmt, num::NonZeroU32, sync::Arc};
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::TempoChainSpec;
+use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 use tempo_evm::{
-    TempoBlockAssembler, TempoBlockEnv, TempoBlockExecutionCtx, TempoEvmConfig, TempoEvmError,
-    TempoHaltReason, TempoNextBlockEnvAttributes,
+    FeeTokenResolver, TempoBlockAssembler, TempoBlockEnv, TempoBlockExecutionCtx, TempoEvmConfig,
+    TempoEvmError, TempoHaltReason, TempoNextBlockEnvAttributes, TempoStateAccess,
     evm::{TempoEvm, TempoEvmFactory},
 };
 use tempo_payload_types::TempoExecutionData;
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv,
     RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    account_keychain::AccountKeychain, nonce::NonceManager,
+    account_keychain::AccountKeychain, error::Result as TempoResult, nonce::NonceManager,
     receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
-    storage_credits::NonCreditableSlots, tip_fee_manager::TipFeeManager, tip20::is_tip20_prefix,
+    tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
 };
+use tempo_revm::TempoTxEnv;
 use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_OUTBOX_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::{L1StateCache, L1StateProvider, L1StateProviderConfig};
@@ -85,13 +90,14 @@ where
 
     fn register_precompiles<DB: Database, I: Inspector<TempoCtx<L1OverlayDB<DB, L1>>>>(
         &self,
-        mut evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
+        evm: TempoEvm<L1OverlayDB<DB, L1>, I>,
         l1: L1State<L1>,
     ) -> TempoEvm<L1OverlayDB<DB, L1>, I> {
+        let mut evm = evm.with_fee_manager(ZoneProtocolFeeManager::new());
         let cfg = evm.ctx().cfg.clone();
-        let (_, _, precompiles) = evm.components_mut();
         let actions = StorageActions::disabled();
-        let non_creditable_slots = Rc::new(RefCell::new(NonCreditableSlots::empty()));
+        let non_creditable_slots = evm.non_creditable_slots();
+        let (_, _, precompiles) = evm.components_mut();
         let env = ZonePrecompileEnv::new(&cfg, actions.clone(), non_creditable_slots.clone());
         precompiles.apply_precompile(&TEMPO_STATE_ADDRESS, |_| {
             Some(TempoState::create(l1.clone(), &env))
@@ -111,6 +117,11 @@ where
         precompiles.apply_precompile(&ZONE_TIP20_FACTORY_ADDRESS, |_| {
             Some(ZoneTokenFactory::create(&env))
         });
+        precompiles.apply_precompile(&TIP_FEE_MANAGER_ADDRESS, |_| None);
+        let fee_env = env.clone();
+        precompiles.apply_precompile(&ZONE_FEE_MANAGER_ADDRESS, move |_| {
+            Some(create_zone_fee_manager_precompile(&fee_env))
+        });
         let tip403_env = env.clone();
         precompiles.apply_precompile(&TIP403_REGISTRY_ADDRESS, move |_| {
             Some(create_tip403_precompile(&tip403_env))
@@ -120,8 +131,6 @@ where
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, tip20_l1.clone()))
-            } else if *address == TIP_FEE_MANAGER_ADDRESS {
-                Some(TipFeeManager::create_precompile(&tempo_env))
             } else if *address == STABLECOIN_DEX_ADDRESS {
                 None
             } else if *address == NONCE_PRECOMPILE_ADDRESS {
@@ -241,6 +250,22 @@ pub struct ZoneEvmConfig<L1 = L1StateProvider> {
     block_assembler: ZoneBlockAssembler,
 }
 
+impl<L1> FeeTokenResolver for ZoneEvmConfig<L1> {
+    fn resolve_fee_token<S, M>(
+        &self,
+        state: &mut S,
+        tx: &TempoTxEnv,
+        _fee_payer: Address,
+        spec: TempoHardfork,
+        actions: StorageActions,
+    ) -> TempoResult<Address>
+    where
+        S: TempoStateAccess<M>,
+    {
+        fee_manager::resolve_fee_token(state, tx, spec, actions)
+    }
+}
+
 impl<L1> ZoneEvmConfig<L1>
 where
     L1: L1StorageReader,
@@ -289,8 +314,7 @@ impl ZoneEvmConfig {
     ///
     /// Intended for CLI subcommands (import, stage, re-execute) that need a type-compatible
     /// EVM config but don't have access to an L1 RPC connection. Tempo hardfork conditions come
-    /// from `chain_spec` because the parent L1 spec cannot be resolved in this mode. The portal
-    /// address defaults to zero, so sequencer reads are unavailable.
+    /// from `chain_spec` because the parent L1 spec cannot be resolved in this mode.
     pub fn new_without_l1(chain_spec: Arc<ZoneChainSpec>) -> Self {
         let cache = L1StateCache::default();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
