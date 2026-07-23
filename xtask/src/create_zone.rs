@@ -10,10 +10,11 @@ use alloy::{
     sol_types::SolEvent,
 };
 use alloy_rlp::Encodable;
-use eyre::{WrapErr as _, eyre};
+use eyre::{WrapErr as _, ensure, eyre};
 use std::path::PathBuf;
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_contracts::precompiles::{ITIP403Registry, TIP403_REGISTRY_ADDRESS};
 use tempo_zone_contracts::{ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory};
 use zone_primitives::constants::zone_chain_id;
 
@@ -101,9 +102,43 @@ impl CreateZone {
             .await?;
 
         let factory = ZoneFactory::new(self.zone_factory, &provider);
+        let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
 
         println!("Verifier: {ZONE_VERIFIER_ADDRESS}");
         println!("Messenger: {ZONE_MESSENGER_ADDRESS}");
+
+        let mut policy = registry
+            .tokenTransferPolicyId(self.initial_token)
+            .call()
+            .await
+            .wrap_err("failed querying the initial token transfer policy")?;
+        if !policy.isSet {
+            println!("Migrating the initial token's legacy transfer policy into TIP-403...");
+            let receipt = registry
+                .migrateTransferPolicyIds(vec![self.initial_token])
+                .send_sync()
+                .await
+                .wrap_err("failed migrating the initial token transfer policy")?;
+            ensure!(
+                receipt.status(),
+                "initial token transfer-policy migration reverted (tx: {:?})",
+                receipt.transaction_hash
+            );
+            policy = registry
+                .tokenTransferPolicyId(self.initial_token)
+                .call()
+                .await
+                .wrap_err("failed verifying the migrated initial token transfer policy")?;
+            ensure!(
+                policy.isSet,
+                "TIP-403 did not register the initial token transfer policy"
+            );
+            println!(
+                "Initial token transfer policy migrated in block {:?}",
+                receipt.block_number
+            );
+        }
+        println!("Initial token transfer policy: {}", policy.policyId);
 
         // Anchor before createZone so the zone replays the creation block and its
         // initial TokenEnabled event during L1 backfill.
