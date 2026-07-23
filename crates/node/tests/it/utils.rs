@@ -2641,23 +2641,25 @@ pub(crate) async fn spawn_sequencer(
     portal_address: Address,
     sequencer_signer: alloy_signer_local::PrivateKeySigner,
 ) -> zone_sequencer::ZoneSequencerHandle {
-    spawn_sequencer_with_anchor_config(
+    spawn_sequencer_with_config(
         l1,
         zone,
         portal_address,
         sequencer_signer,
         zone_sequencer::BatchAnchorConfig::default(),
+        zone_sequencer::WithdrawalBatchLimits::default(),
     )
     .await
 }
 
-/// Spawn the zone sequencer background tasks with custom EIP-2935 anchor limits.
-pub(crate) async fn spawn_sequencer_with_anchor_config(
+/// Spawn the zone sequencer background tasks with custom limits.
+pub(crate) async fn spawn_sequencer_with_config(
     l1: &L1TestNode,
     zone: &ZoneTestNode,
     portal_address: Address,
     sequencer_signer: alloy_signer_local::PrivateKeySigner,
     batch_anchor_config: zone_sequencer::BatchAnchorConfig,
+    withdrawal_batch_limits: zone_sequencer::WithdrawalBatchLimits,
 ) -> zone_sequencer::ZoneSequencerHandle {
     use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
@@ -2666,7 +2668,7 @@ pub(crate) async fn spawn_sequencer_with_anchor_config(
         l1_rpc_url: l1.http_url().to_string(),
         retry_connection_interval: Duration::from_millis(100),
         withdrawal_poll_interval: Duration::from_millis(500),
-        withdrawal_batch_limits: zone_sequencer::WithdrawalBatchLimits::default(),
+        withdrawal_batch_limits,
         outbox_address: ZONE_OUTBOX_ADDRESS,
         inbox_address: ZONE_INBOX_ADDRESS,
         tempo_state_address: TEMPO_STATE_ADDRESS,
