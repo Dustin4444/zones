@@ -1,18 +1,13 @@
 //! Adapter between Tempo's protocol fee hooks and the Zone fee manager.
 
-use alloy_evm::{
-    Database,
-    revm::context::{Journal, result::EVMError},
-};
+use alloy_evm::{Database, revm::context::Journal};
 use alloy_primitives::{Address, U256};
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_evm::{ProtocolFeeContext, ProtocolFeeManager};
-use tempo_precompiles::{
-    error::Result,
-    storage::{ContractStorage, StorageActions},
-    tip20::TIP20Token,
+use tempo_precompiles::{error::Result, storage::StorageActions};
+use tempo_revm::{
+    FeeTokenValidation, FeeTokenValidationContext, TempoStateAccess, TempoTx, TempoTxEnv,
 };
-use tempo_revm::{TempoInvalidTransaction, TempoStateAccess, TempoTx, TempoTxEnv};
 use zone_precompiles::ZoneFeeManager;
 
 /// Resolves the fee token selected by a Zone transaction against the supplied state view.
@@ -64,23 +59,14 @@ where
 
     fn validate_fee_token(
         &self,
-        journal: &mut Journal<DB>,
+        ctx: &mut FeeTokenValidationContext<'_, DB>,
         fee_token: Address,
-        spec: TempoHardfork,
-        actions: StorageActions,
-    ) -> core::result::Result<(), EVMError<DB::Error, TempoInvalidTransaction>> {
-        let initialized = journal
-            .with_read_only_storage_ctx(spec, actions, || {
-                // The handler validates the TIP-20 prefix before entering this hook.
-                TIP20Token::from_address_unchecked(fee_token).is_initialized()
-            })
-            .map_err(|error| EVMError::Custom(error.to_string()))?;
-
-        if !initialized {
-            return Err(TempoInvalidTransaction::InvalidFeeToken(fee_token).into());
-        }
-
-        Ok(())
+    ) -> Result<FeeTokenValidation> {
+        Ok(if ctx.is_initialized(fee_token)? {
+            FeeTokenValidation::Valid
+        } else {
+            FeeTokenValidation::Invalid
+        })
     }
 
     fn collect_fee_pre_tx(
@@ -178,25 +164,20 @@ mod tests {
         let mut journal = Journal::new(db);
         let manager = ZoneProtocolFeeManager::new();
 
-        assert!(
-            manager
-                .validate_fee_token(
-                    &mut journal,
-                    initialized_token,
-                    TempoHardfork::T9,
-                    StorageActions::disabled(),
-                )
-                .is_ok()
+        let mut ctx = FeeTokenValidationContext::new(
+            &mut journal,
+            TempoHardfork::T9,
+            StorageActions::disabled(),
         );
-        assert!(matches!(
-            manager.validate_fee_token(
-                &mut journal,
-                missing_token,
-                TempoHardfork::T9,
-                StorageActions::disabled(),
-            ),
-            Err(EVMError::Transaction(TempoInvalidTransaction::InvalidFeeToken(address)))
-                if address == missing_token
-        ));
+        assert_eq!(
+            manager
+                .validate_fee_token(&mut ctx, initialized_token)
+                .unwrap(),
+            FeeTokenValidation::Valid
+        );
+        assert_eq!(
+            manager.validate_fee_token(&mut ctx, missing_token).unwrap(),
+            FeeTokenValidation::Invalid
+        );
     }
 }
