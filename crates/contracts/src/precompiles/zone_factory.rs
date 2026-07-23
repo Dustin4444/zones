@@ -26,8 +26,6 @@ crate::sol! {
         }
         struct CreateZoneParams {
             address initialToken;
-            address[] allowedAccounts;
-            address[] zoneGateways;
             address admin;
             address[] sequencers;
             uint8 threshold;

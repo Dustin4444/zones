@@ -1405,8 +1405,6 @@ impl L1TestNode {
                 sequencers: vec![sequencer],
                 threshold: 1,
                 rpcUrl: String::new(),
-                allowedAccounts: Vec::new(),
-                zoneGateways: Vec::new(),
             })
             .send()
             .await?

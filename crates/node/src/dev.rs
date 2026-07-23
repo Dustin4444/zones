@@ -67,8 +67,8 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         dev_key,
         factory,
         initial_token,
-        zone_gateways,
-        allowed_accounts,
+        zone_gateways: _,
+        allowed_accounts: _,
         rpc_url,
     } = config;
     let dev_address = dev_key.address();
@@ -111,8 +111,6 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
     let receipt = factory
         .createZone(ZoneFactory::CreateZoneParams {
             initialToken: initial_token,
-            allowedAccounts: allowed_accounts,
-            zoneGateways: zone_gateways,
             admin: dev_address,
             sequencers: vec![dev_address],
             threshold: 1,
