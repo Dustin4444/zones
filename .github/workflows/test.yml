@@ -18,12 +18,18 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  build-test-artifacts:
-    name: build test artifacts
+  # sccache caches compilation, mold keeps linking cheap — faster than
+  # shipping a target-dir cache between jobs (same setup as tempo/reth).
+  test:
+    name: test (${{ matrix.partition }}/3)
     runs-on: depot-ubuntu-latest-16
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -41,6 +47,7 @@ jobs:
       - uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
         with:
           toolchain: stable
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
           tool: nextest@0.9.124
@@ -77,60 +84,11 @@ jobs:
             --no-lint \
             --out "$GITHUB_WORKSPACE/specs/ref-impls/out"
 
-      - name: Build and archive tests
-        run: cargo nextest archive --profile ci --archive-file nextest-archive.tar.zst
+      - name: Build and compile tests
+        run: cargo nextest run --profile ci --partition count:${{ matrix.partition }}/3 --no-run
 
-      - name: Upload test artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-archive
-          path: |
-            nextest-archive.tar.zst
-            specs/ref-impls/out
-          if-no-files-found: error
-          retention-days: 1
-          # The nextest archive is already zstd-compressed; recompressing it is
-          # slower and does not materially reduce artifact transfer size.
-          compression-level: 0
-
-  test:
-    name: test (${{ matrix.partition }}/2)
-    runs-on: depot-ubuntu-latest-16
-    needs: build-test-artifacts
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2]
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      # The run phase consumes prebuilt binaries and does not need Rust/Cargo.
-      - name: Prepare nextest install directory
-        run: mkdir -p "$HOME/.cargo/bin"
-
-      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
-        with:
-          tool: nextest@0.9.124
-
-      - name: Download test artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: nextest-archive
-          path: .
-
-      - name: Run test shard
-        run: |
-          cargo-nextest nextest run \
-            --archive-file nextest-archive.tar.zst \
-            --workspace-remap "$GITHUB_WORKSPACE" \
-            --profile ci \
-            --partition hash:${{ matrix.partition }}/2
+      - name: Run tests
+        run: cargo nextest run --profile ci --partition count:${{ matrix.partition }}/3
 
   test-success:
     name: test success
@@ -138,7 +96,6 @@ jobs:
     if: always()
     permissions: {}
     needs:
-      - build-test-artifacts
       - test
     timeout-minutes: 30
     steps:
