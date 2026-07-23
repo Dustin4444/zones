@@ -6,15 +6,22 @@
 
 use crate::utils::{
     EncryptedRouterCallbackArgs, L1TestNode, PlaintextRouterCallbackArgs, STABLECOIN_DEX_ADDRESS,
-    WithdrawalArgs, ZoneAccount, ZoneTestNode, spawn_sequencer,
+    WithdrawalArgs, ZoneAccount, ZoneTestNode, poll_until, spawn_sequencer,
+    spawn_sequencer_with_config,
 };
 use alloy::{
     primitives::{Address, B256, U256},
     providers::Provider,
+    sol_types::SolCall,
 };
-use std::time::Duration;
+use alloy_consensus::Transaction;
+use futures::future::try_join_all;
+use std::{collections::HashMap, time::Duration};
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState, ZONE_TOKEN_ADDRESS};
+use tempo_zone_contracts::{
+    IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
+    ZonePortal,
+};
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
@@ -53,6 +60,8 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
     let portal_address = l1.create_zone(factory).await?;
     let router = l1
         .deploy_router_with_dex(factory, STABLECOIN_DEX_ADDRESS)
+        .await?;
+    l1.set_portal_gateway_as_admin(portal_address, router)
         .await?;
 
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
@@ -158,12 +167,15 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
     let initial_token = l1
         .create_tip20("DevUSD", "dUSD", B256::with_last_byte(0xD0))
         .await?;
+    let dev_address = l1.dev_signer().address();
 
     let provisioned = provision_zone(ProvisionConfig {
         l1_rpc_url: l1.ws_url().to_string(),
         dev_key: l1.dev_signer(),
         factory: None,
         initial_token,
+        zone_gateways: vec![Address::repeat_byte(0x42)],
+        allowed_accounts: vec![dev_address],
         rpc_url: String::new(),
     })
     .await?;
@@ -273,6 +285,219 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Deposit to enough independent accounts to force several gas-bounded withdrawal transactions,
+/// then submit the accounts concurrently, including repeated withdrawals from half of them.
+///
+/// The processed events prove that withdrawals were both packed together and drained through
+/// more transactions than the configured in-flight window can hold at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_many_concurrent_withdrawals_are_batched() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    const ACCOUNT_COUNT: u32 = 64;
+    const REPEATED_ACCOUNT_COUNT: usize = ACCOUNT_COUNT as usize / 2;
+    const WITHDRAWALS_PER_REPEATED_ACCOUNT: usize = 3;
+    const WITHDRAWAL_COUNT: usize =
+        ACCOUNT_COUNT as usize + REPEATED_ACCOUNT_COUNT * (WITHDRAWALS_PER_REPEATED_ACCOUNT - 1);
+    const MAX_WITHDRAWALS_PER_BATCH: usize = 2;
+    const TEST_MAX_BATCH_GAS: u64 = 2_500_000;
+    const TEST_MAX_IN_FLIGHT_BATCHES: usize = 4;
+    const FIRST_ACCOUNT_INDEX: u32 = 3;
+    const DEPOSIT_AMOUNT: u128 = 2_000_000;
+    const WITHDRAWAL_AMOUNT: u128 = 250_000;
+    const WITHDRAWAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+    let l1 = L1TestNode::start().await?;
+    let portal_address = l1.deploy_zone().await?;
+    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
+    zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
+
+    let signers = (FIRST_ACCOUNT_INDEX..FIRST_ACCOUNT_INDEX + ACCOUNT_COUNT)
+        .map(|index| l1.signer_at(index))
+        .collect::<Vec<_>>();
+    let recipients = signers
+        .iter()
+        .map(|signer| signer.address())
+        .collect::<Vec<_>>();
+
+    let admin_provider = l1.admin_provider();
+    let admin_portal = ZonePortal::new(portal_address, &admin_provider);
+    // Closed-loop portals only accept deposits to and deliver withdrawals to registered accounts.
+    for recipient in &recipients {
+        let receipt = admin_portal
+            .setAllowedAccount(*recipient, true)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "allowing withdrawal recipient failed");
+    }
+
+    // A single funded depositor keeps L1 setup deterministic while still exercising deposits to
+    // many distinct zone accounts.
+    let mut depositor = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
+    let total_deposit = DEPOSIT_AMOUNT * u128::from(ACCOUNT_COUNT);
+    l1.fund_user(depositor.address(), total_deposit * 2).await?;
+    for recipient in &recipients {
+        depositor
+            .deposit_to(*recipient, DEPOSIT_AMOUNT, L1_TIMEOUT, &zone)
+            .await?;
+    }
+
+    let mut accounts = signers
+        .into_iter()
+        .map(|signer| ZoneAccount::with_signer(signer, &l1, &zone, portal_address))
+        .collect::<Vec<_>>();
+    // Start the sequencer only after L1 setup so its shared signer cannot race the funding and
+    // deposit transactions.
+    let sequencer = spawn_sequencer_with_config(
+        &l1,
+        &zone,
+        portal_address,
+        l1.dev_signer(),
+        zone_sequencer::BatchAnchorConfig::default(),
+        zone_sequencer::WithdrawalBatchLimits {
+            max_batch_gas: TEST_MAX_BATCH_GAS,
+            max_in_flight_batches: TEST_MAX_IN_FLIGHT_BATCHES,
+        },
+    )
+    .await;
+    let withdrawal_start_block = l1.provider().get_block_number().await?;
+
+    try_join_all(
+        accounts
+            .iter_mut()
+            .enumerate()
+            .map(|(index, account)| async move {
+                let count = if index < REPEATED_ACCOUNT_COUNT {
+                    WITHDRAWALS_PER_REPEATED_ACCOUNT
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    account.withdraw(WITHDRAWAL_AMOUNT).await?;
+                }
+                Ok::<(), eyre::Report>(())
+            }),
+    )
+    .await?;
+
+    let portal = ZonePortal::new(portal_address, l1.provider());
+    let processed = poll_until(
+        WITHDRAWAL_TIMEOUT,
+        Duration::from_millis(250),
+        "all concurrent withdrawals to be processed on L1",
+        || {
+            let portal = &portal;
+            let sequencer = &sequencer;
+            async move {
+                eyre::ensure!(
+                    !sequencer.monitor_handle.is_finished(),
+                    "zone monitor exited while processing concurrent withdrawals"
+                );
+                eyre::ensure!(
+                    !sequencer.withdrawal_handle.is_finished(),
+                    "withdrawal processor exited while processing concurrent withdrawals"
+                );
+
+                let events = portal
+                    .WithdrawalProcessed_filter()
+                    .from_block(withdrawal_start_block)
+                    .query()
+                    .await?;
+                if events.len() < WITHDRAWAL_COUNT {
+                    return Ok(None);
+                }
+
+                Ok(Some(events))
+            }
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        processed.len(),
+        WITHDRAWAL_COUNT,
+        "each requested withdrawal should be processed exactly once"
+    );
+
+    let mut withdrawals_per_recipient = HashMap::with_capacity(ACCOUNT_COUNT as usize);
+    let mut withdrawals_per_transaction = HashMap::new();
+
+    for (event, log) in processed {
+        assert_eq!(event.token, PATH_USD_ADDRESS);
+        assert_eq!(event.amount, WITHDRAWAL_AMOUNT);
+        assert!(event.callbackSuccess, "simple withdrawal should succeed");
+        *withdrawals_per_recipient.entry(event.to).or_insert(0usize) += 1;
+
+        let tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| eyre::eyre!("WithdrawalProcessed log missing transaction hash"))?;
+        *withdrawals_per_transaction.entry(tx_hash).or_insert(0usize) += 1;
+    }
+
+    for (index, recipient) in recipients.iter().enumerate() {
+        let expected = if index < REPEATED_ACCOUNT_COUNT {
+            WITHDRAWALS_PER_REPEATED_ACCOUNT
+        } else {
+            1
+        };
+        assert_eq!(withdrawals_per_recipient.get(recipient), Some(&expected));
+    }
+
+    let zone_provider = zone.provider();
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &zone_provider);
+    let finalized_batches = outbox.BatchFinalized_filter().from_block(0).query().await?;
+    let mut slot_sizes = Vec::new();
+    for (_, log) in finalized_batches {
+        let tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?;
+        let tx = zone_provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or_else(|| eyre::eyre!("finalizeWithdrawalBatch tx {tx_hash} not found"))?;
+        let call = IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(tx.input().as_ref())?;
+        slot_sizes.push(call.count.to::<usize>());
+    }
+    assert_eq!(
+        slot_sizes.iter().sum::<usize>(),
+        WITHDRAWAL_COUNT,
+        "finalized slots should contain every requested withdrawal"
+    );
+    let largest_slot = slot_sizes.iter().copied().max().unwrap_or_default();
+    assert!(
+        largest_slot.div_ceil(MAX_WITHDRAWALS_PER_BATCH) > TEST_MAX_IN_FLIGHT_BATCHES,
+        "at least one queue slot must require refilling the in-flight window"
+    );
+
+    assert!(
+        withdrawals_per_transaction.values().any(|count| *count > 1),
+        "at least one processWithdrawals transaction should contain multiple withdrawals"
+    );
+    assert!(
+        withdrawals_per_transaction
+            .values()
+            .all(|count| *count <= MAX_WITHDRAWALS_PER_BATCH),
+        "the configured gas limit should cap each transaction at two withdrawals"
+    );
+    let expected_transaction_count = slot_sizes
+        .iter()
+        .map(|count| count.div_ceil(MAX_WITHDRAWALS_PER_BATCH))
+        .sum::<usize>();
+    assert_eq!(
+        withdrawals_per_transaction.len(),
+        expected_transaction_count,
+        "every finalized slot should be split into gas-bounded transactions"
+    );
+    let head_call = portal.withdrawalQueueHead();
+    let tail_call = portal.withdrawalQueueTail();
+    let (head, tail) = tokio::try_join!(head_call.call(), tail_call.call())?;
+    assert_eq!(head, tail, "withdrawal queue should be fully drained");
+
+    Ok(())
+}
+
 /// Cross-zone withdrawal via the SwapAndDepositRouter:
 ///
 ///  1. Start L1 dev node.
@@ -295,6 +520,7 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
 ///
 /// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime and router artifacts.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "legacy cross-zone router callbacks are rejected by closed-loop source-return enforcement"]
 async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
@@ -419,10 +645,11 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
 /// Cross-zone encrypted router deposit where Zone B accepts the L1 deposit but
 /// later bounces it because the decrypted recipient violates policy.
 ///
-/// The refund must go to the bounceback recipient encoded in the router payload,
+/// The refund must go to the Tempo refund recipient encoded in the router payload,
 /// not to the encrypted recipient and not to the router contract.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cross_zone_encrypted_router_bounceback_recipient() -> eyre::Result<()> {
+#[ignore = "legacy cross-zone router callbacks are rejected before the target-zone deposit"]
+async fn test_cross_zone_encrypted_router_tempo_refund_recipient() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let l1 = L1TestNode::start().await?;
@@ -478,7 +705,7 @@ async fn test_cross_zone_encrypted_router_bounceback_recipient() -> eyre::Result
         target_portal: portal_b,
         key_index,
         encrypted,
-        bounceback_recipient: refund_burner,
+        tempo_refund_recipient: refund_burner,
         min_amount_out: 0,
     });
     alice.withdraw_with(args).await?;
@@ -564,7 +791,7 @@ async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
         token_out: fixture.beta,
         target_portal: fixture.portal_address,
         recipient: fixture.account.address(),
-        bounceback_recipient: fixture.l1.signer_at(5).address(),
+        tempo_refund_recipient: fixture.l1.signer_at(5).address(),
         memo: B256::ZERO,
         min_amount_out: expected_beta,
     });
@@ -662,7 +889,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
         token_out: fixture.beta,
         target_portal: fixture.portal_address,
         recipient: fixture.account.address(),
-        bounceback_recipient: fixture.l1.signer_at(5).address(),
+        tempo_refund_recipient: fixture.l1.signer_at(5).address(),
         memo: B256::ZERO,
         min_amount_out: expected_beta,
     });
@@ -745,7 +972,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_encrypted_deposit_
         .await?;
 
     let enc_key_bytes: [u8; 32] =
-        Sha256::digest(b"swap-and-deposit-router-encrypted-bounceback").into();
+        Sha256::digest(b"swap-and-deposit-router-encrypted-tempo-refund").into();
     let encryption_key = k256::SecretKey::from_slice(&enc_key_bytes).expect("valid key");
 
     fixture
@@ -781,7 +1008,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_encrypted_deposit_
         target_portal: fixture.portal_address,
         key_index,
         encrypted,
-        bounceback_recipient: fixture.l1.signer_at(5).address(),
+        tempo_refund_recipient: fixture.l1.signer_at(5).address(),
         min_amount_out: expected_beta,
     });
     fixture

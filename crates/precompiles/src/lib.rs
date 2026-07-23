@@ -62,9 +62,6 @@ pub use storage::{L1State, L1StateError, L1StorageReader};
 pub use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
 pub use tempo_state::TempoState;
 pub use tip20_factory::{ZONE_TIP20_FACTORY_ADDRESS, ZoneTokenFactory};
-pub use ztip20::SequencerSetExt;
-
-use alloc::sync::Arc;
 
 use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::Address;
@@ -72,11 +69,7 @@ use tempo_precompiles::{Precompile as _, tip20::TIP20Token, tip403_registry::TIP
 
 /// Creates the native ZoneOutbox over ordinary Zone storage and direct finalized portal reads.
 #[cfg(feature = "std")]
-pub fn create_outbox_precompile<P>(
-    portal_address: Address,
-    l1: L1State<P>,
-    env: &ZonePrecompileEnv,
-) -> DynPrecompile
+pub fn create_outbox_precompile<P>(l1: L1State<P>, env: &ZonePrecompileEnv) -> DynPrecompile
 where
     P: L1StorageReader,
 {
@@ -87,14 +80,7 @@ where
         move |data, caller| {
             let (tx_hash, fee_payer) =
                 tx_context::current_transaction().unwrap_or((Default::default(), caller));
-            ZoneOutbox::new().call_with_transaction(
-                &l1,
-                portal_address,
-                data,
-                caller,
-                tx_hash,
-                fee_payer,
-            )
+            ZoneOutbox::new().call_with_transaction(&l1, data, caller, tx_hash, fee_payer)
         },
     )
 }
@@ -110,15 +96,18 @@ pub fn create_tip403_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {
 }
 
 /// Creates upstream TIP-20 execution with zone rules and adapter-backed L1 policy reads.
-pub fn create_tip20_precompile(
+pub fn create_tip20_precompile<P>(
     address: Address,
     env: &ZonePrecompileEnv,
-    sequencers: Arc<dyn SequencerSetExt>,
-) -> DynPrecompile {
+    l1: L1State<P>,
+) -> DynPrecompile
+where
+    P: L1StorageReader,
+{
     execution::create_precompile(
         "TIP20Token",
         env,
-        ztip20::TIP20Rules::new(sequencers),
+        ztip20::TIP20Rules::new(l1),
         move |data, caller| TIP20Token::from_address_unchecked(address).call(data, caller),
     )
 }

@@ -62,11 +62,10 @@ pub const PORTAL_ADMIN_SLOT: B256 = B256::ZERO;
 pub const PORTAL_TOKEN_CONFIGS_SLOT: B256 = B256::with_last_byte(6);
 
 /// ZonePortal storage slot 19: `isSequencer` (mapping(address => bool)).
-pub const PORTAL_IS_SEQUENCER_SLOT: B256 = {
-    let mut bytes = [0u8; 32];
-    bytes[31] = 19;
-    B256::new(bytes)
-};
+pub const PORTAL_IS_SEQUENCER_SLOT: B256 = B256::with_last_byte(19);
+
+/// ZonePortal storage slot 20: `role` (mapping(address => Role)).
+pub const PORTAL_ROLE_SLOT: B256 = B256::with_last_byte(20);
 
 // ---------------------------------------------------------------------------
 //  Storage slot constants for the proof system

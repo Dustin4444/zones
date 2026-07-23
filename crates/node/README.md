@@ -56,10 +56,8 @@ Each zone block processes exactly one L1 block. The flow is driven by the
    This is always the first transaction in a zone block.
 4. Pool transactions are appended after the system transaction, followed by a
    withdrawal batch finalization if applicable.
-5. After resolving the locally executed payload, the engine **confirms** the L1
-   block in the deposit queue (removing it); Reth fast-path inserts the payload
-   into its engine tree without re-executing it. On build failure the block
-   stays for retry.
+5. After `newPayload` succeeds, the engine **confirms** the L1 block in the
+   deposit queue (removing it). On failure the block stays for retry.
 
 The zone uses **instant finality** — head, safe, and finalized all point to the
 same block.
@@ -117,7 +115,7 @@ header chain linking back to the target block.
 3. At batch finalization, withdrawals are hashed into a chain and submitted to
    L1 as part of the batch proof.
 4. The `WithdrawalProcessor` polls the L1 portal queue and calls
-   gas-bounded `processWithdrawals` batches using ordered, concurrently in-flight transactions.
+   gas-bounded `processWithdrawals` batches through an ordered, bounded in-flight queue.
 
 ## TIP-403 Policy Enforcement
 

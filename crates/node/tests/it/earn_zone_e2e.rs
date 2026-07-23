@@ -484,7 +484,7 @@ impl EarnZoneFixture {
                     to: Some(self.gateway),
                     memo: B256::ZERO,
                     gas_limit: WITHDRAWAL_CALLBACK_GAS_LIMIT,
-                    fallback_recipient: Some(self.user.address()),
+                    zone_fallback_recipient: Some(self.user.address()),
                     data,
                     reveal_to: Bytes::new(),
                 },
@@ -542,7 +542,7 @@ impl EarnZoneFixture {
                     to: Some(self.gateway),
                     memo: B256::ZERO,
                     gas_limit: WITHDRAWAL_CALLBACK_GAS_LIMIT,
-                    fallback_recipient: Some(self.user.address()),
+                    zone_fallback_recipient: Some(self.user.address()),
                     data,
                     reveal_to: Bytes::new(),
                 },
@@ -669,7 +669,7 @@ impl EarnZoneFixture {
                     amount: earn_shares_u128,
                     keyIndex: key_index,
                     encrypted,
-                    bouncebackRecipient: user,
+                    tempoRefundRecipient: user,
                 }
                 .abi_encode()
                 .into(),
