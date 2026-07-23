@@ -1,19 +1,10 @@
 use super::*;
-use std::collections::HashSet;
-use tempo_primitives::is_tip20_prefix;
+use std::collections::HashMap;
 
 /// Poll interval for the HTTP block filter fallback (500ms, matching L1 block time).
 const HTTP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-type L1ProcessedEvents = (L1PortalEvents, HashSet<Address>);
-
-fn cache_invalidation_address(address: Address, topic0: Option<&B256>) -> Option<Address> {
-    use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
-
-    (address == TIP403_REGISTRY_ADDRESS
-        || (is_tip20_prefix(address) && topic0 == Some(&TransferPolicyUpdate::SIGNATURE_HASH)))
-    .then_some(TIP403_REGISTRY_ADDRESS)
-}
+const TRACKED_ACCOUNT_COUNT: usize = 2;
 
 /// Configuration for the L1 subscriber.
 #[derive(Debug, Clone)]
@@ -304,6 +295,7 @@ impl L1Subscriber {
 
         let concurrency = self.config.l1_fetch_concurrency.max(1);
         let subscriber_metrics = self.subscriber_metrics.clone();
+        let portal_address = self.config.portal_address;
 
         let mut fetched = stream::iter(from..=to)
             .map(move |block_number| {
@@ -328,13 +320,25 @@ impl L1Subscriber {
                     let block = NumHash::new(block_number, block_hash);
                     let expected_receipts_root = header_resp.receipts_root();
                     let expected_logs_bloom = header_resp.logs_bloom();
-                    let receipts = fetch_and_verify_receipts_for_header(
-                        provider,
-                        block,
-                        expected_receipts_root,
-                        expected_logs_bloom,
+                    let state_root = header_resp.state_root();
+                    let tracked_accounts = [
+                        portal_address,
+                        tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS,
+                    ];
+                    let (receipts, storage_roots) = futures::try_join!(
+                        fetch_and_verify_receipts_for_header(
+                            provider,
+                            block,
+                            expected_receipts_root,
+                            expected_logs_bloom,
+                        ),
+                        fetch_and_verify_storage_roots(
+                            provider,
+                            block,
+                            state_root,
+                            tracked_accounts,
+                        ),
                     )
-                    .await
                     .inspect_err(|_| {
                         fetch_failures.increment(1);
                     })?;
@@ -347,7 +351,7 @@ impl L1Subscriber {
                         "Fetched and validated L1 block data"
                     );
                     let header = header_resp.inner.inner;
-                    Ok::<_, eyre::Report>((header, receipts))
+                    Ok::<_, eyre::Report>((header, receipts, storage_roots))
                 }
             })
             .buffered(concurrency);
@@ -355,13 +359,13 @@ impl L1Subscriber {
         let mut enqueued = 0u64;
         let backfill_start = std::time::Instant::now();
 
-        while let Some((header, receipts)) = fetched.try_next().await? {
+        while let Some((header, receipts, storage_roots)) = fetched.try_next().await? {
             let block_number = header.number();
-            let (events, invalidated) = self.extract_events(block_number, &receipts);
+            let events = self.extract_events(block_number, &receipts);
             self.record_seen_block(block_number, to.saturating_sub(block_number));
 
             let sealed = SealedHeader::seal_slow(header);
-            self.update_l1_state_anchor(block_number, &invalidated);
+            self.update_l1_state_anchor(block_number, storage_roots);
             self.deposit_queue.enqueue_sealed(sealed, events);
             enqueued += 1;
             self.subscriber_metrics.blocks_enqueued.increment(1);
@@ -408,35 +412,29 @@ impl L1Subscriber {
         self.follow_finalized(&provider, triggers).await
     }
 
-    /// Extract portal events and raw-cache mutation barriers from fetched receipts.
+    /// Extract portal events from fetched receipts.
     fn extract_events(
         &self,
         block_number: u64,
         receipts: &[tempo_alloy::rpc::TempoTransactionReceipt],
-    ) -> L1ProcessedEvents {
+    ) -> L1PortalEvents {
         let portal_address = self.config.portal_address;
         let mut portal_events = L1PortalEvents::default();
-        let mut invalidated = HashSet::new();
 
         for receipt in receipts {
             for log in receipt.logs() {
                 let address = log.address();
 
-                if address == portal_address {
-                    invalidated.insert(address);
-                    if let Err(e) = portal_events.push_log(log, block_number) {
-                        warn!(block_number, %e, "Failed to decode portal event from receipt");
-                    }
-                } else if let Some(address) =
-                    cache_invalidation_address(address, log.topics().first())
+                if address == portal_address
+                    && let Err(e) = portal_events.push_log(log, block_number)
                 {
-                    invalidated.insert(address);
+                    warn!(block_number, %e, "Failed to decode portal event from receipt");
                 }
             }
         }
 
         self.record_portal_event_metrics(&portal_events);
-        (portal_events, invalidated)
+        portal_events
     }
 
     fn record_seen_block(&self, block_number: u64, lag_blocks: u64) {
@@ -478,13 +476,76 @@ impl L1Subscriber {
     pub(crate) fn update_l1_state_anchor(
         &self,
         number: u64,
-        invalidated_accounts: &HashSet<Address>,
+        storage_roots: HashMap<Address, B256>,
     ) {
         self.config
             .l1_state_cache
             .write()
-            .invalidate_and_set_anchor(number, invalidated_accounts.iter().copied());
+            .set_anchor_with_storage_roots(number, storage_roots);
     }
+}
+
+/// Fetch and authenticate account storage roots against a finalized header's state root.
+async fn fetch_and_verify_storage_roots(
+    provider: &impl Provider<TempoNetwork>,
+    block: NumHash,
+    state_root: B256,
+    addresses: [Address; TRACKED_ACCOUNT_COUNT],
+) -> eyre::Result<HashMap<Address, B256>> {
+    use futures::stream;
+
+    stream::iter(addresses)
+        .map(|address| async move {
+            let proof = provider
+                .get_proof(address, Vec::new())
+                .block_id(BlockId::hash(block.hash))
+                .await
+                .map_err(|error| {
+                    eyre::eyre!(
+                        "failed to fetch account proof for {address} at block {} ({}): {error}",
+                        block.number,
+                        block.hash,
+                    )
+                })?;
+            let storage_root = verify_account_storage_root(state_root, address, &proof)?;
+            Ok::<_, eyre::Report>((address, storage_root))
+        })
+        .buffer_unordered(TRACKED_ACCOUNT_COUNT)
+        .try_collect()
+        .await
+}
+
+fn verify_account_storage_root(
+    state_root: B256,
+    address: Address,
+    proof: &alloy_rpc_types_eth::EIP1186AccountProofResponse,
+) -> eyre::Result<B256> {
+    use alloy_consensus::TrieAccount;
+    use alloy_trie::{Nibbles, proof::verify_proof};
+
+    eyre::ensure!(
+        proof.address == address,
+        "account proof address mismatch: requested {address}, got {}",
+        proof.address,
+    );
+
+    let account = TrieAccount {
+        nonce: proof.nonce,
+        balance: proof.balance,
+        storage_root: proof.storage_hash,
+        code_hash: proof.code_hash,
+    };
+    verify_proof(
+        state_root,
+        Nibbles::unpack(keccak256(address)),
+        Some(alloy_rlp::encode(account)),
+        &proof.account_proof,
+    )
+    .map_err(|error| {
+        eyre::eyre!("invalid account proof for {address} against state root {state_root}: {error}")
+    })?;
+
+    Ok(proof.storage_hash)
 }
 
 /// Fetch receipts for the L1 header by block hash and verify they match the
@@ -548,16 +609,41 @@ pub(crate) fn verify_receipts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
-    use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
+    use alloy_primitives::{Bytes, U256, address};
+    use alloy_rlp::Encodable as _;
+    use alloy_trie::{Nibbles, nodes::LeafNode};
 
     #[test]
-    fn token_policy_updates_invalidate_the_registry() {
-        let token = address!("20C0000000000000000000000000000000000999");
+    fn account_storage_root_is_authenticated_by_the_header_state_root() {
+        let address = address!("0x0000000000000000000000000000000000004242");
+        let storage_root = B256::with_last_byte(0x42);
+        let account = alloy_consensus::TrieAccount {
+            nonce: 1,
+            balance: U256::from(2),
+            storage_root,
+            code_hash: B256::with_last_byte(3),
+        };
+        let mut encoded_leaf = Vec::new();
+        LeafNode::new(
+            Nibbles::unpack(keccak256(address)),
+            alloy_rlp::encode(account),
+        )
+        .encode(&mut encoded_leaf);
+        let state_root = keccak256(&encoded_leaf);
+        let proof = alloy_rpc_types_eth::EIP1186AccountProofResponse {
+            address,
+            balance: account.balance,
+            code_hash: account.code_hash,
+            nonce: account.nonce,
+            storage_hash: account.storage_root,
+            account_proof: vec![Bytes::from(encoded_leaf)],
+            storage_proof: Vec::new(),
+        };
 
         assert_eq!(
-            cache_invalidation_address(token, Some(&TransferPolicyUpdate::SIGNATURE_HASH)),
-            Some(TIP403_REGISTRY_ADDRESS)
+            verify_account_storage_root(state_root, address, &proof).unwrap(),
+            storage_root,
         );
+        assert!(verify_account_storage_root(B256::with_last_byte(0xff), address, &proof).is_err());
     }
 }

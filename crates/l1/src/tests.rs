@@ -1,13 +1,15 @@
 use super::*;
 use crate::abi::DepositType;
 use alloy_consensus::{Header, ReceiptWithBloom};
-use alloy_primitives::{Bloom, FixedBytes, address};
-use alloy_rpc_types_eth::{Header as RpcHeader, TransactionReceipt};
+use alloy_primitives::{Bloom, Bytes, FixedBytes, U256, address};
+use alloy_rlp::Encodable as _;
+use alloy_rpc_types_eth::{EIP1186AccountProofResponse, Header as RpcHeader, TransactionReceipt};
 use alloy_sol_types::SolEvent;
 use alloy_transport::mock::Asserter;
+use alloy_trie::{Nibbles, nodes::LeafNode};
 use serde::Deserialize;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     time::Duration,
 };
 use tempo_alloy::rpc::{TempoHeaderResponse, TempoTransactionReceipt};
@@ -203,6 +205,37 @@ fn header_response(header: TempoHeader) -> TempoHeaderResponse {
 fn push_header_and_empty_receipts(asserter: &Asserter, header: TempoHeader) {
     asserter.push_success(&Some(header_response(header)));
     asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
+}
+
+fn tracked_account_proof(address: Address) -> (B256, EIP1186AccountProofResponse) {
+    let account = alloy_consensus::TrieAccount {
+        nonce: 1,
+        balance: U256::from(2),
+        storage_root: B256::with_last_byte(3),
+        code_hash: B256::with_last_byte(4),
+    };
+    let mut encoded_leaf = Vec::new();
+    LeafNode::new(
+        Nibbles::unpack(keccak256(address)),
+        alloy_rlp::encode(account),
+    )
+    .encode(&mut encoded_leaf);
+    let state_root = keccak256(&encoded_leaf);
+    let proof = EIP1186AccountProofResponse {
+        address,
+        balance: account.balance,
+        code_hash: account.code_hash,
+        nonce: account.nonce,
+        storage_hash: account.storage_root,
+        account_proof: vec![Bytes::from(encoded_leaf)],
+        storage_proof: Vec::new(),
+    };
+    (state_root, proof)
+}
+
+fn push_account_proofs(asserter: &Asserter, proof: &EIP1186AccountProofResponse) {
+    asserter.push_success(proof);
+    asserter.push_success(proof);
 }
 
 fn make_test_receipt(
@@ -414,33 +447,27 @@ fn assert_tempo_header_rejected(input: &[u8]) {
 }
 
 #[test]
-fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
+fn update_l1_state_anchor_applies_storage_root_changes_before_publishing_coverage() {
     let subscriber = test_subscriber(
         Arc::new(SequenceLocalTempoCheckpointReader::new([0])),
         Some(0),
     );
     let slot = B256::with_last_byte(1);
     let value = B256::with_last_byte(2);
-    let stable_account = address!("0x0000000000000000000000000000000000000ABC");
-    let stable_slot = B256::with_last_byte(3);
-    let stable_value = B256::with_last_byte(4);
     subscriber
         .config
         .l1_state_cache
         .write()
-        .invalidate_and_set_anchor(9, []);
+        .set_anchor_with_storage_roots(9, [(TIP403_REGISTRY_ADDRESS, B256::with_last_byte(9))]);
     subscriber
         .config
         .l1_state_cache
         .write()
         .set(TIP403_REGISTRY_ADDRESS, slot, 10, value);
-    subscriber
-        .config
-        .l1_state_cache
-        .write()
-        .set(stable_account, stable_slot, 10, stable_value);
-
-    subscriber.update_l1_state_anchor(10, &HashSet::new());
+    subscriber.update_l1_state_anchor(
+        10,
+        HashMap::from([(TIP403_REGISTRY_ADDRESS, B256::with_last_byte(9))]),
+    );
     assert_eq!(
         subscriber
             .config
@@ -450,12 +477,11 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
         Some(value)
     );
 
-    subscriber.update_l1_state_anchor(11, &HashSet::from([TIP403_REGISTRY_ADDRESS]));
-    let mut cache = subscriber.config.l1_state_cache.write();
-    assert_eq!(
-        cache.get(stable_account, stable_slot, 11),
-        Some(stable_value)
+    subscriber.update_l1_state_anchor(
+        11,
+        HashMap::from([(TIP403_REGISTRY_ADDRESS, B256::with_last_byte(10))]),
     );
+    let mut cache = subscriber.config.l1_state_cache.write();
     assert_eq!(cache.get(TIP403_REGISTRY_ADDRESS, slot, 11), None);
 }
 
@@ -504,24 +530,35 @@ async fn test_resolve_start_block_skips_backfill_without_checkpoint() {
 
 #[tokio::test]
 async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() {
-    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
+    let mut subscriber =
+        test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
+    // Use one address for both tracked accounts so this mocked-provider test can focus on finalized
+    // range synchronization while still serving authenticated account proofs.
+    subscriber.config.portal_address = TIP403_REGISTRY_ADDRESS;
     let asserter = Asserter::new();
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let header_10 = make_test_header(10);
-    let header_11 = make_chained_header(11, header_hash(&header_10));
-    let header_12 = make_chained_header(12, header_hash(&header_11));
+    let (state_root, proof) = tracked_account_proof(TIP403_REGISTRY_ADDRESS);
+    let mut header_10 = make_test_header(10);
+    header_10.inner.state_root = state_root;
+    let mut header_11 = make_chained_header(11, header_hash(&header_10));
+    header_11.inner.state_root = state_root;
+    let mut header_12 = make_chained_header(12, header_hash(&header_11));
+    header_12.inner.state_root = state_root;
 
     // Initial sync through finalized block 10.
     asserter.push_success(&Some(header_response(header_10.clone())));
     push_header_and_empty_receipts(&asserter, header_10);
+    push_account_proofs(&asserter, &proof);
 
     // One newHeads notification wakes the subscriber. The finalized tag has
     // advanced by two blocks, so both missing blocks must be ingested.
     asserter.push_success(&Some(header_response(header_12.clone())));
     push_header_and_empty_receipts(&asserter, header_11);
+    push_account_proofs(&asserter, &proof);
     push_header_and_empty_receipts(&asserter, header_12);
+    push_account_proofs(&asserter, &proof);
 
     let err = subscriber
         .follow_finalized(

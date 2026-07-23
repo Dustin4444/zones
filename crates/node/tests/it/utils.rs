@@ -3507,7 +3507,7 @@ pub(crate) struct L1Fixture {
     next_timestamp: u64,
     last_hash: B256,
     /// Raw L1 caches seeded by this fixture, updated with state implied by injected deposits.
-    caches: Mutex<Vec<L1StateCache>>,
+    caches: Mutex<Vec<(L1StateCache, Address)>>,
 }
 
 impl L1Fixture {
@@ -3587,7 +3587,10 @@ impl L1Fixture {
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         drop(cache);
-        self.caches.lock().unwrap().push(cache_handle.clone());
+        self.caches
+            .lock()
+            .unwrap()
+            .push((cache_handle.clone(), portal_address));
     }
 
     /// Seed the absence of an address-level TIP-403 receive policy at the current Zone anchor.
@@ -3599,7 +3602,7 @@ impl L1Fixture {
     fn seed_no_receive_policy_at(&self, block_number: u64, recipient: Address) -> eyre::Result<()> {
         // TODO(rusowsky): make `ReceivePolicy` public upstream to use the handlers
         let receive_policy_slot = recipient.mapping_slot(tip403_registry_slots::RECEIVE_POLICIES);
-        for cache in self.caches.lock().unwrap().iter() {
+        for (cache, _) in self.caches.lock().unwrap().iter() {
             cache.write().set(
                 TIP403_REGISTRY_ADDRESS,
                 B256::from(receive_policy_slot.to_be_bytes()),
@@ -3618,7 +3621,7 @@ impl L1Fixture {
     }
 
     fn seed_enabled_token_policy_state(&self, block_number: u64, tokens: &[EnabledToken]) {
-        for cache in self.caches.lock().unwrap().iter() {
+        for (cache, _) in self.caches.lock().unwrap().iter() {
             let mut cache = cache.write();
             for token in tokens {
                 seed_raw_tip403_token_policy(
@@ -3655,10 +3658,16 @@ impl L1Fixture {
         self.next_block_number += 1;
         self.next_timestamp += 1; // 1s per L1 block
 
-        // Synthetic injection bypasses the subscriber, so publish the same verified-receipt
+        // Synthetic injection bypasses the subscriber, so publish the same verified-root
         // coverage the subscriber would publish before the engine consumes this block.
-        for cache in self.caches.lock().unwrap().iter() {
-            cache.write().invalidate_and_set_anchor(number, []);
+        for (cache, portal_address) in self.caches.lock().unwrap().iter() {
+            cache.write().set_anchor_with_storage_roots(
+                number,
+                [
+                    (*portal_address, B256::with_last_byte(1)),
+                    (TIP403_REGISTRY_ADDRESS, B256::with_last_byte(2)),
+                ],
+            );
         }
 
         header

@@ -9,13 +9,13 @@
 //!
 //! Each `(contract_address, slot_key)` pair maps to a [`BTreeMap<u64, B256>`] of
 //! `block_number → value`. Slot histories are bounded by both a weighted LRU and a per-slot limit.
-//! A lookup for block N may inherit the most recent earlier value only when verified receipt
-//! coverage and mutation barriers prove that it remained current.
+//! A lookup for block N may inherit the most recent earlier value only when verified account
+//! storage roots prove that the owning account remained unchanged.
 //!
 //! ## Write path
 //!
-//! - The [`L1Subscriber`](crate::l1::L1Subscriber) records mutation barriers from finalized L1
-//!   receipts.
+//! - The [`L1Subscriber`](crate::l1::L1Subscriber) verifies tracked account proofs against each
+//!   finalized header and records a mutation barrier whenever an account storage root changes.
 //! - The [`L1StateProvider`](super::provider::L1StateProvider) writes RPC-fetched values on
 //!   cache miss, tagged with the block number that was requested.
 
@@ -62,9 +62,9 @@ impl L1StateCache {
 /// i.e. the value that was current at that height. This allows the zone to read L1 state at
 /// the `tempoBlockNumber` it committed to, even if the L1 chain has since advanced.
 ///
-/// Inherited values are valid only when the subscriber has processed every intervening L1 block
-/// and no log from the owning contract indicates a possible mutation. The coverage range starts
-/// at the current floor and ends at the latest finalized block whose receipts were processed.
+/// Inherited values are valid only when the subscriber has authenticated the owning account's
+/// storage root at every intervening L1 block. The coverage range starts at the current floor and
+/// ends at the latest finalized block whose tracked account proofs were verified.
 #[derive(Debug)]
 pub struct L1StateCacheInner {
     /// Bounded per-slot value histories, promoted as a unit on access.
@@ -75,8 +75,16 @@ pub struct L1StateCacheInner {
     invalidation_count: usize,
     /// Maximum number of mutation barriers retained before resetting.
     max_invalidations: usize,
-    /// Contiguous receipt coverage: earliest usable value height through latest processed block.
+    /// Latest verified storage root and the first continuously observed block per account.
+    storage_roots: HashMap<Address, TrackedStorageRoot>,
+    /// Contiguous proof coverage: earliest usable value height through latest processed block.
     coverage: RangeInclusive<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackedStorageRoot {
+    root: B256,
+    first_observed: u64,
 }
 
 impl Default for L1StateCacheInner {
@@ -97,6 +105,7 @@ impl L1StateCacheInner {
             invalidations: HashMap::new(),
             invalidation_count: 0,
             max_invalidations,
+            storage_roots: HashMap::new(),
             coverage: 0..=0,
         }
     }
@@ -104,8 +113,8 @@ impl L1StateCacheInner {
     /// Returns the cached value for a storage slot at the given block number.
     ///
     /// An exact-height value is always valid. A value inherited from an earlier height is returned
-    /// only when the subscriber has processed receipts through `block_number` and no mutation
-    /// barrier exists after the value was populated.
+    /// only when the subscriber has verified the owning account's storage root through
+    /// `block_number` and no root-change barrier exists after the value was populated.
     pub fn get(&mut self, address: Address, slot: B256, block_number: u64) -> Option<B256> {
         let (&cached_block, &value) = self
             .slots
@@ -120,6 +129,13 @@ impl L1StateCacheInner {
 
         // If we didn't yet process the requested block, we can't use the cached value
         if block_number > *self.coverage.end() {
+            return None;
+        }
+
+        // Cross-height reuse is safe only for accounts whose storage roots have been observed
+        // continuously through the requested block. Untracked accounts remain exact-height-only.
+        let tracked_root = self.storage_roots.get(&address)?;
+        if block_number < tracked_root.first_observed {
             return None;
         }
 
@@ -159,24 +175,27 @@ impl L1StateCacheInner {
         debug_assert!(inserted, "trimmed slot history must fit cache capacity");
     }
 
-    /// Clears cached state and establishes a new contiguous receipt-coverage baseline.
+    /// Clears cached state and establishes a new contiguous proof-coverage baseline.
     fn reset(&mut self, floor: u64) {
         self.slots.clear();
         self.invalidations.clear();
         self.invalidation_count = 0;
+        self.storage_roots.clear();
         self.coverage = floor..=floor;
     }
 
-    /// Records mutation barriers and publishes receipt coverage for one finalized block.
+    /// Records verified account storage roots and publishes coverage for one finalized block.
     ///
     /// Coverage only advances one block at a time. A duplicate, skipped, or out-of-order block
     /// invalidates the cache's continuity assumptions, so cached state is cleared and `anchor`
-    /// becomes the new coverage floor.
-    pub fn invalidate_and_set_anchor(
+    /// becomes the new coverage floor. A changed storage root creates an address-level mutation
+    /// barrier. Accounts omitted from `storage_roots` are no longer eligible for inheritance.
+    pub fn set_anchor_with_storage_roots(
         &mut self,
         anchor: u64,
-        invalidated_addresses: impl IntoIterator<Item = Address>,
+        storage_roots: impl IntoIterator<Item = (Address, B256)>,
     ) {
+        let storage_roots = storage_roots.into_iter().collect::<HashMap<_, _>>();
         if self.coverage.end().checked_add(1) != Some(anchor) {
             warn!(
                 anchor,
@@ -184,7 +203,39 @@ impl L1StateCacheInner {
                 "Non-contiguous L1 state cache update; resetting cache coverage"
             );
             self.reset(anchor);
+            self.storage_roots
+                .extend(storage_roots.into_iter().map(|(address, root)| {
+                    (
+                        address,
+                        TrackedStorageRoot {
+                            root,
+                            first_observed: anchor,
+                        },
+                    )
+                }));
             return;
+        }
+
+        self.storage_roots
+            .retain(|address, _| storage_roots.contains_key(address));
+
+        let mut invalidated_addresses = Vec::new();
+        for (&address, &root) in &storage_roots {
+            match self.storage_roots.entry(address) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().root != root {
+                        entry.get_mut().root = root;
+                        invalidated_addresses.push(address);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(TrackedStorageRoot {
+                        root,
+                        first_observed: anchor,
+                    });
+                    invalidated_addresses.push(address);
+                }
+            }
         }
 
         for address in invalidated_addresses {
@@ -202,6 +253,16 @@ impl L1StateCacheInner {
                     "L1 state invalidation capacity reached; resetting cache coverage"
                 );
                 self.reset(anchor);
+                self.storage_roots
+                    .extend(storage_roots.into_iter().map(|(address, root)| {
+                        (
+                            address,
+                            TrackedStorageRoot {
+                                root,
+                                first_observed: anchor,
+                            },
+                        )
+                    }));
                 return;
             }
         }
@@ -291,10 +352,11 @@ mod tests {
     use alloy_primitives::address;
 
     const PORTAL: Address = address!("0x0000000000000000000000000000000000004242");
+    const PORTAL_ROOT: B256 = B256::with_last_byte(0x42);
 
     fn cover_through(cache: &mut L1StateCacheInner, block_number: u64) {
         while *cache.coverage.end() < block_number {
-            cache.invalidate_and_set_anchor(*cache.coverage.end() + 1, []);
+            cache.set_anchor_with_storage_roots(*cache.coverage.end() + 1, [(PORTAL, PORTAL_ROOT)]);
         }
     }
 
@@ -351,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_value_requires_receipt_coverage() {
+    fn inherited_value_requires_verified_root_coverage() {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
         let value = B256::with_last_byte(0x0a);
@@ -363,6 +425,19 @@ mod tests {
     }
 
     #[test]
+    fn untracked_accounts_are_exact_height_only() {
+        let mut cache = L1StateCacheInner::new();
+        let untracked = address!("0x0000000000000000000000000000000000004343");
+        let slot = B256::with_last_byte(1);
+        let value = B256::with_last_byte(0x0a);
+        cache.set(untracked, slot, 10, value);
+        cover_through(&mut cache, 11);
+
+        assert_eq!(cache.get(untracked, slot, 10), Some(value));
+        assert_eq!(cache.get(untracked, slot, 11), None);
+    }
+
+    #[test]
     fn invalidation_blocks_inheritance_until_refetched() {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
@@ -370,8 +445,9 @@ mod tests {
         let new = B256::with_last_byte(0x0b);
         cache.set(PORTAL, slot, 10, old);
         cover_through(&mut cache, 10);
-        cache.invalidate_and_set_anchor(11, [PORTAL]);
-        cover_through(&mut cache, 12);
+        let changed_root = B256::with_last_byte(0x43);
+        cache.set_anchor_with_storage_roots(11, [(PORTAL, changed_root)]);
+        cache.set_anchor_with_storage_roots(12, [(PORTAL, changed_root)]);
 
         assert_eq!(cache.get(PORTAL, slot, 11), None);
         assert_eq!(cache.get(PORTAL, slot, 12), None);
@@ -386,6 +462,7 @@ mod tests {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
         cache.reset(10);
+        cache.set_anchor_with_storage_roots(10, [(PORTAL, PORTAL_ROOT)]);
         cache.set(PORTAL, slot, 9, B256::with_last_byte(9));
         cover_through(&mut cache, 11);
 
@@ -406,7 +483,7 @@ mod tests {
     #[test]
     fn contiguous_update_advances_coverage() {
         let mut cache = L1StateCacheInner::new();
-        cache.invalidate_and_set_anchor(1, []);
+        cache.set_anchor_with_storage_roots(1, [(PORTAL, PORTAL_ROOT)]);
         assert_eq!(*cache.coverage.end(), 1);
     }
 
@@ -416,7 +493,7 @@ mod tests {
         let slot = B256::with_last_byte(1);
         cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a));
 
-        cache.invalidate_and_set_anchor(10, [PORTAL]);
+        cache.set_anchor_with_storage_roots(10, [(PORTAL, PORTAL_ROOT)]);
 
         assert_eq!(*cache.coverage.end(), 10);
         assert_eq!(*cache.coverage.start(), 10);
@@ -528,8 +605,8 @@ mod tests {
 
         cache.reset(10);
         cache.set(PORTAL, slot, 10, B256::with_last_byte(0x0a));
-        cache.invalidate_and_set_anchor(11, [PORTAL]);
-        cache.invalidate_and_set_anchor(12, [PORTAL]);
+        cache.set_anchor_with_storage_roots(11, [(PORTAL, B256::with_last_byte(0x43))]);
+        cache.set_anchor_with_storage_roots(12, [(PORTAL, B256::with_last_byte(0x44))]);
 
         assert_eq!(*cache.coverage.start(), 12);
         assert_eq!(cache.invalidation_count, 0);
@@ -540,7 +617,7 @@ mod tests {
         assert_eq!(cache.get(PORTAL, slot, 11), None);
 
         cache.set(PORTAL, slot, 12, B256::with_last_byte(0x0c));
-        cover_through(&mut cache, 13);
+        cache.set_anchor_with_storage_roots(13, [(PORTAL, B256::with_last_byte(0x44))]);
         assert_eq!(
             cache.get(PORTAL, slot, 13),
             Some(B256::with_last_byte(0x0c))
