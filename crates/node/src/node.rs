@@ -13,6 +13,7 @@ use crate::{
 use alloy_primitives::Address;
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorObjectOwned};
 use k256::SecretKey;
 use reth_chainspec::EthChainSpec;
 use reth_eth_wire_types::primitives::BasicNetworkPrimitives;
@@ -42,7 +43,11 @@ use reth_transaction_pool::{
     Pool, PoolTransaction, TransactionPool as _, TransactionValidationTaskExecutor,
     blobstore::InMemoryBlobStore, error::InvalidPoolTransactionError,
 };
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::TempoInvalidTransaction;
@@ -79,6 +84,54 @@ use zone_sequencer::{
     AttestationStore, BatchAnchorConfig, WithdrawalBatchLimits, ZoneSequencerConfig,
     attestation::AttestationDomain, spawn_zone_sequencer,
 };
+
+type SharedZoneRpcApi = Arc<OnceLock<Arc<dyn ZoneRpcApi>>>;
+
+#[rpc(server, namespace = "zone")]
+trait PublicZoneRpcApi {
+    #[method(name = "getZoneInfo")]
+    async fn get_zone_info(&self) -> RpcResult<Box<serde_json::value::RawValue>>;
+
+    #[method(name = "getEncryptionKey")]
+    async fn get_encryption_key(&self) -> RpcResult<Box<serde_json::value::RawValue>>;
+}
+
+struct PublicZoneRpc {
+    api: SharedZoneRpcApi,
+}
+
+impl PublicZoneRpc {
+    fn api(&self) -> RpcResult<&dyn ZoneRpcApi> {
+        self.api
+            .get()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| ErrorObjectOwned::owned(-32603, "zone RPC is initializing", None::<()>))
+    }
+
+    fn auth_context() -> zone_rpc::auth::AuthContext {
+        zone_rpc::auth::AuthContext {
+            caller: Address::ZERO,
+            expires_at: 0,
+            keychain_key_id: None,
+        }
+    }
+}
+
+impl PublicZoneRpcApiServer for PublicZoneRpc {
+    async fn get_zone_info(&self) -> RpcResult<Box<serde_json::value::RawValue>> {
+        self.api()?
+            .zone_get_zone_info(Self::auth_context())
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(err.code, err.message, err.data))
+    }
+
+    async fn get_encryption_key(&self) -> RpcResult<Box<serde_json::value::RawValue>> {
+        self.api()?
+            .zone_get_encryption_key(Self::auth_context())
+            .await
+            .map_err(|err| ErrorObjectOwned::owned(err.code, err.message, err.data))
+    }
+}
 
 /// Returns a known Tempo chain spec for an L1 chain ID.
 ///
@@ -406,6 +459,8 @@ where
     portal_address: Address,
     /// Private RPC configuration.
     private_rpc_config: ZonePrivateRpcConfig,
+    /// Shared implementation used by the public and private zone RPC surfaces.
+    zone_rpc_api: SharedZoneRpcApi,
     /// Sequencer configuration.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     /// Static Zone P2P networking configuration.
@@ -435,6 +490,8 @@ where
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
         p2p_config: Option<P2pConfig>,
     ) -> Self {
+        let zone_rpc_api = Arc::new(OnceLock::new());
+        let public_zone_rpc_api = zone_rpc_api.clone();
         Self {
             inner: RpcAddOns::new(
                 TempoEthApiBuilder::default(),
@@ -443,11 +500,21 @@ where
                 BasicEngineValidatorBuilder::default(),
                 Identity::default(),
                 Default::default(),
-            ),
+            )
+            .extend_rpc_modules(move |ctx| {
+                ctx.modules.merge_configured(
+                    PublicZoneRpc {
+                        api: public_zone_rpc_api,
+                    }
+                    .into_rpc(),
+                )?;
+                Ok(())
+            }),
             deposit_queue,
             l1_config,
             portal_address,
             private_rpc_config,
+            zone_rpc_api,
             sequencer_config,
             p2p_config,
         }
@@ -538,6 +605,7 @@ where
 
         Self::launch_private_rpc(
             self.private_rpc_config,
+            self.zone_rpc_api,
             &handle,
             self.l1_config.l1_rpc_url.clone(),
             self.l1_config.retry_connection_interval,
@@ -785,6 +853,7 @@ where
     /// Launch the private RPC server.
     async fn launch_private_rpc(
         config: ZonePrivateRpcConfig,
+        shared_api: SharedZoneRpcApi,
         handle: &<Self as NodeAddOns<N>>::Handle,
         l1_rpc_url: String,
         retry_connection_interval: Duration,
@@ -821,6 +890,9 @@ where
         };
         let api: Arc<dyn ZoneRpcApi> =
             Arc::new(ZoneRpc::new(eth_handlers, private_rpc_config.clone()).await?);
+        shared_api
+            .set(api.clone())
+            .map_err(|_| eyre::eyre!("zone RPC API was initialized more than once"))?;
         let local_addr = start_private_rpc(private_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Private zone RPC server started");
 
@@ -1240,6 +1312,19 @@ mod tests {
     use tempo_primitives::transaction::{
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
+
+    #[test]
+    fn public_zone_rpc_exposes_only_unauthenticated_methods() {
+        let methods = PublicZoneRpc {
+            api: Arc::new(OnceLock::new()),
+        }
+        .into_rpc();
+        let names = methods.method_names().collect::<Vec<_>>();
+
+        assert!(names.contains(&"zone_getZoneInfo"));
+        assert!(names.contains(&"zone_getEncryptionKey"));
+        assert!(!names.contains(&"zone_getAuthorizationTokenInfo"));
+    }
 
     fn pooled_transaction(envelope: TempoTxEnvelope, sender: Address) -> TempoPooledTransaction {
         TempoPooledTransaction::new(Recovered::new_unchecked(envelope, sender))
