@@ -13,6 +13,7 @@ use crate::{
 use alloy_primitives::Address;
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
+use futures::StreamExt;
 use k256::SecretKey;
 use reth_chainspec::EthChainSpec;
 use reth_eth_wire_types::primitives::BasicNetworkPrimitives;
@@ -31,8 +32,8 @@ use reth_node_builder::{
         PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns,
     },
 };
-use reth_primitives_traits::SealedHeader;
-use reth_provider::ChainSpecProvider;
+use reth_primitives_traits::{Block as _, SealedHeader};
+use reth_provider::{CanonStateSubscriptions, ChainSpecProvider};
 use reth_rpc_builder::Identity;
 use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
@@ -877,7 +878,16 @@ where
         let l1_transaction_signer = config
             .l1_transaction_signer
             .unwrap_or(config.sequencer_signer);
-        let seq_handle = spawn_zone_sequencer(sequencer_config, l1_transaction_signer).await;
+        let zone_head_notifications =
+            Box::pin(handle.node.provider().canonical_state_stream().filter_map(
+                |notification| async move { notification.tip_checked().map(|tip| tip.number()) },
+            ));
+        let seq_handle = spawn_zone_sequencer(
+            sequencer_config,
+            l1_transaction_signer,
+            zone_head_notifications,
+        )
+        .await;
         info!(target: "reth::cli", "Sequencer tasks spawned");
 
         // Critical task — node shuts down if either exits.

@@ -3,12 +3,13 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use std::{sync::Arc, time::Duration};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::TransportResult;
+use futures::Stream;
 use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderBuilderExt};
 use tokio::sync::Notify;
 
@@ -34,6 +35,9 @@ pub use withdrawals::{
     MAX_WITHDRAWAL_BATCH_GAS, SharedWithdrawalStore, WithdrawalBatchLimits,
     WithdrawalProcessorConfig, WithdrawalStore,
 };
+
+/// In-process notifications carrying the latest Zone canonical block number.
+pub type ZoneHeadNotifications = Pin<Box<dyn Stream<Item = u64> + Send>>;
 
 use crate::rpc::rpc_connection_config;
 
@@ -65,7 +69,7 @@ pub struct ZoneSequencerConfig {
     pub tempo_state_address: Address,
     /// Zone L2 RPC URL.
     pub zone_rpc_url: String,
-    /// How often the zone monitor polls for new L2 blocks.
+    /// How often the zone monitor polls for new L2 blocks as a recovery fallback.
     pub zone_poll_interval: Duration,
     /// Number of zone blocks between empty withdrawal batch boundaries / L1 submissions.
     pub batch_interval_blocks: u64,
@@ -97,6 +101,7 @@ pub struct ZoneSequencerHandle {
 pub async fn spawn_zone_sequencer(
     config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
+    zone_head_notifications: ZoneHeadNotifications,
 ) -> ZoneSequencerHandle {
     let sequencer_address = signer.address();
     // Build a single shared L1 provider with the sequencer wallet.
@@ -146,6 +151,7 @@ pub async fn spawn_zone_sequencer(
         monitor_config,
         l1_provider,
         signer,
+        zone_head_notifications,
         withdrawal_store,
         withdrawal_notify,
         withdrawal_repair_notify,

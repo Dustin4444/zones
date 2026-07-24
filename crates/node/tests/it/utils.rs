@@ -3161,7 +3161,14 @@ pub(crate) async fn spawn_sequencer_with_config(
         attestation_store: None,
     };
 
-    zone_sequencer::spawn_zone_sequencer(config, sequencer_signer).await
+    use futures::StreamExt;
+
+    use reth_primitives_traits::Block as _;
+
+    let zone_head_notifications = Box::pin(zone.subscribe_to_canonical_state().filter_map(
+        |notification| async move { notification.tip_checked().map(|tip| tip.number()) },
+    ));
+    zone_sequencer::spawn_zone_sequencer(config, sequencer_signer, zone_head_notifications).await
 }
 
 /// Start a local zone node with an L1Fixture already seeded for `seed_blocks` blocks.

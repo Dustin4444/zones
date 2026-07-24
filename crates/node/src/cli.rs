@@ -344,11 +344,11 @@ pub struct ZoneArgs {
     )]
     pub sequencer_role: Option<Role>,
 
-    /// How often (in seconds) the zone monitor polls for new L2 blocks.
+    /// How often (in seconds) the zone monitor polls for new L2 blocks as a recovery fallback.
     #[arg(
         long = "zone.poll-interval-secs",
         env = "ZONE_POLL_INTERVAL_SECS",
-        default_value_t = 1
+        default_value_t = 30
     )]
     pub zone_poll_interval_secs: u64,
 

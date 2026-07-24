@@ -29,6 +29,7 @@ use alloy_rpc_client::RpcClient;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::{Result, WrapErr};
+use futures::StreamExt;
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
@@ -36,7 +37,7 @@ use tracing::{error, info, instrument, warn};
 use alloy_sol_types::{ContractError, SolInterface as _};
 
 use crate::{
-    AttestationStore,
+    AttestationStore, ZoneHeadNotifications,
     abi::{self, IZoneInbox, IZoneOutbox, NO_QUEUE_INDEX, TempoState, ZonePortal},
     rpc::rpc_connection_config,
     settlement::{
@@ -74,7 +75,7 @@ pub struct ZoneMonitorConfig {
     pub zone_rpc_url: String,
     /// Interval between WebSocket reconnection attempts for the zone RPC client.
     pub retry_connection_interval: Duration,
-    /// How often to poll the zone L2 for new blocks (cheap RPC call).
+    /// How often to poll the zone L2 for new blocks if a canonical-chain notification is missed.
     pub poll_interval: Duration,
     /// Number of zone blocks between empty withdrawal batch boundaries.
     ///
@@ -262,7 +263,8 @@ impl ZoneMonitor {
 
     /// Run the monitor loop. This method never returns under normal operation.
     ///
-    /// Polls the zone L2 frequently (`poll_interval`) but only submits a batch
+    /// Wakes on canonical-chain notifications, with `poll_interval` as a recovery fallback, but
+    /// only submits a batch
     /// to L1 when:
     /// - Enough new zone blocks have accumulated to cross an empty-batch
     ///   boundary (`batch_interval_blocks`), OR
@@ -271,7 +273,7 @@ impl ZoneMonitor {
         outbox = %self.config.outbox_address,
         inbox = %self.config.inbox_address,
     ))]
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, zone_heads: &mut ZoneHeadNotifications) -> Result<()> {
         info!(
             zone_rpc = %self.config.zone_rpc_url,
             batch_interval_blocks = self.config.batch_interval_blocks,
@@ -279,19 +281,21 @@ impl ZoneMonitor {
             "Zone monitor started"
         );
 
-        let mut poll = tokio::time::interval(self.config.poll_interval);
+        let mut fallback_poll = tokio::time::interval(self.config.poll_interval);
 
         loop {
-            tokio::select! {
-                _ = poll.tick() => {}
+            let latest_zone_block = tokio::select! {
+                _ = fallback_poll.tick() => {
+                    let Ok(latest_zone_block) = self.provider.get_block_number().await else {
+                        continue;
+                    };
+                    latest_zone_block
+                }
+                Some(latest_zone_block) = zone_heads.next() => latest_zone_block,
                 _ = self.repair_notify.notified() => {
                     self.repair_missing_withdrawal_slot().await;
                     continue;
                 }
-            }
-
-            let Ok(latest_zone_block) = self.provider.get_block_number().await else {
-                continue;
             };
             self.record_observed_zone_block(latest_zone_block);
             if latest_zone_block <= self.last_submitted_zone_block {
@@ -920,6 +924,7 @@ pub fn spawn_zone_monitor(
     config: ZoneMonitorConfig,
     l1_provider: DynProvider<TempoNetwork>,
     signer: PrivateKeySigner,
+    mut zone_head_notifications: ZoneHeadNotifications,
     withdrawal_store: SharedWithdrawalStore,
     withdrawal_notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
@@ -945,7 +950,7 @@ pub fn spawn_zone_monitor(
         };
 
         loop {
-            if let Err(e) = monitor.run().await {
+            if let Err(e) = monitor.run(&mut zone_head_notifications).await {
                 error!(error = %e, "Zone monitor failed, restarting in 5s");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
