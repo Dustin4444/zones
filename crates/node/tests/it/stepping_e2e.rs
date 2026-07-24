@@ -409,31 +409,23 @@ async fn test_configured_short_l1_gap_submits_multiple_batch_boundaries() -> eyr
                 }
 
                 let events = portal.BatchSubmitted_filter().from_block(0).query().await?;
-                // Bootstrap settlement is the first BatchSubmitted event and has a zero anchor.
-                // It is not one of the configured ancestry-boundary submissions under test.
-                if events.len() < SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize + 1 {
+                if events.len() < SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize {
                     return Ok(None);
                 }
 
                 let mut calls = Vec::with_capacity(SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize);
-                for (_, log) in &events {
+                for (_, log) in events
+                    .iter()
+                    .take(SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize)
+                {
                     let tx_hash = log.transaction_hash.ok_or_else(|| {
                         eyre::eyre!("BatchSubmitted log missing transaction hash")
                     })?;
                     let (call, _) = fetch_submit_batch_call(l1, tx_hash).await?;
-                    if call.tempoBlockNumber != 0 {
-                        calls.push(call);
-                    }
-                    if calls.len() == SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize {
-                        break;
-                    }
+                    calls.push(call);
                 }
 
-                if calls.len() == SHORT_MULTI_BOUNDARY_BATCH_COUNT as usize {
-                    Ok(Some(calls))
-                } else {
-                    Ok(None)
-                }
+                Ok(Some(calls))
             }
         },
     )

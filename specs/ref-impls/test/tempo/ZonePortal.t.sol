@@ -1452,11 +1452,14 @@ contract ZonePortalTest is BaseTest {
                        BATCH SUBMISSION TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_submitBatch_bootstrapUsesZeroAnchorAndDoesNotConsumeWithdrawalBatch() public {
+    function test_submitBatch_bootstrapUsesTempoAnchorAndConsumesWithdrawalBatch() public {
         address[] memory signers = _activateSequencerSet(2);
-        bytes32 genesisHash = keccak256("canonical genesis");
+        vm.roll(block.number + 1);
+        uint64 tempoBlockNumber = uint64(block.number - 1);
+        bytes32 anchorBlockHash = blockhash(tempoBlockNumber);
+        bytes32 firstBatchTip = keccak256("first batch tip");
         BlockTransition memory blockTransition =
-            BlockTransition({ prevBlockHash: bytes32(0), nextBlockHash: genesisHash });
+            BlockTransition({ prevBlockHash: bytes32(0), nextBlockHash: firstBatchTip });
         DepositQueueTransition memory depositQueueTransition = DepositQueueTransition({
             prevProcessedHash: bytes32(0),
             nextProcessedHash: bytes32(0),
@@ -1465,31 +1468,47 @@ contract ZonePortalTest is BaseTest {
         });
         bytes[] memory signatures = _quorumSignatures(
             _attestationDigest(
-                0, 0, 0, 0, bytes32(0), blockTransition, depositQueueTransition, bytes32(0), ""
+                1,
+                1,
+                tempoBlockNumber,
+                tempoBlockNumber,
+                anchorBlockHash,
+                blockTransition,
+                depositQueueTransition,
+                bytes32(0),
+                ""
             )
         );
 
         vm.expectEmit(true, true, false, true);
-        emit IZonePortal.BatchSubmitted(0, NO_QUEUE_INDEX, bytes32(0), genesisHash, bytes32(0), 0);
+        emit IZonePortal.BatchSubmitted(1, NO_QUEUE_INDEX, bytes32(0), firstBatchTip, bytes32(0), 0);
         vm.prank(signers[0]);
         portal.submitBatch(
-            0, 0, blockTransition, depositQueueTransition, bytes32(0), "", "", 0, signatures
+            tempoBlockNumber,
+            0,
+            blockTransition,
+            depositQueueTransition,
+            bytes32(0),
+            "",
+            "",
+            1,
+            signatures
         );
 
-        assertEq(portal.blockHash(), genesisHash);
-        assertEq(portal.zoneHeight(), 0);
-        assertEq(portal.withdrawalBatchIndex(), 0);
+        assertEq(portal.blockHash(), firstBatchTip);
+        assertEq(portal.zoneHeight(), 1);
+        assertEq(portal.withdrawalBatchIndex(), 1);
         assertEq(portal.withdrawalQueueHead(), 0);
         assertEq(portal.withdrawalQueueTail(), 0);
-        assertEq(portal.lastSyncedTempoBlockNumber(), 0);
+        assertEq(portal.lastSyncedTempoBlockNumber(), tempoBlockNumber);
         assertEq(portal.lastProcessedDepositNumber(), 0);
     }
 
-    function test_submitBatch_bootstrapRejectsNonemptyOutputs() public {
+    function test_submitBatch_rejectsGenesisOnlyBootstrap() public {
         bytes[] memory signatures = new bytes[](1);
         signatures[0] = hex"01";
 
-        vm.expectRevert(IZonePortal.InvalidBootstrap.selector);
+        vm.expectRevert(IZonePortal.InvalidTempoBlockNumber.selector);
         vm.prank(sequencer);
         portal.submitBatch(
             0,
@@ -1503,7 +1522,7 @@ contract ZonePortalTest is BaseTest {
                 prevDepositNumber: 0,
                 nextDepositNumber: 0
             }),
-            keccak256("phantom withdrawal batch"),
+            bytes32(0),
             "",
             "",
             0,

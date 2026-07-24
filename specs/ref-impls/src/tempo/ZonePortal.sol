@@ -1106,26 +1106,8 @@ contract ZonePortal is IZonePortal {
         // Determine anchor block: either tempoBlockNumber (direct) or recentTempoBlockNumber (ancestry)
         uint64 anchorBlockNumber;
         bytes32 anchorBlockHash;
-        bool isBootstrap = blockHash == bytes32(0);
-
-        if (isBootstrap) {
-            // Bootstrap mode: the first proof derives the canonical genesis block from zoneId and
-            // proves that TempoState still has an empty checkpoint. Genesis executes no system
-            // transactions, so it cannot process deposits or finalize a withdrawal batch.
-            if (
-                tempoBlockNumber != 0 || recentTempoBlockNumber != 0 || nextZoneHeight != 0
-                    || blockTransition.nextBlockHash == bytes32(0)
-                    || depositQueueTransition.prevProcessedHash != bytes32(0)
-                    || depositQueueTransition.nextProcessedHash != bytes32(0)
-                    || depositQueueTransition.prevDepositNumber != 0
-                    || depositQueueTransition.nextDepositNumber != 0
-                    || withdrawalQueueHash != bytes32(0)
-            ) {
-                revert InvalidBootstrap();
-            }
-            anchorBlockNumber = 0;
-            anchorBlockHash = bytes32(0);
-        } else if (recentTempoBlockNumber == 0) {
+        bool isFirstBatch = blockHash == bytes32(0);
+        if (recentTempoBlockNumber == 0) {
             // Direct mode: read tempoBlockNumber hash from EIP-2935
             anchorBlockNumber = tempoBlockNumber;
             if (tempoBlockNumber > block.number) {
@@ -1146,16 +1128,16 @@ contract ZonePortal is IZonePortal {
             anchorBlockHash = getBlockHash(recentTempoBlockNumber);
         }
 
-        if (!isBootstrap && anchorBlockHash == bytes32(0)) {
+        if (anchorBlockHash == bytes32(0)) {
             revert InvalidTempoBlockNumber();
         }
 
         // The certificate binds every value that affects settlement, rather than only the
         // zone block hash. A leader therefore cannot reuse signatures for this block with a
         // different withdrawal root, deposit transition, Tempo anchor, or verifier config.
-        uint64 expectedWithdrawalBatchIndex = isBootstrap ? 0 : withdrawalBatchIndex + 1;
+        uint64 expectedWithdrawalBatchIndex = withdrawalBatchIndex + 1;
         if (!_verifySettlement(
-                isBootstrap,
+                isFirstBatch,
                 expectedWithdrawalBatchIndex,
                 nextZoneHeight,
                 tempoBlockNumber,
@@ -1198,16 +1180,8 @@ contract ZonePortal is IZonePortal {
             );
         if (!valid) revert InvalidProof();
 
-        // Bootstrap only establishes the canonical genesis tip. It must not consume a withdrawal
-        // batch or queue slot because genesis executes no ZoneOutbox.finalizeWithdrawalBatch.
         blockHash = blockTransition.nextBlockHash;
         zoneHeight = nextZoneHeight;
-        if (isBootstrap) {
-            emit BatchSubmitted(0, NO_QUEUE_INDEX, bytes32(0), blockHash, bytes32(0), 0);
-            return;
-        }
-
-        // Update ordinary batch state.
         withdrawalBatchIndex = expectedWithdrawalBatchIndex;
         lastSyncedTempoBlockNumber = tempoBlockNumber;
         lastProcessedDepositNumber = depositQueueTransition.nextDepositNumber;
@@ -1225,7 +1199,7 @@ contract ZonePortal is IZonePortal {
     }
 
     function _verifySettlement(
-        bool isBootstrap,
+        bool isFirstBatch,
         uint64 expectedWithdrawalBatchIndex,
         uint256 nextZoneHeight,
         uint64 tempoBlockNumber,
@@ -1243,8 +1217,8 @@ contract ZonePortal is IZonePortal {
     {
         uint256 threshold = sequencerThreshold;
         if (
-            (!isBootstrap && nextZoneHeight <= zoneHeight) || signatures.length < threshold
-                || signatures.length > _sequencers.length
+            nextZoneHeight <= zoneHeight || (isFirstBatch && expectedWithdrawalBatchIndex != 1)
+                || signatures.length < threshold || signatures.length > _sequencers.length
         ) return false;
 
         bytes32 structHash = keccak256(

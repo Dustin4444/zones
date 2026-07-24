@@ -156,23 +156,6 @@ pub struct BatchData {
     pub withdrawal_batch_index: u64,
 }
 
-impl BatchData {
-    /// Whether this statement is the one-time transition from an uninitialized portal to the
-    /// canonical zone genesis block.
-    fn is_bootstrap(&self) -> bool {
-        self.zone_height == 0
-            && self.tempo_block_number == 0
-            && self.prev_block_hash.is_zero()
-            && !self.next_block_hash.is_zero()
-            && self.prev_processed_deposit_hash.is_zero()
-            && self.next_processed_deposit_hash.is_zero()
-            && self.prev_deposit_number == 0
-            && self.next_deposit_number == 0
-            && self.withdrawal_queue_hash.is_zero()
-            && self.withdrawal_batch_index == 0
-    }
-}
-
 struct SettlementAttestationInput<'a> {
     batch: &'a BatchData,
     anchor_block_number: u64,
@@ -409,10 +392,12 @@ impl BatchSubmitter {
         withdrawal_batch_index = batch.withdrawal_batch_index,
     ))]
     pub async fn submit_batch(&self, batch: &BatchData) -> Result<ZonePortal::BatchSubmitted> {
-        let is_bootstrap = batch.is_bootstrap();
         eyre::ensure!(
-            !batch.prev_block_hash.is_zero() || is_bootstrap,
-            "an uninitialized portal must settle the canonical genesis block before ordinary batches"
+            !batch.prev_block_hash.is_zero()
+                || (batch.zone_height > 0
+                    && batch.tempo_block_number > 0
+                    && batch.withdrawal_batch_index > 0),
+            "the bootstrap batch must extend canonical genesis through at least one anchored non-genesis block"
         );
         if !batch.withdrawal_queue_hash.is_zero() {
             self.check_withdrawal_queue_capacity().await?;
@@ -459,14 +444,8 @@ impl BatchSubmitter {
                 let current_l1_block = self.l1_provider.get_block_number().await?;
                 (Some(certificate), anchor_mode, current_l1_block)
             } else {
-                let (anchor_mode, current_l1_block) = if is_bootstrap {
-                    (
-                        AnchorMode::Bootstrap,
-                        self.l1_provider.get_block_number().await?,
-                    )
-                } else {
-                    self.resolve_anchor_mode(batch.tempo_block_number).await?
-                };
+                let (anchor_mode, current_l1_block) =
+                    self.resolve_anchor_mode(batch.tempo_block_number).await?;
                 (None, anchor_mode, current_l1_block)
             };
         let recent_tempo_block_number = anchor_mode.recent_block_number();
@@ -476,16 +455,13 @@ impl BatchSubmitter {
         } else {
             // Legacy mode, where the 1-of-1 sequencer will self-sign the attestation
             let anchor_block_number = anchor_mode.anchor_block_number(batch.tempo_block_number);
-            let anchor_block_hash = if is_bootstrap {
-                B256::ZERO
-            } else {
-                self.l1_provider
-                    .get_block_by_number(anchor_block_number.into())
-                    .await?
-                    .ok_or_eyre(format!("L1 anchor block {anchor_block_number} not found"))?
-                    .header
-                    .hash
-            };
+            let anchor_block_hash = self
+                .l1_provider
+                .get_block_by_number(anchor_block_number.into())
+                .await?
+                .ok_or_eyre(format!("L1 anchor block {anchor_block_number} not found"))?
+                .header
+                .hash;
             let signer = self
                 .signer
                 .as_ref()
@@ -657,7 +633,6 @@ impl BatchSubmitter {
             verifier_call.call(),
         )?;
 
-        let is_bootstrap = batch.is_bootstrap();
         let expected_block_transition_hash = alloy_primitives::keccak256(
             (batch.prev_block_hash, batch.next_block_hash).abi_encode(),
         );
@@ -682,11 +657,7 @@ impl BatchSubmitter {
             attestation.zoneHeight == U256::from(zone_height),
             "certificate zone height changed"
         );
-        let expected_withdrawal_batch_index = if is_bootstrap {
-            0
-        } else {
-            withdrawal_index.saturating_add(1)
-        };
+        let expected_withdrawal_batch_index = withdrawal_index.saturating_add(1);
         eyre::ensure!(
             attestation.withdrawalBatchIndex == U256::from(expected_withdrawal_batch_index),
             "certificate withdrawal batch index changed"
@@ -715,14 +686,6 @@ impl BatchSubmitter {
             attestation.verifierConfigHash == alloy_primitives::keccak256(Bytes::new()),
             "certificate verifier config changed"
         );
-
-        if is_bootstrap {
-            eyre::ensure!(
-                attestation.anchorBlockNumber == 0 && attestation.anchorBlockHash.is_zero(),
-                "bootstrap certificate must use the empty L1 anchor"
-            );
-            return Ok(AnchorMode::Bootstrap);
-        }
 
         let current_l1_block = self.l1_provider.get_block_number().await?;
         eyre::ensure!(
@@ -1446,8 +1409,6 @@ fn backward_log_query_start(hi: u64, floor: u64) -> u64 {
 /// window.
 #[allow(dead_code)] // Ancestry::ancestry_headers is collected but not yet consumed — available for prover integration
 enum AnchorMode {
-    /// The one-time canonical genesis transition has no Tempo L1 anchor.
-    Bootstrap,
     /// `tempoBlockNumber` is within the effective EIP-2935 window — the portal
     /// reads its hash directly. No extra proof data required.
     Direct,
@@ -1469,14 +1430,13 @@ impl AnchorMode {
     /// `0` for direct mode, or the anchor block number for ancestry mode.
     const fn recent_block_number(&self) -> u64 {
         match self {
-            Self::Bootstrap | Self::Direct => 0,
+            Self::Direct => 0,
             Self::Ancestry { anchor_block, .. } => *anchor_block,
         }
     }
 
     const fn anchor_block_number(&self, tempo_block_number: u64) -> u64 {
         match self {
-            Self::Bootstrap => 0,
             Self::Direct => tempo_block_number,
             Self::Ancestry { anchor_block, .. } => *anchor_block,
         }
@@ -1486,7 +1446,6 @@ impl AnchorMode {
 impl fmt::Display for AnchorMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bootstrap => f.write_str("bootstrap"),
             Self::Direct => f.write_str("direct"),
             Self::Ancestry { .. } => f.write_str("ancestry"),
         }
@@ -1517,31 +1476,6 @@ mod tests {
     use proptest::prelude::*;
     use tempo_alloy::rpc::TempoHeaderResponse;
     use tempo_primitives::TempoHeader;
-
-    #[test]
-    fn bootstrap_batch_has_only_canonical_genesis_outputs() {
-        let bootstrap = BatchData {
-            zone_height: 0,
-            tempo_block_number: 0,
-            prev_block_hash: B256::ZERO,
-            next_block_hash: B256::repeat_byte(0x11),
-            prev_processed_deposit_hash: B256::ZERO,
-            next_processed_deposit_hash: B256::ZERO,
-            prev_deposit_number: 0,
-            next_deposit_number: 0,
-            withdrawal_queue_hash: B256::ZERO,
-            withdrawal_batch_index: 0,
-        };
-        assert!(bootstrap.is_bootstrap());
-
-        let mut with_withdrawal = bootstrap.clone();
-        with_withdrawal.withdrawal_queue_hash = B256::repeat_byte(0x22);
-        assert!(!with_withdrawal.is_bootstrap());
-
-        let mut ordinary_height = bootstrap;
-        ordinary_height.zone_height = 1;
-        assert!(!ordinary_height.is_bootstrap());
-    }
 
     fn mock_l1_header(number: u64, parent_hash: B256) -> (TempoHeaderResponse, B256) {
         let header = TempoHeader {

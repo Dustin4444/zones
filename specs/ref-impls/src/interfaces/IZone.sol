@@ -397,7 +397,7 @@ interface IVerifier {
     /// @param anchorBlockNumber Block whose hash is verified (tempoBlockNumber or recent block)
     /// @param anchorBlockHash Hash of anchorBlockNumber (from EIP-2935)
     /// @param expectedWithdrawalBatchIndex Expected batch index
-    ///        (`0` for bootstrap, otherwise `portal.withdrawalBatchIndex + 1`)
+    ///        (`portal.withdrawalBatchIndex + 1`)
     /// @param blockTransition Zone block hash transition
     /// @param depositQueueTransition Deposit queue processing transition
     /// @param withdrawalQueueHash Withdrawal queue hash chain for this batch (0 if none)
@@ -510,12 +510,10 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
-    /// @notice Emitted after a bootstrap or ordinary batch is accepted by `submitBatch`.
+    /// @notice Emitted after a batch is accepted by `submitBatch`.
     /// @dev `withdrawalQueueIndex` is the logical (non-wrapping) withdrawal queue index the
     ///      batch's hash chain was enqueued under, or `NO_QUEUE_INDEX` (`type(uint256).max`)
-    ///      when the transition carried no withdrawals. Bootstrap emits withdrawal batch index
-    ///      `0` and `NO_QUEUE_INDEX` without advancing either withdrawal queue counter. Indexed so
-    ///      off-chain recovery can query
+    ///      when the transition carried no withdrawals. Indexed so off-chain recovery can query
     ///      the event for a specific logical index instead of counting events positionally.
     event BatchSubmitted(
         uint64 indexed withdrawalBatchIndex,
@@ -614,7 +612,6 @@ interface IZonePortal {
     error MustDelegateCall();
     error NotPendingAdmin();
     error InvalidProof();
-    error InvalidBootstrap();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
     error TransferFailed();
