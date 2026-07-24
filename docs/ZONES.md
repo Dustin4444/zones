@@ -327,6 +327,8 @@ This is a same-zone demo only. The command creates its own temporary tokens and 
 
 The private RPC (port 8544) requires a signed auth token derived from your private key. This ensures only the account owner can query their own scoped state.
 
+The node also serves its standard RPC on port 8545 without account authorization or caller-scoped redaction. Expose that endpoint only to trusted services, such as Tempo API, through gateway-level access controls; direct account-scoped clients should continue to use the private RPC on port 8544.
+
 Use the built-in helper if you only want a quick balance check:
 
 ```bash
