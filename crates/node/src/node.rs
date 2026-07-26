@@ -36,7 +36,7 @@ use reth_node_builder::{
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::ChainSpecProvider;
-use reth_rpc_builder::Identity;
+use reth_rpc_builder::{Identity, RpcServerHandle};
 use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
     BlockNumReader, EmptyBodyStorage, HeaderProvider, StateProvider, StateProviderFactory,
@@ -103,6 +103,27 @@ fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
 
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
+
+/// Select a configured vanilla RPC endpoint for internal Zone RPC calls.
+///
+/// The public namespace is installed on every configured transport, so the
+/// shared implementation must not require HTTP specifically.
+fn vanilla_rpc_url(handle: &RpcServerHandle) -> eyre::Result<String> {
+    select_vanilla_rpc_url(handle.http_url(), handle.ws_url(), handle.ipc_endpoint())
+}
+
+fn select_vanilla_rpc_url(
+    http_url: Option<String>,
+    ws_url: Option<String>,
+    ipc_endpoint: Option<String>,
+) -> eyre::Result<String> {
+    // IPC exposes the full RPC module set in reth, while HTTP and WS can be
+    // configured with narrower namespace selections.
+    ipc_endpoint
+        .or(http_url)
+        .or(ws_url)
+        .ok_or_else(|| eyre::eyre!("at least one vanilla RPC transport must be enabled"))
+}
 
 /// Sequencer-side sender reveal encryptor used while building
 /// `finalizeWithdrawalBatch` system transactions.
@@ -819,11 +840,7 @@ where
         }
 
         let eth_handlers = handle.eth_handlers().clone();
-        let zone_rpc_url = handle
-            .rpc_server_handles
-            .rpc
-            .http_url()
-            .expect("HTTP RPC server must be enabled for private RPC");
+        let zone_rpc_url = vanilla_rpc_url(&handle.rpc_server_handles.rpc)?;
         let private_rpc_config = zone_rpc::PrivateRpcConfig {
             listen_addr: ([0, 0, 0, 0], config.private_rpc_port).into(),
             l1_rpc_url,
@@ -870,11 +887,7 @@ where
             }
         }
 
-        let zone_rpc_url = handle
-            .rpc_server_handles
-            .rpc
-            .http_url()
-            .expect("HTTP RPC server must be enabled for sequencer mode");
+        let zone_rpc_url = vanilla_rpc_url(&handle.rpc_server_handles.rpc)?;
 
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
@@ -1253,8 +1266,10 @@ mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
     use alloy_primitives::{Bytes, Signature, TxKind, U256};
+    use jsonrpsee::RpcModule;
     use reth_chainspec::EthChainSpec;
     use reth_primitives_traits::Recovered;
+    use reth_rpc_builder::TransportRpcModules;
     use tempo_primitives::transaction::{
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
@@ -1290,6 +1305,50 @@ mod tests {
         assert_eq!(tempo_chain_spec_for_l1(31319).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
         unsafe { std::env::remove_var("ZONE_L1_DEV_CHAIN_IDS") };
+    }
+
+    #[test]
+    fn selects_any_configured_vanilla_rpc_transport() {
+        assert_eq!(
+            select_vanilla_rpc_url(Some("http".into()), Some("ws".into()), Some("ipc".into()))
+                .unwrap(),
+            "ipc"
+        );
+        assert_eq!(
+            select_vanilla_rpc_url(None, Some("ws".into()), Some("ipc".into())).unwrap(),
+            "ipc"
+        );
+        assert_eq!(
+            select_vanilla_rpc_url(Some("http".into()), Some("ws".into()), None).unwrap(),
+            "http"
+        );
+        assert_eq!(
+            select_vanilla_rpc_url(None, Some("ws".into()), None).unwrap(),
+            "ws"
+        );
+        assert!(select_vanilla_rpc_url(None, None, None).is_err());
+    }
+
+    #[test]
+    fn exposes_only_public_zone_methods_on_all_vanilla_transports() {
+        let mut modules = TransportRpcModules::default()
+            .with_http(RpcModule::new(()))
+            .with_ws(RpcModule::new(()))
+            .with_ipc(RpcModule::new(()));
+        modules
+            .merge_configured(PublicZoneRpc::default().into_rpc())
+            .unwrap();
+
+        for methods in [
+            modules.http_methods(|_| true).unwrap(),
+            modules.ws_methods(|_| true).unwrap(),
+            modules.ipc_methods(|_| true).unwrap(),
+        ] {
+            let names = methods.method_names().collect::<Vec<_>>();
+            assert!(names.contains(&"zone_getZoneInfo"));
+            assert!(names.contains(&"zone_getEncryptionKey"));
+            assert!(!names.contains(&"zone_getAuthorizationTokenInfo"));
+        }
     }
 
     #[test]
