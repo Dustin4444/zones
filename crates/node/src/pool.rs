@@ -214,14 +214,12 @@ fn validate_has_enabled_token_balance(
 ///
 /// # Scope
 ///
-/// This policy runs only when the pool admits a transaction. A transaction whose recovered
-/// `PoolTransaction::sender()` is in `CONTRACT_DEPLOYER_ALLOWLIST` bypasses the hook entirely. For
-/// every other sender, the hook does not affect consensus validation, EVM execution, payload
-/// conversion, or the validity of transactions in imported blocks. `TransactionOrigin` is
-/// intentionally ignored, so origin metadata cannot grant or bypass the sender allowlist. Legitimate
-/// Zone system transactions are synthesized and handled outside pool admission. The production
-/// allowlist is currently empty, so no transaction takes the bypass until a protocol deployer is
-/// configured.
+/// This policy runs only when the pool admits a transaction; it does not affect consensus
+/// validation, EVM execution, payload conversion, or the validity of transactions in imported
+/// blocks. `TransactionOrigin` is intentionally ignored, so origin metadata cannot grant or bypass
+/// the contract-deployer allowlist. The allowlist is passed to the base transaction validator and
+/// only exempts contract creation; configured calldata filtering still applies to every call.
+/// Legitimate Zone system transactions are synthesized and handled outside pool admission.
 ///
 /// After base transaction validation, the configured calldata filter receives every call target
 /// and input from the direct transaction or AA batch. Contract creation remains the responsibility
@@ -229,21 +227,27 @@ fn validate_has_enabled_token_balance(
 ///
 /// # Errors
 ///
-/// Allowlisted senders cannot fail this hook. Base-validation failures are wrapped in
-/// `TempoPoolTransactionError::Evm`; a configured calldata filter returns its own
-/// `InvalidPoolTransactionError`.
+/// Base-validation failures are wrapped in `TempoPoolTransactionError::Evm`; a configured calldata
+/// filter returns its own `InvalidPoolTransactionError`.
 pub(crate) fn validate_zone_pool_transaction(
     _origin: TransactionOrigin,
     tx: &TempoPooledTransaction,
     calldata_filter: Option<CalldataFilterRef<'_>>,
 ) -> Result<(), InvalidPoolTransactionError> {
-    let allowlist = zone_primitives::constants::CONTRACT_DEPLOYER_ALLOWLIST;
-    if allowlist.contains(&tx.sender()) {
-        return Ok(());
-    }
+    validate_zone_pool_transaction_with_allowlist(
+        tx,
+        zone_primitives::constants::CONTRACT_DEPLOYER_ALLOWLIST,
+        calldata_filter,
+    )
+}
 
+fn validate_zone_pool_transaction_with_allowlist(
+    tx: &TempoPooledTransaction,
+    contract_deployer_allowlist: &[Address],
+    calldata_filter: Option<CalldataFilterRef<'_>>,
+) -> Result<(), InvalidPoolTransactionError> {
     let tx = tx.tx_env();
-    zone_evm::validate_transaction(tx, allowlist)
+    zone_evm::validate_transaction(tx, contract_deployer_allowlist)
         .map_err(|err| InvalidPoolTransactionError::other(TempoPoolTransactionError::Evm(err)))?;
 
     if let Some(calldata_filter) = calldata_filter {
@@ -264,7 +268,8 @@ fn validation_error(message: &'static str) -> InvalidPoolTransactionError {
 /// Production calldata policy for Zone transaction-pool admission.
 ///
 /// State-changing Zone system operations are rejected because they must be synthesized as system
-/// transactions. TIP-20 targets accept only fully decodable `transferFrom` and `approve` calls.
+/// transactions. TIP-20 targets accept only fully decodable `transferFrom`, `transferWithMemo`,
+/// `transferFromWithMemo`, and `approve` calls.
 pub(crate) fn validate_zone_pool_calldata(
     target: Address,
     input: &[u8],
@@ -290,6 +295,12 @@ pub(crate) fn validate_zone_pool_calldata(
     if input.starts_with(&ITIP20::transferFromCall::SELECTOR) {
         ITIP20::transferFromCall::abi_decode(input)
             .map_err(|_| validation_error("malformed TIP-20 transferFrom call"))?;
+    } else if input.starts_with(&ITIP20::transferWithMemoCall::SELECTOR) {
+        ITIP20::transferWithMemoCall::abi_decode(input)
+            .map_err(|_| validation_error("malformed TIP-20 transferWithMemo call"))?;
+    } else if input.starts_with(&ITIP20::transferFromWithMemoCall::SELECTOR) {
+        ITIP20::transferFromWithMemoCall::abi_decode(input)
+            .map_err(|_| validation_error("malformed TIP-20 transferFromWithMemo call"))?;
     } else if input.starts_with(&ITIP20::approveCall::SELECTOR) {
         ITIP20::approveCall::abi_decode(input)
             .map_err(|_| validation_error("malformed TIP-20 approve call"))?;
@@ -304,7 +315,7 @@ pub(crate) fn validate_zone_pool_calldata(
 mod tests {
     use super::*;
     use alloy_consensus::{Signed, TxEip1559};
-    use alloy_primitives::{Address, Bytes, Signature, U256, address};
+    use alloy_primitives::{Address, B256, Bytes, Signature, U256, address};
     use reth_primitives_traits::Recovered;
     use tempo_primitives::{
         TempoTxEnvelope,
@@ -344,11 +355,54 @@ mod tests {
         )
     }
 
+    fn create_transaction(sender: Address) -> TempoPooledTransaction {
+        pooled_transaction(
+            TempoTxEnvelope::Eip1559(Signed::new_unhashed(
+                TxEip1559 {
+                    to: TxKind::Create,
+                    ..Default::default()
+                },
+                Signature::test_signature(),
+            )),
+            sender,
+        )
+    }
+
     fn validate_pool_transaction(
         origin: TransactionOrigin,
         transaction: &TempoPooledTransaction,
     ) -> Result<(), InvalidPoolTransactionError> {
         validate_zone_pool_transaction(origin, transaction, Some(&validate_zone_pool_calldata))
+    }
+
+    #[test]
+    fn pool_policy_allowlist_only_exempts_contract_creation() {
+        let sender = Address::repeat_byte(0x11);
+        let create = create_transaction(sender);
+        let reject_all_calls =
+            |_target, _input: &[u8]| Err(validation_error("custom calldata rejection"));
+
+        assert!(
+            validate_zone_pool_transaction_with_allowlist(
+                &create,
+                &[sender],
+                Some(&reject_all_calls),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_zone_pool_transaction_with_allowlist(&create, &[], Some(&reject_all_calls),)
+                .is_err()
+        );
+
+        let call = call_transaction(sender, Address::repeat_byte(0x22), Bytes::new());
+        let error = validate_zone_pool_transaction_with_allowlist(
+            &call,
+            &[sender],
+            Some(&reject_all_calls),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "custom calldata rejection");
     }
 
     #[test]
@@ -384,8 +438,24 @@ mod tests {
             spender: Address::repeat_byte(0x33),
             amount: U256::from(9),
         };
+        let transfer_with_memo = ITIP20::transferWithMemoCall {
+            to: Address::repeat_byte(0x44),
+            amount: U256::from(11),
+            memo: B256::with_last_byte(12),
+        };
+        let transfer_from_with_memo = ITIP20::transferFromWithMemoCall {
+            from: sender,
+            to: Address::repeat_byte(0x55),
+            amount: U256::from(13),
+            memo: B256::with_last_byte(14),
+        };
 
-        for input in [transfer_from.abi_encode(), approve.abi_encode()] {
+        for input in [
+            transfer_from.abi_encode(),
+            transfer_with_memo.abi_encode(),
+            transfer_from_with_memo.abi_encode(),
+            approve.abi_encode(),
+        ] {
             let transaction = call_transaction(sender, TOKEN, input.into());
             assert!(validate_pool_transaction(TransactionOrigin::External, &transaction).is_ok());
         }
@@ -402,11 +472,29 @@ mod tests {
             "TIP-20 operation is not allowed on zones"
         );
 
-        let transaction =
-            call_transaction(sender, TOKEN, ITIP20::approveCall::SELECTOR.to_vec().into());
-        let error =
-            validate_pool_transaction(TransactionOrigin::External, &transaction).unwrap_err();
-        assert_eq!(error.to_string(), "malformed TIP-20 approve call");
+        for (selector, expected_error) in [
+            (
+                ITIP20::transferFromCall::SELECTOR,
+                "malformed TIP-20 transferFrom call",
+            ),
+            (
+                ITIP20::transferWithMemoCall::SELECTOR,
+                "malformed TIP-20 transferWithMemo call",
+            ),
+            (
+                ITIP20::transferFromWithMemoCall::SELECTOR,
+                "malformed TIP-20 transferFromWithMemo call",
+            ),
+            (
+                ITIP20::approveCall::SELECTOR,
+                "malformed TIP-20 approve call",
+            ),
+        ] {
+            let transaction = call_transaction(sender, TOKEN, selector.to_vec().into());
+            let error =
+                validate_pool_transaction(TransactionOrigin::External, &transaction).unwrap_err();
+            assert_eq!(error.to_string(), expected_error);
+        }
     }
 
     #[test]
