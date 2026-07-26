@@ -3,10 +3,10 @@
 //! This is a lightweight L2 node built on reth's node builder infrastructure.
 //! It reuses Tempo's EVM, primitives, and pool, but with noop consensus/network/payload.
 
-pub use crate::pool::ZonePoolBuilder;
+pub use crate::pool::{CalldataFilter, ZonePoolBuilder};
 use crate::{
     ZoneEngine,
-    pool::validate_zone_pool_transaction,
+    pool::validate_zone_pool_calldata,
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     settlement_attestation::collect_leader_settlements,
@@ -37,20 +37,23 @@ use reth_primitives_traits::SealedHeader;
 use reth_provider::ChainSpecProvider;
 use reth_rpc_builder::Identity;
 use reth_rpc_eth_api::EthApiTypes;
-use reth_storage_api::{BlockNumReader, EmptyBodyStorage, HeaderProvider};
+use reth_storage_api::{BlockNumReader, EmptyBodyStorage, HeaderProvider, StateProviderFactory};
+use reth_transaction_pool::TransactionPool as _;
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_node::{engine::TempoEngineValidator, rpc::TempoEthApiBuilder};
 use tempo_primitives::{self as primitives, TempoHeader, TempoPrimitives, TempoTxEnvelope};
 use tempo_transaction_pool::transaction::TempoPooledTransaction;
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
+};
 use tracing::info;
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
-    DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig,
-    state::{L1StateCache, L1StateProvider, L1StateProviderConfig},
+    DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig, TempoStateExt,
+    state::{EnabledTokenRegistry, L1StateCache, L1StateProvider, L1StateProviderConfig},
 };
 use zone_p2p::{P2pConfig, P2pNetworkId, Role, spawn_p2p};
 use zone_payload::{
@@ -174,6 +177,8 @@ pub struct ZoneNode {
     l1_state_provider_config: L1StateProviderConfig,
     /// Shared L1 state cache (enabled tokens, zone metadata, etc.).
     l1_state_cache: L1StateCache,
+    /// Shared registry of tokens enabled for this zone.
+    enabled_tokens: EnabledTokenRegistry,
     /// L1 anchors independently observed and applied by the subscriber.
     l1_block_tracker: L1BlockTracker,
     /// Address of the L1 deposit portal contract.
@@ -202,11 +207,13 @@ impl ZoneNode {
         let deposit_queue = DepositQueue::default();
 
         let l1_state_cache = L1StateCache::new();
+        let enabled_tokens = EnabledTokenRegistry::default();
         let l1_block_tracker = L1BlockTracker::default();
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
             genesis_tempo_block_number,
+            enabled_tokens: enabled_tokens.clone(),
             l1_state_cache: l1_state_cache.clone(),
             block_tracker: l1_block_tracker.clone(),
             l1_fetch_concurrency,
@@ -225,6 +232,7 @@ impl ZoneNode {
             l1_config,
             l1_state_provider_config,
             l1_state_cache,
+            enabled_tokens,
             l1_block_tracker,
             portal_address,
             withdrawal_batch_interval_blocks: DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
@@ -302,6 +310,11 @@ impl ZoneNode {
         self.l1_state_cache.clone()
     }
 
+    /// Returns the shared enabled-token registry.
+    pub fn enabled_tokens(&self) -> EnabledTokenRegistry {
+        self.enabled_tokens.clone()
+    }
+
     /// Returns the L1 block observation tracker.
     pub fn l1_block_tracker(&self) -> L1BlockTracker {
         self.l1_block_tracker.clone()
@@ -340,8 +353,8 @@ impl ZoneNode {
         ComponentsBuilder::default()
             .node_types::<N>()
             .pool(
-                ZonePoolBuilder::default()
-                    .with_additional_stateless_validation(validate_zone_pool_transaction),
+                ZonePoolBuilder::new(executor_builder.enabled_tokens.clone())
+                    .with_calldata_filter(validate_zone_pool_calldata),
             )
             .executor(executor_builder)
             .payload(BasicPayloadServiceBuilder::new(payload_factory))
@@ -445,6 +458,7 @@ where
     > as NodeAddOns<N>>::Handle;
 
     async fn launch_add_ons(mut self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
+        let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
                 &self.l1_config.l1_rpc_url,
@@ -452,6 +466,9 @@ where
             )
             .await?
             .erased();
+
+        self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
+            .await?;
 
         let p2p_role = self.p2p_config.as_ref().map(P2pConfig::role);
         self.spawn_l1_subscriber(&ctx, p2p_role == Some(Role::Follower));
@@ -650,6 +667,56 @@ where
                 }
             },
         );
+        Ok(())
+    }
+
+    /// Seed the enabled-token registry from the zone's current L1 snapshot.
+    async fn resolve_and_seed_tokens(
+        &mut self,
+        l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
+        block_number: u64,
+    ) -> eyre::Result<()> {
+        let portal = self.portal_address;
+        let block_id = alloy_rpc_types_eth::BlockId::number(block_number);
+        let portal_code = l1_provider
+            .get_code_at(portal)
+            .block_id(block_id)
+            .await
+            .map_err(|err| {
+                eyre::eyre!(
+                    "failed to check portal {portal} deployment at L1 block {block_number}: {err}"
+                )
+            })?;
+        let enabled_tokens = if portal_code.is_empty() {
+            info!(
+                target: "reth::cli",
+                %portal,
+                block_number,
+                "Portal is not deployed at the L1 anchor, starting with an empty enabled-token registry"
+            );
+            Vec::new()
+        } else {
+            ZonePortal::new(portal, l1_provider)
+                .enabled_tokens_at(block_id)
+                .await
+                .map_err(|err| {
+                    eyre::eyre!(
+                        "failed to discover enabled tokens from portal {portal} at L1 block \
+                         {block_number}: {err}"
+                    )
+                })?
+        };
+        info!(
+            target: "reth::cli",
+            count = enabled_tokens.len(),
+            ?enabled_tokens,
+            block_number,
+            "Discovered enabled tokens from L1"
+        );
+
+        let mut registry = self.l1_config.enabled_tokens.write();
+        registry.clear();
+        registry.extend(enabled_tokens);
         Ok(())
     }
 
@@ -877,6 +944,7 @@ where
         let executor_builder = ZoneExecutorBuilder::new(
             self.l1_state_provider_config.clone(),
             self.l1_state_cache.clone(),
+            self.enabled_tokens.clone(),
         );
         let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks);
         if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
@@ -938,6 +1006,7 @@ impl PayloadAttributesBuilder<ZonePayloadAttributes, TempoHeader> for ZonePayloa
 pub struct ZoneExecutorBuilder {
     l1_state_provider_config: L1StateProviderConfig,
     l1_state_cache: L1StateCache,
+    enabled_tokens: EnabledTokenRegistry,
 }
 
 impl ZoneExecutorBuilder {
@@ -945,10 +1014,12 @@ impl ZoneExecutorBuilder {
     pub fn new(
         l1_state_provider_config: L1StateProviderConfig,
         l1_state_cache: L1StateCache,
+        enabled_tokens: EnabledTokenRegistry,
     ) -> Self {
         Self {
             l1_state_provider_config,
             l1_state_cache,
+            enabled_tokens,
         }
     }
 }

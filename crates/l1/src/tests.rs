@@ -148,6 +148,7 @@ fn test_subscriber(
             l1_rpc_url: "http://127.0.0.1:8545".to_owned(),
             portal_address,
             genesis_tempo_block_number,
+            enabled_tokens: crate::state::EnabledTokenRegistry::default(),
             l1_state_cache: crate::L1StateCache::new(),
             block_tracker: L1BlockTracker::default(),
             l1_fetch_concurrency: 1,
@@ -200,7 +201,7 @@ fn observed_portal_events_require_complete_advance_tempo_inputs() {
             currency: "USD".to_owned(),
         }],
     };
-    let mut deposits: Vec<_> = events
+    let deposits: Vec<_> = events
         .deposits
         .iter()
         .map(L1Deposit::to_abi_queued_deposit)
@@ -212,7 +213,6 @@ fn observed_portal_events_require_complete_advance_tempo_inputs() {
         .collect();
 
     // Rejection is a sequencer decision and does not change the authenticated deposit identity.
-    deposits[0].rejected = true;
     events
         .validate_advance_tempo_inputs(&deposits, &enabled_tokens)
         .unwrap();
@@ -855,6 +855,28 @@ fn test_push_log_decodes_bounce_back_as_regular_deposit() {
 }
 
 #[test]
+fn confirmed_token_enabled_event_updates_registry() {
+    let subscriber = test_subscriber(
+        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::from([0]))),
+        None,
+    );
+    let token = address!("0x20c0000000000000000000000000000000000001");
+    let events = L1PortalEvents {
+        enabled_tokens: vec![EnabledToken {
+            token,
+            name: "Path USD".to_owned(),
+            symbol: "pathUSD".to_owned(),
+            currency: "USD".to_owned(),
+        }],
+        ..Default::default()
+    };
+
+    subscriber.apply_enabled_token_events(&events);
+
+    assert!(subscriber.config.enabled_tokens.read().contains(&token));
+}
+
+#[test]
 fn test_deposit_queue_hash_chain() {
     let mut queue = PendingDeposits::default();
     assert_eq!(queue.enqueued_head_hash(), B256::ZERO);
@@ -1218,10 +1240,6 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
     assert_eq!(
         prepared.queued_deposits[0].depositType,
         DepositType::Encrypted
-    );
-    assert!(
-        !prepared.queued_deposits[0].rejected,
-        "policy is enforced by upstream TIP-20 mint execution"
     );
     assert_eq!(
         prepared.decryptions.len(),

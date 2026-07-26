@@ -48,10 +48,6 @@ pub const CHAUM_PEDERSEN_VERIFY_ADDRESS: Address =
 /// AES-GCM decryption precompile address.
 pub const AES_GCM_DECRYPT_ADDRESS: Address = address!("0x1C00000000000000000000000000000000000101");
 
-/// TIP-20 zone token factory precompile address.
-pub const ZONE_TIP20_FACTORY_ADDRESS: Address =
-    address!("0x20Fc000000000000000000000000000000000000");
-
 /// Zone-native fee manager precompile address.
 ///
 /// This is adjacent to, but distinct from, Tempo L1's fee manager at `0xfeec...0000`.
@@ -63,6 +59,12 @@ pub const ZONE_TOKEN_ADDRESS: Address = address!("0x20C0000000000000000000000000
 
 /// ZonePortal storage slot 0: `admin` (address).
 pub const PORTAL_ADMIN_SLOT: B256 = B256::ZERO;
+
+/// ZonePortal storage slot 3: `currentDepositQueueHash` (bytes32).
+pub const PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT: B256 = B256::with_last_byte(3);
+
+/// ZonePortal storage slot 5: `_encryptionKeys` dynamic array.
+pub const PORTAL_ENCRYPTION_KEYS_SLOT: B256 = B256::with_last_byte(5);
 
 /// ZonePortal storage slot 6: `_tokenConfigs` mapping.
 pub const PORTAL_TOKEN_CONFIGS_SLOT: B256 = B256::with_last_byte(6);
