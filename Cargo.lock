@@ -13674,6 +13674,7 @@ dependencies = [
  "base64 0.22.1",
  "eyre",
  "futures",
+ "jsonrpsee",
  "metrics",
  "p256",
  "parking_lot",

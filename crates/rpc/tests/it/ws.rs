@@ -218,7 +218,7 @@ impl ZoneRpcApi for MockZoneRpcApi {
         })
     }
 
-    fn zone_get_zone_info(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
+    fn zone_get_zone_info(&self) -> BoxFut<'_> {
         Box::pin(async move {
             zone_rpc::types::to_raw(&serde_json::json!({
                 "zoneId": "0x1",
@@ -228,7 +228,7 @@ impl ZoneRpcApi for MockZoneRpcApi {
         })
     }
 
-    fn zone_get_encryption_key(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
+    fn zone_get_encryption_key(&self) -> BoxFut<'_> {
         Box::pin(async { Err(zone_rpc::types::JsonRpcError::internal("not implemented")) })
     }
 }

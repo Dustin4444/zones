@@ -177,12 +177,12 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// and token expiry.
     fn zone_get_authorization_token_info(&self, auth: AuthContext) -> BoxFut<'_>;
 
-    /// `zone_getZoneInfo()` — returns zone metadata.
-    fn zone_get_zone_info(&self, auth: AuthContext) -> BoxFut<'_>;
+    /// `zone_getZoneInfo()` — returns authentication-independent zone metadata.
+    fn zone_get_zone_info(&self) -> BoxFut<'_>;
 
     /// `zone_getEncryptionKey()` — returns the active encryption key at the
     /// current Tempo L1 head.
-    fn zone_get_encryption_key(&self, auth: AuthContext) -> BoxFut<'_>;
+    fn zone_get_encryption_key(&self) -> BoxFut<'_>;
 }
 
 /// Deserialize JSON-RPC params, returning an error response on failure.
@@ -333,15 +333,11 @@ pub async fn dispatch(
             "zone_getAuthorizationTokenInfo",
             api.zone_get_authorization_token_info(auth.clone()).await,
         ),
-        "zone_getZoneInfo" => api_result(
-            id,
-            "zone_getZoneInfo",
-            api.zone_get_zone_info(auth.clone()).await,
-        ),
+        "zone_getZoneInfo" => api_result(id, "zone_getZoneInfo", api.zone_get_zone_info().await),
         "zone_getEncryptionKey" => api_result(
             id,
             "zone_getEncryptionKey",
-            api.zone_get_encryption_key(auth.clone()).await,
+            api.zone_get_encryption_key().await,
         ),
         _ => {
             // Method is whitelisted but not yet implemented via direct API
@@ -809,7 +805,7 @@ mod tests {
             Box::pin(async move { to_raw(&Address::repeat_byte(0xbb)) })
         }
 
-        fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
+        fn zone_get_zone_info(&self) -> BoxFut<'_> {
             Box::pin(async move {
                 to_raw(&json!({
                     "zoneId": "0x1",
@@ -821,7 +817,7 @@ mod tests {
             })
         }
 
-        stub!(zone_get_encryption_key, _auth: AuthContext);
+        stub!(zone_get_encryption_key);
     }
 
     fn auth() -> AuthContext {

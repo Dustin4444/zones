@@ -6,7 +6,10 @@
 use crate::{
     ZoneEngine,
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
-    rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
+    rpc::{
+        PublicZoneRpc, ZoneApiServer as _, ZoneRpc, ZoneRpcApi, rpc_connection_config,
+        start_private_rpc,
+    },
     settlement_attestation::collect_leader_settlements,
     tx_forwarding::{forward_new_transactions, insert_forwarded_transactions, route_p2p_events},
 };
@@ -406,6 +409,8 @@ where
     portal_address: Address,
     /// Private RPC configuration.
     private_rpc_config: ZonePrivateRpcConfig,
+    /// Shared implementation for the public and private Zone RPC surfaces.
+    public_zone_rpc: PublicZoneRpc,
     /// Sequencer configuration.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     /// Static Zone P2P networking configuration.
@@ -435,6 +440,8 @@ where
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
         p2p_config: Option<P2pConfig>,
     ) -> Self {
+        let public_zone_rpc = PublicZoneRpc::default();
+        let public_zone_rpc_module = public_zone_rpc.clone();
         Self {
             inner: RpcAddOns::new(
                 TempoEthApiBuilder::default(),
@@ -443,11 +450,17 @@ where
                 BasicEngineValidatorBuilder::default(),
                 Identity::default(),
                 Default::default(),
-            ),
+            )
+            .extend_rpc_modules(move |ctx| {
+                ctx.modules
+                    .merge_configured(public_zone_rpc_module.into_rpc())?;
+                Ok(())
+            }),
             deposit_queue,
             l1_config,
             portal_address,
             private_rpc_config,
+            public_zone_rpc,
             sequencer_config,
             p2p_config,
         }
@@ -538,6 +551,7 @@ where
 
         Self::launch_private_rpc(
             self.private_rpc_config,
+            self.public_zone_rpc,
             &handle,
             self.l1_config.l1_rpc_url.clone(),
             self.l1_config.retry_connection_interval,
@@ -785,6 +799,7 @@ where
     /// Launch the private RPC server.
     async fn launch_private_rpc(
         config: ZonePrivateRpcConfig,
+        public_zone_rpc: PublicZoneRpc,
         handle: &<Self as NodeAddOns<N>>::Handle,
         l1_rpc_url: String,
         retry_connection_interval: Duration,
@@ -821,6 +836,9 @@ where
         };
         let api: Arc<dyn ZoneRpcApi> =
             Arc::new(ZoneRpc::new(eth_handlers, private_rpc_config.clone()).await?);
+        public_zone_rpc
+            .set_api(api.clone())
+            .map_err(|_| eyre::eyre!("zone RPC API was initialized more than once"))?;
         let local_addr = start_private_rpc(private_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Private zone RPC server started");
 

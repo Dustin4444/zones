@@ -1,7 +1,9 @@
-//! Private zone RPC server.
+//! Zone RPC servers and shared namespace definitions.
 //!
 //! Provides an authenticated JSON-RPC endpoint that sits in front of the
 //! standard reth RPC, adding per-caller privacy redactions and access control.
+//! It also defines the public `zone_` namespace exposed by the standard node
+//! RPC.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -12,6 +14,7 @@ pub mod error;
 pub mod filter;
 pub mod handlers;
 mod metrics;
+pub mod namespace;
 pub mod policy;
 pub mod provider;
 pub mod server;
@@ -21,6 +24,7 @@ mod ws;
 
 pub use config::PrivateRpcConfig;
 pub use handlers::ZoneRpcApi;
+pub use namespace::{PublicZoneRpc, ZoneApiServer};
 pub use provider::{ZoneProvider, ZoneProviderConfig};
 pub use server::start_private_rpc;
 pub use subscription::{BoxWsSubscriptionFut, WsSubscriptionStream};

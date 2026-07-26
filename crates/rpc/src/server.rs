@@ -395,8 +395,8 @@ mod tests {
         stub!(new_block_filter, _c: crate::auth::AuthContext);
         stub!(uninstall_filter, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
         stub!(zone_get_authorization_token_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_zone_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_encryption_key, _c: crate::auth::AuthContext);
+        stub!(zone_get_zone_info);
+        stub!(zone_get_encryption_key);
     }
 
     fn test_config() -> PrivateRpcConfig {

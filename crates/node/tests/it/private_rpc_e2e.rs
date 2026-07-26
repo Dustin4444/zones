@@ -16,7 +16,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use alloy_eips::eip2718::Encodable2718;
-use alloy_provider::ProviderBuilder;
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer::SignerSync;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::SolCall;
@@ -1263,6 +1263,13 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
         format!("0x{tempo_block_number:x}"),
     );
 
+    let public_zone_info: Value = ctx
+        .zone
+        .provider()
+        .raw_request("zone_getZoneInfo".into(), ())
+        .await?;
+    assert_eq!(public_zone_info, zone_info["result"]);
+
     Ok(())
 }
 
@@ -1345,6 +1352,12 @@ async fn test_zone_get_encryption_key_reads_latest_l1_key() -> eyre::Result<()> 
             "keyIndex": "0x1",
         })
     );
+    let public_key: Value = ctx
+        .zone
+        .provider()
+        .raw_request("zone_getEncryptionKey".into(), ())
+        .await?;
+    assert_eq!(public_key, second["result"]);
 
     Ok(())
 }

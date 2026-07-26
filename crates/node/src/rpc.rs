@@ -819,7 +819,7 @@ where
         })
     }
 
-    fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
+    fn zone_get_zone_info(&self) -> BoxFut<'_> {
         Box::pin(async move {
             let zone_tokens = self.zone_tokens().await?;
             let sequencers = self.zone_sequencers().await?;
@@ -843,7 +843,7 @@ where
         })
     }
 
-    fn zone_get_encryption_key(&self, _auth: AuthContext) -> BoxFut<'_> {
+    fn zone_get_encryption_key(&self) -> BoxFut<'_> {
         Box::pin(async move {
             let block_number = self
                 .l1_provider
