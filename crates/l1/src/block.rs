@@ -25,6 +25,21 @@ impl L1BlockDeposits {
         sequencer_key: &k256::SecretKey,
         portal_address: Address,
     ) -> eyre::Result<PreparedL1Block> {
+        self.prepare_for_build(sequencer_key, portal_address)
+            .await
+            .map(|(block, _)| block)
+    }
+
+    /// Prepare deposits and retain the event-derived L1 reads needed during their execution.
+    ///
+    /// Leaders use the returned plan to populate the shared exact-block L1 cache before triggering
+    /// payload construction. Keeping the plan separate leaves [`PreparedL1Block`] and its Engine
+    /// API encoding unchanged.
+    pub async fn prepare_for_build(
+        self,
+        sequencer_key: &k256::SecretKey,
+        portal_address: Address,
+    ) -> eyre::Result<(PreparedL1Block, crate::state::DepositPrefetchPlan)> {
         use crate::precompiles::ecies;
 
         let start = std::time::Instant::now();
@@ -32,12 +47,23 @@ impl L1BlockDeposits {
         let total_deposits = self.events.deposits.len();
         let mut queued_deposits: Vec<abi::QueuedDeposit> = Vec::new();
         let mut decryptions: Vec<abi::DecryptionData> = Vec::new();
+        let mut prefetch = crate::state::DepositPrefetchPlan::new(l1_block_number, portal_address);
 
-        for deposit in &self.events.deposits {
-            match deposit {
-                L1Deposit::Regular(_) => queued_deposits.push(deposit.to_abi_queued_deposit()),
+        for l1_deposit in &self.events.deposits {
+            match l1_deposit {
+                L1Deposit::Regular(deposit) => {
+                    if deposit.tempo_refund_recipient.is_zero() {
+                        // The effective withdrawal bounce-back recipient comes from Zone-local
+                        // Outbox state, but its token policy remains event-derived.
+                        prefetch.add_deposit_token(deposit.token);
+                    } else {
+                        prefetch.add_mint(deposit.token, deposit.to);
+                    }
+                    queued_deposits.push(l1_deposit.to_abi_queued_deposit());
+                }
                 L1Deposit::Encrypted(d) => {
-                    let queued = deposit.to_abi_queued_deposit();
+                    let queued = l1_deposit.to_abi_queued_deposit();
+                    prefetch.add_encryption_key(d.key_index);
 
                     // Attempt full ECIES decryption.
                     let dec = ecies::decrypt_deposit(
@@ -52,6 +78,7 @@ impl L1BlockDeposits {
                     );
 
                     if let Some(dec) = dec {
+                        prefetch.add_mint(d.token, dec.to);
                         debug!(
                             target: "zone::engine",
                             l1_block = l1_block_number,
@@ -126,7 +153,10 @@ impl L1BlockDeposits {
             .events
             .enabled_tokens
             .iter()
-            .map(|t| t.to_abi())
+            .map(|token| {
+                prefetch.add_enabled_token(token.token);
+                token.to_abi()
+            })
             .collect();
 
         let elapsed = start.elapsed();
@@ -140,12 +170,15 @@ impl L1BlockDeposits {
             "Prepared L1 block deposits"
         );
 
-        Ok(PreparedL1Block {
-            header: self.header,
-            queued_deposits,
-            decryptions,
-            enabled_tokens,
-        })
+        Ok((
+            PreparedL1Block {
+                header: self.header,
+                queued_deposits,
+                decryptions,
+                enabled_tokens,
+            },
+            prefetch,
+        ))
     }
 }
 

@@ -16,7 +16,11 @@ use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::BlockId;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
-use std::num::NonZeroU32;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+};
 use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
 use zone_precompiles::{L1StateError, L1StorageReader};
@@ -239,6 +243,29 @@ impl L1StateProvider {
         let value = self.fetch_slot(address, slot, block_number).await?;
         self.cache.lock().set(address, slot, block_number, value);
         Ok(value)
+    }
+
+    /// Populate the shared cache for a set of storage slots at one exact L1 block.
+    ///
+    /// Requests are deduplicated before dispatch and bounded by `concurrency`, so callers can move
+    /// predictable read latency out of synchronous EVM execution without issuing an unbounded RPC
+    /// burst. Returned values are keyed by `(address, slot)` for value-dependent prefetch planning.
+    pub(crate) async fn prefetch_storage(
+        &self,
+        slots: impl IntoIterator<Item = (Address, B256)>,
+        block_number: u64,
+        concurrency: usize,
+    ) -> Result<HashMap<(Address, B256), B256>> {
+        let slots: HashSet<_> = slots.into_iter().collect();
+        stream::iter(slots)
+            .map(|(address, slot)| async move {
+                self.get_storage_async(address, slot, block_number)
+                    .await
+                    .map(|value| ((address, slot), value))
+            })
+            .buffer_unordered(concurrency.max(1))
+            .try_collect()
+            .await
     }
 
     /// Expose the shared cache handle for external use (e.g. the engine).

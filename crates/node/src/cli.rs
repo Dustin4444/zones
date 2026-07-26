@@ -396,7 +396,7 @@ pub struct ZoneArgs {
     #[arg(long = "l1.genesis-block-number", env = "L1_GENESIS_BLOCK_NUMBER")]
     pub l1_genesis_block_number: Option<u64>,
 
-    /// Maximum number of concurrent L1 receipt fetches.
+    /// Maximum number of concurrent L1 RPC fetches.
     #[arg(
         long = "l1.fetch-concurrency",
         env = "L1_FETCH_CONCURRENCY",

@@ -765,6 +765,7 @@ where
         let last_header = provider
             .sealed_header(provider.best_block_number()?)?
             .ok_or_else(|| eyre::eyre!("no latest block header"))?;
+        let l1_state_provider = ctx.node.evm_config().l1_reader().clone();
         let engine = ZoneEngine::new(
             provider.chain_spec(),
             ctx.beacon_engine_handle.clone(),
@@ -774,6 +775,8 @@ where
             fee_recipient,
             sequencer_key,
             self.portal_address,
+            l1_state_provider,
+            self.l1_config.l1_fetch_concurrency,
         );
         ctx.node
             .task_executor()

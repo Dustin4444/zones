@@ -10,21 +10,22 @@
 //! L1Subscriber ──enqueue──► DepositQueue ──notify──► ZoneEngine
 //!                                │                       │
 //!                                │                   1. peek queue → L1 block
-//!                                │                   2. build ZonePayloadAttributes
+//!                                │                   2. decrypt + prefetch L1 state
+//!                                │                   3. build ZonePayloadAttributes
 //!                                │                      (inner attrs + l1_block)
-//!                                │                   3. FCU w/ payload attributes
+//!                                │                   4. FCU w/ payload attributes
 //!                                │                       │
 //!                                │                       ▼
 //!                                │               reth payload service
 //!                                │                       │
-//!                                │               4. build payload
+//!                                │               5. build payload
 //!                                │                  (L1 data from attributes)
 //!                                │                       │
 //!                                │                       ▼
 //!                                │                  ZoneEngine
-//!                                │               5. resolve payload
-//!                                │               6. newPayload
-//!                                │               7. FCU (update head)
+//!                                │               6. resolve payload
+//!                                │               7. newPayload
+//!                                │               8. FCU (update head)
 //!                                │                       │
 //!                                ◄── confirm ◄───────────┘
 //! ```
@@ -47,22 +48,27 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
 use std::{sync::Arc, time::Duration};
+use tempo_chainspec::TempoHardforks as _;
 use tempo_primitives::TempoHeader;
 use tracing::{error, warn};
 
 use zone_chainspec::ZoneChainSpec;
-use zone_l1::{DepositQueue, L1BlockDeposits, PreparedL1Block};
+use zone_l1::{
+    DepositQueue, L1BlockDeposits, PreparedL1Block,
+    state::{DepositPrefetchConfig, L1StateProvider},
+};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 
 /// Engine that drives L2 block production from L1 events.
 ///
 /// Waits for L1 blocks in the [`DepositQueue`], then for each block:
 /// 1. Peeks the L1 block from the queue
-/// 2. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
-/// 3. Sends FCU with payload attributes to start a build
-/// 4. Resolves the built payload
-/// 5. Submits via `newPayload`
-/// 6. Confirms the L1 block in the queue (removes it)
+/// 2. Decrypts deposits and prefetches their event-derived L1 state
+/// 3. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
+/// 4. Sends FCU with payload attributes to start a build
+/// 5. Resolves the built payload
+/// 6. Submits via `newPayload`
+/// 7. Confirms the L1 block in the queue (removes it)
 ///
 /// On failure the L1 block stays in the queue and is retried.
 #[derive(Debug)]
@@ -84,6 +90,10 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
+    /// L1 reader shared with EVM execution, used to warm exact-child deposit state.
+    l1_state_provider: L1StateProvider,
+    /// Operator-selected bound for concurrent L1 RPC fetches.
+    l1_fetch_concurrency: usize,
 }
 
 impl ZoneEngine {
@@ -96,6 +106,8 @@ impl ZoneEngine {
         fee_recipient: Address,
         sequencer_key: k256::SecretKey,
         portal_address: Address,
+        l1_state_provider: L1StateProvider,
+        l1_fetch_concurrency: usize,
     ) -> Self {
         Self {
             chain_spec,
@@ -106,6 +118,8 @@ impl ZoneEngine {
             fee_recipient,
             sequencer_key,
             portal_address,
+            l1_state_provider,
+            l1_fetch_concurrency,
         }
     }
 
@@ -177,13 +191,25 @@ impl ZoneEngine {
         }
     }
 
-    /// Decrypt encrypted deposits and ABI-encode them into a [`PreparedL1Block`] ready for
-    /// the payload builder. Mint-recipient policy is enforced during upstream TIP-20 execution
-    /// against the finalized L1 anchor.
+    /// Decrypt deposits and prefetch their exact-child L1 state before payload construction.
+    ///
+    /// Mint-recipient policy remains enforced by upstream TIP-20 execution. Prefetching only moves
+    /// event-derived RPC reads ahead of the payload-builder deadline and populates the same cache
+    /// that execution uses.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
-        l1_block
-            .prepare(&self.sequencer_key, self.portal_address)
-            .await
+        let timestamp = l1_block.header.timestamp();
+        let prefetch_config = DepositPrefetchConfig::new(
+            self.chain_spec.is_t6_active_at_timestamp(timestamp),
+            self.chain_spec.is_t9_active_at_timestamp(timestamp),
+            self.l1_fetch_concurrency,
+        );
+        let (prepared, prefetch) = l1_block
+            .prepare_for_build(&self.sequencer_key, self.portal_address)
+            .await?;
+        prefetch
+            .prefetch(&self.l1_state_provider, prefetch_config)
+            .await?;
+        Ok(prepared)
     }
 
     /// Advance the chain by one block.

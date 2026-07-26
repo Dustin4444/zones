@@ -13465,12 +13465,14 @@ dependencies = [
  "serde_json",
  "tempo-alloy",
  "tempo-contracts",
+ "tempo-precompiles",
  "tempo-primitives",
  "tempo-zone-contracts",
  "tokio",
  "tracing",
  "url",
  "zone-precompiles",
+ "zone-primitives",
 ]
 
 [[package]]

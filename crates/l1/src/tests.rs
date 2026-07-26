@@ -1231,11 +1231,28 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         queue_hash_after: B256::ZERO,
     };
 
-    let prepared = block
-        .prepare(&sequencer_key, portal)
+    let failed_key = k256::SecretKey::from_slice(&[0x12; 32]).expect("valid alternate key");
+    let (_, failed_prefetch) = block
+        .clone()
+        .prepare_for_build(&failed_key, portal)
+        .await
+        .expect("failed local decryption should still prepare a refund proof");
+    assert!(failed_prefetch.plans_encryption_key(U256::ZERO));
+    assert!(
+        !failed_prefetch.plans_deposit_token(token),
+        "a failed encrypted decryption never reaches mint policy execution"
+    );
+
+    let (prepared, prefetch) = block
+        .prepare_for_build(&sequencer_key, portal)
         .await
         .expect("decrypted deposit should prepare without an engine-side policy read");
 
+    assert!(prefetch.plans_encryption_key(U256::ZERO));
+    assert!(
+        prefetch.plans_deposit_token(token),
+        "a successfully decrypted deposit reaches mint policy execution"
+    );
     assert_eq!(prepared.queued_deposits.len(), 1);
     assert_eq!(
         prepared.queued_deposits[0].depositType,
