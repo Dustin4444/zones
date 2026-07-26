@@ -3,6 +3,17 @@ pragma solidity ^0.8.13;
 
 // Protocol-managed ZoneFactory precompile defined by TIP-1091.
 address constant ZONE_FACTORY_ADDRESS = 0x5aF2000000000000000000000000000000000000;
+bytes12 constant ZONE_PORTAL_PREFIX = 0x5AD000000000000000000000;
+address constant ZONE_PORTAL_IMPL_ADDRESS = 0x5AD1000000000000000000000000000000000000;
+address constant ZONE_VERIFIER_ADDRESS = 0x5a56000000000000000000000000000000000000;
+address constant ZONE_MESSENGER_ADDRESS = 0x5A4d000000000000000000000000000000000000;
+
+/// @notice Mutually exclusive authorization role assigned to a Tempo account.
+enum Role {
+    None,
+    Account,
+    CallbackGateway
+}
 
 /// @title IZoneToken
 /// @notice Interface for the zone's zone token (TIP-20 with mint/burn for system)
@@ -11,6 +22,20 @@ interface IZoneToken {
     function mint(address to, uint256 amount) external;
 
     function burn(uint256 amount) external;
+
+    function initialize(
+        address admin,
+        string calldata name,
+        string calldata symbol,
+        string calldata currency,
+        address quoteToken,
+        address policyAdmin
+    )
+        external;
+
+    function ISSUER_ROLE() external view returns (bytes32);
+
+    function grantRole(bytes32 role, address account) external;
 
     function transfer(address to, uint256 amount) external returns (bool);
 
@@ -24,21 +49,13 @@ interface IZoneToken {
 struct ZoneInfo {
     uint32 zoneId;
     address portal;
-    address initialToken; // first TIP-20 enabled at zone creation (additional tokens enabled via enableToken)
+    bool accessMode; // creation-time enforcement flag; query the portal for the current value
+    bool gatewayMode; // creation-time enforcement flag; query the portal for the current value
     address admin;
-    address sequencer;
+    address[] sequencers;
+    uint8 threshold;
     address verifier;
-    bytes32 genesisBlockHash;
-    bytes32 genesisTempoBlockHash;
-    uint64 genesisTempoBlockNumber;
     string rpcUrl;
-}
-
-/// @notice Zone creation parameters stored in genesis
-struct ZoneParams {
-    bytes32 genesisBlockHash;
-    bytes32 genesisTempoBlockHash;
-    uint64 genesisTempoBlockNumber;
 }
 
 /// @notice Block transition for zone batch proofs
@@ -74,7 +91,7 @@ struct Deposit {
     address sender;
     address to;
     uint128 amount;
-    address bouncebackRecipient;
+    address tempoRefundRecipient;
     bytes32 memo;
 }
 
@@ -101,7 +118,7 @@ struct EncryptedDeposit {
     address token; // TIP-20 token being deposited (public, for escrow accounting)
     address sender; // Depositor (public, for refunds)
     uint128 amount; // Amount (public, for accounting)
-    address bouncebackRecipient; // Tempo recipient for a failed-deposit refund
+    address tempoRefundRecipient; // Tempo recipient for a failed-deposit refund
     uint256 keyIndex; // Index of encryption key used (specified by depositor)
     EncryptedDepositPayload encrypted; // Encrypted (to, memo)
 }
@@ -164,7 +181,7 @@ struct DecryptionData {
                     CRYPTOGRAPHIC PRECOMPILES
 //////////////////////////////////////////////////////////////*/
 
-/// @notice Token to be enabled on the zone via the TIP20 factory
+/// @notice Token to be activated directly by the ZoneInbox
 struct EnabledToken {
     address token;
     string name;
@@ -172,22 +189,8 @@ struct EnabledToken {
     string currency;
 }
 
-/// @title ITIP20ZoneFactory
-/// @notice Interface for the zone's TIP20 factory that enables new tokens
-interface ITIP20ZoneFactory {
-
-    function enableToken(
-        address token,
-        string calldata name,
-        string calldata symbol,
-        string calldata currency
-    )
-        external;
-
-}
-
-// TIP20 factory predeploy address
-address constant TIP20_FACTORY_ADDRESS = 0x20Fc000000000000000000000000000000000000;
+// Default quote token for zone TIP-20 activation.
+address constant PATH_USD_ADDRESS = 0x20C0000000000000000000000000000000000000;
 
 // Precompile address for Chaum-Pedersen proof verification
 // Predeploy at 0x1c00000000000000000000000000000000000100
@@ -269,7 +272,7 @@ interface IAesGcmDecrypt {
 
 // Maximum callback gas a withdrawal may request.
 // The processor adds fixed overhead, so this value keeps the outer
-// keeps the outer `processWithdrawals` transaction well below a 30M gas L1 block
+// `processWithdrawals` transaction well below a 30M gas L1 block
 // limit.
 uint64 constant MAX_WITHDRAWAL_CALLBACK_GAS = 10_000_000;
 
@@ -331,38 +334,49 @@ interface IZoneTxContext {
 //////////////////////////////////////////////////////////////*/
 
 // ZonePortal storage layout:
-//   slot 0: sequencer (address)
-//   slot 1: admin (address)
-//   slot 2: pendingSequencer (address)
-//   slot 3: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
-//   slot 4: blockHash (bytes32)
-//   slot 5: currentDepositQueueHash (bytes32)
-//   slot 6: depositCount (uint64) + lastProcessedDepositNumber (uint64) + lastSyncedTempoBlockNumber (uint64) [packed]
-//   slot 7: _encryptionKeys (EncryptionKeyEntry[])
-//   slot 8: _tokenConfigs (mapping(address => TokenConfig))
-//   slot 9: _enabledTokens (address[])
-//   slot 10: refunds (mapping(address => mapping(address => uint128)))
-//   slot 11: _withdrawalQueue.head
-//   slot 12: _withdrawalQueue.tail
-//   slot 13: _withdrawalQueue.slots (mapping(uint256 => bytes32))
-//   slot 14: rpcUrl (string)
-//   slot 15: pendingAdmin (address)
-//   slot 16: _withdrawalReentrancyStatus (uint256)
-//   slot 17: zoneId (uint32) + messenger (address) [packed]
-//   slot 18: verifier (address) + genesisTempoBlockNumber (uint64) + _initialized (bool) [packed]
+//   slot 0: admin (address)
+//   slot 1: zoneGasRate (uint128) + withdrawalBatchIndex (uint64) [packed]
+//   slot 2: blockHash (bytes32)
+//   slot 3: currentDepositQueueHash (bytes32)
+//   slot 4: depositCount (uint64) + lastProcessedDepositNumber (uint64)
+//           + lastSyncedTempoBlockNumber (uint64) + bouncebackGas (uint64) [packed]
+//   slot 5: _encryptionKeys (EncryptionKeyEntry[])
+//   slot 6: _tokenConfigs (mapping(address => TokenConfig))
+//   slot 7: _enabledTokens (address[])
+//   slot 8: refunds (mapping(address => mapping(address => uint128)))
+//   slot 9: _withdrawalQueue.head
+//   slot 10: _withdrawalQueue.tail
+//   slot 11: _withdrawalQueue.slots (mapping(uint256 => bytes32))
+//   slot 12: rpcUrl (string)
+//   slot 13: pendingAdmin (address)
+//   slot 14: _withdrawalReentrancyStatus (uint256)
+//   slot 15: zoneId (uint32) + messenger (address) [packed]
+//   slot 16: verifier (address) + _initialized (bool) + sequencerSetVersion (uint64)
+//            + sequencerThreshold (uint8) [packed]
+//   slot 17: zoneHeight (uint256)
+//   slot 18: _sequencers (address[])
+//   slot 19: isSequencer (mapping(address => bool))
+//   slot 20: role (mapping(address => Role))
+//   slot 21: _isAccessEnforced (bool) + _isGatewayEnforced (bool) [packed]
+//   slot 22: maxTempoGasRate (uint128)
 //
 // These constants are the single source of truth for cross-domain reads.
 // ZoneConfig and ZoneInbox use them to read portal state via
 // TempoState.readTempoStorageSlot(). If the portal layout changes,
 // update these constants and the vm.load regression tests will catch mismatches.
-bytes32 constant PORTAL_SEQUENCER_SLOT = bytes32(uint256(0));
-bytes32 constant PORTAL_ADMIN_SLOT = bytes32(uint256(1));
-bytes32 constant PORTAL_PENDING_SEQUENCER_SLOT = bytes32(uint256(2));
-bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(5));
-bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(7));
-bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(8));
-bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(9));
-bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(15));
+bytes32 constant PORTAL_ADMIN_SLOT = bytes32(uint256(0));
+bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(3));
+bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(5));
+bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(6));
+bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(7));
+bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(13));
+bytes32 constant PORTAL_IS_SEQUENCER_SLOT = bytes32(uint256(19));
+bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(PORTAL_IS_SEQUENCER_SLOT) + 1);
+bytes32 constant PORTAL_ENFORCEMENT_MODES_SLOT = bytes32(uint256(PORTAL_ROLE_SLOT) + 1);
+bytes32 constant PORTAL_MAX_TEMPO_GAS_RATE_SLOT =
+    bytes32(uint256(PORTAL_ENFORCEMENT_MODES_SLOT) + 1);
+bytes32 constant PORTAL_ACCESS_MODE_SLOT = PORTAL_ENFORCEMENT_MODES_SLOT;
+bytes32 constant PORTAL_GATEWAY_MODE_SLOT = PORTAL_ENFORCEMENT_MODES_SLOT;
 
 /// @title IVerifier
 /// @notice Interface for zone proof/attestation verification
@@ -376,14 +390,12 @@ interface IVerifier {
     ///      4. If anchorBlockNumber > tempoBlockNumber: ancestry chain from tempoBlockNumber to anchorBlockNumber
     ///      5. ZoneOutbox.lastBatch().withdrawalBatchIndex == expectedWithdrawalBatchIndex
     ///      6. ZoneOutbox.lastBatch().withdrawalQueueHash matches withdrawalQueueHash
-    ///      7. Zone block beneficiary matches sequencer
-    ///      8. Deposit processing is correct (validated via Tempo state read inside proof)
+    ///      7. Deposit processing is correct (validated via Tempo state read inside proof)
     /// @param zoneId Unique identifier of the zone whose batch is being verified
     /// @param tempoBlockNumber Block zone committed to (from TempoState)
     /// @param anchorBlockNumber Block whose hash is verified (tempoBlockNumber or recent block)
     /// @param anchorBlockHash Hash of anchorBlockNumber (from EIP-2935)
     /// @param expectedWithdrawalBatchIndex Expected batch index (portal.withdrawalBatchIndex + 1)
-    /// @param sequencer Sequencer address (zone block beneficiary must match)
     /// @param blockTransition Zone block hash transition
     /// @param depositQueueTransition Deposit queue processing transition
     /// @param withdrawalQueueHash Withdrawal queue hash chain for this batch (0 if none)
@@ -395,7 +407,6 @@ interface IVerifier {
         uint64 anchorBlockNumber,
         bytes32 anchorBlockHash,
         uint64 expectedWithdrawalBatchIndex,
-        address sequencer,
         BlockTransition calldata blockTransition,
         DepositQueueTransition calldata depositQueueTransition,
         bytes32 withdrawalQueueHash,
@@ -415,11 +426,14 @@ interface IZoneFactory {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     struct CreateZoneParams {
-        address initialToken; // first TIP-20 to enable (sequencer can enable more later)
+        address initialToken; // first TIP-20 to enable (admin can enable more later)
+        bool accessMode; // whether to initially enforce the account allowlist
+        bool gatewayMode; // whether to initially enforce callback gateway registration
+        address[] allowedAccounts; // initial account allowlist (retained while access is open)
+        address[] zoneGateways; // initial withdrawal-and-call implementations
         address admin;
-        address sequencer;
-        address verifier;
-        ZoneParams zoneParams;
+        address[] sequencers;
+        uint8 threshold;
         string rpcUrl;
     }
 
@@ -427,22 +441,21 @@ interface IZoneFactory {
         uint32 indexed zoneId,
         address indexed portal,
         address initialToken,
+        bool accessMode,
+        bool gatewayMode,
         address admin,
-        address sequencer,
-        address verifier,
-        bytes32 genesisBlockHash,
-        bytes32 genesisTempoBlockHash,
-        uint64 genesisTempoBlockNumber
+        address[] sequencers,
+        uint8 threshold,
+        address verifier
     );
 
     error InvalidToken();
-    error InvalidOwner();
     error NotOwner();
     error InvalidAdmin();
-    error InvalidSequencer();
-    error InvalidVerifier();
-    error InsufficientGas();
-    error ZoneIdOverflow();
+    error InvalidSequencerSet();
+    error InvalidClosedLoopConfig();
+    error DuplicateAllowedAccount();
+    error DuplicateZoneGateway();
 
     /// @notice Returns the account authorized to create zones.
     function owner() external view returns (address);
@@ -450,40 +463,24 @@ interface IZoneFactory {
     /// @notice Transfers zone-creation authority to `newOwner`.
     function transferOwnership(address newOwner) external;
 
-    /// @notice Returns whether a verifier contract is approved for zone creation.
-    /// @param verifier The verifier contract address to check.
-    /// @return valid True if `verifier` can be passed to `createZone`.
-    function isValidVerifier(address verifier) external view returns (bool);
-
-    /// @notice Returns the default verifier deployed by the factory.
-    /// @return verifier The default verifier contract address.
-    function verifier() external view returns (address);
-
     /// @notice Creates a new zone and deploys its portal contract.
-    /// @param params The initial token, sequencer, verifier, and genesis parameters for the zone.
+    /// @param params The initial token, admin, sequencer set, threshold, and RPC URL.
     /// @return zoneId The newly assigned zone ID.
     /// @return portal The deployed portal address for the new zone.
     function createZone(CreateZoneParams calldata params)
         external
         returns (uint32 zoneId, address portal);
 
-    /// @notice Returns the number of zones created so far.
-    /// @return count The total number of created zones, excluding reserved zone ID 0.
-    function zoneCount() external view returns (uint32);
+    /// @notice Returns the next zone ID that will be assigned.
+    function nextZoneId() external view returns (uint32);
 
     /// @notice Returns the stored metadata for a zone.
-    /// @param zoneId The zone ID to query.
-    /// @return info The zone metadata recorded for `zoneId`.
-    function zones(uint32 zoneId) external view returns (ZoneInfo memory);
+    function zones(uint32 id) external view returns (ZoneInfo memory info);
 
     /// @notice Returns whether an address is a portal deployed by this factory.
     /// @param portal The portal address to check.
     /// @return isPortal True if `portal` was created by this factory.
     function isZonePortal(address portal) external view returns (bool);
-
-    /// @notice Returns the shared messenger used for withdrawal callbacks.
-    /// @return messenger The shared messenger contract address.
-    function messenger() external view returns (address);
 
 }
 
@@ -507,7 +504,7 @@ interface IZonePortal {
         uint128 netAmount,
         uint128 fee,
         bytes32 memo,
-        address bouncebackRecipient,
+        address tempoRefundRecipient,
         uint64 depositNumber
     );
 
@@ -541,14 +538,6 @@ interface IZonePortal {
         uint64 depositNumber
     );
 
-    /// @notice Emitted when the current sequencer nominates a new sequencer (two-step transfer).
-    /// @dev A `pendingSequencer` of address(0) signals cancellation of a pending transfer.
-    event SequencerTransferStarted(
-        address indexed currentSequencer, address indexed pendingSequencer
-    );
-    /// @notice Emitted when a pending sequencer accepts and the sequencer role is handed over.
-    event SequencerTransferred(address indexed previousSequencer, address indexed newSequencer);
-
     /// @notice Emitted when the current admin nominates a new admin (two-step transfer).
     /// @dev A `newAdmin` of address(0) signals cancellation of a pending transfer.
     event AdminTransferStarted(address indexed currentAdmin, address indexed pendingAdmin);
@@ -568,16 +557,16 @@ interface IZonePortal {
         bytes ciphertext,
         bytes12 nonce,
         bytes16 tag,
-        address bouncebackRecipient,
+        address tempoRefundRecipient,
         uint64 depositNumber
     );
 
     event DepositBounceBack(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+        address indexed tempoRefundRecipient, address token, uint128 amount, uint128 bouncebackFee
     );
 
     event DepositBounceBackPending(
-        address indexed bouncebackRecipient, address token, uint128 amount, uint128 bouncebackFee
+        address indexed tempoRefundRecipient, address token, uint128 amount, uint128 bouncebackFee
     );
 
     /// @notice Emitted when a recipient claims a previously-parked bounce-back refund.
@@ -592,6 +581,7 @@ interface IZonePortal {
         bytes32 x, uint8 yParity, uint256 keyIndex, uint64 activationBlock
     );
     event ZoneGasRateUpdated(uint128 zoneGasRate);
+    event MaxTempoGasRateUpdated(uint128 maxTempoGasRate);
     event BouncebackGasUpdated(uint64 bouncebackGas);
 
     /// @notice Emitted when admin enables a new TIP-20 token for bridging
@@ -606,18 +596,23 @@ interface IZonePortal {
     /// @notice Emitted when the sequencer updates the zone's public RPC endpoint
     event RpcUrlUpdated(string rpcUrl);
 
+    /// @notice Emitted when the admin replaces the batch-attestation signer set.
+    event SequencerSetUpdated(uint64 indexed nonce, uint8 threshold, address[] sequencers);
+
+    /// @notice Emitted when the independently mutable enforcement flags are initialized or updated.
+    event EnforcementModesUpdated(bool accessMode, bool gatewayMode);
+
     error NotSequencer();
     error NotAdmin();
     error NotFactory();
+    error NotSelf();
     error AlreadyInitialized();
     error MustDelegateCall();
-    error NotPendingSequencer();
     error NotPendingAdmin();
     error InvalidProof();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
     error TransferFailed();
-    error NotSelf();
     error ReentrantWithdrawal();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
     error InvalidEncryptionKeyIndex(uint256 keyIndex);
@@ -631,18 +626,32 @@ interface IZonePortal {
     error TokenNotEnabled();
     error DepositsNotActive();
     error TokenAlreadyEnabled();
+    error TokenTransferPolicyNotSet();
     error InvalidBouncebackRecipient();
     error InvalidDepositTransition();
+    error InvalidSequencerSet();
+    error SequencerConfigurationUnchanged();
+    error InvalidQuorumCertificate();
+    error InvalidCallbackTarget();
+    error CallbackDidNotReturnToZone();
+    error InvalidAllowedAccount();
+    error AccountNotAllowed(address account);
+
+    /// @notice Emitted when an account's portal role is initialized or updated.
+    event RoleUpdated(address indexed account, Role prev, Role next);
 
     function initialize(
         uint32 zoneId,
         address initialToken,
+        bool accessMode,
+        bool gatewayMode,
+        address[] calldata allowedAccounts,
+        address[] calldata zoneGateways,
         address messenger,
         address admin,
-        address sequencer,
+        address[] calldata sequencers,
+        uint8 threshold,
         address verifier,
-        bytes32 genesisBlockHash,
-        uint64 genesisTempoBlockNumber,
         string calldata rpcUrl
     )
         external;
@@ -658,17 +667,39 @@ interface IZonePortal {
 
     function zoneId() external view returns (uint32);
 
+    /// @notice Fixed callback messenger assigned during portal initialization.
     function messenger() external view returns (address);
 
-    function sequencer() external view returns (address);
+    /// @notice Whether account allowlist enforcement is enabled.
+    function isAccessEnforced() external view returns (bool);
+
+    /// @notice Change account allowlist enforcement. Only callable by the admin.
+    function setAccessMode(bool enforced) external;
+
+    /// @notice Whether callback gateway registration enforcement is disabled.
+    function isGatewayOpen() external view returns (bool);
+
+    /// @notice Change callback gateway enforcement. Only callable by the admin.
+    function setGatewayMode(bool enforced) external;
+
+    function role(address account) external view returns (Role);
+
+    /// @notice Assign an account's portal role. Only callable by the admin.
+    function setRole(address account, Role role) external;
+
+    /// @notice Add or remove an account from closed-loop portal flows.
+    function setAllowedAccount(address account, bool allowed) external;
+
+    /// @notice Add or remove a callback gateway.
+    function setGateway(address account, bool allowed) external;
 
     function admin() external view returns (address);
-
-    function pendingSequencer() external view returns (address);
 
     function pendingAdmin() external view returns (address);
 
     function zoneGasRate() external view returns (uint128);
+
+    function maxTempoGasRate() external view returns (uint128);
 
     function bouncebackGas() external view returns (uint64);
 
@@ -688,7 +719,23 @@ interface IZonePortal {
 
     function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32);
 
-    function genesisTempoBlockNumber() external view returns (uint64);
+    /// @notice Configuration nonce for the active sequencer set and threshold.
+    function sequencerSetVersion() external view returns (uint64);
+
+    /// @notice Number of distinct registered signatures required for batch settlement.
+    function sequencerThreshold() external view returns (uint8);
+
+    /// @notice Highest zone block height accepted with a quorum certificate.
+    function zoneHeight() external view returns (uint256);
+
+    /// @notice Whether an account belongs to the active settlement signer set.
+    function isSequencer(address account) external view returns (bool);
+
+    /// @notice Number of accounts in the active settlement signer set.
+    function sequencerCount() external view returns (uint256);
+
+    /// @notice Return a signer-set member by index.
+    function sequencerAt(uint256 index) external view returns (address);
 
     /*//////////////////////////////////////////////////////////////
                           TOKEN REGISTRY
@@ -709,9 +756,8 @@ interface IZonePortal {
     /// @notice Get an enabled token by index
     function enabledTokenAt(uint256 index) external view returns (address);
 
-    /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
+    /// @notice Enable another TIP-20 token for bridging. Only callable by admin.
     /// @dev Irreversible: once enabled, a token cannot be disabled.
-    ///      Validates the token is a TIP-20.
     function enableToken(address token) external;
 
     /// @notice Pause deposits for a token. Only callable by admin.
@@ -729,12 +775,9 @@ interface IZonePortal {
     /// @param rpcUrl The new RPC URL (may be empty to clear it)
     function setRpcUrl(string calldata rpcUrl) external;
 
-    /// @notice Start a sequencer transfer. Only callable by current sequencer.
-    /// @param newSequencer The address that will become sequencer after accepting.
-    function transferSequencer(address newSequencer) external;
-
-    /// @notice Accept a pending sequencer transfer. Only callable by pending sequencer.
-    function acceptSequencer() external;
+    /// @notice Atomically replace the sequencer set and settlement threshold. Only callable by admin.
+    /// @dev Signers must be nonzero and unique; their order has no protocol meaning.
+    function setSequencerSet(address[] calldata sequencers, uint8 threshold) external;
 
     /// @notice Start an admin transfer. Only callable by the current admin.
     /// @param newAdmin The address that will become admin after accepting (address(0) cancels).
@@ -784,11 +827,16 @@ interface IZonePortal {
         view
         returns (bytes32 x, uint8 yParity, uint256 keyIndex);
 
-    /// @notice Set zone gas rate. Only callable by sequencer.
+    /// @notice Set zone gas rate. Only callable by admin.
     /// @param _zoneGasRate Zone token units per gas unit on the zone
     function setZoneGasRate(uint128 _zoneGasRate) external;
 
+    /// @notice Set the maximum Tempo gas rate a sequencer may configure on the zone.
+    /// @param _maxTempoGasRate Maximum zone token units per gas unit on Tempo
+    function setMaxTempoGasRate(uint128 _maxTempoGasRate) external;
+
     /// @notice Set the gas amount used to price failed-deposit bounce-backs on Tempo.
+    /// @dev Only callable by admin.
     /// @param _bouncebackGas Gas amount used in the Tempo-side bounce-back fee calculation
     function setBouncebackGas(uint64 _bouncebackGas) external;
 
@@ -814,7 +862,7 @@ interface IZonePortal {
         address to,
         uint128 amount,
         bytes32 memo,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -834,7 +882,7 @@ interface IZonePortal {
         uint128 amount,
         uint256 keyIndex,
         EncryptedDepositPayload calldata encrypted,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash);
@@ -855,6 +903,7 @@ interface IZonePortal {
 
     function claimRefund(address token) external returns (uint128 amount);
 
+    /// @notice Submit a batch with an n-of-m certificate for its zone tip.
     function submitBatch(
         uint64 tempoBlockNumber,
         uint64 recentTempoBlockNumber,
@@ -862,7 +911,9 @@ interface IZonePortal {
         DepositQueueTransition calldata depositQueueTransition,
         bytes32 withdrawalQueueHash,
         bytes calldata verifierConfig,
-        bytes calldata proof
+        bytes calldata proof,
+        uint256 zoneHeight,
+        bytes[] calldata signatures
     )
         external;
 
@@ -1005,7 +1056,7 @@ interface IZoneInbox {
         address indexed to,
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     );
 
     event DepositRejected(
@@ -1014,15 +1065,15 @@ interface IZoneInbox {
         DepositType depositType,
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     );
 
     event WithdrawalBounceBackProcessed(
-        address indexed fallbackRecipient, address token, uint128 amount
+        address indexed zoneFallbackRecipient, address token, uint128 amount
     );
 
     event WithdrawalBounceBackPending(
-        address indexed fallbackRecipient, address token, uint128 amount
+        address indexed zoneFallbackRecipient, address token, uint128 amount
     );
 
     event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
@@ -1070,7 +1121,7 @@ interface IZoneInbox {
     /// @param header RLP-encoded Tempo block header
     /// @param deposits Array of queued deposits to process (oldest first, must be contiguous)
     /// @param decryptions Decryption data for valid encrypted deposits, in order
-    /// @param enabledTokens Tokens to enable on the zone via the TIP20 factory
+    /// @param enabledTokens Tokens to activate directly in the ZoneInbox
     function advanceTempo(
         bytes calldata header,
         QueuedDeposit[] calldata deposits,
@@ -1130,7 +1181,9 @@ interface IZoneOutbox {
     function lastFallbackNonce() external view returns (uint64);
 
     /// @notice Resolve and delete a fallback recipient. Only callable by ZoneInbox.
-    function consumeFallbackRecipient(uint64 fallbackNonce) external returns (address recipient);
+    function consumeFallbackRecipient(uint64 fallbackNonce)
+        external
+        returns (address zoneFallbackRecipient);
 
     /// @notice Last finalized batch parameters (for proof access via state root)
     function lastBatch() external view returns (LastBatch memory);
@@ -1149,6 +1202,7 @@ interface IZoneOutbox {
 
     /// @notice Set Tempo gas rate. Only callable by sequencer.
     /// @dev Sequencer publishes this rate and takes the risk on Tempo gas price fluctuations.
+    ///      The rate must not exceed the finalized portal maxTempoGasRate.
     /// @param _tempoGasRate Zone token units per gas unit on Tempo
     function setTempoGasRate(uint128 _tempoGasRate) external;
 
@@ -1171,7 +1225,7 @@ interface IZoneOutbox {
         uint128 amount,
         bytes32 memo,
         uint64 gasLimit,
-        address fallbackRecipient,
+        address zoneFallbackRecipient,
         bytes calldata data,
         bytes calldata revealTo
     )
@@ -1180,7 +1234,7 @@ interface IZoneOutbox {
     function enqueueDepositBounceBack(
         address token,
         uint128 amount,
-        address bouncebackRecipient
+        address tempoRefundRecipient
     )
         external;
 
@@ -1203,7 +1257,7 @@ interface IZoneOutbox {
 /// @title IZoneConfig
 /// @notice Interface for zone configuration and L1 state access
 /// @dev System contract predeploy at 0x1c00000000000000000000000000000000000003
-///      Provides centralized access to zone metadata and reads sequencer from L1.
+///      Provides centralized access to zone metadata and reads the sequencer set from L1.
 interface IZoneConfig {
 
     error NotSequencer();
@@ -1215,21 +1269,30 @@ interface IZoneConfig {
     /// @notice TempoState predeploy for L1 reads
     function tempoState() external view returns (ITempoState);
 
-    /// @notice Get current sequencer by reading from L1 ZonePortal
-    /// @dev Reads from finalized Tempo state. L1 is single source of truth.
-    function sequencer() external view returns (address);
-
-    /// @notice Get pending sequencer by reading from L1 ZonePortal
-    function pendingSequencer() external view returns (address);
-
     /// @notice Get sequencer's encryption public key by reading from L1 ZonePortal
     /// @dev Used for encrypted deposits (ECIES).
     function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity);
 
-    /// @notice Check if an address is the current sequencer
+    /// @notice Check if an address belongs to the active sequencer set.
     function isSequencer(address account) external view returns (bool);
 
     /// @notice Check if a token is enabled by reading from L1 ZonePortal
     function isEnabledToken(address token) external view returns (bool);
+
+    /// @notice Read the maximum sequencer-configurable Tempo gas rate from L1 ZonePortal.
+    function maxTempoGasRate() external view returns (uint128);
+
+    /// @notice Read whether account allowlist enforcement is enabled on L1 ZonePortal.
+    function isAccessEnforced() external view returns (bool);
+
+    /// @notice Read whether callback gateway registration enforcement is disabled on L1 ZonePortal.
+    function isGatewayOpen() external view returns (bool);
+
+    /// @notice Check whether an account is authorized under the zone's access policy.
+    /// @dev Returns true for every account when enforcement is disabled.
+    function isAllowedAccount(address account) external view returns (bool);
+
+    /// @notice Check whether an address is a registered callback-only ZoneGateway.
+    function isZoneGateway(address gateway) external view returns (bool);
 
 }

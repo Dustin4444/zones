@@ -1,20 +1,5 @@
 use super::*;
 
-/// A sequencer-management event emitted by the L1 portal.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum L1SequencerEvent {
-    /// The current sequencer nominated a pending successor.
-    TransferStarted {
-        current_sequencer: Address,
-        pending_sequencer: Address,
-    },
-    /// The pending sequencer accepted and became the active sequencer.
-    Transferred {
-        previous_sequencer: Address,
-        new_sequencer: Address,
-    },
-}
-
 /// Result of attempting to enqueue an L1 block into the deposit queue.
 #[derive(Debug)]
 pub(crate) enum EnqueueOutcome {
@@ -34,8 +19,6 @@ pub struct L1PortalEvents {
     pub deposits: Vec<L1Deposit>,
     /// Tokens newly enabled for bridging in this block, with metadata.
     pub enabled_tokens: Vec<EnabledToken>,
-    /// Sequencer transfer events in the order they appeared in the block.
-    pub sequencer_events: Vec<L1SequencerEvent>,
 }
 
 /// A token newly enabled for bridging, with metadata for L2 creation.
@@ -65,13 +48,11 @@ impl EnabledToken {
 
 impl L1PortalEvents {
     /// Event signature hashes that this container knows how to decode.
-    const SIGNATURE_HASHES: [B256; 6] = [
+    const SIGNATURE_HASHES: [B256; 4] = [
         DepositMade::SIGNATURE_HASH,
         EncryptedDepositMade::SIGNATURE_HASH,
         WithdrawalBounceBack::SIGNATURE_HASH,
         TokenEnabled::SIGNATURE_HASH,
-        SequencerTransferStarted::SIGNATURE_HASH,
-        SequencerTransferred::SIGNATURE_HASH,
     ];
 
     /// Create portal events from deposits only.
@@ -80,6 +61,43 @@ impl L1PortalEvents {
             deposits,
             ..Default::default()
         }
+    }
+
+    /// Validate that `advanceTempo` processes every deposit and token enable observed in this
+    /// block's verified L1 receipts, in canonical log order.
+    ///
+    /// The sequencer-controlled `rejected` flag is deliberately excluded from deposit identity.
+    pub fn validate_advance_tempo_inputs(
+        &self,
+        deposits: &[abi::QueuedDeposit],
+        enabled_tokens: &[abi::EnabledToken],
+    ) -> eyre::Result<()> {
+        eyre::ensure!(
+            deposits.len() == self.deposits.len(),
+            "advanceTempo deposit count does not match observed L1 events: expected {}, got {}",
+            self.deposits.len(),
+            deposits.len()
+        );
+
+        for (index, (expected, actual)) in self.deposits.iter().zip(deposits).enumerate() {
+            let expected = expected.to_abi_queued_deposit();
+            eyre::ensure!(
+                actual.depositType == expected.depositType
+                    && actual.depositData == expected.depositData,
+                "advanceTempo deposit {index} does not match the observed L1 event"
+            );
+        }
+
+        let expected_tokens: Vec<_> = self
+            .enabled_tokens
+            .iter()
+            .map(EnabledToken::to_abi)
+            .collect();
+        eyre::ensure!(
+            enabled_tokens == expected_tokens,
+            "advanceTempo token enables do not match observed L1 events"
+        );
+        Ok(())
     }
 
     /// Decode a portal log and add the event to this container.
@@ -147,31 +165,6 @@ impl L1PortalEvents {
                     name: event.name,
                     symbol: event.symbol,
                     currency: event.currency,
-                });
-            }
-            ZonePortalEvents::SequencerTransferStarted(event) => {
-                info!(
-                    l1_block = block_number,
-                    current_sequencer = %event.currentSequencer,
-                    pending_sequencer = %event.pendingSequencer,
-                    "👤 Sequencer transfer started on L1"
-                );
-                self.sequencer_events
-                    .push(L1SequencerEvent::TransferStarted {
-                        current_sequencer: event.currentSequencer,
-                        pending_sequencer: event.pendingSequencer,
-                    });
-            }
-            ZonePortalEvents::SequencerTransferred(event) => {
-                info!(
-                    l1_block = block_number,
-                    previous_sequencer = %event.previousSequencer,
-                    new_sequencer = %event.newSequencer,
-                    "👤 Sequencer transferred on L1"
-                );
-                self.sequencer_events.push(L1SequencerEvent::Transferred {
-                    previous_sequencer: event.previousSequencer,
-                    new_sequencer: event.newSequencer,
                 });
             }
             _ => {}
