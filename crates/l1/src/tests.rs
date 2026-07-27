@@ -1,7 +1,7 @@
 use super::*;
 use crate::abi::DepositType;
 use alloy_consensus::{Header, ReceiptWithBloom};
-use alloy_primitives::{Bloom, Bytes, FixedBytes, address};
+use alloy_primitives::{Bloom, Bytes, address};
 use alloy_rpc_types_eth::{EIP1186AccountProofResponse, Header as RpcHeader, TransactionReceipt};
 use alloy_sol_types::SolEvent;
 use alloy_transport::mock::Asserter;
