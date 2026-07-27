@@ -73,9 +73,9 @@ struct GenerateInputArgs {
     #[arg(long)]
     tempo_rpc_url: String,
 
-    /// Authenticated private Zone HTTP RPC URL used for Zone discovery.
+    /// Authenticated private Zone HTTP RPC URL validated against Zone discovery.
     #[arg(long)]
-    zone_rpc_url: String,
+    zone_private_rpc_url: String,
 
     /// Unrestricted Zone RPC URL used for full blocks, state, and debug methods.
     #[arg(long)]
@@ -84,14 +84,6 @@ struct GenerateInputArgs {
     /// Private key used to authenticate with the private Zone RPC.
     #[arg(long, env = "PRIVATE_KEY", value_name = "HEX", hide_env_values = true)]
     private_key: String,
-
-    /// Numeric Zone identifier used in the private RPC authorization token.
-    #[arg(long)]
-    zone_id: u32,
-
-    /// Zone chain ID. Defaults to the chain ID canonically derived from `--zone-id`.
-    #[arg(long)]
-    zone_chain_id: Option<u64>,
 
     /// Override the first Zone block in the batch.
     #[arg(long)]
@@ -151,7 +143,6 @@ struct Discovery {
 
 #[derive(Debug)]
 struct PortalSnapshot {
-    zone_id: u32,
     sequencer: Address,
     withdrawal_batch_index: u64,
     tempo_block_number: u64,
@@ -161,6 +152,7 @@ struct PortalSnapshot {
 #[derive(Debug)]
 struct ExtractedBlock {
     input: ZoneBlock,
+    block_hash: B256,
     checkpoint_number: Option<u64>,
     has_finalization: bool,
     user_transaction_count: usize,
@@ -204,7 +196,6 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     let total_started = Instant::now();
     let mut timings = Timings::default();
     info!(
-        zone_id = args.zone_id,
         from_block = ?args.from_block,
         to_block = ?args.to_block,
         zone_block_count = ?args.zone_block_count,
@@ -223,23 +214,14 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         .private_key
         .parse::<PrivateKeySigner>()
         .context("parse private Zone RPC key")?;
-    let expected_zone_chain_id = args
-        .zone_chain_id
-        .unwrap_or_else(|| zone_chain_id(args.zone_id));
+    let (mut discovery, zone_chain_id) = discover(&tempo_provider, &zone_provider).await?;
     let private_zone_provider = connect_private_zone(
-        &args.zone_rpc_url,
+        &args.zone_private_rpc_url,
         signer,
-        args.zone_id,
-        expected_zone_chain_id,
+        discovery.zone_id,
+        zone_chain_id,
     )?;
-    let mut discovery = discover(
-        &tempo_provider,
-        &private_zone_provider,
-        args.zone_id,
-        expected_zone_chain_id,
-    )
-    .await?;
-    validate_unrestricted_zone(&zone_provider, &discovery, expected_zone_chain_id).await?;
+    validate_private_zone(&private_zone_provider, &discovery).await?;
     info!(
         zone_id = discovery.zone_id,
         portal = %discovery.portal,
@@ -273,8 +255,9 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         .expect("batch discovery returns a non-empty batch")
         .input
         .number;
-    let to_block = extracted.last().expect("non-empty").input.number;
-    let next_block_hash = zone_header(&zone_provider, to_block).await?.hash_slow();
+    let last_extracted = extracted.last().expect("non-empty");
+    let to_block = last_extracted.input.number;
+    let next_block_hash = last_extracted.block_hash;
     let finalization_count = extracted
         .iter()
         .filter(|block| block.has_finalization)
@@ -426,57 +409,56 @@ fn connect_private_zone(
 
 async fn discover(
     tempo: &DynProvider<TempoNetwork>,
-    private_zone: &DynProvider<TempoNetwork>,
-    expected_zone_id: u32,
-    expected_zone_chain_id: u64,
-) -> Result<Discovery> {
-    let (tempo_chain_id, zone_chain_id) =
-        tokio::try_join!(tempo.get_chain_id(), private_zone.get_chain_id())?;
-    if zone_chain_id != expected_zone_chain_id {
-        bail!(
-            "private Zone RPC reports chain ID {zone_chain_id}, but the auth token uses {expected_zone_chain_id}"
-        );
-    }
-    let zone_id = private_zone
-        .client()
-        .request_noparams::<Value>("zone_getZoneInfo")
-        .await
-        .context("call authenticated zone_getZoneInfo")?
-        .get("zoneId")
-        .and_then(Value::as_str)
-        .map(parse_quantity)
-        .transpose()?
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| eyre!("zone_getZoneInfo returned no valid zoneId"))?;
-    if zone_id != expected_zone_id {
-        bail!("private Zone RPC reports Zone ID {zone_id}, but --zone-id is {expected_zone_id}");
-    }
-
-    let portal_address = ZoneInbox::new(ZONE_INBOX_ADDRESS, private_zone.clone())
-        .tempoPortal()
-        .call()
-        .await
-        .context("read Tempo portal address from ZoneInbox")?;
+    zone: &DynProvider<TempoNetwork>,
+) -> Result<(Discovery, u64)> {
+    let inbox = ZoneInbox::new(ZONE_INBOX_ADDRESS, zone.clone());
+    let portal_call = inbox.tempoPortal();
+    let (tempo_chain_id, actual_zone_chain_id, portal_address) = tokio::try_join!(
+        async { tempo.get_chain_id().await.context("read Tempo chain ID") },
+        async {
+            zone.get_chain_id()
+                .await
+                .context("read unrestricted Zone chain ID")
+        },
+        async {
+            portal_call
+                .call()
+                .await
+                .context("read Tempo portal from unrestricted Zone RPC")
+        }
+    )?;
     if portal_address == Address::ZERO {
         bail!("ZoneInbox reports a zero Tempo portal address");
     }
-    let portal = read_portal_snapshot(tempo, portal_address).await?;
-    if portal.zone_id != zone_id {
+    let (zone_id, portal) = tokio::try_join!(
+        async {
+            ZonePortal::new(portal_address, tempo.clone())
+                .zoneId()
+                .call()
+                .await
+                .wrap_err_with(|| format!("read Zone ID from portal {portal_address}"))
+        },
+        read_portal_snapshot(tempo, portal_address),
+    )?;
+    let expected_chain_id = zone_chain_id(zone_id);
+    if actual_zone_chain_id != expected_chain_id {
         bail!(
-            "ZoneInbox points to Tempo portal {portal_address}, but that portal reports Zone ID {} instead of {zone_id}",
-            portal.zone_id
+            "Zone portal reports Zone ID {zone_id}, which requires chain ID {expected_chain_id}, but the unrestricted Zone RPC reports {actual_zone_chain_id}"
         );
     }
 
-    Ok(Discovery {
-        zone_id,
-        portal: portal_address,
-        sequencer: portal.sequencer,
-        portal_withdrawal_batch_index: portal.withdrawal_batch_index,
-        portal_tempo_block_number: portal.tempo_block_number,
-        tempo_chain_id,
-        portal_block_hash: portal.block_hash,
-    })
+    Ok((
+        Discovery {
+            zone_id,
+            portal: portal_address,
+            sequencer: portal.sequencer,
+            portal_withdrawal_batch_index: portal.withdrawal_batch_index,
+            portal_tempo_block_number: portal.tempo_block_number,
+            tempo_chain_id,
+            portal_block_hash: portal.block_hash,
+        },
+        actual_zone_chain_id,
+    ))
 }
 
 async fn read_portal_snapshot(
@@ -484,22 +466,18 @@ async fn read_portal_snapshot(
     portal_address: Address,
 ) -> Result<PortalSnapshot> {
     let portal = ZonePortal::new(portal_address, tempo.clone());
-    let zone_id_call = portal.zoneId();
     let sequencer_call = portal.sequencer();
     let withdrawal_batch_index_call = portal.withdrawalBatchIndex();
     let block_hash_call = portal.blockHash();
     let tempo_block_number_call = portal.lastSyncedTempoBlockNumber();
-    let (zone_id, sequencer, withdrawal_batch_index, block_hash, tempo_block_number) =
-        tokio::try_join!(
-            zone_id_call.call(),
-            sequencer_call.call(),
-            withdrawal_batch_index_call.call(),
-            block_hash_call.call(),
-            tempo_block_number_call.call(),
-        )
-        .wrap_err_with(|| format!("read Zone portal state from {portal_address}"))?;
+    let (sequencer, withdrawal_batch_index, block_hash, tempo_block_number) = tokio::try_join!(
+        sequencer_call.call(),
+        withdrawal_batch_index_call.call(),
+        block_hash_call.call(),
+        tempo_block_number_call.call(),
+    )
+    .wrap_err_with(|| format!("read Zone portal state from {portal_address}"))?;
     Ok(PortalSnapshot {
-        zone_id,
         sequencer,
         withdrawal_batch_index,
         tempo_block_number,
@@ -507,41 +485,29 @@ async fn read_portal_snapshot(
     })
 }
 
-fn apply_portal_snapshot(discovery: &mut Discovery, snapshot: PortalSnapshot) -> Result<()> {
-    if snapshot.zone_id != discovery.zone_id {
-        bail!(
-            "Tempo portal {} changed from Zone ID {} to {}",
-            discovery.portal,
-            discovery.zone_id,
-            snapshot.zone_id
-        );
-    }
+fn apply_portal_snapshot(discovery: &mut Discovery, snapshot: PortalSnapshot) {
     discovery.sequencer = snapshot.sequencer;
     discovery.portal_withdrawal_batch_index = snapshot.withdrawal_batch_index;
     discovery.portal_tempo_block_number = snapshot.tempo_block_number;
     discovery.portal_block_hash = snapshot.block_hash;
-    Ok(())
 }
 
-async fn validate_unrestricted_zone(
-    zone: &DynProvider<TempoNetwork>,
+async fn validate_private_zone(
+    private_zone: &DynProvider<TempoNetwork>,
     discovery: &Discovery,
-    expected_chain_id: u64,
 ) -> Result<()> {
-    let inbox = ZoneInbox::new(ZONE_INBOX_ADDRESS, zone.clone());
-    let portal_call = inbox.tempoPortal();
-    let (chain_id, portal) = tokio::join!(zone.get_chain_id(), portal_call.call());
-    let chain_id = chain_id.context("read unrestricted Zone chain ID")?;
-    let portal = portal.context("read Tempo portal from unrestricted Zone RPC")?;
-    if chain_id != expected_chain_id {
-        bail!(
-            "unrestricted Zone RPC reports chain ID {chain_id}, but the private Zone RPC reports {expected_chain_id}"
-        );
-    }
+    // This first request authenticates with the discovered, fully scoped Zone
+    // and chain IDs before checking that both RPC endpoints expose the same Zone.
+    let inbox = ZoneInbox::new(ZONE_INBOX_ADDRESS, private_zone.clone());
+    let portal = inbox
+        .tempoPortal()
+        .call()
+        .await
+        .context("read Tempo portal from private Zone RPC")?;
     if portal != discovery.portal {
         bail!(
-            "unrestricted Zone RPC points to Tempo portal {portal}, but the private Zone RPC points to {}",
-            discovery.portal
+            "private Zone RPC points to Tempo portal {portal}, but the unrestricted Zone RPC points to {}",
+            discovery.portal,
         );
     }
     Ok(())
@@ -591,7 +557,7 @@ async fn discover_counted_batch(
                         "portal advanced while waiting; rebasing counted range"
                     );
                     let snapshot = read_portal_snapshot(tempo, discovery.portal).await?;
-                    apply_portal_snapshot(&mut discovery, snapshot)?;
+                    apply_portal_snapshot(&mut discovery, snapshot);
                     continue 'selection;
                 }
                 zone_head
@@ -644,10 +610,10 @@ async fn discover_counted_batch(
                     new_committed_zone_hash = %snapshot.block_hash,
                     "portal advanced after Zone target was reached; rebasing counted range"
                 );
-                apply_portal_snapshot(&mut discovery, snapshot)?;
+                apply_portal_snapshot(&mut discovery, snapshot);
                 continue;
             }
-            apply_portal_snapshot(&mut discovery, snapshot)?;
+            apply_portal_snapshot(&mut discovery, snapshot);
         }
 
         let (parent_header, parent_number, blocks) =
@@ -661,10 +627,10 @@ async fn discover_counted_batch(
                     new_committed_zone_hash = %snapshot.block_hash,
                     "portal advanced during batch extraction; discarding range and rebasing"
                 );
-                apply_portal_snapshot(&mut discovery, snapshot)?;
+                apply_portal_snapshot(&mut discovery, snapshot);
                 continue;
             }
-            apply_portal_snapshot(&mut discovery, snapshot)?;
+            apply_portal_snapshot(&mut discovery, snapshot);
         }
 
         return Ok((discovery, parent_header, parent_number, blocks));
@@ -762,6 +728,7 @@ async fn zone_header(zone: &DynProvider<TempoNetwork>, number: u64) -> Result<Te
 
 fn extract_block(block: RpcBlock) -> Result<ExtractedBlock> {
     let header = block.header.as_ref().clone();
+    let block_hash = header.hash_slow();
     let transactions = match block.transactions {
         BlockTransactions::Full(transactions) => transactions,
         _ => bail!(
@@ -851,6 +818,7 @@ fn extract_block(block: RpcBlock) -> Result<ExtractedBlock> {
             finalize_withdrawal_batch_encrypted_senders: finalize_encrypted_senders,
             transactions: user_transactions,
         },
+        block_hash,
         checkpoint_number,
         has_finalization,
         user_transaction_count,
@@ -1219,16 +1187,6 @@ fn print_summary(
     }
 }
 
-fn parse_quantity(value: &str) -> Result<u64> {
-    if let Some(hex) = value.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).wrap_err_with(|| format!("parse RPC quantity {value}"))
-    } else {
-        value
-            .parse()
-            .wrap_err_with(|| format!("parse RPC quantity {value}"))
-    }
-}
-
 fn format_duration(duration: Duration) -> String {
     if duration.as_secs() > 0 {
         format!("{:.3}s", duration.as_secs_f64())
@@ -1259,12 +1217,6 @@ mod tests {
         let reads = collect_l1_reads(&[(4, trace)], &checkpoints).unwrap();
 
         assert!(reads[&99][&account].contains(&slot));
-    }
-
-    #[test]
-    fn parses_hex_and_decimal_rpc_quantities() {
-        assert_eq!(parse_quantity("0x10").unwrap(), 16);
-        assert_eq!(parse_quantity("10").unwrap(), 10);
     }
 
     #[test]
