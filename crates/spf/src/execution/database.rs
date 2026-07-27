@@ -1,6 +1,6 @@
 //! REVM database adapters backed by stateless trie witnesses.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
@@ -8,12 +8,11 @@ use alloy_rlp::Decodable as _;
 use revm::{
     Database,
     database::states::bundle_state::BundleState,
-    precompile::PrecompileError,
     primitives::{AddressMap, B256Map, U256Map},
     state::{AccountInfo, Bytecode},
 };
 use tempo_primitives::TempoHeader;
-use zone_precompiles::{L1StorageReader, SequencerExt};
+use zone_precompiles::{L1StateError, L1StorageReader};
 
 use crate::{
     Error, StatelessSparseTrieError, TempoStateWitness, ZoneStateWitness, mpt::StatelessSparseTrie,
@@ -166,7 +165,14 @@ pub struct TempoWitnessDatabase {
     tempo_block_hash: B256,
     tempo_block_number: u64,
     node_pool: Arc<Vec<Bytes>>,
-    sequencer: Option<Address>,
+    missing_read: Arc<Mutex<Option<MissingTempoStorageRead>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MissingTempoStorageRead {
+    pub(crate) account: Address,
+    pub(crate) slot: B256,
+    pub(crate) block_number: u64,
 }
 
 impl TempoWitnessDatabase {
@@ -181,7 +187,7 @@ impl TempoWitnessDatabase {
             tempo_block_hash,
             tempo_block_number,
             node_pool,
-            sequencer: None,
+            missing_read: Arc::default(),
         })
     }
 
@@ -200,21 +206,32 @@ impl TempoWitnessDatabase {
             tempo_block_hash,
             tempo_block_number,
             node_pool: self.node_pool.clone(),
-            sequencer: self.sequencer,
+            missing_read: self.missing_read.clone(),
         })
-    }
-
-    /// Attach the Zone's registered sequencer while creating one EVM instance.
-    pub(crate) fn for_sequencer(&self, sequencer: Address) -> Self {
-        Self {
-            sequencer: Some(sequencer),
-            ..self.clone()
-        }
     }
 
     /// Returns the checkpoint committed by the decoded initial Tempo header.
     pub(crate) fn checkpoint(&self) -> (u64, B256) {
         (self.tempo_block_number, self.tempo_block_hash)
+    }
+
+    pub(crate) fn missing_read(&self) -> Option<MissingTempoStorageRead> {
+        *self
+            .missing_read
+            .lock()
+            .expect("missing Tempo storage read mutex poisoned")
+    }
+
+    fn record_missing_read(&self, account: Address, slot: B256, block_number: u64) {
+        let mut missing = self
+            .missing_read
+            .lock()
+            .expect("missing Tempo storage read mutex poisoned");
+        missing.get_or_insert(MissingTempoStorageRead {
+            account,
+            slot,
+            block_number,
+        });
     }
 }
 
@@ -245,31 +262,62 @@ impl L1StorageReader for TempoWitnessDatabase {
         account: Address,
         slot: B256,
         tempo_block_number: u64,
-    ) -> Result<B256, PrecompileError> {
+    ) -> Result<B256, L1StateError> {
         if tempo_block_number != self.tempo_block_number {
-            return Err(PrecompileError::Fatal(format!(
-                "Tempo witness has no root for checkpoint {tempo_block_number}"
-            )));
+            return Err(storage_unavailable(
+                account,
+                slot,
+                tempo_block_number,
+                "witness has no root for the requested checkpoint",
+            ));
         }
 
         let state = self.state.as_ref().ok_or_else(|| {
-            PrecompileError::Fatal(format!(
-                "Tempo witness has no root for checkpoint {tempo_block_number}"
-            ))
+            self.record_missing_read(account, slot, tempo_block_number);
+            storage_unavailable(
+                account,
+                slot,
+                tempo_block_number,
+                "witness does not include the checkpoint state root",
+            )
         })?;
-        let value = state
-            .storage(account, U256::from_be_bytes(slot.0))
-            .map_err(|error| {
-                PrecompileError::Fatal(format!(
-                    "invalid or incomplete Tempo witness for account {account:?} at slot {slot:?}: {error}"
-                ))
-            })?;
+        let value = match state.storage(account, U256::from_be_bytes(slot.0)) {
+            Ok(value) => value,
+            Err(
+                error @ (StatelessSparseTrieError::IncompleteAccountProof { .. }
+                | StatelessSparseTrieError::IncompleteStorageProof { .. }),
+            ) => {
+                self.record_missing_read(account, slot, tempo_block_number);
+                return Err(L1StateError::StorageUnavailable {
+                    account,
+                    slot,
+                    block_number: tempo_block_number,
+                    reason: format!("incomplete Tempo witness: {error}"),
+                });
+            }
+            Err(error) => {
+                return Err(L1StateError::StorageUnavailable {
+                    account,
+                    slot,
+                    block_number: tempo_block_number,
+                    reason: format!("invalid Tempo witness: {error}"),
+                });
+            }
+        };
         Ok(B256::from(value.to_be_bytes::<32>()))
     }
 }
 
-impl SequencerExt for TempoWitnessDatabase {
-    fn latest_sequencer(&self) -> Option<Address> {
-        self.sequencer
+fn storage_unavailable(
+    account: Address,
+    slot: B256,
+    block_number: u64,
+    reason: &'static str,
+) -> L1StateError {
+    L1StateError::StorageUnavailable {
+        account,
+        slot,
+        block_number,
+        reason: reason.into(),
     }
 }

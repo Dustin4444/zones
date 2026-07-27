@@ -9,7 +9,7 @@ use alloy_consensus::{
 use alloy_eips::{eip2718::Decodable2718 as _, eip4895::Withdrawals};
 use alloy_evm::{
     EvmFactory as _,
-    block::{BlockExecutionResult, BlockExecutor as _},
+    block::{BlockExecutionResult, BlockExecutor as _, TxResult as _},
     eth::EthBlockExecutionCtx,
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -29,8 +29,8 @@ use tempo_primitives::{
     TempoHeader, TempoReceipt, TempoTxEnvelope,
     transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
 };
-use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox};
-use zone_evm::{ZoneBlockExecutor, ZoneEvmFactory};
+use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
+use zone_evm::{L1OverlayDB, ZoneBlockExecutor, ZoneEvmFactory};
 use zone_primitives::constants::zone_chain_id;
 
 use crate::{
@@ -39,6 +39,10 @@ use crate::{
 };
 
 type ZoneState = State<WitnessDatabase>;
+type WitnessOverlay<'db> = L1OverlayDB<&'db mut ZoneState, TempoWitnessDatabase>;
+type WitnessContext<'db> = tempo_revm::evm::TempoContext<WitnessOverlay<'db>>;
+type WitnessExecutor<'a, 'db, I> =
+    ZoneBlockExecutor<'a, &'db mut ZoneState, I, TempoWitnessDatabase>;
 
 /// Execution artifacts committed by one Zone block header.
 #[derive(Debug)]
@@ -52,7 +56,7 @@ pub(crate) struct BlockReplayContext<'a> {
     pub(crate) parent: &'a TempoHeader,
     pub(crate) block_index: usize,
     pub(crate) zone_id: u32,
-    pub(crate) sequencer: Address,
+    pub(crate) portal: Address,
 }
 
 /// Execute a complete Zone block in system-then-user order.
@@ -71,7 +75,7 @@ pub(crate) fn execute_zone_block(
         parent,
         block_index: zone_block_index,
         zone_id,
-        sequencer,
+        portal,
     } = replay;
     let user_transactions = decode_user_transactions(zone_block_index, &block.transactions)?;
     let mut transactions = Vec::with_capacity(
@@ -97,11 +101,10 @@ pub(crate) fn execute_zone_block(
         .block_hashes
         .insert(parent_number, block.parent_hash);
 
-    let tempo_reader = tempo_database.for_sequencer(sequencer);
     let env = next_block_evm_env(config, parent, block, zone_id)?;
     let assembly_env = env.clone();
     let block_gas_limit = env.block_env.inner.gas_limit;
-    let factory = ZoneEvmFactory::new(tempo_reader);
+    let factory = ZoneEvmFactory::new(tempo_database.clone(), portal);
     let evm = factory.create_evm(&mut *zone_state, env);
     let mut executor = ZoneBlockExecutor::new(
         evm,
@@ -253,15 +256,15 @@ pub(crate) fn next_block_execution_context(
 }
 
 fn execute_advance_tempo<'a, 'db, I>(
-    executor: &mut ZoneBlockExecutor<'a, &'db mut ZoneState, I>,
+    executor: &mut WitnessExecutor<'a, 'db, I>,
     header: &Bytes,
     block: &ZoneBlock,
     block_index: usize,
 ) -> Result<TempoTxEnvelope, Error>
 where
-    I: alloy_evm::revm::Inspector<tempo_revm::evm::TempoContext<&'db mut ZoneState>>,
+    I: alloy_evm::revm::Inspector<WitnessContext<'db>>,
 {
-    let calldata = ZoneInbox::advanceTempoCall {
+    let calldata = IZoneInbox::advanceTempoCall {
         header: header.clone(),
         deposits: block.deposits.clone(),
         decryptions: block.decryptions.clone(),
@@ -291,16 +294,16 @@ where
 }
 
 fn execute_finalize_withdrawal_batch<'a, 'db, I>(
-    executor: &mut ZoneBlockExecutor<'a, &'db mut ZoneState, I>,
+    executor: &mut WitnessExecutor<'a, 'db, I>,
     count: U256,
     block_number: u64,
     encrypted_senders: Vec<Bytes>,
     block_index: usize,
 ) -> Result<TempoTxEnvelope, Error>
 where
-    I: alloy_evm::revm::Inspector<tempo_revm::evm::TempoContext<&'db mut ZoneState>>,
+    I: alloy_evm::revm::Inspector<WitnessContext<'db>>,
 {
-    let calldata = ZoneOutbox::finalizeWithdrawalBatchCall {
+    let calldata = IZoneOutbox::finalizeWithdrawalBatchCall {
         count,
         blockNumber: block_number,
         encryptedSenders: encrypted_senders,
@@ -359,12 +362,12 @@ fn decode_user_transactions(
 }
 
 fn execute_user_transactions<'a, 'db, I>(
-    executor: &mut ZoneBlockExecutor<'a, &'db mut ZoneState, I>,
+    executor: &mut WitnessExecutor<'a, 'db, I>,
     block_index: usize,
     transactions: Vec<Recovered<TempoTxEnvelope>>,
 ) -> Result<Vec<TempoTxEnvelope>, Error>
 where
-    I: alloy_evm::revm::Inspector<tempo_revm::evm::TempoContext<&'db mut ZoneState>>,
+    I: alloy_evm::revm::Inspector<WitnessContext<'db>>,
 {
     let mut executed = Vec::with_capacity(transactions.len());
     for (transaction_index, transaction) in transactions.into_iter().enumerate() {
@@ -385,18 +388,18 @@ where
 }
 
 fn execute_recovered_transaction<'a, 'db, I>(
-    executor: &mut ZoneBlockExecutor<'a, &'db mut ZoneState, I>,
+    executor: &mut WitnessExecutor<'a, 'db, I>,
     transaction: Recovered<TempoTxEnvelope>,
     execution_error: Error,
     require_success: bool,
 ) -> Result<(), Error>
 where
-    I: alloy_evm::revm::Inspector<tempo_revm::evm::TempoContext<&'db mut ZoneState>>,
+    I: alloy_evm::revm::Inspector<WitnessContext<'db>>,
 {
     let result = executor
         .execute_transaction_without_commit(transaction)
         .map_err(|error| map_block_execution_error(error, execution_error))?;
-    if require_success && !result.result.result.is_success() {
+    if require_success && !result.result().result.is_success() {
         return Err(execution_error);
     }
     executor.commit_transaction(result);

@@ -35,6 +35,8 @@ impl SpfConfig {
 pub struct PublicInputs {
     /// Zone identifier from which the SPF derives the EVM chain ID.
     pub zone_id: u32,
+    /// Tempo ZonePortal whose state governs L1-backed Zone execution.
+    pub portal: Address,
     /// Tempo block number committed by the submitted batch.
     pub tempo_block_number: u64,
     /// Tempo block number used to anchor this batch.
@@ -43,8 +45,6 @@ pub struct PublicInputs {
     pub anchor_block_hash: B256,
     /// Withdrawal batch index expected by the portal.
     pub expected_withdrawal_batch_index: u64,
-    /// Registered zone sequencer.
-    pub sequencer: Address,
 }
 
 /// Complete prover input for one Zone batch.

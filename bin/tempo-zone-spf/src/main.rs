@@ -22,28 +22,34 @@ use tempo_alloy::{TempoNetwork, rpc::TempoHeaderResponse};
 use tempo_chainspec::spec::chainspec_from_chain_id;
 use tempo_primitives::{TempoHeader, TempoTxEnvelope};
 use tempo_zone_contracts::{
-    TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZoneInbox,
-    ZoneOutbox, ZonePortal,
+    IZoneInbox as ZoneInbox, IZoneOutbox as ZoneOutbox, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 use zone_chainspec::ZoneChainSpec;
 use zone_precompiles::tempo_state::slots as tempo_state_slots;
-use zone_primitives::constants::zone_chain_id;
+use zone_primitives::constants::{PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, zone_chain_id};
 use zone_rpc::{ZoneProvider, ZoneProviderConfig};
 use zone_spf::{
-    BatchOutput, BatchWitness, PublicInputs, SpfConfig, TempoStateWitness, ZoneBlock,
-    ZoneStateWitness, prove_zone_batch,
+    BatchOutput, BatchWitness, Error as SpfError, PublicInputs, SpfConfig, TempoStateWitness,
+    ZoneBlock, ZoneStateWitness, prove_zone_batch,
 };
 
 const EIP2935_HISTORY_WINDOW: u64 = 8191;
 const EIP2935_SAFETY_MARGIN: u64 = 360;
 const RPC_CONCURRENCY: usize = 8;
 const ZONE_HEAD_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT: B256 = B256::with_last_byte(5);
 
 type RpcBlock = Block<Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 type L1Reads = BTreeMap<u64, BTreeMap<Address, BTreeSet<B256>>>;
+
+alloy_sol_types::sol! {
+    interface TempoStateStorageReads {
+        function readTempoStorageSlot(address account, bytes32 slot) external view returns (bytes32);
+        function readTempoStorageSlots(address account, bytes32[] calldata slots) external view returns (bytes32[] memory);
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "tempo-zone-spf", about = "Tempo Zone SPF development tools")]
@@ -134,7 +140,6 @@ impl Timings {
 struct Discovery {
     zone_id: u32,
     portal: Address,
-    sequencer: Address,
     portal_withdrawal_batch_index: u64,
     portal_tempo_block_number: u64,
     tempo_chain_id: u64,
@@ -143,7 +148,6 @@ struct Discovery {
 
 #[derive(Debug)]
 struct PortalSnapshot {
-    sequencer: Address,
     withdrawal_batch_index: u64,
     tempo_block_number: u64,
     block_hash: B256,
@@ -225,7 +229,6 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     info!(
         zone_id = discovery.zone_id,
         portal = %discovery.portal,
-        sequencer = %discovery.sequencer,
         committed_zone_hash = %discovery.portal_block_hash,
         portal_tempo_block = discovery.portal_tempo_block_number,
         withdrawal_batch_index = discovery.portal_withdrawal_batch_index,
@@ -303,6 +306,9 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     }
     let mut reads = collect_l1_reads(&traces, &checkpoint_by_zone_block)?;
     for block in &extracted {
+        if block.input.tempo_header_rlp.is_none() {
+            continue;
+        }
         let checkpoint = checkpoint_by_zone_block[&block.input.number];
         // advanceTempo always authenticates the portal deposit-queue head.
         reads
@@ -312,8 +318,8 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
             .or_default()
             .insert(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
     }
-    let tempo_state_witness =
-        tempo_state_witness(&tempo_provider, &initial_tempo_header, reads).await?;
+    let initial_tempo_state_witness =
+        tempo_state_witness(&tempo_provider, &initial_tempo_header, reads.clone()).await?;
     timings.record("Tempo state witness", started, ());
 
     let final_tempo_header = extracted
@@ -329,24 +335,64 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         tempo_anchor(&tempo_provider, &final_tempo_header).await?;
     timings.record("Tempo ancestry", started, ());
 
-    let witness = BatchWitness {
+    let mut witness = BatchWitness {
         public_inputs: PublicInputs {
             zone_id: discovery.zone_id,
+            portal: discovery.portal,
             tempo_block_number: final_tempo_header.number(),
             anchor_block_number,
             anchor_block_hash,
             expected_withdrawal_batch_index,
-            sequencer: discovery.sequencer,
         },
         parent_header,
         zone_blocks: extracted.iter().map(|block| block.input.clone()).collect(),
         zone_state_witness,
-        tempo_state_witness,
+        tempo_state_witness: initial_tempo_state_witness,
         tempo_ancestry_headers,
     };
 
     let started = start_phase("SPF validation");
-    let output = validate_witness(discovery.tempo_chain_id, &witness)?;
+    let config = spf_config(discovery.tempo_chain_id)?;
+    let output = loop {
+        match prove_zone_batch(&config, witness.clone()) {
+            Ok(output) => break output,
+            Err(
+                error @ SpfError::MissingTempoStorage {
+                    account,
+                    slot,
+                    block_number,
+                },
+            ) => {
+                let inserted = reads
+                    .entry(block_number)
+                    .or_default()
+                    .entry(account)
+                    .or_default()
+                    .insert(slot);
+                if !inserted {
+                    return Err(error).context("generated witness failed SPF validation");
+                }
+
+                info!(
+                    tempo_block = block_number,
+                    account = %account,
+                    slot = %slot,
+                    "SPF replay discovered an additional Tempo storage proof"
+                );
+                let additional_reads = BTreeMap::from([(
+                    block_number,
+                    BTreeMap::from([(account, BTreeSet::from([slot]))]),
+                )]);
+                let additional =
+                    tempo_state_witness(&tempo_provider, &initial_tempo_header, additional_reads)
+                        .await?;
+                merge_tempo_state_witness(&mut witness.tempo_state_witness, additional)?;
+            }
+            Err(error) => {
+                return Err(error).context("generated witness failed SPF validation");
+            }
+        }
+    };
     if output.block_transition.nextBlockHash != next_block_hash {
         bail!(
             "SPF replay produced {}, but Zone block {to_block} has hash {next_block_hash}",
@@ -451,7 +497,6 @@ async fn discover(
         Discovery {
             zone_id,
             portal: portal_address,
-            sequencer: portal.sequencer,
             portal_withdrawal_batch_index: portal.withdrawal_batch_index,
             portal_tempo_block_number: portal.tempo_block_number,
             tempo_chain_id,
@@ -466,19 +511,16 @@ async fn read_portal_snapshot(
     portal_address: Address,
 ) -> Result<PortalSnapshot> {
     let portal = ZonePortal::new(portal_address, tempo.clone());
-    let sequencer_call = portal.sequencer();
     let withdrawal_batch_index_call = portal.withdrawalBatchIndex();
     let block_hash_call = portal.blockHash();
     let tempo_block_number_call = portal.lastSyncedTempoBlockNumber();
-    let (sequencer, withdrawal_batch_index, block_hash, tempo_block_number) = tokio::try_join!(
-        sequencer_call.call(),
+    let (withdrawal_batch_index, block_hash, tempo_block_number) = tokio::try_join!(
         withdrawal_batch_index_call.call(),
         block_hash_call.call(),
         tempo_block_number_call.call(),
     )
     .wrap_err_with(|| format!("read Zone portal state from {portal_address}"))?;
     Ok(PortalSnapshot {
-        sequencer,
         withdrawal_batch_index,
         tempo_block_number,
         block_hash,
@@ -486,7 +528,6 @@ async fn read_portal_snapshot(
 }
 
 fn apply_portal_snapshot(discovery: &mut Discovery, snapshot: PortalSnapshot) {
-    discovery.sequencer = snapshot.sequencer;
     discovery.portal_withdrawal_batch_index = snapshot.withdrawal_batch_index;
     discovery.portal_tempo_block_number = snapshot.tempo_block_number;
     discovery.portal_block_hash = snapshot.block_hash;
@@ -968,7 +1009,9 @@ fn collect_trace_reads(value: &Value, checkpoint: u64, reads: &mut L1Reads) -> R
                 let to: Address = to.parse().wrap_err("parse call-trace target")?;
                 if to == TEMPO_STATE_ADDRESS {
                     let input: Bytes = input.parse().wrap_err("parse TempoState trace input")?;
-                    if let Ok(call) = TempoState::readTempoStorageSlotCall::abi_decode(&input) {
+                    if let Ok(call) =
+                        TempoStateStorageReads::readTempoStorageSlotCall::abi_decode(&input)
+                    {
                         reads
                             .entry(checkpoint)
                             .or_default()
@@ -976,7 +1019,7 @@ fn collect_trace_reads(value: &Value, checkpoint: u64, reads: &mut L1Reads) -> R
                             .or_default()
                             .insert(call.slot);
                     } else if let Ok(call) =
-                        TempoState::readTempoStorageSlotsCall::abi_decode(&input)
+                        TempoStateStorageReads::readTempoStorageSlotsCall::abi_decode(&input)
                     {
                         reads
                             .entry(checkpoint)
@@ -1099,11 +1142,26 @@ async fn tempo_anchor(
     ))
 }
 
-fn validate_witness(tempo_chain_id: u64, witness: &BatchWitness) -> Result<BatchOutput> {
+fn spf_config(tempo_chain_id: u64) -> Result<SpfConfig> {
     let tempo_spec = chainspec_from_chain_id(tempo_chain_id)
         .ok_or_else(|| eyre!("unsupported Tempo chain ID {tempo_chain_id}"))?;
-    let config = SpfConfig::new(Arc::new(ZoneChainSpec::from(tempo_spec)));
-    prove_zone_batch(&config, witness.clone()).context("generated witness failed SPF validation")
+    Ok(SpfConfig::new(Arc::new(ZoneChainSpec::from(tempo_spec))))
+}
+
+fn merge_tempo_state_witness(
+    witness: &mut TempoStateWitness,
+    additional: TempoStateWitness,
+) -> Result<()> {
+    if witness.initial_tempo_header_rlp != additional.initial_tempo_header_rlp {
+        bail!("cannot merge Tempo witnesses with different initial headers");
+    }
+
+    let mut nodes = BTreeMap::new();
+    for node in witness.node_pool.drain(..).chain(additional.node_pool) {
+        nodes.entry(keccak256(&node)).or_insert(node);
+    }
+    witness.node_pool = nodes.into_values().collect();
+    Ok(())
 }
 
 fn print_summary(
@@ -1204,7 +1262,7 @@ mod tests {
     fn collects_tempo_storage_reads_from_nested_call_traces() {
         let account = address!("00000000000000000000000000000000000000aa");
         let slot = B256::repeat_byte(0x11);
-        let input = TempoState::readTempoStorageSlotCall { account, slot }.abi_encode();
+        let input = TempoStateStorageReads::readTempoStorageSlotCall { account, slot }.abi_encode();
         let trace = serde_json::json!([{
             "result": {
                 "to": format!("{TEMPO_STATE_ADDRESS:#x}"),
@@ -1225,5 +1283,28 @@ mod tests {
         assert!(counted_range(0, 20).is_err());
         assert!(counted_range(501, 0).is_err());
         assert!(counted_range(u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn merges_and_deduplicates_tempo_witness_nodes() {
+        let header = Bytes::from_static(b"header");
+        let first = Bytes::from_static(b"first");
+        let second = Bytes::from_static(b"second");
+        let mut witness = TempoStateWitness {
+            initial_tempo_header_rlp: header.clone(),
+            node_pool: vec![first.clone()],
+        };
+
+        merge_tempo_state_witness(
+            &mut witness,
+            TempoStateWitness {
+                initial_tempo_header_rlp: header,
+                node_pool: vec![first, second.clone()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(witness.node_pool.len(), 2);
+        assert!(witness.node_pool.contains(&second));
     }
 }

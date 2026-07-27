@@ -132,12 +132,6 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
                 actual: block.timestamp,
             });
         }
-        if block.beneficiary != witness.public_inputs.sequencer {
-            return Err(Error::BlockBeneficiaryMismatch {
-                expected: witness.public_inputs.sequencer,
-                actual: block.beneficiary,
-            });
-        }
         validate_system_inputs(block, block_index)?;
 
         // The EVM environment uses the verifier-selected fork schedule at this
@@ -154,10 +148,23 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
                 parent: &previous_header,
                 block_index,
                 zone_id: witness.public_inputs.zone_id,
-                sequencer: witness.public_inputs.sequencer,
+                portal: witness.public_inputs.portal,
             },
             block,
-        )?;
+        );
+        let executed_block = match executed_block {
+            Ok(executed_block) => executed_block,
+            Err(error) => {
+                if let Some(missing) = tempo_database.missing_read() {
+                    return Err(Error::MissingTempoStorage {
+                        account: missing.account,
+                        slot: missing.slot,
+                        block_number: missing.block_number,
+                    });
+                }
+                return Err(error);
+            }
+        };
 
         let state_root = zone_state.database.state_root(&zone_state.bundle_state)?;
         let gas_limit = executed_block.evm_env.block_env.inner.gas_limit;
@@ -414,6 +421,13 @@ pub enum Error {
     /// A read against the provided state witness failed.
     #[error(transparent)]
     WitnessDatabase(#[from] WitnessDatabaseError),
+    /// The Tempo witness omitted an L1 storage proof required by execution.
+    #[error("Tempo witness is missing account {account:?} slot {slot:?} at block {block_number}")]
+    MissingTempoStorage {
+        account: alloy_primitives::Address,
+        slot: B256,
+        block_number: u64,
+    },
     /// A batch must execute at least one Zone block.
     #[error("zone batch contains no blocks")]
     EmptyZoneBatch,
@@ -447,12 +461,6 @@ pub enum Error {
     /// A Zone block timestamp regressed from its predecessor.
     #[error("zone block timestamp regressed: previous {previous}, got {actual}")]
     BlockTimestampRegression { previous: u64, actual: u64 },
-    /// A Zone block beneficiary is not the public sequencer.
-    #[error("zone block beneficiary mismatch: expected {expected:?}, got {actual:?}")]
-    BlockBeneficiaryMismatch {
-        expected: alloy_primitives::Address,
-        actual: alloy_primitives::Address,
-    },
     /// Tempo-dependent inputs appeared without a Tempo header import.
     #[error("zone block {block_index} has Tempo inputs without a Tempo header")]
     TempoInputsWithoutHeader { block_index: usize },
@@ -597,11 +605,11 @@ mod tests {
         BatchWitness {
             public_inputs: PublicInputs {
                 zone_id: 1,
+                portal: Address::repeat_byte(0x11),
                 tempo_block_number: 2,
                 anchor_block_number: 2,
                 anchor_block_hash: B256::ZERO,
                 expected_withdrawal_batch_index: 3,
-                sequencer: Address::ZERO,
             },
             parent_header,
             zone_blocks: Vec::new(),
@@ -830,18 +838,41 @@ mod tests {
             TempoWitnessDatabase::from_tempo_state_witness(empty_tempo_witness(9)).unwrap();
 
         assert_eq!(
-            database
-                .for_sequencer(Address::ZERO)
-                .read_l1_storage(account, slot, 9)
-                .unwrap(),
+            database.read_l1_storage(account, slot, 9).unwrap(),
             B256::ZERO
         );
+        assert!(database.read_l1_storage(account, slot, 8).is_err());
+        assert_eq!(database.missing_read(), None);
+    }
+
+    #[test]
+    fn reports_the_exact_missing_tempo_storage_proof() {
+        let account = Address::repeat_byte(0x33);
+        let slot = B256::repeat_byte(0x07);
+        let block_number = 9;
+        let header = TempoHeader {
+            inner: Header {
+                number: block_number,
+                state_root: B256::repeat_byte(0x44),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let database = TempoWitnessDatabase::from_tempo_state_witness(TempoStateWitness {
+            initial_tempo_header_rlp: Bytes::from(alloy_rlp::encode(header)),
+            node_pool: Vec::new(),
+        })
+        .unwrap();
+
         assert!(
             database
-                .for_sequencer(Address::ZERO)
-                .read_l1_storage(account, slot, 8)
+                .read_l1_storage(account, slot, block_number)
                 .is_err()
         );
+        let missing = database.missing_read().unwrap();
+        assert_eq!(missing.account, account);
+        assert_eq!(missing.slot, slot);
+        assert_eq!(missing.block_number, block_number);
     }
 
     #[test]
@@ -886,7 +917,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
-            beneficiary: witness.public_inputs.sequencer,
+            beneficiary: Address::ZERO,
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),
@@ -935,7 +966,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
-            beneficiary: witness.public_inputs.sequencer,
+            beneficiary: Address::ZERO,
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),
@@ -955,7 +986,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
-            beneficiary: witness.public_inputs.sequencer,
+            beneficiary: Address::ZERO,
             tempo_header_rlp: None,
             deposits: Vec::new(),
             decryptions: Vec::new(),
@@ -983,7 +1014,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
-            beneficiary: witness.public_inputs.sequencer,
+            beneficiary: Address::ZERO,
             tempo_header_rlp: Some(Bytes::from([0x01])),
             deposits: Vec::new(),
             decryptions: Vec::new(),

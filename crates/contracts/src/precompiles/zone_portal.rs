@@ -57,13 +57,11 @@ crate::sol! {
             uint64 activationBlock;
         }
 
-        #[derive(PartialEq, Eq)]
         struct BlockTransition {
             bytes32 prevBlockHash;
             bytes32 nextBlockHash;
         }
 
-        #[derive(PartialEq, Eq)]
         struct DepositQueueTransition {
             bytes32 prevProcessedHash;
             bytes32 nextProcessedHash;
