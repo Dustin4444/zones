@@ -124,7 +124,10 @@ using Tempo's upstream policy implementation over anchored raw L1 state:
 
 1. **L1StateProvider** — resolves storage slots at an explicit L1 block through
    the block-versioned `L1StateCache`, falling back to an exact-block L1 RPC
-   read and caching the result.
+   read and caching the result. The L1 subscriber verifies ZonePortal and
+   TIP-403 account proofs against each finalized header before reusing values
+   across block heights. Tempo/Reth RPC nodes must configure a historical proof
+   window with `--rpc.eth-proof-window <blocks>` that covers the finalized lag.
 2. **L1OverlayDB** — composes ordinary zone EVM storage with the raw L1
    reader at the exact finalized block recorded in `TempoState`. TIP-403
    registry state and each token's L1-owned transfer-policy field come from L1;
