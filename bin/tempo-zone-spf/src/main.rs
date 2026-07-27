@@ -7,6 +7,7 @@ use std::{
 
 use alloy_consensus::{BlockHeader as _, Sealable as _, Transaction as _};
 use alloy_eips::{BlockId, eip2718::Encodable2718 as _};
+use alloy_genesis::Genesis;
 use alloy_network::primitives::BlockTransactions;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
@@ -19,7 +20,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::Value;
 use tempo_alloy::{TempoNetwork, rpc::TempoHeaderResponse};
-use tempo_chainspec::spec::chainspec_from_chain_id;
+use tempo_chainspec::{TempoChainSpec, spec::chainspec_from_chain_id};
 use tempo_primitives::{TempoHeader, TempoTxEnvelope};
 use tempo_zone_contracts::{
     IZoneInbox as ZoneInbox, IZoneOutbox as ZoneOutbox, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS,
@@ -78,6 +79,10 @@ struct GenerateInputArgs {
     /// Tempo L1 HTTP or WebSocket RPC URL.
     #[arg(long)]
     tempo_rpc_url: String,
+
+    /// Tempo genesis JSON path or HTTP(S) URL. Required for unknown Tempo chain IDs.
+    #[arg(long, value_name = "PATH_OR_URL")]
+    tempo_genesis: Option<String>,
 
     /// Authenticated private Zone HTTP RPC URL validated against Zone discovery.
     #[arg(long)]
@@ -219,6 +224,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         .parse::<PrivateKeySigner>()
         .context("parse private Zone RPC key")?;
     let (mut discovery, zone_chain_id) = discover(&tempo_provider, &zone_provider).await?;
+    let spf_config = spf_config(discovery.tempo_chain_id, args.tempo_genesis.as_deref()).await?;
     let private_zone_provider = connect_private_zone(
         &args.zone_private_rpc_url,
         signer,
@@ -352,9 +358,8 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     };
 
     let started = start_phase("SPF validation");
-    let config = spf_config(discovery.tempo_chain_id)?;
     let output = loop {
-        match prove_zone_batch(&config, witness.clone()) {
+        match prove_zone_batch(&spf_config, witness.clone()) {
             Ok(output) => break output,
             Err(
                 error @ SpfError::MissingTempoStorage {
@@ -1142,10 +1147,44 @@ async fn tempo_anchor(
     ))
 }
 
-fn spf_config(tempo_chain_id: u64) -> Result<SpfConfig> {
-    let tempo_spec = chainspec_from_chain_id(tempo_chain_id)
-        .ok_or_else(|| eyre!("unsupported Tempo chain ID {tempo_chain_id}"))?;
+async fn spf_config(tempo_chain_id: u64, genesis_source: Option<&str>) -> Result<SpfConfig> {
+    let tempo_spec = match genesis_source {
+        Some(source) => {
+            let raw = read_genesis(source).await?;
+            let genesis: Genesis =
+                serde_json::from_slice(&raw).context("parse Tempo genesis JSON")?;
+            if genesis.config.chain_id != tempo_chain_id {
+                bail!(
+                    "Tempo genesis chain ID {} does not match RPC chain ID {tempo_chain_id}",
+                    genesis.config.chain_id
+                );
+            }
+            Arc::new(TempoChainSpec::from_genesis(genesis))
+        }
+        None => chainspec_from_chain_id(tempo_chain_id).ok_or_else(|| {
+            eyre!("unsupported Tempo chain ID {tempo_chain_id}; pass --tempo-genesis <PATH_OR_URL>")
+        })?,
+    };
     Ok(SpfConfig::new(Arc::new(ZoneChainSpec::from(tempo_spec))))
+}
+
+async fn read_genesis(source: &str) -> Result<Vec<u8>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let response = reqwest::get(source)
+            .await
+            .context("fetch Tempo genesis URL")?
+            .error_for_status()
+            .context("Tempo genesis URL returned an error")?;
+        return response
+            .bytes()
+            .await
+            .context("read Tempo genesis URL response")
+            .map(|bytes| bytes.to_vec());
+    }
+
+    tokio::fs::read(source)
+        .await
+        .wrap_err_with(|| format!("read Tempo genesis file {source}"))
 }
 
 fn merge_tempo_state_witness(
@@ -1306,5 +1345,30 @@ mod tests {
 
         assert_eq!(witness.node_pool.len(), 2);
         assert!(witness.node_pool.contains(&second));
+    }
+
+    #[tokio::test]
+    async fn loads_a_custom_tempo_genesis_from_a_local_path() {
+        let mut genesis = Genesis::default();
+        genesis.config.chain_id = 31_318;
+        let path = std::env::temp_dir().join(format!(
+            "tempo-zone-spf-genesis-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&genesis).unwrap()).unwrap();
+
+        let config = spf_config(31_318, path.to_str()).await.unwrap();
+        let mismatch = spf_config(31_319, path.to_str()).await.unwrap_err();
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            config.zone_chain_spec.inner.inner.genesis().config.chain_id,
+            31_318
+        );
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not match RPC chain ID 31319")
+        );
     }
 }
