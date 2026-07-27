@@ -1,7 +1,6 @@
 //! Zone runtime EVM and its private execution policies.
 
 pub(crate) mod contract_creation;
-mod permit2_privacy;
 
 use crate::{
     TempoCtx,
@@ -39,7 +38,6 @@ impl<DB: Database, I, L1: L1StorageReader> ZoneEvm<DB, I, L1> {
     /// Creates a new `ZoneEvm` with guarded `CREATE` and `CREATE2` opcodes.
     pub(super) fn new(mut evm: TempoEvm<L1OverlayDB<DB, L1>, I>) -> Self {
         contract_creation::configure_runtime(&mut evm);
-        permit2_privacy::configure_runtime(&mut evm);
         Self { inner: evm }
     }
 
@@ -107,14 +105,8 @@ where
         &mut self,
         tx: TempoTxEnv,
     ) -> (TempoPoolValidationResult<DB::Error>, TempoTxEnv) {
-        let current_sequencer = self.inner.ctx().block.beneficiary;
         let (result, tx) = self.inner.validate_pool_transaction(tx);
-        let mut result = result.map_err(map_adapter_error);
-        if result.is_ok()
-            && let Err(error) = permit2_privacy::validate_transaction(&tx, current_sequencer)
-        {
-            result = Err(error.into());
-        }
+        let result = result.map_err(map_adapter_error);
         self.clear_l1_overlay_state();
         (result, tx)
     }
@@ -152,10 +144,6 @@ where
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
         contract_creation::validate_transaction(&tx, CONTRACT_DEPLOYER_ALLOWLIST)?;
-        let current_sequencer = self.inner.ctx().block.beneficiary;
-        if let Err(error) = permit2_privacy::validate_transaction(&tx, current_sequencer) {
-            return Err(error.into());
-        }
         self.execute_and_sanitize(|evm| evm.transact_raw(tx))
     }
 
@@ -165,12 +153,6 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        let current_sequencer = self.inner.ctx().block.beneficiary;
-        if let Err(error) =
-            permit2_privacy::validate_call(caller, contract, &data, current_sequencer)
-        {
-            return Err(error.into());
-        }
         self.execute_and_sanitize(|evm| evm.transact_system_call(caller, contract, data))
     }
 

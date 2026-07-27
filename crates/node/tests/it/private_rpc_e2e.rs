@@ -26,12 +26,9 @@ use rand::thread_rng;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
-use tempo_contracts::{
-    PERMIT2_ADDRESS, Permit2,
-    precompiles::{
-        INonce, ITIP20 as ContractTip20,
-        account_keychain::IAccountKeychain::{SignatureType as KeyInfoSignatureType, getKeyCall},
-    },
+use tempo_contracts::precompiles::{
+    INonce, ITIP20 as ContractTip20,
+    account_keychain::IAccountKeychain::{SignatureType as KeyInfoSignatureType, getKeyCall},
 };
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
@@ -830,9 +827,6 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
     let owner = owner_signer.address();
     let outsider_signer = PrivateKeySigner::random();
     let key = Address::repeat_byte(0x44);
-    let token = PATH_USD_ADDRESS;
-    let spender = Address::repeat_byte(0x55);
-
     let private_reads = [
         (
             ACCOUNT_KEYCHAIN_ADDRESS,
@@ -856,25 +850,6 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
             PATH_USD_ADDRESS,
             PrecompileTip20::noncesCall { owner }.abi_encode(),
             "TIP20.nonces",
-        ),
-        (
-            PERMIT2_ADDRESS,
-            Permit2::allowanceCall {
-                _0: owner,
-                _1: token,
-                _2: spender,
-            }
-            .abi_encode(),
-            "Permit2.allowance",
-        ),
-        (
-            PERMIT2_ADDRESS,
-            Permit2::nonceBitmapCall {
-                _0: owner,
-                _1: U256::ZERO,
-            }
-            .abi_encode(),
-            "Permit2.nonceBitmap",
         ),
     ];
 
@@ -917,7 +892,7 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
     }
 
     // Exercise each target in its own aggregate. A single aggregate containing every target would
-    // stop at the first revert and leave later enforcement paths (notably Permit2) untested.
+    // stop at the first revert and leave later enforcement paths untested.
     for (target, data, label) in &private_reads {
         let multicall = IMulticall3::aggregateCall {
             calls: vec![IMulticall3::Call {
