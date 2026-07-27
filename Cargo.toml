@@ -171,6 +171,7 @@ alloy-contract = { version = "2.1.0", default-features = false }
 alloy-eips = { version = "2.1.0", default-features = false }
 alloy-evm = { version = "0.37.1", default-features = false }
 alloy-genesis = { version = "2.1.0", default-features = false }
+alloy-json-rpc = "2.1.0"
 alloy-network = { version = "2.1.0", default-features = false }
 alloy-primitives = { version = "1.6.0", default-features = false }
 alloy-provider = { version = "2.1.0", default-features = false }
@@ -223,6 +224,7 @@ thiserror = "2"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-util = "0.7.18"
 toml = "0.9.12"
+tower = "0.5"
 axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = [
   "json",

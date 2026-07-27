@@ -979,13 +979,16 @@ The connection is terminated when the authorization token expires. For keychain-
 
 ### Zone-Specific Methods
 
-The zone exposes four methods under the `zone_` namespace:
+The zone exposes three methods under the `zone_` namespace. The public
+authentication-independent methods are installed on each standard RPC
+transport whose operator-selected module set includes `eth`. The authenticated
+private RPC exposes the same two methods from the same implementation.
 
 | Method | Access | Description |
 |--------|--------|-------------|
-| `zone_getAuthorizationTokenInfo` | Any authenticated | Returns the authenticated account address and token expiry |
-| `zone_getZoneInfo` | Any authenticated | Returns `zoneId`, `isAccessEnforced`, `isGatewayOpen`, `zoneTokens`, `sequencers`, `chainId`, and `tempoBlockNumber` |
-| `zone_getEncryptionKey` | Any authenticated | Returns the active sequencer encryption key at the current Tempo L1 head |
+| `zone_getAuthorizationTokenInfo` | Authenticated private RPC only | Returns the authenticated account address and token expiry |
+| `zone_getZoneInfo` | Public standard RPC and authenticated private RPC | Returns `zoneId`, `isAccessEnforced`, `isGatewayOpen`, `zoneTokens`, `sequencers`, `chainId`, and `tempoBlockNumber` |
+| `zone_getEncryptionKey` | Public standard RPC and authenticated private RPC | Returns the active sequencer encryption key at the current Tempo L1 head |
 
 `zone_getEncryptionKey` reads the active key directly from the portal at the current Tempo L1 head.
 Its response is:

@@ -1,6 +1,9 @@
 //! Public `zone_` JSON-RPC namespace.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use jsonrpsee::{
     core::RpcResult,
@@ -11,6 +14,9 @@ use serde_json::value::RawValue;
 use tokio::sync::watch;
 
 use crate::{ZoneRpcApi, types::JsonRpcError};
+
+const PUBLIC_RPC_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal error";
 
 /// Public, authentication-independent Zone RPC methods.
 #[rpc(server, namespace = "zone")]
@@ -45,21 +51,43 @@ impl PublicZoneRpc {
 impl ZoneApiServer for PublicZoneRpc {
     async fn get_zone_info(&self) -> RpcResult<Box<RawValue>> {
         self.api
-            .get()
+            .get(PUBLIC_RPC_INITIALIZATION_TIMEOUT)
             .await
+            .ok_or_else(initialization_error)?
             .zone_get_zone_info()
             .await
-            .map_err(Into::into)
+            .map_err(|error| sanitized_public_error("zone_getZoneInfo", error))
     }
 
     async fn get_encryption_key(&self) -> RpcResult<Box<RawValue>> {
         self.api
-            .get()
+            .get(PUBLIC_RPC_INITIALIZATION_TIMEOUT)
             .await
+            .ok_or_else(initialization_error)?
             .zone_get_encryption_key()
             .await
-            .map_err(Into::into)
+            .map_err(|error| sanitized_public_error("zone_getEncryptionKey", error))
     }
+}
+
+fn initialization_error() -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, "Zone RPC is initializing", None::<()>)
+}
+
+fn sanitized_public_error(method: &'static str, error: JsonRpcError) -> ErrorObjectOwned {
+    tracing::warn!(
+        target: "zone::rpc",
+        method,
+        error_code = error.code,
+        error_message = %error.message,
+        error_data = ?error.data,
+        "Public Zone RPC request failed"
+    );
+    ErrorObjectOwned::owned(
+        INTERNAL_ERROR_CODE,
+        PUBLIC_INTERNAL_ERROR_MESSAGE,
+        None::<()>,
+    )
 }
 
 /// A value installed once after the RPC servers have begun initializing.
@@ -79,20 +107,17 @@ impl<T: ?Sized> Deferred<T> {
         Ok(())
     }
 
-    async fn get(&self) -> Arc<T> {
+    async fn get(&self, timeout: Duration) -> Option<Arc<T>> {
         if let Some(value) = self.value.get() {
-            return value.clone();
+            return Some(value.clone());
         }
 
         let mut ready = self.ready.subscribe();
-        ready
-            .wait_for(|ready| *ready)
+        tokio::time::timeout(timeout, ready.wait_for(|ready| *ready))
             .await
-            .expect("deferred value retains the readiness sender");
-        self.value
-            .get()
-            .expect("readiness is signalled after installing the value")
-            .clone()
+            .ok()?
+            .ok()?;
+        self.value.get().cloned()
     }
 }
 
@@ -115,13 +140,6 @@ impl<T: ?Sized> Default for Deferred<T> {
     }
 }
 
-impl From<JsonRpcError> for ErrorObjectOwned {
-    fn from(error: JsonRpcError) -> Self {
-        let code = i32::try_from(error.code).unwrap_or(INTERNAL_ERROR_CODE);
-        Self::owned(code, error.message, error.data)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,23 +155,32 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_private_error_code_becomes_internal_error() {
-        let error = ErrorObjectOwned::from(JsonRpcError {
-            code: i64::MAX,
-            message: "invalid code".to_string(),
-            data: None,
-        });
+    fn public_errors_are_sanitized() {
+        let error = sanitized_public_error(
+            "zone_getZoneInfo",
+            JsonRpcError {
+                code: -32000,
+                message: "provider https://token@internal.example failed".to_string(),
+                data: Some(serde_json::json!({"host": "internal.example"})),
+            },
+        );
 
         assert_eq!(error.code(), INTERNAL_ERROR_CODE);
-        assert_eq!(error.message(), "invalid code");
+        assert_eq!(error.message(), PUBLIC_INTERNAL_ERROR_MESSAGE);
+        assert!(error.data().is_none());
     }
 
     #[tokio::test]
-    async fn early_requests_wait_for_initialization() {
+    async fn early_requests_wait_for_initialization_within_the_deadline() {
         let value = Deferred::<u64>::default();
         let mut waiter = tokio::spawn({
             let value = value.clone();
-            async move { *value.get().await }
+            async move {
+                *value
+                    .get(Duration::from_secs(1))
+                    .await
+                    .expect("value initialized before deadline")
+            }
         });
 
         assert!(
@@ -164,5 +191,11 @@ mod tests {
 
         value.set(Arc::new(42)).unwrap();
         assert_eq!(waiter.await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn early_requests_time_out_when_initialization_stalls() {
+        let value = Deferred::<u64>::default();
+        assert!(value.get(Duration::from_millis(10)).await.is_none());
     }
 }

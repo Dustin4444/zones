@@ -7,14 +7,14 @@ use crate::{
     ZoneEngine,
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{
-        PublicZoneRpc, ZoneApiServer as _, ZoneRpc, ZoneRpcApi, rpc_connection_config,
-        start_private_rpc,
+        PublicZoneRpc, ZoneApiServer as _, ZoneRpc, ZoneRpcApi, in_process_provider,
+        rpc_connection_config, start_private_rpc,
     },
     settlement_attestation::collect_leader_settlements,
     tx_forwarding::{forward_new_transactions, insert_forwarded_transactions, route_p2p_events},
 };
 use alloy_primitives::Address;
-use alloy_provider::Provider as _;
+use alloy_provider::{DynProvider, Provider as _};
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
 use reth_chainspec::EthChainSpec;
@@ -36,7 +36,7 @@ use reth_node_builder::{
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::ChainSpecProvider;
-use reth_rpc_builder::{Identity, RpcServerHandle};
+use reth_rpc_builder::{Identity, RethRpcModule};
 use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
     BlockNumReader, EmptyBodyStorage, HeaderProvider, StateProvider, StateProviderFactory,
@@ -45,7 +45,11 @@ use reth_transaction_pool::{
     Pool, PoolTransaction, TransactionPool as _, TransactionValidationTaskExecutor,
     blobstore::InMemoryBlobStore, error::InvalidPoolTransactionError,
 };
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::TempoInvalidTransaction;
@@ -80,7 +84,7 @@ use zone_payload::{
 };
 use zone_sequencer::{
     AttestationStore, BatchAnchorConfig, WithdrawalBatchLimits, ZoneSequencerConfig,
-    attestation::AttestationDomain, spawn_zone_sequencer,
+    attestation::AttestationDomain,
 };
 
 /// Returns a known Tempo chain spec for an L1 chain ID.
@@ -103,27 +107,6 @@ fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
 
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
-
-/// Select a configured vanilla RPC endpoint for internal Zone RPC calls.
-///
-/// The public namespace is installed on every configured transport, so the
-/// shared implementation must not require HTTP specifically.
-fn vanilla_rpc_url(handle: &RpcServerHandle) -> eyre::Result<String> {
-    select_vanilla_rpc_url(handle.http_url(), handle.ws_url(), handle.ipc_endpoint())
-}
-
-fn select_vanilla_rpc_url(
-    http_url: Option<String>,
-    ws_url: Option<String>,
-    ipc_endpoint: Option<String>,
-) -> eyre::Result<String> {
-    // IPC exposes the full RPC module set in reth, while HTTP and WS can be
-    // configured with narrower namespace selections.
-    ipc_endpoint
-        .or(http_url)
-        .or(ws_url)
-        .ok_or_else(|| eyre::eyre!("at least one vanilla RPC transport must be enabled"))
-}
 
 /// Sequencer-side sender reveal encryptor used while building
 /// `finalizeWithdrawalBatch` system transactions.
@@ -432,6 +415,8 @@ where
     private_rpc_config: ZonePrivateRpcConfig,
     /// Shared implementation for the public and private Zone RPC surfaces.
     public_zone_rpc: PublicZoneRpc,
+    /// Dedicated in-process provider for internal Zone reads.
+    internal_zone_provider: Arc<OnceLock<DynProvider<TempoNetwork>>>,
     /// Sequencer configuration.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
     /// Static Zone P2P networking configuration.
@@ -463,6 +448,8 @@ where
     ) -> Self {
         let public_zone_rpc = PublicZoneRpc::default();
         let public_zone_rpc_module = public_zone_rpc.clone();
+        let internal_zone_provider = Arc::new(OnceLock::new());
+        let provider_slot = internal_zone_provider.clone();
         Self {
             inner: RpcAddOns::new(
                 TempoEthApiBuilder::default(),
@@ -473,8 +460,21 @@ where
                 Default::default(),
             )
             .extend_rpc_modules(move |ctx| {
-                ctx.modules
-                    .merge_configured(public_zone_rpc_module.into_rpc())?;
+                let mut internal_module = jsonrpsee::RpcModule::new(());
+                for methods in ctx
+                    .registry
+                    .reth_methods(std::iter::once(RethRpcModule::Eth))
+                {
+                    internal_module.merge(methods)?;
+                }
+                provider_slot
+                    .set(in_process_provider(internal_module))
+                    .map_err(|_| eyre::eyre!("internal Zone provider was initialized twice"))?;
+
+                ctx.modules.merge_if_module_configured(
+                    RethRpcModule::Eth,
+                    public_zone_rpc_module.into_rpc(),
+                )?;
                 Ok(())
             }),
             deposit_queue,
@@ -482,6 +482,7 @@ where
             portal_address,
             private_rpc_config,
             public_zone_rpc,
+            internal_zone_provider,
             sequencer_config,
             p2p_config,
         }
@@ -568,13 +569,25 @@ where
         }
 
         let chain_id = ctx.node.provider().chain_spec().genesis().config.chain_id;
+        let internal_zone_provider = self.internal_zone_provider.clone();
         let handle = self.inner.launch_add_ons(ctx).await?;
+        let internal_zone_provider = internal_zone_provider
+            .get()
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("internal Zone provider was not initialized"))?;
+        let internal_chain_id = internal_zone_provider.get_chain_id().await?;
+        eyre::ensure!(
+            internal_chain_id == chain_id,
+            "internal Zone provider chain ID mismatch: expected {chain_id}, got {internal_chain_id}"
+        );
 
         Self::launch_private_rpc(
             self.private_rpc_config,
             self.public_zone_rpc,
             &handle,
             self.l1_config.l1_rpc_url.clone(),
+            l1_provider.clone(),
+            internal_zone_provider.clone(),
             self.l1_config.retry_connection_interval,
             self.l1_config.portal_address,
             chain_id,
@@ -589,6 +602,7 @@ where
                 &handle,
                 &task_executor,
                 self.l1_config.l1_rpc_url,
+                internal_zone_provider,
                 self.l1_config.portal_address,
                 self.l1_config.retry_connection_interval,
                 sequencer_addr,
@@ -823,6 +837,8 @@ where
         public_zone_rpc: PublicZoneRpc,
         handle: &<Self as NodeAddOns<N>>::Handle,
         l1_rpc_url: String,
+        l1_provider: DynProvider<TempoNetwork>,
+        zone_provider: DynProvider<TempoNetwork>,
         retry_connection_interval: Duration,
         portal_address: Address,
         chain_id: u64,
@@ -840,19 +856,22 @@ where
         }
 
         let eth_handlers = handle.eth_handlers().clone();
-        let zone_rpc_url = vanilla_rpc_url(&handle.rpc_server_handles.rpc)?;
         let private_rpc_config = zone_rpc::PrivateRpcConfig {
             listen_addr: ([0, 0, 0, 0], config.private_rpc_port).into(),
             l1_rpc_url,
-            zone_rpc_url,
+            zone_rpc_url: "in-process".to_string(),
             retry_connection_interval,
             zone_id: config.zone_id,
             chain_id,
             max_auth_token_validity: config.max_auth_token_validity,
             zone_portal: portal_address,
         };
-        let api: Arc<dyn ZoneRpcApi> =
-            Arc::new(ZoneRpc::new(eth_handlers, private_rpc_config.clone()).await?);
+        let api: Arc<dyn ZoneRpcApi> = Arc::new(ZoneRpc::new_with_provider(
+            eth_handlers,
+            private_rpc_config.clone(),
+            l1_provider,
+            zone_provider,
+        )?);
         public_zone_rpc
             .set_api(api.clone())
             .map_err(|_| eyre::eyre!("zone RPC API was initialized more than once"))?;
@@ -869,6 +888,7 @@ where
         handle: &<Self as NodeAddOns<N>>::Handle,
         task_executor: &reth_tasks::TaskExecutor,
         l1_rpc_url: String,
+        zone_provider: DynProvider<TempoNetwork>,
         portal_address: Address,
         retry_connection_interval: Duration,
         sequencer_addr: Address,
@@ -887,8 +907,6 @@ where
             }
         }
 
-        let zone_rpc_url = vanilla_rpc_url(&handle.rpc_server_handles.rpc)?;
-
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
@@ -899,7 +917,7 @@ where
             outbox_address: ZONE_OUTBOX_ADDRESS,
             inbox_address: ZONE_INBOX_ADDRESS,
             tempo_state_address: TEMPO_STATE_ADDRESS,
-            zone_rpc_url,
+            zone_rpc_url: "in-process".to_string(),
             zone_poll_interval: config.zone_poll_interval,
             batch_interval_blocks: config.batch_interval_blocks,
             batch_anchor_config: config.batch_anchor_config,
@@ -908,7 +926,12 @@ where
         let l1_transaction_signer = config
             .l1_transaction_signer
             .unwrap_or(config.sequencer_signer);
-        let seq_handle = spawn_zone_sequencer(sequencer_config, l1_transaction_signer).await;
+        let seq_handle = zone_sequencer::spawn_zone_sequencer_with_provider(
+            sequencer_config,
+            l1_transaction_signer,
+            zone_provider,
+        )
+        .await;
         info!(target: "reth::cli", "Sequencer tasks spawned");
 
         // Critical task — node shuts down if either exits.
@@ -1269,7 +1292,7 @@ mod tests {
     use jsonrpsee::RpcModule;
     use reth_chainspec::EthChainSpec;
     use reth_primitives_traits::Recovered;
-    use reth_rpc_builder::TransportRpcModules;
+    use reth_rpc_builder::{TransportRpcModuleConfig, TransportRpcModules};
     use tempo_primitives::transaction::{
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
@@ -1308,40 +1331,22 @@ mod tests {
     }
 
     #[test]
-    fn selects_any_configured_vanilla_rpc_transport() {
-        assert_eq!(
-            select_vanilla_rpc_url(Some("http".into()), Some("ws".into()), Some("ipc".into()))
-                .unwrap(),
-            "ipc"
-        );
-        assert_eq!(
-            select_vanilla_rpc_url(None, Some("ws".into()), Some("ipc".into())).unwrap(),
-            "ipc"
-        );
-        assert_eq!(
-            select_vanilla_rpc_url(Some("http".into()), Some("ws".into()), None).unwrap(),
-            "http"
-        );
-        assert_eq!(
-            select_vanilla_rpc_url(None, Some("ws".into()), None).unwrap(),
-            "ws"
-        );
-        assert!(select_vanilla_rpc_url(None, None, None).is_err());
-    }
-
-    #[test]
-    fn exposes_only_public_zone_methods_on_all_vanilla_transports() {
+    fn exposes_public_zone_methods_only_on_eth_transports() {
+        let config = TransportRpcModuleConfig::default()
+            .with_http([RethRpcModule::Eth])
+            .with_ws([RethRpcModule::Net])
+            .with_ipc([RethRpcModule::Eth]);
         let mut modules = TransportRpcModules::default()
+            .with_config(config)
             .with_http(RpcModule::new(()))
             .with_ws(RpcModule::new(()))
             .with_ipc(RpcModule::new(()));
         modules
-            .merge_configured(PublicZoneRpc::default().into_rpc())
+            .merge_if_module_configured(RethRpcModule::Eth, PublicZoneRpc::default().into_rpc())
             .unwrap();
 
         for methods in [
             modules.http_methods(|_| true).unwrap(),
-            modules.ws_methods(|_| true).unwrap(),
             modules.ipc_methods(|_| true).unwrap(),
         ] {
             let names = methods.method_names().collect::<Vec<_>>();
@@ -1349,6 +1354,14 @@ mod tests {
             assert!(names.contains(&"zone_getEncryptionKey"));
             assert!(!names.contains(&"zone_getAuthorizationTokenInfo"));
         }
+
+        let ws_names = modules
+            .ws_methods(|_| true)
+            .unwrap()
+            .method_names()
+            .collect::<Vec<_>>();
+        assert!(!ws_names.contains(&"zone_getZoneInfo"));
+        assert!(!ws_names.contains(&"zone_getEncryptionKey"));
     }
 
     #[test]

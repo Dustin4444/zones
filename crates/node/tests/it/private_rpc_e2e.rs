@@ -1268,7 +1268,12 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
         .provider()
         .raw_request("zone_getZoneInfo".into(), ())
         .await?;
-    assert_eq!(public_zone_info, zone_info["result"]);
+    // This helper starts a standalone private server with zone_id=1 in
+    // front of a test node whose built-in public/private add-ons use the
+    // default zone_id=0. All provider-backed metadata must still match.
+    let mut expected_public_zone_info = zone_info["result"].clone();
+    expected_public_zone_info["zoneId"] = serde_json::json!("0x0");
+    assert_eq!(public_zone_info, expected_public_zone_info);
 
     Ok(())
 }

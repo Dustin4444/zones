@@ -12,17 +12,21 @@ use std::{
 };
 
 use alloy_consensus::BlockHeader;
+use alloy_json_rpc::{RequestPacket, Response, ResponsePacket, SerializedRequest};
 use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
+use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
     FilterId, TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
 use alloy_sol_types::SolCall;
+use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
 use eyre::WrapErr;
 use futures::StreamExt;
+use jsonrpsee::RpcModule;
 use reth_provider::CanonStateSubscriptions;
 use reth_rpc::{EthFilter, eth::filter::EthFilterError};
 use reth_rpc_builder::EthHandlers;
@@ -45,6 +49,7 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
+use tower::Service;
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
 use tempo_zone_contracts::{
@@ -61,6 +66,73 @@ use zone_rpc::{
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_WS_FRAME_AND_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+
+/// In-process Alloy transport backed by reth's full local `eth` RPC module.
+///
+/// Internal Zone consumers use this instead of reconnecting through a public
+/// HTTP, WebSocket, or IPC endpoint. That keeps settlement-critical reads
+/// independent of operator namespace selection and avoids host-global socket
+/// paths.
+#[derive(Clone)]
+pub(crate) struct InProcessRpcTransport {
+    module: RpcModule<()>,
+}
+
+impl InProcessRpcTransport {
+    /// Creates a transport backed by the provided local RPC module.
+    pub(crate) const fn new(module: RpcModule<()>) -> Self {
+        Self { module }
+    }
+}
+
+async fn execute_in_process_request(
+    module: &RpcModule<()>,
+    request: SerializedRequest,
+) -> Result<Response, TransportError> {
+    let (response, _) = module
+        .raw_json_request(request.serialized().get(), 1)
+        .await
+        .map_err(TransportErrorKind::non_retryable)?;
+    serde_json::from_str(response.get()).map_err(TransportErrorKind::non_retryable)
+}
+
+impl Service<RequestPacket> for InProcessRpcTransport {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        let module = self.module.clone();
+        Box::pin(async move {
+            match request {
+                RequestPacket::Single(request) => execute_in_process_request(&module, request)
+                    .await
+                    .map(ResponsePacket::Single),
+                RequestPacket::Batch(requests) => {
+                    let mut responses = Vec::with_capacity(requests.len());
+                    for request in requests {
+                        responses.push(execute_in_process_request(&module, request).await?);
+                    }
+                    Ok(ResponsePacket::Batch(responses))
+                }
+            }
+        })
+    }
+}
+
+/// Builds a read-only provider over the node's in-process RPC module.
+pub(crate) fn in_process_provider(module: RpcModule<()>) -> DynProvider<TempoNetwork> {
+    ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_client(RpcClient::new(InProcessRpcTransport::new(module), true))
+        .erased()
+}
 
 fn filter_not_found_error() -> JsonRpcError {
     JsonRpcError::invalid_params("filter not found")
@@ -174,6 +246,19 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             .await
             .wrap_err("failed to connect private RPC zone provider")?
             .erased();
+        Self::new_with_provider(eth, config, l1_provider, zone_provider)
+    }
+
+    /// Wrap reth's [`EthHandlers`] using already constructed L1 and Zone providers.
+    ///
+    /// The node assembly uses this with an in-process Zone provider so internal
+    /// reads cannot be redirected through externally configured transports.
+    pub fn new_with_provider(
+        eth: EthHandlers<Api>,
+        config: zone_rpc::PrivateRpcConfig,
+        l1_provider: DynProvider<TempoNetwork>,
+        zone_provider: DynProvider<TempoNetwork>,
+    ) -> eyre::Result<Self> {
         let tempo_state =
             tempo_zone_contracts::TempoState::new(TEMPO_STATE_ADDRESS, zone_provider.clone());
         let rpc = Self {
@@ -938,6 +1023,18 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn in_process_provider_routes_requests_to_the_local_module() {
+        let mut module = RpcModule::new(());
+        module
+            .register_method("eth_chainId", |_, _, _| "0x1234")
+            .unwrap();
+
+        let provider = in_process_provider(module);
+
+        assert_eq!(provider.get_chain_id().await.unwrap(), 0x1234);
+    }
 
     #[test]
     fn redact_fee_history_preserves_shape_and_public_values() {

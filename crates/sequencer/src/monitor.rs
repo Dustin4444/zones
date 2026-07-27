@@ -178,7 +178,7 @@ impl ZoneMonitor {
         .await
     }
 
-    async fn new_with_provider(
+    pub(crate) async fn new_with_provider(
         config: ZoneMonitorConfig,
         provider: DynProvider<TempoNetwork>,
         l1_provider: DynProvider<TempoNetwork>,
@@ -939,6 +939,52 @@ pub fn spawn_zone_monitor(
                 Ok(monitor) => break monitor,
                 Err(e) => {
                     error!(error = %e, "Zone monitor failed to start, retrying in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
+
+        loop {
+            if let Err(e) = monitor.run().await {
+                error!(error = %e, "Zone monitor failed, restarting in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    })
+}
+
+/// Spawn the zone monitor with a trusted provider supplied by the embedding node.
+///
+/// This path is used by the Zone node's in-process provider so settlement
+/// reads do not depend on any externally configured RPC transport.
+pub fn spawn_zone_monitor_with_provider(
+    config: ZoneMonitorConfig,
+    zone_provider: DynProvider<TempoNetwork>,
+    l1_provider: DynProvider<TempoNetwork>,
+    signer: PrivateKeySigner,
+    withdrawal_store: SharedWithdrawalStore,
+    withdrawal_notify: Arc<Notify>,
+    repair_notify: Arc<Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut monitor = loop {
+            match ZoneMonitor::new_with_provider(
+                config.clone(),
+                zone_provider.clone(),
+                l1_provider.clone(),
+                Some(signer.clone()),
+                withdrawal_store.clone(),
+                withdrawal_notify.clone(),
+                repair_notify.clone(),
+            )
+            .await
+            {
+                Ok(monitor) => break monitor,
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "In-process Zone monitor failed to start, retrying in 5s"
+                    );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }

@@ -27,7 +27,7 @@ pub mod withdrawals;
 
 pub use attestation::AttestationStore;
 pub use encryption_key::register_encryption_key;
-pub use monitor::{ZoneMonitorConfig, spawn_zone_monitor};
+pub use monitor::{ZoneMonitorConfig, spawn_zone_monitor, spawn_zone_monitor_with_provider};
 pub use settlement::{BatchAnchorConfig, BatchData, BatchSubmitter};
 pub use withdrawals::{
     DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
@@ -98,6 +98,23 @@ pub async fn spawn_zone_sequencer(
     config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
 ) -> ZoneSequencerHandle {
+    spawn_zone_sequencer_inner(config, signer, None).await
+}
+
+/// Spawn all sequencer tasks with a trusted in-process Zone L2 provider.
+pub async fn spawn_zone_sequencer_with_provider(
+    config: ZoneSequencerConfig,
+    signer: PrivateKeySigner,
+    zone_provider: DynProvider<TempoNetwork>,
+) -> ZoneSequencerHandle {
+    spawn_zone_sequencer_inner(config, signer, Some(zone_provider)).await
+}
+
+async fn spawn_zone_sequencer_inner(
+    config: ZoneSequencerConfig,
+    signer: PrivateKeySigner,
+    zone_provider: Option<DynProvider<TempoNetwork>>,
+) -> ZoneSequencerHandle {
     let sequencer_address = signer.address();
     // Build a single shared L1 provider with the sequencer wallet.
     // Both the batch submitter (inside the zone monitor) and the withdrawal
@@ -142,14 +159,26 @@ pub async fn spawn_zone_sequencer(
         withdrawal_notify.clone(),
         withdrawal_repair_notify.clone(),
     );
-    let monitor_handle = spawn_zone_monitor(
-        monitor_config,
-        l1_provider,
-        signer,
-        withdrawal_store,
-        withdrawal_notify,
-        withdrawal_repair_notify,
-    );
+    let monitor_handle = if let Some(zone_provider) = zone_provider {
+        spawn_zone_monitor_with_provider(
+            monitor_config,
+            zone_provider,
+            l1_provider,
+            signer,
+            withdrawal_store,
+            withdrawal_notify,
+            withdrawal_repair_notify,
+        )
+    } else {
+        spawn_zone_monitor(
+            monitor_config,
+            l1_provider,
+            signer,
+            withdrawal_store,
+            withdrawal_notify,
+            withdrawal_repair_notify,
+        )
+    };
 
     ZoneSequencerHandle {
         withdrawal_handle,
