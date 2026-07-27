@@ -18,8 +18,8 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  # sccache caches compilation, mold keeps linking cheap — faster than
-  # shipping a target-dir cache between jobs (same setup as tempo/reth).
+  # Each shard compiles the workspace with sccache and mold, avoiding the
+  # large target-dir transfer and allowing test execution to start in parallel.
   test:
     name: test (${{ matrix.partition }}/3)
     runs-on: depot-ubuntu-latest-16
@@ -50,7 +50,7 @@ jobs:
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
-          tool: nextest@0.9.124
+          tool: nextest@0.9.127
       - name: Install Foundry
         uses: tempoxyz/gh-actions/actions/setup-foundry@98b1081dcf34361b576aca2ab3041772708582ef
         with:
@@ -85,10 +85,10 @@ jobs:
             --out "$GITHUB_WORKSPACE/specs/ref-impls/out"
 
       - name: Build and compile tests
-        run: cargo nextest run --profile ci --partition count:${{ matrix.partition }}/3 --no-run
+        run: cargo nextest run --profile ci --partition slice:${{ matrix.partition }}/3 --no-run
 
       - name: Run tests
-        run: cargo nextest run --profile ci --partition count:${{ matrix.partition }}/3
+        run: cargo nextest run --profile ci --partition slice:${{ matrix.partition }}/3
 
   test-success:
     name: test success
