@@ -219,18 +219,25 @@ mod tests {
         let portal = Address::repeat_byte(0x66);
         let sequencer = Address::repeat_byte(0x77);
         let l1 = TestL1::default();
-        l1.seed_active_sequencer(portal, 0, sequencer);
+        let observed_l1 = l1.clone();
+        let mut input: EvmEnv<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv> =
+            EvmEnv::default();
+        input.block_env.inner.beneficiary = sequencer;
         let mut evm = test_evm_with_l1(
             test_db([(PERMIT2_ADDRESS, Bytes::from_static(&[0x00]))]),
-            EvmEnv::default(),
+            input,
             l1,
             portal,
         );
         let result = evm
             .transact_raw(call_tx_data(sequencer, PERMIT2_ADDRESS, nonce.clone()))
-            .expect("active sequencer must retain Permit2 read access")
+            .expect("current sequencer must retain Permit2 read access")
             .result;
         assert!(matches!(result, ExecutionResult::Success { .. }));
+        assert!(
+            observed_l1.storage_requests().is_empty(),
+            "Permit2 privacy authorization must not read unverified L1 RPC state"
+        );
 
         // A forwarding contract copies calldata into a STATICCALL to Permit2 and returns the
         // subcall's returndata. Permit2 sees the forwarding contract as msg.sender, so even an

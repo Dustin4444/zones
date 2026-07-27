@@ -1,35 +1,30 @@
 //! Shared authorization for account-indexed private reads.
+//!
+//! The current Zone block beneficiary is a consensus-committed identifier for its sequencer.
 
 use alloy_primitives::Address;
 use alloy_sol_types::SolError;
 use tempo_zone_contracts::Unauthorized;
 
-use crate::{
-    execution::{CallCheck, CallRuleError},
-    storage::{L1State, L1StorageReader},
-};
+use crate::execution::CallCheck;
 
 #[derive(Clone)]
-pub(crate) struct AccountPrivacy<P> {
-    l1: L1State<P>,
+pub(crate) struct AccountPrivacy {
+    current_sequencer: Address,
 }
 
-impl<P> AccountPrivacy<P> {
-    pub(crate) fn new(l1: L1State<P>) -> Self {
-        Self { l1 }
+impl AccountPrivacy {
+    pub(crate) const fn new(current_sequencer: Address) -> Self {
+        Self { current_sequencer }
     }
-}
 
-impl<P: L1StorageReader> AccountPrivacy<P> {
     pub(crate) fn authorize(&self, caller: Address, accounts: &[Address]) -> CallCheck {
-        if accounts.contains(&caller) {
-            return CallCheck::Continue;
-        }
-
-        match self.l1.read_portal(|portal| &portal.is_sequencer[caller]) {
-            Ok(true) => CallCheck::Continue,
-            Ok(false) => CallCheck::Revert(Unauthorized {}.abi_encode().into()),
-            Err(error) => CallCheck::Error(CallRuleError::Tempo(error)),
+        if accounts.contains(&caller)
+            || (self.current_sequencer != Address::ZERO && caller == self.current_sequencer)
+        {
+            CallCheck::Continue
+        } else {
+            CallCheck::Revert(Unauthorized {}.abi_encode().into())
         }
     }
 }

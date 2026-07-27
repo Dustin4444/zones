@@ -37,6 +37,7 @@ pub struct ZonePrecompileEnv {
     cfg: revm::context::CfgEnv<TempoHardfork>,
     actions: StorageActions,
     non_creditable_slots: Rc<RefCell<NonCreditableSlots>>,
+    current_sequencer: Address,
 }
 
 impl ZonePrecompileEnv {
@@ -45,12 +46,19 @@ impl ZonePrecompileEnv {
         cfg: &revm::context::CfgEnv<TempoHardfork>,
         actions: StorageActions,
         non_creditable_slots: Rc<RefCell<NonCreditableSlots>>,
+        current_sequencer: Address,
     ) -> Self {
         Self {
             cfg: cfg.clone(),
             actions,
             non_creditable_slots,
+            current_sequencer,
         }
+    }
+
+    /// Returns the consensus-committed beneficiary for the current Zone block.
+    pub const fn current_sequencer(&self) -> Address {
+        self.current_sequencer
     }
 }
 
@@ -221,6 +229,7 @@ mod tests {
             &cfg,
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
+            Address::ZERO,
         );
         let precompile = create_precompile(
             "ForwardingTest",
@@ -263,6 +272,7 @@ mod tests {
             &cfg,
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
+            Address::ZERO,
         );
         let checked = Rc::new(Cell::new(false));
         let rejected = create_precompile(
@@ -315,6 +325,7 @@ mod tests {
             &cfg,
             StorageActions::disabled(),
             Rc::new(RefCell::new(NonCreditableSlots::empty())),
+            Address::ZERO,
         );
         let precompile = create_precompile(
             "AdmissionTest",

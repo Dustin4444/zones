@@ -14,18 +14,17 @@ use tempo_precompiles::{
 use crate::{
     account_privacy::AccountPrivacy,
     execution::{CallCheck, CallRules},
-    storage::{L1State, L1StorageReader},
 };
 
 #[derive(Clone)]
-pub(crate) struct AccountKeychainRules<P> {
-    privacy: AccountPrivacy<P>,
+pub(crate) struct AccountKeychainRules {
+    privacy: AccountPrivacy,
 }
 
-impl<P> AccountKeychainRules<P> {
-    pub(crate) fn new(l1: L1State<P>) -> Self {
+impl AccountKeychainRules {
+    pub(crate) fn new(current_sequencer: Address) -> Self {
         Self {
-            privacy: AccountPrivacy::new(l1),
+            privacy: AccountPrivacy::new(current_sequencer),
         }
     }
 }
@@ -34,7 +33,7 @@ fn account_from<C: SolCall>(args: &[u8], account: impl FnOnce(C) -> Address) -> 
     C::abi_decode_raw(args).ok().map(account)
 }
 
-impl<P: L1StorageReader> CallRules for AccountKeychainRules<P> {
+impl CallRules for AccountKeychainRules {
     fn admit(&self, data: &[u8], caller: Address) -> CallCheck {
         let Some(selector) = selector_from_calldata(data) else {
             return CallCheck::Continue;
@@ -75,27 +74,16 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use alloy_sol_types::SolError;
-    use tempo_precompiles::storage::StorageCtx;
     use tempo_zone_contracts::Unauthorized;
 
-    use crate::test_utils::{MockL1Reader, test_context, test_storage_provider};
-
-    fn assert_allowed(
-        rules: &AccountKeychainRules<MockL1Reader>,
-        call: impl SolCall,
-        caller: Address,
-    ) {
+    fn assert_allowed(rules: &AccountKeychainRules, call: impl SolCall, caller: Address) {
         assert!(matches!(
             rules.admit(&call.abi_encode(), caller),
             CallCheck::Continue
         ));
     }
 
-    fn assert_unauthorized(
-        rules: &AccountKeychainRules<MockL1Reader>,
-        call: impl SolCall,
-        caller: Address,
-    ) {
+    fn assert_unauthorized(rules: &AccountKeychainRules, call: impl SolCall, caller: Address) {
         let CallCheck::Revert(bytes) = rules.admit(&call.abi_encode(), caller) else {
             panic!("private account read must revert")
         };
@@ -108,55 +96,48 @@ mod tests {
         let outsider = Address::repeat_byte(0x22);
         let sequencer = Address::repeat_byte(0x33);
         let key = Address::repeat_byte(0x44);
-        let portal = Address::repeat_byte(0x55);
-        let reader = MockL1Reader::default();
-        reader.seed_active_sequencer(portal, 0, sequencer);
-        let rules = AccountKeychainRules::new(L1State::new(reader, portal));
-        let mut context = test_context();
-        let mut storage = test_storage_provider(&mut context, u64::MAX, false);
+        let rules = AccountKeychainRules::new(sequencer);
 
-        StorageCtx::enter(&mut storage, || {
-            macro_rules! check {
-                ($call:expr) => {{
-                    let call = $call;
-                    assert_allowed(&rules, call.clone(), owner);
-                    assert_allowed(&rules, call.clone(), sequencer);
-                    assert_unauthorized(&rules, call, outsider);
-                }};
-            }
+        macro_rules! check {
+            ($call:expr) => {{
+                let call = $call;
+                assert_allowed(&rules, call.clone(), owner);
+                assert_allowed(&rules, call.clone(), sequencer);
+                assert_unauthorized(&rules, call, outsider);
+            }};
+        }
 
-            check!(getKeyCall {
-                account: owner,
-                keyId: key
-            });
-            check!(getRemainingLimitCall {
-                account: owner,
-                keyId: key,
-                token: Address::repeat_byte(0x66),
-            });
-            check!(getRemainingLimitWithPeriodCall {
-                account: owner,
-                keyId: key,
-                token: Address::repeat_byte(0x66),
-            });
-            check!(getAllowedCallsCall {
-                account: owner,
-                keyId: key
-            });
-            check!(isKeyAuthorizationWitnessBurnedCall {
-                account: owner,
-                witness: B256::repeat_byte(0x77),
-            });
-            check!(IAccountKeychain::isAdminKeyCall {
-                account: owner,
-                keyId: key
-            });
+        check!(getKeyCall {
+            account: owner,
+            keyId: key
+        });
+        check!(getRemainingLimitCall {
+            account: owner,
+            keyId: key,
+            token: Address::repeat_byte(0x66),
+        });
+        check!(getRemainingLimitWithPeriodCall {
+            account: owner,
+            keyId: key,
+            token: Address::repeat_byte(0x66),
+        });
+        check!(getAllowedCallsCall {
+            account: owner,
+            keyId: key
+        });
+        check!(isKeyAuthorizationWitnessBurnedCall {
+            account: owner,
+            witness: B256::repeat_byte(0x77),
+        });
+        check!(IAccountKeychain::isAdminKeyCall {
+            account: owner,
+            keyId: key
         });
     }
 
     #[test]
     fn non_account_getter_is_unchanged() {
-        let rules = AccountKeychainRules::new(L1State::new(MockL1Reader::default(), Address::ZERO));
+        let rules = AccountKeychainRules::new(Address::ZERO);
         assert!(matches!(
             rules.admit(
                 &IAccountKeychain::getTransactionKeyCall {}.abi_encode(),
@@ -164,5 +145,19 @@ mod tests {
             ),
             CallCheck::Continue
         ));
+    }
+
+    #[test]
+    fn zero_beneficiary_does_not_authorize_zero_caller() {
+        let owner = Address::repeat_byte(0x11);
+        let rules = AccountKeychainRules::new(Address::ZERO);
+        assert_unauthorized(
+            &rules,
+            getKeyCall {
+                account: owner,
+                keyId: Address::repeat_byte(0x22),
+            },
+            Address::ZERO,
+        );
     }
 }

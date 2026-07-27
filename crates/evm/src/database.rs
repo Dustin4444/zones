@@ -74,7 +74,7 @@ impl<DB: fmt::Debug, L1> fmt::Debug for L1OverlayDB<DB, L1> {
 }
 
 impl<DB: Database, L1: L1StorageReader> L1OverlayDB<DB, L1> {
-    pub(crate) fn anchor(&mut self) -> Result<u64, ZoneDbError<DB::Error>> {
+    fn anchor(&mut self) -> Result<u64, ZoneDbError<DB::Error>> {
         if let Some(anchor) = self.l1.get_anchor() {
             return Ok(anchor);
         }

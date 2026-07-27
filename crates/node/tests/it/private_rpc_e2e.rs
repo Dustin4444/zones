@@ -916,32 +916,33 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
         );
     }
 
-    let multicall = IMulticall3::aggregateCall {
-        calls: private_reads
-            .iter()
-            .map(|(target, data, _)| IMulticall3::Call {
+    // Exercise each target in its own aggregate. A single aggregate containing every target would
+    // stop at the first revert and leave later enforcement paths (notably Permit2) untested.
+    for (target, data, label) in &private_reads {
+        let multicall = IMulticall3::aggregateCall {
+            calls: vec![IMulticall3::Call {
                 target: *target,
                 callData: data.clone().into(),
-            })
-            .collect(),
-    };
-    let forwarded = ctx
-        .call_as_user(
-            "eth_call",
-            json!([
-                {
-                    "to": format!("{:#x}", alloy_provider::MULTICALL3_ADDRESS),
-                    "data": format!("0x{}", hex::encode(multicall.abi_encode())),
-                },
-                "latest"
-            ]),
-            &outsider_signer,
-        )
-        .await?;
-    assert!(
-        forwarded.get("result").is_none() && forwarded.get("error").is_some(),
-        "Multicall3 must not expose account-indexed system state: {forwarded}"
-    );
+            }],
+        };
+        let forwarded = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{:#x}", alloy_provider::MULTICALL3_ADDRESS),
+                        "data": format!("0x{}", hex::encode(multicall.abi_encode())),
+                    },
+                    "latest"
+                ]),
+                &outsider_signer,
+            )
+            .await?;
+        assert!(
+            forwarded.get("result").is_none() && forwarded.get("error").is_some(),
+            "Multicall3 must not expose {label}: {forwarded}"
+        );
+    }
 
     Ok(())
 }

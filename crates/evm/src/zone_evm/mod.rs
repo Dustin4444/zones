@@ -107,15 +107,14 @@ where
         &mut self,
         tx: TempoTxEnv,
     ) -> (TempoPoolValidationResult<DB::Error>, TempoTxEnv) {
-        if let Err(error) = permit2_privacy::validate_transaction(
-            &mut self.inner.ctx_mut().journaled_state.database,
-            &tx,
-        ) {
-            self.clear_l1_overlay_state();
-            return (Err(error.into()), tx);
-        }
+        let current_sequencer = self.inner.ctx().block.beneficiary;
         let (result, tx) = self.inner.validate_pool_transaction(tx);
-        let result = result.map_err(map_adapter_error);
+        let mut result = result.map_err(map_adapter_error);
+        if result.is_ok()
+            && let Err(error) = permit2_privacy::validate_transaction(&tx, current_sequencer)
+        {
+            result = Err(error.into());
+        }
         self.clear_l1_overlay_state();
         (result, tx)
     }
@@ -153,11 +152,8 @@ where
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
         contract_creation::validate_transaction(&tx, CONTRACT_DEPLOYER_ALLOWLIST)?;
-        if let Err(error) = permit2_privacy::validate_transaction(
-            &mut self.inner.ctx_mut().journaled_state.database,
-            &tx,
-        ) {
-            self.clear_l1_overlay_state();
+        let current_sequencer = self.inner.ctx().block.beneficiary;
+        if let Err(error) = permit2_privacy::validate_transaction(&tx, current_sequencer) {
             return Err(error.into());
         }
         self.execute_and_sanitize(|evm| evm.transact_raw(tx))
@@ -169,13 +165,10 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        if let Err(error) = permit2_privacy::validate_call(
-            &mut self.inner.ctx_mut().journaled_state.database,
-            caller,
-            contract,
-            &data,
-        ) {
-            self.clear_l1_overlay_state();
+        let current_sequencer = self.inner.ctx().block.beneficiary;
+        if let Err(error) =
+            permit2_privacy::validate_call(caller, contract, &data, current_sequencer)
+        {
             return Err(error.into());
         }
         self.execute_and_sanitize(|evm| evm.transact_system_call(caller, contract, data))

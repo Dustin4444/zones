@@ -3,7 +3,8 @@
 //! Direct transaction calls are rejected during Zone transaction validation. Nested `CALL` and
 //! `STATICCALL` frames are guarded in the instruction table, where denied calls execute a tiny
 //! `Unauthorized()` revert program instead of Permit2 bytecode. This avoids both RPC-only gaps and
-//! the per-opcode overhead of enabling REVM's tracing inspector in consensus execution.
+//! the per-opcode overhead of enabling REVM's tracing inspector in consensus execution. Sequencer
+//! access is derived from the current block beneficiary, which is committed in the Zone header.
 
 use crate::database::L1OverlayDB;
 use alloy_evm::Database;
@@ -35,40 +36,39 @@ where
     L1: L1StorageReader,
 {
     let instructions = &mut evm.inner_mut().inner.instruction;
-    instructions.insert_instruction(CALL, Instruction::new(call::<CALL, DB, L1>), 0);
-    instructions.insert_instruction(STATICCALL, Instruction::new(call::<STATICCALL, DB, L1>), 0);
+    let call_gas = instructions.gas_table()[CALL as usize];
+    let staticcall_gas = instructions.gas_table()[STATICCALL as usize];
+    instructions.insert_instruction(CALL, Instruction::new(call::<CALL, DB, L1>), call_gas);
+    instructions.insert_instruction(
+        STATICCALL,
+        Instruction::new(call::<STATICCALL, DB, L1>),
+        staticcall_gas,
+    );
 }
 
-pub(super) fn validate_transaction<DB, L1>(
-    database: &mut L1OverlayDB<DB, L1>,
+pub(super) fn validate_transaction(
     tx: &TempoTxEnv,
-) -> Result<(), TempoInvalidTransaction>
-where
-    DB: Database,
-    L1: L1StorageReader,
-{
+    current_sequencer: Address,
+) -> Result<(), TempoInvalidTransaction> {
     for (kind, data) in tx.calls() {
         let TxKind::Call(target) = kind else {
             continue;
         };
-        validate_call(database, tx.caller, *target, data)?;
+        validate_call(tx.caller, *target, data, current_sequencer)?;
     }
     Ok(())
 }
 
-pub(super) fn validate_call<DB, L1>(
-    database: &mut L1OverlayDB<DB, L1>,
+pub(super) fn validate_call(
     caller: Address,
     target: Address,
     data: &[u8],
-) -> Result<(), TempoInvalidTransaction>
-where
-    DB: Database,
-    L1: L1StorageReader,
-{
+    current_sequencer: Address,
+) -> Result<(), TempoInvalidTransaction> {
     if target == PERMIT2_ADDRESS
         && permit2_authorized_accounts(data).is_some_and(|accounts| {
-            !accounts.contains(&caller) && !is_active_sequencer(database, caller)
+            !accounts.contains(&caller)
+                && (current_sequencer == Address::ZERO || caller != current_sequencer)
         })
     {
         return Err(TempoInvalidTransaction::CallsValidation(
@@ -100,8 +100,9 @@ where
     let Some(accounts) = permit2_authorized_accounts(&data) else {
         return result;
     };
+    let current_sequencer = context.host.block.beneficiary;
     if accounts.contains(&caller)
-        || is_active_sequencer(&mut context.host.journaled_state.database, caller)
+        || (current_sequencer != Address::ZERO && caller == current_sequencer)
     {
         return result;
     }
@@ -152,24 +153,32 @@ fn permit2_authorized_accounts(data: &[u8]) -> Option<Vec<Address>> {
     }
 }
 
-fn is_active_sequencer<DB, L1>(database: &mut L1OverlayDB<DB, L1>, caller: Address) -> bool
-where
-    DB: Database,
-    L1: L1StorageReader,
-{
-    let Ok(anchor) = database.anchor() else {
-        return false;
-    };
-    database
-        .l1_state()
-        .is_active_sequencer_at(caller, anchor)
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_evm::EvmEnv;
     use alloy_primitives::U256;
+    use revm::{database::EmptyDB, inspector::NoOpInspector};
+    use tempo_evm::TempoBlockEnv;
+    use zone_precompiles::test_utils::MockL1Reader;
+
+    #[test]
+    fn runtime_preserves_call_opcode_base_gas() {
+        let db = L1OverlayDB::new(EmptyDB::default(), MockL1Reader::default(), Address::ZERO);
+        let mut evm = TempoEvm::<_, NoOpInspector>::new(
+            db,
+            EvmEnv::<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv>::default(),
+        );
+        let before = {
+            let gas = evm.inner_mut().inner.instruction.gas_table();
+            (gas[CALL as usize], gas[STATICCALL as usize])
+        };
+
+        configure_runtime(&mut evm);
+
+        let gas = evm.inner_mut().inner.instruction.gas_table();
+        assert_eq!((gas[CALL as usize], gas[STATICCALL as usize]), before);
+    }
 
     #[test]
     fn extracts_only_privacy_bearing_permit2_getters() {
@@ -216,5 +225,17 @@ mod tests {
 
         assert!(Permit2::nonceBitmapCall::abi_decode_raw_validate(&data[4..]).is_err());
         assert_eq!(permit2_authorized_accounts(&data), Some(vec![owner]));
+    }
+
+    #[test]
+    fn zero_beneficiary_does_not_authorize_zero_caller() {
+        let owner = Address::repeat_byte(0x11);
+        let data = Permit2::nonceBitmapCall {
+            _0: owner,
+            _1: U256::ZERO,
+        }
+        .abi_encode();
+
+        assert!(validate_call(Address::ZERO, PERMIT2_ADDRESS, &data, Address::ZERO).is_err());
     }
 }

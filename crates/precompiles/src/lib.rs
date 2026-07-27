@@ -71,30 +71,21 @@ use alloy_primitives::Address;
 use tempo_precompiles::{Precompile as _, tip20::TIP20Token, tip403_registry::TIP403Registry};
 
 /// Creates upstream account-keychain execution with Zone account-read privacy rules.
-pub fn create_account_keychain_precompile<P>(
-    l1: L1State<P>,
-    env: &ZonePrecompileEnv,
-) -> DynPrecompile
-where
-    P: L1StorageReader,
-{
+pub fn create_account_keychain_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {
     execution::create_precompile(
         "AccountKeychain",
         env,
-        account_keychain::AccountKeychainRules::new(l1),
+        account_keychain::AccountKeychainRules::new(env.current_sequencer()),
         account_keychain::execute,
     )
 }
 
 /// Creates upstream nonce-manager execution with Zone account-read privacy rules.
-pub fn create_nonce_precompile<P>(l1: L1State<P>, env: &ZonePrecompileEnv) -> DynPrecompile
-where
-    P: L1StorageReader,
-{
+pub fn create_nonce_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {
     execution::create_precompile(
         "NonceManager",
         env,
-        nonce::NonceRules::new(l1),
+        nonce::NonceRules::new(env.current_sequencer()),
         nonce::execute,
     )
 }
@@ -149,7 +140,7 @@ where
     execution::create_precompile(
         "TIP20Token",
         env,
-        ztip20::TIP20Rules::new(l1),
+        ztip20::TIP20Rules::new(l1, env.current_sequencer()),
         move |data, caller| TIP20Token::from_address_unchecked(address).call(data, caller),
     )
 }
