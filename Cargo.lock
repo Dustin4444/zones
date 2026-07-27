@@ -13420,6 +13420,7 @@ dependencies = [
  "revm",
  "tempo-alloy",
  "tempo-chainspec",
+ "tempo-contracts",
  "tempo-evm",
  "tempo-payload-types",
  "tempo-precompiles",

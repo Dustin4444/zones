@@ -26,11 +26,17 @@ use rand::thread_rng;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
-use tempo_contracts::precompiles::{
-    ITIP20 as ContractTip20,
-    account_keychain::IAccountKeychain::SignatureType as KeyInfoSignatureType,
+use tempo_contracts::{
+    PERMIT2_ADDRESS, Permit2,
+    precompiles::{
+        INonce, ITIP20 as ContractTip20,
+        account_keychain::IAccountKeychain::{SignatureType as KeyInfoSignatureType, getKeyCall},
+    },
 };
-use tempo_precompiles::{PATH_USD_ADDRESS, tip20::ITIP20 as PrecompileTip20};
+use tempo_precompiles::{
+    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
+    tip20::ITIP20 as PrecompileTip20,
+};
 use tempo_primitives::{
     TempoTxEnvelope,
     transaction::{AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction},
@@ -808,6 +814,133 @@ async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
     assert_eq!(
         PrecompileTip20::allowanceCall::abi_decode_returns(&sequencer_allowance_bytes)?,
         U256::from(allowance_amount)
+    );
+
+    Ok(())
+}
+
+/// Every remaining ZONE-97 account-indexed getter is enforced during execution, including
+/// contract-forwarded calls that bypass the RPC request's outer `from` field.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_private_rpc().await?;
+    let owner_signer = PrivateKeySigner::random();
+    let owner = owner_signer.address();
+    let outsider_signer = PrivateKeySigner::random();
+    let key = Address::repeat_byte(0x44);
+    let token = PATH_USD_ADDRESS;
+    let spender = Address::repeat_byte(0x55);
+
+    let private_reads = [
+        (
+            ACCOUNT_KEYCHAIN_ADDRESS,
+            getKeyCall {
+                account: owner,
+                keyId: key,
+            }
+            .abi_encode(),
+            "AccountKeychain.getKey",
+        ),
+        (
+            NONCE_PRECOMPILE_ADDRESS,
+            INonce::getNonceCall {
+                account: owner,
+                nonceKey: U256::from(1),
+            }
+            .abi_encode(),
+            "NonceManager.getNonce",
+        ),
+        (
+            PATH_USD_ADDRESS,
+            PrecompileTip20::noncesCall { owner }.abi_encode(),
+            "TIP20.nonces",
+        ),
+        (
+            PERMIT2_ADDRESS,
+            Permit2::allowanceCall {
+                _0: owner,
+                _1: token,
+                _2: spender,
+            }
+            .abi_encode(),
+            "Permit2.allowance",
+        ),
+        (
+            PERMIT2_ADDRESS,
+            Permit2::nonceBitmapCall {
+                _0: owner,
+                _1: U256::ZERO,
+            }
+            .abi_encode(),
+            "Permit2.nonceBitmap",
+        ),
+    ];
+
+    for (target, data, label) in &private_reads {
+        let outsider = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{target:#x}"),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest"
+                ]),
+                &outsider_signer,
+            )
+            .await?;
+        assert!(
+            outsider.get("result").is_none() && outsider.get("error").is_some(),
+            "{label} must reject a caller reading another account: {outsider}"
+        );
+
+        let owner_result = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{target:#x}"),
+                        "data": format!("0x{}", hex::encode(data)),
+                    },
+                    "latest"
+                ]),
+                &owner_signer,
+            )
+            .await?;
+        assert!(
+            owner_result.get("result").is_some() && owner_result.get("error").is_none(),
+            "{label} must retain the owner's read access: {owner_result}"
+        );
+    }
+
+    let multicall = IMulticall3::aggregateCall {
+        calls: private_reads
+            .iter()
+            .map(|(target, data, _)| IMulticall3::Call {
+                target: *target,
+                callData: data.clone().into(),
+            })
+            .collect(),
+    };
+    let forwarded = ctx
+        .call_as_user(
+            "eth_call",
+            json!([
+                {
+                    "to": format!("{:#x}", alloy_provider::MULTICALL3_ADDRESS),
+                    "data": format!("0x{}", hex::encode(multicall.abi_encode())),
+                },
+                "latest"
+            ]),
+            &outsider_signer,
+        )
+        .await?;
+    assert!(
+        forwarded.get("result").is_none() && forwarded.get("error").is_some(),
+        "Multicall3 must not expose account-indexed system state: {forwarded}"
     );
 
     Ok(())

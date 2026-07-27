@@ -22,8 +22,9 @@ use crate::{
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
         L1State, L1StorageReader, TIP403_REGISTRY_ADDRESS, TempoState, ZONE_FEE_MANAGER_ADDRESS,
-        ZoneInbox, ZonePrecompileEnv, create_tip20_precompile, create_tip403_precompile,
-        create_zone_fee_manager_precompile, tx_context::ZoneTxContext,
+        ZoneInbox, ZonePrecompileEnv, create_account_keychain_precompile, create_nonce_precompile,
+        create_tip20_precompile, create_tip403_precompile, create_zone_fee_manager_precompile,
+        tx_context::ZoneTxContext,
     },
 };
 use alloy_evm::{
@@ -53,9 +54,9 @@ use tempo_payload_types::TempoExecutionData;
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv,
     RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS, account_keychain::AccountKeychain,
-    error::Result as TempoResult, nonce::NonceManager, receive_policy_guard::ReceivePolicyGuard,
-    storage::actions::StorageActions, tip20::is_tip20_prefix,
+    TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS, error::Result as TempoResult,
+    receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
+    tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -133,6 +134,8 @@ where
             Some(create_tip403_precompile(&tip403_env))
         });
         let tip20_l1 = l1.clone();
+        let nonce_l1 = l1.clone();
+        let keychain_l1 = l1.clone();
         let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots);
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
@@ -140,9 +143,12 @@ where
             } else if *address == STABLECOIN_DEX_ADDRESS {
                 None
             } else if *address == NONCE_PRECOMPILE_ADDRESS {
-                Some(NonceManager::create_precompile(&tempo_env))
+                Some(create_nonce_precompile(nonce_l1.clone(), &env))
             } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
-                Some(AccountKeychain::create_precompile(&tempo_env))
+                Some(create_account_keychain_precompile(
+                    keychain_l1.clone(),
+                    &env,
+                ))
             } else if *address == RECEIVE_POLICY_GUARD_ADDRESS {
                 Some(ReceivePolicyGuard::create_precompile(&tempo_env))
             } else {

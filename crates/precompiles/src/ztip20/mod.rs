@@ -86,6 +86,9 @@ impl<P: L1StorageReader> CallRules for TIP20Rules<P> {
                     self.check_auth_with_sequencer(caller, &[call.owner, call.spender])
                 })
             }
+            ITIP20::noncesCall::SELECTOR => decode_and_check::<ITIP20::noncesCall>(args, |call| {
+                self.check_auth_with_sequencer(caller, &[call.owner])
+            }),
             IRolesAuth::hasRoleCall::SELECTOR => {
                 decode_and_check::<IRolesAuth::hasRoleCall>(args, |call| {
                     self.check_auth_with_sequencer(caller, &[call.account])
@@ -293,6 +296,11 @@ mod tests {
                 assert_allowed(&rules, allowance.clone(), caller);
             }
             assert_unauthorized(&rules, allowance, outsider);
+
+            let nonce = ITIP20::noncesCall { owner };
+            assert_allowed(&rules, nonce.clone(), owner);
+            assert_allowed(&rules, nonce.clone(), sequencer);
+            assert_unauthorized(&rules, nonce, outsider);
 
             let role = IRolesAuth::hasRoleCall {
                 account: owner,

@@ -76,6 +76,7 @@ mod tests {
     use crate::{L1OverlayDB, ZoneEvm};
     use alloy_evm::{Evm, EvmEnv};
     use alloy_primitives::{Address, Bytes, TxKind, U256, bytes};
+    use alloy_sol_types::{SolCall, SolError};
     use revm::{
         bytecode::Bytecode,
         context::{
@@ -86,9 +87,11 @@ mod tests {
         inspector::NoOpInspector,
         state::AccountInfo,
     };
+    use tempo_contracts::{PERMIT2_ADDRESS, Permit2};
     use tempo_evm::{TempoBlockEnv, TempoHaltReason};
     use tempo_primitives::transaction::Call;
     use tempo_revm::{TempoBatchCallEnv, TempoTxEnv};
+    use tempo_zone_contracts::Unauthorized;
     use zone_precompiles::test_utils::MockL1Reader as TestL1;
 
     type TestDb = CacheDB<EmptyDB>;
@@ -128,7 +131,16 @@ mod tests {
         db: TestDb,
         input: EvmEnv<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv>,
     ) -> ZoneEvm<TestDb, NoOpInspector, TestL1> {
-        let db = L1OverlayDB::new(db, TestL1::default(), Address::ZERO);
+        test_evm_with_l1(db, input, TestL1::default(), Address::ZERO)
+    }
+
+    fn test_evm_with_l1(
+        db: TestDb,
+        input: EvmEnv<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv>,
+        l1: TestL1,
+        portal: Address,
+    ) -> ZoneEvm<TestDb, NoOpInspector, TestL1> {
+        let db = L1OverlayDB::new(db, l1, portal);
         ZoneEvm::new(TempoEvm::new(db, input))
     }
 
@@ -138,16 +150,111 @@ mod tests {
     }
 
     fn call_tx(caller: Address, contract: Address) -> TempoTxEnv {
+        call_tx_data(caller, contract, Bytes::new())
+    }
+
+    fn call_tx_data(caller: Address, contract: Address, data: Bytes) -> TempoTxEnv {
         TempoTxEnv {
             inner: TxEnv {
                 caller,
                 gas_price: 0,
                 gas_limit: 1_000_000,
                 kind: TxKind::Call(contract),
+                data,
                 ..Default::default()
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn permit2_private_getters_are_guarded_for_direct_and_nested_calls() {
+        let owner = Address::repeat_byte(0x11);
+        let spender = Address::repeat_byte(0x22);
+        let outsider = Address::repeat_byte(0x33);
+        let token = Address::repeat_byte(0x44);
+        let unauthorized = Bytes::from(Unauthorized {}.abi_encode());
+        let allowance = Bytes::from(
+            Permit2::allowanceCall {
+                _0: owner,
+                _1: token,
+                _2: spender,
+            }
+            .abi_encode(),
+        );
+        let nonce = Bytes::from(
+            Permit2::nonceBitmapCall {
+                _0: owner,
+                _1: U256::from(7),
+            }
+            .abi_encode(),
+        );
+
+        for (data, caller) in [
+            (allowance.clone(), owner),
+            (allowance.clone(), spender),
+            (nonce.clone(), owner),
+        ] {
+            let mut evm = evm_with_contract(PERMIT2_ADDRESS, &[0x00]);
+            let result = evm
+                .transact_raw(call_tx_data(caller, PERMIT2_ADDRESS, data))
+                .expect("authorized Permit2 read must execute")
+                .result;
+            assert!(matches!(result, ExecutionResult::Success { .. }));
+        }
+
+        for data in [allowance, nonce.clone()] {
+            let mut evm = evm_with_contract(PERMIT2_ADDRESS, &[0x00]);
+            let error = evm
+                .transact_raw(call_tx_data(outsider, PERMIT2_ADDRESS, data))
+                .expect_err("direct outsider Permit2 read must fail validation");
+            assert!(matches!(
+                error,
+                EVMError::Transaction(TempoInvalidTransaction::CallsValidation(
+                    "unauthorized Permit2 account read"
+                ))
+            ));
+        }
+
+        let portal = Address::repeat_byte(0x66);
+        let sequencer = Address::repeat_byte(0x77);
+        let l1 = TestL1::default();
+        l1.seed_active_sequencer(portal, 0, sequencer);
+        let mut evm = test_evm_with_l1(
+            test_db([(PERMIT2_ADDRESS, Bytes::from_static(&[0x00]))]),
+            EvmEnv::default(),
+            l1,
+            portal,
+        );
+        let result = evm
+            .transact_raw(call_tx_data(sequencer, PERMIT2_ADDRESS, nonce.clone()))
+            .expect("active sequencer must retain Permit2 read access")
+            .result;
+        assert!(matches!(result, ExecutionResult::Success { .. }));
+
+        // A forwarding contract copies calldata into a STATICCALL to Permit2 and returns the
+        // subcall's returndata. Permit2 sees the forwarding contract as msg.sender, so even an
+        // owner-authenticated outer call cannot turn the RPC identity into a nested bypass.
+        let forwarder = Address::repeat_byte(0x55);
+        let mut forwarder_code = vec![0x36, 0x5f, 0x5f, 0x37, 0x5f, 0x5f, 0x36, 0x5f, 0x73];
+        forwarder_code.extend_from_slice(PERMIT2_ADDRESS.as_slice());
+        forwarder_code
+            .extend_from_slice(&[0x5a, 0xfa, 0x50, 0x3d, 0x5f, 0x5f, 0x3e, 0x3d, 0x5f, 0xf3]);
+        let mut evm = test_evm(
+            test_db([
+                (PERMIT2_ADDRESS, Bytes::from_static(&[0x00])),
+                (forwarder, Bytes::from(forwarder_code)),
+            ]),
+            EvmEnv::default(),
+        );
+        let result = evm
+            .transact_raw(call_tx_data(owner, forwarder, nonce))
+            .expect("forwarder transaction must execute")
+            .result;
+        let ExecutionResult::Success { output, .. } = result else {
+            panic!("forwarder deliberately returns the nested revert bytes")
+        };
+        assert_eq!(output.data(), unauthorized.as_ref());
     }
 
     fn assert_not_activated(result: ExecutionResult<TempoHaltReason>) {

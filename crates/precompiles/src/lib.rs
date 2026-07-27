@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+mod account_keychain;
+mod account_privacy;
 pub mod error;
 pub use error::{Result, ZonePrecompileError, ZoneResult};
 
@@ -44,6 +46,7 @@ pub mod dispatch {
 }
 
 mod execution;
+mod nonce;
 pub use execution::ZonePrecompileEnv;
 pub mod inbox;
 pub mod storage;
@@ -66,6 +69,35 @@ pub use zone_fee_manager::{ZONE_FEE_MANAGER_ADDRESS, ZoneFeeManager};
 use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::Address;
 use tempo_precompiles::{Precompile as _, tip20::TIP20Token, tip403_registry::TIP403Registry};
+
+/// Creates upstream account-keychain execution with Zone account-read privacy rules.
+pub fn create_account_keychain_precompile<P>(
+    l1: L1State<P>,
+    env: &ZonePrecompileEnv,
+) -> DynPrecompile
+where
+    P: L1StorageReader,
+{
+    execution::create_precompile(
+        "AccountKeychain",
+        env,
+        account_keychain::AccountKeychainRules::new(l1),
+        account_keychain::execute,
+    )
+}
+
+/// Creates upstream nonce-manager execution with Zone account-read privacy rules.
+pub fn create_nonce_precompile<P>(l1: L1State<P>, env: &ZonePrecompileEnv) -> DynPrecompile
+where
+    P: L1StorageReader,
+{
+    execution::create_precompile(
+        "NonceManager",
+        env,
+        nonce::NonceRules::new(l1),
+        nonce::execute,
+    )
+}
 
 /// Creates the zone-native fee manager precompile.
 pub fn create_zone_fee_manager_precompile(env: &ZonePrecompileEnv) -> DynPrecompile {

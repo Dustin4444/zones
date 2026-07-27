@@ -113,6 +113,21 @@ impl<P> L1State<P> {
 }
 
 impl<P: L1StorageReader> L1State<P> {
+    /// Returns whether `account` is an active sequencer at an explicitly selected Tempo block.
+    ///
+    /// This raw-slot form is used by EVM call policies that run outside a precompile
+    /// [`StorageCtx`].
+    pub fn is_active_sequencer_at(
+        &self,
+        account: Address,
+        block_number: u64,
+    ) -> Result<bool, L1StateError> {
+        let portal = ZonePortal::new(self.portal_address);
+        let slot = portal.is_sequencer[account].slot();
+        self.read_l1_storage(self.portal_address, slot.into(), block_number)
+            .map(|value| value != B256::ZERO)
+    }
+
     /// Reads L1 storage after selecting or validating `block_number` as this transaction's anchor.
     pub fn read_l1_storage(
         &self,
