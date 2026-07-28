@@ -5,7 +5,10 @@
 
 use crate::{
     ZoneEngine,
-    replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
+    replication::{
+        AttestationContext, LeaderRecovery, after_leader_recovery, broadcast_persisted_blocks,
+        run_follower_block_sync, run_leader_block_sync,
+    },
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     settlement_attestation::collect_leader_settlements,
     tx_forwarding::{forward_new_transactions, insert_forwarded_transactions, route_p2p_events},
@@ -167,6 +170,17 @@ pub struct ZoneSequencerAddOnsConfig {
     pub withdrawal_poll_interval: Duration,
     /// Gas and concurrency limits for withdrawal processing transactions.
     pub withdrawal_batch_limits: WithdrawalBatchLimits,
+}
+
+/// Read the sealed header at the local canonical head.
+fn latest_sealed_header<P>(provider: &P) -> eyre::Result<SealedHeader<TempoHeader>>
+where
+    P: BlockNumReader + HeaderProvider<Header = TempoHeader>,
+{
+    let number = provider.best_block_number()?;
+    provider
+        .sealed_header(number)?
+        .ok_or_else(|| eyre::eyre!("no header at zone head {number}"))
 }
 
 /// Configuration for the Zone private RPC server extension.
@@ -513,6 +527,7 @@ where
             .as_ref()
             .filter(|config| config.role() == Role::Leader)
             .map(|_| AttestationStore::default());
+        let mut leader_recovery = None;
         if let Some(config) = self.p2p_config.take() {
             let l1_chain_id = l1_provider.get_chain_id().await?;
             let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
@@ -535,7 +550,7 @@ where
                 l1_provider.clone(),
                 anchor_config,
             );
-            Self::launch_p2p(
+            leader_recovery = Self::launch_p2p(
                 config,
                 network_id,
                 attestation,
@@ -551,7 +566,7 @@ where
         if let Some(ref config) = self.sequencer_config {
             let sequencer_addr = config.sequencer_signer.address();
             let sequencer_key = SecretKey::from(config.sequencer_signer.credential());
-            self.spawn_zone_engine(&ctx, sequencer_addr, sequencer_key)?;
+            self.spawn_zone_engine(&ctx, sequencer_addr, sequencer_key, leader_recovery);
         }
 
         let chain_id = ctx.node.provider().chain_spec().genesis().config.chain_id;
@@ -606,10 +621,9 @@ where
         engine: ConsensusEngineHandle<ZonePayloadTypes>,
         l1_block_tracker: L1BlockTracker,
         deposit_queue: DepositQueue,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<Option<LeaderRecovery>> {
         let local_ed25519_public_key = config.ed25519_public_key();
-        let leadership = config.leadership();
-        let role = leadership.role_of(&local_ed25519_public_key);
+        let role = config.leadership().role_of(&local_ed25519_public_key);
         // Subscribe before starting Commonware (and, importantly, before RPC launch) so a
         // follower cannot admit a transaction in a startup gap.
         let new_transactions = (role == Role::Follower).then(|| pool.new_transactions_listener());
@@ -622,12 +636,8 @@ where
             events,
         } = handle.into_parts();
 
-        let sync_events = match role {
+        let leader_recovery = match role {
             Role::Leader => {
-                task_executor.spawn_critical_task(
-                    "zone-p2p-block-broadcast",
-                    broadcast_persisted_blocks(provider.clone(), commands.clone()),
-                );
                 let (sync_events_tx, sync_events) = tokio::sync::mpsc::channel(128);
                 let (transaction_events_tx, transaction_events) = tokio::sync::mpsc::channel(128);
                 task_executor.spawn_critical_task(
@@ -638,7 +648,39 @@ where
                     "zone-p2p-transaction-import",
                     insert_forwarded_transactions(pool, transaction_events),
                 );
-                sync_events
+                let (caught_up, recovered) = tokio::sync::watch::channel(false);
+                let recovery = LeaderRecovery::new(recovered);
+
+                // A leader that restarted behind its peers must reach their tip before it
+                // broadcasts or settles anything — both would otherwise speak for a stale head.
+                task_executor.spawn_critical_task("zone-p2p-block-broadcast", {
+                    let (provider, commands) = (provider.clone(), commands.clone());
+                    after_leader_recovery(Some(recovery.clone()), move || {
+                        broadcast_persisted_blocks(provider, commands)
+                    })
+                });
+                // Only a leader can propose settlement attestations.
+                task_executor.spawn_critical_task("zone-p2p-settlement-collection", {
+                    let (provider, commands) = (provider.clone(), commands.clone());
+                    let attestation = attestation.clone();
+                    after_leader_recovery(Some(recovery.clone()), move || {
+                        collect_leader_settlements(provider, commands, attestation)
+                    })
+                });
+                task_executor.spawn_critical_task(
+                    "zone-p2p-block-sync",
+                    run_leader_block_sync(
+                        provider,
+                        engine,
+                        sync_events,
+                        commands,
+                        l1_block_tracker,
+                        deposit_queue,
+                        attestation,
+                        caught_up,
+                    ),
+                );
+                Some(recovery)
             }
             Role::Follower => {
                 task_executor.spawn_critical_task(
@@ -649,30 +691,21 @@ where
                         commands.clone(),
                     ),
                 );
-                events
+                task_executor.spawn_critical_task(
+                    "zone-p2p-block-sync",
+                    run_follower_block_sync(
+                        provider,
+                        engine,
+                        events,
+                        commands,
+                        l1_block_tracker,
+                        deposit_queue,
+                        attestation,
+                    ),
+                );
+                None
             }
         };
-        task_executor.spawn_critical_task(
-            "zone-p2p-block-sync",
-            run_block_sync(
-                local_ed25519_public_key,
-                leadership,
-                provider.clone(),
-                engine,
-                sync_events,
-                commands.clone(),
-                l1_block_tracker,
-                deposit_queue,
-                attestation.clone(),
-            ),
-        );
-        if role == Role::Leader {
-            // Only a leader can propose settlement attestations
-            task_executor.spawn_critical_task(
-                "zone-p2p-settlement-collection",
-                collect_leader_settlements(provider, commands, attestation),
-            );
-        }
         task_executor.spawn_critical_with_graceful_shutdown_signal(
             "zone-p2p",
             |shutdown| async move {
@@ -707,7 +740,7 @@ where
                 }
             },
         );
-        Ok(())
+        Ok(leader_recovery)
     }
 
     /// Seed the enabled-token registry from the zone's current L1 snapshot.
@@ -788,32 +821,50 @@ where
     }
 
     /// Spawn the [`ZoneEngine`] for L1-event-driven block production.
+    ///
+    /// A recovering leader must not build on — or forkchoice back to — the head it started with,
+    /// so the engine's parent header is read after `recovery` releases rather than at launch. The
+    /// wait cannot happen here: recovery imports blocks through the engine API, which reth only
+    /// starts serving once add-ons have finished launching.
     fn spawn_zone_engine(
         &self,
         ctx: &AddOnsContext<'_, N>,
         fee_recipient: Address,
         sequencer_key: SecretKey,
-    ) -> eyre::Result<()> {
-        let provider = ctx.node.provider();
-        let last_header = provider
-            .sealed_header(provider.best_block_number()?)?
-            .ok_or_else(|| eyre::eyre!("no latest block header"))?;
-        let engine = ZoneEngine::new(
-            provider.chain_spec(),
-            ctx.beacon_engine_handle.clone(),
-            ctx.node.payload_builder_handle().clone(),
-            self.deposit_queue.clone(),
-            self.l1_config.block_tracker.clone(),
-            last_header,
-            fee_recipient,
-            sequencer_key,
-            self.portal_address,
+        recovery: Option<LeaderRecovery>,
+    ) {
+        let provider = ctx.node.provider().clone();
+        let chain_spec = provider.chain_spec();
+        let engine_handle = ctx.beacon_engine_handle.clone();
+        let payload_builder = ctx.node.payload_builder_handle().clone();
+        let deposit_queue = self.deposit_queue.clone();
+        let block_tracker = self.l1_config.block_tracker.clone();
+        let portal_address = self.portal_address;
+
+        ctx.node.task_executor().spawn_critical_task(
+            "zone-engine",
+            after_leader_recovery(recovery, move || async move {
+                // Fail loudly rather than returning: a leader that cannot read its own head but
+                // keeps its role would look alive while never producing a block. `spawn_critical_task`
+                // turns this into node shutdown, which is the honest outcome.
+                let last_header = latest_sealed_header(&provider)
+                    .expect("ZoneEngine requires a readable canonical zone head");
+                ZoneEngine::new(
+                    chain_spec,
+                    engine_handle,
+                    payload_builder,
+                    deposit_queue,
+                    block_tracker,
+                    last_header,
+                    fee_recipient,
+                    sequencer_key,
+                    portal_address,
+                )
+                .run()
+                .await
+            }),
         );
-        ctx.node
-            .task_executor()
-            .spawn_critical_task("zone-engine", engine.run());
         info!(target: "reth::cli", "ZoneEngine spawned");
-        Ok(())
     }
 
     /// Launch the private RPC server.

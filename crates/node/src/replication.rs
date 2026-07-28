@@ -18,10 +18,10 @@ use std::{
 };
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt as _};
-use zone_p2p::{Leadership, P2pCommand, P2pEvent, P2pPeerId, Role};
+use zone_p2p::{P2pCommand, P2pEvent};
 use zone_payload::{
     ZonePayloadTypes,
     abi::{IZoneInbox, ZONE_INBOX_ADDRESS},
@@ -215,6 +215,14 @@ const MAX_PENDING_BLOCKS: usize = 128;
 const BACKFILL_PAGE_SIZE: u64 = 64;
 const BACKFILL_SERVE_QUEUE_CAPACITY: usize = 8;
 
+/// How long a restarting leader waits for any peer to answer its catch-up probe.
+///
+/// A leader that hears nothing cannot tell a fresh zone apart from unreachable followers, so it
+/// eventually starts producing blocks either way — the behaviour it had before startup recovery
+/// existed. The window is several times Commonware's dial interval and handshake timeout, so a
+/// follower that is actually running gets to answer first.
+const LEADER_CATCHUP_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
 struct BackfillRequest {
     peer: zone_p2p::P2pPeerId,
     request_id: u64,
@@ -383,22 +391,67 @@ async fn serve_backfill_requests<P>(
     }
 }
 
-/// Run role-appropriate block replication.
+/// Barrier released once a leader's startup catch-up has produced a canonical head.
 ///
-/// Leaders are deliberately serve-only: [`ZoneEngine`](crate::ZoneEngine) is their sole
-/// chain-head writer. Leader recovery is deferred to a future startup recovery phase, before the
-/// zone engine starts. Followers serve catch-up requests and import live/backfilled blocks in
-/// canonical order.
-pub(crate) async fn run_block_sync<P>(
-    local_ed25519_public_key: P2pPeerId,
-    leadership: Leadership,
+/// Block production, block broadcast, and settlement proposals must all start from the recovered
+/// head rather than the one the process came up with. Recovery cannot be awaited during node
+/// launch: it imports blocks through the engine API, and reth only starts the consensus engine
+/// after add-ons finish launching. So each of those tasks waits on this barrier instead.
+#[derive(Debug, Clone)]
+pub(crate) struct LeaderRecovery(watch::Receiver<bool>);
+
+impl LeaderRecovery {
+    /// Creates the barrier from the receiving half of a catch-up signal.
+    pub(crate) const fn new(recovered: watch::Receiver<bool>) -> Self {
+        Self(recovered)
+    }
+
+    /// Wait until the leader's canonical head is safe to build on.
+    pub(crate) async fn wait(mut self) -> eyre::Result<()> {
+        self.0
+            .wait_for(|recovered| *recovered)
+            .await
+            .map(drop)
+            .map_err(|_| eyre::eyre!("leader block sync stopped before startup catch-up finished"))
+    }
+}
+
+/// Build and run a leader task once startup catch-up has released `recovery`.
+///
+/// `build` runs *after* the barrier, so a task cannot capture the head the process came up with —
+/// the mistake the barrier exists to prevent. `None` means this node never recovers as a leader,
+/// so the task starts immediately.
+pub(crate) async fn after_leader_recovery<F, T>(recovery: Option<LeaderRecovery>, build: F)
+where
+    F: FnOnce() -> T,
+    T: Future<Output = ()>,
+{
+    if let Some(recovery) = recovery
+        && let Err(err) = recovery.wait().await
+    {
+        tracing::error!(target: "zone::p2p", %err, "Skipping leader task; startup catch-up never finished");
+        return;
+    }
+    build().await;
+}
+
+/// Recover a restarted leader, then serve peer backfill requests.
+///
+/// Only followers are backfilled in steady state, so a leader that crashed or lost its disk has
+/// no other way back to the canonical chain. Recovery therefore runs before
+/// [`ZoneEngine`](crate::ZoneEngine) becomes the sole writer of the leader's head, importing peer
+/// blocks through the same validating path a follower uses. `caught_up` releases the tasks that
+/// need the recovered head; afterwards the leader is serve-only and never follows a peer chain
+/// head again.
+pub(crate) async fn run_leader_block_sync<P>(
     provider: P,
     engine: ConsensusEngineHandle<ZonePayloadTypes>,
-    events: mpsc::Receiver<P2pEvent>,
+    mut events: mpsc::Receiver<P2pEvent>,
     commands: mpsc::Sender<P2pCommand>,
     l1_block_tracker: L1BlockTracker,
     deposit_queue: DepositQueue,
     attestation: AttestationContext,
+    caught_up: watch::Sender<bool>,
 ) where
     P: BlockNumReader
         + BlockReader<Block = Block>
@@ -410,30 +463,171 @@ pub(crate) async fn run_block_sync<P>(
         + Sync
         + 'static,
 {
-    let role = leadership.role_of(&local_ed25519_public_key);
-    match role {
-        Role::Leader => run_leader_backfill_server(provider, events, commands, attestation).await,
-        Role::Follower => {
-            run_follower_block_sync(
-                provider,
-                engine,
-                events,
-                commands,
-                l1_block_tracker,
-                deposit_queue,
-                attestation,
-            )
-            .await
+    // Serving spans both phases: a peer even further behind than this leader must not have to
+    // wait for the leader's own recovery to finish.
+    let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
+    let mut backfill_server = BackfillServerTask(tokio::spawn(serve_backfill_requests(
+        provider.clone(),
+        commands.clone(),
+        backfill_request_rx,
+    )));
+
+    if let Err(err) = run_leader_catch_up(
+        &provider,
+        &engine,
+        &mut events,
+        &commands,
+        &l1_block_tracker,
+        &deposit_queue,
+        &backfill_requests,
+        &mut backfill_server,
+    )
+    .await
+    {
+        tracing::error!(target: "zone::p2p", %err, "Leader startup catch-up stopped");
+        return;
+    }
+    caught_up.send_replace(true);
+
+    run_leader_backfill_server(
+        provider,
+        events,
+        attestation,
+        backfill_requests,
+        backfill_server,
+    )
+    .await
+}
+
+/// Import canonical peer blocks until the leader's head is safe to hand to block production.
+///
+/// Returns once recovery is finished. An error means the runtime is going away, so the caller
+/// must not release the startup barrier.
+async fn run_leader_catch_up<P>(
+    provider: &P,
+    engine: &ConsensusEngineHandle<ZonePayloadTypes>,
+    events: &mut mpsc::Receiver<P2pEvent>,
+    commands: &mpsc::Sender<P2pCommand>,
+    l1_block_tracker: &L1BlockTracker,
+    deposit_queue: &DepositQueue,
+    backfill_requests: &mpsc::Sender<BackfillRequest>,
+    backfill_server: &mut BackfillServerTask,
+) -> eyre::Result<()>
+where
+    P: BlockNumReader
+        + HeaderProvider<Header = TempoHeader>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let mut pending = BTreeMap::<u64, Vec<u8>>::new();
+    let mut backfill = BackfillProgress::new();
+    // The only authoritative source is a peer: a leader that lost its disk looks exactly like a
+    // leader starting a brand new zone. Once any peer answers, its advertised tip decides when
+    // recovery is finished, and the leader keeps catching up rather than forking the zone.
+    let mut heard_from_peer = false;
+
+    let mut retry = tokio::time::interval(BACKFILL_RETRY_INTERVAL);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let grace = tokio::time::sleep(LEADER_CATCHUP_GRACE_PERIOD);
+    tokio::pin!(grace);
+
+    info!(target: "zone::p2p", head = ?local_head(provider), "Probing peers before leader block production");
+
+    loop {
+        if heard_from_peer && !backfill.needed {
+            info!(target: "zone::p2p", head = ?local_head(provider), "Leader startup catch-up complete");
+            return Ok(());
+        }
+
+        tokio::select! {
+            event = events.recv() => {
+                let Some(event) = event else {
+                    eyre::bail!("P2P event channel closed");
+                };
+                match event {
+                    P2pEvent::BackfillRequested { peer, request_id, start } => {
+                        queue_backfill_request(backfill_requests, peer, request_id, start);
+                    }
+                    P2pEvent::BackfillBlockReceived { block, .. } => {
+                        // Only a well-formed block proves a peer is answering. Counting the frame
+                        // instead would let a peer sending garbage both suppress the grace-period
+                        // start and never satisfy the tip, wedging the leader permanently.
+                        if absorb_peer_block(
+                            provider,
+                            engine,
+                            l1_block_tracker,
+                            deposit_queue,
+                            &mut pending,
+                            &mut backfill,
+                            block,
+                        ).await {
+                            heard_from_peer = true;
+                            grace.as_mut().reset(tokio::time::Instant::now() + LEADER_CATCHUP_GRACE_PERIOD);
+                        }
+                    }
+                    P2pEvent::BackfillCompleted { peer, tip } => {
+                        heard_from_peer = true;
+                        grace.as_mut().reset(tokio::time::Instant::now() + LEADER_CATCHUP_GRACE_PERIOD);
+                        complete_backfill(provider, &mut backfill, &pending, &peer, tip);
+                    }
+                    P2pEvent::Started { .. }
+                    | P2pEvent::BlockReceived { .. }
+                    | P2pEvent::TransactionReceived { .. }
+                    | P2pEvent::SettlementProposalReceived { .. }
+                    | P2pEvent::SettlementSignatureReceived { .. } => {
+                        // A recovering leader neither builds blocks nor settles, and it follows
+                        // peer heads only through the backfill it asked for.
+                        debug!(target: "zone::p2p", "Ignoring non-backfill event during leader startup catch-up");
+                    }
+                }
+            }
+            _ = retry.tick(), if backfill.needed => {
+                let Some(best) = local_head(provider) else { continue };
+                if let Some(command) = backfill.request(best) {
+                    commands.send(command).await.map_err(|_| eyre::eyre!("P2P command channel closed"))?;
+                }
+            }
+            () = &mut grace => {
+                let head = local_head(provider);
+                if !heard_from_peer {
+                    warn!(
+                        target: "zone::p2p",
+                        ?head,
+                        grace_secs = LEADER_CATCHUP_GRACE_PERIOD.as_secs(),
+                        "No peer answered the leader catch-up probe; starting block production from the local head"
+                    );
+                    return Ok(());
+                }
+                // A peer did answer, so its tip is authoritative: keep retrying instead of
+                // forking the zone from a stale head.
+                warn!(
+                    target: "zone::p2p",
+                    ?head,
+                    target_tip = ?backfill.target_tip,
+                    "Leader startup catch-up is still waiting for peer blocks"
+                );
+                grace.as_mut().reset(tokio::time::Instant::now() + LEADER_CATCHUP_GRACE_PERIOD);
+            }
+            result = &mut backfill_server.0 => {
+                match result {
+                    Ok(()) => eyre::bail!("block backfill server stopped unexpectedly"),
+                    Err(err) => eyre::bail!("block backfill server task failed: {err}"),
+                }
+            }
         }
     }
 }
 
-/// Leader will serve follower backfill requests (without ever requesting or importing peer blocks).
+/// Leader will serve peer backfill requests (without ever requesting or importing peer blocks).
 async fn run_leader_backfill_server<P>(
     provider: P,
     mut events: mpsc::Receiver<P2pEvent>,
-    commands: mpsc::Sender<P2pCommand>,
     attestation: AttestationContext,
+    backfill_requests: mpsc::Sender<BackfillRequest>,
+    mut backfill_server: BackfillServerTask,
 ) where
     P: BlockNumReader
         + BlockReader<Block = Block>
@@ -444,13 +638,6 @@ async fn run_leader_backfill_server<P>(
         + Sync
         + 'static,
 {
-    let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
-    let mut backfill_server = BackfillServerTask(tokio::spawn(serve_backfill_requests(
-        provider.clone(),
-        commands,
-        backfill_request_rx,
-    )));
-
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -461,9 +648,7 @@ async fn run_leader_backfill_server<P>(
                 match event {
                     P2pEvent::Started { .. } => {}
                     P2pEvent::BackfillRequested { peer, request_id, start } => {
-                        if let Err(err) = backfill_requests.try_send(BackfillRequest { peer, request_id, start }) {
-                            tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
-                        }
+                        queue_backfill_request(&backfill_requests, peer, request_id, start);
                     }
                     P2pEvent::SettlementSignatureReceived { follower, signature } => {
                         let result = async {
@@ -517,7 +702,7 @@ async fn run_leader_backfill_server<P>(
 }
 
 /// Serve catch-up requests and import live/backfilled blocks in canonical order on a follower.
-async fn run_follower_block_sync<P>(
+pub(crate) async fn run_follower_block_sync<P>(
     provider: P,
     engine: ConsensusEngineHandle<ZonePayloadTypes>,
     mut events: mpsc::Receiver<P2pEvent>,
@@ -599,83 +784,28 @@ async fn run_follower_block_sync<P>(
                         }
                     }
                     P2pEvent::BackfillRequested { peer, request_id, start } => {
-                        if let Err(err) = backfill_requests.try_send(BackfillRequest { peer, request_id, start }) {
-                            tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
-                        }
+                        queue_backfill_request(&backfill_requests, peer, request_id, start);
                     }
                     P2pEvent::BlockReceived { block, .. }
                     | P2pEvent::BackfillBlockReceived { block, .. } => {
-                        match encoded_block_number(&block) {
-                            Ok(number) => {
-                                inactivity
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
-                                let best = match provider.best_block_number() {
-                                    Ok(best) => best,
-                                    Err(err) => {
-                                        tracing::error!(target: "zone::p2p", %err, "Failed reading local head");
-                                        continue;
-                                    }
-                                };
-                                if number <= best {
-                                    if let Err(err) = import_peer_block(
-                                        &provider,
-                                        &engine,
-                                        &l1_block_tracker,
-                                        &deposit_queue,
-                                        &block,
-                                    ).await {
-                                        tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
-                                    }
-                                    continue;
-                                }
-                                backfill.observe_block(number, best);
-                                if let Some(dropped) = buffer_pending_block(&mut pending, number, block) {
-                                    tracing::warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
-                                }
-                                if number > best.saturating_add(1) {
-                                    info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
-                                }
-                                if let Err(err) = drain_pending_blocks(
-                                    &provider,
-                                    &engine,
-                                    &l1_block_tracker,
-                                    &deposit_queue,
-                                    &mut pending,
-                                ).await {
-                                    tracing::error!(target: "zone::p2p", %err, "Rejected peer block while draining backfill");
-                                    backfill.needed = true;
-                                } else {
-                                    let best = match provider.best_block_number() {
-                                        Ok(best) => best,
-                                        Err(err) => {
-                                            tracing::error!(target: "zone::p2p", %err, "Failed reading local head after importing peer blocks");
-                                            continue;
-                                        }
-                                    };
-                                    backfill.refresh_after_import(
-                                        best,
-                                        pending.first_key_value().map(|(&number, _)| number),
-                                    );
-                                }
-                            }
-                            Err(err) => tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block"),
+                        // Only a well-formed block counts as peer liveness; a peer flooding
+                        // malformed frames must not suppress the inactivity probe.
+                        if absorb_peer_block(
+                            &provider,
+                            &engine,
+                            &l1_block_tracker,
+                            &deposit_queue,
+                            &mut pending,
+                            &mut backfill,
+                            block,
+                        ).await {
+                            inactivity
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
                         }
                     }
                     P2pEvent::BackfillCompleted { peer, tip } => {
-                        let best = match provider.best_block_number() {
-                            Ok(best) => best,
-                            Err(err) => {
-                                tracing::error!(target: "zone::p2p", %err, "Failed reading local head after backfill response");
-                                continue;
-                            }
-                        };
-                        backfill.complete(
-                            tip,
-                            best,
-                            pending.first_key_value().map(|(&number, _)| number),
-                        );
-                        debug!(target: "zone::p2p", %peer, best, tip, backfill_needed = backfill.needed, "Completed block backfill response page");
+                        complete_backfill(&provider, &mut backfill, &pending, &peer, tip);
                     }
                     P2pEvent::TransactionReceived { .. } => {
                         debug!(target: "zone::p2p", "Ignoring unexpected transaction event in follower block sync");
@@ -686,13 +816,7 @@ async fn run_follower_block_sync<P>(
                 }
             }
             _ = retry.tick(), if backfill.needed => {
-                let best = match provider.best_block_number() {
-                    Ok(best) => best,
-                    Err(err) => {
-                        tracing::error!(target: "zone::p2p", %err, "Failed reading local head for backfill request");
-                        continue;
-                    }
-                };
+                let Some(best) = local_head(&provider) else { continue };
 
                 // retry the backfill
                 if let Some(command) = backfill.request(best)
@@ -708,13 +832,7 @@ async fn run_follower_block_sync<P>(
                 inactivity
                     .as_mut()
                     .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
-                let best = match provider.best_block_number() {
-                    Ok(best) => best,
-                    Err(err) => {
-                        tracing::error!(target: "zone::p2p", %err, "Failed reading local head for inactivity backfill probe");
-                        continue;
-                    }
-                };
+                let Some(best) = local_head(&provider) else { continue };
                 let command = backfill.probe_after_inactivity(best);
                 info!(target: "zone::p2p", best, "No peer block received recently; probing for backfill");
                 if commands.send(command).await.is_err() {
@@ -731,6 +849,116 @@ async fn run_follower_block_sync<P>(
             }
         }
     }
+}
+
+/// Read the local canonical head, logging and yielding `None` on a provider error.
+fn local_head<P: BlockNumReader>(provider: &P) -> Option<u64> {
+    provider
+        .best_block_number()
+        .inspect_err(|err| tracing::error!(target: "zone::p2p", %err, "Failed reading local head"))
+        .ok()
+}
+
+/// Number of the lowest buffered block, if any.
+fn first_pending(pending: &BTreeMap<u64, Vec<u8>>) -> Option<u64> {
+    pending.first_key_value().map(|(&number, _)| number)
+}
+
+/// Record a peer's end-of-page marker against backfill progress.
+///
+/// Shared by follower replication and leader startup catch-up: a page ends the same way for both.
+fn complete_backfill<P: BlockNumReader>(
+    provider: &P,
+    backfill: &mut BackfillProgress,
+    pending: &BTreeMap<u64, Vec<u8>>,
+    peer: &zone_p2p::P2pPeerId,
+    tip: u64,
+) {
+    let Some(best) = local_head(provider) else {
+        return;
+    };
+    backfill.complete(tip, best, first_pending(pending));
+    debug!(target: "zone::p2p", %peer, best, tip, backfill_needed = backfill.needed, "Completed block backfill response page");
+}
+
+/// Hand one peer catch-up request to the serving worker, dropping it under backpressure.
+fn queue_backfill_request(
+    backfill_requests: &mpsc::Sender<BackfillRequest>,
+    peer: zone_p2p::P2pPeerId,
+    request_id: u64,
+    start: u64,
+) {
+    if let Err(err) = backfill_requests.try_send(BackfillRequest {
+        peer,
+        request_id,
+        start,
+    }) {
+        warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
+    }
+}
+
+/// Absorb one received peer block, then import everything that is now contiguous with the head.
+///
+/// Shared by follower replication and leader startup catch-up: both import strictly in canonical
+/// order and both track the same backfill progress. Returns whether the frame decoded as a zone
+/// block, so callers can treat only well-formed blocks as peer liveness.
+async fn absorb_peer_block<P>(
+    provider: &P,
+    engine: &ConsensusEngineHandle<ZonePayloadTypes>,
+    l1_block_tracker: &L1BlockTracker,
+    deposit_queue: &DepositQueue,
+    pending: &mut BTreeMap<u64, Vec<u8>>,
+    backfill: &mut BackfillProgress,
+    block: Vec<u8>,
+) -> bool
+where
+    P: BlockNumReader
+        + HeaderProvider<Header = TempoHeader>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let number = match encoded_block_number(&block) {
+        Ok(number) => number,
+        Err(err) => {
+            tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block");
+            return false;
+        }
+    };
+    let Some(best) = local_head(provider) else {
+        return true;
+    };
+
+    if number <= best {
+        if let Err(err) =
+            import_peer_block(provider, engine, l1_block_tracker, deposit_queue, &block).await
+        {
+            tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
+        }
+        return true;
+    }
+
+    backfill.observe_block(number, best);
+    if let Some(dropped) = buffer_pending_block(pending, number, block) {
+        warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
+    }
+    if number > best.saturating_add(1) {
+        info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
+    }
+
+    if let Err(err) =
+        drain_pending_blocks(provider, engine, l1_block_tracker, deposit_queue, pending).await
+    {
+        tracing::error!(target: "zone::p2p", %err, "Rejected peer block while draining backfill");
+        backfill.needed = true;
+        return true;
+    }
+    if let Some(best) = local_head(provider) {
+        backfill.refresh_after_import(best, first_pending(pending));
+    }
+    true
 }
 
 async fn drain_pending_blocks<P>(
@@ -1332,6 +1560,49 @@ mod tests {
                 start: LOCAL_HEAD + 1,
             })
         );
+    }
+
+    // Leader recovery ends on `heard_from_peer && !backfill.needed`. Both tests below have heard
+    // from a peer, so they pin down the half that carries the logic: when the leader still owes
+    // itself blocks.
+
+    #[test]
+    fn leader_catch_up_ends_when_peers_advertise_the_local_head() {
+        const LOCAL_HEAD: u64 = 42;
+
+        let mut backfill = BackfillProgress::new();
+        assert_eq!(
+            backfill.request(LOCAL_HEAD),
+            Some(P2pCommand::RequestBackfill {
+                start: LOCAL_HEAD + 1,
+            })
+        );
+
+        // A peer at the same height answers with an empty page, so there is nothing left to fetch.
+        backfill.complete(LOCAL_HEAD, LOCAL_HEAD, None);
+        assert!(!backfill.needed);
+    }
+
+    #[test]
+    fn leader_catch_up_keeps_importing_while_a_peer_is_ahead() {
+        const LOCAL_HEAD: u64 = 42;
+        const PEER_TIP: u64 = 108;
+
+        let mut backfill = BackfillProgress::new();
+        backfill.complete(PEER_TIP, LOCAL_HEAD, None);
+
+        // The leader is provably behind, so it must not start producing on the stale head.
+        assert!(backfill.needed);
+        assert_eq!(
+            backfill.request(LOCAL_HEAD),
+            Some(P2pCommand::RequestBackfill {
+                start: LOCAL_HEAD + 1,
+            })
+        );
+
+        // Importing through the advertised tip ends recovery without another response page.
+        backfill.refresh_after_import(PEER_TIP, None);
+        assert!(!backfill.needed);
     }
 
     #[test]
