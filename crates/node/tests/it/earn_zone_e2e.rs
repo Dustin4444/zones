@@ -57,28 +57,20 @@ alloy_sol_types::sol! {
 
     struct FixedFeeRecipient {
         address account;
-        uint96 rate;
+        uint16 rateBps;
     }
 
     struct ExcessReturnFee {
         bool enabled;
         address account;
-        uint96 annualTargetRate;
-        uint96 excessFeeRate;
+        uint16 annualTargetRateBps;
+        uint16 excessFeeRateBps;
     }
 
     struct FeeConfig {
         uint8 fixedFeeCount;
         FixedFeeRecipient[4] fixedFees;
         ExcessReturnFee excess;
-    }
-
-    struct EarnFeesInit {
-        address administrator;
-        address guardian;
-        uint96 fixedFeeCap;
-        uint96 excessFeeCap;
-        FeeConfig initialConfig;
     }
 
     struct EarnEncryptedDepositPayload {
@@ -109,7 +101,7 @@ alloy_sol_types::sol! {
         address engine;
         address owner;
         EarnVaultControls controls;
-        EarnFeesInit fees;
+        FeeConfig fees;
     }
 
     #[sol(rpc)]
@@ -380,23 +372,17 @@ impl EarnZoneFixture {
         )
         .await?;
 
-        let fees = EarnFeesInit {
-            administrator: Address::ZERO,
-            guardian: Address::ZERO,
-            fixedFeeCap: Default::default(),
-            excessFeeCap: Default::default(),
-            initialConfig: FeeConfig {
-                fixedFeeCount: 0,
-                fixedFees: std::array::from_fn(|_| FixedFeeRecipient {
-                    account: Address::ZERO,
-                    rate: Default::default(),
-                }),
-                excess: ExcessReturnFee {
-                    enabled: false,
-                    account: Address::ZERO,
-                    annualTargetRate: Default::default(),
-                    excessFeeRate: Default::default(),
-                },
+        let fees = FeeConfig {
+            fixedFeeCount: 0,
+            fixedFees: std::array::from_fn(|_| FixedFeeRecipient {
+                account: Address::ZERO,
+                rateBps: 0,
+            }),
+            excess: ExcessReturnFee {
+                enabled: false,
+                account: Address::ZERO,
+                annualTargetRateBps: 0,
+                excessFeeRateBps: 0,
             },
         };
         let params = EarnDeployParams {
@@ -454,6 +440,8 @@ impl EarnZoneFixture {
             .abi_encode(),
         )
         .await?;
+        let authority_provider = l1.dev_provider();
+        let authority = DemoTokenAuthority::new(token_authority, &authority_provider);
         let unwrap_role = authority.UNWRAPPER_ROLE().call().await?;
         let receipt = authority
             .grantRole(unwrap_role, router)
@@ -747,16 +735,6 @@ impl EarnZoneFixture {
             min_earn_shares: 0,
             min_output_amount,
         })
-    }
-
-    async fn assert_router_empty(&self) -> eyre::Result<()> {
-        for token in [self.vault_asset, self.alternate_asset, self.earn_share] {
-            eyre::ensure!(
-                self.l1.balance_of(token, self.router).await? == U256::ZERO,
-                "SingleZoneEarnRouter retained token {token}"
-            );
-        }
-        Ok(())
     }
 
     async fn assert_private_return(
