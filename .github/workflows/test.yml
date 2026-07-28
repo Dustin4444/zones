@@ -55,9 +55,11 @@ jobs:
           persist-credentials: false
           submodules: true
       - name: Verify pinned benchmark Earn revision
+        env:
+          EXPECTED_EARN_REVISION: ${{ steps.earn-revision.outputs.sha }}
         run: |
           set -euo pipefail
-          test "$(git -C _benchmark-earn rev-parse HEAD)" = "${{ steps.earn-revision.outputs.sha }}"
+          test "$(git -C _benchmark-earn rev-parse HEAD)" = "$EXPECTED_EARN_REVISION"
       - uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
         with:
           toolchain: stable

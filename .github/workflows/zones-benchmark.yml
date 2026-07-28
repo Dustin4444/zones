@@ -655,9 +655,11 @@ jobs:
 
       - name: Verify pinned Earn revision
         if: needs.authorize.outputs.phase == 'neobank-e2e'
+        env:
+          EXPECTED_EARN_REVISION: ${{ steps.earn-revision.outputs.sha }}
         run: |
           set -euo pipefail
-          test "$(git -C earn rev-parse HEAD)" = "${{ steps.earn-revision.outputs.sha }}"
+          test "$(git -C earn rev-parse HEAD)" = "$EXPECTED_EARN_REVISION"
 
       - name: Prepare persistent topology control path
         env:
