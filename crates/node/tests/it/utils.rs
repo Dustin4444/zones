@@ -1875,9 +1875,22 @@ impl L1TestNode {
         symbol: &str,
         salt: B256,
     ) -> eyre::Result<Address> {
+        use tempo_precompiles::PATH_USD_ADDRESS;
+        self.create_tip20_with_quote(name, symbol, PATH_USD_ADDRESS, salt)
+            .await
+    }
+
+    /// Create a new TIP-20 token with an explicit quote token.
+    pub(crate) async fn create_tip20_with_quote(
+        &self,
+        name: &str,
+        symbol: &str,
+        quote_token: Address,
+        salt: B256,
+    ) -> eyre::Result<Address> {
         use alloy_sol_types::SolEvent;
         use tempo_contracts::precompiles::ITIP20Factory;
-        use tempo_precompiles::{PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS};
+        use tempo_precompiles::TIP20_FACTORY_ADDRESS;
 
         let provider = self.dev_provider();
         let factory = ITIP20Factory::new(TIP20_FACTORY_ADDRESS, &provider);
@@ -1886,7 +1899,7 @@ impl L1TestNode {
                 name.to_string(),
                 symbol.to_string(),
                 "USD".to_string(),
-                PATH_USD_ADDRESS,
+                quote_token,
                 self.dev_address(),
                 salt,
             )
