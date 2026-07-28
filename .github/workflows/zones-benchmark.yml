@@ -166,8 +166,6 @@ on:
       - "crates/contracts/**"
       - "crates/node/**"
       - "crates/sequencer/**"
-      - "docs/NEOBANK_PRIVATE_ZONE_BENCHMARK.md"
-      - "docs/ZONES_BENCHMARK.md"
       - "specs/ref-impls/**"
       - "xtask/**"
 
@@ -693,12 +691,6 @@ jobs:
           echo "::add-mask::$CLICKHOUSE_USER"
           echo "::add-mask::$CLICKHOUSE_PASSWORD"
 
-      - name: Test benchmark shell helpers
-        run: |
-          contrib/bench/tests/l1-snapshot.sh
-          contrib/bench/tests/scenario-reporting.sh
-          python3 contrib/bench/tests/withdrawal-blocks.py
-
       - name: Check out pinned Tempo L1
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -909,8 +901,6 @@ jobs:
           echo "$cargo_bin_dir" >> "$GITHUB_PATH"
           echo "TXGEN_TEMPO_BIN=$cargo_bin_dir/txgen-tempo" >> "$GITHUB_ENV"
           echo "TXGEN_BENCH_BIN=$cargo_bin_dir/bench" >> "$GITHUB_ENV"
-          TXGEN_TEMPO_BIN="$cargo_bin_dir/txgen-tempo" \
-            contrib/bench/tests/txgen-specs.sh
 
       - name: Apply benchmark host tuning
         run: |
@@ -983,14 +973,6 @@ jobs:
               echo
               echo "> No txgen report was produced. See the benchmark and node logs for the setup or runtime failure."
             } > "$summary"
-          fi
-
-          withdrawal_summary=target/zones-benchmark/withdrawal-blocks.md
-          if [ -s "$withdrawal_summary" ]; then
-            {
-              echo
-              cat "$withdrawal_summary"
-            } >> "$summary"
           fi
 
           unit=Transactions

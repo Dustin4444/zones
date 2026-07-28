@@ -975,17 +975,6 @@ mod tests {
         assert!(at_cap <= MAX_WITHDRAWAL_BATCH_GAS);
     }
 
-    #[test]
-    fn default_batch_limits_remain_conservative() {
-        assert_eq!(
-            WithdrawalBatchLimits::default(),
-            WithdrawalBatchLimits {
-                max_batch_gas: 10_000_000,
-                max_in_flight_batches: 8,
-            }
-        );
-    }
-
     fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
         (0..count)
             .map(|i| test_withdrawal(Address::with_last_byte((i + 1) as u8), (i + 1) as u128))

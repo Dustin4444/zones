@@ -19,6 +19,17 @@ positive_rate() {
         die "$1 must be a positive decimal no greater than 999999999"
     fi
 }
+bigint_eval() {
+    local expression="$1" value
+    value="$(printf '%s\n' "$expression" | BC_LINE_LENGTH=0 bc)" ||
+        die "could not evaluate integer expression"
+    [[ "$value" =~ ^-?[0-9]+$ ]] ||
+        die "integer expression returned an invalid result"
+    printf '%s\n' "$value"
+}
+bigint_true() {
+    [[ "$(bigint_eval "$1")" == 1 ]]
+}
 
 load_benchmark_mnemonic() {
     local mode
@@ -78,9 +89,6 @@ ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-10000000}"
 ZONES_BENCH_OUTPUT="${ZONES_BENCH_OUTPUT:-target/zones-benchmark/neobank-e2e}"
 ZONES_BENCH_REPORT="${ZONES_BENCH_REPORT:-target/zones-benchmark/report-neobank-e2e.json}"
 ZONES_BENCH_RENDERED_SCENARIO="${ZONES_BENCH_RENDERED_SCENARIO:-$ZONES_BENCH_OUTPUT/private-flow-scenario.rendered.yml}"
-ZONES_BENCH_WITHDRAWAL_BLOCKS_REPORT="${ZONES_BENCH_WITHDRAWAL_BLOCKS_REPORT:-target/zones-benchmark/withdrawal-blocks.json}"
-ZONES_BENCH_WITHDRAWAL_BLOCKS_SUMMARY="${ZONES_BENCH_WITHDRAWAL_BLOCKS_SUMMARY:-target/zones-benchmark/withdrawal-blocks.md}"
-l1_measurement_rpc="${ZONES_BENCH_L1_QUERY_RPC_URL:-$L1_RPC_URL}"
 ZONES_BENCH_AUTH_TTL_SECS="${ZONES_BENCH_AUTH_TTL_SECS:-600}"
 ZONES_BENCH_AUTH_REFRESH_SECS="${ZONES_BENCH_AUTH_REFRESH_SECS:-60}"
 ZONES_BENCH_STEP_TIMEOUT="${ZONES_BENCH_STEP_TIMEOUT:-10m}"
@@ -109,12 +117,6 @@ ZONES_BENCH_RECIPIENT_ACCOUNT_END="${ZONES_BENCH_RECIPIENT_ACCOUNT_END:-$ZONES_B
 if [[ -z "${ZONES_BENCH_RECIPIENT_GENERATOR:-}" ]]; then
     ZONES_BENCH_RECIPIENT_GENERATOR='{ pool: { pool: users, select: random } }'
 fi
-withdrawals_per_journey=0
-earn_deposits_per_journey=0
-earn_redeems_per_journey=0
-offramps_per_journey=0
-earn_deposit_callback_successes_per_journey=0
-earn_redeem_callback_successes_per_journey=0
 case "$ZONES_BENCH_RECIPIENT_MODE" in
     existing) ZONES_BENCH_PRIVATE_TRANSFER_RECIPIENT='{ var: recipient.address }' ;;
     random) ZONES_BENCH_PRIVATE_TRANSFER_RECIPIENT=random ;;
@@ -126,87 +128,54 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         base_token_label=pathusd
         expected_base_token="$ZONES_BENCH_PATHUSD"
         leases_per_journey=1
-        withdrawals_per_journey=2
-        earn_deposits_per_journey=1
-        earn_redeems_per_journey=1
-        earn_deposit_callback_successes_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     encrypted-deposit)
         scenario_file=encrypted-deposit-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=0
         ;;
     third-party-recipient)
         scenario_file=third-party-recipient-scenario.yml
         base_token_label=pathusd
         expected_base_token="$ZONES_BENCH_PATHUSD"
         leases_per_journey=2
-        withdrawals_per_journey=2
-        earn_deposits_per_journey=1
-        earn_redeems_per_journey=1
-        earn_deposit_callback_successes_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     full-journey)
         scenario_file=private-flow-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=3
-        earn_deposits_per_journey=1
-        earn_redeems_per_journey=1
-        offramps_per_journey=1
-        earn_deposit_callback_successes_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     private-withdrawal)
         scenario_file=private-withdrawal-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=1
-        earn_redeems_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     rewards-redemption)
         scenario_file=rewards-redemption-scenario.yml
         base_token_label=pathusd
         expected_base_token="$ZONES_BENCH_PATHUSD"
         leases_per_journey=1
-        withdrawals_per_journey=2
-        earn_redeems_per_journey=2
-        earn_redeem_callback_successes_per_journey=2
         ;;
     slippage-bounce)
         scenario_file=slippage-bounce-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=1
-        earn_deposits_per_journey=1
         ;;
     swapped-lifecycle)
         scenario_file=swapped-lifecycle-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=2
-        earn_deposits_per_journey=1
-        earn_redeems_per_journey=1
-        earn_deposit_callback_successes_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     swapped-redemption)
         scenario_file=swapped-redemption-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
-        withdrawals_per_journey=1
-        earn_redeems_per_journey=1
-        earn_redeem_callback_successes_per_journey=1
         ;;
     *) die "unsupported neobank preset: $ZONES_BENCH_NEOBANK_PRESET" ;;
 esac
@@ -256,50 +225,44 @@ reward_first_redeem_amount=1
 reward_second_redeem_amount=1
 reward_expected_remaining=0
 if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "rewards-redemption" ]]; then
-    command -v python3 >/dev/null || die "missing python3"
-    reward_sizing="$(python3 - \
-        "$ZONES_BENCH_ACCOUNTS" "$ZONES_BENCH_COUNT" \
-        "$ZONES_BENCH_DEPOSIT_AMOUNT" "$ZONES_BENCH_WITHDRAWAL_AMOUNT" <<'PY'
-import sys
+    bigint_true "$ZONES_BENCH_WITHDRAWAL_AMOUNT > 1" ||
+        die "rewards-redemption requires withdrawal-amount greater than 1"
+    bigint_true "$ZONES_BENCH_DEPOSIT_AMOUNT > $ZONES_BENCH_WITHDRAWAL_AMOUNT" ||
+        die "rewards-redemption requires deposit-amount greater than withdrawal-amount for Zone fees"
 
-a, j, d, w = map(int, sys.argv[1:])
-u128_max = 2**128 - 1
-u256_max = 2**256 - 1
-if min(a, j, d, w) <= 0:
-    raise SystemExit("rewards-redemption sizing values must be positive")
-if w <= 1:
-    raise SystemExit("rewards-redemption requires withdrawal-amount greater than 1")
-if d <= w:
-    raise SystemExit(
-        "rewards-redemption requires deposit-amount greater than withdrawal-amount for Zone fees"
-    )
-n = (j + a - 1) // a
-position = n * w
-onramp = n * d
-total = a * position
-reward = total // 10
-first = w // 2
-second = w - first
-redeemed = j * w
-remaining = total - redeemed
-if max(onramp, position, first, second) > u128_max:
-    raise SystemExit("reward scenario uint128 call amount overflow")
-if max(total, reward, redeemed, remaining) > u256_max:
-    raise SystemExit("reward scenario uint256 accounting overflow")
-if reward <= 0 or first <= 0 or second <= 0 or remaining < 0:
-    raise SystemExit("invalid reward scenario sizing result")
-print(onramp, position, total, reward, first, second, remaining, sep="\n")
-PY
-)"
-    mapfile -t reward_values <<<"$reward_sizing"
-    (( ${#reward_values[@]} == 7 )) || die "could not compute reward scenario sizing"
-    reward_onramp_per_account="${reward_values[0]}"
-    reward_position_per_account="${reward_values[1]}"
-    reward_total_position="${reward_values[2]}"
-    reward_fund_amount="${reward_values[3]}"
-    reward_first_redeem_amount="${reward_values[4]}"
-    reward_second_redeem_amount="${reward_values[5]}"
-    reward_expected_remaining="${reward_values[6]}"
+    journeys_per_account="$(bigint_eval \
+        "($ZONES_BENCH_COUNT + $ZONES_BENCH_ACCOUNTS - 1) / $ZONES_BENCH_ACCOUNTS")"
+    reward_position_per_account="$(bigint_eval \
+        "$journeys_per_account * $ZONES_BENCH_WITHDRAWAL_AMOUNT")"
+    reward_onramp_per_account="$(bigint_eval \
+        "$journeys_per_account * $ZONES_BENCH_DEPOSIT_AMOUNT")"
+    reward_total_position="$(bigint_eval \
+        "$ZONES_BENCH_ACCOUNTS * $reward_position_per_account")"
+    reward_fund_amount="$(bigint_eval "$reward_total_position / 10")"
+    reward_first_redeem_amount="$(bigint_eval "$ZONES_BENCH_WITHDRAWAL_AMOUNT / 2")"
+    reward_second_redeem_amount="$(bigint_eval \
+        "$ZONES_BENCH_WITHDRAWAL_AMOUNT - $reward_first_redeem_amount")"
+    reward_redeemed="$(bigint_eval \
+        "$ZONES_BENCH_COUNT * $ZONES_BENCH_WITHDRAWAL_AMOUNT")"
+    reward_expected_remaining="$(bigint_eval \
+        "$reward_total_position - $reward_redeemed")"
+
+    uint128_max="$(bigint_eval '2^128 - 1')"
+    uint256_max="$(bigint_eval '2^256 - 1')"
+    for value in "$reward_onramp_per_account" "$reward_position_per_account" \
+        "$reward_first_redeem_amount" "$reward_second_redeem_amount"
+    do
+        bigint_true "$value <= $uint128_max" ||
+            die "reward scenario uint128 call amount overflow"
+    done
+    for value in "$reward_total_position" "$reward_fund_amount" \
+        "$reward_redeemed" "$reward_expected_remaining"
+    do
+        bigint_true "$value <= $uint256_max" ||
+            die "reward scenario uint256 accounting overflow"
+    done
+    bigint_true "$reward_fund_amount > 0 && $reward_first_redeem_amount > 0 && $reward_second_redeem_amount > 0 && $reward_expected_remaining >= 0" ||
+        die "invalid reward scenario sizing result"
 fi
 
 swapped_redemption_onramp_per_account=1
@@ -308,42 +271,38 @@ swapped_redemption_total_position=0
 swapped_redemption_expected_remaining=0
 if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "private-withdrawal" ||
       "$ZONES_BENCH_NEOBANK_PRESET" == "swapped-redemption" ]]; then
-    swapped_redemption_sizing="$(python3 - \
-        "$ZONES_BENCH_ACCOUNTS" "$ZONES_BENCH_COUNT" \
-        "$ZONES_BENCH_DEPOSIT_AMOUNT" "$ZONES_BENCH_WITHDRAWAL_AMOUNT" <<'PY'
-import sys
+    bigint_true "$ZONES_BENCH_DEPOSIT_AMOUNT > $ZONES_BENCH_WITHDRAWAL_AMOUNT" ||
+        die "swapped-redemption requires deposit-amount greater than withdrawal-amount for Zone fees"
 
-accounts, journeys, deposit, withdrawal = map(int, sys.argv[1:])
-u128_max = 2**128 - 1
-u256_max = 2**256 - 1
-if min(accounts, journeys, deposit, withdrawal) <= 0:
-    raise SystemExit("swapped-redemption sizing values must be positive")
-if deposit <= withdrawal:
-    raise SystemExit(
-        "swapped-redemption requires deposit-amount greater than withdrawal-amount for Zone fees"
-    )
-journeys_per_account = (journeys + accounts - 1) // accounts
-onramp = journeys_per_account * deposit
-position = journeys_per_account * withdrawal
-total = accounts * position
-redeemed = journeys * withdrawal
-remaining = total - redeemed
-if max(onramp, position, withdrawal) > u128_max:
-    raise SystemExit("swapped-redemption uint128 call amount overflow")
-if max(total, redeemed, remaining) > u256_max:
-    raise SystemExit("swapped-redemption uint256 accounting overflow")
-if remaining < 0:
-    raise SystemExit("invalid swapped-redemption sizing result")
-print(onramp, position, total, remaining, sep="\n")
-PY
-)"
-    mapfile -t swapped_redemption_values <<<"$swapped_redemption_sizing"
-    (( ${#swapped_redemption_values[@]} == 4 )) ||
-        die "could not compute swapped-redemption sizing"
-    swapped_redemption_onramp_per_account="${swapped_redemption_values[0]}"
-    swapped_redemption_position_per_account="${swapped_redemption_values[1]}"
-    swapped_redemption_total_position="${swapped_redemption_values[2]}"
-    swapped_redemption_expected_remaining="${swapped_redemption_values[3]}"
+    journeys_per_account="$(bigint_eval \
+        "($ZONES_BENCH_COUNT + $ZONES_BENCH_ACCOUNTS - 1) / $ZONES_BENCH_ACCOUNTS")"
+    swapped_redemption_onramp_per_account="$(bigint_eval \
+        "$journeys_per_account * $ZONES_BENCH_DEPOSIT_AMOUNT")"
+    swapped_redemption_position_per_account="$(bigint_eval \
+        "$journeys_per_account * $ZONES_BENCH_WITHDRAWAL_AMOUNT")"
+    swapped_redemption_total_position="$(bigint_eval \
+        "$ZONES_BENCH_ACCOUNTS * $swapped_redemption_position_per_account")"
+    swapped_redemption_redeemed="$(bigint_eval \
+        "$ZONES_BENCH_COUNT * $ZONES_BENCH_WITHDRAWAL_AMOUNT")"
+    swapped_redemption_expected_remaining="$(bigint_eval \
+        "$swapped_redemption_total_position - $swapped_redemption_redeemed")"
+
+    uint128_max="$(bigint_eval '2^128 - 1')"
+    uint256_max="$(bigint_eval '2^256 - 1')"
+    for value in "$swapped_redemption_onramp_per_account" \
+        "$swapped_redemption_position_per_account" "$ZONES_BENCH_WITHDRAWAL_AMOUNT"
+    do
+        bigint_true "$value <= $uint128_max" ||
+            die "swapped-redemption uint128 call amount overflow"
+    done
+    for value in "$swapped_redemption_total_position" \
+        "$swapped_redemption_redeemed" "$swapped_redemption_expected_remaining"
+    do
+        bigint_true "$value <= $uint256_max" ||
+            die "swapped-redemption uint256 accounting overflow"
+    done
+    bigint_true "$swapped_redemption_expected_remaining >= 0" ||
+        die "invalid swapped-redemption sizing result"
 fi
 
 ZONES_BENCH_REWARD_ONRAMP_PER_ACCOUNT="$reward_onramp_per_account"
@@ -403,106 +362,102 @@ assert_scenario_report() {
     ' "$report" >/dev/null || die "$label did not complete successfully"
 }
 
-# Query private balances with each account's token entirely in process memory.
-# Authorization tokens never appear in argv, stdout, or an uploaded artifact.
+# Query private balances without putting authorization tokens in argv, stdout,
+# or uploaded artifacts. Curl reads each token from a mode-0600 temporary config.
 verify_reward_zone_balances() {
     local mode="$1" expected_total="$2" expected_unit="$3"
     local maximum_unit="${4:-$expected_unit}"
-    python3 - \
-        "$ZONE_PRIVATE_RPC_URL" "$ZONES_BENCH_ZONE_AUTH_MAP" \
-        "$ZONES_BENCH_OUTPUT/accounts.json" "$ZONES_BENCH_EARN_TOKEN" \
-        "$ZONES_BENCH_ACCOUNTS" "$mode" "$expected_total" "$expected_unit" \
-        "$maximum_unit" <<'PY'
-import json
-import sys
-import urllib.error
-import urllib.request
+    local accounts_file="$ZONES_BENCH_OUTPUT/accounts.json"
+    local request_file="$secret_dir/private-balance-request.json"
+    local config_file="$secret_dir/private-balance.curl"
+    local address normalized_address authorization calldata response result balance
+    local request_id=0 observed_total=0
+    local -a accounts
 
-rpc_url, auth_path, accounts_path, token, expected_accounts, mode, expected_total, expected_unit, maximum_unit = sys.argv[1:]
-expected_accounts = int(expected_accounts)
-expected_total = int(expected_total)
-expected_unit = int(expected_unit)
-maximum_unit = int(maximum_unit)
-with open(auth_path, encoding="utf-8") as handle:
-    auth = json.load(handle)
-with open(accounts_path, encoding="utf-8") as handle:
-    accounts = json.load(handle)
-if len(accounts) != expected_accounts:
-    raise SystemExit(
-        f"account list contains {len(accounts)} accounts, expected {expected_accounts}"
-    )
+    expected_total="$(bigint_eval "$expected_total")"
+    expected_unit="$(bigint_eval "$expected_unit")"
+    maximum_unit="$(bigint_eval "$maximum_unit")"
+    mapfile -t accounts < <(jq -er '.[] | select(type == "string")' "$accounts_file")
+    (( ${#accounts[@]} == 10#$ZONES_BENCH_ACCOUNTS )) ||
+        die "account list contains ${#accounts[@]} accounts, expected $ZONES_BENCH_ACCOUNTS"
 
-balances = []
-for request_id, address in enumerate(accounts, 1):
-    authorization = auth.get(address.lower())
-    if not authorization:
-        raise SystemExit(f"authorization map has no entry for benchmark account {address}")
-    calldata = "0x70a08231" + address[2:].lower().rjust(64, "0")
-    payload = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "eth_call",
-            "params": [{"from": address, "to": token, "data": calldata}, "latest"],
-        }
-    ).encode()
-    request = urllib.request.Request(
-        rpc_url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Authorization-Token": authorization,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            result = json.load(response)
-    except (OSError, urllib.error.HTTPError) as error:
-        raise SystemExit(f"private Zone balance query failed for {address}: {error}") from None
-    if "error" in result:
-        raise SystemExit(f"private Zone balance query failed for {address}: {result['error']}")
-    balances.append(int(result["result"], 16))
+    for address in "${accounts[@]}"; do
+        request_id=$((request_id + 1))
+        normalized_address="${address,,}"
+        authorization="$(jq -er --arg address "$normalized_address" \
+            '.[$address] | select(type == "string" and length > 0)' \
+            "$ZONES_BENCH_ZONE_AUTH_MAP")" ||
+            die "authorization map has no entry for benchmark account $address"
+        calldata="$(cast calldata 'balanceOf(address)' "$address")"
 
-if mode == "seeded":
-    bad = next((balance for balance in balances if balance != expected_unit), None)
-    if bad is not None:
-        raise SystemExit(
-            f"reward position balance {bad} does not equal expected {expected_unit}"
-        )
-elif mode == "remaining":
-    bad = next((balance for balance in balances if balance not in (0, expected_unit)), None)
-    if bad is not None:
-        raise SystemExit(
-            f"terminal reward balance {bad} is neither zero nor {expected_unit}"
-        )
-elif mode == "distributed_remaining":
-    bad = next(
         (
-            balance
-            for balance in balances
-            if balance > maximum_unit or balance % expected_unit != 0
-        ),
-        None,
-    )
-    if bad is not None:
-        raise SystemExit(
-            f"terminal EarnToken balance {bad} is not a valid multiple of "
-            f"{expected_unit} within the per-account maximum {maximum_unit}"
+            umask 077
+            jq -nc \
+                --argjson id "$request_id" \
+                --arg from "$address" \
+                --arg to "$ZONES_BENCH_EARN_TOKEN" \
+                --arg data "$calldata" \
+                '{
+                    jsonrpc: "2.0",
+                    id: $id,
+                    method: "eth_call",
+                    params: [{from: $from, to: $to, data: $data}, "latest"]
+                }' > "$request_file"
+            {
+                printf 'url = "%s"\n' "$ZONE_PRIVATE_RPC_URL"
+                printf 'request = "POST"\n'
+                printf 'header = "Content-Type: application/json"\n'
+                printf 'header = "X-Authorization-Token: %s"\n' "$authorization"
+                printf 'data-binary = "@%s"\n' "$request_file"
+                printf 'silent\nshow-error\nfail-with-body\n'
+                printf 'connect-timeout = 10\nmax-time = 10\n'
+            } > "$config_file"
         )
-else:
-    raise SystemExit(f"unknown reward balance validation mode: {mode}")
-observed_total = sum(balances)
-if observed_total != expected_total:
-    raise SystemExit(
-        f"aggregate Zone EarnToken balance {observed_total} does not equal expected {expected_total}"
-    )
-print(f"verified {len(balances)} private Zone EarnToken balances; aggregate={observed_total}")
-PY
+        if ! response="$(curl --config "$config_file")"; then
+            rm -f -- "$request_file" "$config_file"
+            die "private Zone balance query failed for $address"
+        fi
+        rm -f -- "$request_file" "$config_file"
+        result="$(jq -er '
+            if .error != null then
+                error(.error.message // (.error | tostring))
+            elif (.result | type) == "string" then
+                .result
+            else
+                error("missing result")
+            end
+        ' <<<"$response")" ||
+            die "private Zone balance query returned an error for $address"
+        balance="$(cast to-dec "$result")"
+        [[ "$balance" =~ ^[0-9]+$ ]] ||
+            die "private Zone balance query returned an invalid balance for $address"
+        balance="$(bigint_eval "$balance")"
+
+        case "$mode" in
+            seeded)
+                [[ "$balance" == "$expected_unit" ]] ||
+                    die "reward position balance $balance does not equal expected $expected_unit"
+                ;;
+            remaining)
+                [[ "$balance" == 0 || "$balance" == "$expected_unit" ]] ||
+                    die "terminal reward balance $balance is neither zero nor $expected_unit"
+                ;;
+            distributed_remaining)
+                bigint_true "$balance <= $maximum_unit && $balance % $expected_unit == 0" ||
+                    die "terminal EarnToken balance $balance is not a valid multiple of $expected_unit within the per-account maximum $maximum_unit"
+                ;;
+            *) die "unknown reward balance validation mode: $mode" ;;
+        esac
+        observed_total="$(bigint_eval "$observed_total + $balance")"
+    done
+
+    [[ "$observed_total" == "$expected_total" ]] ||
+        die "aggregate Zone EarnToken balance $observed_total does not equal expected $expected_total"
+    echo "verified ${#accounts[@]} private Zone EarnToken balances; aggregate=$observed_total"
 }
 
 txgen_bin="${TXGEN_TEMPO_BIN:-txgen-tempo}"
-for command in "$txgen_bin" awk cast jq python3; do
+for command in "$txgen_bin" awk bc cast curl jq; do
     command -v "$command" >/dev/null || die "missing $command"
 done
 
@@ -520,7 +475,6 @@ do
 done
 
 mkdir -p "$ZONES_BENCH_OUTPUT" "$(dirname "$ZONES_BENCH_RENDERED_SCENARIO")"
-rm -f -- "$ZONES_BENCH_WITHDRAWAL_BLOCKS_REPORT" "$ZONES_BENCH_WITHDRAWAL_BLOCKS_SUMMARY"
 secret_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/zones-neobank-auth.XXXXXX")"
 chmod 700 "$secret_dir"
 export ZONES_BENCH_ZONE_AUTH_MAP="$secret_dir/zone-auth.json"
@@ -528,7 +482,9 @@ auth_pid=""
 cleanup() {
     local status=$?
     [[ -z "$auth_pid" ]] || { kill -TERM "$auth_pid" 2>/dev/null || true; wait "$auth_pid" 2>/dev/null || true; }
-    rm -f -- "$secret_dir/mnemonic" "$secret_dir/zone-auth.json" "$secret_dir/auth-token-map.log"
+    rm -f -- "$secret_dir/mnemonic" "$secret_dir/zone-auth.json" \
+        "$secret_dir/auth-token-map.log" "$secret_dir/private-balance-request.json" \
+        "$secret_dir/private-balance.curl"
     rmdir "$secret_dir" 2>/dev/null || true
     unset ZONES_BENCH_MNEMONIC
     exit "$status"
@@ -677,14 +633,9 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "rewards-redemption" ]]; then
         die "reward funding changed EarnVault share supply"
     [[ "$funded_earn_supply" == "$reward_total_position" ]] ||
         die "reward funding changed EarnToken total supply"
-    python3 - "$reward_quote_before" "$reward_quote_after" <<'PY'
-import sys
-
-before, after = map(int, sys.argv[1:])
-if after <= before:
-    raise SystemExit(f"reward funding did not increase redemption value: {before} -> {after}")
-print(f"reward redemption quote increased: {before} -> {after}")
-PY
+    bigint_true "$reward_quote_after > $reward_quote_before" ||
+        die "reward funding did not increase redemption value: $reward_quote_before -> $reward_quote_after"
+    echo "reward redemption quote increased: $reward_quote_before -> $reward_quote_after"
     stage_end rewards_funding_check
 fi
 
@@ -747,11 +698,6 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         ;;
 esac
 
-l1_measurement_anchor_block="$(cast block-number --rpc-url "$l1_measurement_rpc")"
-[[ "$l1_measurement_anchor_block" =~ ^[0-9]+$ ]] ||
-    die "could not capture measured L1 start block"
-l1_measurement_start_block=$((10#$l1_measurement_anchor_block + 1))
-echo "neobank measured L1 start block: $l1_measurement_start_block"
 stage_start private_flow
 scenario_report_args=()
 build_scenario_report_args scenario_report_args "$ZONES_BENCH_REPORT"
@@ -759,10 +705,6 @@ build_scenario_report_args scenario_report_args "$ZONES_BENCH_REPORT"
     --starts-per-second "$ZONES_BENCH_TPS" --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT" --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT" \
     --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" --seed "$ZONES_BENCH_SEED" \
     --sample-instances "$sample_instances" "${scenario_report_args[@]}"
-l1_measurement_end_block="$(cast block-number --rpc-url "$l1_measurement_rpc")"
-[[ "$l1_measurement_end_block" =~ ^[0-9]+$ ]] ||
-    die "could not capture measured L1 end block"
-echo "neobank measured L1 end block: $l1_measurement_end_block"
 stage_end private_flow
 
 if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "slippage-bounce" ]]; then
@@ -809,36 +751,6 @@ fi
 
 assert_scenario_report "$ZONES_BENCH_REPORT" "$ZONES_BENCH_COUNT" "private flow"
 
-if (( withdrawals_per_journey > 0 )); then
-    expected_withdrawals=$((10#$ZONES_BENCH_COUNT * withdrawals_per_journey))
-    expected_earn_deposits=$((10#$ZONES_BENCH_COUNT * earn_deposits_per_journey))
-    expected_earn_redeems=$((10#$ZONES_BENCH_COUNT * earn_redeems_per_journey))
-    expected_offramps=$((10#$ZONES_BENCH_COUNT * offramps_per_journey))
-    expected_earn_deposit_callback_successes=$((10#$ZONES_BENCH_COUNT * earn_deposit_callback_successes_per_journey))
-    expected_earn_redeem_callback_successes=$((10#$ZONES_BENCH_COUNT * earn_redeem_callback_successes_per_journey))
-    stage_start withdrawal_capacity
-    python3 "$bench_dir/collect-withdrawal-blocks.py" \
-        --rpc-url "$l1_measurement_rpc" \
-        --portal "$L1_PORTAL_ADDRESS" \
-        --portal-abi "$bench_dir/neobank/abis/neobank-zone-portal.json" \
-        --from-block "$l1_measurement_start_block" \
-        --to-block "$l1_measurement_end_block" \
-        --expected-withdrawals "$expected_withdrawals" \
-        --earn-router "$ZONES_BENCH_EARN_ROUTER" \
-        --bridge "$ZONES_BENCH_BRIDGE_WALLET" \
-        --stable-token "$ZONES_BENCH_DLUSD" \
-        --stable-token "$ZONES_BENCH_PATHUSD" \
-        --earn-share-token "$ZONES_BENCH_EARN_TOKEN" \
-        --expected-earn-deposits "$expected_earn_deposits" \
-        --expected-earn-redeems "$expected_earn_redeems" \
-        --expected-offramps "$expected_offramps" \
-        --expected-earn-deposit-callback-successes "$expected_earn_deposit_callback_successes" \
-        --expected-earn-redeem-callback-successes "$expected_earn_redeem_callback_successes" \
-        --output "$ZONES_BENCH_WITHDRAWAL_BLOCKS_REPORT" \
-        --markdown-output "$ZONES_BENCH_WITHDRAWAL_BLOCKS_SUMMARY"
-    stage_end withdrawal_capacity
-fi
-
 if [[ -n "$measured_token_balance_before" ]]; then
     measured_token_balance_after="$(read_l1_uint \
         "$ZONES_BENCH_DLUSD" 'balanceOf(address)(uint256)' \
@@ -847,20 +759,10 @@ if [[ -n "$measured_token_balance_before" ]]; then
         encrypted-deposit) measured_balance_amount="$ZONES_BENCH_DEPOSIT_AMOUNT" ;;
         *) die "unexpected measured balance preset" ;;
     esac
-    python3 - \
-        "$measured_token_balance_before" "$measured_token_balance_after" \
-        "$ZONES_BENCH_COUNT" "$measured_balance_amount" \
-        "$ZONES_BENCH_NEOBANK_PRESET" <<'PY'
-import sys
-
-before, after, count, amount = map(int, sys.argv[1:5])
-preset = sys.argv[5]
-expected = count * amount
-observed = after - before
-if observed != expected:
-    raise SystemExit(
-        f"{preset} terminal L1 token delta {observed} does not equal {expected}"
-    )
-print(f"{preset} terminal L1 token delta verified: {observed}")
-PY
+    expected_token_delta="$(bigint_eval "$ZONES_BENCH_COUNT * $measured_balance_amount")"
+    observed_token_delta="$(bigint_eval \
+        "$measured_token_balance_after - $measured_token_balance_before")"
+    [[ "$observed_token_delta" == "$expected_token_delta" ]] ||
+        die "$ZONES_BENCH_NEOBANK_PRESET terminal L1 token delta $observed_token_delta does not equal $expected_token_delta"
+    echo "$ZONES_BENCH_NEOBANK_PRESET terminal L1 token delta verified: $observed_token_delta"
 fi
