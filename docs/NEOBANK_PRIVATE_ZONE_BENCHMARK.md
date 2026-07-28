@@ -188,7 +188,11 @@ bridge rates to zero, waits for Zone token ingestion, and writes only
 non-secret runtime metadata:
 
 ```bash
+earn_revision="$(tr -d '\r\n' < contrib/bench/earn-revision.lock)"
 git clone --recurse-submodules git@github.com:tempoxyz/earn.git earn
+git -C earn checkout --detach "$earn_revision"
+git -C earn submodule update --init --recursive
+test "$(git -C earn rev-parse HEAD)" = "$earn_revision"
 forge build --root specs/ref-impls --no-lint
 forge build --root earn --skip test --skip script --no-lint \
   --out "$PWD/specs/ref-impls/out"
@@ -500,8 +504,9 @@ its tick-zero order-book liquidity is created by provisioning. These paths do
 not represent final production economics, liquidity, policy administration, or
 a final vault venue.
 
-Each run follows Earn `main` at checkout time and records the resolved commit
-SHA. Earn is compiled with its own Foundry configuration rather than a copied
-or patched source tree. The benchmark deploys Earn's current scoped routers and
-full DirectSwap contracts, but the local assets, seeded liquidity, vault venue,
-and policy administration remain benchmark fixtures.
+Each run checks out the exact Earn commit in
+`contrib/bench/earn-revision.lock`, verifies it, and records that SHA. Earn is
+compiled with its own Foundry configuration rather than a copied or patched
+source tree. The benchmark deploys that revision's scoped routers and full
+DirectSwap contracts, but the local assets, seeded liquidity, vault venue, and
+policy administration remain benchmark fixtures.

@@ -633,16 +633,31 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Resolve pinned Earn revision
+        if: needs.authorize.outputs.phase == 'neobank-e2e'
+        id: earn-revision
+        run: |
+          set -euo pipefail
+          earn_revision="$(tr -d '\r\n' < contrib/bench/earn-revision.lock)"
+          [[ "$earn_revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$earn_revision" >> "$GITHUB_OUTPUT"
+
       - name: Check out Earn contracts
         if: needs.authorize.outputs.phase == 'neobank-e2e'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: tempoxyz/earn
-          ref: main
+          ref: ${{ steps.earn-revision.outputs.sha }}
           path: earn
           ssh-key: ${{ secrets.EARN_DEPLOY_KEY }}
           persist-credentials: false
           submodules: true
+
+      - name: Verify pinned Earn revision
+        if: needs.authorize.outputs.phase == 'neobank-e2e'
+        run: |
+          set -euo pipefail
+          test "$(git -C earn rev-parse HEAD)" = "${{ steps.earn-revision.outputs.sha }}"
 
       - name: Prepare persistent topology control path
         env:

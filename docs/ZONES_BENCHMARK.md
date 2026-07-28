@@ -713,8 +713,9 @@ still creates a new Zone, portal, fee configuration, bootstrap fixture, and
 Zone state.
 
 Tempo and txgen are fetched from public repositories at exact commits. Neobank
-runs use the repository's existing `EARN_DEPLOY_KEY` to check out
-`tempoxyz/earn@main`; the resolved Earn SHA is recorded in the results. No
+runs use the repository's existing `EARN_DEPLOY_KEY` to check out the exact
+`tempoxyz/earn` commit in `contrib/bench/earn-revision.lock`; the workflow
+verifies the checkout and records the Earn SHA in the results. No
 mnemonic, portal, chain ID, token, target ID, or RPC URL needs to be configured
 externally. A runner-local private
 mnemonic is generated once when its identity file does not exist. An operator
