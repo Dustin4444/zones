@@ -29,7 +29,7 @@ use super::cache::L1StateCache;
 use crate::rpc::rpc_connection_config;
 
 /// One type-erased L1 storage word, keyed by account and raw slot.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct StorageSlot(pub(super) Address, pub(super) B256);
 
 impl From<(Address, U256)> for StorageSlot {

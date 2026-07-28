@@ -111,6 +111,11 @@ impl DepositPrefetchConfig {
             concurrency,
         }
     }
+
+    #[cfg(test)]
+    const fn all() -> Self {
+        Self::new(true, 4)
+    }
 }
 
 /// One deposit mint whose effective recipient is derivable before payload construction.
@@ -417,24 +422,151 @@ mod tests {
     use super::*;
     use alloy_primitives::address;
 
+    const PORTAL: Address = address!("1000000000000000000000000000000000000001");
     const TOKEN: Address = address!("20c0000000000000000000000000000000000001");
+    const ENABLED_TOKEN: Address = address!("20c0000000000000000000000000000000000002");
+    const RECIPIENT: Address = address!("3000000000000000000000000000000000000001");
+    const VIRTUAL_RECIPIENT: Address = address!("01020304fdfdfdfdfdfdfdfdfdfd010203040506");
+
+    fn storage_slot<T: Storable>(handler: &impl Handler<T>) -> StorageSlot {
+        let slot = handler.as_slot();
+        (slot.address(), slot.slot()).into()
+    }
+
+    fn stored_word<T: Storable>(handler: &impl Handler<T>, value: U256) -> (StorageSlot, B256) {
+        (storage_slot(handler), value.into())
+    }
+
+    fn values<T: Storable>(handler: &impl Handler<T>, value: U256) -> StorageValues {
+        StorageValues(HashMap::from([stored_word(handler, value)]))
+    }
 
     #[test]
-    fn packed_typed_fields_deduplicate_and_decode() -> Result<()> {
+    fn root_slots_are_deduplicated_across_deposits() -> Result<()> {
+        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        plan.add_enabled_token(TOKEN);
+        plan.add_mint(TOKEN, RECIPIENT);
+        plan.add_mint(TOKEN, RECIPIENT);
+        plan.add_encryption_key(U256::from(4));
+        plan.add_encryption_key(U256::from(4));
+
+        let slots = plan.root_slots(DepositPrefetchConfig::all())?.0;
+        let registry = TIP403Registry::new();
+        let portal = ZonePortalStorage::new(PORTAL);
+        assert_eq!(slots.len(), 5);
+        assert!(slots.contains(&storage_slot(&portal.current_deposit_queue_hash)));
+        let encryption_key = &portal.encryption_keys[4];
+        let encryption_slot = encryption_key.as_slot();
+        for offset in 0..2 {
+            assert!(
+                slots.contains(
+                    &(
+                        encryption_slot.address(),
+                        encryption_slot.slot() + U256::from(offset)
+                    )
+                        .into()
+                )
+            );
+        }
+        assert!(slots.contains(&storage_slot(&registry.token_transfer_policies[TOKEN])));
+        assert!(slots.contains(&storage_slot(&registry.receive_policies[RECIPIENT].config)));
+        Ok(())
+    }
+
+    #[test]
+    fn root_slots_follow_registry_policy_hardfork() -> Result<()> {
+        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        plan.add_enabled_token(ENABLED_TOKEN);
+        plan.add_mint(TOKEN, RECIPIENT);
+        let registry = TIP403Registry::new();
+
+        let before_t9 = plan.root_slots(DepositPrefetchConfig::new(false, 4))?.0;
+        assert_eq!(before_t9.len(), 3);
+        assert!(before_t9.contains(&storage_slot(
+            &registry.token_transfer_policies[ENABLED_TOKEN]
+        )));
+        assert!(!before_t9.contains(&storage_slot(&registry.token_transfer_policies[TOKEN])));
+        assert!(before_t9.contains(&storage_slot(&registry.receive_policies[RECIPIENT].config)));
+
+        let at_t9 = plan.root_slots(DepositPrefetchConfig::all())?.0;
+        assert_eq!(at_t9.len(), 4);
+        assert!(at_t9.contains(&storage_slot(&registry.token_transfer_policies[TOKEN])));
+        Ok(())
+    }
+
+    #[test]
+    fn policy_values_expand_into_every_dependent_wave() -> Result<()> {
+        let outer_policy_id = 42;
+        let mint_policy_id = 77;
+        let sender_policy_id = 11;
+        let token_filter_id = 12;
         let registry = TIP403Registry::new();
         let handler = &registry.token_transfer_policies[TOKEN];
-        let mut wave = PrefetchSlots::default();
-        wave.insert(&handler.policy_id);
-        wave.insert(&handler.is_set);
-        assert_eq!(wave.0.len(), 1);
-        let raw = U256::from(42) | (U256::ONE << 64usize);
-        let values = StorageValues(HashMap::from([(
-            (handler.policy_id.address(), handler.policy_id.slot()).into(),
-            B256::from(raw.to_be_bytes::<32>()),
-        )]));
-        let binding = values.read(handler)?;
-        assert_eq!(binding.policy_id, 42);
-        assert!(binding.is_set);
+        let receive = &registry.receive_policies[RECIPIENT];
+        let outer = &registry.policy_records[outer_policy_id];
+        let mint = &registry.policy_records[mint_policy_id];
+        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        plan.add_mint(TOKEN, RECIPIENT);
+
+        let binding_value = U256::from(outer_policy_id) | (U256::ONE << 64usize);
+        let receive_value = U256::ONE
+            | (U256::from(sender_policy_id) << 8usize)
+            | (U256::from(1) << 72usize)
+            | (U256::from(token_filter_id) << 80usize)
+            | (U256::from(1) << 144usize)
+            | (U256::from(RecoveryMode::ThirdParty as u8) << 152usize);
+        let roots = StorageValues(HashMap::from([
+            stored_word(handler, binding_value),
+            stored_word(&receive.config, receive_value),
+        ]));
+        let token_policies =
+            plan.registered_token_policies(&roots, DepositPrefetchConfig::all())?;
+        assert_eq!(token_policies.get(&TOKEN), Some(&outer_policy_id));
+
+        let second = plan.policy_and_receive_slots(&roots, &token_policies)?.0;
+        for slot in [
+            storage_slot(&registry.policy_id_counter),
+            storage_slot(&outer.base),
+            storage_slot(&registry.policy_set[token_filter_id][TOKEN]),
+            storage_slot(&registry.policy_set[sender_policy_id][ZONE_INBOX_ADDRESS]),
+            storage_slot(&receive.recovery_address),
+        ] {
+            assert!(second.contains(&slot));
+        }
+
+        let p_values = values(&outer.base, U256::from(PolicyType::COMPOUND as u8));
+        let third = plan.mint_policy_slots(&token_policies, &p_values)?.0;
+        assert_eq!(third, HashSet::from([storage_slot(&outer.compound)]));
+
+        let c_values = values(&outer.compound, U256::from(mint_policy_id) << 128usize);
+        let fourth = plan.compound_subpolicy_slots(&token_policies, &p_values, &c_values)?;
+        assert_eq!(
+            fourth.0,
+            HashSet::from([
+                storage_slot(&mint.base),
+                storage_slot(&registry.policy_set[mint_policy_id][RECIPIENT]),
+            ])
+        );
+
+        let mut unresolved = DepositPrefetchPlan::new(7, PORTAL);
+        unresolved.add_mint(TOKEN, VIRTUAL_RECIPIENT);
+        assert_eq!(
+            unresolved.mint_policy_slots(&token_policies, &p_values)?,
+            PrefetchSlots(HashSet::from([storage_slot(&outer.compound)]))
+        );
+        assert_eq!(
+            unresolved.compound_subpolicy_slots(&token_policies, &p_values, &c_values)?,
+            PrefetchSlots(HashSet::from([storage_slot(&mint.base)]))
+        );
+
+        let built_in = HashMap::from([(TOKEN, ALLOW_ALL_POLICY_ID)]);
+        let no_mints = DepositPrefetchPlan::new(7, PORTAL).0;
+        assert!(
+            no_mints
+                .policy_and_receive_slots(&StorageValues(HashMap::new()), &built_in)?
+                .is_empty()
+        );
+        assert!(no_mints.mint_policy_slots(&built_in, &p_values)?.is_empty());
         Ok(())
     }
 
