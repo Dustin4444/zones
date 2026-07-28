@@ -41,12 +41,13 @@ jobs:
       - uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
         with:
           toolchain: stable
-      # sccache avoids recompiling dependencies, while this cache also keeps the
-      # final linked workspace test binaries that sccache cannot cache.
+      # sccache avoids recompiling dependencies. Do not cache the linked test
+      # target: the nextest archive already preserves it for the test shards,
+      # and duplicating the ~15 GB target can exhaust runner disk during save.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: test-build
-          cache-workspace-crates: true
+          cache-targets: false
           cache-on-failure: true
       - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
         with:
