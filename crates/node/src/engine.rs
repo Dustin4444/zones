@@ -244,7 +244,6 @@ impl ZoneEngine {
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
         let timestamp = l1_block.header.timestamp();
         let prefetch_config = DepositPrefetchConfig::new(
-            self.chain_spec.is_t6_active_at_timestamp(timestamp),
             self.chain_spec.is_t9_active_at_timestamp(timestamp),
             self.l1_fetch_concurrency,
         );

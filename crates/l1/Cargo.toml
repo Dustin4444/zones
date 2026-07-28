@@ -51,7 +51,6 @@ serde = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tracing.workspace = true
 url = "2"
-zone-primitives.workspace = true
 
 [dev-dependencies]
 alloy-rlp.workspace = true

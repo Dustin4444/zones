@@ -28,6 +28,16 @@ use zone_precompiles::{L1StateError, L1StorageReader};
 use super::cache::L1StateCache;
 use crate::rpc::rpc_connection_config;
 
+/// One type-erased L1 storage word, keyed by account and raw slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct StorageSlot(pub(super) Address, pub(super) B256);
+
+impl From<(Address, U256)> for StorageSlot {
+    fn from((address, slot): (Address, U256)) -> Self {
+        Self(address, slot.into())
+    }
+}
+
 /// Configuration for the [`L1StateProvider`].
 #[derive(Debug, Clone)]
 pub struct L1StateProviderConfig {
@@ -249,19 +259,19 @@ impl L1StateProvider {
     ///
     /// Requests are deduplicated before dispatch and bounded by `concurrency`, so callers can move
     /// predictable read latency out of synchronous EVM execution without issuing an unbounded RPC
-    /// burst. Returned values are keyed by `(address, slot)` for value-dependent prefetch planning.
-    pub(crate) async fn prefetch_storage(
+    /// burst. Returned values retain their storage keys for value-dependent prefetch planning.
+    pub(super) async fn prefetch_storage(
         &self,
-        slots: impl IntoIterator<Item = (Address, B256)>,
+        slots: impl IntoIterator<Item = StorageSlot>,
         block_number: u64,
         concurrency: usize,
-    ) -> Result<HashMap<(Address, B256), B256>> {
+    ) -> Result<HashMap<StorageSlot, B256>> {
         let slots: HashSet<_> = slots.into_iter().collect();
         stream::iter(slots)
-            .map(|(address, slot)| async move {
-                self.get_storage_async(address, slot, block_number)
+            .map(|slot @ StorageSlot(address, key)| async move {
+                self.get_storage_async(address, key, block_number)
                     .await
-                    .map(|value| ((address, slot), value))
+                    .map(|value| (slot, value))
             })
             .buffer_unordered(concurrency.max(1))
             .try_collect()
