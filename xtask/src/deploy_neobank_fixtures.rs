@@ -208,7 +208,7 @@ pub(crate) struct DeployNeobankFixtures {
     private_asset: Address,
 
     /// Directory containing Foundry artifacts from the external Earn checkout and local fixtures.
-    #[arg(long, default_value = "specs/ref-impls/out")]
+    #[arg(long, default_value = "specs/ref-impls/benchmark-out")]
     specs_out: PathBuf,
 
     /// Exact revision of the external Earn checkout used to build the Foundry artifacts.
@@ -1765,10 +1765,12 @@ mod tests {
 
     #[test]
     fn fixture_deployment_uses_external_earn_artifacts() {
-        let out = PathBuf::from("specs/ref-impls/out");
+        let out = PathBuf::from("specs/ref-impls/benchmark-out");
         assert_eq!(
             artifact_path(&out, "SingleZoneEarnRouter.sol/SingleZoneEarnRouter"),
-            PathBuf::from("specs/ref-impls/out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json")
+            PathBuf::from(
+                "specs/ref-impls/benchmark-out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json"
+            )
         );
         assert_eq!(
             artifact_path(
@@ -1776,7 +1778,7 @@ mod tests {
                 "SingleZoneBridgeEarnRouter.sol/SingleZoneBridgeEarnRouter"
             ),
             PathBuf::from(
-                "specs/ref-impls/out/SingleZoneBridgeEarnRouter.sol/SingleZoneBridgeEarnRouter.json"
+                "specs/ref-impls/benchmark-out/SingleZoneBridgeEarnRouter.sol/SingleZoneBridgeEarnRouter.json"
             )
         );
         assert_eq!(
@@ -1785,20 +1787,20 @@ mod tests {
                 "SingleZoneMinimalEarnRouter.sol/SingleZoneMinimalEarnRouter"
             ),
             PathBuf::from(
-                "specs/ref-impls/out/SingleZoneMinimalEarnRouter.sol/SingleZoneMinimalEarnRouter.json"
+                "specs/ref-impls/benchmark-out/SingleZoneMinimalEarnRouter.sol/SingleZoneMinimalEarnRouter.json"
             )
         );
         assert_eq!(
             artifact_path(&out, "EarnVault.sol/EarnVault"),
-            PathBuf::from("specs/ref-impls/out/EarnVault.sol/EarnVault.json")
+            PathBuf::from("specs/ref-impls/benchmark-out/EarnVault.sol/EarnVault.json")
         );
         assert_eq!(
             artifact_path(&out, "EarnFees.sol/EarnFees"),
-            PathBuf::from("specs/ref-impls/out/EarnFees.sol/EarnFees.json")
+            PathBuf::from("specs/ref-impls/benchmark-out/EarnFees.sol/EarnFees.json")
         );
         assert_eq!(
             artifact_path(&out, "EarnFactory.sol/EarnFactory"),
-            PathBuf::from("specs/ref-impls/out/EarnFactory.sol/EarnFactory.json")
+            PathBuf::from("specs/ref-impls/benchmark-out/EarnFactory.sol/EarnFactory.json")
         );
         assert_eq!(
             artifact_path(
@@ -1806,12 +1808,12 @@ mod tests {
                 "EarnContributionController.sol/EarnContributionController"
             ),
             PathBuf::from(
-                "specs/ref-impls/out/EarnContributionController.sol/EarnContributionController.json"
+                "specs/ref-impls/benchmark-out/EarnContributionController.sol/EarnContributionController.json"
             )
         );
         assert_eq!(
             artifact_path(&out, "DirectSwapV2.sol/DirectSwapV2"),
-            PathBuf::from("specs/ref-impls/out/DirectSwapV2.sol/DirectSwapV2.json")
+            PathBuf::from("specs/ref-impls/benchmark-out/DirectSwapV2.sol/DirectSwapV2.json")
         );
         assert_eq!(
             artifact_path(
@@ -1819,7 +1821,7 @@ mod tests {
                 "ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler"
             ),
             PathBuf::from(
-                "specs/ref-impls/out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json"
+                "specs/ref-impls/benchmark-out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json"
             )
         );
     }
@@ -1828,7 +1830,8 @@ mod tests {
     fn deployment_bindings_match_external_earn_selectors() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         let factory: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("specs/ref-impls/out/EarnFactory.sol/EarnFactory.json")).unwrap(),
+            &fs::read(root.join("specs/ref-impls/benchmark-out/EarnFactory.sol/EarnFactory.json"))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1839,8 +1842,10 @@ mod tests {
         );
 
         let engine: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("specs/ref-impls/out/ERC4626Engine.sol/ERC4626Engine.json"))
-                .unwrap(),
+            &fs::read(
+                root.join("specs/ref-impls/benchmark-out/ERC4626Engine.sol/ERC4626Engine.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1856,7 +1861,7 @@ mod tests {
         let handler: serde_json::Value = serde_json::from_slice(
             &fs::read(
                 root.join(
-                    "specs/ref-impls/out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json",
+                    "specs/ref-impls/benchmark-out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json",
                 ),
             )
             .unwrap(),
@@ -1885,12 +1890,12 @@ mod tests {
         for (minimal, artifact, functions) in [
             (
                 "contrib/bench/neobank/abis/earn-contribution-controller.json",
-                "specs/ref-impls/out/EarnContributionController.sol/EarnContributionController.json",
+                "specs/ref-impls/benchmark-out/EarnContributionController.sol/EarnContributionController.json",
                 &["fund"][..],
             ),
             (
                 "contrib/bench/neobank/abis/earn-vault.json",
-                "specs/ref-impls/out/EarnVault.sol/EarnVault.json",
+                "specs/ref-impls/benchmark-out/EarnVault.sol/EarnVault.json",
                 &["redeem", "totalEarnShares", "previewRedeem"][..],
             ),
         ] {
@@ -1923,9 +1928,9 @@ mod tests {
         )
         .unwrap();
         let artifact: serde_json::Value = serde_json::from_slice(
-            &fs::read(
-                root.join("specs/ref-impls/out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json"),
-            )
+            &fs::read(root.join(
+                "specs/ref-impls/benchmark-out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json",
+            ))
             .unwrap(),
         )
         .unwrap();

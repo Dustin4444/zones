@@ -735,6 +735,7 @@ jobs:
             earn/cache
             specs/ref-impls/cache
             specs/ref-impls/out
+            specs/ref-impls/benchmark-out
           key: forge-${{ runner.os }}-${{ steps.solidity-key.outputs.forge-sha }}-${{ steps.solidity-key.outputs.specs-tree }}-${{ steps.solidity-key.outputs.earn-sha }}
 
       - name: Add file-backed mnemonic support to pinned Tempo xtask
@@ -836,36 +837,38 @@ jobs:
         run: |
           set -euo pipefail
           forge build --root specs/ref-impls --no-lint
+          mkdir -p specs/ref-impls/benchmark-out
+          cp -a specs/ref-impls/out/. specs/ref-impls/benchmark-out/
           forge build \
             --root earn \
             --skip test \
             --skip script \
             --no-lint \
-            --out "$GITHUB_WORKSPACE/specs/ref-impls/out"
+            --out "$GITHUB_WORKSPACE/specs/ref-impls/benchmark-out"
           forge build \
             --root earn \
             --skip test \
             --skip script \
             --no-lint \
-            --out "$GITHUB_WORKSPACE/specs/ref-impls/out" \
+            --out "$GITHUB_WORKSPACE/specs/ref-impls/benchmark-out" \
             vendor/bridge/auth-registry/AuthRegistry.sol \
             vendor/bridge/direct-swaps/direct-swaps/DirectSwapV2.sol \
             vendor/bridge/direct-swaps/token-handler/ReserveLedgerWrappedHandler.sol \
             vendor/bridge/tip20-controller/TIP20Controller.sol
-          test -s specs/ref-impls/out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json
-          test -s specs/ref-impls/out/SingleZoneBridgeEarnRouter.sol/SingleZoneBridgeEarnRouter.json
-          test -s specs/ref-impls/out/SingleZoneMinimalEarnRouter.sol/SingleZoneMinimalEarnRouter.json
-          test -s specs/ref-impls/out/EarnVault.sol/EarnVault.json
-          test -s specs/ref-impls/out/EarnFees.sol/EarnFees.json
-          test -s specs/ref-impls/out/EarnFactory.sol/EarnFactory.json
-          test -s specs/ref-impls/out/EarnContributionController.sol/EarnContributionController.json
-          test -s specs/ref-impls/out/ERC4626Engine.sol/ERC4626Engine.json
-          test -s specs/ref-impls/out/Simple4626Vault.sol/Simple4626Vault.json
-          test -s specs/ref-impls/out/DirectSwapV2.sol/DirectSwapV2.json
-          test -s specs/ref-impls/out/TIP20Controller.sol/TIP20Controller.json
-          test -s specs/ref-impls/out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json
-          test -s specs/ref-impls/out/AuthRegistry.sol/AuthRegistry.json
-          test -s specs/ref-impls/out/ERC1967Proxy.sol/ERC1967Proxy.json
+          test -s specs/ref-impls/benchmark-out/SingleZoneEarnRouter.sol/SingleZoneEarnRouter.json
+          test -s specs/ref-impls/benchmark-out/SingleZoneBridgeEarnRouter.sol/SingleZoneBridgeEarnRouter.json
+          test -s specs/ref-impls/benchmark-out/SingleZoneMinimalEarnRouter.sol/SingleZoneMinimalEarnRouter.json
+          test -s specs/ref-impls/benchmark-out/EarnVault.sol/EarnVault.json
+          test -s specs/ref-impls/benchmark-out/EarnFees.sol/EarnFees.json
+          test -s specs/ref-impls/benchmark-out/EarnFactory.sol/EarnFactory.json
+          test -s specs/ref-impls/benchmark-out/EarnContributionController.sol/EarnContributionController.json
+          test -s specs/ref-impls/benchmark-out/ERC4626Engine.sol/ERC4626Engine.json
+          test -s specs/ref-impls/benchmark-out/Simple4626Vault.sol/Simple4626Vault.json
+          test -s specs/ref-impls/benchmark-out/DirectSwapV2.sol/DirectSwapV2.json
+          test -s specs/ref-impls/benchmark-out/TIP20Controller.sol/TIP20Controller.json
+          test -s specs/ref-impls/benchmark-out/ReserveLedgerWrappedHandler.sol/ReserveLedgerWrappedHandler.json
+          test -s specs/ref-impls/benchmark-out/AuthRegistry.sol/AuthRegistry.json
+          test -s specs/ref-impls/benchmark-out/ERC1967Proxy.sol/ERC1967Proxy.json
 
       - name: Prepare or restore persistent Tempo L1 baseline
         run: |

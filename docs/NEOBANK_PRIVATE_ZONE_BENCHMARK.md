@@ -22,11 +22,12 @@ private EarnShare position outside measurement, then measure one composable
 EarnShare withdrawal, vault redemption, configured swap, and encrypted DLUSD
 return.
 
-The workflow checks out `tempoxyz/earn` at `main` into `earn/` with the same
-credential-isolated `actions/checkout` step used by the Zones e2e tests. It
-builds that checkout with Earn's Foundry configuration and writes the artifacts
-into `specs/ref-impls/out` after building the local Zone fixtures. The exact
-Earn commit is recorded in fixture metadata and the workflow report.
+The workflow checks out the exact `tempoxyz/earn` commit in
+`contrib/bench/earn-revision.lock` into `earn/` with a credential-isolated
+`actions/checkout` step. It builds that checkout with Earn's Foundry
+configuration and writes the artifacts into
+`specs/ref-impls/benchmark-out` after building the local Zone fixtures. The
+verified Earn commit is recorded in fixture metadata and the workflow report.
 
 ### Swap mechanism
 
@@ -194,10 +195,12 @@ git -C earn checkout --detach "$earn_revision"
 git -C earn submodule update --init --recursive
 test "$(git -C earn rev-parse HEAD)" = "$earn_revision"
 forge build --root specs/ref-impls --no-lint
+mkdir -p specs/ref-impls/benchmark-out
+cp -a specs/ref-impls/out/. specs/ref-impls/benchmark-out/
 forge build --root earn --skip test --skip script --no-lint \
-  --out "$PWD/specs/ref-impls/out"
+  --out "$PWD/specs/ref-impls/benchmark-out"
 forge build --root earn --skip test --skip script --no-lint \
-  --out "$PWD/specs/ref-impls/out" \
+  --out "$PWD/specs/ref-impls/benchmark-out" \
   vendor/bridge/auth-registry/AuthRegistry.sol \
   vendor/bridge/direct-swaps/direct-swaps/DirectSwapV2.sol \
   vendor/bridge/direct-swaps/token-handler/ReserveLedgerWrappedHandler.sol \
