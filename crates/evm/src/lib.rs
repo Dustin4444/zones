@@ -52,10 +52,11 @@ use tempo_evm::{
 use tempo_payload_types::TempoExecutionData;
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv,
-    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
-    TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS, account_keychain::AccountKeychain,
-    error::Result as TempoResult, nonce::NonceManager, receive_policy_guard::ReceivePolicyGuard,
-    storage::actions::StorageActions, tip20::is_tip20_prefix,
+    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS,
+    TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS,
+    account_keychain::AccountKeychain, error::Result as TempoResult, nonce::NonceManager,
+    receive_policy_guard::ReceivePolicyGuard, storage::actions::StorageActions,
+    storage_credits::StorageCredits, tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -145,6 +146,8 @@ where
                 Some(AccountKeychain::create_precompile(&tempo_env))
             } else if *address == RECEIVE_POLICY_GUARD_ADDRESS {
                 Some(ReceivePolicyGuard::create_precompile(&tempo_env))
+            } else if *address == STORAGE_CREDITS_ADDRESS {
+                Some(StorageCredits::create_precompile(&tempo_env))
             } else {
                 None
             }
@@ -509,13 +512,11 @@ mod tests {
     };
     use tempo_precompiles::{
         TIP403_REGISTRY_ADDRESS, storage::StorageKey, tip403_registry::tip403_registry_slots,
+        zone_factory::ZonePortalStorage,
     };
     use tempo_zone_contracts::IZoneInbox;
     use zone_precompiles::{tempo_state::TEMPO_BLOCK_NUMBER_SLOT, test_utils::MockL1Reader};
-    use zone_primitives::constants::{
-        PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, PORTAL_IS_SEQUENCER_SLOT, TEMPO_STATE_ADDRESS,
-        ZONE_INBOX_ADDRESS,
-    };
+    use zone_primitives::constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS};
 
     #[test]
     fn composed_chain_spec_uses_zone_identity_and_parent_tempo_forks() {
@@ -541,21 +542,13 @@ mod tests {
         let token = address!("0x20C00000000000000000000000000000000000AA");
         let reader = MockL1Reader::default();
 
-        let membership_slot = sequencer.mapping_slot(PORTAL_IS_SEQUENCER_SLOT.into());
-        reader.set_u256(portal, membership_slot, PARENT, U256::ZERO);
-        reader.set_u256(portal, membership_slot, CHILD, U256::ONE);
-        reader.set_u256(
-            portal,
-            U256::from_be_bytes(PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT.0),
-            CHILD,
-            U256::ZERO,
-        );
+        reader.seed_active_sequencer(portal, CHILD, sequencer);
 
         let policy_slot = token.mapping_slot(tip403_registry_slots::TOKEN_TRANSFER_POLICIES);
         let parent_policy = U256::from(0xaaaa);
         let child_policy = U256::from(0xbbbb);
-        reader.set_u256(TIP403_REGISTRY_ADDRESS, policy_slot, PARENT, parent_policy);
-        reader.set_u256(TIP403_REGISTRY_ADDRESS, policy_slot, CHILD, child_policy);
+        reader.insert(TIP403_REGISTRY_ADDRESS, policy_slot, PARENT, parent_policy);
+        reader.insert(TIP403_REGISTRY_ADDRESS, policy_slot, CHILD, child_policy);
 
         let genesis = TempoHeader::default();
         let mut genesis_rlp = Vec::new();
@@ -612,8 +605,7 @@ mod tests {
         );
 
         let requests = reader.storage_requests();
-        let child_membership_request = (portal, B256::from(membership_slot.to_be_bytes()), CHILD);
-        let parent_membership_request = (portal, B256::from(membership_slot.to_be_bytes()), PARENT);
+        let portal = ZonePortalStorage::new(portal);
         let child_policy_request = (
             TIP403_REGISTRY_ADDRESS,
             B256::from(policy_slot.to_be_bytes()),
@@ -624,13 +616,11 @@ mod tests {
             B256::from(policy_slot.to_be_bytes()),
             PARENT,
         );
-        let queue_head_request = (portal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, CHILD);
-
-        assert!(!requests.contains(&child_membership_request));
-        assert!(!requests.contains(&parent_membership_request));
+        assert!(!reader.requested(CHILD, &portal.is_sequencer[sequencer]));
+        assert!(!reader.requested(PARENT, &portal.is_sequencer[sequencer]));
         assert!(requests.contains(&child_policy_request));
         assert!(!requests.contains(&parent_policy_request));
-        assert!(requests.contains(&queue_head_request));
+        assert!(reader.requested(CHILD, &portal.current_deposit_queue_hash));
     }
 
     #[test]
