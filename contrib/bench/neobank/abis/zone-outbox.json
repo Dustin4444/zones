@@ -1,6 +1,6 @@
 [
   {
-    "type": "function",
+    "type":"function",
     "name": "requestWithdrawal",
     "stateMutability": "nonpayable",
     "inputs": [
@@ -40,7 +40,7 @@
     "outputs": []
   },
   {
-    "type": "event",
+    "type":"event",
     "name": "WithdrawalRequested",
     "anonymous": false,
     "inputs": [

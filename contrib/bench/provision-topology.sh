@@ -16,7 +16,7 @@
 # leaves Schelk promotion to the caller. `up` starts from a verified private
 # restored copy and stops after node and contract readiness. It does not fund
 # Zone accounts, submit benchmark deposits, or wait for benchmark bridge events.
-# On success the processes remain alive for a following run-phase.sh invocation.
+# On success the processes remain alive for the neobank scenario runner.
 # Always call `cleanup` from the workflow's `if: always()` teardown step.
 
 set -Eeuo pipefail
@@ -709,18 +709,11 @@ provision_up() {
     local setup_settlement_timeout_secs="${ZONES_BENCH_SETUP_SETTLEMENT_TIMEOUT_SECS:-120}"
     local drain_timeout="${ZONES_BENCH_DRAIN_TIMEOUT:-300}"
     local run_key="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-    local profile="${ZONES_BENCH_PROFILE:-generic}"
     local neobank_preset="${ZONES_BENCH_NEOBANK_PRESET:-full-journey}"
-    case "$profile" in
-        generic|neobank) ;;
-        *) die "ZONES_BENCH_PROFILE must be generic or neobank" ;;
+    case "$neobank_preset" in
+        direct-lifecycle|encrypted-deposit|private-withdrawal|rewards-redemption|third-party-recipient|full-journey|slippage-bounce|swapped-lifecycle|swapped-redemption) ;;
+        *) die "unsupported neobank preset for provisioning: $neobank_preset" ;;
     esac
-    if [[ "$profile" == "neobank" ]]; then
-        case "$neobank_preset" in
-            direct-lifecycle|encrypted-deposit|private-withdrawal|rewards-redemption|third-party-recipient|full-journey|slippage-bounce|swapped-lifecycle|swapped-redemption) ;;
-            *) die "unsupported neobank preset for provisioning: $neobank_preset" ;;
-        esac
-    fi
 
     ZONES_BENCH_ACCOUNT_START="$account_start"
     ZONES_BENCH_ACCOUNTS="$accounts"
@@ -814,43 +807,42 @@ provision_up() {
     (( count > 0 )) || die "ZONES_BENCH_COUNT must be greater than zero"
     (( max_concurrent > 0 )) || die "ZONES_BENCH_MAX_CONCURRENT must be greater than zero"
     (( withdrawal_amount > 0 )) || die "ZONES_BENCH_WITHDRAWAL_AMOUNT must be greater than zero"
-    if [[ "$profile" == neobank ]]; then
-        if [[ "$swap_mechanism" =~ ^(direct-swap|simple)$ ]] && (( swap_liquidity >= 1000000000000000 )); then
-            die "$swap_mechanism liquidity must be below the Bridge controller absolute mint limit of 1000000000000000"
-        fi
-        if [[ "$swap_mechanism" == stablecoin-dex ]] && (( swap_liquidity < 100000000 )); then
-            die "StablecoinDEX liquidity must be at least its 100000000 minimum order amount"
-        fi
-        local required_swap_uses=0
-        case "$neobank_preset" in
-            full-journey|swapped-lifecycle)
-                if [[ "$swap_mechanism" == stablecoin-dex ]]; then
-                    required_swap_uses="$count"
-                else
-                    required_swap_uses="$max_concurrent"
-                fi
-                ;;
-            private-withdrawal|swapped-redemption)
-                local setup_journeys_per_account setup_position_uses
-                setup_journeys_per_account=$(((count + accounts - 1) / accounts))
-                setup_position_uses=$((accounts * setup_journeys_per_account))
-                if [[ "$swap_mechanism" == direct-swap ]]; then
-                    local callback_reservation callbacks_per_batch setup_batch_uses
-                    callback_reservation=$((1750000 + callback_gas_limit))
-                    callbacks_per_batch=$(((withdrawal_max_batch_gas - 500000) / callback_reservation))
-                    (( callbacks_per_batch > 0 )) || callbacks_per_batch=1
-                    setup_batch_uses=$((callbacks_per_batch * setup_journeys_per_account))
-                    required_swap_uses="$max_concurrent"
-                    (( setup_batch_uses <= required_swap_uses )) ||
-                        required_swap_uses="$setup_batch_uses"
-                else
-                    required_swap_uses="$setup_position_uses"
-                fi
-                ;;
-            slippage-bounce) required_swap_uses=1 ;;
-        esac
-        (( required_swap_uses == 0 || swap_liquidity / withdrawal_amount >= required_swap_uses )) \
-            || die "$swap_mechanism liquidity must cover $required_swap_uses swap(s) of ZONES_BENCH_WITHDRAWAL_AMOUNT=$withdrawal_amount for $neobank_preset"
+    if [[ "$swap_mechanism" =~ ^(direct-swap|simple)$ ]] && (( swap_liquidity >= 1000000000000000 )); then
+        die "$swap_mechanism liquidity must be below the Bridge controller absolute mint limit of 1000000000000000"
+    fi
+    if [[ "$swap_mechanism" == stablecoin-dex ]] && (( swap_liquidity < 100000000 )); then
+        die "StablecoinDEX liquidity must be at least its 100000000 minimum order amount"
+    fi
+    local required_swap_uses=0
+    case "$neobank_preset" in
+        full-journey|swapped-lifecycle)
+            if [[ "$swap_mechanism" == stablecoin-dex ]]; then
+                required_swap_uses="$count"
+            else
+                required_swap_uses="$max_concurrent"
+            fi
+            ;;
+        private-withdrawal|swapped-redemption)
+            local setup_journeys_per_account setup_position_uses
+            setup_journeys_per_account=$(((count + accounts - 1) / accounts))
+            setup_position_uses=$((accounts * setup_journeys_per_account))
+            if [[ "$swap_mechanism" == direct-swap ]]; then
+                local callback_reservation callbacks_per_batch setup_batch_uses
+                callback_reservation=$((1750000 + callback_gas_limit))
+                callbacks_per_batch=$(((withdrawal_max_batch_gas - 500000) / callback_reservation))
+                (( callbacks_per_batch > 0 )) || callbacks_per_batch=1
+                setup_batch_uses=$((callbacks_per_batch * setup_journeys_per_account))
+                required_swap_uses="$max_concurrent"
+                (( setup_batch_uses <= required_swap_uses )) ||
+                    required_swap_uses="$setup_batch_uses"
+            else
+                required_swap_uses="$setup_position_uses"
+            fi
+            ;;
+        slippage-bounce) required_swap_uses=1 ;;
+    esac
+    if (( required_swap_uses > 0 && swap_liquidity / withdrawal_amount < required_swap_uses )); then
+        die "$swap_mechanism liquidity must cover $required_swap_uses swap(s) of ZONES_BENCH_WITHDRAWAL_AMOUNT=$withdrawal_amount for $neobank_preset"
     fi
     (( callback_gas_limit > 0 && callback_gas_limit <= 10000000 )) \
         || die "ZONES_BENCH_CALLBACK_GAS_LIMIT must be between 1 and 10000000"
@@ -859,14 +851,10 @@ provision_up() {
     (( withdrawal_max_batch_gas <= l1_general_gas_limit )) \
         || die "ZONES_BENCH_WITHDRAWAL_MAX_BATCH_GAS cannot exceed ZONES_BENCH_L1_GENERAL_GAS_LIMIT"
     local planned_singleton_withdrawal_gas=0
-    if [[ "$profile" == generic && "${ZONES_BENCH_PHASE:-roundtrip}" == roundtrip ]]; then
-        planned_singleton_withdrawal_gas=1750000
-    elif [[ "$profile" == neobank ]]; then
-        case "$neobank_preset" in
-            encrypted-deposit) ;;
-            *) planned_singleton_withdrawal_gas=$((500000 + 1750000 + callback_gas_limit)) ;;
-        esac
-    fi
+    case "$neobank_preset" in
+        encrypted-deposit) ;;
+        *) planned_singleton_withdrawal_gas=$((500000 + 1750000 + callback_gas_limit)) ;;
+    esac
     (( planned_singleton_withdrawal_gas == 0 ||
        planned_singleton_withdrawal_gas <= l1_general_gas_limit )) \
         || die "ZONES_BENCH_L1_GENERAL_GAS_LIMIT cannot fit a withdrawal planned at $planned_singleton_withdrawal_gas gas"
@@ -939,20 +927,18 @@ provision_up() {
     admin_address="$(derive_address "$mnemonic_file" 3)"
     sequencer_address="$(derive_address "$mnemonic_file" 4)"
     local -a neobank_allowed_accounts=()
-    local neobank_allowed_accounts_file=""
-    if [[ "$profile" == neobank ]]; then
-        neobank_allowed_accounts+=("$owner_address")
-        local account_index account_address
-        for ((account_index = account_start; account_index < account_start + accounts; account_index++)); do
-            account_address="$(derive_address "$mnemonic_file" "$account_index")"
-            neobank_allowed_accounts+=("$account_address")
-        done
-        neobank_allowed_accounts_file="$(mktemp \
-            "${RUNNER_TEMP:-/tmp}/zones-neobank-allowed-accounts.XXXXXX")"
-        chmod 600 "$neobank_allowed_accounts_file"
-        provision_secret_files+=("$neobank_allowed_accounts_file")
-        printf '%s\n' "${neobank_allowed_accounts[@]}" >"$neobank_allowed_accounts_file"
-    fi
+    neobank_allowed_accounts+=("$owner_address")
+    local account_index account_address
+    for ((account_index = account_start; account_index < account_start + accounts; account_index++)); do
+        account_address="$(derive_address "$mnemonic_file" "$account_index")"
+        neobank_allowed_accounts+=("$account_address")
+    done
+    local neobank_allowed_accounts_file
+    neobank_allowed_accounts_file="$(mktemp \
+        "${RUNNER_TEMP:-/tmp}/zones-neobank-allowed-accounts.XXXXXX")"
+    chmod 600 "$neobank_allowed_accounts_file"
+    provision_secret_files+=("$neobank_allowed_accounts_file")
+    printf '%s\n' "${neobank_allowed_accounts[@]}" >"$neobank_allowed_accounts_file"
 
     mkdir -p "$zone_db" "$zone_dir"
 
@@ -1045,13 +1031,11 @@ provision_up() {
     [[ "$(rpc "$l1_a_rpc" eth_getCode "[\"$ZONE_FACTORY\",\"latest\"]")" != "0x" ]] \
         || die "canonical ZoneFactory has no code on Tempo L1"
 
-    local zone_token="$PATH_USD"
-    if [[ "$profile" == "neobank" ]]; then
-        case "$neobank_preset" in
-            direct-lifecycle|rewards-redemption|third-party-recipient) zone_token="$PATH_USD" ;;
-            encrypted-deposit|full-journey|private-withdrawal|slippage-bounce|swapped-lifecycle|swapped-redemption) zone_token="$DLUSD" ;;
-        esac
-    fi
+    local zone_token
+    case "$neobank_preset" in
+        direct-lifecycle|rewards-redemption|third-party-recipient) zone_token="$PATH_USD" ;;
+        encrypted-deposit|full-journey|private-withdrawal|slippage-bounce|swapped-lifecycle|swapped-redemption) zone_token="$DLUSD" ;;
+    esac
 
     echo "creating a Zone through the canonical factory"
     local -a create_zone_args=(
@@ -1061,12 +1045,9 @@ provision_up() {
         --initial-token "$zone_token"
         --admin "$admin_address"
         --sequencer "$sequencer_address"
+        --access-mode
     )
-    if [[ "$profile" == neobank ]]; then
-        # Keep createZone below the production 30M block limit. Access starts
-        # closed with an empty allowlist; untimed fixture setup applies the map.
-        create_zone_args+=(--access-mode)
-    fi
+    # Access starts closed with an empty allowlist; untimed fixture setup applies the map.
     ZONE_FACTORY_OWNER_KEY="$owner_key" "$ZONES_XTASK_BIN" create-zone "${create_zone_args[@]}"
     local zone_json="$zone_dir/zone.json"
     local zone_genesis="$zone_dir/genesis.json"
@@ -1084,44 +1065,35 @@ provision_up() {
     L1_RPC_URL="$l1_a_rpc" L1_PORTAL_ADDRESS="$portal" PRIVATE_KEY="$sequencer_key" \
         "$ZONES_XTASK_BIN" set-encryption-key
 
-    local fixture_metadata=""
-    if [[ "$profile" == "neobank" ]]; then
-        fixture_metadata="$control_root/neobank-fixtures.json"
-        echo "deploying and configuring private-Zone benchmark fixtures"
-        FIXTURE_DEPLOYER_KEY="$owner_key" PORTAL_ADMIN_KEY="$admin_key" \
-            "$ZONES_XTASK_BIN" deploy-neobank-fixtures \
-                --l1-rpc-url "$l1_a_rpc" \
-                --portal "$portal" \
-                --dlusd "$DLUSD" \
-                --pathusd "$PATH_USD" \
-                --private-asset "$zone_token" \
-                --earn-revision "${ZONES_BENCH_EARN_REVISION:?external Earn revision is required}" \
-                --swap-mechanism "$swap_mechanism" \
-                --liquidity "$swap_liquidity" \
-                --allowed-accounts-file "$neobank_allowed_accounts_file" \
-                --output "$fixture_metadata"
-        rm -f -- "$neobank_allowed_accounts_file"
-        provision_secret_files=()
-        require_file "$fixture_metadata"
-        verify_neobank_fixture_topology \
-            "$l1_a_rpc" "$fixture_metadata" "$owner_address" "$PATH_USD" \
-            "$swap_mechanism" "$zone_token"
-        verify_neobank_token_topology \
-            "$l1_a_rpc" "$portal" "$zone_token" "$(jq -er '.earnToken' "$fixture_metadata")"
-        echo "configuring zero user bridge and withdrawal protocol fees"
-        SEQUENCER_KEY="$sequencer_key" "$ZONES_XTASK_BIN" configure-benchmark-fees \
+    local fixture_metadata="$control_root/neobank-fixtures.json"
+    echo "deploying and configuring private-Zone benchmark fixtures"
+    FIXTURE_DEPLOYER_KEY="$owner_key" PORTAL_ADMIN_KEY="$admin_key" \
+        "$ZONES_XTASK_BIN" deploy-neobank-fixtures \
             --l1-rpc-url "$l1_a_rpc" \
             --portal "$portal" \
-            --token "$zone_token" \
-            --zone-gas-rate 0 \
-            --bounceback-gas 0
-    else
-        echo "configuring non-zero deposit and bounce-back fee rates"
-        SEQUENCER_KEY="$sequencer_key" "$ZONES_XTASK_BIN" configure-benchmark-fees \
-            --l1-rpc-url "$l1_a_rpc" \
-            --portal "$portal" \
-            --token "$PATH_USD"
-    fi
+            --dlusd "$DLUSD" \
+            --pathusd "$PATH_USD" \
+            --private-asset "$zone_token" \
+            --earn-revision "${ZONES_BENCH_EARN_REVISION:?external Earn revision is required}" \
+            --swap-mechanism "$swap_mechanism" \
+            --liquidity "$swap_liquidity" \
+            --allowed-accounts-file "$neobank_allowed_accounts_file" \
+            --output "$fixture_metadata"
+    rm -f -- "$neobank_allowed_accounts_file"
+    provision_secret_files=()
+    require_file "$fixture_metadata"
+    verify_neobank_fixture_topology \
+        "$l1_a_rpc" "$fixture_metadata" "$owner_address" "$PATH_USD" \
+        "$swap_mechanism" "$zone_token"
+    verify_neobank_token_topology \
+        "$l1_a_rpc" "$portal" "$zone_token" "$(jq -er '.earnToken' "$fixture_metadata")"
+    echo "configuring zero user bridge and withdrawal protocol fees"
+    SEQUENCER_KEY="$sequencer_key" "$ZONES_XTASK_BIN" configure-benchmark-fees \
+        --l1-rpc-url "$l1_a_rpc" \
+        --portal "$portal" \
+        --token "$zone_token" \
+        --zone-gas-rate 0 \
+        --bounceback-gas 0
 
     export SEQUENCER_KEY="$sequencer_key"
     # The pinned Reth revision predates the retained-branch pruning fix. Its
@@ -1155,13 +1127,11 @@ provision_up() {
     wait_for_rpc "$zone_rpc" "Zone" "$zone_timeout"
     wait_for_chain_advance "$zone_rpc" "Zone" "$zone_timeout"
     wait_for_zone_configuration "$zone_rpc" "$anchor_block" "$sequencer_address" "$zone_token" "$zone_timeout"
-    if [[ "$profile" == "neobank" ]]; then
-        wait_for_zone_enabled_token "$zone_rpc" "$(jq -er '.earnToken' "$fixture_metadata")" "$zone_timeout"
-        neobank_allowed_accounts+=("$(jq -er '.bridgeWallet' "$fixture_metadata")")
-        wait_for_neobank_enforcement \
-            "$zone_rpc" "$zone_timeout" "$(jq -er '.earnRouter' "$fixture_metadata")" \
-            "${neobank_allowed_accounts[@]}"
-    fi
+    wait_for_zone_enabled_token "$zone_rpc" "$(jq -er '.earnToken' "$fixture_metadata")" "$zone_timeout"
+    neobank_allowed_accounts+=("$(jq -er '.bridgeWallet' "$fixture_metadata")")
+    wait_for_neobank_enforcement \
+        "$zone_rpc" "$zone_timeout" "$(jq -er '.earnRouter' "$fixture_metadata")" \
+        "${neobank_allowed_accounts[@]}"
     local queried_zone_chain_id
     queried_zone_chain_id="$(hex_to_dec "$(rpc "$zone_rpc" eth_chainId)")"
     [[ "$queried_zone_chain_id" == "$zone_chain_id" ]] \
@@ -1178,7 +1148,6 @@ provision_up() {
         ZONE_WS_RPC_URL "ws://127.0.0.1:8546" \
         ZONE_PRIVATE_RPC_URL "$zone_private_rpc" \
         ZONES_BENCH_TOKEN "$zone_token" \
-        ZONES_BENCH_PROFILE "$profile" \
         L1_PORTAL_ADDRESS "$portal" \
         ZONES_BENCH_EXPECTED_L1_CHAIN_ID "$chain_a" \
         ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID "$queried_zone_chain_id" \
@@ -1218,33 +1187,29 @@ provision_up() {
         ZONES_BENCH_TOPOLOGY_DIR "$control_root" \
         ZONES_BENCH_STATE_A_ROOT "$state_a_root" \
         ZONES_BENCH_STATE_B_ROOT "$state_b_root" \
-        ZONES_BENCH_ZONE_STATE_ROOT "$zone_state_root"
+        ZONES_BENCH_ZONE_STATE_ROOT "$zone_state_root" \
+        ZONES_BENCH_NEOBANK_PRESET "$neobank_preset" \
+        ZONES_BENCH_DLUSD "$DLUSD" \
+        ZONES_BENCH_PATHUSD "$PATH_USD" \
+        ZONES_BENCH_EARN_REVISION "$(jq -er '.earnFixtureRevision' "$fixture_metadata")" \
+        ZONES_BENCH_EARN_TOKEN "$(jq -er '.earnToken' "$fixture_metadata")" \
+        ZONES_BENCH_EARN_ROUTER "$(jq -er '.earnRouter' "$fixture_metadata")" \
+        ZONES_BENCH_EARN_VAULT "$(jq -er '.earnVault' "$fixture_metadata")" \
+        ZONES_BENCH_EARN_CONTRIBUTION_CONTROLLER "$(jq -er '.contributionController' "$fixture_metadata")" \
+        ZONES_BENCH_GATEWAY "$(jq -er '.gateway' "$fixture_metadata")" \
+        ZONES_BENCH_BRIDGE_WALLET "$(jq -er '.bridgeWallet' "$fixture_metadata")" \
+        ZONES_BENCH_DEFAULT_SWAPPER "$(jq -er '.defaultSwapper' "$fixture_metadata")" \
+        ZONES_BENCH_ROUTE_SWAPPER "$(jq -r '.routeSwapper // empty' "$fixture_metadata")" \
+        ZONES_BENCH_SWAP_ADAPTER "$(jq -r '.swapAdapter // empty' "$fixture_metadata")" \
+        ZONES_BENCH_DIRECT_SWAP "$(jq -r '.directSwap // empty' "$fixture_metadata")" \
+        ZONES_BENCH_SIMPLE_SWAP "$(jq -r '.simpleSwap // empty' "$fixture_metadata")" \
+        ZONES_BENCH_STABLECOIN_DEX "$(jq -er '.stablecoinDex' "$fixture_metadata")" \
+        ZONES_BENCH_VAULT "$(jq -er '.vault' "$fixture_metadata")" \
+        ZONES_BENCH_ENGINE "$(jq -er '.engine' "$fixture_metadata")" \
+        ZONES_BENCH_VAULT_ADAPTER "$(jq -er '.vaultAdapter' "$fixture_metadata")" \
+        ZONES_BENCH_REWARDS "$(jq -er '.rewards' "$fixture_metadata")" \
+        ZONES_BENCH_FIXTURE_METADATA "$fixture_metadata"
     )
-    if [[ "$profile" == "neobank" ]]; then
-        env_pairs+=(
-            ZONES_BENCH_NEOBANK_PRESET "$neobank_preset"
-            ZONES_BENCH_DLUSD "$DLUSD"
-            ZONES_BENCH_PATHUSD "$PATH_USD"
-            ZONES_BENCH_EARN_REVISION "$(jq -er '.earnFixtureRevision' "$fixture_metadata")"
-            ZONES_BENCH_EARN_TOKEN "$(jq -er '.earnToken' "$fixture_metadata")"
-            ZONES_BENCH_EARN_ROUTER "$(jq -er '.earnRouter' "$fixture_metadata")"
-            ZONES_BENCH_EARN_VAULT "$(jq -er '.earnVault' "$fixture_metadata")"
-            ZONES_BENCH_EARN_CONTRIBUTION_CONTROLLER "$(jq -er '.contributionController' "$fixture_metadata")"
-            ZONES_BENCH_GATEWAY "$(jq -er '.gateway' "$fixture_metadata")"
-            ZONES_BENCH_BRIDGE_WALLET "$(jq -er '.bridgeWallet' "$fixture_metadata")"
-            ZONES_BENCH_DEFAULT_SWAPPER "$(jq -er '.defaultSwapper' "$fixture_metadata")"
-            ZONES_BENCH_ROUTE_SWAPPER "$(jq -r '.routeSwapper // empty' "$fixture_metadata")"
-            ZONES_BENCH_SWAP_ADAPTER "$(jq -r '.swapAdapter // empty' "$fixture_metadata")"
-            ZONES_BENCH_DIRECT_SWAP "$(jq -r '.directSwap // empty' "$fixture_metadata")"
-            ZONES_BENCH_SIMPLE_SWAP "$(jq -r '.simpleSwap // empty' "$fixture_metadata")"
-            ZONES_BENCH_STABLECOIN_DEX "$(jq -er '.stablecoinDex' "$fixture_metadata")"
-            ZONES_BENCH_VAULT "$(jq -er '.vault' "$fixture_metadata")"
-            ZONES_BENCH_ENGINE "$(jq -er '.engine' "$fixture_metadata")"
-            ZONES_BENCH_VAULT_ADAPTER "$(jq -er '.vaultAdapter' "$fixture_metadata")"
-            ZONES_BENCH_REWARDS "$(jq -er '.rewards' "$fixture_metadata")"
-            ZONES_BENCH_FIXTURE_METADATA "$fixture_metadata"
-        )
-    fi
     write_env "$env_file" "${env_pairs[@]}"
 
     provision_succeeded=1

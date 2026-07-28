@@ -13,8 +13,8 @@ accounts:
     range: [${ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX}, ${ZONES_BENCH_SEQUENCER_ACCOUNT_END}]
 
 artifacts:
-  TIP20: ../txgen/abis/tip20.json
-  ZoneOutbox: ../txgen/abis/zone-outbox.json
+  TIP20: abis/tip20.json
+  ZoneOutbox: abis/zone-outbox.json
   ZoneInbox: abis/neobank-zone-inbox.json
   EarnRouter: abis/earn-router.json
 

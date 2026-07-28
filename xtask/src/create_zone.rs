@@ -58,11 +58,6 @@ pub(crate) struct CreateZone {
     #[arg(long = "allowed-account")]
     allowed_accounts: Vec<Address>,
 
-    /// Mode-0600 file containing one allowed account per line. Entries are merged with
-    /// `--allowed-account` but are not copied into zone.json.
-    #[arg(long)]
-    allowed_accounts_file: Option<PathBuf>,
-
     /// Sequencer address that will operate the zone. Repeat for a
     /// multi-sequencer set; the first address is the leader.
     ///
@@ -140,9 +135,6 @@ impl CreateZone {
         }
 
         let mut allowed_accounts = self.allowed_accounts.clone();
-        if let Some(path) = self.allowed_accounts_file.as_deref() {
-            allowed_accounts.extend(read_private_address_file(path)?);
-        }
         allowed_accounts.sort_unstable();
         allowed_accounts.dedup();
 
@@ -319,12 +311,6 @@ impl CreateZone {
         genesis_cmd.run().await?;
 
         // Write zone.json with deployment metadata for downstream tooling (e.g. `just zone-up`).
-        let allowed_accounts_redacted = self.allowed_accounts_file.is_some();
-        let serialized_allowed_accounts = if allowed_accounts_redacted {
-            Vec::new()
-        } else {
-            allowed_accounts.iter().map(ToString::to_string).collect()
-        };
         let zone_json = serde_json::json!({
             "zoneId": zone_id,
             "chainId": chain_id,
@@ -334,9 +320,7 @@ impl CreateZone {
             "accessMode": self.access_mode,
             "gatewayMode": self.gateway_mode,
             "zoneGateways": self.zone_gateways.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "allowedAccounts": serialized_allowed_accounts,
-            "allowedAccountCount": allowed_accounts.len(),
-            "allowedAccountsRedacted": allowed_accounts_redacted,
+            "allowedAccounts": allowed_accounts.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "admin": format!("{}", self.admin),
             "sequencer": format!("{leader}"),
             "sequencers": self.sequencers.iter().map(ToString::to_string).collect::<Vec<_>>(),

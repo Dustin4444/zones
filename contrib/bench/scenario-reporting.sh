@@ -44,7 +44,8 @@ build_scenario_report_args() {
 
     for name in \
         CLICKHOUSE_USER CLICKHOUSE_PASSWORD \
-        ZONES_BENCH_ZONES_REF ZONES_BENCH_GIT_REF ZONES_BENCH_PHASE
+        ZONES_BENCH_ZONES_REF ZONES_BENCH_GIT_REF ZONES_BENCH_PHASE \
+        ZONES_BENCH_NEOBANK_PRESET
     do
         if [[ -z "${!name:-}" ]]; then
             echo "error: $name is required when ClickHouse reporting is enabled" >&2
@@ -58,16 +59,13 @@ build_scenario_report_args() {
         --metadata "git-ref=$ZONES_BENCH_GIT_REF"
         --metadata "phase=$ZONES_BENCH_PHASE"
     )
-    [[ -z "${ZONES_BENCH_NEOBANK_PRESET:-}" || "$ZONES_BENCH_NEOBANK_PRESET" == none ]] ||
-        destination+=(--metadata "neobank-preset=$ZONES_BENCH_NEOBANK_PRESET")
-    if [[ "${ZONES_BENCH_PHASE:-}" == neobank-e2e ]]; then
-        [[ -z "${ZONES_BENCH_SWAP_MECHANISM:-}" ]] ||
-            destination+=(--metadata "swap-mechanism=$ZONES_BENCH_SWAP_MECHANISM")
-        [[ -z "${ZONES_BENCH_SWAP_LIQUIDITY:-}" ]] ||
-            destination+=(--metadata "swap-liquidity=$ZONES_BENCH_SWAP_LIQUIDITY")
-        [[ -z "${ZONES_BENCH_CALLBACK_GAS_LIMIT:-}" ]] ||
-            destination+=(--metadata "callback-gas-limit=$ZONES_BENCH_CALLBACK_GAS_LIMIT")
-    fi
+    destination+=(--metadata "neobank-preset=$ZONES_BENCH_NEOBANK_PRESET")
+    [[ -z "${ZONES_BENCH_SWAP_MECHANISM:-}" ]] ||
+        destination+=(--metadata "swap-mechanism=$ZONES_BENCH_SWAP_MECHANISM")
+    [[ -z "${ZONES_BENCH_SWAP_LIQUIDITY:-}" ]] ||
+        destination+=(--metadata "swap-liquidity=$ZONES_BENCH_SWAP_LIQUIDITY")
+    [[ -z "${ZONES_BENCH_CALLBACK_GAS_LIMIT:-}" ]] ||
+        destination+=(--metadata "callback-gas-limit=$ZONES_BENCH_CALLBACK_GAS_LIMIT")
     [[ -z "${ZONES_BENCH_RECIPIENT_MODE:-}" ]] ||
         destination+=(--metadata "recipient-mode=$ZONES_BENCH_RECIPIENT_MODE")
     for pair in "${configuration_metadata[@]}"; do

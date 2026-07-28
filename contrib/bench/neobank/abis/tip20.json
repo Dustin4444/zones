@@ -1,6 +1,6 @@
 [
   {
-    "type": "function",
+    "type":"function",
     "name": "approve",
     "stateMutability": "nonpayable",
     "inputs": [
@@ -21,7 +21,7 @@
     ]
   },
   {
-    "type": "function",
+    "type":"function",
     "name": "transfer",
     "stateMutability": "nonpayable",
     "inputs": [

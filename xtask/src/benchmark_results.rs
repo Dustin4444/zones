@@ -15,9 +15,9 @@ pub(crate) struct BenchmarkResults {
     #[arg(long)]
     report: PathBuf,
 
-    /// Rendered scenario YAML used to produce a scenario report.
+    /// Rendered scenario YAML used to produce the report.
     #[arg(long)]
-    scenario: Option<PathBuf>,
+    scenario: PathBuf,
 
     /// Destination for the rendered Markdown.
     #[arg(long)]
@@ -28,15 +28,9 @@ impl BenchmarkResults {
     pub(crate) fn run(self) -> Result<()> {
         let report = fs::read_to_string(&self.report)
             .wrap_err_with(|| format!("failed to read report {}", self.report.display()))?;
-        let scenario = self
-            .scenario
-            .as_ref()
-            .map(|path| {
-                fs::read_to_string(path)
-                    .wrap_err_with(|| format!("failed to read scenario {}", path.display()))
-            })
-            .transpose()?;
-        let markdown = render_results(&report, scenario.as_deref())?;
+        let scenario = fs::read_to_string(&self.scenario)
+            .wrap_err_with(|| format!("failed to read scenario {}", self.scenario.display()))?;
+        let markdown = render_results(&report, &scenario)?;
 
         if let Some(parent) = self
             .output
@@ -54,26 +48,12 @@ impl BenchmarkResults {
     }
 }
 
-fn render_results(report_json: &str, scenario_yaml: Option<&str>) -> Result<String> {
-    let value: serde_json::Value =
-        serde_json::from_str(report_json).wrap_err("failed to parse benchmark report JSON")?;
-    if value.get("version").is_some() || value.get("scenario").is_some() {
-        let report: ScenarioReport =
-            serde_json::from_value(value).wrap_err("failed to parse txgen scenario report")?;
-        let scenario_yaml = scenario_yaml
-            .ok_or_else(|| eyre::eyre!("--scenario is required for a scenario report"))?;
-        let scenario: ScenarioSpec = serde_yaml::from_str(scenario_yaml)
-            .wrap_err("failed to parse rendered scenario YAML")?;
-        render_scenario_results(&report, &scenario)
-    } else {
-        ensure!(
-            scenario_yaml.is_none(),
-            "--scenario can only be used with a scenario report"
-        );
-        let report: PhaseReport =
-            serde_json::from_value(value).wrap_err("failed to parse txgen phase report")?;
-        render_phase_results(&report)
-    }
+fn render_results(report_json: &str, scenario_yaml: &str) -> Result<String> {
+    let report: ScenarioReport =
+        serde_json::from_str(report_json).wrap_err("failed to parse txgen scenario report")?;
+    let scenario: ScenarioSpec =
+        serde_yaml::from_str(scenario_yaml).wrap_err("failed to parse rendered scenario YAML")?;
+    render_scenario_results(&report, &scenario)
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,19 +701,6 @@ fn write_observation_configuration(output: &mut String, chains: &[ReportChain]) 
 }
 
 #[derive(Debug, Deserialize)]
-struct PhaseReport {
-    sent: u64,
-    success: u64,
-    failed: u64,
-    elapsed_secs: f64,
-    tps: f64,
-    success_rate: f64,
-    latency: Option<PhaseLatency>,
-    #[serde(default)]
-    receipt_metrics: Vec<ReceiptMetricReport>,
-}
-
-#[derive(Debug, Deserialize)]
 struct ReceiptMetricReport {
     #[serde(default)]
     labels: BTreeMap<String, String>,
@@ -750,90 +717,6 @@ struct QuantityDistribution {
     p50: Option<f64>,
     p95: Option<f64>,
     p99: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PhaseLatency {
-    min_ms: f64,
-    max_ms: f64,
-    mean_ms: f64,
-    p50_ms: f64,
-    p95_ms: f64,
-    p99_ms: f64,
-}
-
-fn render_phase_results(report: &PhaseReport) -> Result<String> {
-    ensure!(
-        report.elapsed_secs.is_finite() && report.elapsed_secs > 0.0,
-        "phase measured time must be greater than zero"
-    );
-    validate_nonnegative_finite("phase TPS", report.tps)?;
-    validate_nonnegative_finite("phase acceptance rate", report.success_rate)?;
-    ensure!(
-        report.success <= report.sent,
-        "successful count exceeds sent count"
-    );
-    ensure!(
-        report.failed <= report.sent,
-        "failed count exceeds sent count"
-    );
-    let mut output = String::new();
-    writeln!(output, "# Zones benchmark results\n")?;
-    writeln!(output, "## Outcome\n")?;
-    writeln!(
-        output,
-        "| Sent | RPC accepted | Failed | Acceptance rate | Measured time |"
-    )?;
-    writeln!(output, "| ---: | ---: | ---: | ---: | ---: |")?;
-    writeln!(
-        output,
-        "| {} | {} | {} | {:.3}% | {} |\n",
-        report.sent,
-        report.success,
-        report.failed,
-        report.success_rate,
-        format_seconds(report.elapsed_secs)
-    )?;
-
-    writeln!(output, "## Throughput\n")?;
-    writeln!(output, "| Scope | Effective rate |")?;
-    writeln!(output, "| --- | ---: |")?;
-    writeln!(
-        output,
-        "| Attempted transactions | **{:.3} TPS** |",
-        report.tps
-    )?;
-    writeln!(
-        output,
-        "| RPC-accepted transactions | **{:.3} TPS** |\n",
-        report.success as f64 / report.elapsed_secs
-    )?;
-
-    if let Some(latency) = &report.latency {
-        validate_phase_latency(latency)?;
-        writeln!(output, "## RPC response latency\n")?;
-        writeln!(output, "| Samples | Min | Mean | P50 | P95 | P99 | Max |")?;
-        writeln!(output, "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")?;
-        writeln!(
-            output,
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
-            report.success,
-            format_millis(latency.min_ms),
-            format_millis(latency.mean_ms),
-            format_millis(latency.p50_ms),
-            format_millis(latency.p95_ms),
-            format_millis(latency.p99_ms),
-            format_millis(latency.max_ms)
-        )?;
-    }
-
-    write_receipt_metrics(&mut output, &report.receipt_metrics)?;
-
-    writeln!(
-        output,
-        "> Rates use the complete measured window, including ramp-up and drain. Latency ends when the RPC returns; setup transactions are excluded from the measured phase report. RPC-accepted and failed counts can overlap when an accepted transaction later reverts or its receipt wait fails."
-    )?;
-    Ok(output)
 }
 
 fn validate_latency(name: &str, latency: &Latency) -> Result<()> {
@@ -873,24 +756,6 @@ fn validate_signed_latency(name: &str, latency: &Latency) -> Result<()> {
             "{name} minimum exceeds maximum"
         );
     }
-    Ok(())
-}
-
-fn validate_phase_latency(latency: &PhaseLatency) -> Result<()> {
-    for (field, value) in [
-        ("phase latency min", latency.min_ms),
-        ("phase latency max", latency.max_ms),
-        ("phase latency mean", latency.mean_ms),
-        ("phase latency p50", latency.p50_ms),
-        ("phase latency p95", latency.p95_ms),
-        ("phase latency p99", latency.p99_ms),
-    ] {
-        validate_nonnegative_finite(field, value)?;
-    }
-    ensure!(
-        latency.min_ms <= latency.max_ms,
-        "phase latency minimum exceeds maximum"
-    );
     Ok(())
 }
 

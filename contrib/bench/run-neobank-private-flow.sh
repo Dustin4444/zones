@@ -88,7 +88,7 @@ ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT="${ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT:-10
 ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-10000000}"
 ZONES_BENCH_OUTPUT="${ZONES_BENCH_OUTPUT:-target/zones-benchmark/neobank-e2e}"
 ZONES_BENCH_REPORT="${ZONES_BENCH_REPORT:-target/zones-benchmark/report-neobank-e2e.json}"
-ZONES_BENCH_RENDERED_SCENARIO="${ZONES_BENCH_RENDERED_SCENARIO:-$ZONES_BENCH_OUTPUT/private-flow-scenario.rendered.yml}"
+ZONES_BENCH_RENDERED_SCENARIO="${ZONES_BENCH_RENDERED_SCENARIO:-$ZONES_BENCH_OUTPUT/scenario.rendered.yml}"
 ZONES_BENCH_AUTH_TTL_SECS="${ZONES_BENCH_AUTH_TTL_SECS:-600}"
 ZONES_BENCH_AUTH_REFRESH_SECS="${ZONES_BENCH_AUTH_REFRESH_SECS:-60}"
 ZONES_BENCH_STEP_TIMEOUT="${ZONES_BENCH_STEP_TIMEOUT:-10m}"
@@ -462,9 +462,8 @@ for command in "$txgen_bin" awk bc cast curl jq; do
 done
 
 neobank_specs="$bench_dir/neobank"
-generic_specs="$bench_dir/txgen"
 scenario_path="$neobank_specs/$scenario_file"
-bootstrap_scenario="$generic_specs/bootstrap-scenario.yml"
+bootstrap_scenario="$neobank_specs/bootstrap-scenario.yml"
 portal_approval_scenario="$neobank_specs/l1-portal-approval-scenario.yml"
 zone_approval_scenario="$neobank_specs/zone-outbox-approvals-scenario.yml"
 admission_seed_scenario="$neobank_specs/admission-seed-scenario.yml"
@@ -525,7 +524,7 @@ stage_start render_scenario
     --scenario "$scenario_path" \
     --output "$ZONES_BENCH_RENDERED_SCENARIO"
 [[ -s "$ZONES_BENCH_RENDERED_SCENARIO" ]] ||
-    die "txgen did not render the composed private-flow scenario"
+    die "txgen did not render the selected neobank scenario"
 stage_end render_scenario
 
 # The bootstrap scenario approves the control account before depositing the

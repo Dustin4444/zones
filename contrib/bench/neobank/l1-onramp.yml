@@ -13,7 +13,7 @@ accounts:
     range: [${ZONES_BENCH_CONTROL_ACCOUNT_INDEX}, ${ZONES_BENCH_CONTROL_ACCOUNT_END}]
 
 artifacts:
-  TIP20: ../txgen/abis/tip20.json
+  TIP20: abis/tip20.json
   ZonePortal: abis/neobank-zone-portal.json
   EarnRouter: abis/earn-router.json
   EarnContributionController: abis/earn-contribution-controller.json

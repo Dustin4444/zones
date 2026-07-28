@@ -11,7 +11,7 @@ accounts:
 
 artifacts:
   TIP20: abis/tip20.json
-  ZonePortal: abis/zone-portal.json
+  ZonePortal: abis/neobank-zone-portal.json
 
 templates:
   control_portal_approval:

@@ -6,40 +6,38 @@ on:
 
   workflow_dispatch:
     inputs:
-      phase:
-        description: Benchmark workload to run.
+      preset:
+        description: Neobank scenario to run.
         type: choice
         required: true
-        default: neobank-full-journey
+        default: full-journey
         options:
-          - neobank-encrypted-deposit
-          - neobank-private-withdrawal
-          - neobank-rewards-redemption
-          - neobank-full-journey
-          - neobank-slippage-bounce
-          - neobank-third-party-recipient
-          - neobank-direct-lifecycle
-          - neobank-swapped-lifecycle
-          - neobank-swapped-redemption
-          - roundtrip
-          - deposit
+          - encrypted-deposit
+          - private-withdrawal
+          - rewards-redemption
+          - full-journey
+          - slippage-bounce
+          - third-party-recipient
+          - direct-lifecycle
+          - swapped-lifecycle
+          - swapped-redemption
       accounts:
         description: Number of benchmark accounts.
         type: string
         required: true
         default: "100"
       count:
-        description: Number of measured transactions, or complete journeys for a scenario.
+        description: Number of complete scenario journeys.
         type: string
         required: true
         default: "100"
       tps:
-        description: Target phase TPS, or fractional journey starts per second for a scenario.
+        description: Target journey starts per second.
         type: string
         required: true
         default: "20"
       max-concurrent:
-        description: Maximum concurrent transactions, or leased journeys for roundtrip.
+        description: Maximum leased journeys in flight.
         type: string
         required: true
         default: "12"
@@ -185,8 +183,6 @@ env:
   SCCACHE_IDLE_TIMEOUT: "21600"
   ZONES_BENCH_ACCOUNT_START: "16"
   ZONES_BENCH_ACCOUNT_CAPACITY: "10000"
-  ZONES_BENCH_DEFAULT_PHASE: neobank-full-journey
-  ZONES_BENCH_TOKEN: "0x20C0000000000000000000000000000000000000"
 
 jobs:
   authorize:
@@ -198,7 +194,6 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     outputs:
-      phase: ${{ steps.config.outputs.phase }}
       neobank-preset: ${{ steps.config.outputs.neobank-preset }}
       sha: ${{ steps.config.outputs.sha }}
       accounts: ${{ steps.config.outputs.accounts }}
@@ -261,7 +256,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          INPUT_PHASE: ${{ inputs.phase || 'neobank-full-journey' }}
+          INPUT_PRESET: ${{ inputs.preset || 'full-journey' }}
           INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
           INPUT_COUNT: ${{ inputs.count || '100' }}
           INPUT_TPS: ${{ inputs.tps || '20' }}
@@ -293,64 +288,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          requested_phase="$INPUT_PHASE"
+          neobank_preset="$INPUT_PRESET"
           if [ "$EVENT_NAME" = pull_request ]; then
-            requested_phase="$ZONES_BENCH_DEFAULT_PHASE"
+            neobank_preset=full-journey
             INPUT_COUNT=100
           fi
-          case "$requested_phase" in
-            neobank-encrypted-deposit)
-              phase=neobank-e2e
-              neobank_preset=encrypted-deposit
-              leases_per_journey=1
-              ;;
-            neobank-private-withdrawal)
-              phase=neobank-e2e
-              neobank_preset=private-withdrawal
-              leases_per_journey=1
-              ;;
-            neobank-rewards-redemption)
-              phase=neobank-e2e
-              neobank_preset=rewards-redemption
-              leases_per_journey=1
-              ;;
-            neobank-slippage-bounce)
-              phase=neobank-e2e
-              neobank_preset=slippage-bounce
-              leases_per_journey=1
-              ;;
-            neobank-third-party-recipient)
-              phase=neobank-e2e
-              neobank_preset=third-party-recipient
-              leases_per_journey=2
-              ;;
-            neobank-direct-lifecycle)
-              phase=neobank-e2e
-              neobank_preset=direct-lifecycle
-              leases_per_journey=1
-              ;;
-            neobank-full-journey)
-              phase=neobank-e2e
-              neobank_preset=full-journey
-              leases_per_journey=1
-              ;;
-            neobank-swapped-lifecycle)
-              phase=neobank-e2e
-              neobank_preset=swapped-lifecycle
-              leases_per_journey=1
-              ;;
-            neobank-swapped-redemption)
-              phase=neobank-e2e
-              neobank_preset=swapped-redemption
-              leases_per_journey=1
-              ;;
-            roundtrip|deposit)
-              phase="$requested_phase"
-              neobank_preset=none
-              leases_per_journey=1
-              ;;
-            *) echo "::error::unsupported benchmark phase: $requested_phase"; exit 1 ;;
+          case "$neobank_preset" in
+            encrypted-deposit|private-withdrawal|rewards-redemption|full-journey|\
+            slippage-bounce|third-party-recipient|direct-lifecycle|\
+            swapped-lifecycle|swapped-redemption) ;;
+            *) echo "::error::unsupported neobank preset: $neobank_preset"; exit 1 ;;
           esac
+          leases_per_journey=1
+          if [ "$neobank_preset" = third-party-recipient ]; then
+            leases_per_journey=2
+          fi
 
           if [ -z "$INPUT_SEED" ]; then
             INPUT_SEED=$((10#$RUN_ID * 100000 + 10#$RUN_ATTEMPT))
@@ -382,21 +334,12 @@ jobs:
               exit 1
             fi
           done
-          if [ "$phase" = neobank-e2e ]; then
-            if ! [[ "$INPUT_TPS" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] \
-              || ! awk -v value="$INPUT_TPS" 'BEGIN { exit !(value > 0 && value <= 999999999) }'; then
-              echo "::error::INPUT_TPS must be a positive decimal no greater than 999999999"
-              exit 1
-            fi
-            INPUT_TPS="$(awk -v value="$INPUT_TPS" 'BEGIN { printf "%.15g", value }')"
-          else
-            if ! [[ "$INPUT_TPS" =~ ^[0-9]+$ ]] \
-              || (( ${#INPUT_TPS} > 9 || 10#$INPUT_TPS == 0 )); then
-              echo "::error::INPUT_TPS must be between 1 and 999999999"
-              exit 1
-            fi
-            INPUT_TPS=$((10#$INPUT_TPS))
+          if ! [[ "$INPUT_TPS" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] \
+            || ! awk -v value="$INPUT_TPS" 'BEGIN { exit !(value > 0 && value <= 999999999) }'; then
+            echo "::error::INPUT_TPS must be a positive decimal no greater than 999999999"
+            exit 1
           fi
+          INPUT_TPS="$(awk -v value="$INPUT_TPS" 'BEGIN { printf "%.15g", value }')"
           for name in \
             INPUT_DEPOSIT_AMOUNT INPUT_BOOTSTRAP_DEPOSIT_AMOUNT \
             INPUT_ACTIVITY_AMOUNT INPUT_WITHDRAWAL_AMOUNT
@@ -448,10 +391,9 @@ jobs:
           (( 10#$INPUT_WITHDRAWAL_MAX_BATCH_GAS <= 10#$INPUT_L1_GENERAL_GAS_LIMIT )) \
             || { echo "::error::withdrawal-max-batch-gas cannot exceed l1-general-gas-limit"; exit 1; }
           planned_singleton_withdrawal_gas=0
-          case "$phase:$neobank_preset" in
-            roundtrip:*) planned_singleton_withdrawal_gas=1750000 ;;
-            neobank-e2e:encrypted-deposit) ;;
-            neobank-e2e:*) planned_singleton_withdrawal_gas=$((500000 + 1750000 + 10#$INPUT_CALLBACK_GAS_LIMIT)) ;;
+          case "$neobank_preset" in
+            encrypted-deposit) ;;
+            *) planned_singleton_withdrawal_gas=$((500000 + 1750000 + 10#$INPUT_CALLBACK_GAS_LIMIT)) ;;
           esac
           (( planned_singleton_withdrawal_gas == 0 ||
              planned_singleton_withdrawal_gas <= 10#$INPUT_L1_GENERAL_GAS_LIMIT )) \
@@ -467,9 +409,8 @@ jobs:
           (( 10#$INPUT_DRAIN_TIMEOUT <= 86400 )) \
             || { echo "::error::drain-timeout cannot exceed 86400"; exit 1; }
           required_accounts=$((10#$INPUT_MAX_CONCURRENT * leases_per_journey))
-          if { [ "$phase" = roundtrip ] || [ "$phase" = neobank-e2e ]; } \
-            && (( required_accounts > 10#$INPUT_ACCOUNTS )); then
-            echo "::error::$requested_phase requires at least $required_accounts accounts for max-concurrent=$INPUT_MAX_CONCURRENT"
+          if (( required_accounts > 10#$INPUT_ACCOUNTS )); then
+            echo "::error::$neobank_preset requires at least $required_accounts accounts for max-concurrent=$INPUT_MAX_CONCURRENT"
             exit 1
           fi
           case "$INPUT_STATE_BLOAT_GIB" in
@@ -491,48 +432,46 @@ jobs:
             echo "::error::accounts cannot exceed the cached funded-account capacity of 10000"
             exit 1
           fi
-          if [ "$phase" = neobank-e2e ]; then
-            if [[ "$INPUT_SWAP_MECHANISM" =~ ^(direct-swap|simple)$ ]] && (( swap_liquidity >= 1000000000000000 )); then
-              echo "::error::$INPUT_SWAP_MECHANISM liquidity must be below the Bridge controller absolute mint limit of 1000000000000000"
-              exit 1
-            fi
-            if [ "$INPUT_SWAP_MECHANISM" = stablecoin-dex ] && (( swap_liquidity < 100000000 )); then
-              echo "::error::stablecoin-dex liquidity must be at least its 100000000 minimum order amount"
-              exit 1
-            fi
-            required_swap_uses=0
-            case "$neobank_preset" in
-              full-journey|swapped-lifecycle)
-                if [ "$INPUT_SWAP_MECHANISM" = stablecoin-dex ]; then
-                  required_swap_uses=$INPUT_COUNT
-                else
-                  required_swap_uses=$INPUT_MAX_CONCURRENT
+          if [[ "$INPUT_SWAP_MECHANISM" =~ ^(direct-swap|simple)$ ]] && (( swap_liquidity >= 1000000000000000 )); then
+            echo "::error::$INPUT_SWAP_MECHANISM liquidity must be below the Bridge controller absolute mint limit of 1000000000000000"
+            exit 1
+          fi
+          if [ "$INPUT_SWAP_MECHANISM" = stablecoin-dex ] && (( swap_liquidity < 100000000 )); then
+            echo "::error::stablecoin-dex liquidity must be at least its 100000000 minimum order amount"
+            exit 1
+          fi
+          required_swap_uses=0
+          case "$neobank_preset" in
+            full-journey|swapped-lifecycle)
+              if [ "$INPUT_SWAP_MECHANISM" = stablecoin-dex ]; then
+                required_swap_uses=$INPUT_COUNT
+              else
+                required_swap_uses=$INPUT_MAX_CONCURRENT
+              fi
+              ;;
+            private-withdrawal|swapped-redemption)
+              setup_journeys_per_account=$(((INPUT_COUNT + INPUT_ACCOUNTS - 1) / INPUT_ACCOUNTS))
+              setup_position_uses=$((INPUT_ACCOUNTS * setup_journeys_per_account))
+              if [ "$INPUT_SWAP_MECHANISM" = direct-swap ]; then
+                callback_reservation=$((1750000 + 10#$INPUT_CALLBACK_GAS_LIMIT))
+                callbacks_per_batch=$(((10#$INPUT_WITHDRAWAL_MAX_BATCH_GAS - 500000) / callback_reservation))
+                if (( callbacks_per_batch == 0 )); then
+                  callbacks_per_batch=1
                 fi
-                ;;
-              private-withdrawal|swapped-redemption)
-                setup_journeys_per_account=$(((INPUT_COUNT + INPUT_ACCOUNTS - 1) / INPUT_ACCOUNTS))
-                setup_position_uses=$((INPUT_ACCOUNTS * setup_journeys_per_account))
-                if [ "$INPUT_SWAP_MECHANISM" = direct-swap ]; then
-                  callback_reservation=$((1750000 + 10#$INPUT_CALLBACK_GAS_LIMIT))
-                  callbacks_per_batch=$(((10#$INPUT_WITHDRAWAL_MAX_BATCH_GAS - 500000) / callback_reservation))
-                  if (( callbacks_per_batch == 0 )); then
-                    callbacks_per_batch=1
-                  fi
-                  setup_batch_uses=$((callbacks_per_batch * setup_journeys_per_account))
-                  required_swap_uses=$INPUT_MAX_CONCURRENT
-                  if (( setup_batch_uses > required_swap_uses )); then
-                    required_swap_uses=$setup_batch_uses
-                  fi
-                else
-                  required_swap_uses=$setup_position_uses
+                setup_batch_uses=$((callbacks_per_batch * setup_journeys_per_account))
+                required_swap_uses=$INPUT_MAX_CONCURRENT
+                if (( setup_batch_uses > required_swap_uses )); then
+                  required_swap_uses=$setup_batch_uses
                 fi
-                ;;
-              slippage-bounce) required_swap_uses=1 ;;
-            esac
-            if (( required_swap_uses > 0 && swap_liquidity / withdrawal_amount < required_swap_uses )); then
-              echo "::error::$INPUT_SWAP_MECHANISM liquidity must cover $required_swap_uses swap(s) of withdrawal-amount=$withdrawal_amount for $requested_phase"
-              exit 1
-            fi
+              else
+                required_swap_uses=$setup_position_uses
+              fi
+              ;;
+            slippage-bounce) required_swap_uses=1 ;;
+          esac
+          if (( required_swap_uses > 0 && swap_liquidity / withdrawal_amount < required_swap_uses )); then
+            echo "::error::$INPUT_SWAP_MECHANISM liquidity must cover $required_swap_uses swap(s) of withdrawal-amount=$withdrawal_amount for $neobank_preset"
+            exit 1
           fi
           for name in INPUT_TEMPO_REF INPUT_TXGEN_REF; do
             if ! [[ "${!name}" =~ ^[0-9a-fA-F]{40}$ ]]; then
@@ -542,7 +481,6 @@ jobs:
           done
 
           {
-            echo "phase=$phase"
             echo "neobank-preset=$neobank_preset"
             echo "sha=$EVENT_SHA"
             echo "accounts=$INPUT_ACCOUNTS"
@@ -574,12 +512,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   benchmark:
-    name: ${{ needs.authorize.outputs.phase }}
+    name: neobank-${{ needs.authorize.outputs.neobank-preset }}
     needs: authorize
     runs-on: [self-hosted, Linux, X64, bare-metal-dual-schelk]
     timeout-minutes: 300
     env:
-      ZONES_BENCH_PHASE: ${{ needs.authorize.outputs.phase }}
+      ZONES_BENCH_PHASE: neobank-e2e
       ZONES_BENCH_NEOBANK_PRESET: ${{ needs.authorize.outputs.neobank-preset }}
       ZONES_BENCH_ACCOUNTS: ${{ needs.authorize.outputs.accounts }}
       ZONES_BENCH_COUNT: ${{ needs.authorize.outputs.count }}
@@ -619,8 +557,8 @@ jobs:
       ZONES_BENCH_L1_B_CPUS: 4-7,20-23
       ZONES_BENCH_ZONE_CPUS: 8-13,24-29
       ZONES_BENCH_CPUSET: 14-15,30-31
-      ZONES_BENCH_OUTPUT: target/zones-benchmark/${{ needs.authorize.outputs.phase }}
-      ZONES_BENCH_REPORT: target/zones-benchmark/report-${{ needs.authorize.outputs.phase }}.json
+      ZONES_BENCH_OUTPUT: target/zones-benchmark/neobank-e2e
+      ZONES_BENCH_REPORT: target/zones-benchmark/report-neobank-e2e.json
       ZONES_BENCH_TOPOLOGY_ENV: target/zones-benchmark/topology.env
       ZONES_BENCH_TOPOLOGY_DIR: target/zones-benchmark/topology
       TEMPO_ROOT: ${{ github.workspace }}/_benchmark-tempo
@@ -632,7 +570,6 @@ jobs:
           submodules: recursive
 
       - name: Resolve pinned Earn revision
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         id: earn-revision
         run: |
           set -euo pipefail
@@ -641,7 +578,6 @@ jobs:
           echo "sha=$earn_revision" >> "$GITHUB_OUTPUT"
 
       - name: Check out Earn contracts
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: tempoxyz/earn
@@ -652,7 +588,6 @@ jobs:
           submodules: true
 
       - name: Verify pinned Earn revision
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         env:
           EXPECTED_EARN_REVISION: ${{ steps.earn-revision.outputs.sha }}
         run: |
@@ -674,7 +609,6 @@ jobs:
           contrib/bench/provision-topology.sh cleanup "$ZONES_BENCH_PID_FILE"
 
       - name: Configure ClickHouse scenario reporting
-        if: needs.authorize.outputs.phase == 'roundtrip' || needs.authorize.outputs.phase == 'neobank-e2e'
         env:
           CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
           CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
@@ -709,7 +643,6 @@ jobs:
           version: nightly
 
       - name: Resolve Solidity cache key
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         id: solidity-key
         run: |
           set -euo pipefail
@@ -722,7 +655,6 @@ jobs:
           echo "ZONES_BENCH_EARN_REVISION=$earn_sha" >> "$GITHUB_ENV"
 
       - name: Restore Solidity artifacts
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
@@ -827,7 +759,6 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build neobank fixture contracts
-        if: needs.authorize.outputs.phase == 'neobank-e2e'
         run: |
           set -euo pipefail
           forge build --root specs/ref-impls --no-lint
@@ -908,7 +839,7 @@ jobs:
           echo "ZONES_BENCH_TUNED=1" >> "$GITHUB_ENV"
           nu -c "source '$TEMPO_ROOT/tempo.nu'; apply-system-tuning | ignore"
 
-      - name: Provision topology and run ${{ needs.authorize.outputs.phase }} workload
+      - name: Provision topology and run neobank workload
         env:
           CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
           CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
@@ -917,9 +848,6 @@ jobs:
         run: |
           set -euo pipefail
           export ZONES_BENCH_ENV_FILE="$ZONES_BENCH_TOPOLOGY_ENV"
-          if [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-            export ZONES_BENCH_PROFILE=neobank
-          fi
           contrib/bench/provision-topology.sh up
           set -a
           # shellcheck source=/dev/null
@@ -936,13 +864,7 @@ jobs:
           do
             printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
           done
-          if [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-            contrib/bench/run-neobank-private-flow.sh
-          elif [ "$ZONES_BENCH_PHASE" = roundtrip ]; then
-            contrib/bench/run-roundtrip.sh
-          else
-            contrib/bench/run-phase.sh "$ZONES_BENCH_PHASE"
-          fi
+          contrib/bench/run-neobank-private-flow.sh
 
       - name: Publish benchmark results
         if: ${{ !cancelled() }}
@@ -957,15 +879,9 @@ jobs:
             --output "$summary"
           )
           if [ -s "$ZONES_BENCH_REPORT" ]; then
-            if [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-              results_args+=(
-                --scenario "$ZONES_BENCH_OUTPUT/private-flow-scenario.rendered.yml"
-              )
-            elif [ "$ZONES_BENCH_PHASE" = roundtrip ]; then
-              results_args+=(
-                --scenario "$ZONES_BENCH_OUTPUT/roundtrip-scenario.rendered.yml"
-              )
-            fi
+            results_args+=(
+              --scenario "$ZONES_BENCH_OUTPUT/scenario.rendered.yml"
+            )
             "$ZONES_XTASK_BIN" benchmark-results "${results_args[@]}"
           else
             {
@@ -975,12 +891,8 @@ jobs:
             } > "$summary"
           fi
 
-          unit=Transactions
-          rate="Target TPS"
-          if [ "$ZONES_BENCH_PHASE" = roundtrip ] || [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-            unit=Journeys
-            rate="Target journey starts/s"
-          fi
+          unit=Journeys
+          rate="Target journey starts/s"
           snapshot_status=hit
           if [ "${ZONES_BENCH_L1_CACHE_REBUILT:-0}" = 1 ]; then
             snapshot_status=rebuilt
@@ -989,12 +901,9 @@ jobs:
             echo
             echo "## Run configuration"
             echo
-            echo "- Phase: \`$ZONES_BENCH_PHASE\`"
-            if [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-              echo "- Neobank preset: \`$ZONES_BENCH_NEOBANK_PRESET\`"
-              echo "- Swap mechanism: \`$ZONES_BENCH_SWAP_MECHANISM\` (setup liquidity \`$ZONES_BENCH_SWAP_LIQUIDITY\`)"
-              echo "- Callback gas limit: \`$ZONES_BENCH_CALLBACK_GAS_LIMIT\`"
-            fi
+            echo "- Neobank preset: \`$ZONES_BENCH_NEOBANK_PRESET\`"
+            echo "- Swap mechanism: \`$ZONES_BENCH_SWAP_MECHANISM\` (setup liquidity \`$ZONES_BENCH_SWAP_LIQUIDITY\`)"
+            echo "- Callback gas limit: \`$ZONES_BENCH_CALLBACK_GAS_LIMIT\`"
             echo "- Recipient mode: \`$ZONES_BENCH_RECIPIENT_MODE\`"
             echo "- $unit: \`$ZONES_BENCH_COUNT\`"
             echo "- $rate: \`$ZONES_BENCH_TPS\`"
@@ -1009,9 +918,7 @@ jobs:
             echo "- Zones revision: \`$ZONES_BENCH_ZONES_REF\`"
             echo "- Tempo revision: \`$ZONES_BENCH_TEMPO_REF\`"
             echo "- Txgen revision: \`$ZONES_BENCH_TXGEN_REF\`"
-            if [ "$ZONES_BENCH_PHASE" = neobank-e2e ]; then
-              echo "- Earn revision: \`${ZONES_BENCH_EARN_REVISION:-unavailable}\`"
-            fi
+            echo "- Earn revision: \`${ZONES_BENCH_EARN_REVISION:-unavailable}\`"
             echo "- Build: \`$ZONES_BENCH_BUILD_PROFILE\`, \`RUSTFLAGS=$RUSTFLAGS\`"
             echo "- L1 block/general gas limits: \`${ZONES_BENCH_L1_GAS_LIMIT:-unavailable}\` / \`${ZONES_BENCH_L1_GENERAL_GAS_LIMIT:-unavailable}\`"
             echo "- Withdrawal scheduler (batch gas / in-flight / Zone blocks / poll): \`$ZONES_BENCH_WITHDRAWAL_MAX_BATCH_GAS\` / \`$ZONES_BENCH_WITHDRAWAL_MAX_IN_FLIGHT_BATCHES\` / \`$ZONES_BENCH_ZONE_BATCH_INTERVAL_BLOCKS\` / \`${ZONES_BENCH_WITHDRAWAL_POLL_INTERVAL_SECS}s\`"
@@ -1156,9 +1063,9 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zones-benchmark-${{ needs.authorize.outputs.phase }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: zones-benchmark-neobank-${{ needs.authorize.outputs.neobank-preset }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            target/zones-benchmark/${{ needs.authorize.outputs.phase }}/
+            target/zones-benchmark/neobank-e2e/
             target/zones-benchmark/*.json
             target/zones-benchmark/*.md
             target/zones-benchmark/topology/neobank-fixtures.json

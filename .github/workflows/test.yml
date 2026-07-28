@@ -38,28 +38,6 @@ jobs:
           ssh-key: ${{ secrets.EARN_DEPLOY_KEY }}
           persist-credentials: false
           submodules: true
-      - name: Resolve pinned Earn revision
-        id: earn-revision
-        run: |
-          set -euo pipefail
-          earn_revision="$(tr -d '\r\n' < contrib/bench/earn-revision.lock)"
-          [[ "$earn_revision" =~ ^[0-9a-f]{40}$ ]]
-          echo "sha=$earn_revision" >> "$GITHUB_OUTPUT"
-      - name: Check out pinned benchmark Earn contracts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: tempoxyz/earn
-          ref: ${{ steps.earn-revision.outputs.sha }}
-          path: _benchmark-earn
-          ssh-key: ${{ secrets.EARN_DEPLOY_KEY }}
-          persist-credentials: false
-          submodules: true
-      - name: Verify pinned benchmark Earn revision
-        env:
-          EXPECTED_EARN_REVISION: ${{ steps.earn-revision.outputs.sha }}
-        run: |
-          set -euo pipefail
-          test "$(git -C _benchmark-earn rev-parse HEAD)" = "$EXPECTED_EARN_REVISION"
       - uses: tempoxyz/gh-actions/actions/setup-rust-build@98b1081dcf34361b576aca2ab3041772708582ef
         with:
           toolchain: stable
@@ -78,7 +56,6 @@ jobs:
             echo "forge-sha=$(forge --version | sed -n 's/^Commit SHA: //p')"
             echo "specs-tree=$(git rev-parse HEAD:specs/ref-impls)"
             echo "current-earn-sha=$(git -C earn rev-parse HEAD)"
-            echo "benchmark-earn-sha=$(git -C _benchmark-earn rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Restore Solidity artifacts
@@ -86,40 +63,20 @@ jobs:
         with:
           path: |
             earn/cache
-            _benchmark-earn/cache
             specs/ref-impls/cache
             specs/ref-impls/out
-            specs/ref-impls/benchmark-out
-          key: forge-${{ runner.os }}-${{ steps.solidity-key.outputs.forge-sha }}-${{ steps.solidity-key.outputs.specs-tree }}-${{ steps.solidity-key.outputs.current-earn-sha }}-${{ steps.solidity-key.outputs.benchmark-earn-sha }}
+          key: forge-${{ runner.os }}-${{ steps.solidity-key.outputs.forge-sha }}-${{ steps.solidity-key.outputs.specs-tree }}-${{ steps.solidity-key.outputs.current-earn-sha }}
 
       - name: Build Solidity artifacts
         run: |
           set -euo pipefail
           forge build --root specs/ref-impls --no-lint
-          mkdir -p specs/ref-impls/benchmark-out
-          cp -a specs/ref-impls/out/. specs/ref-impls/benchmark-out/
           forge build \
             --root earn \
             --skip test \
             --skip script \
             --no-lint \
             --out "$GITHUB_WORKSPACE/specs/ref-impls/out"
-          forge build \
-            --root _benchmark-earn \
-            --skip test \
-            --skip script \
-            --no-lint \
-            --out "$GITHUB_WORKSPACE/specs/ref-impls/benchmark-out"
-          forge build \
-            --root _benchmark-earn \
-            --skip test \
-            --skip script \
-            --no-lint \
-            --out "$GITHUB_WORKSPACE/specs/ref-impls/benchmark-out" \
-            vendor/bridge/auth-registry/AuthRegistry.sol \
-            vendor/bridge/direct-swaps/direct-swaps/DirectSwapV2.sol \
-            vendor/bridge/direct-swaps/token-handler/ReserveLedgerWrappedHandler.sol \
-            vendor/bridge/tip20-controller/TIP20Controller.sol
 
       - name: Build and archive tests
         run: cargo nextest archive --profile ci --archive-file nextest-archive.tar.zst
@@ -131,7 +88,6 @@ jobs:
           path: |
             nextest-archive.tar.zst
             specs/ref-impls/out
-            specs/ref-impls/benchmark-out
           if-no-files-found: error
           retention-days: 1
           # The nextest archive is already zstd-compressed; recompressing it is
