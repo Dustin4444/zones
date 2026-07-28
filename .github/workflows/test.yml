@@ -33,7 +33,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: tempoxyz/earn
-          ref: main
+          # Keep the external contracts in sync with the router API exercised by
+          # crates/node/tests/it/earn_zone_e2e.rs. Earn main removed this API in #126.
+          ref: 36ce683da968a4ff3a0bdd88090a8c701fedc962
           path: earn
           ssh-key: ${{ secrets.EARN_DEPLOY_KEY }}
           persist-credentials: false
