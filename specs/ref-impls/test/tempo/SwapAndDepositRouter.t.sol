@@ -385,6 +385,28 @@ contract SwapAndDepositRouterTest is BaseTest {
         );
     }
 
+    /// @dev TODO: Enable once https://github.com/tempoxyz/tempo/pull/6614 is included in Forge.
+    function test_swapOutputMatchesQuote() public {
+        vm.skip(true, "Tempo #6614: exact-input quotes still round per tick instead of per order");
+
+        uint128 quote = exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), AMOUNT);
+        bytes memory data = _buildPlaintextData(
+            address(token1),
+            address(mockPortal2),
+            alice,
+            refundBurner,
+            bytes32("quote parity"),
+            quote
+        );
+
+        vm.prank(ZONE_MESSENGER_ADDRESS);
+        router.onWithdrawalReceived(
+            SOURCE_ZONE_ID, sourcePortal, senderTag, address(pathUSD), AMOUNT, data
+        );
+
+        assertEq(mockPortal2.lastDepositAmount(), quote);
+    }
+
     function testFuzz_swapDeposit_conservesBalancesAndQueuesDeposit(
         bool encrypted,
         bytes32 metadata,
