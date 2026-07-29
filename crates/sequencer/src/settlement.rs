@@ -1063,7 +1063,23 @@ impl BatchSubmitter {
         // Step 1: read pending slot range from the L1 portal.
         let (head, tail) = self.read_portal_withdrawal_queue_bounds().await?;
 
-        if head >= tail {
+        if head > tail {
+            eyre::bail!(
+                "invalid withdrawal queue bounds during restore: head {head} exceeds tail {tail}"
+            );
+        }
+
+        if head == tail {
+            let (head2, tail2) = self.read_portal_withdrawal_queue_bounds().await?;
+            if head2 != head || tail2 != tail {
+                eyre::bail!(
+                    "withdrawal queue changed during restore ({}..{} -> {}..{}), retry on next startup",
+                    head,
+                    tail,
+                    head2,
+                    tail2
+                );
+            }
             info!(head, tail, "No pending withdrawals to restore");
             return Ok(BTreeMap::new());
         }
@@ -1264,13 +1280,11 @@ fn resolve_pending_slots(
 /// `current_slot_hash`. Returns `Some(0)` if no withdrawals have been processed,
 /// `Some(n)` if n have been processed (n remaining), or `None` if no match is
 /// found.
-///
-/// Also checks `offset == len` (all consumed, hash chain = `B256::ZERO`).
 pub(crate) fn find_processed_offset(
     withdrawals: &[abi::Withdrawal],
     current_slot_hash: B256,
 ) -> Option<usize> {
-    for offset in 0..=withdrawals.len() {
+    for offset in 0..withdrawals.len() {
         let hash = abi::Withdrawal::queue_hash(&withdrawals[offset..]);
         if hash == current_slot_hash {
             return Some(offset);
@@ -2123,11 +2137,10 @@ mod tests {
     }
 
     #[test]
-    fn find_offset_all_processed() {
+    fn find_offset_rejects_empty_suffix() {
         let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let withdrawals = vec![w0];
-        // B256::ZERO = queue_hash(&[]), meaning all withdrawals have been consumed.
-        assert_eq!(find_processed_offset(&withdrawals, B256::ZERO), Some(1));
+        assert_eq!(find_processed_offset(&withdrawals, B256::ZERO), None);
     }
 
     #[test]
@@ -2316,7 +2329,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_single_slot_fully_processed() {
+    fn resolve_rejects_zero_pending_head_slot() {
         let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let withdrawals = vec![w0];
         let full_hash = abi::Withdrawal::queue_hash(&withdrawals);
@@ -2326,10 +2339,8 @@ mod tests {
         let mut slot_withdrawals = BTreeMap::new();
         slot_withdrawals.insert(5, withdrawals);
 
-        // B256::ZERO = queue_hash(&[]), all consumed. find_processed_offset returns
-        // Some(1) (offset == len), so remaining is empty and slot is not stored.
-        let result = resolve_pending_slots(5, 6, &events, &slot_withdrawals, B256::ZERO).unwrap();
-        assert!(result.is_empty());
+        let result = resolve_pending_slots(5, 6, &events, &slot_withdrawals, B256::ZERO);
+        assert!(result.is_err());
     }
 
     #[test]

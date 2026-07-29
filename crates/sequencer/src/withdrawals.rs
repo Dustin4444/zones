@@ -189,9 +189,27 @@ impl WithdrawalStore {
         self.batches.insert(batch_index, withdrawals);
     }
 
-    /// Replace the entire store with an authoritative set of pending batches.
-    pub(crate) fn replace_batches(&mut self, batches: BTreeMap<u64, Vec<abi::Withdrawal>>) {
-        self.batches = batches;
+    /// Merge verified batches without removing preimages omitted by the observed queue range.
+    pub(crate) fn merge_batches(
+        &mut self,
+        batches: BTreeMap<u64, Vec<abi::Withdrawal>>,
+    ) -> Result<(), u64> {
+        for (&slot, withdrawals) in &batches {
+            if let Some(existing) = self.batches.get(&slot)
+                && !existing.ends_with(withdrawals)
+                && !withdrawals.ends_with(existing)
+            {
+                return Err(slot);
+            }
+        }
+
+        for (slot, withdrawals) in batches {
+            let existing = self.batches.entry(slot).or_default();
+            if withdrawals.len() > existing.len() {
+                *existing = withdrawals;
+            }
+        }
+        Ok(())
     }
 
     /// Get all withdrawals for a batch.
@@ -207,6 +225,19 @@ impl WithdrawalStore {
     /// Remove slots that the portal head has already passed.
     fn remove_before(&mut self, batch_index: u64) {
         self.batches.retain(|&index, _| index >= batch_index);
+    }
+
+    /// Remove processed slots only when the portal head advanced exactly past the attempted slot.
+    fn prune_after_confirmed_processing(
+        &mut self,
+        processed_slot: u64,
+        confirmed_head: u64,
+    ) -> bool {
+        if processed_slot.checked_add(1) != Some(confirmed_head) {
+            return false;
+        }
+        self.remove_before(confirmed_head);
+        true
     }
 
     pub fn has_batch(&self, batch_index: u64) -> bool {
@@ -411,7 +442,6 @@ impl WithdrawalProcessor {
                 );
                 return Ok(());
             }
-            self.store.lock().remove_before(head_val);
             let StoreSnapshot {
                 batch_count: store_batch_count,
                 first_slot: store_first_slot,
@@ -505,13 +535,8 @@ impl WithdrawalProcessor {
 
             let remaining = &withdrawals[offset..];
             if remaining.is_empty() {
-                // Defensive: queue_hash never produces B256::ZERO for a pending head
-                // slot, but if it happens drop the stale batch and wait for the portal.
-                warn!(
-                    slot = head_val,
-                    "Head slot fully processed but head not advanced"
-                );
-                self.store.lock().remove_batch(head_val);
+                error!(slot = head_val, "Pending head slot has an empty queue hash");
+                self.repair_notify.notify_one();
                 return Ok(());
             }
 
@@ -535,11 +560,39 @@ impl WithdrawalProcessor {
 
             match outcome {
                 SubmitOutcome::Confirmed => {
-                    self.store.lock().remove_batch(head_val);
+                    let (confirmed_head, confirmed_tail): (U256, U256) = self
+                        .provider
+                        .multicall()
+                        .add(self.portal.withdrawalQueueHead())
+                        .add(self.portal.withdrawalQueueTail())
+                        .aggregate()
+                        .await?;
+                    let confirmed_head: u64 = confirmed_head
+                        .try_into()
+                        .map_err(|_| eyre::eyre!("confirmed head overflow"))?;
+                    let confirmed_tail: u64 = confirmed_tail
+                        .try_into()
+                        .map_err(|_| eyre::eyre!("confirmed tail overflow"))?;
+
+                    let pruned = confirmed_head <= confirmed_tail
+                        && self
+                            .store
+                            .lock()
+                            .prune_after_confirmed_processing(head_val, confirmed_head);
+                    if !pruned {
+                        warn!(
+                            slot = head_val,
+                            confirmed_head,
+                            confirmed_tail,
+                            "Portal head did not advance exactly past processed slot; retaining preimages"
+                        );
+                        self.repair_notify.notify_one();
+                        return Ok(());
+                    }
                     info!(
                         slot = head_val,
                         count = remaining.len(),
-                        "Slot fully processed and removed from store"
+                        "Slot fully processed and obsolete preimages removed"
                     );
                 }
                 SubmitOutcome::Retry => {
@@ -1122,7 +1175,19 @@ mod tests {
     }
 
     #[test]
-    fn store_replace_batches_reconciles_authoritative_view() {
+    fn false_advanced_head_does_not_prune_withdrawal_preimages() {
+        let mut store = WithdrawalStore::new();
+        let withdrawal = test_withdrawal(Address::repeat_byte(0x42), 100);
+        store.add_batch(5, vec![withdrawal.clone()]);
+        store.add_batch(6, vec![withdrawal]);
+
+        assert!(!store.prune_after_confirmed_processing(6, 6));
+        assert!(store.has_batch(5));
+        assert!(store.has_batch(6));
+    }
+
+    #[test]
+    fn store_merge_batches_preserves_unobserved_preimages() {
         let mut store = WithdrawalStore::new();
         let addr = address!("0x0000000000000000000000000000000000000042");
 
@@ -1133,13 +1198,13 @@ mod tests {
         reconciled.insert(5, vec![test_withdrawal(addr, 500)]);
         reconciled.insert(6, vec![test_withdrawal(addr, 600)]);
 
-        store.replace_batches(reconciled);
+        store.merge_batches(reconciled).unwrap();
 
-        assert!(!store.has_batch(0));
-        assert!(!store.has_batch(9));
+        assert!(store.has_batch(0));
+        assert!(store.has_batch(9));
         assert!(store.has_batch(5));
         assert!(store.has_batch(6));
-        assert_eq!(store.batch_count(), 2);
+        assert_eq!(store.batch_count(), 4);
     }
 
     fn abi_encode_b256(value: B256) -> Bytes {
@@ -1254,6 +1319,68 @@ mod tests {
                 .is_err()
         );
         assert!(store.lock().has_batch(5));
+        assert!(l1.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_queue_preserves_preimage_on_false_empty_observation() {
+        let l1 = Asserter::new();
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(6),
+            abi_encode_u64(6),
+        ]));
+
+        let store = SharedWithdrawalStore::new();
+        store.lock().add_batch(
+            5,
+            vec![test_withdrawal(
+                address!("0x0000000000000000000000000000000000000042"),
+                100,
+            )],
+        );
+
+        let repair_notify = Arc::new(Notify::new());
+        let mut processor = test_processor(l1.clone(), store.clone(), repair_notify.clone());
+
+        processor.process_queue().await.unwrap();
+
+        assert!(store.lock().has_batch(5));
+        assert!(
+            timeout(Duration::from_millis(50), repair_notify.notified())
+                .await
+                .is_err()
+        );
+        assert!(l1.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_queue_zero_slot_hash_preserves_preimage_and_requests_repair() {
+        let l1 = Asserter::new();
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(5),
+            abi_encode_u64(6),
+        ]));
+        l1.push_success(&abi_encode_u64(0));
+        l1.push_success(&abi_encode_b256(B256::ZERO));
+
+        let store = SharedWithdrawalStore::new();
+        store.lock().add_batch(
+            5,
+            vec![test_withdrawal(
+                address!("0x0000000000000000000000000000000000000042"),
+                100,
+            )],
+        );
+
+        let repair_notify = Arc::new(Notify::new());
+        let mut processor = test_processor(l1.clone(), store.clone(), repair_notify.clone());
+
+        processor.process_queue().await.unwrap();
+
+        assert!(store.lock().has_batch(5));
+        timeout(Duration::from_millis(50), repair_notify.notified())
+            .await
+            .expect("zero pending slot hash should request repair");
         assert!(l1.read_q().is_empty());
     }
 }

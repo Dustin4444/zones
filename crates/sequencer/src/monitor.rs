@@ -303,9 +303,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// Rebuild the in-memory withdrawal store from authoritative chain state.
     ///
     /// The L1 portal only stores queue hashes, so the monitor reconstructs the
-    /// pending withdrawal payloads from L1 + zone-L2 events and replaces the
-    /// local store with that result. Used during startup and after a portal
-    /// resync when local withdrawal data may be stale or missing.
+    /// pending withdrawal payloads from L1 + zone-L2 events and merges them
+    /// into the local store. Observations never remove local preimages; only
+    /// confirmed processing may prune them.
     async fn restore_pending_withdrawals_from_chain(&self) -> Result<()> {
         let pending = match self
             .batch_submitter
@@ -326,11 +326,13 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
 
         let mut store = self.withdrawal_store.lock();
         let (previous_slots, previous_first_slot, previous_last_slot) = store.summary();
-        store.replace_batches(pending);
+        store.merge_batches(pending).map_err(|slot| {
+            eyre::eyre!("restored withdrawals conflict with local preimages for slot {slot}")
+        })?;
         let reconciled_slots = store.batch_count();
         drop(store);
 
-        if reconciled_slots > 0 {
+        if restored_withdrawals > 0 {
             info!(
                 previous_slots,
                 previous_first_slot,
@@ -342,13 +344,6 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                 "Restored pending withdrawals from chain"
             );
             self.withdrawal_notify.notify_one();
-        } else if previous_slots > 0 {
-            info!(
-                previous_slots,
-                previous_first_slot,
-                previous_last_slot,
-                "Cleared stale withdrawal batches after restoring pending withdrawals from chain"
-            );
         }
 
         Ok(())
@@ -706,21 +701,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         if let Some(store) = &self.config.attestation_store {
             store.remove_submitted(last_submitted_zone_block);
         }
-        if let Err(e) = self.restore_pending_withdrawals_from_chain().await {
-            let (stale_store_batches, stale_store_first_slot, stale_store_last_slot) = {
-                let mut store = self.withdrawal_store.lock();
-                let summary = store.summary();
-                store.replace_batches(Default::default());
-                summary
-            };
-            error!(
-                error = %e,
-                stale_store_batches,
-                stale_store_first_slot,
-                stale_store_last_slot,
-                "Failed to restore pending withdrawals during portal resync; cleared local withdrawal store"
-            );
-        }
+        self.restore_pending_withdrawals_from_chain()
+            .await
+            .wrap_err("failed to restore pending withdrawals during portal resync")?;
 
         Ok(last_submitted_zone_block)
     }
@@ -1021,6 +1004,10 @@ mod tests {
             abi_encode_u64(7),
             abi_encode_u64(7),
         ]));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
 
         let mut monitor = test_monitor(l1.clone(), zone);
 
@@ -1033,7 +1020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_missing_withdrawal_slot_resyncs_portal_and_rebuilds_withdrawal_store() {
+    async fn repair_missing_withdrawal_slot_preserves_store_on_empty_observation() {
         let l1 = Asserter::new();
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
@@ -1041,6 +1028,10 @@ mod tests {
         let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
 
         l1.push_success(&abi_encode_b256(portal_hash));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
         l1.push_success(&abi_encode_multicall(vec![
             abi_encode_u64(7),
             abi_encode_u64(7),
@@ -1065,14 +1056,15 @@ mod tests {
         monitor.repair_missing_withdrawal_slot().await;
 
         let store = monitor.withdrawal_store.lock();
-        assert_eq!(store.batch_count(), 0);
+        assert_eq!(store.batch_count(), 1);
+        assert!(store.has_batch(3));
         assert_eq!(monitor.prev_zone_block_hash, portal_hash);
         assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
         assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
     }
 
     #[tokio::test]
-    async fn resync_clears_stale_withdrawal_store_when_restore_fails() {
+    async fn resync_preserves_withdrawal_store_when_restore_fails() {
         let l1 = Asserter::new();
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
@@ -1099,14 +1091,64 @@ mod tests {
             },
         );
 
-        let anchor = monitor.resync_from_portal().await.unwrap();
+        let error = monitor.resync_from_portal().await.unwrap_err();
 
-        assert_eq!(anchor, confirmed_zone_block);
+        assert!(
+            error
+                .to_string()
+                .contains("failed to restore pending withdrawals during portal resync")
+        );
         let store = monitor.withdrawal_store.lock();
-        assert_eq!(store.batch_count(), 0);
+        assert_eq!(store.batch_count(), 1);
+        assert!(store.has_batch(3));
         assert_eq!(monitor.prev_zone_block_hash, portal_hash);
         assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
         assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
+    }
+
+    #[tokio::test]
+    async fn resync_preserves_withdrawal_store_on_false_empty_observation() {
+        let l1 = Asserter::new();
+        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
+        let confirmed_zone_block = 42;
+        let confirmed_deposit_hash = B256::repeat_byte(0x33);
+        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+
+        l1.push_success(&abi_encode_b256(portal_hash));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(6),
+            abi_encode_u64(7),
+        ]));
+
+        let mut monitor = test_monitor(l1.clone(), zone);
+        monitor.withdrawal_store.lock().add_withdrawal(
+            3,
+            abi::Withdrawal {
+                token: Address::repeat_byte(0x10),
+                senderTag: B256::repeat_byte(0x11),
+                to: Address::repeat_byte(0x12),
+                amount: 100,
+                memo: B256::ZERO,
+                gasLimit: 0,
+                fallbackNonce: 1,
+                callbackData: Default::default(),
+                encryptedSender: Default::default(),
+            },
+        );
+
+        let error = monitor.resync_from_portal().await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("withdrawal queue changed during restore"),
+            "unexpected error: {error:#}"
+        );
+        let store = monitor.withdrawal_store.lock();
+        assert_eq!(store.batch_count(), 1);
+        assert!(store.has_batch(3));
     }
 
     #[tokio::test]
@@ -1119,6 +1161,10 @@ mod tests {
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_b256(portal_hash));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
         l1.push_success(&abi_encode_multicall(vec![
             abi_encode_u64(7),
             abi_encode_u64(7),
@@ -1165,6 +1211,10 @@ mod tests {
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_b256(portal_hash));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
         l1.push_success(&abi_encode_multicall(vec![
             abi_encode_u64(7),
             abi_encode_u64(7),
