@@ -85,6 +85,11 @@ impl StorageOps for AccountValues<'_> {
 struct PrefetchSlots(HashSet<StorageSlot>);
 
 impl PrefetchSlots {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Schedule every raw word occupied by a typed value.
     fn insert<T: Storable>(&mut self, handler: &impl Handler<T>) {
         let slot = handler.as_slot();
