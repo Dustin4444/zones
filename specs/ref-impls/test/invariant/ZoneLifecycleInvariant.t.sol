@@ -28,6 +28,8 @@ import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
 import { Test } from "forge-std/Test.sol";
+import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
+import { ISignatureVerifier } from "tempo-std/interfaces/ISignatureVerifier.sol";
 
 /// @title ZoneLifecycleHandler
 /// @notice Honest-sequencer driver for the zone deposit/withdrawal lifecycle. Every action
@@ -420,6 +422,11 @@ contract ZoneLifecycleInvariantTest is BaseTest {
 
         token.setMinter(address(inbox), true);
         token.setBurner(address(outbox), true);
+        vm.mockCall(
+            address(StdPrecompiles.SIGNATURE_VERIFIER),
+            abi.encodeWithSelector(ISignatureVerifier.recover.selector),
+            abi.encode(address(this))
+        );
 
         handler = new ZoneLifecycleHandler(
             portal, inbox, outbox, token, tempoState, address(this), alice, bob, charlie
