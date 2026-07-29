@@ -9,6 +9,7 @@ from pathlib import Path
 CONSTANTS = {
     "ZonePortal": "ZONE_PORTAL_RUNTIME",
     "ZoneMessenger": "ZONE_MESSENGER_RUNTIME",
+    "Verifier": "ZONE_VERIFIER_RUNTIME",
 }
 
 

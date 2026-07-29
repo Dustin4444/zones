@@ -36,6 +36,7 @@ jobs:
         run: |
           forge inspect ZonePortal deployedBytecode > "$RUNNER_TEMP/ZonePortal"
           forge inspect ZoneMessenger deployedBytecode > "$RUNNER_TEMP/ZoneMessenger"
+          forge inspect Verifier deployedBytecode > "$RUNNER_TEMP/Verifier"
 
       - name: Mint Tempo pull request token
         id: app-token
@@ -63,6 +64,7 @@ jobs:
           python3 zones/scripts/sync-tempo-zone-runtimes.py \
             --runtime "ZonePortal=$RUNNER_TEMP/ZonePortal" \
             --runtime "ZoneMessenger=$RUNNER_TEMP/ZoneMessenger" \
+            --runtime "Verifier=$RUNNER_TEMP/Verifier" \
             --tempo-file tempo/crates/contracts/src/zones.rs \
             --presto tempo/crates/chainspec/src/genesis/presto.json \
             --zones-sha "$GITHUB_SHA" \
@@ -101,7 +103,7 @@ jobs:
             title="chore(contracts): sync Zone runtimes"
           fi
           printf \
-            "Syncs the embedded ZonePortal and ZoneMessenger runtimes with [tempoxyz/zones@%s](https://github.com/tempoxyz/zones/commit/%s).\n" \
+            "Syncs the embedded ZonePortal, ZoneMessenger, and Verifier runtimes with [tempoxyz/zones@%s](https://github.com/tempoxyz/zones/commit/%s).\n" \
             "$ZONES_SHA" "$ZONES_SHA" > "$RUNNER_TEMP/runtimes-pr-body.md"
 
           pr=$(gh pr list \
