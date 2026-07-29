@@ -18,7 +18,10 @@ use crate::{
     ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
-use zone_sequencer::BatchAnchorConfig;
+use zone_sequencer::{
+    BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+    MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
+};
 
 const MAX_LOGS_PER_RESPONSE: u64 = 1_000_000;
 const MAX_BLOCKS_PER_FILTER: u64 = 1_000_000;
@@ -33,7 +36,7 @@ const ZONE_LOG_FILTER_DIRECTIVES: &str = concat!(
 /// Tempo Zone CLI entry point.
 pub enum ZoneCli {
     Node(Box<Cli<ZoneChainSpecParser, ZoneArgs>>),
-    Dev(DevCommand),
+    Dev(Box<DevCommand>),
 }
 
 impl ZoneCli {
@@ -65,7 +68,9 @@ impl ZoneCli {
     {
         let matches = Self::command().try_get_matches_from(args)?;
         if let Some(("dev", dev_matches)) = matches.subcommand() {
-            return DevCommand::from_arg_matches(dev_matches).map(Self::Dev);
+            return DevCommand::from_arg_matches(dev_matches)
+                .map(Box::new)
+                .map(Self::Dev);
         }
         Cli::from_arg_matches(&matches)
             .map(Box::new)
@@ -79,7 +84,7 @@ impl ZoneCli {
     pub fn run(self) -> eyre::Result<()> {
         match self {
             Self::Node(cli) => run_node(*cli),
-            Self::Dev(command) => command.run(),
+            Self::Dev(command) => (*command).run(),
         }
     }
 }
@@ -100,6 +105,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         info!(target: "reth::cli", "Launching Tempo Zone node");
 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
+        validate_portal_address(args.portal_address)?;
 
         let p2p_config = args
             .sequencer_manifest
@@ -122,11 +128,9 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 )
             })
             .transpose()?;
-        let manifest_role = p2p_config.as_ref().map(P2pConfig::role);
         if let Some(config) = p2p_config.as_ref() {
             info!(
                 target: "reth::cli",
-                role = %config.role(),
                 ed25519_public_key = %config.ed25519_public_key(),
                 secp256k1_address = %config.secp256k1_address(),
                 listen = %config.listen(),
@@ -141,8 +145,11 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             builder.config_mut().engine.persistence_threshold = 0;
             builder.config_mut().engine.memory_block_buffer_target = 0;
         }
-        let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, manifest_role);
-        let sequencer_signer = if should_sequence_blocks || manifest_mode {
+        // Every node constructs all the sequencer resources: activation
+        // is gated at runtime by the leadership schedule, so a follower must be
+        // able to become a leader without a restart.
+        let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, manifest_mode);
+        let sequencer_signer = if should_sequence_blocks {
             Some(
                 load_sequencer_signer(args.sequencer_key, args.sequencer_key_file.as_deref())
                     .await?,
@@ -175,17 +182,20 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         if should_sequence_blocks {
             let sequencer_signer = sequencer_signer
                 .expect("sequencer signer is parsed whenever sequencing is enabled");
+            let l1_transaction_signer =
+                p2p_config.as_ref().map(P2pConfig::block_attestation_signer);
             node = node.with_sequencer(ZoneSequencerAddOnsConfig {
                 sequencer_signer,
+                l1_transaction_signer,
                 zone_id: args.zone_id,
                 zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
-                batch_interval_blocks: args.zone_batch_interval_blocks,
                 batch_anchor_config: BatchAnchorConfig::default(),
                 withdrawal_poll_interval: Duration::from_secs(args.withdrawal_poll_interval_secs),
+                withdrawal_batch_limits: WithdrawalBatchLimits {
+                    max_batch_gas: args.withdrawal_max_batch_gas,
+                    max_in_flight_batches: args.withdrawal_max_in_flight_batches,
+                },
             });
-        }
-        if manifest_role == Some(Role::Follower) {
-            info!(target: "reth::cli", "Starting in follower mode");
         }
         if let Some(config) = p2p_config {
             node = node.with_p2p(config);
@@ -329,7 +339,8 @@ pub struct ZoneArgs {
     )]
     pub sequencer_role: Option<Role>,
 
-    /// How often (in seconds) the zone monitor polls for new L2 blocks.
+    /// How often (in seconds) the zone monitor reconciles with the canonical head if no
+    /// canonical-state notification triggers it first.
     #[arg(
         long = "zone.poll-interval-secs",
         env = "ZONE_POLL_INTERVAL_SECS",
@@ -339,9 +350,7 @@ pub struct ZoneArgs {
 
     /// Number of zone blocks between withdrawal batch boundaries.
     ///
-    /// Also used by the sequencer monitor to decide when enough chain progress has
-    /// occurred to look for empty finalized batches to submit to L1. Default 120 is
-    /// ~1 minute at Tempo's expected 500 ms block time.
+    /// Default 120 is ~1 minute at Tempo's expected 500 ms block time.
     #[arg(
         long = "zone.batch-interval-blocks",
         env = "ZONE_BATCH_INTERVAL_BLOCKS",
@@ -356,6 +365,26 @@ pub struct ZoneArgs {
         default_value_t = 5
     )]
     pub withdrawal_poll_interval_secs: u64,
+
+    /// Maximum gas reserved by one processWithdrawals transaction, up to 20,000,000. An oversized
+    /// withdrawal is submitted alone.
+    #[arg(
+        long = "withdrawal-max-batch-gas",
+        env = "WITHDRAWAL_MAX_BATCH_GAS",
+        default_value_t = DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new()
+            .range(1..=MAX_WITHDRAWAL_BATCH_GAS)
+    )]
+    pub withdrawal_max_batch_gas: u64,
+
+    /// Maximum number of ordered processWithdrawals transactions kept in flight.
+    #[arg(
+        long = "withdrawal-max-in-flight-batches",
+        env = "WITHDRAWAL_MAX_IN_FLIGHT_BATCHES",
+        default_value_t = DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub withdrawal_max_in_flight_batches: usize,
 
     /// Genesis Tempo L1 block number override.
     #[arg(long = "l1.genesis-block-number", env = "L1_GENESIS_BLOCK_NUMBER")]
@@ -415,12 +444,9 @@ fn prepend_log_filter(filter: &mut String, directives: &str) {
     }
 }
 
-fn sequencer_enabled(cli_flag: bool, manifest_role: Option<Role>) -> bool {
-    match manifest_role {
-        Some(Role::Leader) => true,
-        Some(Role::Follower) => false,
-        None => cli_flag,
-    }
+/// Whether the sequencer add-on is configured at boot.
+const fn sequencer_enabled(cli_flag: bool, manifest_mode: bool) -> bool {
+    manifest_mode || cli_flag
 }
 
 fn validate_l1_rpc_url(l1_rpc_url: &str) -> eyre::Result<()> {
@@ -435,14 +461,25 @@ fn validate_l1_rpc_url(l1_rpc_url: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+fn validate_portal_address(portal_address: Address) -> eyre::Result<()> {
+    eyre::ensure!(
+        !portal_address.is_zero(),
+        "--l1.portal-address must be nonzero"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io::Write as _, process::Command, thread, time::Duration};
 
     use clap::Parser as _;
 
-    use super::{ZoneArgs, ZoneCli, load_sequencer_signer, sequencer_enabled, validate_l1_rpc_url};
-    use zone_p2p::Role;
+    use super::{
+        ZoneArgs, ZoneCli, load_sequencer_signer, sequencer_enabled, validate_l1_rpc_url,
+        validate_portal_address,
+    };
+    use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
     #[derive(Debug, clap::Parser)]
     struct ZoneArgsParser {
@@ -462,6 +499,12 @@ mod tests {
     fn dev_is_parsed_by_the_top_level_cli() {
         let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
         assert!(matches!(parsed, ZoneCli::Dev(_)));
+    }
+
+    #[test]
+    fn portal_address_must_be_nonzero() {
+        assert!(validate_portal_address(alloy_primitives::Address::ZERO).is_err());
+        assert!(validate_portal_address(alloy_primitives::Address::repeat_byte(0x11)).is_ok());
     }
 
     #[test]
@@ -628,6 +671,46 @@ mod tests {
     }
 
     #[test]
+    fn zone_poll_interval_keeps_one_second_default_and_accepts_override() {
+        let common = [
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key",
+            "0x01",
+        ];
+
+        let default = ZoneArgsParser::try_parse_from(common).unwrap();
+        assert_eq!(default.zone.zone_poll_interval_secs, 1);
+
+        let overridden = ZoneArgsParser::try_parse_from(
+            common.into_iter().chain(["--zone.poll-interval-secs", "3"]),
+        )
+        .unwrap();
+        assert_eq!(overridden.zone.zone_poll_interval_secs, 3);
+    }
+
+    #[test]
+    fn withdrawal_batch_gas_rejects_values_above_the_safe_limit() {
+        let above_limit = (MAX_WITHDRAWAL_BATCH_GAS + 1).to_string();
+        let error = ZoneArgsParser::try_parse_from([
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key",
+            "0x01",
+            "--withdrawal-max-batch-gas",
+            &above_limit,
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn p2p_ip_check_bypass_is_explicit_and_requires_manifest_mode() {
         let common = [
             "tempo-zone",
@@ -664,11 +747,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_role_is_authoritative_for_sequencer_startup() {
-        assert!(sequencer_enabled(false, Some(Role::Leader)));
-        assert!(!sequencer_enabled(true, Some(Role::Follower)));
-        assert!(sequencer_enabled(true, None));
-        assert!(!sequencer_enabled(false, None));
+    fn manifest_mode_always_configures_sequencer_resources() {
+        // Followers must hold the complete leader construction so runtime promotion never
+        // requires a restart; activation is gated by the leadership schedule instead.
+        assert!(sequencer_enabled(false, true));
+        assert!(sequencer_enabled(true, true));
+        assert!(sequencer_enabled(true, false));
+        assert!(!sequencer_enabled(false, false));
     }
 
     #[test]

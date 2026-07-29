@@ -1,9 +1,9 @@
 //! L1 chain subscription and deposit extraction.
 //!
-//! Subscribes to L1 block headers and extracts deposit events from the
-//! ZonePortal contract for each block. Supports both WebSocket (subscription)
-//! and HTTP (polling) transports — the transport is auto-detected from the URL
-//! scheme.
+//! Uses L1 block notifications to follow the finalized chain and extracts
+//! deposit events from the ZonePortal contract for each finalized block.
+//! WebSocket connections use `newHeads`; HTTP connections use block-filter
+//! polling.
 //!
 //! The module is split into:
 //! - [`subscriber`] — the [`L1Subscriber`] background task and its config.
@@ -11,15 +11,15 @@
 //!   [`L1Deposit`]).
 //! - [`event`] — portal event types extracted per L1 block.
 //! - [`block`] — per-block deposit grouping and prepared payload types.
-//! - [`queue`] — the deposit hash-chain queue consumed by the engine.
+//! - [`queue`] — the finalized L1 block queue consumed by the engine.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use alloy_consensus::BlockHeader as _;
-use alloy_eips::NumHash;
+use alloy_eips::{BlockNumberOrTag, NumHash};
 use alloy_network::primitives::HeaderResponse as _;
-use alloy_primitives::{Address, B256, Bloom, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bloom, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::{BlockId, Log};
@@ -66,17 +66,12 @@ pub(crate) mod rpc {
     }
 }
 
-use crate::{
-    abi::{
-        EncryptedDeposit as AbiEncryptedDeposit,
-        EncryptedDepositPayload as AbiEncryptedDepositPayload, PORTAL_PENDING_SEQUENCER_SLOT,
-        PORTAL_SEQUENCER_SLOT,
-        ZonePortal::{
-            self, DepositMade, EncryptedDepositMade, SequencerTransferStarted,
-            SequencerTransferred, TokenEnabled, WithdrawalBounceBack, ZonePortalEvents,
-        },
+use crate::abi::{
+    EncryptedDeposit as AbiEncryptedDeposit, EncryptedDepositPayload as AbiEncryptedDepositPayload,
+    ZonePortal::{
+        DepositMade, EncryptedDepositMade, LeaderUpdated, TokenEnabled, WithdrawalBounceBack,
+        ZonePortalEvents,
     },
-    state::cache::L1StateCacheInner,
 };
 
 mod block;
@@ -90,17 +85,16 @@ mod tests;
 
 pub use block::{L1BlockDeposits, PreparedL1Block};
 pub use deposit::{Deposit, EncryptedDeposit, L1Deposit};
-pub use event::{EnabledToken, L1PortalEvents, L1SequencerEvent};
+pub use event::{EnabledToken, L1PortalEvents, LeaderTransition};
 pub use ext::{ChainTempoStateExt, TempoStateExt};
 pub use queue::DepositQueue;
 pub use state::L1StateCache;
-pub use subscriber::{L1Subscriber, L1SubscriberConfig};
-
-pub(crate) use event::EnqueueOutcome;
+pub use subscriber::{
+    L1BlockTracker, L1Subscriber, L1SubscriberConfig, LeadershipSink,
+    MAX_FOLLOWER_L1_LOOKAHEAD_BLOCKS,
+};
 
 #[cfg(test)]
 pub(crate) use queue::PendingDeposits;
 #[cfg(test)]
-pub(crate) use subscriber::{
-    LocalTempoCheckpointReader, apply_sequencer_events_to_cache, verify_receipts,
-};
+pub(crate) use subscriber::{LocalTempoCheckpointReader, verify_receipts};

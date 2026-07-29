@@ -1,18 +1,24 @@
 //! Anchor coordination and packed-storage compatibility shared by the zone EVM database adapter
 //! and the native `TempoState` precompile.
 
-use alloc::{rc::Rc, string::String};
+use alloc::{
+    rc::Rc,
+    string::{String, ToString},
+};
 use core::{cell::Cell, fmt};
 
 use alloy_primitives::{Address, B256, U256};
 use revm::{context::result::AnyError, precompile::PrecompileError};
-use tempo_precompiles::tip20::tip20_slots;
-use tempo_primitives::TempoAddressExt;
+use tempo_precompiles::{
+    error::TempoPrecompileError, zone_factory::ZonePortalStorage as ZonePortal,
+};
 use thiserror::Error;
+
+use crate::tempo_state::TempoState;
 
 pub(crate) use tempo_precompiles::storage::*;
 
-/// L1 storage access needed by the anchored Zone database and `TempoState` reads.
+/// L1 storage access needed by the anchored Zone database and native precompiles.
 pub trait L1StorageReader: Clone + Send + Sync + 'static {
     /// Read `account[slot]` at `block_number` on Tempo L1.
     fn read_l1_storage(
@@ -41,23 +47,26 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
 /// rejected. The Zone EVM resets the anchor after every transaction attempt, including failed and
 /// noncommitting simulations.
 ///
-/// Clones share the selected anchor and provider handle so the Zone database adapter and native
-/// `TempoState` precompile enforce one view of L1 state. A new `L1State` must be created for each
-/// EVM execution context; it must not be shared across independent EVMs.
+/// Clones share the selected anchor and provider handle so the Zone database adapter, `TempoState`,
+/// and other native precompiles enforce one view of L1 state. A new `L1State` must be created for
+/// each EVM execution context; it must not be shared across independent EVMs.
 #[derive(Clone)]
 pub struct L1State<P> {
     /// Tempo block number selected for the current transaction attempt.
     anchor: Rc<Cell<Option<u64>>>,
     /// Underlying cache/RPC-backed reader for storage at an explicit Tempo block number.
     provider: P,
+    /// ZonePortal read through the L1 provider by explicit storage operations.
+    portal_address: Address,
 }
 
 impl<P> L1State<P> {
-    /// Creates execution-local L1 state backed by `provider`.
-    pub fn new(provider: P) -> Self {
+    /// Creates execution-local L1 state backed by `provider` for `portal_address`.
+    pub fn new(provider: P, portal_address: Address) -> Self {
         Self {
             anchor: Rc::new(Cell::new(None)),
             provider,
+            portal_address,
         }
     }
 
@@ -69,6 +78,11 @@ impl<P> L1State<P> {
     /// Returns the anchor selected for the current transaction, if any.
     pub fn get_anchor(&self) -> Option<u64> {
         self.anchor.get()
+    }
+
+    /// Returns the configured ZonePortal address.
+    pub const fn portal(&self) -> Address {
+        self.portal_address
     }
 
     fn set_anchor(&self, new: u64) -> Result<(), L1StateError> {
@@ -109,18 +123,40 @@ impl<P: L1StorageReader> L1State<P> {
         self.set_anchor(block_number)?;
         self.provider.read_l1_storage(account, slot, block_number)
     }
+
+    /// Reads and decodes a typed slot from an L1 account at the active anchor.
+    pub fn read_l1<T: Storable>(&self, slot: &Slot<T>) -> tempo_precompiles::Result<T> {
+        let storage = L1Storage {
+            l1: self,
+            account: slot.address(),
+        };
+        T::load(&storage, slot.slot(), slot.ctx())
+    }
+
+    /// Selects and reads a typed slot from the configured ZonePortal at the active anchor.
+    ///
+    /// The callback only exposes the portal for selecting a handler; the selected value is always
+    /// resolved through [`Self::read_l1`] rather than the local EVM journal.
+    pub fn read_portal<T: Storable>(
+        &self,
+        select_slot: impl for<'a> FnOnce(&'a ZonePortal) -> &'a Slot<T>,
+    ) -> tempo_precompiles::Result<T> {
+        let portal = ZonePortal::new(self.portal_address);
+        self.read_l1(select_slot(&portal))
+    }
 }
 
 impl<P> fmt::Debug for L1State<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("L1State")
             .field("anchor", &self.get_anchor())
+            .field("portal_address", &self.portal_address)
             .finish_non_exhaustive()
     }
 }
 
 /// Failure to read or advance execution-local Tempo L1 state.
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum L1StateError {
     /// The underlying L1 provider could not resolve storage at the requested block.
     #[error(
@@ -167,17 +203,35 @@ impl From<L1StateError> for PrecompileError {
     }
 }
 
-/// Returns whether this is the packed TIP-20 transfer-policy slot.
-pub fn is_tip20_policy_id_slot(address: Address, key: U256) -> bool {
-    address.is_tip20() && key == tip20_slots::TRANSFER_POLICY_ID
+/// Read-only [`StorageOps`] adapter for one L1 account.
+///
+/// This lets typed precompile storage handlers decode L1 slots without inserting the fetched
+/// values into the EVM journal. Reads use the transaction's selected anchor, falling back to the
+/// checkpoint stored in [`TempoState`] on the first read; writes are always rejected.
+struct L1Storage<'a, P> {
+    /// Execution-local provider and anchor coordination shared by all L1 reads.
+    l1: &'a L1State<P>,
+    /// L1 account whose storage slots are exposed through [`StorageOps`].
+    account: Address,
 }
 
-/// Replaces the L1-owned transfer-policy field while preserving Zone-local packed fields.
-pub fn merge_transfer_policy_id(local_slot: U256, l1_slot: U256) -> U256 {
-    let offset_bits = tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8;
-    let field_bits = core::mem::size_of::<u64>() * 8;
-    let field_mask = ((U256::ONE << field_bits) - U256::ONE) << offset_bits;
-    (local_slot & !field_mask) | (l1_slot & field_mask)
+impl<P: L1StorageReader> StorageOps for L1Storage<'_, P> {
+    fn load(&self, slot: U256) -> tempo_precompiles::Result<U256> {
+        let anchor = match self.l1.get_anchor() {
+            Some(anchor) => anchor,
+            None => TempoState::new().tempo_block_number.read()?,
+        };
+        self.l1
+            .read_l1_storage(self.account, slot.into(), anchor)
+            .map(Into::into)
+            .map_err(|err| TempoPrecompileError::Fatal(err.to_string()))
+    }
+
+    fn store(&mut self, _slot: U256, _value: U256) -> tempo_precompiles::Result<()> {
+        Err(TempoPrecompileError::Fatal(
+            "L1 storage is read-only".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -191,14 +245,14 @@ mod tests {
 
     #[test]
     fn l1_state_rejects_advance_after_parent_read() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         read(&l1, 10).unwrap();
         assert!(l1.advance_anchor(10, 11).is_err());
     }
 
     #[test]
     fn l1_state_accepts_reads_at_advanced_anchor() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         l1.advance_anchor(10, 11).unwrap();
         read(&l1, 11).unwrap();
         assert_eq!(l1.get_anchor(), Some(11));
@@ -206,7 +260,7 @@ mod tests {
 
     #[test]
     fn l1_state_clones_reject_reads_at_different_anchors() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         let clone = l1.clone();
         read(&l1, 10).unwrap();
         assert!(read(&clone, 11).is_err());
@@ -214,21 +268,21 @@ mod tests {
 
     #[test]
     fn l1_state_rejects_duplicate_advance() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         l1.advance_anchor(10, 11).unwrap();
         assert!(l1.advance_anchor(11, 12).is_err());
     }
 
     #[test]
     fn l1_state_rejects_non_contiguous_advance() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         assert!(l1.advance_anchor(10, 12).is_err());
         assert_eq!(l1.get_anchor(), None);
     }
 
     #[test]
     fn l1_state_reset_allows_a_new_anchor() {
-        let l1 = L1State::new(MockL1Reader::default());
+        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         read(&l1, 10).unwrap();
         l1.reset_anchor();
         l1.advance_anchor(10, 11).unwrap();

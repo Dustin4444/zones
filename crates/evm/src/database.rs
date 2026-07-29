@@ -17,7 +17,7 @@ use revm::{
 use thiserror::Error;
 use zone_precompiles::{
     TIP403_REGISTRY_ADDRESS,
-    storage::{self, L1State, L1StateError, L1StorageReader},
+    storage::{L1State, L1StateError, L1StorageReader},
     tempo_state::TEMPO_BLOCK_NUMBER_SLOT,
 };
 use zone_primitives::constants::TEMPO_STATE_ADDRESS;
@@ -31,10 +31,10 @@ pub struct L1OverlayDB<DB, L1> {
 
 impl<DB, L1> L1OverlayDB<DB, L1> {
     /// Creates an adapter around the caller-provided database.
-    pub fn new(inner: DB, l1: L1) -> Self {
+    pub fn new(inner: DB, l1: L1, portal_address: Address) -> Self {
         Self {
             inner,
-            l1: L1State::new(l1),
+            l1: L1State::new(l1, portal_address),
         }
     }
 
@@ -73,6 +73,92 @@ impl<DB: fmt::Debug, L1> fmt::Debug for L1OverlayDB<DB, L1> {
     }
 }
 
+impl<DB: Database, L1: L1StorageReader> L1OverlayDB<DB, L1> {
+    fn anchor(&mut self) -> Result<u64, ZoneDbError<DB::Error>> {
+        if let Some(anchor) = self.l1.get_anchor() {
+            return Ok(anchor);
+        }
+
+        let value = self
+            .inner
+            .storage(TEMPO_STATE_ADDRESS, TEMPO_BLOCK_NUMBER_SLOT)
+            .map_err(ZoneDbError::Inner)?;
+        let anchor = u64::try_from(value).map_err(|_| ZoneDbError::AnchorOverflow(value))?;
+        Ok(anchor)
+    }
+
+    fn l1_storage(
+        &self,
+        address: Address,
+        slot: U256,
+        anchor: u64,
+    ) -> Result<U256, ZoneDbError<DB::Error>> {
+        self.l1
+            .read_l1_storage(address, B256::from(slot), anchor)
+            .map(Into::into)
+            .map_err(ZoneDbError::L1State)
+    }
+
+    /// Rejects writes to the L1-mirrored TIP-403 registry.
+    pub fn sanitize_state(
+        &mut self,
+        state: &mut AddressMap<Account>,
+    ) -> Result<(), ZoneDbError<DB::Error>> {
+        if let Some(account) = state.get(&TIP403_REGISTRY_ADDRESS) {
+            if account.info != account.original_info() {
+                return Err(ZoneDbError::L1Write {
+                    address: TIP403_REGISTRY_ADDRESS,
+                    slot: U256::ZERO,
+                });
+            }
+            for (slot, value) in &account.storage {
+                if value.is_changed() {
+                    return Err(ZoneDbError::L1Write {
+                        address: TIP403_REGISTRY_ADDRESS,
+                        slot: *slot,
+                    });
+                }
+            }
+            // A read-only overlay has identical original and present values, so it is not changed
+            // above, but committing the touched account could still persist that L1 value locally.
+            // Since every registry slot is mirrored and writes were rejected, drop the transition.
+            state.remove(&TIP403_REGISTRY_ADDRESS);
+        }
+
+        Ok(())
+    }
+}
+
+impl<DB: Database, L1: L1StorageReader> RevmDatabase for L1OverlayDB<DB, L1> {
+    type Error = ZoneDbError<DB::Error>;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.inner.basic(address).map_err(ZoneDbError::Inner)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.inner
+            .code_by_hash(code_hash)
+            .map_err(ZoneDbError::Inner)
+    }
+
+    fn storage(&mut self, address: Address, slot: StorageKey) -> Result<StorageValue, Self::Error> {
+        if address != TIP403_REGISTRY_ADDRESS {
+            return self
+                .inner
+                .storage(address, slot)
+                .map_err(ZoneDbError::Inner);
+        }
+
+        let anchor = self.anchor()?;
+        self.l1_storage(address, slot, anchor)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.inner.block_hash(number).map_err(ZoneDbError::Inner)
+    }
+}
+
 /// Database error produced by [`L1OverlayDB`].
 #[derive(Debug, Error)]
 pub enum ZoneDbError<E> {
@@ -101,124 +187,6 @@ impl<E: DBErrorMarker> ZoneDbError<E> {
     }
 }
 
-impl<DB: Database, L1: L1StorageReader> L1OverlayDB<DB, L1> {
-    fn anchor(&mut self) -> Result<u64, ZoneDbError<DB::Error>> {
-        if let Some(anchor) = self.l1.get_anchor() {
-            return Ok(anchor);
-        }
-
-        let value = self
-            .inner
-            .storage(TEMPO_STATE_ADDRESS, TEMPO_BLOCK_NUMBER_SLOT)
-            .map_err(ZoneDbError::Inner)?;
-        let anchor = u64::try_from(value).map_err(|_| ZoneDbError::AnchorOverflow(value))?;
-        Ok(anchor)
-    }
-
-    fn l1_storage(
-        &self,
-        address: Address,
-        slot: U256,
-        anchor: u64,
-    ) -> Result<U256, ZoneDbError<DB::Error>> {
-        self.l1
-            .read_l1_storage(address, B256::from(slot), anchor)
-            .map(Into::into)
-            .map_err(ZoneDbError::L1State)
-    }
-
-    /// Rejects writes to the L1-mirrored slots and removes the mirrored field from packed TIP-20 transitions.
-    pub fn sanitize_state(
-        &mut self,
-        state: &mut AddressMap<Account>,
-    ) -> Result<(), ZoneDbError<DB::Error>> {
-        if let Some(account) = state.get(&TIP403_REGISTRY_ADDRESS) {
-            if account.info != account.original_info() {
-                return Err(ZoneDbError::L1Write {
-                    address: TIP403_REGISTRY_ADDRESS,
-                    slot: U256::ZERO,
-                });
-            }
-            for (slot, value) in &account.storage {
-                if value.is_changed() {
-                    return Err(ZoneDbError::L1Write {
-                        address: TIP403_REGISTRY_ADDRESS,
-                        slot: *slot,
-                    });
-                }
-            }
-            // A read-only overlay has identical original and present values, so it is not changed
-            // above, but committing the touched account could still persist that L1 value locally.
-            // Since every registry slot is mirrored and writes were rejected, drop the transition.
-            state.remove(&TIP403_REGISTRY_ADDRESS);
-        }
-
-        // TODO(rusowsky): remove once TIP-1092 is implemented
-        for (address, account) in state {
-            for (slot, value) in &mut account.storage {
-                if !storage::is_tip20_policy_id_slot(*address, *slot) {
-                    continue;
-                }
-
-                if storage::merge_transfer_policy_id(U256::ZERO, value.present_value)
-                    != storage::merge_transfer_policy_id(U256::ZERO, value.original_value)
-                {
-                    return Err(ZoneDbError::L1Write {
-                        address: *address,
-                        slot: *slot,
-                    });
-                }
-
-                let local = self
-                    .inner
-                    .storage(*address, *slot)
-                    .map_err(ZoneDbError::Inner)?;
-                value.original_value =
-                    storage::merge_transfer_policy_id(value.original_value, local);
-                value.present_value = storage::merge_transfer_policy_id(value.present_value, local);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<DB: Database, L1: L1StorageReader> RevmDatabase for L1OverlayDB<DB, L1> {
-    type Error = ZoneDbError<DB::Error>;
-
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.inner.basic(address).map_err(ZoneDbError::Inner)
-    }
-
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.inner
-            .code_by_hash(code_hash)
-            .map_err(ZoneDbError::Inner)
-    }
-
-    fn storage(&mut self, address: Address, slot: StorageKey) -> Result<StorageValue, Self::Error> {
-        let local = self
-            .inner
-            .storage(address, slot)
-            .map_err(ZoneDbError::Inner)?;
-        if address != TIP403_REGISTRY_ADDRESS && !storage::is_tip20_policy_id_slot(address, slot) {
-            return Ok(local);
-        }
-
-        let anchor = self.anchor()?;
-        let l1 = self.l1_storage(address, slot, anchor)?;
-
-        if storage::is_tip20_policy_id_slot(address, slot) {
-            Ok(storage::merge_transfer_policy_id(local, l1))
-        } else {
-            Ok(l1)
-        }
-    }
-
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        self.inner.block_hash(number).map_err(ZoneDbError::Inner)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +195,6 @@ mod tests {
         database_interface::DatabaseCommit,
         state::EvmStorageSlot,
     };
-    use tempo_precompiles::{PATH_USD_ADDRESS, tip20::tip20_slots};
     use zone_precompiles::test_utils::MockL1Reader as TestL1;
 
     fn test_db(anchor: u64) -> CacheDB<EmptyDB> {
@@ -249,7 +216,7 @@ mod tests {
         let l1 = TestL1::default();
         l1.insert(TIP403_REGISTRY_ADDRESS, slot, anchor - 1, U256::from(98));
         l1.insert(TIP403_REGISTRY_ADDRESS, slot, anchor, expected);
-        let mut db = L1OverlayDB::new(test_db(anchor), l1);
+        let mut db = L1OverlayDB::new(test_db(anchor), l1, Address::ZERO);
 
         assert_eq!(db.storage(TIP403_REGISTRY_ADDRESS, slot).unwrap(), expected);
         assert_eq!(db.l1_state().get_anchor(), Some(anchor));
@@ -259,7 +226,8 @@ mod tests {
     fn l1_failures_and_read_before_advance_fail_closed() {
         let anchor = 42;
         let slot = U256::from(7);
-        let mut failing = L1OverlayDB::new(test_db(anchor), TestL1::failing_storage());
+        let mut failing =
+            L1OverlayDB::new(test_db(anchor), TestL1::failing_storage(), Address::ZERO);
         assert!(matches!(
             failing.storage(TIP403_REGISTRY_ADDRESS, slot),
             Err(ZoneDbError::L1State(L1StateError::StorageUnavailable {
@@ -270,7 +238,7 @@ mod tests {
 
         let reader = TestL1::default();
         reader.insert(TIP403_REGISTRY_ADDRESS, slot, anchor, U256::ONE);
-        let mut db = L1OverlayDB::new(test_db(anchor), reader.clone());
+        let mut db = L1OverlayDB::new(test_db(anchor), reader.clone(), Address::ZERO);
         let l1 = db.l1_state().clone();
         assert_eq!(
             db.storage(TIP403_REGISTRY_ADDRESS, slot).unwrap(),
@@ -290,7 +258,7 @@ mod tests {
         inner
             .insert_account_storage(TIP403_REGISTRY_ADDRESS, slot, local)
             .unwrap();
-        let mut db = L1OverlayDB::new(inner, l1);
+        let mut db = L1OverlayDB::new(inner, l1, Address::ZERO);
         let observed = db.storage(TIP403_REGISTRY_ADDRESS, slot).unwrap();
         assert_eq!(observed, l1_value);
 
@@ -315,77 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn packed_policy_field_is_removed_from_canonical_transition() {
-        let (anchor, token, slot) = (42, PATH_USD_ADDRESS, tip20_slots::TRANSFER_POLICY_ID);
-        let offset = tempo_precompiles::tip20::tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8;
-        let local = storage::merge_transfer_policy_id(U256::from(10), U256::from(2) << offset);
-        let l1_value = U256::from(99) << offset;
-        let l1 = TestL1::default();
-        l1.insert(token, slot, anchor, l1_value);
-        let mut inner = test_db(anchor);
-        inner.insert_account_storage(token, slot, local).unwrap();
-        let mut db = L1OverlayDB::new(inner, l1);
-        let observed = db.storage(token, slot).unwrap();
-
-        let mut state = AddressMap::default();
-        let mut account = Account::default();
-        account.storage.insert(
-            slot,
-            EvmStorageSlot {
-                original_value: observed,
-                present_value: observed + U256::ONE,
-                ..Default::default()
-            },
-        );
-        state.insert(token, account);
-        db.sanitize_state(&mut state).unwrap();
-
-        let sanitized = state[&token].storage[&slot].present_value;
-        assert_eq!(
-            storage::merge_transfer_policy_id(U256::ZERO, sanitized),
-            storage::merge_transfer_policy_id(U256::ZERO, local)
-        );
-        assert_eq!(sanitized & U256::from(u64::MAX), U256::from(11));
-    }
-
-    #[test]
-    fn packed_policy_field_write_is_rejected() {
-        let (anchor, token, slot) = (42, PATH_USD_ADDRESS, tip20_slots::TRANSFER_POLICY_ID);
-        let offset = tip20_slots::TRANSFER_POLICY_ID_OFFSET * 8;
-        let l1 = TestL1::default();
-        l1.insert(token, slot, anchor, U256::from(99) << offset);
-        let mut db = L1OverlayDB::new(test_db(anchor), l1);
-        let observed = db.storage(token, slot).unwrap();
-
-        let mut account = Account::default();
-        account.storage.insert(
-            slot,
-            EvmStorageSlot {
-                original_value: observed,
-                present_value: storage::merge_transfer_policy_id(
-                    observed,
-                    U256::from(100) << offset,
-                ),
-                ..Default::default()
-            },
-        );
-        let mut state = AddressMap::from_iter([(token, account)]);
-
-        assert!(matches!(
-            db.sanitize_state(&mut state),
-            Err(ZoneDbError::L1Write { address, slot: written_slot })
-                if address == token && written_slot == slot
-        ));
-    }
-
-    #[test]
     fn transaction_reset_clears_anchor() {
-        let (anchor, token, slot) = (42, PATH_USD_ADDRESS, tip20_slots::TRANSFER_POLICY_ID);
+        let (anchor, slot) = (42, U256::from(7));
         let l1 = TestL1::default();
-        l1.insert(token, slot, anchor, U256::from(7));
-        let mut db = L1OverlayDB::new(test_db(anchor), l1);
+        l1.insert(TIP403_REGISTRY_ADDRESS, slot, anchor, U256::from(7));
+        let mut db = L1OverlayDB::new(test_db(anchor), l1, Address::ZERO);
 
-        db.storage(token, slot).unwrap();
+        db.storage(TIP403_REGISTRY_ADDRESS, slot).unwrap();
         assert_eq!(db.l1_state().get_anchor(), Some(anchor));
 
         db.reset_transaction_state();
@@ -400,7 +304,7 @@ mod tests {
         let value = U256::from(5);
         let mut inner = test_db(1);
         inner.insert_account_storage(address, slot, value).unwrap();
-        let mut db = L1OverlayDB::new(inner, TestL1::default());
+        let mut db = L1OverlayDB::new(inner, TestL1::default(), Address::ZERO);
 
         assert_eq!(db.storage(address, slot).unwrap(), value);
         let mut inner: CacheDB<EmptyDB> = db.into_inner();

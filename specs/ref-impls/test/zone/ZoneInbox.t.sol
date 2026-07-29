@@ -13,14 +13,16 @@ import {
     EncryptedDepositPayload,
     IAesGcmDecrypt,
     IChaumPedersenVerify,
-    ITIP20ZoneFactory,
     IZoneConfig,
     IZoneInbox,
     IZoneOutbox,
+    IZonePortal,
+    IZoneToken,
+    PORTAL_ACCESS_MODE_SLOT,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
+    PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
-    TIP20_FACTORY_ADDRESS,
     ZONE_OUTBOX
 } from "../../src/interfaces/IZone.sol";
 import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
@@ -48,6 +50,14 @@ contract ZoneInboxHarness is ZoneInbox {
 
 }
 
+contract RefundCallForwarder {
+
+    function refunds(address inbox, address token, address owner) external view returns (uint128) {
+        return IZoneInbox(inbox).refunds(token, owner);
+    }
+
+}
+
 /// @title ZoneInboxTest
 /// @notice Tests for ZoneInbox covering edge cases
 contract ZoneInboxTest is Test {
@@ -71,8 +81,14 @@ contract ZoneInboxTest is Test {
             new MockTempoState(sequencer, GENESIS_TEMPO_BLOCK_HASH, GENESIS_TEMPO_BLOCK_NUMBER);
         config = new ZoneConfig(mockPortal, address(tempoState));
         tempoState.setMockStorageValue(
-            mockPortal, bytes32(uint256(0)), bytes32(uint256(uint160(sequencer)))
+            mockPortal,
+            keccak256(abi.encode(sequencer, PORTAL_IS_SEQUENCER_SLOT)),
+            bytes32(uint256(1))
         );
+        tempoState.setMockStorageValue(mockPortal, PORTAL_ACCESS_MODE_SLOT, bytes32(uint256(1)));
+        tempoState.setMockAccountAllowed(mockPortal, alice, true);
+        tempoState.setMockAccountAllowed(mockPortal, bob, true);
+        tempoState.setMockAccountAllowed(mockPortal, address(0x500), true);
         inbox = new ZoneInbox(address(config), mockPortal, address(tempoState));
         vm.etch(ZONE_OUTBOX, hex"00");
 
@@ -115,6 +131,13 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         _advanceTempo(deposits);
 
+        // Any additional active member has the same authority.
+        tempoState.setMockStorageValue(
+            mockPortal, keccak256(abi.encode(alice, PORTAL_IS_SEQUENCER_SLOT)), bytes32(uint256(1))
+        );
+        vm.prank(alice);
+        _advanceTempo(deposits);
+
         // State should remain at bytes32(0)
         assertEq(inbox.processedDepositQueueHash(), bytes32(0));
     }
@@ -126,7 +149,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 1000e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("payment")
         });
 
@@ -151,7 +174,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: alice,
             amount: 100e6,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             memo: bytes32("d1")
         });
         deposits[1] = Deposit({
@@ -159,7 +182,7 @@ contract ZoneInboxTest is Test {
             sender: bob,
             to: bob,
             amount: 200e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d2")
         });
         deposits[2] = Deposit({
@@ -167,7 +190,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 300e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d3")
         });
 
@@ -199,7 +222,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 1000e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("payment")
         });
 
@@ -226,7 +249,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: alice,
             amount: 100e6,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             memo: bytes32("d1")
         });
         allDeposits[1] = Deposit({
@@ -234,7 +257,7 @@ contract ZoneInboxTest is Test {
             sender: bob,
             to: bob,
             amount: 200e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d2")
         });
 
@@ -300,7 +323,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: alice,
             amount: 100e6,
-            bouncebackRecipient: alice,
+            tempoRefundRecipient: alice,
             memo: bytes32("d1")
         });
         batch1[1] = Deposit({
@@ -308,7 +331,7 @@ contract ZoneInboxTest is Test {
             sender: bob,
             to: bob,
             amount: 200e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d2")
         });
 
@@ -330,7 +353,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 500e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d3")
         });
 
@@ -357,7 +380,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 1000e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("payment")
         });
 
@@ -387,7 +410,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 1000e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("payment")
         });
 
@@ -416,7 +439,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 0,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("empty")
         });
 
@@ -458,7 +481,7 @@ contract ZoneInboxTest is Test {
                 sender: alice,
                 to: bob,
                 amount: uint128(i + 1) * 1e6,
-                bouncebackRecipient: bob,
+                tempoRefundRecipient: bob,
                 memo: bytes32(i)
             });
             currentHash = keccak256(abi.encode(DepositType.Regular, deposits[i], currentHash));
@@ -586,7 +609,7 @@ contract ZoneInboxTest is Test {
             token: address(zoneToken),
             sender: sender,
             amount: amount,
-            bouncebackRecipient: sender,
+            tempoRefundRecipient: sender,
             keyIndex: keyIndex,
             encrypted: EncryptedDepositPayload({
                 ephemeralPubkeyX: bytes32(uint256(0x1234)),
@@ -665,6 +688,31 @@ contract ZoneInboxTest is Test {
         assertEq(inbox.processedDepositQueueHash(), expectedHash);
     }
 
+    function test_advanceTempo_regularDeposit_allowsUnlistedRecipient() public {
+        address outsider = address(0x600);
+        assertFalse(config.isAllowedAccount(outsider));
+
+        Deposit[] memory deposits = new Deposit[](1);
+        deposits[0] = Deposit({
+            token: address(zoneToken),
+            sender: alice,
+            to: outsider,
+            amount: 1000e6,
+            tempoRefundRecipient: alice,
+            memo: bytes32("payment")
+        });
+        bytes32 expectedHash = keccak256(abi.encode(DepositType.Regular, deposits[0], bytes32(0)));
+        tempoState.setMockStorageValue(
+            mockPortal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, expectedHash
+        );
+
+        vm.prank(sequencer);
+        _advanceTempo(deposits);
+
+        assertEq(zoneToken.balanceOf(outsider), 1000e6);
+        assertEq(inbox.processedDepositQueueHash(), expectedHash);
+    }
+
     function test_advanceTempo_encryptedDeposit_decryptionFails() public {
         uint128 amount = 1000e6;
 
@@ -731,7 +779,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 100e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d1")
         });
         QueuedDeposit memory qdRegular = QueuedDeposit({
@@ -798,7 +846,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: bob,
             amount: 100e6,
-            bouncebackRecipient: bob,
+            tempoRefundRecipient: bob,
             memo: bytes32("d1")
         });
         QueuedDeposit memory qd = QueuedDeposit({
@@ -1092,6 +1140,22 @@ contract ZoneInboxTest is Test {
         assertEq(zoneToken.balanceOf(alice), 0, "sender should get nothing (successful deposit)");
     }
 
+    function test_advanceTempo_encryptedDeposit_allowsUnlistedRecipient() public {
+        address outsider = address(0x600);
+        assertFalse(config.isAllowedAccount(outsider));
+
+        bytes memory plaintext =
+            EncryptedDepositLib.encodePlaintext(outsider, bytes32("secret memo"));
+        (QueuedDeposit[] memory deposits, DecryptionData[] memory decs) =
+            _setupEncryptedDepositWithPlaintext(plaintext, true);
+
+        vm.prank(sequencer);
+        inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
+
+        assertEq(zoneToken.balanceOf(outsider), 1000e6);
+        assertEq(zoneToken.balanceOf(alice), 0);
+    }
+
     function _advanceTempoQueued(
         QueuedDeposit[] memory deposits,
         DecryptionData[] memory decryptions,
@@ -1102,15 +1166,20 @@ contract ZoneInboxTest is Test {
         inbox.advanceTempo("", deposits, decryptions, enabledTokens);
     }
 
+    function _mockTokenActivation(address token) internal {
+        bytes32 issuerRole = keccak256("ISSUER_ROLE");
+        vm.mockCall(token, abi.encodeWithSelector(IZoneToken.initialize.selector), abi.encode());
+        vm.mockCall(
+            token, abi.encodeWithSelector(IZoneToken.ISSUER_ROLE.selector), abi.encode(issuerRole)
+        );
+        vm.mockCall(token, abi.encodeWithSelector(IZoneToken.grantRole.selector), abi.encode());
+    }
+
     /// @notice Advancing accepts an enabled token even if the portal has not enabled it.
     function test_advanceTempo_enabledTokenNotPortalEnabled_accepts() public {
         address token = address(0x777);
-        vm.etch(TIP20_FACTORY_ADDRESS, hex"00");
-        vm.mockCall(
-            TIP20_FACTORY_ADDRESS,
-            abi.encodeWithSelector(ITIP20ZoneFactory.enableToken.selector),
-            abi.encode()
-        );
+        vm.etch(token, hex"00");
+        _mockTokenActivation(token);
 
         EnabledToken[] memory enabledTokens = new EnabledToken[](1);
         enabledTokens[0] =
@@ -1123,12 +1192,8 @@ contract ZoneInboxTest is Test {
     /// @notice Advancing accepts duplicate enabled token entries.
     function test_advanceTempo_duplicateEnabledToken_accepts() public {
         address token = address(0x777);
-        vm.etch(TIP20_FACTORY_ADDRESS, hex"00");
-        vm.mockCall(
-            TIP20_FACTORY_ADDRESS,
-            abi.encodeWithSelector(ITIP20ZoneFactory.enableToken.selector),
-            abi.encode()
-        );
+        vm.etch(token, hex"00");
+        _mockTokenActivation(token);
 
         EnabledToken[] memory enabledTokens = new EnabledToken[](2);
         enabledTokens[0] =
@@ -1148,6 +1213,30 @@ contract ZoneInboxTest is Test {
         assertEq(zoneToken.balanceOf(alice), 0);
     }
 
+    function test_refunds_ownerCanRead() public {
+        vm.prank(bob);
+        assertEq(inbox.refunds(address(zoneToken), bob), 0);
+    }
+
+    function test_refunds_sequencerCanRead() public {
+        vm.prank(sequencer);
+        assertEq(inbox.refunds(address(zoneToken), bob), 0);
+    }
+
+    function test_refunds_nonOwnerReverts() public {
+        vm.prank(alice);
+        vm.expectRevert(IZoneInbox.Unauthorized.selector);
+        inbox.refunds(address(zoneToken), bob);
+    }
+
+    function test_refunds_forwardedReadReverts() public {
+        RefundCallForwarder forwarder = new RefundCallForwarder();
+
+        vm.prank(bob);
+        vm.expectRevert(IZoneInbox.Unauthorized.selector);
+        forwarder.refunds(address(inbox), address(zoneToken), bob);
+    }
+
     /// @notice Claiming pays a parked withdrawal bounce-back refund and clears it.
     function test_claimRefund_success() public {
         uint64 fallbackNonce = 1;
@@ -1164,7 +1253,7 @@ contract ZoneInboxTest is Test {
             sender: alice,
             to: address(uint160(fallbackNonce)),
             amount: 100e6,
-            bouncebackRecipient: address(0),
+            tempoRefundRecipient: address(0),
             memo: bytes32(0)
         });
         tempoState.setMockStorageValue(
@@ -1175,13 +1264,52 @@ contract ZoneInboxTest is Test {
 
         vm.prank(sequencer);
         _advanceTempo(deposits);
+        vm.prank(bob);
         assertEq(inbox.refunds(address(zoneToken), bob), 100e6);
 
         zoneToken.setMinter(address(inbox), true);
+        tempoState.setMockAccountAllowed(mockPortal, bob, false);
         vm.prank(bob);
         uint128 amount = inbox.claimRefund(address(zoneToken));
 
         assertEq(amount, 100e6);
+        vm.prank(bob);
+        assertEq(inbox.refunds(address(zoneToken), bob), 0);
+        assertEq(zoneToken.balanceOf(bob), 100e6);
+    }
+
+    function test_withdrawalBounceBack_mintsToUnlistedZoneFallbackRecipient() public {
+        uint64 fallbackNonce = 1;
+        vm.mockCall(
+            ZONE_OUTBOX,
+            abi.encodeWithSelector(IZoneOutbox.consumeFallbackRecipient.selector, fallbackNonce),
+            abi.encode(bob)
+        );
+        tempoState.setMockAccountAllowed(mockPortal, bob, false);
+
+        Deposit[] memory deposits = new Deposit[](1);
+        deposits[0] = Deposit({
+            token: address(zoneToken),
+            sender: alice,
+            to: address(uint160(fallbackNonce)),
+            amount: 100e6,
+            tempoRefundRecipient: address(0),
+            memo: bytes32(0)
+        });
+        tempoState.setMockStorageValue(
+            mockPortal,
+            PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+            keccak256(abi.encode(DepositType.Regular, deposits[0], bytes32(0)))
+        );
+
+        vm.prank(sequencer);
+        _advanceTempo(deposits);
+
+        assertEq(
+            inbox.processedDepositQueueHash(),
+            keccak256(abi.encode(DepositType.Regular, deposits[0], bytes32(0)))
+        );
+        vm.prank(bob);
         assertEq(inbox.refunds(address(zoneToken), bob), 0);
         assertEq(zoneToken.balanceOf(bob), 100e6);
     }
@@ -1213,7 +1341,7 @@ contract ZoneInboxTest is Test {
                 sender: alice,
                 to: bob,
                 amount: uint128((i + 1) * 10e6),
-                bouncebackRecipient: bob,
+                tempoRefundRecipient: bob,
                 memo: bytes32(i)
             });
             deposits[i] = QueuedDeposit({
@@ -1244,8 +1372,11 @@ contract ZoneInboxTest is Test {
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        uint256 parkedRefunds = inbox.refunds(address(zoneToken), bob)
-            + inbox.refunds(address(zoneToken), encryptedRecipient);
+        vm.prank(bob);
+        uint128 bobRefunds = inbox.refunds(address(zoneToken), bob);
+        vm.prank(encryptedRecipient);
+        uint128 encryptedRecipientRefunds = inbox.refunds(address(zoneToken), encryptedRecipient);
+        uint256 parkedRefunds = uint256(bobRefunds) + encryptedRecipientRefunds;
         assertEq(zoneToken.totalSupply() + parkedRefunds, netCredited);
     }
 

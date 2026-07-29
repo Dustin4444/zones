@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use alloy_consensus::BlockHeader;
 use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
@@ -19,9 +20,10 @@ use alloy_rpc_types_eth::{
     FilterId, TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
-use alloy_sol_types::{SolCall, SolEvent, SolEventInterface};
+use alloy_sol_types::SolCall;
 use eyre::WrapErr;
 use futures::StreamExt;
+use jsonrpsee::{RpcModule, types::ErrorObjectOwned};
 use reth_provider::CanonStateSubscriptions;
 use reth_rpc::{EthFilter, eth::filter::EthFilterError};
 use reth_rpc_builder::EthHandlers;
@@ -30,9 +32,10 @@ use reth_rpc_eth_api::{
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
 };
 use reth_rpc_eth_types::logs_utils;
+use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use tempo_alloy::{
     TempoNetwork,
-    rpc::{TempoHeaderResponse, TempoTransactionRequest},
+    rpc::{TempoCallBuilderExt as _, TempoHeaderResponse, TempoTransactionRequest},
 };
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::{
@@ -44,19 +47,206 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
+use zone_l1::TempoStateExt as _;
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
 use tempo_zone_contracts::{
-    DepositType, TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneInbox, ZonePortal,
+    TEMPO_STATE_ADDRESS, ZONE_CONFIG_ADDRESS, ZONE_TOKEN_ADDRESS, ZoneConfig, ZonePortal,
 };
+use zone_p2p::{LeadershipSchedule, ZoneManifest};
 use zone_rpc::{
     auth::AuthContext,
     types::{
-        AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, DepositKind, DepositState,
-        DepositStatusEntry, DepositStatusResponse, JsonRpcError, ZoneInfoResponse, internal,
+        ActiveLeaderInfo, AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, JsonRpcError,
+        LocalSequencerInfo, PeerTipInfo, SequencerInfoResponse, SequencerPeerInfo,
+        SequencerProgress, SequencerReadiness, SetLeaderResponse, ZoneInfoResponse, internal,
         raw_null, raw_zero, to_raw,
     },
 };
+
+use crate::{replication::PeerTipRegistry, role::SharedRoleStatus};
+
+/// Multi-sequencer handles for the sequencer RPC methods.
+///
+/// The RPC servers launch before the role controller, so the node installs this context
+/// through an [`std::sync::OnceLock`] indirection once the leadership machinery exists.
+#[derive(Debug)]
+pub struct SequencerRpcContext {
+    /// Shared finalized leadership schedule.
+    pub schedule: LeadershipSchedule,
+    /// Live role and promotion-readiness snapshot from the role controller.
+    pub status: SharedRoleStatus,
+    /// Hash-carrying peer tip evidence.
+    pub(crate) peer_tips: PeerTipRegistry,
+    /// Validated static topology manifest.
+    pub manifest: Arc<ZoneManifest>,
+    /// This node's individual secp256k1 address (the `setLeader` relayer identity).
+    pub local_secp256k1_address: Address,
+    /// This node's Ed25519 public key.
+    pub local_ed25519_public_key: zone_p2p::P2pPeerId,
+    /// Wallet-backed L1 provider signing with the individual key.
+    pub relayer: DynProvider<TempoNetwork>,
+}
+
+impl SequencerRpcContext {
+    /// Create the RPC context for a multi-sequencer node.
+    pub(crate) fn new(
+        schedule: LeadershipSchedule,
+        status: SharedRoleStatus,
+        peer_tips: PeerTipRegistry,
+        manifest: Arc<ZoneManifest>,
+        local_secp256k1_address: Address,
+        local_ed25519_public_key: zone_p2p::P2pPeerId,
+        relayer: DynProvider<TempoNetwork>,
+    ) -> Self {
+        Self {
+            schedule,
+            status,
+            peer_tips,
+            manifest,
+            local_secp256k1_address,
+            local_ed25519_public_key,
+            relayer,
+        }
+    }
+}
+
+/// Build the unauthenticated Zone extension installed on the node's public HTTP RPC.
+pub(crate) fn public_zone_rpc_module<P>(
+    portal_address: Address,
+    sequencer: Arc<std::sync::OnceLock<SequencerRpcContext>>,
+    provider: P,
+) -> Result<RpcModule<()>, jsonrpsee::core::RegisterMethodError>
+where
+    P: BlockNumReader + StateProviderFactory + Clone + Send + Sync + 'static,
+{
+    let mut module = RpcModule::new(());
+    let set_leader_sequencer = sequencer.clone();
+    module.register_async_method("zone_setLeader", move |params, _, _| {
+        let sequencer = set_leader_sequencer.clone();
+        async move {
+            let (target,) = params.parse::<(Address,)>()?;
+            set_leader(portal_address, sequencer.as_ref(), target)
+                .await
+                .map_err(public_rpc_error)
+        }
+    })?;
+    module.register_async_method("zone_getSequencerInfo", move |_, _, _| {
+        let sequencer = sequencer.clone();
+        let provider = provider.clone();
+        async move {
+            get_sequencer_info(portal_address, sequencer.as_ref(), &provider)
+                .map_err(public_rpc_error)
+        }
+    })?;
+    Ok(module)
+}
+
+fn public_rpc_error(error: JsonRpcError) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(error.code as i32, error.message, error.data)
+}
+
+fn get_sequencer_info<P>(
+    portal_address: Address,
+    sequencer: &std::sync::OnceLock<SequencerRpcContext>,
+    provider: &P,
+) -> Result<SequencerInfoResponse, JsonRpcError>
+where
+    P: BlockNumReader + StateProviderFactory,
+{
+    let Some(context) = sequencer.get() else {
+        // Single-sequencer (or not yet initialized) node: report the minimal view.
+        return Ok(SequencerInfoResponse {
+            mode: "single".to_owned(),
+            portal: portal_address,
+            local: None,
+            active_leader: None,
+            peers: Vec::new(),
+            progress: None,
+            readiness: None,
+        });
+    };
+
+    let status = context.status.lock().expect("poisoned").clone();
+    let latest = context.schedule.latest();
+    let active_leader = latest.as_ref().map(|record| {
+        let node = context.manifest.node_by_ed25519_public_key(&record.leader);
+        ActiveLeaderInfo {
+            name: node.map(|node| node.name().to_owned()),
+            sequencer_address: node
+                .map(|node| node.secp256k1_address())
+                .unwrap_or_default(),
+            p2p_public_key: record.leader.to_string(),
+            epoch: U64::from(record.epoch),
+            activation_tempo_block: U64::from(record.activation_tempo_block),
+        }
+    });
+
+    let tips: HashMap<_, _> = context
+        .peer_tips
+        .snapshot()
+        .into_iter()
+        .map(|(peer, tip, _)| (peer, tip))
+        .collect();
+    let peers = context
+        .manifest
+        .nodes()
+        .iter()
+        .map(|node| SequencerPeerInfo {
+            name: node.name().to_owned(),
+            sequencer_address: node.secp256k1_address(),
+            is_local: node.ed25519_public_key() == &context.local_ed25519_public_key,
+            tip: tips.get(node.ed25519_public_key()).map(|tip| PeerTipInfo {
+                zone_height: U64::from(tip.zone_height),
+                zone_hash: tip.zone_hash,
+                tempo_block_number: U64::from(tip.tempo_block_number),
+                tempo_block_hash: tip.tempo_block_hash,
+            }),
+        })
+        .collect();
+
+    let zone_height = provider.best_block_number().map_err(internal)?;
+    let tempo_block_number = provider
+        .latest()
+        .map_err(internal)?
+        .tempo_block_number()
+        .map_err(internal)?;
+
+    let local_node = context
+        .manifest
+        .node_by_ed25519_public_key(&context.local_ed25519_public_key);
+    Ok(SequencerInfoResponse {
+        mode: "multi".to_owned(),
+        portal: portal_address,
+        local: Some(LocalSequencerInfo {
+            name: local_node
+                .map(|node| node.name().to_owned())
+                .unwrap_or_default(),
+            sequencer_address: context.local_secp256k1_address,
+            p2p_public_key: context.local_ed25519_public_key.to_string(),
+            role: status.role.to_owned(),
+        }),
+        active_leader,
+        peers,
+        progress: Some(SequencerProgress {
+            zone_height: U64::from(zone_height),
+            tempo_block_number: U64::from(tempo_block_number),
+            latest_observed_leadership_epoch: context
+                .schedule
+                .latest_observed_epoch()
+                .map(U64::from),
+            locally_applied_leadership_epoch: context
+                .schedule
+                .locally_applied_epoch()
+                .map(U64::from),
+            pending_transitions: U64::from(context.schedule.pending_transitions() as u64),
+        }),
+        readiness: Some(SequencerReadiness {
+            ready_for_promotion: status.ready_for_promotion,
+            reasons: status.promotion_reasons,
+        }),
+    })
+}
 
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
@@ -244,58 +434,6 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         }
     }
 
-    async fn portal_deposits_for_block(
-        &self,
-        tempo_block_number: u64,
-    ) -> Result<Vec<PortalDepositRecord>, JsonRpcError> {
-        if self.config.zone_portal.is_zero() {
-            return Err(JsonRpcError::internal("zone portal not configured"));
-        }
-
-        let filter = Filter::new()
-            .address(self.config.zone_portal)
-            .from_block(tempo_block_number)
-            .to_block(tempo_block_number)
-            .event_signature(vec![
-                ZonePortal::DepositMade::SIGNATURE_HASH,
-                ZonePortal::EncryptedDepositMade::SIGNATURE_HASH,
-            ]);
-
-        let logs = self.l1_provider.get_logs(&filter).await.map_err(internal)?;
-        let mut deposits = Vec::with_capacity(logs.len());
-
-        for log in logs {
-            match ZonePortal::ZonePortalEvents::decode_log(&log.inner)
-                .map_err(internal)?
-                .data
-            {
-                ZonePortal::ZonePortalEvents::DepositMade(event) => {
-                    deposits.push(PortalDepositRecord::Regular {
-                        deposit_hash: event.newCurrentDepositQueueHash,
-                        sender: event.sender,
-                        recipient: event.to,
-                        bounceback_recipient: event.bouncebackRecipient,
-                        token: event.token,
-                        amount: event.netAmount,
-                        memo: event.memo,
-                    });
-                }
-                ZonePortal::ZonePortalEvents::EncryptedDepositMade(event) => {
-                    deposits.push(PortalDepositRecord::Encrypted {
-                        deposit_hash: event.newCurrentDepositQueueHash,
-                        sender: event.sender,
-                        bounceback_recipient: event.bouncebackRecipient,
-                        token: event.token,
-                        amount: event.netAmount,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        Ok(deposits)
-    }
-
     async fn zone_tokens(&self) -> Result<Vec<Address>, JsonRpcError> {
         if self.config.zone_portal.is_zero() {
             return Ok(vec![ZONE_TOKEN_ADDRESS]);
@@ -307,93 +445,53 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
             .map_err(internal)
     }
 
-    async fn zone_sequencer(&self) -> Result<Address, JsonRpcError> {
+    async fn zone_sequencers(&self) -> Result<Vec<Address>, JsonRpcError> {
+        let portal = ZonePortal::new(self.config.zone_portal, &self.l1_provider);
+        let count = portal.sequencerCount().call().await.map_err(internal)?;
+        let count = count.to::<usize>();
+        let mut sequencers = Vec::with_capacity(count);
+        for index in 0..count {
+            sequencers.push(
+                portal
+                    .sequencerAt(U256::from(index))
+                    .call()
+                    .await
+                    .map_err(internal)?,
+            );
+        }
+        Ok(sequencers)
+    }
+
+    async fn zone_is_access_enforced(&self) -> Result<bool, JsonRpcError> {
         if self.config.zone_portal.is_zero() {
-            return Ok(Address::ZERO);
+            return Ok(false);
         }
 
-        ZonePortal::new(self.config.zone_portal, &self.l1_provider)
-            .sequencer()
+        ZoneConfig::new(ZONE_CONFIG_ADDRESS, &self.zone_provider)
+            .isAccessEnforced()
             .call()
             .await
             .map_err(internal)
     }
 
-    async fn enforce_authorized(
+    async fn zone_is_gateway_open(&self) -> Result<bool, JsonRpcError> {
+        if self.config.zone_portal.is_zero() {
+            return Ok(true);
+        }
+
+        ZoneConfig::new(ZONE_CONFIG_ADDRESS, &self.zone_provider)
+            .isGatewayOpen()
+            .call()
+            .await
+            .map_err(internal)
+    }
+
+    fn enforce_authorized(
         &self,
         request: &mut TempoTransactionRequest,
         auth: &AuthContext,
     ) -> Result<(), JsonRpcError> {
-        let caller = auth.caller;
-        zone_rpc::policy::enforce_authorized(request, auth, async {
-            Ok(self.zone_sequencer().await? == caller)
-        })
-        .await
-    }
-
-    async fn terminal_event_for_deposit(
-        &self,
-        deposit_hash: B256,
-    ) -> Result<Option<TerminalDepositEvent>, JsonRpcError> {
-        let filter = Filter::new()
-            .address(ZONE_INBOX_ADDRESS)
-            .from_block(0)
-            .event_signature(vec![
-                ZoneInbox::DepositProcessed::SIGNATURE_HASH,
-                ZoneInbox::DepositFailed::SIGNATURE_HASH,
-                ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH,
-                ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH,
-                ZoneInbox::DepositRejected::SIGNATURE_HASH,
-            ])
-            .topic1(deposit_hash);
-
-        let logs = self
-            .zone_provider
-            .get_logs(&filter)
-            .await
-            .map_err(internal)?;
-        let Some(log) = logs.last() else {
-            return Ok(None);
-        };
-
-        let Some(signature) = log.topics().first().copied() else {
-            return Ok(None);
-        };
-
-        if signature == ZoneInbox::DepositProcessed::SIGNATURE_HASH {
-            ZoneInbox::DepositProcessed::decode_log(&log.inner).map_err(internal)?;
-            return Ok(Some(TerminalDepositEvent::RegularProcessed));
-        }
-
-        if signature == ZoneInbox::DepositFailed::SIGNATURE_HASH {
-            ZoneInbox::DepositFailed::decode_log(&log.inner).map_err(internal)?;
-            return Ok(Some(TerminalDepositEvent::RegularFailed));
-        }
-
-        if signature == ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH {
-            let event =
-                ZoneInbox::EncryptedDepositProcessed::decode_log(&log.inner).map_err(internal)?;
-            return Ok(Some(TerminalDepositEvent::EncryptedProcessed {
-                recipient: event.to,
-                memo: event.memo,
-            }));
-        }
-
-        if signature == ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH {
-            ZoneInbox::EncryptedDepositFailed::decode_log(&log.inner).map_err(internal)?;
-            return Ok(Some(TerminalDepositEvent::EncryptedFailed));
-        }
-
-        if signature == ZoneInbox::DepositRejected::SIGNATURE_HASH {
-            let event = ZoneInbox::DepositRejected::decode_log(&log.inner).map_err(internal)?;
-            return match event.depositType {
-                DepositType::Regular => Ok(Some(TerminalDepositEvent::RegularRejected)),
-                DepositType::Encrypted => Ok(Some(TerminalDepositEvent::EncryptedRejected)),
-                _ => Ok(None),
-            };
-        }
-
-        Ok(None)
+        zone_rpc::policy::enforce_authorized(request, auth)
     }
 }
 
@@ -454,7 +552,13 @@ where
     }
 
     fn coinbase(&self) -> BoxFut<'_> {
-        Box::pin(async move { to_raw(&self.zone_sequencer().await?) })
+        Box::pin(async move {
+            let header = EthBlocks::rpc_block_header(&self.eth.api, BlockId::latest())
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| JsonRpcError::internal("latest block not found"))?;
+            to_raw(&header.beneficiary())
+        })
     }
 
     fn gas_price(&self) -> BoxFut<'_> {
@@ -619,7 +723,7 @@ where
                 return Err(JsonRpcError::invalid_params("state overrides not allowed"));
             }
 
-            self.enforce_authorized(&mut request, &auth).await?;
+            self.enforce_authorized(&mut request, &auth)?;
 
             let result = EthCall::call(
                 &self.eth.api,
@@ -645,7 +749,7 @@ where
                 return Err(JsonRpcError::invalid_params("state overrides not allowed"));
             }
 
-            self.enforce_authorized(&mut request, &auth).await?;
+            self.enforce_authorized(&mut request, &auth)?;
 
             let result = EthCall::estimate_gas_at(
                 &self.eth.api,
@@ -690,7 +794,7 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            self.enforce_authorized(&mut request, &auth).await?;
+            self.enforce_authorized(&mut request, &auth)?;
 
             // Prefill the users request so the `fill_transaction` doesnt leak dynamic fee estimates via
             // missing fee fields.
@@ -900,7 +1004,9 @@ where
     fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
             let zone_tokens = self.zone_tokens().await?;
-            let sequencer = self.zone_sequencer().await?;
+            let sequencers = self.zone_sequencers().await?;
+            let is_access_enforced = self.zone_is_access_enforced().await?;
+            let is_gateway_open = self.zone_is_gateway_open().await?;
             let tempo_block_number = self
                 .tempo_state
                 .tempoBlockNumber()
@@ -909,8 +1015,10 @@ where
                 .map_err(internal)?;
             to_raw(&ZoneInfoResponse {
                 zone_id: U64::from(self.config.zone_id),
+                is_access_enforced,
+                is_gateway_open,
                 zone_tokens,
-                sequencer,
+                sequencers,
                 chain_id: U64::from(self.config.chain_id),
                 tempo_block_number: U64::from(tempo_block_number),
             })
@@ -934,177 +1042,87 @@ where
             to_raw(&key)
         })
     }
+}
 
-    fn zone_get_deposit_status(&self, tempo_block_number: u64, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let zone_processed_through = self
-                .tempo_state
-                .tempoBlockNumber()
-                .call()
-                .await
-                .map_err(internal)?;
-            let portal_deposits = self.portal_deposits_for_block(tempo_block_number).await?;
-
-            let mut deposits = Vec::new();
-            for deposit in portal_deposits {
-                match deposit {
-                    PortalDepositRecord::Regular {
-                        deposit_hash,
-                        sender,
-                        recipient,
-                        bounceback_recipient,
-                        token,
-                        amount,
-                        memo,
-                    } => {
-                        if sender != auth.caller
-                            && recipient != auth.caller
-                            && bounceback_recipient != auth.caller
-                        {
-                            continue;
-                        }
-
-                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
-                        let status = regular_deposit_status(terminal)?;
-
-                        deposits.push(DepositStatusEntry {
-                            deposit_hash,
-                            kind: DepositKind::Regular,
-                            token,
-                            sender,
-                            recipient: Some(recipient),
-                            amount: U256::from(amount),
-                            memo: Some(memo),
-                            status,
-                        });
-                    }
-                    PortalDepositRecord::Encrypted {
-                        deposit_hash,
-                        sender,
-                        bounceback_recipient,
-                        token,
-                        amount,
-                    } => {
-                        let terminal = self.terminal_event_for_deposit(deposit_hash).await?;
-
-                        let include = match (
-                            &terminal,
-                            sender == auth.caller || bounceback_recipient == auth.caller,
-                        ) {
-                            (_, true) => true,
-                            (
-                                Some(TerminalDepositEvent::EncryptedProcessed {
-                                    recipient, ..
-                                }),
-                                false,
-                            ) => *recipient == auth.caller,
-                            _ => false,
-                        };
-
-                        if !include {
-                            continue;
-                        }
-
-                        let (recipient, memo, status) = encrypted_deposit_details(terminal)?;
-
-                        deposits.push(DepositStatusEntry {
-                            deposit_hash,
-                            kind: DepositKind::Encrypted,
-                            token,
-                            sender,
-                            recipient,
-                            amount: U256::from(amount),
-                            memo,
-                            status,
-                        });
-                    }
-                }
-            }
-
-            let processed = zone_processed_through >= tempo_block_number
-                && deposits
-                    .iter()
-                    .all(|deposit| deposit.status != DepositState::Pending);
-
-            to_raw(&DepositStatusResponse {
-                tempo_block_number: U64::from(tempo_block_number),
-                zone_processed_through: U64::from(zone_processed_through),
-                processed,
-                deposits,
-            })
-        })
+async fn set_leader(
+    portal_address: Address,
+    sequencer: &std::sync::OnceLock<SequencerRpcContext>,
+    target: Address,
+) -> Result<SetLeaderResponse, JsonRpcError> {
+    let Some(context) = sequencer.get() else {
+        return Err(JsonRpcError::invalid_params(
+            "zone_setLeader requires multi-sequencer mode",
+        ));
+    };
+    if portal_address.is_zero() {
+        return Err(JsonRpcError::invalid_params(
+            "zone_setLeader requires a nonzero portal",
+        ));
     }
-}
 
-#[derive(Debug, Clone)]
-enum PortalDepositRecord {
-    Regular {
-        deposit_hash: B256,
-        sender: Address,
-        recipient: Address,
-        bounceback_recipient: Address,
-        token: Address,
-        amount: u128,
-        memo: B256,
-    },
-    Encrypted {
-        deposit_hash: B256,
-        sender: Address,
-        bounceback_recipient: Address,
-        token: Address,
-        amount: u128,
-    },
-}
+    // The public endpoint is intentionally unauthenticated. The transaction itself is still
+    // signed by this node's individual sequencer key, and the portal enforces relayer authority.
+    let portal = ZonePortal::new(portal_address, &context.relayer);
 
-#[derive(Debug, Clone)]
-enum TerminalDepositEvent {
-    RegularProcessed,
-    RegularFailed,
-    RegularRejected,
-    EncryptedProcessed { recipient: Address, memo: B256 },
-    EncryptedFailed,
-    EncryptedRejected,
-}
-
-fn regular_deposit_status(
-    terminal: Option<TerminalDepositEvent>,
-) -> Result<DepositState, JsonRpcError> {
-    match terminal {
-        Some(TerminalDepositEvent::RegularProcessed) => Ok(DepositState::Processed),
-        Some(TerminalDepositEvent::RegularFailed | TerminalDepositEvent::RegularRejected) => {
-            Ok(DepositState::Failed)
-        }
-        Some(TerminalDepositEvent::EncryptedProcessed { .. }) => Err(JsonRpcError::internal(
-            "encrypted deposit event matched regular deposit hash",
-        )),
-        Some(TerminalDepositEvent::EncryptedFailed | TerminalDepositEvent::EncryptedRejected) => {
-            Err(JsonRpcError::internal(
-                "encrypted deposit failure matched regular deposit hash",
-            ))
-        }
-        None => Ok(DepositState::Pending),
+    // The target must be a manifest member and a registered portal sequencer.
+    if context.manifest.node_by_secp256k1_address(target).is_none() {
+        return Err(JsonRpcError::invalid_params(
+            "target is not a manifest member",
+        ));
     }
-}
-
-fn encrypted_deposit_details(
-    terminal: Option<TerminalDepositEvent>,
-) -> Result<(Option<Address>, Option<B256>, DepositState), JsonRpcError> {
-    match terminal {
-        Some(TerminalDepositEvent::EncryptedProcessed { recipient, memo }) => {
-            Ok((Some(recipient), Some(memo), DepositState::Processed))
-        }
-        Some(TerminalDepositEvent::EncryptedFailed | TerminalDepositEvent::EncryptedRejected) => {
-            Ok((None, None, DepositState::Failed))
-        }
-        Some(
-            TerminalDepositEvent::RegularProcessed
-            | TerminalDepositEvent::RegularFailed
-            | TerminalDepositEvent::RegularRejected,
-        ) => Err(JsonRpcError::internal(
-            "regular deposit event matched encrypted deposit hash",
-        )),
-        None => Ok((None, None, DepositState::Pending)),
+    let is_sequencer = portal
+        .isSequencer(target)
+        .block(BlockId::finalized())
+        .call()
+        .await
+        .map_err(internal)?;
+    if !is_sequencer {
+        return Err(JsonRpcError::invalid_params(
+            "target is not a registered portal sequencer",
+        ));
     }
+
+    // Read the finalized epoch for the compare-and-set guard. A duplicate fanout to
+    // the already-active leader is answered without a transaction; races remain safe
+    // because same-target calls no-op on chain and the epoch guard rejects delayed
+    // stale calls.
+    let leader_call = portal.leader().block(BlockId::finalized());
+    let epoch_call = portal.leaderEpoch().block(BlockId::finalized());
+    let (leader, expected_epoch) =
+        tokio::try_join!(leader_call.call(), epoch_call.call()).map_err(internal)?;
+    if leader == target {
+        return Ok(SetLeaderResponse {
+            status: "alreadyActive".to_owned(),
+            tx_hash: None,
+            relayer: context.local_secp256k1_address,
+            requested_leader: target,
+        });
+    }
+
+    // Relay with the individual key on the reserved admin-operations nonce lane and
+    // return immediately: the node's role changes only when its finalized L1
+    // subscriber observes the resulting transition (I6).
+    let pending = portal
+        .setLeader(target, expected_epoch)
+        .nonce_key(zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY)
+        .send()
+        .await
+        .map_err(internal)?;
+    let tx_hash = *pending.tx_hash();
+    metrics::counter!("zone_set_leader_submissions_total", "result" => "submitted").increment(1);
+    tracing::info!(
+        target: "zone::rpc",
+        %target,
+        %tx_hash,
+        expected_epoch,
+        "Relayed setLeader to the ZonePortal"
+    );
+    Ok(SetLeaderResponse {
+        status: "submitted".to_owned(),
+        tx_hash: Some(tx_hash),
+        relayer: context.local_secp256k1_address,
+        requested_leader: target,
+    })
 }
 
 /// Clear RPC header fields that reveal private execution state from the header
@@ -1112,9 +1130,14 @@ fn redact_header(header: &mut TempoHeaderResponse) {
     header.inner.size = header.inner.size.map(|_| U256::ZERO);
     let inner = &mut header.inner.inner.inner;
     inner.gas_used = 0;
+    inner.state_root = B256::ZERO;
+    inner.transactions_root = B256::ZERO;
+    inner.receipts_root = B256::ZERO;
     inner.logs_bloom = Bloom::ZERO;
+    inner.extra_data = Bytes::new();
     inner.blob_gas_used = inner.blob_gas_used.map(|_| 0);
     inner.excess_blob_gas = inner.excess_blob_gas.map(|_| 0);
+    inner.withdrawals_root = inner.withdrawals_root.map(|_| B256::ZERO);
 }
 
 /// Clear gas related fields that leak the size (and therefore tx counts)
@@ -1179,54 +1202,38 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 mod tests {
     use super::*;
 
-    #[test]
-    fn regular_deposit_status_maps_terminal_events() {
-        assert_eq!(
-            regular_deposit_status(Some(TerminalDepositEvent::RegularProcessed)).unwrap(),
-            DepositState::Processed
-        );
-        assert_eq!(regular_deposit_status(None).unwrap(), DepositState::Pending);
-    }
+    #[tokio::test]
+    async fn public_rpc_module_exposes_sequencer_methods_without_auth() {
+        let module = public_zone_rpc_module(
+            Address::repeat_byte(0x11),
+            Arc::new(std::sync::OnceLock::new()),
+            Arc::new(reth_provider::test_utils::MockEthProvider::default()),
+        )
+        .expect("public zone RPC module should register");
 
-    #[test]
-    fn regular_deposit_status_rejects_encrypted_terminal_events() {
-        let err = regular_deposit_status(Some(TerminalDepositEvent::EncryptedFailed)).unwrap_err();
-        assert_eq!(
-            err.message,
-            "encrypted deposit failure matched regular deposit hash"
-        );
-    }
+        let methods = module.method_names().collect::<HashSet<_>>();
+        assert_eq!(methods.len(), 2);
+        assert!(methods.contains("zone_getSequencerInfo"));
+        assert!(methods.contains("zone_setLeader"));
 
-    #[test]
-    fn encrypted_deposit_details_maps_terminal_events() {
-        let recipient = Address::repeat_byte(0x11);
-        let memo = B256::from([0x22; 32]);
+        let info = module
+            .call::<_, SequencerInfoResponse>(
+                "zone_getSequencerInfo",
+                jsonrpsee::core::EmptyServerParams::new(),
+            )
+            .await
+            .expect("single-sequencer info should be available without authentication");
+        assert_eq!(info.mode, "single");
+        assert_eq!(info.portal, Address::repeat_byte(0x11));
 
-        assert_eq!(
-            encrypted_deposit_details(Some(TerminalDepositEvent::EncryptedProcessed {
-                recipient,
-                memo,
-            }))
-            .unwrap(),
-            (Some(recipient), Some(memo), DepositState::Processed)
-        );
-        assert_eq!(
-            encrypted_deposit_details(Some(TerminalDepositEvent::EncryptedFailed)).unwrap(),
-            (None, None, DepositState::Failed)
-        );
-        assert_eq!(
-            encrypted_deposit_details(None).unwrap(),
-            (None, None, DepositState::Pending)
-        );
-    }
-
-    #[test]
-    fn encrypted_deposit_details_rejects_regular_terminal_events() {
-        let err =
-            encrypted_deposit_details(Some(TerminalDepositEvent::RegularProcessed)).unwrap_err();
-        assert_eq!(
-            err.message,
-            "regular deposit event matched encrypted deposit hash"
+        let error = module
+            .call::<_, SetLeaderResponse>("zone_setLeader", [Address::repeat_byte(0x22)])
+            .await
+            .expect_err("an uninitialized sequencer context should reject the call");
+        assert!(
+            error
+                .to_string()
+                .contains("zone_setLeader requires multi-sequencer mode")
         );
     }
 
@@ -1336,9 +1343,14 @@ mod tests {
         assert_eq!(header.inner.size, Some(U256::ZERO));
         assert_eq!(header.timestamp_millis, 123_000);
         assert_eq!(inner.gas_used, 0);
+        assert_eq!(inner.state_root, B256::ZERO);
+        assert_eq!(inner.transactions_root, B256::ZERO);
+        assert_eq!(inner.receipts_root, B256::ZERO);
         assert_eq!(inner.logs_bloom, Bloom::ZERO);
+        assert!(inner.extra_data.is_empty());
         assert_eq!(inner.blob_gas_used, Some(0));
         assert_eq!(inner.excess_blob_gas, Some(0));
+        assert_eq!(inner.withdrawals_root, Some(B256::ZERO));
     }
 
     #[test]
