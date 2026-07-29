@@ -107,15 +107,15 @@ fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
     })
 }
 
-fn validate_zone_chain_id(zone_id: u32, l1_chain_id: u64, chain_id: u64) -> eyre::Result<()> {
+fn validate_zone_chain_id(zone_id: u32, parent_chain_id: u64, chain_id: u64) -> eyre::Result<()> {
     if zone_id == 0 {
         return Ok(());
     }
 
-    let expected = zone_primitives::constants::zone_chain_id_for_l1(l1_chain_id, zone_id);
+    let expected = zone_primitives::constants::zone_chain_id_for_parent(parent_chain_id, zone_id);
     if chain_id != expected {
         eyre::bail!(
-            "chain ID mismatch: zone.id={zone_id} on parent chain {l1_chain_id} requires \
+            "chain ID mismatch: zone.id={zone_id} on parent chain {parent_chain_id} requires \
              chain_id={expected}, but genesis has {chain_id}",
         );
     }

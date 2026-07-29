@@ -19,7 +19,7 @@ use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
 use tempo_zone_contracts::{
     ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
 };
-use zone_primitives::constants::zone_chain_id_for_l1;
+use zone_primitives::constants::zone_chain_id_for_parent;
 
 use crate::zone_utils::MODERATO_ZONE_FACTORY;
 
@@ -265,7 +265,7 @@ impl CreateZone {
 
         let zone_id = event.zoneId;
         let portal = event.portal;
-        let chain_id = zone_chain_id_for_l1(l1_chain_id, zone_id);
+        let chain_id = zone_chain_id_for_parent(l1_chain_id, zone_id);
 
         let portal_contract = ZonePortal::new(portal, &provider);
         if self.sequencers.len() > 1 {

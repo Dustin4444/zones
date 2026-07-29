@@ -167,8 +167,8 @@ pub const fn zone_chain_id_testnet(zone_id: u32) -> u64 {
 ///
 /// Presto zones use the mainnet range. Zones on Moderato and development
 /// parents use the disjoint testnet range.
-pub const fn zone_chain_id_for_l1(l1_chain_id: u64, zone_id: u32) -> u64 {
-    if l1_chain_id == TEMPO_MAINNET_CHAIN_ID {
+pub const fn zone_chain_id_for_parent(parent_chain_id: u64, zone_id: u32) -> u64 {
+    if parent_chain_id == TEMPO_MAINNET_CHAIN_ID {
         zone_chain_id(zone_id)
     } else {
         zone_chain_id_testnet(zone_id)
@@ -184,21 +184,24 @@ mod tests {
         let zone_id = 1;
 
         assert_eq!(
-            zone_chain_id_for_l1(TEMPO_MAINNET_CHAIN_ID, zone_id),
+            zone_chain_id_for_parent(TEMPO_MAINNET_CHAIN_ID, zone_id),
             zone_chain_id(zone_id)
         );
         assert_eq!(
-            zone_chain_id_for_l1(42_431, zone_id),
+            zone_chain_id_for_parent(42_431, zone_id),
             zone_chain_id_testnet(zone_id)
         );
         assert_ne!(
-            zone_chain_id_for_l1(TEMPO_MAINNET_CHAIN_ID, zone_id),
-            zone_chain_id_for_l1(42_431, zone_id)
+            zone_chain_id_for_parent(TEMPO_MAINNET_CHAIN_ID, zone_id),
+            zone_chain_id_for_parent(42_431, zone_id)
         );
     }
 
     #[test]
     fn development_parents_use_the_testnet_range() {
-        assert_eq!(zone_chain_id_for_l1(31_337, 1), zone_chain_id_testnet(1));
+        assert_eq!(
+            zone_chain_id_for_parent(31_337, 1),
+            zone_chain_id_testnet(1)
+        );
     }
 }
