@@ -191,47 +191,6 @@ contract ReentrantWithdrawalReceiver is IWithdrawalReceiver {
 
 }
 
-/// @dev Keeps the twelve-argument portal initializer encoder out of the already-large proxy test.
-contract ZonePortalInitializationForwarder {
-
-    function initialize(
-        address target,
-        uint32 id,
-        address initialToken,
-        address portalMessenger,
-        address portalAdmin,
-        address sequencer,
-        address portalVerifier
-    )
-        external
-    {
-        address[] memory accounts = new address[](2);
-        accounts[0] = portalAdmin;
-        accounts[1] = sequencer;
-        address[] memory gateways = new address[](1);
-        gateways[0] = portalMessenger;
-        address[] memory sequencers = new address[](1);
-        sequencers[0] = sequencer;
-
-        ZonePortal(target)
-            .initialize(
-                id,
-                initialToken,
-                true,
-                true,
-                accounts,
-                gateways,
-                portalMessenger,
-                portalAdmin,
-                sequencers,
-                1,
-                portalVerifier,
-                ""
-            );
-    }
-
-}
-
 contract ZonePortalProxyStorageTest is Test {
 
     function _emptyAddresses() internal pure returns (address[] memory values) {
@@ -297,8 +256,6 @@ contract ZonePortalProxyStorageTest is Test {
         );
         vm.etch(proxyA, runtime);
         vm.etch(proxyB, runtime);
-        ZonePortalInitializationForwarder forwarder = new ZonePortalInitializationForwarder();
-        vm.etch(ZONE_FACTORY_ADDRESS, address(forwarder).code);
 
         address messengerA = makeAddr("messenger A");
         address messengerB = makeAddr("messenger B");
@@ -430,15 +387,30 @@ contract ZonePortalProxyStorageTest is Test {
     )
         internal
     {
-        ZonePortalInitializationForwarder(ZONE_FACTORY_ADDRESS)
+        address portalAdmin = makeAddr(string.concat("admin ", vm.toString(id)));
+        address sequencer = makeAddr(string.concat("sequencer ", vm.toString(id)));
+        address[] memory accounts = new address[](2);
+        accounts[0] = portalAdmin;
+        accounts[1] = sequencer;
+        address[] memory gateways = new address[](1);
+        gateways[0] = portalMessenger;
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = sequencer;
+
+        ZonePortal(target)
             .initialize(
-                target,
                 id,
                 initialToken,
+                true,
+                true,
+                accounts,
+                gateways,
                 portalMessenger,
-                makeAddr(string.concat("admin ", vm.toString(id))),
-                makeAddr(string.concat("sequencer ", vm.toString(id))),
-                portalVerifier
+                portalAdmin,
+                sequencers,
+                1,
+                portalVerifier,
+                ""
             );
     }
 

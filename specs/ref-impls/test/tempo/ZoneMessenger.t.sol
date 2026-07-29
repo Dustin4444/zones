@@ -3,6 +3,7 @@ pragma solidity ^0.8.13;
 
 import {
     IWithdrawalReceiver,
+    IZoneFactory,
     IZonePortal,
     MAX_WITHDRAWAL_CALLBACK_GAS,
     Role,
@@ -14,21 +15,6 @@ import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
-
-contract MockZoneFactoryForMessenger {
-
-    mapping(uint32 => ZoneInfo) internal _zones;
-
-    function setPortal(uint32 zoneId, address portal) external {
-        _zones[zoneId].zoneId = zoneId;
-        _zones[zoneId].portal = portal;
-    }
-
-    function zones(uint32 id) external view returns (ZoneInfo memory) {
-        return _zones[id];
-    }
-
-}
 
 contract AcceptingWithdrawalReceiver is IWithdrawalReceiver {
 
@@ -134,7 +120,7 @@ contract ZoneMessengerTest is BaseTest {
     uint32 internal constant OTHER_ZONE_ID = 2;
     uint64 internal constant CALLBACK_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
 
-    MockZoneFactoryForMessenger public messengerFactory;
+    IZoneFactory public messengerFactory;
     ZoneMessenger public messenger;
     MockZoneToken public zoneToken;
 
@@ -144,10 +130,17 @@ contract ZoneMessengerTest is BaseTest {
 
     function setUp() public override {
         super.setUp();
-        vm.etch(ZONE_FACTORY_ADDRESS, type(MockZoneFactoryForMessenger).runtimeCode);
-        messengerFactory = MockZoneFactoryForMessenger(ZONE_FACTORY_ADDRESS);
-        messengerFactory.setPortal(ZONE_ID, portal);
-        messengerFactory.setPortal(OTHER_ZONE_ID, otherPortal);
+        messengerFactory = IZoneFactory(ZONE_FACTORY_ADDRESS);
+        vm.mockCall(
+            ZONE_FACTORY_ADDRESS,
+            abi.encodeWithSelector(IZoneFactory.zones.selector, ZONE_ID),
+            abi.encode(_zoneInfo(ZONE_ID, portal))
+        );
+        vm.mockCall(
+            ZONE_FACTORY_ADDRESS,
+            abi.encodeWithSelector(IZoneFactory.zones.selector, OTHER_ZONE_ID),
+            abi.encode(_zoneInfo(OTHER_ZONE_ID, otherPortal))
+        );
 
         vm.etch(ZONE_MESSENGER_ADDRESS, type(ZoneMessenger).runtimeCode);
         messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
@@ -156,6 +149,19 @@ contract ZoneMessengerTest is BaseTest {
         );
         zoneToken = new MockZoneToken("Zone USD", "zUSD");
         zoneToken.setMinter(address(this), true);
+    }
+
+    function _zoneInfo(
+        uint32 zoneId,
+        address zonePortal
+    )
+        internal
+        pure
+        returns (ZoneInfo memory info)
+    {
+        info.zoneId = zoneId;
+        info.portal = zonePortal;
+        info.sequencers = new address[](0);
     }
 
     function _mockTransfer(address target, uint128 amount, bool result) internal {
