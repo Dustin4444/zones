@@ -390,6 +390,7 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         vm.fee(0); // zero basefee => zero bounceback fee, so deposits never hit DepositTooSmall
 
         token = new MockZoneToken("Zone USD", "zUSD");
+        _mockTokenPolicyMigration(address(token), true);
 
         // Pre-fund actors with L1 balance to deposit.
         token.setMinter(address(this), true);

@@ -73,6 +73,7 @@ contract ZoneEncryptionKeyInvariantTest is BaseTest {
     function setUp() public override {
         super.setUp();
         token = new MockZoneToken("Zone USD", "zUSD");
+        _mockTokenPolicyMigration(address(token), true);
 
         address[] memory sequencers = new address[](1);
         sequencers[0] = SEQ;

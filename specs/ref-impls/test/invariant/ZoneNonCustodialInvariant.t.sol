@@ -201,6 +201,7 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
         vm.fee(0);
 
         token = new MockZoneToken("Zone USD", "zUSD");
+        _mockTokenPolicyMigration(address(token), true);
 
         token.setMinter(address(this), true);
         token.mint(alice, 1_000_000e6);

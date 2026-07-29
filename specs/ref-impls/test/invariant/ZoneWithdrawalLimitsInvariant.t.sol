@@ -153,14 +153,14 @@ contract ZoneWithdrawalLimitsHandler is Test {
         }
     }
 
-    /// @notice Finalize part of the queue so the active range advances (head moves).
-    function finalize(uint256 countSeed) external {
+    /// @notice Finalize the pending queue so the active range advances (head moves).
+    function finalize(uint256) external {
+        vm.prank(sequencer);
         uint256 pending = outbox.pendingWithdrawalsCount();
         if (pending == 0) return;
-        uint256 count = bound(countSeed, 0, pending);
-        bytes[] memory encryptedSenders = new bytes[](count);
+        bytes[] memory encryptedSenders = new bytes[](pending);
         vm.prank(sequencer);
-        outbox.finalizeWithdrawalBatch(count, uint64(block.number), encryptedSenders);
+        outbox.finalizeWithdrawalBatch(pending, uint64(block.number), encryptedSenders);
     }
 
 }
