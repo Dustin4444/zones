@@ -7,16 +7,16 @@ import {
     DepositType,
     EnabledToken,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
-    PORTAL_SEQUENCER_SLOT,
+    PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
+    ZONE_MESSENGER_ADDRESS,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
-import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { ZoneInbox } from "../../src/predeploys/ZoneInbox.sol";
-import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
+import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
+import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
+import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
+import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
@@ -102,7 +102,7 @@ contract ZoneNonCustodialHandler is Test {
             sender: user,
             to: user,
             amount: amount, // fee is zero in this suite
-            bouncebackRecipient: user,
+            tempoRefundRecipient: user,
             memo: bytes32(0)
         });
         mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
@@ -184,7 +184,6 @@ contract ZoneNonCustodialHandler is Test {
 ///         withdrawal guarantee (TEMPO-ZONE-TOKEN-DEPOSIT-PAUSE-ONLY) under random pause/resume interleavings.
 contract ZoneNonCustodialInvariantTest is BaseTest {
 
-    ZoneFactory internal zoneFactory;
     ZonePortal internal portal;
     ZoneMessenger internal messenger;
     MockZoneToken internal token;
@@ -201,7 +200,6 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
         super.setUp();
         vm.fee(0);
 
-        zoneFactory = new ZoneFactory();
         token = new MockZoneToken("Zone USD", "zUSD");
 
         token.setMinter(address(this), true);
@@ -212,26 +210,18 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
 
         uint64 genesisTempoBlockNumber = uint64(block.number);
 
-        uint256 nonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), nonce + 1);
-        messenger = new ZoneMessenger(predictedPortal);
-        portal = new ZonePortal(
-            1,
-            address(token),
-            address(messenger),
-            address(this),
-            address(this),
-            zoneFactory.verifier(),
-            GENESIS_BLOCK_HASH,
-            genesisTempoBlockNumber,
-            ""
-        );
+        messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = address(this);
+        portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
         tempoState =
             new MockTempoState(address(this), GENESIS_TEMPO_BLOCK_HASH, genesisTempoBlockNumber);
         config = new ZoneConfig(address(portal), address(tempoState));
         tempoState.setMockStorageValue(
-            address(portal), PORTAL_SEQUENCER_SLOT, bytes32(uint256(uint160(address(this))))
+            address(portal),
+            keccak256(abi.encode(address(this), PORTAL_IS_SEQUENCER_SLOT)),
+            bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(address(portal), address(token), true);
         inbox = new ZoneInbox(address(config), address(portal), address(tempoState));

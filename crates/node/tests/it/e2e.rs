@@ -5,23 +5,357 @@
 //! subscriber retries a dummy URL in the background, but L2 execution is fully
 //! exercised via queue injection (with the L1 state cache seeded for precompile reads).
 
-use alloy::primitives::{Address, B256, Bytes, U256, address};
+use std::{net::TcpListener, time::Duration};
+
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_consensus::Transaction;
 use alloy_eips::NumHash;
 use alloy_provider::{DynProvider, Provider};
+use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::SolCall;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{
-    TEMPO_STATE_ADDRESS, TempoState, Withdrawal, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
-    ZoneInbox, ZoneOutbox,
+    IZoneInbox, IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, Withdrawal, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS,
 };
-use zone_l1::ChainTempoStateExt;
+use zone_l1::{ChainTempoStateExt, L1Deposit, L1PortalEvents};
 
 use crate::utils::{
-    DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, WITHDRAWAL_TX_GAS, ZoneTestNode, approve_outbox,
-    local_dev_zone_account, poll_until, seed_fixture_for_zone, start_local_zone_with_fixture,
+    DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, ZoneTestNode,
+    approve_outbox, leader_p2p_config, local_dev_zone_account, poll_until, seed_fixture_for_zone,
+    start_chain_id_rpc, start_local_p2p_pair, start_local_zone_with_fixture,
 };
+
+const CONTRACT_CREATION_TX_GAS: u64 = 1_000_000;
+const LEADER_INCLUSION_TIMEOUT: Duration = Duration::from_secs(30);
+const P2P_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// A follower imports the leader's executed block and exposes the resulting state over RPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (leader, follower, mut fixture) = start_local_p2p_pair(10).await?;
+
+    // Commonware deliberately drops messages for offline peers. Wait for
+    // peer dial/handshake (loopback dials every 500ms) before producing the
+    // first block.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let anchor = fixture.inject_empty_block(leader.deposit_queue());
+    leader.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    // Receiving the peer block is not enough: the follower must independently
+    // observe its exact L1 anchor before importing it.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        follower.provider().get_block_number().await?,
+        0,
+        "follower imported a block before observing its L1 anchor"
+    );
+
+    follower.l1_block_tracker().record(anchor)?;
+    follower.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    let depositor = address!("0x0000000000000000000000000000000000001234");
+    let recipient = address!("0x0000000000000000000000000000000000005678");
+    let amount = 1_000_000_u128;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
+    let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(deposit.clone())]);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    follower
+        .l1_block_tracker()
+        .record_with_portal_events(anchor, observed)?;
+
+    leader
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            recipient,
+            U256::from(amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    let follower_balance = follower
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            recipient,
+            U256::from(amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+    assert_eq!(follower_balance, U256::from(amount));
+
+    // Submit only to the follower. Its local pool admission is forwarded as canonical EIP-2718
+    // bytes, then independently validated by the leader pool for the next L1-derived build.
+    let (follower_wallet, sender) = local_dev_zone_account(&follower)?;
+    let transfer_recipient = address!("0x0000000000000000000000000000000000009abc");
+    fixture.seed_no_receive_policy(transfer_recipient)?;
+    let sender_deposit = fixture.make_deposit(PATH_USD_ADDRESS, sender, sender, amount);
+    let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(sender_deposit.clone())]);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![sender_deposit]);
+    follower
+        .l1_block_tracker()
+        .record_with_portal_events(anchor, observed)?;
+    leader
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            sender,
+            U256::from(amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    follower
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            sender,
+            U256::from(amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+
+    let transfer_amount = 123_456_u128;
+    let pending = ITIP20::new(PATH_USD_ADDRESS, follower_wallet)
+        .transfer(transfer_recipient, U256::from(transfer_amount))
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(TIP20_TX_GAS)
+        .send()
+        .await?;
+    let transaction_hash = *pending.tx_hash();
+
+    let leader_provider = leader.provider();
+    poll_until(
+        DEFAULT_TIMEOUT,
+        DEFAULT_POLL,
+        "forwarded transaction in leader pool",
+        || {
+            let leader_provider = &leader_provider;
+            async move {
+                Ok(leader_provider
+                    .get_transaction_by_hash(transaction_hash)
+                    .await?)
+            }
+        },
+    )
+    .await?;
+    // A transaction admitted to the pool is not guaranteed to make the very next payload under
+    // load. Produce blocks one at a time until it is included, with one overall timeout rather
+    // than spending the full timeout on every attempt.
+    let leader_receipt = tokio::time::timeout(LEADER_INCLUSION_TIMEOUT, async {
+        loop {
+            let next_block = leader_provider.get_block_number().await? + 1;
+            let anchor = fixture.inject_empty_block(leader.deposit_queue());
+            follower.l1_block_tracker().record(anchor)?;
+            leader
+                .wait_for_block_number(next_block, DEFAULT_TIMEOUT)
+                .await?;
+            if let Some(receipt) = leader_provider
+                .get_transaction_receipt(transaction_hash)
+                .await?
+            {
+                return Ok::<_, eyre::Report>(receipt);
+            }
+        }
+    })
+    .await
+    .map_err(|_| eyre::eyre!("timed out producing blocks for leader transaction inclusion"))??;
+    assert!(leader_receipt.status(), "leader receipt should succeed");
+    let inclusion_block = leader_receipt
+        .block_number
+        .ok_or_else(|| eyre::eyre!("leader receipt missing block number"))?;
+
+    // A live broadcast can be missed while the peer reconnects. Allow enough time for the
+    // follower's 30-second inactivity probe to recover the inclusion block through backfill.
+    follower
+        .wait_for_block_number(inclusion_block, P2P_RECOVERY_TIMEOUT)
+        .await?;
+    let follower_receipt = tokio::time::timeout(DEFAULT_TIMEOUT, pending.get_receipt())
+        .await
+        .map_err(|_| eyre::eyre!("timed out waiting for follower transaction receipt"))??;
+    assert!(
+        follower_receipt.status(),
+        "forwarded transfer should succeed"
+    );
+
+    for zone in [&leader, &follower] {
+        let balance = zone
+            .wait_for_balance(
+                PATH_USD_ADDRESS,
+                transfer_recipient,
+                U256::from(transfer_amount),
+                DEFAULT_TIMEOUT,
+            )
+            .await?;
+        assert_eq!(balance, U256::from(transfer_amount));
+    }
+    Ok(())
+}
+
+/// A follower must enforce a TIP-403 policy change at the *exact* L1 block its
+/// imported zone block is anchored to — never one block late.
+///
+/// Flow:
+/// 1. Zone block 1 (anchor L1#1, pathUSD still allow-all): a deposit funds Alice.
+/// 2. Between blocks, pathUSD's transfer policy switches to a blacklist that
+///    bans Bob as a recipient, effective at L1 block 2.
+/// 3. Zone block 2 (anchor L1#2): Alice's pathUSD transfer is included and
+///    reverts on the leader because policy now resolves at height 2.
+/// 4. The follower imports block 2 — only possible if it, too, reads policy at
+///    height 2 and reproduces the revert, matching the leader's state root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Result<()> {
+    use alloy_provider::ProviderBuilder;
+    use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
+    use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+    use tempo_contracts::precompiles::{
+        ITIP20, ITIP403Registry::PolicyType, TIP_FEE_MANAGER_ADDRESS,
+    };
+
+    use crate::utils::{
+        PolicySeed, TEST_MNEMONIC, TIP20_TX_GAS, seed_raw_tip403_policy,
+        seed_raw_tip403_token_policy,
+    };
+
+    reth_tracing::init_test_tracing();
+
+    let (leader, follower, mut fixture) = start_local_p2p_pair(10).await?;
+
+    // Commonware drops messages for offline peers; wait for the dial/handshake
+    // before producing the first block (mirrors the sibling P2P test).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Alice funds the transfer; Bob becomes blacklisted at the next L1 anchor.
+    let alice_signer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .index(1)?
+        .build()?;
+    let alice = alice_signer.address();
+    let sequencer = MnemonicBuilder::<English>::default()
+        .phrase(TEST_MNEMONIC)
+        .build()?
+        .address();
+    let bob = address!("0x0000000000000000000000000000000000000B0B");
+
+    // --- Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1). ---
+    let deposit_amount: u128 = 1_000_000;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
+    let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(deposit.clone())]);
+    let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
+    leader
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            alice,
+            U256::from(deposit_amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+
+    follower
+        .l1_block_tracker()
+        .record_with_portal_events(anchor, observed)?;
+    follower
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            alice,
+            U256::from(deposit_amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    follower.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
+
+    // --- Policy change effective at L1 block 2: blacklist Bob on pathUSD. ---
+    // Seed identically on both nodes, mirroring each node's L1 observer having
+    // made block-2 TIP-403 and TIP-20 storage available before publishing the
+    // anchor. The L1-backed execution database must select these values from
+    // the anchor advanced by the first `advanceTempo` transaction.
+    const BLACKLIST_POLICY_ID: u64 = 7;
+    const POLICY_L1_BLOCK: u64 = 2;
+    let policy_block = fixture.next_block();
+    assert_eq!(policy_block.header.inner.number, POLICY_L1_BLOCK);
+    fixture.seed_no_receive_policy(bob)?;
+    for node in [&leader, &follower] {
+        seed_raw_tip403_policy(
+            node.l1_state_cache(),
+            POLICY_L1_BLOCK,
+            &[PolicySeed::simple(
+                BLACKLIST_POLICY_ID,
+                PolicyType::BLACKLIST,
+                &[
+                    (alice, false),
+                    (bob, true),
+                    (sequencer, false),
+                    (TIP_FEE_MANAGER_ADDRESS, false),
+                ],
+            )],
+        )?;
+        seed_raw_tip403_token_policy(
+            &mut node.l1_state_cache().lock(),
+            POLICY_L1_BLOCK,
+            PATH_USD_ADDRESS,
+            BLACKLIST_POLICY_ID,
+        );
+    }
+
+    // --- Block 2: Alice's transfer is submitted, then the anchoring L1 block is
+    // injected to trigger the build that includes it. ---
+    let alice_provider = ProviderBuilder::new()
+        .wallet(alice_signer)
+        .connect_http(leader.http_url().clone());
+    let tip20 = ITIP20::new(PATH_USD_ADDRESS, &alice_provider);
+    let pending = tip20
+        .transfer(bob, U256::from(200_000u128))
+        .gas_price(TEMPO_T0_BASE_FEE as u128)
+        .gas(TIP20_TX_GAS)
+        .send()
+        .await?;
+
+    let anchor =
+        reth_primitives_traits::SealedHeader::seal_slow(policy_block.header.clone()).num_hash();
+    fixture.enqueue(&policy_block, leader.deposit_queue(), vec![]);
+    leader.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+
+    // The leader, resolving policy at height 2, must revert Alice's transfer
+    // (proves the exact-anchor policy behavior and that the tx was included, not dropped).
+    let receipt = pending.get_receipt().await?;
+    assert!(
+        !receipt.status(),
+        "leader should revert the blacklisted transfer in the block anchored at L1#2"
+    );
+
+    // --- The follower must independently reproduce that revert at height 2. ---
+    // If it read policy at height 1 (allow-all) it would replay the transfer as
+    // a success, diverge from the leader's state root, reject the block, and
+    // never reach block 2 — so this import succeeding proves exact-anchor policy reads.
+    follower.l1_block_tracker().record(anchor)?;
+    follower.wait_for_block_number(2, DEFAULT_TIMEOUT).await?;
+
+    // Bob received nothing on the follower: the reverted transfer moved no funds.
+    assert_eq!(
+        follower.balance_of(PATH_USD_ADDRESS, bob).await?,
+        U256::ZERO,
+        "follower must reflect the reverted transfer: Bob received nothing"
+    );
+
+    Ok(())
+}
+
+/// A P2P bind failure is fatal rather than leaving the node running without P2P.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_p2p_listener_failure_stops_node() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let occupied_listener = TcpListener::bind("127.0.0.1:0")?;
+    let p2p_config = leader_p2p_config(occupied_listener.local_addr()?)?;
+    let l1_rpc_url = start_chain_id_rpc(1337).await?;
+    let mut zone = ZoneTestNode::start_local_with_p2p(l1_rpc_url.to_string(), p2p_config).await?;
+
+    let _exit = tokio::time::timeout(DEFAULT_TIMEOUT, zone.wait_for_node_exit())
+        .await
+        .expect("node did not exit after its P2P listener failed");
+    Ok(())
+}
 
 /// Self-contained test: inject a deposit via the queue and verify the zone
 /// mints the corresponding pathUSD balance on L2.
@@ -56,6 +390,44 @@ async fn test_deposit_via_queue_injection() -> eyre::Result<()> {
         balance,
         U256::from(deposit_amount),
         "minted amount should equal deposit amount"
+    );
+
+    Ok(())
+}
+
+/// Verify a contract-creation transaction is rejected by a running zone node.
+///
+/// This exercises the complete public transaction path: wallet signing, HTTP RPC,
+/// transaction-pool validation, and the zone contract-deployer policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_contract_creation_transaction_is_rejected() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
+    let (provider, dev_address) = local_dev_zone_account(&zone)?;
+    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, 1_000_000);
+    fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        dev_address,
+        U256::from(1_000_000u128),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+
+    let mut request = TransactionRequest::default().input(Bytes::from_static(&[0x00]).into());
+    request.to = Some(TxKind::Create);
+    request.gas = Some(CONTRACT_CREATION_TX_GAS);
+    request.gas_price = Some(TEMPO_T0_BASE_FEE as u128);
+
+    let err = provider
+        .send_transaction(request)
+        .await
+        .expect_err("an unlisted account must not submit a contract-creation transaction");
+    let error_message = format!("{err:#}");
+    assert!(
+        error_message.contains("error code -32000: contract creation is not supported"),
+        "unexpected contract-creation rejection: {error_message}"
     );
 
     Ok(())
@@ -124,6 +496,59 @@ async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
 
     // Each L1 block advances tempoBlockNumber — wait for all 5
     zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+
+    Ok(())
+}
+
+/// Cancelling the `ZoneEngine` must stop it only between zone blocks, leaving the deposit
+/// queue cursor and the local head in agreement.
+///
+/// This is the graceful-stop invariant needed by the future leadership handoff: an advance
+/// consumes an L1 block from the queue and canonicalizes the resulting zone block across several
+/// awaits. Stopping partway would either replay an L1 anchor (`advanceTempo` rejects it) or skip
+/// one, and either way the node could never build another block.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_zone_engine_stops_cleanly_between_blocks() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+
+    // Produce a few blocks so the stop lands on a running engine, not an idle one.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 5);
+    zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+
+    // Keep feeding the queue while the engine is asked to stop, so cancellation races with
+    // block production instead of arriving during an idle period.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 10);
+    let head = zone.stop_engine().await?;
+
+    // Every L1 block the engine consumed produced exactly one zone block, and nothing was
+    // half-consumed: the queue front is the next unbuilt anchor.
+    let tempo_block_number = zone.tempo_block_number().await?;
+    assert_eq!(
+        tempo_block_number, head,
+        "each zone block imports exactly one L1 block, so the head and the Tempo cursor must agree"
+    );
+    let next_anchor = zone
+        .deposit_queue()
+        .peek()
+        .map(|block| block.header.num_hash().number);
+    if let Some(next_anchor) = next_anchor {
+        assert_eq!(
+            next_anchor,
+            tempo_block_number + 1,
+            "the queue front must be the anchor of the next unbuilt zone block"
+        );
+    }
+
+    // A stopped engine stays stopped, and the node keeps serving RPC.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        zone.provider().get_block_number().await?,
+        head,
+        "a cancelled engine must not resume building"
+    );
 
     Ok(())
 }
@@ -278,7 +703,7 @@ async fn test_zone_inbox_events_on_deposit() -> eyre::Result<()> {
     .await?;
 
     // Query TempoAdvanced events from ZoneInbox
-    let zone_inbox = ZoneInbox::new(ZONE_INBOX_ADDRESS, zone.provider());
+    let zone_inbox = IZoneInbox::new(ZONE_INBOX_ADDRESS, zone.provider());
     let tempo_advanced_filter = zone_inbox.TempoAdvanced_filter().from_block(0);
     let tempo_advanced_events = tempo_advanced_filter.query().await?;
 
@@ -369,23 +794,46 @@ async fn test_large_deposit_batch() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Verify empty withdrawal batches finalize on the configured chain-time interval.
+/// Verify empty withdrawal batches finalize at deterministic block boundaries.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    let zone_outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, zone.provider());
+    let zone_outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, zone.provider());
 
-    let initial_batch_index = zone_outbox.withdrawalBatchIndex().call().await?;
-    let initial_zone_block = zone.provider().get_block_number().await?;
+    let initial_batch_index = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
+    // Local test nodes finalize empty batches every eight zone blocks.
+    const BATCH_INTERVAL_BLOCKS: u64 = 8;
 
-    // The first fixture block has a large timestamp jump from genesis, so it
-    // closes the first empty batch immediately.
+    fixture.inject_empty_blocks(zone.deposit_queue(), BATCH_INTERVAL_BLOCKS - 1);
+
+    let before_first_boundary = poll_until(
+        DEFAULT_TIMEOUT,
+        DEFAULT_POLL,
+        "blocks before first empty withdrawal batch boundary",
+        || {
+            let provider = zone.provider();
+            async move {
+                let number = provider.get_block_number().await?;
+                if number >= BATCH_INTERVAL_BLOCKS - 1 {
+                    Ok(Some(number))
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+    )
+    .await?;
+    assert_eq!(before_first_boundary, BATCH_INTERVAL_BLOCKS - 1);
+    assert_eq!(
+        zone_outbox.lastBatch().call().await?.withdrawalBatchIndex,
+        initial_batch_index,
+        "withdrawalBatchIndex should not advance before a block-number boundary"
+    );
+
     fixture.inject_empty_block(zone.deposit_queue());
-    let first_boundary_block = initial_zone_block + 1;
-
     poll_until(
         DEFAULT_TIMEOUT,
         DEFAULT_POLL,
@@ -393,7 +841,7 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
         || {
             let zone_outbox = &zone_outbox;
             async move {
-                let idx = zone_outbox.withdrawalBatchIndex().call().await?;
+                let idx = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if idx == initial_batch_index + 1 {
                     Ok(Some(idx))
                 } else {
@@ -404,7 +852,7 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
     )
     .await?;
 
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    fixture.inject_empty_blocks(zone.deposit_queue(), BATCH_INTERVAL_BLOCKS - 1);
     poll_until(
         DEFAULT_TIMEOUT,
         DEFAULT_POLL,
@@ -413,7 +861,7 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
             let provider = zone.provider();
             async move {
                 let number = provider.get_block_number().await?;
-                if number >= first_boundary_block + 3 {
+                if number >= (2 * BATCH_INTERVAL_BLOCKS) - 1 {
                     Ok(Some(number))
                 } else {
                     Ok(None)
@@ -423,11 +871,11 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
     )
     .await?;
 
-    let intermediate_batch_index = zone_outbox.withdrawalBatchIndex().call().await?;
+    let intermediate_batch_index = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
     assert_eq!(
         intermediate_batch_index,
         initial_batch_index + 1,
-        "withdrawalBatchIndex should not advance before the configured interval elapses"
+        "withdrawalBatchIndex should not advance before the next block-number boundary"
     );
 
     fixture.inject_empty_blocks(zone.deposit_queue(), 1);
@@ -439,7 +887,7 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
         || {
             let zone_outbox = &zone_outbox;
             async move {
-                let idx = zone_outbox.withdrawalBatchIndex().call().await?;
+                let idx = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if idx == initial_batch_index + 2 {
                     Ok(Some(idx))
                 } else {
@@ -453,7 +901,7 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
     assert_eq!(
         final_batch_index,
         initial_batch_index + 2,
-        "withdrawalBatchIndex should advance when the configured interval elapses"
+        "withdrawalBatchIndex should advance at the next block-number boundary"
     );
 
     // lastBatch should have zero withdrawalQueueHash (no withdrawals requested)
@@ -474,7 +922,7 @@ async fn submit_withdrawal(
     dev_address: Address,
     amount: u128,
 ) -> eyre::Result<u64> {
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
     let pending = outbox
         .requestWithdrawal(
             PATH_USD_ADDRESS,
@@ -492,7 +940,11 @@ async fn submit_withdrawal(
         .await?;
     fixture.inject_empty_block(zone.deposit_queue());
     let receipt = pending.get_receipt().await?;
-    assert!(receipt.status(), "withdrawal should succeed");
+    assert!(
+        receipt.status(),
+        "withdrawal should succeed (gas used: {})",
+        receipt.gas_used
+    );
     receipt
         .block_number
         .ok_or_else(|| eyre::eyre!("withdrawal receipt missing block number"))
@@ -505,7 +957,7 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
 
     let deposit_amount: u128 = 2_000_000;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
@@ -519,7 +971,7 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
     .await?;
     approve_outbox(&mut fixture, &zone, &provider).await?;
 
-    let batch_index_before = outbox.withdrawalBatchIndex().call().await?;
+    let batch_index_before = outbox.lastBatch().call().await?.withdrawalBatchIndex;
     let withdrawal_block =
         submit_withdrawal(&mut fixture, &zone, &provider, dev_address, 250_000).await?;
 
@@ -535,12 +987,17 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
         "withdrawal block {withdrawal_block} should defer BatchFinalized"
     );
     assert_eq!(
-        outbox.withdrawalBatchIndex().call().await?,
+        outbox.lastBatch().call().await?.withdrawalBatchIndex,
         batch_index_before,
         "withdrawalBatchIndex should not advance on deferred block"
     );
     assert!(
-        outbox.pendingWithdrawalsCount().call().await? > U256::ZERO,
+        outbox
+            .pendingWithdrawalsCount()
+            .from(Address::ZERO)
+            .call()
+            .await?
+            > U256::ZERO,
         "withdrawal should remain pending after deferred block"
     );
 
@@ -554,7 +1011,7 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
         || {
             let outbox = &outbox;
             async move {
-                let index = outbox.withdrawalBatchIndex().call().await?;
+                let index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if index == batch_index_before + 1 {
                     Ok(Some(index))
                 } else {
@@ -566,7 +1023,11 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
     .await?;
 
     assert_eq!(
-        outbox.pendingWithdrawalsCount().call().await?,
+        outbox
+            .pendingWithdrawalsCount()
+            .from(Address::ZERO)
+            .call()
+            .await?,
         U256::ZERO,
         "finalize block should sweep pending withdrawals"
     );
@@ -618,7 +1079,7 @@ async fn test_withdrawal_requests_finalize_next_block() -> eyre::Result<()> {
         .await?
         .ok_or_else(|| eyre::eyre!("finalizeWithdrawalBatch tx {tx_hash} not found"))?;
     let finalize_call =
-        ZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
+        IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
     assert_eq!(
         finalize_call.count,
         U256::from(1),
@@ -640,7 +1101,7 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
 
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, 2_000_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
@@ -653,7 +1114,7 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
     .await?;
     approve_outbox(&mut fixture, &zone, &provider).await?;
 
-    let batch_index_before = outbox.withdrawalBatchIndex().call().await?;
+    let batch_index_before = outbox.lastBatch().call().await?.withdrawalBatchIndex;
     let block_n = submit_withdrawal(&mut fixture, &zone, &provider, dev_address, 250_000).await?;
     let deferred_logs = outbox
         .BatchFinalized_filter()
@@ -676,7 +1137,7 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
         || {
             let outbox = &outbox;
             async move {
-                let index = outbox.withdrawalBatchIndex().call().await?;
+                let index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if index == batch_index_before + 1 {
                     Ok(Some(index))
                 } else {
@@ -737,7 +1198,7 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
         .await?
         .ok_or_else(|| eyre::eyre!("finalizeWithdrawalBatch tx {tx_hash} not found"))?;
     let finalize_call =
-        ZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
+        IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
     assert_eq!(
         finalize_call.count,
         U256::from(2),
@@ -748,25 +1209,28 @@ async fn test_consecutive_withdrawal_blocks_joined_into_one_batch() -> eyre::Res
     Ok(())
 }
 
-/// Current-only block with interval elapsed finalizes that block's withdrawals.
+/// Current-only block at a batch boundary finalizes that block's withdrawals.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_current_only_block_finalizes_when_interval_elapsed() -> eyre::Result<()> {
+async fn test_current_only_block_finalizes_at_batch_boundary() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
 
-    let batch_index = outbox.withdrawalBatchIndex().call().await?;
-    fixture.inject_empty_block(zone.deposit_queue());
+    // Local test nodes finalize empty batches every eight zone blocks.
+    const BATCH_INTERVAL_BLOCKS: u64 = 8;
+
+    let batch_index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
+    fixture.inject_empty_blocks(zone.deposit_queue(), BATCH_INTERVAL_BLOCKS);
     poll_until(
         DEFAULT_TIMEOUT,
         DEFAULT_POLL,
-        "genesis empty batch closed",
+        "first empty batch boundary closed",
         || {
             let outbox = &outbox;
             async move {
-                let idx = outbox.withdrawalBatchIndex().call().await?;
+                let idx = outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if idx == batch_index + 1 {
                     Ok(Some(idx))
                 } else {
@@ -788,22 +1252,53 @@ async fn test_current_only_block_finalizes_when_interval_elapsed() -> eyre::Resu
     .await?;
     approve_outbox(&mut fixture, &zone, &provider).await?;
 
-    // Advance 3 quiet blocks (3s < 4s interval) after the boundary.
-    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    // Advance to exactly one block before the next batch boundary, then wait
+    // for those quiet blocks to be built. `inject_empty_blocks` only enqueues
+    // L1 blocks; without this wait the withdrawal can race into one of those
+    // still-building quiet zone blocks.
+    let current_block = zone.provider().get_block_number().await?;
+    let quiet_blocks_until_pre_boundary =
+        (BATCH_INTERVAL_BLOCKS - 1) - (current_block % BATCH_INTERVAL_BLOCKS);
+    let pre_boundary_block = current_block + quiet_blocks_until_pre_boundary;
+    fixture.inject_empty_blocks(zone.deposit_queue(), quiet_blocks_until_pre_boundary);
+    let observed_pre_boundary = poll_until(
+        DEFAULT_TIMEOUT,
+        DEFAULT_POLL,
+        "quiet blocks before withdrawal boundary built",
+        || {
+            let provider = zone.provider();
+            async move {
+                let number = provider.get_block_number().await?;
+                if number >= pre_boundary_block {
+                    Ok(Some(number))
+                } else {
+                    Ok(None)
+                }
+            }
+        },
+    )
+    .await?;
+    assert_eq!(
+        observed_pre_boundary, pre_boundary_block,
+        "zone should be exactly one block before the withdrawal boundary"
+    );
+    assert_eq!((observed_pre_boundary + 1) % BATCH_INTERVAL_BLOCKS, 0);
 
-    let batch_index_before = outbox.withdrawalBatchIndex().call().await?;
-    // 4th block after the boundary: interval elapsed, current-only block should finalize.
+    let batch_index_before = outbox.lastBatch().call().await?.withdrawalBatchIndex;
+    // The next block is a deterministic batch boundary, so it finalizes its
+    // own withdrawal rather than deferring it to the following block.
     let withdrawal_block =
         submit_withdrawal(&mut fixture, &zone, &provider, dev_address, 250_000).await?;
+    assert_eq!(withdrawal_block % BATCH_INTERVAL_BLOCKS, 0);
 
     poll_until(
         DEFAULT_TIMEOUT,
         DEFAULT_POLL,
-        "interval-elapsed current-only block finalized",
+        "batch-boundary current-only block finalized",
         || {
             let outbox = &outbox;
             async move {
-                let index = outbox.withdrawalBatchIndex().call().await?;
+                let index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
                 if index == batch_index_before + 1 {
                     Ok(Some(index))
                 } else {
@@ -823,7 +1318,7 @@ async fn test_current_only_block_finalizes_when_interval_elapsed() -> eyre::Resu
     assert_eq!(
         finalized_logs.len(),
         1,
-        "interval-elapsed current-only block should finalize in the same block"
+        "batch-boundary current-only block should finalize in the same block"
     );
 
     let requested_logs = outbox
@@ -851,7 +1346,7 @@ async fn test_current_only_block_finalizes_when_interval_elapsed() -> eyre::Resu
         .await?
         .ok_or_else(|| eyre::eyre!("finalizeWithdrawalBatch tx {tx_hash} not found"))?;
     let finalize_call =
-        ZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
+        IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(finalize_tx.input().as_ref())?;
     assert_eq!(finalize_call.count, U256::from(1));
 
     Ok(())
@@ -860,7 +1355,7 @@ async fn test_current_only_block_finalizes_when_interval_elapsed() -> eyre::Resu
 /// Submit a signed L2 withdrawal request with an over-cap callback gas limit.
 ///
 /// This exercises the RPC transaction path: the transaction is accepted into a
-/// zone block, reverts in `ZoneOutbox`, and does not enter the pending
+/// zone block, reverts in `IZoneOutbox`, and does not enter the pending
 /// withdrawal queue.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result<()> {
@@ -869,7 +1364,7 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider);
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider);
 
     let deposit_amount: u128 = 1_000_000;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
@@ -885,7 +1380,11 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
 
     approve_outbox(&mut fixture, &zone, &provider).await?;
 
-    let pending_before = outbox.pendingWithdrawalsCount().call().await?;
+    let pending_before = outbox
+        .pendingWithdrawalsCount()
+        .from(Address::ZERO)
+        .call()
+        .await?;
     let max_callback_gas = outbox.MAX_WITHDRAWAL_GAS_LIMIT().call().await?;
 
     let withdrawal_pending = outbox
@@ -911,7 +1410,11 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
         "over-cap withdrawal request should revert on L2"
     );
 
-    let pending_after = outbox.pendingWithdrawalsCount().call().await?;
+    let pending_after = outbox
+        .pendingWithdrawalsCount()
+        .from(Address::ZERO)
+        .call()
+        .await?;
     assert_eq!(
         pending_after, pending_before,
         "reverted withdrawal must not enter the pending queue"

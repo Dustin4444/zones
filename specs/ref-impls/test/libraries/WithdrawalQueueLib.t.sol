@@ -4,6 +4,7 @@ pragma solidity ^0.8.13;
 import { Withdrawal } from "../../src/interfaces/IZone.sol";
 import {
     EMPTY_SENTINEL,
+    NO_QUEUE_INDEX,
     WITHDRAWAL_QUEUE_CAPACITY,
     WithdrawalQueue,
     WithdrawalQueueLib
@@ -18,8 +19,8 @@ contract WithdrawalQueueHarness {
 
     WithdrawalQueue internal queue;
 
-    function enqueue(bytes32 withdrawalQueueHash) external {
-        queue.enqueue(withdrawalQueueHash);
+    function enqueue(bytes32 withdrawalQueueHash) external returns (uint256 assignedIndex) {
+        return queue.enqueue(withdrawalQueueHash);
     }
 
     function dequeue(Withdrawal calldata withdrawal, bytes32 remainingQueue) external {
@@ -46,8 +47,10 @@ contract WithdrawalQueueHarness {
         return queue.slots[index];
     }
 
-    function isFull() external view returns (bool) {
-        return queue.isFull();
+    function setRawState(uint256 head, uint256 tail, uint256 slot, bytes32 value) external {
+        queue.head = head;
+        queue.tail = tail;
+        queue.slots[slot] = value;
     }
 
 }
@@ -85,8 +88,9 @@ contract WithdrawalQueueLibTest is Test {
         Withdrawal memory w = _makeWithdrawal(alice, bob, 100e6);
         bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
 
-        harness.enqueue(wHash);
+        uint256 assignedIndex = harness.enqueue(wHash);
 
+        assertEq(assignedIndex, 0);
         assertEq(harness.head(), 0);
         assertEq(harness.tail(), 1);
         assertEq(harness.slots(0), wHash);
@@ -115,8 +119,9 @@ contract WithdrawalQueueLibTest is Test {
     }
 
     function test_enqueue_emptyTransition_noOp() public {
-        harness.enqueue(bytes32(0));
+        uint256 assignedIndex = harness.enqueue(bytes32(0));
 
+        assertEq(assignedIndex, NO_QUEUE_INDEX);
         assertEq(harness.head(), 0);
         assertEq(harness.tail(), 0);
         assertFalse(harness.hasWithdrawals());
@@ -126,14 +131,17 @@ contract WithdrawalQueueLibTest is Test {
         bytes32 h1 = keccak256("batch1");
         bytes32 h2 = keccak256("batch2");
 
-        harness.enqueue(h1);
+        uint256 firstIndex = harness.enqueue(h1);
+        assertEq(firstIndex, 0);
         assertEq(harness.tail(), 1);
 
         // Empty batch - no change
-        harness.enqueue(bytes32(0));
+        uint256 emptyIndex = harness.enqueue(bytes32(0));
+        assertEq(emptyIndex, NO_QUEUE_INDEX);
         assertEq(harness.tail(), 1);
 
-        harness.enqueue(h2);
+        uint256 secondIndex = harness.enqueue(h2);
+        assertEq(secondIndex, 1);
         assertEq(harness.tail(), 2);
 
         // Slots should be contiguous
@@ -168,7 +176,8 @@ contract WithdrawalQueueLibTest is Test {
 
         // Enqueue again — should succeed since we freed a slot
         bytes32 hNew = keccak256("new");
-        harness.enqueue(hNew);
+        uint256 assignedIndex = harness.enqueue(hNew);
+        assertEq(assignedIndex, WITHDRAWAL_QUEUE_CAPACITY);
         assertEq(harness.length(), WITHDRAWAL_QUEUE_CAPACITY);
 
         // hNew should be written to slots[tail % capacity] = slots[CAPACITY % CAPACITY] = slots[0]
@@ -266,6 +275,29 @@ contract WithdrawalQueueLibTest is Test {
         // Try to dequeue with wrong remaining queue
         vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
         harness.dequeue(w1, keccak256("wrongHash"));
+    }
+
+    function test_dequeue_revertsIfRemainingQueueIsEmptySentinel() public {
+        Withdrawal memory w = _makeWithdrawal(alice, bob, 100e6);
+        bytes32 wHash = keccak256(abi.encode(w, EMPTY_SENTINEL));
+        harness.enqueue(wHash);
+
+        vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
+        harness.dequeue(w, EMPTY_SENTINEL);
+
+        assertEq(harness.head(), 0);
+        assertEq(harness.slots(0), wHash);
+    }
+
+    function test_dequeue_revertsIfCurrentSlotIsEmptySentinel() public {
+        Withdrawal memory w = _makeWithdrawal(alice, bob, 100e6);
+        harness.setRawState(0, 1, 0, EMPTY_SENTINEL);
+
+        vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
+        harness.dequeue(w, bytes32(0));
+
+        assertEq(harness.head(), 0);
+        assertEq(harness.slots(0), EMPTY_SENTINEL);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -417,89 +449,6 @@ contract WithdrawalQueueLibTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-                            isFull TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice isFull is true only at exactly capacity, false otherwise.
-    /// @dev Kills mutants on `tail - head == CAPACITY`: `==`->`!=`, `==`->`<`.
-    function test_isFull_trueOnlyAtCapacity() public {
-        assertFalse(harness.isFull()); // empty: length 0
-
-        for (uint256 i = 0; i < WITHDRAWAL_QUEUE_CAPACITY - 1; i++) {
-            harness.enqueue(keccak256(abi.encode("b", i)));
-            assertFalse(harness.isFull()); // below capacity stays false
-        }
-
-        harness.enqueue(keccak256("last"));
-        assertTrue(harness.isFull()); // exactly capacity
-    }
-
-    /// @notice isFull uses tail - head (a difference), not a bitwise/other op.
-    /// @dev With a non-zero head, `tail & head` and similar diverge from `tail - head`,
-    ///      so asserting isFull in a wrapped full state kills those arithmetic mutants.
-    function test_isFull_trueWithNonZeroHead() public {
-        Withdrawal memory w0 = _makeWithdrawal(alice, bob, 100e6);
-        harness.enqueue(keccak256(abi.encode(w0, EMPTY_SENTINEL)));
-        for (uint256 i = 1; i < WITHDRAWAL_QUEUE_CAPACITY; i++) {
-            harness.enqueue(keccak256(abi.encode("b", i)));
-        }
-        // Free one slot then refill so head advances past zero while staying full.
-        harness.dequeue(w0, bytes32(0));
-        harness.enqueue(keccak256("refill"));
-
-        assertEq(harness.head(), 1);
-        assertEq(harness.tail(), WITHDRAWAL_QUEUE_CAPACITY + 1);
-        assertEq(harness.length(), WITHDRAWAL_QUEUE_CAPACITY);
-        assertTrue(harness.isFull()); // tail-head == 100; tail & head == 101 & 1 == 1
-    }
-
-    /// @notice enqueue reverts when full even after head has advanced past zero.
-    /// @dev Kills the `tail - head` -> `tail >> head` mutant on the full-check: with
-    ///      head=1, tail=101 the real length is 100 (revert) but `101 >> 1 == 50` would
-    ///      not, so the mutant would wrongly accept the enqueue.
-    function test_enqueue_revertsWhenFullWithNonZeroHead() public {
-        Withdrawal memory w0 = _makeWithdrawal(alice, bob, 100e6);
-        harness.enqueue(keccak256(abi.encode(w0, EMPTY_SENTINEL)));
-        for (uint256 i = 1; i < WITHDRAWAL_QUEUE_CAPACITY; i++) {
-            harness.enqueue(keccak256(abi.encode("b", i)));
-        }
-        harness.dequeue(w0, bytes32(0)); // head = 1, length 99
-        harness.enqueue(keccak256("refill")); // tail = 101, length 100 (full again)
-
-        assertEq(harness.head(), 1);
-        assertEq(harness.tail(), WITHDRAWAL_QUEUE_CAPACITY + 1);
-        vm.expectRevert(WithdrawalQueueLib.WithdrawalQueueFull.selector);
-        harness.enqueue(keccak256("overflow"));
-    }
-
-    /// @notice dequeue rejects a wrong withdrawal whose hash is numerically below the
-    ///         stored slot, not just above it.
-    /// @dev Kills the `!= currentSlot` -> `> currentSlot` mutant: a strict `>` check
-    ///      would let a wrong withdrawal with hash < slot pass. We search for such a
-    ///      withdrawal so the inequality direction is actually exercised.
-    function test_dequeue_revertsIfWrongHashBelowSlot() public {
-        Withdrawal memory real = _makeWithdrawal(alice, bob, 100e6);
-        bytes32 slot = keccak256(abi.encode(real, EMPTY_SENTINEL));
-        harness.enqueue(slot);
-
-        // Find a wrong withdrawal whose hash is strictly less than the stored slot.
-        Withdrawal memory wrong;
-        bool found;
-        for (uint128 amount = 1; amount < 2000; amount++) {
-            wrong = _makeWithdrawal(bob, charlie, amount);
-            bytes32 wrongHash = keccak256(abi.encode(wrong, EMPTY_SENTINEL));
-            if (wrongHash < slot && wrongHash != slot) {
-                found = true;
-                break;
-            }
-        }
-        assertTrue(found, "no wrong hash below slot found in search range");
-
-        vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
-        harness.dequeue(wrong, bytes32(0));
-    }
-
-    /*//////////////////////////////////////////////////////////////
                             HELPER FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
@@ -517,10 +466,9 @@ contract WithdrawalQueueLibTest is Test {
             senderTag: keccak256(abi.encodePacked(sender)),
             to: to,
             amount: amount,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
-            fallbackRecipient: sender,
+            fallbackNonce: uint64(uint160(sender)),
             callbackData: "",
             encryptedSender: ""
         });

@@ -16,16 +16,19 @@ use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_eth::BlockId;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
+use std::num::NonZeroU32;
 use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
-use zone_precompiles::SequencerExt;
+use zone_precompiles::{L1StateError, L1StorageReader};
 
 use super::cache::L1StateCache;
-use crate::{abi::PORTAL_SEQUENCER_SLOT, rpc::rpc_connection_config};
+use crate::rpc::rpc_connection_config;
 
 /// Configuration for the [`L1StateProvider`].
 #[derive(Debug, Clone)]
 pub struct L1StateProviderConfig {
+    /// Optional known L1 chain ID, avoiding an RPC lookup when configured.
+    pub chain_id: Option<u64>,
     /// HTTP RPC endpoint for Tempo L1.
     pub l1_rpc_url: String,
     /// Zone portal address on Tempo L1, used for sequencer lookups.
@@ -39,16 +42,20 @@ pub struct L1StateProviderConfig {
     /// Interval between WebSocket reconnection attempts.
     /// Defaults to 100ms.
     pub retry_connection_interval: std::time::Duration,
+    /// Maximum number of synchronous RPC attempts per cache miss. `None` retries indefinitely.
+    pub max_sync_attempts: Option<NonZeroU32>,
 }
 
 impl Default for L1StateProviderConfig {
     fn default() -> Self {
         Self {
+            chain_id: None,
             l1_rpc_url: String::new(),
             portal_address: Address::ZERO,
             max_retries: 10,
             initial_backoff_ms: 20,
             retry_connection_interval: std::time::Duration::from_millis(100),
+            max_sync_attempts: None,
         }
     }
 }
@@ -71,19 +78,29 @@ impl Default for L1StateProviderConfig {
 /// `spawn_blocking`). Calling it from within an async task on the same runtime will panic.
 #[derive(Debug, Clone)]
 pub struct L1StateProvider {
+    /// Known L1 chain ID, if configured.
+    chain_id: Option<u64>,
     /// In-memory cache of L1 contract storage slots, checked before any RPC call.
     cache: L1StateCache,
-    /// Zone portal address on Tempo L1 used for sequencer lookups.
-    portal_address: Address,
     /// HTTP provider pointed at **Tempo L1**, used as a fallback when the cache misses.
     /// Wraps a [`RetryBackoffLayer`] that handles retries with exponential backoff.
     provider: DynProvider<TempoNetwork>,
     /// Handle to the tokio runtime, used by [`get_storage`](Self::get_storage) to
     /// dispatch async RPC calls from a blocking (non-async) context.
     runtime_handle: tokio::runtime::Handle,
+    /// Optional finite attempt limit for synchronous cache-miss fallback.
+    max_sync_attempts: Option<NonZeroU32>,
 }
 
 impl L1StateProvider {
+    /// Returns the chain ID reported by the configured L1 provider.
+    pub async fn chain_id(&self) -> Result<u64> {
+        match self.chain_id {
+            Some(chain_id) => Ok(chain_id),
+            None => Ok(self.provider.get_chain_id().await?),
+        }
+    }
+
     /// Create a new provider.
     ///
     /// The provider is created eagerly from [`L1StateProviderConfig::l1_rpc_url`] and reused
@@ -116,10 +133,11 @@ impl L1StateProvider {
             .erased();
 
         Ok(Self {
+            chain_id: config.chain_id,
             cache,
-            portal_address: config.portal_address,
             provider,
             runtime_handle,
+            max_sync_attempts: config.max_sync_attempts,
         })
     }
 
@@ -134,10 +152,11 @@ impl L1StateProvider {
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
+            chain_id: config.chain_id,
             cache,
-            portal_address: config.portal_address,
             provider,
             runtime_handle,
+            max_sync_attempts: config.max_sync_attempts,
         }
     }
 
@@ -155,9 +174,8 @@ impl L1StateProvider {
     /// docs).
     pub fn get_storage(&self, address: Address, slot: B256, block_number: u64) -> Result<B256> {
         {
-            let cache = self.cache.read();
+            let mut cache = self.cache.lock();
             if let Some(value) = cache.get(address, slot, block_number) {
-                debug!(%address, %slot, block_number, %value, "L1 storage cache hit");
                 return Ok(value);
             }
         }
@@ -176,7 +194,7 @@ impl L1StateProvider {
 
             match result {
                 Ok(value) => {
-                    self.cache.write().set(address, slot, block_number, value);
+                    self.cache.lock().set(address, slot, block_number, value);
                     if attempt > 1 {
                         info!(%address, %slot, block_number, %value, ?elapsed, attempt, "L1 storage RPC fetch succeeded after retries");
                     } else {
@@ -185,37 +203,18 @@ impl L1StateProvider {
                     return Ok(value);
                 }
                 Err(rpc_err) => {
+                    if self
+                        .max_sync_attempts
+                        .is_some_and(|max_attempts| attempt >= max_attempts.get())
+                    {
+                        return Err(eyre::eyre!(
+                            "L1 storage RPC fetch failed after {attempt} attempts for address={address} slot={slot} block={block_number}: {rpc_err}"
+                        ));
+                    }
                     warn!(%address, %slot, block_number, %rpc_err, ?elapsed, attempt, "L1 storage RPC fetch failed, retrying");
                 }
             }
         }
-    }
-
-    /// Read a storage slot at the latest known L1 height.
-    ///
-    /// Uses the cache anchor when available; otherwise falls back to the
-    /// current RPC head before resolving the slot value.
-    pub fn get_latest_storage(&self, address: Address, slot: B256) -> Result<B256> {
-        let anchor_number = self.cache.read().anchor().number;
-        let block_number = if anchor_number != 0 {
-            anchor_number
-        } else {
-            tokio::task::block_in_place(|| {
-                self.runtime_handle.block_on(async {
-                    self.provider.get_block_number().await.map_err(|e| {
-                        eyre::eyre!("eth_blockNumber failed while reading latest storage: {e}")
-                    })
-                })
-            })?
-        };
-
-        self.get_storage(address, slot, block_number)
-    }
-
-    /// Read the active sequencer address from the configured portal at the latest known L1 height.
-    pub fn get_latest_sequencer(&self) -> Result<Address> {
-        let value = self.get_latest_storage(self.portal_address, PORTAL_SEQUENCER_SLOT)?;
-        Ok(Address::from_slice(&value.as_slice()[12..]))
     }
 
     /// Read a storage slot asynchronously at a specific L1 block — cache first, RPC fallback.
@@ -229,9 +228,8 @@ impl L1StateProvider {
         block_number: u64,
     ) -> Result<B256> {
         {
-            let cache = self.cache.read();
+            let mut cache = self.cache.lock();
             if let Some(value) = cache.get(address, slot, block_number) {
-                debug!(%address, %slot, block_number, %value, "L1 storage cache hit");
                 return Ok(value);
             }
         }
@@ -239,7 +237,7 @@ impl L1StateProvider {
         warn!(%address, %slot, block_number, "L1 storage cache miss, fetching from RPC");
 
         let value = self.fetch_slot(address, slot, block_number).await?;
-        self.cache.write().set(address, slot, block_number, value);
+        self.cache.lock().set(address, slot, block_number, value);
         Ok(value)
     }
 
@@ -263,8 +261,52 @@ impl L1StateProvider {
     }
 }
 
-impl SequencerExt for L1StateProvider {
-    fn latest_sequencer(&self) -> Option<Address> {
-        self.get_latest_sequencer().ok()
+impl L1StorageReader for L1StateProvider {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> std::result::Result<B256, L1StateError> {
+        self.get_storage(account, slot, block_number)
+            .map_err(|error| L1StateError::StorageUnavailable {
+                account,
+                slot,
+                block_number,
+                reason: error.to_string(),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finite_sync_attempt_limit_returns_diagnostic_error() {
+        let config = L1StateProviderConfig {
+            max_sync_attempts: Some(NonZeroU32::MIN),
+            ..Default::default()
+        };
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect("http://127.0.0.1:1")
+            .await
+            .expect("HTTP transport construction is lazy")
+            .erased();
+        let reader = L1StateProvider::new_raw(
+            config,
+            L1StateCache::default(),
+            provider,
+            tokio::runtime::Handle::current(),
+        );
+
+        let err =
+            tokio::task::spawn_blocking(move || reader.get_storage(Address::ZERO, B256::ZERO, 7))
+                .await
+                .expect("storage task must not panic")
+                .expect_err("dead endpoint must fail after one attempt");
+        let message = err.to_string();
+        assert!(message.contains("after 1 attempts"), "{message}");
+        assert!(message.contains("block=7"), "{message}");
     }
 }

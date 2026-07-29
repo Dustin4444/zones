@@ -8,9 +8,14 @@ use eyre as _;
 
 #[cfg(feature = "cli")]
 pub mod cli;
+pub mod dev;
 pub mod engine;
+pub mod genesis;
 pub mod node;
+mod replication;
 pub mod rpc;
+mod settlement_attestation;
+mod tx_forwarding;
 
 pub use engine::ZoneEngine;
 pub use node::{ZoneExecutorBuilder, ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig};

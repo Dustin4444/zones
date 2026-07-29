@@ -312,7 +312,7 @@ fn classify_public_methods() {
         "web3_sha3",
         "zone_getAuthorizationTokenInfo",
         "zone_getZoneInfo",
-        "zone_getDepositStatus",
+        "zone_getEncryptionKey",
     ] {
         assert_eq!(
             classify_method(method),
@@ -390,5 +390,6 @@ fn classify_admin_wildcard() {
 fn classify_unknown_is_none() {
     assert_eq!(classify_method("eth_someNewMethod"), None);
     assert_eq!(classify_method("foo_bar"), None);
+    assert_eq!(classify_method("zone_getDepositStatus"), None);
     assert_eq!(classify_method(""), None);
 }

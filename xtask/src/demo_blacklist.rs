@@ -75,7 +75,7 @@ use tempo_precompiles::{
     PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS, tip20::ISSUER_ROLE,
 };
 use tempo_zone_contracts::{
-    EncryptedDepositPayload, ZONE_OUTBOX_ADDRESS, ZoneInbox, ZoneOutbox, ZonePortal,
+    EncryptedDepositPayload, IZoneInbox, IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
 use zone_precompiles::ecies::encrypt_deposit;
 
@@ -454,7 +454,8 @@ impl DemoBlacklist {
         println!();
 
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
-        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount).await?;
+        send_encrypted_deposit(&portal, self.portal, token_addr, target, admin, self.amount)
+            .await?;
 
         println!("  Waiting for zone to process (expecting EncryptedDepositFailed)...");
         let bounced =
@@ -523,7 +524,8 @@ impl DemoBlacklist {
         println!();
 
         let l2_block_before = l2.get_block_number().await.unwrap_or(0);
-        send_encrypted_deposit(&portal, self.portal, token_addr, target, self.amount).await?;
+        send_encrypted_deposit(&portal, self.portal, token_addr, target, admin, self.amount)
+            .await?;
 
         println!("  Waiting for zone to process (expecting EncryptedDepositProcessed)...");
         let bounced =
@@ -570,7 +572,7 @@ impl DemoBlacklist {
         if withdraw_amount == 0 {
             println!("  No balance to withdraw — skipping.");
         } else {
-            let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &l2_target);
+            let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &l2_target);
 
             let l1_block_before = l1.get_block_number().await?;
             let receipt = outbox
@@ -678,6 +680,7 @@ async fn send_encrypted_deposit<P: Provider<TempoNetwork>>(
     portal_addr: Address,
     token: Address,
     to: Address,
+    tempo_refund_recipient: Address,
     amount: u128,
 ) -> eyre::Result<()> {
     let (key, key_index) = portal
@@ -701,7 +704,7 @@ async fn send_encrypted_deposit<P: Provider<TempoNetwork>>(
     };
 
     let receipt = portal
-        .depositEncrypted(token, amount, key_index, payload, to)
+        .depositEncrypted(token, amount, key_index, payload, tempo_refund_recipient)
         .send_sync()
         .await
         .wrap_err("depositEncrypted send failed")?;
@@ -737,13 +740,13 @@ async fn wait_for_token_enabled<P: Provider<TempoNetwork>>(
 ) -> eyre::Result<()> {
     let filter = Filter::new()
         .address(tempo_zone_contracts::ZONE_INBOX_ADDRESS)
-        .event_signature(ZoneInbox::TokenEnabled::SIGNATURE_HASH)
+        .event_signature(IZoneInbox::TokenEnabled::SIGNATURE_HASH)
         .from_block(1);
 
     for _ in 0..120 {
         let logs = l2.get_logs(&filter).await.unwrap_or_default();
         for log in &logs {
-            if let Ok(event) = ZoneInbox::TokenEnabled::decode_log(&log.inner)
+            if let Ok(event) = IZoneInbox::TokenEnabled::decode_log(&log.inner)
                 && event.data.token == token
             {
                 return Ok(());
@@ -765,13 +768,13 @@ async fn wait_for_deposit_processed<P: Provider<TempoNetwork>>(
 ) -> eyre::Result<u64> {
     let filter = Filter::new()
         .address(tempo_zone_contracts::ZONE_INBOX_ADDRESS)
-        .event_signature(ZoneInbox::DepositProcessed::SIGNATURE_HASH)
+        .event_signature(IZoneInbox::DepositProcessed::SIGNATURE_HASH)
         .from_block(from_block);
 
     for _ in 0..120 {
         let logs = l2.get_logs(&filter).await.unwrap_or_default();
         for log in &logs {
-            if let Ok(event) = ZoneInbox::DepositProcessed::decode_log(&log.inner)
+            if let Ok(event) = IZoneInbox::DepositProcessed::decode_log(&log.inner)
                 && event.data.sender == sender
                 && event.data.to == to
             {
@@ -798,17 +801,16 @@ async fn wait_for_encrypted_result<P: Provider<TempoNetwork>>(
 ) -> eyre::Result<bool> {
     let processed_filter = Filter::new()
         .address(tempo_zone_contracts::ZONE_INBOX_ADDRESS)
-        .event_signature(ZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH)
+        .event_signature(IZoneInbox::EncryptedDepositProcessed::SIGNATURE_HASH)
         .from_block(from_block);
     let failed_filter = Filter::new()
         .address(tempo_zone_contracts::ZONE_INBOX_ADDRESS)
-        .event_signature(ZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH)
+        .event_signature(IZoneInbox::EncryptedDepositFailed::SIGNATURE_HASH)
         .from_block(from_block);
-
     for _ in 0..120 {
         let logs = l2.get_logs(&processed_filter).await.unwrap_or_default();
         for log in &logs {
-            if let Ok(event) = ZoneInbox::EncryptedDepositProcessed::decode_log(&log.inner)
+            if let Ok(event) = IZoneInbox::EncryptedDepositProcessed::decode_log(&log.inner)
                 && event.data.sender == sender
                 && event.data.to == to
                 && event.data.token == token
@@ -820,7 +822,7 @@ async fn wait_for_encrypted_result<P: Provider<TempoNetwork>>(
 
         let logs = l2.get_logs(&failed_filter).await.unwrap_or_default();
         for log in &logs {
-            if let Ok(event) = ZoneInbox::EncryptedDepositFailed::decode_log(&log.inner)
+            if let Ok(event) = IZoneInbox::EncryptedDepositFailed::decode_log(&log.inner)
                 && event.data.sender == sender
                 && event.data.token == token
                 && event.data.amount == amount

@@ -9,21 +9,20 @@ import {
     DepositType,
     EnabledToken,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
-    PORTAL_SEQUENCER_SLOT,
+    PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
     Withdrawal,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
-import { ZoneFactory } from "../../src/l1/ZoneFactory.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
 import {
     EMPTY_SENTINEL,
     WITHDRAWAL_QUEUE_CAPACITY
 } from "../../src/libraries/WithdrawalQueueLib.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { ZoneInbox } from "../../src/predeploys/ZoneInbox.sol";
-import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
+import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
+import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
+import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
+import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { BaseTest } from "../BaseTest.t.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
@@ -156,7 +155,7 @@ contract ZoneLifecycleHandler is Test {
         );
         prevPortalBatchIndex = pbi;
 
-        uint64 obi = outbox.withdrawalBatchIndex();
+        uint64 obi = outbox.lastBatch().withdrawalBatchIndex;
         require(
             obi >= prevOutboxBatchIndex,
             "TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX: outbox withdrawalBatchIndex decreased"
@@ -182,7 +181,7 @@ contract ZoneLifecycleHandler is Test {
             sender: user,
             to: user,
             amount: net,
-            bouncebackRecipient: user,
+            tempoRefundRecipient: user,
             memo: bytes32(0)
         });
         mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
@@ -256,10 +255,9 @@ contract ZoneLifecycleHandler is Test {
             senderTag: keccak256(abi.encodePacked(holder, txHash)),
             to: holder,
             amount: amount,
-            fee: 0,
             memo: bytes32(0),
             gasLimit: 0,
-            fallbackRecipient: holder,
+            fallbackNonce: uint64(seqBefore + 1),
             callbackData: "",
             encryptedSender: ""
         });
@@ -313,7 +311,9 @@ contract ZoneLifecycleHandler is Test {
         vm.roll(block.number + 1);
         uint64 anchor = uint64(block.number - 1);
         vm.prank(sequencer);
-        portal.submitBatch(anchor, 0, bt, dt, wHash, "", "");
+        bytes[] memory signatures = new bytes[](1);
+        signatures[0] = hex"01";
+        portal.submitBatch(anchor, 0, bt, dt, wHash, "", "", numFinalizes + 1, signatures);
 
         batches.push();
         Batch storage b = batches[batches.length - 1];
@@ -350,10 +350,12 @@ contract ZoneLifecycleHandler is Test {
 
         Withdrawal memory w = b.ws[idx];
         vm.prank(sequencer);
-        portal.processWithdrawal(w, remaining);
+        Withdrawal[] memory withdrawals = new Withdrawal[](1);
+        withdrawals[0] = w;
+        portal.processWithdrawals(withdrawals, remaining);
 
         b.head = idx + 1;
-        escrowOut += w.amount + w.fee;
+        escrowOut += w.amount;
         numWithdrawalsProcessed++;
         _recordMonotonicCounters();
     }
@@ -372,7 +374,6 @@ contract ZoneLifecycleHandler is Test {
 /// forge-config: default.invariant.depth = 200
 contract ZoneLifecycleInvariantTest is BaseTest {
 
-    ZoneFactory internal zoneFactory;
     ZonePortal internal portal;
     MockZoneToken internal token;
     MockTempoState internal tempoState;
@@ -388,7 +389,6 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         super.setUp();
         vm.fee(0); // zero basefee => zero bounceback fee, so deposits never hit DepositTooSmall
 
-        zoneFactory = new ZoneFactory(); // verifier source only
         token = new MockZoneToken("Zone USD", "zUSD");
 
         // Pre-fund actors with L1 balance to deposit.
@@ -400,28 +400,18 @@ contract ZoneLifecycleInvariantTest is BaseTest {
 
         uint64 genesisTempoBlockNumber = uint64(block.number);
 
-        // Deploy messenger + portal directly (admin == sequencer == this test contract).
-        uint256 nonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), nonce + 1);
-        ZoneMessenger messenger = new ZoneMessenger(predictedPortal);
-        portal = new ZonePortal(
-            1,
-            address(token),
-            address(messenger),
-            address(this),
-            address(this),
-            zoneFactory.verifier(),
-            GENESIS_BLOCK_HASH,
-            genesisTempoBlockNumber,
-            ""
-        );
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = address(this);
+        portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
         // Zone side.
         tempoState =
             new MockTempoState(address(this), GENESIS_TEMPO_BLOCK_HASH, genesisTempoBlockNumber);
         config = new ZoneConfig(address(portal), address(tempoState));
         tempoState.setMockStorageValue(
-            address(portal), PORTAL_SEQUENCER_SLOT, bytes32(uint256(uint160(address(this))))
+            address(portal),
+            keccak256(abi.encode(address(this), PORTAL_IS_SEQUENCER_SLOT)),
+            bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(address(portal), address(token), true);
         inbox = new ZoneInbox(address(config), address(portal), address(tempoState));
@@ -478,7 +468,7 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         );
         assertEq(
             portal.withdrawalBatchIndex(),
-            outbox.withdrawalBatchIndex(),
+            outbox.lastBatch().withdrawalBatchIndex,
             "TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX: L1 and zone withdrawal batch indices out of lockstep"
         );
     }

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ZONE_INBOX, ZONE_TX_CONTEXT } from "../../src/interfaces/IZone.sol";
-import { ZoneConfig } from "../../src/predeploys/ZoneConfig.sol";
-import { ZoneOutbox } from "../../src/predeploys/ZoneOutbox.sol";
+import {
+    PORTAL_IS_SEQUENCER_SLOT,
+    ZONE_INBOX,
+    ZONE_TX_CONTEXT
+} from "../../src/interfaces/IZone.sol";
+import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
+import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
@@ -18,10 +22,6 @@ contract ZoneOutboxHarness is ZoneOutbox {
 
     function rawLength() external view returns (uint256) {
         return _pendingWithdrawals.length;
-    }
-
-    function rawHead() external view returns (uint256) {
-        return _pendingWithdrawalsHead;
     }
 
     function gasLimitAt(uint256 i) external view returns (uint64) {
@@ -194,7 +194,7 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
         tempoState = new MockTempoState(SEQ, GENESIS_TEMPO_BLOCK_HASH, GENESIS_TEMPO_BLOCK_NUMBER);
         config = new ZoneConfig(MOCK_PORTAL, address(tempoState));
         tempoState.setMockStorageValue(
-            MOCK_PORTAL, bytes32(uint256(0)), bytes32(uint256(uint160(SEQ)))
+            MOCK_PORTAL, keccak256(abi.encode(SEQ, PORTAL_IS_SEQUENCER_SLOT)), bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(MOCK_PORTAL, address(token), true);
         outbox = new ZoneOutboxHarness(address(config));
@@ -207,7 +207,7 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
         token.setMinter(address(this), false);
 
         vm.prank(SEQ);
-        outbox.setMaxWithdrawalsPerBlock(CAP);
+        outbox.setMaxWithdrawalsPerBlock(uint32(CAP));
 
         handler = new ZoneWithdrawalLimitsHandler(outbox, token, SEQ, alice, bob, charlie);
         targetContract(address(handler));
@@ -217,7 +217,7 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
     ///         callback-data-size caps; an over-bounds request can never enter the queue.
     function invariant_storedWithdrawalBounds() public view {
         uint256 len = outbox.rawLength();
-        for (uint256 i = outbox.rawHead(); i < len; i++) {
+        for (uint256 i; i < len; i++) {
             assertLe(
                 outbox.gasLimitAt(i),
                 handler.maxGas(),

@@ -1,14 +1,30 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ZONE_TX_CONTEXT } from "../src/interfaces/IZone.sol";
+import {
+    BlockTransition,
+    DepositQueueTransition,
+    IZoneFactory,
+    IZonePortal,
+    Withdrawal,
+    ZONE_FACTORY_ADDRESS,
+    ZONE_MESSENGER_ADDRESS,
+    ZONE_TX_CONTEXT,
+    ZONE_VERIFIER_ADDRESS,
+    ZoneInfo
+} from "../src/interfaces/IZone.sol";
 import { EIP2935 } from "../src/libraries/BlockHashHistory.sol";
+import { Verifier } from "../src/tempo/Verifier.sol";
+import { ZoneMessenger } from "../src/tempo/ZoneMessenger.sol";
+import { ZonePortal } from "../src/tempo/ZonePortal.sol";
+import { MockZoneGateway } from "./mocks/MockZoneGateway.sol";
 import { MockZoneTxContext } from "./mocks/MockZoneTxContext.sol";
 import { Test, console } from "forge-std/Test.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { IAccountKeychain } from "tempo-std/interfaces/IAccountKeychain.sol";
 import { IFeeManager } from "tempo-std/interfaces/IFeeManager.sol";
 import { INonce } from "tempo-std/interfaces/INonce.sol";
+import { ISignatureVerifier } from "tempo-std/interfaces/ISignatureVerifier.sol";
 import { IStablecoinDEX } from "tempo-std/interfaces/IStablecoinDEX.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP20Token } from "tempo-std/interfaces/ITIP20.sol";
@@ -19,6 +35,8 @@ import { IValidatorConfig } from "tempo-std/interfaces/IValidatorConfig.sol";
 /// @notice Base test framework for all spec tests
 /// pathUSD is just a TIP20 at a special address (0x20C0...) with token_id=0
 contract BaseTest is Test {
+
+    mapping(address portal => uint256 height) private _submittedZoneHeights;
 
     // Registry precompiles
     address internal constant _ACCOUNT_KEYCHAIN = StdPrecompiles.ACCOUNT_KEYCHAIN_ADDRESS;
@@ -31,6 +49,7 @@ contract BaseTest is Test {
     address internal constant _VALIDATOR_CONFIG = StdPrecompiles.VALIDATOR_CONFIG_ADDRESS;
     address internal constant _BLOCKHASH_HISTORY = EIP2935;
     address internal constant _ZONE_TX_CONTEXT = ZONE_TX_CONTEXT;
+    address internal constant _ZONE_FACTORY = ZONE_FACTORY_ADDRESS;
 
     // EIP-2935 serve window: hashes for the most recent 8191 blocks are available
     // (block.number - 8191 ..= block.number - 1); reads outside that range return zero.
@@ -63,11 +82,14 @@ contract BaseTest is Test {
     ITIP20Token public token1;
     ITIP20Token public token2;
     MockZoneTxContext public zoneTxContext = MockZoneTxContext(_ZONE_TX_CONTEXT);
+    MockZoneGateway public zoneGateway;
 
     error MissingPrecompile(string name, address addr);
     error CallShouldHaveReverted();
 
     function setUp() public virtual {
+        zoneGateway = new MockZoneGateway();
+
         if (_ACCOUNT_KEYCHAIN.code.length == 0) {
             revert MissingPrecompile("AccountKeychain", _ACCOUNT_KEYCHAIN);
         }
@@ -128,6 +150,139 @@ contract BaseTest is Test {
                 "TOKEN2", "T2", "USD", ITIP20(_PATH_USD), sequencer, bytes32("token2")
             )
         );
+
+        _mockTokenPolicyMigration(_PATH_USD, true);
+    }
+
+    function _mockTokenPolicyMigration(address token, bool isSet) internal {
+        address[] memory tokens = new address[](1);
+        tokens[0] = token;
+        vm.mockCall(
+            _TIP403REGISTRY,
+            abi.encodeCall(ITIP403Registry.migrateTransferPolicyIds, (tokens)),
+            abi.encode(isSet ? 1 : 0)
+        );
+        vm.mockCall(
+            _TIP403REGISTRY,
+            abi.encodeCall(ITIP403Registry.tokenTransferPolicyId, (token)),
+            abi.encode(isSet, uint64(1))
+        );
+    }
+
+    function _zoneGateways() internal view returns (address[] memory gateways) {
+        gateways = new address[](1);
+        gateways[0] = address(zoneGateway);
+    }
+
+    function _closedLoopAccounts() internal view returns (address[] memory accounts) {
+        accounts = new address[](5);
+        accounts[0] = address(this);
+        accounts[1] = admin;
+        accounts[2] = alice;
+        accounts[3] = bob;
+        accounts[4] = charlie;
+    }
+
+    /// @notice Installs the shared runtimes managed by the native TIP-1091 factory.
+    function _installSharedZoneRuntimes() internal {
+        vm.etch(ZONE_VERIFIER_ADDRESS, type(Verifier).runtimeCode);
+        vm.etch(ZONE_MESSENGER_ADDRESS, type(ZoneMessenger).runtimeCode);
+    }
+
+    /// @notice Creates a direct portal fixture with native-factory-equivalent storage.
+    /// @dev Native ZoneFactory behavior is tested in Tempo. Solidity behavior tests use a direct
+    ///      implementation because vanilla Forge cannot execute the Rust precompile.
+    function _createZonePortal(
+        uint32 zoneId,
+        address initialToken,
+        address portalAdmin,
+        address[] memory sequencers,
+        uint8 threshold,
+        string memory rpcUrl
+    )
+        internal
+        returns (ZonePortal portal)
+    {
+        _installSharedZoneRuntimes();
+        portal = new ZonePortal();
+        vm.prank(ZONE_FACTORY_ADDRESS);
+        portal.initialize(
+            zoneId,
+            initialToken,
+            true,
+            true,
+            _closedLoopAccounts(),
+            _zoneGateways(),
+            ZONE_MESSENGER_ADDRESS,
+            portalAdmin,
+            sequencers,
+            threshold,
+            ZONE_VERIFIER_ADDRESS,
+            rpcUrl
+        );
+
+        vm.mockCall(
+            ZONE_FACTORY_ADDRESS,
+            abi.encodeCall(IZoneFactory.zones, (zoneId)),
+            abi.encode(
+                ZoneInfo({
+                    zoneId: zoneId,
+                    portal: address(portal),
+                    accessMode: true,
+                    gatewayMode: true,
+                    admin: portalAdmin,
+                    sequencers: sequencers,
+                    threshold: threshold,
+                    verifier: ZONE_VERIFIER_ADDRESS,
+                    rpcUrl: rpcUrl
+                })
+            )
+        );
+    }
+
+    function _singleWithdrawal(Withdrawal memory withdrawal)
+        internal
+        pure
+        returns (Withdrawal[] memory withdrawals)
+    {
+        withdrawals = new Withdrawal[](1);
+        withdrawals[0] = withdrawal;
+    }
+
+    /// @notice Submit through the TIP-1091 entrypoint while dedicated certificate tests exercise
+    ///         the real signature precompile behavior independently.
+    function _submitBatch(
+        IZonePortal portal,
+        uint64 tempoBlockNumber,
+        uint64 recentTempoBlockNumber,
+        BlockTransition memory blockTransition,
+        DepositQueueTransition memory depositQueueTransition,
+        bytes32 withdrawalQueueHash,
+        bytes memory verifierConfig,
+        bytes memory proof
+    )
+        internal
+    {
+        bytes[] memory signatures = new bytes[](1);
+        signatures[0] = hex"01";
+        vm.mockCall(
+            address(StdPrecompiles.SIGNATURE_VERIFIER),
+            abi.encodeWithSelector(ISignatureVerifier.recover.selector),
+            abi.encode(sequencer)
+        );
+        uint256 nextZoneHeight = _submittedZoneHeights[address(portal)] + 1;
+        portal.submitBatch(
+            tempoBlockNumber,
+            recentTempoBlockNumber,
+            blockTransition,
+            depositQueueTransition,
+            withdrawalQueueHash,
+            verifierConfig,
+            proof,
+            nextZoneHeight,
+            signatures
+        );
+        _submittedZoneHeights[address(portal)] = nextZoneHeight;
     }
 
 }

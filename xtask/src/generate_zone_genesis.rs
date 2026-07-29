@@ -28,28 +28,27 @@ use tempo_contracts::{
 };
 use tempo_evm::evm::{TempoEvm, TempoEvmFactory};
 use tempo_precompiles::{
-    PATH_USD_ADDRESS,
+    PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS,
     account_keychain::AccountKeychain,
     nonce::NonceManager,
+    receive_policy_guard::ReceivePolicyGuard,
     stablecoin_dex::StablecoinDEX,
     storage::{StorageActions, StorageCtx},
-    tip_fee_manager::TipFeeManager,
+    storage_credits::StorageCredits,
     tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
     tip20_factory::TIP20Factory,
     tip403_registry::TIP403Registry,
 };
+use tempo_primitives::TempoHeader;
 use tempo_revm::{TempoBlockEnv, TempoTxEnv};
-use zone_precompiles::ZoneTokenFactory;
+use zone_precompiles::{
+    TempoState as NativeTempoState, ZoneFeeManager, ZoneOutbox as NativeZoneOutbox,
+};
 
 const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
 const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
-
-/// TempoStateReader precompile address — has no deployed contract code, but the zone EVM
-/// registers a custom precompile here. We must insert dummy bytecode (`0xFE`) in genesis
-/// so that Solidity's `EXTCODESIZE` check passes before issuing the STATICCALL.
-const TEMPO_STATE_READER_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000004");
 
 const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
@@ -70,8 +69,13 @@ pub(crate) struct GenerateZoneGenesis {
     #[arg(long)]
     pub(crate) tempo_portal: Address,
 
+    /// Canonical fee token used when a zone transaction omits `fee_token`.
+    #[arg(long, default_value_t = PATH_USD_ADDRESS)]
+    pub(crate) default_fee_token: Address,
+
+    /// RLP-encoded Tempo genesis header. Defaults to `TempoHeader::default()`.
     #[arg(long)]
-    pub(crate) tempo_genesis_header_rlp: String,
+    pub(crate) tempo_genesis_header_rlp: Option<String>,
 
     #[arg(long)]
     pub(crate) admin: Address,
@@ -113,8 +117,12 @@ impl GenerateZoneGenesis {
             return Err(eyre!("--admin must not be the zero address"));
         }
 
-        let header_rlp = const_hex::decode(&self.tempo_genesis_header_rlp)
-            .wrap_err("failed to decode hex string")?;
+        let header_rlp = match &self.tempo_genesis_header_rlp {
+            Some(header_rlp) => {
+                const_hex::decode(header_rlp).wrap_err("failed to decode hex string")?
+            }
+            None => alloy_rlp::encode(TempoHeader::default()),
+        };
 
         let mut evm = setup_zone_evm(self.chain_id, self.gas_limit);
 
@@ -133,27 +141,18 @@ impl GenerateZoneGenesis {
         deploy_permit2(&mut evm)?;
 
         initialize_tip403_registry(&mut evm)?;
-        initialize_tip20_factory(&mut evm)?;
         create_path_usd_token(&mut evm, self.admin)?;
-        initialize_fee_manager(&mut evm)?;
+        initialize_fee_manager(&mut evm, self.default_fee_token)?;
         initialize_stablecoin_dex(&mut evm)?;
         initialize_nonce_manager(&mut evm)?;
         initialize_account_keychain(&mut evm)?;
+        initialize_receive_policy_guard(&mut evm)?;
+        initialize_storage_credits(&mut evm)?;
 
-        let tempo_state_bytecode = load_artifact(&self.specs_out, "TempoState")?;
-        let tempo_state_args = (Bytes::from(header_rlp),).abi_encode_params();
         let mut nonce = 0u64;
 
-        deploy_contract(
-            &mut evm,
-            &tempo_state_bytecode,
-            &tempo_state_args,
-            TEMPO_STATE_ADDRESS,
-            "TempoState",
-            self.chain_id,
-            nonce,
-        )?;
-        nonce += 1;
+        initialize_tempo_state(&mut evm, &header_rlp)?;
+        initialize_zone_outbox(&mut evm)?;
 
         let zone_config_bytecode = load_artifact(&self.specs_out, "ZoneConfig")?;
         let zone_config_args = (self.tempo_portal, TEMPO_STATE_ADDRESS).abi_encode_params();
@@ -180,41 +179,6 @@ impl GenerateZoneGenesis {
             self.chain_id,
             nonce,
         )?;
-        nonce += 1;
-
-        let zone_outbox_bytecode = load_artifact(&self.specs_out, "ZoneOutbox")?;
-        let zone_outbox_args = (ZONE_CONFIG_ADDRESS,).abi_encode_params();
-        deploy_contract(
-            &mut evm,
-            &zone_outbox_bytecode,
-            &zone_outbox_args,
-            ZONE_OUTBOX_ADDRESS,
-            "ZoneOutbox",
-            self.chain_id,
-            nonce,
-        )?;
-
-        // Insert dummy bytecode at the TempoStateReader precompile address.
-        //
-        // The zone EVM registers a custom precompile at this address, but Solidity ≥0.8
-        // checks `EXTCODESIZE` before every high-level external call. If the address has
-        // no code, the call reverts immediately without issuing the STATICCALL — the
-        // precompile never gets a chance to execute. `0xFE` (INVALID opcode) is safe
-        // because revm routes to the precompile before ever executing bytecode.
-        {
-            use reth_evm::revm::bytecode::Bytecode;
-            evm.db_mut().insert_account_info(
-                TEMPO_STATE_READER_ADDRESS,
-                AccountInfo {
-                    code: Some(Bytecode::new_raw(Bytes::from_static(&[0xFE]))),
-                    nonce: 1,
-                    ..Default::default()
-                },
-            );
-            println!(
-                "Inserted dummy bytecode at TempoStateReader precompile {TEMPO_STATE_READER_ADDRESS}"
-            );
-        }
 
         let db = evm.db_mut();
         for (name, addr) in [
@@ -238,7 +202,7 @@ impl GenerateZoneGenesis {
             .cache
             .accounts
             .iter()
-            .filter(|(addr, _)| **addr != DEPLOYER)
+            .filter(|(addr, _)| **addr != DEPLOYER && **addr != TIP20_FACTORY_ADDRESS)
             .filter(|(addr, _)| {
                 self.with_create2_factory || **addr != ARACHNID_CREATE2_FACTORY_ADDRESS
             })
@@ -340,8 +304,11 @@ impl GenerateZoneGenesis {
         genesis.alloc = genesis_alloc;
         genesis.config = chain_config;
 
-        let json =
-            serde_json::to_string_pretty(&genesis).wrap_err("failed encoding genesis as JSON")?;
+        let genesis_json =
+            serde_json::to_value(&genesis).wrap_err("failed encoding genesis as JSON")?;
+        let mut json = serde_json::to_string_pretty(&genesis_json)
+            .wrap_err("failed encoding genesis as JSON")?;
+        json.push('\n');
 
         std::fs::create_dir_all(&self.output).wrap_err_with(|| {
             format!(
@@ -477,6 +444,39 @@ fn deploy_permit2(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Initialize the native TempoState precompile storage from the L1 genesis header.
+fn initialize_tempo_state(
+    evm: &mut TempoEvm<CacheDB<EmptyDB>>,
+    header_rlp: &[u8],
+) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || NativeTempoState::new().initialize(header_rlp),
+    )?;
+    println!("Initialized native TempoState at {TEMPO_STATE_ADDRESS}");
+    Ok(())
+}
+
+/// Initialize the native ZoneOutbox account marker and storage.
+fn initialize_zone_outbox(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || NativeZoneOutbox::new().initialize(),
+    )?;
+    println!("Initialized native ZoneOutbox at {ZONE_OUTBOX_ADDRESS}");
+    Ok(())
+}
+
 /// Initialize the TIP403Registry precompile (required for fee token transfer checks).
 fn initialize_tip403_registry(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
@@ -489,21 +489,6 @@ fn initialize_tip403_registry(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Res
         || TIP403Registry::new().initialize(),
     )?;
     println!("Initialized TIP403Registry");
-    Ok(())
-}
-
-/// Initialize the ZoneTokenFactory precompile (required before creating any TIP20 tokens).
-fn initialize_tip20_factory(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
-    let ctx = evm.ctx_mut();
-    StorageCtx::enter_evm(
-        &mut ctx.journaled_state,
-        &ctx.block,
-        &ctx.cfg,
-        &ctx.tx,
-        StorageActions::disabled(),
-        || ZoneTokenFactory::new().initialize(),
-    )?;
-    println!("Initialized ZoneTokenFactory");
     Ok(())
 }
 
@@ -555,8 +540,11 @@ fn create_path_usd_token(evm: &mut TempoEvm<CacheDB<EmptyDB>>, admin: Address) -
     Ok(())
 }
 
-/// Initialize the TipFeeManager precompile.
-fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+/// Initialize the Zone fee manager precompile.
+fn initialize_fee_manager(
+    evm: &mut TempoEvm<CacheDB<EmptyDB>>,
+    default_fee_token: Address,
+) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
     StorageCtx::enter_evm(
         &mut ctx.journaled_state,
@@ -565,13 +553,13 @@ fn initialize_fee_manager(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<
         &ctx.tx,
         StorageActions::disabled(),
         || {
-            let mut fee_manager = TipFeeManager::new();
+            let mut fee_manager = ZoneFeeManager::new();
             fee_manager
-                .initialize()
+                .initialize(default_fee_token)
                 .expect("Could not init fee manager");
         },
     );
-    println!("Initialized TipFeeManager");
+    println!("Initialized ZoneFeeManager with default fee token {default_fee_token}");
     Ok(())
 }
 
@@ -617,5 +605,39 @@ fn initialize_account_keychain(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Re
         || AccountKeychain::new().initialize(),
     )?;
     println!("Initialized AccountKeychain");
+    Ok(())
+}
+
+/// Initialize the ReceivePolicyGuard precompile account.
+fn initialize_receive_policy_guard(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || ReceivePolicyGuard::new().initialize(),
+    )?;
+    println!("Initialized ReceivePolicyGuard");
+    Ok(())
+}
+
+/// Initialize the StorageCredits precompile account.
+///
+/// TIP-1060 bookkeeping writes this account from the EVM handler, even when no transaction calls
+/// the precompile directly. Keeping the account non-empty prevents EIP-161 from dropping the
+/// sequential transition while the sparse-trie state hook still observes its storage updates.
+fn initialize_storage_credits(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        StorageActions::disabled(),
+        || StorageCredits::new().initialize(),
+    )?;
+    println!("Initialized StorageCredits");
     Ok(())
 }

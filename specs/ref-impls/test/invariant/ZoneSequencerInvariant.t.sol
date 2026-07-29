@@ -1,133 +1,80 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
-import { MockZoneToken } from "../mocks/MockZoneToken.sol";
+import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
+import { BaseTest } from "../BaseTest.t.sol";
 import { Test } from "forge-std/Test.sol";
 
-/// @title ZoneSequencerHandler
-/// @notice Drives the two-step sequencer handover (`transferSequencer` / `acceptSequencer`)
-///         while mirroring the expected `(sequencer, pendingSequencer)` state. Every action is
-///         a legal operation replayed against a ghost model, so the invariant test can assert
-///         the on-chain state machine never diverges from the reference (TEMPO-ZONE-SEQUENCER-TWO-STEP).
+/// @notice Drives valid TIP-1091 sequencer-set and threshold replacements.
 contract ZoneSequencerHandler is Test {
 
     ZonePortal internal immutable portal;
+    address internal immutable admin;
     address[4] internal candidates;
 
-    address public expectedSequencer;
-    address public expectedPending;
-    uint256 public handoverCount; // coverage: proves the accept path actually executed
+    uint64 public successfulUpdates;
 
-    constructor(ZonePortal _portal, address _initialSequencer, address[4] memory _candidates) {
+    constructor(ZonePortal _portal, address _admin) {
         portal = _portal;
-        expectedSequencer = _initialSequencer;
-        candidates = _candidates;
+        admin = _admin;
+        candidates = [address(0xA1), address(0xA2), address(0xA3), address(0xA4)];
     }
 
-    function _candidate(uint256 seed) internal view returns (address) {
-        return candidates[seed % candidates.length];
-    }
+    function replaceSequencerSet(uint8 countSeed, uint8 thresholdSeed) external {
+        uint256 count = uint256(countSeed % 4) + 1;
+        address[] memory members = new address[](count);
+        for (uint256 i; i < count; ++i) {
+            members[i] = candidates[i];
+        }
+        uint8 threshold = uint8(uint256(thresholdSeed) % count) + 1;
 
-    /// @notice Current sequencer starts a transfer to a (non-zero) candidate.
-    function propose(uint256 candidateSeed) external {
-        address next = _candidate(candidateSeed);
-        vm.prank(expectedSequencer);
-        portal.transferSequencer(next);
-        expectedPending = next;
-    }
-
-    /// @notice The pending sequencer accepts, completing the handover exactly once.
-    function accept() external {
-        if (expectedPending == address(0)) return;
-        vm.prank(expectedPending);
-        portal.acceptSequencer();
-        expectedSequencer = expectedPending;
-        expectedPending = address(0);
-        handoverCount++;
-    }
-
-    /// @notice Propose then immediately accept, guaranteeing handovers regardless of
-    ///         random interleaving (keeps the accept path well-covered).
-    function proposeThenAccept(uint256 candidateSeed) external {
-        address next = _candidate(candidateSeed);
-        vm.prank(expectedSequencer);
-        portal.transferSequencer(next);
-        vm.prank(next);
-        portal.acceptSequencer();
-        expectedSequencer = next;
-        expectedPending = address(0);
-        handoverCount++;
+        vm.prank(admin);
+        try portal.setSequencerSet(members, threshold) {
+            ++successfulUpdates;
+        } catch { }
     }
 
 }
 
-/// @title ZoneSequencerInvariantTest
-/// @notice Stateful invariant for the two-step sequencer transfer (TEMPO-ZONE-SEQUENCER-TWO-STEP): `pendingSequencer`
-///         is set by the current sequencer, consumed exactly once by `acceptSequencer`, then
-///         reset to zero — so block production can never be seized by an unintended address.
-contract ZoneSequencerInvariantTest is Test {
+/// @notice Stateful invariants for the current multi-sequencer configuration model.
+contract ZoneSequencerInvariantTest is BaseTest {
 
     ZonePortal internal portal;
-    MockZoneToken internal token;
     ZoneSequencerHandler internal handler;
+    uint64 internal initialVersion;
 
-    address internal constant SEQ0 = address(0x5e9001);
-    address internal constant SEQ1 = address(0x5e9002);
-    address internal constant SEQ2 = address(0x5e9003);
-    address internal constant SEQ3 = address(0x5e9004);
-
-    bytes32 constant GENESIS_BLOCK_HASH = keccak256("genesis");
-
-    function setUp() public {
-        token = new MockZoneToken("Zone USD", "zUSD");
-
-        uint256 nonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), nonce + 1);
-        ZoneMessenger messenger = new ZoneMessenger(predictedPortal);
-        portal = new ZonePortal(
-            1,
-            address(token),
-            address(messenger),
-            address(this), // admin
-            SEQ0, // initial sequencer
-            address(0), // verifier (unused by sequencer handover)
-            GENESIS_BLOCK_HASH,
-            uint64(block.number),
-            ""
-        );
-
-        handler = new ZoneSequencerHandler(portal, SEQ0, [SEQ0, SEQ1, SEQ2, SEQ3]);
+    function setUp() public override {
+        super.setUp();
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = sequencer;
+        portal = _createZonePortal(1, address(pathUSD), admin, sequencers, 1, "");
+        initialVersion = portal.sequencerSetVersion();
+        handler = new ZoneSequencerHandler(portal, admin);
         targetContract(address(handler));
     }
 
-    /// @notice On-chain sequencer state never diverges from the legal-operation ghost model,
-    ///         and the live sequencer is never the zero address (block production stays owned).
-    function invariant_sequencerStateMachine() public view {
-        assertEq(
-            portal.sequencer(),
-            handler.expectedSequencer(),
-            "TEMPO-ZONE-SEQUENCER-TWO-STEP: sequencer diverged from two-step handover model"
-        );
-        assertEq(
-            portal.pendingSequencer(),
-            handler.expectedPending(),
-            "TEMPO-ZONE-SEQUENCER-TWO-STEP: pendingSequencer diverged from two-step handover model"
-        );
-        assertTrue(
-            portal.sequencer() != address(0),
-            "TEMPO-ZONE-SEQUENCER-TWO-STEP: sequencer became the zero address"
-        );
+    function invariant_sequencerSetIsValid() public view {
+        uint256 count = portal.sequencerCount();
+        assertGt(count, 0);
+        assertLe(count, portal.MAX_SEQUENCERS());
+        assertGt(portal.sequencerThreshold(), 0);
+        assertLe(portal.sequencerThreshold(), count);
+
+        for (uint256 i; i < count; ++i) {
+            address member = portal.sequencerAt(i);
+            assertTrue(portal.isSequencer(member));
+            for (uint256 j; j < i; ++j) {
+                assertNotEq(member, portal.sequencerAt(j));
+            }
+        }
     }
 
-    /// @notice Guard against a vacuous pass: at least one full handover must have completed.
+    function invariant_versionTracksSuccessfulUpdates() public view {
+        assertEq(portal.sequencerSetVersion(), initialVersion + handler.successfulUpdates());
+    }
+
     function afterInvariant() public view {
-        assertGt(
-            handler.handoverCount(),
-            0,
-            "TEMPO-ZONE-SEQUENCER-TWO-STEP: handover path never exercised"
-        );
+        assertGt(handler.successfulUpdates(), 0, "sequencer update path not exercised");
     }
 
 }

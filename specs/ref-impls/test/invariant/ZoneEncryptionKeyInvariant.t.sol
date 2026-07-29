@@ -2,8 +2,9 @@
 pragma solidity ^0.8.13;
 
 import { ENCRYPTION_KEY_GRACE_PERIOD } from "../../src/interfaces/IZone.sol";
-import { ZoneMessenger } from "../../src/l1/ZoneMessenger.sol";
-import { ZonePortal } from "../../src/l1/ZonePortal.sol";
+import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
+import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
+import { BaseTest } from "../BaseTest.t.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
 import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
@@ -60,7 +61,7 @@ contract ZoneEncryptionKeyHandler is Test {
 /// @notice Stateful invariant for encryption-key rotation (TEMPO-ZONE-ENCRYPTION-KEY-GRACE): the latest key never expires,
 ///         and an older key is valid for new deposits exactly while
 ///         `block.number < nextKey.activationBlock + ENCRYPTION_KEY_GRACE_PERIOD`.
-contract ZoneEncryptionKeyInvariantTest is Test {
+contract ZoneEncryptionKeyInvariantTest is BaseTest {
 
     ZonePortal internal portal;
     MockZoneToken internal token;
@@ -69,23 +70,13 @@ contract ZoneEncryptionKeyInvariantTest is Test {
     address internal constant SEQ = address(0x5e9);
     bytes32 constant GENESIS_BLOCK_HASH = keccak256("genesis");
 
-    function setUp() public {
+    function setUp() public override {
+        super.setUp();
         token = new MockZoneToken("Zone USD", "zUSD");
 
-        uint256 nonce = vm.getNonce(address(this));
-        address predictedPortal = vm.computeCreateAddress(address(this), nonce + 1);
-        ZoneMessenger messenger = new ZoneMessenger(predictedPortal);
-        portal = new ZonePortal(
-            1,
-            address(token),
-            address(messenger),
-            address(this), // admin
-            SEQ, // sequencer (only it can register keys)
-            address(0), // verifier (unused here)
-            GENESIS_BLOCK_HASH,
-            uint64(block.number),
-            ""
-        );
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = SEQ;
+        portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
         handler = new ZoneEncryptionKeyHandler(portal, SEQ);
         targetContract(address(handler));

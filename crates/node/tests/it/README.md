@@ -43,7 +43,7 @@ The harness provides two independent testing paths:
 
 Uses `L1Fixture` to manually construct `TempoHeader` and `Deposit` objects,
 push them into the `DepositQueue`, and seed the `L1StateCache` for
-`TempoStateReader` precompile reads. Fast (~1s per test) and deterministic.
+`TempoState` storage reads. Fast (~1s per test) and deterministic.
 
 ```rust
 let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
@@ -55,8 +55,8 @@ fixture.inject_deposits(&zone.deposit_queue, vec![deposit]);
 **L1Fixture internals:**
 - Chains `parent_hash = keccak256(rlp(prev_header))` to match `TempoState` verification
 - Monotonic block numbers starting from 1, timestamps from 1,000,000
-- `seed_l1_cache()` populates portal storage slots (sequencer=0, deposit_queue_hash=4)
-  so `TempoStateReader` precompile reads succeed without a real L1
+- `seed_l1_cache()` populates portal storage slots (sequencer membership and deposit queue hash=3)
+  so `TempoState` storage reads succeed without a real L1
 
 **Multi-zone support:** Use `next_block()` + `enqueue()` to broadcast the same
 `FixtureBlock` to multiple zone deposit queues:
@@ -76,7 +76,8 @@ real blocks over WebSocket.
 **Genesis patching in `start_from_l1()`:**
 
 The zone's `TempoState` genesis must be anchored to the L1's current state.
-`start_from_l1()` fetches the L1's latest header and patches `zone-test-genesis.json`:
+`start_from_l1()` fetches the L1's latest header and patches the bundled genesis
+template (`crates/node/assets/zone-dev-genesis.json`, via `zone_node::genesis`):
 
 1. **Slot 0** (`tempoBlockHash`): Set to `keccak256(rlp(l1_header))`
 2. **Slot 7** (packed `uint64` fields): Low 64 bits set to `l1_header.number`
@@ -121,18 +122,6 @@ The zone's `TempoState` genesis must be anchored to the L1's current state.
 - **`L1Fixture`** — Synthetic L1 block builder maintaining hash chain continuity.
 - **`FixtureBlock`** — Clonable L1 block for multi-zone broadcast.
 - **`poll_until`** — Generic async condition poller with timeout.
-
-## Remaining Work (Task 245)
-
-Full `ZoneFactory` deployment + deposit-through-portal on local L1:
-
-1. Add Rust `sol!` bindings for `ZoneFactory` (or load Foundry artifacts)
-2. Deploy `ZoneFactory` from the dev account on `L1TestNode`
-3. Call `createZone()` → capture the deployed portal address
-4. Start `ZoneTestNode` with the real portal address and anchor block
-5. Perform a real deposit: `pathUSD.approve()` + `portal.deposit()`
-6. Verify pathUSD mint on L2 + `DepositProcessed` event
-7. Test full withdrawal finalization and L1 processing cycle
 
 ## Known Issues / Improvements
 

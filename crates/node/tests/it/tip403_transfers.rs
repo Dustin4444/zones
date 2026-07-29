@@ -16,11 +16,11 @@ use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_node::rpc::NATIVE_BALANCE_PLACEHOLDER;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZoneOutbox};
+use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS};
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, WITHDRAWAL_TX_GAS, approve_outbox, local_dev_zone_account,
-    start_local_zone_with_fixture,
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, approve_outbox,
+    local_dev_zone_account, start_local_zone_with_fixture,
 };
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
@@ -53,6 +53,8 @@ async fn test_deposit_then_transfer() -> eyre::Result<()> {
     // Dev transfers 400,000 to Bob.
     // Submit the tx then inject an L1 block so the zone produces a block including it.
     let transfer_amount: u128 = 400_000;
+    // Seed the current anchor before estimation/pool validation. The next empty block inherits it.
+    fixture.seed_no_receive_policy(bob)?;
     let tip20 = ITIP20::new(PATH_USD_ADDRESS, &provider);
 
     let native_balance = provider.get_balance(dev_address).await?;
@@ -120,12 +122,15 @@ async fn test_deposit_then_request_withdrawal() -> eyre::Result<()> {
 
     let withdrawal_amount: u128 = 250_000;
 
-    let outbox = ZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider);
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &provider);
 
     let withdrawal_fee = outbox.calculateWithdrawalFee(0).call().await?;
+    let gas_buffer = u128::from(TIP20_TX_GAS)
+        .checked_add(u128::from(WITHDRAWAL_TX_GAS))
+        .expect("test gas buffer should not overflow");
     let deposit_amount = withdrawal_amount
         .checked_add(withdrawal_fee)
-        .and_then(|value| value.checked_add(100_000))
+        .and_then(|value| value.checked_add(gas_buffer))
         .expect("test deposit amount should not overflow");
 
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
@@ -234,12 +239,13 @@ async fn test_sequential_transfers() -> eyre::Result<()> {
     let alice_provider = ProviderBuilder::new()
         .wallet(alice_signer)
         .connect_http(zone.http_url().clone());
+    fixture.seed_no_receive_policy(bob)?;
     let tip20_alice = ITIP20::new(PATH_USD_ADDRESS, &alice_provider);
 
     let pending = tip20_alice
         .transfer(bob, U256::from(alice_to_bob))
         .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(150_000)
+        .gas(TIP20_TX_GAS)
         .send()
         .await?;
 
@@ -262,12 +268,13 @@ async fn test_sequential_transfers() -> eyre::Result<()> {
     let bob_provider = ProviderBuilder::new()
         .wallet(bob_signer)
         .connect_http(zone.http_url().clone());
+    fixture.seed_no_receive_policy(charlie)?;
     let tip20_bob = ITIP20::new(PATH_USD_ADDRESS, &bob_provider);
 
     let pending = tip20_bob
         .transfer(charlie, U256::from(bob_to_charlie))
         .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(150_000)
+        .gas(TIP20_TX_GAS)
         .send()
         .await?;
 
@@ -344,13 +351,14 @@ async fn test_transfer_emits_events() -> eyre::Result<()> {
     )
     .await?;
 
-    // Transfer to Bob
+    // Transfer to Bob. Seed its receive-policy baseline before pool validation.
+    fixture.seed_no_receive_policy(bob)?;
     let tip20 = ITIP20::new(PATH_USD_ADDRESS, &provider);
 
     let pending = tip20
         .transfer(bob, U256::from(transfer_amount))
         .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(150_000)
+        .gas(TIP20_TX_GAS)
         .send()
         .await?;
 
@@ -410,13 +418,14 @@ async fn test_transfer_with_memo() -> eyre::Result<()> {
     )
     .await?;
 
-    // Transfer with memo
+    // Transfer with memo. Seed its receive-policy baseline before pool validation.
+    fixture.seed_no_receive_policy(bob)?;
     let tip20 = ITIP20::new(PATH_USD_ADDRESS, &provider);
 
     let pending = tip20
         .transferWithMemo(bob, U256::from(transfer_amount), memo)
         .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(150_000)
+        .gas(TIP20_TX_GAS)
         .send()
         .await?;
 

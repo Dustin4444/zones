@@ -44,15 +44,49 @@ use eyre::OptionExt;
 use reth_chainspec::EthereumHardforks;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
 use std::{sync::Arc, time::Duration};
-use tempo_chainspec::spec::TempoChainSpec;
 use tempo_primitives::TempoHeader;
-use tracing::{error, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
-use zone_l1::{DepositQueue, L1BlockDeposits, PolicyProvider, PreparedL1Block};
+use zone_chainspec::ZoneChainSpec;
+use zone_l1::{DepositQueue, L1BlockDeposits, L1BlockTracker, PreparedL1Block};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
+
+/// A queue-backed block consumer that can drain all work currently available.
+///
+/// Kept separate from [`ZoneEngine`] so cancellation at the boundary between two advances can
+/// be tested deterministically without mocking the Engine API and payload builder.
+trait AvailableBlockDrain {
+    type Block;
+
+    /// Returns the next available block without consuming it.
+    fn next_available(&self) -> Option<Self::Block>;
+
+    /// Completes and consumes one block.
+    async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()>;
+}
+
+/// Drain available blocks until the queue is empty or cancellation is observed.
+///
+/// Cancellation is checked only before starting a new advance. An advance already in flight is
+/// always allowed to finish so its queue confirmation and canonical head remain consistent.
+async fn drain_all_available<D>(drain: &mut D, stop: &CancellationToken) -> eyre::Result<()>
+where
+    D: AvailableBlockDrain,
+{
+    loop {
+        if stop.is_cancelled() {
+            return Ok(());
+        }
+        let Some(block) = drain.next_available() else {
+            return Ok(());
+        };
+        drain.advance_one(block).await?;
+    }
+}
 
 /// Engine that drives L2 block production from L1 events.
 ///
@@ -68,13 +102,15 @@ use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 #[derive(Debug)]
 pub struct ZoneEngine {
     /// Chain spec for hardfork checks when building attributes.
-    chain_spec: Arc<TempoChainSpec>,
+    chain_spec: Arc<ZoneChainSpec>,
     /// Engine API handle for FCU and newPayload.
     to_engine: ConsensusEngineHandle<ZonePayloadTypes>,
     /// Payload builder handle.
     payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
     /// Queue of L1 blocks with their deposits.
     deposit_queue: DepositQueue,
+    /// Independently observed L1 blocks retained until their zone payload is accepted.
+    l1_block_tracker: L1BlockTracker,
     /// Latest block header — used as parent for the next payload and as the
     /// head/safe/finalized hash in FCU (instant finality).
     last_header: SealedHeader<TempoHeader>,
@@ -84,43 +120,40 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
-    /// Cache-first, RPC-fallback TIP-403 policy provider for authorization checks
-    /// on encrypted deposit recipients during preparation.
-    policy_provider: PolicyProvider,
 }
 
 impl ZoneEngine {
     pub fn new(
-        chain_spec: Arc<TempoChainSpec>,
+        chain_spec: Arc<ZoneChainSpec>,
         to_engine: ConsensusEngineHandle<ZonePayloadTypes>,
         payload_builder: PayloadBuilderHandle<ZonePayloadTypes>,
         deposit_queue: DepositQueue,
+        l1_block_tracker: L1BlockTracker,
         last_header: SealedHeader<TempoHeader>,
         fee_recipient: Address,
         sequencer_key: k256::SecretKey,
         portal_address: Address,
-        policy_provider: PolicyProvider,
     ) -> Self {
         Self {
             chain_spec,
             to_engine,
             payload_builder,
             deposit_queue,
+            l1_block_tracker,
             last_header,
             fee_recipient,
             sequencer_key,
             portal_address,
-            policy_provider,
         }
     }
 
-    /// Runs the main Zone engine loop.
+    /// Runs the main Zone engine loop until cancelled at a block boundary.
     ///
     /// This method never returns under normal operation. It:
     /// 1. Waits for L1 blocks to arrive in the deposit queue
     /// 2. Advances the zone chain for each available L1 block (no delay between blocks)
     /// 3. Sends periodic FCU heartbeats
-    pub async fn run(mut self) {
+    pub async fn run_until(mut self, stop: CancellationToken) {
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
         fcu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -131,19 +164,29 @@ impl ZoneEngine {
 
         loop {
             tokio::select! {
+                biased;
+                () = stop.cancelled() => {
+                    info!(target: "zone::engine", "ZoneEngine stopped at a block boundary");
+                    return;
+                }
                 // Wait for new L1 blocks in the deposit queue
                 _ = self.deposit_queue.notified() => {
-                    self.advance_all_available().await;
+                    self.advance_all_available(&stop).await;
                 }
                 // Periodic FCU heartbeat — also drains any blocks we missed
                 _ = fcu_interval.tick() => {
-                    self.advance_all_available().await;
+                    self.advance_all_available(&stop).await;
                     if let Err(e) = self.update_forkchoice_state().await {
                         error!(target: "zone::engine", "Error updating fork choice: {:?}", e);
                     }
                 }
             }
         }
+    }
+
+    /// Runs the engine loop forever.
+    pub async fn run(self) {
+        self.run_until(CancellationToken::new()).await
     }
 
     /// Returns the current forkchoice state.
@@ -159,7 +202,7 @@ impl ZoneEngine {
         let res = self.to_engine.fork_choice_updated(state, None).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid fork choice update {state:?}: {res:?}")
+            eyre::bail!("Invalid fork choice update {state:?}: {res:?}");
         }
 
         Ok(())
@@ -171,28 +214,20 @@ impl ZoneEngine {
     /// them, with no timer delays between blocks.
     ///
     /// Reorg safety is handled upstream by the L1 subscriber, which only
-    /// enqueues blocks once they are confirmed by a successor.
-    async fn advance_all_available(&mut self) {
-        while let Some(l1_block) = self.deposit_queue.peek() {
-            if let Err(e) = self.advance(l1_block).await {
-                error!(target: "zone::engine", "Error advancing the chain: {:?}", e);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                break;
-            }
+    /// enqueues blocks exposed by L1's `finalized` tag.
+    async fn advance_all_available(&mut self, stop: &CancellationToken) {
+        if let Err(e) = drain_all_available(self, stop).await {
+            error!(target: "zone::engine", "Error advancing the chain: {:?}", e);
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// Decrypt encrypted deposits, check TIP-403 policy authorization, and
-    /// ABI-encode everything into a [`PreparedL1Block`] ready for the payload
-    /// builder. Errors (e.g. policy RPC failures) are propagated so the engine
-    /// retries rather than allowing unauthorized deposits through.
+    /// Decrypt encrypted deposits and ABI-encode them into a [`PreparedL1Block`] ready for
+    /// the payload builder. Mint-recipient policy is enforced during upstream TIP-20 execution
+    /// against the finalized L1 anchor.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
         l1_block
-            .prepare(
-                &self.sequencer_key,
-                self.portal_address,
-                &self.policy_provider,
-            )
+            .prepare(&self.sequencer_key, self.portal_address)
             .await
     }
 
@@ -241,7 +276,7 @@ impl ZoneEngine {
             .await?;
 
         if res.is_invalid() {
-            eyre::bail!("Invalid payload status")
+            eyre::bail!("Invalid payload status");
         }
 
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
@@ -251,31 +286,21 @@ impl ZoneEngine {
             .resolve_kind(payload_id, PayloadKind::WaitForPending)
             .await
         else {
-            eyre::bail!("No payload")
+            eyre::bail!("No payload");
         };
 
         let header = payload.block().sealed_header().clone();
         let block_number = header.number();
-        let payload = ZonePayloadTypes::block_to_payload(payload.block().clone(), None);
-        let res = self.to_engine.new_payload(payload).await?;
+        let res = self.to_engine.new_payload(payload.into()).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid payload for block {block_number}")
+            eyre::bail!("Invalid payload for block {block_number}");
         }
 
-        // newPayload succeeded — confirm the L1 block in the queue so it is
-        // removed. If the queue was reorged between peek and confirm, the
-        // block was already purged; log a warning but still update
-        // last_header since the zone chain has advanced.
-        if self.deposit_queue.confirm(l1_num_hash).is_none() {
-            warn!(target: "zone::engine", ?l1_num_hash, "L1 block was purged from queue during build");
-        }
-
-        // GC stale versioned entries from the policy cache. Only the engine
-        // drives this — the subscriber must not advance past blocks the engine
-        // hasn't processed yet, otherwise policy lookups for in-flight blocks
-        // could return wrong results.
-        self.policy_provider.cache().advance(l1_num_hash.number);
+        // newPayload succeeded — remove the exact finalized L1 block that
+        // produced it. A mismatch indicates an internal consumer-ordering bug.
+        self.deposit_queue.confirm(l1_num_hash)?;
+        self.l1_block_tracker.prune_through(l1_num_hash.number);
 
         self.last_header = header;
 
@@ -287,5 +312,85 @@ impl ZoneEngine {
         }
 
         Ok(())
+    }
+}
+
+impl AvailableBlockDrain for ZoneEngine {
+    type Block = L1BlockDeposits;
+
+    fn next_available(&self) -> Option<Self::Block> {
+        self.deposit_queue.peek()
+    }
+
+    async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()> {
+        self.advance(block).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::sync::oneshot;
+
+    struct PausedDrain {
+        pending: VecDeque<u64>,
+        advanced: Vec<u64>,
+        first_started: Option<oneshot::Sender<()>>,
+        release_first: Option<oneshot::Receiver<()>>,
+    }
+
+    impl AvailableBlockDrain for PausedDrain {
+        type Block = u64;
+
+        fn next_available(&self) -> Option<Self::Block> {
+            self.pending.front().copied()
+        }
+
+        async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()> {
+            if let Some(started) = self.first_started.take() {
+                let _ = started.send(());
+                self.release_first
+                    .take()
+                    .expect("first advance has a release signal")
+                    .await
+                    .expect("test releases the first advance");
+            }
+
+            assert_eq!(self.pending.pop_front(), Some(block));
+            self.advanced.push(block);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_finishes_the_in_flight_block_without_draining_the_backlog() {
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let (first_started, started) = oneshot::channel();
+        let (release, release_first) = oneshot::channel();
+        let mut drain = PausedDrain {
+            pending: VecDeque::from([1, 2, 3]),
+            advanced: Vec::new(),
+            first_started: Some(first_started),
+            release_first: Some(release_first),
+        };
+
+        let task = tokio::spawn(async move {
+            drain_all_available(&mut drain, &task_stop)
+                .await
+                .expect("drain succeeds");
+            drain
+        });
+
+        started.await.expect("the first block starts");
+        stop.cancel();
+        release
+            .send(())
+            .expect("the first block is still in flight");
+
+        let drain = task.await.expect("drain task succeeds");
+        assert_eq!(drain.advanced, [1]);
+        assert_eq!(drain.pending, [2, 3]);
     }
 }
