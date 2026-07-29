@@ -913,15 +913,15 @@ async fn run_receivers(
                         P2pEvent::BackfillBlockReceived { peer, block: payload.to_vec() }
                     }
                     BACKFILL_COMPLETE_FRAME => {
+                        let Some(tip) = PeerTip::decode(payload) else {
+                            warn!(target: "zone::p2p", %peer, request_id, size = payload.len(), "Ignoring malformed backfill completion");
+                            continue;
+                        };
                         let accepted = backfill_job.complete(&peer, request_id, received_at);
                         if !accepted {
                             warn!(target: "zone::p2p", %peer, request_id, "Ignoring unsolicited or stale backfill completion");
                             continue;
                         }
-                        let Some(tip) = PeerTip::decode(payload) else {
-                            warn!(target: "zone::p2p", %peer, request_id, size = payload.len(), "Ignoring malformed backfill completion");
-                            continue;
-                        };
                         P2pEvent::BackfillCompleted { peer, tip }
                     }
                     _ => {
