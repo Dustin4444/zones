@@ -52,7 +52,6 @@ use reth_transaction_pool::{
 };
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::TempoInvalidTransaction;
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
@@ -76,6 +75,7 @@ use zone_l1::{
     DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig, LeaderTransition,
     LeadershipSink, TempoStateExt,
     state::{EnabledTokenRegistry, L1StateCache, L1StateProvider, L1StateProviderConfig},
+    tempo_chain_spec_for_l1,
 };
 use zone_p2p::{
     LeadershipSchedule, LeadershipState, P2pConfig, P2pNetworkId, ZoneManifest, spawn_p2p,
@@ -101,25 +101,6 @@ fn disable_simulation_methods(modules: &mut TransportRpcModules) {
     modules.remove_ws_methods(PUBLIC_SIMULATION_METHODS);
     modules.remove_ipc_methods(PUBLIC_SIMULATION_METHODS);
 }
-
-/// Returns a known Tempo chain spec for an L1 chain ID.
-///
-/// Tempo Anvil uses chain ID 31337 and the same hardfork schedule as Tempo DEV (1337).
-///
-/// Additional dev-schedule L1 chain IDs (devnets that activate all Tempo
-/// hardforks at genesis) can be allowed via the `ZONE_L1_DEV_CHAIN_IDS`
-/// environment variable as a comma-separated list.
-fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
-    chainspec_from_chain_id(chain_id).or_else(|| match chain_id {
-        1337 | 31337 => Some(DEV.clone()),
-        _ => std::env::var("ZONE_L1_DEV_CHAIN_IDS")
-            .ok()?
-            .split(',')
-            .any(|id| id.trim().parse() == Ok(chain_id))
-            .then(|| DEV.clone()),
-    })
-}
-
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
 
@@ -1648,9 +1629,15 @@ mod tests {
 
     #[test]
     fn resolves_public_and_local_tempo_l1_specs() {
-        assert_eq!(tempo_chain_spec_for_l1(4217).unwrap().chain().id(), 4217);
-        assert_eq!(tempo_chain_spec_for_l1(42431).unwrap().chain().id(), 42431);
-        assert_eq!(tempo_chain_spec_for_l1(1337).unwrap().chain().id(), 1337);
+        let presto = tempo_chain_spec_for_l1(4217).unwrap();
+        assert_eq!(presto.chain().id(), 4217);
+        assert!(presto.network_identity.is_some());
+        let moderato = tempo_chain_spec_for_l1(42431).unwrap();
+        assert_eq!(moderato.chain().id(), 42431);
+        assert!(moderato.network_identity.is_some());
+        let dev = tempo_chain_spec_for_l1(1337).unwrap();
+        assert_eq!(dev.chain().id(), 1337);
+        assert!(dev.network_identity.is_none());
         assert_eq!(tempo_chain_spec_for_l1(31337).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
 

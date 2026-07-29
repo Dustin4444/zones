@@ -1,9 +1,7 @@
 //! L1 chain subscription and deposit extraction.
 //!
-//! Uses L1 block notifications to follow the finalized chain and extracts
-//! deposit events from the ZonePortal contract for each finalized block.
-//! WebSocket connections use `newHeads`; HTTP connections use block-filter
-//! polling.
+//! Verifies Tempo consensus certificates while following the finalized chain,
+//! then extracts deposit events from the ZonePortal contract for each block.
 //!
 //! The module is split into:
 //! - [`subscriber`] — the [`L1Subscriber`] background task and its config.
@@ -31,6 +29,7 @@ use reth_primitives_traits::SealedHeader;
 use reth_storage_api::StateProviderFactory;
 use std::{pin::Pin, sync::Arc};
 use tempo_alloy::TempoNetwork;
+use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_primitives::TempoHeader;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -93,6 +92,21 @@ pub use subscriber::{
     L1BlockTracker, L1Subscriber, L1SubscriberConfig, LeadershipSink,
     MAX_FOLLOWER_L1_LOOKAHEAD_BLOCKS,
 };
+
+/// Returns the Tempo chain spec used for an L1 chain ID.
+///
+/// Tempo Anvil uses chain ID 31337 with the Tempo DEV hardfork schedule. Additional
+/// dev-schedule chain IDs can be listed in `ZONE_L1_DEV_CHAIN_IDS`.
+pub fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
+    chainspec_from_chain_id(chain_id).or_else(|| match chain_id {
+        1337 | 31337 => Some(DEV.clone()),
+        _ => std::env::var("ZONE_L1_DEV_CHAIN_IDS")
+            .ok()?
+            .split(',')
+            .any(|id| id.trim().parse() == Ok(chain_id))
+            .then(|| DEV.clone()),
+    })
+}
 
 #[cfg(test)]
 pub(crate) use queue::PendingDeposits;
