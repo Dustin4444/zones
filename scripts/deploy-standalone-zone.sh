@@ -69,6 +69,18 @@ echo "  factory authority ${FACTORY_AUTHORITY}"
 echo "  initial token     ${INITIAL_TOKEN}"
 echo
 
+# ZonePortal.initialize enables the initial token through the TIP-403 registry, whose
+# tokenTransferPolicyId/migrateTransferPolicyIds entry points are TIP-1092 and only exist from T9
+# onwards. Check before spending gas on three deployments that would fail to initialize.
+TIP403_REGISTRY=0x403C000000000000000000000000000000000000
+if ! cast call "$TIP403_REGISTRY" 'tokenTransferPolicyId(address)(bool,uint64)' "$INITIAL_TOKEN" \
+  --rpc-url "$ETH_RPC_URL" >/dev/null 2>&1; then
+  echo "This chain's TIP-403 registry does not expose tokenTransferPolicyId, so the portal cannot" >&2
+  echo "enable its initial token. Those entry points are TIP-1092 and activate at T9 — wait for the" >&2
+  echo "chain to reach T9, or target one where it is already active." >&2
+  exit 1
+fi
+
 # Always put the canonical constant back, however this exits.
 restore_constants() {
   git -C "$REPO_ROOT" checkout -- "$CONSTANTS_FILE"
