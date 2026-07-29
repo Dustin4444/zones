@@ -274,11 +274,11 @@ The factory performs this initialization natively in the portal account; the Sol
 Each zone has a chain ID derived from its parent Tempo network and zone ID:
 
 ```
-Presto:       chain_id = 421700000  + (zone_id % 1002610000)
-Moderato/dev: chain_id = 1424310000 + (zone_id % 723173648)
+Mainnet: chain_id = 421700000  + (zone_id % 1002610000)
+Testnet: chain_id = 1424310000 + (zone_id % 723173648)
 ```
 
-The disjoint ranges prevent transaction replay between mainnet and non-mainnet
+The disjoint ranges prevent transaction replay between mainnet and testnet
 zones that have the same factory-local zone ID. The chain ID is set in the
 zone's genesis configuration and validated against the parent Tempo network by
 the zone node at startup.
