@@ -81,7 +81,7 @@ impl StorageOps for AccountValues<'_> {
 ///
 /// Inserting a typed handler expands every contiguous word described by [`Storable::SLOTS`].
 /// Packed fields naturally collapse to one [`StorageSlot`] through the underlying [`HashSet`].
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct PrefetchSlots(HashSet<StorageSlot>);
 
 impl PrefetchSlots {
@@ -560,7 +560,7 @@ mod tests {
         );
 
         let built_in = HashMap::from([(TOKEN, ALLOW_ALL_POLICY_ID)]);
-        let no_mints = DepositPrefetchPlan::new(7, PORTAL).0;
+        let no_mints = DepositPrefetchPlan::new(7, PORTAL);
         assert!(
             no_mints
                 .policy_and_receive_slots(&StorageValues(HashMap::new()), &built_in)?
