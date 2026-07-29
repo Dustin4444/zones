@@ -12,6 +12,8 @@ import {
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
     Withdrawal,
+    ZONE_INBOX,
+    ZONE_OUTBOX,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
 import {
@@ -31,6 +33,15 @@ import { Test } from "forge-std/Test.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { ISignatureVerifier } from "tempo-std/interfaces/ISignatureVerifier.sol";
 
+/// @notice Callback target used to force the portal's withdrawal bounce-back path.
+contract RevertingLifecycleReceiver {
+
+    fallback() external {
+        revert("intentional callback failure");
+    }
+
+}
+
 /// @title ZoneLifecycleHandler
 /// @notice Honest-sequencer driver for the zone deposit/withdrawal lifecycle. Every action
 ///         mirrors the cross-domain state the sequencer is trusted to maintain and asserts the
@@ -44,6 +55,7 @@ contract ZoneLifecycleHandler is Test {
     ZoneOutbox internal immutable outbox;
     MockZoneToken internal immutable token;
     MockTempoState internal immutable tempoState;
+    RevertingLifecycleReceiver internal immutable revertingReceiver;
     MockZoneTxContext internal constant txCtx = MockZoneTxContext(ZONE_TX_CONTEXT);
 
     address internal immutable sequencer;
@@ -60,6 +72,7 @@ contract ZoneLifecycleHandler is Test {
     // Deposit mirror (enqueued on L1, awaiting zone-side advanceTempo).
     Deposit[] internal depositMirror;
     uint256 internal depositHead;
+    mapping(uint64 => address) internal fallbackRecipients;
     bytes32 internal mirrorDepositHash; // matches portal.currentDepositQueueHash()
     bytes32 internal mirrorProcessedHash; // matches inbox.processedDepositQueueHash()
 
@@ -70,6 +83,7 @@ contract ZoneLifecycleHandler is Test {
     // Submitted L1 batches awaiting processWithdrawal (FIFO, one ring-buffer slot each).
     struct Batch {
         Withdrawal[] ws;
+        bool[] failedCallbacks;
         uint256 head;
     }
 
@@ -85,6 +99,11 @@ contract ZoneLifecycleHandler is Test {
     uint256 public numWithdrawalRequests;
     uint256 public numFinalizes;
     uint256 public numWithdrawalsProcessed;
+    uint256 public numFailedCallbackRequests;
+    uint256 public numFailedCallbacksProcessed;
+    uint256 public numTerminalFailedCallbacksProcessed;
+    uint256 public numSuffixedFailedCallbacksProcessed;
+    uint256 public numFailedCallbackReplaysRejected;
 
     // High-water marks for monotonic counters (TEMPO-ZONE-WITHDRAWAL-BATCH-INDEX, TEMPO-ZONE-DEPOSIT-NUMBER-MONOTONIC).
     uint64 internal prevDepositCount;
@@ -98,6 +117,7 @@ contract ZoneLifecycleHandler is Test {
         ZoneOutbox _outbox,
         MockZoneToken _token,
         MockTempoState _tempoState,
+        RevertingLifecycleReceiver _revertingReceiver,
         address _sequencer,
         address _alice,
         address _bob,
@@ -108,6 +128,7 @@ contract ZoneLifecycleHandler is Test {
         outbox = _outbox;
         token = _token;
         tempoState = _tempoState;
+        revertingReceiver = _revertingReceiver;
         sequencer = _sequencer;
         actors = [_alice, _bob, _charlie];
         initialSupply = _token.totalSupply();
@@ -227,7 +248,10 @@ contract ZoneLifecycleHandler is Test {
         for (uint256 i = 0; i < count; i++) {
             Deposit memory d = depositMirror[depositHead + i];
             minted += d.amount;
-            zoneCredit[d.to] += d.amount;
+            address recipient =
+                d.sender == address(portal) ? fallbackRecipients[uint64(uint160(d.to))] : d.to;
+            require(recipient != address(0), "unknown bounce recipient");
+            zoneCredit[recipient] += d.amount;
         }
         mirrorProcessedHash = expectedHash;
         depositHead += count;
@@ -267,6 +291,46 @@ contract ZoneLifecycleHandler is Test {
         burned += amount;
         zoneCredit[holder] -= amount;
         numWithdrawalRequests++;
+        _recordMonotonicCounters();
+    }
+
+    /// @notice Requests a callback withdrawal whose target always reverts. Processing it must
+    ///         consume the withdrawal once and append exactly one bounce-back deposit.
+    function requestFailingCallback(uint256 actorSeed, uint256 amountSeed) external {
+        address holder = _actor(actorSeed);
+        uint256 credit = zoneCredit[holder];
+        uint256 bal = token.balanceOf(holder);
+        uint256 maxAmount = credit < bal ? credit : bal;
+        if (maxAmount == 0) return;
+        uint128 amount = uint128(bound(amountSeed, 1, maxAmount));
+
+        uint256 seqBefore = txCtx.sequence();
+        vm.startPrank(holder);
+        token.approve(address(outbox), amount);
+        outbox.requestWithdrawal(
+            address(token), address(revertingReceiver), amount, bytes32(0), 50_000, holder, "fail"
+        );
+        vm.stopPrank();
+
+        uint64 fallbackNonce = outbox.lastFallbackNonce();
+        pendingWithdrawals.push(
+            Withdrawal({
+                token: address(token),
+                senderTag: keccak256(abi.encodePacked(holder, txCtx.txHashFor(seqBefore + 1))),
+                to: address(revertingReceiver),
+                amount: amount,
+                memo: bytes32(0),
+                gasLimit: 50_000,
+                fallbackNonce: fallbackNonce,
+                callbackData: "fail",
+                encryptedSender: ""
+            })
+        );
+        fallbackRecipients[fallbackNonce] = holder;
+        burned += amount;
+        zoneCredit[holder] -= amount;
+        numWithdrawalRequests++;
+        numFailedCallbackRequests++;
         _recordMonotonicCounters();
     }
 
@@ -321,6 +385,7 @@ contract ZoneLifecycleHandler is Test {
         Batch storage b = batches[batches.length - 1];
         for (uint256 i = 0; i < count; i++) {
             b.ws.push(ws[i]);
+            b.failedCallbacks.push(ws[i].to == address(revertingReceiver));
         }
         withdrawalFinalizeHead += count;
         numFinalizes++;
@@ -351,13 +416,65 @@ contract ZoneLifecycleHandler is Test {
         }
 
         Withdrawal memory w = b.ws[idx];
+        bool failedCallback = b.failedCallbacks[idx];
+        uint64 depositsBefore = portal.depositCount();
+        uint256 queueHeadBefore = portal.withdrawalQueueHead();
+        uint256 queueTailBefore = portal.withdrawalQueueTail();
         vm.prank(sequencer);
         Withdrawal[] memory withdrawals = new Withdrawal[](1);
         withdrawals[0] = w;
         portal.processWithdrawals(withdrawals, remaining);
 
+        require(portal.withdrawalQueueTail() == queueTailBefore, "processing changed queue tail");
+        if (remaining == bytes32(0)) {
+            require(
+                portal.withdrawalQueueHead() == queueHeadBefore + 1,
+                "processing did not consume the queue slot"
+            );
+        } else {
+            require(
+                portal.withdrawalQueueHead() == queueHeadBefore,
+                "processing consumed more than one withdrawal"
+            );
+            require(
+                portal.withdrawalQueueSlot(queueHeadBefore % WITHDRAWAL_QUEUE_CAPACITY)
+                    == remaining,
+                "processing did not preserve the queue suffix"
+            );
+        }
+
         b.head = idx + 1;
-        escrowOut += w.amount;
+        if (failedCallback) {
+            require(portal.depositCount() == depositsBefore + 1, "callback bounce count mismatch");
+
+            Deposit memory d = Deposit({
+                token: w.token,
+                sender: address(portal),
+                to: address(uint160(w.fallbackNonce)),
+                amount: w.amount,
+                tempoRefundRecipient: address(0),
+                memo: bytes32(0)
+            });
+            mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
+            require(portal.currentDepositQueueHash() == mirrorDepositHash, "bounce hash mismatch");
+            depositMirror.push(d);
+            numFailedCallbacksProcessed++;
+            if (remaining == bytes32(0)) {
+                numTerminalFailedCallbacksProcessed++;
+            } else {
+                numSuffixedFailedCallbacksProcessed++;
+            }
+
+            // The queue item was consumed before the callback was attempted, so replay must fail
+            // and must not append a second bounce-back deposit.
+            vm.expectRevert();
+            vm.prank(sequencer);
+            portal.processWithdrawals(withdrawals, remaining);
+            require(portal.depositCount() == depositsBefore + 1, "replay created another bounce");
+            numFailedCallbackReplaysRejected++;
+        } else {
+            escrowOut += w.amount;
+        }
         numWithdrawalsProcessed++;
         _recordMonotonicCounters();
     }
@@ -373,7 +490,7 @@ contract ZoneLifecycleHandler is Test {
 /// @dev Raise the per-run call depth above the default: the `afterInvariant` guard requires the
 ///      fuzzer to organically complete the full deposit -> advance -> request -> finalize ->
 ///      process chain, and the deep withdrawal legs are not reliably reached within 50 calls.
-/// forge-config: default.invariant.depth = 200
+/// forge-config: default.invariant.depth = 1000
 contract ZoneLifecycleInvariantTest is BaseTest {
 
     ZonePortal internal portal;
@@ -382,6 +499,7 @@ contract ZoneLifecycleInvariantTest is BaseTest {
     ZoneConfig internal config;
     ZoneInbox internal inbox;
     ZoneOutbox internal outbox;
+    RevertingLifecycleReceiver internal revertingReceiver;
     ZoneLifecycleHandler internal handler;
 
     bytes32 constant GENESIS_BLOCK_HASH = keccak256("genesis");
@@ -417,11 +535,18 @@ contract ZoneLifecycleInvariantTest is BaseTest {
             bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(address(portal), address(token), true);
-        inbox = new ZoneInbox(address(config), address(portal), address(tempoState));
-        outbox = new ZoneOutbox(address(config));
+        ZoneInbox inboxImpl = new ZoneInbox(address(config), address(portal), address(tempoState));
+        vm.etch(ZONE_INBOX, address(inboxImpl).code);
+        inbox = ZoneInbox(ZONE_INBOX);
+        ZoneOutbox outboxImpl = new ZoneOutbox(address(config));
+        vm.etch(ZONE_OUTBOX, address(outboxImpl).code);
+        outbox = ZoneOutbox(ZONE_OUTBOX);
 
         token.setMinter(address(inbox), true);
         token.setBurner(address(outbox), true);
+        revertingReceiver = new RevertingLifecycleReceiver();
+        portal.setGateway(address(revertingReceiver), true);
+        tempoState.setMockZoneGateway(address(portal), address(revertingReceiver), true);
         vm.mockCall(
             address(StdPrecompiles.SIGNATURE_VERIFIER),
             abi.encodeWithSelector(ISignatureVerifier.recover.selector),
@@ -429,7 +554,16 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         );
 
         handler = new ZoneLifecycleHandler(
-            portal, inbox, outbox, token, tempoState, address(this), alice, bob, charlie
+            portal,
+            inbox,
+            outbox,
+            token,
+            tempoState,
+            revertingReceiver,
+            address(this),
+            alice,
+            bob,
+            charlie
         );
 
         targetContract(address(handler));
@@ -512,6 +646,26 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         assertGt(handler.numFinalizes(), 0, "lifecycle: no withdrawal batch was submitted");
         assertGt(
             handler.numWithdrawalsProcessed(), 0, "lifecycle: no withdrawal was processed on L1"
+        );
+        assertGt(
+            handler.numFailedCallbacksProcessed(),
+            0,
+            "lifecycle: no failed callback produced a bounce-back deposit"
+        );
+        assertGt(
+            handler.numTerminalFailedCallbacksProcessed(),
+            0,
+            "lifecycle: no terminal failed callback was processed"
+        );
+        assertGt(
+            handler.numSuffixedFailedCallbacksProcessed(),
+            0,
+            "lifecycle: no failed callback with a queue suffix was processed"
+        );
+        assertEq(
+            handler.numFailedCallbackReplaysRejected(),
+            handler.numFailedCallbacksProcessed(),
+            "lifecycle: failed callback withdrawal was not consumed exactly once"
         );
         // The contiguity invariant must have compared a real (non-empty) processed hash chain.
         assertTrue(

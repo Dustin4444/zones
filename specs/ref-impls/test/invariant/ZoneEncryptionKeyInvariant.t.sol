@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { ENCRYPTION_KEY_GRACE_PERIOD } from "../../src/interfaces/IZone.sol";
+import {
+    ENCRYPTION_KEY_GRACE_PERIOD,
+    EncryptedDepositPayload,
+    IZonePortal
+} from "../../src/interfaces/IZone.sol";
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
 import { BaseTest } from "../BaseTest.t.sol";
@@ -17,13 +21,24 @@ import { Vm } from "forge-std/Vm.sol";
 contract ZoneEncryptionKeyHandler is Test {
 
     ZonePortal internal immutable portal;
+    MockZoneToken internal immutable token;
     address internal immutable sequencer;
 
     uint64[] public activationBlocks; // ghost: activation block of each registered key, in order
+    uint256 public latestDepositCount;
+    uint256 public graceDepositCount;
+    uint256 public nonAdjacentGraceDepositCount;
+    uint256 public expiredDepositCount;
 
-    constructor(ZonePortal _portal, address _sequencer) {
+    uint128 internal constant DEPOSIT_AMOUNT = 1e6;
+    bytes32 internal constant VALID_SECP256K1_X =
+        0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798;
+
+    constructor(ZonePortal _portal, MockZoneToken _token, address _sequencer) {
         portal = _portal;
+        token = _token;
         sequencer = _sequencer;
+        token.approve(address(portal), type(uint256).max);
     }
 
     function keyCount() external view returns (uint256) {
@@ -36,6 +51,10 @@ contract ZoneEncryptionKeyHandler is Test {
 
     /// @notice Register a fresh key with a valid proof-of-possession at the current block.
     function registerKey(uint256 walletSeed) external {
+        _registerKey(walletSeed);
+    }
+
+    function _registerKey(uint256 walletSeed) internal {
         uint256 pk = bound(walletSeed, 1, type(uint128).max);
         Vm.Wallet memory w = vm.createWallet(pk);
         bytes32 x = bytes32(w.publicKeyX);
@@ -47,6 +66,87 @@ contract ZoneEncryptionKeyHandler is Test {
         vm.prank(sequencer);
         portal.setSequencerEncryptionKey(x, yParity, v, r, s);
         activationBlocks.push(uint64(block.number));
+    }
+
+    function _payload() internal pure returns (EncryptedDepositPayload memory) {
+        return EncryptedDepositPayload({
+            ephemeralPubkeyX: VALID_SECP256K1_X,
+            ephemeralPubkeyYParity: 0x02,
+            ciphertext: new bytes(64),
+            nonce: bytes12(0),
+            tag: bytes16(0)
+        });
+    }
+
+    /// @notice The latest key admits deposits regardless of prior block advances.
+    function depositWithLatestKey(uint256 walletSeed) external {
+        if (activationBlocks.length == 0) _registerKey(walletSeed);
+        portal.depositEncrypted(
+            address(token), DEPOSIT_AMOUNT, activationBlocks.length - 1, _payload(), address(this)
+        );
+        latestDepositCount++;
+    }
+
+    /// @notice Normalize into a fresh grace window and deposit with its historical key.
+    function depositWithKeyDuringGrace(uint256 walletSeed) external {
+        if (activationBlocks.length == 0) _registerKey(walletSeed);
+        uint256 oldKeyIndex = activationBlocks.length - 1;
+        _registerKey(uint256(keccak256(abi.encode(walletSeed, "grace"))));
+
+        uint64 expiry = activationBlocks[oldKeyIndex + 1] + ENCRYPTION_KEY_GRACE_PERIOD;
+        assertLt(block.number, expiry, "ghost ledger did not produce a grace-window key");
+        portal.depositEncrypted(
+            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
+        );
+        graceDepositCount++;
+    }
+
+    /// @notice A still-valid key remains admissible after more than one subsequent rotation.
+    function depositWithNonAdjacentKeyDuringGrace(uint256 walletSeed) external {
+        if (activationBlocks.length == 0) _registerKey(walletSeed);
+        uint256 oldKeyIndex = activationBlocks.length - 1;
+        _registerKey(uint256(keccak256(abi.encode(walletSeed, "first successor"))));
+        _registerKey(uint256(keccak256(abi.encode(walletSeed, "second successor"))));
+
+        uint64 expiry = activationBlocks[oldKeyIndex + 1] + ENCRYPTION_KEY_GRACE_PERIOD;
+        assertLt(block.number, expiry, "ghost ledger did not preserve the older grace window");
+        portal.depositEncrypted(
+            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
+        );
+        nonAdjacentGraceDepositCount++;
+    }
+
+    /// @notice At the exact ghost-derived expiry, rejection is atomic.
+    function rejectKeyAtExactExpiry(uint256 walletSeed) external {
+        if (activationBlocks.length == 0) _registerKey(walletSeed);
+        uint256 oldKeyIndex = activationBlocks.length - 1;
+        _registerKey(uint256(keccak256(abi.encode(walletSeed, "expiry"))));
+        vm.roll(activationBlocks[oldKeyIndex + 1] + ENCRYPTION_KEY_GRACE_PERIOD);
+
+        uint256 depositorBalance = token.balanceOf(address(this));
+        uint256 portalBalance = token.balanceOf(address(portal));
+        uint64 deposits = portal.depositCount();
+        bytes32 queueHash = portal.currentDepositQueueHash();
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.EncryptionKeyExpired.selector,
+                oldKeyIndex,
+                activationBlocks[oldKeyIndex],
+                activationBlocks[oldKeyIndex + 1]
+            )
+        );
+        portal.depositEncrypted(
+            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
+        );
+
+        assertEq(
+            token.balanceOf(address(this)), depositorBalance, "revert changed depositor balance"
+        );
+        assertEq(token.balanceOf(address(portal)), portalBalance, "revert changed portal balance");
+        assertEq(portal.depositCount(), deposits, "revert changed deposit count");
+        assertEq(portal.currentDepositQueueHash(), queueHash, "revert changed queue hash");
+        expiredDepositCount++;
     }
 
     /// @notice Advance the chain, sometimes far enough to push old keys past their grace window.
@@ -72,6 +172,7 @@ contract ZoneEncryptionKeyInvariantTest is BaseTest {
 
     function setUp() public override {
         super.setUp();
+        vm.fee(0);
         token = new MockZoneToken("Zone USD", "zUSD");
         _mockTokenPolicyMigration(address(token), true);
 
@@ -79,7 +180,11 @@ contract ZoneEncryptionKeyInvariantTest is BaseTest {
         sequencers[0] = SEQ;
         portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
-        handler = new ZoneEncryptionKeyHandler(portal, SEQ);
+        handler = new ZoneEncryptionKeyHandler(portal, token, SEQ);
+        portal.setAllowedAccount(address(handler), true);
+        token.setMinter(address(this), true);
+        token.mint(address(handler), type(uint128).max);
+        token.setMinter(address(this), false);
         targetContract(address(handler));
     }
 
@@ -129,6 +234,14 @@ contract ZoneEncryptionKeyInvariantTest is BaseTest {
             2,
             "TEMPO-ZONE-ENCRYPTION-KEY-GRACE: rotation path (>=2 keys) never exercised"
         );
+        assertGt(handler.latestDepositCount(), 0, "latest-key deposit path never exercised");
+        assertGt(handler.graceDepositCount(), 0, "grace-window deposit path never exercised");
+        assertGt(
+            handler.nonAdjacentGraceDepositCount(),
+            0,
+            "non-adjacent grace-window deposit path never exercised"
+        );
+        assertGt(handler.expiredDepositCount(), 0, "exact-expiry rejection path never exercised");
     }
 
 }
