@@ -4,7 +4,7 @@
 //! Unlike the Tempo L1 `TempoBlockExecutor`, this executor does **not** enforce subblock
 //! ordering, shared-gas accounting, or the end-of-block subblock metadata system transaction.
 
-use alloy_consensus::transaction::TxHashRef;
+use alloy_consensus::{TxReceipt as _, transaction::TxHashRef};
 use alloy_evm::{
     Database, Evm, RecoveredTx,
     block::{
@@ -13,15 +13,18 @@ use alloy_evm::{
     },
     eth::{EthBlockExecutor, EthTxResult},
 };
+use alloy_primitives::Log;
+use alloy_sol_types::SolEvent as _;
 use reth_evm::block::StateDB;
 use reth_revm::{Inspector, context::result::ResultAndState};
 use tempo_evm::{TempoBlockExecutionCtx, TempoReceiptBuilder};
 use tempo_primitives::{TempoReceipt, TempoTxEnvelope, TempoTxType};
 use tempo_revm::evm::TempoContext;
+use tempo_zone_contracts::IZoneOutbox;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::L1StateProvider;
 use zone_precompiles::{ADVANCE_TEMPO_SELECTOR, L1StorageReader, tx_context};
-use zone_primitives::constants::ZONE_INBOX_ADDRESS;
+use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
 use crate::{L1OverlayDB, ZoneEvm};
 
@@ -139,6 +142,12 @@ where
             )
             .into());
         }
+        validate_withdrawal_event_order(
+            self.inner
+                .receipts()
+                .iter()
+                .flat_map(|receipt| receipt.logs()),
+        )?;
         self.inner.finish()
     }
 
@@ -153,6 +162,34 @@ where
     fn receipts(&self) -> &[Self::Receipt] {
         self.inner.receipts()
     }
+}
+
+/// Ensure a finalized withdrawal batch is a tail boundary for all successful withdrawal requests.
+fn validate_withdrawal_event_order<'a>(
+    logs: impl IntoIterator<Item = &'a Log>,
+) -> Result<(), BlockExecutionError> {
+    let mut batch_finalized = false;
+
+    for log in logs {
+        if log.address != ZONE_OUTBOX_ADDRESS {
+            continue;
+        }
+
+        let Some(signature) = log.topics().first() else {
+            continue;
+        };
+        if signature == &IZoneOutbox::BatchFinalized::SIGNATURE_HASH {
+            batch_finalized = true;
+        } else if batch_finalized && signature == &IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH
+        {
+            return Err(BlockValidationError::msg(
+                "withdrawal request must not follow finalizeWithdrawalBatch in the same block",
+            )
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_advance_tempo(
@@ -179,10 +216,14 @@ fn validate_advance_tempo(
 
 #[cfg(test)]
 mod tests {
-    use super::{ADVANCE_TEMPO_SELECTOR, ZONE_INBOX_ADDRESS, validate_advance_tempo};
+    use super::{
+        ADVANCE_TEMPO_SELECTOR, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, validate_advance_tempo,
+        validate_withdrawal_event_order,
+    };
 
     use alloy_consensus::{Signed, TxLegacy};
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, B256, Bytes, Log, U256};
+    use alloy_sol_types::SolEvent as _;
     use tempo_precompiles::{
         DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
@@ -191,6 +232,7 @@ mod tests {
     };
     use tempo_primitives::{TempoTxEnvelope, transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE};
     use tempo_revm::{TempoBatchCallEnv, TempoTxEnv};
+    use tempo_zone_contracts::IZoneOutbox;
 
     fn system_tx(to: Address, input: Bytes) -> TempoTxEnvelope {
         TempoTxEnvelope::Legacy(Signed::new_unhashed(
@@ -201,6 +243,10 @@ mod tests {
             },
             TEMPO_SYSTEM_TX_SIGNATURE,
         ))
+    }
+
+    fn event_log(address: Address, signature: B256) -> Log {
+        Log::new_unchecked(address, vec![signature], Bytes::new())
     }
 
     #[test]
@@ -239,6 +285,58 @@ mod tests {
             duplicate.to_string(),
             "advanceTempo must only execute once per zone block"
         );
+    }
+
+    #[test]
+    fn withdrawal_request_before_finalizer_is_valid() {
+        let logs = [
+            event_log(
+                ZONE_OUTBOX_ADDRESS,
+                IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH,
+            ),
+            event_log(
+                ZONE_OUTBOX_ADDRESS,
+                IZoneOutbox::BatchFinalized::SIGNATURE_HASH,
+            ),
+        ];
+
+        validate_withdrawal_event_order(logs.iter()).unwrap();
+    }
+
+    #[test]
+    fn withdrawal_request_after_finalizer_is_invalid() {
+        let logs = [
+            event_log(
+                ZONE_OUTBOX_ADDRESS,
+                IZoneOutbox::BatchFinalized::SIGNATURE_HASH,
+            ),
+            event_log(
+                ZONE_OUTBOX_ADDRESS,
+                IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH,
+            ),
+        ];
+
+        let error = validate_withdrawal_event_order(logs.iter()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "withdrawal request must not follow finalizeWithdrawalBatch in the same block"
+        );
+    }
+
+    #[test]
+    fn unrelated_logs_after_finalizer_are_valid() {
+        let logs = [
+            event_log(
+                ZONE_OUTBOX_ADDRESS,
+                IZoneOutbox::BatchFinalized::SIGNATURE_HASH,
+            ),
+            event_log(
+                Address::ZERO,
+                IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH,
+            ),
+        ];
+
+        validate_withdrawal_event_order(logs.iter()).unwrap();
     }
 
     #[test]
