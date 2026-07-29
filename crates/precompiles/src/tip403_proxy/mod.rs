@@ -8,7 +8,8 @@
 use crate::execution::{CallCheck, CallRules};
 use alloy_primitives::Address;
 use alloy_sol_types::{SolCall, SolError};
-use tempo_contracts::precompiles::ITIP403Registry;
+use tempo_contracts::precompiles::{ITIP403Registry, SYSTEM_PRECOMPILES};
+use tempo_zone_contracts::Unauthorized;
 
 const TIP403_MUTATING_SELECTORS: &[[u8; 4]] = &[
     ITIP403Registry::createPolicyCall::SELECTOR,
@@ -31,7 +32,17 @@ alloy_sol_types::sol! {
 pub(crate) struct Tip403Rules;
 
 impl CallRules for Tip403Rules {
-    fn admit(&self, data: &[u8], _caller: Address) -> CallCheck {
+    fn admit(&self, data: &[u8], caller: Address) -> CallCheck {
+        // Public calls can force uncached L1-backed storage reads onto the payload-building
+        // critical path. Tempo precompiles execute their policy checks in-process, so only
+        // fixed system precompiles need access to the registry's external dispatch on zones.
+        if !SYSTEM_PRECOMPILES
+            .iter()
+            .any(|(address, _)| *address == caller)
+        {
+            return CallCheck::Revert(Unauthorized {}.abi_encode().into());
+        }
+
         if TIP403_MUTATING_SELECTORS
             .iter()
             .any(|selector| data.starts_with(selector))
@@ -88,12 +99,9 @@ mod tests {
             }
         }
 
-        fn call(&mut self, data: &[u8], gas: u64) -> Result<PrecompileOutput, PrecompileError> {
-            self.call_as(data, gas, TIP403_REGISTRY_ADDRESS, TIP403_REGISTRY_ADDRESS)
-        }
-
         fn call_as(
             &mut self,
+            caller: Address,
             data: &[u8],
             gas: u64,
             target: Address,
@@ -102,12 +110,22 @@ mod tests {
             call_precompile(
                 &mut self.ctx,
                 &self.precompile,
-                CALLER,
+                caller,
                 data,
                 gas,
                 true,
                 target,
                 bytecode,
+            )
+        }
+
+        fn call(&mut self, data: &[u8], gas: u64) -> Result<PrecompileOutput, PrecompileError> {
+            self.call_as(
+                TIP403_REGISTRY_ADDRESS,
+                data,
+                gas,
+                TIP403_REGISTRY_ADDRESS,
+                TIP403_REGISTRY_ADDRESS,
             )
         }
     }
@@ -117,7 +135,7 @@ mod tests {
         let rules = Tip403Rules;
         for selector in TIP403_MUTATING_SELECTORS {
             assert!(matches!(
-                rules.admit(selector, CALLER),
+                rules.admit(selector, TIP403_REGISTRY_ADDRESS),
                 CallCheck::Revert(data) if data == ReadOnlyRegistry {}.abi_encode()
             ));
         }
@@ -131,9 +149,27 @@ mod tests {
         .abi_encode();
 
         assert!(matches!(
-            Tip403Rules.admit(&call, CALLER),
+            Tip403Rules.admit(&call, TIP403_REGISTRY_ADDRESS),
             CallCheck::Revert(data) if data == ReadOnlyRegistry {}.abi_encode()
         ));
+    }
+
+    #[test]
+    fn public_callers_are_rejected_before_dispatch() -> eyre::Result<()> {
+        let mut harness = RegistryHarness::new();
+        let call = ITIP403Registry::receivePolicyCall { account: CALLER }.abi_encode();
+
+        let output = harness.call_as(
+            CALLER,
+            &call,
+            u64::MAX,
+            TIP403_REGISTRY_ADDRESS,
+            TIP403_REGISTRY_ADDRESS,
+        )?;
+
+        assert!(output.is_revert());
+        assert_eq!(output.bytes, Bytes::from(Unauthorized {}.abi_encode()));
+        Ok(())
     }
 
     #[test]
@@ -172,6 +208,7 @@ mod tests {
         let mut harness = RegistryHarness::new();
         let call = ITIP403Registry::policyIdCounterCall {}.abi_encode();
         let output = harness.call_as(
+            TIP403_REGISTRY_ADDRESS,
             &call,
             u64::MAX,
             TIP403_REGISTRY_ADDRESS,
