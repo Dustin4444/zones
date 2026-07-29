@@ -11843,6 +11843,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "slab",
  "tokio",
@@ -13501,6 +13502,7 @@ dependencies = [
  "const-hex",
  "eyre",
  "futures",
+ "jsonrpsee",
  "k256",
  "metrics",
  "p256",
@@ -13544,6 +13546,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tracing",
  "url",
  "zeroize",
@@ -13699,6 +13702,7 @@ name = "zone-sequencer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -13715,7 +13719,10 @@ dependencies = [
  "metrics",
  "parking_lot",
  "proptest",
+ "reth-chain-state",
  "reth-metrics",
+ "reth-provider",
+ "reth-storage-api",
  "schnellru",
  "serde_json",
  "tempo-alloy",
@@ -13724,6 +13731,7 @@ dependencies = [
  "tempo-zone-contracts",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tracing",
 ]
 

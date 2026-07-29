@@ -25,7 +25,7 @@ use zone_l1::{ChainTempoStateExt, L1Deposit, L1PortalEvents};
 use crate::utils::{
     DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, ZoneTestNode,
     approve_outbox, leader_p2p_config, local_dev_zone_account, poll_until, seed_fixture_for_zone,
-    start_chain_id_rpc, start_local_p2p_pair, start_local_zone_with_fixture,
+    start_chain_id_rpc, start_local_p2p_cluster, start_local_zone_with_fixture,
 };
 
 const CONTRACT_CREATION_TX_GAS: u64 = 1_000_000;
@@ -37,12 +37,19 @@ const P2P_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (leader, follower, mut fixture) = start_local_p2p_pair(10).await?;
+    let mut cluster = start_local_p2p_cluster(10).await?;
 
     // Commonware deliberately drops messages for offline peers. Wait for
     // peer dial/handshake (loopback dials every 500ms) before producing the
-    // first block.
+    // first block. The bootstrap leader also needs tip evidence from both
+    // followers before its first promotion.
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut fixture = std::mem::replace(&mut cluster.fixture, L1Fixture::new());
+    let [leader, follower, _third] = cluster
+        .nodes
+        .try_into()
+        .map_err(|_| eyre::eyre!("cluster must have three nodes"))?;
 
     let anchor = fixture.inject_empty_block(leader.deposit_queue());
     leader.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
@@ -220,11 +227,19 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
 
     reth_tracing::init_test_tracing();
 
-    let (leader, follower, mut fixture) = start_local_p2p_pair(10).await?;
+    let mut cluster = start_local_p2p_cluster(10).await?;
 
     // Commonware drops messages for offline peers; wait for the dial/handshake
     // before producing the first block (mirrors the sibling P2P test).
     tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // The block producer (fee recipient) must be covered by the seeded policy below.
+    let producer = cluster.sequencer_signers[0].address();
+    let mut fixture = std::mem::replace(&mut cluster.fixture, L1Fixture::new());
+    let [leader, follower, _third] = cluster
+        .nodes
+        .try_into()
+        .map_err(|_| eyre::eyre!("cluster must have three nodes"))?;
 
     // Alice funds the transfer; Bob becomes blacklisted at the next L1 anchor.
     let alice_signer = MnemonicBuilder::<English>::default()
@@ -232,10 +247,6 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
         .index(1)?
         .build()?;
     let alice = alice_signer.address();
-    let sequencer = MnemonicBuilder::<English>::default()
-        .phrase(TEST_MNEMONIC)
-        .build()?
-        .address();
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
     // --- Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1). ---
@@ -285,7 +296,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
                 &[
                     (alice, false),
                     (bob, true),
-                    (sequencer, false),
+                    (producer, false),
                     (TIP_FEE_MANAGER_ADDRESS, false),
                 ],
             )],
@@ -496,6 +507,59 @@ async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
 
     // Each L1 block advances tempoBlockNumber — wait for all 5
     zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+
+    Ok(())
+}
+
+/// Cancelling the `ZoneEngine` must stop it only between zone blocks, leaving the deposit
+/// queue cursor and the local head in agreement.
+///
+/// This is the graceful-stop invariant needed by the future leadership handoff: an advance
+/// consumes an L1 block from the queue and canonicalizes the resulting zone block across several
+/// awaits. Stopping partway would either replay an L1 anchor (`advanceTempo` rejects it) or skip
+/// one, and either way the node could never build another block.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_zone_engine_stops_cleanly_between_blocks() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (zone, mut fixture) = start_local_zone_with_fixture(20).await?;
+
+    // Produce a few blocks so the stop lands on a running engine, not an idle one.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 5);
+    zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+
+    // Keep feeding the queue while the engine is asked to stop, so cancellation races with
+    // block production instead of arriving during an idle period.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 10);
+    let head = zone.stop_engine().await?;
+
+    // Every L1 block the engine consumed produced exactly one zone block, and nothing was
+    // half-consumed: the queue front is the next unbuilt anchor.
+    let tempo_block_number = zone.tempo_block_number().await?;
+    assert_eq!(
+        tempo_block_number, head,
+        "each zone block imports exactly one L1 block, so the head and the Tempo cursor must agree"
+    );
+    let next_anchor = zone
+        .deposit_queue()
+        .peek()
+        .map(|block| block.header.num_hash().number);
+    if let Some(next_anchor) = next_anchor {
+        assert_eq!(
+            next_anchor,
+            tempo_block_number + 1,
+            "the queue front must be the anchor of the next unbuilt zone block"
+        );
+    }
+
+    // A stopped engine stays stopped, and the node keeps serving RPC.
+    fixture.inject_empty_blocks(zone.deposit_queue(), 3);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        zone.provider().get_block_number().await?,
+        head,
+        "a cancelled engine must not resume building"
+    );
 
     Ok(())
 }
