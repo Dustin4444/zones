@@ -22,7 +22,21 @@ pub(crate) const SETTLEMENT_PROPOSAL_CHANNEL: u64 = 4;
 /// Follower-to-leader settlement signature channel.
 pub(crate) const SETTLEMENT_SIGNATURE_CHANNEL: u64 = 5;
 pub(crate) const BLOCK_BACKLOG: usize = 128;
-pub(crate) const TRANSACTION_BACKLOG: usize = 1_024;
+/// Small-message channels are drained by a dedicated runtime and can safely drop bursts: follower
+/// transactions are periodically reconciled and settlement messages are retried at the next
+/// proposal. Keeping this well below the block backlog bounds memory before application-level
+/// frame limits can run.
+pub(crate) const SMALL_MESSAGE_BACKLOG: usize = 4;
+
+/// Maximum raw EIP-2718 transaction frame accepted from a follower.
+///
+/// This is comfortably above the default 128 KiB transaction input limit while leaving room for
+/// envelope data without allowing block-sized frames into node event queues.
+pub(crate) const MAX_TRANSACTION_MESSAGE_SIZE: usize = 1024 * 1024;
+/// Settlement proposals have a canonical fixed-shape ABI encoding smaller than 512 bytes.
+pub(crate) const MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE: usize = 512;
+/// Signed settlement attestations have a canonical ABI encoding smaller than 1 KiB.
+pub(crate) const MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE: usize = 1024;
 
 // At 30M gas, calldata is bounded below 7.5 MiB; leave headroom for block overhead.
 pub(crate) const MAX_MESSAGE_SIZE: u32 = 20 * 1024 * 1024;

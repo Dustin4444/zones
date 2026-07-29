@@ -15,6 +15,10 @@ use tokio::sync::{Notify, watch};
 type SettlementSignatures =
     BTreeMap<u64, BTreeMap<B256, BTreeMap<Address, SignedSettlementAttestation>>>;
 
+const MAX_SETTLEMENT_PROPOSAL_SIZE: usize = 512;
+const MAX_SETTLEMENT_SIGNATURE_SIZE: usize = 1024;
+const SECP256K1_SIGNATURE_SIZE: usize = 65;
+
 sol! {
     /// Exact settlement statement verified by ZonePortal.
     #[derive(Debug, PartialEq, Eq)]
@@ -71,6 +75,11 @@ impl SettlementAttestation {
     }
 
     pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
+        eyre::ensure!(
+            encoded.len() <= MAX_SETTLEMENT_PROPOSAL_SIZE,
+            "settlement proposal encoding is {} bytes; maximum is {MAX_SETTLEMENT_PROPOSAL_SIZE}",
+            encoded.len()
+        );
         Self::abi_decode(encoded).wrap_err("invalid settlement proposal encoding")
     }
 }
@@ -93,7 +102,18 @@ impl SignedSettlementAttestation {
     }
 
     pub fn decode(encoded: &[u8]) -> eyre::Result<Self> {
-        Self::abi_decode(encoded).wrap_err("invalid settlement signature encoding")
+        eyre::ensure!(
+            encoded.len() <= MAX_SETTLEMENT_SIGNATURE_SIZE,
+            "settlement signature encoding is {} bytes; maximum is {MAX_SETTLEMENT_SIGNATURE_SIZE}",
+            encoded.len()
+        );
+        let signed = Self::abi_decode(encoded).wrap_err("invalid settlement signature encoding")?;
+        eyre::ensure!(
+            signed.signature.len() == SECP256K1_SIGNATURE_SIZE,
+            "settlement signature is {} bytes; expected {SECP256K1_SIGNATURE_SIZE}",
+            signed.signature.len()
+        );
+        Ok(signed)
     }
 
     pub fn recover_signer(&self, domain: AttestationDomain) -> eyre::Result<Address> {
@@ -360,6 +380,40 @@ mod tests {
         signed.signature = Bytes::copy_from_slice(&high_s_signature.as_bytes());
 
         assert!(signed.recover_signer(domain).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_or_noncanonical_settlement_signature_encodings() {
+        let signer = PrivateKeySigner::random();
+        let domain = domain();
+        let attestation = SettlementAttestation {
+            zoneId: 7,
+            sequencerSetVersion: 3,
+            zoneHeight: U256::from(10),
+            withdrawalBatchIndex: U256::from(1),
+            verifier: Address::repeat_byte(2),
+            tempoBlockNumber: 100,
+            anchorBlockNumber: 100,
+            anchorBlockHash: B256::repeat_byte(3),
+            blockTransitionHash: B256::repeat_byte(4),
+            depositQueueTransitionHash: B256::repeat_byte(5),
+            withdrawalQueueHash: B256::repeat_byte(6),
+            verifierConfigHash: B256::repeat_byte(7),
+        };
+
+        let mut signed = SignedSettlementAttestation::sign(attestation, domain, &signer).unwrap();
+        signed.signature = Bytes::from(vec![0; SECP256K1_SIGNATURE_SIZE + 1]);
+        let error = SignedSettlementAttestation::decode(&signed.encode()).unwrap_err();
+        assert!(error.to_string().contains("expected 65"));
+
+        let error =
+            SignedSettlementAttestation::decode(&vec![0; MAX_SETTLEMENT_SIGNATURE_SIZE + 1])
+                .unwrap_err();
+        assert!(error.to_string().contains("maximum is 1024"));
+
+        let error =
+            SettlementAttestation::decode(&vec![0; MAX_SETTLEMENT_PROPOSAL_SIZE + 1]).unwrap_err();
+        assert!(error.to_string().contains("maximum is 512"));
     }
 
     #[tokio::test]

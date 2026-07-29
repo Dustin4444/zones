@@ -11,7 +11,7 @@ use commonware_cryptography::ed25519::PublicKey;
 use commonware_p2p::{
     AddressableManager as _, Receiver as _, Recipients, Sender as _, authenticated::lookup,
 };
-use commonware_runtime::{Runner as _, Spawner as _};
+use commonware_runtime::{IoBuf, Runner as _, Spawner as _};
 use eyre::WrapErr as _;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -22,8 +22,10 @@ use crate::{
     identity::{Ed25519Identity, Secp256k1Identity},
     network::{
         self, BACKFILL_REQUEST_CHANNEL, BACKFILL_RESPONSE_CHANNEL, BLOCK_BACKLOG, BLOCK_CHANNEL,
-        MAX_MESSAGE_SIZE, SETTLEMENT_PROPOSAL_CHANNEL, SETTLEMENT_SIGNATURE_CHANNEL,
-        TRANSACTION_BACKLOG, TRANSACTION_CHANNEL,
+        MAX_MESSAGE_SIZE, MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE,
+        MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE, MAX_TRANSACTION_MESSAGE_SIZE,
+        SETTLEMENT_PROPOSAL_CHANNEL, SETTLEMENT_SIGNATURE_CHANNEL, SMALL_MESSAGE_BACKLOG,
+        TRANSACTION_CHANNEL,
     },
 };
 
@@ -72,6 +74,14 @@ impl PeerTip {
 type CommonwareSender = lookup::Sender<PublicKey, commonware_runtime::tokio::Context>;
 type CommonwareReceiver = lookup::Receiver<PublicKey>;
 type SharedBackfillLifecycle = Arc<Mutex<BackfillJob>>;
+
+fn into_bounded_payload(bytes: IoBuf, max_size: usize) -> Result<Vec<u8>, usize> {
+    let size = bytes.len();
+    if size > max_size {
+        return Err(size);
+    }
+    Ok(bytes.into())
+}
 
 #[derive(Debug, Clone, Copy)]
 struct OutstandingBackfill {
@@ -485,12 +495,12 @@ fn run(
         let (settlement_proposal_sender, settlement_proposal_receiver) = commonware.register(
             SETTLEMENT_PROPOSAL_CHANNEL,
             network::settlement_quota(),
-            BLOCK_BACKLOG,
+            SMALL_MESSAGE_BACKLOG,
         );
         let (settlement_signature_sender, settlement_signature_receiver) = commonware.register(
             SETTLEMENT_SIGNATURE_CHANNEL,
             network::settlement_quota(),
-            BLOCK_BACKLOG,
+            SMALL_MESSAGE_BACKLOG,
         );
 
         // The backfill request and responses are on separate channels
@@ -507,7 +517,7 @@ fn run(
         let (transaction_sender, transaction_receiver) = commonware.register(
             TRANSACTION_CHANNEL,
             network::transaction_quota(),
-            TRANSACTION_BACKLOG,
+            SMALL_MESSAGE_BACKLOG,
         );
         let mut network_task = commonware.start();
 
@@ -699,6 +709,21 @@ async fn run_commands(
                     warn!(target: "zone::p2p", "Ignoring settlement proposal command without retained scheduled leadership");
                     continue;
                 }
+                if proposal.len() > MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE {
+                    metrics::counter!(
+                        "zone_p2p_oversized_messages_dropped_total",
+                        "channel" => "settlement_proposal",
+                        "direction" => "outbound",
+                    )
+                    .increment(1);
+                    warn!(
+                        target: "zone::p2p",
+                        size = proposal.len(),
+                        max_size = MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE,
+                        "Dropping oversized settlement proposal"
+                    );
+                    continue;
+                }
                 senders
                     .settlement_proposals
                     .send(Recipients::Some(others()), proposal, true)
@@ -712,6 +737,21 @@ async fn run_commands(
                 if leader == local_ed25519_public_key || !leadership.is_scheduled_leader(&leader) {
                     metrics::counter!("zone_p2p_role_invalid_messages_dropped_total").increment(1);
                     warn!(target: "zone::p2p", %leader, "Ignoring settlement signature addressed to a peer without retained scheduled leadership");
+                    continue;
+                }
+                if signature.len() > MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE {
+                    metrics::counter!(
+                        "zone_p2p_oversized_messages_dropped_total",
+                        "channel" => "settlement_signature",
+                        "direction" => "outbound",
+                    )
+                    .increment(1);
+                    warn!(
+                        target: "zone::p2p",
+                        size = signature.len(),
+                        max_size = MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE,
+                        "Dropping oversized settlement signature"
+                    );
                     continue;
                 }
                 senders
@@ -778,6 +818,22 @@ async fn run_commands(
                 if leader == local_ed25519_public_key {
                     metrics::counter!("zone_p2p_role_invalid_messages_dropped_total").increment(1);
                     warn!(target: "zone::p2p", ?transaction_hash, "Ignoring outbound transaction command on the next-anchor leader");
+                    continue;
+                }
+                if transaction.len() > MAX_TRANSACTION_MESSAGE_SIZE {
+                    metrics::counter!(
+                        "zone_p2p_oversized_messages_dropped_total",
+                        "channel" => "transaction",
+                        "direction" => "outbound",
+                    )
+                    .increment(1);
+                    warn!(
+                        target: "zone::p2p",
+                        ?transaction_hash,
+                        size = transaction.len(),
+                        max_size = MAX_TRANSACTION_MESSAGE_SIZE,
+                        "Dropping oversized forwarded transaction"
+                    );
                     continue;
                 }
                 let sent = match senders
@@ -848,6 +904,26 @@ async fn run_receivers(
             // Got a settlement proposal at a batch boundary
             result = settlement_proposals.recv() => {
                 let (peer, bytes) = result.wrap_err("settlement proposal channel receive failed")?;
+                let proposal =
+                    match into_bounded_payload(bytes, MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE) {
+                    Ok(proposal) => proposal,
+                    Err(size) => {
+                        metrics::counter!(
+                            "zone_p2p_oversized_messages_dropped_total",
+                            "channel" => "settlement_proposal",
+                            "direction" => "inbound",
+                        )
+                        .increment(1);
+                        warn!(
+                            target: "zone::p2p",
+                            %peer,
+                            size,
+                            max_size = MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE,
+                            "Ignoring oversized settlement proposal"
+                        );
+                        continue;
+                    }
+                };
                 // The proposer must lead somewhere in the retained schedule — during a scheduled handoff the
                 // outgoing leader still settles pre-boundary batches. The follower rebuilds
                 // the proposal from its own state before signing.
@@ -855,19 +931,39 @@ async fn run_receivers(
                     warn!(target: "zone::p2p", %peer, "Ignoring settlement proposal from ineligible peer");
                     continue;
                 }
-                P2pEvent::SettlementProposalReceived { leader: peer, proposal: bytes.into() }
+                P2pEvent::SettlementProposalReceived { leader: peer, proposal }
             }
 
             // Got a response from a follower to the settlement proposal
             result = settlement_signatures.recv() => {
                 let (peer, bytes) = result.wrap_err("settlement signature channel receive failed")?;
+                let signature =
+                    match into_bounded_payload(bytes, MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE) {
+                        Ok(signature) => signature,
+                        Err(size) => {
+                            metrics::counter!(
+                                "zone_p2p_oversized_messages_dropped_total",
+                                "channel" => "settlement_signature",
+                                "direction" => "inbound",
+                            )
+                            .increment(1);
+                            warn!(
+                                target: "zone::p2p",
+                                %peer,
+                                size,
+                                max_size = MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE,
+                                "Ignoring oversized settlement signature"
+                            );
+                            continue;
+                        }
+                    };
                 if peer == local_ed25519_public_key
                     || !leadership.is_scheduled_leader(&local_ed25519_public_key)
                 {
                     warn!(target: "zone::p2p", %peer, "Ignoring settlement signature from ineligible peer");
                     continue;
                 }
-                P2pEvent::SettlementSignatureReceived { follower: peer, signature: bytes.into() }
+                P2pEvent::SettlementSignatureReceived { follower: peer, signature }
             }
 
             // Got backfill request
@@ -934,6 +1030,25 @@ async fn run_receivers(
             // Got a transaction forwarded by an authenticated follower.
             result = transactions.recv() => {
                 let (peer, bytes) = result.map_err(|err| eyre::eyre!("transaction channel receive failed: {err}"))?;
+                let transaction = match into_bounded_payload(bytes, MAX_TRANSACTION_MESSAGE_SIZE) {
+                    Ok(transaction) => transaction,
+                    Err(size) => {
+                        metrics::counter!(
+                            "zone_p2p_oversized_messages_dropped_total",
+                            "channel" => "transaction",
+                            "direction" => "inbound",
+                        )
+                        .increment(1);
+                        warn!(
+                            target: "zone::p2p",
+                            %peer,
+                            size,
+                            max_size = MAX_TRANSACTION_MESSAGE_SIZE,
+                            "Ignoring oversized forwarded transaction"
+                        );
+                        continue;
+                    }
+                };
                 if peer == local_ed25519_public_key
                     || !manifest.contains_ed25519_public_key(&peer)
                     || !leadership.is_scheduled_leader(&local_ed25519_public_key)
@@ -945,7 +1060,7 @@ async fn run_receivers(
                 metrics::counter!("zone_p2p_transactions_received_total").increment(1);
                 P2pEvent::TransactionReceived {
                     follower_ed25519_public_key: peer,
-                    transaction: bytes.into(),
+                    transaction,
                 }
             }
         };
@@ -969,13 +1084,16 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 
     use super::{
-        BACKFILL_RESPONSE_TIMEOUT, BackfillJob, P2pCommand, P2pConfig, P2pEvent, spawn_p2p,
-        validate_ip_check_configuration,
+        BACKFILL_RESPONSE_TIMEOUT, BackfillJob, P2pCommand, P2pConfig, P2pEvent,
+        into_bounded_payload, spawn_p2p, validate_ip_check_configuration,
     };
     use crate::{
         P2pNetworkId, ZoneManifest,
         identity::{Ed25519Identity, Secp256k1Identity},
-        network::MAX_MESSAGE_SIZE,
+        network::{
+            MAX_MESSAGE_SIZE, MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE,
+            MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE, MAX_TRANSACTION_MESSAGE_SIZE,
+        },
     };
 
     fn test_tip(zone_height: u64) -> super::PeerTip {
@@ -1085,6 +1203,17 @@ mod tests {
         let error = validate_ip_check_configuration(&manifest, false).unwrap_err();
         assert!(error.to_string().contains("--p2p.bypass-ip-check"));
         validate_ip_check_configuration(&manifest, true).unwrap();
+    }
+
+    #[test]
+    fn bounded_payload_rejects_oversized_frames_before_copying_into_events() {
+        let accepted =
+            into_bounded_payload(commonware_runtime::IoBuf::from(vec![0x11; 4]), 4).unwrap();
+        assert_eq!(accepted, vec![0x11; 4]);
+
+        let oversized =
+            into_bounded_payload(commonware_runtime::IoBuf::from(vec![0x22; 5]), 4).unwrap_err();
+        assert_eq!(oversized, 5);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1199,6 +1328,13 @@ mod tests {
         let transaction = vec![0x76, 0x01, 0x02, 0x03];
         follower_commands
             .send(P2pCommand::ForwardTransaction {
+                transaction_hash: B256::with_last_byte(3),
+                transaction: vec![0; MAX_TRANSACTION_MESSAGE_SIZE + 1],
+            })
+            .await
+            .unwrap();
+        follower_commands
+            .send(P2pCommand::ForwardTransaction {
                 transaction_hash,
                 transaction: transaction.clone(),
             })
@@ -1235,6 +1371,14 @@ mod tests {
 
         let proposal = vec![0x10, 0x20];
         leader_commands
+            .send(P2pCommand::BroadcastSettlementProposal(vec![
+                0;
+                MAX_SETTLEMENT_PROPOSAL_MESSAGE_SIZE
+                    + 1
+            ]))
+            .await
+            .unwrap();
+        leader_commands
             .send(P2pCommand::BroadcastSettlementProposal(proposal.clone()))
             .await
             .unwrap();
@@ -1255,6 +1399,13 @@ mod tests {
         .expect("follower did not receive settlement proposal");
 
         let settlement_signature = vec![0x30, 0x40];
+        follower_commands
+            .send(P2pCommand::SendSettlementSignature {
+                leader: leader_peer.clone(),
+                signature: vec![0; MAX_SETTLEMENT_SIGNATURE_MESSAGE_SIZE + 1],
+            })
+            .await
+            .unwrap();
         follower_commands
             .send(P2pCommand::SendSettlementSignature {
                 leader: leader_peer.clone(),
