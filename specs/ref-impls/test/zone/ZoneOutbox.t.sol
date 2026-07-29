@@ -1438,6 +1438,7 @@ contract ZoneOutboxTest is Test {
         assertEq(_pendingWithdrawalsCount(), 0);
     }
 
+    /// @notice A withdrawal records exact fields while burning its amount and advancing indices.
     function testFuzz_requestWithdrawal_exactBurnPendingIndexAndFallbackNonce(
         uint128 rawAmount,
         uint128 rawRate,
@@ -1482,6 +1483,7 @@ contract ZoneOutboxTest is Test {
         assertEq(outbox.consumeFallbackRecipient(1), fallbackRecipient);
     }
 
+    /// @notice Every withdrawal validation branch rejects without burning or advancing state.
     function testFuzz_requestWithdrawal_rejectionMatrixIsAtomic(uint8 rawCase) public {
         uint8 rejectionCase = uint8(bound(rawCase, 0, 5));
         bytes memory data;
@@ -1542,6 +1544,7 @@ contract ZoneOutboxTest is Test {
         assertEq(outbox.lastFallbackNonce(), nonceBefore);
     }
 
+    /// @notice Finalized sender tags bind both the withdrawal sender and current zone transaction.
     function testFuzz_finalizeWithdrawalBatch_senderTagBindsSenderAndCurrentTxHash(
         address sender,
         bytes32 memo
@@ -1563,6 +1566,7 @@ contract ZoneOutboxTest is Test {
         assertEq(expected.senderTag, keccak256(abi.encodePacked(sender, txContext.txHashFor(1))));
     }
 
+    /// @notice Invalid withdrawal and encrypted-sender counts leave the pending batch unchanged.
     function testFuzz_finalizeWithdrawalBatch_shapeRejectionIsAtomic(
         uint8 rawCase,
         uint8 rawWrongLength

@@ -385,6 +385,7 @@ contract SwapAndDepositRouterTest is BaseTest {
         );
     }
 
+    /// @notice Verifies an exact-input quote equals the output delivered through the router.
     /// @dev TODO: Enable once https://github.com/tempoxyz/tempo/pull/6614 is included in Forge.
     function test_swapOutputMatchesQuote() public {
         vm.skip(true, "Tempo #6614: exact-input quotes still round per tick instead of per order");
@@ -407,6 +408,7 @@ contract SwapAndDepositRouterTest is BaseTest {
         assertEq(mockPortal2.lastDepositAmount(), quote);
     }
 
+    /// @notice Swapped value is conserved across the real DEX, router, and target portal.
     function testFuzz_swapDeposit_conservesBalancesAndQueuesDeposit(
         bool encrypted,
         bytes32 metadata,
@@ -450,6 +452,7 @@ contract SwapAndDepositRouterTest is BaseTest {
         assertNotEq(mockPortal2.currentDepositQueueHash(), hashBefore);
     }
 
+    /// @notice DEX slippage and downstream portal rejection revert every swap and deposit mutation.
     function testFuzz_swapDeposit_failureIsAtomic(bool portalRejects, bool encrypted) public {
         uint128 quote = exchange.quoteSwapExactAmountIn(address(pathUSD), address(token1), AMOUNT);
         mockPortal2.setRejectDeposits(portalRejects);

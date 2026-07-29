@@ -315,6 +315,7 @@ contract ZoneMessengerTest is BaseTest {
         );
     }
 
+    /// @notice Only the matching portal and gateway can relay, and every callback failure rolls back.
     function testFuzz_relayMessage_authorizationAndCallbackRollbackMatrix(
         bool factoryPortalCaller,
         bool matchingZone,

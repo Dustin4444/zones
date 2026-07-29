@@ -316,6 +316,7 @@ contract EncryptionGraceSymbolic is Test {
         h = new EncryptionGraceHarness();
     }
 
+    /// @notice Production key validity changes exactly at the superseding key's grace boundary.
     function check_encryptionGraceExpiresAtExactBoundary(
         uint64 activation,
         uint256 currentBlock
@@ -331,6 +332,7 @@ contract EncryptionGraceSymbolic is Test {
         assertEq(valid, currentBlock < expiry);
     }
 
+    /// @notice An overflowing grace-period calculation reverts without altering key history.
     function check_encryptionGraceAdditionCannotWrap(uint64 activation) external {
         vm.assume(activation > type(uint64).max - ENCRYPTION_KEY_GRACE_PERIOD);
         h.setTwoKeys(activation);
@@ -341,6 +343,7 @@ contract EncryptionGraceSymbolic is Test {
         assertEq(h.encryptionKeyAt(1).activationBlock, activation);
     }
 
+    /// @notice Production key lookup accepts stored indices and safely rejects all others.
     function check_encryptionKeyIndexRange(uint256 index) external {
         h.setTwoKeys(1);
         (bool valid, uint64 expiry) = h.isEncryptionKeyValid(index);
