@@ -8,6 +8,8 @@
 //! - [`DepositPrefetchPlan`] — event-derived Portal and canonical policy reads needed by deposits.
 //! - [`PolicyCheckExecutor`] — the node-specific execution boundary for canonical policy reads.
 //! - [`PrefetchCtx`] — exact Zone/L1 child context shared by one prefetch operation.
+//!
+//! TIP-20 and TIP-403 policy semantics are evaluated by Tempo's upstream precompiles.
 
 pub mod cache;
 pub mod enabled_tokens;

@@ -1,14 +1,9 @@
 //! Event-derived prefetching for the L1 storage read by `advanceTempo`.
 //!
-//! Deposit execution is sequential, but Portal events reveal most tokens and mint recipients before
-//! payload construction. [`DepositPrefetchPlan`] first warms the directly derivable Portal slots,
-//! then evaluates Tempo's canonical policy APIs in bounded dependency waves. Those APIs discover
-//! the hardfork-sensitive TIP-20 and TIP-403 reads, avoiding a second, local implementation of
-//! Tempo's policy storage layout.
-//!
-//! Portal reads use the shared [`L1StateProvider`] cache directly. Policy reads are delegated to a
-//! [`PolicyCheckExecutor`] because they also require parent Zone state and a correctly configured
-//! Tempo EVM. Both paths populate the same exact-child L1 cache used by payload execution.
+//! Deposit execution is sequential, but Portal events reveal most tokens and recipients before
+//! payload construction starts. This module uses that data to prefetch typed Portal slots and run
+//! canonical policy checks in bounded waves, so the payload builder normally observes exact-L1
+//! cache hits instead of serial RPC calls.
 
 use super::L1StateProvider;
 use alloy_primitives::{Address, B256, U256};
@@ -69,13 +64,12 @@ pub trait PolicyCheckExecutor: Debug + Send + Sync {
     ) -> Result<()>;
 }
 
-/// Event-derived inputs needed to warm one finalized L1 block's deposit state.
+/// Symbolic L1 reads derived from one finalized block's Portal events.
 ///
-/// Tokens from both enablement and deposit events share one deduplicated set because canonical
-/// Tempo execution resolves both through the same transfer-policy API. Mint pairs retain only
-/// recipients known before Zone execution; virtual recipients require Zone-local resolution and
-/// therefore cannot have recipient-specific policy reads scheduled here. Encryption-key indices
-/// remain symbolic until Portal slots are derived at prefetch time.
+/// The plan retains tokens, known mint recipients, and encryption-key indices. At prefetch time it
+/// derives typed Portal slots and runs canonical policy checks to discover dependent reads. Virtual
+/// recipients still receive token-level prefetching, but their recipient-specific checks require
+/// Zone-local resolution and cannot be scheduled here.
 #[derive(Debug)]
 pub struct DepositPrefetchPlan {
     block_number: u64,
@@ -129,11 +123,10 @@ impl DepositPrefetchPlan {
 
     /// Warm all event-derived Portal and policy reads before payload construction.
     ///
-    /// Work proceeds in four bounded phases:
-    /// 1. directly derivable Portal queue and encryption-key slots;
-    /// 2. one canonical transfer-policy lookup per token;
-    /// 3. one mint authorization per unique `(policy_id, recipient)` pair;
-    /// 4. receive-policy validation for every authorized `(token, recipient)` mint.
+    /// Work is split into dependency waves:
+    /// 1. Portal slots and transfer-policy lookup per token.
+    /// 2. Mint authorizations for each unique `(policy_id, recipient)` pair.
+    /// 3. Receive-policy validation for every authorized `(token, recipient)` mint.
     ///
     /// Each wave is deduplicated and concurrent. Starting payload construction only after this
     /// method succeeds keeps unavoidable RPC latency outside sequential EVM execution.
@@ -146,11 +139,70 @@ impl DepositPrefetchPlan {
     ) -> Result<()> {
         let started = Instant::now();
         let l1_block = self.block_number;
-        let portal_slots = self.prefetch_portal(provider, concurrency).await
-            .inspect_err(|error| warn!(target: "zone::l1", %error, "failed to prefetch portal L1 state at block {l1_block}")).unwrap_or(0);
-        if let Err(error) = self.prefetch_policies(concurrency, ctx, executor).await {
-            warn!(target: "zone::l1", %error, "failed to prefetch policy L1 state at block {l1_block}");
-        };
+
+        // Wave 1: Fetch Portal slots and transfer policy ids
+        let shared_concurrency = (concurrency / 2).max(1);
+        let (portal_result, policies_result) = tokio::join!(
+            async {
+                let slots = self.portal_slots()?;
+                let slot_count = slots.len();
+                provider
+                    .prefetch_storage(slots, self.block_number, shared_concurrency)
+                    .await?;
+                Ok::<_, eyre::Report>(slot_count)
+            },
+            self.prefetch_wave(
+                shared_concurrency,
+                ctx.clone(),
+                executor.clone(),
+                self.tokens.iter().copied(),
+                |exec, ctx, token| exec.transfer_policy(ctx, token).map(|id| (token, id)),
+            )
+            .try_collect::<HashMap<_, _>>()
+        );
+        let portal_slots = portal_result
+            .inspect_err(|error| warn!(target: "zone::l1", %error, "failed to prefetch portal L1 state at block {l1_block}"))
+            .unwrap_or(0);
+        let policies = policies_result?;
+
+        // Group tokens by policy id, and track their recipients.
+        let mut tokens = HashMap::<(u64, Address), Vec<Address>>::with_capacity(self.mints.len());
+        self.mints
+            .iter()
+            .filter_map(|(token, to)| Some(((*policies.get(token)?, *to), *token)))
+            .for_each(|(key, token)| tokens.entry(key).or_default().push(token));
+
+        // Wave 2: Fetch authorized mints
+        let authorized_mints = self
+            .prefetch_wave(
+                concurrency,
+                ctx.clone(),
+                executor.clone(),
+                tokens,
+                |exec, ctx, ((policy_id, to), tokens)| {
+                    exec.is_mint_authorized(ctx, policy_id, to)
+                        .map(|is_auth| (to, tokens, is_auth))
+                },
+            ) // Only keep tokens where minting is authorized
+            .try_fold(Vec::new(), |mut acc, (to, tokens, is_auth)| async move {
+                if is_auth {
+                    acc.extend(tokens.into_iter().map(|token| (token, to)));
+                }
+                Ok(acc)
+            })
+            .await?;
+
+        // Wave 3: Fetch receive policies on authorized minters
+        self.prefetch_wave(
+            concurrency,
+            ctx,
+            executor,
+            authorized_mints,
+            |exec, ctx, (token, to)| exec.validate_receive_policy(ctx, token, to),
+        )
+        .try_for_each(|_| async { Ok(()) })
+        .await?;
+
         info!(
             target: "zone::l1",
             l1_block,
@@ -161,19 +213,6 @@ impl DepositPrefetchPlan {
             "Prefetched deposit L1 state"
         );
         Ok(())
-    }
-
-    async fn prefetch_portal(
-        &self,
-        provider: &L1StateProvider,
-        concurrency: usize,
-    ) -> Result<usize> {
-        let slots = self.portal_slots()?;
-        let slot_count = slots.len();
-        provider
-            .prefetch_storage(slots, self.block_number, concurrency)
-            .await?;
-        Ok(slot_count)
     }
 
     #[inline]
@@ -193,69 +232,12 @@ impl DepositPrefetchPlan {
         Ok(slots)
     }
 
-    async fn prefetch_policies<E>(
-        &self,
-        concurrency: usize,
-        ctx: PrefetchCtx,
-        executor: Arc<E>,
-    ) -> Result<()>
-    where
-        E: PolicyCheckExecutor + ?Sized + 'static,
-    {
-        // Wave 1: Fetch policy ids
-        let policies: HashMap<Address, u64> = Self::prefetch_wave(
-            concurrency,
-            ctx.clone(),
-            executor.clone(),
-            self.tokens.iter().copied(),
-            |exec, ctx, token| exec.transfer_policy(ctx, token).map(|id| (token, id)),
-        )
-        .try_collect()
-        .await?;
-
-        // Group tokens by policy id, and track their recipients.
-        let mut tokens = HashMap::<(u64, Address), Vec<Address>>::with_capacity(self.mints.len());
-        self.mints
-            .iter()
-            .filter_map(|(token, recipient)| Some(((*policies.get(token)?, *recipient), *token)))
-            .for_each(|(key, token)| tokens.entry(key).or_default().push(token));
-
-        // Wave 2: Fetch authorized mints
-        let authorized_mints = Self::prefetch_wave(
-            concurrency,
-            ctx.clone(),
-            executor.clone(),
-            tokens,
-            |exec, ctx, ((policy_id, recipient), tokens)| {
-                exec.is_mint_authorized(ctx, policy_id, recipient)
-                    .map(|is_auth| (recipient, tokens, is_auth))
-            },
-        ) // Only keep tokens where minting is authorized
-        .try_fold(Vec::new(), |mut acc, (recp, tkns, is_auth)| async move {
-            if is_auth {
-                acc.extend(tkns.into_iter().map(|tkn| (tkn, recp)));
-            }
-            Ok(acc)
-        })
-        .await?;
-
-        // Wave 3: Fetch receive policies on authorized minters
-        Self::prefetch_wave(
-            concurrency,
-            ctx,
-            executor,
-            authorized_mints,
-            |exec, ctx, (token, recipient)| exec.validate_receive_policy(ctx, token, recipient),
-        )
-        .try_for_each(|_| async { Ok(()) })
-        .await
-    }
-
     /// Execute one homogeneous dependency wave in bounded blocking tasks.
     ///
     /// Policy APIs are synchronous because they run inside an EVM context. Moving each operation
     /// to `spawn_blocking` keeps RPC fallback and EVM work off the async engine worker.
     fn prefetch_wave<E, I, O>(
+        &self,
         concurrency: usize,
         ctx: PrefetchCtx,
         executor: Arc<E>,
@@ -267,6 +249,7 @@ impl DepositPrefetchPlan {
         I: Send + 'static,
         O: Send + 'static,
     {
+        let l1_block = self.block_number;
         futures::stream::iter(checks)
             .map(move |check| {
                 let (executor, ctx) = (executor.clone(), ctx.clone());
@@ -277,6 +260,7 @@ impl DepositPrefetchPlan {
                 }
             })
             .buffer_unordered(concurrency.max(1))
+            .inspect_err(move |error| warn!(target: "zone::l1", %error, "failed to prefetch policy L1 state at block {l1_block}"))
     }
 }
 
@@ -289,9 +273,13 @@ fn insert_slot<T: Storable>(slots: &mut HashSet<(Address, B256)>, slot: &Slot<T>
 
 #[cfg(test)]
 mod tests {
+    use crate::{L1StateCache, state::L1StateProviderConfig};
+
     use super::*;
     use alloy_primitives::address;
+    use alloy_provider::{Provider as _, ProviderBuilder};
     use std::sync::Mutex;
+    use tempo_alloy::TempoNetwork;
 
     const PORTAL: Address = address!("1000000000000000000000000000000000000001");
     const TOKEN_A: Address = address!("20c0000000000000000000000000000000000001");
@@ -358,9 +346,8 @@ mod tests {
         let slots = plan.portal_slots()?;
         let portal = ZonePortalStorage::new(PORTAL);
         let key = &portal.encryption_keys[4];
-        let expected = [&portal.current_deposit_queue_hash, &key.x];
         assert_eq!(slots.len(), 3, "queue plus two encryption-key words");
-        for slot in expected {
+        for slot in [&portal.current_deposit_queue_hash, &key.x] {
             assert!(slots.contains(&(slot.address(), slot.slot().into())));
         }
         assert!(slots.contains(&(key.y_parity.address(), key.y_parity.slot().into())));
@@ -369,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_waves_deduplicate_and_gate_receive_checks() -> Result<()> {
-        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        let mut plan = DepositPrefetchPlan::new(7, Address::ZERO);
         plan.add_mint(TOKEN_A, RECIPIENT);
         plan.add_mint(TOKEN_A, RECIPIENT);
         plan.add_mint(TOKEN_B, RECIPIENT);
@@ -378,8 +365,18 @@ mod tests {
         plan.add_mint(TOKEN_E, Address::ZERO);
         plan.add_mint(TOKEN_E, TOKEN_A);
 
+        let rpc = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect("http://127.0.0.1:1")
+            .await?
+            .erased();
+        let provider = L1StateProvider::new_raw(
+            L1StateProviderConfig::default(),
+            L1StateCache::default(),
+            rpc,
+            tokio::runtime::Handle::current(),
+        );
         let executor = Arc::new(MockExecutor::default());
-        plan.prefetch_policies(2, ctx(), executor.clone()).await?;
+        plan.prefetch(&provider, 2, ctx(), executor.clone()).await?;
 
         let policy_calls = executor.policy_calls.lock().unwrap();
         assert_eq!(policy_calls.len(), 4, "each planned token is resolved once");
