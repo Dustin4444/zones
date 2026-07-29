@@ -168,6 +168,16 @@ impl DepositPrefetchPlan {
         provider: &L1StateProvider,
         concurrency: usize,
     ) -> Result<usize> {
+        let slots = self.portal_slots()?;
+        let slot_count = slots.len();
+        provider
+            .prefetch_storage(slots, self.block_number, concurrency)
+            .await?;
+        Ok(slot_count)
+    }
+
+    #[inline]
+    fn portal_slots(&self) -> Result<HashSet<(Address, B256)>> {
         let mut slots = HashSet::new();
         if !self.portal.is_zero() {
             let portal = ZonePortalStorage::new(self.portal);
@@ -180,11 +190,7 @@ impl DepositPrefetchPlan {
                 insert_slot(&mut slots, &key.y_parity); // packed with `activation_block`
             }
         }
-        let slot_count = slots.len();
-        provider
-            .prefetch_storage(slots, self.block_number, concurrency)
-            .await?;
-        Ok(slot_count)
+        Ok(slots)
     }
 
     async fn prefetch_policies<E>(
@@ -278,5 +284,126 @@ impl DepositPrefetchPlan {
 fn insert_slot<T: Storable>(slots: &mut HashSet<(Address, B256)>, slot: &Slot<T>) {
     for offset in 0..T::SLOTS {
         slots.insert((slot.address(), (slot.slot() + U256::from(offset)).into()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+    use std::sync::Mutex;
+
+    const PORTAL: Address = address!("1000000000000000000000000000000000000001");
+    const TOKEN_A: Address = address!("20c0000000000000000000000000000000000001");
+    const TOKEN_B: Address = address!("20c0000000000000000000000000000000000002");
+    const TOKEN_C: Address = address!("20c0000000000000000000000000000000000003");
+    const TOKEN_D: Address = address!("20c0000000000000000000000000000000000004");
+    const TOKEN_E: Address = address!("20c0000000000000000000000000000000000005");
+    const RECIPIENT: Address = address!("3000000000000000000000000000000000000001");
+    const DENIED: Address = address!("3000000000000000000000000000000000000002");
+    const VIRTUAL_RECIPIENT: Address = address!("01020304fdfdfdfdfdfdfdfdfdfd010203040506");
+
+    #[derive(Debug, Default)]
+    struct MockExecutor {
+        policy_calls: Mutex<Vec<Address>>,
+        authorization_calls: Mutex<Vec<(u64, Address)>>,
+        receive_calls: Mutex<Vec<(Address, Address)>>,
+    }
+
+    impl PolicyCheckExecutor for MockExecutor {
+        fn transfer_policy(&self, _ctx: &PrefetchCtx, token: Address) -> Result<u64> {
+            self.policy_calls.lock().unwrap().push(token);
+            Ok(if token == TOKEN_C { 8 } else { 7 })
+        }
+
+        fn is_mint_authorized(
+            &self,
+            _ctx: &PrefetchCtx,
+            policy_id: u64,
+            recipient: Address,
+        ) -> Result<bool> {
+            self.authorization_calls
+                .lock()
+                .unwrap()
+                .push((policy_id, recipient));
+            Ok(recipient != DENIED)
+        }
+
+        fn validate_receive_policy(
+            &self,
+            _ctx: &PrefetchCtx,
+            token: Address,
+            recipient: Address,
+        ) -> Result<()> {
+            self.receive_calls.lock().unwrap().push((token, recipient));
+            Ok(())
+        }
+    }
+
+    fn ctx() -> PrefetchCtx {
+        PrefetchCtx {
+            parent: SealedHeader::seal_slow(TempoHeader::default()),
+            target_l1_block: 7,
+            timestamp: 1,
+            timestamp_millis_part: 0,
+        }
+    }
+
+    #[test]
+    fn portal_slots_use_typed_layout_and_deduplicate_keys() -> Result<()> {
+        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        plan.add_encryption_key(U256::from(4));
+        plan.add_encryption_key(U256::from(4));
+
+        let slots = plan.portal_slots()?;
+        let portal = ZonePortalStorage::new(PORTAL);
+        let key = &portal.encryption_keys[4];
+        let expected = [&portal.current_deposit_queue_hash, &key.x];
+        assert_eq!(slots.len(), 3, "queue plus two encryption-key words");
+        for slot in expected {
+            assert!(slots.contains(&(slot.address(), slot.slot().into())));
+        }
+        assert!(slots.contains(&(key.y_parity.address(), key.y_parity.slot().into())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_waves_deduplicate_and_gate_receive_checks() -> Result<()> {
+        let mut plan = DepositPrefetchPlan::new(7, PORTAL);
+        plan.add_mint(TOKEN_A, RECIPIENT);
+        plan.add_mint(TOKEN_A, RECIPIENT);
+        plan.add_mint(TOKEN_B, RECIPIENT);
+        plan.add_mint(TOKEN_C, DENIED);
+        plan.add_mint(TOKEN_D, VIRTUAL_RECIPIENT);
+        plan.add_mint(TOKEN_E, Address::ZERO);
+        plan.add_mint(TOKEN_E, TOKEN_A);
+
+        let executor = Arc::new(MockExecutor::default());
+        plan.prefetch_policies(2, ctx(), executor.clone()).await?;
+
+        let policy_calls = executor.policy_calls.lock().unwrap();
+        assert_eq!(policy_calls.len(), 4, "each planned token is resolved once");
+        assert_eq!(
+            policy_calls.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([TOKEN_A, TOKEN_B, TOKEN_C, TOKEN_D]),
+            "virtual recipients retain token-level reads, while invalid recipients are discarded"
+        );
+        drop(policy_calls);
+        let authorization_calls = executor.authorization_calls.lock().unwrap();
+        assert_eq!(authorization_calls.len(), 2);
+        assert_eq!(
+            authorization_calls.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([(7, RECIPIENT), (8, DENIED)]),
+            "tokens sharing a policy and recipient use one authorization check"
+        );
+        drop(authorization_calls);
+        let receive_calls = executor.receive_calls.lock().unwrap();
+        assert_eq!(receive_calls.len(), 2);
+        assert_eq!(
+            receive_calls.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([(TOKEN_A, RECIPIENT), (TOKEN_B, RECIPIENT)]),
+            "only authorized mints reach receive-policy validation"
+        );
+        Ok(())
     }
 }
