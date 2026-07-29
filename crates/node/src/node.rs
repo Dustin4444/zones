@@ -112,7 +112,9 @@ fn validate_zone_chain_id(zone_id: u32, parent_chain_id: u64, chain_id: u64) -> 
         return Ok(());
     }
 
-    let expected = zone_primitives::constants::zone_chain_id_for_parent(parent_chain_id, zone_id);
+    let parent = tempo_chain_spec_for_l1(parent_chain_id)
+        .ok_or_else(|| eyre::eyre!("unsupported parent Tempo chain ID {parent_chain_id}"))?;
+    let expected = zone_chainspec::zone_chain_id(&parent, zone_id);
     if chain_id != expected {
         eyre::bail!(
             "chain ID mismatch: zone.id={zone_id} on parent chain {parent_chain_id} requires \

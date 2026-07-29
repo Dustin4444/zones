@@ -13,13 +13,12 @@ use alloy_rlp::Encodable;
 use eyre::{WrapErr as _, eyre};
 use std::path::PathBuf;
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_chainspec::spec::{DEV, TEMPO_T0_BASE_FEE, chainspec_from_chain_id};
 use tempo_contracts::precompiles::ITIP403Registry;
 use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
 use tempo_zone_contracts::{
     ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
 };
-use zone_primitives::constants::zone_chain_id_for_parent;
 
 use crate::zone_utils::MODERATO_ZONE_FACTORY;
 
@@ -163,6 +162,7 @@ impl CreateZone {
             .connect(&self.l1_rpc_url)
             .await?;
         let l1_chain_id = provider.get_chain_id().await?;
+        let parent_chain_spec = chainspec_from_chain_id(l1_chain_id).unwrap_or_else(|| DEV.clone());
 
         let factory = ZoneFactory::new(self.zone_factory, &provider);
 
@@ -265,7 +265,7 @@ impl CreateZone {
 
         let zone_id = event.zoneId;
         let portal = event.portal;
-        let chain_id = zone_chain_id_for_parent(l1_chain_id, zone_id);
+        let chain_id = zone_chainspec::zone_chain_id(&parent_chain_spec, zone_id);
 
         let portal_contract = ZonePortal::new(portal, &provider);
         if self.sequencers.len() > 1 {

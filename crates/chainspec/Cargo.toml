@@ -11,6 +11,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# zone
+zone-primitives.workspace = true
+
 # tempo
 tempo-chainspec.workspace = true
 tempo-primitives.workspace = true

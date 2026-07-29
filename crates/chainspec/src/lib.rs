@@ -13,8 +13,21 @@ use reth_chainspec::{
 };
 use reth_network_peers::NodeRecord;
 use std::{fmt::Display, sync::Arc};
-use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork, spec::TempoHardforks};
+use tempo_chainspec::{
+    TempoChainSpec,
+    hardfork::TempoHardfork,
+    spec::{PRESTO, TempoHardforks},
+};
 use tempo_primitives::TempoHeader;
+
+/// Derives a Zone's EIP-155 chain ID from its parent Tempo chain specification.
+pub fn zone_chain_id(parent: &TempoChainSpec, zone_id: u32) -> u64 {
+    if parent.chain() == PRESTO.chain() {
+        zone_primitives::constants::zone_chain_id(zone_id)
+    } else {
+        zone_primitives::constants::zone_chain_id_testnet(zone_id)
+    }
+}
 
 /// Chain specification for a Tempo Zone.
 ///
@@ -178,7 +191,29 @@ mod tests {
     use super::*;
     #[cfg(feature = "cli")]
     use reth_cli::chainspec::ChainSpecParser;
-    use tempo_chainspec::spec::DEV;
+    use tempo_chainspec::spec::{DEV, MODERATO};
+
+    #[test]
+    fn parent_networks_use_disjoint_zone_chain_ids() {
+        let zone_id = 1;
+
+        assert_eq!(
+            zone_chain_id(&PRESTO, zone_id),
+            zone_primitives::constants::zone_chain_id(zone_id)
+        );
+        assert_eq!(
+            zone_chain_id(&MODERATO, zone_id),
+            zone_primitives::constants::zone_chain_id_testnet(zone_id)
+        );
+        assert_eq!(
+            zone_chain_id(&DEV, zone_id),
+            zone_primitives::constants::zone_chain_id_testnet(zone_id)
+        );
+        assert_ne!(
+            zone_chain_id(&PRESTO, zone_id),
+            zone_chain_id(&MODERATO, zone_id)
+        );
+    }
 
     #[test]
     fn delegates_tempo_chain_behavior() {

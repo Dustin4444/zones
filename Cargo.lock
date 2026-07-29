@@ -11553,8 +11553,8 @@ dependencies = [
  "tempo-revm",
  "tempo-zone-contracts",
  "tokio",
+ "zone-chainspec",
  "zone-precompiles",
- "zone-primitives",
  "zone-sequencer",
 ]
 
@@ -13401,6 +13401,7 @@ dependencies = [
  "reth-network-peers",
  "tempo-chainspec",
  "tempo-primitives",
+ "zone-primitives",
 ]
 
 [[package]]
