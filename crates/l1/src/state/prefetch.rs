@@ -11,7 +11,7 @@
 //! Tempo EVM. Both paths populate the same exact-child L1 cache used by payload execution.
 
 use super::L1StateProvider;
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr as _};
 use futures::{StreamExt as _, TryStreamExt as _};
 use reth_primitives_traits::SealedHeader;
@@ -21,11 +21,12 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use tempo_precompiles::{
+    storage::{Slot, Storable},
+    zone_factory::ZonePortalStorage,
+};
 use tempo_primitives::{TempoAddressExt as _, TempoHeader};
 use tracing::{info, warn};
-use zone_primitives::constants::{
-    PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT,
-};
 
 /// Zone and L1 block context shared by every canonical check in one prefetch operation.
 ///
@@ -145,13 +146,8 @@ impl DepositPrefetchPlan {
     ) -> Result<()> {
         let started = Instant::now();
         let l1_block = self.block_number;
-        let portal_slots = match self.prefetch_storage(provider, concurrency).await {
-            Ok(slots) => slots,
-            Err(error) => {
-                warn!(target: "zone::l1", %error, "failed to prefetch portal L1 state at block {l1_block}");
-                0
-            }
-        };
+        let portal_slots = self.prefetch_portal(provider, concurrency).await
+            .inspect_err(|error| warn!(target: "zone::l1", %error, "failed to prefetch portal L1 state at block {l1_block}")).unwrap_or(0);
         if let Err(error) = self.prefetch_policies(concurrency, ctx, executor).await {
             warn!(target: "zone::l1", %error, "failed to prefetch policy L1 state at block {l1_block}");
         };
@@ -167,17 +163,21 @@ impl DepositPrefetchPlan {
         Ok(())
     }
 
-    async fn prefetch_storage(
+    async fn prefetch_portal(
         &self,
         provider: &L1StateProvider,
         concurrency: usize,
     ) -> Result<usize> {
         let mut slots = HashSet::new();
         if !self.portal.is_zero() {
-            slots.insert((self.portal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT));
+            let portal = ZonePortalStorage::new(self.portal);
+            insert_slot(&mut slots, &portal.current_deposit_queue_hash);
             for &key_index in &self.encryption_key_indices {
-                let (x, metadata) = encryption_key_slots(key_index)?;
-                slots.extend([(self.portal, x), (self.portal, metadata)]);
+                let index = usize::try_from(key_index)
+                    .wrap_err_with(|| "encryption key index exceeds usize".to_string())?;
+                let key = &portal.encryption_keys[index];
+                insert_slot(&mut slots, &key.x);
+                insert_slot(&mut slots, &key.y_parity); // packed with `activation_block`
             }
         }
         let slot_count = slots.len();
@@ -196,71 +196,66 @@ impl DepositPrefetchPlan {
     where
         E: PolicyCheckExecutor + ?Sized + 'static,
     {
-        let policies = Self::prefetch_wave(
+        // Wave 1: Fetch policy ids
+        let policies: HashMap<Address, u64> = Self::prefetch_wave(
             concurrency,
             ctx.clone(),
             executor.clone(),
             self.tokens.iter().copied(),
-            |executor, ctx, token| {
-                executor
-                    .transfer_policy(ctx, token)
-                    .map(|policy_id| (token, policy_id))
-            },
+            |exec, ctx, token| exec.transfer_policy(ctx, token).map(|id| (token, id)),
         )
+        .try_collect()
         .await?;
-        let policies = policies.into_iter().collect::<HashMap<_, _>>();
 
-        let mut tokens = HashMap::<(u64, Address), Vec<Address>>::new();
-        for &(token, recipient) in &self.mints {
-            if let Some(&policy_id) = policies.get(&token) {
-                tokens
-                    .entry((policy_id, recipient))
-                    .or_default()
-                    .push(token);
-            }
-        }
-        let authorizations = Self::prefetch_wave(
+        // Group tokens by policy id, and track their recipients.
+        let mut tokens = HashMap::<(u64, Address), Vec<Address>>::with_capacity(self.mints.len());
+        self.mints
+            .iter()
+            .filter_map(|(token, recipient)| Some(((*policies.get(token)?, *recipient), *token)))
+            .for_each(|(key, token)| tokens.entry(key).or_default().push(token));
+
+        // Wave 2: Fetch authorized mints
+        let authorized_mints = Self::prefetch_wave(
             concurrency,
             ctx.clone(),
             executor.clone(),
             tokens,
-            |executor, ctx, ((policy_id, recipient), tokens)| {
-                executor
-                    .is_mint_authorized(ctx, policy_id, recipient)
-                    .map(|authorized| (recipient, tokens, authorized))
+            |exec, ctx, ((policy_id, recipient), tokens)| {
+                exec.is_mint_authorized(ctx, policy_id, recipient)
+                    .map(|is_auth| (recipient, tokens, is_auth))
             },
-        )
+        ) // Only keep tokens where minting is authorized
+        .try_fold(Vec::new(), |mut acc, (recp, tkns, is_auth)| async move {
+            if is_auth {
+                acc.extend(tkns.into_iter().map(|tkn| (tkn, recp)));
+            }
+            Ok(acc)
+        })
         .await?;
-        let checks = authorizations
-            .into_iter()
-            .filter(|(_, _, authorized)| *authorized)
-            .flat_map(|(recipient, tokens, _)| {
-                tokens.into_iter().map(move |token| (token, recipient))
-            });
+
+        // Wave 3: Fetch receive policies on authorized minters
         Self::prefetch_wave(
             concurrency,
             ctx,
             executor,
-            checks,
-            |executor, ctx, (token, recipient)| {
-                executor.validate_receive_policy(ctx, token, recipient)
-            },
+            authorized_mints,
+            |exec, ctx, (token, recipient)| exec.validate_receive_policy(ctx, token, recipient),
         )
-        .await?;
-        Ok(())
+        .try_for_each(|_| async { Ok(()) })
+        .await
     }
 
     /// Execute one homogeneous dependency wave in bounded blocking tasks.
     ///
     /// Policy APIs are synchronous because they run inside an EVM context. Moving each operation
     /// to `spawn_blocking` keeps RPC fallback and EVM work off the async engine worker.
-    async fn prefetch_wave<E, I, O>(
+    fn prefetch_wave<E, I, O>(
         concurrency: usize,
         ctx: PrefetchCtx,
         executor: Arc<E>,
         checks: impl IntoIterator<Item = I, IntoIter: Send>,
         run_check: fn(&E, &PrefetchCtx, I) -> Result<O>,
-    ) -> Result<Vec<O>>
+    ) -> impl futures::Stream<Item = Result<O>>
     where
         E: PolicyCheckExecutor + ?Sized + 'static,
         I: Send + 'static,
@@ -268,8 +263,7 @@ impl DepositPrefetchPlan {
     {
         futures::stream::iter(checks)
             .map(move |check| {
-                let executor = executor.clone();
-                let ctx = ctx.clone();
+                let (executor, ctx) = (executor.clone(), ctx.clone());
                 async move {
                     tokio::task::spawn_blocking(move || run_check(&executor, &ctx, check))
                         .await
@@ -277,22 +271,12 @@ impl DepositPrefetchPlan {
                 }
             })
             .buffer_unordered(concurrency.max(1))
-            .try_collect()
-            .await
     }
 }
 
-fn encryption_key_slots(key_index: U256) -> Result<(B256, B256)> {
-    let base: U256 = keccak256(PORTAL_ENCRYPTION_KEYS_SLOT.as_slice()).into();
-    let x = key_index
-        .checked_mul(U256::from(2))
-        .and_then(|offset| base.checked_add(offset))
-        .ok_or_else(|| eyre::eyre!("Portal encryption key slot overflow for index {key_index}"))?;
-    let metadata = x
-        .checked_add(U256::ONE)
-        .ok_or_else(|| eyre::eyre!("Portal encryption key metadata slot overflow"))?;
-    Ok((
-        B256::from(x.to_be_bytes::<32>()),
-        B256::from(metadata.to_be_bytes::<32>()),
-    ))
+/// Add every raw word occupied by a generated typed storage value.
+fn insert_slot<T: Storable>(slots: &mut HashSet<(Address, B256)>, slot: &Slot<T>) {
+    for offset in 0..T::SLOTS {
+        slots.insert((slot.address(), (slot.slot() + U256::from(offset)).into()));
+    }
 }
