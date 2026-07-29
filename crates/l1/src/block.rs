@@ -51,7 +51,7 @@ impl L1BlockDeposits {
                     if deposit.tempo_refund_recipient.is_zero() {
                         // The effective withdrawal bounce-back recipient comes from Zone-local
                         // Outbox state, but its token policy remains event-derived.
-                        prefetch.add_deposit_token(deposit.token);
+                        prefetch.add_token(deposit.token);
                     } else {
                         prefetch.add_mint(deposit.token, deposit.to);
                     }
@@ -150,7 +150,7 @@ impl L1BlockDeposits {
             .enabled_tokens
             .iter()
             .map(|token| {
-                prefetch.add_enabled_token(token.token);
+                prefetch.add_token(token.token);
                 token.to_abi()
             })
             .collect();

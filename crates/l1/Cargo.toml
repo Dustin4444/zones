@@ -18,7 +18,6 @@ zone-precompiles = { workspace = true, features = ["std"] }
 # tempo
 tempo-alloy.workspace = true
 tempo-contracts.workspace = true
-tempo-precompiles.workspace = true
 tempo-primitives.workspace = true
 
 # reth

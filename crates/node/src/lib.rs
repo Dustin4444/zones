@@ -12,6 +12,7 @@ pub mod dev;
 pub mod engine;
 pub mod genesis;
 pub mod node;
+pub mod prefetch;
 mod replication;
 pub mod rpc;
 mod settlement_attestation;

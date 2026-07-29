@@ -5,6 +5,7 @@
 
 use crate::{
     ZoneEngine,
+    prefetch::L1PolicyExecutor,
     replication::{AttestationContext, broadcast_persisted_blocks, run_block_sync},
     rpc::{ZoneRpc, ZoneRpcApi, rpc_connection_config, start_private_rpc},
     settlement_attestation::collect_leader_settlements,
@@ -799,6 +800,10 @@ where
             .sealed_header(provider.best_block_number()?)?
             .ok_or_else(|| eyre::eyre!("no latest block header"))?;
         let l1_state_provider = ctx.node.evm_config().l1_reader().clone();
+        let policy_executor = Arc::new(L1PolicyExecutor {
+            provider: provider.clone(),
+            evm_config: ctx.node.evm_config().clone(),
+        });
         let engine = ZoneEngine::new(
             provider.chain_spec(),
             ctx.beacon_engine_handle.clone(),
@@ -811,6 +816,7 @@ where
             self.portal_address,
             l1_state_provider,
             self.l1_config.l1_fetch_concurrency,
+            policy_executor,
         );
         ctx.node
             .task_executor()

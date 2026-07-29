@@ -38,6 +38,14 @@ impl<DB, L1> L1OverlayDB<DB, L1> {
         }
     }
 
+    /// Creates an adapter initialized at an exact anchor for throwaway pre-execution reads.
+    pub(crate) fn new_at_anchor(inner: DB, l1: L1, portal_address: Address, anchor: u64) -> Self {
+        Self {
+            inner,
+            l1: L1State::new_at_anchor(l1, portal_address, anchor),
+        }
+    }
+
     /// Returns the original caller-provided database.
     pub const fn inner(&self) -> &DB {
         &self.inner

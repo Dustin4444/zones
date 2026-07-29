@@ -48,7 +48,6 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
 use std::{sync::Arc, time::Duration};
-use tempo_chainspec::TempoHardforks as _;
 use tempo_primitives::TempoHeader;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -56,7 +55,7 @@ use tracing::{error, info};
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{
     DepositQueue, L1BlockDeposits, L1BlockTracker, PreparedL1Block,
-    state::{DepositPrefetchConfig, L1StateProvider},
+    state::{L1StateProvider, PolicyCheckExecutor, PrefetchCtx},
 };
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 
@@ -126,10 +125,12 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
-    /// L1 reader shared with EVM execution, used to warm exact-child deposit state.
+    /// L1 reader shared with payload execution and event-derived Portal prefetching.
     l1_state_provider: L1StateProvider,
-    /// Operator-selected bound for concurrent L1 RPC fetches.
+    /// Operator-selected bound for concurrent L1 RPC and policy checks.
     l1_fetch_concurrency: usize,
+    /// Node-state adapter used to evaluate canonical Tempo policy reads before a build.
+    policy_executor: Arc<dyn PolicyCheckExecutor>,
 }
 
 impl ZoneEngine {
@@ -145,6 +146,7 @@ impl ZoneEngine {
         portal_address: Address,
         l1_state_provider: L1StateProvider,
         l1_fetch_concurrency: usize,
+        policy_executor: Arc<dyn PolicyCheckExecutor>,
     ) -> Self {
         Self {
             chain_spec,
@@ -158,6 +160,7 @@ impl ZoneEngine {
             portal_address,
             l1_state_provider,
             l1_fetch_concurrency,
+            policy_executor,
         }
     }
 
@@ -236,23 +239,29 @@ impl ZoneEngine {
         }
     }
 
-    /// Decrypt deposits and prefetch their exact-child L1 state before payload construction.
+    /// Decrypt deposits and prefetch their exact-child L1 reads before payload construction.
     ///
-    /// Mint-recipient policy remains enforced by upstream TIP-20 execution. Prefetching only moves
-    /// event-derived RPC reads ahead of the payload-builder deadline and populates the same cache
-    /// that execution uses.
+    /// The event-derived plan warms the same shared L1 cache read by payload execution. Canonical
+    /// policy checks run against independent EVMs rooted at `last_header`, while Portal and policy
+    /// reads are anchored to the finalized L1 child represented by the prepared block.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
         let timestamp = l1_block.header.timestamp();
-        let prefetch_config = DepositPrefetchConfig::new(
-            self.chain_spec.is_t6_active_at_timestamp(timestamp),
-            self.chain_spec.is_t9_active_at_timestamp(timestamp),
-            self.l1_fetch_concurrency,
-        );
+        let timestamp_millis_part = l1_block.header.timestamp_millis_part;
         let (prepared, prefetch) = l1_block
             .prepare_for_build(&self.sequencer_key, self.portal_address)
             .await?;
         prefetch
-            .prefetch(&self.l1_state_provider, prefetch_config)
+            .prefetch(
+                &self.l1_state_provider,
+                self.l1_fetch_concurrency,
+                PrefetchCtx {
+                    parent: self.last_header.clone(),
+                    target_l1_block: prepared.header.number(),
+                    timestamp,
+                    timestamp_millis_part,
+                },
+                self.policy_executor.clone(),
+            )
             .await?;
         Ok(prepared)
     }

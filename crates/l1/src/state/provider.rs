@@ -17,10 +17,7 @@ use alloy_rpc_types_eth::BlockId;
 use alloy_transport::layers::RetryBackoffLayer;
 use eyre::Result;
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU32,
-};
+use std::{collections::HashSet, num::NonZeroU32};
 use tempo_alloy::TempoNetwork;
 use tracing::{debug, info, warn};
 use zone_precompiles::{L1StateError, L1StorageReader};
@@ -249,23 +246,26 @@ impl L1StateProvider {
     ///
     /// Requests are deduplicated before dispatch and bounded by `concurrency`, so callers can move
     /// predictable read latency out of synchronous EVM execution without issuing an unbounded RPC
-    /// burst. Returned values are keyed by `(address, slot)` for value-dependent prefetch planning.
-    pub(crate) async fn prefetch_storage(
+    /// burst. Values are admitted into the same exact-block cache used by synchronous EVM reads;
+    /// callers that need values should subsequently read through the provider rather than relying
+    /// on a separate result map.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first RPC or cache-admission error encountered by the bounded request stream.
+    pub async fn prefetch_storage(
         &self,
         slots: impl IntoIterator<Item = (Address, B256)>,
         block_number: u64,
         concurrency: usize,
-    ) -> Result<HashMap<(Address, B256), B256>> {
+    ) -> Result<()> {
         let slots: HashSet<_> = slots.into_iter().collect();
         stream::iter(slots)
-            .map(|(address, slot)| async move {
-                self.get_storage_async(address, slot, block_number)
-                    .await
-                    .map(|value| ((address, slot), value))
-            })
+            .map(|(address, slot)| self.get_storage_async(address, slot, block_number))
             .buffer_unordered(concurrency.max(1))
-            .try_collect()
-            .await
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
     }
 
     /// Expose the shared cache handle for external use (e.g. the engine).

@@ -1159,7 +1159,7 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         .expect("failed local decryption should still prepare a refund proof");
     assert!(failed_prefetch.plans_encryption_key(U256::ZERO));
     assert!(
-        !failed_prefetch.plans_deposit_token(token),
+        !failed_prefetch.plans_token(token),
         "a failed encrypted decryption never reaches mint policy execution"
     );
 
@@ -1170,7 +1170,7 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
 
     assert!(prefetch.plans_encryption_key(U256::ZERO));
     assert!(
-        prefetch.plans_deposit_token(token),
+        prefetch.plans_token(token),
         "a successfully decrypted deposit reaches mint policy execution"
     );
     assert_eq!(prepared.queued_deposits.len(), 1);
