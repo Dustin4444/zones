@@ -144,6 +144,9 @@ pub const ZONE_CHAIN_ID_BASE_TESTNET: u64 = 1_424_310_000;
 /// strictly below the EIP-2294 safe ceiling.
 pub const ZONE_CHAIN_ID_RANGE_TESTNET: u64 = 723_173_648;
 
+/// Tempo mainnet (Presto) chain ID.
+pub const TEMPO_MAINNET_CHAIN_ID: u64 = 4_217;
+
 /// Derives the EIP-155 chain ID for a **mainnet** zone from its on-chain zone ID.
 ///
 /// Wraps via modulo so the result always falls in
@@ -158,4 +161,44 @@ pub const fn zone_chain_id(zone_id: u32) -> u64 {
 /// `[ZONE_CHAIN_ID_BASE_TESTNET, ZONE_CHAIN_ID_BASE_TESTNET + ZONE_CHAIN_ID_RANGE_TESTNET)`.
 pub const fn zone_chain_id_testnet(zone_id: u32) -> u64 {
     ZONE_CHAIN_ID_BASE_TESTNET + (zone_id as u64 % ZONE_CHAIN_ID_RANGE_TESTNET)
+}
+
+/// Derives the EIP-155 chain ID for a zone from its parent Tempo chain.
+///
+/// Presto zones use the mainnet range. Zones on Moderato and development
+/// parents use the disjoint testnet range.
+pub const fn zone_chain_id_for_l1(l1_chain_id: u64, zone_id: u32) -> u64 {
+    if l1_chain_id == TEMPO_MAINNET_CHAIN_ID {
+        zone_chain_id(zone_id)
+    } else {
+        zone_chain_id_testnet(zone_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_networks_use_disjoint_zone_chain_ids() {
+        let zone_id = 1;
+
+        assert_eq!(
+            zone_chain_id_for_l1(TEMPO_MAINNET_CHAIN_ID, zone_id),
+            zone_chain_id(zone_id)
+        );
+        assert_eq!(
+            zone_chain_id_for_l1(42_431, zone_id),
+            zone_chain_id_testnet(zone_id)
+        );
+        assert_ne!(
+            zone_chain_id_for_l1(TEMPO_MAINNET_CHAIN_ID, zone_id),
+            zone_chain_id_for_l1(42_431, zone_id)
+        );
+    }
+
+    #[test]
+    fn development_parents_use_the_testnet_range() {
+        assert_eq!(zone_chain_id_for_l1(31_337, 1), zone_chain_id_testnet(1));
+    }
 }

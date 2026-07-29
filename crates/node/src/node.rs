@@ -107,6 +107,22 @@ fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
     })
 }
 
+fn validate_zone_chain_id(zone_id: u32, l1_chain_id: u64, chain_id: u64) -> eyre::Result<()> {
+    if zone_id == 0 {
+        return Ok(());
+    }
+
+    let expected = zone_primitives::constants::zone_chain_id_for_l1(l1_chain_id, zone_id);
+    if chain_id != expected {
+        eyre::bail!(
+            "chain ID mismatch: zone.id={zone_id} on parent chain {l1_chain_id} requires \
+             chain_id={expected}, but genesis has {chain_id}",
+        );
+    }
+
+    Ok(())
+}
+
 /// Network primitives for Zone Nodes
 type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnvelope>;
 
@@ -507,6 +523,7 @@ where
             )
             .await?
             .erased();
+        let l1_chain_id = l1_provider.get_chain_id().await?;
 
         self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
             .await?;
@@ -542,7 +559,6 @@ where
         let sequencer_rpc_slot = Arc::new(std::sync::OnceLock::new());
         let mut p2p_runtime = None;
         if let Some(config) = self.p2p_config.take() {
-            let l1_chain_id = l1_provider.get_chain_id().await?;
             let network_id = P2pNetworkId::new(l1_chain_id, self.portal_address);
             let attestation_domain = AttestationDomain {
                 l1_chain_id,
@@ -657,6 +673,7 @@ where
             self.l1_config.l1_rpc_url.clone(),
             self.l1_config.retry_connection_interval,
             self.l1_config.portal_address,
+            l1_chain_id,
             chain_id,
         )
         .await?;
@@ -685,6 +702,7 @@ where
                     self.l1_config.l1_rpc_url.clone(),
                     self.l1_config.portal_address,
                     self.l1_config.retry_connection_interval,
+                    l1_chain_id,
                     chain_id,
                     attestation.store.clone(),
                 )?),
@@ -734,6 +752,7 @@ where
                 self.l1_config.portal_address,
                 self.l1_config.retry_connection_interval,
                 sequencer_addr,
+                l1_chain_id,
                 chain_id,
                 None,
             )
@@ -927,20 +946,11 @@ where
         l1_rpc_url: String,
         portal_address: Address,
         retry_connection_interval: Duration,
+        l1_chain_id: u64,
         chain_id: u64,
         attestation_store: Option<AttestationStore>,
     ) -> eyre::Result<LeaderSequencerDeps> {
-        if config.zone_id != 0 {
-            let expected = zone_primitives::constants::zone_chain_id(config.zone_id);
-            if chain_id != expected {
-                eyre::bail!(
-                    "chain ID mismatch: zone.id={} requires chain_id={}, but genesis has {}",
-                    config.zone_id,
-                    expected,
-                    chain_id,
-                );
-            }
-        }
+        validate_zone_chain_id(config.zone_id, l1_chain_id, chain_id)?;
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
             l1_rpc_url,
@@ -1072,19 +1082,10 @@ where
         l1_rpc_url: String,
         retry_connection_interval: Duration,
         portal_address: Address,
+        l1_chain_id: u64,
         chain_id: u64,
     ) -> eyre::Result<()> {
-        if config.zone_id != 0 {
-            let expected = zone_primitives::constants::zone_chain_id(config.zone_id);
-            if chain_id != expected {
-                eyre::bail!(
-                    "chain ID mismatch: zone.id={} requires chain_id={}, but genesis has {}",
-                    config.zone_id,
-                    expected,
-                    chain_id,
-                );
-            }
-        }
+        validate_zone_chain_id(config.zone_id, l1_chain_id, chain_id)?;
 
         let eth_handlers = handle.eth_handlers().clone();
         let zone_rpc_url = handle
@@ -1121,20 +1122,11 @@ where
         portal_address: Address,
         retry_connection_interval: Duration,
         sequencer_addr: Address,
+        l1_chain_id: u64,
         chain_id: u64,
         attestation_store: Option<AttestationStore>,
     ) -> eyre::Result<()> {
-        if config.zone_id != 0 {
-            let expected = zone_primitives::constants::zone_chain_id(config.zone_id);
-            if chain_id != expected {
-                eyre::bail!(
-                    "chain ID mismatch: zone.id={} requires chain_id={}, but genesis has {}",
-                    config.zone_id,
-                    expected,
-                    chain_id,
-                );
-            }
-        }
+        validate_zone_chain_id(config.zone_id, l1_chain_id, chain_id)?;
 
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
@@ -1555,6 +1547,18 @@ mod tests {
         assert_eq!(tempo_chain_spec_for_l1(31319).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
         unsafe { std::env::remove_var("ZONE_L1_DEV_CHAIN_IDS") };
+    }
+
+    #[test]
+    fn validates_zone_chain_id_against_parent_network() {
+        let zone_id = 1;
+        let mainnet_chain_id = zone_primitives::constants::zone_chain_id(zone_id);
+        let testnet_chain_id = zone_primitives::constants::zone_chain_id_testnet(zone_id);
+
+        assert!(validate_zone_chain_id(zone_id, 4217, mainnet_chain_id).is_ok());
+        assert!(validate_zone_chain_id(zone_id, 42431, testnet_chain_id).is_ok());
+        assert!(validate_zone_chain_id(zone_id, 4217, testnet_chain_id).is_err());
+        assert!(validate_zone_chain_id(zone_id, 42431, mainnet_chain_id).is_err());
     }
 
     #[test]

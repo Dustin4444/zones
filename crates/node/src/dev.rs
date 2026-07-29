@@ -15,7 +15,7 @@ use alloy_sol_types::SolEvent;
 use tempo_alloy::TempoNetwork;
 use tempo_contracts::precompiles::{ITIP20, PATH_USD_ADDRESS};
 use tempo_zone_contracts::{ZONE_FACTORY_ADDRESS, ZoneFactory};
-use zone_primitives::constants::zone_chain_id;
+use zone_primitives::constants::zone_chain_id_for_l1;
 use zone_sequencer::register_encryption_key;
 
 /// Provisioning options for [`provision_zone`].
@@ -84,6 +84,7 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         .wallet(wallet.clone())
         .connect(&l1_rpc_url)
         .await?;
+    let l1_chain_id = provider.get_chain_id().await?;
 
     ensure_canonical_tempo_header_hash(&provider).await?;
     fund_dev_account(&provider, dev_address).await?;
@@ -140,7 +141,7 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
     let zone_id = zone_created.zoneId;
     let portal = zone_created.portal;
-    let chain_id = zone_chain_id(zone_id);
+    let chain_id = zone_chain_id_for_l1(l1_chain_id, zone_id);
 
     register_encryption_key(&provider, portal, &dev_key).await?;
 
