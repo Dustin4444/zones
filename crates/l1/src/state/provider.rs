@@ -246,13 +246,8 @@ impl L1StateProvider {
     ///
     /// Requests are deduplicated before dispatch and bounded by `concurrency`, so callers can move
     /// predictable read latency out of synchronous EVM execution without issuing an unbounded RPC
-    /// burst. Values are admitted into the same exact-block cache used by synchronous EVM reads;
-    /// callers that need values should subsequently read through the provider rather than relying
-    /// on a separate result map.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first RPC or cache-admission error encountered by the bounded request stream.
+    /// burst. Values are admitted into the same exact-block cache used by synchronous EVM reads.
+    /// Callers that need values should read through the provider (cached after the prefetch call).
     pub async fn prefetch_storage(
         &self,
         slots: impl IntoIterator<Item = (Address, B256)>,

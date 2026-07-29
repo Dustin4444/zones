@@ -241,9 +241,9 @@ impl ZoneEngine {
 
     /// Decrypt deposits and prefetch their exact-child L1 reads before payload construction.
     ///
-    /// The event-derived plan warms the same shared L1 cache read by payload execution. Canonical
-    /// policy checks run against independent EVMs rooted at `last_header`, while Portal and policy
-    /// reads are anchored to the finalized L1 child represented by the prepared block.
+    /// Mint-recipient policy remains enforced by upstream TIP-20 execution. Prefetching only moves
+    /// event-derived RPC reads ahead of the payload-builder deadline and populates the same cache
+    /// that execution uses.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
         let timestamp = l1_block.header.timestamp();
         let timestamp_millis_part = l1_block.header.timestamp_millis_part;

@@ -38,7 +38,9 @@ impl<DB, L1> L1OverlayDB<DB, L1> {
         }
     }
 
-    /// Creates an adapter initialized at an exact anchor for throwaway pre-execution reads.
+    /// Creates execution-local L1 state initialized at an exact read-only anchor.
+    ///
+    /// **IMPORTANT:** This is only intended for throwaway pre-execution contexts.
     pub(crate) fn new_at_anchor(inner: DB, l1: L1, portal_address: Address, anchor: u64) -> Self {
         Self {
             inner,

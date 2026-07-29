@@ -72,7 +72,7 @@ impl<P> L1State<P> {
 
     /// Creates execution-local L1 state initialized at an exact read-only anchor.
     ///
-    /// **WARNING:** This is intended for throwaway pre-execution contexts.
+    /// **IMPORTANT:** This is intended for throwaway pre-execution contexts.
     /// Protocol execution must use [`advance_anchor`](Self::advance_anchor) so `TempoState`
     /// validates the L1 header transition before selecting its child anchor.
     pub fn new_at_anchor(provider: P, portal_address: Address, anchor: u64) -> Self {
