@@ -1,0 +1,73 @@
+version: 1
+
+chains:
+  l1:
+    network: tempo
+    rpc_url: "${L1_RPC_URL}"
+    query_rpc_url: "${ZONES_BENCH_L1_QUERY_RPC_URL}"
+    observation:
+      mode: auto
+      websocket_url: "${L1_WS_RPC_URL}"
+      poll_interval: 50ms
+    chain_id: ${ZONES_BENCH_EXPECTED_L1_CHAIN_ID}
+    workload: ./l1-onramp.yml
+
+scenario:
+  name: neobank-invalid-encrypted-deposit-batch
+  execution: dag
+  timeout: 3m
+
+  bindings:
+    account:
+      account: { pool: users, select: lease }
+    memo:
+      bytes32: { random_bytes: 32 }
+
+  steps:
+    - id: encryption
+      invoke:
+        chain: l1
+        action: prepare_encrypted_deposit
+        with:
+          recipient: { var: account.address }
+          zoneId: ${ZONES_BENCH_EXPECTED_ZONE_ID}
+          portalAddress: "${L1_PORTAL_ADDRESS}"
+          memo: { var: memo }
+      save: encryption
+
+    - id: submission
+      depends_on: [encryption]
+      submit:
+        chain: l1
+        template: invalid_encrypted_onramp
+        with:
+          from: { var: account.ref }
+          call:
+            args:
+              - "${ZONES_BENCH_TOKEN}"
+              - ${ZONES_BENCH_DEPOSIT_AMOUNT}
+              - { var: encryption.keyIndex }
+              - - { var: encryption.encrypted.ephemeralPubkeyX }
+                - { var: encryption.encrypted.ephemeralPubkeyYParity }
+                - { var: encryption.encrypted.ciphertext }
+                - { var: encryption.encrypted.nonce }
+                - "0x00000000000000000000000000000000"
+              - { var: account.address }
+      save: submission
+
+    - id: enqueued
+      depends_on: [submission]
+      wait_log:
+        chain: l1
+        transaction_hash: { var: submission.tx_hash }
+        sender: { var: submission.sender }
+        events:
+          deposit:
+            address: "${L1_PORTAL_ADDRESS}"
+            abi: ZonePortal
+            event: EncryptedDepositMade
+            where:
+              sender: { var: account.address }
+              token: "${ZONES_BENCH_DLUSD}"
+      timeout: 2m
+      save: enqueued

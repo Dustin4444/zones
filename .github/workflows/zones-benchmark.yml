@@ -13,6 +13,7 @@ on:
         default: full-journey
         options:
           - encrypted-deposit
+          - invalid-encrypted-deposit-batch
           - private-withdrawal
           - rewards-redemption
           - full-journey
@@ -290,11 +291,10 @@ jobs:
 
           neobank_preset="$INPUT_PRESET"
           if [ "$EVENT_NAME" = pull_request ]; then
-            neobank_preset=full-journey
-            INPUT_COUNT=100
+            neobank_preset=invalid-encrypted-deposit-batch
           fi
           case "$neobank_preset" in
-            encrypted-deposit|private-withdrawal|rewards-redemption|full-journey|\
+            encrypted-deposit|invalid-encrypted-deposit-batch|private-withdrawal|rewards-redemption|full-journey|\
             slippage-bounce|third-party-recipient|direct-lifecycle|\
             swapped-lifecycle|swapped-redemption) ;;
             *) echo "::error::unsupported neobank preset: $neobank_preset"; exit 1 ;;
@@ -302,6 +302,14 @@ jobs:
           leases_per_journey=1
           if [ "$neobank_preset" = third-party-recipient ]; then
             leases_per_journey=2
+          fi
+          if [ "$neobank_preset" = invalid-encrypted-deposit-batch ]; then
+            # This preset is intentionally fixed within the requested 317–329
+            # deposit range so every invocation targets the same boundary.
+            INPUT_ACCOUNTS=320
+            INPUT_COUNT=320
+            INPUT_MAX_CONCURRENT=320
+            INPUT_TPS=0
           fi
 
           if [ -z "$INPUT_SEED" ]; then
@@ -334,7 +342,10 @@ jobs:
               exit 1
             fi
           done
-          if ! [[ "$INPUT_TPS" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] \
+          if [ "$neobank_preset" = invalid-encrypted-deposit-batch ]; then
+            [ "$INPUT_TPS" = 0 ] ||
+              { echo "::error::invalid-encrypted-deposit-batch requires INPUT_TPS=0"; exit 1; }
+          elif ! [[ "$INPUT_TPS" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] \
             || ! awk -v value="$INPUT_TPS" 'BEGIN { exit !(value > 0 && value <= 999999999) }'; then
             echo "::error::INPUT_TPS must be a positive decimal no greater than 999999999"
             exit 1
@@ -392,7 +403,7 @@ jobs:
             || { echo "::error::withdrawal-max-batch-gas cannot exceed l1-general-gas-limit"; exit 1; }
           planned_singleton_withdrawal_gas=0
           case "$neobank_preset" in
-            encrypted-deposit) ;;
+            encrypted-deposit|invalid-encrypted-deposit-batch) ;;
             *) planned_singleton_withdrawal_gas=$((500000 + 1750000 + 10#$INPUT_CALLBACK_GAS_LIMIT)) ;;
           esac
           (( planned_singleton_withdrawal_gas == 0 ||

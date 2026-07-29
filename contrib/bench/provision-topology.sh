@@ -711,7 +711,7 @@ provision_up() {
     local run_key="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
     local neobank_preset="${ZONES_BENCH_NEOBANK_PRESET:-full-journey}"
     case "$neobank_preset" in
-        direct-lifecycle|encrypted-deposit|private-withdrawal|rewards-redemption|third-party-recipient|full-journey|slippage-bounce|swapped-lifecycle|swapped-redemption) ;;
+        direct-lifecycle|encrypted-deposit|invalid-encrypted-deposit-batch|private-withdrawal|rewards-redemption|third-party-recipient|full-journey|slippage-bounce|swapped-lifecycle|swapped-redemption) ;;
         *) die "unsupported neobank preset for provisioning: $neobank_preset" ;;
     esac
 
@@ -852,7 +852,7 @@ provision_up() {
         || die "ZONES_BENCH_WITHDRAWAL_MAX_BATCH_GAS cannot exceed ZONES_BENCH_L1_GENERAL_GAS_LIMIT"
     local planned_singleton_withdrawal_gas=0
     case "$neobank_preset" in
-        encrypted-deposit) ;;
+        encrypted-deposit|invalid-encrypted-deposit-batch) ;;
         *) planned_singleton_withdrawal_gas=$((500000 + 1750000 + callback_gas_limit)) ;;
     esac
     (( planned_singleton_withdrawal_gas == 0 ||
@@ -1034,7 +1034,7 @@ provision_up() {
     local zone_token
     case "$neobank_preset" in
         direct-lifecycle|rewards-redemption|third-party-recipient) zone_token="$PATH_USD" ;;
-        encrypted-deposit|full-journey|private-withdrawal|slippage-bounce|swapped-lifecycle|swapped-redemption) zone_token="$DLUSD" ;;
+        encrypted-deposit|invalid-encrypted-deposit-batch|full-journey|private-withdrawal|slippage-bounce|swapped-lifecycle|swapped-redemption) zone_token="$DLUSD" ;;
     esac
 
     echo "creating a Zone through the canonical factory"

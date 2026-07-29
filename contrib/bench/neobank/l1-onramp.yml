@@ -53,6 +53,31 @@ templates:
         - { var: encrypted.encrypted }
         - { var: account.address }
 
+  invalid_encrypted_onramp:
+    type: tempo
+    from: { var: account.ref }
+    gas_limit: 1000000
+    fee_token: "${ZONES_BENCH_TOKEN}"
+    expiring_nonce: true
+    valid_after: ${ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER}
+    valid_before: ${ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE}
+    call:
+      to: "${L1_PORTAL_ADDRESS}"
+      abi: ZonePortal
+      function: "depositEncrypted(address,uint128,uint256,(bytes32,uint8,bytes,bytes12,bytes16),address)"
+      args:
+        - "${ZONES_BENCH_TOKEN}"
+        - ${ZONES_BENCH_DEPOSIT_AMOUNT}
+        - { var: encrypted.keyIndex }
+        - - { var: encrypted.encrypted.ephemeralPubkeyX }
+          - { var: encrypted.encrypted.ephemeralPubkeyYParity }
+          - { var: encrypted.encrypted.ciphertext }
+          - { var: encrypted.encrypted.nonce }
+          # Replace only the authentication tag. The ephemeral key remains valid,
+          # forcing the Zone through ECDH proof verification and AES-GCM decryption.
+          - "0x00000000000000000000000000000000"
+        - { var: account.address }
+
   reward_approval:
     type: tempo
     from: { var: account.ref }

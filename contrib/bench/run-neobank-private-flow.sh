@@ -98,6 +98,8 @@ ZONES_BENCH_RECIPIENT_MODE="${ZONES_BENCH_RECIPIENT_MODE:-existing}"
 ZONES_BENCH_NEOBANK_PRESET="${ZONES_BENCH_NEOBANK_PRESET:-full-journey}"
 ZONES_BENCH_SWAP_MECHANISM="${ZONES_BENCH_SWAP_MECHANISM:-direct-swap}"
 ZONES_BENCH_L1_QUERY_RPC_URL="${ZONES_BENCH_L1_QUERY_RPC_URL:-$L1_RPC_URL}"
+ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER="${ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER:-1}"
+ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE="${ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE:-2}"
 ZONES_BENCH_ACCOUNT_END="${ZONES_BENCH_ACCOUNT_END:-$((10#$ZONES_BENCH_ACCOUNT_START + 10#$ZONES_BENCH_ACCOUNTS))}"
 ZONES_BENCH_CONTROL_ACCOUNT_END="${ZONES_BENCH_CONTROL_ACCOUNT_END:-$((10#$ZONES_BENCH_CONTROL_ACCOUNT_INDEX + 1))}"
 ZONES_BENCH_SEQUENCER_ACCOUNT_END="${ZONES_BENCH_SEQUENCER_ACCOUNT_END:-$((10#$ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX + 1))}"
@@ -131,6 +133,12 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         ;;
     encrypted-deposit)
         scenario_file=encrypted-deposit-scenario.yml
+        base_token_label=dlusd
+        expected_base_token="$ZONES_BENCH_DLUSD"
+        leases_per_journey=1
+        ;;
+    invalid-encrypted-deposit-batch)
+        scenario_file=invalid-encrypted-deposit-batch-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
@@ -198,7 +206,12 @@ for name in ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_ACCOUNT_START ZONES_BE
     ZONES_BENCH_ADMISSION_SEED_AMOUNT ZONES_BENCH_RECIPIENT_ACCOUNT_START \
     ZONES_BENCH_RECIPIENT_ACCOUNT_END
 do uint "$name"; done
-positive_rate ZONES_BENCH_TPS
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "invalid-encrypted-deposit-batch" ]]; then
+    [[ "$ZONES_BENCH_TPS" == 0 ]] ||
+        die "invalid-encrypted-deposit-batch requires ZONES_BENCH_TPS=0"
+else
+    positive_rate ZONES_BENCH_TPS
+fi
 (( 10#$ZONES_BENCH_ACCOUNTS > 0 && 10#$ZONES_BENCH_COUNT > 0 )) || die "accounts and count must be positive"
 (( 10#$ZONES_BENCH_MAX_CONCURRENT > 0 )) || die "max concurrency must be positive"
 (( 10#$ZONES_BENCH_SAMPLE_INSTANCES > 0 )) ||
@@ -315,6 +328,7 @@ ZONES_BENCH_SWAPPED_REDEMPTION_ONRAMP_PER_ACCOUNT="$swapped_redemption_onramp_pe
 ZONES_BENCH_SWAPPED_REDEMPTION_POSITION_PER_ACCOUNT="$swapped_redemption_position_per_account"
 export L1_RPC_URL L1_WS_RPC_URL ZONE_RPC_URL ZONE_WS_RPC_URL ZONE_PRIVATE_RPC_URL
 export L1_PORTAL_ADDRESS ZONES_BENCH_L1_QUERY_RPC_URL ZONES_BENCH_MNEMONIC
+export ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE
 export ZONES_BENCH_ACCOUNT_START ZONES_BENCH_ACCOUNT_END ZONES_BENCH_ACCOUNTS
 export ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_CONTROL_ACCOUNT_END
 export ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX ZONES_BENCH_SEQUENCER_ACCOUNT_END
@@ -539,7 +553,8 @@ run_setup_scenario \
 
 # Deposit-only never submits a user transaction to the Zone. Every other preset
 # seeds the enabled-token balance required by current Zone txpool admission.
-if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" ]]; then
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" &&
+      "$ZONES_BENCH_NEOBANK_PRESET" != "invalid-encrypted-deposit-batch" ]]; then
     seed_zone_admission_balances
 fi
 
@@ -568,7 +583,8 @@ stage_end auth_token_map
 
 # Approvals are untimed. Deposit-only submits no user Zone transaction.
 # The fixed scenario approves both enabled assets for each leased account.
-if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" ]]; then
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" &&
+      "$ZONES_BENCH_NEOBANK_PRESET" != "invalid-encrypted-deposit-batch" ]]; then
     run_setup_scenario \
         zone_approvals "$zone_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
         "$ZONES_BENCH_OUTPUT/zone-approvals-report.json" \
@@ -689,7 +705,7 @@ fi
 measured_token_balance_before=""
 measured_token_balance_holder=""
 case "$ZONES_BENCH_NEOBANK_PRESET" in
-    encrypted-deposit)
+    encrypted-deposit|invalid-encrypted-deposit-batch)
         measured_token_balance_holder="$L1_PORTAL_ADDRESS"
         measured_token_balance_before="$(read_l1_uint \
             "$ZONES_BENCH_DLUSD" 'balanceOf(address)(uint256)' \
@@ -697,14 +713,96 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         ;;
 esac
 
+invalid_batch_l1_before=""
+invalid_batch_zone_log_offset=""
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "invalid-encrypted-deposit-batch" ]]; then
+    [[ "$ZONES_BENCH_COUNT" == 320 &&
+       "$ZONES_BENCH_ACCOUNTS" == 320 &&
+       "$ZONES_BENCH_MAX_CONCURRENT" == 320 ]] ||
+        die "invalid-encrypted-deposit-batch requires count=accounts=max-concurrent=320"
+
+    invalid_batch_l1_before="$(cast block-number --rpc-url "$L1_RPC_URL")"
+    scheduling_timestamp="$(date -u +%s)"
+    [[ "$invalid_batch_l1_before" =~ ^[0-9]+$ && "$scheduling_timestamp" =~ ^[0-9]+$ ]] ||
+        die "could not read the Tempo L1 scheduling cursor"
+    ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER=$((scheduling_timestamp + 10))
+    ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE=$((scheduling_timestamp + 30))
+    export ZONES_BENCH_INVALID_DEPOSIT_VALID_AFTER ZONES_BENCH_INVALID_DEPOSIT_VALID_BEFORE
+
+    "$txgen_bin" scenario render \
+        --scenario "$scenario_path" \
+        --output "$ZONES_BENCH_RENDERED_SCENARIO"
+    [[ -s "$ZONES_BENCH_RENDERED_SCENARIO" ]] ||
+        die "txgen did not render the invalid encrypted deposit batch scenario"
+
+    zone_log="${ZONES_BENCH_TOPOLOGY_DIR:?}/logs/zone.log"
+    [[ -f "$zone_log" ]] || die "Zone process log is missing: $zone_log"
+    invalid_batch_zone_log_offset="$(stat -c %s "$zone_log")"
+fi
+
 stage_start private_flow
 scenario_report_args=()
 build_scenario_report_args scenario_report_args "$ZONES_BENCH_REPORT"
+scenario_starts_per_second="$ZONES_BENCH_TPS"
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "invalid-encrypted-deposit-batch" ]]; then
+    scenario_starts_per_second=0
+fi
 "$txgen_bin" scenario run --scenario "$scenario_path" --count "$ZONES_BENCH_COUNT" \
-    --starts-per-second "$ZONES_BENCH_TPS" --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT" --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT" \
+    --starts-per-second "$scenario_starts_per_second" --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT" --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT" \
     --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" --seed "$ZONES_BENCH_SEED" \
     --sample-instances "$sample_instances" "${scenario_report_args[@]}"
 stage_end private_flow
+
+if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "invalid-encrypted-deposit-batch" ]]; then
+    stage_start invalid_encrypted_deposit_batch_check
+    deposit_event='EncryptedDepositMade(bytes32,address,address,uint128,uint128,uint256,bytes32,uint8,bytes,bytes12,bytes16,address,uint64)'
+    invalid_logs="$ZONES_BENCH_OUTPUT/invalid-encrypted-deposit-logs.json"
+    cast logs --json --rpc-url "$L1_RPC_URL" \
+        --from-block "$((invalid_batch_l1_before + 1))" --to-block latest \
+        --address "$L1_PORTAL_ADDRESS" "$deposit_event" >"$invalid_logs"
+
+    jq -e --argjson expected "$ZONES_BENCH_COUNT" '
+        length == $expected and
+        ([.[].blockNumber] | unique | length) == 1
+    ' "$invalid_logs" >/dev/null ||
+        die "txgen did not place all $ZONES_BENCH_COUNT invalid encrypted deposits in one L1 block"
+    deposit_l1_block_hex="$(jq -er '.[0].blockNumber' "$invalid_logs")"
+    deposit_l1_block="$(cast to-dec "$deposit_l1_block_hex")"
+
+    failure_observed=0
+    for _ in $(seq 1 30); do
+        new_zone_log="$(tail -c "+$((invalid_batch_zone_log_offset + 1))" "$zone_log")"
+        if grep -Fq 'OutOfGas(Precompile)' <<<"$new_zone_log" &&
+           grep -Fq "deposits=$ZONES_BENCH_COUNT" <<<"$new_zone_log"; then
+            failure_observed=1
+            break
+        fi
+        sleep 1
+    done
+    (( failure_observed == 1 )) ||
+        die "Zone log did not report OutOfGas(Precompile) while processing the $ZONES_BENCH_COUNT-deposit L1 block"
+
+    zone_tempo_block="$(cast call \
+        0x1c00000000000000000000000000000000000000 \
+        'tempoBlockNumber()(uint64)' --rpc-url "$ZONE_RPC_URL" | awk '{print $1}')"
+    [[ "$zone_tempo_block" =~ ^[0-9]+$ ]] ||
+        die "could not read the Zone Tempo anchor after the invalid batch"
+    (( zone_tempo_block < deposit_l1_block )) ||
+        die "Zone unexpectedly advanced through invalid deposit L1 block $deposit_l1_block"
+
+    jq -n \
+        --argjson deposits "$ZONES_BENCH_COUNT" \
+        --argjson l1Block "$deposit_l1_block" \
+        --argjson zoneTempoBlock "$zone_tempo_block" \
+        '{
+            deposits: $deposits,
+            l1Block: $l1Block,
+            zoneTempoBlock: $zoneTempoBlock,
+            outcome: "OutOfGas(Precompile)"
+        }' >"$ZONES_BENCH_OUTPUT/invalid-encrypted-deposit-result.json"
+    echo "verified $ZONES_BENCH_COUNT invalid-tag encrypted deposits in L1 block $deposit_l1_block; Zone stalled at Tempo block $zone_tempo_block with OutOfGas(Precompile)"
+    stage_end invalid_encrypted_deposit_batch_check
+fi
 
 if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "slippage-bounce" ]]; then
     stage_start slippage_postcondition
@@ -755,7 +853,9 @@ if [[ -n "$measured_token_balance_before" ]]; then
         "$ZONES_BENCH_DLUSD" 'balanceOf(address)(uint256)' \
         "$measured_token_balance_holder")"
     case "$ZONES_BENCH_NEOBANK_PRESET" in
-        encrypted-deposit) measured_balance_amount="$ZONES_BENCH_DEPOSIT_AMOUNT" ;;
+        encrypted-deposit|invalid-encrypted-deposit-batch)
+            measured_balance_amount="$ZONES_BENCH_DEPOSIT_AMOUNT"
+            ;;
         *) die "unexpected measured balance preset" ;;
     esac
     expected_token_delta="$(bigint_eval "$ZONES_BENCH_COUNT * $measured_balance_amount")"
