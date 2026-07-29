@@ -80,6 +80,54 @@ contract RejectingWithdrawalReceiver is IWithdrawalReceiver {
 
 }
 
+contract MatrixWithdrawalReceiver is IWithdrawalReceiver {
+
+    bytes4 internal immutable _selector;
+    uint256 public calls;
+    bytes32 public callbackHash;
+
+    constructor(bytes4 selector) {
+        _selector = selector;
+    }
+
+    function onWithdrawalReceived(
+        uint32 zoneId,
+        address sourcePortal,
+        bytes32 senderTag,
+        address token,
+        uint128 amount,
+        bytes calldata data
+    )
+        external
+        returns (bytes4)
+    {
+        ++calls;
+        callbackHash = keccak256(abi.encode(zoneId, sourcePortal, senderTag, token, amount, data));
+        return _selector;
+    }
+
+}
+
+contract MatrixTransferToken {
+
+    mapping(address => uint256) public balanceOf;
+    bool internal immutable _result;
+
+    constructor(address owner, uint256 amount, bool result) {
+        balanceOf[owner] = amount;
+        _result = result;
+    }
+
+    function transfer(address target, uint256 amount) external returns (bool) {
+        if (!_result) return false;
+        require(balanceOf[msg.sender] >= amount);
+        balanceOf[msg.sender] -= amount;
+        balanceOf[target] += amount;
+        return true;
+    }
+
+}
+
 contract ZoneMessengerTest is BaseTest {
 
     uint32 internal constant ZONE_ID = 1;
@@ -259,6 +307,63 @@ contract ZoneMessengerTest is BaseTest {
             50_000,
             _callback()
         );
+    }
+
+    function testFuzz_relayMessage_authorizationAndCallbackRollbackMatrix(
+        bool factoryPortalCaller,
+        bool matchingZone,
+        bool callbackGateway,
+        bool transferResult,
+        bytes4 callbackSelector,
+        bytes calldata data
+    )
+        public
+    {
+        MatrixWithdrawalReceiver receiver = new MatrixWithdrawalReceiver(callbackSelector);
+        uint128 amount = 17;
+        MatrixTransferToken matrixToken =
+            new MatrixTransferToken(address(messenger), amount, transferResult);
+        address caller = factoryPortalCaller ? portal : alice;
+        uint32 zoneId = matchingZone ? ZONE_ID : OTHER_ZONE_ID;
+        vm.mockCall(
+            caller, abi.encodeWithSelector(IZonePortal.isGatewayOpen.selector), abi.encode(false)
+        );
+        vm.mockCall(
+            caller,
+            abi.encodeWithSelector(IZonePortal.role.selector, address(receiver)),
+            abi.encode(callbackGateway ? Role.CallbackGateway : Role.None)
+        );
+
+        bool authorized = caller == portal && zoneId == ZONE_ID;
+        bool succeeds = authorized && callbackGateway && transferResult
+            && callbackSelector == IWithdrawalReceiver.onWithdrawalReceived.selector;
+        vm.prank(caller);
+        if (!succeeds) vm.expectRevert();
+        messenger.relayMessage(
+            zoneId,
+            address(matrixToken),
+            bytes32("matrix"),
+            address(receiver),
+            amount,
+            CALLBACK_GAS_LIMIT,
+            data
+        );
+
+        assertEq(matrixToken.balanceOf(address(messenger)), succeeds ? 0 : amount);
+        assertEq(matrixToken.balanceOf(address(receiver)), succeeds ? amount : 0);
+        assertEq(receiver.calls(), succeeds ? 1 : 0);
+        if (succeeds) {
+            assertEq(
+                receiver.callbackHash(),
+                keccak256(
+                    abi.encode(
+                        zoneId, caller, bytes32("matrix"), address(matrixToken), amount, data
+                    )
+                )
+            );
+        } else {
+            assertEq(receiver.callbackHash(), bytes32(0));
+        }
     }
 
 }

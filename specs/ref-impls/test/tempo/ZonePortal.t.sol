@@ -4515,6 +4515,229 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.depositCount(), iterations);
     }
 
+    /// @notice Every rejected regular deposit leaves escrow, fees, and queue state untouched.
+    function testFuzz_deposit_rejectionIsAtomic(uint128 amount, uint8 failure) public {
+        failure = uint8(bound(failure, 0, 2));
+        vm.fee(1e12);
+        _setZoneGasRate(1);
+        _setBouncebackGas(300_000);
+        uint128 minimum = portal.calculateDepositFee() + portal.calculateBouncebackFee();
+        amount = failure == 0
+            ? uint128(bound(amount, 0, minimum - 1))
+            : uint128(bound(amount, minimum, 1000e6));
+
+        uint256 aliceBalance = pathUSD.balanceOf(alice);
+        uint256 adminBalance = pathUSD.balanceOf(admin);
+        uint256 portalBalance = pathUSD.balanceOf(address(portal));
+        bytes32 queueHash = portal.currentDepositQueueHash();
+        uint64 depositCount = portal.depositCount();
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), failure == 1 ? amount - 1 : amount);
+        if (failure == 0) {
+            vm.expectRevert(IZonePortal.DepositTooSmall.selector);
+        } else if (failure == 1) {
+            vm.expectRevert();
+        } else {
+            vm.stopPrank();
+            vm.prank(admin);
+            portal.pauseDeposits(address(pathUSD));
+            vm.startPrank(alice);
+            vm.expectRevert(IZonePortal.DepositsNotActive.selector);
+        }
+        portal.deposit(address(pathUSD), bob, amount, bytes32("atomic"), bob);
+        vm.stopPrank();
+
+        assertEq(pathUSD.balanceOf(alice), aliceBalance);
+        assertEq(pathUSD.balanceOf(admin), adminBalance);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalance);
+        assertEq(portal.currentDepositQueueHash(), queueHash);
+        assertEq(portal.depositCount(), depositCount);
+    }
+
+    /// @notice Invalid encrypted payload/key combinations cannot partially collect or enqueue.
+    function testFuzz_depositEncrypted_validationIsAtomic(
+        uint8 failure,
+        uint16 ciphertextLength
+    )
+        public
+    {
+        failure = uint8(bound(failure, 0, 5));
+        _setEncKeyWithPoP(ENC_KEY_1);
+        uint256 secondKeyBlock = block.number + 2;
+        vm.roll(secondKeyBlock);
+        _setEncKeyWithPoP(ENC_KEY_2);
+
+        EncryptedDepositPayload memory payload = _makeEncryptedPayload();
+        uint256 keyIndex = 1;
+        if (failure == 0) payload.ephemeralPubkeyYParity = uint8(bound(ciphertextLength, 0, 255));
+        if (failure == 0) {
+            vm.assume(
+                payload.ephemeralPubkeyYParity != 0x02 && payload.ephemeralPubkeyYParity != 0x03
+            );
+        }
+        if (failure == 1) payload.ephemeralPubkeyX = bytes32(0);
+        if (failure == 2) {
+            uint256 length = bound(ciphertextLength, 0, 128);
+            vm.assume(length != 64);
+            payload.ciphertext = new bytes(length);
+        }
+        if (failure == 3) keyIndex = 2 + uint256(ciphertextLength);
+        if (failure == 4) {
+            keyIndex = 0;
+            vm.roll(secondKeyBlock + ENCRYPTION_KEY_GRACE_PERIOD);
+        }
+        if (failure == 5) keyIndex = type(uint256).max;
+
+        uint256 aliceBalance = pathUSD.balanceOf(alice);
+        uint256 adminBalance = pathUSD.balanceOf(admin);
+        uint256 portalBalance = pathUSD.balanceOf(address(portal));
+        bytes32 queueHash = portal.currentDepositQueueHash();
+        uint64 depositCount = portal.depositCount();
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        if (failure <= 1) {
+            vm.expectRevert(IZonePortal.InvalidEphemeralPubkey.selector);
+        } else if (failure == 2) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    IZonePortal.InvalidCiphertextLength.selector, payload.ciphertext.length, 64
+                )
+            );
+        } else if (failure == 4) {
+            vm.expectRevert(
+                abi.encodeWithSelector(
+                    IZonePortal.EncryptionKeyExpired.selector, 0, uint64(1), uint64(secondKeyBlock)
+                )
+            );
+        } else {
+            vm.expectRevert(
+                abi.encodeWithSelector(IZonePortal.InvalidEncryptionKeyIndex.selector, keyIndex)
+            );
+        }
+        portal.depositEncrypted(address(pathUSD), 1000e6, keyIndex, payload, alice);
+        vm.stopPrank();
+
+        assertEq(pathUSD.balanceOf(alice), aliceBalance);
+        assertEq(pathUSD.balanceOf(admin), adminBalance);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalance);
+        assertEq(portal.currentDepositQueueHash(), queueHash);
+        assertEq(portal.depositCount(), depositCount);
+    }
+
+    /// @notice Malformed deposit transitions reject the whole batch before settlement state changes.
+    function testFuzz_submitBatch_invalidDepositTransitionIsAtomic(uint8 failure) public {
+        failure = uint8(bound(failure, 0, 2));
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        portal.deposit(address(pathUSD), bob, 1000e6, bytes32("batch"), bob);
+        vm.stopPrank();
+
+        if (failure == 1) {
+            bytes32 previousBlockHash = portal.blockHash();
+            vm.roll(block.number + 1);
+            _submitBatch(
+                portal,
+                uint64(block.number - 1),
+                0,
+                BlockTransition({
+                    prevBlockHash: previousBlockHash, nextBlockHash: keccak256("valid")
+                }),
+                DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: portal.currentDepositQueueHash(),
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 1
+                }),
+                bytes32(0),
+                "",
+                ""
+            );
+        }
+
+        DepositQueueTransition memory transition = DepositQueueTransition({
+            prevProcessedHash: failure == 1 ? portal.currentDepositQueueHash() : bytes32(0),
+            nextProcessedHash: portal.currentDepositQueueHash(),
+            prevDepositNumber: failure == 0 ? 1 : 0,
+            nextDepositNumber: failure == 2 ? 2 : 0
+        });
+        if (failure == 1) {
+            transition.prevDepositNumber = 1;
+            transition.nextDepositNumber = 0;
+        }
+        bytes32 oldBlockHash = portal.blockHash();
+        uint256 oldBatchIndex = portal.withdrawalBatchIndex();
+        uint256 oldTail = portal.withdrawalQueueTail();
+        uint64 oldProcessedNumber = portal.lastProcessedDepositNumber();
+        vm.roll(block.number + 1);
+
+        vm.expectRevert(IZonePortal.InvalidDepositTransition.selector);
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({ prevBlockHash: oldBlockHash, nextBlockHash: keccak256("invalid") }),
+            transition,
+            keccak256("withdrawals"),
+            "",
+            ""
+        );
+
+        assertEq(portal.blockHash(), oldBlockHash);
+        assertEq(portal.withdrawalBatchIndex(), oldBatchIndex);
+        assertEq(portal.withdrawalQueueTail(), oldTail);
+        assertEq(portal.lastProcessedDepositNumber(), oldProcessedNumber);
+    }
+
+    /// @notice Invalid withdrawal data or suffix hashes cannot partially dequeue a slot.
+    function testFuzz_processWithdrawals_invalidDequeueIsAtomic(
+        bytes32 mutation,
+        bool badSuffix
+    )
+        public
+    {
+        vm.assume(mutation != bytes32(0));
+        Withdrawal memory withdrawal =
+            _withdrawal(address(pathUSD), alice, bob, 1, bytes32("valid"), 0, alice, "");
+        bytes32 withdrawalHash = keccak256(abi.encode(withdrawal, EMPTY_SENTINEL));
+        vm.roll(block.number + 1);
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("queued")
+            }),
+            DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: bytes32(0),
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0
+                }),
+            withdrawalHash,
+            "",
+            ""
+        );
+
+        uint256 head = portal.withdrawalQueueHead();
+        uint256 tail = portal.withdrawalQueueTail();
+        if (!badSuffix) withdrawal.memo ^= mutation;
+        bytes32 remainingQueue = badSuffix ? mutation : bytes32(0);
+
+        vm.expectRevert(WithdrawalQueueLib.InvalidWithdrawalHash.selector);
+        portal.processWithdrawals(_singleWithdrawal(withdrawal), remainingQueue);
+
+        assertEq(portal.withdrawalQueueHead(), head);
+        assertEq(portal.withdrawalQueueTail(), tail);
+
+        // A subsequent valid dequeue proves the failed call did not alter the head slot hash.
+        Withdrawal memory validWithdrawal =
+            _withdrawal(address(pathUSD), alice, bob, 1, bytes32("valid"), 0, alice, "");
+        portal.processWithdrawals(_singleWithdrawal(validWithdrawal), bytes32(0));
+        assertEq(portal.withdrawalQueueHead(), head + 1);
+    }
+
     /// @notice Key lookup returns the latest encryption key active at the query block.
     function testFuzz_encryptionKeyAtBlock(
         uint16 gap1,

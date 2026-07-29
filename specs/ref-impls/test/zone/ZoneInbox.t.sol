@@ -821,22 +821,51 @@ contract ZoneInboxTest is Test {
         // Set up encryption key
         _setupEncryptionKeyMock(0, keccak256("seq-key"), 0x03);
 
-        // Build encrypted deposit but provide NO decryption data
+        // Process a regular deposit before reaching an encrypted deposit with no decryption data.
+        // The regular mint must roll back along with the queue progression.
+        Deposit memory regular = Deposit({
+            token: address(zoneToken),
+            sender: alice,
+            to: bob,
+            amount: 100e6,
+            tempoRefundRecipient: bob,
+            memo: bytes32("before missing")
+        });
         (QueuedDeposit memory qd,) = _makeEncryptedDeposit(alice, 1000e6, 0);
 
-        // We need to set the current hash to something - doesn't matter since we expect revert
+        bytes32 regularHash = keccak256(abi.encode(DepositType.Regular, regular, bytes32(0)));
         tempoState.setMockStorageValue(
-            mockPortal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, keccak256("whatever")
+            mockPortal,
+            PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+            keccak256(
+                abi.encode(
+                    DepositType.Encrypted,
+                    abi.decode(qd.depositData, (EncryptedDeposit)),
+                    regularHash
+                )
+            )
         );
 
-        QueuedDeposit[] memory deposits = new QueuedDeposit[](1);
-        deposits[0] = qd;
+        QueuedDeposit[] memory deposits = new QueuedDeposit[](2);
+        deposits[0] = QueuedDeposit({
+            depositType: DepositType.Regular, depositData: abi.encode(regular), rejected: false
+        });
+        deposits[1] = qd;
 
         DecryptionData[] memory emptyDecs = new DecryptionData[](0);
+
+        bytes32 hashBefore = inbox.processedDepositQueueHash();
+        uint64 numberBefore = inbox.processedDepositNumber();
+        uint256 supplyBefore = zoneToken.totalSupply();
 
         vm.prank(sequencer);
         vm.expectRevert(IZoneInbox.MissingDecryptionData.selector);
         inbox.advanceTempo("", deposits, emptyDecs, new EnabledToken[](0));
+
+        assertEq(inbox.processedDepositQueueHash(), hashBefore);
+        assertEq(inbox.processedDepositNumber(), numberBefore);
+        assertEq(zoneToken.totalSupply(), supplyBefore);
+        assertEq(zoneToken.balanceOf(bob), 0);
     }
 
     function test_advanceTempo_extraDecryptionData() public {
@@ -869,9 +898,17 @@ contract ZoneInboxTest is Test {
             cpProof: ChaumPedersenProof({ s: bytes32(uint256(1)), c: bytes32(uint256(2)) })
         });
 
+        bytes32 hashBefore = inbox.processedDepositQueueHash();
+        uint64 numberBefore = inbox.processedDepositNumber();
+        uint256 supplyBefore = zoneToken.totalSupply();
+
         vm.prank(sequencer);
         vm.expectRevert(IZoneInbox.ExtraDecryptionData.selector);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
+
+        assertEq(inbox.processedDepositQueueHash(), hashBefore);
+        assertEq(inbox.processedDepositNumber(), numberBefore);
+        assertEq(zoneToken.totalSupply(), supplyBefore);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1378,6 +1415,125 @@ contract ZoneInboxTest is Test {
         uint128 encryptedRecipientRefunds = inbox.refunds(address(zoneToken), encryptedRecipient);
         uint256 parkedRefunds = uint256(bobRefunds) + encryptedRecipientRefunds;
         assertEq(zoneToken.totalSupply() + parkedRefunds, netCredited);
+    }
+
+    /// @notice A shuffled batch containing every processing outcome advances every queue item once
+    ///         while conserving its value between zone supply, Tempo bounce-backs, and refunds.
+    function testFuzz_advanceTempo_shuffledMixedBatchConservesValue(
+        bytes32 seed,
+        uint8 rawExtra
+    )
+        public
+    {
+        uint256 count = 7 + bound(rawExtra, 0, 5);
+        uint8[] memory kinds = new uint8[](count);
+        for (uint256 i = 0; i < count; i++) {
+            // The first seven guarantee dense mixed coverage; extras fuzz all outcomes.
+            kinds[i] = i < 7 ? uint8(i) : uint8(uint256(keccak256(abi.encode(seed, i))) % 7);
+        }
+        for (uint256 i = count - 1; i > 0; i--) {
+            uint256 j = uint256(keccak256(abi.encode(seed, i, "shuffle"))) % (i + 1);
+            (kinds[i], kinds[j]) = (kinds[j], kinds[i]);
+        }
+
+        MockZoneToken failedToken = new MockZoneToken("Failed USD", "fUSD");
+        address encryptedRecipient = address(0x500);
+        address fallbackRecipient = address(0x501);
+        _setupEncryptionKeyMock(0, keccak256("mixed-key"), 0x03);
+        _setupPrecompileMocks(encryptedRecipient, bytes32("mixed"));
+        vm.mockCall(
+            ZONE_OUTBOX,
+            abi.encodeWithSelector(IZoneOutbox.consumeFallbackRecipient.selector),
+            abi.encode(fallbackRecipient)
+        );
+
+        uint256 decryptionCount;
+        for (uint256 i = 0; i < count; i++) {
+            if (kinds[i] == 1 || kinds[i] == 4) decryptionCount++;
+        }
+        QueuedDeposit[] memory deposits = new QueuedDeposit[](count);
+        DecryptionData[] memory decs = new DecryptionData[](decryptionCount);
+        uint256 decIndex;
+        bytes32 expectedHash;
+        uint256 acceptedValue;
+        uint256 bouncedValue;
+        uint256 parkedValue;
+
+        for (uint256 i = 0; i < count; i++) {
+            uint128 amount = uint128((i + 1) * 1e6);
+            uint8 kind = kinds[i];
+            if (kind == 1 || kind == 3 || kind == 4) {
+                address token = kind == 4 ? address(failedToken) : address(zoneToken);
+                (QueuedDeposit memory qd, EncryptedDeposit memory ed) =
+                    _makeEncryptedDeposit(alice, amount, 0);
+                ed.token = token;
+                qd.depositData = abi.encode(ed);
+                qd.rejected = kind == 3;
+                deposits[i] = qd;
+                expectedHash = keccak256(abi.encode(DepositType.Encrypted, ed, expectedHash));
+                if (kind != 3) {
+                    decs[decIndex++] = DecryptionData({
+                        sharedSecret: bytes32(i + 1),
+                        sharedSecretYParity: 0x02,
+                        cpProof: ChaumPedersenProof({
+                            s: bytes32(uint256(1)), c: bytes32(uint256(2))
+                        })
+                    });
+                }
+                if (kind == 1) acceptedValue += amount;
+                else bouncedValue += amount;
+            } else {
+                bool parked = kind == 6;
+                address token = kind == 5 || parked ? address(failedToken) : address(zoneToken);
+                Deposit memory d = Deposit({
+                    token: token,
+                    sender: alice,
+                    to: parked ? address(uint160(uint64(i + 1))) : bob,
+                    amount: amount,
+                    tempoRefundRecipient: parked ? address(0) : bob,
+                    memo: bytes32(i)
+                });
+                bool rejected = kind == 2;
+                deposits[i] = QueuedDeposit({
+                    depositType: DepositType.Regular, depositData: abi.encode(d), rejected: rejected
+                });
+                expectedHash = keccak256(abi.encode(DepositType.Regular, d, expectedHash));
+                if (kind == 0) acceptedValue += amount;
+                else if (parked) parkedValue += amount;
+                else bouncedValue += amount;
+            }
+
+            if (kind == 2 || kind == 3 || kind == 4 || kind == 5) {
+                address bounceToken =
+                    kind == 4 || kind == 5 ? address(failedToken) : address(zoneToken);
+                address refundRecipient = kind == 3 || kind == 4 ? alice : bob;
+                vm.expectCall(
+                    ZONE_OUTBOX,
+                    abi.encodeCall(
+                        IZoneOutbox.enqueueDepositBounceBack, (bounceToken, amount, refundRecipient)
+                    ),
+                    1
+                );
+            }
+        }
+
+        tempoState.setMockStorageValue(
+            mockPortal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, expectedHash
+        );
+        vm.prank(sequencer);
+        inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
+
+        assertEq(inbox.processedDepositQueueHash(), expectedHash);
+        assertEq(inbox.processedDepositNumber(), count);
+        assertEq(zoneToken.totalSupply(), acceptedValue);
+        assertEq(failedToken.totalSupply(), 0);
+        vm.prank(fallbackRecipient);
+        assertEq(inbox.refunds(address(failedToken), fallbackRecipient), parkedValue);
+        assertEq(zoneToken.totalSupply() + bouncedValue + parkedValue, _sumMixedAmounts(count));
+    }
+
+    function _sumMixedAmounts(uint256 count) internal pure returns (uint256) {
+        return count * (count + 1) * 1e6 / 2;
     }
 
 }

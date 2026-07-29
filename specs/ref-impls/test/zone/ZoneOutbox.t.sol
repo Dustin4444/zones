@@ -1438,4 +1438,180 @@ contract ZoneOutboxTest is Test {
         assertEq(_pendingWithdrawalsCount(), 0);
     }
 
+    function testFuzz_requestWithdrawal_exactBurnPendingIndexAndFallbackNonce(
+        uint128 rawAmount,
+        uint128 rawRate,
+        uint64 rawGasLimit,
+        bytes32 memo,
+        address fallbackRecipient
+    )
+        public
+    {
+        vm.assume(fallbackRecipient != address(0));
+        uint128 rate = uint128(bound(rawRate, 0, 500));
+        uint64 gasLimit = uint64(bound(rawGasLimit, 0, outbox.MAX_WITHDRAWAL_GAS_LIMIT()));
+        uint128 fee = uint128(50_000 + gasLimit) * rate;
+        uint128 amount = uint128(bound(rawAmount, 0, zoneToken.balanceOf(alice) - fee));
+        address recipient = gasLimit == 0 ? bob : callbackTarget;
+        bytes memory data = gasLimit == 0 ? bytes("") : bytes("opaque");
+
+        vm.prank(sequencer);
+        outbox.setTempoGasRate(rate);
+        uint256 balanceBefore = zoneToken.balanceOf(alice);
+        uint256 supplyBefore = zoneToken.totalSupply();
+
+        vm.startPrank(alice);
+        zoneToken.approve(address(outbox), amount + fee);
+        outbox.requestWithdrawal(
+            address(zoneToken), recipient, amount, memo, gasLimit, fallbackRecipient, data
+        );
+        vm.stopPrank();
+
+        assertEq(zoneToken.balanceOf(alice), balanceBefore - amount - fee);
+        assertEq(zoneToken.totalSupply(), supplyBefore - amount - fee);
+        assertEq(outbox.nextWithdrawalIndex(), 1);
+        assertEq(outbox.lastFallbackNonce(), 1);
+        PendingWithdrawal[] memory pending = _getPendingWithdrawals();
+        assertEq(pending.length, 1);
+        assertEq(pending[0].sender, alice);
+        assertEq(pending[0].txHash, txContext.txHashFor(1));
+        assertEq(pending[0].amount, amount);
+        assertEq(pending[0].gasLimit, gasLimit);
+        assertEq(pending[0].fallbackNonce, 1);
+        vm.prank(ZONE_INBOX);
+        assertEq(outbox.consumeFallbackRecipient(1), fallbackRecipient);
+    }
+
+    function testFuzz_requestWithdrawal_rejectionMatrixIsAtomic(uint8 rawCase) public {
+        uint8 rejectionCase = uint8(bound(rawCase, 0, 5));
+        bytes memory data;
+        address recipient = bob;
+        address fallbackRecipient = alice;
+        uint64 gasLimit;
+
+        if (rejectionCase == 0) {
+            gasLimit = outbox.MAX_WITHDRAWAL_GAS_LIMIT() + 1;
+        } else if (rejectionCase == 1) {
+            data = new bytes(outbox.MAX_CALLBACK_DATA_SIZE() + 1);
+        } else if (rejectionCase == 2) {
+            fallbackRecipient = address(0);
+        } else if (rejectionCase == 3) {
+            recipient = callbackTarget;
+        } else if (rejectionCase == 4) {
+            gasLimit = 1;
+        } else {
+            vm.prank(sequencer);
+            outbox.setMaxWithdrawalsPerBlock(1);
+            vm.startPrank(alice);
+            zoneToken.approve(address(outbox), 2);
+            outbox.requestWithdrawal(address(zoneToken), bob, 1, bytes32(0), 0, alice, "");
+            vm.stopPrank();
+        }
+
+        uint256 balanceBefore = zoneToken.balanceOf(alice);
+        uint256 supplyBefore = zoneToken.totalSupply();
+        uint256 pendingBefore = _pendingWithdrawalsCount();
+        uint64 indexBefore = outbox.nextWithdrawalIndex();
+        uint64 nonceBefore = outbox.lastFallbackNonce();
+
+        bytes memory expectedError;
+        if (rejectionCase == 0) {
+            expectedError = abi.encodeWithSelector(ZoneOutbox.GasLimitTooHigh.selector);
+        } else if (rejectionCase == 1) {
+            expectedError = abi.encodeWithSelector(ZoneOutbox.CallbackDataTooLarge.selector);
+        } else if (rejectionCase == 2) {
+            expectedError = abi.encodeWithSelector(ZoneOutbox.InvalidFallbackRecipient.selector);
+        } else if (rejectionCase == 3 || rejectionCase == 4) {
+            expectedError = abi.encodeWithSelector(IZonePortal.InvalidCallbackTarget.selector);
+        } else {
+            expectedError = abi.encodeWithSelector(ZoneOutbox.TooManyWithdrawalsThisBlock.selector);
+        }
+
+        vm.startPrank(alice);
+        zoneToken.approve(address(outbox), 500e6);
+        vm.expectRevert(expectedError);
+        outbox.requestWithdrawal(
+            address(zoneToken), recipient, 500e6, bytes32(0), gasLimit, fallbackRecipient, data
+        );
+        vm.stopPrank();
+
+        assertEq(zoneToken.balanceOf(alice), balanceBefore);
+        assertEq(zoneToken.totalSupply(), supplyBefore);
+        assertEq(_pendingWithdrawalsCount(), pendingBefore);
+        assertEq(outbox.nextWithdrawalIndex(), indexBefore);
+        assertEq(outbox.lastFallbackNonce(), nonceBefore);
+    }
+
+    function testFuzz_finalizeWithdrawalBatch_senderTagBindsSenderAndCurrentTxHash(
+        address sender,
+        bytes32 memo
+    )
+        public
+    {
+        vm.assume(sender != address(0) && sender.code.length == 0);
+        vm.assume(sender != ZONE_INBOX && sender != ZONE_TX_CONTEXT);
+        zoneToken.mint(sender, 1);
+
+        vm.startPrank(sender);
+        zoneToken.approve(address(outbox), 1);
+        outbox.requestWithdrawal(address(zoneToken), bob, 1, memo, 0, sender, "");
+        vm.stopPrank();
+
+        Withdrawal memory expected = _withdrawal(1, sender, bob, 1, memo, 0, sender, "");
+        bytes32 expectedHash = keccak256(abi.encode(expected, EMPTY_SENTINEL));
+        assertEq(_finalizeWithdrawalBatch(1), expectedHash);
+        assertEq(expected.senderTag, keccak256(abi.encodePacked(sender, txContext.txHashFor(1))));
+    }
+
+    function testFuzz_finalizeWithdrawalBatch_shapeRejectionIsAtomic(
+        uint8 rawCase,
+        uint8 rawWrongLength
+    )
+        public
+    {
+        vm.startPrank(alice);
+        zoneToken.approve(address(outbox), 2);
+        outbox.requestWithdrawal(address(zoneToken), bob, 1, bytes32("plain"), 0, alice, "");
+        outbox.requestWithdrawal(
+            address(zoneToken), bob, 1, bytes32("private"), 0, alice, "", _validRevealTo()
+        );
+        vm.stopPrank();
+
+        uint8 rejectionCase = uint8(bound(rawCase, 0, 2));
+        uint256 count = 2;
+        bytes[] memory encryptedSenders;
+        bytes memory expectedError;
+        if (rejectionCase == 0) {
+            count = 3;
+            encryptedSenders = new bytes[](3);
+            expectedError = abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 3, 2);
+        } else if (rejectionCase == 1) {
+            encryptedSenders = new bytes[](1);
+            expectedError =
+                abi.encodeWithSelector(ZoneOutbox.InvalidEncryptedSenderCount.selector, 1, 2);
+        } else {
+            encryptedSenders = new bytes[](2);
+            uint256 wrongLength = bound(rawWrongLength, 1, 112);
+            encryptedSenders[1] = new bytes(wrongLength);
+            expectedError = abi.encodeWithSelector(
+                ZoneOutbox.InvalidEncryptedSenderLength.selector, wrongLength, 113
+            );
+        }
+
+        LastBatch memory beforeBatch = outbox.lastBatch();
+        uint64 timestampBefore = outbox.lastFinalizedTimestamp();
+        vm.expectRevert(expectedError);
+        vm.prank(sequencer);
+        outbox.finalizeWithdrawalBatch(count, uint64(block.number), encryptedSenders);
+
+        LastBatch memory afterBatch = outbox.lastBatch();
+        assertEq(afterBatch.withdrawalQueueHash, beforeBatch.withdrawalQueueHash);
+        assertEq(afterBatch.withdrawalBatchIndex, beforeBatch.withdrawalBatchIndex);
+        assertEq(outbox.lastFinalizedTimestamp(), timestampBefore);
+        assertEq(_pendingWithdrawalsCount(), 2);
+        PendingWithdrawal[] memory pending = _getPendingWithdrawals();
+        assertEq(pending[0].memo, bytes32("plain"));
+        assertEq(pending[1].memo, bytes32("private"));
+    }
+
 }
