@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
+import { ENCRYPTION_KEY_GRACE_PERIOD, EncryptionKeyEntry } from "../../src/interfaces/IZone.sol";
 import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import {
     WITHDRAWAL_QUEUE_CAPACITY,
     WithdrawalQueue,
     WithdrawalQueueLib
 } from "../../src/libraries/WithdrawalQueueLib.sol";
+import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
 import { ZonePortalTest } from "../tempo/ZonePortal.t.sol";
 import { ZoneOutboxTest } from "./ZoneOutbox.t.sol";
 import { Test } from "forge-std/Test.sol";
@@ -28,6 +30,29 @@ import { Test } from "forge-std/Test.sol";
 ///         Inherits ZonePortalTest to reuse its concrete setUp (a real ZonePortal deployed via
 ///         ZoneFactory, with separate portal admin and sequencer roles).
 contract ZonePortalSymbolic is ZonePortalTest {
+
+    /// @notice At the configured maximum rate the deposit fee still fits the uint128 return
+    ///         type. The rate is concrete so the solver only has to establish a cast boundary,
+    ///         not a multiplication of two symbolic values.
+    function check_depositFeeAtRateCapFitsCast() external {
+        uint128 rate = portal.MAX_GAS_FEE_RATE();
+        vm.prank(admin);
+        portal.setZoneGasRate(rate);
+
+        uint256 wideFee = uint256(portal.FIXED_DEPOSIT_GAS()) * rate;
+        assertLe(wideFee, type(uint128).max);
+        assertEq(portal.calculateDepositFee(), uint128(wideFee));
+    }
+
+    /// @notice The bounce-back ceil-division is still exactly representable at the uint128 cast
+    ///         boundary. Both factors are concrete to keep this out of nonlinear arithmetic.
+    function check_bouncebackFeeAtUint128CastBoundary() external {
+        vm.prank(admin);
+        portal.setBouncebackGas(1);
+        vm.fee(uint256(type(uint128).max) * 1e12);
+
+        assertEq(portal.calculateBouncebackFee(), type(uint128).max);
+    }
 
     /// @notice Deposit fee never overflows uint128 for any rate within the enforced cap, so
     ///         `calculateDepositFee` cannot revert. Proven over all 2^128 rate values.
@@ -80,6 +105,10 @@ contract WithdrawalQueueHarness {
 
     function tail() external view returns (uint256) {
         return q.tail;
+    }
+
+    function slot(uint256 index) external view returns (bytes32) {
+        return q.slots[index];
     }
 
     function length() external view returns (uint256) {
@@ -184,12 +213,42 @@ contract WithdrawalQueueSymbolic is Test {
         qh.enqueue(h);
     }
 
+    /// @notice A non-full queue at the maximum tail cannot wrap, and the failed enqueue is atomic.
+    function check_enqueueAtMaxTailRevertsWithoutMutation(bytes32 h) external {
+        vm.assume(h != bytes32(0));
+        uint256 tail = type(uint256).max;
+        uint256 head = tail - qh.capacity() + 1;
+        uint256 slotIndex = tail % qh.capacity();
+        qh.setHeadTail(head, tail);
+        bytes32 slotBefore = qh.slot(slotIndex);
+
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+        qh.enqueue(h);
+
+        assertEq(qh.head(), head);
+        assertEq(qh.tail(), tail);
+        assertEq(qh.slot(slotIndex), slotBefore);
+    }
+
 }
 
 /// @title ZoneOutbox symbolic properties
 /// @notice Symbolic checks for the zone→Tempo withdrawal fee arithmetic. Inherits ZoneOutboxTest
 ///         to reuse its concrete setUp (real ZoneOutbox + ZoneConfig, `sequencer` authorized).
 contract ZoneOutboxSymbolic is ZoneOutboxTest {
+
+    /// @notice At both callback-gas boundaries the fee fits uint128 and the cast is lossless at
+    ///         the maximum configured rate.
+    function check_withdrawalFeeCastFitsAtGasBoundaries(bool useMaximum) external {
+        uint64 gasLimit = useMaximum ? outbox.MAX_WITHDRAWAL_GAS_LIMIT() : 0;
+        uint128 rate = config.maxTempoGasRate();
+        vm.prank(sequencer);
+        outbox.setTempoGasRate(rate);
+
+        uint256 wideFee = uint256(outbox.WITHDRAWAL_BASE_GAS() + gasLimit) * rate;
+        assertLe(wideFee, type(uint128).max);
+        assertEq(outbox.calculateWithdrawalFee(gasLimit), uint128(wideFee));
+    }
 
     /// @notice The withdrawal fee `(WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate` never
     ///         overflows uint128, so `calculateWithdrawalFee` cannot revert. Verifies the
@@ -228,6 +287,70 @@ contract ZoneOutboxSymbolic is ZoneOutboxTest {
         try outbox.calculateWithdrawalFee(gasLimit) returns (uint128) {
             fail(); // an over-cap gas limit must never produce a fee
         } catch { }
+    }
+
+}
+
+/// @notice Exposes production ZonePortal key-history storage setup to the symbolic properties.
+contract EncryptionGraceHarness is ZonePortal {
+
+    function setTwoKeys(uint64 supersedingActivation) external {
+        delete _encryptionKeys;
+        _encryptionKeys.push(
+            EncryptionKeyEntry({ x: bytes32(uint256(1)), yParity: 0x02, activationBlock: 0 })
+        );
+        _encryptionKeys.push(
+            EncryptionKeyEntry({
+                x: bytes32(uint256(2)), yParity: 0x03, activationBlock: supersedingActivation
+            })
+        );
+    }
+
+}
+
+contract EncryptionGraceSymbolic is Test {
+
+    EncryptionGraceHarness internal h;
+
+    function setUp() public {
+        h = new EncryptionGraceHarness();
+    }
+
+    function check_encryptionGraceExpiresAtExactBoundary(
+        uint64 activation,
+        uint256 currentBlock
+    )
+        external
+    {
+        vm.assume(activation <= type(uint64).max - ENCRYPTION_KEY_GRACE_PERIOD);
+        h.setTwoKeys(activation);
+        vm.roll(currentBlock);
+
+        (bool valid, uint64 expiry) = h.isEncryptionKeyValid(0);
+        assertEq(expiry, uint256(activation) + ENCRYPTION_KEY_GRACE_PERIOD);
+        assertEq(valid, currentBlock < expiry);
+    }
+
+    function check_encryptionGraceAdditionCannotWrap(uint64 activation) external {
+        vm.assume(activation > type(uint64).max - ENCRYPTION_KEY_GRACE_PERIOD);
+        h.setTwoKeys(activation);
+
+        try h.isEncryptionKeyValid(0) returns (bool, uint64) {
+            fail();
+        } catch { }
+        assertEq(h.encryptionKeyAt(1).activationBlock, activation);
+    }
+
+    function check_encryptionKeyIndexRange(uint256 index) external {
+        h.setTwoKeys(1);
+        (bool valid, uint64 expiry) = h.isEncryptionKeyValid(index);
+        if (index >= 2) {
+            assertFalse(valid);
+            assertEq(expiry, 0);
+        } else if (index == 1) {
+            assertTrue(valid);
+            assertEq(expiry, 0);
+        }
     }
 
 }
