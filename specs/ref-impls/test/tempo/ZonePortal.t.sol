@@ -2,6 +2,7 @@
 pragma solidity ^0.8.13;
 
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
+import { ISignatureVerifier } from "tempo-std/interfaces/ISignatureVerifier.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
@@ -1662,6 +1663,61 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.blockHash(), newStateRoot);
         assertEq(portal.withdrawalBatchIndex(), 1);
         assertEq(portal.lastSyncedTempoBlockNumber(), uint64(block.number - 1));
+    }
+
+    function test_submitBatch_passesZoneHeightToVerifier() public {
+        vm.roll(block.number + 1);
+
+        uint64 tempoBlockNumber = uint64(block.number - 1);
+        BlockTransition memory blockTransition = BlockTransition({
+            prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("next block")
+        });
+        DepositQueueTransition memory depositQueueTransition = DepositQueueTransition({
+            prevProcessedHash: bytes32(0),
+            nextProcessedHash: bytes32(0),
+            prevDepositNumber: 0,
+            nextDepositNumber: 0
+        });
+        uint256 nextZoneHeight = 42;
+        bytes[] memory signatures = new bytes[](1);
+        signatures[0] = hex"01";
+        vm.mockCall(
+            address(StdPrecompiles.SIGNATURE_VERIFIER),
+            abi.encodeWithSelector(ISignatureVerifier.recover.selector),
+            abi.encode(sequencer)
+        );
+
+        vm.expectCall(
+            ZONE_VERIFIER_ADDRESS,
+            abi.encodeCall(
+                IVerifier.verify,
+                (
+                    testZoneId,
+                    tempoBlockNumber,
+                    tempoBlockNumber,
+                    getBlockHash(tempoBlockNumber),
+                    1,
+                    nextZoneHeight,
+                    blockTransition,
+                    depositQueueTransition,
+                    bytes32(0),
+                    bytes(""),
+                    bytes("")
+                )
+            )
+        );
+
+        portal.submitBatch(
+            tempoBlockNumber,
+            0,
+            blockTransition,
+            depositQueueTransition,
+            bytes32(0),
+            "",
+            "",
+            nextZoneHeight,
+            signatures
+        );
     }
 
     function test_submitBatch_emitsAssignedWithdrawalQueueIndex() public {

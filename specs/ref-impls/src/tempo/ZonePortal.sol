@@ -1214,6 +1214,7 @@ contract ZonePortal is IZonePortal {
                 anchorBlockNumber,
                 anchorBlockHash,
                 withdrawalBatchIndex + 1,
+                nextZoneHeight,
                 blockTransition,
                 depositQueueTransition,
                 withdrawalQueueHash,

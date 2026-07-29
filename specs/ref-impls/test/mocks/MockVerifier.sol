@@ -19,6 +19,7 @@ contract MockVerifier is IVerifier {
         uint64, // anchorBlockNumber
         bytes32, // anchorBlockHash
         uint64, // expectedWithdrawalBatchIndex
+        uint256, // expectedZoneHeight
         BlockTransition calldata,
         DepositQueueTransition calldata,
         bytes32, // withdrawalQueueHash

@@ -394,13 +394,15 @@ interface IVerifier {
     ///      3. If anchorBlockNumber == tempoBlockNumber: zone's hash matches anchorBlockHash
     ///      4. If anchorBlockNumber > tempoBlockNumber: ancestry chain from tempoBlockNumber to anchorBlockNumber
     ///      5. ZoneOutbox.lastBatch().withdrawalBatchIndex == expectedWithdrawalBatchIndex
-    ///      6. ZoneOutbox.lastBatch().withdrawalQueueHash matches withdrawalQueueHash
-    ///      7. Deposit processing is correct (validated via Tempo state read inside proof)
+    ///      6. Final proven Zone block number == expectedZoneHeight
+    ///      7. ZoneOutbox.lastBatch().withdrawalQueueHash matches withdrawalQueueHash
+    ///      8. Deposit processing is correct (validated via Tempo state read inside proof)
     /// @param zoneId Unique identifier of the zone whose batch is being verified
     /// @param tempoBlockNumber Block zone committed to (from TempoState)
     /// @param anchorBlockNumber Block whose hash is verified (tempoBlockNumber or recent block)
     /// @param anchorBlockHash Hash of anchorBlockNumber (from EIP-2935)
     /// @param expectedWithdrawalBatchIndex Expected batch index (portal.withdrawalBatchIndex + 1)
+    /// @param expectedZoneHeight Expected final Zone block number (portal nextZoneHeight)
     /// @param blockTransition Zone block hash transition
     /// @param depositQueueTransition Deposit queue processing transition
     /// @param withdrawalQueueHash Withdrawal queue hash chain for this batch (0 if none)
@@ -412,6 +414,7 @@ interface IVerifier {
         uint64 anchorBlockNumber,
         bytes32 anchorBlockHash,
         uint64 expectedWithdrawalBatchIndex,
+        uint256 expectedZoneHeight,
         BlockTransition calldata blockTransition,
         DepositQueueTransition calldata depositQueueTransition,
         bytes32 withdrawalQueueHash,
