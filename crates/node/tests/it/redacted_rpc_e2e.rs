@@ -8,8 +8,9 @@
 //! - Method tier enforcement (restricted/disabled/unknown methods)
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, now_secs, start_zone_with_redacted_rpc,
-    start_zone_with_redacted_rpc_l1, start_zone_with_redacted_rpc_l1_with_encryption,
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, ZoneAccount, now_secs,
+    start_zone_with_redacted_rpc, start_zone_with_redacted_rpc_l1,
+    start_zone_with_redacted_rpc_l1_with_encryption,
 };
 use alloy::{
     primitives::{Address, B256, TxKind, U256, address, hex},
@@ -696,6 +697,36 @@ async fn test_balance_privacy() -> eyre::Result<()> {
         resp.get("result").is_some() && resp.get("error").is_none(),
         "sequencer should be able to query any address's balance"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_configured_sequencer_reads_foreign_account_state() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
+    let recipient = address!("0x0000000000000000000000000000000000005678");
+    let deposit_amount: u128 = 1_000_000;
+
+    let mut depositor = ZoneAccount::from_l1_and_zone(ctx.l1(), &ctx.zone, ctx.portal_address());
+    ctx.l1()
+        .fund_user(depositor.address(), deposit_amount * 2)
+        .await?;
+    depositor
+        .deposit_to(recipient, deposit_amount, DEFAULT_TIMEOUT, &ctx.zone)
+        .await?;
+
+    for (method, address) in [
+        ("eth_getBalance", recipient),
+        ("eth_getTransactionCount", ZONE_INBOX_ADDRESS),
+    ] {
+        let response = ctx
+            .call_as_sequencer(method, json!([format!("{address:#x}"), "latest"]))
+            .await?;
+        let result = response["result"].as_str().expect("missing RPC result");
+        assert_ne!(result, "0x0");
+    }
 
     Ok(())
 }

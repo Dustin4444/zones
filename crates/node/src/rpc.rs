@@ -597,6 +597,18 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         zone_tokens(self.config.zone_portal, &self.l1_provider).await
     }
 
+    async fn is_sequencer(&self, address: Address) -> bool {
+        ZonePortal::new(self.config.zone_portal, &self.l1_provider)
+            .isSequencer(address)
+            .call()
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn is_authorized_for(&self, auth: &AuthContext, address: Address) -> bool {
+        address == auth.caller || self.is_sequencer(auth.caller).await
+    }
+
     fn enforce_authorized(
         &self,
         request: &mut TempoTransactionRequest,
@@ -705,8 +717,7 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
-            if address != auth.caller {
+            if !self.is_authorized_for(&auth, address).await {
                 return Ok(raw_zero());
             }
             let balance = EthState::balance(&self.eth.api, address, block)
@@ -723,8 +734,7 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
-            if address != auth.caller {
+            if !self.is_authorized_for(&auth, address).await {
                 return Ok(raw_zero());
             }
             let count = EthState::transaction_count(&self.eth.api, address, block)
