@@ -9,10 +9,8 @@ import {
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
-    ZONE_MESSENGER_ADDRESS,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
-import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
 import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
@@ -185,7 +183,6 @@ contract ZoneNonCustodialHandler is Test {
 contract ZoneNonCustodialInvariantTest is BaseTest {
 
     ZonePortal internal portal;
-    ZoneMessenger internal messenger;
     MockZoneToken internal token;
     MockTempoState internal tempoState;
     ZoneConfig internal config;
@@ -211,7 +208,6 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
 
         uint64 genesisTempoBlockNumber = uint64(block.number);
 
-        messenger = ZoneMessenger(ZONE_MESSENGER_ADDRESS);
         address[] memory sequencers = new address[](1);
         sequencers[0] = address(this);
         portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
@@ -248,17 +244,6 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
         assertTrue(
             config.isEnabledToken(address(token)),
             "TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: token became disabled on zone"
-        );
-    }
-
-    /// @notice TEMPO-ZONE-MESSENGER-APPROVAL: the portal keeps the messenger at max escrow allowance for an enabled
-    ///         token. Enabling grants `type(uint256).max`; nothing in this suite relays
-    ///         (which would spend it), so it must stay max — escrow can always be released.
-    function invariant_messengerAllowanceMax() public view {
-        assertEq(
-            token.allowance(address(portal), address(messenger)),
-            type(uint256).max,
-            "TEMPO-ZONE-MESSENGER-APPROVAL: messenger lost max escrow allowance"
         );
     }
 

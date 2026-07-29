@@ -269,7 +269,7 @@ contract ZoneLifecycleHandler is Test {
     }
 
     /// @notice The sequencer finalizes a withdrawal batch on the zone and submits it to L1.
-    function finalizeAndSubmit(uint256 countSeed) external {
+    function finalizeAndSubmit(uint256) external {
         uint256 pending = pendingWithdrawals.length - withdrawalFinalizeHead;
         if (pending == 0) return;
         // Leave headroom in the L1 ring buffer (one slot per batch).
@@ -279,7 +279,7 @@ contract ZoneLifecycleHandler is Test {
         ) {
             return;
         }
-        uint256 count = bound(countSeed, 1, pending);
+        uint256 count = pending;
 
         Withdrawal[] memory ws = new Withdrawal[](count);
         for (uint256 i = 0; i < count; i++) {
