@@ -1,0 +1,138 @@
+version: 1
+
+include:
+  - ./scenario-fragments.yml
+
+chains:
+  l1:
+    network: tempo
+    rpc_url: "${L1_RPC_URL}"
+    query_rpc_url: "${ZONES_BENCH_L1_QUERY_RPC_URL}"
+    chain_id: ${ZONES_BENCH_EXPECTED_L1_CHAIN_ID}
+    workload: ./deposit.yml
+
+  zone:
+    network: tempo
+    rpc_url: "${ZONE_PRIVATE_RPC_URL}"
+    query_rpc_url: "${ZONE_RPC_URL}"
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: "${ZONES_BENCH_ZONE_AUTH_MAP}"
+        reload_interval: 1s
+    chain_id: ${ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID}
+    workload: ./zone-roundtrip.yml
+
+scenario:
+  name: zones-l1-zone-l1-roundtrip
+  timeout: 10m
+
+  bindings:
+    account:
+      account:
+        pool: users
+        select: lease
+    recipient:
+      account:
+        pool: ${ZONES_BENCH_RECIPIENT_POOL}
+        select: ${ZONES_BENCH_RECIPIENT_SELECT}
+
+  steps:
+    - checkpoint:
+        chain: zone
+      save: zone_before_deposit
+
+    - use: deposit-and-wait-zone
+      as: deposit_to_zone
+      with:
+        template: deposit
+        sender: { var: account.ref }
+        sender_address: { var: account.address }
+        recipient: { var: account.address }
+        amount: ${ZONES_BENCH_DEPOSIT_AMOUNT}
+        zone_from_block: { var: zone_before_deposit.block_number }
+
+    - submit:
+        chain: zone
+        template: tip20_transfer
+        with:
+          from: { var: account.ref }
+          call:
+            args:
+              - { var: recipient.address }
+              - ${ZONES_BENCH_ACTIVITY_AMOUNT}
+      save: activity
+
+    - wait_receipt:
+        chain: zone
+        transaction_hash: { var: activity.tx_hash }
+        sender: { var: activity.sender }
+      save: activity_receipt
+
+    # Capture L1 before requesting the withdrawal so the terminal event can be
+    # backfilled even if settlement completes before its wait starts polling.
+    - checkpoint:
+        chain: l1
+      save: l1_before_withdrawal
+
+    # The private Zone RPC intentionally filters non-TIP-20 receipt logs. Use a
+    # trusted log-query checkpoint for the outbox event while retaining the
+    # transaction hash as the exact request correlation key.
+    - checkpoint:
+        chain: zone
+      save: zone_before_withdrawal
+
+    - submit:
+        chain: zone
+        template: request_withdrawal
+        with:
+          from: { var: account.ref }
+          call:
+            args:
+              - "${ZONES_BENCH_TOKEN}"
+              - { var: recipient.address }
+              - ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
+              - { random_bytes: 32 }
+              - 0
+              - { var: account.address }
+              - "0x"
+              - "0x"
+      save: withdrawal
+
+    # Transaction scoping identifies the exact overload call and captures its
+    # random memo, fee, fallback nonce, and other request fields for correlation.
+    - wait_log:
+        chain: zone
+        from_block: { var: zone_before_withdrawal.block_number }
+        transaction_hash: { var: withdrawal.tx_hash }
+        sender: { var: withdrawal.sender }
+        address: "${ZONES_BENCH_OUTBOX}"
+        abi: ZoneOutbox
+        event: WithdrawalRequested
+        where:
+          sender: { var: account.address }
+          token: "${ZONES_BENCH_TOKEN}"
+          to: { var: recipient.address }
+          amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
+          gasLimit: 0
+      save: withdrawal_requested
+
+    - wait_log:
+        chain: l1
+        from_block: { var: l1_before_withdrawal.block_number }
+        address: "${L1_PORTAL_ADDRESS}"
+        abi: ZonePortal
+        event: WithdrawalProcessed
+        where:
+          to: { var: recipient.address }
+          senderTag:
+            keccak256_packed:
+              types: [address, bytes32]
+              values:
+                - { var: account.address }
+                - { var: withdrawal.tx_hash }
+          token: "${ZONES_BENCH_TOKEN}"
+          amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
+          callbackSuccess: true
+        max_block_range: 1000
+      save: withdrawal_processed

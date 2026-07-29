@@ -79,11 +79,10 @@ pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
 
 /// Largest supported planned gas budget for one `processWithdrawals` transaction.
 ///
-/// Tempo L1 currently caps transaction gas at 30,000,000. Packed batches cannot exceed this
-/// 20,000,000 budget. Oversized singletons bypass the budget, but the protocol callback cap keeps
-/// their maximum planned gas at 12,250,000. Both remain below the L1 limit, avoiding repeated
-/// submission of a transaction that can never be mined.
-pub const MAX_WITHDRAWAL_BATCH_GAS: u64 = 20_000_000;
+/// Tempo L1 currently caps transaction gas at 30,000,000, so packed batches cannot exceed that
+/// budget. Oversized singletons bypass the budget, but the protocol callback cap keeps their
+/// maximum planned gas at 12,250,000.
+pub const MAX_WITHDRAWAL_BATCH_GAS: u64 = 30_000_000;
 
 /// Default maximum number of ordered withdrawal transactions kept in flight.
 pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 8;
@@ -974,6 +973,17 @@ mod tests {
                 + MAX_WITHDRAWAL_GAS_LIMIT
         );
         assert!(at_cap <= MAX_WITHDRAWAL_BATCH_GAS);
+    }
+
+    #[test]
+    fn default_batch_limits_remain_conservative() {
+        assert_eq!(
+            WithdrawalBatchLimits::default(),
+            WithdrawalBatchLimits {
+                max_batch_gas: 10_000_000,
+                max_in_flight_batches: 8,
+            }
+        );
     }
 
     fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
