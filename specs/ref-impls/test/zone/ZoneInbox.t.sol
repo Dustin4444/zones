@@ -62,6 +62,14 @@ contract RefundCallForwarder {
 /// @notice Tests for ZoneInbox covering edge cases
 contract ZoneInboxTest is Test {
 
+    struct MixedBatchExpectations {
+        bytes32 queueHash;
+        uint256 decryptionIndex;
+        uint256 acceptedValue;
+        uint256 bouncedValue;
+        uint256 parkedValue;
+    }
+
     ZoneConfig public config;
     ZoneInbox public inbox;
     MockZoneToken public zoneToken;
@@ -1453,11 +1461,7 @@ contract ZoneInboxTest is Test {
         }
         QueuedDeposit[] memory deposits = new QueuedDeposit[](count);
         DecryptionData[] memory decs = new DecryptionData[](decryptionCount);
-        uint256 decIndex;
-        bytes32 expectedHash;
-        uint256 acceptedValue;
-        uint256 bouncedValue;
-        uint256 parkedValue;
+        MixedBatchExpectations memory expected;
 
         for (uint256 i = 0; i < count; i++) {
             uint128 amount = uint128((i + 1) * 1e6);
@@ -1470,9 +1474,10 @@ contract ZoneInboxTest is Test {
                 qd.depositData = abi.encode(ed);
                 qd.rejected = kind == 3;
                 deposits[i] = qd;
-                expectedHash = keccak256(abi.encode(DepositType.Encrypted, ed, expectedHash));
+                expected.queueHash =
+                    keccak256(abi.encode(DepositType.Encrypted, ed, expected.queueHash));
                 if (kind != 3) {
-                    decs[decIndex++] = DecryptionData({
+                    decs[expected.decryptionIndex++] = DecryptionData({
                         sharedSecret: bytes32(i + 1),
                         sharedSecretYParity: 0x02,
                         cpProof: ChaumPedersenProof({
@@ -1480,8 +1485,8 @@ contract ZoneInboxTest is Test {
                         })
                     });
                 }
-                if (kind == 1) acceptedValue += amount;
-                else bouncedValue += amount;
+                if (kind == 1) expected.acceptedValue += amount;
+                else expected.bouncedValue += amount;
             } else {
                 bool parked = kind == 6;
                 address token = kind == 5 || parked ? address(failedToken) : address(zoneToken);
@@ -1497,10 +1502,11 @@ contract ZoneInboxTest is Test {
                 deposits[i] = QueuedDeposit({
                     depositType: DepositType.Regular, depositData: abi.encode(d), rejected: rejected
                 });
-                expectedHash = keccak256(abi.encode(DepositType.Regular, d, expectedHash));
-                if (kind == 0) acceptedValue += amount;
-                else if (parked) parkedValue += amount;
-                else bouncedValue += amount;
+                expected.queueHash =
+                    keccak256(abi.encode(DepositType.Regular, d, expected.queueHash));
+                if (kind == 0) expected.acceptedValue += amount;
+                else if (parked) expected.parkedValue += amount;
+                else expected.bouncedValue += amount;
             }
 
             if (kind == 2 || kind == 3 || kind == 4 || kind == 5) {
@@ -1518,18 +1524,21 @@ contract ZoneInboxTest is Test {
         }
 
         tempoState.setMockStorageValue(
-            mockPortal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, expectedHash
+            mockPortal, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, expected.queueHash
         );
         vm.prank(sequencer);
         inbox.advanceTempo("", deposits, decs, new EnabledToken[](0));
 
-        assertEq(inbox.processedDepositQueueHash(), expectedHash);
+        assertEq(inbox.processedDepositQueueHash(), expected.queueHash);
         assertEq(inbox.processedDepositNumber(), count);
-        assertEq(zoneToken.totalSupply(), acceptedValue);
+        assertEq(zoneToken.totalSupply(), expected.acceptedValue);
         assertEq(failedToken.totalSupply(), 0);
         vm.prank(fallbackRecipient);
-        assertEq(inbox.refunds(address(failedToken), fallbackRecipient), parkedValue);
-        assertEq(zoneToken.totalSupply() + bouncedValue + parkedValue, _sumMixedAmounts(count));
+        assertEq(inbox.refunds(address(failedToken), fallbackRecipient), expected.parkedValue);
+        assertEq(
+            zoneToken.totalSupply() + expected.bouncedValue + expected.parkedValue,
+            _sumMixedAmounts(count)
+        );
     }
 
     function _sumMixedAmounts(uint256 count) internal pure returns (uint256) {
