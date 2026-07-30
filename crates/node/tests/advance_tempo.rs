@@ -1,10 +1,10 @@
-//! Reproduce the `advanceTempo` system tx reverting at 232 gas.
+//! Pins the zone genesis predeploys and portal storage-slot constants to the
+//! Solidity reference implementation.
 //!
-//! Run with: `cargo test -p zone-node --test advance_tempo -- --nocapture`
+//! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
 
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
-use alloy_sol_types::{SolCall, sol};
 use revm::{
     context::result::{ExecutionResult, Output},
     database::{CacheDB, EmptyDB},
@@ -15,41 +15,11 @@ use tempo_evm::evm::{TempoEvm, TempoEvmFactory};
 use tempo_revm::TempoBlockEnv;
 use zone_primitives::constants::{
     PORTAL_ADMIN_SLOT, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT,
-    PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT, zone_chain_id,
+    PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT, TEMPO_STATE_ADDRESS,
+    ZONE_CONFIG_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
 };
 
-const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000000");
-const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
-const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
-const ZONE_CONFIG_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000003");
-
 const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
-sol! {
-    function advanceTempo(bytes calldata header, QueuedDeposit[] calldata deposits, DecryptionData[] calldata decryptions, EnabledToken[] calldata enabledTokens);
-    function config() external view returns (address);
-    function tempoBlockHash() external view returns (bytes32);
-
-    struct QueuedDeposit {
-        uint8 depositType;
-        bytes depositData;
-    }
-    struct ChaumPedersenProof {
-        bytes32 s;
-        bytes32 c;
-    }
-    struct DecryptionData {
-        bytes32 sharedSecret;
-        uint8 sharedSecretYParity;
-        ChaumPedersenProof cpProof;
-    }
-    struct EnabledToken {
-        address token;
-        string name;
-        string symbol;
-        string currency;
-    }
-}
 
 /// Load a Foundry artifact's creation bytecode from the specs output directory.
 fn load_artifact(name: &str) -> Vec<u8> {
@@ -131,11 +101,6 @@ fn deploy_contract(
     }
 
     println!("Deployed {name} at {predeploy_addr} (created at {created_addr})");
-}
-
-/// Build an EVM with the zone contracts deployed in-memory (same as xtask generate_zone_genesis).
-fn setup_zone_evm_with_contracts() -> TempoEvm<CacheDB<EmptyDB>> {
-    setup_zone_evm_with_contracts_for_portal(zone_chain_id(1), Address::repeat_byte(0xbb))
 }
 
 fn setup_zone_evm_with_contracts_for_portal(
@@ -382,188 +347,6 @@ fn build_dummy_header_rlp() -> Vec<u8> {
     let mut buf = Vec::new();
     header.encode(&mut buf);
     buf
-}
-
-#[test]
-fn advance_tempo_repro() {
-    let mut evm = setup_zone_evm_with_contracts();
-
-    // System txs use Address::ZERO which bypasses OnlySequencer in ZoneInbox/ZoneOutbox
-    let sequencer = Address::ZERO;
-
-    // ---------------------------------------------------------------
-    // Step 1: Call config() on ZoneInbox — simple view call to verify contracts work
-    // ---------------------------------------------------------------
-    println!("\n=== Calling ZoneInbox.config() ===");
-    let config_calldata = configCall {}.abi_encode();
-    let config_result =
-        evm.transact_system_call(sequencer, ZONE_INBOX_ADDRESS, Bytes::from(config_calldata));
-    match &config_result {
-        Ok(result) => {
-            println!("config() result: {:?}", result.result);
-            let gas_used = result.result.tx_gas_used();
-            match &result.result {
-                ExecutionResult::Success { output, .. } => {
-                    if let Output::Call(data) = output {
-                        println!("config() returned: {data}");
-                    }
-                    println!("config() gas_used: {gas_used}");
-                }
-                ExecutionResult::Revert { output, .. } => {
-                    println!("config() REVERTED: {output}, gas_used: {gas_used}");
-                }
-                ExecutionResult::Halt { reason, .. } => {
-                    println!("config() HALTED: {reason:?}, gas_used: {gas_used}");
-                }
-            }
-        }
-        Err(e) => println!("config() ERROR: {e:?}"),
-    }
-
-    // ---------------------------------------------------------------
-    // Step 2: Call tempoBlockHash() on TempoState to verify it works
-    // ---------------------------------------------------------------
-    println!("\n=== Calling TempoState.tempoBlockHash() ===");
-    let hash_calldata = tempoBlockHashCall {}.abi_encode();
-    let hash_result =
-        evm.transact_system_call(sequencer, TEMPO_STATE_ADDRESS, Bytes::from(hash_calldata));
-    match &hash_result {
-        Ok(result) => {
-            let gas_used = result.result.tx_gas_used();
-            match &result.result {
-                ExecutionResult::Success { output, .. } => {
-                    if let Output::Call(data) = output {
-                        println!("tempoBlockHash() returned: {data}");
-                    }
-                    println!("tempoBlockHash() gas_used: {gas_used}");
-                }
-                ExecutionResult::Revert { output, .. } => {
-                    println!("tempoBlockHash() REVERTED: {output}, gas_used: {gas_used}");
-                }
-                other => println!("tempoBlockHash() other: {other:?}"),
-            }
-        }
-        Err(e) => println!("tempoBlockHash() ERROR: {e:?}"),
-    }
-
-    // ---------------------------------------------------------------
-    // Step 3: Call advanceTempo with a minimal next header
-    // ---------------------------------------------------------------
-    // Verify contracts have code
-    {
-        let inbox_code = evm
-            .db_mut()
-            .cache
-            .accounts
-            .get(&ZONE_INBOX_ADDRESS)
-            .and_then(|a| a.info.code.as_ref())
-            .map(|c| c.len())
-            .unwrap_or(0);
-        let tempostate_code = evm
-            .db_mut()
-            .cache
-            .accounts
-            .get(&TEMPO_STATE_ADDRESS)
-            .and_then(|a| a.info.code.as_ref())
-            .map(|c| c.len())
-            .unwrap_or(0);
-        println!("ZoneInbox code size: {inbox_code}");
-        println!("TempoState code size: {tempostate_code}");
-    }
-
-    // ---------------------------------------------------------------
-    // Step 2.5: Call finalizeTempo directly on TempoState to isolate
-    // ---------------------------------------------------------------
-    println!("\n=== Building child header ===");
-
-    // Build a "next" header that's a child of the genesis.
-    // finalizeTempo requires: tempoParentHash == prev tempoBlockHash, tempoBlockNumber == prev + 1
-    let genesis_hash = {
-        use alloy_rlp::Encodable;
-        let genesis = tempo_primitives::TempoHeader::default();
-        let mut buf = Vec::new();
-        genesis.encode(&mut buf);
-        alloy_primitives::keccak256(&buf)
-    };
-    println!("Genesis hash (computed): {genesis_hash}");
-
-    let next_header = tempo_primitives::TempoHeader {
-        inner: alloy_consensus::Header {
-            number: 1,
-            parent_hash: genesis_hash,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let next_header_rlp = {
-        use alloy_rlp::Encodable;
-        let mut buf = Vec::new();
-        next_header.encode(&mut buf);
-        buf
-    };
-    println!("Next header RLP length: {}", next_header_rlp.len());
-    println!("Next header block number: {}", next_header.inner.number);
-    println!("Next header parent hash: {}", next_header.inner.parent_hash);
-
-    // NOTE: finalizeTempo() tested separately and works (86729 gas).
-    // Skip calling it directly here to avoid corrupting state for the advanceTempo call.
-
-    println!("\n=== Calling ZoneInbox.advanceTempo() ===");
-
-    let advance_calldata = advanceTempoCall {
-        header: Bytes::from(next_header_rlp),
-        deposits: vec![],
-        decryptions: vec![],
-        enabledTokens: vec![],
-    }
-    .abi_encode();
-
-    println!(
-        "advanceTempo calldata length: {} bytes",
-        advance_calldata.len()
-    );
-    println!(
-        "advanceTempo selector: 0x{}",
-        const_hex::encode(&advance_calldata[..4])
-    );
-
-    let advance_result =
-        evm.transact_system_call(sequencer, ZONE_INBOX_ADDRESS, Bytes::from(advance_calldata));
-    match &advance_result {
-        Ok(result) => {
-            let gas_used = result.result.tx_gas_used();
-            match &result.result {
-                ExecutionResult::Success { output, .. } => {
-                    if let Output::Call(data) = output {
-                        println!("advanceTempo() SUCCESS, output: {data}");
-                    }
-                    println!("advanceTempo() gas_used: {gas_used}");
-                }
-                ExecutionResult::Revert { output, .. } => {
-                    println!("advanceTempo() REVERTED: {output}");
-                    println!("advanceTempo() gas_used: {gas_used}");
-                    if output.len() >= 4 {
-                        let sel = &output[..4];
-                        println!("  error selector: 0x{}", const_hex::encode(sel));
-                        if sel == [0x08, 0xc3, 0x79, 0xa0]
-                            && output.len() > 4
-                            && let Ok(msg) = <alloy_sol_types::sol_data::String as alloy_sol_types::SolType>::abi_decode(&output[4..])
-                        {
-                            println!("  Error message: {msg}");
-                        }
-                    }
-                }
-                ExecutionResult::Halt { reason, .. } => {
-                    println!("advanceTempo() HALTED: {reason:?}");
-                    println!("advanceTempo() gas_used: {gas_used}");
-                }
-            }
-        }
-        Err(e) => println!("advanceTempo() ERROR: {e:?}"),
-    }
-
-    // The test should not panic; we want to see the output
-    println!("\n=== Test complete ===");
 }
 
 /// Pins the Rust portal storage-slot constants to the ZonePortal storage layout.
