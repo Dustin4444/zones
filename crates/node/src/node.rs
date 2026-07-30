@@ -15,8 +15,8 @@ use crate::{
         route_events_to_generations, run_role_controller,
     },
     rpc::{
-        SequencerRpcContext, ZoneRpc, ZoneRpcApi, public_zone_rpc_module, rpc_connection_config,
-        start_private_rpc,
+        PublicZoneApi, SequencerRpcContext, ZoneApiServer as _, ZoneRpc, ZoneRpcApi,
+        public_zone_rpc_module, rpc_connection_config, start_private_rpc,
     },
 };
 use alloy_primitives::Address;
@@ -225,7 +225,6 @@ impl ZoneNode {
     pub fn new(
         l1_rpc_url: String,
         portal_address: Address,
-        genesis_tempo_block_number: Option<u64>,
         l1_fetch_concurrency: usize,
         retry_connection_interval: Duration,
     ) -> Self {
@@ -237,7 +236,6 @@ impl ZoneNode {
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
-            genesis_tempo_block_number,
             enabled_tokens: enabled_tokens.clone(),
             l1_state_cache: l1_state_cache.clone(),
             block_tracker: l1_block_tracker.clone(),
@@ -520,11 +518,7 @@ where
         // leadership transition.
         if let Some(p2p) = self.p2p_config.as_ref() {
             let schedule = p2p.leadership();
-            let snapshot_anchor = if tempo_block_number > 0 {
-                tempo_block_number
-            } else {
-                self.l1_config.genesis_tempo_block_number.unwrap_or(0)
-            };
+            let snapshot_anchor = tempo_block_number;
             seed_leadership_schedule(
                 &l1_provider,
                 self.portal_address,
@@ -640,10 +634,20 @@ where
         });
         let public_rpc_slot = sequencer_rpc_slot.clone();
         let public_rpc_provider = provider.clone();
+        let public_zone_api = PublicZoneApi::new(
+            self.private_rpc_config.zone_id,
+            chain_id,
+            self.portal_address,
+            l1_provider.clone(),
+            provider.clone(),
+        );
         let portal_address = self.portal_address;
         let handle = self
             .inner
             .launch_add_ons_with(ctx, move |container| {
+                container
+                    .modules
+                    .merge_configured(public_zone_api.into_rpc())?;
                 container.modules.merge_http(public_zone_rpc_module(
                     portal_address,
                     public_rpc_slot,
