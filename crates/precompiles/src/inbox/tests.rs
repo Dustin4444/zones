@@ -205,7 +205,10 @@ fn system_advance_selects_child_anchor_and_reads_queue() -> eyre::Result<()> {
         harness.advance_call(Vec::new(), Vec::new()).abi_encode(),
     )?;
 
-    assert_eq!(harness.l1_state.get_anchor(), Some(1));
+    assert_eq!(
+        harness.l1_state.get_anchor().map(|a| a.block_number()),
+        Some(1)
+    );
     assert!(harness.l1.requested(
         1,
         &ZonePortalStorage::new(PORTAL).current_deposit_queue_hash,
@@ -268,9 +271,11 @@ fn static_advance_and_delegate_call_revert_before_l1_reads() -> eyre::Result<()>
 #[test]
 fn advance_rejects_a_preselected_anchor_before_child_selection() -> eyre::Result<()> {
     let mut harness = Harness::new()?;
-    harness
-        .l1_state
-        .read_l1_storage(Address::ZERO, B256::ZERO, 0)?;
+    harness.l1_state.read_l1_storage(
+        Address::ZERO,
+        B256::ZERO,
+        crate::TempoAnchor::new(0, B256::ZERO),
+    )?;
     let request_count = harness.l1.storage_requests().len();
 
     let result = harness.call(

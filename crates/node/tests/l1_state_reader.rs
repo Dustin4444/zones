@@ -47,7 +47,11 @@ async fn l1_provider_reads_storage_slot() {
     let block = recent_block_number().await;
 
     let value = provider
-        .get_storage_async(ZONE_PORTAL, B256::ZERO, block)
+        .get_storage_async(
+            ZONE_PORTAL,
+            B256::ZERO,
+            zone_precompiles::TempoAnchor::new(block, B256::ZERO),
+        )
         .await
         .expect("should read storage from L1 RPC");
 
@@ -66,19 +70,31 @@ async fn l1_provider_caches_result() {
     let block = recent_block_number().await;
 
     let v1 = provider
-        .get_storage_async(ZONE_PORTAL, B256::ZERO, block)
+        .get_storage_async(
+            ZONE_PORTAL,
+            B256::ZERO,
+            zone_precompiles::TempoAnchor::new(block, B256::ZERO),
+        )
         .await
         .unwrap();
 
     // Should be served from cache now
     let v2 = provider
-        .get_storage_async(ZONE_PORTAL, B256::ZERO, block)
+        .get_storage_async(
+            ZONE_PORTAL,
+            B256::ZERO,
+            zone_precompiles::TempoAnchor::new(block, B256::ZERO),
+        )
         .await
         .unwrap();
 
     assert_eq!(v1, v2, "cached and fresh values must match");
 
-    let cached = provider.cache().lock().get(ZONE_PORTAL, B256::ZERO, block);
+    let cached =
+        provider
+            .cache()
+            .lock()
+            .get::<zone_l1::state::Unverified>(ZONE_PORTAL, B256::ZERO, block);
     assert_eq!(cached, Some(v1), "value should be in cache after read");
     println!("Cache hit verified for slot 0 at block {block}: {v1}");
 }
@@ -102,14 +118,22 @@ async fn l1_provider_reads_multiple_slots() {
 
     for (i, slot) in slots.iter().enumerate() {
         let value = provider
-            .get_storage_async(ZONE_PORTAL, *slot, block)
+            .get_storage_async(
+                ZONE_PORTAL,
+                *slot,
+                zone_precompiles::TempoAnchor::new(block, B256::ZERO),
+            )
             .await
             .expect("should read slot from L1");
         println!("ZonePortal slot[{i}] at block {block}: {value}");
     }
 
     // Slot 0 should be non-zero (contains init data)
-    let v0 = provider.cache().lock().get(ZONE_PORTAL, B256::ZERO, block);
+    let v0 =
+        provider
+            .cache()
+            .lock()
+            .get::<zone_l1::state::Unverified>(ZONE_PORTAL, B256::ZERO, block);
     assert!(
         v0.is_some_and(|v| v != B256::ZERO),
         "slot 0 should be non-zero"
@@ -128,7 +152,11 @@ async fn l1_provider_sync_read_from_blocking_thread() {
 
     let value = tokio::task::spawn_blocking(move || {
         provider
-            .get_storage(ZONE_PORTAL, B256::ZERO, block)
+            .get_storage(
+                ZONE_PORTAL,
+                B256::ZERO,
+                zone_precompiles::TempoAnchor::new(block, B256::ZERO),
+            )
             .expect("sync get_storage should work from blocking thread")
     })
     .await
