@@ -32,6 +32,11 @@ use crate::{
 const MAX_CALLBACK_DATA_SIZE: usize = 1024;
 const WITHDRAWAL_BASE_GAS: u64 = 50_000;
 
+/// Returns whether `calldata` carries the `finalizeWithdrawalBatch` selector.
+pub fn is_finalize_withdrawal_batch_selector(calldata: &[u8]) -> bool {
+    calldata.starts_with(&IZoneOutbox::finalizeWithdrawalBatchCall::SELECTOR)
+}
+
 /// Returns whether `calldata` is a canonical `finalizeWithdrawalBatch` call.
 pub fn is_finalize_withdrawal_batch_calldata(calldata: &[u8]) -> bool {
     let Ok(call) = IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(calldata) else {

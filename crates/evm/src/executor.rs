@@ -21,7 +21,8 @@ use tempo_revm::evm::TempoContext;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::L1StateProvider;
 use zone_precompiles::{
-    ADVANCE_TEMPO_SELECTOR, L1StorageReader, is_finalize_withdrawal_batch_calldata, tx_context,
+    ADVANCE_TEMPO_SELECTOR, L1StorageReader, is_finalize_withdrawal_batch_calldata,
+    is_finalize_withdrawal_batch_selector, tx_context,
 };
 use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
@@ -205,7 +206,7 @@ fn validate_system_transaction(
 
     if !tx.is_system_tx()
         && tx.calls().any(|(kind, input)| {
-            kind.to() == Some(&ZONE_OUTBOX_ADDRESS) && is_finalize_withdrawal_batch_calldata(input)
+            kind.to() == Some(&ZONE_OUTBOX_ADDRESS) && is_finalize_withdrawal_batch_selector(input)
         })
     {
         return Err(BlockValidationError::msg(
@@ -221,6 +222,7 @@ fn validate_system_transaction(
 mod tests {
     use super::{
         ADVANCE_TEMPO_SELECTOR, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+        is_finalize_withdrawal_batch_calldata, is_finalize_withdrawal_batch_selector,
         validate_system_transaction,
     };
 
@@ -367,6 +369,15 @@ mod tests {
             "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction"
         );
 
+        let mut noncanonical_finalize_calldata = finalize_calldata.to_vec();
+        noncanonical_finalize_calldata.extend([0_u8; 32]);
+        let noncanonical_finalize_calldata = Bytes::from(noncanonical_finalize_calldata);
+        assert!(!is_finalize_withdrawal_batch_calldata(
+            &noncanonical_finalize_calldata
+        ));
+        assert!(is_finalize_withdrawal_batch_selector(
+            &noncanonical_finalize_calldata
+        ));
         let aa = AASigned::new_unhashed(
             TempoTransaction {
                 calls: vec![
@@ -389,7 +400,7 @@ mod tests {
                     Call {
                         to: TxKind::Call(ZONE_OUTBOX_ADDRESS),
                         value: U256::ZERO,
-                        input: finalize_calldata,
+                        input: noncanonical_finalize_calldata,
                     },
                 ],
                 ..Default::default()
