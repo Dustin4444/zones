@@ -138,22 +138,6 @@ impl Default for BatchAnchorConfig {
     }
 }
 
-fn validate_certificate_anchor(
-    anchor_block_number: u64,
-    current_l1_block: u64,
-    history_window: u64,
-) -> Result<()> {
-    eyre::ensure!(
-        anchor_block_number <= current_l1_block,
-        "certificate anchor block is ahead of the current L1 tip"
-    );
-    eyre::ensure!(
-        current_l1_block.saturating_sub(anchor_block_number) < history_window,
-        "certificate anchor block fell outside the EIP-2935 history window"
-    );
-    Ok(())
-}
-
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
 ///
 /// Holds a contract instance pointing at the portal, backed by a shared
@@ -317,6 +301,8 @@ impl BatchSubmitter {
                 (None, anchor_mode, current_l1_block)
             };
         let recent_tempo_block_number = anchor_mode.recent_block_number();
+        // EIP-2935 exposes hash(N) starting in N+1. A transaction built after observing head N
+        // cannot land before N+1, so anchoring to the current tip is valid at execution time.
         let anchors_to_current_tip =
             anchor_mode.anchor_block_number(batch.tempo_block_number) == current_l1_block;
 
@@ -392,6 +378,8 @@ impl BatchSubmitter {
             .nonce(nonce)
             .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
             .max_priority_fee_per_gas(0);
+        // Estimation against state N cannot see hash(N), although execution in N+1 can. If this
+        // send does not settle, a retry after the head advances uses normal estimation.
         if anchors_to_current_tip {
             submission = submission.gas(CURRENT_TIP_SUBMIT_BATCH_GAS_LIMIT);
         }
@@ -1252,6 +1240,22 @@ impl fmt::Display for AnchorMode {
             Self::Ancestry { .. } => f.write_str("ancestry"),
         }
     }
+}
+
+fn validate_certificate_anchor(
+    anchor_block_number: u64,
+    current_l1_block: u64,
+    history_window: u64,
+) -> Result<()> {
+    eyre::ensure!(
+        anchor_block_number <= current_l1_block,
+        "certificate anchor block is ahead of the current L1 tip"
+    );
+    eyre::ensure!(
+        current_l1_block.saturating_sub(anchor_block_number) < history_window,
+        "certificate anchor block fell outside the EIP-2935 history window"
+    );
+    Ok(())
 }
 
 /// Merge cached and fetched headers into one validated ancestry range.
