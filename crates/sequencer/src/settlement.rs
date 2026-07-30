@@ -56,6 +56,14 @@ const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
 /// the block falls out of the window between our check and on-chain execution.
 const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 
+/// Gas limit used only when settlement anchors to the observed L1 head.
+///
+/// `eth_estimateGas` executes against that head before EIP-2935 has stored its hash, so the portal
+/// reports `InvalidTempoBlockNumber`. The transaction itself can only land in a successor block,
+/// where the system call has stored the observed head's hash. `submitBatch` has at most eight
+/// certificate signatures, so this leaves conservative headroom without consuming a full block.
+const CURRENT_TIP_SUBMIT_BATCH_GAS_LIMIT: u64 = 2_000_000;
+
 /// Maximum number of encoded L1 headers retained between ancestry submissions.
 ///
 /// At roughly 600 bytes per header, this caps payload storage near 150 MiB plus
@@ -128,6 +136,22 @@ impl Default for BatchAnchorConfig {
             safety_margin: DEFAULT_EIP2935_SAFETY_MARGIN,
         }
     }
+}
+
+fn validate_certificate_anchor(
+    anchor_block_number: u64,
+    current_l1_block: u64,
+    history_window: u64,
+) -> Result<()> {
+    eyre::ensure!(
+        anchor_block_number <= current_l1_block,
+        "certificate anchor block is ahead of the current L1 tip"
+    );
+    eyre::ensure!(
+        current_l1_block.saturating_sub(anchor_block_number) < history_window,
+        "certificate anchor block fell outside the EIP-2935 history window"
+    );
+    Ok(())
 }
 
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
@@ -293,6 +317,8 @@ impl BatchSubmitter {
                 (None, anchor_mode, current_l1_block)
             };
         let recent_tempo_block_number = anchor_mode.recent_block_number();
+        let anchors_to_current_tip =
+            anchor_mode.anchor_block_number(batch.tempo_block_number) == current_l1_block;
 
         let signatures = if let Some(certificate) = &certificate {
             certificate.signatures.clone()
@@ -345,31 +371,37 @@ impl BatchSubmitter {
             batch_prev_block_hash = %batch.prev_block_hash,
             nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             nonce,
+            gas_limit = anchors_to_current_tip.then_some(CURRENT_TIP_SUBMIT_BATCH_GAS_LIMIT),
             "Submitting batch to ZonePortal on L1"
         );
 
-        let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.portal
-                .submitBatch(
-                    batch.tempo_block_number,
-                    recent_tempo_block_number,
-                    block_transition,
-                    deposit_transition,
-                    batch.withdrawal_queue_hash,
-                    verifier_config,
-                    Bytes::new(),
-                    U256::from(batch.zone_height),
-                    signatures,
-                )
-                .nonce_key(SUBMIT_BATCH_NONCE_KEY)
-                .nonce(nonce)
-                .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                .max_priority_fee_per_gas(0)
-                .send_sync(),
-        )
-        .await
-        .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))??;
+        let mut submission = self
+            .portal
+            .submitBatch(
+                batch.tempo_block_number,
+                recent_tempo_block_number,
+                block_transition,
+                deposit_transition,
+                batch.withdrawal_queue_hash,
+                verifier_config,
+                Bytes::new(),
+                U256::from(batch.zone_height),
+                signatures,
+            )
+            .nonce_key(SUBMIT_BATCH_NONCE_KEY)
+            .nonce(nonce)
+            .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
+            .max_priority_fee_per_gas(0);
+        if anchors_to_current_tip {
+            submission = submission.gas(CURRENT_TIP_SUBMIT_BATCH_GAS_LIMIT);
+        }
+
+        let receipt =
+            tokio::time::timeout(std::time::Duration::from_secs(30), submission.send_sync())
+                .await
+                .map_err(|_| {
+                    eyre::eyre!("submitBatch sync submission timed out after 30 seconds")
+                })??;
 
         let tx_hash = receipt.transaction_hash();
         if !receipt.status() {
@@ -669,15 +701,11 @@ impl BatchSubmitter {
         );
 
         let current_l1_block = self.l1_provider.get_block_number().await?;
-        eyre::ensure!(
-            attestation.anchorBlockNumber < current_l1_block,
-            "certificate anchor block is not yet available through EIP-2935"
-        );
-        eyre::ensure!(
-            current_l1_block.saturating_sub(attestation.anchorBlockNumber)
-                < self.anchor_config.history_window(),
-            "certificate anchor block fell outside the EIP-2935 history window"
-        );
+        validate_certificate_anchor(
+            attestation.anchorBlockNumber,
+            current_l1_block,
+            self.anchor_config.history_window(),
+        )?;
 
         let anchor = self
             .l1_provider
@@ -719,7 +747,7 @@ impl BatchSubmitter {
     async fn resolve_anchor_mode(&self, tempo_block_number: u64) -> Result<(AnchorMode, u64)> {
         let current_l1_block = self.l1_provider.get_block_number().await?;
 
-        if tempo_block_number >= current_l1_block {
+        if tempo_block_number > current_l1_block {
             return Err(eyre::eyre!(
                 "tempo_block_number ({tempo_block_number}) is not yet confirmed on L1 \
                  (tip={current_l1_block}), will retry after L1 advances"
@@ -1973,7 +2001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anchor_resolution_returns_observed_l1_tip() {
+    async fn anchor_resolution_accepts_observed_l1_tip() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
@@ -1981,11 +2009,54 @@ mod tests {
         let submitter = BatchSubmitter::new(Address::ZERO, provider);
 
         asserter.push_success(&100_u64);
-        let (mode, current_l1_block) = submitter.resolve_anchor_mode(99).await.unwrap();
+        let (mode, current_l1_block) = submitter.resolve_anchor_mode(100).await.unwrap();
 
         assert!(matches!(mode, AnchorMode::Direct));
         assert_eq!(current_l1_block, 100);
         assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anchor_resolution_rejects_future_l1_block() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::ZERO, provider);
+
+        asserter.push_success(&100_u64);
+        let err = match submitter.resolve_anchor_mode(101).await {
+            Ok(_) => panic!("future L1 anchor was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("tempo_block_number (101) is not yet confirmed on L1 (tip=100)")
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn certificate_anchor_validation_accepts_tip_and_rejects_future() {
+        validate_certificate_anchor(100, 100, 10).unwrap();
+
+        let err = validate_certificate_anchor(101, 100, 10).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("certificate anchor block is ahead of the current L1 tip")
+        );
+    }
+
+    #[test]
+    fn certificate_anchor_validation_preserves_history_window() {
+        validate_certificate_anchor(91, 100, 10).unwrap();
+
+        let err = validate_certificate_anchor(90, 100, 10).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("certificate anchor block fell outside the EIP-2935 history window")
+        );
     }
 
     #[tokio::test]
