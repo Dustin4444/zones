@@ -1,6 +1,6 @@
 use super::*;
-use alloy_trie::{Nibbles, proof};
 use eyre::WrapErr as _;
+use reth_trie_common::AccountProof;
 use std::collections::BTreeMap;
 use tempo_contracts::precompiles::TIP403_REGISTRY_ADDRESS;
 
@@ -678,6 +678,7 @@ impl L1Subscriber {
                         block,
                         header_resp.state_root(),
                         &tracked_accounts,
+                        metrics,
                     ),
                 );
 
@@ -902,7 +903,9 @@ async fn fetch_and_verify_storage_roots<P: Provider<TempoNetwork>>(
     block: NumHash,
     state_root: B256,
     accounts: &[Address],
+    metrics: &crate::metrics::L1SubscriberMetrics,
 ) -> eyre::Result<impl Iterator<Item = (Address, Option<B256>)> + use<P>> {
+    let started_at = std::time::Instant::now();
     let tasks = accounts.iter().map(|&address| async move {
         match provider
             .get_proof(address, Vec::new())
@@ -923,7 +926,11 @@ async fn fetch_and_verify_storage_roots<P: Provider<TempoNetwork>>(
             }
         }
     });
-    Ok(futures::future::try_join_all(tasks).await?.into_iter())
+    let result = futures::future::try_join_all(tasks).await;
+    metrics
+        .account_proof_fetch_duration_seconds
+        .record(started_at.elapsed().as_secs_f64());
+    Ok(result?.into_iter())
 }
 
 fn verify_account_storage_root(
@@ -937,22 +944,9 @@ fn verify_account_storage_root(
         proof.address,
     );
 
-    let expected_account = (!proof.is_empty()).then(|| {
-        alloy_rlp::encode(alloy_consensus::TrieAccount {
-            nonce: proof.nonce,
-            balance: proof.balance,
-            storage_root: proof.storage_hash,
-            code_hash: proof.code_hash,
-        })
-    });
-
-    proof::verify_proof(
-        state_root,
-        Nibbles::unpack(keccak256(address)),
-        expected_account,
-        &proof.account_proof,
-    )
-    .map_err(|err| eyre::eyre!("invalid proof for {address} against {state_root}: {err}"))?;
+    AccountProof::from_eip1186_proof(proof.clone())
+        .verify(state_root)
+        .map_err(|err| eyre::eyre!("invalid proof for {address} against {state_root}: {err}"))?;
 
     Ok(proof.storage_hash)
 }
@@ -1020,7 +1014,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Bytes, U256, address};
     use alloy_rlp::Encodable as _;
-    use alloy_trie::nodes::LeafNode;
+    use alloy_trie::{Nibbles, nodes::LeafNode};
 
     #[test]
     fn account_storage_root_is_authenticated_by_the_header_state_root() {

@@ -126,8 +126,11 @@ using Tempo's upstream policy implementation over anchored raw L1 state:
    the block-versioned `L1StateCache`, falling back to an exact-block L1 RPC
    read and caching the result. The L1 subscriber verifies ZonePortal and
    TIP-403 account proofs against each finalized header before reusing values
-   across block heights. Tempo/Reth RPC nodes must configure a historical proof
-   window with `--rpc.eth-proof-window <blocks>` that covers the finalized lag.
+   across block heights. On restart, proof fetching resumes at the L1 block after
+   the latest persisted zone checkpoint; there is no fixed maximum lookback.
+   Tempo/Reth RPC nodes must therefore set `--rpc.eth-proof-window <blocks>` to
+   cover the maximum expected finalized-head distance from that checkpoint
+   (including the longest expected zone downtime).
 2. **L1OverlayDB** — composes ordinary zone EVM storage with the raw L1
    reader at the exact finalized block recorded in `TempoState`. TIP-403
    registry state and each token's L1-owned transfer-policy field come from L1;
