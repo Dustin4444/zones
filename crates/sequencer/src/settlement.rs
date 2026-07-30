@@ -23,18 +23,22 @@
 //! configured direct window by falling back to ancestry mode — a recent anchor
 //! block plus a locally validated parent-hash header chain.
 
-use std::{collections::BTreeMap, fmt, sync::OnceLock};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::OnceLock};
 
 use crate::{
     ZoneSequencerProvider,
     abi::{self, BlockTransition, DepositQueueTransition, IZoneInbox, IZoneOutbox, ZonePortal},
     attestation::{AttestationStore, SettlementAttestation, SettlementCertificate},
+    pending_submission::PendingCombinedSubmissionStore,
 };
-use alloy_consensus::{Transaction, TxReceipt as _, transaction::TxHashRef as _};
+use alloy_consensus::{
+    Transaction, TxReceipt as _,
+    transaction::{SignerRecoverable as _, TxHashRef as _},
+};
 use alloy_eips::BlockHashOrNumber;
-use alloy_network::ReceiptResponse;
+use alloy_network::{EthereumWallet, NetworkWallet, ReceiptResponse};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_provider::{DynProvider, Provider};
+use alloy_provider::{DynProvider, PendingTransactionBuilder, Provider};
 use alloy_rlp::Encodable;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -43,11 +47,18 @@ use eyre::{OptionExt as _, Result};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use schnellru::{ByLength, LruMap};
-use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderExt, rpc::TempoCallBuilderExt};
-use tempo_primitives::{Block, TempoReceipt};
+use tempo_alloy::{
+    TempoNetwork,
+    provider::ext::TempoProviderExt,
+    rpc::{TempoCallBuilderExt, TempoTransactionReceipt, TempoTransactionRequest},
+};
+use tempo_primitives::{Block, TempoReceipt, TempoTxEnvelope, transaction::Call};
 use tracing::{info, instrument, warn};
 
-use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
+use crate::{
+    nonce_keys::SUBMIT_BATCH_NONCE_KEY,
+    withdrawals::{CombinedWithdrawalPlan, TEMPO_TRANSACTION_GAS_LIMIT, plan_combined_withdrawals},
+};
 
 /// EIP-2935 stores the last 8192 block hashes, so the usable window is 8191 blocks.
 const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
@@ -62,6 +73,9 @@ const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 /// map overhead while covering more than the current Zone E recovery gap.
 const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
 
+/// Maximum wait for one combined-transaction receipt before the retry loop resumes the exact hash.
+const COMBINED_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
 pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
 
@@ -69,6 +83,11 @@ pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
 ///
 /// Native Zone reads no longer use this limit; it remains the bound for L1 portal log recovery.
 pub(crate) const LOG_QUERY_BLOCK_CHUNK: u64 = 5_000;
+
+/// A newly enqueued withdrawal slot is guaranteed to become the head only when the queue is empty.
+const fn queue_allows_combined_submission(head: u64, tail: u64) -> bool {
+    head == tail
+}
 
 /// EIP-2935 anchor limits used by the batch submitter.
 ///
@@ -130,6 +149,123 @@ impl Default for BatchAnchorConfig {
     }
 }
 
+/// L1 transaction shape used for a successful batch submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSubmissionMode {
+    /// `submitBatch` was the transaction's only portal call. Any enqueued withdrawals remain for
+    /// the standalone withdrawal processor.
+    SubmitOnly,
+    /// `submitBatch` and whole-slot `processWithdrawals` ran as ordered calls in one Tempo AA
+    /// transaction.
+    SubmitAndProcessWithdrawals,
+}
+
+impl fmt::Display for BatchSubmissionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SubmitOnly => f.write_str("submit-only"),
+            Self::SubmitAndProcessWithdrawals => f.write_str("submit-and-process-withdrawals"),
+        }
+    }
+}
+
+/// Confirmed L1 batch submission and its same-transaction withdrawal accounting.
+#[derive(Debug, Clone)]
+pub struct BatchSubmissionReceipt {
+    /// `BatchSubmitted` decoded from the confirmed receipt.
+    pub event: ZonePortal::BatchSubmitted,
+    /// Whether the receipt came from one or two ordered portal calls.
+    pub mode: BatchSubmissionMode,
+    /// Confirmed L1 transaction hash.
+    pub transaction_hash: B256,
+    /// Number of `WithdrawalProcessed` events emitted by the combined second call.
+    pub withdrawals_processed: usize,
+}
+
+/// A failed batch-submission attempt, including whether an atomic two-call transaction was sent.
+///
+/// The monitor uses this bit to retry submit-only after an ambiguous or reverted combined send.
+/// Preparation failures and submit-only failures leave the fast path eligible for the next retry.
+#[derive(Debug)]
+pub struct BatchSubmissionError {
+    source: eyre::Report,
+    combined_transaction_hash: Option<B256>,
+    combined_fallback_safe: bool,
+}
+
+impl BatchSubmissionError {
+    /// Hash of the deterministic atomic request when it may already be known to L1.
+    pub const fn combined_transaction_hash(&self) -> Option<B256> {
+        self.combined_transaction_hash
+    }
+
+    /// Whether the combined transaction is confirmed reverted, so a different transaction may
+    /// safely use the next committed settlement-lane nonce.
+    pub const fn combined_fallback_safe(&self) -> bool {
+        self.combined_fallback_safe
+    }
+
+    /// Underlying report retained for provider-specific revert decoding.
+    pub const fn report(&self) -> &eyre::Report {
+        &self.source
+    }
+}
+
+impl fmt::Display for BatchSubmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for BatchSubmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug, Default)]
+struct CombinedAttemptState {
+    transaction_hash: Option<B256>,
+    fallback_safe: bool,
+}
+
+struct BatchSubmissionOptions<'a> {
+    withdrawals: &'a [abi::Withdrawal],
+    max_withdrawal_batch_gas: u64,
+    allow_combined: bool,
+    validate_withdrawals: bool,
+}
+
+#[derive(Debug)]
+struct PreparedCombinedSubmission {
+    request: TempoTransactionRequest,
+    envelope: TempoTxEnvelope,
+    transaction_hash: B256,
+}
+
+#[derive(Debug)]
+struct DecodedCombinedSubmission {
+    envelope: TempoTxEnvelope,
+    transaction_hash: B256,
+    signer: Address,
+    nonce: u64,
+    submit: ZonePortal::submitBatchCall,
+    process: ZonePortal::processWithdrawalsCall,
+}
+
+#[derive(Debug)]
+enum CombinedTransactionOutcome {
+    Receipt(Box<TempoTransactionReceipt>),
+    NonceConsumedWithoutReceipt,
+}
+
+#[derive(Debug)]
+enum WithdrawalReceiptEvent {
+    Processed(ZonePortal::WithdrawalProcessed),
+    DepositBounceBack(ZonePortal::DepositBounceBack),
+    DepositBounceBackPending(ZonePortal::DepositBounceBackPending),
+}
+
 /// Submits zone batches to the ZonePortal contract on Tempo L1.
 ///
 /// Holds a contract instance pointing at the portal, backed by a shared
@@ -154,6 +290,8 @@ pub struct BatchSubmitter {
     anchor_config: BatchAnchorConfig,
     /// Signatures from followers attesting to the batch.
     attestation_store: Option<AttestationStore>,
+    /// Exact signed combined envelope, persisted before broadcast and retained until finality.
+    combined_submission_store: Option<PendingCombinedSubmissionStore>,
     /// Validated, RLP-encoded L1 headers retained across overlapping ancestry
     /// requests. Settlement batches are submitted in order, so later requests
     /// can reuse almost the entire preceding range.
@@ -212,6 +350,7 @@ impl BatchSubmitter {
             l1_fetch_concurrency: 16,
             anchor_config,
             attestation_store: None,
+            combined_submission_store: None,
             ancestry_header_cache: RwLock::new(LruMap::new(ByLength::new(
                 DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY,
             ))),
@@ -221,6 +360,25 @@ impl BatchSubmitter {
     /// Attach the shared store populated by leader and follower settlement signatures.
     pub fn set_attestation_store(&mut self, store: Option<AttestationStore>) {
         self.attestation_store = store;
+    }
+
+    /// Configure the durable singleton used for exact-envelope combined settlement recovery.
+    pub fn set_combined_submission_store_path(
+        &mut self,
+        path: PathBuf,
+        durable_root: PathBuf,
+    ) -> Result<()> {
+        self.combined_submission_store =
+            Some(PendingCombinedSubmissionStore::new(path, durable_root)?);
+        Ok(())
+    }
+
+    /// Whether a signed combined envelope is durably pending.
+    pub fn has_pending_combined_submission(&self) -> Result<bool> {
+        match &self.combined_submission_store {
+            Some(store) => store.exists(),
+            None => Ok(false),
+        }
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -236,7 +394,34 @@ impl BatchSubmitter {
     /// `verifierConfig` and `proof` are empty until real proof generation is
     /// implemented.
     ///
-    /// Returns the `BatchSubmitted` event decoded from the confirmed receipt.
+    /// This compatibility entry point preserves submit-only behavior for callers that do not have
+    /// the withdrawal payloads. Sequencer code should use
+    /// [`Self::submit_batch_with_withdrawals`] so it can select the atomic fast path.
+    pub async fn submit_batch(&self, batch: &BatchData) -> Result<ZonePortal::BatchSubmitted> {
+        let mut combined_attempt = CombinedAttemptState::default();
+        self.submit_batch_inner(
+            batch,
+            BatchSubmissionOptions {
+                withdrawals: &[],
+                max_withdrawal_batch_gas: 0,
+                allow_combined: false,
+                validate_withdrawals: false,
+            },
+            &mut combined_attempt,
+        )
+        .await
+        .map(|receipt| receipt.event)
+    }
+
+    /// Submit a batch with the exact withdrawal payloads available for receipt reconciliation.
+    ///
+    /// When `allow_combined` is true, a non-empty withdrawal slot may be processed in the same
+    /// atomic Tempo AA transaction. The fast path is used only when the portal queue is freshly
+    /// observed empty, the payload hash matches the submitted commitment, and the complete slot
+    /// fits one planner-bounded call.
+    ///
+    /// Returns the decoded `BatchSubmitted` event together with transaction-mode and withdrawal
+    /// receipt accounting.
     // TODO: pass real proof bytes once proof generation is implemented.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
@@ -246,7 +431,86 @@ impl BatchSubmitter {
         withdrawal_queue_hash = %batch.withdrawal_queue_hash,
         withdrawal_batch_index = batch.withdrawal_batch_index,
     ))]
-    pub async fn submit_batch(&self, batch: &BatchData) -> Result<ZonePortal::BatchSubmitted> {
+    pub async fn submit_batch_with_withdrawals(
+        &self,
+        batch: &BatchData,
+        withdrawals: &[abi::Withdrawal],
+        max_withdrawal_batch_gas: u64,
+        allow_combined: bool,
+    ) -> std::result::Result<BatchSubmissionReceipt, BatchSubmissionError> {
+        let mut combined_attempt = CombinedAttemptState::default();
+        self.submit_batch_inner(
+            batch,
+            BatchSubmissionOptions {
+                withdrawals,
+                max_withdrawal_batch_gas,
+                allow_combined,
+                validate_withdrawals: true,
+            },
+            &mut combined_attempt,
+        )
+        .await
+        .map_err(|source| BatchSubmissionError {
+            source,
+            combined_transaction_hash: combined_attempt.transaction_hash,
+            combined_fallback_safe: combined_attempt.fallback_safe,
+        })
+    }
+
+    async fn submit_batch_inner(
+        &self,
+        batch: &BatchData,
+        options: BatchSubmissionOptions<'_>,
+        combined_attempt: &mut CombinedAttemptState,
+    ) -> Result<BatchSubmissionReceipt> {
+        let BatchSubmissionOptions {
+            withdrawals,
+            max_withdrawal_batch_gas,
+            allow_combined,
+            validate_withdrawals,
+        } = options;
+        if let Some(receipt) = self
+            .resume_persisted_combined_submission(batch, withdrawals, combined_attempt)
+            .await?
+        {
+            return Ok(receipt);
+        }
+
+        let combined_plan = if validate_withdrawals {
+            plan_combined_withdrawals(
+                withdrawals,
+                batch.withdrawal_queue_hash,
+                max_withdrawal_batch_gas,
+            )?
+        } else {
+            Err(crate::withdrawals::CombinedWithdrawalFallback::NoWithdrawals)
+        };
+        let combined_plan = match combined_plan {
+            Ok(plan) if allow_combined && self.combined_submission_store.is_some() => Some(plan),
+            Ok(_) if allow_combined => {
+                info!(
+                    withdrawal_count = withdrawals.len(),
+                    "Durable combined-submission storage is unavailable; using submit-only path"
+                );
+                None
+            }
+            Ok(_) => {
+                info!(
+                    withdrawal_count = withdrawals.len(),
+                    "Combined settlement fast path disabled for this retry"
+                );
+                None
+            }
+            Err(reason) => {
+                info!(
+                    withdrawal_count = withdrawals.len(),
+                    fallback_reason = %reason,
+                    "Using submit-only settlement path"
+                );
+                None
+            }
+        };
+
         let block_transition = BlockTransition {
             prevBlockHash: batch.prev_block_hash,
             nextBlockHash: batch.next_block_hash,
@@ -330,13 +594,101 @@ impl BatchSubmitter {
         // Refetch the committed lane nonce for every submission attempt. The provider's
         // process-local nonce cache advances before a send is known to have succeeded, so
         // relying on it after a failed send can create an unfillable 2D-nonce gap.
-        let submission_address = signer
-            .ok_or_eyre("batch submission requires the local sequencer signer")?
-            .address();
+        let submission_signer =
+            signer.ok_or_eyre("batch submission requires the local sequencer signer")?;
+        let submission_address = submission_signer.address();
         let nonce = self
             .l1_provider
             .get_transaction_count_with_nonce_key(submission_address, SUBMIT_BATCH_NONCE_KEY)
             .await?;
+
+        let combined_submission = if let Some(plan) = combined_plan {
+            let request = Self::build_combined_submission_request(
+                self.portal_address,
+                submission_address,
+                metadata.stable.chain_id,
+                nonce,
+                plan,
+                ZonePortal::submitBatchCall {
+                    tempoBlockNumber: batch.tempo_block_number,
+                    recentTempoBlockNumber: recent_tempo_block_number,
+                    blockTransition: block_transition.clone(),
+                    depositQueueTransition: deposit_transition.clone(),
+                    withdrawalQueueHash: batch.withdrawal_queue_hash,
+                    verifierConfig: verifier_config.clone(),
+                    proof: Bytes::new(),
+                    nextZoneHeight: U256::from(batch.zone_height),
+                    signatures: signatures.clone(),
+                }
+                .abi_encode()
+                .into(),
+                withdrawals,
+            );
+            let prepared = Self::prepare_combined_submission(submission_signer, request).await?;
+
+            // Queue bounds are refreshed immediately before first broadcast. A transaction can
+            // still race this read, but the ordered second call then reverts the whole AA
+            // transaction. Only a confirmed revert permits submit-only fallback.
+            let (queue_head, queue_tail) = self.read_withdrawal_queue_bounds().await?;
+            if !queue_allows_combined_submission(queue_head, queue_tail) {
+                info!(
+                    queue_head,
+                    queue_tail,
+                    pending_slots = queue_tail.saturating_sub(queue_head),
+                    "Withdrawal backlog disables combined settlement fast path"
+                );
+                None
+            } else {
+                match self
+                    .l1_provider
+                    .estimate_gas(prepared.request.clone())
+                    .await
+                {
+                    Ok(estimated_gas) if estimated_gas <= plan.gas_limit => {
+                        let store = self.combined_submission_store.as_ref().ok_or_eyre(
+                            "combined submission selected without durable envelope storage",
+                        )?;
+                        store.persist(&prepared.envelope)?;
+                        combined_attempt.transaction_hash = Some(prepared.transaction_hash);
+                        info!(
+                            queue_head,
+                            withdrawal_count = withdrawals.len(),
+                            planned_gas = plan.gas_limit,
+                            estimated_gas,
+                            transaction_hash = %prepared.transaction_hash,
+                            anchor_mode = %anchor_mode,
+                            "Combined settlement transaction passed gas preflight and was persisted"
+                        );
+                        Some(prepared)
+                    }
+                    Ok(estimated_gas) => {
+                        warn!(
+                            withdrawal_count = withdrawals.len(),
+                            planned_gas = plan.gas_limit,
+                            estimated_gas,
+                            "Combined settlement estimate exceeds its gas budget; falling back to submit-only"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            withdrawal_count = withdrawals.len(),
+                            planned_gas = plan.gas_limit,
+                            %error,
+                            "Combined settlement preflight failed; falling back to submit-only"
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let submission_mode = if combined_submission.is_some() {
+            BatchSubmissionMode::SubmitAndProcessWithdrawals
+        } else {
+            BatchSubmissionMode::SubmitOnly
+        };
 
         info!(
             anchor_mode = %anchor_mode,
@@ -345,53 +697,692 @@ impl BatchSubmitter {
             batch_prev_block_hash = %batch.prev_block_hash,
             nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             nonce,
+            submission_mode = %submission_mode,
+            withdrawals_in_same_transaction =
+                matches!(submission_mode, BatchSubmissionMode::SubmitAndProcessWithdrawals),
             "Submitting batch to ZonePortal on L1"
         );
 
-        let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.portal
-                .submitBatch(
-                    batch.tempo_block_number,
-                    recent_tempo_block_number,
-                    block_transition,
-                    deposit_transition,
-                    batch.withdrawal_queue_hash,
-                    verifier_config,
-                    Bytes::new(),
-                    U256::from(batch.zone_height),
-                    signatures,
+        let receipt = if let Some(prepared) = combined_submission {
+            match self
+                .send_or_resume_combined(
+                    prepared.envelope,
+                    prepared.transaction_hash,
+                    submission_address,
+                    nonce,
+                    combined_attempt,
                 )
-                .nonce_key(SUBMIT_BATCH_NONCE_KEY)
-                .nonce(nonce)
-                .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                .max_priority_fee_per_gas(0)
-                .send_sync(),
-        )
-        .await
-        .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))??;
+                .await?
+            {
+                CombinedTransactionOutcome::Receipt(receipt) => *receipt,
+                CombinedTransactionOutcome::NonceConsumedWithoutReceipt => {
+                    self.clear_pending_combined_submission(prepared.transaction_hash)?;
+                    return Err(eyre::eyre!(
+                        "settlement nonce {nonce} was consumed without a receipt for persisted combined transaction {}",
+                        prepared.transaction_hash
+                    ));
+                }
+            }
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.portal
+                    .submitBatch(
+                        batch.tempo_block_number,
+                        recent_tempo_block_number,
+                        block_transition,
+                        deposit_transition,
+                        batch.withdrawal_queue_hash,
+                        verifier_config,
+                        Bytes::new(),
+                        U256::from(batch.zone_height),
+                        signatures,
+                    )
+                    .nonce_key(SUBMIT_BATCH_NONCE_KEY)
+                    .nonce(nonce)
+                    .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
+                    .max_priority_fee_per_gas(0)
+                    .send_sync(),
+            )
+            .await
+            .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))??
+        };
 
         let tx_hash = receipt.transaction_hash();
         if !receipt.status() {
+            if matches!(
+                submission_mode,
+                BatchSubmissionMode::SubmitAndProcessWithdrawals
+            ) {
+                combined_attempt.transaction_hash = Some(tx_hash);
+                self.clear_pending_combined_submission(tx_hash)?;
+                combined_attempt.fallback_safe = true;
+            }
             return Err(eyre::eyre!(
-                "submitBatch tx {tx_hash} was included but reverted on L1"
+                "{submission_mode} transaction {tx_hash} was included but reverted on L1"
             ));
         }
 
         let event = self.decode_batch_submitted(receipt.logs())?;
+        eyre::ensure!(
+            event.withdrawalQueueHash == batch.withdrawal_queue_hash,
+            "confirmed {submission_mode} receipt committed withdrawal hash {}, expected {}",
+            event.withdrawalQueueHash,
+            batch.withdrawal_queue_hash
+        );
+        eyre::ensure!(
+            event.withdrawalBatchIndex == batch.withdrawal_batch_index,
+            "confirmed {submission_mode} receipt used withdrawal batch index {}, expected {}",
+            event.withdrawalBatchIndex,
+            batch.withdrawal_batch_index
+        );
+        let withdrawals_processed =
+            self.verify_withdrawal_receipt(receipt.logs(), withdrawals, submission_mode)?;
 
         if let (Some(store), Some(_)) = (&self.attestation_store, &certificate) {
             store.remove_submitted(batch.zone_height);
+        }
+        if matches!(
+            submission_mode,
+            BatchSubmissionMode::SubmitAndProcessWithdrawals
+        ) {
+            self.clear_pending_combined_submission(tx_hash)?;
         }
 
         info!(
             %tx_hash,
             withdrawal_batch_index = event.withdrawalBatchIndex,
             withdrawal_queue_index = %event.withdrawalQueueIndex,
+            submission_mode = %submission_mode,
+            withdrawals_processed,
             "Batch submitted to L1"
         );
 
-        Ok(event)
+        Ok(BatchSubmissionReceipt {
+            event,
+            mode: submission_mode,
+            transaction_hash: tx_hash,
+            withdrawals_processed,
+        })
+    }
+
+    /// Build the ordered two-call Tempo request. `submitBatch` must remain call 0 so call 1 sees
+    /// the newly enqueued slot; the settlement nonce lane orders this transaction with every other
+    /// batch submission.
+    fn build_combined_submission_request(
+        portal_address: Address,
+        submission_address: Address,
+        chain_id: u64,
+        nonce: u64,
+        plan: CombinedWithdrawalPlan,
+        submit_batch_input: Bytes,
+        withdrawals: &[abi::Withdrawal],
+    ) -> TempoTransactionRequest {
+        let mut request = TempoTransactionRequest {
+            calls: vec![
+                Call {
+                    to: portal_address.into(),
+                    value: U256::ZERO,
+                    input: submit_batch_input,
+                },
+                Call {
+                    to: portal_address.into(),
+                    value: U256::ZERO,
+                    input: ZonePortal::processWithdrawalsCall {
+                        withdrawals: withdrawals.to_vec(),
+                        remainingQueue: plan.remaining_queue,
+                    }
+                    .abi_encode()
+                    .into(),
+                },
+            ],
+            nonce_key: Some(SUBMIT_BATCH_NONCE_KEY),
+            ..Default::default()
+        };
+        request.inner.from = Some(submission_address);
+        request.inner.chain_id = Some(chain_id);
+        request.inner.nonce = Some(nonce);
+        request.inner.gas = Some(plan.gas_limit);
+        request.inner.max_fee_per_gas = Some(crate::TEMPO_L1_MAX_FEE_PER_GAS);
+        request.inner.max_priority_fee_per_gas = Some(0);
+        request
+    }
+
+    /// Sign the complete AA request before it is durably persisted and broadcast.
+    async fn prepare_combined_submission(
+        signer: &PrivateKeySigner,
+        request: TempoTransactionRequest,
+    ) -> Result<PreparedCombinedSubmission> {
+        let wallet = EthereumWallet::from(signer.clone());
+        let envelope: TempoTxEnvelope =
+            <EthereumWallet as NetworkWallet<TempoNetwork>>::sign_request(&wallet, request.clone())
+                .await?;
+        let transaction_hash = *envelope.tx_hash();
+        Ok(PreparedCombinedSubmission {
+            request,
+            envelope,
+            transaction_hash,
+        })
+    }
+
+    /// Resolve a durable combined envelope before any mutable planner, certificate, or queue read.
+    async fn resume_persisted_combined_submission(
+        &self,
+        batch: &BatchData,
+        withdrawals: &[abi::Withdrawal],
+        combined_attempt: &mut CombinedAttemptState,
+    ) -> Result<Option<BatchSubmissionReceipt>> {
+        let Some(decoded) = self.load_pending_combined_submission().await? else {
+            return Ok(None);
+        };
+        combined_attempt.transaction_hash = Some(decoded.transaction_hash);
+
+        let outcome = self
+            .send_or_resume_combined(
+                decoded.envelope.clone(),
+                decoded.transaction_hash,
+                decoded.signer,
+                decoded.nonce,
+                combined_attempt,
+            )
+            .await?;
+        let receipt = match outcome {
+            CombinedTransactionOutcome::Receipt(receipt) => *receipt,
+            CombinedTransactionOutcome::NonceConsumedWithoutReceipt => {
+                self.clear_pending_combined_submission(decoded.transaction_hash)?;
+                return Err(eyre::eyre!(
+                    "settlement nonce {} was consumed without a receipt for persisted combined transaction {}",
+                    decoded.nonce,
+                    decoded.transaction_hash
+                ));
+            }
+        };
+
+        if !receipt.status() {
+            self.clear_pending_combined_submission(decoded.transaction_hash)?;
+            combined_attempt.fallback_safe =
+                Self::ensure_persisted_submission_matches_batch(&decoded, batch, withdrawals)
+                    .is_ok();
+            return Err(eyre::eyre!(
+                "persisted combined transaction {} was included but reverted on L1",
+                decoded.transaction_hash
+            ));
+        }
+
+        let submission = self.validate_persisted_combined_receipt(&receipt, &decoded)?;
+        let zone_height: u64 = decoded
+            .submit
+            .nextZoneHeight
+            .try_into()
+            .map_err(|_| eyre::eyre!("persisted combined zone height does not fit u64"))?;
+        if let Some(store) = &self.attestation_store {
+            store.remove_submitted(zone_height);
+        }
+        self.clear_pending_combined_submission(decoded.transaction_hash)?;
+        Self::ensure_persisted_submission_matches_batch(&decoded, batch, withdrawals)?;
+        eyre::ensure!(
+            submission.event.withdrawalBatchIndex == batch.withdrawal_batch_index,
+            "persisted combined receipt withdrawal batch index {} does not match local batch {}",
+            submission.event.withdrawalBatchIndex,
+            batch.withdrawal_batch_index
+        );
+        info!(
+            transaction_hash = %decoded.transaction_hash,
+            nonce = decoded.nonce,
+            "Resolved durable combined settlement transaction"
+        );
+        Ok(Some(submission))
+    }
+
+    /// Finish any durable combined envelope before the monitor derives its portal anchor.
+    ///
+    /// Startup blocks here until the exact transaction has a receipt (or its nonce is
+    /// definitively consumed), preventing a restart from constructing different calldata.
+    pub async fn recover_persisted_combined_submission(&self) -> Result<()> {
+        let Some(decoded) = self.load_pending_combined_submission().await? else {
+            return Ok(());
+        };
+        let mut combined_attempt = CombinedAttemptState {
+            transaction_hash: Some(decoded.transaction_hash),
+            fallback_safe: false,
+        };
+        let outcome = self
+            .send_or_resume_combined(
+                decoded.envelope.clone(),
+                decoded.transaction_hash,
+                decoded.signer,
+                decoded.nonce,
+                &mut combined_attempt,
+            )
+            .await?;
+
+        let receipt = match outcome {
+            CombinedTransactionOutcome::Receipt(receipt) => *receipt,
+            CombinedTransactionOutcome::NonceConsumedWithoutReceipt => {
+                self.clear_pending_combined_submission(decoded.transaction_hash)?;
+                warn!(
+                    transaction_hash = %decoded.transaction_hash,
+                    nonce = decoded.nonce,
+                    "Cleared durable combined transaction after its settlement nonce was consumed without an observable receipt"
+                );
+                return Ok(());
+            }
+        };
+
+        if !receipt.status() {
+            self.clear_pending_combined_submission(decoded.transaction_hash)?;
+            warn!(
+                transaction_hash = %decoded.transaction_hash,
+                nonce = decoded.nonce,
+                "Recovered durable combined transaction with a confirmed revert"
+            );
+            return Ok(());
+        }
+
+        let submission = self.validate_persisted_combined_receipt(&receipt, &decoded)?;
+        if let Some(store) = &self.attestation_store {
+            let zone_height: u64 = decoded
+                .submit
+                .nextZoneHeight
+                .try_into()
+                .map_err(|_| eyre::eyre!("persisted combined zone height does not fit u64"))?;
+            store.remove_submitted(zone_height);
+        }
+        self.clear_pending_combined_submission(decoded.transaction_hash)?;
+        info!(
+            transaction_hash = %decoded.transaction_hash,
+            nonce = decoded.nonce,
+            withdrawal_batch_index = submission.event.withdrawalBatchIndex,
+            withdrawals_processed = submission.withdrawals_processed,
+            "Recovered and reconciled durable combined settlement transaction"
+        );
+        Ok(())
+    }
+
+    async fn load_pending_combined_submission(&self) -> Result<Option<DecodedCombinedSubmission>> {
+        let Some(store) = &self.combined_submission_store else {
+            return Ok(None);
+        };
+        let Some(envelope) = store.load()? else {
+            return Ok(None);
+        };
+        let transaction_hash = *envelope.tx_hash();
+        let TempoTxEnvelope::AA(signed) = &envelope else {
+            return Err(eyre::eyre!(
+                "pending combined transaction {transaction_hash} is not a Tempo AA envelope"
+            ));
+        };
+        let signer = signed.recover_signer().map_err(|error| {
+            eyre::eyre!("failed recovering persisted transaction signer: {error}")
+        })?;
+        let expected_signer = self
+            .signer
+            .as_ref()
+            .ok_or_eyre("pending combined transaction recovery requires the local signer")?
+            .address();
+        eyre::ensure!(
+            signer == expected_signer,
+            "pending combined transaction signer {signer} does not match configured signer {expected_signer}"
+        );
+
+        let transaction = signed.tx();
+        let chain_id = self.l1_provider.get_chain_id().await?;
+        eyre::ensure!(
+            transaction.chain_id == chain_id,
+            "pending combined transaction chain {} does not match L1 chain {chain_id}",
+            transaction.chain_id
+        );
+        eyre::ensure!(
+            transaction.nonce_key == SUBMIT_BATCH_NONCE_KEY,
+            "pending combined transaction uses nonce key {}, expected {}",
+            transaction.nonce_key,
+            SUBMIT_BATCH_NONCE_KEY
+        );
+        eyre::ensure!(
+            transaction.gas_limit <= TEMPO_TRANSACTION_GAS_LIMIT,
+            "pending combined transaction gas {} exceeds Tempo cap {TEMPO_TRANSACTION_GAS_LIMIT}",
+            transaction.gas_limit
+        );
+        eyre::ensure!(
+            transaction.calls.len() == 2,
+            "pending combined transaction has {} calls, expected 2",
+            transaction.calls.len()
+        );
+        for (index, call) in transaction.calls.iter().enumerate() {
+            eyre::ensure!(
+                call.to == self.portal_address.into(),
+                "pending combined call {index} targets {:?}, expected {}",
+                call.to,
+                self.portal_address
+            );
+            eyre::ensure!(
+                call.value.is_zero(),
+                "pending combined call {index} transfers unexpected value {}",
+                call.value
+            );
+        }
+        let submit = ZonePortal::submitBatchCall::abi_decode(&transaction.calls[0].input)
+            .map_err(|error| eyre::eyre!("failed decoding persisted submitBatch call: {error}"))?;
+        let process = ZonePortal::processWithdrawalsCall::abi_decode(&transaction.calls[1].input)
+            .map_err(|error| {
+            eyre::eyre!("failed decoding persisted processWithdrawals call: {error}")
+        })?;
+        eyre::ensure!(
+            process.remainingQueue.is_zero(),
+            "persisted combined transaction must exhaust its withdrawal slot"
+        );
+        let reconstructed_hash = abi::Withdrawal::queue_hash(&process.withdrawals);
+        eyre::ensure!(
+            reconstructed_hash == submit.withdrawalQueueHash,
+            "persisted withdrawal payload hash {reconstructed_hash} does not match submitted hash {}",
+            submit.withdrawalQueueHash
+        );
+        let nonce = transaction.nonce;
+
+        Ok(Some(DecodedCombinedSubmission {
+            envelope,
+            transaction_hash,
+            signer,
+            nonce,
+            submit,
+            process,
+        }))
+    }
+
+    fn ensure_persisted_submission_matches_batch(
+        decoded: &DecodedCombinedSubmission,
+        batch: &BatchData,
+        withdrawals: &[abi::Withdrawal],
+    ) -> Result<()> {
+        let submit = &decoded.submit;
+        eyre::ensure!(
+            submit.tempoBlockNumber == batch.tempo_block_number
+                && submit.blockTransition.prevBlockHash == batch.prev_block_hash
+                && submit.blockTransition.nextBlockHash == batch.next_block_hash
+                && submit.depositQueueTransition.prevProcessedHash
+                    == batch.prev_processed_deposit_hash
+                && submit.depositQueueTransition.nextProcessedHash
+                    == batch.next_processed_deposit_hash
+                && submit.depositQueueTransition.prevDepositNumber == batch.prev_deposit_number
+                && submit.depositQueueTransition.nextDepositNumber == batch.next_deposit_number
+                && submit.withdrawalQueueHash == batch.withdrawal_queue_hash
+                && submit.nextZoneHeight == U256::from(batch.zone_height),
+            "persisted combined transaction {} does not match pending zone batch {}",
+            decoded.transaction_hash,
+            batch.zone_height
+        );
+        eyre::ensure!(
+            decoded.process.withdrawals == withdrawals,
+            "persisted combined transaction {} withdrawal payloads do not match pending zone batch {}",
+            decoded.transaction_hash,
+            batch.zone_height
+        );
+        Ok(())
+    }
+
+    fn validate_persisted_combined_receipt(
+        &self,
+        receipt: &TempoTransactionReceipt,
+        decoded: &DecodedCombinedSubmission,
+    ) -> Result<BatchSubmissionReceipt> {
+        let transaction_hash = receipt.transaction_hash();
+        eyre::ensure!(
+            transaction_hash == decoded.transaction_hash,
+            "combined receipt hash {transaction_hash} does not match persisted transaction {}",
+            decoded.transaction_hash
+        );
+        let event = self.decode_batch_submitted(receipt.logs())?;
+        eyre::ensure!(
+            event.nextBlockHash == decoded.submit.blockTransition.nextBlockHash
+                && event.nextProcessedDepositQueueHash
+                    == decoded.submit.depositQueueTransition.nextProcessedHash
+                && event.lastProcessedDepositNumber
+                    == decoded.submit.depositQueueTransition.nextDepositNumber
+                && event.withdrawalQueueHash == decoded.submit.withdrawalQueueHash,
+            "persisted combined receipt does not match the signed submitBatch call"
+        );
+        eyre::ensure!(
+            event.withdrawalQueueIndex != abi::NO_QUEUE_INDEX,
+            "persisted combined receipt emitted NO_QUEUE_INDEX for non-empty withdrawals"
+        );
+        let withdrawals_processed = self.verify_withdrawal_receipt(
+            receipt.logs(),
+            &decoded.process.withdrawals,
+            BatchSubmissionMode::SubmitAndProcessWithdrawals,
+        )?;
+        Ok(BatchSubmissionReceipt {
+            event,
+            mode: BatchSubmissionMode::SubmitAndProcessWithdrawals,
+            transaction_hash,
+            withdrawals_processed,
+        })
+    }
+
+    fn clear_pending_combined_submission(&self, transaction_hash: B256) -> Result<()> {
+        self.combined_submission_store
+            .as_ref()
+            .ok_or_eyre("combined transaction exists without durable envelope storage")?
+            .clear(transaction_hash)
+    }
+
+    /// Broadcast an already-persisted combined transaction, or resume waiting for its exact hash.
+    async fn send_or_resume_combined(
+        &self,
+        envelope: TempoTxEnvelope,
+        transaction_hash: B256,
+        signer: Address,
+        nonce: u64,
+        combined_attempt: &mut CombinedAttemptState,
+    ) -> Result<CombinedTransactionOutcome> {
+        combined_attempt.transaction_hash = Some(transaction_hash);
+        self.combined_submission_store
+            .as_ref()
+            .ok_or_eyre("combined transaction exists without durable envelope storage")?
+            .ensure_durable(transaction_hash)?;
+
+        if let Some(receipt) = self
+            .l1_provider
+            .get_transaction_receipt(transaction_hash)
+            .await?
+        {
+            return Ok(CombinedTransactionOutcome::Receipt(Box::new(receipt)));
+        }
+
+        let committed_nonce = self
+            .l1_provider
+            .get_transaction_count_with_nonce_key(signer, SUBMIT_BATCH_NONCE_KEY)
+            .await?;
+        if committed_nonce > nonce {
+            return Ok(CombinedTransactionOutcome::NonceConsumedWithoutReceipt);
+        }
+        eyre::ensure!(
+            committed_nonce == nonce,
+            "persisted combined transaction {transaction_hash} uses settlement nonce {nonce}, but L1 committed nonce is {committed_nonce}"
+        );
+
+        let already_known = self
+            .l1_provider
+            .get_transaction_by_hash(transaction_hash)
+            .await?
+            .is_some();
+        if !already_known {
+            match self.l1_provider.send_tx_envelope(envelope).await {
+                Ok(pending) => {
+                    eyre::ensure!(
+                        *pending.tx_hash() == transaction_hash,
+                        "combined settlement broadcast returned hash {}, expected {}",
+                        pending.tx_hash(),
+                        transaction_hash
+                    );
+                    info!(
+                        %transaction_hash,
+                        "Broadcast combined settlement transaction"
+                    );
+                }
+                Err(error) => {
+                    // The transport may have lost the response after L1 accepted the transaction.
+                    // Keep the known local hash and let the retry loop resume it.
+                    if let Some(receipt) = self
+                        .l1_provider
+                        .get_transaction_receipt(transaction_hash)
+                        .await?
+                    {
+                        return Ok(CombinedTransactionOutcome::Receipt(Box::new(receipt)));
+                    }
+                    if self
+                        .l1_provider
+                        .get_transaction_by_hash(transaction_hash)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(eyre::eyre!(
+                            "combined settlement broadcast for {transaction_hash} failed and the transaction is not yet observable: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let receipt_result =
+            PendingTransactionBuilder::new(self.l1_provider.root().clone(), transaction_hash)
+                .with_timeout(Some(COMBINED_RECEIPT_TIMEOUT))
+                .get_receipt()
+                .await;
+        match receipt_result {
+            Ok(receipt) => Ok(CombinedTransactionOutcome::Receipt(Box::new(receipt))),
+            Err(error) => {
+                if let Some(receipt) = self
+                    .l1_provider
+                    .get_transaction_receipt(transaction_hash)
+                    .await?
+                {
+                    return Ok(CombinedTransactionOutcome::Receipt(Box::new(receipt)));
+                }
+                let committed_nonce = self
+                    .l1_provider
+                    .get_transaction_count_with_nonce_key(signer, SUBMIT_BATCH_NONCE_KEY)
+                    .await?;
+                if committed_nonce > nonce {
+                    return Ok(CombinedTransactionOutcome::NonceConsumedWithoutReceipt);
+                }
+                Err(eyre::eyre!(
+                    "combined settlement transaction {transaction_hash} receipt unavailable after {} seconds: {error}",
+                    COMBINED_RECEIPT_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// Refresh just the FIFO bounds immediately before a possible combined send.
+    async fn read_withdrawal_queue_bounds(&self) -> Result<(u64, u64)> {
+        let (head, tail): (U256, U256) = self
+            .l1_provider
+            .multicall()
+            .add(self.portal.withdrawalQueueHead())
+            .add(self.portal.withdrawalQueueTail())
+            .aggregate()
+            .await?;
+        let head = head
+            .try_into()
+            .map_err(|_| eyre::eyre!("withdrawal queue head overflow"))?;
+        let tail = tail
+            .try_into()
+            .map_err(|_| eyre::eyre!("withdrawal queue tail overflow"))?;
+        eyre::ensure!(
+            head <= tail,
+            "inconsistent withdrawal queue bounds before submission: head {head}, tail {tail}"
+        );
+        Ok((head, tail))
+    }
+
+    /// Verify that one successful receipt contains an ordered terminal event for every supplied
+    /// withdrawal. Deposit bouncebacks use dedicated events instead of `WithdrawalProcessed`.
+    fn verify_withdrawal_receipt(
+        &self,
+        logs: &[alloy_rpc_types_eth::Log],
+        withdrawals: &[abi::Withdrawal],
+        mode: BatchSubmissionMode,
+    ) -> Result<usize> {
+        let events = logs
+            .iter()
+            .filter(|log| log.address() == self.portal_address)
+            .filter_map(|log| {
+                if let Ok(event) = ZonePortal::WithdrawalProcessed::decode_log(&log.inner) {
+                    return Some(WithdrawalReceiptEvent::Processed(event.data));
+                }
+                if let Ok(event) = ZonePortal::DepositBounceBack::decode_log(&log.inner) {
+                    return Some(WithdrawalReceiptEvent::DepositBounceBack(event.data));
+                }
+                if let Ok(event) = ZonePortal::DepositBounceBackPending::decode_log(&log.inner) {
+                    return Some(WithdrawalReceiptEvent::DepositBounceBackPending(event.data));
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+
+        if matches!(mode, BatchSubmissionMode::SubmitOnly) {
+            eyre::ensure!(
+                events.is_empty(),
+                "confirmed submit-only receipt unexpectedly emitted {} withdrawal terminal events",
+                events.len()
+            );
+            return Ok(0);
+        }
+
+        eyre::ensure!(
+            events.len() == withdrawals.len(),
+            "confirmed combined receipt emitted {} withdrawal terminal events, expected {}",
+            events.len(),
+            withdrawals.len()
+        );
+
+        for (index, (withdrawal, event)) in withdrawals.iter().zip(events).enumerate() {
+            match (withdrawal.fallbackNonce, event) {
+                (0, WithdrawalReceiptEvent::DepositBounceBack(event)) => {
+                    eyre::ensure!(
+                        event.tempoRefundRecipient == withdrawal.to
+                            && event.token == withdrawal.token
+                            && event.amount.checked_add(event.bouncebackFee)
+                                == Some(withdrawal.amount),
+                        "combined receipt deposit-bounceback event {index} does not match supplied withdrawal"
+                    );
+                }
+                (0, WithdrawalReceiptEvent::DepositBounceBackPending(event)) => {
+                    eyre::ensure!(
+                        event.tempoRefundRecipient == withdrawal.to
+                            && event.token == withdrawal.token
+                            && event.amount.checked_add(event.bouncebackFee)
+                                == Some(withdrawal.amount),
+                        "combined receipt pending deposit-bounceback event {index} does not match supplied withdrawal"
+                    );
+                }
+                (0, WithdrawalReceiptEvent::Processed(_)) => {
+                    return Err(eyre::eyre!(
+                        "combined receipt event {index} used WithdrawalProcessed for a deposit bounceback"
+                    ));
+                }
+                (_, WithdrawalReceiptEvent::Processed(event)) => {
+                    eyre::ensure!(
+                        event.to == withdrawal.to
+                            && event.senderTag == withdrawal.senderTag
+                            && event.token == withdrawal.token
+                            && event.amount == withdrawal.amount,
+                        "combined receipt WithdrawalProcessed event {index} does not match supplied withdrawal"
+                    );
+                }
+                (
+                    _,
+                    WithdrawalReceiptEvent::DepositBounceBack(_)
+                    | WithdrawalReceiptEvent::DepositBounceBackPending(_),
+                ) => {
+                    return Err(eyre::eyre!(
+                        "combined receipt event {index} used a deposit-bounceback event for a regular withdrawal"
+                    ));
+                }
+            }
+        }
+
+        Ok(withdrawals.len())
     }
 
     fn sign_settlement_attestation(
@@ -1654,15 +2645,15 @@ fn backward_log_query_start(hi: u64, floor: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::abi;
-    use alloy_consensus::Header as ConsensusHeader;
+    use alloy_consensus::{Header as ConsensusHeader, ReceiptWithBloom};
     use alloy_primitives::{B256, address};
     use alloy_provider::ProviderBuilder;
-    use alloy_rpc_types_eth::Header as RpcHeader;
+    use alloy_rpc_types_eth::{Header as RpcHeader, TransactionReceipt};
     use alloy_sol_types::SolValue;
     use alloy_transport::mock::Asserter;
     use proptest::prelude::*;
     use tempo_alloy::rpc::TempoHeaderResponse;
-    use tempo_primitives::TempoHeader;
+    use tempo_primitives::{TempoHeader, TempoTxType};
 
     fn abi_word(value: impl SolValue) -> Bytes {
         value.abi_encode().into()
@@ -1884,6 +2875,381 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    #[test]
+    fn combined_submission_requires_empty_fifo_queue() {
+        assert!(queue_allows_combined_submission(7, 7));
+        assert!(!queue_allows_combined_submission(7, 8));
+        assert!(!queue_allows_combined_submission(7, 10));
+    }
+
+    #[test]
+    fn combined_request_orders_calls_and_uses_settlement_nonce_lane() {
+        let portal = Address::repeat_byte(0x11);
+        let sender = Address::repeat_byte(0x22);
+        let withdrawal = test_withdrawal(Address::repeat_byte(0x33), 42);
+        let submit_input = Bytes::copy_from_slice(&ZonePortal::submitBatchCall::SELECTOR);
+        let request = BatchSubmitter::build_combined_submission_request(
+            portal,
+            sender,
+            42431,
+            9,
+            CombinedWithdrawalPlan {
+                gas_limit: 7_500_000,
+                remaining_queue: B256::ZERO,
+            },
+            submit_input.clone(),
+            std::slice::from_ref(&withdrawal),
+        );
+
+        assert_eq!(request.calls.len(), 2);
+        assert_eq!(request.calls[0].to, portal.into());
+        assert_eq!(request.calls[0].input, submit_input);
+        assert_eq!(request.calls[1].to, portal.into());
+        let process = ZonePortal::processWithdrawalsCall::abi_decode(&request.calls[1].input)
+            .expect("second call should decode as processWithdrawals");
+        assert_eq!(process.withdrawals, vec![withdrawal]);
+        assert_eq!(process.remainingQueue, B256::ZERO);
+        assert_eq!(request.nonce_key, Some(SUBMIT_BATCH_NONCE_KEY));
+        assert_eq!(request.inner.nonce, Some(9));
+        assert_eq!(request.inner.gas, Some(7_500_000));
+        assert_eq!(request.inner.chain_id, Some(42431));
+    }
+
+    #[tokio::test]
+    async fn combined_request_hash_is_deterministic_for_restart_recovery() {
+        let signer = PrivateKeySigner::random();
+        let request = BatchSubmitter::build_combined_submission_request(
+            Address::repeat_byte(0x11),
+            signer.address(),
+            42431,
+            9,
+            CombinedWithdrawalPlan {
+                gas_limit: 7_500_000,
+                remaining_queue: B256::ZERO,
+            },
+            Bytes::copy_from_slice(&ZonePortal::submitBatchCall::SELECTOR),
+            &[test_withdrawal(Address::repeat_byte(0x33), 42)],
+        );
+
+        let first = BatchSubmitter::prepare_combined_submission(&signer, request.clone())
+            .await
+            .unwrap();
+        let second = BatchSubmitter::prepare_combined_submission(&signer, request)
+            .await
+            .unwrap();
+
+        assert_eq!(first.transaction_hash, second.transaction_hash);
+        assert_eq!(first.envelope, second.envelope);
+    }
+
+    #[tokio::test]
+    async fn durable_combined_store_refuses_mutated_same_nonce_envelope() {
+        let signer = PrivateKeySigner::random();
+        let path = std::env::temp_dir().join(format!(
+            "zone-pending-combined-{}-{}.rlp",
+            std::process::id(),
+            signer.address()
+        ));
+        let store =
+            PendingCombinedSubmissionStore::new(path, std::env::temp_dir()).expect("valid store");
+        let first = BatchSubmitter::prepare_combined_submission(
+            &signer,
+            BatchSubmitter::build_combined_submission_request(
+                Address::repeat_byte(0x11),
+                signer.address(),
+                42431,
+                9,
+                CombinedWithdrawalPlan {
+                    gas_limit: 7_500_000,
+                    remaining_queue: B256::ZERO,
+                },
+                Bytes::from_static(&[0x01]),
+                &[test_withdrawal(Address::repeat_byte(0x33), 42)],
+            ),
+        )
+        .await
+        .unwrap();
+        let mutated = BatchSubmitter::prepare_combined_submission(
+            &signer,
+            BatchSubmitter::build_combined_submission_request(
+                Address::repeat_byte(0x11),
+                signer.address(),
+                42431,
+                9,
+                CombinedWithdrawalPlan {
+                    gas_limit: 7_500_000,
+                    remaining_queue: B256::ZERO,
+                },
+                Bytes::from_static(&[0x02]),
+                &[test_withdrawal(Address::repeat_byte(0x33), 42)],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let forced_error = store
+            .persist_with_after_link_hook(&first.envelope, || {
+                Err(eyre::eyre!("forced failure after canonical hard link"))
+            })
+            .unwrap_err();
+        assert!(forced_error.to_string().contains("forced failure"));
+        assert_eq!(
+            store.load().unwrap().unwrap().tx_hash(),
+            &first.transaction_hash
+        );
+
+        // The idempotent retry must repeat and complete the durability barrier before it can
+        // return success; a mutated same-nonce envelope still cannot replace the canonical link.
+        store.persist(&first.envelope).unwrap();
+        let error = store.persist(&mutated.envelope).unwrap_err();
+        assert!(error.to_string().contains("refusing to replace"));
+        assert_eq!(
+            store.load().unwrap().unwrap().tx_hash(),
+            &first.transaction_hash
+        );
+        store.clear(first.transaction_hash).unwrap();
+        assert!(!store.exists().unwrap());
+    }
+
+    #[tokio::test]
+    async fn durable_combined_envelope_restores_exact_batch_and_withdrawals() {
+        let signer = PrivateKeySigner::random();
+        let portal = Address::repeat_byte(0x11);
+        let withdrawal = test_withdrawal(Address::repeat_byte(0x33), 42);
+        let withdrawal_queue_hash = abi::Withdrawal::queue_hash(std::slice::from_ref(&withdrawal));
+        let batch = BatchData {
+            zone_height: 17,
+            tempo_block_number: 100,
+            prev_block_hash: B256::repeat_byte(0x41),
+            next_block_hash: B256::repeat_byte(0x42),
+            prev_processed_deposit_hash: B256::repeat_byte(0x51),
+            next_processed_deposit_hash: B256::repeat_byte(0x52),
+            prev_deposit_number: 3,
+            next_deposit_number: 5,
+            withdrawal_queue_hash,
+            withdrawal_batch_index: 7,
+        };
+        let request = BatchSubmitter::build_combined_submission_request(
+            portal,
+            signer.address(),
+            42431,
+            9,
+            CombinedWithdrawalPlan {
+                gas_limit: 7_500_000,
+                remaining_queue: B256::ZERO,
+            },
+            ZonePortal::submitBatchCall {
+                tempoBlockNumber: batch.tempo_block_number,
+                recentTempoBlockNumber: batch.tempo_block_number,
+                blockTransition: BlockTransition {
+                    prevBlockHash: batch.prev_block_hash,
+                    nextBlockHash: batch.next_block_hash,
+                },
+                depositQueueTransition: DepositQueueTransition {
+                    prevProcessedHash: batch.prev_processed_deposit_hash,
+                    nextProcessedHash: batch.next_processed_deposit_hash,
+                    prevDepositNumber: batch.prev_deposit_number,
+                    nextDepositNumber: batch.next_deposit_number,
+                },
+                withdrawalQueueHash: batch.withdrawal_queue_hash,
+                verifierConfig: Bytes::new(),
+                proof: Bytes::new(),
+                nextZoneHeight: U256::from(batch.zone_height),
+                signatures: vec![Bytes::from_static(&[0x01])],
+            }
+            .abi_encode()
+            .into(),
+            std::slice::from_ref(&withdrawal),
+        );
+        let prepared = BatchSubmitter::prepare_combined_submission(&signer, request)
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&42431_u64);
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        let path = std::env::temp_dir().join(format!(
+            "zone-pending-combined-decode-{}-{}.rlp",
+            std::process::id(),
+            signer.address()
+        ));
+        let mut submitter = BatchSubmitter::with_signer_and_anchor_config(
+            portal,
+            provider,
+            signer,
+            BatchAnchorConfig::default(),
+        );
+        submitter
+            .set_combined_submission_store_path(path, std::env::temp_dir())
+            .unwrap();
+        submitter
+            .combined_submission_store
+            .as_ref()
+            .unwrap()
+            .persist(&prepared.envelope)
+            .unwrap();
+
+        let decoded = submitter
+            .load_pending_combined_submission()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.transaction_hash, prepared.transaction_hash);
+        BatchSubmitter::ensure_persisted_submission_matches_batch(
+            &decoded,
+            &batch,
+            std::slice::from_ref(&withdrawal),
+        )
+        .unwrap();
+
+        let mut changed_batch = batch;
+        changed_batch.next_block_hash = B256::repeat_byte(0x99);
+        assert!(
+            BatchSubmitter::ensure_persisted_submission_matches_batch(
+                &decoded,
+                &changed_batch,
+                std::slice::from_ref(&withdrawal),
+            )
+            .is_err()
+        );
+        submitter
+            .clear_pending_combined_submission(prepared.transaction_hash)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reconciles_and_clears_persisted_combined_receipt() {
+        let signer = PrivateKeySigner::random();
+        let portal = Address::repeat_byte(0x11);
+        let withdrawal = test_withdrawal(Address::repeat_byte(0x33), 42);
+        let withdrawal_queue_hash = abi::Withdrawal::queue_hash(std::slice::from_ref(&withdrawal));
+        let next_block_hash = B256::repeat_byte(0x42);
+        let next_deposit_hash = B256::repeat_byte(0x52);
+        let request = BatchSubmitter::build_combined_submission_request(
+            portal,
+            signer.address(),
+            42431,
+            9,
+            CombinedWithdrawalPlan {
+                gas_limit: 7_500_000,
+                remaining_queue: B256::ZERO,
+            },
+            ZonePortal::submitBatchCall {
+                tempoBlockNumber: 100,
+                recentTempoBlockNumber: 100,
+                blockTransition: BlockTransition {
+                    prevBlockHash: B256::repeat_byte(0x41),
+                    nextBlockHash: next_block_hash,
+                },
+                depositQueueTransition: DepositQueueTransition {
+                    prevProcessedHash: B256::repeat_byte(0x51),
+                    nextProcessedHash: next_deposit_hash,
+                    prevDepositNumber: 3,
+                    nextDepositNumber: 5,
+                },
+                withdrawalQueueHash: withdrawal_queue_hash,
+                verifierConfig: Bytes::new(),
+                proof: Bytes::new(),
+                nextZoneHeight: U256::from(17),
+                signatures: vec![Bytes::from_static(&[0x01])],
+            }
+            .abi_encode()
+            .into(),
+            std::slice::from_ref(&withdrawal),
+        );
+        let prepared = BatchSubmitter::prepare_combined_submission(&signer, request)
+            .await
+            .unwrap();
+        let batch_event = ZonePortal::BatchSubmitted {
+            withdrawalBatchIndex: 7,
+            withdrawalQueueIndex: U256::from(3),
+            nextProcessedDepositQueueHash: next_deposit_hash,
+            nextBlockHash: next_block_hash,
+            withdrawalQueueHash: withdrawal_queue_hash,
+            lastProcessedDepositNumber: 5,
+        };
+        let withdrawal_event = ZonePortal::WithdrawalProcessed {
+            to: withdrawal.to,
+            senderTag: withdrawal.senderTag,
+            token: withdrawal.token,
+            amount: withdrawal.amount,
+            callbackSuccess: true,
+        };
+        let logs = vec![
+            alloy_rpc_types_eth::Log {
+                inner: alloy_primitives::Log {
+                    address: portal,
+                    data: batch_event.encode_log_data(),
+                },
+                ..Default::default()
+            },
+            alloy_rpc_types_eth::Log {
+                inner: alloy_primitives::Log {
+                    address: portal,
+                    data: withdrawal_event.encode_log_data(),
+                },
+                ..Default::default()
+            },
+        ];
+        let receipt = TempoTransactionReceipt {
+            inner: TransactionReceipt {
+                inner: ReceiptWithBloom::from(TempoReceipt {
+                    tx_type: TempoTxType::AA,
+                    success: true,
+                    cumulative_gas_used: 1_000_000,
+                    logs,
+                }),
+                transaction_hash: prepared.transaction_hash,
+                transaction_index: Some(0),
+                block_hash: Some(B256::repeat_byte(0x77)),
+                block_number: Some(123),
+                gas_used: 1_000_000,
+                effective_gas_price: 1,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: signer.address(),
+                to: Some(portal),
+                contract_address: None,
+            },
+            fee_token: None,
+            fee_payer: signer.address(),
+        };
+        let asserter = Asserter::new();
+        asserter.push_success(&42431_u64);
+        asserter.push_success(&Some(receipt));
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let path = std::env::temp_dir().join(format!(
+            "zone-pending-combined-recovery-{}-{}.rlp",
+            std::process::id(),
+            signer.address()
+        ));
+        let mut submitter = BatchSubmitter::with_signer_and_anchor_config(
+            portal,
+            provider,
+            signer,
+            BatchAnchorConfig::default(),
+        );
+        submitter
+            .set_combined_submission_store_path(path, std::env::temp_dir())
+            .unwrap();
+        submitter
+            .combined_submission_store
+            .as_ref()
+            .unwrap()
+            .persist(&prepared.envelope)
+            .unwrap();
+
+        submitter
+            .recover_persisted_combined_submission()
+            .await
+            .unwrap();
+        assert!(!submitter.has_pending_combined_submission().unwrap());
+        assert!(asserter.read_q().is_empty());
     }
 
     #[tokio::test]
@@ -2230,6 +3596,63 @@ mod tests {
         assert_eq!(decoded.nextBlockHash, B256::repeat_byte(0x22));
 
         assert!(submitter.decode_batch_submitted(&[unrelated]).is_err());
+    }
+
+    #[test]
+    fn combined_receipt_reconciles_regular_and_deposit_bounceback_events() {
+        let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
+        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+        let submitter = BatchSubmitter::new(portal_address, provider);
+        let regular = test_withdrawal(Address::repeat_byte(0x11), 42);
+        let mut bounceback = test_withdrawal(Address::repeat_byte(0x44), 100);
+        bounceback.fallbackNonce = 0;
+        let processed = abi::ZonePortal::WithdrawalProcessed {
+            to: regular.to,
+            senderTag: regular.senderTag,
+            token: regular.token,
+            amount: regular.amount,
+            callbackSuccess: true,
+        };
+        let processed_log = alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: portal_address,
+                data: processed.encode_log_data(),
+            },
+            ..Default::default()
+        };
+        let bounced = abi::ZonePortal::DepositBounceBack {
+            tempoRefundRecipient: bounceback.to,
+            token: bounceback.token,
+            amount: 93,
+            bouncebackFee: 7,
+        };
+        let bounced_log = alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: portal_address,
+                data: bounced.encode_log_data(),
+            },
+            ..Default::default()
+        };
+        let unrelated_log = alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::repeat_byte(0x99),
+                data: processed.encode_log_data(),
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            submitter
+                .verify_withdrawal_receipt(
+                    &[processed_log, unrelated_log, bounced_log],
+                    &[regular, bounceback],
+                    BatchSubmissionMode::SubmitAndProcessWithdrawals,
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]

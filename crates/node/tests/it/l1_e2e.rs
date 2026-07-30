@@ -11,15 +11,22 @@ use crate::utils::{
     spawn_sequencer_with_config,
 };
 use alloy::{
+    network::{EthereumWallet, ReceiptResponse as _},
     primitives::{Address, B256, U256},
-    providers::Provider,
+    providers::{Provider, ProviderBuilder},
     sol_types::SolCall,
 };
 use alloy_consensus::Transaction;
 use eyre::WrapErr as _;
 use futures::future::try_join_all;
 use std::{collections::HashMap, time::Duration};
+use tempo_alloy::{
+    TempoNetwork,
+    provider::ext::{TempoProviderBuilderExt as _, TempoProviderExt as _},
+    rpc::TempoTransactionRequest,
+};
 use tempo_precompiles::PATH_USD_ADDRESS;
+use tempo_primitives::transaction::Call;
 use tempo_zone_contracts::{
     IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
     ZonePortal, ZonePortal::Role as PortalRole,
@@ -177,6 +184,92 @@ async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Tempo AA executes ordered calls atomically: if the second portal call observes stale queue
+/// state and reverts, state written by the first call must also roll back.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tempo_aa_second_call_revert_rolls_back_first_portal_call() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let l1 = L1TestNode::start().await?;
+    let factory = l1.native_zone_factory().await?;
+    let signer = l1.dev_signer();
+    let signer_address = signer.address();
+    let portal_address = l1
+        .create_zone_with_admin_sequencer_and_config(
+            factory,
+            signer_address,
+            signer_address,
+            ZoneCreationConfig::closed(vec![signer_address]),
+        )
+        .await?;
+    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .with_nonce_key_filler()
+        .wallet(EthereumWallet::from(signer))
+        .connect_http(l1.http_url().clone())
+        .erased();
+    let portal = ZonePortal::new(portal_address, &provider);
+    assert!(portal.isAccessEnforced().call().await?);
+
+    let nonce = provider
+        .get_transaction_count_with_nonce_key(
+            signer_address,
+            zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY,
+        )
+        .await?;
+    let fake_withdrawal = tempo_zone_contracts::Withdrawal {
+        token: PATH_USD_ADDRESS,
+        senderTag: B256::repeat_byte(0x11),
+        to: signer_address,
+        amount: 1,
+        memo: B256::ZERO,
+        gasLimit: 0,
+        fallbackNonce: 1,
+        callbackData: Default::default(),
+        encryptedSender: Default::default(),
+    };
+    let mut request = TempoTransactionRequest {
+        calls: vec![
+            Call {
+                to: portal_address.into(),
+                value: U256::ZERO,
+                input: ZonePortal::setAccessModeCall { enforced: false }
+                    .abi_encode()
+                    .into(),
+            },
+            Call {
+                to: portal_address.into(),
+                value: U256::ZERO,
+                input: ZonePortal::processWithdrawalsCall {
+                    withdrawals: vec![fake_withdrawal],
+                    remainingQueue: B256::ZERO,
+                }
+                .abi_encode()
+                .into(),
+            },
+        ],
+        nonce_key: Some(zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY),
+        ..Default::default()
+    };
+    request.inner.from = Some(signer_address);
+    request.inner.nonce = Some(nonce);
+    request.inner.gas = Some(5_000_000);
+    request.inner.max_fee_per_gas =
+        Some(tempo_chainspec::constants::gas::TEMPO_T1_BASE_FEE as u128);
+    request.inner.max_priority_fee_per_gas = Some(0);
+
+    let receipt = provider.send_transaction_sync(request).await?;
+    assert!(
+        !receipt.status(),
+        "empty-queue processWithdrawals call should revert"
+    );
+    assert!(
+        portal.isAccessEnforced().call().await?,
+        "the first portal call must roll back when the second call reverts"
+    );
+
+    Ok(())
+}
+
 /// The dev provisioner anchors immediately before `createZone`, so the zone
 /// replays the creation block and initializes a custom initial token from the
 /// portal constructor's `TokenEnabled` event.
@@ -284,6 +377,7 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
 
     // Spawn zone sequencer (batch submitter + withdrawal processor)
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+    let withdrawal_start_block = l1.provider().get_block_number().await?;
 
     // Request withdrawal on L2
     let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
@@ -298,6 +392,31 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
         withdrawal_timeout,
     )
     .await?;
+
+    let portal = ZonePortal::new(portal_address, l1.provider());
+    let processed = portal
+        .WithdrawalProcessed_filter()
+        .from_block(withdrawal_start_block)
+        .query()
+        .await?
+        .into_iter()
+        .find(|(event, _)| event.to == account.address() && event.amount == withdrawal_amount)
+        .ok_or_else(|| eyre::eyre!("missing WithdrawalProcessed event for fast-path withdrawal"))?;
+    let processed_tx = processed
+        .1
+        .transaction_hash
+        .ok_or_else(|| eyre::eyre!("WithdrawalProcessed log missing transaction hash"))?;
+    let batch_in_same_transaction = portal
+        .BatchSubmitted_filter()
+        .from_block(withdrawal_start_block)
+        .query()
+        .await?
+        .into_iter()
+        .any(|(_, log)| log.transaction_hash == Some(processed_tx));
+    assert!(
+        batch_in_same_transaction,
+        "eligible empty-queue withdrawal should be processed in its BatchSubmitted transaction"
+    );
 
     // Verify the L2 balance decreased by at least the withdrawal amount
     let l2_balance_after = zone
@@ -1975,14 +2094,30 @@ async fn test_plaintext_deposit_policy_failure_bounces_to_tempo_refund_recipient
         .from_block(0)
         .query()
         .await?;
-    let bounced = bouncebacks.iter().any(|(event, _)| {
-        event.tempoRefundRecipient == tempo_refund_recipient
-            && event.token == PATH_USD_ADDRESS
-            && event.amount + event.bouncebackFee == deposit_amount
-    });
+    let (_, bounceback_log) = bouncebacks
+        .iter()
+        .find(|(event, _)| {
+            event.tempoRefundRecipient == tempo_refund_recipient
+                && event.token == PATH_USD_ADDRESS
+                && event.amount + event.bouncebackFee == deposit_amount
+        })
+        .ok_or_else(|| eyre::eyre!("expected completed plaintext deposit bounceback event"))?;
+    let bounceback_tx = bounceback_log
+        .transaction_hash
+        .ok_or_else(|| eyre::eyre!("DepositBounceBack log missing transaction hash"))?;
+    let bounceback_block = bounceback_log
+        .block_number
+        .ok_or_else(|| eyre::eyre!("DepositBounceBack log missing block number"))?;
+    let batch_in_same_transaction = portal
+        .BatchSubmitted_filter()
+        .from_block(bounceback_block)
+        .query()
+        .await?
+        .into_iter()
+        .any(|(_, log)| log.transaction_hash == Some(bounceback_tx));
     eyre::ensure!(
-        bounced,
-        "expected completed plaintext deposit bounceback event"
+        batch_in_same_transaction,
+        "deposit bounceback should be reconciled in its BatchSubmitted transaction"
     );
 
     Ok(())

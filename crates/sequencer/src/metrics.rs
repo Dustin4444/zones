@@ -68,6 +68,18 @@ pub(crate) struct ZoneMonitorMetrics {
     /// Successful batch submissions.
     pub batch_submit_success_total: Counter,
 
+    /// Successful submit-only batch transactions.
+    pub batch_submit_only_success_total: Counter,
+
+    /// Successful atomic `submitBatch` + `processWithdrawals` transactions.
+    pub batch_submit_combined_success_total: Counter,
+
+    /// Withdrawals processed in the same L1 transaction as their batch submission.
+    pub withdrawals_processed_with_batch_total: Counter,
+
+    /// Confirmed combined reverts that caused the retry loop to force submit-only settlement.
+    pub batch_submit_combined_fallback_total: Counter,
+
     /// Failed batch submissions after exhausting retries.
     pub batch_submit_failure_total: Counter,
 

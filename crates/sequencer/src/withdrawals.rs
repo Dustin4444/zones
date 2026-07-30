@@ -7,7 +7,8 @@
 //!   withdrawal data to provide it when calling `processWithdrawals`.
 //!
 //! - [`WithdrawalProcessor`] — a background task that polls the ZonePortal withdrawal queue on
-//!   **Tempo L1** and processes withdrawals by calling `processWithdrawals(withdrawals, remainingQueue)`.
+//!   **Tempo L1** and processes withdrawals by calling
+//!   `processWithdrawals(withdrawals, remainingQueue)`.
 //!
 //! ## Data flow
 //!
@@ -16,8 +17,12 @@
 //!    [`WithdrawalStore`].
 //! 3. At batch finalization, the sequencer calls `finalizeWithdrawalBatch` on L2, which builds a
 //!    hash chain. The proof then enqueues this hash chain into the portal's withdrawal queue on L1.
-//! 4. The [`WithdrawalProcessor`] polls the portal queue on L1 and processes each withdrawal by
-//!    providing the original data and the remaining queue hash.
+//! 4. If the portal queue is empty and the complete slot fits the configured gas policy, batch
+//!    settlement submits ordered `submitBatch` and `processWithdrawals` calls in one atomic Tempo
+//!    transaction.
+//! 5. Otherwise, the [`WithdrawalProcessor`] polls the portal queue on L1 and processes each
+//!    withdrawal by providing the original data and the remaining queue hash. This path also
+//!    handles backlog and recovery after races, failures, or restarts.
 //!
 //! ## Batch-to-slot mapping
 //!
@@ -87,6 +92,17 @@ pub const DEFAULT_MAX_WITHDRAWAL_BATCH_GAS: u64 = 10_000_000;
 /// their maximum planned gas at 12,250,000. Both remain below the L1 limit, avoiding repeated
 /// submission of a transaction that can never be mined.
 pub const MAX_WITHDRAWAL_BATCH_GAS: u64 = 20_000_000;
+
+/// Tempo L1's transaction gas cap.
+pub(crate) const TEMPO_TRANSACTION_GAS_LIMIT: u64 = 30_000_000;
+
+/// Gas reserved for `submitBatch` and Tempo AA multi-call overhead when settlement and withdrawal
+/// processing share one transaction.
+///
+/// The standalone withdrawal planner already includes the portal's per-transaction withdrawal
+/// overhead. Keeping another 5M gas outside the operator-configured withdrawal budget leaves the
+/// combined path at or below 25M under the maximum supported planner configuration.
+const COMBINED_SUBMIT_BATCH_GAS_ALLOWANCE: u64 = 5_000_000;
 
 /// Default maximum number of ordered withdrawal transactions kept in flight.
 pub const DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES: usize = 8;
@@ -268,6 +284,88 @@ pub fn compute_remaining_queue(withdrawals: &[abi::Withdrawal], processed_count:
     let remaining = &withdrawals[processed_count..];
 
     abi::Withdrawal::queue_hash(remaining)
+}
+
+/// A whole-slot withdrawal plan that can safely follow `submitBatch` in the same Tempo AA
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CombinedWithdrawalPlan {
+    /// Explicit gas limit for the complete two-call Tempo transaction.
+    pub(crate) gas_limit: u64,
+    /// The combined fast path always exhausts the newly enqueued slot.
+    pub(crate) remaining_queue: B256,
+}
+
+/// Why a valid withdrawal slot must use submit-only settlement plus the standalone processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CombinedWithdrawalFallback {
+    /// The settled batch does not enqueue a withdrawal slot.
+    NoWithdrawals,
+    /// The slot needs more than one planner-bounded `processWithdrawals` call.
+    RequiresMultipleTransactions,
+    /// A singleton is submit-able by the standalone processor but exceeds the configured planner
+    /// budget and is therefore too risky to couple to settlement.
+    ExceedsPlannerBudget,
+    /// The combined call budget would exceed Tempo's transaction gas cap.
+    ExceedsTempoGasLimit,
+}
+
+impl std::fmt::Display for CombinedWithdrawalFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NoWithdrawals => "no withdrawals",
+            Self::RequiresMultipleTransactions => "slot requires multiple withdrawal transactions",
+            Self::ExceedsPlannerBudget => "slot exceeds the withdrawal planner budget",
+            Self::ExceedsTempoGasLimit => "combined gas exceeds the Tempo transaction limit",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Plan whole-slot withdrawal processing for the atomic settlement fast path.
+///
+/// Hash mismatches are errors rather than fallbacks: settling a commitment whose local payloads
+/// cannot reproduce it would leave the standalone recovery path without trustworthy data.
+pub(crate) fn plan_combined_withdrawals(
+    withdrawals: &[abi::Withdrawal],
+    withdrawal_queue_hash: B256,
+    max_batch_gas: u64,
+) -> eyre::Result<Result<CombinedWithdrawalPlan, CombinedWithdrawalFallback>> {
+    let reconstructed_hash = abi::Withdrawal::queue_hash(withdrawals);
+    eyre::ensure!(
+        reconstructed_hash == withdrawal_queue_hash,
+        "withdrawal payload hash mismatch before L1 submission: batch commitment {}, reconstructed {}",
+        withdrawal_queue_hash,
+        reconstructed_hash
+    );
+
+    if withdrawals.is_empty() {
+        return Ok(Err(CombinedWithdrawalFallback::NoWithdrawals));
+    }
+
+    let batches = build_withdrawal_batches(withdrawals, max_batch_gas);
+    if batches.len() != 1 {
+        return Ok(Err(
+            CombinedWithdrawalFallback::RequiresMultipleTransactions,
+        ));
+    }
+
+    let withdrawal_gas = batches[0].gas_limit;
+    if withdrawal_gas > max_batch_gas {
+        return Ok(Err(CombinedWithdrawalFallback::ExceedsPlannerBudget));
+    }
+
+    let Some(gas_limit) = withdrawal_gas.checked_add(COMBINED_SUBMIT_BATCH_GAS_ALLOWANCE) else {
+        return Ok(Err(CombinedWithdrawalFallback::ExceedsTempoGasLimit));
+    };
+    if gas_limit > TEMPO_TRANSACTION_GAS_LIMIT {
+        return Ok(Err(CombinedWithdrawalFallback::ExceedsTempoGasLimit));
+    }
+
+    Ok(Ok(CombinedWithdrawalPlan {
+        gas_limit,
+        remaining_queue: B256::ZERO,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1105,76 @@ mod tests {
         (0..count)
             .map(|i| test_withdrawal(Address::with_last_byte((i + 1) as u8), (i + 1) as u128))
             .collect()
+    }
+
+    #[test]
+    fn combined_plan_accepts_one_hash_matched_whole_slot() {
+        let withdrawals = simple_withdrawals(3);
+        let queue_hash = abi::Withdrawal::queue_hash(&withdrawals);
+
+        let plan =
+            plan_combined_withdrawals(&withdrawals, queue_hash, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(plan.remaining_queue, B256::ZERO);
+        assert!(plan.gas_limit <= TEMPO_TRANSACTION_GAS_LIMIT);
+        assert_eq!(
+            plan.gas_limit,
+            PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS
+                + 3 * PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS
+                + COMBINED_SUBMIT_BATCH_GAS_ALLOWANCE
+        );
+    }
+
+    #[test]
+    fn combined_plan_skips_batches_without_withdrawals() {
+        assert_eq!(
+            plan_combined_withdrawals(&[], B256::ZERO, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS).unwrap(),
+            Err(CombinedWithdrawalFallback::NoWithdrawals)
+        );
+    }
+
+    #[test]
+    fn combined_plan_rejects_payload_hash_mismatch() {
+        let withdrawals = simple_withdrawals(1);
+        let error = plan_combined_withdrawals(
+            &withdrawals,
+            B256::repeat_byte(0xff),
+            DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("withdrawal payload hash mismatch")
+        );
+    }
+
+    #[test]
+    fn combined_plan_falls_back_when_slot_needs_multiple_transactions() {
+        let withdrawals = simple_withdrawals(3);
+        let queue_hash = abi::Withdrawal::queue_hash(&withdrawals);
+        let two_item_budget =
+            PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+
+        assert_eq!(
+            plan_combined_withdrawals(&withdrawals, queue_hash, two_item_budget).unwrap(),
+            Err(CombinedWithdrawalFallback::RequiresMultipleTransactions)
+        );
+    }
+
+    #[test]
+    fn combined_plan_falls_back_for_oversized_singleton() {
+        let mut withdrawals = simple_withdrawals(1);
+        withdrawals[0].gasLimit = MAX_WITHDRAWAL_GAS_LIMIT;
+        let queue_hash = abi::Withdrawal::queue_hash(&withdrawals);
+
+        assert_eq!(
+            plan_combined_withdrawals(&withdrawals, queue_hash, 1_000_000).unwrap(),
+            Err(CombinedWithdrawalFallback::ExceedsPlannerBudget)
+        );
     }
 
     #[test]

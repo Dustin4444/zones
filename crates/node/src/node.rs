@@ -50,7 +50,7 @@ use reth_transaction_pool::{
     Pool, PoolTransaction, TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::TempoInvalidTransaction;
@@ -499,6 +499,10 @@ where
     > as NodeAddOns<N>>::Handle;
 
     async fn launch_add_ons(mut self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
+        let combined_submission_store_root = ctx.config.datadir().data_dir().to_path_buf();
+        let combined_submission_store_path = combined_submission_store_root
+            .join("zone-sequencer")
+            .join("pending-combined-transaction.rlp");
         let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
@@ -702,6 +706,8 @@ where
                     self.l1_config.portal_address,
                     self.l1_config.retry_connection_interval,
                     attestation.store.clone(),
+                    combined_submission_store_path.clone(),
+                    combined_submission_store_root.clone(),
                 )?),
                 None => None,
             };
@@ -750,6 +756,8 @@ where
                 self.l1_config.retry_connection_interval,
                 sequencer_addr,
                 None,
+                combined_submission_store_path,
+                combined_submission_store_root,
             )
             .await?;
         }
@@ -945,6 +953,8 @@ where
         portal_address: Address,
         retry_connection_interval: Duration,
         attestation_store: AttestationStore,
+        combined_submission_store_path: PathBuf,
+        combined_submission_store_root: PathBuf,
     ) -> eyre::Result<LeaderSequencerDeps> {
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
@@ -957,6 +967,8 @@ where
             inbox_address: ZONE_INBOX_ADDRESS,
             batch_anchor_config: config.batch_anchor_config,
             attestation_store: Some(attestation_store),
+            combined_submission_store_path,
+            combined_submission_store_root,
         };
         Ok(LeaderSequencerDeps {
             config,
@@ -1115,6 +1127,8 @@ where
         retry_connection_interval: Duration,
         sequencer_addr: Address,
         attestation_store: Option<AttestationStore>,
+        combined_submission_store_path: PathBuf,
+        combined_submission_store_root: PathBuf,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
@@ -1128,6 +1142,8 @@ where
             inbox_address: ZONE_INBOX_ADDRESS,
             batch_anchor_config: config.batch_anchor_config,
             attestation_store,
+            combined_submission_store_path,
+            combined_submission_store_root,
         };
         let l1_transaction_signer = config
             .l1_transaction_signer

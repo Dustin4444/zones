@@ -21,12 +21,12 @@
 //! number that IS within the EIP-2935 window, and the proof must include a
 //! block header chain linking that anchor back to `tempoBlockNumber`.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::DynProvider;
 use alloy_signer_local::PrivateKeySigner;
-use eyre::{Result, WrapErr};
+use eyre::{OptionExt as _, Result, WrapErr};
 use futures::StreamExt;
 use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
@@ -38,10 +38,11 @@ use crate::{
     AttestationStore, ZoneSequencerProvider,
     abi::{self, NO_QUEUE_INDEX, ZonePortal},
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, FinalizedBatchLog, ZoneBlockSnapshot,
-        fetch_finalized_batch, fetch_finalized_batch_boundaries, read_zone_block_snapshot,
+        BatchAnchorConfig, BatchData, BatchSubmissionMode, BatchSubmitter, FinalizedBatchLog,
+        ZoneBlockSnapshot, fetch_finalized_batch, fetch_finalized_batch_boundaries,
+        read_zone_block_snapshot,
     },
-    withdrawals::SharedWithdrawalStore,
+    withdrawals::{SharedWithdrawalStore, WithdrawalBatchLimits},
 };
 
 /// Maximum number of times to retry a failed batch submission before resyncing.
@@ -66,8 +67,14 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Withdrawal planner policy shared with the standalone processor and the combined fast path.
+    pub withdrawal_batch_limits: WithdrawalBatchLimits,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
+    /// Durable file containing an exact signed combined settlement envelope until finality.
+    pub combined_submission_store_path: PathBuf,
+    /// Pre-existing node datadir root anchoring journal directory fsync operations.
+    pub combined_submission_store_root: PathBuf,
 }
 
 /// Withdrawal state shared between the zone monitor and withdrawal processor.
@@ -177,6 +184,14 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             config.batch_anchor_config,
         );
         batch_submitter.set_attestation_store(config.attestation_store.clone());
+        batch_submitter.set_combined_submission_store_path(
+            config.combined_submission_store_path.clone(),
+            config.combined_submission_store_root.clone(),
+        )?;
+        batch_submitter
+            .recover_persisted_combined_submission()
+            .await
+            .wrap_err("failed to recover persisted combined settlement during startup")?;
 
         let prev_zone_block_hash = batch_submitter
             .read_portal_block_hash()
@@ -476,10 +491,10 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// On success:
     /// - Advances `prev_zone_block_hash`, `prev_processed_deposit_hash`, and
     ///   `last_submitted_zone_block` to reflect the submitted range.
-    /// - Stores withdrawals under the receipt's assigned portal queue index when
-    ///   the batch included withdrawals.
+    /// - Either processes an eligible withdrawal slot atomically in the settlement transaction,
+    ///   or stores it under the receipt's assigned portal queue index for standalone recovery.
     /// - Signals the [`WithdrawalProcessor`](crate::withdrawals::WithdrawalProcessor)
-    ///   so it can finalize newly enqueued withdrawal slots.
+    ///   so it can reconcile newly enqueued or already-consumed withdrawal slots.
     ///
     /// On failure (after [`MAX_RETRIES`] attempts with [`INITIAL_RETRY_DELAY`]
     /// doubling each time): resyncs the local submission anchor from the
@@ -492,12 +507,16 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         withdrawals: Vec<abi::Withdrawal>,
     ) -> Result<()> {
         let mut delay = INITIAL_RETRY_DELAY;
+        let mut allow_combined = true;
 
         for attempt in 1..=MAX_RETRIES {
             // Reconcile before every attempt. A prior submitBatch may have landed even when its
             // receipt timed out, in which case waiting for the old certificate can block forever.
-            let portal_hash = match self.batch_submitter.read_portal_block_hash().await {
-                Ok(portal_hash) => portal_hash,
+            // A durable combined envelope takes precedence: the submitter must resolve its exact
+            // hash before any mutable portal-state decision.
+            let has_pending_combined = match self.batch_submitter.has_pending_combined_submission()
+            {
+                Ok(pending) => pending,
                 Err(e) => {
                     if attempt < MAX_RETRIES {
                         self.metrics.batch_submit_retry_total.increment(1);
@@ -506,7 +525,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                             max_retries = MAX_RETRIES,
                             delay_secs = delay.as_secs(),
                             error = %e,
-                            "Failed reading portal state before batch submission, retrying"
+                            "Failed reading durable combined settlement state, retrying"
                         );
                         tokio::time::sleep(delay).await;
                         delay *= 2;
@@ -516,9 +535,38 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     error!(
                         error = %e,
                         last_zone_block,
-                        "Failed reading portal state before batch submission after {MAX_RETRIES} retries"
+                        "Failed reading durable combined settlement state after {MAX_RETRIES} retries"
                     );
                     break;
+                }
+            };
+            let portal_hash = if has_pending_combined {
+                batch_data.prev_block_hash
+            } else {
+                match self.batch_submitter.read_portal_block_hash().await {
+                    Ok(portal_hash) => portal_hash,
+                    Err(e) => {
+                        if attempt < MAX_RETRIES {
+                            self.metrics.batch_submit_retry_total.increment(1);
+                            warn!(
+                                attempt,
+                                max_retries = MAX_RETRIES,
+                                delay_secs = delay.as_secs(),
+                                error = %e,
+                                "Failed reading portal state before batch submission, retrying"
+                            );
+                            tokio::time::sleep(delay).await;
+                            delay *= 2;
+                            continue;
+                        }
+                        self.metrics.batch_submit_failure_total.increment(1);
+                        error!(
+                            error = %e,
+                            last_zone_block,
+                            "Failed reading portal state before batch submission after {MAX_RETRIES} retries"
+                        );
+                        break;
+                    }
                 }
             };
             if portal_hash != batch_data.prev_block_hash {
@@ -538,8 +586,18 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             }
 
             let submit_started = std::time::Instant::now();
-            match self.batch_submitter.submit_batch(batch_data).await {
-                Ok(event) => {
+            match self
+                .batch_submitter
+                .submit_batch_with_withdrawals(
+                    batch_data,
+                    &withdrawals,
+                    self.config.withdrawal_batch_limits.max_batch_gas,
+                    allow_combined,
+                )
+                .await
+            {
+                Ok(submission) => {
+                    let event = submission.event;
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None
                     } else {
@@ -559,9 +617,26 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         withdrawal_batch_index = event.withdrawalBatchIndex,
                         withdrawal_queue_index = %event.withdrawalQueueIndex,
                         withdrawal_queue_hash = %batch_data.withdrawal_queue_hash,
+                        submission_mode = %submission.mode,
+                        transaction_hash = %submission.transaction_hash,
+                        withdrawals_processed_in_same_transaction =
+                            submission.withdrawals_processed,
                         "Batch successfully submitted to L1"
                     );
                     self.metrics.batch_submit_success_total.increment(1);
+                    match submission.mode {
+                        BatchSubmissionMode::SubmitOnly => {
+                            self.metrics.batch_submit_only_success_total.increment(1);
+                        }
+                        BatchSubmissionMode::SubmitAndProcessWithdrawals => {
+                            self.metrics
+                                .batch_submit_combined_success_total
+                                .increment(1);
+                            self.metrics
+                                .withdrawals_processed_with_batch_total
+                                .increment(submission.withdrawals_processed as u64);
+                        }
+                    }
                     self.metrics
                         .batch_size_blocks
                         .record(blocks_in_batch as f64);
@@ -579,23 +654,49 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         .set(last_zone_block as f64);
                     self.update_submission_lag();
 
-                    // Store withdrawals under the logical portal queue index assigned on-chain.
-                    if let Some(portal_index) = portal_index {
-                        if !withdrawals.is_empty() {
-                            let count = withdrawals.len();
-                            let mut store = self.withdrawal_store.lock();
-                            store.add_batch(portal_index, withdrawals);
+                    match submission.mode {
+                        BatchSubmissionMode::SubmitOnly => {
+                            // Store withdrawals under the logical portal queue index assigned
+                            // on-chain so standalone recovery can drain the slot.
+                            if let Some(portal_index) = portal_index {
+                                if !withdrawals.is_empty() {
+                                    let count = withdrawals.len();
+                                    let mut store = self.withdrawal_store.lock();
+                                    store.add_batch(portal_index, withdrawals);
+                                    info!(
+                                        portal_index,
+                                        count,
+                                        "Stored withdrawals for standalone portal queue processing"
+                                    );
+                                }
+                            } else if !batch_data.withdrawal_queue_hash.is_zero()
+                                || !withdrawals.is_empty()
+                            {
+                                warn!(
+                                    withdrawal_queue_hash = %batch_data.withdrawal_queue_hash,
+                                    withdrawal_count = withdrawals.len(),
+                                    "submitBatch emitted NO_QUEUE_INDEX for a batch that locally had withdrawals"
+                                );
+                            }
+                        }
+                        BatchSubmissionMode::SubmitAndProcessWithdrawals => {
+                            let portal_index = portal_index.ok_or_eyre(
+                                "combined settlement emitted NO_QUEUE_INDEX for non-empty withdrawals",
+                            )?;
+                            eyre::ensure!(
+                                submission.withdrawals_processed == withdrawals.len(),
+                                "combined settlement processed {} withdrawals, expected {}",
+                                submission.withdrawals_processed,
+                                withdrawals.len()
+                            );
+                            // The atomic second call exhausted this slot. Remove any stale local
+                            // entry defensively; the standalone processor must not look for it.
+                            self.withdrawal_store.lock().remove_batch(portal_index);
                             info!(
                                 portal_index,
-                                count, "Stored withdrawals for portal queue index"
-                            );
-                        }
-                    } else {
-                        if !batch_data.withdrawal_queue_hash.is_zero() || !withdrawals.is_empty() {
-                            warn!(
-                                withdrawal_queue_hash = %batch_data.withdrawal_queue_hash,
-                                withdrawal_count = withdrawals.len(),
-                                "submitBatch emitted NO_QUEUE_INDEX for a batch that locally had withdrawals"
+                                count = submission.withdrawals_processed,
+                                transaction_hash = %submission.transaction_hash,
+                                "Withdrawals processed atomically with batch submission"
                             );
                         }
                     }
@@ -608,6 +709,23 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.metrics
                         .batch_submit_latency_seconds
                         .record(submit_started.elapsed().as_secs_f64());
+                    if allow_combined && e.combined_fallback_safe() {
+                        allow_combined = false;
+                        self.metrics
+                            .batch_submit_combined_fallback_total
+                            .increment(1);
+                        warn!(
+                            error = %e,
+                            transaction_hash = ?e.combined_transaction_hash(),
+                            "Confirmed combined revert; retrying settlement submit-only"
+                        );
+                    } else if let Some(transaction_hash) = e.combined_transaction_hash() {
+                        warn!(
+                            %transaction_hash,
+                            error = %e,
+                            "Combined settlement outcome remains ambiguous; retry will resume the durable exact envelope"
+                        );
+                    }
                     if attempt < MAX_RETRIES {
                         self.metrics.batch_submit_retry_total.increment(1);
                         warn!(
@@ -621,7 +739,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         delay *= 2;
                     } else {
                         self.metrics.batch_submit_failure_total.increment(1);
-                        let revert_reason = decode_portal_revert(&e);
+                        let revert_reason = decode_portal_revert(e.report());
                         error!(
                             error = %e,
                             revert_reason,
@@ -956,7 +1074,11 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
+            combined_submission_store_path: std::env::temp_dir()
+                .join("zone-monitor-test-pending-combined-1.rlp"),
+            combined_submission_store_root: std::env::temp_dir(),
         };
         let l1_provider = mock_provider(l1);
 
@@ -986,7 +1108,11 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
+            combined_submission_store_path: std::env::temp_dir()
+                .join("zone-monitor-test-pending-combined-2.rlp"),
+            combined_submission_store_root: std::env::temp_dir(),
         };
 
         l1.push_failure_msg("boom");

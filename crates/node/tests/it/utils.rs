@@ -618,6 +618,8 @@ type RpcApiFactory = dyn Fn(zone_node::rpc::PrivateRpcConfig) -> RpcApiFuture + 
 
 pub(crate) struct ZoneTestNode {
     http_url: url::Url,
+    combined_submission_store_path: std::path::PathBuf,
+    combined_submission_store_root: std::path::PathBuf,
     deposit_queue: DepositQueue,
     enabled_tokens: EnabledTokenRegistry,
     l1_state_cache: L1StateCache,
@@ -1288,6 +1290,11 @@ impl ZoneTestNode {
             .unwrap()
             .parse()
             .unwrap();
+        let combined_submission_store_root =
+            node_handle.node.config.datadir().data_dir().to_path_buf();
+        let combined_submission_store_path = combined_submission_store_root
+            .join("zone-sequencer")
+            .join("pending-combined-transaction.rlp");
 
         // Build the real private RPC API while the handle is still concrete,
         // before type-erasing it into Box<dyn TestNodeHandle>.
@@ -1307,6 +1314,8 @@ impl ZoneTestNode {
             deposit_queue,
             enabled_tokens,
             http_url,
+            combined_submission_store_path,
+            combined_submission_store_root,
             l1_state_cache,
             l1_block_tracker,
             rpc_api_factory,
@@ -3293,6 +3302,8 @@ pub(crate) async fn spawn_sequencer_with_config(
         inbox_address: ZONE_INBOX_ADDRESS,
         batch_anchor_config,
         attestation_store: None,
+        combined_submission_store_path: zone.combined_submission_store_path.clone(),
+        combined_submission_store_root: zone.combined_submission_store_root.clone(),
     };
 
     zone.spawn_sequencer(config, sequencer_signer).await

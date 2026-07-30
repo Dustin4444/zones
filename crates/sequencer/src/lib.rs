@@ -3,7 +3,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
@@ -24,6 +24,7 @@ mod encryption_key;
 mod metrics;
 pub mod monitor;
 pub mod nonce_keys;
+mod pending_submission;
 mod rpc;
 pub mod settlement;
 pub mod withdrawals;
@@ -105,6 +106,10 @@ pub struct ZoneSequencerConfig {
     pub batch_anchor_config: BatchAnchorConfig,
     /// Shared P2P attestation store used for quorum batch submission.
     pub attestation_store: Option<AttestationStore>,
+    /// Durable file used to resume the exact signed atomic settlement transaction after restart.
+    pub combined_submission_store_path: PathBuf,
+    /// Pre-existing node datadir root anchoring journal directory fsync operations.
+    pub combined_submission_store_root: PathBuf,
 }
 
 /// Handles returned by [`spawn_zone_sequencer`] for managing background tasks.
@@ -119,11 +124,12 @@ pub struct ZoneSequencerHandle {
 ///
 /// This is the top-level POC entrypoint that starts:
 /// - **Zone monitor** — consumes native canonical Zone blocks and receipts, extracts withdrawal
-///   events into the shared store, builds [`crate::BatchData`], and submits each batch
-///   synchronously to the ZonePortal on Tempo L1. Local state only advances on successful
-///   submission.
+///   events, builds [`crate::BatchData`], and submits each batch synchronously to the ZonePortal
+///   on Tempo L1. When the portal queue is empty and the slot fits the shared gas policy, it
+///   atomically follows `submitBatch` with `processWithdrawals` in the same Tempo transaction.
+///   Local state only advances on successful submission.
 /// - **Withdrawal processor** — polls the ZonePortal withdrawal queue on Tempo L1 and calls
-///   `processWithdrawals` for each pending withdrawal.
+///   `processWithdrawals` for backlog, oversized slots, and all recovery cases.
 ///
 /// Both tasks share a single L1 provider and nonce manager to prevent signing/nonce contention
 /// when submitting concurrent L1 transactions.
@@ -166,7 +172,10 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
         poll_interval: config.zone_poll_interval,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
+        withdrawal_batch_limits: config.withdrawal_batch_limits,
         attestation_store: config.attestation_store,
+        combined_submission_store_path: config.combined_submission_store_path,
+        combined_submission_store_root: config.combined_submission_store_root,
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(
