@@ -53,6 +53,78 @@ const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Backoff before restarting the processing loop after an unexpected failure.
 const RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WithdrawalQueueAction {
+    Empty,
+    InspectLocalBatch,
+    ReadSlot,
+    RequestRepair { reason: WithdrawalRepairReason },
+    SubmitSuffix { offset: usize },
+    Retry { reason: WithdrawalRetryReason },
+    DropStaleLocalBatch { offset: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WithdrawalRepairReason {
+    MissingOrEmptyLocalBatch,
+    SlotHashMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WithdrawalRetryReason {
+    InconsistentQueueBounds,
+    HeadSlotAlreadyConsumed,
+}
+
+/// Classify queue bounds before observing or mutating the local store.
+fn plan_queue_bounds(head: u64, tail: u64) -> WithdrawalQueueAction {
+    if head > tail {
+        WithdrawalQueueAction::Retry {
+            reason: WithdrawalRetryReason::InconsistentQueueBounds,
+        }
+    } else if head == tail {
+        WithdrawalQueueAction::Empty
+    } else {
+        WithdrawalQueueAction::InspectLocalBatch
+    }
+}
+
+/// Reconcile the local head batch with an optional slot observation.
+///
+/// Returning [`WithdrawalQueueAction::ReadSlot`] keeps the nonce read ahead of the slot RPC.
+fn plan_head_reconciliation(
+    withdrawals: Option<&[abi::Withdrawal]>,
+    slot_hash: Option<B256>,
+) -> WithdrawalQueueAction {
+    let Some(withdrawals) = withdrawals.filter(|withdrawals| !withdrawals.is_empty()) else {
+        return WithdrawalQueueAction::RequestRepair {
+            reason: WithdrawalRepairReason::MissingOrEmptyLocalBatch,
+        };
+    };
+
+    let Some(slot_hash) = slot_hash else {
+        return WithdrawalQueueAction::ReadSlot;
+    };
+
+    if slot_hash == EMPTY_SENTINEL {
+        return WithdrawalQueueAction::Retry {
+            reason: WithdrawalRetryReason::HeadSlotAlreadyConsumed,
+        };
+    }
+
+    let Some(offset) = find_processed_offset(withdrawals, slot_hash) else {
+        return WithdrawalQueueAction::RequestRepair {
+            reason: WithdrawalRepairReason::SlotHashMismatch,
+        };
+    };
+
+    if offset == withdrawals.len() {
+        WithdrawalQueueAction::DropStaleLocalBatch { offset }
+    } else {
+        WithdrawalQueueAction::SubmitSuffix { offset }
+    }
+}
+
 // These planner allowances were calibrated against the current ZonePortal/ZoneMessenger bytecode.
 // Pre-refund T1 dev-L1 traces used 553,703, 1,068,088, and 1,348,063 gas for one, two, and four
 // successful simple items, and 1,347,339 gas around a callback. T3 Foundry traces used 1,026,857
@@ -406,14 +478,22 @@ impl WithdrawalProcessor {
 
             let head_val: u64 = head.try_into().map_err(|_| eyre::eyre!("head overflow"))?;
             let tail_val: u64 = tail.try_into().map_err(|_| eyre::eyre!("tail overflow"))?;
-            if head_val > tail_val {
-                warn!(
-                    head = head_val,
-                    tail = tail_val,
-                    "Inconsistent withdrawal queue bounds"
-                );
-                return Ok(());
+            let bounds_action = plan_queue_bounds(head_val, tail_val);
+            match bounds_action {
+                WithdrawalQueueAction::Retry {
+                    reason: WithdrawalRetryReason::InconsistentQueueBounds,
+                } => {
+                    warn!(
+                        head = head_val,
+                        tail = tail_val,
+                        "Inconsistent withdrawal queue bounds"
+                    );
+                    return Ok(());
+                }
+                WithdrawalQueueAction::Empty | WithdrawalQueueAction::InspectLocalBatch => {}
+                _ => unreachable!("queue bounds planner returned an invalid action"),
             }
+
             self.store.lock().remove_before(head_val);
             let StoreSnapshot {
                 batch_count: store_batch_count,
@@ -425,7 +505,7 @@ impl WithdrawalProcessor {
             } = self.capture_store_snapshot(head_val);
             self.record_queue_metrics(head_val, tail_val, store_batch_count);
 
-            if head_val == tail_val {
+            if bounds_action == WithdrawalQueueAction::Empty {
                 debug!("Withdrawal queue empty, nothing to process");
                 return Ok(());
             }
@@ -438,9 +518,14 @@ impl WithdrawalProcessor {
                 "Withdrawal queue has pending slots"
             );
 
-            let withdrawals = match withdrawals {
-                Some(w) if !w.is_empty() => w,
-                _ => {
+            let local_action = plan_head_reconciliation(withdrawals.as_deref(), None);
+            let withdrawals = match (local_action, withdrawals) {
+                (
+                    WithdrawalQueueAction::RequestRepair {
+                        reason: WithdrawalRepairReason::MissingOrEmptyLocalBatch,
+                    },
+                    _,
+                ) => {
                     self.repair_notify.notify_one();
                     warn!(
                         slot = head_val,
@@ -455,6 +540,8 @@ impl WithdrawalProcessor {
                     );
                     return Ok(());
                 }
+                (WithdrawalQueueAction::ReadSlot, Some(withdrawals)) => withdrawals,
+                _ => unreachable!("local batch planner returned an invalid action"),
             };
 
             // Read the committed nonce before the slot. If an older pending transaction lands
@@ -476,25 +563,51 @@ impl WithdrawalProcessor {
                 .call()
                 .await?;
 
-            if slot_hash == EMPTY_SENTINEL {
-                // The slot was fully consumed and head advanced between our reads.
-                // Re-check on the next cycle.
-                debug!(
-                    slot = head_val,
-                    "Head slot already consumed; skipping cycle"
-                );
-                return Ok(());
-            }
+            let offset = match plan_head_reconciliation(Some(&withdrawals), Some(slot_hash)) {
+                WithdrawalQueueAction::Retry {
+                    reason: WithdrawalRetryReason::HeadSlotAlreadyConsumed,
+                } => {
+                    // The slot was fully consumed and head advanced between our reads.
+                    // Re-check on the next cycle.
+                    debug!(
+                        slot = head_val,
+                        "Head slot already consumed; skipping cycle"
+                    );
+                    return Ok(());
+                }
+                WithdrawalQueueAction::RequestRepair {
+                    reason: WithdrawalRepairReason::SlotHashMismatch,
+                } => {
+                    error!(
+                        slot = head_val,
+                        on_chain_slot_hash = %slot_hash,
+                        store_queue_hash = %abi::Withdrawal::queue_hash(&withdrawals),
+                        "Store data does not match the head slot's on-chain hash; requesting repair"
+                    );
+                    self.repair_notify.notify_one();
+                    return Ok(());
+                }
+                WithdrawalQueueAction::DropStaleLocalBatch { offset } => {
+                    if offset > 0 {
+                        info!(
+                            slot = head_val,
+                            processed = offset,
+                            remaining = withdrawals.len() - offset,
+                            "Trimmed withdrawals already consumed by the portal"
+                        );
+                    }
 
-            let Some(offset) = find_processed_offset(&withdrawals, slot_hash) else {
-                error!(
-                    slot = head_val,
-                    on_chain_slot_hash = %slot_hash,
-                    store_queue_hash = %abi::Withdrawal::queue_hash(&withdrawals),
-                    "Store data does not match the head slot's on-chain hash; requesting repair"
-                );
-                self.repair_notify.notify_one();
-                return Ok(());
+                    // Defensive: queue_hash never produces B256::ZERO for a pending head
+                    // slot, but if it happens drop the stale batch and wait for the portal.
+                    warn!(
+                        slot = head_val,
+                        "Head slot fully processed but head not advanced"
+                    );
+                    self.store.lock().remove_batch(head_val);
+                    return Ok(());
+                }
+                WithdrawalQueueAction::SubmitSuffix { offset } => offset,
+                _ => unreachable!("head slot planner returned an invalid action"),
             };
 
             if offset > 0 {
@@ -507,16 +620,6 @@ impl WithdrawalProcessor {
             }
 
             let remaining = &withdrawals[offset..];
-            if remaining.is_empty() {
-                // Defensive: queue_hash never produces B256::ZERO for a pending head
-                // slot, but if it happens drop the stale batch and wait for the portal.
-                warn!(
-                    slot = head_val,
-                    "Head slot fully processed but head not advanced"
-                );
-                self.store.lock().remove_batch(head_val);
-                return Ok(());
-            }
 
             let batches =
                 build_withdrawal_batches(remaining, self.config.batch_limits.max_batch_gas);
@@ -894,6 +997,106 @@ mod tests {
             fallbackNonce: 1,
             callbackData: Default::default(),
             encryptedSender: Default::default(),
+        }
+    }
+
+    #[test]
+    fn plans_queue_bounds() {
+        let cases = [
+            ("empty", 5, 5, WithdrawalQueueAction::Empty),
+            (
+                "inconsistent",
+                6,
+                5,
+                WithdrawalQueueAction::Retry {
+                    reason: WithdrawalRetryReason::InconsistentQueueBounds,
+                },
+            ),
+            ("pending", 5, 6, WithdrawalQueueAction::InspectLocalBatch),
+        ];
+
+        for (name, head, tail, expected) in cases {
+            assert_eq!(plan_queue_bounds(head, tail), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn plans_head_slot_reconciliation() {
+        let withdrawals = vec![
+            test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100),
+            test_withdrawal(address!("0x0000000000000000000000000000000000000002"), 200),
+            test_withdrawal(address!("0x0000000000000000000000000000000000000003"), 300),
+        ];
+        let full_hash = abi::Withdrawal::queue_hash(&withdrawals);
+        let partial_hash = abi::Withdrawal::queue_hash(&withdrawals[1..]);
+        let unknown_hash = B256::repeat_byte(0xde);
+        let cases = [
+            (
+                "missing local batch",
+                None,
+                None,
+                WithdrawalQueueAction::RequestRepair {
+                    reason: WithdrawalRepairReason::MissingOrEmptyLocalBatch,
+                },
+            ),
+            (
+                "empty local batch",
+                Some(&[] as &[abi::Withdrawal]),
+                None,
+                WithdrawalQueueAction::RequestRepair {
+                    reason: WithdrawalRepairReason::MissingOrEmptyLocalBatch,
+                },
+            ),
+            (
+                "slot observation required",
+                Some(withdrawals.as_slice()),
+                None,
+                WithdrawalQueueAction::ReadSlot,
+            ),
+            (
+                "already consumed sentinel",
+                Some(withdrawals.as_slice()),
+                Some(EMPTY_SENTINEL),
+                WithdrawalQueueAction::Retry {
+                    reason: WithdrawalRetryReason::HeadSlotAlreadyConsumed,
+                },
+            ),
+            (
+                "unknown slot hash",
+                Some(withdrawals.as_slice()),
+                Some(unknown_hash),
+                WithdrawalQueueAction::RequestRepair {
+                    reason: WithdrawalRepairReason::SlotHashMismatch,
+                },
+            ),
+            (
+                "zero processed withdrawals",
+                Some(withdrawals.as_slice()),
+                Some(full_hash),
+                WithdrawalQueueAction::SubmitSuffix { offset: 0 },
+            ),
+            (
+                "partially processed withdrawals",
+                Some(withdrawals.as_slice()),
+                Some(partial_hash),
+                WithdrawalQueueAction::SubmitSuffix { offset: 1 },
+            ),
+            (
+                "fully processed defensive case",
+                Some(withdrawals.as_slice()),
+                Some(B256::ZERO),
+                WithdrawalQueueAction::DropStaleLocalBatch {
+                    offset: withdrawals.len(),
+                },
+            ),
+        ];
+
+        for (name, local_batch, slot_hash, expected) in cases {
+            assert_eq!(
+                plan_head_reconciliation(local_batch, slot_hash),
+                expected,
+                "{name}"
+            );
         }
     }
 
