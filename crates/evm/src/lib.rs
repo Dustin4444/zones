@@ -90,23 +90,6 @@ where
         }
     }
 
-    /// Create a throwaway EVM initialized at `target_l1_block` for pre-execution reads.
-    ///
-    /// Unlike protocol execution, initializes an execution-local read anchor rather than advancing
-    /// it through TempoState. The returned EVM must not be used to produce committed zone state.
-    pub fn new_prefetch_evm<DB: Database>(
-        &self,
-        db: DB,
-        input: EvmEnv<TempoHardfork, TempoBlockEnv>,
-        l1_block: u64,
-    ) -> ZoneEvm<DB, NoOpInspector, L1> {
-        let db =
-            L1OverlayDB::new_at_anchor(db, self.l1_reader.clone(), self.portal_address, l1_block);
-        let l1 = db.l1_state().clone();
-        let evm = TempoEvm::new(db, input);
-        ZoneEvm::new(self.register_precompiles(evm, l1))
-    }
-
     fn register_precompiles<DB: Database, I: Inspector<TempoCtx<L1OverlayDB<DB, L1>>>>(
         &self,
         evm: TempoEvm<L1OverlayDB<DB, L1>, I>,

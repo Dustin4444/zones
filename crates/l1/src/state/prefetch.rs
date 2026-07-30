@@ -29,14 +29,10 @@ use tracing::{info, warn};
 /// environment, and select the exact L1 anchor whose storage payload execution will observe.
 #[derive(Debug, Clone)]
 pub struct PrefetchCtx {
-    /// Sealed Zone parent whose state backs each throwaway EVM.
+    /// Sealed Zone parent header whose state backs the simulation.
     pub parent: SealedHeader<TempoHeader>,
-    /// Exact child L1 block being prepared for `advanceTempo`.
-    pub target_l1_block: u64,
-    /// Child Zone block timestamp in whole seconds.
-    pub timestamp: u64,
-    /// Millisecond remainder paired with [`timestamp`](Self::timestamp).
-    pub timestamp_millis_part: u64,
+    /// Sealed Tempo child header used to simulate `advanceTempo` and set the L1 block anchor.
+    pub child: SealedHeader<TempoHeader>,
 }
 
 /// Executes synchronous canonical Tempo policy reads against a Zone parent state.
@@ -331,9 +327,7 @@ mod tests {
     fn ctx() -> PrefetchCtx {
         PrefetchCtx {
             parent: SealedHeader::seal_slow(TempoHeader::default()),
-            target_l1_block: 7,
-            timestamp: 1,
-            timestamp_millis_part: 0,
+            child: SealedHeader::seal_slow(TempoHeader::default()),
         }
     }
 

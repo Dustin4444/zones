@@ -350,8 +350,6 @@ impl ZoneEngine {
     /// event-derived RPC reads ahead of the payload-builder deadline and populates the same cache
     /// that execution uses.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
-        let timestamp = l1_block.header.timestamp();
-        let timestamp_millis_part = l1_block.header.timestamp_millis_part;
         let (prepared, prefetch) = l1_block
             .prepare_for_build(&self.sequencer_key, self.portal_address)
             .await?;
@@ -361,9 +359,7 @@ impl ZoneEngine {
                 self.l1_fetch_concurrency,
                 PrefetchCtx {
                     parent: self.last_header.clone(),
-                    target_l1_block: prepared.header.number(),
-                    timestamp,
-                    timestamp_millis_part,
+                    child: prepared.header.clone(),
                 },
                 self.policy_executor.clone(),
             )

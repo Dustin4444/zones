@@ -70,19 +70,6 @@ impl<P> L1State<P> {
         }
     }
 
-    /// Creates execution-local L1 state initialized at an exact read-only anchor.
-    ///
-    /// **IMPORTANT:** This is intended for throwaway pre-execution contexts.
-    /// Protocol execution must use [`advance_anchor`](Self::advance_anchor) so `TempoState`
-    /// validates the L1 header transition before selecting its child anchor.
-    pub fn new_at_anchor(provider: P, portal_address: Address, anchor: u64) -> Self {
-        Self {
-            anchor: Rc::new(Cell::new(Some(anchor))),
-            provider,
-            portal_address,
-        }
-    }
-
     /// Clears the selected anchor after the current transaction attempt completes.
     pub fn reset_anchor(&self) {
         self.anchor.set(None);
@@ -269,14 +256,6 @@ mod tests {
         l1.advance_anchor(10, 11).unwrap();
         read(&l1, 11).unwrap();
         assert_eq!(l1.get_anchor(), Some(11));
-    }
-
-    #[test]
-    fn l1_state_initialized_at_anchor_rejects_other_blocks() {
-        let l1 = L1State::new_at_anchor(MockL1Reader::default(), Address::ZERO, 11);
-        read(&l1, 11).unwrap();
-        assert!(read(&l1, 10).is_err());
-        assert!(l1.advance_anchor(11, 12).is_err());
     }
 
     #[test]
