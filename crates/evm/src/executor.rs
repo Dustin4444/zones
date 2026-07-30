@@ -163,8 +163,13 @@ fn validate_system_transaction(
     has_advanced_tempo: bool,
     tx: &TempoTxEnvelope,
 ) -> Result<bool, BlockExecutionError> {
+    let mut calls = tx.calls();
+    let first_call = calls.next();
+    let has_additional_calls = calls.next().is_some();
+    let is_single_call = first_call.is_some() && !has_additional_calls;
     let is_advance_tempo = tx.is_system_tx()
-        && tx.calls().any(|(kind, input)| {
+        && is_single_call
+        && first_call.is_some_and(|(kind, input)| {
             kind.to() == Some(&ZONE_INBOX_ADDRESS) && input.starts_with(&ADVANCE_TEMPO_SELECTOR)
         });
 
@@ -186,13 +191,25 @@ fn validate_system_transaction(
         .into());
     }
 
-    if tx.is_system_tx()
-        && !tx.calls().any(|(kind, input)| {
+    let is_finalize_withdrawal_batch = is_single_call
+        && first_call.is_some_and(|(kind, input)| {
+            kind.to() == Some(&ZONE_OUTBOX_ADDRESS) && is_finalize_withdrawal_batch_calldata(input)
+        });
+
+    if tx.is_system_tx() && !is_finalize_withdrawal_batch {
+        return Err(BlockValidationError::msg(
+            "system transactions after advanceTempo must call ZoneOutbox.finalizeWithdrawalBatch",
+        )
+        .into());
+    }
+
+    if !tx.is_system_tx()
+        && tx.calls().any(|(kind, input)| {
             kind.to() == Some(&ZONE_OUTBOX_ADDRESS) && is_finalize_withdrawal_batch_calldata(input)
         })
     {
         return Err(BlockValidationError::msg(
-            "system transactions after advanceTempo must call ZoneOutbox.finalizeWithdrawalBatch",
+            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction",
         )
         .into());
     }
@@ -208,7 +225,7 @@ mod tests {
     };
 
     use alloy_consensus::{Signed, TxLegacy};
-    use alloy_primitives::{Address, Bytes, Signature, U256};
+    use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256};
     use alloy_sol_types::SolCall;
     use tempo_precompiles::{
         DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS,
@@ -216,7 +233,13 @@ mod tests {
         test_util::TIP20Setup,
         tip_fee_manager::{TipFeeManager, amm::PoolKey},
     };
-    use tempo_primitives::{TempoTxEnvelope, transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE};
+    use tempo_primitives::{
+        TempoTxEnvelope,
+        transaction::{
+            AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
+            envelope::TEMPO_SYSTEM_TX_SIGNATURE,
+        },
+    };
     use tempo_revm::{TempoBatchCallEnv, TempoTxEnv};
     use tempo_zone_contracts::IZoneOutbox;
 
@@ -318,6 +341,67 @@ mod tests {
             Signature::test_signature(),
         ));
         assert!(!validate_system_transaction(true, &ordinary).unwrap());
+    }
+
+    #[test]
+    fn withdrawal_finalization_requires_a_system_transaction() {
+        let finalize_calldata: Bytes = IZoneOutbox::finalizeWithdrawalBatchCall {
+            count: U256::ONE,
+            blockNumber: 1,
+            encryptedSenders: vec![Bytes::new()],
+        }
+        .abi_encode()
+        .into();
+
+        let direct = TempoTxEnvelope::Legacy(Signed::new_unhashed(
+            TxLegacy {
+                to: ZONE_OUTBOX_ADDRESS.into(),
+                input: finalize_calldata.clone(),
+                ..Default::default()
+            },
+            Signature::test_signature(),
+        ));
+        let error = validate_system_transaction(true, &direct).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction"
+        );
+
+        let aa = AASigned::new_unhashed(
+            TempoTransaction {
+                calls: vec![
+                    Call {
+                        to: TxKind::Call(ZONE_OUTBOX_ADDRESS),
+                        value: U256::ZERO,
+                        input: IZoneOutbox::requestWithdrawalCall {
+                            token: Address::with_last_byte(1),
+                            to: Address::with_last_byte(2),
+                            amount: 1,
+                            memo: B256::ZERO,
+                            gasLimit: 0,
+                            zoneFallbackRecipient: Address::with_last_byte(3),
+                            data: Bytes::new(),
+                            revealTo: Bytes::new(),
+                        }
+                        .abi_encode()
+                        .into(),
+                    },
+                    Call {
+                        to: TxKind::Call(ZONE_OUTBOX_ADDRESS),
+                        value: U256::ZERO,
+                        input: finalize_calldata,
+                    },
+                ],
+                ..Default::default()
+            },
+            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(Signature::test_signature())),
+        )
+        .into();
+        let error = validate_system_transaction(true, &aa).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction"
+        );
     }
 
     #[test]
