@@ -1,6 +1,7 @@
 use super::*;
 use eyre::WrapErr as _;
 use std::collections::HashSet;
+use tempo_chainspec::spec::chainspec_from_chain_id;
 use tempo_consensus::finalized_block_stream::{FinalizedBlockStream, FinalizedBlockStreamConfig};
 use tempo_contracts::precompiles::{ITIP20::TransferPolicyUpdate, TIP403_REGISTRY_ADDRESS};
 use tempo_primitives::is_tip20_prefix;
@@ -260,6 +261,10 @@ pub trait LeadershipSink: Send + Sync + std::fmt::Debug {
 pub struct L1SubscriberConfig {
     /// RPC URL of the L1 node (HTTP or WebSocket).
     pub l1_rpc_url: String,
+    /// Whether finalized L1 headers must be verified using Tempo consensus certificates.
+    pub verify_certificates: bool,
+    /// Consensus epoch length override for L1 chains without a built-in Tempo chain spec.
+    pub epoch_length: Option<std::num::NonZeroU64>,
     /// ZonePortal contract address on L1.
     pub portal_address: Address,
     /// Shared registry of tokens enabled for this zone.
@@ -753,27 +758,33 @@ impl L1Subscriber {
 
     /// Run the L1 subscriber until an RPC operation fails.
     ///
-    /// Finalized headers are authenticated through Tempo consensus certificates. Tempo Anvil
-    /// retains finalized-tag following because it does not run consensus.
+    /// When configured, finalized headers are authenticated through Tempo consensus
+    /// certificates. Otherwise, the subscriber trusts the RPC's finalized tag.
     ///
     /// [`Self::spawn`] retries transient errors and treats deterministic finalized-block
     /// ingestion failures as fatal.
     pub async fn run(&self) -> eyre::Result<()> {
         let provider = self.connect().await?;
-        let chain_id = provider.get_chain_id().await?;
-        let chain_spec = tempo_chain_spec_for_l1(chain_id)
-            .ok_or_else(|| eyre::eyre!("unsupported parent Tempo chain ID {chain_id}"))?;
         let start_after = self.next_block_to_sync()?;
 
         let headers: Pin<
             Box<dyn Stream<Item = eyre::Result<SealedHeader<TempoHeader>>> + Send + '_>,
-        > = if chain_id != 31337 {
-            let epoch_length = chain_spec.info.epoch_length().ok_or_else(|| {
-                eyre::eyre!("Tempo chain {chain_id} has no consensus epoch length")
-            })?;
+        > = if self.config.verify_certificates {
+            let chain_id = provider.get_chain_id().await?;
+            let chain_spec = chainspec_from_chain_id(chain_id);
+            let epoch_length = self
+                .config
+                .epoch_length
+                .or_else(|| chain_spec.as_ref()?.info.epoch_length())
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "cannot determine the consensus epoch length for Tempo chain {chain_id}; \
+                         provide --l1.epoch-length"
+                    )
+                })?;
             let mut config = FinalizedBlockStreamConfig::new(
                 start_after.hash,
-                chain_spec.network_identity.clone(),
+                chain_spec.and_then(|spec| spec.network_identity.clone()),
                 epoch_length,
             );
             config.fetch_concurrency = self.config.l1_fetch_concurrency.max(1);
@@ -789,9 +800,8 @@ impl L1Subscriber {
             Box::pin(headers)
         } else {
             warn!(
-                chain_id,
-                "Tempo Anvil does not expose consensus certificates; following the trusted \
-                 finalized RPC tag without certificate verification"
+                "L1 consensus certificate verification is disabled; trusting the finalized RPC \
+                 tag"
             );
             let triggers = self.head_triggers(&provider).await?;
             self.rpc_finalized_headers(provider.clone(), start_after, triggers)
