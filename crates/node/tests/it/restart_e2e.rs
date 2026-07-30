@@ -8,14 +8,18 @@
 //! - Multiple restart cycles don't corrupt state
 
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
+use zone_sequencer::ZoneSequencerHandle;
 
 /// Longer timeout for real L1 tests.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout for waiting on withdrawals (includes batch submission + processing).
 const WITHDRAWAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Bound for confirming aborted sequencer tasks have actually terminated.
+const TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Read the portal's `blockHash()` — the last submitted zone block hash.
 async fn portal_block_hash(
@@ -72,9 +76,88 @@ async fn wait_for_withdrawal_requested(
     .await
 }
 
-async fn abort_task(handle: tokio::task::JoinHandle<()>) {
+async fn await_aborted_task(name: &str, handle: tokio::task::JoinHandle<()>) -> eyre::Result<()> {
+    let result = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, handle)
+        .await
+        .map_err(|_| {
+            eyre::eyre!("timed out after {TASK_SHUTDOWN_TIMEOUT:?} waiting for {name} to terminate")
+        })?;
+    match result {
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => eyre::bail!("{name} failed while stopping: {error}"),
+        Ok(()) => eyre::bail!("{name} exited unexpectedly before abort completed"),
+    }
+}
+
+async fn abort_task(name: &str, handle: tokio::task::JoinHandle<()>) -> eyre::Result<()> {
     handle.abort();
-    let _ = handle.await;
+    await_aborted_task(name, handle).await
+}
+
+async fn abort_sequencer(handle: ZoneSequencerHandle) -> eyre::Result<()> {
+    let ZoneSequencerHandle {
+        withdrawal_handle,
+        monitor_handle,
+    } = handle;
+    withdrawal_handle.abort();
+    monitor_handle.abort();
+    let (withdrawal_result, monitor_result) = tokio::join!(
+        await_aborted_task("withdrawal processor", withdrawal_handle),
+        await_aborted_task("zone monitor", monitor_handle),
+    );
+    withdrawal_result?;
+    monitor_result?;
+    Ok(())
+}
+
+async fn wait_for_batch_progress(
+    l1: &L1TestNode,
+    portal_address: Address,
+    before_count: usize,
+    before_hash: B256,
+    sequencer: &ZoneSequencerHandle,
+) -> eyre::Result<(usize, B256)> {
+    let started = std::time::Instant::now();
+    let mut last_observed = (before_count, before_hash);
+    loop {
+        if sequencer.monitor_handle.is_finished() {
+            eyre::bail!("restarted zone monitor exited before submitting a new batch");
+        }
+        if sequencer.withdrawal_handle.is_finished() {
+            eyre::bail!("restarted withdrawal processor exited before batch progress");
+        }
+
+        let remaining = WITHDRAWAL_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            eyre::bail!(
+                "timed out after {WITHDRAWAL_TIMEOUT:?} waiting for batch progress after restart; \
+                 before count={before_count}, hash={before_hash}; last observed count={}, hash={}",
+                last_observed.0,
+                last_observed.1,
+            );
+        }
+        let (count, hash) = tokio::time::timeout(remaining, async {
+            tokio::try_join!(
+                batch_submitted_count(l1, portal_address),
+                portal_block_hash(l1, portal_address),
+            )
+        })
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "timed out after {WITHDRAWAL_TIMEOUT:?} waiting for batch state RPCs after \
+                 restart; before count={before_count}, hash={before_hash}; last observed \
+                 count={}, hash={}",
+                last_observed.0,
+                last_observed.1,
+            )
+        })??;
+        last_observed = (count, hash);
+        if count > before_count && hash != before_hash {
+            return Ok((count, hash));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Sequencer restart after a successful batch + withdrawal cycle.
@@ -126,9 +209,7 @@ async fn test_sequencer_restart_resumes_batch_submission() -> eyre::Result<()> {
     );
 
     // --- Phase 2: Restart sequencer ---
-    seq_handle.monitor_handle.abort();
-    seq_handle.withdrawal_handle.abort();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    abort_sequencer(seq_handle).await?;
 
     // Respawn — should resume from portal's blockHash, not block 0
     let _seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
@@ -190,7 +271,7 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
 
     // Keep batch submission running, but stop L1 processing so the portal queue
     // is guaranteed to remain pending until after the restart.
-    abort_task(withdrawal_handle).await;
+    abort_task("withdrawal processor", withdrawal_handle).await?;
 
     // Request withdrawal — wait for the batch to be submitted to L1
     let withdrawal_amount: u128 = 500_000;
@@ -219,7 +300,7 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     );
 
     // --- Abort sequencer BEFORE the withdrawal is processed ---
-    abort_task(monitor_handle).await;
+    abort_task("zone monitor", monitor_handle).await?;
 
     // --- Respawn sequencer (fetch_pending_withdrawals runs during init) ---
     let seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
@@ -308,9 +389,7 @@ async fn test_double_sequencer_restart() -> eyre::Result<()> {
     )
     .await?;
 
-    seq1.monitor_handle.abort();
-    seq1.withdrawal_handle.abort();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    abort_sequencer(seq1).await?;
 
     // --- Cycle 2 ---
     let seq2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
@@ -324,9 +403,7 @@ async fn test_double_sequencer_restart() -> eyre::Result<()> {
     )
     .await?;
 
-    seq2.monitor_handle.abort();
-    seq2.withdrawal_handle.abort();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    abort_sequencer(seq2).await?;
 
     // --- Cycle 3 (final) ---
     let _seq3 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
@@ -399,29 +476,12 @@ async fn test_batch_only_restart_no_withdrawals() -> eyre::Result<()> {
     let batches_before = batch_submitted_count(&l1, portal_address).await?;
 
     // Restart
-    seq1.monitor_handle.abort();
-    seq1.withdrawal_handle.abort();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    abort_sequencer(seq1).await?;
 
-    let _seq2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+    let seq2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
-    // Wait for more zone blocks to be produced and batched
-    // The zone produces blocks as L1 blocks arrive (every 500ms in dev mode),
-    // so just waiting a bit should produce new blocks to batch.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    let batches_after = batch_submitted_count(&l1, portal_address).await?;
-    assert!(
-        batches_after > batches_before,
-        "new batches should be submitted after restart (before={batches_before}, after={batches_after})"
-    );
-
-    // Portal block hash should have advanced
-    let hash_after = portal_block_hash(&l1, portal_address).await?;
-    assert_ne!(
-        hash_before, hash_after,
-        "portal blockHash should advance after restart"
-    );
+    // Observe the exact post-restart transition instead of assuming a fixed delay is enough.
+    wait_for_batch_progress(&l1, portal_address, batches_before, hash_before, &seq2).await?;
 
     Ok(())
 }
@@ -475,9 +535,7 @@ async fn test_deferred_withdrawal_survives_sequencer_restart() -> eyre::Result<(
     // The continuously running L1/zone stack may already have produced the next L2
     // block by this point, so checking current pendingWithdrawalsCount() would race
     // with the intended +1-block finalization.
-    seq_handle.monitor_handle.abort();
-    seq_handle.withdrawal_handle.abort();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    abort_sequencer(seq_handle).await?;
     let _seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
     l1.wait_for_withdrawal_on_l1(

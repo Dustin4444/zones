@@ -8,8 +8,9 @@
 //! - Method tier enforcement (restricted/disabled/unknown methods)
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, now_secs, start_zone_with_private_rpc,
-    start_zone_with_private_rpc_l1, start_zone_with_private_rpc_l1_with_encryption,
+    DEFAULT_TIMEOUT, JsonRpcResponseExt, TEST_MNEMONIC, TIP20_TX_GAS, now_secs,
+    start_zone_with_private_rpc, start_zone_with_private_rpc_l1,
+    start_zone_with_private_rpc_l1_with_encryption,
 };
 use alloy::{
     primitives::{Address, B256, TxKind, U256, address, hex},
@@ -20,6 +21,7 @@ use alloy_provider::ProviderBuilder;
 use alloy_signer::SignerSync;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::{SolCall, SolError};
+use eyre::WrapErr;
 use futures::{SinkExt, StreamExt};
 use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::thread_rng;
@@ -44,6 +46,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
+use zone_rpc::types::{AuthorizationTokenInfoResponse, ZoneInfoResponse};
 
 alloy::sol! {
     interface IMulticall3 {
@@ -102,72 +105,123 @@ fn signed_sponsored_raw_transaction(
     Ok(format!("0x{}", hex::encode(envelope.encoded_2718())))
 }
 
-fn assert_filter_not_found_error(response: &serde_json::Value) {
-    let error = response
-        .get("error")
-        .unwrap_or_else(|| panic!("expected filter-not-found error, got {response}"));
-    assert_eq!(
-        error["code"].as_i64().unwrap(),
-        -32602,
-        "filter-not-found should surface as invalid params",
-    );
-    assert_eq!(
-        error["message"].as_str().unwrap(),
-        "filter not found",
-        "filter-not-found message should be stable",
-    );
+fn assert_filter_not_found_error(response: &serde_json::Value) -> eyre::Result<()> {
+    response.expect_error(-32602, "filter not found")?;
+    Ok(())
 }
 
-fn assert_redacted_block(block: &Value) {
-    assert!(!block.is_null(), "block should not be null");
-    assert!(
+fn expect_redacted_block(response: &Value) -> eyre::Result<Value> {
+    let block: Value = response.expect_result()?;
+    eyre::ensure!(
+        !block.is_null(),
+        "block should not be null; complete response: {response}"
+    );
+    eyre::ensure!(
         block["transactions"]
             .as_array()
             .is_some_and(|transactions| transactions.is_empty()),
-        "block transactions should be empty (redacted)"
+        "block transactions should be empty (redacted); complete response: {response}"
     );
 
     let zero_root = format!("{:#x}", B256::ZERO);
-    assert_eq!(block["transactionsRoot"], zero_root);
-    assert_eq!(block["receiptsRoot"], zero_root);
-    assert_eq!(block["stateRoot"], zero_root);
-    assert_eq!(block["extraData"], "0x");
+    eyre::ensure!(
+        block["transactionsRoot"] == zero_root,
+        "block transactionsRoot should be zero; complete response: {response}"
+    );
+    eyre::ensure!(
+        block["receiptsRoot"] == zero_root,
+        "block receiptsRoot should be zero; complete response: {response}"
+    );
+    eyre::ensure!(
+        block["stateRoot"] == zero_root,
+        "block stateRoot should be zero; complete response: {response}"
+    );
+    eyre::ensure!(
+        block["extraData"] == "0x",
+        "block extraData should be empty; complete response: {response}"
+    );
 
     if let Some(withdrawals_root) = block.get("withdrawalsRoot") {
-        assert!(
+        eyre::ensure!(
             withdrawals_root.is_null() || withdrawals_root == zero_root.as_str(),
-            "block withdrawalsRoot should be null or zero"
+            "block withdrawalsRoot should be null or zero; complete response: {response}"
         );
     }
     if let Some(bloom) = block.get("logsBloom").and_then(Value::as_str) {
         let bloom_trimmed = bloom.strip_prefix("0x").unwrap_or(bloom);
-        assert!(
+        eyre::ensure!(
             bloom_trimmed.chars().all(|c| c == '0'),
-            "block logsBloom should be all zeros"
+            "block logsBloom should be all zeros; complete response: {response}"
         );
     }
-    assert_eq!(block["gasUsed"], "0x0");
+    eyre::ensure!(
+        block["gasUsed"] == "0x0",
+        "block gasUsed should be zero; complete response: {response}"
+    );
     if let Some(size) = block.get("size") {
-        assert_eq!(size.as_str(), Some("0x0"));
+        eyre::ensure!(
+            size.as_str() == Some("0x0"),
+            "block size should be zero; complete response: {response}"
+        );
     }
     if let Some(blob_gas_used) = block.get("blobGasUsed") {
-        assert_eq!(blob_gas_used.as_str(), Some("0x0"));
+        eyre::ensure!(
+            blob_gas_used.as_str() == Some("0x0"),
+            "block blobGasUsed should be zero; complete response: {response}"
+        );
     }
     if let Some(excess_blob_gas) = block.get("excessBlobGas") {
-        assert_eq!(excess_blob_gas.as_str(), Some("0x0"));
+        eyre::ensure!(
+            excess_blob_gas.as_str() == Some("0x0"),
+            "block excessBlobGas should be zero; complete response: {response}"
+        );
     }
     if let Some(withdrawals) = block.get("withdrawals") {
-        assert!(
+        eyre::ensure!(
             withdrawals
                 .as_array()
                 .is_some_and(|withdrawals| withdrawals.is_empty()),
-            "block withdrawals should be empty when present"
+            "block withdrawals should be empty when present; complete response: {response}"
         );
     }
+    Ok(block)
 }
 
 type PrivateRpcWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(serde::Deserialize)]
+struct LogSubscriptionNotification {
+    params: LogSubscriptionParams,
+}
+
+#[derive(serde::Deserialize)]
+struct LogSubscriptionParams {
+    subscription: String,
+    result: LogSubscriptionResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogSubscriptionResult {
+    transaction_hash: String,
+}
+
+fn expect_log_subscription_notification(
+    notification: &Value,
+    expected_subscription: &str,
+) -> eyre::Result<String> {
+    let parsed: LogSubscriptionNotification = serde_json::from_value(notification.clone())
+        .wrap_err_with(|| {
+            format!("malformed private log subscription notification: {notification}")
+        })?;
+    eyre::ensure!(
+        parsed.params.subscription == expected_subscription,
+        "expected subscription {expected_subscription}, got {}; complete notification: {notification}",
+        parsed.params.subscription,
+    );
+    Ok(parsed.params.result.transaction_hash)
+}
 
 fn private_rpc_ws_url(http_url: &url::Url) -> eyre::Result<url::Url> {
     let mut ws_url = http_url.clone();
@@ -221,10 +275,7 @@ async fn ws_subscribe(ws: &mut PrivateRpcWs, params: Value) -> eyre::Result<Stri
     ))
     .await?;
     let response = ws_next_json(ws).await?;
-    Ok(response["result"]
-        .as_str()
-        .expect("subscription response should include an id")
-        .to_owned())
+    response.expect_result()
 }
 
 async fn ws_collect_messages_until_quiet(
@@ -297,16 +348,10 @@ async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Res
 
     for method in ["eth_sendRawTransaction", "eth_sendRawTransactionSync"] {
         let response = ctx.call_as_user(method, json!([raw]), &user_signer).await?;
-        assert_eq!(
-            response["error"]["code"].as_i64(),
-            Some(-32603),
-            "{method} should reject a sender without enabled-token balance: {response}",
-        );
-        assert_eq!(
-            response["error"]["message"].as_str(),
-            Some("sender must hold a nonzero balance of an enabled zone token"),
-            "{method} should explain why the transaction was rejected: {response}",
-        );
+        response.expect_error(
+            -32603,
+            "sender must hold a nonzero balance of an enabled zone token",
+        )?;
     }
 
     ctx.inject_deposit(
@@ -320,10 +365,7 @@ async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Res
     let response = ctx
         .call_as_user("eth_sendRawTransaction", json!([raw]), &user_signer)
         .await?;
-    assert!(
-        response["result"].as_str().is_some(),
-        "funded sender transaction should be accepted: {response}",
-    );
+    let _: String = response.expect_result()?;
 
     Ok(())
 }
@@ -344,14 +386,7 @@ async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
         let resp = ctx
             .call("eth_blockNumber", serde_json::json!([]), &token)
             .await?;
-        assert!(
-            resp.get("error").is_none(),
-            "auth token should succeed: {resp}"
-        );
-        assert!(
-            resp["result"].as_str().is_some(),
-            "expected block number result"
-        );
+        let _: String = resp.expect_result()?;
     }
 
     Ok(())
@@ -427,9 +462,9 @@ async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
                 &token,
             )
             .await?;
+        let result: String = resp.expect_result()?;
         assert_eq!(
-            resp["result"].as_str().unwrap(),
-            "0x",
+            result, "0x",
             "keychain auth should allow calls from the root account",
         );
     }
@@ -499,6 +534,7 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
         now_secs() + 1,
     )
     .await?;
+    // Intentionally clock-based: exercise real authorization-token expiry, not node readiness.
     sleep(std::time::Duration::from_secs(2)).await;
     let (status, _) = ctx
         .call_raw("eth_blockNumber", serde_json::json!([]), &expired_token)
@@ -545,18 +581,12 @@ async fn test_public_methods() -> eyre::Result<()> {
 
     for method in ["eth_blockNumber", "eth_chainId"] {
         let seq_resp = ctx.call_as_sequencer(method, serde_json::json!([])).await?;
-        assert!(
-            seq_resp.get("result").is_some() && seq_resp.get("error").is_none(),
-            "sequencer should succeed for {method}"
-        );
+        let _: String = seq_resp.expect_result()?;
 
         let user_resp = ctx
             .call_as_user(method, serde_json::json!([]), &user_signer)
             .await?;
-        assert!(
-            user_resp.get("result").is_some() && user_resp.get("error").is_none(),
-            "user should succeed for {method}"
-        );
+        let _: String = user_resp.expect_result()?;
     }
 
     for (method, expected) in [
@@ -567,7 +597,8 @@ async fn test_public_methods() -> eyre::Result<()> {
             ctx.call_as_sequencer(method, json!([])).await?,
             ctx.call_as_user(method, json!([]), &user_signer).await?,
         ] {
-            assert_eq!(response["result"], json!(format!("{expected:#x}")));
+            let result: String = response.expect_result()?;
+            assert_eq!(result, format!("{expected:#x}"));
         }
     }
 
@@ -586,11 +617,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
     let create_resp = ctx
         .call_as_user("eth_newBlockFilter", serde_json::json!([]), &owner_signer)
         .await?;
-    assert!(
-        create_resp.get("error").is_none(),
-        "owner should be able to create a block filter: {create_resp}"
-    );
-    let filter_id = create_resp["result"].clone();
+    let filter_id: String = create_resp.expect_result()?;
 
     ctx.inject_empty_block().await?;
 
@@ -601,14 +628,9 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
             &owner_signer,
         )
         .await?;
+    let owner_changes: Vec<String> = owner_changes.expect_result()?;
     assert!(
-        owner_changes.get("error").is_none(),
-        "owner should be able to read filter changes: {owner_changes}"
-    );
-    assert!(
-        owner_changes["result"]
-            .as_array()
-            .is_some_and(|changes| !changes.is_empty()),
+        !owner_changes.is_empty(),
         "owner should observe at least one new block hash"
     );
 
@@ -619,7 +641,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
             &other_signer,
         )
         .await?;
-    assert_filter_not_found_error(&other_changes);
+    assert_filter_not_found_error(&other_changes)?;
 
     let uninstall_resp = ctx
         .call_as_user(
@@ -629,7 +651,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
         )
         .await?;
     assert!(
-        uninstall_resp["result"].as_bool().unwrap(),
+        uninstall_resp.expect_result::<bool>()?,
         "owner uninstall should succeed",
     );
 
@@ -640,7 +662,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
             &owner_signer,
         )
         .await?;
-    assert_filter_not_found_error(&after_uninstall);
+    assert_filter_not_found_error(&after_uninstall)?;
 
     Ok(())
 }
@@ -664,17 +686,17 @@ async fn test_balance_privacy() -> eyre::Result<()> {
 
     // User querying another address's balance → 0x0
     let resp = ctx.get_balance_as_user(recipient, &user_signer).await?;
+    let balance: String = resp.expect_result()?;
     assert_eq!(
-        resp["result"].as_str().unwrap(),
-        "0x0",
+        balance, "0x0",
         "non-owner should see 0x0 balance for other addresses"
     );
 
     // User querying another address's tx count → 0x0
     let resp = ctx.get_tx_count_as_user(recipient, &user_signer).await?;
+    let tx_count: String = resp.expect_result()?;
     assert_eq!(
-        resp["result"].as_str().unwrap(),
-        "0x0",
+        tx_count, "0x0",
         "non-owner should see 0x0 for other address's tx count"
     );
 
@@ -682,17 +704,11 @@ async fn test_balance_privacy() -> eyre::Result<()> {
     let resp = ctx
         .get_balance_as_user(user_signer.address(), &user_signer)
         .await?;
-    assert!(
-        resp.get("result").is_some() && resp.get("error").is_none(),
-        "user should be able to query own balance"
-    );
+    let _: String = resp.expect_result()?;
 
     // Sequencer querying any address → full access
     let resp = ctx.get_balance_as_sequencer(recipient).await?;
-    assert!(
-        resp.get("result").is_some() && resp.get("error").is_none(),
-        "sequencer should be able to query any address's balance"
-    );
+    let _: String = resp.expect_result()?;
 
     Ok(())
 }
@@ -751,10 +767,7 @@ async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
             &outsider_signer,
         )
         .await?;
-    assert!(
-        outsider_balance.get("error").is_some(),
-        "non-owner balanceOf(other) should revert"
-    );
+    outsider_balance.expect_error_response()?;
 
     let outsider_allowance = ctx
         .call_as_user(
@@ -769,10 +782,7 @@ async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
             &outsider_signer,
         )
         .await?;
-    assert!(
-        outsider_allowance.get("error").is_some(),
-        "unrelated caller allowance(owner, spender) should revert"
-    );
+    outsider_allowance.expect_error_response()?;
 
     let sequencer_balance = ctx
         .call_as_sequencer(
@@ -787,12 +797,8 @@ async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
             ]),
         )
         .await?;
-    let sequencer_balance_bytes = hex::decode(
-        sequencer_balance["result"]
-            .as_str()
-            .expect("sequencer balanceOf should return hex")
-            .trim_start_matches("0x"),
-    )?;
+    let sequencer_balance: String = sequencer_balance.expect_result()?;
+    let sequencer_balance_bytes = hex::decode(sequencer_balance.trim_start_matches("0x"))?;
     assert_eq!(
         PrecompileTip20::balanceOfCall::abi_decode_returns(&sequencer_balance_bytes)?,
         expected_owner_balance
@@ -811,12 +817,8 @@ async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
             ]),
         )
         .await?;
-    let sequencer_allowance_bytes = hex::decode(
-        sequencer_allowance["result"]
-            .as_str()
-            .expect("sequencer allowance should return hex")
-            .trim_start_matches("0x"),
-    )?;
+    let sequencer_allowance: String = sequencer_allowance.expect_result()?;
+    let sequencer_allowance_bytes = hex::decode(sequencer_allowance.trim_start_matches("0x"))?;
     assert_eq!(
         PrecompileTip20::allowanceCall::abi_decode_returns(&sequencer_allowance_bytes)?,
         U256::from(allowance_amount)
@@ -856,12 +858,11 @@ async fn test_zone_inbox_refunds_eth_call_privacy() -> eyre::Result<()> {
             &outsider_signer,
         )
         .await?;
-    let outsider_error = outsider_refunds["error"]["message"]
-        .as_str()
-        .expect("non-owner refund read should return an RPC error message");
+    let outsider_error = outsider_refunds.expect_error_response()?;
     let unauthorized_selector = format!("0x{}", hex::encode(Unauthorized::SELECTOR));
     assert!(
-        outsider_error.contains("Unauthorized") && outsider_error.contains(&unauthorized_selector),
+        outsider_error.message.contains("Unauthorized")
+            && outsider_error.message.contains(&unauthorized_selector),
         "the ZoneInbox getter must reject a direct non-owner refund read with Unauthorized(): {outsider_refunds}"
     );
 
@@ -878,12 +879,8 @@ async fn test_zone_inbox_refunds_eth_call_privacy() -> eyre::Result<()> {
             &owner_signer,
         )
         .await?;
-    let owner_refunds_bytes = hex::decode(
-        owner_refunds["result"]
-            .as_str()
-            .expect("own refunds call should return hex")
-            .trim_start_matches("0x"),
-    )?;
+    let owner_refunds: String = owner_refunds.expect_result()?;
+    let owner_refunds_bytes = hex::decode(owner_refunds.trim_start_matches("0x"))?;
     assert_eq!(
         IZoneInbox::refundsCall::abi_decode_returns(&owner_refunds_bytes)?,
         0,
@@ -909,10 +906,7 @@ async fn test_zone_inbox_refunds_eth_call_privacy() -> eyre::Result<()> {
             &outsider_signer,
         )
         .await?;
-    assert!(
-        forwarded_refunds.get("result").is_none() && forwarded_refunds.get("error").is_some(),
-        "Multicall3 must not expose another owner's refund balance: {forwarded_refunds}"
-    );
+    forwarded_refunds.expect_error_response()?;
 
     Ok(())
 }
@@ -939,15 +933,7 @@ async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Resu
                 &user_signer,
             )
             .await?;
-        assert_eq!(
-            create_resp["error"]["code"].as_i64().unwrap(),
-            -32602,
-            "{method} should reject create-style requests",
-        );
-        assert_eq!(
-            create_resp["error"]["message"].as_str().unwrap(),
-            "contract creation not supported on zones",
-        );
+        create_resp.expect_error(-32602, "contract creation not supported on zones")?;
 
         let user_override_resp = ctx
             .call_as_user(
@@ -963,15 +949,7 @@ async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Resu
                 &user_signer,
             )
             .await?;
-        assert_eq!(
-            user_override_resp["error"]["code"].as_i64().unwrap(),
-            -32602,
-            "{method} should reject user state overrides",
-        );
-        assert_eq!(
-            user_override_resp["error"]["message"].as_str().unwrap(),
-            "state overrides not allowed",
-        );
+        user_override_resp.expect_error(-32602, "state overrides not allowed")?;
     }
 
     let fill_resp = ctx
@@ -985,11 +963,7 @@ async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Resu
             &user_signer,
         )
         .await?;
-    assert_eq!(fill_resp["error"]["code"].as_i64().unwrap(), -32602);
-    assert_eq!(
-        fill_resp["error"]["message"].as_str().unwrap(),
-        "contract creation not supported on zones",
-    );
+    fill_resp.expect_error(-32602, "contract creation not supported on zones")?;
 
     Ok(())
 }
@@ -1013,12 +987,7 @@ async fn test_block_access_control() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    let error = resp.get("error").expect("full=true should be rejected");
-    assert_eq!(
-        error["code"].as_i64().unwrap(),
-        -32005,
-        "full=true should return -32005"
-    );
+    resp.expect_error_code(-32005)?;
 
     // full=false → redacted block (empty txs, zeroed logsBloom)
     let resp = ctx
@@ -1028,10 +997,12 @@ async fn test_block_access_control() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    let block = resp.get("result").expect("should have result");
-    assert_redacted_block(block);
+    let block = expect_redacted_block(&resp)?;
 
-    let block_hash = block["hash"].as_str().expect("block should have hash");
+    let block_hash = block["hash"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("redacted block had no hash; complete response: {resp}"))?
+        .to_owned();
     let resp = ctx
         .call_as_user(
             "eth_getBlockByHash",
@@ -1039,7 +1010,7 @@ async fn test_block_access_control() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    assert_redacted_block(resp.get("result").expect("should have result"));
+    expect_redacted_block(&resp)?;
 
     Ok(())
 }
@@ -1064,14 +1035,7 @@ async fn test_method_tiers() -> eyre::Result<()> {
         let resp = ctx
             .call_as_user(method, serde_json::json!([]), &user_signer)
             .await?;
-        let error = resp
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} should return error"));
-        assert_eq!(
-            error["code"].as_i64().unwrap(),
-            -32005,
-            "{method} should return -32005"
-        );
+        resp.expect_error_code(-32005)?;
     }
 
     // Disabled methods → -32006 for everyone
@@ -1084,14 +1048,7 @@ async fn test_method_tiers() -> eyre::Result<()> {
         let resp = ctx
             .call_as_user(method, serde_json::json!([]), &user_signer)
             .await?;
-        let error = resp
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} should return error"));
-        assert_eq!(
-            error["code"].as_i64().unwrap(),
-            -32006,
-            "{method} should return -32006 (Method disabled)"
-        );
+        resp.expect_error_code(-32006)?;
     }
 
     // Unknown method → -32601
@@ -1102,14 +1059,7 @@ async fn test_method_tiers() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    let error = resp
-        .get("error")
-        .expect("unknown method should return error");
-    assert_eq!(
-        error["code"].as_i64().unwrap(),
-        -32601,
-        "unknown method should return -32601"
-    );
+    resp.expect_error_code(-32601)?;
 
     Ok(())
 }
@@ -1156,12 +1106,11 @@ async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
         ))
         .await?;
     let broad_subscription = ws_next_json(&mut owner_ws).await?;
-    assert_eq!(broad_subscription["id"], 1);
-    assert_eq!(
-        broad_subscription["error"]["code"].as_i64().unwrap(),
-        -32602,
-        "broad private log subscriptions should be rejected"
+    eyre::ensure!(
+        broad_subscription["id"] == 1,
+        "broad subscription response had the wrong id; complete response: {broad_subscription}"
     );
+    broad_subscription.expect_error_code(-32602)?;
 
     let owner_subscription = ws_subscribe(
         &mut owner_ws,
@@ -1210,16 +1159,9 @@ async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
     let owner_hashes = owner_notifications
         .into_iter()
         .map(|notification| {
-            assert_eq!(
-                notification["params"]["subscription"].as_str().unwrap(),
-                owner_subscription
-            );
-            notification["params"]["result"]["transactionHash"]
-                .as_str()
-                .unwrap()
-                .to_owned()
+            expect_log_subscription_notification(&notification, &owner_subscription)
         })
-        .collect::<HashSet<_>>();
+        .collect::<eyre::Result<HashSet<_>>>()?;
     assert_eq!(owner_hashes, HashSet::from([format!("{owner_hash:#x}")]));
 
     Ok(())
@@ -1246,12 +1188,11 @@ async fn test_ws_pending_transaction_subscriptions_are_disabled() -> eyre::Resul
             ))
             .await?;
         let response = ws_next_json(&mut user_ws).await?;
-        assert_eq!(response["id"], id);
-        assert_eq!(
-            response["error"]["code"].as_i64().unwrap(),
-            -32006,
-            "newPendingTransactions should be disabled"
+        eyre::ensure!(
+            response["id"] == id,
+            "pending-subscription response had the wrong id; complete response: {response}"
         );
+        response.expect_error_code(-32006)?;
     }
 
     Ok(())
@@ -1273,45 +1214,27 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    assert_eq!(
-        auth_info["result"]["account"].as_str().unwrap(),
-        format!("{:#x}", user_signer.address()),
-    );
+    let auth_info: AuthorizationTokenInfoResponse = auth_info.expect_result()?;
+    assert_eq!(auth_info.account, user_signer.address());
     assert!(
-        auth_info["result"]["expiresAt"].as_str().is_some(),
-        "expiresAt should be a quantity string",
+        !auth_info.expires_at.is_zero(),
+        "expiresAt should be non-zero"
     );
 
     let zone_info = ctx
         .call_as_user("zone_getZoneInfo", serde_json::json!([]), &user_signer)
         .await?;
-    assert_eq!(
-        zone_info["result"]["zoneId"].as_str().unwrap(),
-        format!("0x{:x}", ctx.config.zone_id),
-    );
-    assert_eq!(zone_info["result"]["isAccessEnforced"], true);
-    assert_eq!(zone_info["result"]["isGatewayOpen"], false);
-    assert_eq!(
-        zone_info["result"]["zoneTokens"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|token| token.as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec!["0x20c0000000000000000000000000000000000000"],
-    );
-    assert_eq!(
-        zone_info["result"]["chainId"].as_str().unwrap(),
-        format!("0x{:x}", ctx.config.chain_id),
-    );
+    let zone_info: ZoneInfoResponse = zone_info.expect_result()?;
+    assert_eq!(zone_info.zone_id.to::<u64>(), u64::from(ctx.config.zone_id));
+    assert!(zone_info.is_access_enforced);
+    assert!(!zone_info.is_gateway_open);
+    assert_eq!(zone_info.zone_tokens, vec![PATH_USD_ADDRESS],);
+    assert_eq!(zone_info.chain_id.to::<u64>(), ctx.config.chain_id);
     let tempo_block_number = TempoState::new(TEMPO_STATE_ADDRESS, ctx.zone.provider())
         .tempoBlockNumber()
         .call()
         .await?;
-    assert_eq!(
-        zone_info["result"]["tempoBlockNumber"],
-        format!("0x{tempo_block_number:x}"),
-    );
+    assert_eq!(zone_info.tempo_block_number.to::<u64>(), tempo_block_number,);
 
     Ok(())
 }
@@ -1336,20 +1259,9 @@ async fn test_zone_get_zone_info_returns_all_enabled_tokens() -> eyre::Result<()
     let zone_info = ctx
         .call_as_user("zone_getZoneInfo", serde_json::json!([]), &user_signer)
         .await?;
-    let zone_tokens = zone_info["result"]["zoneTokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|token| token.as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
+    let zone_tokens = zone_info.expect_result::<ZoneInfoResponse>()?.zone_tokens;
 
-    assert_eq!(
-        zone_tokens,
-        vec![
-            format!("{PATH_USD_ADDRESS:#x}"),
-            format!("{alpha_token:#x}")
-        ],
-    );
+    assert_eq!(zone_tokens, vec![PATH_USD_ADDRESS, alpha_token],);
 
     Ok(())
 }
@@ -1383,12 +1295,9 @@ async fn test_zone_get_encryption_key_reads_latest_l1_key() -> eyre::Result<()> 
     let second = ctx
         .call_as_user("zone_getEncryptionKey", serde_json::json!([]), &caller)
         .await?;
-    assert!(
-        second.get("error").is_none(),
-        "unexpected response: {second}"
-    );
+    let second: Value = second.expect_result()?;
     assert_eq!(
-        second["result"],
+        second,
         serde_json::json!({
             "x": second_x,
             "yParity": second_prefix,

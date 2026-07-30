@@ -23,8 +23,8 @@ use crate::utils::{
 /// Ceiling for one leadership switch: covers the Commonware handshake, the promotion
 /// barrier's tip-evidence round trip, and the generation swap.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a fenced or demoted node is watched to confirm it produces nothing.
-const QUIESCENCE: Duration = Duration::from_secs(3);
+/// Negative-observation window used only to prove a fenced or demoted node produces nothing.
+const NEGATIVE_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
 /// Live-propagation ceiling during the observation→activation window: well below the
 /// follower's 30-second inactivity backfill probe, so a routing regression that degrades
 /// the window to backfill-paced replication fails fast instead of passing slowly.
@@ -39,7 +39,6 @@ async fn test_forced_recovery_resumes_after_leader_crash() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     for _ in 0..3 {
         cluster.inject_block(vec![])?;
@@ -64,7 +63,8 @@ async fn test_forced_recovery_resumes_after_leader_crash() -> eyre::Result<()> {
     for _ in 0..3 {
         cluster.inject_block(vec![])?;
     }
-    tokio::time::sleep(QUIESCENCE).await;
+    // Negative assertion: observe the fenced survivors for the full bounded window.
+    tokio::time::sleep(NEGATIVE_OBSERVATION_WINDOW).await;
     for node in &cluster.nodes {
         assert_eq!(
             node.provider().get_block_number().await?,
@@ -155,9 +155,6 @@ async fn test_planned_handoff_moves_production_at_exact_activation_boundary() ->
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    // Commonware drops messages for offline peers; the bootstrap leader also needs tip
-    // evidence from both followers before its first promotion.
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // --- Blocks 1..=3 are produced by A (the manifest bootstrap leader). ---
     for _ in 0..3 {
@@ -318,7 +315,6 @@ async fn test_lagged_follower_promotes_only_after_catching_up() -> eyre::Result<
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Blocks 1..=2 are observed by everyone.
     for _ in 0..2 {
@@ -349,7 +345,8 @@ async fn test_lagged_follower_promotes_only_after_catching_up() -> eyre::Result<
     // boundary; B cannot produce it either because its consumption is still before the
     // boundary (next anchor 3 is governed by A).
     let boundary = cluster.inject_block_observed_by(vec![], &[0, 2])?;
-    tokio::time::sleep(QUIESCENCE).await;
+    // Negative assertion: observe every node through a bounded no-production window.
+    tokio::time::sleep(NEGATIVE_OBSERVATION_WINDOW).await;
     assert_eq!(
         cluster.nodes[0].provider().get_block_number().await?,
         5,
@@ -409,7 +406,6 @@ async fn test_advance_scheduled_handoff_keeps_outgoing_leader_live() -> eyre::Re
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Blocks 1..=3 are produced by A (the manifest bootstrap leader).
     for _ in 0..3 {

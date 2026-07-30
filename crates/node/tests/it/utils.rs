@@ -20,6 +20,7 @@ use reth_primitives_traits::SealedHeader;
 use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
+use serde::de::DeserializeOwned;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -74,6 +75,7 @@ use zone_node::{ZoneNode, ZoneSequencerAddOnsConfig};
 use zone_p2p::{LeadershipSchedule, LeadershipState, P2pConfig, P2pPeerId, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
 use zone_primitives::constants::{PORTAL_ACCESS_MODE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT};
+use zone_rpc::types::SequencerInfoResponse;
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -102,6 +104,188 @@ pub(crate) const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// Default poll interval for e2e tests.
 pub(crate) const DEFAULT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// P2P startup can span several transport retry rounds on loaded CI hosts.
+const P2P_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Typed assertions for complete JSON-RPC response objects.
+pub(crate) trait JsonRpcResponseExt {
+    /// Extract and deserialize a successful `result`.
+    fn expect_result<T: DeserializeOwned>(&self) -> eyre::Result<T>;
+
+    /// Extract an error payload without constraining its code or message.
+    fn expect_error_response(&self) -> eyre::Result<JsonRpcErrorPayload>;
+
+    /// Assert an error code while returning the complete typed error payload.
+    fn expect_error_code(&self, expected_code: i64) -> eyre::Result<JsonRpcErrorPayload>;
+
+    /// Assert an exact error code and message.
+    fn expect_error(
+        &self,
+        expected_code: i64,
+        expected_message: &str,
+    ) -> eyre::Result<JsonRpcErrorPayload>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct JsonRpcErrorPayload {
+    pub code: i64,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+impl JsonRpcResponseExt for serde_json::Value {
+    fn expect_result<T: DeserializeOwned>(&self) -> eyre::Result<T> {
+        if self.get("error").is_some() {
+            eyre::bail!(
+                "expected JSON-RPC success with result type {}, but response contained an error; \
+                 complete response: {self}",
+                std::any::type_name::<T>(),
+            );
+        }
+        let result = self.get("result").ok_or_else(|| {
+            eyre::eyre!(
+                "expected JSON-RPC success with result type {}, but response had no result; \
+                 complete response: {self}",
+                std::any::type_name::<T>(),
+            )
+        })?;
+        serde_json::from_value(result.clone()).wrap_err_with(|| {
+            format!(
+                "failed to deserialize JSON-RPC result as {}; complete response: {self}",
+                std::any::type_name::<T>(),
+            )
+        })
+    }
+
+    fn expect_error_response(&self) -> eyre::Result<JsonRpcErrorPayload> {
+        if self.get("result").is_some() {
+            eyre::bail!(
+                "expected JSON-RPC error, but response contained a result; complete response: {self}"
+            );
+        }
+        let error = self.get("error").ok_or_else(|| {
+            eyre::eyre!(
+                "expected JSON-RPC error, but response had no error; complete response: {self}"
+            )
+        })?;
+        serde_json::from_value(error.clone()).wrap_err_with(|| {
+            format!("failed to deserialize JSON-RPC error payload; complete response: {self}")
+        })
+    }
+
+    fn expect_error_code(&self, expected_code: i64) -> eyre::Result<JsonRpcErrorPayload> {
+        let actual = self.expect_error_response()?;
+        eyre::ensure!(
+            actual.code == expected_code,
+            "expected JSON-RPC error code {expected_code}, got code {} with message {:?}; \
+             complete response: {self}",
+            actual.code,
+            actual.message,
+        );
+        Ok(actual)
+    }
+
+    fn expect_error(
+        &self,
+        expected_code: i64,
+        expected_message: &str,
+    ) -> eyre::Result<JsonRpcErrorPayload> {
+        let actual = self.expect_error_response()?;
+        eyre::ensure!(
+            actual.code == expected_code && actual.message == expected_message,
+            "expected JSON-RPC error code {expected_code} with message {expected_message:?}, got \
+             code {} with message {:?}; complete response: {self}",
+            actual.code,
+            actual.message,
+        );
+        Ok(actual)
+    }
+}
+
+#[cfg(test)]
+mod json_rpc_response_tests {
+    use super::JsonRpcResponseExt;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_typed_result() {
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": ["0x1", "0x2"]});
+        let result = response
+            .expect_result::<Vec<String>>()
+            .expect("valid typed result");
+        assert_eq!(result, vec!["0x1", "0x2"]);
+    }
+
+    #[test]
+    fn missing_result_reports_complete_response() {
+        let response = json!({"jsonrpc": "2.0", "id": 7});
+        let error = response.expect_result::<String>().unwrap_err().to_string();
+        assert!(error.contains("had no result"));
+        assert!(error.contains(r#""jsonrpc":"2.0""#));
+        assert!(error.contains(r#""id":7"#));
+    }
+
+    #[test]
+    fn malformed_result_reports_complete_response() {
+        let response = json!({"jsonrpc": "2.0", "id": 8, "result": {"not": "a string"}});
+        let error = response.expect_result::<String>().unwrap_err().to_string();
+        assert!(error.contains("failed to deserialize JSON-RPC result"));
+        assert!(error.contains(r#""result":{"not":"a string"}"#));
+        assert!(error.contains(r#""id":8"#));
+    }
+
+    #[test]
+    fn exact_error_assertion_accepts_typed_payload() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32602, "message": "invalid params", "data": {"field": "from"}}
+        });
+        let error = response
+            .expect_error(-32602, "invalid params")
+            .expect("matching error");
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "invalid params");
+        assert_eq!(error.data, Some(json!({"field": "from"})));
+    }
+
+    #[test]
+    fn missing_or_malformed_error_reports_complete_response() {
+        let missing = json!({"jsonrpc": "2.0", "id": 9});
+        let missing_error = missing
+            .expect_error(-32602, "invalid")
+            .unwrap_err()
+            .to_string();
+        assert!(missing_error.contains("had no error"));
+        assert!(missing_error.contains(r#""id":9"#));
+
+        let malformed =
+            json!({"jsonrpc": "2.0", "id": 10, "error": {"code": "bad", "message": 42}});
+        let malformed_error = malformed
+            .expect_error(-32602, "invalid")
+            .unwrap_err()
+            .to_string();
+        assert!(malformed_error.contains("failed to deserialize JSON-RPC error payload"));
+        assert!(malformed_error.contains(r#""code":"bad""#));
+        assert!(malformed_error.contains(r#""id":10"#));
+    }
+
+    #[test]
+    fn mismatched_error_reports_expected_actual_and_complete_response() {
+        let response =
+            json!({"jsonrpc": "2.0", "id": 11, "error": {"code": -32000, "message": "actual"}});
+        let error = response
+            .expect_error(-32602, "expected")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected JSON-RPC error code -32602"));
+        assert!(error.contains("got code -32000"));
+        assert!(error.contains(r#""message":"actual""#));
+        assert!(error.contains(r#""id":11"#));
+    }
+}
 
 /// Gas limit for ordinary TIP-20 calls under the current Tempo fork schedule.
 pub(crate) const TIP20_TX_GAS: u64 = 500_000;
@@ -3412,6 +3596,93 @@ impl P2pCluster {
         Ok(())
     }
 
+    /// Wait until the role controller has promoted the bootstrap leader and started every
+    /// follower generation. Requiring each follower to finish its startup backfill probe against
+    /// the leader proves the P2P sessions needed for live block routing are established.
+    async fn wait_until_ready(&self, timeout: Duration) -> eyre::Result<()> {
+        let expected_roles = ["leader", "follower", "follower"];
+        eyre::ensure!(
+            self.nodes.len() == expected_roles.len(),
+            "P2P readiness expects {} nodes, got {}",
+            expected_roles.len(),
+            self.nodes.len(),
+        );
+
+        let started = std::time::Instant::now();
+        let mut last_observed = Vec::new();
+        loop {
+            if started.elapsed() >= timeout {
+                eyre::bail!(
+                    "timed out after {timeout:?} waiting for P2P cluster readiness; last observed: {}",
+                    last_observed.join("; "),
+                );
+            }
+            last_observed.clear();
+            let mut ready = true;
+            for (index, (node, expected_role)) in self.nodes.iter().zip(expected_roles).enumerate()
+            {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    ready = false;
+                    last_observed.push(format!("node {index}: readiness deadline elapsed"));
+                    break;
+                }
+                let provider = node.provider();
+                let request = provider.raw_request("zone_getSequencerInfo".into(), ());
+                let info: SequencerInfoResponse =
+                    match tokio::time::timeout(remaining, request).await {
+                        Ok(Ok(info)) => info,
+                        Ok(Err(error)) => {
+                            ready = false;
+                            last_observed.push(format!("node {index}: RPC error: {error}"));
+                            continue;
+                        }
+                        Err(_) => {
+                            ready = false;
+                            last_observed.push(format!(
+                                "node {index}: status request exceeded the readiness deadline"
+                            ));
+                            break;
+                        }
+                    };
+                let role = info
+                    .local
+                    .as_ref()
+                    .map(|local| local.role.as_str())
+                    .unwrap_or("<uninitialized>");
+                let promotion_ready = info
+                    .readiness
+                    .as_ref()
+                    .is_some_and(|readiness| readiness.ready_for_promotion);
+                let reasons = info
+                    .readiness
+                    .map(|readiness| readiness.reasons)
+                    .unwrap_or_default();
+                let leader_tip_observed = info
+                    .peers
+                    .iter()
+                    .any(|peer| peer.name == "node-0" && peer.tip.is_some());
+                last_observed.push(format!(
+                    "node {index}: role={role}, promotion_ready={promotion_ready}, \
+                     leader_tip_observed={leader_tip_observed}, reasons={reasons:?}"
+                ));
+                ready &= role == expected_role
+                    && (expected_role != "leader" || promotion_ready)
+                    && (expected_role != "follower" || leader_tip_observed);
+            }
+            if ready {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                eyre::bail!(
+                    "timed out after {timeout:?} waiting for P2P cluster readiness; last observed: {}",
+                    last_observed.join("; "),
+                );
+            }
+            tokio::time::sleep(DEFAULT_POLL).await;
+        }
+    }
+
     /// Assert every node holds the same block at `height` and return its header.
     pub(crate) async fn assert_same_block(
         &self,
@@ -3545,12 +3816,14 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
             seed_blocks,
         );
     }
-    Ok(P2pCluster {
+    let cluster = P2pCluster {
         nodes,
         p2p_public_keys: public_keys.to_vec(),
         sequencer_signers,
         fixture,
-    })
+    };
+    cluster.wait_until_ready(P2P_STARTUP_TIMEOUT).await?;
+    Ok(cluster)
 }
 
 pub(crate) fn leader_p2p_config(listen: SocketAddr) -> eyre::Result<P2pConfig> {
@@ -3746,11 +4019,13 @@ async fn private_rpc_call(
     let status = resp.status();
     let text = resp.text().await?;
 
-    if !status.is_success() && text.is_empty() {
-        eyre::bail!("HTTP {status}");
+    if !status.is_success() {
+        eyre::bail!("private RPC returned HTTP {status}; complete response body: {text}");
     }
 
-    Ok(serde_json::from_str(&text)?)
+    serde_json::from_str(&text).wrap_err_with(|| {
+        format!("private RPC returned malformed JSON; complete response body: {text}")
+    })
 }
 
 /// Send a JSON-RPC request to the private zone RPC and return the HTTP status + body.
