@@ -464,8 +464,8 @@ impl BatchSubmitter {
         let gas_limit = match build_withdrawal_batches(withdrawals, max_withdrawal_batch_gas)[..] {
             // An oversized singleton exceeds the budget and stays on the standalone path, which
             // deliberately submits such slots on their own.
-            [batch] if batch.gas_limit <= max_withdrawal_batch_gas => {
-                batch.gas_limit + COMBINED_SUBMIT_BATCH_GAS
+            [batch] if batch.gas_limit() <= max_withdrawal_batch_gas => {
+                batch.gas_limit() + COMBINED_SUBMIT_BATCH_GAS
             }
             _ => return None,
         };
@@ -1787,7 +1787,7 @@ fn backward_log_query_start(hi: u64, floor: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi;
+    use crate::{abi, withdrawals::MAX_WITHDRAWAL_BATCH_GAS};
     use alloy_consensus::Header as ConsensusHeader;
     use alloy_primitives::{B256, address};
     use alloy_provider::ProviderBuilder;
@@ -2020,13 +2020,15 @@ mod tests {
         assert!(BatchAnchorConfig::new(10, 11).is_err());
     }
 
-    fn test_submit_batch_call(withdrawals: &[abi::Withdrawal]) -> ZonePortal::submitBatchCall {
+    /// `try_combined_submission` only embeds this call's encoding, so field values are
+    /// irrelevant to fast-path eligibility.
+    fn test_submit_batch_call() -> ZonePortal::submitBatchCall {
         ZonePortal::submitBatchCall {
-            tempoBlockNumber: 100,
-            recentTempoBlockNumber: 100,
+            tempoBlockNumber: 0,
+            recentTempoBlockNumber: 0,
             blockTransition: BlockTransition {
-                prevBlockHash: B256::repeat_byte(0x41),
-                nextBlockHash: B256::repeat_byte(0x42),
+                prevBlockHash: B256::ZERO,
+                nextBlockHash: B256::ZERO,
             },
             depositQueueTransition: DepositQueueTransition {
                 prevProcessedHash: B256::ZERO,
@@ -2034,19 +2036,12 @@ mod tests {
                 prevDepositNumber: 0,
                 nextDepositNumber: 0,
             },
-            withdrawalQueueHash: abi::Withdrawal::queue_hash(withdrawals),
+            withdrawalQueueHash: B256::ZERO,
             verifierConfig: Bytes::new(),
             proof: Bytes::new(),
-            nextZoneHeight: U256::from(17),
-            signatures: vec![Bytes::from_static(&[0x01])],
+            nextZoneHeight: U256::ZERO,
+            signatures: vec![],
         }
-    }
-
-    fn mocked_submitter(portal_address: Address, asserter: Asserter) -> BatchSubmitter {
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_mocked_client(asserter)
-            .erased();
-        BatchSubmitter::new(portal_address, provider)
     }
 
     fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
@@ -2061,17 +2056,19 @@ mod tests {
         // eth_estimateGas preflight for the two-call transaction.
         asserter.push_success(&alloy_primitives::U64::from(1_000_000u64));
         let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
-        let submitter = mocked_submitter(portal_address, asserter.clone());
-
-        let withdrawals = vec![test_withdrawal(Address::repeat_byte(0x11), 42)];
-        let submit_call = test_submit_batch_call(&withdrawals);
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(portal_address, provider);
+        let withdrawals = simple_withdrawals(1);
+        let submit_call = test_submit_batch_call();
         let sender = Address::repeat_byte(0x22);
 
         let request = submitter
             .try_combined_submission(
                 &submit_call,
                 &withdrawals,
-                crate::withdrawals::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+                MAX_WITHDRAWAL_BATCH_GAS,
                 sender,
                 9,
             )
@@ -2092,73 +2089,43 @@ mod tests {
         assert_eq!(request.nonce_key, Some(SUBMIT_BATCH_NONCE_KEY));
         assert_eq!(request.inner.from, Some(sender));
         assert_eq!(request.inner.nonce, Some(9));
-        let expected_gas = build_withdrawal_batches(
-            &withdrawals,
-            crate::withdrawals::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
-        )[0]
-        .gas_limit
-            + COMBINED_SUBMIT_BATCH_GAS;
-        assert_eq!(request.inner.gas, Some(expected_gas));
+        let withdrawal_gas =
+            build_withdrawal_batches(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS)[0].gas_limit();
+        assert_eq!(
+            request.inner.gas,
+            Some(withdrawal_gas + COMBINED_SUBMIT_BATCH_GAS)
+        );
         assert!(asserter.read_q().is_empty(), "preflight estimate consumed");
     }
 
     #[tokio::test]
-    async fn combined_submission_skips_ineligible_slots() {
-        let submitter = mocked_submitter(Address::ZERO, Asserter::new());
-        let withdrawals = simple_withdrawals(3);
-        let submit_call = test_submit_batch_call(&withdrawals);
-        let sender = Address::repeat_byte(0x22);
-
-        // A batch without withdrawals has no slot to process.
-        assert!(
-            submitter
-                .try_combined_submission(&submit_call, &[], u64::MAX, sender, 0)
-                .await
-                .is_none()
-        );
-
-        // A budget of one item per transaction splits the slot; partial slots stay standalone.
-        let single_item_budget = build_withdrawal_batches(&withdrawals[..1], u64::MAX)[0].gas_limit;
-        assert!(
-            submitter
-                .try_combined_submission(&submit_call, &withdrawals, single_item_budget, sender, 0)
-                .await
-                .is_none()
-        );
-
-        // An oversized singleton exceeds the budget and stays standalone.
-        assert!(
-            submitter
-                .try_combined_submission(&submit_call, &withdrawals[..1], 1, sender, 0)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn combined_submission_requires_estimate_within_budget() {
+    async fn combined_submission_falls_back_to_submit_only() {
         let asserter = Asserter::new();
-        asserter.push_success(&alloy_primitives::U64::from(u64::from(u32::MAX)));
-        let submitter = mocked_submitter(Address::ZERO, asserter);
-        let withdrawals = simple_withdrawals(1);
-        let submit_call = test_submit_batch_call(&withdrawals);
-        let sender = Address::repeat_byte(0x22);
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::ZERO, provider);
+        let withdrawals = simple_withdrawals(3);
+        let submit_call = test_submit_batch_call();
+        let eligible = async |slot: &[abi::Withdrawal], budget: u64| {
+            submitter
+                .try_combined_submission(&submit_call, slot, budget, Address::repeat_byte(0x22), 0)
+                .await
+                .is_some()
+        };
 
+        // No withdrawals to process.
+        assert!(!eligible(&[], MAX_WITHDRAWAL_BATCH_GAS).await);
+        // A one-item budget splits the slot across multiple transactions.
+        let one_item_budget = build_withdrawal_batches(&withdrawals[..1], u64::MAX)[0].gas_limit();
+        assert!(!eligible(&withdrawals, one_item_budget).await);
+        // An oversized singleton exceeds the budget.
+        assert!(!eligible(&withdrawals[..1], 1).await);
         // The estimate exceeds the reserved combined budget.
-        assert!(
-            submitter
-                .try_combined_submission(&submit_call, &withdrawals, u64::MAX, sender, 0)
-                .await
-                .is_none()
-        );
-
-        // A failing estimate (empty mock queue) also falls back to submit-only.
-        assert!(
-            submitter
-                .try_combined_submission(&submit_call, &withdrawals, u64::MAX, sender, 0)
-                .await
-                .is_none()
-        );
+        asserter.push_success(&alloy_primitives::U64::from(u64::MAX));
+        assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
+        // The estimate call itself fails (empty mock queue).
+        assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
     }
 
     #[tokio::test]

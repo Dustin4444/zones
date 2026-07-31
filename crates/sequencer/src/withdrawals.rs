@@ -803,12 +803,17 @@ const fn process_withdrawal_item_gas(callback_gas_limit: u64, fallback_nonce: u6
 pub(crate) struct WithdrawalBatch {
     start: usize,
     end: usize,
-    pub(crate) gas_limit: u64,
+    gas_limit: u64,
 }
 
 impl WithdrawalBatch {
     fn len(self) -> usize {
         self.end - self.start
+    }
+
+    /// Planned gas limit for this transaction.
+    pub(crate) const fn gas_limit(self) -> u64 {
+        self.gas_limit
     }
 }
 
