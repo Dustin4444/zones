@@ -250,7 +250,7 @@ impl BatchSubmitter {
     ///
     /// When the batch's withdrawal slot fits one `processWithdrawals` call within
     /// `max_withdrawal_batch_gas`, that call is appended to the `submitBatch` transaction so the
-    /// slot is consumed atomically with settlement; see [`Self::try_combined_submission`].
+    /// slot is consumed atomically with settlement; see [`Self::try_build_combined_submission_request`].
     ///
     /// Returns the `BatchSubmitted` event decoded from the confirmed receipt, along with whether
     /// the withdrawal slot was processed in the same transaction.
@@ -373,7 +373,7 @@ impl BatchSubmitter {
         };
 
         let combined = self
-            .try_combined_submission(
+            .try_build_combined_submission_request(
                 &call,
                 withdrawals,
                 max_withdrawal_batch_gas,
@@ -450,7 +450,7 @@ impl BatchSubmitter {
     /// (the freshly enqueued slot would not be the queue head) or the reserved budget is
     /// insufficient. `submitBatch` must stay the first call so the second call observes the slot
     /// it drains, and a revert of either call rolls back the entire transaction.
-    async fn try_combined_submission(
+    async fn try_build_combined_submission_request(
         &self,
         submit_call: &ZonePortal::submitBatchCall,
         withdrawals: &[abi::Withdrawal],
@@ -2022,7 +2022,7 @@ mod tests {
         assert!(BatchAnchorConfig::new(10, 11).is_err());
     }
 
-    /// `try_combined_submission` only embeds this call's encoding, so field values are
+    /// `try_build_combined_submission_request` only embeds this call's encoding, so field values are
     /// irrelevant to fast-path eligibility.
     fn test_submit_batch_call() -> ZonePortal::submitBatchCall {
         ZonePortal::submitBatchCall {
@@ -2067,7 +2067,7 @@ mod tests {
         let sender = Address::repeat_byte(0x22);
 
         let request = submitter
-            .try_combined_submission(
+            .try_build_combined_submission_request(
                 &submit_call,
                 &withdrawals,
                 MAX_WITHDRAWAL_BATCH_GAS,
@@ -2111,7 +2111,13 @@ mod tests {
         let submit_call = test_submit_batch_call();
         let eligible = async |slot: &[abi::Withdrawal], budget: u64| {
             submitter
-                .try_combined_submission(&submit_call, slot, budget, Address::repeat_byte(0x22), 0)
+                .try_build_combined_submission_request(
+                    &submit_call,
+                    slot,
+                    budget,
+                    Address::repeat_byte(0x22),
+                    0,
+                )
                 .await
                 .is_some()
         };
