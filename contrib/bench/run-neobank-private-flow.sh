@@ -88,9 +88,14 @@ ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT="${ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT:-10
 #
 # Do not lower this based on receipt gas: under TIP-1016, each new storage slot needs
 # ~248k gas in-frame on top of execution gas, and that state gas never appears in
-# receipt gas_used (receipts report the regular dimension only). A first-time user's
-# callback creates dozens of slots, so 5M and below deterministically out-of-gases.
+# receipt gas_used (receipts report the regular dimension only). The first-ever
+# callback per flow creates dozens of system-level slots (router, vault, and portal
+# balances, DEX state), so 5M and below deterministically out-of-gases cold. When a
+# lower measured value is configured, one untimed warm-up journey pays those one-time
+# creations with the full allowance first; measured journeys then only need execution
+# gas plus per-transaction state headroom (approve-cycle slots).
 ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-10000000}"
+ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT="${ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT:-10000000}"
 ZONES_BENCH_OUTPUT="${ZONES_BENCH_OUTPUT:-target/zones-benchmark/neobank-e2e}"
 ZONES_BENCH_REPORT="${ZONES_BENCH_REPORT:-target/zones-benchmark/report-neobank-e2e.json}"
 ZONES_BENCH_RENDERED_SCENARIO="${ZONES_BENCH_RENDERED_SCENARIO:-$ZONES_BENCH_OUTPUT/scenario.rendered.yml}"
@@ -193,7 +198,8 @@ esac
 for name in ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_ACCOUNT_START ZONES_BENCH_ACCOUNTS ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX ZONES_BENCH_COUNT \
     ZONES_BENCH_MAX_CONCURRENT ZONES_BENCH_DEPOSIT_AMOUNT ZONES_BENCH_ACTIVITY_AMOUNT \
     ZONES_BENCH_WITHDRAWAL_AMOUNT ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT \
-    ZONES_BENCH_CALLBACK_GAS_LIMIT ZONES_BENCH_SAMPLE_INSTANCES ZONES_BENCH_SEED \
+    ZONES_BENCH_CALLBACK_GAS_LIMIT ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT \
+    ZONES_BENCH_SAMPLE_INSTANCES ZONES_BENCH_SEED \
     ZONES_BENCH_ACCOUNT_END ZONES_BENCH_CONTROL_ACCOUNT_END \
     ZONES_BENCH_SEQUENCER_ACCOUNT_END ZONES_BENCH_EXPECTED_L1_CHAIN_ID \
     ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID ZONES_BENCH_EXPECTED_ZONE_ID \
@@ -689,6 +695,19 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "slippage-bounce" ]]; then
     [[ "$bounce_earn_supply" =~ ^[0-9]+$ && "$bounce_vault_balance" =~ ^[0-9]+$ ]] ||
         die "could not read slippage-bounce L1 preconditions"
     stage_end slippage_precondition
+fi
+
+# One untimed journey pays the one-time system-level TIP-1016 state creations with the
+# full callback allowance so the measured journeys can run with the configured lower
+# value; see the ZONES_BENCH_CALLBACK_GAS_LIMIT note above. A failed cold callback
+# reverts its creations, so without this the first measured wave can never warm the
+# state itself. Skipped when the measured allowance is not lower.
+if (( 10#$ZONES_BENCH_CALLBACK_GAS_LIMIT < 10#$ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT )); then
+    measured_callback_gas_limit="$ZONES_BENCH_CALLBACK_GAS_LIMIT"
+    export ZONES_BENCH_CALLBACK_GAS_LIMIT="$ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT"
+    run_setup_scenario earn_warmup "$scenario_path" 1 \
+        "$ZONES_BENCH_OUTPUT/earn-warmup-report.json"
+    export ZONES_BENCH_CALLBACK_GAS_LIMIT="$measured_callback_gas_limit"
 fi
 
 measured_token_balance_before=""
