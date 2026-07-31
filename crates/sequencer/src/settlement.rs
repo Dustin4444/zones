@@ -520,6 +520,9 @@ impl BatchSubmitter {
             .with_max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
             .with_max_priority_fee_per_gas(0);
 
+        // Estimation against state N cannot see hash(N), although execution in N+1 can, so
+        // optimistically use the computed gas limit; a revert rolls the whole transaction back
+        // into the retry loop, which re-estimates once the head has advanced.
         if anchors_to_current_tip {
             return Some(request);
         }
