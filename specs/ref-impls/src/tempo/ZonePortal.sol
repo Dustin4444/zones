@@ -55,6 +55,16 @@ contract ZonePortal is IZonePortal {
     ///      to adjust the zoneGasRate based on operational costs.
     uint64 public constant FIXED_DEPOSIT_GAS = 100_000;
 
+    /// @notice Maximum deposits that may be appended to this portal in one Tempo block.
+    /// @dev Under T9, processing 640 encrypted deposits uses 185,349,414 of the
+    ///      250,000,000 gas available to `advanceTempo`. This leaves 64,650,586 gas
+    ///      (25.86%) for fixed overhead and gas-cost variance.
+    uint64 public constant MAX_DEPOSITS_PER_TEMPO_BLOCK = 640;
+
+    /// @dev Reserves enough capacity for one maximum-size sequencer withdrawal batch to bounce.
+    ///      The 20M batch gas ceiling fits at most 19 simple withdrawals (plus one slot of margin).
+    uint64 internal constant WITHDRAWAL_BOUNCEBACK_RESERVE = 20;
+
     /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
     uint256 internal constant TEMPO_BASE_FEE_SCALE = 1e12;
 
@@ -130,7 +140,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Withdrawal queue (zone→Tempo): fixed-size ring buffer
     WithdrawalQueue internal _withdrawalQueue;
 
-    /// @notice Public RPC endpoint for the zone
+    /// @notice Operator RPC endpoint for the zone
     string public rpcUrl;
 
     /// @notice Pending admin for two-step admin transfer
@@ -179,6 +189,10 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Tempo block number that recorded the most recent leader transition.
     uint64 public leaderActivationTempoBlock;
+
+    /// @dev Per-Tempo-block deposit admission counter. Appended for upgrade-safe storage layout.
+    uint64 internal _depositCountBlock;
+    uint64 internal _depositsInCurrentBlock;
 
     /*//////////////////////////////////////////////////////////////
                              INITIALIZATION
@@ -356,6 +370,9 @@ contract ZonePortal is IZonePortal {
         _setLeader(newLeader);
     }
 
+    /// @dev Single write path for a leadership transition: assign, bump the fencing epoch,
+    ///      stamp the activation block, emit. `crates/l1` decodes `LeaderUpdated` to drive
+    ///      node roles, so every transition must go through here to stay consistent.
     function _setLeader(address newLeader) private {
         address previous = leader;
         leader = newLeader;
@@ -555,7 +572,7 @@ contract ZonePortal is IZonePortal {
         emit TokenEnabled(_token, name, symbol, currency);
     }
 
-    /// @notice Update the zone's public RPC endpoint.
+    /// @notice Update the zone's operator RPC endpoint.
     /// @param _rpcUrl The new RPC url
     function setRpcUrl(string calldata _rpcUrl) external onlySequencer {
         rpcUrl = _rpcUrl;
@@ -775,10 +792,25 @@ contract ZonePortal is IZonePortal {
         }
     }
 
-    function _recordDeposit(bytes32 newCurrentDepositQueueHash)
+    function _recordDeposit(
+        bytes32 newCurrentDepositQueueHash,
+        uint64 maximum
+    )
         internal
         returns (uint64 thisDeposit)
     {
+        uint64 currentBlock = uint64(block.number);
+        if (_depositCountBlock != currentBlock) {
+            _depositCountBlock = currentBlock;
+            _depositsInCurrentBlock = 0;
+        }
+        if (_depositsInCurrentBlock >= maximum) {
+            revert DepositBlockCapacityExceeded(maximum);
+        }
+        unchecked {
+            ++_depositsInCurrentBlock;
+        }
+
         currentDepositQueueHash = newCurrentDepositQueueHash;
         thisDeposit = ++depositCount;
     }
@@ -822,7 +854,9 @@ contract ZonePortal is IZonePortal {
 
         // Insert deposit into queue
         newCurrentDepositQueueHash = DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
-        uint64 thisDeposit = _recordDeposit(newCurrentDepositQueueHash);
+        uint64 thisDeposit = _recordDeposit(
+            newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
+        );
 
         emit DepositMade(
             newCurrentDepositQueueHash,
@@ -913,7 +947,9 @@ contract ZonePortal is IZonePortal {
         // Insert encrypted deposit into queue
         newCurrentDepositQueueHash =
             DepositQueueLib.enqueueEncrypted(currentDepositQueueHash, depositData);
-        uint64 thisDeposit = _recordDeposit(newCurrentDepositQueueHash);
+        uint64 thisDeposit = _recordDeposit(
+            newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
+        );
 
         emit EncryptedDepositMade(
             newCurrentDepositQueueHash,
@@ -1120,8 +1156,8 @@ contract ZonePortal is IZonePortal {
 
         bytes32 newCurrentDepositQueueHash =
             DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
-        currentDepositQueueHash = newCurrentDepositQueueHash;
-        uint64 thisDeposit = ++depositCount;
+        uint64 thisDeposit =
+            _recordDeposit(newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK);
 
         emit WithdrawalBounceBack(
             newCurrentDepositQueueHash, fallbackNonce, _token, amount, thisDeposit
