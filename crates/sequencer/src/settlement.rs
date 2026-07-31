@@ -69,10 +69,12 @@ const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
 /// Gas reserved for the `submitBatch` call when whole-slot withdrawal processing shares its
 /// transaction.
 ///
-/// The withdrawal portion is bounded by the planner budget
-/// ([`crate::withdrawals::MAX_WITHDRAWAL_BATCH_GAS`] at most), so the combined limit stays at or
-/// below 22M, within Tempo's 30M transaction gas cap. The estimate preflight falls back to
-/// submit-only settlement if `submitBatch` ever needs more (e.g. a long ancestry header chain).
+/// The combined path is restricted to direct-anchor submissions, whose `submitBatch` cost is
+/// small and bounded — no gas estimation runs, since simulation would spuriously revert for
+/// anchors at the observed L1 head, where EIP-2935 does not yet expose the anchor hash. The
+/// withdrawal portion is bounded by the planner budget
+/// ([`crate::withdrawals::MAX_WITHDRAWAL_BATCH_GAS`] at most), keeping the combined limit at or
+/// below 22M, within Tempo's 30M transaction gas cap.
 const COMBINED_SUBMIT_BATCH_GAS: u64 = 2_000_000;
 
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
@@ -445,12 +447,15 @@ impl BatchSubmitter {
     /// Build the two-call transaction that settles the batch and drains its complete withdrawal
     /// slot atomically, or `None` when the slot must be left to the standalone processor.
     ///
-    /// The slot is eligible when it fits a single `processWithdrawals` call within
-    /// `max_withdrawal_batch_gas`. Gas estimation then simulates both ordered calls against
-    /// current state, so it also rejects the fast path whenever the portal queue has a backlog
-    /// (the freshly enqueued slot would not be the queue head) or the reserved budget is
-    /// insufficient. `submitBatch` must stay the first call so the second call observes the slot
-    /// it drains, and a revert of either call rolls back the entire transaction.
+    /// The slot is eligible when the submission uses a direct anchor (the fixed
+    /// [`COMBINED_SUBMIT_BATCH_GAS`] allowance does not cover ancestry header chains), it fits a
+    /// single `processWithdrawals` call within `max_withdrawal_batch_gas`, and the portal queue
+    /// is empty, making the freshly enqueued slot the head that the second call drains. The
+    /// empty-queue observation cannot go stale: only this sequencer's serialized submissions
+    /// enqueue slots and only its withdrawal processor drains them. No gas estimation runs — it
+    /// would spuriously revert for anchors at the observed L1 head. `submitBatch` must stay the
+    /// first call so the second call observes the slot it drains, and a revert of either call
+    /// rolls back the entire transaction.
     async fn try_build_combined_submission_request(
         &self,
         submit_call: &ZonePortal::submitBatchCall,
@@ -459,7 +464,8 @@ impl BatchSubmitter {
         from: Address,
         nonce: u64,
     ) -> Option<TempoTransactionRequest> {
-        if withdrawals.is_empty() {
+        // A non-zero recent block number selects ancestry mode.
+        if withdrawals.is_empty() || submit_call.recentTempoBlockNumber != 0 {
             return None;
         }
         let gas_limit = match build_withdrawal_batches(withdrawals, max_withdrawal_batch_gas)[..] {
@@ -470,6 +476,34 @@ impl BatchSubmitter {
             }
             _ => return None,
         };
+
+        match self
+            .l1_provider
+            .multicall()
+            .add(self.portal.withdrawalQueueHead())
+            .add(self.portal.withdrawalQueueTail())
+            .aggregate()
+            .await
+        {
+            Ok((head, tail)) if head == tail => {}
+            Ok((head, tail)) => {
+                info!(
+                    %head,
+                    %tail,
+                    withdrawal_count = withdrawals.len(),
+                    "Withdrawal backlog pending; submitting batch alone"
+                );
+                return None;
+            }
+            Err(error) => {
+                warn!(
+                    withdrawal_count = withdrawals.len(),
+                    %error,
+                    "Failed reading withdrawal queue bounds; submitting batch alone"
+                );
+                return None;
+            }
+        }
 
         let request = TempoTransactionRequest::default()
             .with_calls(vec![
@@ -495,31 +529,7 @@ impl BatchSubmitter {
             .with_gas_limit(gas_limit)
             .with_max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
             .with_max_priority_fee_per_gas(0);
-
-        // The estimate is only a go/no-go preflight: a backlogged queue or an oversized
-        // submitBatch surfaces here as a revert or an excessive estimate. The planner limit
-        // remains the transaction's gas limit because callbacks may burn their full reserve
-        // on-chain even when simulation is cheap.
-        match self.l1_provider.estimate_gas(request.clone()).await {
-            Ok(estimated) if estimated <= gas_limit => Some(request),
-            Ok(estimated) => {
-                warn!(
-                    withdrawal_count = withdrawals.len(),
-                    gas_limit,
-                    estimated,
-                    "Combined settlement estimate exceeds its budget; submitting batch alone"
-                );
-                None
-            }
-            Err(error) => {
-                info!(
-                    withdrawal_count = withdrawals.len(),
-                    %error,
-                    "Combined settlement preflight failed; submitting batch alone"
-                );
-                None
-            }
-        }
+        Some(request)
     }
 
     fn sign_settlement_attestation(
@@ -2056,8 +2066,11 @@ mod tests {
     #[tokio::test]
     async fn combined_submission_drains_whole_slot_on_settlement_nonce_lane() {
         let asserter = Asserter::new();
-        // eth_estimateGas preflight for the two-call transaction.
-        asserter.push_success(&alloy_primitives::U64::from(1_000_000u64));
+        // Queue bounds preflight: head == tail means the queue is empty.
+        asserter.push_success(&abi_encode_multicall(vec![
+            abi_word(U256::from(7)),
+            abi_word(U256::from(7)),
+        ]));
         let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
@@ -2098,7 +2111,7 @@ mod tests {
             request.inner.gas,
             Some(withdrawal_gas + COMBINED_SUBMIT_BATCH_GAS)
         );
-        assert!(asserter.read_q().is_empty(), "preflight estimate consumed");
+        assert!(asserter.read_q().is_empty(), "queue bounds read consumed");
     }
 
     #[tokio::test]
@@ -2130,11 +2143,32 @@ mod tests {
         assert!(!eligible(&withdrawals, one_item_budget).await);
         // An oversized singleton exceeds the budget.
         assert!(!eligible(&withdrawals[..1], 1).await);
-        // The estimate exceeds the reserved combined budget.
-        asserter.push_success(&alloy_primitives::U64::from(u64::MAX));
+        // A backlogged queue keeps the freshly enqueued slot from being the head.
+        asserter.push_success(&abi_encode_multicall(vec![
+            abi_word(U256::from(3)),
+            abi_word(U256::from(4)),
+        ]));
         assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
-        // The estimate call itself fails (empty mock queue).
+        // The queue-bounds read itself fails (empty mock queue).
         assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
+
+        // An ancestry-anchored submission stays submit-only.
+        let ancestry_call = ZonePortal::submitBatchCall {
+            recentTempoBlockNumber: 1,
+            ..test_submit_batch_call()
+        };
+        assert!(
+            submitter
+                .try_build_combined_submission_request(
+                    &ancestry_call,
+                    &withdrawals,
+                    MAX_WITHDRAWAL_BATCH_GAS,
+                    Address::repeat_byte(0x22),
+                    0,
+                )
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
