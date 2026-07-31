@@ -32,7 +32,7 @@ use crate::{
 };
 use alloy_consensus::{Transaction, TxReceipt as _, transaction::TxHashRef as _};
 use alloy_eips::BlockHashOrNumber;
-use alloy_network::ReceiptResponse;
+use alloy_network::{ReceiptResponse, TransactionBuilder as _};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rlp::Encodable;
@@ -470,8 +470,8 @@ impl BatchSubmitter {
             _ => return None,
         };
 
-        let mut request = TempoTransactionRequest {
-            calls: vec![
+        let request = TempoTransactionRequest::default()
+            .with_calls(vec![
                 Call {
                     to: self.portal_address.into(),
                     value: U256::ZERO,
@@ -487,15 +487,13 @@ impl BatchSubmitter {
                     .abi_encode()
                     .into(),
                 },
-            ],
-            nonce_key: Some(SUBMIT_BATCH_NONCE_KEY),
-            ..Default::default()
-        };
-        request.inner.from = Some(from);
-        request.inner.nonce = Some(nonce);
-        request.inner.gas = Some(gas_limit);
-        request.inner.max_fee_per_gas = Some(crate::TEMPO_L1_MAX_FEE_PER_GAS);
-        request.inner.max_priority_fee_per_gas = Some(0);
+            ])
+            .with_nonce_key(SUBMIT_BATCH_NONCE_KEY)
+            .with_from(from)
+            .with_nonce(nonce)
+            .with_gas_limit(gas_limit)
+            .with_max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
+            .with_max_priority_fee_per_gas(0);
 
         match self.l1_provider.estimate_gas(request.clone()).await {
             Ok(estimated) if estimated <= gas_limit => Some(request),
