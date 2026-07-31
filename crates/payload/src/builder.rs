@@ -277,7 +277,7 @@ where
             l1_fetch_concurrency: self.l1_fetch_concurrency,
             parent_hash: parent_header.hash(),
             parent_header: (*parent_header).clone(),
-            next_block_env_attributes: next_block_env_attributes.clone(),
+            next_block_env_attributes,
             prepared: prepared.clone(),
         }
         .start();
