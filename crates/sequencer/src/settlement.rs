@@ -49,7 +49,7 @@ use tempo_alloy::{
     rpc::{TempoCallBuilderExt, TempoTransactionRequest},
 };
 use tempo_primitives::{Block, TempoReceipt, transaction::Call};
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::{nonce_keys::SUBMIT_BATCH_NONCE_KEY, withdrawals::build_withdrawal_batches};
 
@@ -408,6 +408,11 @@ impl BatchSubmitter {
         let send = async {
             match combined {
                 Some(request) => {
+                    debug!(
+                        gas_limit = ?request.inner.gas,
+                        withdrawal_count = withdrawals.len(),
+                        "Broadcasting combined settlement transaction"
+                    );
                     Ok::<_, eyre::Report>(self.l1_provider.send_transaction_sync(request).await?)
                 }
                 None => {
@@ -424,6 +429,10 @@ impl BatchSubmitter {
                     if anchors_to_current_tip {
                         submission = submission.gas(SUBMIT_BATCH_GAS_LIMIT);
                     }
+                    debug!(
+                        gas_limit = ?anchors_to_current_tip.then_some(SUBMIT_BATCH_GAS_LIMIT),
+                        "Broadcasting submit-only settlement transaction"
+                    );
                     Ok(submission.send_sync().await?)
                 }
             }
