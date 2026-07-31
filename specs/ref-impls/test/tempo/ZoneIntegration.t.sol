@@ -269,7 +269,7 @@ contract ZoneIntegrationTest is BaseTest {
         if (count == type(uint256).max) {
             count = l2Outbox.pendingWithdrawalsCount();
         }
-        vm.startPrank(sequencer);
+        vm.startPrank(address(0));
         bytes32 hash = l2Outbox.finalizeWithdrawalBatch(
             count, uint64(block.number), _emptyEncryptedSenders(count)
         );
