@@ -9,8 +9,8 @@
 //!
 //! Each `(contract_address, slot_key)` pair maps to a [`BTreeMap<u64, B256>`] of
 //! `block_number → value`. Slot histories are bounded by both a weighted LRU and a per-slot limit.
-//! A lookup for block N may inherit the most recent earlier value only when verified receipt
-//! coverage and mutation barriers prove that it remained current.
+//! Lookups only return values fetched at the exact requested height; receipt logs cannot prove
+//! that storage remained unchanged across blocks because mutations may be log-free.
 //!
 //! ## Write path
 //!
@@ -58,13 +58,8 @@ impl L1StateCache {
 /// Block-versioned cache of Tempo L1 contract storage slots.
 ///
 /// Each `(contract_address, slot_key)` pair maintains a history of values indexed by L1 block
-/// number. Lookups for a given block return the most recent value at or before that block,
-/// i.e. the value that was current at that height. This allows the zone to read L1 state at
-/// the `tempoBlockNumber` it committed to, even if the L1 chain has since advanced.
-///
-/// Inherited values are valid only when the subscriber has processed every intervening L1 block
-/// and no log from the owning contract indicates a possible mutation. The coverage range starts
-/// at the current floor and ends at the latest finalized block whose receipts were processed.
+/// number. Lookups require an exact block-height match, ensuring the zone reads L1 state at the
+/// `tempoBlockNumber` it committed to even when storage changes without emitting a recognized log.
 #[derive(Debug)]
 pub struct L1StateCacheInner {
     /// Bounded per-slot value histories, promoted as a unit on access.
@@ -102,44 +97,16 @@ impl L1StateCacheInner {
     }
 
     /// Returns the cached value for a storage slot at the given block number.
-    ///
-    /// An exact-height value is always valid. A value inherited from an earlier height is returned
-    /// only when the subscriber has processed receipts through `block_number` and no mutation
-    /// barrier exists after the value was populated.
     pub fn get(&mut self, address: Address, slot: B256, block_number: u64) -> Option<B256> {
-        let (&cached_block, &value) = self
-            .slots
+        self.slots
             .get(&(address, slot))?
-            .range(..=block_number)
-            .next_back()?;
-
-        // On exact match, just return the value
-        if cached_block == block_number {
-            return Some(value);
-        }
-
-        // If we didn't yet process the requested block, we can't use the cached value
-        if block_number > *self.coverage.end() {
-            return None;
-        }
-
-        // If there was an invalidation between cached and requested block, we can't use the cached value
-        if self
-            .invalidations
-            .get(&address)
-            .and_then(|blocks| blocks.range(..=block_number).next_back())
-            .is_some_and(|&invalidated_at| invalidated_at > cached_block)
-        {
-            return None;
-        }
-
-        Some(value)
+            .get(&block_number)
+            .copied()
     }
 
     /// Sets a storage slot value in the forward cache at the given block number.
     ///
-    /// Values below the current coverage floor are deliberately not admitted, so historical
-    /// reads cannot later be inherited by canonical execution.
+    /// Values below the current coverage floor are deliberately not admitted.
     pub fn set(&mut self, address: Address, slot: B256, block_number: u64, value: B256) {
         if block_number < *self.coverage.start() {
             return;
@@ -315,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn get_returns_latest_value_at_or_before_requested_block() {
+    fn get_requires_an_exact_block_height() {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
 
@@ -327,18 +294,12 @@ mod tests {
             cache.get(PORTAL, slot, 10),
             Some(B256::with_last_byte(0x0a))
         );
-        assert_eq!(
-            cache.get(PORTAL, slot, 15),
-            Some(B256::with_last_byte(0x0a))
-        );
+        assert_eq!(cache.get(PORTAL, slot, 15), None);
         assert_eq!(
             cache.get(PORTAL, slot, 20),
             Some(B256::with_last_byte(0x14))
         );
-        assert_eq!(
-            cache.get(PORTAL, slot, 25),
-            Some(B256::with_last_byte(0x14))
-        );
+        assert_eq!(cache.get(PORTAL, slot, 25), None);
     }
 
     #[test]
@@ -351,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_value_requires_receipt_coverage() {
+    fn receipt_coverage_does_not_authorize_cross_height_reuse() {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
         let value = B256::with_last_byte(0x0a);
@@ -359,11 +320,11 @@ mod tests {
 
         assert_eq!(cache.get(PORTAL, slot, 11), None);
         cover_through(&mut cache, 11);
-        assert_eq!(cache.get(PORTAL, slot, 11), Some(value));
+        assert_eq!(cache.get(PORTAL, slot, 11), None);
     }
 
     #[test]
-    fn invalidation_blocks_inheritance_until_refetched() {
+    fn refetched_value_is_scoped_to_its_exact_height() {
         let mut cache = L1StateCacheInner::new();
         let slot = B256::with_last_byte(1);
         let old = B256::with_last_byte(0x0a);
@@ -378,7 +339,7 @@ mod tests {
 
         cache.set(PORTAL, slot, 11, new);
         assert_eq!(cache.get(PORTAL, slot, 11), Some(new));
-        assert_eq!(cache.get(PORTAL, slot, 12), Some(new));
+        assert_eq!(cache.get(PORTAL, slot, 12), None);
     }
 
     #[test]
@@ -394,7 +355,8 @@ mod tests {
 
         let current = B256::with_last_byte(10);
         cache.set(PORTAL, slot, 10, current);
-        assert_eq!(cache.get(PORTAL, slot, 11), Some(current));
+        assert_eq!(cache.get(PORTAL, slot, 10), Some(current));
+        assert_eq!(cache.get(PORTAL, slot, 11), None);
     }
 
     #[test]
@@ -457,7 +419,7 @@ mod tests {
         // Keep A hot, then insert a two-version history for C. B is the oldest history and is
         // evicted to keep the total version count at three.
         assert_eq!(
-            cache.get(PORTAL, slot_a, 20),
+            cache.get(PORTAL, slot_a, 10),
             Some(B256::with_last_byte(0x0a))
         );
         cache.set(PORTAL, slot_c, 10, B256::with_last_byte(0x0c));
@@ -466,7 +428,7 @@ mod tests {
         assert_eq!(cache.slots.limiter().versions(), 3);
         assert_eq!(cache.get(PORTAL, slot_b, 20), None);
         assert_eq!(
-            cache.get(PORTAL, slot_a, 20),
+            cache.get(PORTAL, slot_a, 10),
             Some(B256::with_last_byte(0x0a))
         );
         assert_eq!(
@@ -542,8 +504,9 @@ mod tests {
         cache.set(PORTAL, slot, 12, B256::with_last_byte(0x0c));
         cover_through(&mut cache, 13);
         assert_eq!(
-            cache.get(PORTAL, slot, 13),
+            cache.get(PORTAL, slot, 12),
             Some(B256::with_last_byte(0x0c))
         );
+        assert_eq!(cache.get(PORTAL, slot, 13), None);
     }
 }

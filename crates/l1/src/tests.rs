@@ -386,7 +386,7 @@ fn subscriber_applies_state_and_records_observation() {
             .l1_state_cache
             .lock()
             .get(cached_address, cached_slot, 10),
-        Some(cached_value)
+        None
     );
     assert_eq!(
         subscriber.config.block_tracker.observed_hash(10),
@@ -650,7 +650,7 @@ fn assert_tempo_header_rejected(input: &[u8]) {
 }
 
 #[test]
-fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
+fn update_l1_state_anchor_does_not_enable_cross_height_reuse() {
     let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([0])));
     let slot = B256::with_last_byte(1);
     let value = B256::with_last_byte(2);
@@ -685,10 +685,7 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
 
     subscriber.update_l1_state_anchor(11, &HashSet::from([TIP403_REGISTRY_ADDRESS]));
     let mut cache = subscriber.config.l1_state_cache.lock();
-    assert_eq!(
-        cache.get(stable_account, stable_slot, 11),
-        Some(stable_value)
-    );
+    assert_eq!(cache.get(stable_account, stable_slot, 11), None);
     assert_eq!(cache.get(TIP403_REGISTRY_ADDRESS, slot, 11), None);
 }
 
@@ -813,8 +810,8 @@ async fn observer_advances_caches_without_retaining_deposit_blocks() {
             .l1_state_cache
             .lock()
             .get(cached_address, cached_slot, 12),
-        Some(cached_value),
-        "receipt coverage must keep advancing on an observer"
+        None,
+        "receipt coverage must not authorize cross-height cache reuse"
     );
     assert_eq!(subscriber.config.block_tracker.latest().unwrap().number, 12);
     assert_eq!(

@@ -281,6 +281,38 @@ impl L1StorageReader for L1StateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_transport::mock::Asserter;
+
+    #[tokio::test]
+    async fn cross_height_read_fetches_and_caches_the_requested_block() {
+        let address = Address::with_last_byte(1);
+        let slot = B256::with_last_byte(2);
+        let cache = L1StateCache::new();
+        cache.lock().set(address, slot, 10, B256::with_last_byte(3));
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(4));
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let reader = L1StateProvider::new_raw(
+            L1StateProviderConfig::default(),
+            cache,
+            provider,
+            tokio::runtime::Handle::current(),
+        );
+
+        let expected = B256::with_last_byte(4);
+        assert_eq!(
+            reader.get_storage_async(address, slot, 11).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            reader.get_storage_async(address, slot, 11).await.unwrap(),
+            expected
+        );
+        assert!(asserter.read_q().is_empty());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn finite_sync_attempt_limit_returns_diagnostic_error() {
