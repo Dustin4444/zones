@@ -66,16 +66,18 @@ const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 /// map overhead while covering more than the current Zone E recovery gap.
 const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
 
-/// Gas reserved for the `submitBatch` call when whole-slot withdrawal processing shares its
-/// transaction.
+/// Bounded gas for one `submitBatch` call, used whenever gas estimation is unavailable or
+/// bypassed.
 ///
-/// The combined path is restricted to direct-anchor submissions, whose `submitBatch` cost is
-/// small and bounded — no gas estimation runs, since simulation would spuriously revert for
-/// anchors at the observed L1 head, where EIP-2935 does not yet expose the anchor hash. The
-/// withdrawal portion is bounded by the planner budget
-/// ([`crate::withdrawals::MAX_WITHDRAWAL_BATCH_GAS`] at most), keeping the combined limit at or
-/// below 22M, within Tempo's 30M transaction gas cap.
-const COMBINED_SUBMIT_BATCH_GAS: u64 = 2_000_000;
+/// Settlement anchored to the observed L1 head cannot be estimated: `eth_estimateGas` executes
+/// against that head before EIP-2935 has stored its hash, so the portal reports
+/// `InvalidTempoBlockNumber`, while the transaction itself can only land in a successor block
+/// where the hash is available. Head-anchored submit-only transactions therefore use this as
+/// their gas limit directly. Combined settlement transactions add it to the planner's withdrawal
+/// slot gas, staying at or below 22M under the largest supported planner budget, within Tempo's
+/// 30M cap. `submitBatch` has at most eight certificate signatures, so this leaves conservative
+/// headroom without consuming a full block.
+const SUBMIT_BATCH_GAS_LIMIT: u64 = 2_000_000;
 
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
 pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
@@ -318,6 +320,10 @@ impl BatchSubmitter {
                 (None, anchor_mode, current_l1_block)
             };
         let recent_tempo_block_number = anchor_mode.recent_block_number();
+        // EIP-2935 exposes hash(N) starting in N+1. A transaction built after observing head N
+        // cannot land before N+1, so anchoring to the current tip is valid at execution time.
+        let anchors_to_current_tip =
+            anchor_mode.anchor_block_number(batch.tempo_block_number) == current_l1_block;
 
         let signatures = if let Some(certificate) = &certificate {
             certificate.signatures.clone()
@@ -382,6 +388,7 @@ impl BatchSubmitter {
                 max_withdrawal_batch_gas,
                 submission_address,
                 nonce,
+                anchors_to_current_tip,
             )
             .await;
         let withdrawals_processed = combined.is_some();
@@ -394,6 +401,7 @@ impl BatchSubmitter {
             nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             nonce,
             withdrawals_in_transaction = withdrawals_processed,
+            anchors_to_current_tip,
             "Submitting batch to ZonePortal on L1"
         );
 
@@ -402,15 +410,22 @@ impl BatchSubmitter {
                 Some(request) => {
                     Ok::<_, eyre::Report>(self.l1_provider.send_transaction_sync(request).await?)
                 }
-                None => Ok(self
-                    .portal
-                    .call_builder(&call)
-                    .nonce_key(SUBMIT_BATCH_NONCE_KEY)
-                    .nonce(nonce)
-                    .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                    .max_priority_fee_per_gas(0)
-                    .send_sync()
-                    .await?),
+                None => {
+                    let mut submission = self
+                        .portal
+                        .call_builder(&call)
+                        .nonce_key(SUBMIT_BATCH_NONCE_KEY)
+                        .nonce(nonce)
+                        .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
+                        .max_priority_fee_per_gas(0);
+                    // Estimation against state N cannot see hash(N), although execution in N+1
+                    // can. If this send does not settle, a retry after the head advances uses
+                    // normal estimation.
+                    if anchors_to_current_tip {
+                        submission = submission.gas(SUBMIT_BATCH_GAS_LIMIT);
+                    }
+                    Ok(submission.send_sync().await?)
+                }
             }
         };
         let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), send)
@@ -430,16 +445,11 @@ impl BatchSubmitter {
             store.remove_submitted(batch.zone_height);
         }
 
-        info!(
-            %tx_hash,
-            withdrawal_batch_index = event.withdrawalBatchIndex,
-            withdrawal_queue_index = %event.withdrawalQueueIndex,
-            withdrawals_processed,
-            "Batch submitted to L1"
-        );
-
         Ok(BatchSubmission {
             event,
+            transaction_hash: tx_hash,
+            block_number: receipt.block_number,
+            gas_used: receipt.gas_used,
             withdrawals_processed,
         })
     }
@@ -447,15 +457,14 @@ impl BatchSubmitter {
     /// Build the two-call transaction that settles the batch and drains its complete withdrawal
     /// slot atomically, or `None` when the slot must be left to the standalone processor.
     ///
-    /// The slot is eligible when the submission uses a direct anchor (the fixed
-    /// [`COMBINED_SUBMIT_BATCH_GAS`] allowance does not cover ancestry header chains), it fits a
-    /// single `processWithdrawals` call within `max_withdrawal_batch_gas`, and the portal queue
-    /// is empty, making the freshly enqueued slot the head that the second call drains. The
-    /// empty-queue observation cannot go stale: only this sequencer's serialized submissions
-    /// enqueue slots and only its withdrawal processor drains them. No gas estimation runs — it
-    /// would spuriously revert for anchors at the observed L1 head. `submitBatch` must stay the
-    /// first call so the second call observes the slot it drains, and a revert of either call
-    /// rolls back the entire transaction.
+    /// The slot is eligible when it fits a single `processWithdrawals` call within
+    /// `max_withdrawal_batch_gas`. Gas estimation then simulates both ordered calls against
+    /// current state, so it also rejects the fast path whenever the portal queue has a backlog
+    /// (the freshly enqueued slot would not be the queue head) or the reserved budget is
+    /// insufficient. Tip-anchored submissions cannot be estimated (EIP-2935 stores the tip's
+    /// hash only in its successor block) and are sent optimistically instead; a revert rolls
+    /// back the entire transaction and the retry re-estimates against an advanced head.
+    /// `submitBatch` must stay the first call so the second call observes the slot it drains.
     async fn try_build_combined_submission_request(
         &self,
         submit_call: &ZonePortal::submitBatchCall,
@@ -463,47 +472,19 @@ impl BatchSubmitter {
         max_withdrawal_batch_gas: u64,
         from: Address,
         nonce: u64,
+        anchors_to_current_tip: bool,
     ) -> Option<TempoTransactionRequest> {
-        // A non-zero recent block number selects ancestry mode.
-        if withdrawals.is_empty() || submit_call.recentTempoBlockNumber != 0 {
+        if withdrawals.is_empty() {
             return None;
         }
         let gas_limit = match build_withdrawal_batches(withdrawals, max_withdrawal_batch_gas)[..] {
             // An oversized singleton exceeds the budget and stays on the standalone path, which
             // deliberately submits such slots on their own.
             [batch] if batch.gas_limit() <= max_withdrawal_batch_gas => {
-                batch.gas_limit() + COMBINED_SUBMIT_BATCH_GAS
+                batch.gas_limit() + SUBMIT_BATCH_GAS_LIMIT
             }
             _ => return None,
         };
-
-        match self
-            .l1_provider
-            .multicall()
-            .add(self.portal.withdrawalQueueHead())
-            .add(self.portal.withdrawalQueueTail())
-            .aggregate()
-            .await
-        {
-            Ok((head, tail)) if head == tail => {}
-            Ok((head, tail)) => {
-                info!(
-                    %head,
-                    %tail,
-                    withdrawal_count = withdrawals.len(),
-                    "Withdrawal backlog pending; submitting batch alone"
-                );
-                return None;
-            }
-            Err(error) => {
-                warn!(
-                    withdrawal_count = withdrawals.len(),
-                    %error,
-                    "Failed reading withdrawal queue bounds; submitting batch alone"
-                );
-                return None;
-            }
-        }
 
         let request = TempoTransactionRequest::default()
             .with_calls(vec![
@@ -529,7 +510,35 @@ impl BatchSubmitter {
             .with_gas_limit(gas_limit)
             .with_max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
             .with_max_priority_fee_per_gas(0);
-        Some(request)
+
+        if anchors_to_current_tip {
+            return Some(request);
+        }
+
+        // The estimate is only a go/no-go preflight: a backlogged queue or an oversized
+        // submitBatch surfaces here as a revert or an excessive estimate. The planner limit
+        // remains the transaction's gas limit because callbacks may burn their full reserve
+        // on-chain even when simulation is cheap.
+        match self.l1_provider.estimate_gas(request.clone()).await {
+            Ok(estimated) if estimated <= gas_limit => Some(request),
+            Ok(estimated) => {
+                warn!(
+                    withdrawal_count = withdrawals.len(),
+                    gas_limit,
+                    estimated,
+                    "Combined settlement estimate exceeds its budget; submitting batch alone"
+                );
+                None
+            }
+            Err(error) => {
+                info!(
+                    withdrawal_count = withdrawals.len(),
+                    %error,
+                    "Combined settlement preflight failed; submitting batch alone"
+                );
+                None
+            }
+        }
     }
 
     fn sign_settlement_attestation(
@@ -807,15 +816,11 @@ impl BatchSubmitter {
         );
 
         let current_l1_block = self.l1_provider.get_block_number().await?;
-        eyre::ensure!(
-            attestation.anchorBlockNumber < current_l1_block,
-            "certificate anchor block is not yet available through EIP-2935"
-        );
-        eyre::ensure!(
-            current_l1_block.saturating_sub(attestation.anchorBlockNumber)
-                < self.anchor_config.history_window(),
-            "certificate anchor block fell outside the EIP-2935 history window"
-        );
+        validate_certificate_anchor(
+            attestation.anchorBlockNumber,
+            current_l1_block,
+            self.anchor_config.history_window(),
+        )?;
 
         let anchor = self
             .l1_provider
@@ -857,7 +862,7 @@ impl BatchSubmitter {
     async fn resolve_anchor_mode(&self, tempo_block_number: u64) -> Result<(AnchorMode, u64)> {
         let current_l1_block = self.l1_provider.get_block_number().await?;
 
-        if tempo_block_number >= current_l1_block {
+        if tempo_block_number > current_l1_block {
             return Err(eyre::eyre!(
                 "tempo_block_number ({tempo_block_number}) is not yet confirmed on L1 \
                  (tip={current_l1_block}), will retry after L1 advances"
@@ -1222,6 +1227,12 @@ pub struct BatchData {
 pub struct BatchSubmission {
     /// `BatchSubmitted` event decoded from the confirmed receipt.
     pub event: ZonePortal::BatchSubmitted,
+    /// Confirmed L1 transaction hash.
+    pub transaction_hash: B256,
+    /// L1 block number the transaction was included in.
+    pub block_number: Option<u64>,
+    /// Gas used by the confirmed transaction.
+    pub gas_used: u64,
     /// Whether the batch's withdrawal slot was fully processed in the same transaction.
     pub withdrawals_processed: bool,
 }
@@ -1362,6 +1373,22 @@ impl AnchorMode {
             Self::Ancestry { anchor_block, .. } => *anchor_block,
         }
     }
+}
+
+fn validate_certificate_anchor(
+    anchor_block_number: u64,
+    current_l1_block: u64,
+    history_window: u64,
+) -> Result<()> {
+    eyre::ensure!(
+        anchor_block_number <= current_l1_block,
+        "certificate anchor block is ahead of the current L1 tip"
+    );
+    eyre::ensure!(
+        current_l1_block.saturating_sub(anchor_block_number) < history_window,
+        "certificate anchor block fell outside the EIP-2935 history window"
+    );
+    Ok(())
 }
 
 impl fmt::Display for AnchorMode {
@@ -2066,11 +2093,8 @@ mod tests {
     #[tokio::test]
     async fn combined_submission_drains_whole_slot_on_settlement_nonce_lane() {
         let asserter = Asserter::new();
-        // Queue bounds preflight: head == tail means the queue is empty.
-        asserter.push_success(&abi_encode_multicall(vec![
-            abi_word(U256::from(7)),
-            abi_word(U256::from(7)),
-        ]));
+        // eth_estimateGas preflight for the two-call transaction.
+        asserter.push_success(&alloy_primitives::U64::from(1_000_000u64));
         let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
@@ -2087,6 +2111,7 @@ mod tests {
                 MAX_WITHDRAWAL_BATCH_GAS,
                 sender,
                 9,
+                false,
             )
             .await
             .expect("a whole slot within the planner budget is eligible");
@@ -2109,9 +2134,25 @@ mod tests {
             build_withdrawal_batches(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS)[0].gas_limit();
         assert_eq!(
             request.inner.gas,
-            Some(withdrawal_gas + COMBINED_SUBMIT_BATCH_GAS)
+            Some(withdrawal_gas + SUBMIT_BATCH_GAS_LIMIT)
         );
-        assert!(asserter.read_q().is_empty(), "queue bounds read consumed");
+        assert!(asserter.read_q().is_empty(), "preflight estimate consumed");
+
+        // A tip-anchored submission skips estimation and sends optimistically: the mock queue
+        // is empty, so any estimate attempt would fail and fall back to submit-only.
+        assert!(
+            submitter
+                .try_build_combined_submission_request(
+                    &submit_call,
+                    &withdrawals,
+                    MAX_WITHDRAWAL_BATCH_GAS,
+                    sender,
+                    9,
+                    true,
+                )
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2131,6 +2172,7 @@ mod tests {
                     budget,
                     Address::repeat_byte(0x22),
                     0,
+                    false,
                 )
                 .await
                 .is_some()
@@ -2143,32 +2185,11 @@ mod tests {
         assert!(!eligible(&withdrawals, one_item_budget).await);
         // An oversized singleton exceeds the budget.
         assert!(!eligible(&withdrawals[..1], 1).await);
-        // A backlogged queue keeps the freshly enqueued slot from being the head.
-        asserter.push_success(&abi_encode_multicall(vec![
-            abi_word(U256::from(3)),
-            abi_word(U256::from(4)),
-        ]));
+        // The estimate exceeds the reserved combined budget.
+        asserter.push_success(&alloy_primitives::U64::from(u64::MAX));
         assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
-        // The queue-bounds read itself fails (empty mock queue).
+        // The estimate call itself fails (empty mock queue).
         assert!(!eligible(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS).await);
-
-        // An ancestry-anchored submission stays submit-only.
-        let ancestry_call = ZonePortal::submitBatchCall {
-            recentTempoBlockNumber: 1,
-            ..test_submit_batch_call()
-        };
-        assert!(
-            submitter
-                .try_build_combined_submission_request(
-                    &ancestry_call,
-                    &withdrawals,
-                    MAX_WITHDRAWAL_BATCH_GAS,
-                    Address::repeat_byte(0x22),
-                    0,
-                )
-                .await
-                .is_none()
-        );
     }
 
     #[tokio::test]
@@ -2258,7 +2279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anchor_resolution_returns_observed_l1_tip() {
+    async fn anchor_resolution_accepts_observed_l1_tip() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
@@ -2266,11 +2287,54 @@ mod tests {
         let submitter = BatchSubmitter::new(Address::ZERO, provider);
 
         asserter.push_success(&100_u64);
-        let (mode, current_l1_block) = submitter.resolve_anchor_mode(99).await.unwrap();
+        let (mode, current_l1_block) = submitter.resolve_anchor_mode(100).await.unwrap();
 
         assert!(matches!(mode, AnchorMode::Direct));
         assert_eq!(current_l1_block, 100);
         assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn anchor_resolution_rejects_future_l1_block() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let submitter = BatchSubmitter::new(Address::ZERO, provider);
+
+        asserter.push_success(&100_u64);
+        let err = match submitter.resolve_anchor_mode(101).await {
+            Ok(_) => panic!("future L1 anchor was accepted"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("tempo_block_number (101) is not yet confirmed on L1 (tip=100)")
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn certificate_anchor_validation_accepts_tip_and_rejects_future() {
+        validate_certificate_anchor(100, 100, 10).unwrap();
+
+        let err = validate_certificate_anchor(101, 100, 10).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("certificate anchor block is ahead of the current L1 tip")
+        );
+    }
+
+    #[test]
+    fn certificate_anchor_validation_preserves_history_window() {
+        validate_certificate_anchor(91, 100, 10).unwrap();
+
+        let err = validate_certificate_anchor(90, 100, 10).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("certificate anchor block fell outside the EIP-2935 history window")
+        );
     }
 
     #[tokio::test]
