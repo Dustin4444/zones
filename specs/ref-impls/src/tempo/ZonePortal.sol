@@ -984,6 +984,32 @@ contract ZonePortal is IZonePortal {
         onlySequencer
         nonReentrantWithdrawal
     {
+        _processWithdrawals(withdrawals, remainingQueue, false);
+    }
+
+    /// @notice Simulate withdrawal processing without committing any state changes.
+    /// @dev This intentionally reverts after a successful run so callers must use `eth_call`.
+    ///      Unlike `processWithdrawals`, callback failures are surfaced to help size callbacks.
+    function simulateProcessWithdrawals(
+        Withdrawal[] calldata withdrawals,
+        bytes32 remainingQueue
+    )
+        external
+        onlySequencer
+        nonReentrantWithdrawal
+    {
+        uint256 gasStart = gasleft();
+        _processWithdrawals(withdrawals, remainingQueue, true);
+        revert SimulationPassed(gasStart - gasleft());
+    }
+
+    function _processWithdrawals(
+        Withdrawal[] calldata withdrawals,
+        bytes32 remainingQueue,
+        bool strict
+    )
+        internal
+    {
         bytes32[] memory remainingQueues = new bytes32[](withdrawals.length);
         bytes32 nextQueue = remainingQueue;
 
@@ -994,11 +1020,18 @@ contract ZonePortal is IZonePortal {
         }
 
         for (uint256 i; i < withdrawals.length; ++i) {
-            _processWithdrawal(withdrawals[i], remainingQueues[i]);
+            _processWithdrawal(withdrawals[i], remainingQueues[i], strict, i);
         }
     }
 
-    function _processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) internal {
+    function _processWithdrawal(
+        Withdrawal calldata withdrawal,
+        bytes32 remainingQueue,
+        bool strict,
+        uint256 index
+    )
+        internal
+    {
         // Pop from withdrawal queue (library handles swap and hash verification)
         _withdrawalQueue.dequeue(withdrawal, remainingQueue);
 
@@ -1010,6 +1043,7 @@ contract ZonePortal is IZonePortal {
         }
 
         if (withdrawal.gasLimit > MAX_WITHDRAWAL_GAS_LIMIT) {
+            if (strict) revert WithdrawalSimulationFailed(index, bytes4(0));
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
             emit WithdrawalProcessed(
                 withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, false
@@ -1025,27 +1059,53 @@ contract ZonePortal is IZonePortal {
                 && _isAllowed(withdrawal.to)
                 && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
-            // Isolate callback effects so failure can be caught without reverting the dequeue.
-            try this.deliverWithdrawal(
-                _token,
-                withdrawal.to,
-                withdrawal.amount,
-                withdrawal.senderTag,
-                withdrawal.gasLimit,
-                withdrawal.callbackData
-            ) {
+            if (strict) {
+                // Preserve the real self-call and callback gas semantics, but report the item
+                // that failed instead of converting the failure into a bounce-back.
+                try this.deliverWithdrawal(
+                    _token,
+                    withdrawal.to,
+                    withdrawal.amount,
+                    withdrawal.senderTag,
+                    withdrawal.gasLimit,
+                    withdrawal.callbackData
+                ) { }
+                catch (bytes memory reason) {
+                    revert WithdrawalSimulationFailed(index, _revertSelector(reason));
+                }
                 success = true;
-            } catch {
-                success = false;
+            } else {
+                // Isolate callback effects so failure can be caught without reverting the dequeue.
+                try this.deliverWithdrawal(
+                    _token,
+                    withdrawal.to,
+                    withdrawal.amount,
+                    withdrawal.senderTag,
+                    withdrawal.gasLimit,
+                    withdrawal.callbackData
+                ) {
+                    success = true;
+                } catch {
+                    success = false;
+                }
             }
         }
 
+        if (strict && !success) revert WithdrawalSimulationFailed(index, bytes4(0));
         if (!success) {
             _enqueueBounceBack(_token, withdrawal.amount, withdrawal.fallbackNonce);
         }
         emit WithdrawalProcessed(
             withdrawal.to, withdrawal.senderTag, _token, withdrawal.amount, success
         );
+    }
+
+    function _revertSelector(bytes memory reason) internal pure returns (bytes4 selector) {
+        if (reason.length >= 4) {
+            assembly ("memory-safe") {
+                selector := mload(add(reason, 0x20))
+            }
+        }
     }
 
     /// @notice Deliver a callback withdrawal in a revertable self-call frame.

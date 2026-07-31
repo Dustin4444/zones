@@ -181,6 +181,8 @@ crate::sol! {
         error DepositBlockCapacityExceeded(uint64 maximum);
         error InvalidCallbackTarget();
         error AccountNotAllowed(address account);
+        error SimulationPassed(uint256 gasUsed);
+        error WithdrawalSimulationFailed(uint256 index, bytes4 reason);
         error InvalidLeader();
         error ActiveLeaderRemoved();
         error LeaderAlreadyUpdatedThisBlock();
@@ -238,6 +240,10 @@ crate::sol! {
             returns (bytes32 newCurrentDepositQueueHash);
 
         function processWithdrawals(Withdrawal[] calldata withdrawals, bytes32 remainingQueue) external;
+        function simulateProcessWithdrawals(
+            Withdrawal[] calldata withdrawals,
+            bytes32 remainingQueue
+        ) external;
 
         function submitBatch(
             uint64 tempoBlockNumber,
@@ -386,6 +392,8 @@ impl core::fmt::Display for ZonePortal::ZonePortalErrors {
             Self::DepositBlockCapacityExceeded(_) => f.write_str("DepositBlockCapacityExceeded"),
             Self::InvalidCallbackTarget(_) => f.write_str("InvalidCallbackTarget"),
             Self::AccountNotAllowed(_) => f.write_str("AccountNotAllowed"),
+            Self::SimulationPassed(_) => f.write_str("SimulationPassed"),
+            Self::WithdrawalSimulationFailed(_) => f.write_str("WithdrawalSimulationFailed"),
             Self::InvalidLeader(_) => f.write_str("InvalidLeader"),
             Self::ActiveLeaderRemoved(_) => f.write_str("ActiveLeaderRemoved"),
             Self::LeaderAlreadyUpdatedThisBlock(_) => f.write_str("LeaderAlreadyUpdatedThisBlock"),

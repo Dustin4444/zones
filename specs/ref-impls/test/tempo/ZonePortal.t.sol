@@ -2324,6 +2324,92 @@ contract ZonePortalTest is BaseTest {
         assertEq(withdrawalReceiver.lastCallbackData(), "callback_data");
     }
 
+    function test_simulateProcessWithdrawals_revertsAfterSuccessfulRun() public {
+        _openPortalModes();
+        uint128 amount = 500e6;
+        _fundCallbackWithdrawal(amount);
+
+        Withdrawal memory w = _withdrawal(
+            address(pathUSD),
+            alice,
+            address(successfulReceiver),
+            amount,
+            bytes32(0),
+            5_000_000,
+            alice,
+            "callback_data"
+        );
+        _enqueueWithdrawal(w);
+
+        uint256 headBefore = portal.withdrawalQueueHead();
+        uint256 tailBefore = portal.withdrawalQueueTail();
+        uint256 portalBalanceBefore = pathUSD.balanceOf(address(portal));
+        uint256 receiverBalanceBefore = pathUSD.balanceOf(address(successfulReceiver));
+        uint256 callCountBefore = successfulReceiver.callCount();
+
+        try portal.simulateProcessWithdrawals(_singleWithdrawal(w), bytes32(0)) {
+            assertTrue(false, "simulation should always revert");
+        } catch (bytes memory reason) {
+            bytes4 selector;
+            uint256 gasUsed;
+            assembly {
+                selector := mload(add(reason, 0x20))
+                gasUsed := mload(add(reason, 0x24))
+            }
+            assertEq(selector, IZonePortal.SimulationPassed.selector);
+            assertGt(gasUsed, 0);
+        }
+
+        assertEq(portal.withdrawalQueueHead(), headBefore);
+        assertEq(portal.withdrawalQueueTail(), tailBefore);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
+        assertEq(pathUSD.balanceOf(address(successfulReceiver)), receiverBalanceBefore);
+        assertEq(successfulReceiver.callCount(), callCountBefore);
+    }
+
+    function test_simulateProcessWithdrawals_reportsCallbackFailure() public {
+        _openPortalModes();
+        uint128 amount = 500e6;
+        _fundCallbackWithdrawal(amount);
+        withdrawalReceiver.setShouldRevert(true);
+
+        Withdrawal memory w = _withdrawal(
+            address(pathUSD),
+            alice,
+            address(withdrawalReceiver),
+            amount,
+            bytes32(0),
+            5_000_000,
+            alice,
+            "callback_data"
+        );
+        _enqueueWithdrawal(w);
+
+        uint256 headBefore = portal.withdrawalQueueHead();
+        uint256 tailBefore = portal.withdrawalQueueTail();
+        uint256 portalBalanceBefore = pathUSD.balanceOf(address(portal));
+
+        try portal.simulateProcessWithdrawals(_singleWithdrawal(w), bytes32(0)) {
+            assertTrue(false, "simulation should revert on callback failure");
+        } catch (bytes memory reason) {
+            bytes4 selector;
+            uint256 index;
+            bytes4 callbackReason;
+            assembly {
+                selector := mload(add(reason, 0x20))
+                index := mload(add(reason, 0x24))
+                callbackReason := mload(add(reason, 0x44))
+            }
+            assertEq(selector, IZonePortal.WithdrawalSimulationFailed.selector);
+            assertEq(index, 0);
+            assertEq(callbackReason, IZonePortal.CallbackRejected.selector);
+        }
+
+        assertEq(portal.withdrawalQueueHead(), headBefore);
+        assertEq(portal.withdrawalQueueTail(), tailBefore);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
+    }
+
     function _callbackData(
         GatewayFlow flow,
         address tempoRefundRecipient,

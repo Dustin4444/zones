@@ -660,6 +660,10 @@ interface IZonePortal {
     error CallbackDidNotReturnToZone();
     error InvalidAllowedAccount();
     error AccountNotAllowed(address account);
+    /// @notice Returned by `simulateProcessWithdrawals` after a successful dry run.
+    error SimulationPassed(uint256 gasUsed);
+    /// @notice Identifies the withdrawal and callback error that made a dry run fail.
+    error WithdrawalSimulationFailed(uint256 index, bytes4 reason);
 
     /// @notice Emitted when an account's portal role is initialized or updated.
     event RoleUpdated(address indexed account, Role prev, Role next);
@@ -931,6 +935,14 @@ interface IZonePortal {
         returns (bytes32 newCurrentDepositQueueHash);
 
     function processWithdrawals(Withdrawal[] calldata withdrawals, bytes32 remainingQueue) external;
+
+    /// @notice Execute withdrawal processing for estimation, reverting after a successful run.
+    /// @dev Callback failures are surfaced instead of being converted into bounce-backs.
+    function simulateProcessWithdrawals(
+        Withdrawal[] calldata withdrawals,
+        bytes32 remainingQueue
+    )
+        external;
 
     function deliverWithdrawal(
         address token,

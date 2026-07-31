@@ -686,6 +686,8 @@ The portal dequeues before executing the withdrawal, then independently requires
 
 The sequencer first packs withdrawals into transactions using a configurable per-transaction gas budget, then submits them through a queue bounded by transaction count. Transactions use consecutive nonces on the dedicated withdrawal nonce key, preserving FIFO queue transitions even when later transactions are broadcast before earlier receipts arrive. If a submission reverts or cannot be confirmed, the sequencer stops admitting new transactions, drains those already submitted, then reconciles the on-chain queue and retries its unfinished suffix.
 
+For callback gas estimation, the sequencer may call `simulateProcessWithdrawals(withdrawals, remainingQueue)` with `eth_call` from an active sequencer address. The function runs the same queue, transfer, messenger, and callback path as `processWithdrawals`, but does not convert failures into bounce-backs. A successful dry run reverts with `SimulationPassed(gasUsed)` after all work has executed; a failure reverts with `WithdrawalSimulationFailed(index, reason)`, where `index` identifies the batch item and `reason` is the callback revert selector when available. Because the call reverts, queue, token, callback, and event changes are discarded. The sequencer can vary each withdrawal's callback `gasLimit` and repeat the simulation to find a passing value before estimating the outer processing transaction.
+
 For a plain withdrawal (`gasLimit == 0`), the portal rechecks the current modes and roles before transferring directly. A failed transfer or a destination invalidated by a mode or membership change creates a withdrawal bounce-back deposit for the Zone-local `zoneFallbackRecipient`.
 
 ### Withdrawal Callbacks
@@ -1835,6 +1837,7 @@ interface IZonePortal {
 
     // Withdrawal processing
     function processWithdrawals(Withdrawal[] calldata withdrawals, bytes32 remainingQueue) external;
+    function simulateProcessWithdrawals(Withdrawal[] calldata withdrawals, bytes32 remainingQueue) external;
 
     // Refund registry (deposit bounce-back transfers that reverted on Tempo, e.g.
     // because the recipient was rejected by the token's TIP-403 policy at refund time)
