@@ -1,5 +1,9 @@
 name: Zones benchmark
 
+# PR comments (`derek bench` or `@decofe bench`) compare the PR head with its
+# merge-base by default. `run-side=feature`, schedules, and manual dispatches
+# use the single-run path; only that path may publish directly to ClickHouse.
+
 on:
   schedule:
     - cron: "45 2 * * *"
@@ -154,25 +158,13 @@ on:
         required: false
         default: ""
 
-  # Benchmark-harness changes exercise the default validation preset on PR updates.
-  # Once this workflow is on the default branch, workflow_dispatch selects targeted runs.
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - ".github/workflows/zones-benchmark.yml"
-      - "contrib/bench/**"
-      - "crates/contracts/**"
-      - "crates/node/**"
-      - "crates/sequencer/**"
-      - "specs/ref-impls/**"
-      - "xtask/**"
+  issue_comment:
+    types: [created]
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: {}
 
 concurrency:
-  group: zones-benchmark-${{ github.event.pull_request.number || github.ref }}
+  group: zones-benchmark-${{ github.event.issue.number || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -190,12 +182,23 @@ jobs:
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # acknowledge the command and create the status comment
+      pull-requests: read # resolve and authorize the requested PR revisions
     outputs:
       neobank-preset: ${{ steps.config.outputs.neobank-preset }}
-      sha: ${{ steps.config.outputs.sha }}
+      branches: ${{ steps.request.outputs.branches || steps.config.outputs.branches }}
+      control-sha: ${{ steps.request.outputs.control-sha || steps.config.outputs.control-sha }}
+      run-mode: ${{ steps.request.outputs.run-mode || steps.config.outputs.run-mode }}
+      pr: ${{ steps.request.outputs.pr }}
+      actor: ${{ steps.request.outputs.actor }}
+      baseline-name: ${{ steps.request.outputs.baseline-name }}
+      feature-name: ${{ steps.request.outputs.feature-name || steps.config.outputs.feature-name }}
+      comment-id: ${{ steps.ack.outputs.comment-id }}
       accounts: ${{ steps.config.outputs.accounts }}
       count: ${{ steps.config.outputs.count }}
       tps: ${{ steps.config.outputs.tps }}
@@ -223,11 +226,28 @@ jobs:
       tempo-ref: ${{ steps.config.outputs.tempo-ref }}
       txgen-ref: ${{ steps.config.outputs.txgen-ref }}
     steps:
-      - name: Require a trusted actor and PR author
-        if: github.event_name == 'pull_request'
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: github.event_name == 'issue_comment'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Detect benchmark command
+        id: command
+        if: github.event_name == 'issue_comment'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
+            const { isBenchCommand } = require('./.github/scripts/zones-bench-command.js');
+            core.setOutput('is-bench-command', String(isBenchCommand(context.payload.comment.body)));
+
+      - name: Resolve and authorize comment request
+        id: request
+        if: steps.command.outputs.is-bench-command == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { parseBenchCommand, USAGE } = require('./.github/scripts/zones-bench-command.js');
             const accepted = new Set(['admin', 'maintain', 'write']);
             const permission = async (username) => {
               const response = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -238,8 +258,18 @@ jobs:
               return response.data.permission;
             };
 
-            const actor = context.actor;
-            const author = context.payload.pull_request.user.login;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (!pr.head.repo || pr.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setFailed('Zones benchmarks cannot run code from a fork');
+              return;
+            }
+
+            const actor = context.payload.comment.user.login;
+            const author = pr.user.login;
             const [actorPermission, authorPermission] = await Promise.all([
               permission(actor),
               permission(author),
@@ -250,37 +280,121 @@ jobs:
             if (!accepted.has(authorPermission)) {
               core.setFailed(`PR author @${author} is not a repository member`);
             }
+            if (!accepted.has(actorPermission) || !accepted.has(authorPermission)) return;
+
+            let request;
+            try {
+              request = parseBenchCommand(context.payload.comment.body);
+            } catch (error) {
+              const reason = error.reason || error.message;
+              const message = `❌ **Invalid Zones benchmark command**\n\n${reason}\n\n${USAGE}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: message,
+              });
+              core.setFailed(error.message);
+              return;
+            }
+
+            const resolveRef = async (ref) => {
+              const response = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref,
+              });
+              return response.data.sha;
+            };
+
+            const featureName = request.feature || pr.head.ref;
+            let featureSha;
+            let baselineSha = '';
+            let baselineName = '';
+            try {
+              featureSha = request.feature ? await resolveRef(request.feature) : pr.head.sha;
+              if (request['run-side'] === 'comparison') {
+                if (request.baseline) {
+                  baselineSha = await resolveRef(request.baseline);
+                  baselineName = request.baseline;
+                } else {
+                  const comparison = await github.request(
+                    'GET /repos/{owner}/{repo}/compare/{basehead}',
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      basehead: `${pr.base.sha}...${featureSha}`,
+                    },
+                  );
+                  baselineSha = comparison.data.merge_base_commit.sha;
+                  baselineName = baselineSha;
+                }
+              }
+            } catch (error) {
+              const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `❌ Could not resolve the requested Zones benchmark refs. [View log](${runUrl})`,
+              });
+              core.setFailed(error.message);
+              return;
+            }
+
+            const branches = request['run-side'] === 'comparison'
+              ? [
+                  { name: 'baseline', sha: baselineSha, ref: baselineName },
+                  { name: 'feature', sha: featureSha, ref: featureName },
+                ]
+              : [{ name: 'single-run', sha: featureSha, ref: featureName }];
+
+            for (const [name, value] of Object.entries(request)) {
+              if (name === 'baseline' || name === 'feature' || name === 'run-side') continue;
+              core.setOutput(name, value);
+            }
+            core.setOutput('branches', JSON.stringify(branches));
+            core.setOutput('control-sha', featureSha);
+            core.setOutput('run-mode', request['run-side'] === 'comparison' ? 'comparison' : 'single-run');
+            core.setOutput('pr', String(pr.number));
+            core.setOutput('actor', actor);
+            core.setOutput('baseline-name', baselineName);
+            core.setOutput('feature-name', featureName);
 
       - name: Resolve configuration
         id: config
+        if: >-
+          github.event_name != 'issue_comment' ||
+          steps.command.outputs.is-bench-command == 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          INPUT_PRESET: ${{ inputs.preset || 'full-journey' }}
-          INPUT_ACCOUNTS: ${{ inputs.accounts || '100' }}
-          INPUT_COUNT: ${{ inputs.count || '100' }}
-          INPUT_TPS: ${{ inputs.tps || '20' }}
-          INPUT_MAX_CONCURRENT: ${{ inputs.max-concurrent || '12' }}
-          INPUT_STATE_BLOAT_GIB: ${{ inputs.state-bloat-gib || '1' }}
-          INPUT_FORCE_BLOAT: ${{ inputs.force-bloat == true }}
-          INPUT_DEPOSIT_AMOUNT: ${{ inputs.deposit-amount || '2000000' }}
-          INPUT_BOOTSTRAP_DEPOSIT_AMOUNT: ${{ inputs.bootstrap-deposit-amount || '10000000' }}
-          INPUT_ACTIVITY_AMOUNT: ${{ inputs.activity-amount || '1' }}
-          INPUT_WITHDRAWAL_AMOUNT: ${{ inputs.withdrawal-amount || '1000000' }}
-          INPUT_SWAP_MECHANISM: ${{ inputs.swap-mechanism || 'direct-swap' }}
-          INPUT_RECIPIENT_MODE: ${{ inputs.recipient-mode || 'existing' }}
-          INPUT_CALLBACK_GAS_LIMIT: ${{ inputs.callback-gas-limit || '10000000' }}
-          INPUT_SWAP_LIQUIDITY: ${{ inputs.swap-liquidity || '10000000000' }}
-          INPUT_L1_GAS_LIMIT: ${{ inputs.l1-gas-limit || '30000000' }}
-          INPUT_L1_GENERAL_GAS_LIMIT: ${{ inputs.l1-general-gas-limit || '30000000' }}
-          INPUT_WITHDRAWAL_MAX_BATCH_GAS: ${{ inputs.withdrawal-max-batch-gas || '20000000' }}
-          INPUT_WITHDRAWAL_MAX_IN_FLIGHT_BATCHES: ${{ inputs.withdrawal-max-in-flight-batches || '12' }}
-          INPUT_ZONE_BATCH_INTERVAL_BLOCKS: ${{ inputs.zone-batch-interval-blocks || '120' }}
-          INPUT_WITHDRAWAL_POLL_INTERVAL_SECS: ${{ inputs.withdrawal-poll-interval-secs || '5' }}
-          INPUT_STEP_TIMEOUT: ${{ inputs.step-timeout || '10m' }}
-          INPUT_SETUP_SETTLEMENT_TIMEOUT_SECS: ${{ inputs.setup-settlement-timeout-secs || '120' }}
-          INPUT_DRAIN_TIMEOUT: ${{ inputs.drain-timeout || '300' }}
-          INPUT_SEED: ${{ inputs.seed || '' }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref_name }}
+          INPUT_PRESET: ${{ steps.request.outputs.preset || inputs.preset || 'full-journey' }}
+          INPUT_ACCOUNTS: ${{ steps.request.outputs.accounts || inputs.accounts || '100' }}
+          INPUT_COUNT: ${{ steps.request.outputs.count || inputs.count || '100' }}
+          INPUT_TPS: ${{ steps.request.outputs.tps || inputs.tps || '20' }}
+          INPUT_MAX_CONCURRENT: ${{ steps.request.outputs.max-concurrent || inputs.max-concurrent || '12' }}
+          INPUT_STATE_BLOAT_GIB: ${{ steps.request.outputs.state-bloat-gib || inputs.state-bloat-gib || '1' }}
+          INPUT_FORCE_BLOAT: ${{ steps.request.outputs.force-bloat || (inputs.force-bloat && 'true' || 'false') }}
+          INPUT_DEPOSIT_AMOUNT: ${{ steps.request.outputs.deposit-amount || inputs.deposit-amount || '2000000' }}
+          INPUT_BOOTSTRAP_DEPOSIT_AMOUNT: ${{ steps.request.outputs.bootstrap-deposit-amount || inputs.bootstrap-deposit-amount || '10000000' }}
+          INPUT_ACTIVITY_AMOUNT: ${{ steps.request.outputs.activity-amount || inputs.activity-amount || '1' }}
+          INPUT_WITHDRAWAL_AMOUNT: ${{ steps.request.outputs.withdrawal-amount || inputs.withdrawal-amount || '1000000' }}
+          INPUT_SWAP_MECHANISM: ${{ steps.request.outputs.swap-mechanism || inputs.swap-mechanism || 'direct-swap' }}
+          INPUT_RECIPIENT_MODE: ${{ steps.request.outputs.recipient-mode || inputs.recipient-mode || 'existing' }}
+          INPUT_CALLBACK_GAS_LIMIT: ${{ steps.request.outputs.callback-gas-limit || inputs.callback-gas-limit || '10000000' }}
+          INPUT_SWAP_LIQUIDITY: ${{ steps.request.outputs.swap-liquidity || inputs.swap-liquidity || '10000000000' }}
+          INPUT_L1_GAS_LIMIT: ${{ steps.request.outputs.l1-gas-limit || inputs.l1-gas-limit || '30000000' }}
+          INPUT_L1_GENERAL_GAS_LIMIT: ${{ steps.request.outputs.l1-general-gas-limit || inputs.l1-general-gas-limit || '30000000' }}
+          INPUT_WITHDRAWAL_MAX_BATCH_GAS: ${{ steps.request.outputs.withdrawal-max-batch-gas || inputs.withdrawal-max-batch-gas || '20000000' }}
+          INPUT_WITHDRAWAL_MAX_IN_FLIGHT_BATCHES: ${{ steps.request.outputs.withdrawal-max-in-flight-batches || inputs.withdrawal-max-in-flight-batches || '12' }}
+          INPUT_ZONE_BATCH_INTERVAL_BLOCKS: ${{ steps.request.outputs.zone-batch-interval-blocks || inputs.zone-batch-interval-blocks || '120' }}
+          INPUT_WITHDRAWAL_POLL_INTERVAL_SECS: ${{ steps.request.outputs.withdrawal-poll-interval-secs || inputs.withdrawal-poll-interval-secs || '5' }}
+          INPUT_STEP_TIMEOUT: ${{ steps.request.outputs.step-timeout || inputs.step-timeout || '10m' }}
+          INPUT_SETUP_SETTLEMENT_TIMEOUT_SECS: ${{ steps.request.outputs.setup-settlement-timeout-secs || inputs.setup-settlement-timeout-secs || '120' }}
+          INPUT_DRAIN_TIMEOUT: ${{ steps.request.outputs.drain-timeout || inputs.drain-timeout || '300' }}
+          INPUT_SEED: ${{ steps.request.outputs.seed || inputs.seed || '' }}
           INPUT_TEMPO_REF: a55a6395567f529f03fa88bc457584fa8ed89af8
           INPUT_TXGEN_REF: 072877b673f60b5f559f17da098296f1841b6732
           RUN_ID: ${{ github.run_id }}
@@ -289,10 +403,6 @@ jobs:
           set -euo pipefail
 
           neobank_preset="$INPUT_PRESET"
-          if [ "$EVENT_NAME" = pull_request ]; then
-            neobank_preset=full-journey
-            INPUT_COUNT=100
-          fi
           case "$neobank_preset" in
             encrypted-deposit|private-withdrawal|rewards-redemption|full-journey|\
             slippage-bounce|third-party-recipient|direct-lifecycle|\
@@ -482,7 +592,6 @@ jobs:
 
           {
             echo "neobank-preset=$neobank_preset"
-            echo "sha=$EVENT_SHA"
             echo "accounts=$INPUT_ACCOUNTS"
             echo "count=$INPUT_COUNT"
             echo "tps=$INPUT_TPS"
@@ -509,14 +618,88 @@ jobs:
             echo "seed=$INPUT_SEED"
             echo "tempo-ref=$INPUT_TEMPO_REF"
             echo "txgen-ref=$INPUT_TXGEN_REF"
+            if [ "$EVENT_NAME" != issue_comment ]; then
+              branches="$(jq -cn \
+                --arg sha "$EVENT_SHA" \
+                --arg ref "$EVENT_REF" \
+                '[{name: "single-run", sha: $sha, ref: $ref}]')"
+              echo "branches=$branches"
+              echo "control-sha=$EVENT_SHA"
+              echo "run-mode=single-run"
+              echo "feature-name=$EVENT_REF"
+            fi
           } >> "$GITHUB_OUTPUT"
 
+      - name: Report invalid comment configuration
+        if: >-
+          failure() &&
+          github.event_name == 'issue_comment' &&
+          steps.request.outcome == 'success' &&
+          steps.config.outcome == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `❌ **Invalid Zones benchmark configuration.** [View validation log](${runUrl})`,
+            });
+
+      - name: Acknowledge comment request
+        id: ack
+        if: >-
+          github.event_name == 'issue_comment' &&
+          steps.command.outputs.is-bench-command == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BENCH_ACTOR: ${{ steps.request.outputs.actor }}
+          BENCH_RUN_MODE: ${{ steps.request.outputs.run-mode }}
+          BENCH_PRESET: ${{ steps.config.outputs.neobank-preset }}
+          BENCH_BASELINE: ${{ steps.request.outputs.baseline-name }}
+          BENCH_FEATURE: ${{ steps.request.outputs.feature-name }}
+          BENCH_COUNT: ${{ steps.config.outputs.count }}
+          BENCH_TPS: ${{ steps.config.outputs.tps }}
+          BENCH_SEED: ${{ steps.config.outputs.seed }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const refs = process.env.BENCH_RUN_MODE === 'comparison'
+              ? `baseline: \`${process.env.BENCH_BASELINE}\`, feature: \`${process.env.BENCH_FEATURE}\``
+              : `feature: \`${process.env.BENCH_FEATURE}\``;
+            const config = `preset: \`${process.env.BENCH_PRESET}\`, journeys: \`${process.env.BENCH_COUNT}\`, target rate: \`${process.env.BENCH_TPS}/s\`, seed: \`${process.env.BENCH_SEED}\`, ${refs}`;
+            const response = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `cc @${process.env.BENCH_ACTOR}\n\n🚀 Zones benchmark queued. [View run](${runUrl})\n\n⏳ **Status:** Waiting for runner...\n\n**Config:** ${config}`,
+            });
+            core.setOutput('comment-id', String(response.data.id));
+
   benchmark:
-    name: neobank-${{ needs.authorize.outputs.neobank-preset }}
+    name: neobank-${{ needs.authorize.outputs.neobank-preset }}-${{ matrix.branch.name }}
     needs: authorize
+    if: needs.authorize.outputs.branches != ''
+    permissions:
+      contents: read
     runs-on: [self-hosted, Linux, X64, bare-metal-dual-schelk]
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        branch: ${{ fromJSON(needs.authorize.outputs.branches) }}
     env:
+      ZONES_BENCH_BRANCH: ${{ matrix.branch.name }}
+      ZONES_BENCH_CONTROL_REF: ${{ needs.authorize.outputs.control-sha }}
       ZONES_BENCH_PHASE: neobank-e2e
       ZONES_BENCH_NEOBANK_PRESET: ${{ needs.authorize.outputs.neobank-preset }}
       ZONES_BENCH_ACCOUNTS: ${{ needs.authorize.outputs.accounts }}
@@ -545,29 +728,46 @@ jobs:
       ZONES_BENCH_SEED: ${{ needs.authorize.outputs.seed }}
       ZONES_BENCH_TEMPO_REF: ${{ needs.authorize.outputs.tempo-ref }}
       ZONES_BENCH_TXGEN_REF: ${{ needs.authorize.outputs.txgen-ref }}
-      ZONES_BENCH_ZONES_REF: ${{ needs.authorize.outputs.sha }}
-      ZONES_BENCH_GIT_REF: ${{ github.head_ref || github.ref_name }}
-      ZONES_BENCH_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      ZONES_BENCH_ZONES_REF: ${{ matrix.branch.sha }}
+      ZONES_BENCH_GIT_REF: ${{ matrix.branch.ref }}
+      ZONES_BENCH_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.branch.name }}
       ZONES_BENCH_GITHUB_REPOSITORY: ${{ github.repository }}
       ZONES_BENCH_GITHUB_RUN_ID: ${{ github.run_id }}
       ZONES_BENCH_GITHUB_WORKFLOW: zones-benchmark.yml
-      ZONES_BENCH_GITHUB_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+      ZONES_BENCH_GITHUB_PR_NUMBER: ${{ needs.authorize.outputs.pr }}
       ZONES_BENCH_BUILD_PROFILE: profiling
       ZONES_BENCH_L1_A_CPUS: 0-3,16-19
       ZONES_BENCH_L1_B_CPUS: 4-7,20-23
       ZONES_BENCH_ZONE_CPUS: 8-13,24-29
       ZONES_BENCH_CPUSET: 14-15,30-31
-      ZONES_BENCH_OUTPUT: target/zones-benchmark/neobank-e2e
-      ZONES_BENCH_REPORT: target/zones-benchmark/report-neobank-e2e.json
-      ZONES_BENCH_TOPOLOGY_ENV: target/zones-benchmark/topology.env
-      ZONES_BENCH_TOPOLOGY_DIR: target/zones-benchmark/topology
+      ZONES_BENCH_OUTPUT: target/zones-benchmark/${{ matrix.branch.name }}/neobank-e2e
+      ZONES_BENCH_REPORT: target/zones-benchmark/${{ matrix.branch.name }}/report-neobank-e2e.json
+      ZONES_BENCH_TOPOLOGY_ENV: target/zones-benchmark/${{ matrix.branch.name }}/topology.env
+      ZONES_BENCH_TOPOLOGY_DIR: target/zones-benchmark/${{ matrix.branch.name }}/topology
       TEMPO_ROOT: ${{ github.workspace }}/_benchmark-tempo
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.authorize.outputs.sha }}
+          ref: ${{ needs.authorize.outputs.control-sha }}
+          fetch-depth: 0
           persist-credentials: false
           submodules: recursive
+
+      - name: Prepare benchmark source revision
+        env:
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          source_root="$GITHUB_WORKSPACE"
+          if [ "$ZONES_BENCH_ZONES_REF" != "$ZONES_BENCH_CONTROL_REF" ]; then
+            source_root="$RUNNER_TEMP_DIR/zones-benchmark-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ZONES_BENCH_BRANCH}"
+            if [ -e "$source_root" ]; then
+              echo "::error::benchmark source path already exists: $source_root"
+              exit 1
+            fi
+            git worktree add --detach "$source_root" "$ZONES_BENCH_ZONES_REF"
+          fi
+          echo "ZONES_BENCH_SOURCE_ROOT=$source_root" >> "$GITHUB_ENV"
 
       - name: Resolve pinned Earn revision
         id: earn-revision
@@ -609,6 +809,7 @@ jobs:
           contrib/bench/provision-topology.sh cleanup "$ZONES_BENCH_PID_FILE"
 
       - name: Configure ClickHouse scenario reporting
+        if: matrix.branch.name == 'single-run'
         env:
           CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
           CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
@@ -680,11 +881,13 @@ jobs:
           build_key="$({ rustc -vV; printf '%s\n' "$RUSTFLAGS" profiling; } \
             | sha256sum | awk '{print $1}')"
           cache_root="$cache_base/zones-benchmark/cargo"
-          zones_target="$cache_root/zones/$build_key"
+          zones_target="$cache_root/zones/$ZONES_BENCH_ZONES_REF/$build_key"
+          zones_harness_target="$cache_root/zones-harness/$ZONES_BENCH_CONTROL_REF/$build_key"
           tempo_target="$cache_root/tempo/$ZONES_BENCH_TEMPO_REF/$build_key"
-          mkdir -p "$zones_target" "$tempo_target"
+          mkdir -p "$zones_target" "$zones_harness_target" "$tempo_target"
           {
             echo "ZONES_BENCH_ZONES_TARGET_DIR=$zones_target"
+            echo "ZONES_BENCH_HARNESS_TARGET_DIR=$zones_harness_target"
             echo "ZONES_BENCH_TEMPO_TARGET_DIR=$tempo_target"
           } >> "$GITHUB_ENV"
 
@@ -701,8 +904,8 @@ jobs:
             echo "ZONES_BENCH_BLOAT_MIB=$bloat_mib"
             echo "ZONES_BENCH_STATE_A_ROOT=/reth-bench-a/zones-l1-${bloat_mib}mb"
             echo "ZONES_BENCH_STATE_B_ROOT=/reth-bench-b/zones-l1-${bloat_mib}mb"
-            echo "ZONES_BENCH_ZONE_STATE_ROOT=/reth-bench-a/zones-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "ZONES_BENCH_L1_CACHE_STATUS_FILE=$GITHUB_WORKSPACE/target/zones-benchmark/l1-cache.env"
+            echo "ZONES_BENCH_ZONE_STATE_ROOT=/reth-bench-a/zones-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ZONES_BENCH_BRANCH}"
+            echo "ZONES_BENCH_L1_CACHE_STATUS_FILE=$GITHUB_WORKSPACE/target/zones-benchmark/$ZONES_BENCH_BRANCH/l1-cache.env"
           } >> "$GITHUB_ENV"
 
       - name: Prepare private benchmark identity
@@ -744,7 +947,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --target-dir "$ZONES_BENCH_ZONES_TARGET_DIR" \
-            --profile profiling -p tempo-zone -p tempo-xtask
+            --manifest-path "$ZONES_BENCH_SOURCE_ROOT/Cargo.toml" \
+            --profile profiling -p tempo-zone
+          cargo build --target-dir "$ZONES_BENCH_HARNESS_TARGET_DIR" \
+            --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" \
+            --profile profiling -p tempo-xtask
           nu -c "source '$TEMPO_ROOT/tempo.nu'; build-in-worktree --no-default-features \
             '$TEMPO_ROOT' '$ZONES_BENCH_TEMPO_REF' profiling \
             'jemalloc,asm-keccak,keccak-cache-global,otlp' \
@@ -753,7 +960,7 @@ jobs:
             --manifest-path "$TEMPO_ROOT/Cargo.toml" --profile profiling -p tempo-xtask
           {
             echo "ZONE_BIN=$ZONES_BENCH_ZONES_TARGET_DIR/profiling/tempo-zone"
-            echo "ZONES_XTASK_BIN=$ZONES_BENCH_ZONES_TARGET_DIR/profiling/tempo-xtask"
+            echo "ZONES_XTASK_BIN=$ZONES_BENCH_HARNESS_TARGET_DIR/profiling/tempo-xtask"
             echo "TEMPO_BIN=$TEMPO_ROOT/target/profiling/tempo"
             echo "TEMPO_XTASK_BIN=$ZONES_BENCH_TEMPO_TARGET_DIR/profiling/tempo-xtask"
           } >> "$GITHUB_ENV"
@@ -841,10 +1048,10 @@ jobs:
 
       - name: Provision topology and run neobank workload
         env:
-          CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-          CLICKHOUSE_PASSWORD: ${{ secrets.CLICKHOUSE_PASSWORD }}
-          ZONES_BENCH_REQUIRE_CLICKHOUSE: "1"
+          CLICKHOUSE_URL: ${{ matrix.branch.name == 'single-run' && secrets.CLICKHOUSE_URL || '' }}
+          CLICKHOUSE_USER: ${{ matrix.branch.name == 'single-run' && secrets.CLICKHOUSE_USER || '' }}
+          CLICKHOUSE_PASSWORD: ${{ matrix.branch.name == 'single-run' && secrets.CLICKHOUSE_PASSWORD || '' }}
+          ZONES_BENCH_REQUIRE_CLICKHOUSE: ${{ matrix.branch.name == 'single-run' && '1' || '0' }}
         run: |
           set -euo pipefail
           export ZONES_BENCH_ENV_FILE="$ZONES_BENCH_TOPOLOGY_ENV"
@@ -855,7 +1062,7 @@ jobs:
           set +a
           for name in \
             L1_RPC_URL L1_WS_RPC_URL ZONES_BENCH_L1_QUERY_RPC_URL ZONES_BENCH_L1_SUBMIT_RPC_URLS \
-            ZONE_RPC_URL ZONE_WS_RPC_URL ZONE_PRIVATE_RPC_URL L1_PORTAL_ADDRESS ZONES_BENCH_TOKEN \
+            ZONE_RPC_URL ZONE_WS_RPC_URL ZONE_REDACTED_RPC_URL L1_PORTAL_ADDRESS ZONES_BENCH_TOKEN \
             ZONES_BENCH_EXPECTED_L1_CHAIN_ID ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID \
             ZONES_BENCH_EXPECTED_ZONE_ID ZONES_BENCH_TARGET_ID \
             ZONES_BENCH_L1_GAS_LIMIT ZONES_BENCH_L1_GENERAL_GAS_LIMIT \
@@ -872,7 +1079,7 @@ jobs:
           SUMMARY_STATE_BLOAT_GIB: ${{ needs.authorize.outputs.state-bloat-gib }}
         run: |
           set -euo pipefail
-          summary=target/zones-benchmark/summary.md
+          summary="target/zones-benchmark/$ZONES_BENCH_BRANCH/summary.md"
           mkdir -p "$(dirname "$summary")"
           results_args=(
             --report "$ZONES_BENCH_REPORT"
@@ -929,11 +1136,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          mkdir -p target/zones-benchmark
+          metadata_dir="target/zones-benchmark/$ZONES_BENCH_BRANCH"
+          mkdir -p "$metadata_dir"
           lscpu --json --extended=CPU,NODE,SOCKET,CORE,ONLINE \
-            > target/zones-benchmark/cpu-topology.json
+            > "$metadata_dir/cpu-topology.json"
           lsblk --json --output NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINT \
-            > target/zones-benchmark/storage-topology.json
+            > "$metadata_dir/storage-topology.json"
           jq -n \
             --arg zonesRevision "$ZONES_BENCH_ZONES_REF" \
             --arg tempoRevision "$ZONES_BENCH_TEMPO_REF" \
@@ -1035,13 +1243,14 @@ jobs:
                 zoneBatchIntervalBlocks: $zoneBatchIntervalBlocks,
                 pollIntervalSecs: $withdrawalPollIntervalSecs
               }
-            }' > target/zones-benchmark/run-metadata.json
+            }' > "$metadata_dir/run-metadata.json"
 
       - name: Collect node logs
         if: ${{ !cancelled() }}
         run: |
           if [ -n "${ZONES_BENCH_TOPOLOGY_DIR:-}" ] && [ -d "$ZONES_BENCH_TOPOLOGY_DIR/logs" ]; then
-            cp -R "$ZONES_BENCH_TOPOLOGY_DIR/logs" target/zones-benchmark/node-logs
+            cp -R "$ZONES_BENCH_TOPOLOGY_DIR/logs" \
+              "target/zones-benchmark/$ZONES_BENCH_BRANCH/node-logs"
           fi
 
       - name: Collect invalid block diagnostics
@@ -1049,7 +1258,7 @@ jobs:
         run: |
           witness_dir="${ZONES_BENCH_ZONE_STATE_ROOT:-}/zone/invalid_block_hooks/witness"
           if [ -d "$witness_dir" ]; then
-            output_dir=target/zones-benchmark/invalid-block-diagnostics
+            output_dir="target/zones-benchmark/$ZONES_BENCH_BRANCH/invalid-block-diagnostics"
             mkdir -p "$output_dir"
             find "$witness_dir" -maxdepth 1 -type f \( \
               -name '*.bundle_state.original.json' -o \
@@ -1063,14 +1272,14 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: zones-benchmark-neobank-${{ needs.authorize.outputs.neobank-preset }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: zones-benchmark-${{ matrix.branch.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            target/zones-benchmark/neobank-e2e/
-            target/zones-benchmark/*.json
-            target/zones-benchmark/*.md
-            target/zones-benchmark/topology/neobank-fixtures.json
-            target/zones-benchmark/node-logs/
-            target/zones-benchmark/invalid-block-diagnostics/
+            target/zones-benchmark/${{ matrix.branch.name }}/neobank-e2e/
+            target/zones-benchmark/${{ matrix.branch.name }}/*.json
+            target/zones-benchmark/${{ matrix.branch.name }}/*.md
+            target/zones-benchmark/${{ matrix.branch.name }}/topology/neobank-fixtures.json
+            target/zones-benchmark/${{ matrix.branch.name }}/node-logs/
+            target/zones-benchmark/${{ matrix.branch.name }}/invalid-block-diagnostics/
           if-no-files-found: warn
           retention-days: 14
 
@@ -1096,3 +1305,156 @@ jobs:
           if (( status_a != 0 || status_b != 0 || tuning_status != 0 )); then
             exit 1
           fi
+
+      - name: Remove benchmark source worktree
+        if: always()
+        env:
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set +e
+          source_root="${ZONES_BENCH_SOURCE_ROOT:-}"
+          expected="$RUNNER_TEMP_DIR/zones-benchmark-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ZONES_BENCH_BRANCH}"
+          if [ "$source_root" = "$expected" ] && [ -e "$source_root" ]; then
+            git worktree remove --force "$source_root"
+          fi
+
+  publish:
+    name: Publish Zones benchmark result
+    needs: [authorize, benchmark]
+    if: >-
+      always() &&
+      needs.authorize.result == 'success' &&
+      needs.authorize.outputs.branches != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # replace the queued status comment with final results
+    env:
+      BENCH_ACTOR: ${{ needs.authorize.outputs.actor }}
+      BENCH_COMMENT_ID: ${{ needs.authorize.outputs.comment-id }}
+      BENCH_RESULT: ${{ needs.benchmark.result }}
+      BENCH_RUN_MODE: ${{ needs.authorize.outputs.run-mode }}
+      BENCH_BASELINE_NAME: ${{ needs.authorize.outputs.baseline-name }}
+      BENCH_FEATURE_NAME: ${{ needs.authorize.outputs.feature-name }}
+      BENCH_DOWNLOAD_ROOT: target/zones-benchmark/downloads
+      BENCH_FINAL_SUMMARY: target/zones-benchmark/final-summary.md
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && github.sha || needs.authorize.outputs.control-sha }}
+          persist-credentials: false
+
+      - name: Download benchmark artifacts
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: zones-benchmark-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BENCH_DOWNLOAD_ROOT }}
+
+      - name: Render final summary
+        id: render
+        continue-on-error: true
+        env:
+          BENCH_DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$BENCH_FINAL_SUMMARY")"
+          complete=false
+
+          if [ "$BENCH_RUN_MODE" = comparison ]; then
+            baseline_dir="$BENCH_DOWNLOAD_ROOT/zones-benchmark-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            feature_dir="$BENCH_DOWNLOAD_ROOT/zones-benchmark-feature-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            baseline_report="$(find "$baseline_dir" -type f -name report-neobank-e2e.json -print -quit 2>/dev/null || true)"
+            feature_report="$(find "$feature_dir" -type f -name report-neobank-e2e.json -print -quit 2>/dev/null || true)"
+            if [ -n "$baseline_report" ] && [ -n "$feature_report" ]; then
+              if node .github/scripts/zones-bench-compare.js \
+                --baseline "$baseline_report" \
+                --feature "$feature_report" \
+                --output "$BENCH_FINAL_SUMMARY" \
+                --baseline-label "$BENCH_BASELINE_NAME" \
+                --feature-label "$BENCH_FEATURE_NAME"
+              then
+                complete=true
+              else
+                {
+                  echo "# Zones benchmark comparison"
+                  echo
+                  echo "> The baseline and feature reports were produced, but their comparison could not be rendered. Inspect the publish log and benchmark artifacts."
+                } > "$BENCH_FINAL_SUMMARY"
+              fi
+            else
+              {
+                echo "# Zones benchmark comparison"
+                echo
+                echo "> A complete baseline/feature report pair was not produced. Inspect the benchmark artifacts and node logs."
+              } > "$BENCH_FINAL_SUMMARY"
+            fi
+          else
+            single_dir="$BENCH_DOWNLOAD_ROOT/zones-benchmark-single-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            single_summary="$(find "$single_dir" -type f -name summary.md -print -quit 2>/dev/null || true)"
+            if [ -n "$single_summary" ]; then
+              cp "$single_summary" "$BENCH_FINAL_SUMMARY"
+              complete=true
+            else
+              {
+                echo "# Zones benchmark results"
+                echo
+                echo "> No benchmark summary was produced. Inspect the benchmark artifacts and node logs."
+              } > "$BENCH_FINAL_SUMMARY"
+            fi
+          fi
+
+          if [ "$BENCH_RESULT" != success ] || [ "$complete" != true ] || [ "$BENCH_DOWNLOAD_OUTCOME" != success ]; then
+            failure_summary="${BENCH_FINAL_SUMMARY}.failed"
+            {
+              echo "> **Benchmark result: \`$BENCH_RESULT\`; artifacts: \`$BENCH_DOWNLOAD_OUTCOME\`; complete summary: \`$complete\`.**"
+              echo
+              cat "$BENCH_FINAL_SUMMARY"
+            } > "$failure_summary"
+            mv "$failure_summary" "$BENCH_FINAL_SUMMARY"
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+          cat "$BENCH_FINAL_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update benchmark comment
+        if: always() && env.BENCH_COMMENT_ID != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BENCH_DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          BENCH_RENDER_COMPLETE: ${{ steps.render.outputs.complete }}
+          BENCH_RENDER_OUTCOME: ${{ steps.render.outcome }}
+          BENCH_SUMMARY_PATH: ${{ env.BENCH_FINAL_SUMMARY }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const succeeded = process.env.BENCH_RESULT === 'success' &&
+              process.env.BENCH_DOWNLOAD_OUTCOME === 'success' &&
+              process.env.BENCH_RENDER_OUTCOME === 'success' &&
+              process.env.BENCH_RENDER_COMPLETE === 'true';
+            const status = succeeded
+              ? '✅ Zones benchmark completed.'
+              : process.env.BENCH_RESULT === 'success'
+                ? '❌ Zones benchmark result publication failed.'
+                : `❌ Zones benchmark finished with status \`${process.env.BENCH_RESULT}\`.`;
+            let summary = '# Zones benchmark results\n\n> The final summary could not be rendered. Inspect the workflow logs and artifacts.';
+            if (fs.existsSync(process.env.BENCH_SUMMARY_PATH)) {
+              summary = fs.readFileSync(process.env.BENCH_SUMMARY_PATH, 'utf8');
+            }
+            const body = `cc @${process.env.BENCH_ACTOR}\n\n${status} [View run](${runUrl})\n\n${summary}`;
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: Number(process.env.BENCH_COMMENT_ID),
+              body: body.slice(0, 65000),
+            });
+
+      - name: Require complete published results
+        if: >-
+          steps.download.outcome != 'success' ||
+          steps.render.outcome != 'success' ||
+          steps.render.outputs.complete != 'true'
+        run: |
+          echo "::error::benchmark artifacts did not produce a complete published summary"
+          exit 1
