@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
-# Write call traces, storage state diffs, and compact opcode-level storage traces
-# for receipt transactions as JSON Lines.
+# Write call traces and storage state diffs for receipt transactions as JSON Lines.
 set -Eeuo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -33,7 +32,7 @@ jq -r '[input_line_number - 1, .transactionHash, .blockNumber, .transactionIndex
 trace_one() {
     local record="$1"
     local index transaction_hash block_number transaction_index
-    local call_trace state_diff opcode_trace storage_ops destination
+    local call_trace state_diff destination
 
     IFS=$'\t' read -r index transaction_hash block_number transaction_index <<< "$record"
     destination="$(printf '%s/%08d.json' "$trace_dir" "$index")"
@@ -50,26 +49,6 @@ trace_one() {
         echo "error: could not collect state diff for $transaction_hash" >&2
         return 1
     }
-    opcode_trace="$(cast rpc --rpc-url "$rpc_url" debug_traceTransaction \
-        "$transaction_hash" \
-        "{\"disableMemory\":true,\"disableStack\":true,\"disableStorage\":true,\"enableReturnData\":false,\"timeout\":\"$trace_timeout\"}")" || {
-        echo "error: could not collect opcode trace for $transaction_hash" >&2
-        return 1
-    }
-    storage_ops="$(jq -c '
-        {
-          gas: .gas,
-          failed: .failed,
-          storageOps: [
-            .structLogs[]
-            | select(.op == "SLOAD" or .op == "SSTORE")
-            | {pc, op, gas, gasCost, depth, refund}
-          ]
-        }
-    ' <<< "$opcode_trace")" || {
-        echo "error: could not summarize opcode trace for $transaction_hash" >&2
-        return 1
-    }
 
     jq -cn \
         --arg transactionHash "$transaction_hash" \
@@ -77,10 +56,8 @@ trace_one() {
         --arg transactionIndex "$transaction_index" \
         --argjson callTrace "$call_trace" \
         --argjson stateDiff "$state_diff" \
-        --argjson opcodeStorageTrace "$storage_ops" \
         '{transactionHash: $transactionHash, blockNumber: $blockNumber,
-          transactionIndex: $transactionIndex, callTrace: $callTrace, stateDiff: $stateDiff,
-          opcodeStorageTrace: $opcodeStorageTrace}' \
+          transactionIndex: $transactionIndex, callTrace: $callTrace, stateDiff: $stateDiff}' \
         > "$destination"
 }
 export -f trace_one
