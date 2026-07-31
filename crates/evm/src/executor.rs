@@ -21,8 +21,7 @@ use tempo_revm::evm::TempoContext;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::state::L1StateProvider;
 use zone_precompiles::{
-    ADVANCE_TEMPO_SELECTOR, L1StorageReader, is_finalize_withdrawal_batch_calldata,
-    is_finalize_withdrawal_batch_selector, tx_context,
+    ADVANCE_TEMPO_SELECTOR, L1StorageReader, is_finalize_withdrawal_batch_calldata, tx_context,
 };
 use zone_primitives::constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
@@ -204,17 +203,6 @@ fn validate_system_transaction(
         .into());
     }
 
-    if !tx.is_system_tx()
-        && tx.calls().any(|(kind, input)| {
-            kind.to() == Some(&ZONE_OUTBOX_ADDRESS) && is_finalize_withdrawal_batch_selector(input)
-        })
-    {
-        return Err(BlockValidationError::msg(
-            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction",
-        )
-        .into());
-    }
-
     Ok(false)
 }
 
@@ -222,8 +210,7 @@ fn validate_system_transaction(
 mod tests {
     use super::{
         ADVANCE_TEMPO_SELECTOR, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
-        is_finalize_withdrawal_batch_calldata, is_finalize_withdrawal_batch_selector,
-        validate_system_transaction,
+        is_finalize_withdrawal_batch_calldata, validate_system_transaction,
     };
 
     use alloy_consensus::{Signed, TxLegacy};
@@ -346,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_finalization_requires_a_system_transaction() {
+    fn user_withdrawal_finalization_is_not_a_fatal_block_error() {
         let finalize_calldata: Bytes = IZoneOutbox::finalizeWithdrawalBatchCall {
             count: U256::ONE,
             blockNumber: 1,
@@ -363,19 +350,12 @@ mod tests {
             },
             Signature::test_signature(),
         ));
-        let error = validate_system_transaction(true, &direct).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction"
-        );
+        assert!(!validate_system_transaction(true, &direct).unwrap());
 
         let mut noncanonical_finalize_calldata = finalize_calldata.to_vec();
         noncanonical_finalize_calldata.extend([0_u8; 32]);
         let noncanonical_finalize_calldata = Bytes::from(noncanonical_finalize_calldata);
         assert!(!is_finalize_withdrawal_batch_calldata(
-            &noncanonical_finalize_calldata
-        ));
-        assert!(is_finalize_withdrawal_batch_selector(
             &noncanonical_finalize_calldata
         ));
         let aa = AASigned::new_unhashed(
@@ -408,11 +388,7 @@ mod tests {
             TempoSignature::Primitive(PrimitiveSignature::Secp256k1(Signature::test_signature())),
         )
         .into();
-        let error = validate_system_transaction(true, &aa).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "ZoneOutbox.finalizeWithdrawalBatch requires a system transaction"
-        );
+        assert!(!validate_system_transaction(true, &aa).unwrap());
     }
 
     #[test]

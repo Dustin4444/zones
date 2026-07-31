@@ -235,7 +235,7 @@ impl Harness {
 
     fn finalize(&mut self, count: usize) -> PrecompileResult {
         self.call(
-            SEQUENCER,
+            Address::ZERO,
             ZoneOutboxAbi::finalizeWithdrawalBatchCall {
                 count: U256::from(count),
                 blockNumber: 0,
@@ -517,7 +517,7 @@ fn finalize_single_and_multiple_withdrawals_match_canonical_queue_hash() -> eyre
 }
 
 #[test]
-fn finalize_rejects_wrong_count_and_non_sequencer() -> eyre::Result<()> {
+fn finalize_rejects_wrong_count_and_non_system_callers() -> eyre::Result<()> {
     let mut harness = Harness::new()?;
     harness.request(100, ALICE, B256::ZERO)?;
     assert_revert(
@@ -525,16 +525,15 @@ fn finalize_rejects_wrong_count_and_non_sequencer() -> eyre::Result<()> {
         ZoneOutboxError::invalid_withdrawal_count(U256::ZERO, U256::ONE),
     );
 
-    let result = harness.call(
-        ALICE,
-        ZoneOutboxAbi::finalizeWithdrawalBatchCall {
-            count: U256::ONE,
-            blockNumber: 0,
-            encryptedSenders: vec![Bytes::new()],
-        }
-        .abi_encode(),
-    );
-    assert_revert(result, ZoneOutboxError::only_sequencer());
+    let call = ZoneOutboxAbi::finalizeWithdrawalBatchCall {
+        count: U256::ONE,
+        blockNumber: 0,
+        encryptedSenders: vec![Bytes::new()],
+    };
+    for caller in [ALICE, SEQUENCER] {
+        let result = harness.call(caller, call.abi_encode());
+        assert_revert(result, ZoneOutboxError::only_system_transaction());
+    }
     Ok(())
 }
 
@@ -709,7 +708,7 @@ fn encrypted_sender_count_and_length_are_validated() -> eyre::Result<()> {
     harness.request(1, BOB, B256::ZERO)?;
     assert_revert(
         harness.call(
-            SEQUENCER,
+            Address::ZERO,
             ZoneOutboxAbi::finalizeWithdrawalBatchCall {
                 count: U256::ONE,
                 blockNumber: 0,
@@ -721,7 +720,7 @@ fn encrypted_sender_count_and_length_are_validated() -> eyre::Result<()> {
     );
     assert_revert(
         harness.call(
-            SEQUENCER,
+            Address::ZERO,
             ZoneOutboxAbi::finalizeWithdrawalBatchCall {
                 count: U256::ONE,
                 blockNumber: 0,

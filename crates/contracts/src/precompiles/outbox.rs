@@ -49,6 +49,7 @@ crate::sol! {
         // -- Errors --
 
         error OnlySequencer();
+        error OnlySystemTransaction();
         error GasLimitTooHigh();
         error OnlyZoneInbox();
         error InvalidWithdrawalCount(uint256 actual, uint256 expected);

@@ -101,6 +101,7 @@ contract ZoneOutbox is IZoneOutbox {
     error GasFeeRateTooHigh();
     error TransferFailed();
     error OnlySequencer();
+    error OnlySystemTransaction();
     error InvalidBlockNumber();
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
@@ -373,7 +374,7 @@ contract ZoneOutbox is IZoneOutbox {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Finalize the batch at end of block - build withdrawal hash and emit proof inputs
-    /// @dev Only callable by sequencer at the end of a block.
+    /// @dev Only callable by the canonical system transaction at the end of a block.
     ///      The proof enforces that this is the last call in the block and that a batch
     ///      ends with exactly one finalizeWithdrawalBatch call. `count` must equal the
     ///      current pending withdrawal count (including 0 if no withdrawals).
@@ -401,7 +402,7 @@ contract ZoneOutbox is IZoneOutbox {
         internal
         returns (bytes32 withdrawalQueueHash)
     {
-        if (msg.sender != address(0) && !config.isSequencer(msg.sender)) revert OnlySequencer();
+        if (msg.sender != address(0)) revert OnlySystemTransaction();
         if (blockNumber != uint64(block.number)) revert InvalidBlockNumber();
 
         uint256 pending = _pendingWithdrawals.length;

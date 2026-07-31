@@ -184,7 +184,7 @@ contract ZoneOutboxTest is Test {
     }
 
     function _finalizeWithdrawalBatch(uint256 count) internal returns (bytes32) {
-        return _finalizeWithdrawalBatchAs(sequencer, count);
+        return _finalizeWithdrawalBatchAs(address(0), count);
     }
 
     function test_enqueueDepositBounceBack_queuesRevokedTempoRefundRecipient() public {
@@ -401,7 +401,7 @@ contract ZoneOutboxTest is Test {
 
         bytes[] memory encryptedSenders = new bytes[](0);
 
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 0, 1));
         outbox.finalizeWithdrawalBatch(0, uint64(block.number), encryptedSenders);
         assertEq(_pendingWithdrawalsCount(), 1);
@@ -478,7 +478,7 @@ contract ZoneOutboxTest is Test {
         assertEq(_pendingWithdrawalsCount(), 3);
 
         bytes[] memory encryptedSenders = new bytes[](2);
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 2, 3));
         outbox.finalizeWithdrawalBatch(2, uint64(block.number), encryptedSenders);
         assertEq(_pendingWithdrawalsCount(), 3);
@@ -567,24 +567,23 @@ contract ZoneOutboxTest is Test {
                           ACCESS CONTROL TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_finalizeWithdrawalBatch_onlySequencer() public {
+    function test_finalizeWithdrawalBatch_onlySystemTransaction() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
-        // Non-sequencer should revert
+        // User and registered-sequencer calls should both revert.
         bytes[] memory encryptedSenders = _emptyEncryptedSenders(1);
-        vm.startPrank(alice);
-        vm.expectRevert(ZoneOutbox.OnlySequencer.selector);
+        vm.prank(alice);
+        vm.expectRevert(ZoneOutbox.OnlySystemTransaction.selector);
         outbox.finalizeWithdrawalBatch(1, uint64(block.number), encryptedSenders);
-        vm.stopPrank();
 
-        // Any additional active member has the same authority.
-        tempoState.setMockStorageValue(
-            mockPortal, keccak256(abi.encode(bob, PORTAL_IS_SEQUENCER_SLOT)), bytes32(uint256(1))
-        );
-        vm.prank(bob);
+        vm.prank(sequencer);
+        vm.expectRevert(ZoneOutbox.OnlySystemTransaction.selector);
+        outbox.finalizeWithdrawalBatch(1, uint64(block.number), encryptedSenders);
+
+        vm.prank(address(0));
         bytes32 hash = outbox.finalizeWithdrawalBatch(1, uint64(block.number), encryptedSenders);
         assertTrue(hash != bytes32(0));
     }
@@ -592,7 +591,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_revertsOnInvalidBlockNumber() public {
         bytes[] memory encryptedSenders = new bytes[](0);
 
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(ZoneOutbox.InvalidBlockNumber.selector);
         outbox.finalizeWithdrawalBatch(0, uint64(block.number + 1), encryptedSenders);
     }
@@ -807,7 +806,7 @@ contract ZoneOutboxTest is Test {
         vm.stopPrank();
 
         bytes[] memory senders = _emptyEncryptedSenders(5);
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 5, 4));
         outbox.finalizeWithdrawalBatch(5, uint64(block.number), senders);
         assertEq(_pendingWithdrawalsCount(), 4);
@@ -925,7 +924,7 @@ contract ZoneOutboxTest is Test {
         bytes[] memory encryptedSenders = new bytes[](1);
         encryptedSenders[0] = new bytes(outbox.AUTHENTICATED_WITHDRAWAL_CIPHERTEXT_LENGTH());
 
-        vm.prank(sequencer);
+        vm.prank(address(0));
         bytes32 hash = outbox.finalizeWithdrawalBatch(1, uint64(block.number), encryptedSenders);
         assertTrue(hash != bytes32(0));
     }
@@ -992,7 +991,7 @@ contract ZoneOutboxTest is Test {
 
         bytes[] memory encryptedSenders = new bytes[](0);
 
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(
             abi.encodeWithSelector(ZoneOutbox.InvalidEncryptedSenderCount.selector, 0, 1)
         );
@@ -1017,7 +1016,7 @@ contract ZoneOutboxTest is Test {
                 outbox.AUTHENTICATED_WITHDRAWAL_CIPHERTEXT_LENGTH()
             )
         );
-        vm.prank(sequencer);
+        vm.prank(address(0));
         outbox.finalizeWithdrawalBatch(1, uint64(block.number), encryptedSenders);
     }
 
@@ -1070,7 +1069,7 @@ contract ZoneOutboxTest is Test {
         assertEq(_pendingWithdrawalsCount(), 5);
 
         bytes[] memory encryptedSenders = new bytes[](2);
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 2, 5));
         outbox.finalizeWithdrawalBatch(2, uint64(block.number), encryptedSenders);
         assertEq(_pendingWithdrawalsCount(), 5);
@@ -1084,7 +1083,7 @@ contract ZoneOutboxTest is Test {
         vm.stopPrank();
 
         bytes[] memory encryptedSenders = new bytes[](1000);
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 1000, 2));
         outbox.finalizeWithdrawalBatch(1000, uint64(block.number), encryptedSenders);
 
@@ -1390,7 +1389,7 @@ contract ZoneOutboxTest is Test {
         vm.stopPrank();
 
         bytes[] memory encryptedSenders = new bytes[](0);
-        vm.prank(sequencer);
+        vm.prank(address(0));
         vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 0, 1));
         outbox.finalizeWithdrawalBatch(0, uint64(block.number), encryptedSenders);
         assertEq(_pendingWithdrawalsCount(), 1);
