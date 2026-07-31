@@ -144,8 +144,8 @@ pub struct BatchSubmitter {
     /// ZonePortal contract instance for calling `submitBatch` and reading
     /// on-chain state such as `blockHash()`.
     portal: ZonePortal::ZonePortalInstance<DynProvider<TempoNetwork>, TempoNetwork>,
-    /// Immutable portal and chain identifiers, populated by the first metadata multicall.
-    stable_portal_metadata: OnceLock<StablePortalMetadata>,
+    /// Immutable zone identifier, populated by the first metadata multicall.
+    stable_zone_id: OnceLock<u32>,
     /// Local sequencer key used to produce a 1-of-1 TIP-1091 settlement certificate.
     signer: Option<PrivateKeySigner>,
     /// Concurrency for pipelined L1 header fetching in ancestry mode.
@@ -207,7 +207,7 @@ impl BatchSubmitter {
             portal_address,
             l1_provider,
             portal,
-            stable_portal_metadata: OnceLock::new(),
+            stable_zone_id: OnceLock::new(),
             signer,
             l1_fetch_concurrency: 16,
             anchor_config,
@@ -439,11 +439,11 @@ impl BatchSubmitter {
 
     /// Read all mutable portal state needed for one submission at a single L1 block.
     ///
-    /// The portal and chain identifiers are immutable, so the first call includes and caches
-    /// them. Sequencer membership, verifier configuration, and queue state are deliberately
-    /// refreshed on every submission.
+    /// The portal's zone identifier is immutable, so the first call includes and caches it.
+    /// The provider chain identifier, sequencer membership, verifier configuration, and queue
+    /// state are deliberately refreshed on every submission.
     async fn read_submission_metadata(&self, signer: Address) -> Result<PortalSubmissionMetadata> {
-        if let Some(stable) = self.stable_portal_metadata.get().copied() {
+        if let Some(zone_id) = self.stable_zone_id.get().copied() {
             let (
                 queue_head,
                 queue_tail,
@@ -452,6 +452,7 @@ impl BatchSubmitter {
                 sequencer_threshold,
                 signer_is_sequencer,
                 verifier,
+                chain_id,
             ) = self
                 .l1_provider
                 .multicall()
@@ -462,6 +463,7 @@ impl BatchSubmitter {
                 .add(self.portal.sequencerThreshold())
                 .add(self.portal.isSequencer(signer))
                 .add(self.portal.verifier())
+                .get_chain_id()
                 .aggregate()
                 .await?;
             return Self::build_submission_metadata(
@@ -474,7 +476,12 @@ impl BatchSubmitter {
                     signer_is_sequencer,
                     verifier,
                 },
-                stable,
+                StablePortalMetadata {
+                    zone_id,
+                    chain_id: chain_id
+                        .try_into()
+                        .map_err(|_| eyre::eyre!("Tempo L1 chain ID overflow"))?,
+                },
             );
         }
 
@@ -508,7 +515,7 @@ impl BatchSubmitter {
                 .try_into()
                 .map_err(|_| eyre::eyre!("Tempo L1 chain ID overflow"))?,
         };
-        let _ = self.stable_portal_metadata.set(stable);
+        let _ = self.stable_zone_id.set(zone_id);
         Self::build_submission_metadata(
             RawPortalSubmissionMetadata {
                 queue_head,
@@ -1989,7 +1996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submission_metadata_multicalls_mutable_values_and_caches_stable_values() {
+    async fn submission_metadata_refreshes_chain_id_and_caches_zone_id() {
         let asserter = Asserter::new();
         let portal_address = Address::repeat_byte(0x22);
         let signer = Address::repeat_byte(0x33);
@@ -2029,6 +2036,7 @@ mod tests {
             abi_word(U256::from(1)),
             abi_word(false),
             abi_word(next_verifier),
+            abi_word(U256::from(42432)),
         ]));
         let second = submitter.read_submission_metadata(signer).await.unwrap();
         assert_eq!(second.queue_head, 4);
@@ -2038,7 +2046,7 @@ mod tests {
         assert!(!second.signer_is_sequencer);
         assert_eq!(second.verifier, next_verifier);
         assert_eq!(second.stable.zone_id, 42);
-        assert_eq!(second.stable.chain_id, 42431);
+        assert_eq!(second.stable.chain_id, 42432);
         assert!(asserter.read_q().is_empty());
     }
 
