@@ -83,18 +83,19 @@ ZONES_BENCH_DEPOSIT_AMOUNT="${ZONES_BENCH_DEPOSIT_AMOUNT:-2000000}"
 ZONES_BENCH_ACTIVITY_AMOUNT="${ZONES_BENCH_ACTIVITY_AMOUNT:-1}"
 ZONES_BENCH_WITHDRAWAL_AMOUNT="${ZONES_BENCH_WITHDRAWAL_AMOUNT:-1000000}"
 ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT="${ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT:-10000000}"
-# The canonical Zone boundary e2e uses the full callback allowance: a gateway
-# callback can include a swap, vault action, and encrypted return deposit.
+# Callback gas requested by measured composable withdrawals. The untimed earn warm-up
+# journey below runs first with ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT and pays the
+# one-time system-level TIP-1016 state creation (router, vault, portal, and DEX first
+# touches), so measured callbacks only need execution gas plus per-transaction state
+# headroom (approve-cycle slots).
 #
-# Do not lower this based on receipt gas: under TIP-1016, each new storage slot needs
-# ~248k gas in-frame on top of execution gas, and that state gas never appears in
-# receipt gas_used (receipts report the regular dimension only). The first-ever
-# callback per flow creates dozens of system-level slots (router, vault, and portal
-# balances, DEX state), so 5M and below deterministically out-of-gases cold. When a
-# lower measured value is configured, one untimed warm-up journey pays those one-time
-# creations with the full allowance first; measured journeys then only need execution
-# gas plus per-transaction state headroom (approve-cycle slots).
-ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-10000000}"
+# Do not size these from receipt gas: under TIP-1016, each new storage slot needs
+# ~248k gas in-frame on top of execution gas, and state gas never appears in receipt
+# gas_used (receipts report the regular dimension only). Without the warm-up, the
+# first-ever callback per flow creates dozens of slots, 5M and below deterministically
+# out-of-gases cold, and a failed cold callback reverts its creations, so a too-small
+# allowance can never warm the state itself.
+ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-2500000}"
 ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT="${ZONES_BENCH_WARMUP_CALLBACK_GAS_LIMIT:-10000000}"
 ZONES_BENCH_OUTPUT="${ZONES_BENCH_OUTPUT:-target/zones-benchmark/neobank-e2e}"
 ZONES_BENCH_REPORT="${ZONES_BENCH_REPORT:-target/zones-benchmark/report-neobank-e2e.json}"
