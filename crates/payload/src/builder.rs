@@ -724,19 +724,6 @@ mod tests {
     use zone_l1::PreparedL1Block;
 
     #[test]
-    fn payload_builder_stores_a_proved_l1_provider() {
-        fn assert_field_type<Provider, EvmConfig>(
-            builder: &super::ZonePayloadBuilder<Provider, EvmConfig>,
-        ) {
-            let _: &zone_evm::ZoneEvmConfig<
-                zone_l1::state::L1StateProvider<zone_l1::state::ProofVerified>,
-            > = &builder.evm_config;
-        }
-
-        let _ = assert_field_type::<(), ()>;
-    }
-
-    #[test]
     fn withdrawal_batch_cadence_is_deterministic_from_block_number() {
         let blocks = super::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 

@@ -271,11 +271,9 @@ fn static_advance_and_delegate_call_revert_before_l1_reads() -> eyre::Result<()>
 #[test]
 fn advance_rejects_a_preselected_anchor_before_child_selection() -> eyre::Result<()> {
     let mut harness = Harness::new()?;
-    harness.l1_state.read_l1_storage(
-        Address::ZERO,
-        B256::ZERO,
-        crate::TempoAnchor::new(0, B256::ZERO),
-    )?;
+    harness
+        .l1_state
+        .read_l1_storage(Address::ZERO, B256::ZERO, crate::TempoAnchor::dummy(0))?;
     let request_count = harness.l1.storage_requests().len();
 
     let result = harness.call(

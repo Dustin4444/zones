@@ -253,11 +253,8 @@ mod tests {
             U256::ONE
         );
         assert!(
-            l1.advance_anchor(
-                TempoAnchor::new(anchor, B256::ZERO),
-                TempoAnchor::new(anchor + 1, B256::ZERO)
-            )
-            .is_err()
+            l1.advance_anchor(TempoAnchor::dummy(anchor), TempoAnchor::dummy(anchor + 1))
+                .is_err()
         );
         assert_eq!(reader.storage_requests().len(), 1);
     }

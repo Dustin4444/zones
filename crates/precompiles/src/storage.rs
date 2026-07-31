@@ -43,6 +43,11 @@ impl TempoAnchor {
     pub const fn state_root(&self) -> B256 {
         self.state_root
     }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub const fn dummy(block_number: u64) -> Self {
+        Self::new(block_number, B256::with_last_byte(block_number as u8))
+    }
 }
 
 /// L1 storage access needed by the anchored Zone database and native precompiles.
@@ -269,11 +274,7 @@ mod tests {
     use crate::test_utils::MockL1Reader;
 
     fn read(l1: &L1State<MockL1Reader>, anchor: u64) -> Result<B256, L1StateError> {
-        l1.read_l1_storage(
-            Address::ZERO,
-            B256::ZERO,
-            TempoAnchor::new(anchor, B256::with_last_byte(anchor as u8)),
-        )
+        l1.read_l1_storage(Address::ZERO, B256::ZERO, TempoAnchor::dummy(anchor))
     }
 
     #[test]
@@ -281,22 +282,16 @@ mod tests {
         let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         read(&l1, 10).unwrap();
         assert!(
-            l1.advance_anchor(
-                TempoAnchor::new(10, B256::with_last_byte(10)),
-                TempoAnchor::new(11, B256::with_last_byte(11))
-            )
-            .is_err()
+            l1.advance_anchor(TempoAnchor::dummy(10), TempoAnchor::dummy(11))
+                .is_err()
         );
     }
 
     #[test]
     fn l1_state_accepts_reads_at_advanced_anchor() {
         let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
-        l1.advance_anchor(
-            TempoAnchor::new(10, B256::with_last_byte(10)),
-            TempoAnchor::new(11, B256::with_last_byte(11)),
-        )
-        .unwrap();
+        l1.advance_anchor(TempoAnchor::dummy(10), TempoAnchor::dummy(11))
+            .unwrap();
         read(&l1, 11).unwrap();
         assert_eq!(l1.get_anchor().map(|a| a.block_number()), Some(11));
     }
@@ -325,17 +320,11 @@ mod tests {
     #[test]
     fn l1_state_rejects_duplicate_advance() {
         let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
-        l1.advance_anchor(
-            TempoAnchor::new(10, B256::with_last_byte(10)),
-            TempoAnchor::new(11, B256::with_last_byte(11)),
-        )
-        .unwrap();
+        l1.advance_anchor(TempoAnchor::dummy(10), TempoAnchor::dummy(11))
+            .unwrap();
         assert!(
-            l1.advance_anchor(
-                TempoAnchor::new(11, B256::with_last_byte(11)),
-                TempoAnchor::new(12, B256::with_last_byte(12))
-            )
-            .is_err()
+            l1.advance_anchor(TempoAnchor::dummy(11), TempoAnchor::dummy(12),)
+                .is_err()
         );
     }
 
@@ -343,11 +332,8 @@ mod tests {
     fn l1_state_rejects_non_contiguous_advance() {
         let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         assert!(
-            l1.advance_anchor(
-                TempoAnchor::new(10, B256::with_last_byte(10)),
-                TempoAnchor::new(12, B256::with_last_byte(12))
-            )
-            .is_err()
+            l1.advance_anchor(TempoAnchor::dummy(10), TempoAnchor::dummy(12),)
+                .is_err()
         );
         assert_eq!(l1.get_anchor(), None);
     }
@@ -357,11 +343,8 @@ mod tests {
         let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
         read(&l1, 10).unwrap();
         l1.reset_anchor();
-        l1.advance_anchor(
-            TempoAnchor::new(10, B256::with_last_byte(10)),
-            TempoAnchor::new(11, B256::with_last_byte(11)),
-        )
-        .unwrap();
+        l1.advance_anchor(TempoAnchor::dummy(10), TempoAnchor::dummy(11))
+            .unwrap();
         assert_eq!(l1.get_anchor().map(|a| a.block_number()), Some(11));
     }
 }
