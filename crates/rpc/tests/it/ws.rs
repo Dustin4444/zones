@@ -21,6 +21,8 @@ use zone_rpc::{
     types::{BoxEyreFut, BoxFut, JsonRpcError},
 };
 
+// Shared across three consumers; each uses a subset of its helpers.
+#[allow(dead_code)]
 #[path = "../../test-utils/auth_tokens.rs"]
 mod auth_tokens;
 

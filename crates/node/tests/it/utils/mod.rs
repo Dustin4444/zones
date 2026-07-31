@@ -60,6 +60,14 @@ pub(crate) const WITHDRAWAL_TX_GAS: u64 = 10_000_000;
 /// Local test nodes finalize a withdrawal batch every this many zone blocks.
 pub(crate) const WITHDRAWAL_BATCH_INTERVAL_BLOCKS: u64 = 8;
 
+/// Timeout for operations against a real in-process L1 — its dev node produces
+/// blocks every 500ms and the L1Subscriber needs to connect, backfill, and
+/// subscribe.
+pub(crate) const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Timeout for a withdrawal to be batched, submitted, and processed on L1.
+pub(crate) const WITHDRAWAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(crate) const TEST_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
 

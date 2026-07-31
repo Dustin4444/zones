@@ -14,7 +14,15 @@ use tempo_contracts::precompiles::{
     },
 };
 use tempo_primitives::transaction::tt_signature::TempoSignature;
-use zone_node::rpc::auth::build_token_fields;
+
+/// Validity window for test auth tokens.
+const AUTH_TOKEN_TTL_SECS: u64 = 600;
+
+/// Token fields and signing digest valid from now for [`AUTH_TOKEN_TTL_SECS`].
+fn fresh_token_fields(zone_id: u32, chain_id: u64) -> ([u8; 29], B256) {
+    let now = now_secs();
+    zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, now + AUTH_TOKEN_TTL_SECS)
+}
 
 /// Build a hex-encoded authorization token for the private zone RPC.
 ///
@@ -25,19 +33,9 @@ pub(crate) fn build_auth_token(
     zone_id: u32,
     chain_id: u64,
 ) -> String {
-    let now = now_secs();
-    let expires_at = now + 600;
-
-    let (fields, digest) = build_token_fields(zone_id, chain_id, now, expires_at);
+    let (fields, digest) = fresh_token_fields(zone_id, chain_id);
     let sig = signer.sign_hash_sync(&digest).expect("signing failed");
-
-    let mut blob = Vec::with_capacity(65 + fields.len());
-    blob.extend_from_slice(&sig.r().to_be_bytes::<32>());
-    blob.extend_from_slice(&sig.s().to_be_bytes::<32>());
-    blob.push(sig.v() as u8);
-    blob.extend_from_slice(&fields);
-
-    alloy_primitives::hex::encode(&blob)
+    auth_tokens::build_secp256k1_token(&sig, &fields)
 }
 
 fn build_auth_token_with_signature(
@@ -45,17 +43,12 @@ fn build_auth_token_with_signature(
     zone_id: u32,
     chain_id: u64,
 ) -> String {
-    let now = now_secs();
-    let expires_at = now + 600;
-
-    let (fields, _) = build_token_fields(zone_id, chain_id, now, expires_at);
+    let (fields, _) = fresh_token_fields(zone_id, chain_id);
     auth_tokens::build_token_with_signature(signature, &fields)
 }
 
 fn build_p256_auth_token(signing_key: &P256SigningKey, zone_id: u32, chain_id: u64) -> String {
-    let now = now_secs();
-    let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    let (_, digest) = fresh_token_fields(zone_id, chain_id);
     build_auth_token_with_signature(
         sign_p256_signature(digest, signing_key).expect("p256 signing failed"),
         zone_id,
@@ -69,9 +62,7 @@ fn build_webauthn_auth_token(
     chain_id: u64,
     challenge_digest: Option<B256>,
 ) -> String {
-    let now = now_secs();
-    let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    let (_, digest) = fresh_token_fields(zone_id, chain_id);
     build_auth_token_with_signature(
         sign_webauthn_signature(signing_key, challenge_digest.unwrap_or(digest))
             .expect("webauthn signing failed"),
@@ -87,9 +78,7 @@ fn build_keychain_auth_token(
     zone_id: u32,
     chain_id: u64,
 ) -> (String, Address) {
-    let now = now_secs();
-    let expires_at = now + 600;
-    let (_, digest) = zone_node::rpc::auth::build_token_fields(zone_id, chain_id, now, expires_at);
+    let (_, digest) = fresh_token_fields(zone_id, chain_id);
     let (signature, key_id) = sign_keychain_signature(digest, signing_key, root_account, version)
         .expect("keychain signing failed");
 
@@ -99,89 +88,51 @@ fn build_keychain_auth_token(
     )
 }
 
-/// Send a JSON-RPC request to the private zone RPC and return the parsed response.
+static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
+/// POST a JSON-RPC request to the private zone RPC, optionally authenticated,
+/// returning the HTTP status + raw body.
 ///
-/// Returns the full JSON response body (including `jsonrpc`, `id`, `result`/`error`).
+/// The raw form is what auth-failure tests need (401/403 responses have no
+/// JSON body).
+async fn rpc_call_raw(
+    url: &url::Url,
+    method: &str,
+    params: serde_json::Value,
+    auth_token: Option<&str>,
+) -> eyre::Result<(reqwest::StatusCode, String)> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1
+    });
+
+    let mut request = HTTP_CLIENT.post(url.as_str()).json(&body);
+    if let Some(token) = auth_token {
+        request = request.header("x-authorization-token", token);
+    }
+    let resp = request.send().await?;
+
+    let status = resp.status();
+    let text = resp.text().await?;
+    Ok((status, text))
+}
+
+/// Send an authenticated JSON-RPC request and return the parsed response body
+/// (including `jsonrpc`, `id`, `result`/`error`).
 async fn private_rpc_call(
     url: &url::Url,
     method: &str,
     params: serde_json::Value,
     auth_token: &str,
 ) -> eyre::Result<serde_json::Value> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1
-    });
-
-    let resp = reqwest::Client::new()
-        .post(url.as_str())
-        .header("x-authorization-token", auth_token)
-        .json(&body)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let text = resp.text().await?;
-
+    let (status, text) = rpc_call_raw(url, method, params, Some(auth_token)).await?;
     if !status.is_success() && text.is_empty() {
         eyre::bail!("HTTP {status}");
     }
-
     Ok(serde_json::from_str(&text)?)
-}
-
-/// Send a JSON-RPC request to the private zone RPC and return the HTTP status + body.
-///
-/// Useful for testing authentication failures (401/403).
-async fn private_rpc_call_raw(
-    url: &url::Url,
-    method: &str,
-    params: serde_json::Value,
-    auth_token: &str,
-) -> eyre::Result<(reqwest::StatusCode, String)> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1
-    });
-
-    let resp = reqwest::Client::new()
-        .post(url.as_str())
-        .header("x-authorization-token", auth_token)
-        .json(&body)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let text = resp.text().await?;
-    Ok((status, text))
-}
-
-/// Send a JSON-RPC request WITHOUT any auth header.
-async fn private_rpc_call_no_auth(
-    url: &url::Url,
-    method: &str,
-    params: serde_json::Value,
-) -> eyre::Result<(reqwest::StatusCode, String)> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1
-    });
-
-    let resp = reqwest::Client::new()
-        .post(url.as_str())
-        .json(&body)
-        .send()
-        .await?;
-
-    let status = resp.status();
-    let text = resp.text().await?;
-    Ok((status, text))
 }
 
 /// Context for private RPC e2e tests.
@@ -230,7 +181,7 @@ impl PrivateRpcL1TestCtx {
 
 impl PrivateRpcTestCtx {
     /// Build an auth token for the sequencer.
-    pub(crate) fn sequencer_token(&self) -> String {
+    fn sequencer_token(&self) -> String {
         build_auth_token(
             &self.sequencer_signer,
             self.config.zone_id,
@@ -321,7 +272,7 @@ impl PrivateRpcTestCtx {
         params: serde_json::Value,
         auth_token: &str,
     ) -> eyre::Result<(reqwest::StatusCode, String)> {
-        private_rpc_call_raw(&self.private_rpc_url, method, params, auth_token).await
+        rpc_call_raw(&self.private_rpc_url, method, params, Some(auth_token)).await
     }
 
     /// Send a JSON-RPC call with no auth header, returning HTTP status + body.
@@ -330,7 +281,7 @@ impl PrivateRpcTestCtx {
         method: &str,
         params: serde_json::Value,
     ) -> eyre::Result<(reqwest::StatusCode, String)> {
-        private_rpc_call_no_auth(&self.private_rpc_url, method, params).await
+        rpc_call_raw(&self.private_rpc_url, method, params, None).await
     }
 
     /// Inject an empty L1 block and wait for it to be processed.
@@ -469,22 +420,6 @@ async fn start_private_rpc_url(
     Ok(format!("http://{local_addr}").parse()?)
 }
 
-fn build_private_rpc_ctx(
-    zone: ZoneTestNode,
-    private_rpc_url: url::Url,
-    sequencer_signer: alloy_signer_local::PrivateKeySigner,
-    config: zone_node::rpc::PrivateRpcConfig,
-    fixture: L1Fixture,
-) -> PrivateRpcTestCtx {
-    PrivateRpcTestCtx {
-        zone,
-        private_rpc_url,
-        sequencer_signer,
-        config,
-        fixture,
-    }
-}
-
 /// Start a zone node with a private RPC server for testing.
 ///
 /// Returns a context with:
@@ -521,28 +456,19 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
 
     let private_rpc_url = start_private_rpc_url(&zone, config.clone()).await?;
 
-    Ok(build_private_rpc_ctx(
+    Ok(PrivateRpcTestCtx {
         zone,
         private_rpc_url,
         sequencer_signer,
         config,
         fixture,
-    ))
+    })
 }
 
 /// Start a zone with a private RPC server backed by a real L1 and a portal
 /// with a registered sequencer encryption key.
 pub(crate) async fn start_zone_with_private_rpc_l1() -> eyre::Result<PrivateRpcL1TestCtx> {
-    start_zone_with_private_rpc_l1_inner().await
-}
-
-async fn start_zone_with_private_rpc_l1_inner() -> eyre::Result<PrivateRpcL1TestCtx> {
-    let l1 = L1TestNode::start().await?;
-    let portal_address = l1.deploy_zone().await?;
-
-    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
-
-    zone.wait_for_l2_tempo_finalized(0, DEFAULT_TIMEOUT).await?;
+    let (l1, zone, portal_address) = start_l1_and_zone().await?;
 
     let key = k256::SecretKey::from(l1.dev_signer().credential());
     l1.set_sequencer_encryption_key(portal_address, &key)
@@ -565,13 +491,13 @@ async fn start_zone_with_private_rpc_l1_inner() -> eyre::Result<PrivateRpcL1Test
     let sequencer_signer = l1.dev_signer();
 
     Ok(PrivateRpcL1TestCtx {
-        ctx: build_private_rpc_ctx(
+        ctx: PrivateRpcTestCtx {
             zone,
             private_rpc_url,
             sequencer_signer,
             config,
-            L1Fixture::new(),
-        ),
+            fixture: L1Fixture::new(),
+        },
         l1,
         portal_address,
     })

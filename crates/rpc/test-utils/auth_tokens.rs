@@ -27,6 +27,19 @@ pub(crate) fn build_token_with_signature(signature: TempoSignature, fields: &[u8
     alloy_primitives::hex::encode(build_signed_token_blob(signature, fields))
 }
 
+/// Encode a secp256k1-signed token blob: `r ‖ s ‖ y_parity ‖ fields`, hex-encoded.
+pub(crate) fn build_secp256k1_token(
+    signature: &alloy_primitives::Signature,
+    fields: &[u8],
+) -> String {
+    let mut blob = Vec::with_capacity(65 + fields.len());
+    blob.extend_from_slice(&signature.r().to_be_bytes::<32>());
+    blob.extend_from_slice(&signature.s().to_be_bytes::<32>());
+    blob.push(signature.v() as u8);
+    blob.extend_from_slice(fields);
+    alloy_primitives::hex::encode(blob)
+}
+
 pub(crate) fn sign_p256_signature(
     digest: B256,
     signing_key: &P256SigningKey,
