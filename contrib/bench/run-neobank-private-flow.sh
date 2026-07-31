@@ -86,10 +86,10 @@ ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT="${ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT:-10
 # The canonical Zone boundary e2e uses the full callback allowance: a gateway
 # callback can include a swap, vault action, and encrypted return deposit.
 #
-# Do not lower this based on receipt gas: under TIP-1016 state gas, creating a storage
-# slot needs ~248k available in-frame that the reservoir returns on success, so a
-# first-time user's callback (dozens of new slots) requires several times what it is
-# ultimately charged. 5M and below deterministically out-of-gases the cold path.
+# Do not lower this based on receipt gas: under TIP-1016, each new storage slot needs
+# ~248k gas in-frame on top of execution gas, and that state gas never appears in
+# receipt gas_used (receipts report the regular dimension only). A first-time user's
+# callback creates dozens of slots, so 5M and below deterministically out-of-gases.
 ZONES_BENCH_CALLBACK_GAS_LIMIT="${ZONES_BENCH_CALLBACK_GAS_LIMIT:-10000000}"
 ZONES_BENCH_OUTPUT="${ZONES_BENCH_OUTPUT:-target/zones-benchmark/neobank-e2e}"
 ZONES_BENCH_REPORT="${ZONES_BENCH_REPORT:-target/zones-benchmark/report-neobank-e2e.json}"
