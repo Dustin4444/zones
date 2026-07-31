@@ -5,7 +5,6 @@
 
 use crate::{
     ZoneEngine,
-    prefetch::L1PolicyExecutor,
     replication::{
         AttestationContext, BACKFILL_SERVE_QUEUE_CAPACITY, BackfillRequest, PeerTipRegistry,
         serve_backfill_requests,
@@ -643,11 +642,6 @@ where
         let pool = ctx.node.pool().clone();
         let engine_handle = ctx.beacon_engine_handle.clone();
         let payload_builder = ctx.node.payload_builder_handle().clone();
-        let l1_state_provider = ctx.node.evm_config().l1_reader().clone();
-        let policy_executor = Arc::new(L1PolicyExecutor {
-            provider: provider.clone(),
-            evm_config: ctx.node.evm_config().clone(),
-        });
         let operator_rpc_slot = sequencer_rpc_slot.clone();
         let operator_rpc_provider = provider.clone();
         let operator_zone_api = OperatorZoneApi::new(
@@ -721,9 +715,6 @@ where
                 chain_spec: provider.chain_spec(),
                 deposit_queue: self.deposit_queue.clone(),
                 l1_block_tracker: self.l1_config.block_tracker.clone(),
-                l1_state_provider,
-                l1_fetch_concurrency: self.l1_config.l1_fetch_concurrency,
-                policy_executor,
                 commands,
                 attestation,
                 portal_address: self.portal_address,
@@ -1061,11 +1052,6 @@ where
         let last_header = provider
             .sealed_header(provider.best_block_number()?)?
             .ok_or_else(|| eyre::eyre!("no latest block header"))?;
-        let l1_state_provider = ctx.node.evm_config().l1_reader().clone();
-        let policy_executor = Arc::new(L1PolicyExecutor {
-            provider: provider.clone(),
-            evm_config: ctx.node.evm_config().clone(),
-        });
         let engine = ZoneEngine::new(
             provider.chain_spec(),
             ctx.beacon_engine_handle.clone(),
@@ -1076,9 +1062,6 @@ where
             fee_recipient,
             sequencer_key,
             self.portal_address,
-            l1_state_provider,
-            self.l1_config.l1_fetch_concurrency,
-            policy_executor,
         );
         ctx.node
             .task_executor()
@@ -1239,7 +1222,8 @@ where
             self.l1_state_cache.clone(),
             self.enabled_tokens.clone(),
         );
-        let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks);
+        let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks)
+            .with_l1_fetch_concurrency(self.l1_config.l1_fetch_concurrency);
         if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
             payload_factory = payload_factory.with_withdrawal_reveal_encryptor(encryptor);
         }

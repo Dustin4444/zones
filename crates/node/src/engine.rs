@@ -10,7 +10,7 @@
 //! L1Subscriber ──enqueue──► DepositQueue ──notify──► ZoneEngine
 //!                                │                       │
 //!                                │                   1. peek queue → L1 block
-//!                                │                   2. decrypt + prefetch L1 state
+//!                                │                   2. decrypt deposits
 //!                                │                   3. build ZonePayloadAttributes
 //!                                │                      (inner attrs + l1_block)
 //!                                │                   4. FCU w/ payload attributes
@@ -53,10 +53,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use zone_chainspec::ZoneChainSpec;
-use zone_l1::{
-    DepositQueue, L1BlockDeposits, L1BlockTracker, PreparedL1Block,
-    state::{L1StateProvider, PolicyCheckExecutor, PrefetchCtx},
-};
+use zone_l1::{DepositQueue, L1BlockDeposits, L1BlockTracker, PreparedL1Block};
 use zone_p2p::{LeadershipSchedule, P2pPeerId};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
 
@@ -160,7 +157,7 @@ where
 ///
 /// Waits for L1 blocks in the [`DepositQueue`], then for each block:
 /// 1. Peeks the L1 block from the queue
-/// 2. Decrypts deposits and prefetches their event-derived L1 state
+/// 2. Decrypts deposits
 /// 3. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
 /// 4. Sends FCU with payload attributes to start a build
 /// 5. Resolves the built payload
@@ -189,12 +186,6 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
-    /// L1 reader shared with payload execution and event-derived Portal prefetching.
-    l1_state_provider: L1StateProvider,
-    /// Operator-selected bound for concurrent L1 RPC and policy checks.
-    l1_fetch_concurrency: usize,
-    /// Node-state adapter used to evaluate canonical Tempo policy reads before a build.
-    policy_executor: Arc<dyn PolicyCheckExecutor>,
     /// Optional per-anchor leadership permit. `None` runs the legacy single-sequencer mode.
     production_permit: Option<ProductionPermit>,
 }
@@ -210,9 +201,6 @@ impl ZoneEngine {
         fee_recipient: Address,
         sequencer_key: k256::SecretKey,
         portal_address: Address,
-        l1_state_provider: L1StateProvider,
-        l1_fetch_concurrency: usize,
-        policy_executor: Arc<dyn PolicyCheckExecutor>,
     ) -> Self {
         Self {
             chain_spec,
@@ -224,9 +212,6 @@ impl ZoneEngine {
             fee_recipient,
             sequencer_key,
             portal_address,
-            l1_state_provider,
-            l1_fetch_concurrency,
-            policy_executor,
             production_permit: None,
         }
     }
@@ -327,27 +312,11 @@ impl ZoneEngine {
         }
     }
 
-    /// Decrypt deposits and prefetch their exact-child L1 reads before payload construction.
-    ///
-    /// Mint-recipient policy remains enforced by upstream TIP-20 execution. Prefetching only moves
-    /// event-derived RPC reads ahead of the payload-builder deadline and populates the same cache
-    /// that execution uses.
+    /// Decrypt deposits and prepare canonical `advanceTempo` calldata for payload construction.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
-        let (prepared, prefetch) = l1_block
-            .prepare_for_build(&self.sequencer_key, self.portal_address)
-            .await?;
-        prefetch
-            .prefetch(
-                &self.l1_state_provider,
-                self.l1_fetch_concurrency,
-                PrefetchCtx {
-                    parent: self.last_header.clone(),
-                    child: prepared.header.clone(),
-                },
-                self.policy_executor.clone(),
-            )
-            .await?;
-        Ok(prepared)
+        l1_block
+            .prepare(&self.sequencer_key, self.portal_address)
+            .await
     }
 
     /// Advance the chain by one block.

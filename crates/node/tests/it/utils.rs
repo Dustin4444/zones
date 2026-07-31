@@ -1260,13 +1260,8 @@ impl ZoneTestNode {
             let last_header = provider
                 .sealed_header(provider.best_block_number()?)?
                 .ok_or_else(|| eyre::eyre!("no latest block header"))?;
-            let l1_state_provider = node_handle.node.evm_config().l1_reader().clone();
             let stop = CancellationToken::new();
             engine_stop = Some(stop.clone());
-            let policy_executor = Arc::new(zone_node::prefetch::L1PolicyExecutor {
-                provider: provider.clone(),
-                evm_config: node_handle.node.evm_config().clone(),
-            });
             let engine = zone_node::ZoneEngine::new(
                 provider.chain_spec(),
                 node_handle.node.add_ons_handle.beacon_engine_handle.clone(),
@@ -1277,9 +1272,6 @@ impl ZoneTestNode {
                 sequencer_signer.address(),
                 SecretKey::from(sequencer_signer.credential()),
                 portal_address,
-                l1_state_provider,
-                4,
-                policy_executor,
             );
             node_handle
                 .node
