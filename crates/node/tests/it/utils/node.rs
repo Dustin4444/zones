@@ -20,7 +20,8 @@ use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::{self, PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{
-    TEMPO_STATE_ADDRESS, TempoState, ZONE_CONFIG_ADDRESS, ZoneConfig,
+    IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_CONFIG_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    ZoneConfig,
     ZonePortal::{self},
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -322,6 +323,50 @@ impl ZoneTestNode {
             previous = current;
         }
         eyre::bail!("ZoneEngine kept producing blocks after cancellation")
+    }
+
+    /// Wait until the ZoneOutbox's `withdrawalBatchIndex` equals `expected`.
+    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
+    pub(crate) async fn wait_for_withdrawal_batch_index(
+        &self,
+        expected: u64,
+        timeout: Duration,
+    ) -> eyre::Result<()> {
+        let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, self.provider());
+        let description = format!("ZoneOutbox withdrawalBatchIndex == {expected}");
+        poll_until(timeout, DEFAULT_POLL, &description, || {
+            let outbox = &outbox;
+            async move {
+                let index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
+                if index == expected {
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch the transaction that emitted `log` and decode its calldata as a
+    /// `finalizeWithdrawalBatch` call.
+    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
+    pub(crate) async fn decode_finalize_batch_call(
+        &self,
+        log: &alloy_rpc_types_eth::Log,
+    ) -> eyre::Result<IZoneOutbox::finalizeWithdrawalBatchCall> {
+        let tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| eyre::eyre!("BatchFinalized log missing transaction hash"))?;
+        let finalize_tx = self
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or_else(|| eyre::eyre!("finalizeWithdrawalBatch tx {tx_hash} not found"))?;
+        Ok(IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode(
+            alloy_consensus::Transaction::input(&finalize_tx).as_ref(),
+        )?)
     }
 
     /// Returns an HTTP provider connected to this zone node.
@@ -767,7 +812,9 @@ impl ZoneTestNode {
                     zone_id: 0,
                     zone_poll_interval: Duration::from_secs(1),
                     batch_anchor_config: Default::default(),
-                    withdrawal_poll_interval: Duration::from_secs(5),
+                    // Matches spawn_sequencer_with_config so both harness paths
+                    // process withdrawals at the same cadence.
+                    withdrawal_poll_interval: Duration::from_millis(500),
                     withdrawal_batch_limits: Default::default(),
                 });
         }

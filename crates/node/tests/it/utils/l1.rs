@@ -400,12 +400,7 @@ impl L1TestNode {
     /// This account is NOT pre-funded — use [`fund_user`](Self::fund_user) to
     /// transfer pathUSD from the dev account before depositing.
     pub(crate) fn user_signer(&self) -> alloy_signer_local::PrivateKeySigner {
-        MnemonicBuilder::<English>::default()
-            .phrase(TEST_MNEMONIC)
-            .index(1)
-            .expect("valid derivation index")
-            .build()
-            .expect("valid test mnemonic")
+        self.signer_at(1)
     }
 
     /// Returns a signer derived from [`TEST_MNEMONIC`] at the given BIP-44 index.
@@ -1006,6 +1001,8 @@ impl L1TestNode {
             .get_receipt()
             .await?;
         eyre::ensure!(receipt.status(), "setGatewayMode failed");
+        // Inverted on purpose: enabling gateway-mode enforcement closes the
+        // gateway, so `isGatewayOpen` reads as the negation of `mode`.
         eyre::ensure!(
             portal.isGatewayOpen().call().await? != mode,
             "L1 ZonePortal gateway mode did not update"
@@ -1021,23 +1018,37 @@ impl L1TestNode {
         enabled: bool,
         admin_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<u64> {
+        self.set_role_on_portal(
+            portal_address,
+            gateway,
+            enabled.then_some(PortalRole::CallbackGateway),
+            admin_signer,
+        )
+        .await
+    }
+
+    /// Set (or clear, on `None`) `target`'s role on a portal and verify it took
+    /// effect. Returns the L1 block number after the update.
+    async fn set_role_on_portal(
+        &self,
+        portal_address: Address,
+        target: Address,
+        role: Option<PortalRole>,
+        admin_signer: alloy_signer_local::PrivateKeySigner,
+    ) -> eyre::Result<u64> {
         let provider = self.provider_with_signer(admin_signer);
         let portal = ZonePortal::new(portal_address, &provider);
-        let role = if enabled {
-            PortalRole::CallbackGateway
-        } else {
-            PortalRole::None
-        };
+        let role = role.unwrap_or(PortalRole::None);
         let receipt = portal
-            .setRole(gateway, role)
+            .setRole(target, role)
             .send()
             .await?
             .get_receipt()
             .await?;
-        eyre::ensure!(receipt.status(), "setRole for gateway failed");
+        eyre::ensure!(receipt.status(), "setRole for {target} failed");
         eyre::ensure!(
-            portal.role(gateway).call().await? as u8 == role as u8,
-            "L1 ZonePortal gateway role for {gateway} did not equal {role:?}"
+            portal.role(target).call().await? as u8 == role as u8,
+            "L1 ZonePortal role for {target} did not equal {role:?}"
         );
         Ok(provider.get_block_number().await?)
     }
@@ -1066,25 +1077,13 @@ impl L1TestNode {
         enabled: bool,
         admin_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<u64> {
-        let provider = self.provider_with_signer(admin_signer);
-        let portal = ZonePortal::new(portal_address, &provider);
-        let role = if enabled {
-            PortalRole::Account
-        } else {
-            PortalRole::None
-        };
-        let receipt = portal
-            .setRole(account, role)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
-        eyre::ensure!(receipt.status(), "setRole for account failed");
-        eyre::ensure!(
-            portal.role(account).call().await? as u8 == role as u8,
-            "L1 ZonePortal account role for {account} did not equal {role:?}"
-        );
-        Ok(provider.get_block_number().await?)
+        self.set_role_on_portal(
+            portal_address,
+            account,
+            enabled.then_some(PortalRole::Account),
+            admin_signer,
+        )
+        .await
     }
 
     /// Pause deposits for a token on the ZonePortal.
@@ -1260,17 +1259,17 @@ impl L1TestNode {
         Ok(())
     }
 
-    /// Create a new BLACKLIST policy on L1. Returns the policy ID.
-    pub(crate) async fn create_blacklist_policy(&self) -> eyre::Result<u64> {
+    /// Create a new TIP-403 policy on L1 owned by the dev account. Returns the policy ID.
+    async fn create_policy(&self, policy_type: ITIP403Registry::PolicyType) -> eyre::Result<u64> {
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
-            .createPolicy(self.dev_address(), ITIP403Registry::PolicyType::BLACKLIST)
+            .createPolicy(self.dev_address(), policy_type)
             .send()
             .await?
             .get_receipt()
             .await?;
-        eyre::ensure!(receipt.status(), "createPolicy (BLACKLIST) failed");
+        eyre::ensure!(receipt.status(), "createPolicy failed");
 
         let event = receipt
             .inner
@@ -1282,27 +1281,16 @@ impl L1TestNode {
         Ok(event.policyId)
     }
 
+    /// Create a new BLACKLIST policy on L1. Returns the policy ID.
+    pub(crate) async fn create_blacklist_policy(&self) -> eyre::Result<u64> {
+        self.create_policy(ITIP403Registry::PolicyType::BLACKLIST)
+            .await
+    }
+
     /// Create a new WHITELIST policy on L1. Returns the policy ID.
-    #[allow(dead_code)]
     pub(crate) async fn create_whitelist_policy(&self) -> eyre::Result<u64> {
-        let provider = self.dev_provider();
-        let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
-        let receipt = registry
-            .createPolicy(self.dev_address(), ITIP403Registry::PolicyType::WHITELIST)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
-        eyre::ensure!(receipt.status(), "createPolicy (WHITELIST) failed");
-
-        let event = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| ITIP403Registry::PolicyCreated::decode_log(&log.inner).ok())
-            .ok_or_else(|| eyre::eyre!("PolicyCreated event not found"))?;
-
-        Ok(event.policyId)
+        self.create_policy(ITIP403Registry::PolicyType::WHITELIST)
+            .await
     }
 
     /// Add an address to a blacklist policy.
@@ -1324,7 +1312,6 @@ impl L1TestNode {
     }
 
     /// Add an address to a whitelist policy.
-    #[allow(dead_code)]
     pub(crate) async fn whitelist_address(
         &self,
         policy_id: u64,
@@ -1340,6 +1327,26 @@ impl L1TestNode {
             .await?;
         eyre::ensure!(receipt.status(), "modifyPolicyWhitelist failed");
         Ok(())
+    }
+
+    /// Create a blacklist policy, assign it as `token`'s transfer policy, and
+    /// blacklist `account` on it. Returns the policy ID.
+    ///
+    /// This is the standard preamble for policy-bounce tests.
+    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
+    pub(crate) async fn blacklist_on_token(
+        &self,
+        token: Address,
+        account: Address,
+    ) -> eyre::Result<u64> {
+        let policy_id = self.create_blacklist_policy().await?;
+        self.change_transfer_policy_id(token, policy_id).await?;
+        self.blacklist_address(policy_id, account).await?;
+        eyre::ensure!(
+            !self.is_authorized(policy_id, account).await?,
+            "blacklisted account {account} should not be authorized by policy {policy_id}"
+        );
+        Ok(policy_id)
     }
 
     /// Change a token's transfer policy on L1.

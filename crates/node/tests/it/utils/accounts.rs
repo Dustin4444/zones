@@ -320,6 +320,39 @@ impl ZoneAccount {
         Ok(())
     }
 
+    /// Approve the portal for `token` and submit a raw `deposit` transaction,
+    /// returning the L1 inclusion block WITHOUT waiting for anything on the
+    /// zone.
+    ///
+    /// Negative-path tests use this when the deposit is expected to bounce
+    /// (or revert — the revert surfaces as this method's error).
+    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
+    pub(crate) async fn deposit_raw(
+        &mut self,
+        token: Address,
+        recipient: Address,
+        amount: u128,
+        tempo_refund_recipient: Address,
+    ) -> eyre::Result<u64> {
+        ITIP20::new(token, &self.l1_provider)
+            .approve(self.portal_address, U256::MAX)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        let receipt = ZonePortal::new(self.portal_address, &self.l1_provider)
+            .deposit(token, recipient, amount, B256::ZERO, tempo_refund_recipient)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        eyre::ensure!(receipt.status(), "raw deposit transaction failed on L1");
+        receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("deposit receipt missing block number"))
+    }
+
     /// Approve the ZonePortal to spend pathUSD on L1, then deposit to a specific recipient.
     ///
     /// Waits for the expected post-deposit balance on L2 and returns it.

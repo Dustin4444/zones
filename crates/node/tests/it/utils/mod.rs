@@ -66,6 +66,7 @@ pub(crate) const WITHDRAWAL_BATCH_INTERVAL_BLOCKS: u64 = 8;
 pub(crate) const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Timeout for a withdrawal to be batched, submitted, and processed on L1.
+#[allow(dead_code)] // adopted by the e2e suites in a follow-up
 pub(crate) const WITHDRAWAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) const TEST_MNEMONIC: &str =

@@ -88,6 +88,29 @@ fn build_keychain_auth_token(
     )
 }
 
+/// Extract `result` from a JSON-RPC response, panicking with the full response
+/// body when it is an error — so failures show what the server actually said.
+#[allow(dead_code)] // adopted by private_rpc_e2e in a follow-up
+#[track_caller]
+pub(crate) fn expect_result<'a>(
+    resp: &'a serde_json::Value,
+    context: &str,
+) -> &'a serde_json::Value {
+    resp.get("result")
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("{context}: expected result, got: {resp}"))
+}
+
+/// Extract `error.code` from a JSON-RPC response, panicking with the full
+/// response body when the response is not an error.
+#[allow(dead_code)] // adopted by private_rpc_e2e in a follow-up
+#[track_caller]
+pub(crate) fn expect_error_code(resp: &serde_json::Value, context: &str) -> i64 {
+    resp.pointer("/error/code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("{context}: expected error, got: {resp}"))
+}
+
 static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
 

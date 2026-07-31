@@ -292,6 +292,12 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
             seed_blocks,
         );
     }
+    // Commonware deliberately drops messages for offline peers: give the
+    // cluster one dial interval (loopback dials every 500ms) for peer
+    // handshakes, and the bootstrap leader time to gather tip evidence from
+    // both followers, before tests start producing blocks.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
     Ok(P2pCluster {
         nodes,
         p2p_public_keys: public_keys.to_vec(),
