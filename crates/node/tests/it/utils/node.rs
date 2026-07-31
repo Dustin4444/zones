@@ -244,6 +244,39 @@ pub(crate) struct ZoneTestNode {
     _tasks: Runtime,
 }
 
+/// Parameters for [`ZoneTestNode::launch`].
+///
+/// `..Default::default()` gives a self-contained node on the dummy L1 with a
+/// fresh unique chain ID, a throwaway sequencer key, and the standard
+/// withdrawal batch interval.
+pub(crate) struct ZoneNodeParams {
+    pub(crate) l1_ws_url: String,
+    pub(crate) portal_address: Address,
+    pub(crate) chain_id: u64,
+    pub(crate) genesis: Option<Genesis>,
+    /// `None` uses a throwaway key — fine unless the test exercises encrypted
+    /// deposits or asserts on the block beneficiary.
+    pub(crate) sequencer_signer: Option<alloy_signer_local::PrivateKeySigner>,
+    pub(crate) withdrawal_batch_interval_blocks: u64,
+    pub(crate) p2p_config: Option<P2pConfig>,
+    pub(crate) spawn_engine: bool,
+}
+
+impl Default for ZoneNodeParams {
+    fn default() -> Self {
+        Self {
+            l1_ws_url: DUMMY_L1_URL.to_string(),
+            portal_address: Address::ZERO,
+            chain_id: next_unique_chain_id(),
+            genesis: None,
+            sequencer_signer: None,
+            withdrawal_batch_interval_blocks: WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
+            p2p_config: None,
+            spawn_engine: true,
+        }
+    }
+}
+
 impl ZoneTestNode {
     /// Returns the HTTP RPC URL for connecting providers to this node.
     pub(crate) fn http_url(&self) -> &url::Url {
@@ -559,7 +592,12 @@ impl ZoneTestNode {
 
     /// Start a zone node pointing at a real L1 WebSocket URL.
     pub(crate) async fn start(l1_ws_url: String, portal_address: Address) -> eyre::Result<Self> {
-        Self::launch(l1_ws_url, portal_address, next_unique_chain_id()).await
+        Self::launch(ZoneNodeParams {
+            l1_ws_url,
+            portal_address,
+            ..Default::default()
+        })
+        .await
     }
 
     /// Start a zone node connected to a real L1, generating genesis from the L1's
@@ -571,40 +609,14 @@ impl ZoneTestNode {
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
-        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
-
-        let signer = l1_dev_signer();
-        Self::launch_with_genesis(
-            l1_ws_url.to_string(),
+        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address, None).await?;
+        Self::launch(ZoneNodeParams {
+            l1_ws_url: l1_ws_url.to_string(),
             portal_address,
-            next_unique_chain_id(),
-            Some(genesis),
-            signer,
-        )
-        .await
-    }
-
-    /// Start a zone node connected to a real L1, anchoring genesis to a specific L1 block.
-    pub(crate) async fn start_from_l1_at_block(
-        l1_http_url: &url::Url,
-        l1_ws_url: &url::Url,
-        portal_address: Address,
-        block_number: u64,
-    ) -> eyre::Result<Self> {
-        let (genesis, _) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, block_number).await?;
-
-        let signer = l1_dev_signer();
-        Self::launch_with_genesis_and_withdrawal_batch_interval(
-            l1_ws_url.to_string(),
-            portal_address,
-            next_unique_chain_id(),
-            Some(genesis),
-            signer,
-            8,
-            None,
-            true,
-        )
+            genesis: Some(genesis),
+            sequencer_signer: Some(l1_dev_signer()),
+            ..Default::default()
+        })
         .await
     }
 
@@ -614,19 +626,15 @@ impl ZoneTestNode {
         portal_address: Address,
         withdrawal_batch_interval_blocks: u64,
     ) -> eyre::Result<Self> {
-        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
-
-        let signer = l1_dev_signer();
-        Self::launch_with_genesis_and_withdrawal_batch_interval(
-            l1_ws_url.to_string(),
+        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address, None).await?;
+        Self::launch(ZoneNodeParams {
+            l1_ws_url: l1_ws_url.to_string(),
             portal_address,
-            next_unique_chain_id(),
-            Some(genesis),
-            signer,
+            genesis: Some(genesis),
+            sequencer_signer: Some(l1_dev_signer()),
             withdrawal_batch_interval_blocks,
-            None,
-            true,
-        )
+            ..Default::default()
+        })
         .await
     }
 
@@ -642,17 +650,15 @@ impl ZoneTestNode {
         genesis_block_number: u64,
     ) -> eyre::Result<Self> {
         let (genesis, _) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
+            build_l1_anchored_genesis(l1_http_url, portal_address, Some(genesis_block_number))
                 .await?;
-
-        let signer = l1_dev_signer();
-        Self::launch_with_genesis(
-            l1_ws_url.to_string(),
+        Self::launch(ZoneNodeParams {
+            l1_ws_url: l1_ws_url.to_string(),
             portal_address,
-            next_unique_chain_id(),
-            Some(genesis),
-            signer,
-        )
+            genesis: Some(genesis),
+            sequencer_signer: Some(l1_dev_signer()),
+            ..Default::default()
+        })
         .await
     }
 
@@ -663,12 +669,7 @@ impl ZoneTestNode {
     /// directly into the `deposit_queue`; the L1 state cache must be seeded
     /// via [`L1Fixture::seed_l1_cache`] for TempoState storage reads.
     pub(crate) async fn start_local() -> eyre::Result<Self> {
-        Self::launch(
-            DUMMY_L1_URL.to_string(),
-            Address::ZERO,
-            next_unique_chain_id(),
-        )
-        .await
+        Self::launch(ZoneNodeParams::default()).await
     }
 
     /// Start a self-contained zone node with a custom chain ID.
@@ -676,80 +677,42 @@ impl ZoneTestNode {
     /// Useful for running multiple zone nodes in a single test — each needs
     /// a unique chain ID to avoid datadir collisions.
     pub(crate) async fn start_local_with_chain_id(chain_id: u64) -> eyre::Result<Self> {
-        Self::launch(DUMMY_L1_URL.to_string(), Address::ZERO, chain_id).await
+        Self::launch(ZoneNodeParams {
+            chain_id,
+            ..Default::default()
+        })
+        .await
     }
 
     pub(crate) async fn start_local_with_p2p(
         l1_rpc_url: String,
         p2p_config: P2pConfig,
     ) -> eyre::Result<Self> {
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32])?;
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
-        Self::launch_with_genesis_and_withdrawal_batch_interval(
-            l1_rpc_url,
-            Address::ZERO,
-            next_unique_chain_id(),
-            None,
-            signer,
-            8,
-            Some(p2p_config),
-            true,
-        )
+        Self::launch(ZoneNodeParams {
+            l1_ws_url: l1_rpc_url,
+            p2p_config: Some(p2p_config),
+            ..Default::default()
+        })
         .await
     }
 
-    pub(crate) async fn launch(
-        l1_ws_url: String,
-        portal_address: Address,
-        chain_id: u64,
-    ) -> eyre::Result<Self> {
-        // Generate a throwaway signer for tests that don't use encrypted deposits.
-        let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
-        let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
-        Self::launch_with_genesis_and_withdrawal_batch_interval(
+    pub(crate) async fn launch(params: ZoneNodeParams) -> eyre::Result<Self> {
+        let ZoneNodeParams {
             l1_ws_url,
             portal_address,
             chain_id,
-            None,
-            signer,
-            8,
-            None,
-            true,
-        )
-        .await
-    }
-
-    async fn launch_with_genesis(
-        l1_ws_url: String,
-        portal_address: Address,
-        chain_id: u64,
-        custom_genesis: Option<Genesis>,
-        sequencer_signer: alloy_signer_local::PrivateKeySigner,
-    ) -> eyre::Result<Self> {
-        Self::launch_with_genesis_and_withdrawal_batch_interval(
-            l1_ws_url,
-            portal_address,
-            chain_id,
-            custom_genesis,
+            genesis: custom_genesis,
             sequencer_signer,
-            8,
-            None,
-            true,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn launch_with_genesis_and_withdrawal_batch_interval(
-        l1_ws_url: String,
-        portal_address: Address,
-        chain_id: u64,
-        custom_genesis: Option<Genesis>,
-        sequencer_signer: alloy_signer_local::PrivateKeySigner,
-        withdrawal_batch_interval_blocks: u64,
-        p2p_config: Option<P2pConfig>,
-        spawn_engine: bool,
-    ) -> eyre::Result<Self> {
+            withdrawal_batch_interval_blocks,
+            p2p_config,
+            spawn_engine,
+        } = params;
+        let sequencer_signer = sequencer_signer.unwrap_or_else(|| {
+            // Throwaway signer for tests that don't use encrypted deposits.
+            let throwaway_key =
+                k256::SecretKey::from_slice(&[0x01; 32]).expect("valid throwaway key");
+            alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into())
+        });
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
         let l1_ws_url = if is_local_dummy_l1 {

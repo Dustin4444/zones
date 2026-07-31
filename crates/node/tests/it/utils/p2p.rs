@@ -269,16 +269,15 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
     let mut nodes = Vec::with_capacity(3);
     for (index, config) in configs.into_iter().enumerate() {
         nodes.push(
-            ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
-                l1_rpc_url.clone(),
-                Address::ZERO,
+            ZoneTestNode::launch(ZoneNodeParams {
+                l1_ws_url: l1_rpc_url.clone(),
                 chain_id,
-                Some(genesis.clone()),
-                sequencer_signers[index].clone(),
-                8,
-                Some(config),
-                false,
-            )
+                genesis: Some(genesis.clone()),
+                sequencer_signer: Some(sequencer_signers[index].clone()),
+                p2p_config: Some(config),
+                spawn_engine: false,
+                ..Default::default()
+            })
             .await?,
         );
     }

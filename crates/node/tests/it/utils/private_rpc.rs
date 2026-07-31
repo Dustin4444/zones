@@ -495,12 +495,7 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
     let sequencer_signer = alloy_signer_local::PrivateKeySigner::random();
     let sequencer_address = sequencer_signer.address();
 
-    let zone = ZoneTestNode::launch(
-        DUMMY_L1_URL.to_string(),
-        Address::ZERO,
-        next_unique_chain_id(),
-    )
-    .await?;
+    let zone = ZoneTestNode::start_local().await?;
     let fixture = L1Fixture::new();
 
     fixture.seed_l1_cache(

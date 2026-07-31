@@ -138,7 +138,7 @@ async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
     // the constructor's initial TokenEnabled event.
     let anchor_block_number = l1.provider().get_block_number().await?;
     let portal_address = l1.deploy_zone().await?;
-    let zone = ZoneTestNode::start_from_l1_at_block(
+    let zone = ZoneTestNode::start_from_l1_genesis_block(
         l1.http_url(),
         l1.ws_url(),
         portal_address,
@@ -210,7 +210,7 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
     let latest_l1_block = l1.provider().get_block_number().await?;
     assert!(latest_l1_block > provisioned.anchor_block_number);
 
-    let zone = ZoneTestNode::start_from_l1_at_block(
+    let zone = ZoneTestNode::start_from_l1_genesis_block(
         l1.http_url(),
         l1.ws_url(),
         provisioned.portal,

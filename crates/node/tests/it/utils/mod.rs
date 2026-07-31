@@ -57,6 +57,9 @@ pub(crate) const TIP20_TX_GAS: u64 = 500_000;
 /// withdrawals.
 pub(crate) const WITHDRAWAL_TX_GAS: u64 = 10_000_000;
 
+/// Local test nodes finalize a withdrawal batch every this many zone blocks.
+pub(crate) const WITHDRAWAL_BATCH_INTERVAL_BLOCKS: u64 = 8;
+
 pub(crate) const TEST_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
 

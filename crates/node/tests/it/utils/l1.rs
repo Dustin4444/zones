@@ -1477,45 +1477,23 @@ impl L1TestNode {
     }
 }
 
-/// Build a zone test genesis anchored to a real L1 block.
+/// Build a zone test genesis anchored to a real L1 block — the latest one, or
+/// `at_block` when given.
 ///
-/// Delegates to [`zone_node::genesis::l1_anchored_genesis`] with the latest L1 header.
+/// Delegates to [`zone_node::genesis::l1_anchored_genesis`] with that block's header.
 ///
 /// Returns `(genesis, genesis_block_number)`.
 pub(crate) async fn build_l1_anchored_genesis(
     l1_http_url: &url::Url,
     portal_address: Address,
+    at_block: Option<u64>,
 ) -> eyre::Result<(Genesis, u64)> {
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
 
+    let block_number = at_block.map_or(BlockNumberOrTag::Latest, BlockNumberOrTag::Number);
     let block = l1_provider
-        .get_block_by_number(BlockNumberOrTag::Latest)
-        .await?
-        .ok_or_else(|| eyre::eyre!("L1 latest block not found"))?;
-    let l1_header: &TempoHeader = block.header.as_ref();
-    let default_fee_token = if portal_address.is_zero() {
-        PATH_USD_ADDRESS
-    } else {
-        ZonePortal::new(portal_address, &l1_provider)
-            .enabledTokenAt(U256::ZERO)
-            .call()
-            .await?
-    };
-    zone_node::genesis::l1_anchored_genesis(l1_header, portal_address, default_fee_token)
-}
-
-/// Build a zone test genesis anchored to a specific L1 block number.
-pub(crate) async fn build_l1_anchored_genesis_at_block(
-    l1_http_url: &url::Url,
-    portal_address: Address,
-    block_number: u64,
-) -> eyre::Result<(Genesis, u64)> {
-    let l1_provider =
-        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
-
-    let block = l1_provider
-        .get_block_by_number(block_number.into())
+        .get_block_by_number(block_number)
         .await?
         .ok_or_else(|| eyre::eyre!("L1 block {block_number} not found"))?;
     let l1_header: &TempoHeader = block.header.as_ref();
