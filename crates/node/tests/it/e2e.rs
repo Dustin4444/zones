@@ -29,6 +29,8 @@ use crate::utils::{
 };
 
 const CONTRACT_CREATION_TX_GAS: u64 = 1_000_000;
+/// Local test nodes finalize empty batches every eight zone blocks.
+const BATCH_INTERVAL_BLOCKS: u64 = 8;
 const LEADER_INCLUSION_TIMEOUT: Duration = Duration::from_secs(30);
 const P2P_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -274,7 +276,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
     let alice = alice_signer.address();
     let bob = address!("0x0000000000000000000000000000000000000B0B");
 
-    // --- Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1). ---
+    // Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1).
     let deposit_amount: u128 = 1_000_000;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
     let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(deposit.clone())]);
@@ -301,7 +303,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
         .await?;
     follower.wait_for_block_number(1, DEFAULT_TIMEOUT).await?;
 
-    // --- Policy change effective at L1 block 2: blacklist Bob on pathUSD. ---
+    // Policy change effective at L1 block 2: blacklist Bob on pathUSD.
     // Seed identically on both nodes, mirroring each node's L1 observer having
     // made block-2 TIP-403 and TIP-20 storage available before publishing the
     // anchor. The L1-backed execution database must select these values from
@@ -334,8 +336,8 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
         );
     }
 
-    // --- Block 2: Alice's transfer is submitted, then the anchoring L1 block is
-    // injected to trigger the build that includes it. ---
+    // Block 2: Alice's transfer is submitted, then the anchoring L1 block is
+    // injected to trigger the build that includes it.
     let alice_provider = ProviderBuilder::new()
         .wallet(alice_signer)
         .connect_http(leader.http_url().clone());
@@ -360,7 +362,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
         "leader should revert the blacklisted transfer in the block anchored at L1#2"
     );
 
-    // --- The follower must independently reproduce that revert at height 2. ---
+    // The follower must independently reproduce that revert at height 2.
     // If it read policy at height 1 (allow-all) it would replay the transfer as
     // a success, diverge from the leader's state root, reject the block, and
     // never reach block 2 — so this import succeeding proves exact-anchor policy reads.
@@ -481,14 +483,11 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
     let bob = address!("0x0000000000000000000000000000000000000B0B");
     let sender = address!("0x0000000000000000000000000000000000001111");
 
-    // Block 1: deposit to Alice
     let d1 = fixture.make_deposit(PATH_USD_ADDRESS, sender, alice, 500_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![d1]);
 
-    // Block 2: empty block (no deposits)
     fixture.inject_empty_block(zone.deposit_queue());
 
-    // Block 3: two deposits — one to Alice, one to Bob
     let d2 = fixture.make_deposit(PATH_USD_ADDRESS, sender, alice, 300_000);
     let d3 = fixture.make_deposit(PATH_USD_ADDRESS, sender, bob, 700_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![d2, d3]);
@@ -527,7 +526,6 @@ async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
 
-    // Inject several empty L1 blocks
     fixture.inject_empty_blocks(zone.deposit_queue(), 5);
 
     // Each L1 block advances tempoBlockNumber — wait for all 5
@@ -599,7 +597,6 @@ async fn test_zone_engine_stops_cleanly_between_blocks() -> eyre::Result<()> {
 async fn test_two_zones_independent_deposits() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Start two zones with different chain IDs
     let zone1 = ZoneTestNode::start_local_with_chain_id(71001).await?;
     let zone2 = ZoneTestNode::start_local_with_chain_id(71002).await?;
 
@@ -691,7 +688,6 @@ async fn test_tempo_state_advances_with_l1_blocks() -> eyre::Result<()> {
         "initial tempoBlockHash should be non-zero (genesis hash)"
     );
 
-    // Inject 3 empty L1 blocks
     for _ in 0..3 {
         fixture.inject_empty_block(zone.deposit_queue());
     }
@@ -840,8 +836,6 @@ async fn test_withdrawal_batch_finalization() -> eyre::Result<()> {
     let zone_outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, zone.provider());
 
     let initial_batch_index = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
-    // Local test nodes finalize empty batches every eight zone blocks.
-    const BATCH_INTERVAL_BLOCKS: u64 = 8;
 
     fixture.inject_empty_blocks(zone.deposit_queue(), BATCH_INTERVAL_BLOCKS - 1);
 
@@ -1233,9 +1227,6 @@ async fn test_current_only_block_finalizes_at_batch_boundary() -> eyre::Result<(
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
     let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
-
-    // Local test nodes finalize empty batches every eight zone blocks.
-    const BATCH_INTERVAL_BLOCKS: u64 = 8;
 
     let batch_index = outbox.lastBatch().call().await?.withdrawalBatchIndex;
     fixture.inject_empty_blocks(zone.deposit_queue(), BATCH_INTERVAL_BLOCKS);

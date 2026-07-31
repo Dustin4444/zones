@@ -1,3 +1,7 @@
+//! Shield-and-send demo: deposit into the zone, then transfer on L2.
+//!
+//! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
+
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode};
 use alloy::{primitives::U256, providers::ProviderBuilder};
 use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
@@ -6,13 +10,6 @@ use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shield + in-zone send:
-///
-/// 1. Start L1 dev node.
-/// 2. Create a zone through the native ZoneFactory.
-/// 3. Start zone node connected to L1.
-/// 4. Alice deposits 1 pathUSD into the zone (shield).
-/// 5. Alice transfers 0.5 pathUSD to Bob within the zone (L2 transfer).
-/// 6. Verify Alice has 0.5 and Bob has 0.5 on L2.
 ///
 /// ```text
 ///  L1                         Zone L2
@@ -23,22 +20,17 @@ const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///   |                            |  ✓ Bob has 0.5
 /// ```
 ///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_shield_and_send() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
 
-    // --- Step 2: Deploy L1 infrastructure and create a zone ---
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 3: Start zone node connected to L1 ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
-    // --- Step 4: Alice deposits 1 pathUSD (shield) ---
     let mut alice = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD (6 decimals)
     l1.fund_user(alice.address(), deposit_amount * 2).await?;
@@ -50,7 +42,6 @@ async fn test_shield_and_send() -> eyre::Result<()> {
         "Alice should have 1 pathUSD on L2 after deposit"
     );
 
-    // --- Step 5: Alice transfers 0.5 pathUSD to Bob on L2 ---
     // Bob is derived from mnemonic index 2 (Alice is index 1 via user_signer)
     let bob_address = l1.signer_at(2).address();
 
@@ -82,7 +73,6 @@ async fn test_shield_and_send() -> eyre::Result<()> {
         eyre::ensure!(receipt.status(), "L2 transfer from Alice to Bob failed");
     }
 
-    // --- Step 6: Verify balances ---
     let alice_final = zone.balance_of(ZONE_TOKEN_ADDRESS, alice.address()).await?;
     let bob_final = zone.balance_of(ZONE_TOKEN_ADDRESS, bob_address).await?;
 

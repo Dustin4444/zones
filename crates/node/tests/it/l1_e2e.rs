@@ -1,5 +1,7 @@
 //! Full L1+L2 end-to-end tests with a real in-process Tempo L1 node.
 //!
+//! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
+//!
 //! Unlike the injection-based tests in `e2e.rs`, these tests start a real
 //! Tempo L1 dev node and a Zone L2 node connected via WebSocket. The L1
 //! subscriber naturally receives blocks and deposits — no synthetic injection.
@@ -120,7 +122,6 @@ async fn setup_same_zone_swap_fixture() -> eyre::Result<SameZoneSwapFixture> {
 async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Start real Tempo L1 in dev mode (500ms block time)
     let l1 = L1TestNode::start().await?;
 
     // Verify L1 is producing blocks
@@ -228,23 +229,12 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
     Ok(())
 }
 
-/// Full deposit + withdrawal flow with a real L1:
-/// 1. Start L1 dev node.
-/// 2. Create a zone through the native ZoneFactory (installs ZonePortal).
-/// 3. Start zone node connected to L1 with the portal address.
-/// 4. Deposit pathUSD on the ZonePortal to the dev account.
-/// 5. Verify the zone mints the corresponding pathUSD balance on L2.
-/// 6. Spawn zone sequencer background tasks (batch submitter + withdrawal processor).
-/// 7. Request a withdrawal on L2 (approve + requestWithdrawal on ZoneOutbox).
-/// 8. Wait for the batch to be submitted and the withdrawal to be processed on L1.
-///
-/// NOTE: This test requires the Foundry-compiled shared runtime artifacts.
-/// Run `forge build` in `specs/ref-impls/` first.
+/// Full deposit + withdrawal flow with a real L1: a portal deposit mints
+/// pathUSD on L2, then a withdrawal is batched and processed back on L1.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deposit_via_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // Start real Tempo L1 in dev mode (500ms block time)
     let l1 = L1TestNode::start().await?;
 
     // Deploy L1 infrastructure and create a zone
@@ -255,8 +245,6 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
 
     // Wait for the zone to advance past genesis
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
-
-    // --- Deposit + withdrawal via ZoneAccount ---
 
     let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD (6 decimals)
@@ -274,7 +262,6 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
         "recipient should start with zero on L2"
     );
 
-    // Deposit on L1, wait for mint on L2
     let minted_balance = account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
     assert_eq!(
         minted_balance,
@@ -986,44 +973,23 @@ async fn test_queued_callback_bounces_after_gateway_revocation() -> eyre::Result
     Ok(())
 }
 
-/// Cross-zone withdrawal via the SwapAndDepositRouter:
-///
-///  1. Start L1 dev node.
-///  2. Create zone_a and zone_b through the native factory, then deploy SwapAndDepositRouter.
-///  3. Start both zone nodes connected to L1.
-///  4. Deposit pathUSD into zone_a.
-///  5. Withdraw from zone_a with a callback that deposits into zone_b via the router.
-///  6. Verify the deposit arrives on zone_b.
-///  7. Withdraw from zone_b with a callback that deposits into zone_a via the router.
-///  8. Verify the deposit arrives on zone_a.
-///
-/// ```text
-///  Zone A          L1 (Router)          Zone B
-///    |--- withdraw 0.4 -->|                |
-///    |                    |-- deposit 0.4 ->|
-///    |                    |                 |
-///    |                    |<- withdraw 0.2 -|
-///    |<-- deposit 0.2 ----|                 |
-/// ```
-///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime and router artifacts.
+/// Cross-zone withdrawal via the SwapAndDepositRouter: zone_a withdraws with
+/// a router callback that deposits into zone_b, then zone_b sends back the
+/// other way.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
 
     // Separate sequencer keys for each zone to avoid L1 nonce conflicts
     let seq_a_signer = l1.signer_at(2);
     let seq_b_signer = l1.signer_at(3);
 
-    // --- Step 2: Deploy L1 infrastructure (factory, two portals, router) ---
     let (portal_a, portal_b, router) = l1
         .deploy_two_open_zones_with_sequencers(seq_a_signer.clone(), seq_b_signer.clone())
         .await?;
 
-    // --- Step 3: Start both zone nodes ---
     let zone_a = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_a).await?;
     let zone_b = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_b).await?;
 
@@ -1034,7 +1000,6 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     zone_a.assert_gateway_open(true).await?;
     zone_b.assert_gateway_open(true).await?;
 
-    // --- Step 4: Deposit into zone_a ---
     let mut account_a = ZoneAccount::from_l1_and_zone(&l1, &zone_a, portal_a);
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD
     l1.fund_user(account_a.address(), deposit_amount * 2)
@@ -1047,7 +1012,6 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     let _seq_a = spawn_sequencer(&l1, &zone_a, portal_a, seq_a_signer.clone()).await;
     let _seq_b = spawn_sequencer(&l1, &zone_b, portal_b, seq_b_signer.clone()).await;
 
-    // --- Step 5: Cross-zone withdrawal: zone_a → router → zone_b ---
     let cross_amount: u128 = 400_000; // 0.4 pathUSD
     let args_a_to_b = WithdrawalArgs::cross_zone_via_router(
         cross_amount,
@@ -1059,7 +1023,6 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     );
     account_a.withdraw_with(args_a_to_b).await?;
 
-    // --- Step 6: Verify deposit arrives on zone_b ---
     let cross_timeout = std::time::Duration::from_secs(60);
     zone_b
         .wait_for_balance(
@@ -1088,7 +1051,6 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
         "zone_a balance should decrease by at least the cross-zone amount (got {zone_a_balance})"
     );
 
-    // --- Step 7: Cross-zone withdrawal: zone_b → router → zone_a ---
     let mut account_b = ZoneAccount::from_l1_and_zone(&l1, &zone_b, portal_b);
     let reverse_amount: u128 = 200_000; // 0.2 pathUSD
     let args_b_to_a = WithdrawalArgs::cross_zone_via_router(
@@ -1101,7 +1063,6 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
     );
     account_b.withdraw_with(args_b_to_a).await?;
 
-    // --- Step 8: Verify deposit arrives on zone_a ---
     zone_a
         .wait_for_balance(
             ZONE_TOKEN_ADDRESS,
@@ -1242,13 +1203,9 @@ async fn test_cross_zone_encrypted_router_tempo_refund_recipient() -> eyre::Resu
     Ok(())
 }
 
-/// Same-zone routed withdrawal that takes the real swap branch:
-///
-///  1. Deposit AlphaUSD into the zone.
-///  2. Withdraw AlphaUSD to the router.
-///  3. Swap AlphaUSD -> BetaUSD via the real StablecoinDEX.
-///  4. Deposit BetaUSD back into the same zone.
-///  5. Verify AlphaUSD was consumed and BetaUSD was minted.
+/// Same-zone routed withdrawal that takes the real swap branch: AlphaUSD is
+/// withdrawn to the router, swapped to BetaUSD on the StablecoinDEX, and
+/// redeposited into the same zone.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -1563,34 +1520,15 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_encrypted_deposit_
     Ok(())
 }
 
-/// Multi-asset deposit + withdrawal test:
-///
-///  1. Start L1 dev node.
-///  2. Create a second TIP-20 token ("ZoneUSD") on L1.
-///  3. Create a zone with pathUSD through the native ZoneFactory.
-///  4. Enable ZoneUSD on the portal.
-///  5. Start zone node connected to L1 (ZoneUSD is auto-initialized via TokenEnabled event).
-///  6. Deposit pathUSD and ZoneUSD into the zone.
-///  7. Spawn sequencer, withdraw both tokens back to L1.
-///  8. Verify withdrawals processed and L2 balances decreased.
-///
-/// ```text
-///  L1 (pathUSD + ZoneUSD)          Zone L2
-///    |--- deposit pathUSD -------->|  ✓ pathUSD minted
-///    |--- deposit ZoneUSD -------->|  ✓ ZoneUSD minted
-///    |<-- withdraw pathUSD --------|  ✓ pathUSD burned
-///    |<-- withdraw ZoneUSD --------|  ✓ ZoneUSD burned
-/// ```
-///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime artifacts.
+/// Multi-asset deposit + withdrawal: pathUSD plus a second TIP-20 enabled on
+/// the portal (auto-initialized on L2 via the `TokenEnabled` event) both
+/// round-trip through deposit and withdrawal.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
 
-    // --- Step 2: Create a second TIP-20 token on L1 ---
     let zone_usd_salt = B256::new([
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 42,
@@ -1602,13 +1540,10 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     l1.mint_tip20(l1_zone_usd, l1.dev_address(), mint_amount)
         .await?;
 
-    // --- Step 3: Deploy L1 infrastructure and create a zone ---
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 4: Start zone node connected to L1 ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
 
-    // --- Step 5: Enable ZoneUSD on the portal ---
     // Must happen AFTER zone startup so the zone's L1 subscriber picks up the
     // TokenEnabled event from a live block.
     l1.enable_token_on_portal(portal_address, l1_zone_usd)
@@ -1622,7 +1557,6 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     // L2 token address is the same as L1 by design (auto-initialized via TokenEnabled event)
     let l2_zone_usd = l1_zone_usd;
 
-    // --- Step 6: Deposit both tokens (user account) ---
     let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let pathusd_amount: u128 = 1_000_000; // 1 pathUSD
     let zoneusd_amount: u128 = 2_000_000; // 2 ZoneUSD
@@ -1632,7 +1566,6 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     l1.fund_user_token(l1_zone_usd, account.address(), zoneusd_amount * 2)
         .await?;
 
-    // Deposit pathUSD
     let pathusd_minted = account.deposit(pathusd_amount, L1_TIMEOUT, &zone).await?;
     assert_eq!(
         pathusd_minted,
@@ -1650,11 +1583,9 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
         "ZoneUSD minted balance should equal deposit amount"
     );
 
-    // --- Step 7: Spawn sequencer and withdraw both tokens ---
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
     let withdrawal_timeout = std::time::Duration::from_secs(60);
 
-    // Withdraw pathUSD
     let pathusd_withdrawal: u128 = 500_000; // 0.5 pathUSD
     account.withdraw(pathusd_withdrawal).await?;
 
@@ -1666,7 +1597,6 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     )
     .await?;
 
-    // Withdraw ZoneUSD
     let zoneusd_withdrawal: u128 = 1_000_000; // 1 ZoneUSD
     account
         .withdraw_token(l2_zone_usd, zoneusd_withdrawal)
@@ -1681,7 +1611,6 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     )
     .await?;
 
-    // --- Step 8: Verify L2 balances decreased ---
     let final_pathusd = zone
         .balance_of(ZONE_TOKEN_ADDRESS, account.address())
         .await?;
@@ -1699,54 +1628,18 @@ async fn test_multiasset_deposit_withdrawal() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Full encrypted deposit + withdrawal flow:
-///
-///  1. Start L1 dev node and create a zone through the native ZoneFactory.
-///  2. Generate sequencer encryption key, start zone with sequencer key.
-///  3. Register encryption key on the portal via `setSequencerEncryptionKey`.
-///  4. Fund depositor, call `depositEncrypted` on the portal — encrypting
-///     (recipient, memo) to the sequencer's public key. The recipient is a
-///     known key (mnemonic index 2) so we can withdraw later.
-///     The zone processes this automatically: ECIES decrypt → CP proof →
-///     AES-GCM verify → mint to recipient. `deposit_encrypted` waits for
-///     the L2 balance to confirm the full pipeline succeeded.
-///  5. Spawn sequencer tasks, recipient requests withdrawal on L2.
-///  6. Wait for batch submission + withdrawal processing on L1.
-///
-/// ```text
-///  L1                                       Zone L2
-///   │                                         │
-///   │  setSequencerEncryptionKey              │
-///   │                                         │
-///   │  depositEncrypted ─────────►    │
-///   │                                         │
-///   │               ECIES decrypt             │
-///   │               + CP proof                │
-///   │                   │                    │
-///   │                   ▼                    │
-///   │            advanceTempo                 │
-///   │                   │                    │
-///   │                   ▼                    │
-///   │            CP ✓ + AES decrypt           │
-///   │            → mint to recipient         │
-///   │                                         │
-///   │   ◄──── requestWithdrawal ───── │
-///   │   ◄──── submitBatch ────────  │
-///   │   processWithdrawals                     │
-///   │            → tokens to L1              │
-/// ```
-///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime artifacts.
+/// Full encrypted deposit + withdrawal flow: `depositEncrypted` encrypts
+/// (recipient, memo) to the sequencer's registered public key, the zone runs
+/// the ECIES decrypt → CP proof → AES-GCM verify → mint pipeline, and the
+/// recipient (a known mnemonic key) then withdraws back to L1.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 + deploy zone ---
     let l1 = L1TestNode::start().await?;
     let encryption_key = k256::SecretKey::from(l1.dev_signer().credential());
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 2: Start zone with sequencer key ---
     // Must start the zone BEFORE registering the encryption key, so the zone's
     // genesis anchor captures the current L1 block. The encryption key registration
     // and deposit happen in subsequent L1 blocks that the zone processes naturally.
@@ -1754,12 +1647,10 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
 
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
-    // --- Step 3: Register encryption key on portal ---
     // This produces an L1 block that the zone will process via L1Subscriber.
     l1.set_sequencer_encryption_key(portal_address, &encryption_key)
         .await?;
 
-    // --- Step 4: Encrypted deposit to a recipient we control ---
     // Use mnemonic index 2 as the recipient so we have keys for withdrawal.
     let recipient_signer = l1.signer_at(2);
     let recipient = recipient_signer.address();
@@ -1775,7 +1666,6 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
         .deposit_encrypted(deposit_amount, recipient, B256::ZERO, L1_TIMEOUT, &zone)
         .await?;
 
-    // --- Step 5: Spawn sequencer + withdraw from the recipient's account on L2 ---
     // Spawn sequencer after deposit to avoid L1 nonce races — the dev signer
     // is used by both fund_user and the sequencer's batch submitter.
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
@@ -1786,7 +1676,6 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
     let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
     recipient_account.withdraw(withdrawal_amount).await?;
 
-    // --- Step 6: Wait for the withdrawal to be fully processed on L1 ---
     let withdrawal_timeout = std::time::Duration::from_secs(60);
     l1.wait_for_withdrawal_on_l1(
         portal_address,
@@ -1801,14 +1690,6 @@ async fn test_encrypted_deposit_and_withdrawal() -> eyre::Result<()> {
 
 /// Test that TIP-403 policy operations on L1 work correctly and the zone
 /// continues to advance normally after policy changes.
-///
-///  1. Start L1 dev node, deploy zone.
-///  2. Create a blacklist policy on L1.
-///  3. Assign it to pathUSD.
-///  4. Blacklist a user address.
-///  5. Start zone node, verify it advances past the policy blocks.
-///  6. Verify the policy state on L1 via the helpers.
-///
 /// NOTE: Full on-chain TIP-403 enforcement on the zone (blocking transfers)
 /// requires the TIP403Registry shim precompile, which is not yet wired.
 /// This test validates the L1 infrastructure and that policy changes don't
@@ -1820,7 +1701,6 @@ async fn test_l1_policy_operations_and_zone_advancement() -> eyre::Result<()> {
     let l1 = L1TestNode::start().await?;
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Create policy infrastructure on L1 ---
     let policy_id = l1.create_blacklist_policy().await?;
 
     // Assign the blacklist to pathUSD
@@ -1846,7 +1726,6 @@ async fn test_l1_policy_operations_and_zone_advancement() -> eyre::Result<()> {
         "non-blacklisted user should be authorized on L1"
     );
 
-    // --- Start zone and verify it advances past the policy blocks ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
@@ -1991,23 +1870,16 @@ async fn test_plaintext_deposit_policy_failure_bounces_to_tempo_refund_recipient
 /// Test that an encrypted deposit whose decrypted recipient is blacklisted
 /// gets bounced back to the sender on L1 instead of minting to the recipient.
 ///
-///  1. Start L1 dev node, deploy zone, register encryption key.
-///  2. Create a blacklist policy, assign to pathUSD, blacklist the recipient.
-///  3. Make an encrypted deposit targeting the blacklisted recipient.
-///  4. Verify upstream TIP-20 mint enforcement fails and refunds the sender on L1.
-///
 /// `L1OverlayDB` exposes finalized L1 policy state directly to upstream Tempo execution.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 + deploy zone ---
     let l1 = L1TestNode::start().await?;
     let sequencer_signer = l1.dev_signer();
     let encryption_key = k256::SecretKey::from(sequencer_signer.credential());
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 2: Create blacklist policy and blacklist the intended recipient ---
     let policy_id = l1.create_blacklist_policy().await?;
     l1.change_transfer_policy_id(PATH_USD_ADDRESS, policy_id)
         .await?;
@@ -2022,15 +1894,12 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
         "recipient should be blacklisted"
     );
 
-    // --- Step 3: Start zone with sequencer key ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
-    // --- Step 4: Register encryption key ---
     l1.set_sequencer_encryption_key(portal_address, &encryption_key)
         .await?;
 
-    // --- Step 5: Make an encrypted deposit targeting the blacklisted recipient ---
     let depositor = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let deposit_amount: u128 = 1_000_000;
     l1.fund_user(depositor.address(), deposit_amount).await?;
@@ -2114,16 +1983,9 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Blacklisted sender cannot transfer on the zone.
-///
-///  1. Start L1 dev node, deploy zone.
-///  2. Create a blacklist policy for senders, wrap it in a compound policy
-///     (sender=blacklist, recipient=allow-all, mintRecipient=allow-all).
-///  3. Assign the compound policy to pathUSD's `transferPolicyId`.
-///  4. Blacklist Alice in the sender sub-policy.
-///  5. Start zone connected to L1, wait for it to process the policy blocks.
-///  6. Deposit pathUSD to Alice (succeeds — mint recipient is allow-all).
-///  7. Alice attempts a transfer → rejected at pool level (blacklisted sender).
+/// Blacklisted sender cannot transfer on the zone: a compound policy
+/// (sender=blacklist, recipient/mintRecipient=allow-all) on pathUSD lets the
+/// deposit to Alice mint but rejects her transfer at pool level.
 ///
 /// NOTE: The T2 hardfork must be active on L1 for compound policies and
 /// directional authorization roles to work.
@@ -2131,11 +1993,9 @@ async fn test_encrypted_deposit_blacklisted_recipient() -> eyre::Result<()> {
 async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 2: Create compound policy and blacklist Alice as sender ---
     let alice_signer = l1.user_signer();
     let alice = alice_signer.address();
 
@@ -2160,11 +2020,9 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
         );
     }
 
-    // --- Step 3: Start zone connected to L1 ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
     zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
 
-    // --- Step 4: Deposit to Alice via the dev account ---
     // Alice is blacklisted as a sender, so she can't transfer pathUSD on L1
     // herself. The dev account deposits on her behalf (recipient = allow-all).
     let deposit_amount: u128 = 1_000_000; // 1 pathUSD
@@ -2199,7 +2057,6 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     )
     .await?;
 
-    // --- Step 5: Alice simulates a transfer → should be rejected ---
     // Use an exact stateful call instead of waiting on pool inclusion: policy-invalid
     // transactions are allowed to remain pending, so absence of a receipt is not proof.
     let bob = Address::with_last_byte(0xBB);
@@ -2226,13 +2083,8 @@ async fn test_blacklisted_sender_transfer_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Test that a regular deposit to a blacklisted recipient reverts on L1.
-///
-///  1. Start L1 dev node, deploy zone.
-///  2. Create a blacklist policy, assign to pathUSD, blacklist a user.
-///  3. Fund the blacklisted user on L1.
-///  4. Attempt a deposit targeting the blacklisted user — should revert with
-///     `PolicyForbids` on the L1 portal contract.
+/// Test that a regular deposit to a blacklisted recipient reverts with
+/// `PolicyForbids` on the L1 portal contract.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_deposit_to_blacklisted_recipient_reverts_on_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -2240,7 +2092,6 @@ async fn test_deposit_to_blacklisted_recipient_reverts_on_l1() -> eyre::Result<(
     let l1 = L1TestNode::start().await?;
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Create blacklist policy and blacklist the intended deposit recipient ---
     let policy_id = l1.create_blacklist_policy().await?;
     l1.change_transfer_policy_id(PATH_USD_ADDRESS, policy_id)
         .await?;

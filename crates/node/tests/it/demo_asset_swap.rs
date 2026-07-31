@@ -1,4 +1,6 @@
 //! Multi-asset zone deposit and withdrawal.
+//!
+//! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
 
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::{
@@ -9,15 +11,8 @@ use alloy::{
 /// Longer timeout for real L1 tests.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Multi-asset deposit + withdrawal:
-///
-/// 1. Start L1 dev node.
-/// 2. Create AlphaUSD and BetaUSD on L1.
-/// 3. Deploy zone, enable both tokens.
-/// 4. Start zone node (tokens auto-initialized via `TokenEnabled` events from L1).
-/// 5. Alice deposits AlphaUSD and BetaUSD.
-/// 6. Spawn sequencer, withdraw both tokens.
-/// 7. Verify L1 withdrawals and L2 balance decreases.
+/// Multi-asset deposit + withdrawal with two freshly created TIP-20 tokens,
+/// auto-initialized on L2 via `TokenEnabled` events:
 ///
 /// ```text
 ///  L1 (AlphaUSD + BetaUSD)            Zone L2
@@ -27,15 +22,12 @@ const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///   |<-- withdraw BetaUSD ------------|  ✓ BetaUSD burned
 /// ```
 ///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime artifacts.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
 
-    // --- Step 2: Create two TIP-20 tokens on L1 ---
     let alpha_salt = B256::with_last_byte(100);
     let beta_salt = B256::with_last_byte(101);
 
@@ -48,11 +40,9 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
     l1.mint_tip20(l1_beta, l1.dev_address(), mint_amount)
         .await?;
 
-    // --- Step 3: Deploy zone and start zone node ---
     let portal_address = l1.deploy_zone().await?;
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
 
-    // --- Step 4: Enable both tokens on the portal ---
     // Must happen AFTER zone startup so the zone's L1 subscriber picks up the
     // TokenEnabled events from live blocks.
     l1.enable_token_on_portal(portal_address, l1_alpha).await?;
@@ -67,7 +57,6 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
     let l2_alpha = l1_alpha;
     let l2_beta = l1_beta;
 
-    // --- Step 5: Alice deposits both tokens ---
     let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let alpha_deposit: u128 = 1_000_000; // 1 AlphaUSD
     let beta_deposit: u128 = 2_000_000; // 2 BetaUSD
@@ -102,7 +91,6 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
         "BetaUSD minted should equal deposit"
     );
 
-    // --- Step 6: Spawn zone sequencer (batch submitter + withdrawal processor) ---
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
     let withdrawal_timeout = std::time::Duration::from_secs(60);
 
@@ -132,7 +120,6 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
     )
     .await?;
 
-    // --- Step 7: Verify L2 balances decreased ---
     let final_alpha = zone.balance_of(l2_alpha, account.address()).await?;
     assert!(
         final_alpha <= U256::from(alpha_deposit - alpha_withdrawal),

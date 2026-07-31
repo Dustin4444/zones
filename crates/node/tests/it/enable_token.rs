@@ -1,5 +1,7 @@
 //! E2e tests for native TIP-20 token initialization via `TokenEnabled` events.
 //!
+//! Requires `forge build --root specs/ref-impls` for the Foundry artifacts (real-L1 test).
+//!
 //! These tests verify that new tokens can be enabled on L2 by injecting
 //! `TokenEnabled` events from L1, and that deposits of the newly-enabled
 //! tokens are correctly minted.
@@ -205,58 +207,32 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
 /// 500ms and the L1Subscriber needs to connect, backfill, and subscribe.
 const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Full TokenEnabled pipeline with a real in-process L1 node:
+/// Full TokenEnabled pipeline with a real in-process L1 node: a freshly
+/// created TIP-20 is enabled on the portal, deposited, and withdrawn again.
 ///
-///  1. Start L1 dev node.
-///  2. Create a second TIP-20 token ("AlphaUSD" / "aUSD") on L1.
-///  3. Mint AlphaUSD to the dev account.
-///  4. Create a zone through the native ZoneFactory.
-///  5. Start zone node connected to L1.
-///  6. Enable AlphaUSD on the portal (emits `TokenEnabled` event) — must
-///     happen AFTER zone startup so the live L1 subscriber picks it up
-///     (events in blocks ≤ genesis are not backfilled).
-///  7. Wait for the zone to finalize past the `enableToken` L1 block.
-///  8. Fund user with pathUSD (for L2 gas) and AlphaUSD on L1.
-///  9. Deposit pathUSD first (for L2 gas), then deposit AlphaUSD.
-/// 10. Verify AlphaUSD balance on L2.
-/// 11. Spawn sequencer, withdraw AlphaUSD back to L1.
-/// 12. Wait for the withdrawal to be processed on L1.
-///
-/// ```text
-///  L1 (TokenEnabled + deposit)          Zone L2
-///    |--- enableToken("AlphaUSD") ---->|  ✓ token initialized via builder
-///    |--- deposit pathUSD ------------>|  ✓ pathUSD minted (gas)
-///    |--- deposit AlphaUSD ----------->|  ✓ AlphaUSD minted
-///    |<-- withdraw AlphaUSD -----------|  ✓ AlphaUSD burned
-/// ```
-///
-/// NOTE: Requires `forge build` in `specs/ref-impls/` for shared runtime artifacts.
+/// The token must be enabled AFTER zone startup so the live L1 subscriber
+/// picks up the `TokenEnabled` event (events in blocks ≤ genesis are not
+/// backfilled).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    // --- Step 1: Start L1 ---
     let l1 = L1TestNode::start().await?;
 
-    // --- Step 2: Create AlphaUSD on L1 ---
     let alpha_salt = B256::new([
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 99,
     ]);
     let l1_alpha_usd = l1.create_tip20("AlphaUSD", "aUSD", alpha_salt).await?;
 
-    // --- Step 3: Mint AlphaUSD to the dev account ---
     let mint_amount: u128 = 100_000_000; // 100 AlphaUSD (6 decimals)
     l1.mint_tip20(l1_alpha_usd, l1.dev_address(), mint_amount)
         .await?;
 
-    // --- Step 4: Deploy L1 infrastructure and create a zone ---
     let portal_address = l1.deploy_zone().await?;
 
-    // --- Step 5: Start zone node connected to L1 ---
     let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
 
-    // --- Step 6: Enable AlphaUSD on the portal ---
     // Must happen AFTER zone startup so the zone's L1 subscriber picks up the
     // TokenEnabled event from a live block (events in blocks <= genesis are not
     // backfilled).
@@ -264,11 +240,9 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
         .await?;
     let enable_block = l1.provider().get_block_number().await?;
 
-    // --- Step 7: Wait for the zone to finalize past the enableToken block ---
     zone.wait_for_l2_tempo_finalized(enable_block, L1_TIMEOUT)
         .await?;
 
-    // --- Step 8: Fund user account on L1 ---
     let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
     let pathusd_gas_amount: u128 = 5_000_000; // 5 pathUSD for L2 gas
     let alpha_deposit_amount: u128 = 2_000_000; // 2 AlphaUSD
@@ -278,7 +252,6 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
     l1.fund_user_token(l1_alpha_usd, account.address(), alpha_deposit_amount * 2)
         .await?;
 
-    // --- Step 9: Deposit pathUSD (gas) then AlphaUSD ---
     account
         .deposit(pathusd_gas_amount, L1_TIMEOUT, &zone)
         .await?;
@@ -297,14 +270,12 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
         )
         .await?;
 
-    // --- Step 10: Verify AlphaUSD balance on L2 ---
     assert_eq!(
         alpha_minted,
         U256::from(alpha_deposit_amount),
         "AlphaUSD minted balance should equal deposit amount"
     );
 
-    // --- Step 11: Spawn sequencer and withdraw AlphaUSD ---
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
     let withdrawal_timeout = std::time::Duration::from_secs(60);
 
@@ -313,7 +284,6 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
         .withdraw_token(l2_alpha_usd, alpha_withdrawal)
         .await?;
 
-    // --- Step 12: Wait for the withdrawal to be processed on L1 ---
     l1.wait_for_withdrawal_on_l1_token(
         portal_address,
         l1_alpha_usd,
