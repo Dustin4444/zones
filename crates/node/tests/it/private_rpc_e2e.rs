@@ -8,8 +8,8 @@
 //! - Method tier enforcement (restricted/disabled/unknown methods)
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, now_secs, start_zone_with_private_rpc,
-    start_zone_with_private_rpc_l1, start_zone_with_private_rpc_l1_with_encryption,
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, build_auth_token, now_secs,
+    start_zone_with_private_rpc, start_zone_with_private_rpc_l1,
 };
 use alloy::{
     primitives::{Address, B256, TxKind, U256, address, hex},
@@ -269,7 +269,7 @@ async fn test_auth_rejection() -> eyre::Result<()> {
     );
 
     // Valid signature but wrong chain ID → 403
-    let bad_token = ctx.build_bad_token(&ctx.sequencer_signer, 1, ctx.config.chain_id + 1);
+    let bad_token = build_auth_token(&ctx.sequencer_signer, 1, ctx.config.chain_id + 1);
     let (status, _) = ctx
         .call_raw("eth_blockNumber", serde_json::json!([]), &bad_token)
         .await?;
@@ -1370,7 +1370,7 @@ fn encryption_public_key(secret_key: &k256::SecretKey) -> (String, u8) {
 async fn test_zone_get_encryption_key_reads_latest_l1_key() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc_l1_with_encryption().await?;
+    let ctx = start_zone_with_private_rpc_l1().await?;
     let portal_address = ctx.portal_address();
     let caller = ctx.l1().user_signer();
 

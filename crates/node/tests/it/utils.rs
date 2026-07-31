@@ -67,8 +67,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{
-    Deposit, DepositQueue, EnabledToken, EncryptedDeposit, L1BlockTracker, L1Deposit,
-    L1PortalEvents, L1StateCache, state::EnabledTokenRegistry,
+    Deposit, DepositQueue, EnabledToken, L1BlockTracker, L1Deposit, L1PortalEvents, L1StateCache,
+    state::EnabledTokenRegistry,
 };
 use zone_node::{ZoneNode, ZoneSequencerAddOnsConfig};
 use zone_p2p::{LeadershipSchedule, LeadershipState, P2pConfig, P2pPeerId, Role};
@@ -3438,14 +3438,14 @@ impl P2pCluster {
     }
 }
 
+/// Returns a free localhost address to bind a P2P listener on.
+fn available_address() -> eyre::Result<SocketAddr> {
+    Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
+}
+
 /// Start a three-node multi-sequencer cluster with identical genesis state and authenticated
 /// P2P identities. Node 0 bootstraps as the leader.
 pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2pCluster> {
-    fn available_address() -> eyre::Result<SocketAddr> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        Ok(listener.local_addr()?)
-    }
-
     let addresses = [
         available_address()?,
         available_address()?,
@@ -3554,10 +3554,6 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
 }
 
 pub(crate) fn leader_p2p_config(listen: SocketAddr) -> eyre::Result<P2pConfig> {
-    fn available_address() -> eyre::Result<SocketAddr> {
-        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
-    }
-
     let identities = [
         Ed25519PrivateKey::from_seed(201),
         Ed25519PrivateKey::from_seed(202),
@@ -3636,7 +3632,7 @@ pub(crate) fn seed_fixture_for_zone(fixture: &L1Fixture, zone: &ZoneTestNode, se
 ///
 /// Signs the token with the given signer and returns the hex string (no `0x` prefix)
 /// suitable for the `X-Authorization-Token` header.
-fn build_auth_token(
+pub(crate) fn build_auth_token(
     signer: &alloy_signer_local::PrivateKeySigner,
     zone_id: u32,
     chain_id: u64,
@@ -3954,16 +3950,6 @@ impl PrivateRpcTestCtx {
         private_rpc_call_no_auth(&self.private_rpc_url, method, params).await
     }
 
-    /// Build an auth token with custom zone_id and chain_id (for negative testing).
-    pub(crate) fn build_bad_token(
-        &self,
-        signer: &alloy_signer_local::PrivateKeySigner,
-        zone_id: u32,
-        chain_id: u64,
-    ) -> String {
-        build_auth_token(signer, zone_id, chain_id)
-    }
-
     /// Inject an empty L1 block and wait for it to be processed.
     pub(crate) async fn inject_empty_block(&mut self) -> eyre::Result<()> {
         let dq = self.zone.deposit_queue().clone();
@@ -4168,15 +4154,9 @@ pub(crate) async fn start_zone_with_private_rpc() -> eyre::Result<PrivateRpcTest
     ))
 }
 
-/// Start a zone with a private RPC server backed by a real L1 + ZonePortal.
-pub(crate) async fn start_zone_with_private_rpc_l1() -> eyre::Result<PrivateRpcL1TestCtx> {
-    start_zone_with_private_rpc_l1_inner().await
-}
-
 /// Start a zone with a private RPC server backed by a real L1 and a portal
-/// with a registered encryption key.
-pub(crate) async fn start_zone_with_private_rpc_l1_with_encryption()
--> eyre::Result<PrivateRpcL1TestCtx> {
+/// with a registered sequencer encryption key.
+pub(crate) async fn start_zone_with_private_rpc_l1() -> eyre::Result<PrivateRpcL1TestCtx> {
     start_zone_with_private_rpc_l1_inner().await
 }
 
@@ -4565,37 +4545,6 @@ impl L1Fixture {
         anchor
     }
 
-    /// Inject an L1 block with mixed regular and encrypted deposits.
-    #[allow(dead_code)]
-    pub(crate) fn inject_l1_deposits(&mut self, queue: &DepositQueue, deposits: Vec<L1Deposit>) {
-        let header = self.next_header();
-        let events = L1PortalEvents::from_deposits(deposits);
-        queue.enqueue(header, events);
-    }
-
-    /// Create an [`EncryptedDeposit`] for testing with dummy ECIES parameters.
-    #[allow(dead_code)]
-    pub(crate) fn make_encrypted_deposit(
-        &self,
-        token: Address,
-        sender: Address,
-        amount: u128,
-    ) -> EncryptedDeposit {
-        EncryptedDeposit {
-            token,
-            sender,
-            amount,
-            fee: 0,
-            tempo_refund_recipient: sender,
-            key_index: alloy_primitives::U256::ZERO,
-            ephemeral_pubkey_x: B256::ZERO,
-            ephemeral_pubkey_y_parity: 0x02,
-            ciphertext: vec![0u8; 64], // ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE = 64
-            nonce: [0u8; 12],
-            tag: [0u8; 16],
-        }
-    }
-
     /// Create a [`Deposit`] for testing.
     pub(crate) fn make_deposit(
         &self,
@@ -4612,68 +4561,6 @@ impl L1Fixture {
             fee: 0,
             tempo_refund_recipient: sender,
             memo: B256::ZERO,
-        }
-    }
-
-    /// Create an [`EncryptedDeposit`] with proper ECIES encryption against the
-    /// sequencer's real public key.
-    ///
-    /// Uses a deterministic ephemeral key for reproducibility.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
-    pub(crate) fn make_real_encrypted_deposit(
-        &self,
-        sequencer_pub: &k256::AffinePoint,
-        portal_address: Address,
-        key_index: alloy_primitives::U256,
-        token: Address,
-        sender: Address,
-        recipient: Address,
-        amount: u128,
-        memo: B256,
-    ) -> EncryptedDeposit {
-        use k256::{ProjectivePoint, Scalar, elliptic_curve::sec1::ToEncodedPoint};
-        use sha2::{Digest, Sha256};
-        use zone_precompiles::ecies::{
-            build_plaintext, compressed_x_and_parity, encrypt_plaintext, hkdf_sha256,
-        };
-
-        // Deterministic ephemeral key for reproducibility
-        let eph_bytes: [u8; 32] = Sha256::digest(b"test-ephemeral-key-for-e2e").into();
-        let eph_key = k256::SecretKey::from_slice(&eph_bytes).expect("valid ephemeral key");
-        let eph_scalar: Scalar = *eph_key.to_nonzero_scalar();
-        let eph_pub = k256::AffinePoint::from(ProjectivePoint::GENERATOR * eph_scalar);
-        let (eph_pub_x, eph_pub_y_parity) = compressed_x_and_parity(&eph_pub);
-
-        // ECDH: shared = eph_scalar * sequencer_pub
-        let shared_proj = ProjectivePoint::from(*sequencer_pub) * eph_scalar;
-        let shared_affine = k256::AffinePoint::from(shared_proj);
-        let ss_enc = shared_affine.to_encoded_point(true);
-        let shared_secret_x: [u8; 32] = ss_enc.x().unwrap().as_slice().try_into().unwrap();
-
-        // HKDF-SHA256 key derivation (matching ecies.rs)
-        let mut info = Vec::with_capacity(84);
-        info.extend_from_slice(portal_address.as_slice());
-        info.extend_from_slice(&key_index.to_be_bytes::<32>());
-        info.extend_from_slice(&eph_pub_x.0);
-        let aes_key = hkdf_sha256(&shared_secret_x, b"ecies-aes-key", &info);
-
-        // Build and encrypt plaintext (deterministic zero nonce)
-        let plaintext = build_plaintext(&recipient, &memo);
-        let (ciphertext, nonce, tag) = encrypt_plaintext(&aes_key, &plaintext);
-
-        EncryptedDeposit {
-            token,
-            sender,
-            amount,
-            fee: 0,
-            tempo_refund_recipient: sender,
-            key_index,
-            ephemeral_pubkey_x: eph_pub_x,
-            ephemeral_pubkey_y_parity: eph_pub_y_parity,
-            ciphertext,
-            nonce,
-            tag,
         }
     }
 }
