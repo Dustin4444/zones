@@ -20,7 +20,7 @@ use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS};
 
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, approve_outbox,
-    local_dev_zone_account, start_local_zone_with_fixture,
+    local_dev_zone_account, start_local_zone_with_fixture, submit_withdrawal,
 };
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
@@ -154,27 +154,14 @@ async fn test_deposit_then_request_withdrawal() -> eyre::Result<()> {
         "outbox should start with zero token balance"
     );
 
-    let withdrawal_pending = outbox
-        .requestWithdrawal(
-            PATH_USD_ADDRESS,
-            dev_address,
-            withdrawal_amount,
-            B256::ZERO,
-            0,
-            dev_address,
-            alloy_primitives::Bytes::new(),
-            alloy_primitives::Bytes::new(),
-        )
-        .gas_price(TEMPO_T0_BASE_FEE as u128)
-        .gas(WITHDRAWAL_TX_GAS)
-        .send()
-        .await?;
-    fixture.inject_empty_block(zone.deposit_queue());
-    let withdrawal_receipt = withdrawal_pending.get_receipt().await?;
-    assert!(
-        withdrawal_receipt.status(),
-        "withdrawal request should succeed"
-    );
+    submit_withdrawal(
+        &mut fixture,
+        &zone,
+        &provider,
+        dev_address,
+        withdrawal_amount,
+    )
+    .await?;
 
     let balance_after = zone.balance_of(PATH_USD_ADDRESS, dev_address).await?;
     assert!(

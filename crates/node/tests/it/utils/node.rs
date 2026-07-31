@@ -326,7 +326,6 @@ impl ZoneTestNode {
     }
 
     /// Wait until the ZoneOutbox's `withdrawalBatchIndex` equals `expected`.
-    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
     pub(crate) async fn wait_for_withdrawal_batch_index(
         &self,
         expected: u64,
@@ -351,7 +350,6 @@ impl ZoneTestNode {
 
     /// Fetch the transaction that emitted `log` and decode its calldata as a
     /// `finalizeWithdrawalBatch` call.
-    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
     pub(crate) async fn decode_finalize_batch_call(
         &self,
         log: &alloy_rpc_types_eth::Log,

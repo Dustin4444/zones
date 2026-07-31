@@ -326,7 +326,6 @@ impl ZoneAccount {
     ///
     /// Negative-path tests use this when the deposit is expected to bounce
     /// (or revert — the revert surfaces as this method's error).
-    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
     pub(crate) async fn deposit_raw(
         &mut self,
         token: Address,

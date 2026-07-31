@@ -1333,7 +1333,6 @@ impl L1TestNode {
     /// blacklist `account` on it. Returns the policy ID.
     ///
     /// This is the standard preamble for policy-bounce tests.
-    #[allow(dead_code)] // adopted by the e2e suites in a follow-up
     pub(crate) async fn blacklist_on_token(
         &self,
         token: Address,

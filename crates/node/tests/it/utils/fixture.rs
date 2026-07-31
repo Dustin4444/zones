@@ -1,10 +1,13 @@
 //! Synthetic L1 fixture for deposit-queue injection tests.
 
 use super::*;
+use alloy_provider::{DynProvider, Provider};
+use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_zone_contracts::IZoneOutbox;
 
 use alloy_consensus::Header;
 use alloy_eips::NumHash;
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Encodable;
 use alloy_sol_types::SolValue;
 use reth_primitives_traits::SealedHeader;
@@ -418,4 +421,81 @@ impl L1Fixture {
             memo: B256::ZERO,
         }
     }
+}
+
+/// Submit `requestWithdrawal` transactions from `dev_address` for each amount,
+/// inject one empty L1 block to include them, and return the zone block that
+/// contains them (asserting they all landed in the same block).
+pub(crate) async fn submit_withdrawal(
+    fixture: &mut L1Fixture,
+    zone: &ZoneTestNode,
+    provider: &DynProvider,
+    dev_address: Address,
+    amount: u128,
+) -> eyre::Result<u64> {
+    submit_withdrawals(fixture, zone, provider, dev_address, &[amount]).await
+}
+
+pub(crate) async fn submit_withdrawals(
+    fixture: &mut L1Fixture,
+    zone: &ZoneTestNode,
+    provider: &DynProvider,
+    dev_address: Address,
+    amounts: &[u128],
+) -> eyre::Result<u64> {
+    eyre::ensure!(
+        !amounts.is_empty(),
+        "at least one withdrawal amount is required"
+    );
+
+    let outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, provider.clone());
+    let nonce = provider
+        .get_transaction_count(dev_address)
+        .pending()
+        .await?;
+    let mut pending = Vec::with_capacity(amounts.len());
+    for (offset, amount) in amounts.iter().copied().enumerate() {
+        pending.push(
+            outbox
+                .requestWithdrawal(
+                    PATH_USD_ADDRESS,
+                    dev_address,
+                    amount,
+                    B256::ZERO,
+                    0,
+                    dev_address,
+                    Bytes::new(),
+                    Bytes::new(),
+                )
+                .nonce(nonce + offset as u64)
+                .gas_price(TEMPO_T0_BASE_FEE as u128)
+                .gas(WITHDRAWAL_TX_GAS)
+                .send()
+                .await?,
+        );
+    }
+
+    fixture.inject_empty_block(zone.deposit_queue());
+    let mut withdrawal_block = None;
+    for pending_tx in pending {
+        let receipt = pending_tx.get_receipt().await?;
+        assert!(
+            receipt.status(),
+            "withdrawal should succeed (gas used: {})",
+            receipt.gas_used
+        );
+        let block_number = receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("withdrawal receipt missing block number"))?;
+        if let Some(expected) = withdrawal_block {
+            eyre::ensure!(
+                block_number == expected,
+                "withdrawals were included in different blocks: {expected} and {block_number}"
+            );
+        } else {
+            withdrawal_block = Some(block_number);
+        }
+    }
+
+    withdrawal_block.ok_or_else(|| eyre::eyre!("withdrawal block missing"))
 }
