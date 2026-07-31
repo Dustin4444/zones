@@ -103,7 +103,6 @@ pub(crate) fn expect_result<'a>(
 
 /// Extract `error.code` from a JSON-RPC response, panicking with the full
 /// response body when the response is not an error.
-#[allow(dead_code)] // adopted by private_rpc_e2e in a follow-up
 #[track_caller]
 pub(crate) fn expect_error_code(resp: &serde_json::Value, context: &str) -> i64 {
     resp.pointer("/error/code")

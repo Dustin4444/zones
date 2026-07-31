@@ -78,6 +78,9 @@ alloy_sol_types::sol! {
         ExcessReturnFee excess;
     }
 
+    // Mirrors `tempo_zone_contracts::EncryptedDepositPayload`; sol! cannot
+    // reference externally generated types in struct fields, so the layout is
+    // redeclared here and converted by `map_encrypted_payload`.
     struct EarnEncryptedDepositPayload {
         bytes32 ephemeralPubkeyX;
         uint8 ephemeralPubkeyYParity;
@@ -721,7 +724,6 @@ impl EarnZoneFixture {
     async fn callback_data(
         &self,
         flow: EarnFlow,
-        _output_token: Address,
         recipient: Address,
         refund_recipient: Address,
         limits: EarnLimits,
@@ -896,13 +898,7 @@ impl EarnZoneFixture {
         let portal_before = self.l1.balance_of(self.earn_share, self.portal).await?;
         let limits = self.deposit_limits(input_token, AMOUNT).await?;
         let data = self
-            .callback_data(
-                EarnFlow::Deposit,
-                self.earn_share,
-                recipient,
-                self.user.address(),
-                limits,
-            )
+            .callback_data(EarnFlow::Deposit, recipient, self.user.address(), limits)
             .await?;
         self.user
             .withdraw_token_with(
@@ -966,13 +962,7 @@ impl EarnZoneFixture {
         limits: EarnLimits,
     ) -> eyre::Result<()> {
         let data = self
-            .callback_data(
-                EarnFlow::Deposit,
-                self.earn_share,
-                recipient,
-                self.user.address(),
-                limits,
-            )
+            .callback_data(EarnFlow::Deposit, recipient, self.user.address(), limits)
             .await?;
         self.zone_deposit_with_data_expect_callback_bounce(input_token, recipient, data)
             .await
@@ -1092,7 +1082,6 @@ impl EarnZoneFixture {
         let data = self
             .callback_data(
                 EarnFlow::Deposit,
-                self.earn_share,
                 recipient,
                 self.user.address(),
                 EarnLimits::default(),
@@ -1193,13 +1182,7 @@ impl EarnZoneFixture {
         let portal_before = self.l1.balance_of(output_token, self.portal).await?;
         let limits = self.redeem_limits(shares, output_token).await?;
         let data = self
-            .callback_data(
-                EarnFlow::Redeem,
-                output_token,
-                recipient,
-                account.address(),
-                limits,
-            )
+            .callback_data(EarnFlow::Redeem, recipient, account.address(), limits)
             .await?;
         account
             .withdraw_token_with(
@@ -1403,14 +1386,30 @@ impl EarnZoneFixture {
             .call()
             .await?;
 
-        assert_eq!(venue_after - user_venue_after, venue_shares);
-        assert_eq!(engine_venue_after - engine_venue_before, venue_shares);
+        assert_eq!(
+            venue_after - user_venue_after,
+            venue_shares,
+            "migrated venue shares should leave the user's venue balance"
+        );
+        assert_eq!(
+            engine_venue_after - engine_venue_before,
+            venue_shares,
+            "engine venue balance should grow by the migrated shares"
+        );
         assert_eq!(
             public_after, public_before,
             "migrated EarnShare remained public"
         );
-        assert_eq!(supply_after - supply_before, earn_shares);
-        assert_eq!(private_after - private_before, earn_shares);
+        assert_eq!(
+            supply_after - supply_before,
+            earn_shares,
+            "EarnShare supply should grow by the minted shares"
+        );
+        assert_eq!(
+            private_after - private_before,
+            earn_shares,
+            "the user's private EarnShare balance should grow by the minted shares"
+        );
 
         Ok(earn_shares_u128)
     }
@@ -1858,11 +1857,15 @@ async fn matrix_redeem_public_public_succeeds() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The retired public-to-private router surfaces (`depositToZone` and
+/// `redeemToZone`) are no longer callable.
 #[tokio::test(flavor = "multi_thread")]
-async fn matrix_deposit_public_private_rejects_retired_router_surface() -> eyre::Result<()> {
+async fn matrix_public_private_retired_router_surfaces_reject() -> eyre::Result<()> {
     let fixture = EarnZoneFixture::start().await?;
     let user = fixture.user.address();
-    let result = LegacyUniversalEarnRouter::new(fixture.router, fixture.user.l1_provider())
+    let router = LegacyUniversalEarnRouter::new(fixture.router, fixture.user.l1_provider());
+
+    let result = router
         .depositToZone(
             fixture.earn_vault,
             U256::from(AMOUNT),
@@ -1875,14 +1878,8 @@ async fn matrix_deposit_public_private_rejects_retired_router_surface() -> eyre:
         result.is_err(),
         "retired public-to-private deposit surface remained callable"
     );
-    Ok(())
-}
 
-#[tokio::test(flavor = "multi_thread")]
-async fn matrix_redeem_public_private_rejects_retired_router_surface() -> eyre::Result<()> {
-    let fixture = EarnZoneFixture::start().await?;
-    let user = fixture.user.address();
-    let result = LegacyUniversalEarnRouter::new(fixture.router, fixture.user.l1_provider())
+    let result = router
         .redeemToZone(
             fixture.earn_vault,
             U256::from(AMOUNT),

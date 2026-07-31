@@ -8,7 +8,7 @@
 //! - Method tier enforcement (restricted/disabled/unknown methods)
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, build_auth_token, now_secs,
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, build_auth_token, expect_error_code, now_secs,
     start_zone_with_private_rpc, start_zone_with_private_rpc_l1,
 };
 use alloy::{
@@ -103,18 +103,15 @@ fn signed_sponsored_raw_transaction(
 }
 
 fn assert_filter_not_found_error(response: &serde_json::Value) {
-    let error = response
-        .get("error")
-        .unwrap_or_else(|| panic!("expected filter-not-found error, got {response}"));
     assert_eq!(
-        error["code"].as_i64().unwrap(),
+        expect_error_code(response, "filter-not-found"),
         -32602,
-        "filter-not-found should surface as invalid params",
+        "filter-not-found should surface as invalid params: {response}",
     );
     assert_eq!(
-        error["message"].as_str().unwrap(),
-        "filter not found",
-        "filter-not-found message should be stable",
+        response["error"]["message"].as_str(),
+        Some("filter not found"),
+        "filter-not-found message should be stable: {response}",
     );
 }
 
@@ -246,34 +243,52 @@ async fn ws_collect_messages_until_quiet(
     }
 }
 
-/// Auth enforcement: missing header → 401, garbage token → 401/403, wrong chain ID → 403.
+/// Auth-token acceptance and rejection over HTTP: valid P256 and WebAuthn
+/// tokens authenticate, while missing, garbage, wrong-chain-ID, corrupted
+/// P256, and wrong-challenge WebAuthn tokens are refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_auth_rejection() -> eyre::Result<()> {
+async fn test_auth_token_acceptance_and_rejection() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let ctx = start_zone_with_private_rpc().await?;
+    let p256_signer = P256SigningKey::random(&mut thread_rng());
+    let webauthn_signer = P256SigningKey::random(&mut thread_rng());
 
-    // No auth header → 401
+    for (label, token) in [
+        ("p256", ctx.p256_token(&p256_signer)),
+        ("webauthn", ctx.webauthn_token(&webauthn_signer)),
+    ] {
+        let resp = ctx
+            .call("eth_blockNumber", serde_json::json!([]), &token)
+            .await?;
+        assert!(
+            resp.get("error").is_none() && resp["result"].as_str().is_some(),
+            "{label} token should authenticate: {resp}"
+        );
+    }
+
     let (status, _) = ctx
         .call_no_auth("eth_blockNumber", serde_json::json!([]))
         .await?;
     assert_eq!(status.as_u16(), 401, "missing auth should return 401");
 
-    // Garbage token → 401 or 403
-    let (status, _) = ctx
-        .call_raw("eth_blockNumber", serde_json::json!([]), "deadbeef")
-        .await?;
-    assert!(
-        status.as_u16() == 401 || status.as_u16() == 403,
-        "invalid auth should return 401 or 403, got {status}"
-    );
-
-    // Valid signature but wrong chain ID → 403
-    let bad_token = build_auth_token(&ctx.sequencer_signer, 1, ctx.config.chain_id + 1);
-    let (status, _) = ctx
-        .call_raw("eth_blockNumber", serde_json::json!([]), &bad_token)
-        .await?;
-    assert_eq!(status.as_u16(), 403, "wrong chain ID should return 403");
+    let wrong_chain_id = build_auth_token(&ctx.sequencer_signer, 1, ctx.config.chain_id + 1);
+    let bad_p256 = corrupt_token_hex(&ctx.p256_token(&p256_signer));
+    let bad_webauthn = ctx.webauthn_token_with_challenge(&webauthn_signer, B256::repeat_byte(0x77));
+    for (label, token, expected) in [
+        ("garbage token", "deadbeef".to_string(), &[401u16, 403][..]),
+        ("wrong chain ID", wrong_chain_id, &[403]),
+        ("corrupted p256", bad_p256, &[403]),
+        ("webauthn wrong challenge", bad_webauthn, &[403]),
+    ] {
+        let (status, _) = ctx
+            .call_raw("eth_blockNumber", serde_json::json!([]), &token)
+            .await?;
+        assert!(
+            expected.contains(&status.as_u16()),
+            "{label}: expected one of {expected:?}, got {status}"
+        );
+    }
 
     Ok(())
 }
@@ -323,63 +338,6 @@ async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Res
     assert!(
         response["result"].as_str().is_some(),
         "funded sender transaction should be accepted: {response}",
-    );
-
-    Ok(())
-}
-
-/// Real P256 and WebAuthn auth tokens are accepted by the private RPC.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let ctx = start_zone_with_private_rpc().await?;
-    let p256_signer = P256SigningKey::random(&mut thread_rng());
-    let webauthn_signer = P256SigningKey::random(&mut thread_rng());
-
-    for token in [
-        ctx.p256_token(&p256_signer),
-        ctx.webauthn_token(&webauthn_signer),
-    ] {
-        let resp = ctx
-            .call("eth_blockNumber", serde_json::json!([]), &token)
-            .await?;
-        assert!(
-            resp.get("error").is_none(),
-            "auth token should succeed: {resp}"
-        );
-        assert!(
-            resp["result"].as_str().is_some(),
-            "expected block number result"
-        );
-    }
-
-    Ok(())
-}
-
-/// Invalid P256 signatures and WebAuthn challenge mismatches are rejected.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let ctx = start_zone_with_private_rpc().await?;
-    let p256_signer = P256SigningKey::random(&mut thread_rng());
-    let webauthn_signer = P256SigningKey::random(&mut thread_rng());
-
-    let bad_p256 = corrupt_token_hex(&ctx.p256_token(&p256_signer));
-    let (status, _) = ctx
-        .call_raw("eth_blockNumber", serde_json::json!([]), &bad_p256)
-        .await?;
-    assert_eq!(status.as_u16(), 403, "invalid P256 token should return 403");
-
-    let bad_webauthn = ctx.webauthn_token_with_challenge(&webauthn_signer, B256::repeat_byte(0x77));
-    let (status, _) = ctx
-        .call_raw("eth_blockNumber", serde_json::json!([]), &bad_webauthn)
-        .await?;
-    assert_eq!(
-        status.as_u16(),
-        403,
-        "WebAuthn token with wrong challenge should return 403",
     );
 
     Ok(())
@@ -499,6 +457,8 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
         now_secs() + 1,
     )
     .await?;
+    // The key's expiry is on-chain state compared against wall-clock time by
+    // the precompile, so the test genuinely has to outwait it.
     sleep(std::time::Duration::from_secs(2)).await;
     let (status, _) = ctx
         .call_raw("eth_blockNumber", serde_json::json!([]), &expired_token)
@@ -531,45 +491,6 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
         403,
         "signature-type mismatch should return 403",
     );
-
-    Ok(())
-}
-
-/// Public methods work for both sequencer and users without leaking private fee activity.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_public_methods() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let ctx = start_zone_with_private_rpc().await?;
-    let user_signer = PrivateKeySigner::random();
-
-    for method in ["eth_blockNumber", "eth_chainId"] {
-        let seq_resp = ctx.call_as_sequencer(method, serde_json::json!([])).await?;
-        assert!(
-            seq_resp.get("result").is_some() && seq_resp.get("error").is_none(),
-            "sequencer should succeed for {method}"
-        );
-
-        let user_resp = ctx
-            .call_as_user(method, serde_json::json!([]), &user_signer)
-            .await?;
-        assert!(
-            user_resp.get("result").is_some() && user_resp.get("error").is_none(),
-            "user should succeed for {method}"
-        );
-    }
-
-    for (method, expected) in [
-        ("eth_gasPrice", U256::from(TEMPO_T1_BASE_FEE)),
-        ("eth_maxPriorityFeePerGas", U256::ZERO),
-    ] {
-        for response in [
-            ctx.call_as_sequencer(method, json!([])).await?,
-            ctx.call_as_user(method, json!([]), &user_signer).await?,
-        ] {
-            assert_eq!(response["result"], json!(format!("{expected:#x}")));
-        }
-    }
 
     Ok(())
 }
@@ -1045,13 +966,42 @@ async fn test_block_access_control() -> eyre::Result<()> {
 }
 
 /// Method tier enforcement: restricted → -32005 for all callers,
-/// disabled → -32006 for everyone, unknown → -32601.
+/// disabled → -32006 for everyone, unknown → -32601, and public methods
+/// succeed for both callers without leaking private fee activity.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_method_tiers() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let ctx = start_zone_with_private_rpc().await?;
     let user_signer = PrivateKeySigner::random();
+
+    for method in ["eth_blockNumber", "eth_chainId"] {
+        let seq_resp = ctx.call_as_sequencer(method, serde_json::json!([])).await?;
+        assert!(
+            seq_resp.get("result").is_some() && seq_resp.get("error").is_none(),
+            "sequencer should succeed for {method}"
+        );
+
+        let user_resp = ctx
+            .call_as_user(method, serde_json::json!([]), &user_signer)
+            .await?;
+        assert!(
+            user_resp.get("result").is_some() && user_resp.get("error").is_none(),
+            "user should succeed for {method}"
+        );
+    }
+
+    for (method, expected) in [
+        ("eth_gasPrice", U256::from(TEMPO_T1_BASE_FEE)),
+        ("eth_maxPriorityFeePerGas", U256::ZERO),
+    ] {
+        for response in [
+            ctx.call_as_sequencer(method, json!([])).await?,
+            ctx.call_as_user(method, json!([]), &user_signer).await?,
+        ] {
+            assert_eq!(response["result"], json!(format!("{expected:#x}")));
+        }
+    }
 
     // Restricted methods → -32005 for all callers
     for method in [
@@ -1064,11 +1014,8 @@ async fn test_method_tiers() -> eyre::Result<()> {
         let resp = ctx
             .call_as_user(method, serde_json::json!([]), &user_signer)
             .await?;
-        let error = resp
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} should return error"));
         assert_eq!(
-            error["code"].as_i64().unwrap(),
+            expect_error_code(&resp, method),
             -32005,
             "{method} should return -32005"
         );
@@ -1084,11 +1031,8 @@ async fn test_method_tiers() -> eyre::Result<()> {
         let resp = ctx
             .call_as_user(method, serde_json::json!([]), &user_signer)
             .await?;
-        let error = resp
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} should return error"));
         assert_eq!(
-            error["code"].as_i64().unwrap(),
+            expect_error_code(&resp, method),
             -32006,
             "{method} should return -32006 (Method disabled)"
         );
@@ -1102,11 +1046,8 @@ async fn test_method_tiers() -> eyre::Result<()> {
             &user_signer,
         )
         .await?;
-    let error = resp
-        .get("error")
-        .expect("unknown method should return error");
     assert_eq!(
-        error["code"].as_i64().unwrap(),
+        expect_error_code(&resp, "unknown method"),
         -32601,
         "unknown method should return -32601"
     );
@@ -1298,7 +1239,7 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
             .iter()
             .map(|token| token.as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["0x20c0000000000000000000000000000000000000"],
+        vec![format!("{PATH_USD_ADDRESS:#x}")],
     );
     assert_eq!(
         zone_info["result"]["chainId"].as_str().unwrap(),
@@ -1313,26 +1254,15 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
         format!("0x{tempo_block_number:x}"),
     );
 
-    Ok(())
-}
-
-/// `zone_getZoneInfo` returns every token currently enabled on the portal.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_zone_get_zone_info_returns_all_enabled_tokens() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let ctx = start_zone_with_private_rpc_l1().await?;
-    let user_signer = PrivateKeySigner::random();
+    // Newly enabled portal tokens show up in zoneTokens.
     let alpha_salt = B256::with_last_byte(0x44);
     let alpha_token = ctx
         .l1()
         .create_tip20("AlphaUSD", "aUSD", alpha_salt)
         .await?;
-
     ctx.l1()
         .enable_token_on_portal(ctx.portal_address(), alpha_token)
         .await?;
-
     let zone_info = ctx
         .call_as_user("zone_getZoneInfo", serde_json::json!([]), &user_signer)
         .await?;
@@ -1342,7 +1272,6 @@ async fn test_zone_get_zone_info_returns_all_enabled_tokens() -> eyre::Result<()
         .iter()
         .map(|token| token.as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-
     assert_eq!(
         zone_tokens,
         vec![

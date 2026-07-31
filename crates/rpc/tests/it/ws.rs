@@ -57,24 +57,21 @@ impl MockZoneRpcApi {
         );
         Self {
             key_infos: Mutex::new(key_infos),
-            key_lookup_error: None,
-            ws_subscriptions_enabled: false,
+            ..Default::default()
         }
     }
 
     fn with_key_lookup_error(message: &'static str) -> Self {
         Self {
-            key_infos: Mutex::new(HashMap::new()),
             key_lookup_error: Some(message),
-            ws_subscriptions_enabled: false,
+            ..Default::default()
         }
     }
 
     fn with_ws_subscriptions() -> Self {
         Self {
-            key_infos: Mutex::new(HashMap::new()),
-            key_lookup_error: None,
             ws_subscriptions_enabled: true,
+            ..Default::default()
         }
     }
 
@@ -276,20 +273,19 @@ impl TestContext {
     fn build_token_expiring_at(&self, issued_at: u64, expires_at: u64) -> String {
         let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, issued_at, expires_at);
         let sig = self.signer.sign_hash_sync(&digest).expect("signing failed");
-
-        let mut blob = Vec::with_capacity(65 + fields.len());
-        blob.extend_from_slice(&sig.r().to_be_bytes::<32>());
-        blob.extend_from_slice(&sig.s().to_be_bytes::<32>());
-        blob.push(sig.v() as u8);
-        blob.extend_from_slice(&fields);
-
-        alloy_primitives::hex::encode(&blob)
+        auth_tokens::build_secp256k1_token(&sig, &fields)
     }
 
     fn ws_url(&self) -> String {
         format!("ws://{}", self.addr)
     }
 }
+
+/// JSON-RPC error codes asserted by these tests.
+const PARSE_ERROR: i64 = -32700;
+const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+const SUBSCRIPTIONS_DISABLED: i64 = -32006;
 
 /// Build a JSON-RPC request string.
 fn jsonrpc(method: &str, id: u64) -> String {
@@ -300,10 +296,54 @@ fn jsonrpc_with_params(method: &str, params: Value, id: u64) -> String {
     serde_json::json!({"jsonrpc":"2.0","method":method,"params":params,"id":id}).to_string()
 }
 
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Send a JSON-RPC request and return the parsed response.
+async fn request(ws: &mut WsStream, method: &str, params: Value, id: u64) -> Value {
+    ws.send(tungstenite::Message::Text(
+        jsonrpc_with_params(method, params, id).into(),
+    ))
+    .await
+    .expect("ws send failed");
+    parse_response(ws.next().await.expect("ws stream ended").expect("ws error"))
+}
+
+/// Like [`request`], but skips interleaved subscription notifications until
+/// the response with the matching id arrives.
+async fn request_skipping_notifications(
+    ws: &mut WsStream,
+    method: &str,
+    params: Value,
+    id: u64,
+) -> Value {
+    ws.send(tungstenite::Message::Text(
+        jsonrpc_with_params(method, params, id).into(),
+    ))
+    .await
+    .expect("ws send failed");
+    loop {
+        let message = parse_response(ws.next().await.expect("ws stream ended").expect("ws error"));
+        if message["id"] == id {
+            break message;
+        }
+    }
+}
+
+/// Assert the server terminated the socket: a Close frame, a clean stream end,
+/// or an abrupt reset — anything but a successfully delivered frame.
+fn assert_socket_terminated(event: Option<Result<tungstenite::Message, tungstenite::Error>>) {
+    assert!(
+        matches!(
+            event,
+            None | Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_))
+        ),
+        "expected the server to terminate the socket, got {event:?}"
+    );
+}
+
 /// Connect to the WS endpoint using the X-Authorization-Token header.
-async fn connect_with_header(
-    ctx: &TestContext,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+async fn connect_with_header(ctx: &TestContext) -> WsStream {
     let token = ctx.build_token();
     connect_with_token(&ctx.ws_url(), ctx.addr, &token)
         .await
@@ -314,10 +354,7 @@ async fn connect_with_token(
     ws_url: &str,
     addr: std::net::SocketAddr,
     token: &str,
-) -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    tungstenite::Error,
-> {
+) -> Result<WsStream, tungstenite::Error> {
     let req = tungstenite::http::Request::builder()
         .uri(ws_url)
         .header("x-authorization-token", token)
@@ -352,12 +389,7 @@ async fn ws_roundtrip_with_header_auth() {
     let ctx = TestContext::start(MockZoneRpcApi::default()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_blockNumber", 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_blockNumber", json!([]), 1).await;
 
     assert_eq!(resp["id"], 1);
     assert_eq!(resp["result"], "0x42");
@@ -371,12 +403,7 @@ async fn ws_roundtrip_with_query_auth() {
 
     let (mut ws, _) = connect_async(&url).await.expect("ws connect failed");
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_blockNumber", 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_blockNumber", json!([]), 1).await;
 
     assert_eq!(resp["id"], 1);
     assert_eq!(resp["result"], "0x42");
@@ -398,21 +425,7 @@ async fn ws_reject_no_auth() {
 #[tokio::test]
 async fn ws_reject_invalid_token() {
     let ctx = TestContext::start(MockZoneRpcApi::default()).await;
-    let req = tungstenite::http::Request::builder()
-        .uri(ctx.ws_url())
-        .header("x-authorization-token", "deadbeef")
-        .header(
-            "sec-websocket-key",
-            tungstenite::handshake::client::generate_key(),
-        )
-        .header("host", ctx.addr.to_string())
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-
-    let err = connect_async(req)
+    let err = connect_with_token(&ctx.ws_url(), ctx.addr, "deadbeef")
         .await
         .expect_err("should fail with bad token");
     let tungstenite::Error::Http(response) = err else {
@@ -470,7 +483,7 @@ async fn ws_invalid_json() {
         .unwrap();
     let resp = parse_response(ws.next().await.unwrap().unwrap());
 
-    assert_eq!(resp["error"]["code"], -32700);
+    assert_eq!(resp["error"]["code"], PARSE_ERROR);
 }
 
 #[tokio::test]
@@ -478,13 +491,10 @@ async fn ws_unknown_method() {
     let ctx = TestContext::start(MockZoneRpcApi::default()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(jsonrpc("eth_foobar", 1).into()))
-        .await
-        .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_foobar", json!([]), 1).await;
 
     assert_eq!(resp["id"], 1);
-    assert_eq!(resp["error"]["code"], -32601);
+    assert_eq!(resp["error"]["code"], METHOD_NOT_FOUND);
 }
 
 #[tokio::test]
@@ -492,15 +502,10 @@ async fn ws_disabled_subscription_method() {
     let ctx = TestContext::start(MockZoneRpcApi::default()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["newHeads"]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_subscribe", json!(["newHeads"]), 1).await;
 
     assert_eq!(resp["id"], 1);
-    assert_eq!(resp["error"]["code"], -32006);
+    assert_eq!(resp["error"]["code"], SUBSCRIPTIONS_DISABLED);
 }
 
 #[tokio::test]
@@ -508,12 +513,7 @@ async fn ws_subscribe_new_heads_emits_redacted_headers() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["newHeads"]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_subscribe", json!(["newHeads"]), 1).await;
 
     assert_eq!(resp["id"], 1);
     let subscription_id = resp["result"].as_str().expect("subscription id");
@@ -550,12 +550,7 @@ async fn ws_subscribe_logs_emits_notifications() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["logs", {}]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_subscribe", json!(["logs", {}]), 1).await;
 
     assert_eq!(resp["id"], 1);
     let subscription_id = resp["result"].as_str().expect("subscription id");
@@ -582,15 +577,10 @@ async fn ws_subscribe_pending_transactions_is_disabled() {
         (2, json!(["newPendingTransactions", true])),
         (3, json!(["newPendingTransactions", {}])),
     ] {
-        ws.send(tungstenite::Message::Text(
-            jsonrpc_with_params("eth_subscribe", params, id).into(),
-        ))
-        .await
-        .unwrap();
-        let resp = parse_response(ws.next().await.unwrap().unwrap());
+        let resp = request(&mut ws, "eth_subscribe", params, id).await;
 
         assert_eq!(resp["id"], id);
-        assert_eq!(resp["error"]["code"], -32006);
+        assert_eq!(resp["error"]["code"], SUBSCRIPTIONS_DISABLED);
     }
 }
 
@@ -599,25 +589,12 @@ async fn ws_unsubscribe_removes_subscription() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["logs", {}]), 1).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_subscribe", json!(["logs", {}]), 1).await;
     let subscription_id = resp["result"].clone();
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_unsubscribe", json!([subscription_id]), 2).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = loop {
-        let message = parse_response(ws.next().await.unwrap().unwrap());
-        if message["id"] == 2 {
-            break message;
-        }
-    };
+    let resp =
+        request_skipping_notifications(&mut ws, "eth_unsubscribe", json!([subscription_id]), 2)
+            .await;
 
     assert_eq!(resp["id"], 2);
     assert_eq!(resp["result"], true);
@@ -629,14 +606,9 @@ async fn ws_subscribe_rejects_invalid_param_shapes() {
     let mut ws = connect_with_header(&ctx).await;
 
     for (id, params) in [(1, json!(["newHeads", false])), (2, json!(["logs", false]))] {
-        ws.send(tungstenite::Message::Text(
-            jsonrpc_with_params("eth_subscribe", params, id).into(),
-        ))
-        .await
-        .unwrap();
-        let resp = parse_response(ws.next().await.unwrap().unwrap());
+        let resp = request(&mut ws, "eth_subscribe", params, id).await;
         assert_eq!(resp["id"], id);
-        assert_eq!(resp["error"]["code"], -32602);
+        assert_eq!(resp["error"]["code"], INVALID_PARAMS);
     }
 }
 
@@ -646,36 +618,16 @@ async fn ws_subscribe_rejects_too_many_active_subscriptions() {
     let mut ws = connect_with_header(&ctx).await;
 
     for id in 1..=32 {
-        ws.send(tungstenite::Message::Text(
-            jsonrpc_with_params("eth_subscribe", json!(["newHeads"]), id).into(),
-        ))
-        .await
-        .unwrap();
-
-        let resp = loop {
-            let message = parse_response(ws.next().await.unwrap().unwrap());
-            if message["id"] == id {
-                break message;
-            }
-        };
+        let resp =
+            request_skipping_notifications(&mut ws, "eth_subscribe", json!(["newHeads"]), id).await;
 
         assert!(resp["result"].as_str().is_some());
     }
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc_with_params("eth_subscribe", json!(["newHeads"]), 33).into(),
-    ))
-    .await
-    .unwrap();
+    let resp =
+        request_skipping_notifications(&mut ws, "eth_subscribe", json!(["newHeads"]), 33).await;
 
-    let resp = loop {
-        let message = parse_response(ws.next().await.unwrap().unwrap());
-        if message["id"] == 33 {
-            break message;
-        }
-    };
-
-    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["error"]["code"], INVALID_PARAMS);
     assert!(
         resp["error"]["message"]
             .as_str()
@@ -694,7 +646,7 @@ async fn ws_empty_batch() {
         .unwrap();
     let resp = parse_response(ws.next().await.unwrap().unwrap());
 
-    assert_eq!(resp["error"]["code"], -32700);
+    assert_eq!(resp["error"]["code"], PARSE_ERROR);
 }
 
 #[tokio::test]
@@ -711,12 +663,7 @@ async fn ws_roundtrip_with_p256_auth() {
         .await
         .expect("p256 ws connect failed");
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_blockNumber", 9).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_blockNumber", json!([]), 9).await;
 
     assert_eq!(resp["id"], 9);
     assert_eq!(resp["result"], "0x42");
@@ -736,12 +683,7 @@ async fn ws_roundtrip_with_webauthn_auth() {
         .await
         .expect("webauthn ws connect failed");
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_chainId", 10).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_chainId", json!([]), 10).await;
 
     assert_eq!(resp["id"], 10);
     assert_eq!(resp["result"], "0x1");
@@ -766,12 +708,7 @@ async fn ws_roundtrip_with_keychain_auth() {
         .await
         .expect("authorized keychain ws connect failed");
 
-    ws.send(tungstenite::Message::Text(
-        jsonrpc("eth_blockNumber", 11).into(),
-    ))
-    .await
-    .unwrap();
-    let resp = parse_response(ws.next().await.unwrap().unwrap());
+    let resp = request(&mut ws, "eth_blockNumber", json!([]), 11).await;
 
     assert_eq!(resp["id"], 11);
     assert_eq!(resp["result"], "0x42");
@@ -786,9 +723,10 @@ async fn ws_closes_when_auth_token_expires() {
         .await
         .expect("ws connect failed");
 
-    let _closed = tokio::time::timeout(Duration::from_secs(3), ws.next())
+    let closed = tokio::time::timeout(Duration::from_secs(3), ws.next())
         .await
         .expect("timed out waiting for token-expiry close");
+    assert_socket_terminated(closed);
 }
 
 #[tokio::test]
@@ -812,9 +750,10 @@ async fn ws_closes_when_keychain_key_is_revoked() {
 
     api.revoke_key(root_account, key_id);
 
-    let _closed = tokio::time::timeout(Duration::from_secs(3), ws.next())
+    let closed = tokio::time::timeout(Duration::from_secs(3), ws.next())
         .await
         .expect("timed out waiting for keychain-revocation close");
+    assert_socket_terminated(closed);
 }
 
 #[tokio::test]

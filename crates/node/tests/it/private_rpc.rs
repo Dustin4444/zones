@@ -198,14 +198,11 @@ fn tempo_signature_roundtrip_p256_from_token_bytes() {
     let signing_key = P256SigningKey::random(&mut thread_rng());
     let now = now_secs();
     let (fields, digest) = build_token_fields(1, 2, now, now + 600);
-    let expected = sign_p256_signature(digest, &signing_key)
-        .expect("p256 signing should succeed")
+    let signature = sign_p256_signature(digest, &signing_key).expect("p256 signing should succeed");
+    let expected = signature
         .recover_signer(&digest)
         .expect("p256 recovery should succeed");
-    let blob = build_signed_token_blob(
-        sign_p256_signature(digest, &signing_key).expect("p256 signing should succeed"),
-        &fields,
-    );
+    let blob = build_signed_token_blob(signature, &fields);
     let token = AuthorizationToken::parse(&blob).unwrap();
     let parsed = TempoSignature::from_bytes(&token.signature).unwrap();
 
