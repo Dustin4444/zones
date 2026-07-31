@@ -811,7 +811,26 @@ jobs:
           do
             printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
           done
+          l1_receipt_start_block="$(( $(cast block-number --rpc-url "$ZONES_BENCH_L1_QUERY_RPC_URL") + 1 ))"
+          zone_receipt_start_block="$(( $(cast block-number --rpc-url "$ZONE_RPC_URL") + 1 ))"
+          {
+            echo "ZONES_BENCH_L1_RECEIPT_START_BLOCK=$l1_receipt_start_block"
+            echo "ZONES_BENCH_ZONE_RECEIPT_START_BLOCK=$zone_receipt_start_block"
+          } >> "$GITHUB_ENV"
           contrib/bench/run-neobank-private-flow.sh
+
+      - name: Collect L1 and Zone receipts
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          contrib/bench/collect-receipts.sh \
+            "$ZONES_BENCH_L1_QUERY_RPC_URL" \
+            target/zones-benchmark/l1-receipts.jsonl \
+            "$ZONES_BENCH_L1_RECEIPT_START_BLOCK"
+          contrib/bench/collect-receipts.sh \
+            "$ZONE_RPC_URL" \
+            target/zones-benchmark/zone-receipts.jsonl \
+            "$ZONES_BENCH_ZONE_RECEIPT_START_BLOCK"
 
       - name: Publish benchmark results
         if: ${{ !cancelled() }}
@@ -1006,7 +1025,7 @@ jobs:
             \) -exec cp --target-directory="$output_dir" -- {} +
           fi
 
-      - name: Upload specs, logs, and reports
+      - name: Upload specs, logs, reports, and receipts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1014,6 +1033,7 @@ jobs:
           path: |
             target/zones-benchmark/neobank-e2e/
             target/zones-benchmark/*.json
+            target/zones-benchmark/*.jsonl
             target/zones-benchmark/*.md
             target/zones-benchmark/topology/neobank-fixtures.json
             target/zones-benchmark/node-logs/
