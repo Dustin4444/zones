@@ -495,6 +495,10 @@ impl BatchSubmitter {
             .with_max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
             .with_max_priority_fee_per_gas(0);
 
+        // The estimate is only a go/no-go preflight: a backlogged queue or an oversized
+        // submitBatch surfaces here as a revert or an excessive estimate. The planner limit
+        // remains the transaction's gas limit because callbacks may burn their full reserve
+        // on-chain even when simulation is cheap.
         match self.l1_provider.estimate_gas(request.clone()).await {
             Ok(estimated) if estimated <= gas_limit => Some(request),
             Ok(estimated) => {
