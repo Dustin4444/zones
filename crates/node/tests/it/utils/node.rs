@@ -1,6 +1,5 @@
 //! Zone node harness ([`ZoneTestNode`]) and the mock L1 JSON-RPC server.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy::genesis::Genesis;
@@ -12,14 +11,18 @@ use k256::SecretKey;
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::{NodeBuilder, NodeConfig, NodeHandle, rpc::RethRpcAddOns};
 use reth_node_core::{args::RpcServerArgs, exit::NodeExitFuture};
-use reth_provider::{BlockNumReader, ChainSpecProvider, HeaderProvider};
+use reth_provider::{BlockNumReader, CanonStateSubscriptions, ChainSpecProvider, HeaderProvider};
 use reth_rpc_builder::RpcModuleSelection;
 use reth_tasks::Runtime;
 use std::{future::Future, num::NonZeroU32, pin::Pin, sync::Arc, time::Duration};
 use tempo_alloy::rpc::TempoHeaderResponse;
+use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::{self, PATH_USD_ADDRESS, tip403_registry::ALLOW_ALL_POLICY_ID};
 use tempo_primitives::TempoHeader;
-use tempo_zone_contracts::ZonePortal::{self};
+use tempo_zone_contracts::{
+    TEMPO_STATE_ADDRESS, TempoState, ZONE_CONFIG_ADDRESS, ZoneConfig,
+    ZonePortal::{self},
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 use zone_chainspec::ZoneChainSpec;
@@ -180,7 +183,6 @@ where
     fn subscribe_to_canonical_state(
         &self,
     ) -> reth_provider::CanonStateNotifications<tempo_primitives::TempoPrimitives> {
-        use reth_provider::CanonStateSubscriptions;
         self.node.provider().subscribe_to_canonical_state()
     }
 
@@ -302,7 +304,6 @@ impl ZoneTestNode {
         gateway: Address,
         expected: bool,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::{ZONE_CONFIG_ADDRESS, ZoneConfig};
         let config = ZoneConfig::new(ZONE_CONFIG_ADDRESS, self.provider());
         eyre::ensure!(
             config.isZoneGateway(gateway).call().await? == expected,
@@ -313,7 +314,6 @@ impl ZoneTestNode {
 
     /// Assert whether account enforcement is enabled in the L2 ZoneConfig predeploy.
     pub(crate) async fn assert_access_enforced(&self, expected: bool) -> eyre::Result<()> {
-        use tempo_zone_contracts::{ZONE_CONFIG_ADDRESS, ZoneConfig};
         let config = ZoneConfig::new(ZONE_CONFIG_ADDRESS, self.provider());
         let actual = config.isAccessEnforced().call().await?;
         eyre::ensure!(
@@ -325,7 +325,6 @@ impl ZoneTestNode {
 
     /// Assert whether gateway registration is open in the L2 ZoneConfig predeploy.
     pub(crate) async fn assert_gateway_open(&self, expected: bool) -> eyre::Result<()> {
-        use tempo_zone_contracts::{ZONE_CONFIG_ADDRESS, ZoneConfig};
         let config = ZoneConfig::new(ZONE_CONFIG_ADDRESS, self.provider());
         let actual = config.isGatewayOpen().call().await?;
         eyre::ensure!(
@@ -341,7 +340,6 @@ impl ZoneTestNode {
         account: Address,
         expected: bool,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::{ZONE_CONFIG_ADDRESS, ZoneConfig};
         let config = ZoneConfig::new(ZONE_CONFIG_ADDRESS, self.provider());
         eyre::ensure!(
             config.isAllowedAccount(account).call().await? == expected,
@@ -410,8 +408,6 @@ impl ZoneTestNode {
         min_balance: U256,
         timeout: Duration,
     ) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let tip20 = ITIP20::new(token, self.provider());
         poll_until(timeout, DEFAULT_POLL, "token balance", || {
             let tip20 = &tip20;
@@ -435,8 +431,6 @@ impl ZoneTestNode {
 
     /// Reads `tempoBlockNumber` from the L2 `TempoState` predeploy right now.
     pub(crate) async fn tempo_block_number(&self) -> eyre::Result<u64> {
-        use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState};
-
         Ok(TempoState::new(TEMPO_STATE_ADDRESS, self.provider())
             .tempoBlockNumber()
             .call()
@@ -451,8 +445,6 @@ impl ZoneTestNode {
         target: u64,
         timeout: Duration,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState};
-
         let tempo_state = TempoState::new(TEMPO_STATE_ADDRESS, self.provider());
         poll_until(
             timeout,
@@ -503,7 +495,6 @@ impl ZoneTestNode {
 
     /// Read a TIP-20 token balance on this zone (single-shot, no polling).
     pub(crate) async fn balance_of(&self, token: Address, account: Address) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
         Ok(ITIP20::new(token, self.provider())
             .balanceOf(account)
             .from(account)
@@ -524,8 +515,6 @@ impl ZoneTestNode {
         after_block: u64,
         timeout: Duration,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, TempoState};
-
         let provider = self.provider();
         let tempo_state = TempoState::new(TEMPO_STATE_ADDRESS, &provider);
 

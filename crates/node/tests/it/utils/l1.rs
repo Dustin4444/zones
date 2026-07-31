@@ -1,16 +1,17 @@
 //! In-process Tempo L1 dev node harness ([`L1TestNode`]) and L1-side helpers.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy::genesis::{Genesis, GenesisAccount};
 use alloy_network::{EthereumWallet, ReceiptResponse};
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
+use alloy_signer::SignerSync;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use eyre::WrapErr;
+use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::sec1::ToEncodedPoint};
 use reth_node_builder::{NodeBuilder, NodeConfig};
 use reth_node_core::args::RpcServerArgs;
 use reth_rpc_builder::RpcModuleSelection;
@@ -18,10 +19,13 @@ use reth_tasks::Runtime;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tempo_alloy::{TempoNetwork, rpc::TempoCallBuilderExt};
 use tempo_chainspec::{hardfork::TempoHardfork, spec::TempoChainSpec};
-use tempo_contracts::precompiles::{ITIP20, TIP403_REGISTRY_ADDRESS};
+use tempo_contracts::precompiles::{
+    IRolesAuth, ITIP20, ITIP20Factory, ITIP403Registry, TIP403_REGISTRY_ADDRESS,
+};
 use tempo_precompiles::{
-    PATH_USD_ADDRESS,
+    PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS,
     storage::{Handler, PrecompileStorageProvider, StorageCtx, hashmap::HashMapStorageProvider},
+    tip20::ISSUER_ROLE,
     tip403_registry::{
         ALLOW_ALL_POLICY_ID, AuthRole, CompoundPolicyData as RawCompoundPolicyData, PolicyData,
         PolicyType, TIP403Registry, tip403_registry_slots,
@@ -29,10 +33,12 @@ use tempo_precompiles::{
 };
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{
-    ZONE_FACTORY_ADDRESS,
+    ZONE_FACTORY_ADDRESS, ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
+    ZoneFactory,
     ZonePortal::{self, Role as PortalRole},
 };
 use zone_l1::L1StateCache;
+use zone_precompiles::ecies;
 
 pub(crate) fn enabled_deposits_active_token_config() -> B256 {
     let mut value = [0u8; 32];
@@ -93,10 +99,6 @@ fn forge_deployed_bytecode(contract: &str) -> eyre::Result<alloy_primitives::Byt
 }
 
 fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::Result<()> {
-    use tempo_zone_contracts::{
-        ZONE_MESSENGER_ADDRESS, ZONE_PORTAL_IMPL_ADDRESS, ZONE_VERIFIER_ADDRESS,
-    };
-
     // Native TIP-1091 accounts use the non-empty 0xEF precompile marker. Slot 0 packs
     // `uint32 nextZoneId`, `address owner`, and the implementation lock flag.
     let packed_factory_config: U256 = U256::ONE | (U256::from_be_slice(owner.as_slice()) << 32);
@@ -418,9 +420,6 @@ impl L1TestNode {
 
     /// Transfer pathUSD from the dev account to a recipient on L1.
     pub(crate) async fn fund_user(&self, to: Address, amount: u128) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_precompiles::PATH_USD_ADDRESS;
-
         let provider = self.dev_provider();
         let receipt = ITIP20::new(PATH_USD_ADDRESS, &provider)
             .transfer(to, U256::from(amount))
@@ -434,7 +433,6 @@ impl L1TestNode {
 
     /// Read a TIP-20 token balance on L1 (single-shot, no polling).
     pub(crate) async fn balance_of(&self, token: Address, account: Address) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
         Ok(ITIP20::new(token, self.provider())
             .balanceOf(account)
             .call()
@@ -449,8 +447,6 @@ impl L1TestNode {
         min_balance: U256,
         timeout: Duration,
     ) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let tip20 = ITIP20::new(token, self.provider());
         poll_until(timeout, DEFAULT_POLL, "L1 token balance", || {
             let tip20 = &tip20;
@@ -468,7 +464,6 @@ impl L1TestNode {
 
     /// Assert that a `BatchSubmitted` event exists on the portal.
     pub(crate) async fn assert_batch_submitted(&self, portal_address: Address) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZonePortal;
         let portal = ZonePortal::new(portal_address, self.provider());
         let events = portal.BatchSubmitted_filter().from_block(0).query().await?;
         eyre::ensure!(
@@ -485,7 +480,6 @@ impl L1TestNode {
         to: Address,
         amount: u128,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZonePortal;
         let portal = ZonePortal::new(portal_address, self.provider());
         let events = portal
             .WithdrawalProcessed_filter()
@@ -509,7 +503,6 @@ impl L1TestNode {
         amount: u128,
         callback_success: bool,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZonePortal;
         let portal = ZonePortal::new(portal_address, self.provider());
         let events = portal
             .WithdrawalProcessed_filter()
@@ -538,7 +531,6 @@ impl L1TestNode {
         amount: u128,
         timeout: Duration,
     ) -> eyre::Result<bool> {
-        use tempo_zone_contracts::ZonePortal;
         let portal = ZonePortal::new(portal_address, self.provider());
         poll_until(timeout, DEFAULT_POLL, "WithdrawalProcessed event", || {
             let portal = &portal;
@@ -565,7 +557,6 @@ impl L1TestNode {
         portal_address: Address,
         expected: &[(Address, Address, u128, bool)],
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZonePortal;
         let portal = ZonePortal::new(portal_address, self.provider());
         let events = portal
             .WithdrawalProcessed_filter()
@@ -641,7 +632,6 @@ impl L1TestNode {
         amount: u128,
         timeout: Duration,
     ) -> eyre::Result<()> {
-        use tempo_precompiles::PATH_USD_ADDRESS;
         self.wait_for_withdrawal_on_l1_token(
             portal_address,
             PATH_USD_ADDRESS,
@@ -691,8 +681,6 @@ impl L1TestNode {
         amount: u128,
         tick: i16,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let provider = self.dev_provider();
         let quote_token = ITIP20::new(base_token, &provider)
             .quoteToken()
@@ -727,8 +715,6 @@ impl L1TestNode {
         amount: u128,
         tick: i16,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let provider = self.dev_provider();
         ITIP20::new(base_token, &provider)
             .approve(STABLECOIN_DEX_ADDRESS, U256::MAX)
@@ -812,9 +798,6 @@ impl L1TestNode {
         sequencer: Address,
         config: ZoneCreationConfig,
     ) -> eyre::Result<Address> {
-        use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::ZoneFactory;
-
         let l1_provider = self.dev_provider();
         let create_zone = ZoneFactory::createZoneCall {
             params: ZoneFactory::CreateZoneParams {
@@ -867,10 +850,6 @@ impl L1TestNode {
         factory_address: Address,
         dex_address: Address,
     ) -> eyre::Result<Address> {
-        use alloy_primitives::{Bytes, TxKind};
-        use alloy_rpc_types_eth::TransactionRequest;
-        use alloy_sol_types::SolValue;
-
         let l1_provider = self.dev_provider();
 
         // Constructor: constructor(address _stablecoinDEX, address _zoneFactory)
@@ -929,10 +908,6 @@ impl L1TestNode {
         symbol: &str,
         salt: B256,
     ) -> eyre::Result<Address> {
-        use alloy_sol_types::SolEvent;
-        use tempo_contracts::precompiles::ITIP20Factory;
-        use tempo_precompiles::{PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS};
-
         let provider = self.dev_provider();
         let factory = ITIP20Factory::new(TIP20_FACTORY_ADDRESS, &provider);
         let receipt = factory
@@ -966,7 +941,6 @@ impl L1TestNode {
         portal_address: Address,
         token: Address,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZonePortal;
         let provider = self.admin_provider();
         let portal = ZonePortal::new(portal_address, &provider);
         let receipt = portal
@@ -1001,7 +975,6 @@ impl L1TestNode {
         portal_address: Address,
         mode: bool,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::ZonePortal;
         let provider = self.admin_provider();
         let portal = ZonePortal::new(portal_address, &provider);
         let receipt = portal
@@ -1024,7 +997,6 @@ impl L1TestNode {
         portal_address: Address,
         mode: bool,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::ZonePortal;
         let provider = self.admin_provider();
         let portal = ZonePortal::new(portal_address, &provider);
         let receipt = portal
@@ -1049,7 +1021,6 @@ impl L1TestNode {
         enabled: bool,
         admin_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::ZonePortal;
         let provider = self.provider_with_signer(admin_signer);
         let portal = ZonePortal::new(portal_address, &provider);
         let role = if enabled {
@@ -1095,7 +1066,6 @@ impl L1TestNode {
         enabled: bool,
         admin_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<u64> {
-        use tempo_zone_contracts::ZonePortal;
         let provider = self.provider_with_signer(admin_signer);
         let portal = ZonePortal::new(portal_address, &provider);
         let role = if enabled {
@@ -1163,10 +1133,6 @@ impl L1TestNode {
         encryption_key: &k256::SecretKey,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
     ) -> eyre::Result<()> {
-        use alloy_signer::SignerSync;
-        use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::sec1::ToEncodedPoint};
-        use tempo_zone_contracts::ZonePortal;
-
         // Derive public key coordinates
         let scalar: Scalar = *encryption_key.to_nonzero_scalar();
         let pub_point = AffinePoint::from(ProjectivePoint::GENERATOR * scalar);
@@ -1209,9 +1175,6 @@ impl L1TestNode {
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<(U256, tempo_zone_contracts::EncryptedDepositPayload)> {
-        use tempo_zone_contracts::ZonePortal;
-        use zone_precompiles::ecies;
-
         let portal = ZonePortal::new(portal_address, self.provider());
         let key_result = portal.sequencerEncryptionKey().call().await?;
         let key_count = portal.encryptionKeyCount().call().await?;
@@ -1250,7 +1213,6 @@ impl L1TestNode {
         to: Address,
         amount: u128,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .wallet(EthereumWallet::from(self.dev_signer()))
             .connect_http(self.http_url.clone());
@@ -1277,9 +1239,6 @@ impl L1TestNode {
         to: Address,
         amount: u128,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::{IRolesAuth, ITIP20};
-        use tempo_precompiles::tip20::ISSUER_ROLE;
-
         let provider = self.dev_provider();
 
         // Admin can grant ISSUER_ROLE to self
@@ -1303,9 +1262,6 @@ impl L1TestNode {
 
     /// Create a new BLACKLIST policy on L1. Returns the policy ID.
     pub(crate) async fn create_blacklist_policy(&self) -> eyre::Result<u64> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
@@ -1329,9 +1285,6 @@ impl L1TestNode {
     /// Create a new WHITELIST policy on L1. Returns the policy ID.
     #[allow(dead_code)]
     pub(crate) async fn create_whitelist_policy(&self) -> eyre::Result<u64> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
@@ -1358,9 +1311,6 @@ impl L1TestNode {
         policy_id: u64,
         account: Address,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
@@ -1380,9 +1330,6 @@ impl L1TestNode {
         policy_id: u64,
         account: Address,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
@@ -1403,8 +1350,6 @@ impl L1TestNode {
         token: Address,
         policy_id: u64,
     ) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-
         let provider = self.dev_provider();
         let receipt = ITIP20::new(token, &provider)
             .changeTransferPolicyId(policy_id)
@@ -1425,9 +1370,6 @@ impl L1TestNode {
         recipient_policy_id: u64,
         mint_recipient_policy_id: u64,
     ) -> eyre::Result<u64> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let provider = self.dev_provider();
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, &provider);
         let receipt = registry
@@ -1454,9 +1396,6 @@ impl L1TestNode {
 
     /// Check if a user is authorized under a policy on L1.
     pub(crate) async fn is_authorized(&self, policy_id: u64, user: Address) -> eyre::Result<bool> {
-        use tempo_contracts::precompiles::ITIP403Registry;
-        use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
-
         let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, self.provider());
         Ok(registry.isAuthorized(policy_id, user).call().await?)
     }

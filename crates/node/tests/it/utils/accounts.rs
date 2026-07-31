@@ -1,6 +1,5 @@
 //! Zone account helpers: funded accounts, deposits, withdrawals, router callbacks.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy_network::EthereumWallet;
@@ -12,7 +11,11 @@ use tempo_alloy::TempoNetwork;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
-use tempo_zone_contracts::ZONE_OUTBOX_ADDRESS;
+use tempo_zone_contracts::{
+    EncryptedDepositPayload, IZoneOutbox, SwapAndDepositRouterPlaintextCallback,
+    ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal,
+};
+use zone_precompiles::ecies;
 
 pub(crate) fn local_dev_zone_account(zone: &ZoneTestNode) -> eyre::Result<(DynProvider, Address)> {
     let dev_signer = MnemonicBuilder::<English>::default()
@@ -114,8 +117,6 @@ impl WithdrawalArgs {
 
     /// Plaintext router callback: optionally swap, then deposit into `target_portal`.
     pub(crate) fn swap_and_deposit_via_router(args: PlaintextRouterCallbackArgs) -> Self {
-        use tempo_zone_contracts::SwapAndDepositRouterPlaintextCallback;
-
         let callback_data = SwapAndDepositRouterPlaintextCallback {
             token_out: args.token_out,
             target_portal: args.target_portal,
@@ -306,9 +307,6 @@ impl ZoneAccount {
         recipient: Address,
         tempo_refund_recipient: Address,
     ) -> eyre::Result<()> {
-        use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::ZonePortal;
-
         ZonePortal::new(self.portal_address, &self.l1_provider)
             .deposit(
                 PATH_USD_ADDRESS,
@@ -347,10 +345,6 @@ impl ZoneAccount {
         timeout: Duration,
         zone: &ZoneTestNode,
     ) -> eyre::Result<(u64, U256)> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::{ZONE_TOKEN_ADDRESS, ZonePortal};
-
         if !self.l1_portal_approved {
             ITIP20::new(PATH_USD_ADDRESS, &self.l1_provider)
                 .approve(self.portal_address, U256::MAX)
@@ -411,9 +405,6 @@ impl ZoneAccount {
         timeout: Duration,
         zone: &ZoneTestNode,
     ) -> eyre::Result<U256> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_zone_contracts::ZonePortal;
-
         // Approve portal for this specific token
         ITIP20::new(token, &self.l1_provider)
             .approve(self.portal_address, U256::MAX)
@@ -475,11 +466,6 @@ impl ZoneAccount {
         timeout: Duration,
         zone: &ZoneTestNode,
     ) -> eyre::Result<(u64, U256)> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_precompiles::PATH_USD_ADDRESS;
-        use tempo_zone_contracts::{EncryptedDepositPayload, ZONE_TOKEN_ADDRESS, ZonePortal};
-        use zone_precompiles::ecies;
-
         let portal_address = self.portal_address;
 
         // Approve portal if needed
@@ -567,15 +553,12 @@ impl ZoneAccount {
     /// Skips approval if already approved in this session.
     /// Uses the default zone token (pathUSD / `ZONE_TOKEN_ADDRESS`).
     pub(crate) async fn withdraw_with(&mut self, args: WithdrawalArgs) -> eyre::Result<()> {
-        use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
         self.withdraw_token_with(ZONE_TOKEN_ADDRESS, args).await
     }
 
     /// Simulate a withdrawal request without submitting it to the transaction pool.
     /// Useful for asserting deterministic validation reverts.
     pub(crate) async fn simulate_withdraw_with(&self, args: WithdrawalArgs) -> eyre::Result<()> {
-        use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS};
-
         let to = args.to.unwrap_or(self.address);
         let zone_fallback_recipient = args.zone_fallback_recipient.unwrap_or(self.address);
         IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, &self.l2_provider)
@@ -611,8 +594,6 @@ impl ZoneAccount {
         token: Address,
         args: WithdrawalArgs,
     ) -> eyre::Result<()> {
-        use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS};
-
         self.approve_outbox(token).await?;
 
         let to = args.to.unwrap_or(self.address);
@@ -648,9 +629,6 @@ impl ZoneAccount {
     ///
     /// Reuses a successful max approval for subsequent withdrawals of the same token.
     pub(crate) async fn approve_outbox(&mut self, token: Address) -> eyre::Result<()> {
-        use tempo_contracts::precompiles::ITIP20;
-        use tempo_zone_contracts::ZONE_OUTBOX_ADDRESS;
-
         if self.l2_outbox_approved_tokens.contains(&token) {
             return Ok(());
         }

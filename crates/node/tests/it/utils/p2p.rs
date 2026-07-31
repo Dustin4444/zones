@@ -1,6 +1,5 @@
 //! Multi-sequencer P2P cluster harness and sequencer task spawning.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy::genesis::Genesis;
@@ -17,6 +16,7 @@ use std::{
     sync::atomic::Ordering,
     time::Duration,
 };
+use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 use zone_l1::{Deposit, L1Deposit, L1PortalEvents};
 use zone_p2p::{LeadershipState, P2pConfig, P2pPeerId, Role};
 
@@ -47,8 +47,6 @@ pub(crate) async fn spawn_sequencer_with_config(
     batch_anchor_config: zone_sequencer::BatchAnchorConfig,
     withdrawal_batch_limits: zone_sequencer::WithdrawalBatchLimits,
 ) -> zone_sequencer::ZoneSequencerHandle {
-    use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
-
     let config = zone_sequencer::ZoneSequencerConfig {
         portal_address,
         l1_rpc_url: l1.http_url().to_string(),

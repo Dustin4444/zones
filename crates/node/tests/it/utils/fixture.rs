@@ -1,6 +1,5 @@
 //! Synthetic L1 fixture for deposit-queue injection tests.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy_consensus::Header;

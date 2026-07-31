@@ -1,10 +1,10 @@
 //! Private zone RPC test contexts and auth-token builders.
 
-#[allow(unused_imports)]
 use super::*;
 
 use alloy_primitives::{Address, B256, U256};
-use alloy_provider::ProviderBuilder;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_signer::SignerSync;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use std::{ops::Deref, time::Duration};
 use tempo_contracts::precompiles::{
@@ -14,6 +14,7 @@ use tempo_contracts::precompiles::{
     },
 };
 use tempo_primitives::transaction::tt_signature::TempoSignature;
+use zone_node::rpc::auth::build_token_fields;
 
 /// Build a hex-encoded authorization token for the private zone RPC.
 ///
@@ -24,9 +25,6 @@ pub(crate) fn build_auth_token(
     zone_id: u32,
     chain_id: u64,
 ) -> String {
-    use alloy_signer::SignerSync;
-    use zone_node::rpc::auth::build_token_fields;
-
     let now = now_secs();
     let expires_at = now + 600;
 
@@ -47,8 +45,6 @@ fn build_auth_token_with_signature(
     zone_id: u32,
     chain_id: u64,
 ) -> String {
-    use zone_node::rpc::auth::build_token_fields;
-
     let now = now_secs();
     let expires_at = now + 600;
 
@@ -457,8 +453,6 @@ impl PrivateRpcTestCtx {
 }
 
 async fn zone_chain_id(zone: &ZoneTestNode) -> eyre::Result<u64> {
-    use alloy_provider::Provider;
-
     let chain_id: alloy_primitives::U64 = zone
         .provider()
         .raw_request("eth_chainId".into(), ())
