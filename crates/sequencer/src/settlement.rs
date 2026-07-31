@@ -71,8 +71,9 @@ const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
 ///
 /// The withdrawal portion is bounded by the planner budget
 /// ([`crate::withdrawals::MAX_WITHDRAWAL_BATCH_GAS`] at most), so the combined limit stays at or
-/// below 25M, within Tempo's 30M transaction gas cap.
-const COMBINED_SUBMIT_BATCH_GAS: u64 = 5_000_000;
+/// below 22M, within Tempo's 30M transaction gas cap. The estimate preflight falls back to
+/// submit-only settlement if `submitBatch` ever needs more (e.g. a long ancestry header chain).
+const COMBINED_SUBMIT_BATCH_GAS: u64 = 2_000_000;
 
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
 pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
