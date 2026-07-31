@@ -43,11 +43,15 @@ use eyre::{OptionExt as _, Result};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
 use schnellru::{ByLength, LruMap};
-use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderExt, rpc::TempoCallBuilderExt};
-use tempo_primitives::{Block, TempoReceipt};
+use tempo_alloy::{
+    TempoNetwork,
+    provider::ext::TempoProviderExt,
+    rpc::{TempoCallBuilderExt, TempoTransactionRequest},
+};
+use tempo_primitives::{Block, TempoReceipt, transaction::Call};
 use tracing::{info, instrument, warn};
 
-use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
+use crate::{nonce_keys::SUBMIT_BATCH_NONCE_KEY, withdrawals::build_withdrawal_batches};
 
 /// EIP-2935 stores the last 8192 block hashes, so the usable window is 8191 blocks.
 const DEFAULT_EIP2935_HISTORY_WINDOW: u64 = 8192 - 1;
@@ -61,6 +65,14 @@ const DEFAULT_EIP2935_SAFETY_MARGIN: u64 = 360;
 /// At roughly 600 bytes per header, this caps payload storage near 150 MiB plus
 /// map overhead while covering more than the current Zone E recovery gap.
 const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
+
+/// Gas reserved for the `submitBatch` call when whole-slot withdrawal processing shares its
+/// transaction.
+///
+/// The withdrawal portion is bounded by the planner budget
+/// ([`crate::withdrawals::MAX_WITHDRAWAL_BATCH_GAS`] at most), so the combined limit stays at or
+/// below 25M, within Tempo's 30M transaction gas cap.
+const COMBINED_SUBMIT_BATCH_GAS: u64 = 5_000_000;
 
 /// Maximum number of pending withdrawal queue slots in the portal ring buffer.
 pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
@@ -236,7 +248,12 @@ impl BatchSubmitter {
     /// `verifierConfig` and `proof` are empty until real proof generation is
     /// implemented.
     ///
-    /// Returns the `BatchSubmitted` event decoded from the confirmed receipt.
+    /// When the batch's withdrawal slot fits one `processWithdrawals` call within
+    /// `max_withdrawal_batch_gas`, that call is appended to the `submitBatch` transaction so the
+    /// slot is consumed atomically with settlement; see [`Self::try_combined_submission`].
+    ///
+    /// Returns the `BatchSubmitted` event decoded from the confirmed receipt, along with whether
+    /// the withdrawal slot was processed in the same transaction.
     // TODO: pass real proof bytes once proof generation is implemented.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
@@ -246,7 +263,12 @@ impl BatchSubmitter {
         withdrawal_queue_hash = %batch.withdrawal_queue_hash,
         withdrawal_batch_index = batch.withdrawal_batch_index,
     ))]
-    pub async fn submit_batch(&self, batch: &BatchData) -> Result<ZonePortal::BatchSubmitted> {
+    pub async fn submit_batch(
+        &self,
+        batch: &BatchData,
+        withdrawals: &[abi::Withdrawal],
+        max_withdrawal_batch_gas: u64,
+    ) -> Result<BatchSubmission> {
         let block_transition = BlockTransition {
             prevBlockHash: batch.prev_block_hash,
             nextBlockHash: batch.next_block_hash,
@@ -338,6 +360,29 @@ impl BatchSubmitter {
             .get_transaction_count_with_nonce_key(submission_address, SUBMIT_BATCH_NONCE_KEY)
             .await?;
 
+        let call = ZonePortal::submitBatchCall {
+            tempoBlockNumber: batch.tempo_block_number,
+            recentTempoBlockNumber: recent_tempo_block_number,
+            blockTransition: block_transition,
+            depositQueueTransition: deposit_transition,
+            withdrawalQueueHash: batch.withdrawal_queue_hash,
+            verifierConfig: verifier_config,
+            proof: Bytes::new(),
+            nextZoneHeight: U256::from(batch.zone_height),
+            signatures,
+        };
+
+        let combined = self
+            .try_combined_submission(
+                &call,
+                withdrawals,
+                max_withdrawal_batch_gas,
+                submission_address,
+                nonce,
+            )
+            .await;
+        let withdrawals_processed = combined.is_some();
+
         info!(
             anchor_mode = %anchor_mode,
             recent_tempo_block_number,
@@ -345,31 +390,29 @@ impl BatchSubmitter {
             batch_prev_block_hash = %batch.prev_block_hash,
             nonce_key = ?SUBMIT_BATCH_NONCE_KEY,
             nonce,
+            withdrawals_in_transaction = withdrawals_processed,
             "Submitting batch to ZonePortal on L1"
         );
 
-        let receipt = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.portal
-                .submitBatch(
-                    batch.tempo_block_number,
-                    recent_tempo_block_number,
-                    block_transition,
-                    deposit_transition,
-                    batch.withdrawal_queue_hash,
-                    verifier_config,
-                    Bytes::new(),
-                    U256::from(batch.zone_height),
-                    signatures,
-                )
-                .nonce_key(SUBMIT_BATCH_NONCE_KEY)
-                .nonce(nonce)
-                .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                .max_priority_fee_per_gas(0)
-                .send_sync(),
-        )
-        .await
-        .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))??;
+        let send = async {
+            match combined {
+                Some(request) => {
+                    Ok::<_, eyre::Report>(self.l1_provider.send_transaction_sync(request).await?)
+                }
+                None => Ok(self
+                    .portal
+                    .call_builder(&call)
+                    .nonce_key(SUBMIT_BATCH_NONCE_KEY)
+                    .nonce(nonce)
+                    .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
+                    .max_priority_fee_per_gas(0)
+                    .send_sync()
+                    .await?),
+            }
+        };
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), send)
+            .await
+            .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))??;
 
         let tx_hash = receipt.transaction_hash();
         if !receipt.status() {
@@ -388,10 +431,92 @@ impl BatchSubmitter {
             %tx_hash,
             withdrawal_batch_index = event.withdrawalBatchIndex,
             withdrawal_queue_index = %event.withdrawalQueueIndex,
+            withdrawals_processed,
             "Batch submitted to L1"
         );
 
-        Ok(event)
+        Ok(BatchSubmission {
+            event,
+            withdrawals_processed,
+        })
+    }
+
+    /// Build the two-call transaction that settles the batch and drains its complete withdrawal
+    /// slot atomically, or `None` when the slot must be left to the standalone processor.
+    ///
+    /// The slot is eligible when it fits a single `processWithdrawals` call within
+    /// `max_withdrawal_batch_gas`. Gas estimation then simulates both ordered calls against
+    /// current state, so it also rejects the fast path whenever the portal queue has a backlog
+    /// (the freshly enqueued slot would not be the queue head) or the reserved budget is
+    /// insufficient. `submitBatch` must stay the first call so the second call observes the slot
+    /// it drains, and a revert of either call rolls back the entire transaction.
+    async fn try_combined_submission(
+        &self,
+        submit_call: &ZonePortal::submitBatchCall,
+        withdrawals: &[abi::Withdrawal],
+        max_withdrawal_batch_gas: u64,
+        from: Address,
+        nonce: u64,
+    ) -> Option<TempoTransactionRequest> {
+        if withdrawals.is_empty() {
+            return None;
+        }
+        let gas_limit = match build_withdrawal_batches(withdrawals, max_withdrawal_batch_gas)[..] {
+            // An oversized singleton exceeds the budget and stays on the standalone path, which
+            // deliberately submits such slots on their own.
+            [batch] if batch.gas_limit <= max_withdrawal_batch_gas => {
+                batch.gas_limit + COMBINED_SUBMIT_BATCH_GAS
+            }
+            _ => return None,
+        };
+
+        let mut request = TempoTransactionRequest {
+            calls: vec![
+                Call {
+                    to: self.portal_address.into(),
+                    value: U256::ZERO,
+                    input: submit_call.abi_encode().into(),
+                },
+                Call {
+                    to: self.portal_address.into(),
+                    value: U256::ZERO,
+                    input: ZonePortal::processWithdrawalsCall {
+                        withdrawals: withdrawals.to_vec(),
+                        remainingQueue: B256::ZERO,
+                    }
+                    .abi_encode()
+                    .into(),
+                },
+            ],
+            nonce_key: Some(SUBMIT_BATCH_NONCE_KEY),
+            ..Default::default()
+        };
+        request.inner.from = Some(from);
+        request.inner.nonce = Some(nonce);
+        request.inner.gas = Some(gas_limit);
+        request.inner.max_fee_per_gas = Some(crate::TEMPO_L1_MAX_FEE_PER_GAS);
+        request.inner.max_priority_fee_per_gas = Some(0);
+
+        match self.l1_provider.estimate_gas(request.clone()).await {
+            Ok(estimated) if estimated <= gas_limit => Some(request),
+            Ok(estimated) => {
+                warn!(
+                    withdrawal_count = withdrawals.len(),
+                    gas_limit,
+                    estimated,
+                    "Combined settlement estimate exceeds its budget; submitting batch alone"
+                );
+                None
+            }
+            Err(error) => {
+                info!(
+                    withdrawal_count = withdrawals.len(),
+                    %error,
+                    "Combined settlement preflight failed; submitting batch alone"
+                );
+                None
+            }
+        }
     }
 
     fn sign_settlement_attestation(
@@ -1077,6 +1202,15 @@ pub struct BatchData {
     pub withdrawal_queue_hash: B256,
     /// L2 withdrawal batch index validated against the portal before submission.
     pub withdrawal_batch_index: u64,
+}
+
+/// A confirmed L1 batch submission.
+#[derive(Debug, Clone)]
+pub struct BatchSubmission {
+    /// `BatchSubmitted` event decoded from the confirmed receipt.
+    pub event: ZonePortal::BatchSubmitted,
+    /// Whether the batch's withdrawal slot was fully processed in the same transaction.
+    pub withdrawals_processed: bool,
 }
 
 /// One L2 withdrawal batch finalized by `ZoneOutbox`.
@@ -1884,6 +2018,147 @@ mod tests {
         assert!(BatchAnchorConfig::new(0, 0).is_err());
         assert!(BatchAnchorConfig::new(10, 10).is_err());
         assert!(BatchAnchorConfig::new(10, 11).is_err());
+    }
+
+    fn test_submit_batch_call(withdrawals: &[abi::Withdrawal]) -> ZonePortal::submitBatchCall {
+        ZonePortal::submitBatchCall {
+            tempoBlockNumber: 100,
+            recentTempoBlockNumber: 100,
+            blockTransition: BlockTransition {
+                prevBlockHash: B256::repeat_byte(0x41),
+                nextBlockHash: B256::repeat_byte(0x42),
+            },
+            depositQueueTransition: DepositQueueTransition {
+                prevProcessedHash: B256::ZERO,
+                nextProcessedHash: B256::ZERO,
+                prevDepositNumber: 0,
+                nextDepositNumber: 0,
+            },
+            withdrawalQueueHash: abi::Withdrawal::queue_hash(withdrawals),
+            verifierConfig: Bytes::new(),
+            proof: Bytes::new(),
+            nextZoneHeight: U256::from(17),
+            signatures: vec![Bytes::from_static(&[0x01])],
+        }
+    }
+
+    fn mocked_submitter(portal_address: Address, asserter: Asserter) -> BatchSubmitter {
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        BatchSubmitter::new(portal_address, provider)
+    }
+
+    fn simple_withdrawals(count: usize) -> Vec<abi::Withdrawal> {
+        (0..count)
+            .map(|i| test_withdrawal(Address::with_last_byte((i + 1) as u8), (i + 1) as u128))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn combined_submission_drains_whole_slot_on_settlement_nonce_lane() {
+        let asserter = Asserter::new();
+        // eth_estimateGas preflight for the two-call transaction.
+        asserter.push_success(&alloy_primitives::U64::from(1_000_000u64));
+        let portal_address = address!("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23");
+        let submitter = mocked_submitter(portal_address, asserter.clone());
+
+        let withdrawals = vec![test_withdrawal(Address::repeat_byte(0x11), 42)];
+        let submit_call = test_submit_batch_call(&withdrawals);
+        let sender = Address::repeat_byte(0x22);
+
+        let request = submitter
+            .try_combined_submission(
+                &submit_call,
+                &withdrawals,
+                crate::withdrawals::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+                sender,
+                9,
+            )
+            .await
+            .expect("a whole slot within the planner budget is eligible");
+
+        assert_eq!(request.calls.len(), 2);
+        assert_eq!(request.calls[0].to, portal_address.into());
+        assert_eq!(
+            request.calls[0].input,
+            Bytes::from(submit_call.abi_encode())
+        );
+        assert_eq!(request.calls[1].to, portal_address.into());
+        let process =
+            ZonePortal::processWithdrawalsCall::abi_decode(&request.calls[1].input).unwrap();
+        assert_eq!(process.withdrawals, withdrawals);
+        assert_eq!(process.remainingQueue, B256::ZERO);
+        assert_eq!(request.nonce_key, Some(SUBMIT_BATCH_NONCE_KEY));
+        assert_eq!(request.inner.from, Some(sender));
+        assert_eq!(request.inner.nonce, Some(9));
+        let expected_gas = build_withdrawal_batches(
+            &withdrawals,
+            crate::withdrawals::DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
+        )[0]
+        .gas_limit
+            + COMBINED_SUBMIT_BATCH_GAS;
+        assert_eq!(request.inner.gas, Some(expected_gas));
+        assert!(asserter.read_q().is_empty(), "preflight estimate consumed");
+    }
+
+    #[tokio::test]
+    async fn combined_submission_skips_ineligible_slots() {
+        let submitter = mocked_submitter(Address::ZERO, Asserter::new());
+        let withdrawals = simple_withdrawals(3);
+        let submit_call = test_submit_batch_call(&withdrawals);
+        let sender = Address::repeat_byte(0x22);
+
+        // A batch without withdrawals has no slot to process.
+        assert!(
+            submitter
+                .try_combined_submission(&submit_call, &[], u64::MAX, sender, 0)
+                .await
+                .is_none()
+        );
+
+        // A budget of one item per transaction splits the slot; partial slots stay standalone.
+        let single_item_budget = build_withdrawal_batches(&withdrawals[..1], u64::MAX)[0].gas_limit;
+        assert!(
+            submitter
+                .try_combined_submission(&submit_call, &withdrawals, single_item_budget, sender, 0)
+                .await
+                .is_none()
+        );
+
+        // An oversized singleton exceeds the budget and stays standalone.
+        assert!(
+            submitter
+                .try_combined_submission(&submit_call, &withdrawals[..1], 1, sender, 0)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn combined_submission_requires_estimate_within_budget() {
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy_primitives::U64::from(u64::from(u32::MAX)));
+        let submitter = mocked_submitter(Address::ZERO, asserter);
+        let withdrawals = simple_withdrawals(1);
+        let submit_call = test_submit_batch_call(&withdrawals);
+        let sender = Address::repeat_byte(0x22);
+
+        // The estimate exceeds the reserved combined budget.
+        assert!(
+            submitter
+                .try_combined_submission(&submit_call, &withdrawals, u64::MAX, sender, 0)
+                .await
+                .is_none()
+        );
+
+        // A failing estimate (empty mock queue) also falls back to submit-only.
+        assert!(
+            submitter
+                .try_combined_submission(&submit_call, &withdrawals, u64::MAX, sender, 0)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

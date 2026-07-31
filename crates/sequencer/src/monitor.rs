@@ -38,10 +38,11 @@ use crate::{
     AttestationStore, ZoneSequencerProvider,
     abi::{self, NO_QUEUE_INDEX, ZonePortal},
     settlement::{
-        BatchAnchorConfig, BatchData, BatchSubmitter, FinalizedBatchLog, ZoneBlockSnapshot,
-        fetch_finalized_batch, fetch_finalized_batch_boundaries, read_zone_block_snapshot,
+        BatchAnchorConfig, BatchData, BatchSubmission, BatchSubmitter, FinalizedBatchLog,
+        ZoneBlockSnapshot, fetch_finalized_batch, fetch_finalized_batch_boundaries,
+        read_zone_block_snapshot,
     },
-    withdrawals::SharedWithdrawalStore,
+    withdrawals::{SharedWithdrawalStore, WithdrawalBatchLimits},
 };
 
 /// Maximum number of times to retry a failed batch submission before resyncing.
@@ -66,6 +67,9 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Withdrawal planner limits, shared with the standalone processor. Bounds the slots the
+    /// batch submitter may process atomically with settlement.
+    pub withdrawal_batch_limits: WithdrawalBatchLimits,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
 }
@@ -477,7 +481,8 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// - Advances `prev_zone_block_hash`, `prev_processed_deposit_hash`, and
     ///   `last_submitted_zone_block` to reflect the submitted range.
     /// - Stores withdrawals under the receipt's assigned portal queue index when
-    ///   the batch included withdrawals.
+    ///   the batch included withdrawals, unless the submission already processed
+    ///   the slot in the same transaction.
     /// - Signals the [`WithdrawalProcessor`](crate::withdrawals::WithdrawalProcessor)
     ///   so it can finalize newly enqueued withdrawal slots.
     ///
@@ -538,8 +543,19 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             }
 
             let submit_started = std::time::Instant::now();
-            match self.batch_submitter.submit_batch(batch_data).await {
-                Ok(event) => {
+            match self
+                .batch_submitter
+                .submit_batch(
+                    batch_data,
+                    &withdrawals,
+                    self.config.withdrawal_batch_limits.max_batch_gas,
+                )
+                .await
+            {
+                Ok(BatchSubmission {
+                    event,
+                    withdrawals_processed,
+                }) => {
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None
                     } else {
@@ -580,7 +596,14 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.update_submission_lag();
 
                     // Store withdrawals under the logical portal queue index assigned on-chain.
-                    if let Some(portal_index) = portal_index {
+                    // A slot processed atomically with the submission is already consumed, so
+                    // there is nothing left for the standalone processor.
+                    if withdrawals_processed {
+                        info!(
+                            count = withdrawals.len(),
+                            "Withdrawals processed in the batch submission transaction"
+                        );
+                    } else if let Some(portal_index) = portal_index {
                         if !withdrawals.is_empty() {
                             let count = withdrawals.len();
                             let mut store = self.withdrawal_store.lock();
@@ -956,6 +979,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
         let l1_provider = mock_provider(l1);
@@ -986,6 +1010,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
 

@@ -7,7 +7,9 @@
 //! - Withdrawals continue to be processed after a sequencer restart
 //! - Multiple restart cycles don't corrupt state
 
-use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
+use crate::utils::{
+    L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer, spawn_sequencer_with_config,
+};
 use alloy::primitives::{Address, U256};
 use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 
@@ -183,10 +185,24 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     l1.fund_user(account.address(), deposit_amount).await?;
     account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
 
+    // A tiny gas budget makes every slot ineligible for atomic settlement processing, so this
+    // test deterministically exercises the standalone pending-queue path across the restart.
+    let withdrawal_batch_limits = zone_sequencer::WithdrawalBatchLimits {
+        max_batch_gas: 1,
+        ..Default::default()
+    };
     let zone_sequencer::ZoneSequencerHandle {
         withdrawal_handle,
         monitor_handle,
-    } = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+    } = spawn_sequencer_with_config(
+        &l1,
+        &zone,
+        portal_address,
+        l1.dev_signer(),
+        zone_sequencer::BatchAnchorConfig::default(),
+        withdrawal_batch_limits,
+    )
+    .await;
 
     // Keep batch submission running, but stop L1 processing so the portal queue
     // is guaranteed to remain pending until after the restart.
@@ -222,7 +238,15 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     abort_task(monitor_handle).await;
 
     // --- Respawn sequencer (fetch_pending_withdrawals runs during init) ---
-    let seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+    let seq_handle2 = spawn_sequencer_with_config(
+        &l1,
+        &zone,
+        portal_address,
+        l1.dev_signer(),
+        zone_sequencer::BatchAnchorConfig::default(),
+        withdrawal_batch_limits,
+    )
+    .await;
 
     // The OLD withdrawal from before the restart should be processed via
     // restored data (withdrawal processor was aborted before head advanced).
