@@ -11,6 +11,7 @@ use crate::utils::{
     L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer, spawn_sequencer_with_config,
 };
 use alloy::primitives::{Address, U256};
+use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 
 /// Longer timeout for real L1 tests.
@@ -479,6 +480,9 @@ async fn test_finalized_withdrawal_survives_sequencer_restart() -> eyre::Result<
     let seq_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
     let withdrawal_amount: u128 = 500_000;
+    // The atomic fast path can pay the withdrawal out before the restart below, so take the L1
+    // baseline before the request and accept settlement on either side of the restart.
+    let l1_balance_before = l1.balance_of(PATH_USD_ADDRESS, account.address()).await?;
     account.withdraw(withdrawal_amount).await?;
     let withdrawal_block =
         wait_for_withdrawal_requested(&zone, account.address(), withdrawal_amount).await?;
@@ -502,13 +506,15 @@ async fn test_finalized_withdrawal_survives_sequencer_restart() -> eyre::Result<
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let _seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
-    l1.wait_for_withdrawal_on_l1(
-        portal_address,
+    l1.wait_for_balance(
+        PATH_USD_ADDRESS,
         account.address(),
-        withdrawal_amount,
+        l1_balance_before + U256::from(withdrawal_amount),
         WITHDRAWAL_TIMEOUT,
     )
     .await?;
+    l1.assert_withdrawal_processed(portal_address, account.address(), withdrawal_amount)
+        .await?;
 
     Ok(())
 }
