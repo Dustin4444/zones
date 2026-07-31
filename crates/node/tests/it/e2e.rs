@@ -23,7 +23,7 @@ use zone_l1::{ChainTempoStateExt, L1Deposit, L1PortalEvents};
 use crate::utils::{
     DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, WITHDRAWAL_BATCH_INTERVAL_BLOCKS,
     WITHDRAWAL_TX_GAS, ZoneTestNode, approve_outbox, leader_p2p_config, local_dev_zone_account,
-    poll_until, seed_fixture_for_zone, start_chain_id_rpc, start_local_p2p_cluster,
+    make_deposit, poll_until, seed_fixture_for_zone, start_chain_id_rpc, start_local_p2p_cluster,
     start_local_zone_with_fixture, submit_withdrawal, submit_withdrawals,
 };
 
@@ -87,7 +87,7 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     let depositor = address!("0x0000000000000000000000000000000000001234");
     let recipient = address!("0x0000000000000000000000000000000000005678");
     let amount = 1_000_000_u128;
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
     let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(deposit.clone())]);
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
     follower
@@ -118,7 +118,7 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     let (follower_wallet, sender) = local_dev_zone_account(&follower)?;
     let transfer_recipient = address!("0x0000000000000000000000000000000000009abc");
     fixture.seed_no_receive_policy(transfer_recipient)?;
-    let sender_deposit = fixture.make_deposit(PATH_USD_ADDRESS, sender, sender, amount);
+    let sender_deposit = make_deposit(PATH_USD_ADDRESS, sender, sender, amount);
     let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(sender_deposit.clone())]);
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![sender_deposit]);
     follower
@@ -265,7 +265,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
 
     // Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1).
     let deposit_amount: u128 = 1_000_000;
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
     let observed = L1PortalEvents::from_deposits(vec![L1Deposit::Regular(deposit.clone())]);
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
     leader
@@ -392,7 +392,7 @@ async fn test_contract_creation_transaction_is_rejected() -> eyre::Result<()> {
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let (provider, dev_address) = local_dev_zone_account(&zone)?;
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, 1_000_000);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, 1_000_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
     zone.wait_for_balance(
         PATH_USD_ADDRESS,
@@ -432,13 +432,13 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
     let bob = address!("0x0000000000000000000000000000000000000B0B");
     let sender = address!("0x0000000000000000000000000000000000001111");
 
-    let d1 = fixture.make_deposit(PATH_USD_ADDRESS, sender, alice, 500_000);
+    let d1 = make_deposit(PATH_USD_ADDRESS, sender, alice, 500_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![d1]);
 
     fixture.inject_empty_block(zone.deposit_queue());
 
-    let d2 = fixture.make_deposit(PATH_USD_ADDRESS, sender, alice, 300_000);
-    let d3 = fixture.make_deposit(PATH_USD_ADDRESS, sender, bob, 700_000);
+    let d2 = make_deposit(PATH_USD_ADDRESS, sender, alice, 300_000);
+    let d3 = make_deposit(PATH_USD_ADDRESS, sender, bob, 700_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![d2, d3]);
 
     // Third block: a large batch of deposits to distinct recipients, processed
@@ -453,7 +453,7 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
         .collect();
     let batch: Vec<_> = batch_recipients
         .iter()
-        .map(|to| fixture.make_deposit(PATH_USD_ADDRESS, sender, *to, amount_each))
+        .map(|to| make_deposit(PATH_USD_ADDRESS, sender, *to, amount_each))
         .collect();
     fixture.inject_deposits(zone.deposit_queue(), batch);
 
@@ -577,20 +577,20 @@ async fn test_two_zones_independent_deposits() -> eyre::Result<()> {
 
     // L1 block 1: deposit to Alice on zone1, empty on zone2
     let b1 = fixture.next_block();
-    let d1 = L1Fixture::make_deposit_for_block(PATH_USD_ADDRESS, sender, alice, 500_000);
+    let d1 = make_deposit(PATH_USD_ADDRESS, sender, alice, 500_000);
     fixture.enqueue(&b1, zone1.deposit_queue(), vec![d1]);
     fixture.enqueue(&b1, zone2.deposit_queue(), vec![]);
 
     // L1 block 2: empty on zone1, deposit to Bob on zone2
     let b2 = fixture.next_block();
-    let d2 = L1Fixture::make_deposit_for_block(PATH_USD_ADDRESS, sender, bob, 700_000);
+    let d2 = make_deposit(PATH_USD_ADDRESS, sender, bob, 700_000);
     fixture.enqueue(&b2, zone1.deposit_queue(), vec![]);
     fixture.enqueue(&b2, zone2.deposit_queue(), vec![d2]);
 
     // L1 block 3: deposits on both zones
     let b3 = fixture.next_block();
-    let d3a = L1Fixture::make_deposit_for_block(PATH_USD_ADDRESS, sender, alice, 300_000);
-    let d3b = L1Fixture::make_deposit_for_block(PATH_USD_ADDRESS, sender, bob, 200_000);
+    let d3a = make_deposit(PATH_USD_ADDRESS, sender, alice, 300_000);
+    let d3b = make_deposit(PATH_USD_ADDRESS, sender, bob, 200_000);
     fixture.enqueue(&b3, zone1.deposit_queue(), vec![d3a]);
     fixture.enqueue(&b3, zone2.deposit_queue(), vec![d3b]);
 
@@ -688,7 +688,7 @@ async fn test_zone_inbox_events_on_deposit() -> eyre::Result<()> {
     let recipient = address!("0x0000000000000000000000000000000000002222");
     let deposit_amount: u128 = 5_000_000;
 
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, sender, recipient, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, sender, recipient, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
 
     // Wait for the deposit to be processed
@@ -835,7 +835,7 @@ async fn fund_and_approve_outbox(
     dev_address: Address,
     amount: u128,
 ) -> eyre::Result<()> {
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
     zone.wait_for_balance(
         PATH_USD_ADDRESS,

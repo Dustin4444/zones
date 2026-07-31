@@ -3,14 +3,12 @@
 //! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
 
 use crate::utils::{
-    L1TestNode, WithdrawalArgs, ZoneAccount, ZoneCreationConfig, ZoneTestNode, spawn_sequencer,
+    L1_TIMEOUT, L1TestNode, WITHDRAWAL_TIMEOUT, WithdrawalArgs, ZoneAccount, ZoneCreationConfig,
+    ZoneTestNode, spawn_sequencer,
 };
 use alloy::primitives::U256;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
-
-/// Longer timeout for real L1 tests.
-const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Cross-zone transfer via SwapAndDepositRouter between two open zones:
 ///
@@ -100,12 +98,12 @@ async fn test_cross_zone_send() -> eyre::Result<()> {
             router,
             PATH_USD_ADDRESS,
             cross_amount,
-            std::time::Duration::from_secs(60),
+            WITHDRAWAL_TIMEOUT,
         )
         .await?;
     eyre::ensure!(callback_succeeded, "cross-zone router callback failed");
 
-    let cross_timeout = std::time::Duration::from_secs(60);
+    let cross_timeout = WITHDRAWAL_TIMEOUT;
     zone_b
         .wait_for_balance(
             ZONE_TOKEN_ADDRESS,

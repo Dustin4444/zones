@@ -338,24 +338,6 @@ impl L1Fixture {
         queue.enqueue(block.header.clone(), events);
     }
 
-    /// Create a [`Deposit`] for a specific L1 block.
-    pub(crate) fn make_deposit_for_block(
-        token: Address,
-        sender: Address,
-        to: Address,
-        amount: u128,
-    ) -> Deposit {
-        Deposit {
-            token,
-            sender,
-            to,
-            amount,
-            fee: 0,
-            tempo_refund_recipient: sender,
-            memo: B256::ZERO,
-        }
-    }
-
     /// Inject an L1 block with enabled tokens (no deposits) into the queue.
     pub(crate) fn inject_enabled_tokens(
         &mut self,
@@ -402,24 +384,19 @@ impl L1Fixture {
         queue.enqueue(header, events);
         anchor
     }
+}
 
-    /// Create a [`Deposit`] for testing.
-    pub(crate) fn make_deposit(
-        &self,
-        token: Address,
-        sender: Address,
-        to: Address,
-        amount: u128,
-    ) -> Deposit {
-        Deposit {
-            token,
-            sender,
-            to,
-            amount,
-            fee: 0,
-            tempo_refund_recipient: sender,
-            memo: B256::ZERO,
-        }
+/// Create a [`Deposit`] with zero fee, a zero memo, and the sender as its own
+/// Tempo refund recipient.
+pub(crate) fn make_deposit(token: Address, sender: Address, to: Address, amount: u128) -> Deposit {
+    Deposit {
+        token,
+        sender,
+        to,
+        amount,
+        fee: 0,
+        tempo_refund_recipient: sender,
+        memo: B256::ZERO,
     }
 }
 

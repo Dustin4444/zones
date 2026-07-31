@@ -2,12 +2,9 @@
 //!
 //! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
 
-use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode};
+use crate::utils::{L1_TIMEOUT, L1TestNode, ZoneAccount, ZoneTestNode};
 use alloy::{primitives::U256, providers::ProviderBuilder};
 use tempo_zone_contracts::ZONE_TOKEN_ADDRESS;
-
-/// Longer timeout for real L1 tests.
-const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shield + in-zone send:
 ///

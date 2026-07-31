@@ -39,6 +39,13 @@ The harness provides two independent testing paths:
               └─────────────────────────┘
 ```
 
+The shared harness lives in `utils/`, one module per concern: `node`
+(`ZoneTestNode` + the mock L1 RPC), `l1` (`L1TestNode`, TIP-403 seeding,
+genesis builders), `fixture` (`L1Fixture` + queue injection), `accounts`
+(`ZoneAccount`, withdrawal args), `p2p` (multi-sequencer cluster), and
+`private_rpc` (auth tokens, RPC test contexts). Everything is re-exported
+through `utils::`.
+
 ### Injection Path (`e2e.rs`)
 
 Uses `L1Fixture` to manually construct `TempoHeader` and `Deposit` objects,
@@ -47,8 +54,8 @@ push them into the `DepositQueue`, and seed the `L1StateCache` for
 
 ```rust
 let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
-let deposit = fixture.make_deposit(sender, recipient, amount);
-fixture.inject_deposits(&zone.deposit_queue, vec![deposit]);
+let deposit = make_deposit(PATH_USD_ADDRESS, sender, recipient, amount);
+fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
 // poll for balance change...
 ```
 
@@ -63,15 +70,15 @@ fixture.inject_deposits(&zone.deposit_queue, vec![deposit]);
 
 ```rust
 let b1 = fixture.next_block();
-fixture.enqueue(&b1, &zone1.deposit_queue, vec![deposit_for_zone1]);
-fixture.enqueue(&b1, &zone2.deposit_queue, vec![]);
+fixture.enqueue(&b1, zone1.deposit_queue(), vec![deposit_for_zone1]);
+fixture.enqueue(&b1, zone2.deposit_queue(), vec![]);
 ```
 
 ### Real L1 Path (`l1_e2e.rs`)
 
-Starts an in-process Tempo L1 dev node via `L1TestNode::start()`, then connects
-a zone node via `ZoneTestNode::start_from_l1()`. The `L1Subscriber` receives
-real blocks over WebSocket.
+`start_l1_and_zone()` starts an in-process Tempo L1 dev node, deploys a zone
+portal on it, and connects a zone node whose `L1Subscriber` receives real
+blocks over WebSocket.
 
 **Genesis patching in `start_from_l1()`:**
 
@@ -84,50 +91,43 @@ template (`crates/node/assets/zone-dev-genesis.json`, via `zone_node::genesis`):
    - Layout: `(tempoBlockNumber:u64, tempoGasLimit:u64, tempoGasUsed:u64, tempoTimestamp:u64)`
    - Only `tempoBlockNumber` is currently patched; other fields retain genesis defaults
 
-## Test Inventory
+## Test Modules
 
-### `e2e.rs` — Injection-Based Tests
+| Module | Covers |
+|--------|--------|
+| `e2e.rs` | Injection-based deposits, withdrawal batching, P2P leader/follower, engine lifecycle |
+| `l1_e2e.rs` | Real-L1 deposits/withdrawals, cross-zone routing, encrypted deposits, TIP-403 policy bounces |
+| `earn_zone_e2e.rs` | Earn vault deposit/redeem matrix through the zone (needs the private `earn` artifacts) |
+| `restart_e2e.rs` | Sequencer restart resilience (batch submission and withdrawals resume from portal state) |
+| `handoff_e2e.rs` | Multi-sequencer leadership handoff, forwarded transactions, live propagation |
+| `stepping_e2e.rs` | Out-of-EIP-2935-window batch submission via ancestry anchors |
+| `tip403_policy.rs` | Zone TIP-403 proxy precompile against seeded raw L1 policy state |
+| `tip403_transfers.rs` | TIP-20 transfer/withdrawal flows under receive policies |
+| `enable_token.rs` | `TokenEnabled` pipelines (injected events and the live real-L1 path) |
+| `private_rpc.rs` | Auth-token parsing and method classification (pure unit tests) |
+| `private_rpc_e2e.rs` | Private RPC server: auth, privacy scoping, method tiers, WS subscriptions |
+| `demo_*.rs` | Narrated end-to-end flows: shield-and-send, multi-asset, cross-zone |
+| `deposit.rs` | Real-testnet deposit round trip (`#[ignore]`d; needs `L1_PORTAL_ADDRESS`) |
+| `precompiles.rs` | Precompiles disabled on zones |
 
-| Test | What it exercises |
-|------|-------------------|
-| `test_deposit_via_queue_injection` | Single deposit → pathUSD mint on L2 |
-| `test_multiple_deposits_across_blocks` | Multi-block, multi-recipient deposits |
-| `test_empty_l1_blocks_advance_zone` | Chain continuity without deposits |
-| `test_two_zones_independent_deposits` | Cross-zone isolation (shared L1 timeline, independent queues) |
-| `test_tempo_state_advances_with_l1_blocks` | `tempoBlockNumber` and `tempoBlockHash` tracking |
-| `test_zone_inbox_events_on_deposit` | `TempoAdvanced` + `DepositProcessed` event emission |
-| `test_withdrawal_batch_finalization` | `ZoneOutbox.withdrawalBatchIndex` advancement |
-| `test_large_deposit_batch` | 10 deposits in one L1 block |
-
-### `l1_e2e.rs` — Real L1 Integration Tests
-
-| Test | What it exercises |
-|------|-------------------|
-| `test_zone_advances_with_real_l1` | Full L1Subscriber → DepositQueue → ZoneEngine pipeline |
-| `test_deposit_via_real_l1` | Zone startup from real L1 + initial state verification |
-
-### `deposit.rs` — Testnet Integration Tests (ignored by default)
-
-| Test | What it exercises |
-|------|-------------------|
-| `test_l1_deposit_mints_on_zone` | Real deposit on testnet portal → mint on local zone |
+Real-L1 modules require `forge build --root specs/ref-impls` first.
 
 ## Key Types
 
 - **`ZoneTestNode`** — In-process zone L2 node with RPC endpoint. Fields are
   private; use `http_url()`, `deposit_queue()`, `l1_state_cache()` getters.
-  Constructed via `start_local()`, `start_from_l1()`, or `start()`.
+  Constructed via the `start_*` wrappers or `launch(ZoneNodeParams)`.
 - **`L1TestNode`** — In-process Tempo L1 dev node. Fields are private; use
-  `http_url()` and `ws_url()` getters. Constructed via `start()`.
+  `http_url()` and `ws_url()` getters. Constructed via `start()`; most tests
+  use `start_l1_and_zone()` for the full preamble.
+- **`ZoneAccount`** — A funded account with providers on both layers; wraps
+  deposits (plain, token, encrypted, raw) and withdrawals.
 - **`L1Fixture`** — Synthetic L1 block builder maintaining hash chain continuity.
 - **`FixtureBlock`** — Clonable L1 block for multi-zone broadcast.
 - **`poll_until`** — Generic async condition poller with timeout.
 
 ## Known Issues / Improvements
 
-- **Chain ID collisions:** `start_local()` hardcodes `chain_id = 1337`. Tests
-  running in parallel can collide. Use `start_local_with_chain_id()` with unique
-  IDs, or switch `start_local()` to pick random chain IDs.
 - **Slot 7 partial patch:** `start_from_l1()` only patches `tempoBlockNumber` in
   the packed slot 7. Should also patch `tempoGasLimit`, `tempoGasUsed`, and
   `tempoTimestamp` from the anchor header for full consistency.

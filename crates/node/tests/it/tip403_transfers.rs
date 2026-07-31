@@ -20,7 +20,7 @@ use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS};
 
 use crate::utils::{
     DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, WITHDRAWAL_TX_GAS, approve_outbox,
-    local_dev_zone_account, start_local_zone_with_fixture, submit_withdrawal,
+    local_dev_zone_account, make_deposit, start_local_zone_with_fixture, submit_withdrawal,
 };
 
 /// Deposit pathUSD to the dev account, then transfer a portion to Bob.
@@ -39,7 +39,7 @@ async fn test_deposit_then_transfer() -> eyre::Result<()> {
     let deposit_amount: u128 = 1_000_000;
 
     // Deposit pathUSD to the dev account
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
 
     zone.wait_for_balance(
@@ -133,7 +133,7 @@ async fn test_deposit_then_request_withdrawal() -> eyre::Result<()> {
         .and_then(|value| value.checked_add(gas_buffer))
         .expect("test deposit amount should not overflow");
 
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
 
     zone.wait_for_balance(
@@ -211,7 +211,7 @@ async fn test_sequential_transfers() -> eyre::Result<()> {
     let deposit_amount: u128 = 2_000_000;
 
     // Deposit to Alice
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
     zone.wait_for_balance(
         PATH_USD_ADDRESS,
@@ -328,7 +328,7 @@ async fn test_transfer_emits_events() -> eyre::Result<()> {
     let transfer_amount: u128 = 250_000;
 
     // Deposit to dev
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
     zone.wait_for_balance(
         PATH_USD_ADDRESS,
@@ -395,7 +395,7 @@ async fn test_transfer_with_memo() -> eyre::Result<()> {
     let memo = B256::with_last_byte(0x42);
 
     // Deposit to dev
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
+    let deposit = make_deposit(PATH_USD_ADDRESS, dev_address, dev_address, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
     zone.wait_for_balance(
         PATH_USD_ADDRESS,

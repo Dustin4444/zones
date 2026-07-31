@@ -2,14 +2,13 @@
 //!
 //! Requires `forge build --root specs/ref-impls` for the Foundry artifacts.
 
-use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
+use crate::utils::{
+    L1_TIMEOUT, L1TestNode, WITHDRAWAL_TIMEOUT, ZoneAccount, ZoneTestNode, spawn_sequencer,
+};
 use alloy::{
     primitives::{B256, U256},
     providers::Provider,
 };
-
-/// Longer timeout for real L1 tests.
-const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Multi-asset deposit + withdrawal with two freshly created TIP-20 tokens,
 /// auto-initialized on L2 via `TokenEnabled` events:
@@ -92,7 +91,6 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
     );
 
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
-    let withdrawal_timeout = std::time::Duration::from_secs(60);
 
     // Withdraw AlphaUSD
     let alpha_withdrawal: u128 = 500_000; // 0.5 AlphaUSD
@@ -103,7 +101,7 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
         l1_alpha,
         account.address(),
         alpha_withdrawal,
-        withdrawal_timeout,
+        WITHDRAWAL_TIMEOUT,
     )
     .await?;
 
@@ -116,7 +114,7 @@ async fn test_multiasset_deposit_and_withdraw() -> eyre::Result<()> {
         l1_beta,
         account.address(),
         beta_withdrawal,
-        withdrawal_timeout,
+        WITHDRAWAL_TIMEOUT,
     )
     .await?;
 

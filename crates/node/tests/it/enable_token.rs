@@ -6,22 +6,19 @@
 //! `TokenEnabled` events from L1, and that deposits of the newly-enabled
 //! tokens are correctly minted.
 
-use alloy::primitives::{U256, address};
+use alloy::primitives::{B256, U256, address};
 use alloy_network::ReceiptResponse;
-use zone_l1::{EnabledToken, L1Deposit, L1PortalEvents};
-
-use crate::utils::{
-    DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, local_dev_tempo_zone_account,
-    start_local_zone_with_fixture,
-};
-
-// Imports for real-L1 tests
-use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
-use alloy::primitives::B256;
 use alloy_provider::Provider;
 use tempo_alloy::rpc::TempoCallBuilderExt;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
+use zone_l1::{EnabledToken, L1Deposit, L1PortalEvents};
+
+use crate::utils::{
+    DEFAULT_TIMEOUT, L1_TIMEOUT, L1TestNode, TIP20_TX_GAS, WITHDRAWAL_TIMEOUT, ZoneAccount,
+    ZoneTestNode, local_dev_tempo_zone_account, make_deposit, spawn_sequencer,
+    start_local_zone_with_fixture,
+};
 
 /// Enable a new token (AlphaUSD) via a `TokenEnabled` event, then deposit it
 /// and verify the recipient receives the minted balance.
@@ -47,7 +44,7 @@ async fn test_enable_token_then_deposit() -> eyre::Result<()> {
     let recipient = address!("0x0000000000000000000000000000000000005678");
     let deposit_amount: u128 = 1_000_000;
 
-    let deposit = fixture.make_deposit(alpha_token, sender, recipient, deposit_amount);
+    let deposit = make_deposit(alpha_token, sender, recipient, deposit_amount);
     fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
 
     // Verify the recipient received the AlphaUSD
@@ -92,7 +89,7 @@ async fn test_enable_token_and_deposit_same_block() -> eyre::Result<()> {
 
     // Single L1 block with both TokenEnabled + deposit
     let block = fixture.next_block();
-    let deposit = L1Fixture::make_deposit_for_block(beta_token, sender, recipient, deposit_amount);
+    let deposit = make_deposit(beta_token, sender, recipient, deposit_amount);
     let events = L1PortalEvents {
         deposits: vec![L1Deposit::Regular(deposit)],
         enabled_tokens: vec![enabled],
@@ -134,7 +131,7 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     let transfer_amount = 100_000u128;
 
     let block = fixture.next_block();
-    let deposit = L1Fixture::make_deposit_for_block(token_address, sender, sender, deposit_amount);
+    let deposit = make_deposit(token_address, sender, sender, deposit_amount);
     fixture.enqueue_events(
         &block,
         zone.deposit_queue(),
@@ -203,16 +200,14 @@ async fn test_pool_validation_uses_enabled_token_anchored_policy() -> eyre::Resu
     Ok(())
 }
 
-/// Longer timeout for real L1 tests — the L1 dev node produces blocks every
-/// 500ms and the L1Subscriber needs to connect, backfill, and subscribe.
-const L1_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Full TokenEnabled pipeline with a real in-process L1 node: a freshly
 /// created TIP-20 is enabled on the portal, deposited, and withdrawn again.
 ///
 /// The token must be enabled AFTER zone startup so the live L1 subscriber
 /// picks up the `TokenEnabled` event (events in blocks ≤ genesis are not
-/// backfilled).
+/// backfilled). This is the live-event counterpart of
+/// `demo_asset_swap::test_multiasset_deposit_and_withdraw`, which enables its
+/// tokens before the zone starts and covers the genesis-carried path.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -277,7 +272,6 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
     );
 
     let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
-    let withdrawal_timeout = std::time::Duration::from_secs(60);
 
     let alpha_withdrawal: u128 = 1_000_000; // 1 AlphaUSD
     account
@@ -289,7 +283,7 @@ async fn test_enable_token_via_real_l1() -> eyre::Result<()> {
         l1_alpha_usd,
         account.address(),
         alpha_withdrawal,
-        withdrawal_timeout,
+        WITHDRAWAL_TIMEOUT,
     )
     .await?;
 

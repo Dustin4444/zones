@@ -324,9 +324,7 @@ impl PrivateRpcTestCtx {
         recipient: Address,
         amount: u128,
     ) -> eyre::Result<()> {
-        let deposit = self
-            .fixture
-            .make_deposit(token, depositor, recipient, amount);
+        let deposit = make_deposit(token, depositor, recipient, amount);
         let dq = self.zone.deposit_queue().clone();
         self.fixture.inject_deposits(&dq, vec![deposit]);
         self.zone

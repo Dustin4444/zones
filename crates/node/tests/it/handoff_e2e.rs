@@ -9,15 +9,15 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{U256, address};
+use alloy::primitives::{B256, U256, address};
 use alloy_provider::Provider;
 use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP20;
 use tempo_precompiles::PATH_USD_ADDRESS;
 
 use crate::utils::{
-    DEFAULT_POLL, DEFAULT_TIMEOUT, L1Fixture, TIP20_TX_GAS, local_dev_zone_account, poll_until,
-    start_local_p2p_cluster,
+    DEFAULT_POLL, DEFAULT_TIMEOUT, P2pCluster, TIP20_TX_GAS, ZoneTestNode, local_dev_zone_account,
+    make_deposit, poll_until, start_local_p2p_cluster,
 };
 
 /// Ceiling for one leadership switch: covers the Commonware handshake, the promotion
@@ -30,6 +30,65 @@ const QUIESCENCE: Duration = Duration::from_secs(3);
 /// the window to backfill-paced replication fails fast instead of passing slowly.
 const LIVE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Assert every block in `1..=last_height` is identical on all nodes and was
+/// produced by node 0 below `handoff_anchor` and by node 1 from it onwards.
+async fn assert_producer_boundary(
+    cluster: &P2pCluster,
+    last_height: u64,
+    handoff_anchor: u64,
+) -> eyre::Result<()> {
+    let a_producer = cluster.sequencer_signers[0].address();
+    let b_producer = cluster.sequencer_signers[1].address();
+    for height in 1..=last_height {
+        let header = cluster.assert_same_block(height).await?;
+        let expected = if height < handoff_anchor {
+            a_producer
+        } else {
+            b_producer
+        };
+        assert_eq!(
+            header.beneficiary, expected,
+            "block {height} has the wrong producer (boundary at {handoff_anchor})"
+        );
+    }
+    Ok(())
+}
+
+/// Fund a dev-account sender via a block-4 deposit and wait for the mint.
+async fn fund_sender_in_block_4(
+    cluster: &mut P2pCluster,
+) -> eyre::Result<alloy_provider::DynProvider> {
+    let (sender_wallet, sender) = local_dev_zone_account(&cluster.nodes[2])?;
+    let amount = 1_000_000_u128;
+    cluster.inject_block(vec![make_deposit(PATH_USD_ADDRESS, sender, sender, amount)])?;
+    cluster.wait_all_at(4, DEFAULT_TIMEOUT).await?;
+    cluster.nodes[2]
+        .wait_for_balance(
+            PATH_USD_ADDRESS,
+            sender,
+            U256::from(amount),
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
+    Ok(sender_wallet)
+}
+
+/// Poll until `node`'s transaction pool knows the forwarded transaction.
+async fn wait_for_pooled_tx(
+    node: &ZoneTestNode,
+    transaction_hash: B256,
+    timeout: Duration,
+    description: &'static str,
+) -> eyre::Result<()> {
+    let provider = node.provider();
+    poll_until(timeout, DEFAULT_POLL, description, || {
+        let provider = &provider;
+        async move { Ok(provider.get_transaction_by_hash(transaction_hash).await?) }
+    })
+    .await?;
+    Ok(())
+}
+
 /// A crashes after producing a tip shared by every follower. Three L1 anchors pass with no zone
 /// blocks, then an operator selects B and the shared tip for forced recovery. The matching
 /// finalized transition lets B fill the missing anchor range and continue as the portal leader,
@@ -39,7 +98,6 @@ async fn test_forced_recovery_resumes_after_leader_crash() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     for _ in 0..3 {
         cluster.inject_block(vec![])?;
@@ -155,9 +213,6 @@ async fn test_planned_handoff_moves_production_at_exact_activation_boundary() ->
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    // Commonware drops messages for offline peers; the bootstrap leader also needs tip
-    // evidence from both followers before its first promotion.
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // --- Blocks 1..=3 are produced by A (the manifest bootstrap leader). ---
     for _ in 0..3 {
@@ -166,23 +221,7 @@ async fn test_planned_handoff_moves_production_at_exact_activation_boundary() ->
     cluster.wait_all_at(3, HANDOFF_TIMEOUT).await?;
 
     // --- Block 4 funds a sender so a pending transaction can ride through the handoff. ---
-    let (sender_wallet, sender) = local_dev_zone_account(&cluster.nodes[2])?;
-    let amount = 1_000_000_u128;
-    cluster.inject_block(vec![L1Fixture::make_deposit_for_block(
-        PATH_USD_ADDRESS,
-        sender,
-        sender,
-        amount,
-    )])?;
-    cluster.wait_all_at(4, DEFAULT_TIMEOUT).await?;
-    cluster.nodes[2]
-        .wait_for_balance(
-            PATH_USD_ADDRESS,
-            sender,
-            U256::from(amount),
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
+    let sender_wallet = fund_sender_in_block_4(&mut cluster).await?;
 
     // Submit a transfer to follower C. C admits it locally and forwards it to every quorum peer,
     // including active leader A and incoming leader B. Nobody includes it before the handoff
@@ -197,34 +236,18 @@ async fn test_planned_handoff_moves_production_at_exact_activation_boundary() ->
         .send()
         .await?;
     let transaction_hash = *pending.tx_hash();
-    let leader_provider = cluster.nodes[0].provider();
-    poll_until(
+    wait_for_pooled_tx(
+        &cluster.nodes[0],
+        transaction_hash,
         DEFAULT_TIMEOUT,
-        DEFAULT_POLL,
         "forwarded transaction in the outgoing leader's pool",
-        || {
-            let leader_provider = &leader_provider;
-            async move {
-                Ok(leader_provider
-                    .get_transaction_by_hash(transaction_hash)
-                    .await?)
-            }
-        },
     )
     .await?;
-    let incoming_leader_provider = cluster.nodes[1].provider();
-    poll_until(
+    wait_for_pooled_tx(
+        &cluster.nodes[1],
+        transaction_hash,
         DEFAULT_TIMEOUT,
-        DEFAULT_POLL,
         "forwarded transaction in the incoming leader's pool",
-        || {
-            let incoming_leader_provider = &incoming_leader_provider;
-            async move {
-                Ok(incoming_leader_provider
-                    .get_transaction_by_hash(transaction_hash)
-                    .await?)
-            }
-        },
     )
     .await?;
 
@@ -273,27 +296,14 @@ async fn test_planned_handoff_moves_production_at_exact_activation_boundary() ->
     // at the activation boundary (block height == embedded anchor in this harness). ---
     let final_height = cluster.nodes[1].provider().get_block_number().await?;
     cluster.wait_all_at(final_height, HANDOFF_TIMEOUT).await?;
-    let a_producer = cluster.sequencer_signers[0].address();
-    let b_producer = cluster.sequencer_signers[1].address();
-    for height in 1..=final_height {
-        let header = cluster.assert_same_block(height).await?;
-        let expected = if height < handoff_anchor {
-            a_producer
-        } else {
-            b_producer
-        };
-        assert_eq!(
-            header.beneficiary, expected,
-            "block {height} has the wrong producer (boundary at {handoff_anchor})"
-        );
-    }
+    assert_producer_boundary(&cluster, final_height, handoff_anchor).await?;
 
     // --- A remains a live follower of B: it imports the next B-produced block. ---
     cluster.inject_block(vec![])?;
     let next = final_height + 1;
     cluster.wait_all_at(next, HANDOFF_TIMEOUT).await?;
     let header = cluster.assert_same_block(next).await?;
-    assert_eq!(header.beneficiary, b_producer);
+    assert_eq!(header.beneficiary, cluster.sequencer_signers[1].address());
 
     // Every recipient balance is identical everywhere.
     for node in &cluster.nodes {
@@ -318,7 +328,6 @@ async fn test_lagged_follower_promotes_only_after_catching_up() -> eyre::Result<
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Blocks 1..=2 are observed by everyone.
     for _ in 0..2 {
@@ -374,25 +383,15 @@ async fn test_lagged_follower_promotes_only_after_catching_up() -> eyre::Result<
     cluster.record_anchor(1, boundary, vec![])?;
     cluster.wait_all_at(6, HANDOFF_TIMEOUT).await?;
 
-    let a_producer = cluster.sequencer_signers[0].address();
-    let b_producer = cluster.sequencer_signers[1].address();
-    for height in 1..=6 {
-        let header = cluster.assert_same_block(height).await?;
-        let expected = if height < handoff_anchor {
-            a_producer
-        } else {
-            b_producer
-        };
-        assert_eq!(
-            header.beneficiary, expected,
-            "block {height} has the wrong producer (boundary at {handoff_anchor})"
-        );
-    }
+    assert_producer_boundary(&cluster, 6, handoff_anchor).await?;
 
     // B keeps producing; everyone follows.
     cluster.inject_block(vec![])?;
     cluster.wait_all_at(7, HANDOFF_TIMEOUT).await?;
-    assert_eq!(cluster.assert_same_block(7).await?.beneficiary, b_producer);
+    assert_eq!(
+        cluster.assert_same_block(7).await?.beneficiary,
+        cluster.sequencer_signers[1].address()
+    );
     Ok(())
 }
 
@@ -409,7 +408,6 @@ async fn test_advance_scheduled_handoff_keeps_outgoing_leader_live() -> eyre::Re
     reth_tracing::init_test_tracing();
 
     let mut cluster = start_local_p2p_cluster(24).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Blocks 1..=3 are produced by A (the manifest bootstrap leader).
     for _ in 0..3 {
@@ -418,23 +416,7 @@ async fn test_advance_scheduled_handoff_keeps_outgoing_leader_live() -> eyre::Re
     cluster.wait_all_at(3, HANDOFF_TIMEOUT).await?;
 
     // Block 4 funds a sender used during the window.
-    let (sender_wallet, sender) = local_dev_zone_account(&cluster.nodes[2])?;
-    let amount = 1_000_000_u128;
-    cluster.inject_block(vec![L1Fixture::make_deposit_for_block(
-        PATH_USD_ADDRESS,
-        sender,
-        sender,
-        amount,
-    )])?;
-    cluster.wait_all_at(4, DEFAULT_TIMEOUT).await?;
-    cluster.nodes[2]
-        .wait_for_balance(
-            PATH_USD_ADDRESS,
-            sender,
-            U256::from(amount),
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
+    let sender_wallet = fund_sender_in_block_4(&mut cluster).await?;
 
     // Publish A→B three anchors ahead of the boundary: every node observes B's upcoming
     // leadership while A still rightfully produces anchors 5..=7.
@@ -458,15 +440,11 @@ async fn test_advance_scheduled_handoff_keeps_outgoing_leader_live() -> eyre::Re
         .send()
         .await?;
     let transaction_hash = *pending.tx_hash();
-    let outgoing_leader_provider = cluster.nodes[0].provider();
-    poll_until(
+    wait_for_pooled_tx(
+        &cluster.nodes[0],
+        transaction_hash,
         LIVE_PROPAGATION_TIMEOUT,
-        DEFAULT_POLL,
         "forwarded transaction in the outgoing leader's pool during the window",
-        || {
-            let provider = &outgoing_leader_provider;
-            async move { Ok(provider.get_transaction_by_hash(transaction_hash).await?) }
-        },
     )
     .await?;
 
@@ -502,20 +480,7 @@ async fn test_advance_scheduled_handoff_keeps_outgoing_leader_live() -> eyre::Re
         .wait_all_at(handoff_anchor + 1, HANDOFF_TIMEOUT)
         .await?;
 
-    let a_producer = cluster.sequencer_signers[0].address();
-    let b_producer = cluster.sequencer_signers[1].address();
-    for height in 1..=handoff_anchor + 1 {
-        let header = cluster.assert_same_block(height).await?;
-        let expected = if height < handoff_anchor {
-            a_producer
-        } else {
-            b_producer
-        };
-        assert_eq!(
-            header.beneficiary, expected,
-            "block {height} has the wrong producer (boundary at {handoff_anchor})"
-        );
-    }
+    assert_producer_boundary(&cluster, handoff_anchor + 1, handoff_anchor).await?;
 
     // Every recipient balance is identical everywhere.
     for node in &cluster.nodes {
