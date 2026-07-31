@@ -13628,6 +13628,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-revm",
  "reth-storage-api",
+ "reth-tasks",
  "reth-transaction-pool",
  "serde",
  "tempo-evm",
