@@ -297,14 +297,8 @@ where
                 );
                 err
             })?;
-        // Canonical `advanceTempo` can no longer benefit from additional reads. Stop dispatching
-        // without waiting for workers that are already running.
+        // Canonical `advanceTempo` can no longer benefit from additional reads.
         drop(prewarming);
-        info!(
-            target: "zone::payload",
-            elapsed = ?canonical_advance_start.elapsed(),
-            "canonical advanceTempo completed"
-        );
 
         // Execute pool transactions until either all of them fit or their packed RLP bytes reach
         // the size budget
