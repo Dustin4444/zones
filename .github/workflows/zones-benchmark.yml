@@ -832,6 +832,15 @@ jobs:
             target/zones-benchmark/zone-receipts.jsonl \
             "$ZONES_BENCH_ZONE_RECEIPT_START_BLOCK"
 
+      - name: Collect L1 transaction traces
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          contrib/bench/collect-transaction-traces.sh \
+            "$ZONES_BENCH_L1_QUERY_RPC_URL" \
+            target/zones-benchmark/l1-receipts.jsonl \
+            target/zones-benchmark/l1-transaction-traces.jsonl
+
       - name: Publish benchmark results
         if: ${{ !cancelled() }}
         env:
@@ -1025,7 +1034,7 @@ jobs:
             \) -exec cp --target-directory="$output_dir" -- {} +
           fi
 
-      - name: Upload specs, logs, reports, and receipts
+      - name: Upload specs, logs, reports, receipts, and traces
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
