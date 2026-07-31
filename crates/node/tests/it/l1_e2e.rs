@@ -229,75 +229,6 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
     Ok(())
 }
 
-/// Full deposit + withdrawal flow with a real L1: a portal deposit mints
-/// pathUSD on L2, then a withdrawal is batched and processed back on L1.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_deposit_via_real_l1() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let l1 = L1TestNode::start().await?;
-
-    // Deploy L1 infrastructure and create a zone
-    let portal_address = l1.deploy_zone().await?;
-
-    // Start zone node connected to L1 with the real portal
-    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
-
-    // Wait for the zone to advance past genesis
-    zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
-
-    let mut account = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
-    let deposit_amount: u128 = 1_000_000; // 1 pathUSD (6 decimals)
-
-    // Fund the user account on L1 (separate from the sequencer/dev account)
-    l1.fund_user(account.address(), deposit_amount * 2).await?;
-
-    // Verify recipient starts with zero on L2
-    let balance_before = zone
-        .balance_of(ZONE_TOKEN_ADDRESS, account.address())
-        .await?;
-    assert_eq!(
-        balance_before,
-        U256::ZERO,
-        "recipient should start with zero on L2"
-    );
-
-    let minted_balance = account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
-    assert_eq!(
-        minted_balance,
-        U256::from(deposit_amount),
-        "minted balance should equal deposit amount (fee=0)"
-    );
-
-    // Spawn zone sequencer (batch submitter + withdrawal processor)
-    let _sequencer_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
-
-    // Request withdrawal on L2
-    let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
-    account.withdraw(withdrawal_amount).await?;
-
-    // Wait for the withdrawal to be fully processed on L1
-    let withdrawal_timeout = std::time::Duration::from_secs(60);
-    l1.wait_for_withdrawal_on_l1(
-        portal_address,
-        account.address(),
-        withdrawal_amount,
-        withdrawal_timeout,
-    )
-    .await?;
-
-    // Verify the L2 balance decreased by at least the withdrawal amount
-    let l2_balance_after = zone
-        .balance_of(ZONE_TOKEN_ADDRESS, account.address())
-        .await?;
-    assert!(
-        l2_balance_after <= U256::from(deposit_amount - withdrawal_amount),
-        "L2 balance should decrease by at least the withdrawal amount (got {l2_balance_after})"
-    );
-
-    Ok(())
-}
-
 /// Deposit to enough independent accounts to force several gas-bounded withdrawal transactions,
 /// then submit the accounts concurrently, including repeated withdrawals from half of them.
 ///
@@ -1304,25 +1235,72 @@ async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Same-zone routed withdrawal where the downstream plaintext deposit fails.
-///
-/// Deposits for BetaUSD are paused on the target portal so the router callback
-/// reverts and the original AlphaUSD withdrawal bounces back to the sender.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_failure()
--> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
+/// Which router-callback flavor a bounce test exercises.
+enum RouterCallbackKind {
+    Plaintext,
+    Encrypted,
+}
 
+/// Same-zone routed withdrawal where the downstream deposit fails: deposits
+/// for BetaUSD are paused on the target portal so the router callback reverts
+/// and the original AlphaUSD withdrawal bounces back to the sender.
+async fn run_swap_and_deposit_bounce_test(kind: RouterCallbackKind) -> eyre::Result<()> {
     let mut fixture = setup_same_zone_swap_fixture().await?;
     let expected_beta = fixture
         .l1
         .quote_dex_swap_exact_amount_in(fixture.alpha, fixture.beta, fixture.swap_amount)
         .await?;
 
+    if matches!(kind, RouterCallbackKind::Encrypted) {
+        use sha2::{Digest, Sha256};
+        let enc_key_bytes: [u8; 32] =
+            Sha256::digest(b"swap-and-deposit-router-encrypted-tempo-refund").into();
+        let encryption_key = k256::SecretKey::from_slice(&enc_key_bytes).expect("valid key");
+        fixture
+            .l1
+            .set_sequencer_encryption_key(fixture.portal_address, &encryption_key)
+            .await?;
+    }
+
     fixture
         .l1
         .pause_deposits_on_portal(fixture.portal_address, fixture.beta)
         .await?;
+
+    let args = match kind {
+        RouterCallbackKind::Plaintext => {
+            WithdrawalArgs::swap_and_deposit_via_router(PlaintextRouterCallbackArgs {
+                amount: fixture.swap_amount,
+                router: fixture.router,
+                token_out: fixture.beta,
+                target_portal: fixture.portal_address,
+                recipient: fixture.account.address(),
+                tempo_refund_recipient: fixture.account.address(),
+                memo: B256::ZERO,
+                min_amount_out: expected_beta,
+            })
+        }
+        RouterCallbackKind::Encrypted => {
+            let (key_index, encrypted) = fixture
+                .l1
+                .encrypt_deposit_for_portal(
+                    fixture.portal_address,
+                    fixture.account.address(),
+                    B256::ZERO,
+                )
+                .await?;
+            WithdrawalArgs::swap_and_deposit_encrypted_via_router(EncryptedRouterCallbackArgs {
+                amount: fixture.swap_amount,
+                router: fixture.router,
+                token_out: fixture.beta,
+                target_portal: fixture.portal_address,
+                key_index,
+                encrypted,
+                tempo_refund_recipient: fixture.account.address(),
+                min_amount_out: expected_beta,
+            })
+        }
+    };
 
     let _sequencer = spawn_sequencer(
         &fixture.l1,
@@ -1332,16 +1310,6 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
     )
     .await;
 
-    let args = WithdrawalArgs::swap_and_deposit_via_router(PlaintextRouterCallbackArgs {
-        amount: fixture.swap_amount,
-        router: fixture.router,
-        token_out: fixture.beta,
-        target_portal: fixture.portal_address,
-        recipient: fixture.account.address(),
-        tempo_refund_recipient: fixture.account.address(),
-        memo: B256::ZERO,
-        min_amount_out: expected_beta,
-    });
     fixture
         .account
         .withdraw_token_with(fixture.alpha, args)
@@ -1375,7 +1343,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
     assert_eq!(
         alpha_after,
         U256::from(fixture.swap_amount),
-        "AlphaUSD should bounce back after the router's plaintext deposit reverts"
+        "AlphaUSD should bounce back after the routed deposit reverts"
     );
 
     let beta_after = fixture
@@ -1385,7 +1353,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
     assert_eq!(
         beta_after,
         U256::ZERO,
-        "BetaUSD should not be minted when the routed plaintext deposit fails"
+        "BetaUSD should not be minted when the routed deposit fails"
     );
 
     fixture
@@ -1402,6 +1370,15 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
     Ok(())
 }
 
+/// Same-zone routed withdrawal where the downstream plaintext deposit fails
+/// and the original AlphaUSD withdrawal bounces back to the sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_failure()
+-> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    run_swap_and_deposit_bounce_test(RouterCallbackKind::Plaintext).await
+}
+
 /// Same-zone routed withdrawal where the downstream encrypted deposit fails.
 ///
 /// This pins the callback behavior for `depositEncrypted`: even with a valid
@@ -1411,113 +1388,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_on_plaintext_deposit_
 async fn test_swap_and_deposit_into_same_zone_bounces_back_on_encrypted_deposit_failure()
 -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-
-    use sha2::{Digest, Sha256};
-
-    let mut fixture = setup_same_zone_swap_fixture().await?;
-    let expected_beta = fixture
-        .l1
-        .quote_dex_swap_exact_amount_in(fixture.alpha, fixture.beta, fixture.swap_amount)
-        .await?;
-
-    let enc_key_bytes: [u8; 32] =
-        Sha256::digest(b"swap-and-deposit-router-encrypted-tempo-refund").into();
-    let encryption_key = k256::SecretKey::from_slice(&enc_key_bytes).expect("valid key");
-
-    fixture
-        .l1
-        .set_sequencer_encryption_key(fixture.portal_address, &encryption_key)
-        .await?;
-    fixture
-        .l1
-        .pause_deposits_on_portal(fixture.portal_address, fixture.beta)
-        .await?;
-
-    let (key_index, encrypted) = fixture
-        .l1
-        .encrypt_deposit_for_portal(
-            fixture.portal_address,
-            fixture.account.address(),
-            B256::ZERO,
-        )
-        .await?;
-
-    let _sequencer = spawn_sequencer(
-        &fixture.l1,
-        &fixture.zone,
-        fixture.portal_address,
-        fixture.l1.dev_signer(),
-    )
-    .await;
-
-    let args = WithdrawalArgs::swap_and_deposit_encrypted_via_router(EncryptedRouterCallbackArgs {
-        amount: fixture.swap_amount,
-        router: fixture.router,
-        token_out: fixture.beta,
-        target_portal: fixture.portal_address,
-        key_index,
-        encrypted,
-        tempo_refund_recipient: fixture.account.address(),
-        min_amount_out: expected_beta,
-    });
-    fixture
-        .account
-        .withdraw_token_with(fixture.alpha, args)
-        .await?;
-
-    let alpha_after_request = fixture
-        .zone
-        .balance_of(fixture.alpha, fixture.account.address())
-        .await?;
-    assert_eq!(
-        alpha_after_request,
-        U256::ZERO,
-        "AlphaUSD should leave the zone before the encrypted callback bounces back"
-    );
-
-    let timeout = Duration::from_secs(60);
-    fixture
-        .zone
-        .wait_for_balance(
-            fixture.alpha,
-            fixture.account.address(),
-            U256::from(fixture.swap_amount),
-            timeout,
-        )
-        .await?;
-
-    let alpha_after = fixture
-        .zone
-        .balance_of(fixture.alpha, fixture.account.address())
-        .await?;
-    assert_eq!(
-        alpha_after,
-        U256::from(fixture.swap_amount),
-        "AlphaUSD should bounce back when the routed encrypted deposit fails"
-    );
-
-    let beta_after = fixture
-        .zone
-        .balance_of(fixture.beta, fixture.account.address())
-        .await?;
-    assert_eq!(
-        beta_after,
-        U256::ZERO,
-        "BetaUSD should not be minted when the routed encrypted deposit fails"
-    );
-
-    fixture
-        .l1
-        .assert_withdrawal_processed_with_status(
-            fixture.portal_address,
-            fixture.router,
-            fixture.alpha,
-            fixture.swap_amount,
-            false,
-        )
-        .await?;
-
-    Ok(())
+    run_swap_and_deposit_bounce_test(RouterCallbackKind::Encrypted).await
 }
 
 /// Multi-asset deposit + withdrawal: pathUSD plus a second TIP-20 enabled on

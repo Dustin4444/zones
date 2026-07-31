@@ -86,16 +86,30 @@ async fn fetch_submit_batch_call(
     Ok((call, block_number))
 }
 
-/// Batch submission still works after the zone falls far enough behind L1 that
-/// the first finalized batch boundary lands outside the configured EIP-2935
-/// window (scaled down to 10 blocks so the gap fits integration-test time).
-#[tokio::test(flavor = "multi_thread")]
-async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
+/// Shared harness for the configured-short-window ancestry tests: starts a
+/// fast-block L1, lets it advance `gap_blocks` past the portal genesis, starts
+/// a zone anchored at that genesis, waits for it to replay `replay_windows`
+/// effective windows, verifies the first boundary is genuinely outside the
+/// configured window, and spawns the sequencer with the shortened anchor
+/// config only after the backlog has accumulated.
+struct ShortGapHarness {
+    l1: L1TestNode,
+    /// Kept alive for the duration of the test; the tests themselves only
+    /// observe the L1 portal.
+    _zone: ZoneTestNode,
+    portal_address: alloy_primitives::Address,
+    genesis_block: u64,
+    seq: zone_sequencer::ZoneSequencerHandle,
+}
 
+async fn start_short_gap_harness(
+    gap_blocks: u64,
+    replay_windows: u64,
+) -> eyre::Result<ShortGapHarness> {
     let anchor_config =
         BatchAnchorConfig::new(SHORT_EIP2935_HISTORY_WINDOW, SHORT_EIP2935_SAFETY_MARGIN)?;
 
+    // Fast blocks so the configured test window ages out quickly.
     let l1 = L1TestNode::start_with(|cfg| {
         cfg.dev.block_time = Some(Duration::from_millis(20));
     })
@@ -103,8 +117,7 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
 
     let portal_address = l1.deploy_zone().await?;
     let genesis_block = l1.provider().get_block_number().await?;
-    let portal = ZonePortal::new(portal_address, l1.provider());
-    let target_block = genesis_block + SHORT_EXTENDED_GAP_BLOCKS;
+    let target_block = genesis_block + gap_blocks;
 
     poll_until(
         SHORT_STEPPING_TIMEOUT,
@@ -132,10 +145,11 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
     )
     .await?;
 
-    let first_step_tempo = genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW;
-    zone.wait_for_tempo_block_number(first_step_tempo, SHORT_STEPPING_TIMEOUT)
+    let replay_tempo = genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW * replay_windows;
+    zone.wait_for_tempo_block_number(replay_tempo, SHORT_STEPPING_TIMEOUT)
         .await?;
 
+    let first_step_tempo = genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW;
     let l1_tip = l1.provider().get_block_number().await?;
     eyre::ensure!(
         l1_tip.saturating_sub(first_step_tempo) > SHORT_EIP2935_HISTORY_WINDOW,
@@ -153,34 +167,13 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
     )
     .await;
 
-    poll_until(
-        SHORT_STEPPING_TIMEOUT,
-        Duration::from_millis(250),
-        "BatchSubmitted event after configured short L1 gap",
-        || {
-            let portal = &portal;
-            let seq = &seq;
-            async move {
-                if seq.monitor_handle.is_finished() {
-                    eyre::bail!("monitor task exited before submitting a batch");
-                }
-
-                if seq.withdrawal_handle.is_finished() {
-                    eyre::bail!("withdrawal processor exited before batch submission completed");
-                }
-
-                let events = portal.BatchSubmitted_filter().from_block(0).query().await?;
-                if events.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(events.len()))
-                }
-            }
-        },
-    )
-    .await?;
-
-    Ok(())
+    Ok(ShortGapHarness {
+        l1,
+        _zone: zone,
+        portal_address,
+        genesis_block,
+        seq,
+    })
 }
 
 /// Verifies that a larger configured-window gap submits multiple finalized
@@ -189,76 +182,23 @@ async fn test_batch_submission_after_configured_short_l1_gap() -> eyre::Result<(
 async fn test_configured_short_l1_gap_submits_multiple_batch_boundaries() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let anchor_config =
-        BatchAnchorConfig::new(SHORT_EIP2935_HISTORY_WINDOW, SHORT_EIP2935_SAFETY_MARGIN)?;
-
-    // Start L1 with fast blocks so the configured test window ages out quickly.
-    let l1 = L1TestNode::start_with(|cfg| {
-        cfg.dev.block_time = Some(Duration::from_millis(20));
-    })
-    .await?;
-
-    let portal_address = l1.deploy_zone().await?;
-    let genesis_block = l1.provider().get_block_number().await?;
-    let portal = ZonePortal::new(portal_address, l1.provider());
-    let target_block = genesis_block + SHORT_MULTI_BOUNDARY_GAP_BLOCKS;
-
-    // Mine enough L1 blocks that catching up requires several ancestry batches.
-    poll_until(
-        SHORT_STEPPING_TIMEOUT,
-        Duration::from_millis(50),
-        "L1 advanced far enough to require multiple configured ancestry batches",
-        || {
-            let provider = l1.provider();
-            async move {
-                let current = provider.get_block_number().await?;
-                if current >= target_block {
-                    Ok(Some(current))
-                } else {
-                    Ok(None)
-                }
-            }
-        },
+    let harness = start_short_gap_harness(
+        SHORT_MULTI_BOUNDARY_GAP_BLOCKS,
+        SHORT_MULTI_BOUNDARY_BATCH_COUNT,
     )
     .await?;
+    let l1 = &harness.l1;
+    let seq = &harness.seq;
+    let portal = ZonePortal::new(harness.portal_address, l1.provider());
 
-    let zone = ZoneTestNode::start_from_l1_genesis_block(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_address,
-        genesis_block,
-    )
-    .await?;
-
-    // Let the zone replay far enough to have multiple valid split boundaries.
+    // The multi-boundary target must still be below the safe L1 anchor tip.
     let multi_step_tempo =
-        genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW * SHORT_MULTI_BOUNDARY_BATCH_COUNT;
-    zone.wait_for_tempo_block_number(multi_step_tempo, SHORT_STEPPING_TIMEOUT)
-        .await?;
-
-    // Assert the first submitted boundary is genuinely outside the configured history window.
-    let first_step_tempo = genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW;
+        harness.genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW * SHORT_MULTI_BOUNDARY_BATCH_COUNT;
     let l1_tip = l1.provider().get_block_number().await?;
-    eyre::ensure!(
-        l1_tip.saturating_sub(first_step_tempo) > SHORT_EIP2935_HISTORY_WINDOW,
-        "test precondition not met: first configured boundary tempo {first_step_tempo} is only {} blocks behind L1 tip {l1_tip}",
-        l1_tip.saturating_sub(first_step_tempo),
-    );
     eyre::ensure!(
         multi_step_tempo < l1_tip.saturating_sub(SHORT_EIP2935_SAFETY_MARGIN),
         "test precondition not met: multi-boundary tempo {multi_step_tempo} is not below the safe L1 anchor tip {l1_tip}",
     );
-
-    // Start the sequencer only after the backlog has accumulated.
-    let seq = spawn_sequencer_with_config(
-        &l1,
-        &zone,
-        portal_address,
-        l1.dev_signer(),
-        anchor_config,
-        zone_sequencer::WithdrawalBatchLimits::default(),
-    )
-    .await;
 
     // Wait for the boundary walk to submit the first configured catch-up batches.
     let calls = poll_until(
@@ -267,8 +207,6 @@ async fn test_configured_short_l1_gap_submits_multiple_batch_boundaries() -> eyr
         "multiple boundary BatchSubmitted events",
         || {
             let portal = &portal;
-            let seq = &seq;
-            let l1 = &l1;
             async move {
                 if seq.monitor_handle.is_finished() {
                     eyre::bail!("monitor task exited before submitting boundary batches");
@@ -335,65 +273,10 @@ async fn test_configured_short_l1_gap_submits_multiple_batch_boundaries() -> eyr
 async fn test_boundary_ancestry_submission_uses_recent_anchor() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let anchor_config =
-        BatchAnchorConfig::new(SHORT_EIP2935_HISTORY_WINDOW, SHORT_EIP2935_SAFETY_MARGIN)?;
-
-    let l1 = L1TestNode::start_with(|cfg| {
-        cfg.dev.block_time = Some(Duration::from_millis(20));
-    })
-    .await?;
-
-    let portal_address = l1.deploy_zone().await?;
-    let genesis_block = l1.provider().get_block_number().await?;
-    let portal = ZonePortal::new(portal_address, l1.provider());
-    let target_block = genesis_block + SHORT_EXTENDED_GAP_BLOCKS;
-
-    poll_until(
-        SHORT_STEPPING_TIMEOUT,
-        Duration::from_millis(50),
-        "L1 advanced past configured short EIP-2935 window",
-        || {
-            let provider = l1.provider();
-            async move {
-                let current = provider.get_block_number().await?;
-                if current >= target_block {
-                    Ok(Some(current))
-                } else {
-                    Ok(None)
-                }
-            }
-        },
-    )
-    .await?;
-
-    let zone = ZoneTestNode::start_from_l1_genesis_block(
-        l1.http_url(),
-        l1.ws_url(),
-        portal_address,
-        genesis_block,
-    )
-    .await?;
-
-    let first_step_tempo = genesis_block + SHORT_EIP2935_EFFECTIVE_WINDOW;
-    zone.wait_for_tempo_block_number(first_step_tempo, SHORT_STEPPING_TIMEOUT)
-        .await?;
-
-    let l1_tip = l1.provider().get_block_number().await?;
-    eyre::ensure!(
-        l1_tip.saturating_sub(first_step_tempo) > SHORT_EIP2935_HISTORY_WINDOW,
-        "test precondition not met: first configured boundary tempo {first_step_tempo} is only {} blocks behind L1 tip {l1_tip}",
-        l1_tip.saturating_sub(first_step_tempo),
-    );
-
-    let seq = spawn_sequencer_with_config(
-        &l1,
-        &zone,
-        portal_address,
-        l1.dev_signer(),
-        anchor_config,
-        zone_sequencer::WithdrawalBatchLimits::default(),
-    )
-    .await;
+    let harness = start_short_gap_harness(SHORT_EXTENDED_GAP_BLOCKS, 1).await?;
+    let l1 = &harness.l1;
+    let seq = &harness.seq;
+    let portal = ZonePortal::new(harness.portal_address, l1.provider());
 
     let (call, inclusion_block) = poll_until(
         SHORT_STEPPING_TIMEOUT,
@@ -401,8 +284,6 @@ async fn test_boundary_ancestry_submission_uses_recent_anchor() -> eyre::Result<
         "ancestry submitBatch calldata using recent anchor",
         || {
             let portal = &portal;
-            let seq = &seq;
-            let l1 = &l1;
             async move {
                 if seq.monitor_handle.is_finished() {
                     eyre::bail!("monitor task exited before submitting a batch");

@@ -395,44 +395,6 @@ async fn test_p2p_listener_failure_stops_node() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Self-contained test: inject a deposit via the queue and verify the zone
-/// mints the corresponding pathUSD balance on L2.
-///
-/// Flow:
-/// 1. Start a zone node with no real L1 (dummy URL).
-/// 2. Inject an L1 block with a deposit into the deposit queue.
-/// 3. Wait for the ZoneEngine to produce L2 blocks.
-/// 4. Verify the recipient's pathUSD balance increased on L2.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_deposit_via_queue_injection() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
-
-    let depositor = address!("0x0000000000000000000000000000000000001234");
-    let recipient = address!("0x0000000000000000000000000000000000005678");
-    let deposit_amount: u128 = 1_000_000; // 1 pathUSD (6 decimals)
-
-    let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, deposit_amount);
-    fixture.inject_deposits(zone.deposit_queue(), vec![deposit]);
-
-    let balance = zone
-        .wait_for_balance(
-            PATH_USD_ADDRESS,
-            recipient,
-            U256::from(deposit_amount),
-            DEFAULT_TIMEOUT,
-        )
-        .await?;
-    assert_eq!(
-        balance,
-        U256::from(deposit_amount),
-        "minted amount should equal deposit amount"
-    );
-
-    Ok(())
-}
-
 /// Verify a contract-creation transaction is rejected by a running zone node.
 ///
 /// This exercises the complete public transaction path: wallet signing, HTTP RPC,
@@ -471,8 +433,8 @@ async fn test_contract_creation_transaction_is_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Self-contained test: inject multiple deposits across multiple L1 blocks
-/// and verify all are minted on L2.
+/// Self-contained test: inject deposits across multiple L1 blocks — including
+/// a ten-deposit batch in a single block — and verify all are minted on L2.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -491,6 +453,22 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
     let d2 = fixture.make_deposit(PATH_USD_ADDRESS, sender, alice, 300_000);
     let d3 = fixture.make_deposit(PATH_USD_ADDRESS, sender, bob, 700_000);
     fixture.inject_deposits(zone.deposit_queue(), vec![d2, d3]);
+
+    // Third block: a large batch of deposits to distinct recipients, processed
+    // by a single advanceTempo.
+    let amount_each: u128 = 100_000;
+    let batch_recipients: Vec<Address> = (1..=10u8)
+        .map(|i| {
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes[19] = i;
+            Address::from(addr_bytes)
+        })
+        .collect();
+    let batch: Vec<_> = batch_recipients
+        .iter()
+        .map(|to| fixture.make_deposit(PATH_USD_ADDRESS, sender, *to, amount_each))
+        .collect();
+    fixture.inject_deposits(zone.deposit_queue(), batch);
 
     // Alice should have 500k + 300k = 800k
     let alice_balance = zone
@@ -514,22 +492,23 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
         .await?;
     assert_eq!(bob_balance, U256::from(700_000u128));
 
-    Ok(())
-}
-
-/// Self-contained test: verify the zone produces blocks even for empty L1
-/// blocks (no deposits). The zone must advance its TempoState for every L1
-/// block to maintain chain continuity.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
-
-    fixture.inject_empty_blocks(zone.deposit_queue(), 5);
-
-    // Each L1 block advances tempoBlockNumber — wait for all 5
-    zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+    // All ten batch recipients received their deposit from the single block.
+    let last_recipient = *batch_recipients.last().expect("ten recipients");
+    zone.wait_for_balance(
+        PATH_USD_ADDRESS,
+        last_recipient,
+        U256::from(amount_each),
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    for recipient in &batch_recipients {
+        let balance = zone.balance_of(PATH_USD_ADDRESS, *recipient).await?;
+        assert_eq!(
+            balance,
+            U256::from(amount_each),
+            "recipient {recipient} should have {amount_each}"
+        );
+    }
 
     Ok(())
 }
@@ -773,55 +752,6 @@ async fn test_zone_inbox_events_on_deposit() -> eyre::Result<()> {
         dp_event.amount, deposit_amount,
         "DepositProcessed amount mismatch"
     );
-
-    Ok(())
-}
-
-/// Verify a large batch of deposits in a single L1 block is processed correctly.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_large_deposit_batch() -> eyre::Result<()> {
-    reth_tracing::init_test_tracing();
-
-    let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
-
-    let sender = address!("0x0000000000000000000000000000000000001111");
-    let num_deposits = 10u128;
-    let amount_each: u128 = 100_000;
-
-    // Build 10 deposits to different recipients in one L1 block
-    let recipients: Vec<Address> = (0..num_deposits)
-        .map(|i| {
-            let mut addr_bytes = [0u8; 20];
-            addr_bytes[19] = (i + 1) as u8;
-            Address::from(addr_bytes)
-        })
-        .collect();
-    let deposits: Vec<_> = recipients
-        .iter()
-        .map(|to| fixture.make_deposit(PATH_USD_ADDRESS, sender, *to, amount_each))
-        .collect();
-
-    fixture.inject_deposits(zone.deposit_queue(), deposits);
-
-    // Wait for the last recipient to receive their deposit
-    let last_recipient = *recipients.last().unwrap();
-    zone.wait_for_balance(
-        PATH_USD_ADDRESS,
-        last_recipient,
-        U256::from(amount_each),
-        DEFAULT_TIMEOUT,
-    )
-    .await?;
-
-    // Verify all recipients received the correct amount
-    for recipient in &recipients {
-        let balance = zone.balance_of(PATH_USD_ADDRESS, *recipient).await?;
-        assert_eq!(
-            balance,
-            U256::from(amount_each),
-            "recipient {recipient} should have {amount_each}"
-        );
-    }
 
     Ok(())
 }

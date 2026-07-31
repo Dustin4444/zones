@@ -1496,15 +1496,6 @@ fn ensure_gas_headroom(gas_used: u64, gas_limit: u64, operation: &str) -> eyre::
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn matrix_deposit_private_private_succeeds() -> eyre::Result<()> {
-    let mut fixture = EarnZoneFixture::start().await?;
-    let user = fixture.user.address();
-    let shares = fixture.zone_deposit(fixture.alternate_asset, user).await?;
-    assert_eq!(shares, AMOUNT, "direct Zone deposit was not 1:1");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn zone_deposit_third_party_recipient() -> eyre::Result<()> {
     let mut fixture = EarnZoneFixture::start().await?;
     let recipient = fixture.l1.signer_at(3).address();
@@ -1520,6 +1511,7 @@ async fn matrix_redeem_private_private_succeeds() -> eyre::Result<()> {
     let mut fixture = EarnZoneFixture::start().await?;
     let user = fixture.user.address();
     let shares = fixture.zone_deposit(fixture.alternate_asset, user).await?;
+    assert_eq!(shares, AMOUNT, "direct Zone deposit was not 1:1");
     let output = fixture
         .zone_redeem(shares, fixture.alternate_asset, user)
         .await?;
@@ -1540,21 +1532,10 @@ async fn zone_redeem_third_party_recipient() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The `min_vault_assets` bound is enforced: an unsatisfiable minimum makes
+/// the deposit callback bounce instead of minting shares.
 #[tokio::test(flavor = "multi_thread")]
-async fn zone_lifecycle_swapped() -> eyre::Result<()> {
-    let mut fixture = EarnZoneFixture::start().await?;
-    let user = fixture.user.address();
-    let shares = fixture.zone_deposit(fixture.alternate_asset, user).await?;
-    assert_eq!(shares, AMOUNT, "swapped Zone deposit was not 1:1");
-    let output = fixture
-        .zone_redeem(shares, fixture.alternate_asset, user)
-        .await?;
-    assert_eq!(output, AMOUNT, "swapped Zone lifecycle was not 1:1");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn zone_swap_slippage_bounces() -> eyre::Result<()> {
+async fn zone_deposit_min_vault_assets_bounces() -> eyre::Result<()> {
     let mut fixture = EarnZoneFixture::start().await?;
     let user = fixture.user.address();
 
