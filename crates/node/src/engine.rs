@@ -10,22 +10,21 @@
 //! L1Subscriber ──enqueue──► DepositQueue ──notify──► ZoneEngine
 //!                                │                       │
 //!                                │                   1. peek queue → L1 block
-//!                                │                   2. decrypt deposits
-//!                                │                   3. build ZonePayloadAttributes
+//!                                │                   2. build ZonePayloadAttributes
 //!                                │                      (inner attrs + l1_block)
-//!                                │                   4. FCU w/ payload attributes
+//!                                │                   3. FCU w/ payload attributes
 //!                                │                       │
 //!                                │                       ▼
 //!                                │               reth payload service
 //!                                │                       │
-//!                                │               5. build payload
+//!                                │               4. build payload
 //!                                │                  (L1 data from attributes)
 //!                                │                       │
 //!                                │                       ▼
 //!                                │                  ZoneEngine
-//!                                │               6. resolve payload
-//!                                │               7. newPayload
-//!                                │               8. FCU (update head)
+//!                                │               5. resolve payload
+//!                                │               6. newPayload
+//!                                │               7. FCU (update head)
 //!                                │                       │
 //!                                ◄── confirm ◄───────────┘
 //! ```
@@ -157,12 +156,11 @@ where
 ///
 /// Waits for L1 blocks in the [`DepositQueue`], then for each block:
 /// 1. Peeks the L1 block from the queue
-/// 2. Decrypts deposits
-/// 3. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
-/// 4. Sends FCU with payload attributes to start a build
-/// 5. Resolves the built payload
-/// 6. Submits via `newPayload`
-/// 7. Confirms the L1 block in the queue (removes it)
+/// 2. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
+/// 3. Sends FCU with payload attributes to start a build
+/// 4. Resolves the built payload
+/// 5. Submits via `newPayload`
+/// 6. Confirms the L1 block in the queue (removes it)
 ///
 /// On failure the L1 block stays in the queue and is retried.
 #[derive(Debug)]
@@ -312,7 +310,9 @@ impl ZoneEngine {
         }
     }
 
-    /// Decrypt deposits and prepare canonical `advanceTempo` calldata for payload construction.
+    /// Decrypt encrypted deposits and ABI-encode them into a [`PreparedL1Block`] ready for
+    /// the payload builder. Mint-recipient policy is enforced during upstream TIP-20 execution
+    /// against the finalized L1 anchor.
     async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
         l1_block
             .prepare(&self.sequencer_key, self.portal_address)

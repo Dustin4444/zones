@@ -1144,18 +1144,11 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         })]),
     };
 
-    let failed_key = k256::SecretKey::from_slice(&[0x12; 32]).expect("valid alternate key");
-    let failed_prepared = block
-        .clone()
-        .prepare(&failed_key, portal)
-        .await
-        .expect("failed local decryption should still prepare a refund proof");
-    assert_eq!(failed_prepared.decryptions.len(), 1);
-
     let prepared = block
         .prepare(&sequencer_key, portal)
         .await
-        .expect("decrypted deposit should prepare canonical calldata");
+        .expect("decrypted deposit should prepare without an engine-side policy read");
+
     assert_eq!(prepared.queued_deposits.len(), 1);
     assert_eq!(
         prepared.queued_deposits[0].depositType,

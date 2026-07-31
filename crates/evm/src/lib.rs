@@ -312,13 +312,6 @@ where
         &self.chain_spec
     }
 
-    /// Returns the L1 reader shared by pool validation, payload building, and block execution.
-    ///
-    /// Cloning this reader preserves its underlying block-versioned cache and RPC transport.
-    pub const fn l1_reader(&self) -> &L1 {
-        &self.zone_factory.l1_reader
-    }
-
     /// Returns the underlying chain specification used by Tempo execution.
     pub fn tempo_chain_spec(&self) -> &Arc<TempoChainSpec> {
         self.inner.chain_spec()

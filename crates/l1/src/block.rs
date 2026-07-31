@@ -29,13 +29,12 @@ impl L1BlockDeposits {
         let mut queued_deposits: Vec<abi::QueuedDeposit> = Vec::new();
         let mut decryptions: Vec<abi::DecryptionData> = Vec::new();
 
-        for l1_deposit in &self.events.deposits {
-            match l1_deposit {
-                L1Deposit::Regular(_deposit) => {
-                    queued_deposits.push(l1_deposit.to_abi_queued_deposit());
-                }
+        for deposit in &self.events.deposits {
+            match deposit {
+                L1Deposit::Regular(_) => queued_deposits.push(deposit.to_abi_queued_deposit()),
                 L1Deposit::Encrypted(d) => {
-                    let queued = l1_deposit.to_abi_queued_deposit();
+                    let queued = deposit.to_abi_queued_deposit();
+
                     // Attempt full ECIES decryption.
                     let dec = ecies::decrypt_deposit(
                         sequencer_key,
@@ -123,7 +122,7 @@ impl L1BlockDeposits {
             .events
             .enabled_tokens
             .iter()
-            .map(|token| token.to_abi())
+            .map(|t| t.to_abi())
             .collect();
 
         let elapsed = start.elapsed();
