@@ -283,7 +283,6 @@ where
         .start();
 
         // Execute advanceTempo system transaction — exactly one per zone block.
-        let canonical_advance_start = Instant::now();
         builder
             .execute_transaction(build_advance_tempo_tx(prepared))
             .map(|_| ())
