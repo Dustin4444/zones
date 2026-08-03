@@ -60,6 +60,11 @@ alloy_sol_types::sol! {
         EngineMigrationMode migrationMode;
     }
 
+    struct DistributorConfig {
+        address distributor;
+        uint40 updateDelay;
+    }
+
     struct FixedFeeRecipient {
         address account;
         uint16 rateBps;
@@ -130,6 +135,7 @@ alloy_sol_types::sol! {
         address engine;
         address owner;
         EarnVaultControls controls;
+        DistributorConfig distributorConfig;
         FeeConfig fees;
         uint64 transferPolicyId;
     }
@@ -379,6 +385,10 @@ impl EarnZoneFixture {
                 emergencyGuardian: Address::ZERO,
                 asyncJanitor: Address::ZERO,
                 migrationMode: EngineMigrationMode::OperatorEnabled,
+            },
+            distributorConfig: DistributorConfig {
+                distributor: Address::ZERO,
+                updateDelay: 0,
             },
             fees,
             transferPolicyId: 0,
