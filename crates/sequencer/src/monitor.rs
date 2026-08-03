@@ -48,7 +48,10 @@ use crate::{
 const MAX_RETRIES: u32 = 3;
 
 /// Initial delay between retries (doubles on each attempt).
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Backoff before rebuilding the monitor after a start or run failure.
+const RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Configuration for the [`ZoneMonitor`].
 #[derive(Debug, Clone)]
@@ -65,6 +68,29 @@ pub struct ZoneMonitorConfig {
     pub batch_anchor_config: BatchAnchorConfig,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
+}
+
+/// Withdrawal state shared between the zone monitor and withdrawal processor.
+#[derive(Clone)]
+pub struct ZoneMonitorSharedState {
+    withdrawal_store: SharedWithdrawalStore,
+    withdrawal_notify: Arc<Notify>,
+    repair_notify: Arc<Notify>,
+}
+
+impl ZoneMonitorSharedState {
+    /// Create the shared withdrawal state used by the zone monitor.
+    pub fn new(
+        withdrawal_store: SharedWithdrawalStore,
+        withdrawal_notify: Arc<Notify>,
+        repair_notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            withdrawal_store,
+            withdrawal_notify,
+            repair_notify,
+        }
+    }
 }
 
 /// Monitors the Zone L2 chain for new finalized batch boundaries and submits
@@ -215,7 +241,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         outbox = %self.config.outbox_address,
         inbox = %self.config.inbox_address,
     ))]
-    pub async fn run(&mut self) -> Result<()> {
+    /// Returns `Ok(())` only when `shutdown` fires; the token is observed at the poll
+    /// boundary so an in-flight batch submission resolves before teardown.
+    pub async fn run(&mut self, shutdown: &tokio_util::sync::CancellationToken) -> Result<()> {
         info!("Native zone monitor started");
 
         // Subscribe before reading the head so a block imported during startup cannot be missed.
@@ -226,6 +254,11 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             self.process_available_blocks().await;
 
             tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    info!("Zone monitor observed shutdown");
+                    return Ok(());
+                }
                 _ = fallback.tick() => {}
                 notification = canonical.next() => {
                     let Some(notification) = notification else {
@@ -756,12 +789,21 @@ pub fn spawn_zone_monitor<P: ZoneSequencerProvider>(
     zone_provider: P,
     l1_provider: DynProvider<TempoNetwork>,
     signer: PrivateKeySigner,
-    withdrawal_store: SharedWithdrawalStore,
-    withdrawal_notify: Arc<Notify>,
-    repair_notify: Arc<Notify>,
+    shared_state: ZoneMonitorSharedState,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    let ZoneMonitorSharedState {
+        withdrawal_store,
+        withdrawal_notify,
+        repair_notify,
+    } = shared_state;
+
     tokio::spawn(async move {
         loop {
+            if shutdown.is_cancelled() {
+                info!("Zone monitor stopped before start");
+                return;
+            }
             let mut monitor = match ZoneMonitor::new(
                 config.clone(),
                 zone_provider.clone(),
@@ -776,17 +818,37 @@ pub fn spawn_zone_monitor<P: ZoneSequencerProvider>(
                 Ok(monitor) => monitor,
                 Err(e) => {
                     error!(error = %e, "Zone monitor failed to start, retrying in 5s");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if shutdown
+                        .run_until_cancelled(tokio::time::sleep(RESTART_BACKOFF))
+                        .await
+                        .is_none()
+                    {
+                        info!("Zone monitor stopped before start");
+                        return;
+                    }
                     continue;
                 }
             };
 
-            if let Err(e) = monitor.run().await {
-                error!(
-                    error = %e,
-                    "Zone monitor failed; rebuilding from the portal anchor in 5s"
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            match monitor.run(&shutdown).await {
+                Ok(()) => {
+                    info!("Zone monitor stopped");
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "Zone monitor failed; rebuilding from the portal anchor in 5s"
+                    );
+                    if shutdown
+                        .run_until_cancelled(tokio::time::sleep(RESTART_BACKOFF))
+                        .await
+                        .is_none()
+                    {
+                        info!("Zone monitor stopped");
+                        return;
+                    }
+                }
             }
         }
     })

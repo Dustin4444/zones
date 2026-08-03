@@ -55,6 +55,16 @@ contract ZonePortal is IZonePortal {
     ///      to adjust the zoneGasRate based on operational costs.
     uint64 public constant FIXED_DEPOSIT_GAS = 100_000;
 
+    /// @notice Maximum deposits that may be appended to this portal in one Tempo block.
+    /// @dev Under T9, processing 230 encrypted deposits rejected by the issuer's
+    ///      TIP-403 transfer policy uses 193,044,874 gas, leaving 6,955,126 gas
+    ///      below the buffered 200,000,000 gas ceiling.
+    uint64 public constant MAX_DEPOSITS_PER_TEMPO_BLOCK = 230;
+
+    /// @dev Reserves enough capacity for one maximum-size sequencer withdrawal batch to bounce.
+    ///      The 20M batch gas ceiling fits at most 19 simple withdrawals (plus one slot of margin).
+    uint64 internal constant WITHDRAWAL_BOUNCEBACK_RESERVE = 20;
+
     /// @notice Scale factor from 18-decimal Tempo gas prices to 6-decimal TIP-20 units
     uint256 internal constant TEMPO_BASE_FEE_SCALE = 1e12;
 
@@ -130,7 +140,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Withdrawal queue (zone→Tempo): fixed-size ring buffer
     WithdrawalQueue internal _withdrawalQueue;
 
-    /// @notice Public RPC endpoint for the zone
+    /// @notice Operator RPC endpoint for the zone
     string public rpcUrl;
 
     /// @notice Pending admin for two-step admin transfer
@@ -167,6 +177,23 @@ contract ZonePortal is IZonePortal {
     /// @dev Defaults to zero and is read from finalized Tempo state by ZoneConfig.
     uint128 public maxTempoGasRate;
 
+    /// @notice Individual sequencer address of the active block-producing leader.
+    /// @dev Appended after maxTempoGasRate; do not reorder existing storage. Zone nodes derive
+    ///      leadership exclusively from finalized reads of these fields and the LeaderUpdated
+    ///      event. Reads as zero for portals initialized before leadership landed; the first
+    ///      setLeader from that state bootstraps epoch 1.
+    address public leader;
+
+    /// @notice Monotonic fencing epoch, incremented exactly once per real leader change.
+    uint64 public leaderEpoch;
+
+    /// @notice Tempo block number that recorded the most recent leader transition.
+    uint64 public leaderActivationTempoBlock;
+
+    /// @dev Per-Tempo-block deposit admission counter. Appended for upgrade-safe storage layout.
+    uint64 internal _depositCountBlock;
+    uint64 internal _depositsInCurrentBlock;
+
     /*//////////////////////////////////////////////////////////////
                              INITIALIZATION
     //////////////////////////////////////////////////////////////*/
@@ -202,6 +229,10 @@ contract ZonePortal is IZonePortal {
         emit EnforcementModesUpdated(accessEnforced, gatewayEnforced);
 
         _replaceSequencerSet(initialSequencers, _threshold, false);
+        // The first sequencer bootstraps leadership so a fresh zone has a producer without a
+        // separate setLeader call. The creation block is replayed by every zone node because
+        // zone genesis anchors before createZone.
+        _setLeader(initialSequencers[0]);
 
         for (uint256 i; i < _zoneGateways.length; ++i) {
             _setRole(_zoneGateways[i], Role.CallbackGateway);
@@ -300,6 +331,9 @@ contract ZonePortal is IZonePortal {
             _sequencers.push(signer);
             isSequencer[signer] = true;
         }
+        // Rotating out the active leader would strand block production: transfer leadership
+        // first (add the replacement, setLeader, then remove the old member).
+        if (leader != address(0) && !isSequencer[leader]) revert ActiveLeaderRemoved();
 
         sequencerThreshold = newThreshold;
         uint64 nonce = sequencerSetVersion;
@@ -315,6 +349,37 @@ contract ZonePortal is IZonePortal {
     /// @inheritdoc IZonePortal
     function sequencerAt(uint256 index) external view returns (address) {
         return _sequencers[index];
+    }
+
+    /// @inheritdoc IZonePortal
+    function setLeader(address newLeader, uint64 expectedEpoch) external onlySequencer {
+        if (!isSequencer[newLeader]) revert InvalidLeader();
+        // Idempotent fanout: every node relays the same target, only the first call transitions.
+        if (newLeader == leader) return;
+        // Compare-and-set: a delayed duplicate carrying a pre-handoff epoch cannot roll
+        // leadership back after a later transition.
+        if (leaderEpoch != expectedEpoch) {
+            revert StaleLeadershipEpoch(expectedEpoch, leaderEpoch);
+        }
+        // One distinct leader per Tempo block keeps exactly one authorized producer for the
+        // corresponding zone block.
+        if (leaderActivationTempoBlock == uint64(block.number)) {
+            revert LeaderAlreadyUpdatedThisBlock();
+        }
+
+        _setLeader(newLeader);
+    }
+
+    /// @dev Single write path for a leadership transition: assign, bump the fencing epoch,
+    ///      stamp the activation block, emit. `crates/l1` decodes `LeaderUpdated` to drive
+    ///      node roles, so every transition must go through here to stay consistent.
+    function _setLeader(address newLeader) private {
+        address previous = leader;
+        leader = newLeader;
+        leaderEpoch += 1;
+        uint64 activationTempoBlock = uint64(block.number);
+        leaderActivationTempoBlock = activationTempoBlock;
+        emit LeaderUpdated(previous, newLeader, leaderEpoch, activationTempoBlock);
     }
 
     /// @notice Set zone gas rate. Only callable by admin.
@@ -507,7 +572,7 @@ contract ZonePortal is IZonePortal {
         emit TokenEnabled(_token, name, symbol, currency);
     }
 
-    /// @notice Update the zone's public RPC endpoint.
+    /// @notice Update the zone's operator RPC endpoint.
     /// @param _rpcUrl The new RPC url
     function setRpcUrl(string calldata _rpcUrl) external onlySequencer {
         rpcUrl = _rpcUrl;
@@ -727,10 +792,25 @@ contract ZonePortal is IZonePortal {
         }
     }
 
-    function _recordDeposit(bytes32 newCurrentDepositQueueHash)
+    function _recordDeposit(
+        bytes32 newCurrentDepositQueueHash,
+        uint64 maximum
+    )
         internal
         returns (uint64 thisDeposit)
     {
+        uint64 currentBlock = uint64(block.number);
+        if (_depositCountBlock != currentBlock) {
+            _depositCountBlock = currentBlock;
+            _depositsInCurrentBlock = 0;
+        }
+        if (_depositsInCurrentBlock >= maximum) {
+            revert DepositBlockCapacityExceeded(maximum);
+        }
+        unchecked {
+            ++_depositsInCurrentBlock;
+        }
+
         currentDepositQueueHash = newCurrentDepositQueueHash;
         thisDeposit = ++depositCount;
     }
@@ -774,7 +854,9 @@ contract ZonePortal is IZonePortal {
 
         // Insert deposit into queue
         newCurrentDepositQueueHash = DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
-        uint64 thisDeposit = _recordDeposit(newCurrentDepositQueueHash);
+        uint64 thisDeposit = _recordDeposit(
+            newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
+        );
 
         emit DepositMade(
             newCurrentDepositQueueHash,
@@ -865,7 +947,9 @@ contract ZonePortal is IZonePortal {
         // Insert encrypted deposit into queue
         newCurrentDepositQueueHash =
             DepositQueueLib.enqueueEncrypted(currentDepositQueueHash, depositData);
-        uint64 thisDeposit = _recordDeposit(newCurrentDepositQueueHash);
+        uint64 thisDeposit = _recordDeposit(
+            newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
+        );
 
         emit EncryptedDepositMade(
             newCurrentDepositQueueHash,
@@ -986,6 +1070,7 @@ contract ZonePortal is IZonePortal {
 
         bytes32 depositQueueHashBefore = currentDepositQueueHash;
 
+        // We copy whatever the messenger reverts with, so keep its errors small.
         IZoneMessenger(messenger)
             .relayMessage(zoneId, token, senderTag, target, amount, gasLimit, data);
 
@@ -1071,8 +1156,8 @@ contract ZonePortal is IZonePortal {
 
         bytes32 newCurrentDepositQueueHash =
             DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
-        currentDepositQueueHash = newCurrentDepositQueueHash;
-        uint64 thisDeposit = ++depositCount;
+        uint64 thisDeposit =
+            _recordDeposit(newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK);
 
         emit WithdrawalBounceBack(
             newCurrentDepositQueueHash, fallbackNonce, _token, amount, thisDeposit

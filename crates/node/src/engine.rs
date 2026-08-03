@@ -53,7 +53,58 @@ use tracing::{error, info};
 
 use zone_chainspec::ZoneChainSpec;
 use zone_l1::{DepositQueue, L1BlockDeposits, L1BlockTracker, PreparedL1Block};
+use zone_p2p::{LeadershipSchedule, P2pPeerId};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
+
+/// Per-anchor production permit backed by the effective leadership schedule.
+///
+/// The permit is a single schedule lookup: produce anchor `N` only if the portal schedule or an
+/// active bounded forced-recovery override assigns `N` to this node.
+#[derive(Debug, Clone)]
+pub struct ProductionPermit {
+    schedule: LeadershipSchedule,
+    local_ed25519_public_key: P2pPeerId,
+}
+
+impl ProductionPermit {
+    /// Create a permit for this node based on the shared leadership schedule.
+    pub fn new(schedule: LeadershipSchedule, local_ed25519_public_key: P2pPeerId) -> Self {
+        Self {
+            schedule,
+            local_ed25519_public_key,
+        }
+    }
+
+    /// Decide whether this node may produce the zone block embedding `tempo_anchor`.
+    ///
+    /// `None` authorizes production; `Some(exit)` is the reason the engine must stop.
+    pub fn check(&self, tempo_anchor: u64) -> Option<EngineExit> {
+        match self.schedule.leader_for(tempo_anchor) {
+            None => Some(EngineExit::Fenced { tempo_anchor }),
+            Some(record) if record.leader == self.local_ed25519_public_key => None,
+            Some(record) => Some(EngineExit::Demoted {
+                tempo_anchor,
+                epoch: record.epoch,
+            }),
+        }
+    }
+
+    /// Record that the zone block embedding `tempo_anchor` is locally canonical.
+    pub fn record_applied_anchor(&self, tempo_anchor: u64) {
+        self.schedule.record_applied_anchor(tempo_anchor);
+    }
+}
+
+/// Why the engine loop returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineExit {
+    /// The cancellation token fired at a block boundary.
+    Cancelled,
+    /// The leadership permit assigns the next anchor to another node.
+    Demoted { tempo_anchor: u64, epoch: u64 },
+    /// No leadership record governs the anchor; production is fenced.
+    Fenced { tempo_anchor: u64 },
+}
 
 /// A queue-backed block consumer that can drain all work currently available.
 ///
@@ -65,25 +116,38 @@ trait AvailableBlockDrain {
     /// Returns the next available block without consuming it.
     fn next_available(&self) -> Option<Self::Block>;
 
+    /// Checks the leadership permit for one available block.
+    ///
+    /// `None` authorizes production; `Some(exit)` halts the drain with that reason.
+    fn permit(&self, block: &Self::Block) -> Option<EngineExit>;
+
     /// Completes and consumes one block.
     async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()>;
 }
 
-/// Drain available blocks until the queue is empty or cancellation is observed.
+/// Drain available blocks until the queue is empty, cancellation is observed, or the
+/// leadership permit halts production.
 ///
-/// Cancellation is checked only before starting a new advance. An advance already in flight is
-/// always allowed to finish so its queue confirmation and canonical head remain consistent.
-async fn drain_all_available<D>(drain: &mut D, stop: &CancellationToken) -> eyre::Result<()>
+/// Cancellation and the permit are checked only before starting a new advance. An advance
+/// already in flight is always allowed to finish so its queue confirmation and canonical head
+/// remain consistent.
+async fn drain_all_available<D>(
+    drain: &mut D,
+    stop: &CancellationToken,
+) -> eyre::Result<Option<EngineExit>>
 where
     D: AvailableBlockDrain,
 {
     loop {
         if stop.is_cancelled() {
-            return Ok(());
+            return Ok(Some(EngineExit::Cancelled));
         }
         let Some(block) = drain.next_available() else {
-            return Ok(());
+            return Ok(None);
         };
+        if let Some(exit) = drain.permit(&block) {
+            return Ok(Some(exit));
+        }
         drain.advance_one(block).await?;
     }
 }
@@ -120,6 +184,8 @@ pub struct ZoneEngine {
     sequencer_key: k256::SecretKey,
     /// ZonePortal address on L1 — used as context in HKDF key derivation.
     portal_address: Address,
+    /// Optional per-anchor leadership permit. `None` runs the legacy single-sequencer mode.
+    production_permit: Option<ProductionPermit>,
 }
 
 impl ZoneEngine {
@@ -144,16 +210,23 @@ impl ZoneEngine {
             fee_recipient,
             sequencer_key,
             portal_address,
+            production_permit: None,
         }
     }
 
-    /// Runs the main Zone engine loop until cancelled at a block boundary.
+    /// Enforce the per-anchor leadership permit before every advance.
+    pub fn with_production_permit(mut self, permit: ProductionPermit) -> Self {
+        self.production_permit = Some(permit);
+        self
+    }
+
+    /// Runs the main Zone engine loop until cancelled or halted by the leadership permit.
     ///
-    /// This method never returns under normal operation. It:
+    /// Without a permit this method only returns on cancellation. It:
     /// 1. Waits for L1 blocks to arrive in the deposit queue
     /// 2. Advances the zone chain for each available L1 block (no delay between blocks)
     /// 3. Sends periodic FCU heartbeats
-    pub async fn run_until(mut self, stop: CancellationToken) {
+    pub async fn run_until(mut self, stop: CancellationToken) -> EngineExit {
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
         fcu_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -167,15 +240,19 @@ impl ZoneEngine {
                 biased;
                 () = stop.cancelled() => {
                     info!(target: "zone::engine", "ZoneEngine stopped at a block boundary");
-                    return;
+                    return EngineExit::Cancelled;
                 }
                 // Wait for new L1 blocks in the deposit queue
                 _ = self.deposit_queue.notified() => {
-                    self.advance_all_available(&stop).await;
+                    if let Some(exit) = self.advance_all_available(&stop).await {
+                        return exit;
+                    }
                 }
                 // Periodic FCU heartbeat — also drains any blocks we missed
                 _ = fcu_interval.tick() => {
-                    self.advance_all_available(&stop).await;
+                    if let Some(exit) = self.advance_all_available(&stop).await {
+                        return exit;
+                    }
                     if let Err(e) = self.update_forkchoice_state().await {
                         error!(target: "zone::engine", "Error updating fork choice: {:?}", e);
                     }
@@ -184,9 +261,9 @@ impl ZoneEngine {
         }
     }
 
-    /// Runs the engine loop forever.
+    /// Runs the engine loop forever (legacy single-sequencer mode).
     pub async fn run(self) {
-        self.run_until(CancellationToken::new()).await
+        self.run_until(CancellationToken::new()).await;
     }
 
     /// Returns the current forkchoice state.
@@ -213,12 +290,23 @@ impl ZoneEngine {
     /// During catch-up this processes blocks as fast as the EVM can execute
     /// them, with no timer delays between blocks.
     ///
-    /// Reorg safety is handled upstream by the L1 subscriber, which only
-    /// enqueues blocks exposed by L1's `finalized` tag.
-    async fn advance_all_available(&mut self, stop: &CancellationToken) {
-        if let Err(e) = drain_all_available(self, stop).await {
-            error!(target: "zone::engine", "Error advancing the chain: {:?}", e);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Returns `Some` when the loop must stop: cancellation, demotion, or fenced leadership.
+    async fn advance_all_available(&mut self, stop: &CancellationToken) -> Option<EngineExit> {
+        match drain_all_available(self, stop).await {
+            Ok(Some(EngineExit::Cancelled)) | Ok(None) => None,
+            Ok(Some(exit @ EngineExit::Demoted { .. })) => {
+                info!(target: "zone::engine", ?exit, "Leadership permit revoked; stopping block production at the boundary");
+                Some(exit)
+            }
+            Ok(Some(exit @ EngineExit::Fenced { .. })) => {
+                error!(target: "zone::engine", ?exit, "No leadership record governs the next anchor; fencing block production");
+                Some(exit)
+            }
+            Err(e) => {
+                error!(target: "zone::engine", "Error advancing the chain: {:?}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                None
+            }
         }
     }
 
@@ -301,6 +389,9 @@ impl ZoneEngine {
         // produced it. A mismatch indicates an internal consumer-ordering bug.
         self.deposit_queue.confirm(l1_num_hash)?;
         self.l1_block_tracker.prune_through(l1_num_hash.number);
+        if let Some(permit) = &self.production_permit {
+            permit.record_applied_anchor(l1_num_hash.number);
+        }
 
         self.last_header = header;
 
@@ -322,6 +413,13 @@ impl AvailableBlockDrain for ZoneEngine {
         self.deposit_queue.peek()
     }
 
+    fn permit(&self, block: &Self::Block) -> Option<EngineExit> {
+        // No permit is legacy single-sequencer mode: production is always authorized.
+        self.production_permit
+            .as_ref()
+            .and_then(|permit| permit.check(block.header.number()))
+    }
+
     async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()> {
         self.advance(block).await
     }
@@ -338,6 +436,8 @@ mod tests {
         advanced: Vec<u64>,
         first_started: Option<oneshot::Sender<()>>,
         release_first: Option<oneshot::Receiver<()>>,
+        /// Blocks (by value) the permit rejects, with the exit it produces.
+        denied: Vec<(u64, EngineExit)>,
     }
 
     impl AvailableBlockDrain for PausedDrain {
@@ -345,6 +445,13 @@ mod tests {
 
         fn next_available(&self) -> Option<Self::Block> {
             self.pending.front().copied()
+        }
+
+        fn permit(&self, block: &Self::Block) -> Option<EngineExit> {
+            self.denied
+                .iter()
+                .find(|(denied, _)| denied == block)
+                .map(|(_, exit)| exit.clone())
         }
 
         async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()> {
@@ -374,13 +481,14 @@ mod tests {
             advanced: Vec::new(),
             first_started: Some(first_started),
             release_first: Some(release_first),
+            denied: Vec::new(),
         };
 
         let task = tokio::spawn(async move {
-            drain_all_available(&mut drain, &task_stop)
+            let exit = drain_all_available(&mut drain, &task_stop)
                 .await
                 .expect("drain succeeds");
-            drain
+            (drain, exit)
         });
 
         started.await.expect("the first block starts");
@@ -389,8 +497,120 @@ mod tests {
             .send(())
             .expect("the first block is still in flight");
 
-        let drain = task.await.expect("drain task succeeds");
+        let (drain, exit) = task.await.expect("drain task succeeds");
+        assert_eq!(exit, Some(EngineExit::Cancelled));
         assert_eq!(drain.advanced, [1]);
         assert_eq!(drain.pending, [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn demotion_halts_production_exactly_at_the_activation_boundary() {
+        let stop = CancellationToken::new();
+        let mut drain = PausedDrain {
+            pending: VecDeque::from([1, 2, 3]),
+            advanced: Vec::new(),
+            first_started: None,
+            release_first: None,
+            denied: vec![(
+                3,
+                EngineExit::Demoted {
+                    tempo_anchor: 3,
+                    epoch: 7,
+                },
+            )],
+        };
+
+        let exit = drain_all_available(&mut drain, &stop)
+            .await
+            .expect("drain succeeds");
+        assert_eq!(
+            exit,
+            Some(EngineExit::Demoted {
+                tempo_anchor: 3,
+                epoch: 7,
+            })
+        );
+        // The permitted prefix is produced; the demoted anchor is never consumed.
+        assert_eq!(drain.advanced, [1, 2]);
+        assert_eq!(drain.pending, [3]);
+    }
+
+    #[tokio::test]
+    async fn ungoverned_anchor_fences_production() {
+        let stop = CancellationToken::new();
+        let mut drain = PausedDrain {
+            pending: VecDeque::from([5]),
+            advanced: Vec::new(),
+            first_started: None,
+            release_first: None,
+            denied: vec![(5, EngineExit::Fenced { tempo_anchor: 5 })],
+        };
+
+        let exit = drain_all_available(&mut drain, &stop)
+            .await
+            .expect("drain succeeds");
+        assert_eq!(exit, Some(EngineExit::Fenced { tempo_anchor: 5 }));
+        assert!(drain.advanced.is_empty());
+        assert_eq!(drain.pending, [5]);
+    }
+
+    #[test]
+    fn production_permit_is_a_single_schedule_lookup() {
+        use alloy_primitives::B256;
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use zone_p2p::LeadershipState;
+
+        let me = PrivateKey::from_seed(1).public_key();
+        let other = PrivateKey::from_seed(2).public_key();
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(1, me.clone(), 0));
+        schedule
+            .publish(LeadershipState::new(2, other.clone(), 100))
+            .unwrap();
+        let permit = ProductionPermit::new(schedule, me.clone());
+
+        assert_eq!(permit.check(0), None);
+        assert_eq!(permit.check(99), None);
+        assert_eq!(
+            permit.check(100),
+            Some(EngineExit::Demoted {
+                tempo_anchor: 100,
+                epoch: 2
+            })
+        );
+        assert_eq!(
+            permit.check(u64::MAX),
+            Some(EngineExit::Demoted {
+                tempo_anchor: u64::MAX,
+                epoch: 2
+            })
+        );
+
+        let recovery_schedule = LeadershipSchedule::seeded(LeadershipState::new(7, me, 0));
+        recovery_schedule
+            .prepare_forced_recovery(8, other.clone(), B256::repeat_byte(0x11), 51)
+            .unwrap();
+        recovery_schedule
+            .publish(LeadershipState::new(8, other.clone(), 60))
+            .unwrap();
+        let recovery_permit = ProductionPermit::new(recovery_schedule, other);
+        assert_eq!(
+            recovery_permit.check(50),
+            Some(EngineExit::Demoted {
+                tempo_anchor: 50,
+                epoch: 7
+            })
+        );
+        assert_eq!(recovery_permit.check(51), None);
+        assert_eq!(recovery_permit.check(59), None);
+        assert_eq!(recovery_permit.check(60), None);
+
+        let uninitialized = ProductionPermit::new(
+            LeadershipSchedule::uninitialized(),
+            PrivateKey::from_seed(1).public_key(),
+        );
+        assert_eq!(
+            uninitialized.check(0),
+            Some(EngineExit::Fenced { tempo_anchor: 0 })
+        );
     }
 }
