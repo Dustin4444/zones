@@ -154,9 +154,13 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         // private key for encrypted deposits and must not sit on an internet-facing host.
         let rpc_only = p2p_config.as_ref().is_some_and(P2pConfig::is_rpc_only);
         let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, p2p_config.as_ref());
-        if rpc_only && (args.sequencer_key.is_some() || args.sequencer_key_file.is_some()) {
+        if rpc_only
+            && (args.sequencer_key.is_some()
+                || args.sequencer_key_file.is_some()
+                || !args.sequencer_key_history_files.is_empty())
+        {
             return Err(eyre::eyre!(
-                "this node is `rpc_only` in the manifest, so --sequencer-key/--sequencer-key-file must not be provided: the shared key is never used here and is also the zone ECIES private key for encrypted deposits"
+                "this node is `rpc_only` in the manifest, so sequencer encryption keys must not be provided: the shared keys are never used here"
             ));
         }
         let sequencer_signer = if should_sequence_blocks {
@@ -167,6 +171,21 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         } else {
             None
         };
+        let mut historical_sequencer_signers = Vec::new();
+        if should_sequence_blocks {
+            for path in &args.sequencer_key_history_files {
+                historical_sequencer_signers.push(
+                    load_sequencer_signer(None, Some(path))
+                        .await
+                        .map_err(|err| {
+                            eyre::eyre!(
+                                "failed to load historical sequencer key from {}: {err}",
+                                path.display()
+                            )
+                        })?,
+                );
+            }
+        }
 
         builder.config_mut().network.discovery.disable_discovery = true;
         builder.config_mut().rpc.disable_auth_server = true;
@@ -198,6 +217,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 .and_then(P2pConfig::block_attestation_signer);
             node = node.with_sequencer(ZoneSequencerAddOnsConfig {
                 sequencer_signer,
+                historical_sequencer_signers,
                 l1_transaction_signer,
                 zone_id: args.zone_id,
                 zone_poll_interval: Duration::from_secs(args.zone_poll_interval_secs),
@@ -295,6 +315,16 @@ pub struct ZoneArgs {
         conflicts_with = "sequencer_key"
     )]
     pub sequencer_key_file: Option<PathBuf>,
+
+    /// Historical sequencer encryption key files retained for deposits accepted during rotation.
+    #[arg(
+        long = "sequencer-key-history-file",
+        env = "SEQUENCER_KEY_HISTORY_FILES",
+        value_name = "PATH",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub sequencer_key_history_files: Vec<PathBuf>,
 
     /// Path to the static multi-sequencer manifest. Its presence activates
     /// multi-sequencer mode and makes the manifest authoritative for role selection.
@@ -592,6 +622,30 @@ mod tests {
         ]))
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn sequencer_key_history_files_are_repeatable() {
+        let parsed = ZoneArgsParser::try_parse_from([
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--sequencer-key-history-file",
+            "/run/secrets/sequencer-key-0",
+            "--sequencer-key-history-file",
+            "/run/secrets/sequencer-key-1",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.zone.sequencer_key_history_files,
+            vec![
+                std::path::PathBuf::from("/run/secrets/sequencer-key-0"),
+                std::path::PathBuf::from("/run/secrets/sequencer-key-1"),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

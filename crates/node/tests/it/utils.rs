@@ -1217,6 +1217,7 @@ impl ZoneTestNode {
                 .with_p2p(p2p_config)
                 .with_sequencer(ZoneSequencerAddOnsConfig {
                     sequencer_signer: sequencer_signer.clone(),
+                    historical_sequencer_signers: Vec::new(),
                     l1_transaction_signer: None,
                     zone_id: 0,
                     zone_poll_interval: Duration::from_secs(1),
@@ -1285,7 +1286,10 @@ impl ZoneTestNode {
                 l1_block_tracker.clone(),
                 last_header,
                 sequencer_signer.address(),
-                SecretKey::from(sequencer_signer.credential()),
+                zone_l1::SequencerKeyring::new(vec![(
+                    U256::ZERO,
+                    SecretKey::from(sequencer_signer.credential()),
+                )])?,
                 portal_address,
             );
             node_handle

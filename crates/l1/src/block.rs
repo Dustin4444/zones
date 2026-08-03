@@ -1,5 +1,47 @@
 use super::*;
 
+/// Sequencer encryption private keys indexed by their position in Portal key history.
+#[derive(Clone)]
+pub struct SequencerKeyring {
+    keys: Vec<(U256, k256::SecretKey)>,
+}
+
+impl SequencerKeyring {
+    /// Create a keyring from `(Portal key index, private key)` entries.
+    pub fn new(mut keys: Vec<(U256, k256::SecretKey)>) -> eyre::Result<Self> {
+        eyre::ensure!(!keys.is_empty(), "sequencer encryption keyring is empty");
+        keys.sort_unstable_by_key(|(index, _)| *index);
+        eyre::ensure!(
+            keys.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "sequencer encryption keyring contains duplicate indices"
+        );
+        Ok(Self { keys })
+    }
+
+    /// Return the private key registered at `key_index`.
+    pub fn key_at(&self, key_index: U256) -> eyre::Result<&k256::SecretKey> {
+        self.keys
+            .iter()
+            .find_map(|(index, key)| (*index == key_index).then_some(key))
+            .ok_or_else(|| {
+                eyre::eyre!("missing sequencer encryption key for portal key index {key_index}")
+            })
+    }
+
+    /// Portal indices present in this keyring.
+    pub fn indices(&self) -> impl Iterator<Item = U256> + '_ {
+        self.keys.iter().map(|(index, _)| *index)
+    }
+}
+
+impl core::fmt::Debug for SequencerKeyring {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SequencerKeyring")
+            .field("indices", &self.indices().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// An L1 block's header paired with the deposits found in that block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct L1BlockDeposits {
@@ -18,7 +60,7 @@ impl L1BlockDeposits {
     /// builder.
     pub async fn prepare(
         self,
-        sequencer_key: &k256::SecretKey,
+        sequencer_keys: &SequencerKeyring,
         portal_address: Address,
     ) -> eyre::Result<PreparedL1Block> {
         use crate::precompiles::ecies;
@@ -34,6 +76,7 @@ impl L1BlockDeposits {
                 L1Deposit::Regular(_) => queued_deposits.push(deposit.to_abi_queued_deposit()),
                 L1Deposit::Encrypted(d) => {
                     let queued = deposit.to_abi_queued_deposit();
+                    let sequencer_key = sequencer_keys.key_at(d.key_index)?;
 
                     // Attempt full ECIES decryption.
                     let dec = ecies::decrypt_deposit(

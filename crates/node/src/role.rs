@@ -27,7 +27,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{debug, error, info, warn};
 use zone_chainspec::ZoneChainSpec;
-use zone_l1::{DepositQueue, L1BlockTracker, TempoStateExt as _};
+use zone_l1::{DepositQueue, L1BlockTracker, SequencerKeyring, TempoStateExt as _};
 use zone_p2p::{LeadershipSchedule, P2pCommand, P2pEvent, P2pPeerId};
 use zone_payload::ZonePayloadTypes;
 use zone_sequencer::{
@@ -103,6 +103,7 @@ pub type SharedRoleStatus = Arc<std::sync::Mutex<RoleStatus>>;
 pub(crate) struct LeaderSequencerDeps {
     pub config: ZoneSequencerAddOnsConfig,
     pub sequencer_config: ZoneSequencerConfig,
+    pub encryption_keys: SequencerKeyring,
 }
 
 /// Sinks for the long-lived P2P event demultiplexer.
@@ -902,7 +903,6 @@ fn build_engine<P, Pool>(
 where
     P: Clone,
 {
-    let sequencer_key = k256::SecretKey::from(sequencer.config.sequencer_signer.credential());
     ZoneEngine::new(
         context.chain_spec.clone(),
         context.engine_handle.clone(),
@@ -911,7 +911,7 @@ where
         context.l1_block_tracker.clone(),
         last_header,
         sequencer.config.sequencer_signer.address(),
-        sequencer_key,
+        sequencer.encryption_keys.clone(),
         context.portal_address,
     )
     .with_production_permit(ProductionPermit::new(

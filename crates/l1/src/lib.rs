@@ -83,7 +83,7 @@ mod subscriber;
 #[cfg(test)]
 mod tests;
 
-pub use block::{L1BlockDeposits, PreparedL1Block};
+pub use block::{L1BlockDeposits, PreparedL1Block, SequencerKeyring};
 pub use deposit::{Deposit, EncryptedDeposit, L1Deposit};
 pub use event::{EnabledToken, L1PortalEvents, LeaderTransition};
 pub use ext::{ChainTempoStateExt, TempoStateExt};

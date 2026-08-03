@@ -18,7 +18,7 @@ use crate::{
         operator_zone_rpc_module, rpc_connection_config, start_redacted_rpc,
     },
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
@@ -68,13 +68,15 @@ use tempo_transaction_pool::{
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
     validator::{DEFAULT_MAX_TEMPO_AUTHORIZATIONS, TempoTransactionValidator},
 };
-use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal};
+use tempo_zone_contracts::{
+    ENCRYPTION_KEY_GRACE_PERIOD, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
+};
 use tracing::{debug, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
 use zone_l1::{
     DepositQueue, L1BlockTracker, L1Subscriber, L1SubscriberConfig, LeaderTransition,
-    LeadershipSink, TempoStateExt,
+    LeadershipSink, SequencerKeyring, TempoStateExt,
     state::{EnabledTokenRegistry, L1StateCache, L1StateProvider, L1StateProviderConfig},
 };
 use zone_p2p::{
@@ -162,6 +164,8 @@ impl WithdrawalRevealEncryptor for SequencerWithdrawalRevealEncryptor {
 pub struct ZoneSequencerAddOnsConfig {
     /// Shared sequencer signer used for block production and encryption.
     pub sequencer_signer: PrivateKeySigner,
+    /// Historical encryption keys retained while old-key deposits remain processable.
+    pub historical_sequencer_signers: Vec<PrivateKeySigner>,
     /// Individual manifest-node signer used for L1 settlement transactions.
     pub l1_transaction_signer: Option<PrivateKeySigner>,
     /// Zone ID used by sequencer encryption.
@@ -510,6 +514,18 @@ where
 
         self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
             .await?;
+        let sequencer_encryption_keys = match self.sequencer_config.as_ref() {
+            Some(config) => Some(
+                resolve_sequencer_encryption_keys(
+                    &l1_provider,
+                    self.portal_address,
+                    &config.sequencer_signer,
+                    &config.historical_sequencer_signers,
+                )
+                .await?,
+            ),
+            None => None,
+        };
 
         // Multi-sequencer mode: bootstrap the leadership schedule from the portal
         // snapshot at the local Tempo anchor, and install the transition sink before
@@ -638,8 +654,13 @@ where
         } else if let Some(ref config) = self.sequencer_config {
             // Legacy single-sequencer mode keeps the static engine.
             let sequencer_addr = config.sequencer_signer.address();
-            let sequencer_key = SecretKey::from(config.sequencer_signer.credential());
-            self.spawn_zone_engine(&ctx, sequencer_addr, sequencer_key)?;
+            self.spawn_zone_engine(
+                &ctx,
+                sequencer_addr,
+                sequencer_encryption_keys
+                    .clone()
+                    .expect("sequencer encryption keys are resolved when sequencing is enabled"),
+            )?;
         }
 
         let chain_id = ctx.node.provider().chain_spec().genesis().config.chain_id;
@@ -704,6 +725,9 @@ where
             let sequencer = match self.sequencer_config.take() {
                 Some(config) => Some(Self::build_leader_sequencer_deps(
                     config,
+                    sequencer_encryption_keys.clone().expect(
+                        "sequencer encryption keys are resolved when sequencing is enabled",
+                    ),
                     self.l1_config.l1_rpc_url.clone(),
                     self.l1_config.portal_address,
                     self.l1_config.retry_connection_interval,
@@ -933,6 +957,112 @@ async fn seed_leadership_schedule(
     Ok(())
 }
 
+async fn resolve_sequencer_encryption_keys(
+    l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
+    portal_address: Address,
+    current_signer: &PrivateKeySigner,
+    historical_signers: &[PrivateKeySigner],
+) -> eyre::Result<SequencerKeyring> {
+    let portal = ZonePortal::new(portal_address, l1_provider);
+    let snapshot_block = l1_provider.get_block_number().await?;
+    let block_id = alloy_rpc_types_eth::BlockId::number(snapshot_block);
+    let count = portal.encryptionKeyCount().block(block_id).call().await?;
+    eyre::ensure!(
+        count > U256::ZERO,
+        "portal {portal_address} has no encryption key at L1 block {snapshot_block}"
+    );
+
+    let count = usize::try_from(count)
+        .map_err(|_| eyre::eyre!("portal encryption key count does not fit usize"))?;
+    let entries = futures::future::try_join_all((0..count).map(|index| {
+        let portal = &portal;
+        async move {
+            portal
+                .encryptionKeyAt(U256::from(index))
+                .block(block_id)
+                .call()
+                .await
+        }
+    }))
+    .await?;
+    let keyring =
+        build_sequencer_keyring(&entries, snapshot_block, current_signer, historical_signers)?;
+
+    info!(
+        target: "reth::cli",
+        current_index = entries.len() - 1,
+        retained_indices = ?keyring.indices().collect::<Vec<_>>(),
+        snapshot_block,
+        "Resolved sequencer encryption keyring from Portal history"
+    );
+    Ok(keyring)
+}
+
+fn build_sequencer_keyring(
+    entries: &[ZonePortal::EncryptionKeyEntry],
+    snapshot_block: u64,
+    current_signer: &PrivateKeySigner,
+    historical_signers: &[PrivateKeySigner],
+) -> eyre::Result<SequencerKeyring> {
+    use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+
+    fn public_key(secret: &SecretKey) -> (B256, u8) {
+        let encoded = secret.public_key().to_encoded_point(true);
+        (
+            B256::from_slice(encoded.x().expect("compressed public key has x")),
+            encoded.as_bytes()[0],
+        )
+    }
+
+    eyre::ensure!(
+        !entries.is_empty(),
+        "Portal encryption key history is empty"
+    );
+    let current_index = entries.len() - 1;
+    let current_secret = SecretKey::from(current_signer.credential());
+    let (current_x, current_y_parity) = public_key(&current_secret);
+    eyre::ensure!(
+        entries[current_index].x == current_x && entries[current_index].yParity == current_y_parity,
+        "configured sequencer key does not match portal encryption key index {current_index}"
+    );
+
+    let mut keys = vec![(U256::from(current_index), current_secret)];
+    for signer in historical_signers {
+        let secret = SecretKey::from(signer.credential());
+        let (x, y_parity) = public_key(&secret);
+        let mut matches = entries.iter().enumerate().filter_map(|(index, entry)| {
+            (entry.x == x && entry.yParity == y_parity).then_some(index)
+        });
+        let index = matches.next().ok_or_else(|| {
+            eyre::eyre!("configured historical sequencer key is not in Portal key history")
+        })?;
+        eyre::ensure!(
+            matches.next().is_none(),
+            "configured historical sequencer key appears more than once in Portal history"
+        );
+        eyre::ensure!(
+            index != current_index,
+            "current sequencer key must not also be configured as a historical key"
+        );
+        keys.push((U256::from(index), secret));
+    }
+
+    for index in 0..current_index {
+        let expires_at = entries[index + 1]
+            .activationBlock
+            .saturating_add(ENCRYPTION_KEY_GRACE_PERIOD);
+        if snapshot_block < expires_at {
+            eyre::ensure!(
+                keys.iter()
+                    .any(|(configured_index, _)| *configured_index == U256::from(index)),
+                "Portal encryption key index {index} remains valid until block {expires_at}; configure its private key with --sequencer-key-history-file"
+            );
+        }
+    }
+
+    SequencerKeyring::new(keys)
+}
+
 impl<N> ZoneAddOns<N>
 where
     N: FullNodeComponents<Types = ZoneNode, Evm = ZoneEvmConfig>,
@@ -1005,6 +1135,7 @@ where
     /// Build the leader-generation sequencer dependencies (activated only while leader).
     fn build_leader_sequencer_deps(
         config: ZoneSequencerAddOnsConfig,
+        encryption_keys: SequencerKeyring,
         l1_rpc_url: String,
         portal_address: Address,
         retry_connection_interval: Duration,
@@ -1025,6 +1156,7 @@ where
         Ok(LeaderSequencerDeps {
             config,
             sequencer_config,
+            encryption_keys,
         })
     }
 
@@ -1110,7 +1242,7 @@ where
         &self,
         ctx: &AddOnsContext<'_, N>,
         fee_recipient: Address,
-        sequencer_key: SecretKey,
+        sequencer_keys: SequencerKeyring,
     ) -> eyre::Result<()> {
         let provider = ctx.node.provider();
         let last_header = provider
@@ -1124,7 +1256,7 @@ where
             self.l1_config.block_tracker.clone(),
             last_header,
             fee_recipient,
-            sequencer_key,
+            sequencer_keys,
             self.portal_address,
         );
         ctx.node
@@ -1568,6 +1700,25 @@ mod tests {
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
 
+    fn signer(byte: u8) -> PrivateKeySigner {
+        PrivateKeySigner::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn encryption_key_entry(
+        signer: &PrivateKeySigner,
+        activation_block: u64,
+    ) -> ZonePortal::EncryptionKeyEntry {
+        use k256::elliptic_curve::sec1::ToEncodedPoint as _;
+
+        let secret = SecretKey::from(signer.credential());
+        let encoded = secret.public_key().to_encoded_point(true);
+        ZonePortal::EncryptionKeyEntry {
+            x: B256::from_slice(encoded.x().unwrap()),
+            yParity: encoded.as_bytes()[0],
+            activationBlock: activation_block,
+        }
+    }
+
     fn pooled_transaction(envelope: TempoTxEnvelope, sender: Address) -> TempoPooledTransaction {
         TempoPooledTransaction::new(Recovered::new_unchecked(envelope, sender))
     }
@@ -1599,6 +1750,43 @@ mod tests {
         assert_eq!(tempo_chain_spec_for_l1(31319).unwrap().chain().id(), 1337);
         assert!(tempo_chain_spec_for_l1(999_999).is_none());
         unsafe { std::env::remove_var("ZONE_L1_DEV_CHAIN_IDS") };
+    }
+
+    #[test]
+    fn keyring_requires_every_historical_key_still_in_grace() {
+        let previous = signer(0x11);
+        let current = signer(0x22);
+        let entries = vec![
+            encryption_key_entry(&previous, 10),
+            encryption_key_entry(&current, 100),
+        ];
+
+        let error = build_sequencer_keyring(&entries, 101, &current, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Portal encryption key index 0 remains valid until block 86500")
+        );
+
+        let keyring = build_sequencer_keyring(&entries, 101, &current, &[previous]).unwrap();
+        assert_eq!(
+            keyring.indices().collect::<Vec<_>>(),
+            vec![U256::ZERO, U256::from(1)]
+        );
+    }
+
+    #[test]
+    fn keyring_allows_expired_historical_keys_to_be_omitted() {
+        let previous = signer(0x11);
+        let current = signer(0x22);
+        let entries = vec![
+            encryption_key_entry(&previous, 10),
+            encryption_key_entry(&current, 100),
+        ];
+
+        let keyring = build_sequencer_keyring(&entries, 86_500, &current, &[]).unwrap();
+
+        assert_eq!(keyring.indices().collect::<Vec<_>>(), vec![U256::from(1)]);
     }
 
     #[test]

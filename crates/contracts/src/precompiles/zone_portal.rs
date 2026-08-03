@@ -10,6 +10,9 @@ use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_sol_types::SolValue;
 use zone_primitives::constants::EMPTY_SENTINEL;
 
+/// Old encryption keys remain valid for new deposits for one day at one-second blocks.
+pub const ENCRYPTION_KEY_GRACE_PERIOD: u64 = 86_400;
+
 crate::sol! {
     #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
     contract ZonePortal {
@@ -49,6 +52,12 @@ crate::sol! {
             address tempoRefundRecipient;
             uint256 keyIndex;
             EncryptedDepositPayload encrypted;
+        }
+
+        struct EncryptionKeyEntry {
+            bytes32 x;
+            uint8 yParity;
+            uint64 activationBlock;
         }
 
         struct BlockTransition {
@@ -295,6 +304,8 @@ crate::sol! {
         function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity);
 
         function encryptionKeyCount() external view returns (uint256);
+        function encryptionKeyAt(uint256 index)
+            external view returns (EncryptionKeyEntry memory entry);
         function encryptionKeyAtBlock(uint64 tempoBlockNumber)
             external view returns (bytes32 x, uint8 yParity, uint256 keyIndex);
         function claimRefund(address token) external returns (uint128 amount);

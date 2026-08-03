@@ -1145,7 +1145,10 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
     };
 
     let prepared = block
-        .prepare(&sequencer_key, portal)
+        .prepare(
+            &SequencerKeyring::new(vec![(U256::ZERO, sequencer_key)]).unwrap(),
+            portal,
+        )
         .await
         .expect("decrypted deposit should prepare without an engine-side policy read");
 
@@ -1158,6 +1161,107 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         prepared.decryptions.len(),
         1,
         "successfully decrypted deposits must provide on-chain decryption data"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_selects_encryption_key_by_portal_index() {
+    use k256::{AffinePoint, ProjectivePoint, Scalar};
+
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let sender = address!("0x0000000000000000000000000000000000001234");
+    let token = address!("0x0000000000000000000000000000000000001000");
+    let previous = k256::SecretKey::from_slice(&[0x11; 32]).expect("valid previous key");
+    let current = k256::SecretKey::from_slice(&[0x22; 32]).expect("valid current key");
+
+    let encrypted_deposit = |key: &k256::SecretKey, key_index: U256, recipient: Address| {
+        let scalar: Scalar = *key.to_nonzero_scalar();
+        let public = AffinePoint::from(ProjectivePoint::GENERATOR * scalar);
+        let (x, y_parity) = crate::precompiles::ecies::compressed_x_and_parity(&public);
+        let encrypted = crate::precompiles::ecies::encrypt_deposit(
+            &x,
+            y_parity,
+            recipient,
+            B256::ZERO,
+            portal,
+            key_index,
+        )
+        .expect("encrypted deposit should be valid");
+        L1Deposit::Encrypted(EncryptedDeposit {
+            token,
+            sender,
+            amount: 1_000_000,
+            fee: 0,
+            tempo_refund_recipient: sender,
+            key_index,
+            ephemeral_pubkey_x: encrypted.eph_pub_x,
+            ephemeral_pubkey_y_parity: encrypted.eph_pub_y_parity,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            tag: encrypted.tag,
+        })
+    };
+
+    let block = L1BlockDeposits {
+        header: seal(make_test_header(10)),
+        events: L1PortalEvents::from_deposits(vec![
+            encrypted_deposit(
+                &previous,
+                U256::ZERO,
+                address!("0x000000000000000000000000000000000000BEEF"),
+            ),
+            encrypted_deposit(
+                &current,
+                U256::from(1),
+                address!("0x000000000000000000000000000000000000CAFE"),
+            ),
+        ]),
+    };
+    let keys =
+        SequencerKeyring::new(vec![(U256::ZERO, previous), (U256::from(1), current)]).unwrap();
+
+    let prepared = block.prepare(&keys, portal).await.unwrap();
+
+    assert_eq!(prepared.queued_deposits.len(), 2);
+    assert_eq!(prepared.decryptions.len(), 2);
+}
+
+#[tokio::test]
+async fn test_prepare_fails_when_deposit_key_is_not_retained() {
+    let block = L1BlockDeposits {
+        header: seal(make_test_header(10)),
+        events: L1PortalEvents::from_deposits(vec![L1Deposit::Encrypted(EncryptedDeposit {
+            token: Address::ZERO,
+            sender: Address::ZERO,
+            amount: 1,
+            fee: 0,
+            tempo_refund_recipient: Address::ZERO,
+            key_index: U256::ZERO,
+            ephemeral_pubkey_x: B256::ZERO,
+            ephemeral_pubkey_y_parity: 2,
+            ciphertext: vec![].into(),
+            nonce: [0; 12],
+            tag: [0; 16],
+        })]),
+    };
+    let keys = SequencerKeyring::new(vec![
+        (
+            U256::from(1),
+            k256::SecretKey::from_slice(&[0x11; 32]).unwrap(),
+        ),
+        (
+            U256::from(2),
+            k256::SecretKey::from_slice(&[0x22; 32]).unwrap(),
+        ),
+    ])
+    .unwrap();
+
+    let error = block.prepare(&keys, Address::ZERO).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing sequencer encryption key for portal key index 0")
     );
 }
 
