@@ -912,6 +912,7 @@ where
         .state_by_block_hash(parent.hash())?
         .tempo_num_hash()?;
     validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, block_number)?;
+    validate_zone_block_timestamp(&block, &l1_header)?;
     let anchor = l1_header.num_hash();
 
     // Anchor-aware fence for live blocks: the sender must
@@ -1074,6 +1075,29 @@ fn validate_l1_checkpoint_transition(
     Ok(())
 }
 
+fn validate_zone_block_timestamp(
+    block: &SealedBlock<Block>,
+    l1_header: &SealedHeader<TempoHeader>,
+) -> eyre::Result<()> {
+    if block.timestamp() != l1_header.timestamp() {
+        eyre::bail!(
+            "peer block {} timestamp {} != anchored L1 timestamp {}",
+            block.number(),
+            block.timestamp(),
+            l1_header.timestamp()
+        );
+    }
+    if block.header().timestamp_millis_part != l1_header.header().timestamp_millis_part {
+        eyre::bail!(
+            "peer block {} timestamp millisecond part {} != anchored L1 timestamp millisecond part {}",
+            block.number(),
+            block.header().timestamp_millis_part,
+            l1_header.header().timestamp_millis_part
+        );
+    }
+    Ok(())
+}
+
 /// Decode the L1 header embedded in the first `IZoneInbox.advanceTempo` system transaction.
 #[cfg(test)]
 fn decode_advance_tempo_header(
@@ -1137,7 +1161,7 @@ mod tests {
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS,
         PersistedBlockSource, PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
-        validate_live_block_sender, wait_for_validated_peer_anchor,
+        validate_live_block_sender, validate_zone_block_timestamp, wait_for_validated_peer_anchor,
     };
     use alloy_primitives::B256;
     use zone_l1::{L1BlockTracker, L1PortalEvents};
@@ -1417,6 +1441,43 @@ mod tests {
             super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7)
                 .unwrap_err();
         assert!(wrong_parent.to_string().contains("does not extend"));
+    }
+
+    #[test]
+    fn validates_zone_block_timestamp_against_anchored_l1_header() {
+        use alloy_consensus::Header;
+        use reth_primitives_traits::{SealedBlock, SealedHeader};
+        use tempo_primitives::{Block, TempoHeader};
+
+        let block = SealedBlock::seal_slow(Block {
+            header: TempoHeader {
+                timestamp_millis_part: 123,
+                inner: Header {
+                    timestamp: 456,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            body: Default::default(),
+        });
+        let make_l1_header = |timestamp, timestamp_millis_part| {
+            SealedHeader::seal_slow(TempoHeader {
+                timestamp_millis_part,
+                inner: Header {
+                    timestamp,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+        };
+
+        validate_zone_block_timestamp(&block, &make_l1_header(456, 123)).unwrap();
+
+        let error = validate_zone_block_timestamp(&block, &make_l1_header(457, 123)).unwrap_err();
+        assert!(error.to_string().contains("timestamp 456"));
+
+        let error = validate_zone_block_timestamp(&block, &make_l1_header(456, 124)).unwrap_err();
+        assert!(error.to_string().contains("millisecond part 123"));
     }
 
     #[tokio::test]
