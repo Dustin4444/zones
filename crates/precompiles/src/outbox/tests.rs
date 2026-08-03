@@ -794,6 +794,17 @@ fn per_block_cap_is_unlimited_resettable_and_updateable() -> eyre::Result<()> {
 }
 
 #[test]
+fn tempo_portal_returns_configured_l1_portal() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    let output = harness.call_static(ALICE, ZoneOutboxAbi::tempoPortalCall {}.abi_encode())?;
+    assert_eq!(
+        ZoneOutboxAbi::tempoPortalCall::abi_decode_returns(&output.bytes)?,
+        PORTAL,
+    );
+    Ok(())
+}
+
+#[test]
 fn many_withdrawals_finalize_and_clear_pending_state() -> eyre::Result<()> {
     let mut harness = Harness::new()?;
     for i in 0..20u64 {

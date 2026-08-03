@@ -31,6 +31,7 @@ impl ZoneOutbox {
 
         dispatch!(calldata, |call| match call {
             IZoneOutbox::IZoneOutboxCalls {
+                tempoPortal(_) => metadata::<IZoneOutbox::tempoPortalCall>(|| Ok(l1.portal())),
                 tempoGasRate(_) => metadata::<IZoneOutbox::tempoGasRateCall>(|| self.tempo_gas_rate.read()),
                 maxWithdrawalsPerBlock(_) => metadata::<IZoneOutbox::maxWithdrawalsPerBlockCall>(|| self.max_withdrawals_per_block.read()),
                 lastBatch(_) => metadata::<IZoneOutbox::lastBatchCall>(|| self.last_batch()),
