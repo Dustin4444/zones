@@ -4285,8 +4285,7 @@ impl L1Fixture {
     /// via the TempoState precompile.
     ///
     /// Without a real L1, the precompile would fail with a hard error on cache miss.
-    /// This seeds the cache so that `readTempoStorageSlot(portal, slot)` succeeds
-    /// for each block we plan to inject.
+    /// This seeds the cache so that handler L1-reads succeed for each block we plan to inject.
     pub(crate) fn seed_l1_cache(
         &self,
         cache_handle: &L1StateCache,
