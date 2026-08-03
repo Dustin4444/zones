@@ -217,6 +217,8 @@ pub struct ZoneNode {
     redacted_rpc_config: ZoneRedactedRpcConfig,
     /// Optional sequencer config. When set, sequencer tasks are spawned.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
+    /// Pre-resolved encryption keys for synthetic test environments without Portal RPC state.
+    sequencer_encryption_keys: Option<SequencerKeyring>,
     /// Optional static Zone P2P networking config.
     p2p_config: Option<P2pConfig>,
     /// Whether a consumer outside this builder drains the deposit queue.
@@ -267,6 +269,7 @@ impl ZoneNode {
             withdrawal_reveal_encryptor: None,
             redacted_rpc_config: ZoneRedactedRpcConfig::default(),
             sequencer_config: None,
+            sequencer_encryption_keys: None,
             p2p_config: None,
             external_deposit_consumer: false,
         }
@@ -287,6 +290,13 @@ impl ZoneNode {
             config.zone_id,
         )));
         self.sequencer_config = Some(config);
+        self
+    }
+
+    /// Supply pre-resolved encryption keys for test environments without Portal RPC state.
+    #[cfg(feature = "test-utils")]
+    pub fn with_sequencer_encryption_keys(mut self, keys: SequencerKeyring) -> Self {
+        self.sequencer_encryption_keys = Some(keys);
         self
     }
 
@@ -435,6 +445,8 @@ where
     redacted_rpc_config: ZoneRedactedRpcConfig,
     /// Sequencer configuration.
     sequencer_config: Option<ZoneSequencerAddOnsConfig>,
+    /// Pre-resolved encryption keys for synthetic test environments without Portal RPC state.
+    sequencer_encryption_keys: Option<SequencerKeyring>,
     /// Static Zone P2P networking configuration.
     p2p_config: Option<P2pConfig>,
     /// Whether a consumer outside this builder drains the deposit queue.
@@ -462,6 +474,7 @@ where
         portal_address: Address,
         redacted_rpc_config: ZoneRedactedRpcConfig,
         sequencer_config: Option<ZoneSequencerAddOnsConfig>,
+        sequencer_encryption_keys: Option<SequencerKeyring>,
         p2p_config: Option<P2pConfig>,
         external_deposit_consumer: bool,
     ) -> Self {
@@ -479,6 +492,7 @@ where
             portal_address,
             redacted_rpc_config,
             sequencer_config,
+            sequencer_encryption_keys,
             p2p_config,
             external_deposit_consumer,
         }
@@ -515,6 +529,9 @@ where
         self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
             .await?;
         let sequencer_encryption_keys = match self.sequencer_config.as_ref() {
+            Some(_) if self.sequencer_encryption_keys.is_some() => {
+                self.sequencer_encryption_keys.take()
+            }
             Some(config) => Some(
                 resolve_sequencer_encryption_keys(
                     &l1_provider,
@@ -1432,6 +1449,7 @@ where
             self.portal_address,
             self.redacted_rpc_config.clone(),
             self.sequencer_config.clone(),
+            self.sequencer_encryption_keys.clone(),
             self.p2p_config.clone(),
             self.external_deposit_consumer,
         )

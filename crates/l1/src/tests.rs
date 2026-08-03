@@ -1239,7 +1239,7 @@ async fn test_prepare_fails_when_deposit_key_is_not_retained() {
             key_index: U256::ZERO,
             ephemeral_pubkey_x: B256::ZERO,
             ephemeral_pubkey_y_parity: 2,
-            ciphertext: vec![].into(),
+            ciphertext: vec![],
             nonce: [0; 12],
             tag: [0; 16],
         })]),

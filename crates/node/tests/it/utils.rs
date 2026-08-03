@@ -1224,7 +1224,11 @@ impl ZoneTestNode {
                     batch_anchor_config: Default::default(),
                     withdrawal_poll_interval: Duration::from_secs(5),
                     withdrawal_batch_limits: Default::default(),
-                });
+                })
+                .with_sequencer_encryption_keys(zone_l1::SequencerKeyring::new(vec![(
+                    U256::ZERO,
+                    SecretKey::from(sequencer_signer.credential()),
+                )])?);
         }
         // Multi-sequencer nodes run the real role controller, which owns the engine; the
         // harness must not drive a second head writer against the same queue.
