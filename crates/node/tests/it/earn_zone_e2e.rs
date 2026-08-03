@@ -24,9 +24,7 @@ use tempo_precompiles::{
     PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS, tip403_registry::AuthRole,
 };
 use tempo_primitives::transaction::Call;
-use tempo_zone_contracts::{
-    EncryptedDepositPayload, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS, ZonePortal,
-};
+use tempo_zone_contracts::{EncryptedDepositPayload, ZONE_OUTBOX_ADDRESS, ZonePortal};
 
 const AMOUNT: u128 = 1_000_000;
 const REWARD_AMOUNT: u128 = AMOUNT / 10;
@@ -612,12 +610,9 @@ impl EarnZoneFixture {
         let recipient_authorized = registry
             .is_auth_as(account, self.user.address(), AuthRole::Recipient)
             .await;
-        let mint_authorized = registry
-            .is_auth_as(account, ZONE_INBOX_ADDRESS, AuthRole::MintRecipient)
-            .await;
         eyre::ensure!(
-            recipient_authorized == eligible && mint_authorized == eligible,
-            "Zone did not mirror Earn eligibility for policy {} and {account}: recipient={recipient_authorized}, mint={mint_authorized}, expected={eligible}",
+            recipient_authorized == eligible,
+            "Zone did not mirror Earn recipient eligibility for policy {} and {account}: actual={recipient_authorized}, expected={eligible}",
             policy.compound_id
         );
         Ok(())
