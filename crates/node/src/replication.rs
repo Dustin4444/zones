@@ -911,8 +911,7 @@ where
     let local = provider
         .state_by_block_hash(parent.hash())?
         .tempo_num_hash()?;
-    validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, block_number)?;
-    validate_zone_block_timestamp(&block, &l1_header)?;
+    validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, &block)?;
     let anchor = l1_header.num_hash();
 
     // Anchor-aware fence for live blocks: the sender must
@@ -1054,11 +1053,12 @@ fn validate_l1_checkpoint_transition(
     l1_header: &SealedHeader<TempoHeader>,
     local_number: u64,
     local_hash: B256,
-    zone_block_number: u64,
+    zone_block: &SealedBlock<Block>,
 ) -> eyre::Result<()> {
     if l1_header.number() != local_number.saturating_add(1) {
         eyre::bail!(
-            "peer block {zone_block_number} advances Tempo to L1 block {}, but local checkpoint is {}; expected {}",
+            "peer block {} advances Tempo to L1 block {}, but local checkpoint is {}; expected {}",
+            zone_block.number(),
             l1_header.number(),
             local_number,
             local_number.saturating_add(1)
@@ -1072,26 +1072,19 @@ fn validate_l1_checkpoint_transition(
             local_hash
         );
     }
-    Ok(())
-}
-
-fn validate_zone_block_timestamp(
-    block: &SealedBlock<Block>,
-    l1_header: &SealedHeader<TempoHeader>,
-) -> eyre::Result<()> {
-    if block.timestamp() != l1_header.timestamp() {
+    if zone_block.timestamp() != l1_header.timestamp() {
         eyre::bail!(
             "peer block {} timestamp {} != anchored L1 timestamp {}",
-            block.number(),
-            block.timestamp(),
+            zone_block.number(),
+            zone_block.timestamp(),
             l1_header.timestamp()
         );
     }
-    if block.header().timestamp_millis_part != l1_header.header().timestamp_millis_part {
+    if zone_block.header().timestamp_millis_part != l1_header.header().timestamp_millis_part {
         eyre::bail!(
             "peer block {} timestamp millisecond part {} != anchored L1 timestamp millisecond part {}",
-            block.number(),
-            block.header().timestamp_millis_part,
+            zone_block.number(),
+            zone_block.header().timestamp_millis_part,
             l1_header.header().timestamp_millis_part
         );
     }
@@ -1161,7 +1154,7 @@ mod tests {
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS,
         PersistedBlockSource, PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
-        validate_live_block_sender, validate_zone_block_timestamp, wait_for_validated_peer_anchor,
+        validate_live_block_sender, wait_for_validated_peer_anchor,
     };
     use alloy_primitives::B256;
     use zone_l1::{L1BlockTracker, L1PortalEvents};
@@ -1419,8 +1412,8 @@ mod tests {
 
     #[test]
     fn validates_embedded_l1_checkpoint_continuity() {
-        use reth_primitives_traits::SealedHeader;
-        use tempo_primitives::TempoHeader;
+        use reth_primitives_traits::{SealedBlock, SealedHeader};
+        use tempo_primitives::{Block, TempoHeader};
 
         let local_hash = B256::repeat_byte(0x42);
         let header = SealedHeader::seal_slow(TempoHeader {
@@ -1431,14 +1424,18 @@ mod tests {
             },
             ..Default::default()
         });
-        super::validate_l1_checkpoint_transition(&header, 10, local_hash, 7).unwrap();
+        let block = SealedBlock::seal_slow(Block {
+            header: TempoHeader::default(),
+            body: Default::default(),
+        });
+        super::validate_l1_checkpoint_transition(&header, 10, local_hash, &block).unwrap();
 
         let skipped =
-            super::validate_l1_checkpoint_transition(&header, 9, local_hash, 7).unwrap_err();
+            super::validate_l1_checkpoint_transition(&header, 9, local_hash, &block).unwrap_err();
         assert!(skipped.to_string().contains("expected 10"));
 
         let wrong_parent =
-            super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7)
+            super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), &block)
                 .unwrap_err();
         assert!(wrong_parent.to_string().contains("does not extend"));
     }
@@ -1460,10 +1457,13 @@ mod tests {
             },
             body: Default::default(),
         });
+        let local_hash = B256::ZERO;
         let make_l1_header = |timestamp, timestamp_millis_part| {
             SealedHeader::seal_slow(TempoHeader {
                 timestamp_millis_part,
                 inner: Header {
+                    number: 11,
+                    parent_hash: local_hash,
                     timestamp,
                     ..Default::default()
                 },
@@ -1471,12 +1471,16 @@ mod tests {
             })
         };
 
-        validate_zone_block_timestamp(&block, &make_l1_header(456, 123)).unwrap();
+        let validate = |l1_header| {
+            super::validate_l1_checkpoint_transition(&l1_header, 10, local_hash, &block)
+        };
 
-        let error = validate_zone_block_timestamp(&block, &make_l1_header(457, 123)).unwrap_err();
+        validate(make_l1_header(456, 123)).unwrap();
+
+        let error = validate(make_l1_header(457, 123)).unwrap_err();
         assert!(error.to_string().contains("timestamp 456"));
 
-        let error = validate_zone_block_timestamp(&block, &make_l1_header(456, 124)).unwrap_err();
+        let error = validate(make_l1_header(456, 124)).unwrap_err();
         assert!(error.to_string().contains("millisecond part 123"));
     }
 
