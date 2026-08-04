@@ -380,7 +380,7 @@ impl CreateZone {
 fn ensure_canonical_tempo_header_hash(
     response: tempo_alloy::rpc::TempoHeaderResponse,
 ) -> eyre::Result<tempo_alloy::rpc::TempoHeaderResponse> {
-    let block_number = response.inner.inner.number;
+    let block_number = response.inner.inner.inner.number;
     let rpc_hash = response.inner.hash;
     let canonical_hash = response.inner.inner.hash_slow();
     ensure!(
