@@ -43,7 +43,6 @@ use tempo_primitives::{
 use tempo_transaction_pool::{
     StateAwareBestTransactions, TempoTransactionPool,
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
-    validator::ConfigureTempoPoolEvm,
 };
 use tracing::{error, info, warn};
 use zone_chainspec::ZoneChainSpec;
@@ -815,8 +814,10 @@ mod tests {
     use std::{collections::VecDeque, num::NonZeroU64, sync::Arc, time::Instant};
     use tempo_primitives::{
         TempoHeader, TempoTxEnvelope,
-        transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
-        transaction::{Call, TempoTransaction},
+        transaction::{
+            Call, TempoTransaction,
+            envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
+        },
     };
     use tempo_transaction_pool::transaction::TempoPooledTransaction;
 
