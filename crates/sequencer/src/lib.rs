@@ -105,6 +105,8 @@ pub struct ZoneSequencerConfig {
     pub batch_anchor_config: BatchAnchorConfig,
     /// Shared P2P attestation store used for quorum batch submission.
     pub attestation_store: Option<AttestationStore>,
+    /// Receipt-authenticated finalized L1 observations, including external batch submissions.
+    pub l1_block_tracker: zone_l1::L1BlockTracker,
 }
 
 /// Handles returned by [`spawn_zone_sequencer`] for managing background tasks.
@@ -167,6 +169,7 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
         attestation_store: config.attestation_store,
+        batch_submissions: Some(config.l1_block_tracker.subscribe_batch_submissions()),
     };
 
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(

@@ -741,6 +741,7 @@ where
                     self.l1_config.portal_address,
                     self.l1_config.retry_connection_interval,
                     attestation.store.clone(),
+                    self.l1_config.block_tracker.clone(),
                 )?),
                 None => None,
             };
@@ -791,6 +792,7 @@ where
                 self.l1_config.retry_connection_interval,
                 sequencer_addr,
                 None,
+                self.l1_config.block_tracker.clone(),
             )
             .await?;
         }
@@ -1044,6 +1046,7 @@ where
         portal_address: Address,
         retry_connection_interval: Duration,
         attestation_store: AttestationStore,
+        l1_block_tracker: L1BlockTracker,
     ) -> eyre::Result<LeaderSequencerDeps> {
         let sequencer_config = ZoneSequencerConfig {
             portal_address,
@@ -1056,6 +1059,7 @@ where
             inbox_address: ZONE_INBOX_ADDRESS,
             batch_anchor_config: config.batch_anchor_config,
             attestation_store: Some(attestation_store),
+            l1_block_tracker,
         };
         Ok(LeaderSequencerDeps {
             config,
@@ -1249,6 +1253,7 @@ where
         retry_connection_interval: Duration,
         sequencer_addr: Address,
         attestation_store: Option<AttestationStore>,
+        l1_block_tracker: L1BlockTracker,
     ) -> eyre::Result<()> {
         info!(target: "reth::cli", %sequencer_addr, "Starting sequencer background tasks");
         let sequencer_config = ZoneSequencerConfig {
@@ -1262,6 +1267,7 @@ where
             inbox_address: ZONE_INBOX_ADDRESS,
             batch_anchor_config: config.batch_anchor_config,
             attestation_store,
+            l1_block_tracker,
         };
         let l1_transaction_signer = config
             .l1_transaction_signer

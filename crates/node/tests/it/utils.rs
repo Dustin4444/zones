@@ -3364,6 +3364,7 @@ pub(crate) async fn spawn_sequencer_with_config(
         inbox_address: ZONE_INBOX_ADDRESS,
         batch_anchor_config,
         attestation_store: None,
+        l1_block_tracker: zone_l1::L1BlockTracker::default(),
     };
 
     zone.spawn_sequencer(config, sequencer_signer).await
@@ -4672,6 +4673,7 @@ impl L1Fixture {
             enabled_tokens: tokens,
             encryption_key_rotations: vec![],
             leader_transitions: vec![],
+            batch_submissions: vec![],
         };
         queue.enqueue(header, events);
     }

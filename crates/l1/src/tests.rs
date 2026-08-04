@@ -208,6 +208,27 @@ async fn l1_block_tracker_returns_receipt_authenticated_portal_events() {
     );
 }
 
+#[tokio::test]
+async fn l1_block_tracker_publishes_batch_submissions() {
+    let tracker = L1BlockTracker::default();
+    let mut submissions = tracker.subscribe_batch_submissions();
+    let expected = BatchSubmission {
+        withdrawal_batch_index: 7,
+        next_block_hash: B256::repeat_byte(0x42),
+    };
+    let events = L1PortalEvents {
+        batch_submissions: vec![expected.clone()],
+        ..Default::default()
+    };
+
+    tracker
+        .record_with_portal_events(NumHash::new(10, B256::with_last_byte(0x10)), events)
+        .unwrap();
+
+    submissions.changed().await.unwrap();
+    assert_eq!(submissions.borrow_and_update().as_ref(), Some(&expected));
+}
+
 #[test]
 fn observed_portal_events_require_complete_advance_tempo_inputs() {
     let events = L1PortalEvents {
@@ -223,6 +244,7 @@ fn observed_portal_events_require_complete_advance_tempo_inputs() {
         }],
         encryption_key_rotations: vec![],
         leader_transitions: vec![],
+        batch_submissions: vec![],
     };
     let deposits: Vec<_> = events
         .deposits
@@ -1454,6 +1476,24 @@ fn leader_updated_log(
     }
 }
 
+fn batch_submitted_log(portal: Address, batch_index: u64, next_block_hash: B256) -> Log {
+    let event = crate::abi::ZonePortal::BatchSubmitted {
+        withdrawalBatchIndex: batch_index,
+        withdrawalQueueIndex: U256::MAX,
+        nextProcessedDepositQueueHash: B256::ZERO,
+        nextBlockHash: next_block_hash,
+        withdrawalQueueHash: B256::ZERO,
+        lastProcessedDepositNumber: 0,
+    };
+    Log {
+        inner: alloy_primitives::Log {
+            address: portal,
+            data: event.encode_log_data(),
+        },
+        ..Default::default()
+    }
+}
+
 fn encryption_key_updated_log(
     portal: Address,
     x: B256,
@@ -1523,6 +1563,25 @@ fn decodes_leader_updated_into_portal_events() {
     let transition = events.final_leader_transition().unwrap().unwrap();
     assert_eq!(transition.new_leader, new_leader);
     assert_eq!(transition.epoch, 4);
+}
+
+#[test]
+fn decodes_batch_submitted_into_portal_events() {
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let next_block_hash = B256::repeat_byte(0x42);
+    let mut events = L1PortalEvents::default();
+
+    events
+        .push_log(&batch_submitted_log(portal, 7, next_block_hash), 77)
+        .unwrap();
+
+    assert_eq!(
+        events.batch_submissions,
+        vec![BatchSubmission {
+            withdrawal_batch_index: 7,
+            next_block_hash,
+        }]
+    );
 }
 
 #[test]

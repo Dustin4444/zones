@@ -38,14 +38,17 @@ struct L1BlockObservation {
 pub struct L1BlockTracker {
     state: Arc<parking_lot::RwLock<L1BlockTrackerState>>,
     changed: tokio::sync::watch::Sender<()>,
+    batch_submission: tokio::sync::watch::Sender<Option<crate::BatchSubmission>>,
 }
 
 impl Default for L1BlockTracker {
     fn default() -> Self {
         let (changed, _) = tokio::sync::watch::channel(());
+        let (batch_submission, _) = tokio::sync::watch::channel(None);
         Self {
             state: Default::default(),
             changed,
+            batch_submission,
         }
     }
 }
@@ -71,6 +74,13 @@ impl L1BlockTracker {
     /// Return the highest independently observed L1 anchor.
     pub fn latest(&self) -> Option<NumHash> {
         self.state.read().latest
+    }
+
+    /// Subscribe to the latest receipt-authenticated `BatchSubmitted` event.
+    pub fn subscribe_batch_submissions(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::BatchSubmission>> {
+        self.batch_submission.subscribe()
     }
 
     /// Return whether `number` fits inside the bounded subscriber lookahead window.
@@ -169,6 +179,7 @@ impl L1BlockTracker {
         block: NumHash,
         portal_events: L1PortalEvents,
     ) -> eyre::Result<()> {
+        let batch_submission = portal_events.batch_submissions.last().cloned();
         let mut state = self.state.write();
         if let Some(observation) = state.observed.get(&block.number) {
             eyre::ensure!(
@@ -218,6 +229,9 @@ impl L1BlockTracker {
         );
         state.latest = Some(block);
         drop(state);
+        if let Some(batch_submission) = batch_submission {
+            self.batch_submission.send_replace(Some(batch_submission));
+        }
         self.changed.send_replace(());
         Ok(())
     }

@@ -15,6 +15,18 @@ pub struct L1PortalEvents {
     /// The portal allows at most one distinct transition per Tempo block.
     #[serde(default)]
     pub leader_transitions: Vec<LeaderTransition>,
+    /// Confirmed batch submissions in canonical log order.
+    #[serde(default)]
+    pub batch_submissions: Vec<BatchSubmission>,
+}
+
+/// A finalized `BatchSubmitted` Portal event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BatchSubmission {
+    /// Monotonic batch index assigned by the Portal.
+    pub withdrawal_batch_index: u64,
+    /// Zone block hash accepted as the new Portal tip.
+    pub next_block_hash: B256,
 }
 
 /// A finalized `SequencerEncryptionKeyUpdated` Portal event.
@@ -70,12 +82,13 @@ impl EnabledToken {
 
 impl L1PortalEvents {
     /// Event signature hashes that this container knows how to decode.
-    const SIGNATURE_HASHES: [B256; 5] = [
+    const SIGNATURE_HASHES: [B256; 6] = [
         DepositMade::SIGNATURE_HASH,
         WithdrawalBounceBack::SIGNATURE_HASH,
         TokenEnabled::SIGNATURE_HASH,
         SequencerEncryptionKeyUpdated::SIGNATURE_HASH,
         LeaderUpdated::SIGNATURE_HASH,
+        BatchSubmitted::SIGNATURE_HASH,
     ];
 
     /// Create portal events from deposits only.
@@ -204,6 +217,18 @@ impl L1PortalEvents {
                     new_leader: event.newLeader,
                     epoch: event.epoch,
                     activation_tempo_block: event.activationTempoBlock,
+                });
+            }
+            ZonePortalEvents::BatchSubmitted(event) => {
+                info!(
+                    l1_block = block_number,
+                    withdrawal_batch_index = event.withdrawalBatchIndex,
+                    next_block_hash = %event.nextBlockHash,
+                    "Batch submitted on L1"
+                );
+                self.batch_submissions.push(BatchSubmission {
+                    withdrawal_batch_index: event.withdrawalBatchIndex,
+                    next_block_hash: event.nextBlockHash,
                 });
             }
             _ => {}

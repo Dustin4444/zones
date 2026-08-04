@@ -68,6 +68,8 @@ pub struct ZoneMonitorConfig {
     pub batch_anchor_config: BatchAnchorConfig,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
+    /// Finalized external batch submissions observed by the L1 subscriber.
+    pub batch_submissions: Option<tokio::sync::watch::Receiver<Option<zone_l1::BatchSubmission>>>,
 }
 
 /// Withdrawal state shared between the zone monitor and withdrawal processor.
@@ -177,6 +179,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             config.batch_anchor_config,
         );
         batch_submitter.set_attestation_store(config.attestation_store.clone());
+        batch_submitter.set_batch_submissions(config.batch_submissions.clone());
 
         let prev_zone_block_hash = batch_submitter
             .read_portal_block_hash()
@@ -957,6 +960,7 @@ mod tests {
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
             attestation_store: None,
+            batch_submissions: None,
         };
         let l1_provider = mock_provider(l1);
 
@@ -987,6 +991,7 @@ mod tests {
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
             attestation_store: None,
+            batch_submissions: None,
         };
 
         l1.push_failure_msg("boom");

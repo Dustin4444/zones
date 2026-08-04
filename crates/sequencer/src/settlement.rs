@@ -154,6 +154,8 @@ pub struct BatchSubmitter {
     anchor_config: BatchAnchorConfig,
     /// Signatures from followers attesting to the batch.
     attestation_store: Option<AttestationStore>,
+    /// Finalized external batch submissions published by the L1 subscriber.
+    batch_submissions: Option<tokio::sync::watch::Receiver<Option<zone_l1::BatchSubmission>>>,
     /// Validated, RLP-encoded L1 headers retained across overlapping ancestry
     /// requests. Settlement batches are submitted in order, so later requests
     /// can reuse almost the entire preceding range.
@@ -212,6 +214,7 @@ impl BatchSubmitter {
             l1_fetch_concurrency: 16,
             anchor_config,
             attestation_store: None,
+            batch_submissions: None,
             ancestry_header_cache: RwLock::new(LruMap::new(ByLength::new(
                 DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY,
             ))),
@@ -221,6 +224,14 @@ impl BatchSubmitter {
     /// Attach the shared store populated by leader and follower settlement signatures.
     pub fn set_attestation_store(&mut self, store: Option<AttestationStore>) {
         self.attestation_store = store;
+    }
+
+    /// Attach the finalized batch-submission stream published by the L1 subscriber.
+    pub fn set_batch_submissions(
+        &mut self,
+        submissions: Option<tokio::sync::watch::Receiver<Option<zone_l1::BatchSubmission>>>,
+    ) {
+        self.batch_submissions = submissions;
     }
 
     /// Submit a batch to the ZonePortal on Tempo L1.
@@ -272,9 +283,9 @@ impl BatchSubmitter {
                     zone_height = batch.zone_height,
                     threshold, "Waiting for settlement quorum"
                 );
-                let certificate = store
-                    .wait_for_settlement(batch.zone_height, threshold)
-                    .await;
+                let certificate = self
+                    .wait_for_settlement_or_portal_progress(store, batch, threshold)
+                    .await?;
                 let anchor_mode = match self
                     .validate_certificate(batch, batch.zone_height, metadata, &certificate)
                     .await
@@ -392,6 +403,45 @@ impl BatchSubmitter {
         );
 
         Ok(event)
+    }
+
+    /// Wait for a local settlement certificate while the batch still extends the portal tip.
+    ///
+    /// Another retained leader may submit the same boundary first. In that case honest followers
+    /// stop signing the now-stale statement, so a waiter that only observes the local attestation
+    /// store would never return. The finalized L1 subscriber wakes the submission attempt when it
+    /// observes `BatchSubmitted`; the monitor's existing retry preflight then resyncs from the
+    /// accepted boundary.
+    async fn wait_for_settlement_or_portal_progress(
+        &self,
+        store: &AttestationStore,
+        batch: &BatchData,
+        threshold: usize,
+    ) -> Result<SettlementCertificate> {
+        let quorum = store.wait_for_settlement(batch.zone_height, threshold);
+        tokio::pin!(quorum);
+        let mut batch_submissions = self
+            .batch_submissions
+            .clone()
+            .ok_or_eyre("settlement quorum requires the L1 batch-submission stream")?;
+
+        loop {
+            if let Some(submission) = batch_submissions.borrow_and_update().clone() {
+                eyre::ensure!(
+                    submission.next_block_hash == batch.prev_block_hash,
+                    "portal advanced from {} to {} while waiting for settlement quorum at zone block {}",
+                    batch.prev_block_hash,
+                    submission.next_block_hash,
+                    batch.zone_height,
+                );
+            }
+            tokio::select! {
+                biased;
+                certificate = &mut quorum => return Ok(certificate),
+                changed = batch_submissions.changed() => changed
+                    .map_err(|_| eyre::eyre!("L1 batch-submission stream closed"))?,
+            }
+        }
     }
 
     fn sign_settlement_attestation(
@@ -2039,6 +2089,59 @@ mod tests {
         assert_eq!(second.verifier, next_verifier);
         assert_eq!(second.stable.zone_id, 42);
         assert_eq!(second.stable.chain_id, 42431);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn settlement_wait_stops_after_external_portal_progress() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let mut submitter = BatchSubmitter::new(Address::ZERO, provider);
+        let l1_block_tracker = zone_l1::L1BlockTracker::default();
+        submitter.set_batch_submissions(Some(l1_block_tracker.subscribe_batch_submissions()));
+        let store = AttestationStore::default();
+        let batch = BatchData {
+            zone_height: 20,
+            tempo_block_number: 123,
+            prev_block_hash: B256::repeat_byte(0x11),
+            next_block_hash: B256::repeat_byte(0x22),
+            prev_processed_deposit_hash: B256::ZERO,
+            next_processed_deposit_hash: B256::ZERO,
+            prev_deposit_number: 0,
+            next_deposit_number: 0,
+            withdrawal_queue_hash: B256::ZERO,
+            withdrawal_batch_index: 1,
+        };
+        let portal_hash = batch.next_block_hash;
+
+        let waiting = submitter.wait_for_settlement_or_portal_progress(&store, &batch, 2);
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("settlement wait returned before portal progress"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        l1_block_tracker
+            .record_with_portal_events(
+                alloy_eips::NumHash::new(10, B256::repeat_byte(0x33)),
+                zone_l1::L1PortalEvents {
+                    batch_submissions: vec![zone_l1::BatchSubmission {
+                        withdrawal_batch_index: 1,
+                        next_block_hash: portal_hash,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let error = waiting.await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("portal advanced from 0x1111111111111111111111111111111111111111111111111111111111111111 to 0x2222222222222222222222222222222222222222222222222222222222222222 while waiting for settlement quorum at zone block 20")
+        );
         assert!(asserter.read_q().is_empty());
     }
 
