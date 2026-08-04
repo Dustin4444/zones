@@ -268,8 +268,8 @@ fn validation_error(message: &'static str) -> InvalidPoolTransactionError {
 /// Production calldata policy for Zone transaction-pool admission.
 ///
 /// State-changing Zone system operations are rejected because they must be synthesized as system
-/// transactions. TIP-20 targets accept only fully decodable `transferFrom`, `transferWithMemo`,
-/// `transferFromWithMemo`, and `approve` calls.
+/// transactions. TIP-20 targets accept only fully decodable `transfer`, `transferFrom`,
+/// `transferWithMemo`, `transferFromWithMemo`, and `approve` calls.
 pub(crate) fn validate_zone_pool_calldata(
     target: Address,
     input: &[u8],
@@ -292,7 +292,10 @@ pub(crate) fn validate_zone_pool_calldata(
         return Ok(());
     }
 
-    if input.starts_with(&ITIP20::transferFromCall::SELECTOR) {
+    if input.starts_with(&ITIP20::transferCall::SELECTOR) {
+        ITIP20::transferCall::abi_decode(input)
+            .map_err(|_| validation_error("malformed TIP-20 transfer call"))?;
+    } else if input.starts_with(&ITIP20::transferFromCall::SELECTOR) {
         ITIP20::transferFromCall::abi_decode(input)
             .map_err(|_| validation_error("malformed TIP-20 transferFrom call"))?;
     } else if input.starts_with(&ITIP20::transferWithMemoCall::SELECTOR) {
@@ -429,6 +432,10 @@ mod tests {
     #[test]
     fn pool_policy_restricts_tip20_operations() {
         let sender = Address::repeat_byte(0x11);
+        let transfer = ITIP20::transferCall {
+            to: Address::repeat_byte(0x22),
+            amount: U256::from(7),
+        };
         let transfer_from = ITIP20::transferFromCall {
             from: sender,
             to: Address::repeat_byte(0x22),
@@ -451,6 +458,7 @@ mod tests {
         };
 
         for input in [
+            transfer.abi_encode(),
             transfer_from.abi_encode(),
             transfer_with_memo.abi_encode(),
             transfer_from_with_memo.abi_encode(),
@@ -460,19 +468,11 @@ mod tests {
             assert!(validate_pool_transaction(TransactionOrigin::External, &transaction).is_ok());
         }
 
-        let transfer = ITIP20::transferCall {
-            to: Address::repeat_byte(0x22),
-            amount: U256::from(7),
-        };
-        let transaction = call_transaction(sender, TOKEN, transfer.abi_encode().into());
-        let error =
-            validate_pool_transaction(TransactionOrigin::External, &transaction).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "TIP-20 operation is not allowed on zones"
-        );
-
         for (selector, expected_error) in [
+            (
+                ITIP20::transferCall::SELECTOR,
+                "malformed TIP-20 transfer call",
+            ),
             (
                 ITIP20::transferFromCall::SELECTOR,
                 "malformed TIP-20 transferFrom call",
