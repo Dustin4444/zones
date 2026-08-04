@@ -43,7 +43,7 @@ pub(crate) const MAX_BATCH_SIZE: usize = 100;
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 /// Maximum time allowed to receive an authenticated HTTP request body.
-const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared state for the redacted RPC server.
 #[derive(Clone)]
