@@ -7,15 +7,15 @@
 
 use axum::{
     Router,
-    body::Bytes,
-    extract::State,
+    body::to_bytes,
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
 use std::{
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
     KeyInfo, SignatureType as KeyInfoSignatureType,
@@ -38,6 +38,12 @@ use crate::{
 
 /// Maximum number of requests in a single JSON-RPC batch.
 pub(crate) const MAX_BATCH_SIZE: usize = 100;
+
+/// Maximum HTTP request body size, matching axum's default body limit.
+const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
+
+/// Maximum time allowed to receive an authenticated HTTP request body.
+const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Shared state for the redacted RPC server.
 #[derive(Clone)]
@@ -170,12 +176,9 @@ pub(crate) async fn dispatch_request(
 }
 
 /// Main HTTP RPC handler — authenticates, dispatches, returns response.
-async fn handle_rpc(
-    State(state): State<Arc<RpcState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let auth = match authenticate(&headers, &state.config, state.api.as_ref()).await {
+async fn handle_rpc(State(state): State<Arc<RpcState>>, request: Request) -> impl IntoResponse {
+    let (parts, body) = request.into_parts();
+    let auth = match authenticate(&parts.headers, &state.config, state.api.as_ref()).await {
         Ok(auth) => auth,
         Err(e) => {
             if e.is_invalid() {
@@ -184,6 +187,19 @@ async fn handle_rpc(
             e.log("http");
             return (e.status_code(), "").into_response();
         }
+    };
+
+    let body = match tokio::time::timeout(
+        HTTP_BODY_READ_TIMEOUT,
+        to_bytes(body, MAX_HTTP_BODY_SIZE),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+        }
+        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "request body timed out").into_response(),
     };
 
     let body_str = match std::str::from_utf8(&body) {
@@ -298,7 +314,7 @@ pub(crate) fn now_unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::authenticate_token;
+    use super::{authenticate_token, start_redacted_rpc};
     use crate::{
         RedactedRpcConfig,
         auth::build_token_fields,
@@ -311,9 +327,14 @@ mod tests {
     use p256::ecdsa::SigningKey as P256SigningKey;
     use parking_lot::Mutex;
     use rand::thread_rng;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc, time::Duration};
     use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
         KeyInfo, SignatureType as KeyInfoSignatureType,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        time::timeout,
     };
 
     #[allow(dead_code)]
@@ -410,6 +431,29 @@ mod tests {
             max_auth_token_validity: crate::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
             zone_portal: PORTAL,
         }
+    }
+
+    #[tokio::test]
+    async fn http_rejects_missing_auth_before_reading_body() {
+        let api = Arc::new(TestApi {
+            key_infos: Mutex::new(HashMap::new()),
+        });
+        let addr = start_redacted_rpc(test_config(), api).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let headers = format!("POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 5\r\n\r\n");
+        stream.write_all(headers.as_bytes()).await.unwrap();
+
+        let mut response = [0; 512];
+        let read = timeout(Duration::from_secs(1), stream.read(&mut response))
+            .await
+            .expect("server waited for the request body before authenticating")
+            .unwrap();
+        let response = std::str::from_utf8(&response[..read]).unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "unexpected response: {response}"
+        );
     }
 
     #[tokio::test]
