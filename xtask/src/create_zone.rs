@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use alloy::{
+    consensus::Sealable,
     network::{EthereumWallet, primitives::ReceiptResponse},
     primitives::{Address, address, keccak256},
     providers::{Provider, ProviderBuilder},
@@ -212,7 +213,8 @@ impl CreateZone {
         let anchor_header = provider
             .get_header_by_number(anchor_block_number.into())
             .await?
-            .ok_or_else(|| eyre!("anchor header {anchor_block_number} not found"))?
+            .ok_or_else(|| eyre!("anchor header {anchor_block_number} not found"))
+            .and_then(ensure_canonical_tempo_header_hash)?
             .inner
             .inner;
         let mut genesis_header_rlp = Vec::new();
@@ -375,9 +377,26 @@ impl CreateZone {
     }
 }
 
+fn ensure_canonical_tempo_header_hash(
+    response: tempo_alloy::rpc::TempoHeaderResponse,
+) -> eyre::Result<tempo_alloy::rpc::TempoHeaderResponse> {
+    let block_number = response.inner.inner.number;
+    let rpc_hash = response.inner.hash;
+    let canonical_hash = response.inner.inner.hash_slow();
+    ensure!(
+        rpc_hash == canonical_hash,
+        "L1 block {block_number} reports hash {rpc_hash}, but its canonical Tempo header hash is \
+         {canonical_hash}; use an L1 that mines canonically hashed Tempo headers"
+    );
+    Ok(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::{consensus::Sealable, primitives::B256};
+    use alloy_rpc_types_eth::Header;
+    use tempo_primitives::TempoHeader;
 
     #[test]
     fn factory_params_install_the_requested_quorum_atomically() {
@@ -408,5 +427,31 @@ mod tests {
         let params = command.factory_params();
         assert_eq!(params.sequencers, sequencers);
         assert_eq!(params.threshold, 2);
+    }
+
+    #[test]
+    fn canonical_header_hash_must_match_rpc_hash() {
+        let header = TempoHeader::default();
+        let canonical_hash = header.hash_slow();
+        let matching_response = tempo_alloy::rpc::TempoHeaderResponse {
+            inner: Header {
+                hash: canonical_hash,
+                inner: header.clone(),
+                ..Default::default()
+            },
+            timestamp_millis: 0,
+        };
+        assert!(ensure_canonical_tempo_header_hash(matching_response).is_ok());
+
+        let error = ensure_canonical_tempo_header_hash(tempo_alloy::rpc::TempoHeaderResponse {
+            inner: Header {
+                hash: B256::repeat_byte(1),
+                inner: header,
+                ..Default::default()
+            },
+            timestamp_millis: 0,
+        })
+        .expect_err("mismatched header hashes should be rejected");
+        assert!(error.to_string().contains("canonical Tempo header hash"));
     }
 }
