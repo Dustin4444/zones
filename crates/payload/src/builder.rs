@@ -41,7 +41,9 @@ use tempo_primitives::{
     transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
 };
 use tempo_transaction_pool::{
-    StateAwareBestTransactions, TempoTransactionPool, transaction::TempoPooledTransaction,
+    StateAwareBestTransactions, TempoTransactionPool,
+    transaction::{TempoPoolTransactionError, TempoPooledTransaction},
+    validator::ConfigureTempoPoolEvm,
 };
 use tracing::{error, info, warn};
 use zone_chainspec::ZoneChainSpec;
@@ -256,7 +258,12 @@ where
         let raw_best_txs = self
             .pool
             .best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, None));
-        let mut best_txs = StateAwareBestTransactions::new(raw_best_txs);
+        let timestamp_ready_txs = TimestampReadyTransactions::new(
+            raw_best_txs,
+            attributes.timestamp(),
+            pool_tx_size_budget,
+        );
+        let mut best_txs = StateAwareBestTransactions::new(timestamp_ready_txs);
         if execute_pool_transactions(
             |tx, best_txs| {
                 builder
@@ -430,6 +437,96 @@ fn validate_l1_continuity(
 enum PoolExecutionOutcome {
     Complete,
     Cancelled,
+}
+
+/// Filters pool transactions that are not valid at the pending block timestamp.
+///
+/// Deferred transactions remain in the pool. Marking them invalid only affects the wrapped
+/// iterator, which prevents dependent transactions from the same nonce sequence from being
+/// yielded during this payload build. The scan budget bounds work for independent transactions,
+/// including expiring-nonce transactions whose iterator invalidation is intentionally a no-op.
+struct TimestampReadyTransactions<T> {
+    inner: T,
+    block_timestamp: u64,
+    scanned_tx_bytes: usize,
+    scan_budget: usize,
+}
+
+impl<T> TimestampReadyTransactions<T> {
+    fn new(inner: T, block_timestamp: u64, scan_budget: usize) -> Self {
+        Self {
+            inner,
+            block_timestamp,
+            scanned_tx_bytes: 0,
+            scan_budget,
+        }
+    }
+}
+
+impl<T> Iterator for TimestampReadyTransactions<T>
+where
+    T: BestTransactions<Item = Arc<ValidPoolTransaction<TempoPooledTransaction>>>,
+{
+    type Item = Arc<ValidPoolTransaction<TempoPooledTransaction>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let pool_tx = self.inner.next()?;
+            let scanned_tx_bytes = self
+                .scanned_tx_bytes
+                .saturating_add(pool_tx.transaction.encoded_length());
+            if scanned_tx_bytes > self.scan_budget {
+                return None;
+            }
+            self.scanned_tx_bytes = scanned_tx_bytes;
+
+            let valid_after = pool_tx
+                .transaction
+                .inner()
+                .as_aa()
+                .and_then(|tx| tx.tx().valid_after)
+                .map(|timestamp| timestamp.get());
+            if let Some(valid_after) =
+                valid_after.filter(|valid_after| self.block_timestamp < *valid_after)
+            {
+                // `mark_invalid` is iterator-local. It suppresses descendants for protocol and
+                // regular AA 2D nonce sequences without evicting this transaction from the pool.
+                self.inner.mark_invalid(
+                    &pool_tx,
+                    InvalidPoolTransactionError::other(
+                        TempoPoolTransactionError::InvalidValidAfter {
+                            valid_after,
+                            max_allowed: self.block_timestamp,
+                        },
+                    ),
+                );
+                continue;
+            }
+
+            return Some(pool_tx);
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.inner.size_hint().1)
+    }
+}
+
+impl<T> BestTransactions for TimestampReadyTransactions<T>
+where
+    T: BestTransactions<Item = Arc<ValidPoolTransaction<TempoPooledTransaction>>>,
+{
+    fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
+        self.inner.mark_invalid(transaction, kind);
+    }
+
+    fn no_updates(&mut self) {
+        self.inner.no_updates();
+    }
+
+    fn set_skip_blobs(&mut self, skip_blobs: bool) {
+        self.inner.set_skip_blobs(skip_blobs);
+    }
 }
 
 /// Execute the best pool transactions, skipping any whose RLP size would push the packed pool
@@ -706,7 +803,7 @@ pub fn build_advance_tempo_tx(prepared: &PreparedL1Block) -> Recovered<TempoTxEn
 #[cfg(test)]
 mod tests {
     use alloy_consensus::{Header, Signed, TxLegacy};
-    use alloy_primitives::{Address, B256, U256, address};
+    use alloy_primitives::{Address, B256, Signature, TxKind, U256, address};
     use alloy_sol_types::SolCall;
     use reth_primitives_traits::{Recovered, SealedHeader};
     use reth_revm::cancelled::CancelOnDrop;
@@ -715,10 +812,11 @@ mod tests {
         error::InvalidPoolTransactionError,
         identifier::{SenderId, TransactionId},
     };
-    use std::{collections::VecDeque, sync::Arc, time::Instant};
+    use std::{collections::VecDeque, num::NonZeroU64, sync::Arc, time::Instant};
     use tempo_primitives::{
         TempoHeader, TempoTxEnvelope,
         transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
+        transaction::{Call, TempoTransaction},
     };
     use tempo_transaction_pool::transaction::TempoPooledTransaction;
 
@@ -747,6 +845,7 @@ mod tests {
     struct MockBestTransactions {
         queue: VecDeque<Arc<ValidPoolTransaction<TempoPooledTransaction>>>,
         oversized_marked: usize,
+        deferred_marked: usize,
     }
 
     impl Iterator for MockBestTransactions {
@@ -761,6 +860,8 @@ mod tests {
         fn mark_invalid(&mut self, _tx: &Self::Item, kind: InvalidPoolTransactionError) {
             if matches!(kind, InvalidPoolTransactionError::OversizedData { .. }) {
                 self.oversized_marked += 1;
+            } else {
+                self.deferred_marked += 1;
             }
         }
 
@@ -796,6 +897,30 @@ mod tests {
         })
     }
 
+    fn future_valid_pool_tx(valid_after: u64) -> Arc<ValidPoolTransaction<TempoPooledTransaction>> {
+        let transaction = TempoTransaction {
+            calls: vec![Call {
+                to: TxKind::Call(address!("0x0000000000000000000000000000000000009999")),
+                value: U256::ZERO,
+                input: Default::default(),
+            }],
+            nonce_key: U256::from(1),
+            valid_after: NonZeroU64::new(valid_after),
+            ..Default::default()
+        };
+        let envelope =
+            TempoTxEnvelope::AA(transaction.into_signed(Signature::test_signature().into()));
+        let recovered = Recovered::new_unchecked(envelope, TEMPO_SYSTEM_TX_SENDER);
+        Arc::new(ValidPoolTransaction {
+            transaction: TempoPooledTransaction::new(recovered),
+            transaction_id: TransactionId::new(SenderId::from(0u64), 0),
+            propagate: false,
+            timestamp: Instant::now(),
+            origin: TransactionOrigin::External,
+            authority_ids: None,
+        })
+    }
+
     /// Feed the pool loop far more large transactions than fit in the size budget, and assert it
     /// stops including them once the packed bytes reach the budget — i.e. the block is actually
     /// capped by the size gate rather than growing unbounded.
@@ -823,6 +948,7 @@ mod tests {
         let mut best_txs = MockBestTransactions {
             queue,
             oversized_marked: 0,
+            deferred_marked: 0,
         };
         let mut executed = 0usize;
         let cancel = CancelOnDrop::default();
@@ -843,6 +969,49 @@ mod tests {
         // Only the transactions that fit were executed; the rest were rejected for size.
         assert_eq!(executed, expected_fit);
         assert_eq!(best_txs.oversized_marked, total - expected_fit);
+    }
+
+    #[test]
+    fn future_valid_transactions_are_deferred_until_the_payload_timestamp() {
+        let future_tx = future_valid_pool_tx(101);
+        let ready_tx = pool_tx_with_calldata(0, 1);
+        let inner = MockBestTransactions {
+            queue: VecDeque::from([future_tx.clone(), ready_tx.clone()]),
+            oversized_marked: 0,
+            deferred_marked: 0,
+        };
+        let mut transactions = super::TimestampReadyTransactions::new(inner, 100, usize::MAX);
+
+        assert_eq!(transactions.next().unwrap().hash(), ready_tx.hash());
+        assert!(transactions.next().is_none());
+        assert_eq!(transactions.inner.deferred_marked, 1);
+
+        // Deferral only changes the current iterator. A fresh payload at the transaction's
+        // activation timestamp can select the same pool entry.
+        let inner = MockBestTransactions {
+            queue: VecDeque::from([future_tx.clone()]),
+            oversized_marked: 0,
+            deferred_marked: 0,
+        };
+        let mut transactions = super::TimestampReadyTransactions::new(inner, 101, usize::MAX);
+        assert_eq!(transactions.next().unwrap().hash(), future_tx.hash());
+    }
+
+    #[test]
+    fn future_valid_transaction_scanning_is_bounded() {
+        let future_tx = future_valid_pool_tx(101);
+        let encoded_length = future_tx.encoded_length();
+        let inner = MockBestTransactions {
+            queue: VecDeque::from([future_tx.clone(), future_tx.clone(), future_tx]),
+            oversized_marked: 0,
+            deferred_marked: 0,
+        };
+        let mut transactions =
+            super::TimestampReadyTransactions::new(inner, 100, encoded_length.saturating_mul(2));
+
+        assert!(transactions.next().is_none());
+        assert_eq!(transactions.inner.deferred_marked, 2);
+        assert_eq!(transactions.scanned_tx_bytes, encoded_length * 2);
     }
 
     /// Verify calldata for an internal withdrawal bounce-back followed by an
