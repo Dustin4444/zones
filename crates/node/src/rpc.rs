@@ -32,7 +32,7 @@ use reth_rpc_eth_api::{
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
 };
 use reth_rpc_eth_types::logs_utils;
-use reth_storage_api::{BlockNumReader, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, BlockReaderIdExt, StateProviderFactory};
 use tempo_alloy::{
     TempoNetwork,
     rpc::{TempoCallBuilderExt as _, TempoHeaderResponse, TempoTransactionRequest},
@@ -737,35 +737,23 @@ where
     fn block_by_number(
         &self,
         number: BlockNumberOrTag,
-        full: bool,
+        _full: bool,
         _auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            let block = EthBlocks::rpc_block(&self.eth.api, number.into(), full)
-                .await
-                .map_err(internal)?;
-
-            let Some(mut block) = block else {
+            let Some(block) = redacted_block_from_header(&self.eth.api, number.into())? else {
                 return Ok(raw_null());
             };
-
-            redact_block(&mut block);
 
             to_raw(&block)
         })
     }
 
-    fn block_by_hash(&self, hash: B256, full: bool, _auth: AuthContext) -> BoxFut<'_> {
+    fn block_by_hash(&self, hash: B256, _full: bool, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let block = EthBlocks::rpc_block(&self.eth.api, hash.into(), full)
-                .await
-                .map_err(internal)?;
-
-            let Some(mut block) = block else {
+            let Some(block) = redacted_block_from_header(&self.eth.api, hash.into())? else {
                 return Ok(raw_null());
             };
-
-            redact_block(&mut block);
 
             to_raw(&block)
         })
@@ -1304,6 +1292,42 @@ fn redact_block(block: &mut RpcBlock) {
     redact_header(&mut block.header);
     block.transactions = BlockTransactions::Hashes(Vec::new());
     block.withdrawals = block.withdrawals.take().map(|_| Default::default());
+}
+
+/// Build a redacted block from header-only data.
+///
+/// The regular Reth block helper loads and walks the complete block body even when `full=false`.
+/// The redacted RPC never returns transaction hashes, so fetching the body is unnecessary.
+fn redacted_block_from_header<Api>(
+    api: &Api,
+    block_id: BlockId,
+) -> Result<Option<RpcBlock>, JsonRpcError>
+where
+    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork>,
+{
+    let Some(header) = api
+        .provider()
+        .sealed_header_by_id(block_id)
+        .map_err(internal)?
+    else {
+        return Ok(None);
+    };
+
+    let header = api
+        .converter()
+        // The redacted response zeroes the block size, so no body-derived size is needed here.
+        .convert_header(header, 0)
+        .map_err(internal)?;
+    let withdrawals = header.withdrawals_root().map(|_| Default::default());
+    let mut block = Block {
+        header,
+        uncles: Vec::new(),
+        transactions: BlockTransactions::Hashes(Vec::new()),
+        withdrawals,
+    };
+
+    redact_block(&mut block);
+    Ok(Some(block))
 }
 
 pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> ConnectionConfig {
