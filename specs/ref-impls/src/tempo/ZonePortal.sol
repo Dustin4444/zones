@@ -72,6 +72,9 @@ contract ZonePortal is IZonePortal {
     /// @dev Over-cap legacy withdrawals are dequeued and bounced back in `processWithdrawals`.
     uint64 public constant MAX_WITHDRAWAL_GAS_LIMIT = MAX_WITHDRAWAL_CALLBACK_GAS;
 
+    /// @dev Fixed callback-processing allowance, matching the sequencer's withdrawal planner.
+    uint256 internal constant CALLBACK_PROCESSING_OVERHEAD_GAS = 1_750_000;
+
     /// @notice Maximum allowed gas fee rate to prevent overflows
     uint128 public constant MAX_GAS_FEE_RATE = 1e18;
 
@@ -950,6 +953,16 @@ contract ZonePortal is IZonePortal {
     }
 
     function _processWithdrawal(Withdrawal calldata withdrawal, bytes32 remainingQueue) internal {
+        // Revert before mutating the queue unless this frame has the callback's committed gas plus
+        // the fixed processing allowance used by the sequencer's withdrawal planner.
+        if (
+            withdrawal.fallbackNonce != 0 && withdrawal.gasLimit > 0
+                && withdrawal.gasLimit <= MAX_WITHDRAWAL_GAS_LIMIT
+                && gasleft() < uint256(withdrawal.gasLimit) + CALLBACK_PROCESSING_OVERHEAD_GAS
+        ) {
+            revert InsufficientCallbackGas();
+        }
+
         // Pop from withdrawal queue (library handles swap and hash verification)
         _withdrawalQueue.dequeue(withdrawal, remainingQueue);
 

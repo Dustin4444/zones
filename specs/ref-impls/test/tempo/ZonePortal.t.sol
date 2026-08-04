@@ -3374,6 +3374,49 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
     }
 
+    function test_withdrawal_underfundedProcessorCall_remainsQueued() public {
+        _openPortalModes();
+
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), 1000e6);
+        _deposit(portal, address(pathUSD), alice, 1000e6, bytes32(""), alice);
+        vm.stopPrank();
+
+        bytes32 depositHashBefore = portal.currentDepositQueueHash();
+        Withdrawal memory withdrawal = _withdrawal(
+            address(pathUSD),
+            alice,
+            address(successfulReceiver),
+            500e6,
+            bytes32(0),
+            5_000_000,
+            alice,
+            ""
+        );
+        _enqueueWithdrawal(withdrawal);
+
+        uint256 headBefore = portal.withdrawalQueueHead();
+        uint256 tailBefore = portal.withdrawalQueueTail();
+        bytes32 slotBefore = portal.withdrawalQueueSlot(headBefore % WITHDRAWAL_QUEUE_CAPACITY);
+        uint256 portalBalanceBefore = pathUSD.balanceOf(address(portal));
+
+        (bool success, bytes memory reason) = address(portal).call{ gas: 2_000_000 }(
+            abi.encodeCall(
+                IZonePortal.processWithdrawals, (_singleWithdrawal(withdrawal), bytes32(0))
+            )
+        );
+
+        assertFalse(success);
+        assertEq(reason, abi.encodeWithSelector(IZonePortal.InsufficientCallbackGas.selector));
+        assertEq(portal.withdrawalQueueHead(), headBefore);
+        assertEq(portal.withdrawalQueueTail(), tailBefore);
+        assertEq(portal.withdrawalQueueSlot(headBefore % WITHDRAWAL_QUEUE_CAPACITY), slotBefore);
+        assertEq(portal.currentDepositQueueHash(), depositHashBefore);
+        assertEq(pathUSD.balanceOf(address(portal)), portalBalanceBefore);
+        assertEq(pathUSD.balanceOf(address(successfulReceiver)), 0);
+        assertEq(successfulReceiver.callCount(), 0);
+    }
+
     /// A reverting callback must not outspend its declared `gasLimit` plus fixed overhead.
     /// The blob used to be copied into the messenger frame and again into the portal's, so one
     /// attacker withdrawal could exhaust a batch sized from the queue's declared limits. The batch

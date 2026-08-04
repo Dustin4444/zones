@@ -613,6 +613,7 @@ interface IZonePortal {
     error InvalidProof();
     error InvalidTempoBlockNumber();
     error CallbackRejected();
+    error InsufficientCallbackGas();
     error TransferFailed();
     error ReentrantWithdrawal();
     error EncryptionKeyExpired(uint256 keyIndex, uint64 activationBlock, uint64 supersededAtBlock);
