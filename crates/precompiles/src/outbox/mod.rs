@@ -167,6 +167,9 @@ impl ZoneOutbox {
         if call.zoneFallbackRecipient.is_zero() {
             return Err(ZoneOutboxError::invalid_fallback_recipient().into());
         }
+        if call.amount == 0 {
+            return Err(ZoneOutboxError::zero_amount_withdrawal().into());
+        }
         if call.data.len() > MAX_CALLBACK_DATA_SIZE {
             return Err(ZoneOutboxError::callback_data_too_large().into());
         }
@@ -283,11 +286,13 @@ impl ZoneOutbox {
 
     fn finalize_withdrawal_batch<P: L1StorageReader>(
         &mut self,
-        l1: &L1State<P>,
+        _l1: &L1State<P>,
         caller: Address,
         call: IZoneOutbox::finalizeWithdrawalBatchCall,
     ) -> ZoneResult<B256> {
-        self.ensure_sequencer(l1, caller)?;
+        if caller != Address::ZERO {
+            return Err(ZoneOutboxError::only_sequencer().into());
+        }
         if call.blockNumber != self.storage.block_number() {
             return Err(ZoneOutboxError::invalid_block_number().into());
         }
