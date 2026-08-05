@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
+mod invariants;
 mod l1_facts;
 mod l2_facts;
 
@@ -25,6 +26,8 @@ use tracing::{error, info};
 
 use l1_facts::{authenticate_l1_block, extract_l1_facts, log_l1_facts, verify_l1_receipts};
 use l2_facts::{extract_l2_facts, log_l2_facts};
+
+use invariants::check_token_enabled_invariant;
 
 // ---------------------------------------------------------------------------
 
@@ -380,6 +383,14 @@ where
     let l1_facts = extract_l1_facts(l1_number, l1_hash, portal_address, &receipts)?;
     log_l1_facts(&l1_facts, portal_address);
 
+    // Cross-layer invariant (observe-only — violations are logged, not enforced).
+    check_token_enabled_invariant(
+        &l1_facts,
+        &l2_facts,
+        BlockNumHash::new(number, hash),
+        BlockNumHash::new(l1_number, l1_hash),
+    );
+
     Ok(())
 }
 
@@ -469,6 +480,24 @@ mod tests {
         let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
             Default::default(),
             receipts,
+            first_block,
+            Default::default(),
+        );
+        Arc::new(Chain::new(blocks, outcome, BTreeMap::new()))
+    }
+
+    /// Like `make_chain` but with custom per-block receipt sets.
+    fn make_chain_with_receipts(
+        blocks: Vec<Block>,
+        receipt_sets: Vec<Vec<Receipt>>,
+    ) -> Arc<Chain<EthPrimitives>> {
+        let first_block = blocks
+            .first()
+            .map(|block| block.header().number())
+            .unwrap_or(0);
+        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
+            Default::default(),
+            receipt_sets,
             first_block,
             Default::default(),
         );
@@ -619,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_receipts_is_error() {
+    async fn extraction_error_fails_notification() {
         let b1 = make_block(1, B256::repeat_byte(5));
         let provider = MockEthProvider::<EthPrimitives>::new();
         let mut l1 = Some(mock_l1_provider(0));
@@ -674,5 +703,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tip, BlockNumHash::new(3, b3.hash()));
+    }
+
+    // --- Invariant engine tests ---
+
+    /// A receipt with a `TempoAdvanced` anchor pointing at a specific L1
+    /// hash/number, plus an optional `TokenEnabled` L2 event.
+    fn receipt_with_anchor_and_token(
+        l1_hash: B256,
+        l1_number: u64,
+        token: Option<Address>,
+    ) -> Receipt {
+        let mut logs = vec![Log {
+            address: ZONE_INBOX_ADDRESS,
+            data: IZoneInbox::TempoAdvanced {
+                tempoBlockHash: l1_hash,
+                tempoBlockNumber: l1_number,
+                depositsProcessed: U256::ZERO,
+                newProcessedDepositQueueHash: B256::ZERO,
+                lastProcessedDepositNumber: 0,
+            }
+            .encode_log_data(),
+        }];
+        if let Some(token) = token {
+            logs.push(Log {
+                address: ZONE_INBOX_ADDRESS,
+                data: IZoneInbox::TokenEnabled {
+                    token,
+                    name: "T".into(),
+                    symbol: "T".into(),
+                    currency: "USD".into(),
+                }
+                .encode_log_data(),
+            });
+        }
+        Receipt {
+            tx_type: Default::default(),
+            success: true,
+            cumulative_gas_used: 0,
+            logs,
+        }
+    }
+
+    /// Build a TempoHeader with a given number and empty receipts, returning
+    /// both the header and its computed hash so the anchor and mock stay
+    /// consistent.
+    fn l1_header_for(number: u64) -> (TempoHeader, B256) {
+        let receipts_root = alloy_consensus::proofs::calculate_receipt_root::<
+            alloy_consensus::ReceiptWithBloom<
+                tempo_primitives::TempoReceipt<alloy_primitives::Log>,
+            >,
+        >(&[]);
+        let header = TempoHeader {
+            inner: Header {
+                number,
+                receipts_root,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hash = header.hash_slow();
+        (header, hash)
+    }
+
+    /// Mock L1 provider for a list of (header, hash) anchors, each with empty
+    /// receipts.  Responses are pushed in the order given.
+    fn mock_l1_for_anchors(anchors: &[(TempoHeader, B256)]) -> DynProvider<TempoNetwork> {
+        let asserter = Asserter::new();
+        for (header, hash) in anchors {
+            let resp = TempoHeaderResponse {
+                inner: RpcHeader {
+                    hash: *hash,
+                    inner: header.clone(),
+                    total_difficulty: None,
+                    size: None,
+                },
+                timestamp_millis: 0,
+            };
+            let block = alloy_rpc_types_eth::Block {
+                header: resp,
+                uncles: vec![],
+                transactions:
+                    BlockTransactions::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Hashes(
+                        vec![],
+                    ),
+                withdrawals: None,
+            };
+            asserter.push_success(&Some(block));
+            asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
+        }
+        ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased()
+    }
+
+    #[tokio::test]
+    async fn violation_does_not_fail_notification() {
+        // L2 has a TokenEnabled event, but L1 has none — invariant mismatch.
+        // The notification should still return Ok (observe-only).
+        let (l1_header, l1_hash) = l1_header_for(L1_NUMBER);
+        let b1 = make_block(1, B256::repeat_byte(0x01));
+        let r = receipt_with_anchor_and_token(l1_hash, L1_NUMBER, Some(Address::repeat_byte(0xaa)));
+        let provider = setup_provider(&[(&b1, vec![r.clone()])]);
+        // L1 mock has no TokenEnabled events (empty receipts).
+        let mut l1 = Some(mock_l1_for_anchors(&[(l1_header, l1_hash)]));
+        let notification = ExExNotification::ChainCommitted {
+            new: make_chain_with_receipts(vec![b1.clone()], vec![vec![r]]),
+        };
+        let result = process_notification(&notification, &provider, &mut l1, "", PORTAL).await;
+        assert!(
+            result.is_ok(),
+            "violation should not fail notification: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reorged_in_block_uses_its_own_anchor() {
+        // Two reorged-in blocks with different L1 anchors. If the checker
+        // used the wrong anchor, authentication would fail.
+        let (l1_header_a, l1_hash_a) = l1_header_for(200);
+        let (l1_header_b, l1_hash_b) = l1_header_for(201);
+
+        let parent = B256::repeat_byte(0x04);
+        let old1 = make_block(1, parent);
+        let old2 = make_block(2, old1.hash());
+
+        let new1 = make_block(1, parent);
+        let new2 = make_block(2, new1.hash());
+
+        let r_a = receipt_with_anchor_and_token(l1_hash_a, 200, None);
+        let r_b = receipt_with_anchor_and_token(l1_hash_b, 201, None);
+
+        let provider = setup_provider(&[(&new1, vec![r_a.clone()]), (&new2, vec![r_b.clone()])]);
+
+        // Mock responds with the correct block for each anchor.
+        // Reorged-in blocks are processed oldest-to-newest: new1 then new2.
+        let mut l1 = Some(mock_l1_for_anchors(&[
+            (l1_header_a, l1_hash_a),
+            (l1_header_b, l1_hash_b),
+        ]));
+
+        let notification = ExExNotification::ChainReorged {
+            old: make_chain(vec![old1, old2]),
+            new: make_chain_with_receipts(vec![new1, new2.clone()], vec![vec![r_a], vec![r_b]]),
+        };
+        let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
+            .await
+            .unwrap();
+        assert_eq!(tip, BlockNumHash::new(2, new2.hash()));
     }
 }

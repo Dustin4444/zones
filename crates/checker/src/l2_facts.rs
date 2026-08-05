@@ -91,6 +91,18 @@ impl L2BlockFacts {
     pub(super) fn l1_anchor(&self) -> &L1Anchor {
         &self.anchor
     }
+
+    /// Ordered token addresses from `ZoneInbox.TokenEnabled` events in this
+    /// block, preserving canonical log order.
+    pub(super) fn token_enabled_addresses(&self) -> Vec<Address> {
+        self.events
+            .iter()
+            .filter_map(|fact| match fact {
+                L2BridgeFact::TokenEnabled { token } => Some(*token),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

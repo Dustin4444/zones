@@ -15,7 +15,7 @@ Both L2 and L1 facts are temporary: they are constructed while processing a
 notification, used to produce log summaries, and then discarded. No
 persistence exists yet.
 
-## Current milestone: exact L1 fact extraction (Milestone 3)
+## Current milestone: token-enabled cross-layer invariant (Milestone 4)
 
 The checker now:
 
@@ -92,18 +92,65 @@ later solvency accounting, so they are kept as a distinct typed category.
 Both L2 and L1 facts exist only during block processing. They are constructed,
 used to produce log summaries, and then discarded. No persistence exists yet.
 
-## What is not implemented
+### Token-enabled cross-layer invariant (Milestone 4)
+
+After extracting L2 and L1 facts for each committed or reorged-in block, the
+checker evaluates one cross-layer invariant:
+
+> The ordered token addresses from successful `ZonePortal.TokenEnabled` events
+> on the anchored L1 block must exactly match the ordered token addresses from
+> `ZoneInbox.TokenEnabled` events on the L2 block.
+
+This invariant is valid at the single anchored L1/L2 block boundary because
+the Zone payload builder passes the L1 `enabled_tokens` sequence directly into
+`advanceTempo`, which iterates in order and emits one L2 `TokenEnabled` per
+input token. A failure in any enablement reverts the entire `advanceTempo`
+call, so a successfully committed block must have emitted exactly the L1
+sequence.
+
+**Evaluation result** is a dedicated `TokenEnabledCheck`:
+
+- `Pass` — the ordered sequences match.
+- `Mismatch { expected, observed }` — the L1 and L2 sequences differ (missing,
+  unexpected, duplicate, different address, or reordered).
+
+**Logging:**
+
+- Non-empty match: `info!` with `"Token-enabled invariant passed"`, including
+  `token_count`, L2 block number/hash, and L1 block number/hash.
+- Empty match (`[] == []`): `debug!` only — most blocks enable no tokens, so an
+  info log per block would be noise.
+- Mismatch: `warn!` with expected and observed sequences.
+
+**Observe-only semantics:** A mismatch is logged but does not fail notification
+processing or withhold the ExEx acknowledgement. The checker continues
+observing subsequent notifications. Extraction and authentication failures
+(missing L1 block, receipt root mismatch, decoding errors, etc.) retain their
+existing behaviour: the notification returns an error and the pruning watermark
+is not advanced.
+
+**No generic framework:** The invariant lives in the dedicated `invariants`
+module with its own typed result. There is no generic invariant dispatch,
+registry, or trait.
+
+### What is not implemented
 
 - **Persistence** — no MDBX, SQLite, or other storage. Facts are discarded
   after logging.
 - **Restart/rebuild state** — the checker re-derives facts from notifications
   on each run.
-- **L1/L2 correlation or accounting** — L2 and L1 facts are extracted
-  independently but not yet cross-checked or aggregated.
-- **Invariant evaluation** — no solvency or accounting checks.
+- **L1/L2 accounting correlation** — L2 and L1 facts are extracted
+  independently. Only the token-enabled sequence is cross-checked; no solvency
+  or deposit/withdrawal correlation exists yet.
+- **Other invariants** — only the token-enabled ordering check is implemented.
+  Solvency, deposit matching, and withdrawal accounting remain future work.
 - **Per-user accounting** — no user balances or ledgers.
 - **Enforcement** — the checker does not block proposal, settlement, or any
-  node operation.
+  node operation. Withholding `FinishedHeight` only freezes the ExEx pruning
+  watermark; it does not prevent L2 block production, settlement signing, signer
+  acknowledgement, or batch submission/finalization. Actual enforcement would
+  require integrating invariant results into the proposal, signer-acknowledgement,
+  or settlement-signing path — a separate architectural step.
 - **Metrics** — no metrics are emitted.
 
 ## Modes
@@ -136,9 +183,9 @@ Zone checker
   5. report findings
 ```
 
-Steps 1 and 2 are implemented (L2 fact extraction from receipts and exact L1
-fact extraction from the anchored Tempo block). The remaining steps are
-planned for later milestones.
+Steps 1–4 are implemented (L2 fact extraction, exact L1 fact extraction, and
+the token-enabled cross-layer invariant). The remaining steps are planned for
+later milestones.
 
 ## Staged direction
 
@@ -146,14 +193,18 @@ planned for later milestones.
    notifications, verify receipt/state availability, log observations.
 2. **Extract Zone L2 facts** (Milestone 2) — decode Zone Inbox/Outbox events
    from canonical L2 receipts and construct typed per-block facts.
-3. **Fetch exact Tempo L1 facts** (current, Milestone 3) — fetch the exact L1
-   block anchored by `TempoAdvanced`, verify its identity and receipt root,
-   and independently extract ZonePortal L1 facts.
-4. **Persist derived state and evaluate invariants** — store checker-derived
-   state and check solvency/accounting invariants against the extracted facts.
-5. **Report findings** — surface invariant violations and checker status.
+3. **Fetch exact Tempo L1 facts** (Milestone 3) — fetch the exact L1 block
+   anchored by `TempoAdvanced`, verify its identity and receipt root, and
+   independently extract ZonePortal L1 facts.
+4. **Evaluate cross-layer invariants** (current, Milestone 4) — compare
+   extracted L2 and L1 facts. The token-enabled ordering invariant is the
+   first; additional invariants (solvency, deposit/withdrawal matching) are
+   planned.
+5. **Persist derived state** — store checker-derived state for restart/rebuild.
+6. **Report findings** — surface invariant violations and checker status.
    Enforcement (blocking proposals or settlement) is considered only after
-   reporting is proven reliable.
+   reporting is proven reliable, and requires integrating invariant results
+   into the proposal/signer/settlement path.
 
 ## Reorg handling and acknowledgement ordering
 

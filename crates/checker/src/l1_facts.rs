@@ -28,6 +28,20 @@ pub(super) struct L1BlockFacts {
     events: Vec<L1PortalFact>,
 }
 
+impl L1BlockFacts {
+    /// Ordered token addresses from `ZonePortal.TokenEnabled` events in this
+    /// block, preserving canonical log order.
+    pub(super) fn token_enabled_addresses(&self) -> Vec<Address> {
+        self.events
+            .iter()
+            .filter_map(|fact| match fact {
+                L1PortalFact::TokenEnabled { token, .. } => Some(*token),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// A single decoded ZonePortal L1 event, preserving canonical log order.
 #[derive(Debug)]
 pub(super) enum L1PortalFact {
