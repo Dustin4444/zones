@@ -414,6 +414,19 @@ type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHe
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_WS_FRAME_AND_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
+fn validate_reward_percentiles(percentiles: &[f64], max_count: u64) -> Result<(), JsonRpcError> {
+    if percentiles.len() as u64 > max_count
+        || percentiles
+            .iter()
+            .any(|percentile| *percentile < 0.0 || *percentile > 100.0)
+        || percentiles.windows(2).any(|window| window[0] > window[1])
+    {
+        return Err(JsonRpcError::invalid_params("invalid reward percentiles"));
+    }
+
+    Ok(())
+}
+
 fn filter_not_found_error() -> JsonRpcError {
     JsonRpcError::invalid_params("filter not found")
 }
@@ -709,6 +722,17 @@ where
         reward_percentiles: Option<Vec<f64>>,
     ) -> BoxFut<'_> {
         Box::pin(async move {
+            if let Some(reward_percentiles) = reward_percentiles.as_deref() {
+                validate_reward_percentiles(
+                    reward_percentiles,
+                    self.eth
+                        .api
+                        .gas_oracle()
+                        .config()
+                        .max_reward_percentile_count,
+                )?;
+            }
+
             // Avoid loading private block bodies to calculate reward percentiles.
             let mut history = EthFees::fee_history(&self.eth.api, block_count, newest_block, None)
                 .await

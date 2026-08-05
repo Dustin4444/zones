@@ -281,6 +281,56 @@ async fn test_auth_rejection() -> eyre::Result<()> {
     Ok(())
 }
 
+/// `eth_feeHistory` validates reward percentiles before constructing the redacted reward matrix.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fee_history_validates_reward_percentiles() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_redacted_rpc().await?;
+    let user_signer = PrivateKeySigner::random();
+
+    let invalid_percentiles = [vec![0.0; 101], vec![-0.1], vec![100.1], vec![50.0, 49.0]];
+    for percentiles in invalid_percentiles {
+        let response = ctx
+            .call_as_user(
+                "eth_feeHistory",
+                json!([1, "latest", percentiles]),
+                &user_signer,
+            )
+            .await?;
+        assert_eq!(
+            response["error"]["code"].as_i64(),
+            Some(-32602),
+            "invalid reward percentiles should be rejected: {response}",
+        );
+        assert_eq!(
+            response["error"]["message"].as_str(),
+            Some("invalid reward percentiles"),
+            "the redacted RPC should match reth's validation error: {response}",
+        );
+    }
+
+    let valid_percentiles: Vec<f64> = (0..100).map(f64::from).collect();
+    let response = ctx
+        .call_as_user(
+            "eth_feeHistory",
+            json!([1, "latest", valid_percentiles]),
+            &user_signer,
+        )
+        .await?;
+    assert!(
+        response.get("error").is_none(),
+        "valid reward percentiles should remain supported: {response}",
+    );
+    assert_eq!(
+        response["result"]["reward"][0].as_array().map(Vec::len),
+        Some(100),
+        "the redacted reward matrix should preserve the requested shape: {response}",
+    );
+
+    Ok(())
+}
+
 /// Pool admission requires the transaction sender to hold an enabled zone token.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Result<()> {
