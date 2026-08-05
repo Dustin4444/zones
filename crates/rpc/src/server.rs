@@ -15,7 +15,7 @@ use axum::{
 };
 use std::{
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
     KeyInfo, SignatureType as KeyInfoSignatureType,
@@ -41,9 +41,6 @@ pub(crate) const MAX_BATCH_SIZE: usize = 100;
 
 /// Maximum HTTP request body size, matching axum's default body limit.
 const MAX_HTTP_BODY_SIZE: usize = 2 * 1024 * 1024;
-
-/// Maximum time allowed to receive an authenticated HTTP request body.
-const HTTP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared state for the redacted RPC server.
 #[derive(Clone)]
@@ -189,17 +186,11 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, request: Request) -> imp
         }
     };
 
-    let body = match tokio::time::timeout(
-        HTTP_BODY_READ_TIMEOUT,
-        to_bytes(body, MAX_HTTP_BODY_SIZE),
-    )
-    .await
-    {
-        Ok(Ok(body)) => body,
-        Ok(Err(_)) => {
+    let body = match to_bytes(body, MAX_HTTP_BODY_SIZE).await {
+        Ok(body) => body,
+        Err(_) => {
             return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
         }
-        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "request body timed out").into_response(),
     };
 
     let body_str = match std::str::from_utf8(&body) {
