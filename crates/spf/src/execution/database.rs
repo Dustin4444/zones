@@ -195,7 +195,7 @@ impl TempoWitnessDatabase {
     /// block. `ZoneInbox.advanceTempo` validates that the header is the next
     /// checkpoint before any Tempo-dependent system work executes.
     pub(crate) fn with_imported_checkpoint(
-        &self,
+        self,
         header_rlp: &alloy_primitives::Bytes,
     ) -> Result<Self, Error> {
         let (state, tempo_block_hash, tempo_block_number) =
@@ -205,8 +205,8 @@ impl TempoWitnessDatabase {
             state,
             tempo_block_hash,
             tempo_block_number,
-            node_pool: self.node_pool.clone(),
-            missing_read: self.missing_read.clone(),
+            node_pool: self.node_pool,
+            missing_read: self.missing_read,
         })
     }
 
