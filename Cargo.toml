@@ -132,6 +132,7 @@ zone-precompiles = { path = "crates/precompiles", default-features = false }
 zone-primitives = { path = "crates/primitives", default-features = false }
 zone-rpc = { path = "crates/rpc" }
 zone-sequencer = { path = "crates/sequencer" }
+zone-checker = { path = "crates/checker" }
 zone-spf = { path = "crates/spf" }
 
 # reth

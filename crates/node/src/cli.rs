@@ -475,6 +475,15 @@ pub struct ZoneArgs {
     /// Validate finalized batch candidates with the SPF without changing settlement.
     #[arg(long = "sequencer.enable-prover", env = "SEQUENCER_ENABLE_PROVER")]
     pub enable_prover: bool,
+
+    /// Checker ExEx mode: `off` (default) or `observe`.
+    #[arg(
+        long = "checker.mode",
+        env = "CHECKER_MODE",
+        default_value = "off",
+        value_parser = zone_checker::CheckerMode::parse,
+    )]
+    pub checker_mode: zone_checker::CheckerMode,
 }
 
 fn prepend_log_filter(filter: &mut String, directives: &str) {
