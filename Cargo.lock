@@ -13459,6 +13459,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zone-checker"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "eyre",
+ "futures",
+ "reth-ethereum-primitives",
+ "reth-execution-types",
+ "reth-exex",
+ "reth-node-api",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-storage-api",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "zone-evm"
 version = "0.1.0"
 dependencies = [
@@ -13605,6 +13625,7 @@ dependencies = [
  "url",
  "zeroize",
  "zone-chainspec",
+ "zone-checker",
  "zone-evm",
  "zone-l1",
  "zone-node",

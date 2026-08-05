@@ -13,6 +13,7 @@ members = [
   "crates/evm",
   "crates/l1",
   "crates/node",
+  "crates/checker",
   "crates/p2p",
   "crates/payload",
   "crates/precompiles",
@@ -126,6 +127,7 @@ zone-precompiles = { path = "crates/precompiles", default-features = false }
 zone-primitives = { path = "crates/primitives", default-features = false }
 zone-rpc = { path = "crates/rpc" }
 zone-sequencer = { path = "crates/sequencer" }
+zone-checker = { path = "crates/checker" }
 
 # reth
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
@@ -138,7 +140,10 @@ reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7d
 reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-execution-types = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-metrics = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-node-api = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
