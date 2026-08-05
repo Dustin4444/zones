@@ -4,11 +4,10 @@ pragma solidity ^0.8.13;
 import {
     BlockTransition,
     Deposit,
+    DepositPayload,
     DepositQueueTransition,
     DepositType,
     ENCRYPTION_KEY_GRACE_PERIOD,
-    EncryptedDeposit,
-    EncryptedDepositPayload,
     EncryptionKeyEntry,
     IVerifier,
     IZoneMessenger,
@@ -18,6 +17,7 @@ import {
     Role,
     TokenConfig,
     Withdrawal,
+    WithdrawalBounceBackDeposit,
     ZONE_FACTORY_ADDRESS,
     ZONE_PORTAL_IMPL_ADDRESS
 } from "../interfaces/IZone.sol";
@@ -60,6 +60,18 @@ contract ZonePortal is IZonePortal {
     ///      TIP-403 transfer policy uses 193,044,874 gas, leaving 6,955,126 gas
     ///      below the buffered 200,000,000 gas ceiling.
     uint64 public constant MAX_DEPOSITS_PER_TEMPO_BLOCK = 230;
+
+    /// @notice Maximum tokens that may be enabled for this portal in one Tempo block.
+    /// @dev Under T9, processing 230 worst-case deposits plus 8 token enablements with maximum
+    ///      metadata uses 218,815,278 gas, below the buffered 225,000,000 gas ceiling.
+    uint64 public constant MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK = 8;
+
+    /// @notice Maximum token metadata sizes copied into the zone, measured in bytes.
+    /// @dev Symbol and currency stay within Solidity's one-slot short-string representation.
+    ///      A maximum-size name has a bounded three-slot representation.
+    uint256 public constant MAX_TOKEN_NAME_BYTES = 64;
+    uint256 public constant MAX_TOKEN_SYMBOL_BYTES = 31;
+    uint256 public constant MAX_TOKEN_CURRENCY_BYTES = 31;
 
     /// @dev Reserves enough capacity for one maximum-size sequencer withdrawal batch to bounce.
     ///      The 20M batch gas ceiling fits at most 19 simple withdrawals (plus one slot of margin).
@@ -193,6 +205,10 @@ contract ZonePortal is IZonePortal {
     /// @dev Per-Tempo-block deposit admission counter. Appended for upgrade-safe storage layout.
     uint64 internal _depositCountBlock;
     uint64 internal _depositsInCurrentBlock;
+
+    /// @dev Per-Tempo-block token-enablement admission counter. Appended for upgrade safety.
+    uint64 internal _tokenEnableCountBlock;
+    uint64 internal _tokensEnabledInCurrentBlock;
 
     /*//////////////////////////////////////////////////////////////
                              INITIALIZATION
@@ -549,6 +565,26 @@ contract ZonePortal is IZonePortal {
 
     /// @notice Internal function to enable a token (used by initializer and enableToken)
     function _enableTokenInternal(address _token) internal {
+        _recordTokenEnablement();
+
+        // Bound the metadata copied into the zone before mutating portal or policy state. The zone
+        // must initialize every token emitted in this block inside advanceTempo's fixed gas budget.
+        string memory name = ITIP20(_token).name();
+        string memory symbol = ITIP20(_token).symbol();
+        string memory currency = ITIP20(_token).currency();
+        uint256 nameLength = bytes(name).length;
+        uint256 symbolLength = bytes(symbol).length;
+        uint256 currencyLength = bytes(currency).length;
+        if (nameLength > MAX_TOKEN_NAME_BYTES) {
+            revert TokenNameTooLong(nameLength, MAX_TOKEN_NAME_BYTES);
+        }
+        if (symbolLength > MAX_TOKEN_SYMBOL_BYTES) {
+            revert TokenSymbolTooLong(symbolLength, MAX_TOKEN_SYMBOL_BYTES);
+        }
+        if (currencyLength > MAX_TOKEN_CURRENCY_BYTES) {
+            revert TokenCurrencyTooLong(currencyLength, MAX_TOKEN_CURRENCY_BYTES);
+        }
+
         address[] memory tokens = new address[](1);
         tokens[0] = _token;
 
@@ -564,12 +600,21 @@ contract ZonePortal is IZonePortal {
         _tokenConfigs[_token] = TokenConfig({ enabled: true, depositsActive: true });
         _enabledTokens.push(_token);
 
-        // Read token metadata for the event so zone-side can create matching TIP-20
-        string memory name = ITIP20(_token).name();
-        string memory symbol = ITIP20(_token).symbol();
-        string memory currency = ITIP20(_token).currency();
-
         emit TokenEnabled(_token, name, symbol, currency);
+    }
+
+    function _recordTokenEnablement() internal {
+        uint64 currentBlock = uint64(block.number);
+        if (_tokenEnableCountBlock != currentBlock) {
+            _tokenEnableCountBlock = currentBlock;
+            _tokensEnabledInCurrentBlock = 0;
+        }
+        if (_tokensEnabledInCurrentBlock >= MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK) {
+            revert TokenEnablementBlockCapacityExceeded(MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK);
+        }
+        unchecked {
+            ++_tokensEnabledInCurrentBlock;
+        }
     }
 
     /// @notice Update the zone's operator RPC endpoint.
@@ -753,26 +798,6 @@ contract ZonePortal is IZonePortal {
         return !_isAccessEnforced || role[account] == Role.Account;
     }
 
-    function _validateDepositPolicy(
-        address _token,
-        address to,
-        address tempoRefundRecipient
-    )
-        internal
-        view
-    {
-        uint64 policyId = ITIP20(_token).transferPolicyId();
-        if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, to)) {
-            revert ITIP20.PolicyForbids();
-        }
-        if (!TIP403_REGISTRY.isAuthorizedMintRecipient(policyId, to)) {
-            revert ITIP20.PolicyForbids();
-        }
-        if (!TIP403_REGISTRY.isAuthorizedRecipient(policyId, tempoRefundRecipient)) {
-            revert ITIP20.PolicyForbids();
-        }
-    }
-
     function _collectDepositFunds(
         address _token,
         uint128 amount
@@ -815,67 +840,25 @@ contract ZonePortal is IZonePortal {
         thisDeposit = ++depositCount;
     }
 
-    /// @notice Deposit a TIP-20 token into the zone. Returns the new current deposit queue hash.
-    /// @dev Fee is deducted from amount and paid to the admin in the same token.
-    ///      The token must be enabled and deposits must be active.
-    /// @param _token The TIP-20 token to deposit
-    /// @param to Recipient address on the zone
-    /// @param amount Total amount to deposit (fee will be deducted)
-    /// @param memo User-provided context
-    /// @return newCurrentDepositQueueHash The new deposit queue hash after this deposit
+    /// @notice Alias for `depositEncrypted`.
     function deposit(
         address _token,
-        address to,
         uint128 amount,
-        bytes32 memo,
+        uint256 keyIndex,
+        DepositPayload calldata encrypted,
         address tempoRefundRecipient
     )
         external
         returns (bytes32 newCurrentDepositQueueHash)
     {
-        if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
-        // An enforced, registered gateway is independently authorized to return callback funds.
-        _requireAllowedDepositor(msg.sender);
-        _requireAllowed(tempoRefundRecipient);
-
-        _validateDepositsActive(_token);
-        _validateDepositPolicy(_token, to, tempoRefundRecipient);
-        (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
-
-        // Build deposit struct with net amount (fee already paid to the admin on Tempo)
-        Deposit memory depositData = Deposit({
-            token: _token,
-            sender: msg.sender,
-            to: to,
-            amount: netAmount,
-            tempoRefundRecipient: tempoRefundRecipient,
-            memo: memo
-        });
-
-        // Insert deposit into queue
-        newCurrentDepositQueueHash = DepositQueueLib.enqueue(currentDepositQueueHash, depositData);
-        uint64 thisDeposit = _recordDeposit(
-            newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
-        );
-
-        emit DepositMade(
-            newCurrentDepositQueueHash,
-            msg.sender,
-            _token,
-            to,
-            netAmount,
-            fee,
-            memo,
-            tempoRefundRecipient,
-            thisDeposit
-        );
+        return depositEncrypted(_token, amount, keyIndex, encrypted, tempoRefundRecipient);
     }
 
     /// @notice Deposit with encrypted recipient and memo
     /// @dev The encrypted payload contains (to, memo) encrypted to the sequencer's key.
     ///      The token identity is public (not encrypted) since the portal must escrow it.
     ///      Validates that keyIndex is valid (exists and not expired).
-    ///      Charges the same deposit fee as regular deposits.
+    ///      Charges the configured zone deposit fee.
     /// @param _token The TIP-20 token to deposit
     /// @param amount Amount to deposit (fee deducted from this amount)
     /// @param keyIndex Index of the encryption key used (from encryptionKeyAt)
@@ -885,10 +868,23 @@ contract ZonePortal is IZonePortal {
         address _token,
         uint128 amount,
         uint256 keyIndex,
-        EncryptedDepositPayload calldata encrypted,
+        DepositPayload calldata encrypted,
         address tempoRefundRecipient
     )
-        external
+        public
+        returns (bytes32 newCurrentDepositQueueHash)
+    {
+        return _deposit(_token, amount, keyIndex, encrypted, tempoRefundRecipient);
+    }
+
+    function _deposit(
+        address _token,
+        uint128 amount,
+        uint256 keyIndex,
+        DepositPayload calldata encrypted,
+        address tempoRefundRecipient
+    )
+        internal
         returns (bytes32 newCurrentDepositQueueHash)
     {
         if (tempoRefundRecipient == address(0)) revert InvalidBouncebackRecipient();
@@ -934,8 +930,8 @@ contract ZonePortal is IZonePortal {
 
         (uint128 fee, uint128 netAmount) = _collectDepositFunds(_token, amount);
 
-        // Build encrypted deposit struct
-        EncryptedDeposit memory depositData = EncryptedDeposit({
+        // Build the queued deposit.
+        Deposit memory depositData = Deposit({
             token: _token,
             sender: msg.sender,
             amount: netAmount,
@@ -944,14 +940,14 @@ contract ZonePortal is IZonePortal {
             encrypted: encrypted
         });
 
-        // Insert encrypted deposit into queue
+        // Insert the deposit into the queue.
         newCurrentDepositQueueHash =
-            DepositQueueLib.enqueueEncrypted(currentDepositQueueHash, depositData);
+            DepositQueueLib.enqueueDeposit(currentDepositQueueHash, depositData);
         uint64 thisDeposit = _recordDeposit(
             newCurrentDepositQueueHash, MAX_DEPOSITS_PER_TEMPO_BLOCK - WITHDRAWAL_BOUNCEBACK_RESERVE
         );
 
-        emit EncryptedDepositMade(
+        emit DepositMade(
             newCurrentDepositQueueHash,
             msg.sender,
             _token,
@@ -1145,13 +1141,8 @@ contract ZonePortal is IZonePortal {
     /// @param amount The amount to bounce back
     /// @param fallbackNonce The nonce resolving to the zone bounce-back recipient
     function _enqueueBounceBack(address _token, uint128 amount, uint64 fallbackNonce) internal {
-        Deposit memory depositData = Deposit({
-            token: _token,
-            sender: address(this),
-            to: address(uint160(fallbackNonce)),
-            amount: amount,
-            tempoRefundRecipient: address(0),
-            memo: bytes32(0)
+        WithdrawalBounceBackDeposit memory depositData = WithdrawalBounceBackDeposit({
+            token: _token, to: address(uint160(fallbackNonce)), amount: amount
         });
 
         bytes32 newCurrentDepositQueueHash =
@@ -1298,7 +1289,9 @@ contract ZonePortal is IZonePortal {
         if (
             nextZoneHeight <= zoneHeight || signatures.length < threshold
                 || signatures.length > _sequencers.length
-        ) return false;
+        ) {
+            return false;
+        }
 
         bytes32 structHash = keccak256(
             abi.encode(
