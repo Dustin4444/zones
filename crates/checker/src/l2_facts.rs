@@ -13,6 +13,8 @@ use eyre::WrapErr as _;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 use tracing::info;
 
+use crate::decode_event;
+
 // ---------------------------------------------------------------------------
 // Fact model
 // ---------------------------------------------------------------------------
@@ -23,62 +25,54 @@ use tracing::info;
 /// event linking it to the imported Tempo/L1 block it was produced from.
 #[derive(Debug)]
 pub(super) struct L1Anchor {
-    tempo_block_hash: B256,
-    tempo_block_number: u64,
+    pub(super) tempo_block_hash: B256,
+    pub(super) tempo_block_number: u64,
     deposits_processed: u64,
     processed_deposit_queue_hash: B256,
     last_processed_deposit_number: u64,
 }
 
-/// A deposit outcome from the Zone Inbox — either processed or failed.
+/// A single decoded Zone Inbox or Outbox L2 bridge event, preserving canonical
+/// log order within the block.
 #[derive(Debug)]
-pub(super) struct DepositFact {
-    deposit_hash: B256,
-    token: Address,
-    amount: u128,
-    /// `true` for `DepositProcessed`, `false` for `DepositFailed`.
-    processed: bool,
-}
-
-/// A withdrawal bounce-back, kept distinct from ordinary deposits.
-///
-/// Bounce-backs recycle existing Portal backing rather than introducing new
-/// external backing, so they must not be collapsed into [`DepositFact`] for
-/// later solvency accounting.
-#[derive(Debug)]
-pub(super) struct BounceBackFact {
-    token: Address,
-    amount: u128,
-    /// `true` for `WithdrawalBounceBackProcessed`, `false` for `WithdrawalBounceBackPending`.
-    processed: bool,
-}
-
-/// A Zone refund claim (`ZoneInbox.RefundClaimed`).
-#[derive(Debug)]
-pub(super) struct RefundClaimFact {
-    token: Address,
-    amount: u128,
-}
-
-/// A withdrawal request from the Zone Outbox, with principal and fee preserved
-/// separately for later accounting.
-#[derive(Debug)]
-pub(super) struct WithdrawalRequestFact {
-    withdrawal_index: u64,
-    sender: Address,
-    token: Address,
-    principal: u128,
-    fee: u128,
-    fallback_nonce: u64,
-    /// Inbox-generated failed-deposit refunds have the canonical zero sender.
-    is_deposit_bounce_back: bool,
-}
-
-/// A finalized withdrawal batch boundary from the Zone Outbox.
-#[derive(Debug)]
-pub(super) struct BatchBoundaryFact {
-    withdrawal_queue_hash: B256,
-    withdrawal_batch_index: u64,
+pub(super) enum L2BridgeFact {
+    /// A deposit outcome — either processed or failed.
+    DepositOutcome {
+        deposit_hash: B256,
+        token: Address,
+        amount: u128,
+        /// `true` for `DepositProcessed`, `false` for `DepositFailed`.
+        processed: bool,
+    },
+    /// A withdrawal bounce-back — recycles existing Portal backing, not a new
+    /// external deposit.  Kept distinct from [`Self::DepositOutcome`].
+    WithdrawalBounceBack {
+        token: Address,
+        amount: u128,
+        /// `true` for `WithdrawalBounceBackProcessed`, `false` for `WithdrawalBounceBackPending`.
+        processed: bool,
+    },
+    /// A Zone refund claim (`ZoneInbox.RefundClaimed`).
+    RefundClaimed { token: Address, amount: u128 },
+    /// A newly enabled token (`ZoneInbox.TokenEnabled`).
+    TokenEnabled { token: Address },
+    /// A withdrawal request from the Zone Outbox, with principal and fee
+    /// preserved separately for later accounting.
+    WithdrawalRequested {
+        withdrawal_index: u64,
+        sender: Address,
+        token: Address,
+        principal: u128,
+        fee: u128,
+        fallback_nonce: u64,
+        /// Inbox-generated failed-deposit refunds have the canonical zero sender.
+        is_deposit_bounce_back: bool,
+    },
+    /// A finalized withdrawal batch boundary.  At most one per block.
+    BatchFinalized {
+        withdrawal_queue_hash: B256,
+        withdrawal_batch_index: u64,
+    },
 }
 
 /// Per-block L2 bridge facts extracted from canonical Zone Inbox/Outbox logs.
@@ -87,44 +81,31 @@ pub(super) struct L2BlockFacts {
     l2_block_number: u64,
     l2_block_hash: B256,
     anchor: L1Anchor,
-    deposits: Vec<DepositFact>,
-    bounce_backs: Vec<BounceBackFact>,
-    refund_claims: Vec<RefundClaimFact>,
-    enabled_tokens: Vec<Address>,
-    withdrawal_requests: Vec<WithdrawalRequestFact>,
-    /// At most one `BatchFinalized` per block; duplicates are a malformed-block error.
-    batch_finalized: Option<BatchBoundaryFact>,
+    /// Ordered bridge facts, preserving canonical log order across event types.
+    events: Vec<L2BridgeFact>,
 }
 
-/// Mutable extraction state while receipt logs for one block are decoded.
-#[derive(Default)]
-struct L2BlockFactsBuilder {
-    anchor: Option<L1Anchor>,
-    deposits: Vec<DepositFact>,
-    bounce_backs: Vec<BounceBackFact>,
-    refund_claims: Vec<RefundClaimFact>,
-    enabled_tokens: Vec<Address>,
-    withdrawal_requests: Vec<WithdrawalRequestFact>,
-    batch_finalized: Option<BatchBoundaryFact>,
+impl L2BlockFacts {
+    /// The Tempo/L1 block anchor from `TempoAdvanced`, used to fetch the
+    /// corresponding exact L1 block for independent fact extraction.
+    pub(super) fn l1_anchor(&self) -> &L1Anchor {
+        &self.anchor
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Extraction
 // ---------------------------------------------------------------------------
 
-/// Strictly decode a known event and reject non-canonical encodings that a
-/// permissive ABI decoder could otherwise normalize.
-fn decode_event<E: SolEvent>(log: &Log, name: &str, block: u64) -> eyre::Result<E> {
-    let event = E::decode_log_validate(log)
-        .wrap_err_with(|| format!("malformed {name} in block {block}"))?;
-    eyre::ensure!(
-        event.data.encode_log_data() == log.data,
-        "non-canonical {name} encoding in block {block}"
-    );
-    Ok(event.data)
+/// Mutable extraction state while receipt logs for one block are decoded.
+#[derive(Default)]
+struct L2FactsBuilder {
+    anchor: Option<L1Anchor>,
+    events: Vec<L2BridgeFact>,
+    batch_seen: bool,
 }
 
-impl L2BlockFactsBuilder {
+impl L2FactsBuilder {
     /// Decode a known Zone Inbox event, ignoring unrelated Inbox logs.
     fn extract_inbox(&mut self, log: &Log, block: u64) -> eyre::Result<()> {
         let Some(topic) = log.topics().first() else {
@@ -149,7 +130,7 @@ impl L2BlockFactsBuilder {
             IZoneInbox::DepositProcessed::SIGNATURE_HASH => {
                 let event =
                     decode_event::<IZoneInbox::DepositProcessed>(log, "DepositProcessed", block)?;
-                self.deposits.push(DepositFact {
+                self.events.push(L2BridgeFact::DepositOutcome {
                     deposit_hash: event.depositHash,
                     token: event.token,
                     amount: event.amount,
@@ -158,7 +139,7 @@ impl L2BlockFactsBuilder {
             }
             IZoneInbox::DepositFailed::SIGNATURE_HASH => {
                 let event = decode_event::<IZoneInbox::DepositFailed>(log, "DepositFailed", block)?;
-                self.deposits.push(DepositFact {
+                self.events.push(L2BridgeFact::DepositOutcome {
                     deposit_hash: event.depositHash,
                     token: event.token,
                     amount: event.amount,
@@ -171,7 +152,7 @@ impl L2BlockFactsBuilder {
                     "WithdrawalBounceBackProcessed",
                     block,
                 )?;
-                self.bounce_backs.push(BounceBackFact {
+                self.events.push(L2BridgeFact::WithdrawalBounceBack {
                     token: event.token,
                     amount: event.amount,
                     processed: true,
@@ -183,7 +164,7 @@ impl L2BlockFactsBuilder {
                     "WithdrawalBounceBackPending",
                     block,
                 )?;
-                self.bounce_backs.push(BounceBackFact {
+                self.events.push(L2BridgeFact::WithdrawalBounceBack {
                     token: event.token,
                     amount: event.amount,
                     processed: false,
@@ -191,14 +172,15 @@ impl L2BlockFactsBuilder {
             }
             IZoneInbox::RefundClaimed::SIGNATURE_HASH => {
                 let event = decode_event::<IZoneInbox::RefundClaimed>(log, "RefundClaimed", block)?;
-                self.refund_claims.push(RefundClaimFact {
+                self.events.push(L2BridgeFact::RefundClaimed {
                     token: event.token,
                     amount: event.amount,
                 });
             }
             IZoneInbox::TokenEnabled::SIGNATURE_HASH => {
                 let event = decode_event::<IZoneInbox::TokenEnabled>(log, "TokenEnabled", block)?;
-                self.enabled_tokens.push(event.token);
+                self.events
+                    .push(L2BridgeFact::TokenEnabled { token: event.token });
             }
             _ => {}
         }
@@ -218,7 +200,7 @@ impl L2BlockFactsBuilder {
                     "WithdrawalRequested",
                     block,
                 )?;
-                self.withdrawal_requests.push(WithdrawalRequestFact {
+                self.events.push(L2BridgeFact::WithdrawalRequested {
                     withdrawal_index: event.withdrawalIndex,
                     sender: event.sender,
                     token: event.token,
@@ -231,13 +213,14 @@ impl L2BlockFactsBuilder {
             IZoneOutbox::BatchFinalized::SIGNATURE_HASH => {
                 let event =
                     decode_event::<IZoneOutbox::BatchFinalized>(log, "BatchFinalized", block)?;
-                let boundary = BatchBoundaryFact {
-                    withdrawal_queue_hash: event.withdrawalQueueHash,
-                    withdrawal_batch_index: event.withdrawalBatchIndex,
-                };
-                if self.batch_finalized.replace(boundary).is_some() {
+                if self.batch_seen {
                     eyre::bail!("duplicate BatchFinalized in block {block}");
                 }
+                self.batch_seen = true;
+                self.events.push(L2BridgeFact::BatchFinalized {
+                    withdrawal_queue_hash: event.withdrawalQueueHash,
+                    withdrawal_batch_index: event.withdrawalBatchIndex,
+                });
             }
             _ => {}
         }
@@ -253,12 +236,7 @@ impl L2BlockFactsBuilder {
             l2_block_number,
             l2_block_hash,
             anchor,
-            deposits: self.deposits,
-            bounce_backs: self.bounce_backs,
-            refund_claims: self.refund_claims,
-            enabled_tokens: self.enabled_tokens,
-            withdrawal_requests: self.withdrawal_requests,
-            batch_finalized: self.batch_finalized,
+            events: self.events,
         })
     }
 }
@@ -282,7 +260,7 @@ pub(super) fn extract_l2_facts<R>(
 where
     R: TxReceipt<Log = Log>,
 {
-    let mut facts = L2BlockFactsBuilder::default();
+    let mut builder = L2FactsBuilder::default();
 
     for receipt in receipts {
         // Failed transactions cannot contribute canonical bridge facts. Their EVM logs are
@@ -292,32 +270,62 @@ where
         }
         for log in receipt.logs() {
             match log.address {
-                ZONE_INBOX_ADDRESS => facts.extract_inbox(log, l2_block_number)?,
-                ZONE_OUTBOX_ADDRESS => facts.extract_outbox(log, l2_block_number)?,
+                ZONE_INBOX_ADDRESS => builder.extract_inbox(log, l2_block_number)?,
+                ZONE_OUTBOX_ADDRESS => builder.extract_outbox(log, l2_block_number)?,
                 _ => {}
             }
         }
     }
 
-    facts.finish(l2_block_number, l2_block_hash)
+    builder.finish(l2_block_number, l2_block_hash)
 }
 
 /// Emit one concise structured info log per successfully extracted L2 block.
 pub(super) fn log_l2_facts(facts: &L2BlockFacts) {
+    let mut deposits_processed = 0u64;
+    let mut deposits_failed = 0u64;
+    let mut bounce_backs_processed = 0u64;
+    let mut bounce_backs_pending = 0u64;
+    let mut withdrawal_requests = 0u64;
+    let mut enabled_tokens = 0u64;
+    let mut refund_claims = 0u64;
+    let mut batch_finalized = false;
+
+    for fact in &facts.events {
+        match fact {
+            L2BridgeFact::DepositOutcome {
+                processed: true, ..
+            } => deposits_processed += 1,
+            L2BridgeFact::DepositOutcome {
+                processed: false, ..
+            } => deposits_failed += 1,
+            L2BridgeFact::WithdrawalBounceBack {
+                processed: true, ..
+            } => bounce_backs_processed += 1,
+            L2BridgeFact::WithdrawalBounceBack {
+                processed: false, ..
+            } => bounce_backs_pending += 1,
+            L2BridgeFact::WithdrawalRequested { .. } => withdrawal_requests += 1,
+            L2BridgeFact::TokenEnabled { .. } => enabled_tokens += 1,
+            L2BridgeFact::RefundClaimed { .. } => refund_claims += 1,
+            L2BridgeFact::BatchFinalized { .. } => batch_finalized = true,
+        }
+    }
+
     info!(
         target: "zone::checker",
         l2_block_number = facts.l2_block_number,
         l2_block_hash = %facts.l2_block_hash,
         l1_block_number = facts.anchor.tempo_block_number,
         l1_block_hash = %facts.anchor.tempo_block_hash,
-        deposits_processed = facts.deposits.iter().filter(|d| d.processed).count(),
-        deposits_failed = facts.deposits.iter().filter(|d| !d.processed).count(),
-        bounce_backs_processed = facts.bounce_backs.iter().filter(|b| b.processed).count(),
-        bounce_backs_pending = facts.bounce_backs.iter().filter(|b| !b.processed).count(),
-        withdrawal_requests = facts.withdrawal_requests.len(),
-        enabled_tokens = facts.enabled_tokens.len(),
-        refund_claims = facts.refund_claims.len(),
-        batch_finalized = facts.batch_finalized.is_some(),
+        deposits_processed,
+        deposits_failed,
+        bounce_backs_processed,
+        bounce_backs_pending,
+        withdrawal_requests,
+        enabled_tokens,
+        refund_claims,
+        batch_finalized,
         "L2 bridge facts extracted",
     );
 }
@@ -507,49 +515,78 @@ mod tests {
         assert_eq!(facts.anchor.deposits_processed, 2);
         assert_eq!(facts.anchor.last_processed_deposit_number, 5);
 
-        // Deposits: one processed, one failed.
-        assert_eq!(facts.deposits.len(), 2);
-        assert!(facts.deposits[0].processed);
-        assert_eq!(facts.deposits[0].amount, 500);
-        assert!(!facts.deposits[1].processed);
-        assert_eq!(facts.deposits[1].amount, 300);
+        // 10 bridge events (2 deposits + 2 bounce-backs + 1 refund + 1 token + 2 withdrawals + 1 batch + 1 noise ignored + 1 wrong-addr ignored).
+        // Actually 10 real events, noise and wrong_addr ignored.
+        assert_eq!(facts.events.len(), 9);
 
-        // Bounce-backs distinct from deposits.
-        assert_eq!(facts.bounce_backs.len(), 2);
-        assert!(facts.bounce_backs[0].processed);
-        assert_eq!(facts.bounce_backs[0].amount, 777);
-        assert!(!facts.bounce_backs[1].processed);
-        assert_eq!(facts.bounce_backs[1].amount, 888);
-
-        // Refund claim.
-        assert_eq!(facts.refund_claims.len(), 1);
-        assert_eq!(facts.refund_claims[0].amount, 42);
-
-        // Token enabled.
-        assert_eq!(facts.enabled_tokens, vec![token_b]);
-
-        // Withdrawal — principal and fee separate.
-        assert_eq!(facts.withdrawal_requests.len(), 2);
-        let w = &facts.withdrawal_requests[0];
-        assert_eq!(w.withdrawal_index, 3);
-        assert_eq!(w.principal, 1000);
-        assert_eq!(w.fee, 50);
-        assert!(w.is_deposit_bounce_back);
-        let user = &facts.withdrawal_requests[1];
-        assert!(!user.is_deposit_bounce_back);
-        assert_eq!(user.sender, Address::repeat_byte(0x44));
-        assert_eq!(user.fallback_nonce, 9);
-
-        // Batch finalized.
-        assert!(facts.batch_finalized.is_some());
-        assert_eq!(
-            facts
-                .batch_finalized
-                .as_ref()
-                .unwrap()
-                .withdrawal_batch_index,
-            7
-        );
+        // Events appear in canonical log order.
+        assert!(matches!(
+            facts.events[0],
+            L2BridgeFact::DepositOutcome {
+                processed: true,
+                amount: 500,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[1],
+            L2BridgeFact::DepositOutcome {
+                processed: false,
+                amount: 300,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[2],
+            L2BridgeFact::WithdrawalBounceBack {
+                processed: true,
+                amount: 777,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[3],
+            L2BridgeFact::WithdrawalBounceBack {
+                processed: false,
+                amount: 888,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[4],
+            L2BridgeFact::RefundClaimed { amount: 42, .. }
+        ));
+        assert!(matches!(
+            facts.events[5],
+            L2BridgeFact::TokenEnabled { token } if token == token_b
+        ));
+        assert!(matches!(
+            facts.events[6],
+            L2BridgeFact::WithdrawalRequested {
+                withdrawal_index: 3,
+                principal: 1000,
+                fee: 50,
+                is_deposit_bounce_back: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[7],
+            L2BridgeFact::WithdrawalRequested {
+                withdrawal_index: 4,
+                principal: 2000,
+                fee: 75,
+                is_deposit_bounce_back: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            facts.events[8],
+            L2BridgeFact::BatchFinalized {
+                withdrawal_batch_index: 7,
+                ..
+            }
+        ));
     }
 
     #[test]
