@@ -5,20 +5,17 @@
 #
 #   PRIVATE_KEY=0x... ETH_RPC_URL=http://localhost:8545 ./scripts/deploy-standalone-zone.sh
 #
-# Why this needs to patch a constant
-# ----------------------------------
+# Why this needs to patch the reference contracts
+# ------------------------------------------------
 # ZonePortal.initialize is guarded by `msg.sender != ZONE_FACTORY_ADDRESS -> NotFactory()`, and that
 # address is a compile-time constant. On a live chain nobody can call from the canonical factory
 # address, so this script rewrites the constant to an authority it controls (the deployer by
 # default), rebuilds, deploys, initializes, and then restores the source.
 #
-# The messenger and verifier do NOT need patching: the portal takes both as `initialize` arguments
-# and stores them, so it points at whatever this script deploys.
-#
-# Known limitation: ZoneMessenger reaches the factory through the same constant
-# (`zoneFactory.zones(zoneId)`). With the default EOA authority that call has no code to hit, so
-# cross-zone paths that resolve zone metadata will revert. Set FACTORY_AUTHORITY to a contract
-# implementing `zones(uint32)` if you need those.
+# The shared ZoneMessenger normally authenticates portals through `ZoneFactory.zones(zoneId)`.
+# This deployment has no factory, so after deploying the portal the script temporarily rewrites
+# that check to bind the messenger directly to the portal and its zone ID. This preserves caller
+# authentication without requiring a factory shim.
 
 set -euo pipefail
 
@@ -27,6 +24,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF_IMPLS="${REPO_ROOT}/specs/ref-impls"
 CONSTANTS_FILE="${REF_IMPLS}/src/interfaces/IZone.sol"
+MESSENGER_FILE="${REF_IMPLS}/src/tempo/ZoneMessenger.sol"
 
 if [ -z "${PRIVATE_KEY:-}" ]; then
   echo "PRIVATE_KEY must be set (hex encoded, funded on the target chain)" >&2
@@ -56,10 +54,13 @@ ZONE_RPC_URL="${ZONE_RPC_URL:-}"
 # Whoever is allowed to call initialize. Must be the caller below, so it defaults to the deployer.
 FACTORY_AUTHORITY="$(cast to-check-sum-address "${FACTORY_AUTHORITY:-$DEPLOYER}")"
 
-if ! git -C "$REPO_ROOT" diff --quiet -- "$CONSTANTS_FILE"; then
-  echo "${CONSTANTS_FILE} has uncommitted changes; commit or stash them first" >&2
-  exit 1
-fi
+for patched_file in "$CONSTANTS_FILE" "$MESSENGER_FILE"; do
+  if ! git -C "$REPO_ROOT" diff --quiet -- "$patched_file" \
+    || ! git -C "$REPO_ROOT" diff --cached --quiet -- "$patched_file"; then
+    echo "${patched_file} has uncommitted changes; commit or stash them first" >&2
+    exit 1
+  fi
+done
 
 echo "Deploying a standalone zone"
 echo "  rpc               ${ETH_RPC_URL}"
@@ -81,13 +82,13 @@ if ! cast call "$TIP403_REGISTRY" 'tokenTransferPolicyId(address)(bool,uint64)' 
   exit 1
 fi
 
-# Always put the canonical constant back, however this exits.
-restore_constants() {
-  git -C "$REPO_ROOT" checkout -- "$CONSTANTS_FILE"
+# Always put the canonical sources back, however this exits.
+restore_sources() {
+  git -C "$REPO_ROOT" checkout -- "$CONSTANTS_FILE" "$MESSENGER_FILE"
   echo
-  echo "Restored the canonical ZONE_FACTORY_ADDRESS in $(basename "$CONSTANTS_FILE")"
+  echo "Restored the canonical Zone contracts"
 }
-trap restore_constants EXIT
+trap restore_sources EXIT
 
 echo "Patching ZONE_FACTORY_ADDRESS -> ${FACTORY_AUTHORITY}"
 # Solidity rejects non-checksummed address literals, hence the normalization above.
@@ -111,8 +112,23 @@ deploy() {
 
 echo "Deploying contracts"
 VERIFIER="$(deploy src/tempo/Verifier.sol:Verifier Verifier)"
-MESSENGER="$(deploy src/tempo/ZoneMessenger.sol:ZoneMessenger ZoneMessenger)"
 PORTAL="$(deploy src/tempo/ZonePortal.sol:ZonePortal ZonePortal)"
+
+echo "Binding ZoneMessenger directly to portal ${PORTAL}"
+PORTAL="$PORTAL" perl -0pi -e '
+  $old = "        ZoneInfo memory zone = zoneFactory.zones(zoneId);\n" .
+         "        if (zone.portal != msg.sender) revert UnauthorizedPortal();";
+  $new = "        if (msg.sender != $ENV{PORTAL} || IZonePortal(msg.sender).zoneId() != zoneId) {\n" .
+         "            revert UnauthorizedPortal();\n" .
+         "        }";
+  index($_, $old) >= 0 or die "factory authorization not found";
+  s/\Q$old\E/$new/;
+' "$MESSENGER_FILE"
+grep -q "msg.sender != ${PORTAL}" "$MESSENGER_FILE" \
+  || { echo "failed to bind ZoneMessenger to ${PORTAL}" >&2; exit 1; }
+
+(cd "$REF_IMPLS" && forge build >/dev/null)
+MESSENGER="$(deploy src/tempo/ZoneMessenger.sol:ZoneMessenger ZoneMessenger)"
 
 echo
 echo "Initializing portal ${PORTAL}"
