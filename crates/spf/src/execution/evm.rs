@@ -9,28 +9,26 @@ use alloy_consensus::{
 use alloy_eips::{eip2718::Decodable2718 as _, eip4895::Withdrawals};
 use alloy_evm::{
     EvmFactory as _,
-    block::{BlockExecutionResult, BlockExecutor as _, TxResult as _},
+    block::{BlockExecutionResult, BlockExecutor as _, BlockExecutorFactory, TxResult as _},
     eth::EthBlockExecutionCtx,
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rlp::Decodable as _;
 use alloy_sol_types::SolCall as _;
-use reth_chainspec::{EthChainSpec as _, EthereumHardforks as _};
+use reth_chainspec::EthereumHardforks as _;
 use reth_evm::{ConfigureEvm as _, NextBlockEnvAttributes};
 use revm::{
     database::{State, states::bundle_state::BundleRetention},
     database_interface::bal::EvmDatabaseError,
 };
 use tempo_chainspec::hardfork::TempoHardfork;
-use tempo_evm::{
-    TempoBlockEnv, TempoBlockExecutionCtx, TempoEvmConfig, TempoNextBlockEnvAttributes,
-};
+use tempo_evm::{TempoBlockEnv, TempoBlockExecutionCtx, TempoNextBlockEnvAttributes};
 use tempo_primitives::{
     TempoHeader, TempoReceipt, TempoTxEnvelope,
     transaction::envelope::{TEMPO_SYSTEM_TX_SENDER, TEMPO_SYSTEM_TX_SIGNATURE},
 };
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
-use zone_evm::{L1OverlayDB, ZoneBlockExecutor, ZoneEvmFactory};
+use zone_evm::{L1OverlayDB, ZoneBlockExecutor, ZoneEvmConfig};
 use zone_primitives::constants::zone_chain_id;
 
 use crate::{
@@ -101,15 +99,25 @@ pub(crate) fn execute_zone_block(
         .block_hashes
         .insert(parent_number, block.parent_hash);
 
-    let env = next_block_evm_env(config, parent, block, zone_id)?;
+    let evm_config = ZoneEvmConfig::new(
+        config.zone_chain_spec.clone(),
+        config.zone_chain_spec.inner.clone(),
+        tempo_database.clone(),
+        portal,
+    );
+    let attributes = next_block_env_attributes(evm_config.chain_spec(), parent, block)?;
+    let mut env = evm_config
+        .next_evm_env(parent, &attributes)
+        .map_err(|_| Error::EvmEnvironment)?;
+    // The Zone ID is verifier-bound independently of the parent Tempo chain specification.
+    env.cfg_env.chain_id = zone_chain_id(zone_id);
     let assembly_env = env.clone();
     let block_gas_limit = env.block_env.inner.gas_limit;
-    let factory = ZoneEvmFactory::new(tempo_database.clone(), portal);
-    let evm = factory.create_evm(&mut *zone_state, env);
-    let mut executor = ZoneBlockExecutor::new(
+    let evm = BlockExecutorFactory::evm_factory(&evm_config).create_evm(&mut *zone_state, env);
+    let mut executor = BlockExecutorFactory::create_executor(
+        &evm_config,
         evm,
         next_block_execution_context(config.zone_chain_spec.as_ref(), block, block_gas_limit),
-        config.zone_chain_spec.as_ref(),
     );
 
     executor.apply_pre_execution_changes().map_err(|error| {
@@ -159,30 +167,6 @@ pub(crate) fn execute_zone_block(
         output,
         evm_env: assembly_env,
     })
-}
-
-/// Construct the production Zone EVM environment while using the witness-backed
-/// L1 reader separately from [`zone_evm::ZoneEvmConfig`].
-pub(crate) fn next_block_evm_env(
-    config: &SpfConfig,
-    parent: &TempoHeader,
-    block: &ZoneBlock,
-    zone_id: u32,
-) -> Result<alloy_evm::EvmEnv<TempoHardfork, TempoBlockEnv>, Error> {
-    let evm_config = TempoEvmConfig::new(config.zone_chain_spec.inner.clone());
-    let attributes = next_block_env_attributes(config.zone_chain_spec.as_ref(), parent, block)?;
-    let mut env = evm_config
-        .next_evm_env(parent, &attributes)
-        .map_err(|_| Error::EvmEnvironment)?;
-
-    // ZoneEvmConfig applies these overrides after delegating environment
-    // construction to TempoEvmConfig. Keep replay identical to production.
-    env.cfg_env.chain_id = zone_chain_id(zone_id);
-    env.block_env.inner.basefee = config
-        .zone_chain_spec
-        .next_block_base_fee(parent, block.timestamp)
-        .unwrap_or_default();
-    Ok(env)
 }
 
 /// Construct the same next-block attributes supplied by the production Zone

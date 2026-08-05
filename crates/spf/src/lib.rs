@@ -228,13 +228,13 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
             )?
             .to_be_bytes::<32>(),
         );
-        let index = read_zone_storage(
+        let index_slot = read_zone_storage(
             &mut zone_state,
             ZONE_OUTBOX_ADDRESS,
             ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
-        )?
-        .to::<u64>();
-        (hash, index)
+        )?;
+        // The index occupies the low 64 bits of a packed Solidity slot.
+        (hash, index_slot.as_limbs()[0])
     } else {
         (
             B256::ZERO,
@@ -573,17 +573,24 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::execution::evm::next_block_env_attributes;
+
     use super::*;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+    use reth_chainspec::EthChainSpec;
+    use reth_evm::ConfigureEvm;
     use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, Nibbles, TrieAccount, TrieNode};
     use revm::{
         DatabaseCommit as _,
         database::{State, states::bundle_state::BundleRetention},
     };
     use std::sync::Arc;
+    use tempo_chainspec::TempoHardfork;
+    use tempo_evm::TempoBlockEnv;
     use tempo_primitives::TempoHeader;
     use zone_precompiles::L1StorageReader as _;
+    use zone_primitives::constants::zone_chain_id;
 
     fn test_config() -> SpfConfig {
         SpfConfig::new(Arc::new(zone_chainspec::ZoneChainSpec::from(
@@ -748,6 +755,28 @@ mod tests {
             database.storage(account, U256::from(3)).unwrap(),
             U256::from(9)
         );
+    }
+
+    fn next_block_evm_env(
+        config: &SpfConfig,
+        parent: &TempoHeader,
+        block: &ZoneBlock,
+        zone_id: u32,
+    ) -> Result<alloy_evm::EvmEnv<TempoHardfork, TempoBlockEnv>, Error> {
+        let evm_config = TempoEvmConfig::new(config.zone_chain_spec.inner.clone());
+        let attributes = next_block_env_attributes(config.zone_chain_spec.as_ref(), parent, block)?;
+        let mut env = evm_config
+            .next_evm_env(parent, &attributes)
+            .map_err(|_| Error::EvmEnvironment)?;
+
+        // ZoneEvmConfig applies these overrides after delegating environment
+        // construction to TempoEvmConfig. Keep replay identical to production.
+        env.cfg_env.chain_id = zone_chain_id(zone_id);
+        env.block_env.inner.basefee = config
+            .zone_chain_spec
+            .next_block_base_fee(parent, block.timestamp)
+            .unwrap_or_default();
+        Ok(env)
     }
 
     #[test]
@@ -945,7 +974,7 @@ mod tests {
         );
         assert_eq!(attributes.timestamp_millis_part, 0);
 
-        let env = execution::evm::next_block_evm_env(
+        let env = next_block_evm_env(
             &config,
             &witness.parent_header,
             &block,
