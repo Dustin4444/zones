@@ -1115,12 +1115,13 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Attempt a TIP-20 transfer without bubbling recipient/policy reverts.
-    /// @dev Returns false if the token transfer reverts or returns false. Callers decide
-    ///      whether a failed transfer should be ignored, parked for refund, or reverted.
+    /// @dev Returns false if the receive policy blocks direct delivery, or if the token transfer
+    ///      reverts or returns false. Callers decide whether a failed transfer should be ignored,
+    ///      parked for refund, or reverted.
     /// @param token The TIP-20 token to transfer.
     /// @param to The recipient address.
     /// @param amount The token amount to transfer.
-    /// @return success True if the transfer completed and returned true.
+    /// @return success True if the transfer completed directly to `to` and returned true.
     function _tryTransfer(
         address token,
         address to,
@@ -1129,6 +1130,23 @@ contract ZonePortal is IZonePortal {
         internal
         returns (bool success)
     {
+        address effectiveRecipient;
+        try StdPrecompiles.ADDRESS_REGISTRY.resolveRecipient(to) returns (address resolved) {
+            effectiveRecipient = resolved;
+        } catch {
+            return false;
+        }
+
+        try TIP403_REGISTRY.validateReceivePolicy(
+            token, address(this), effectiveRecipient
+        ) returns (
+            bool authorized, ITIP403Registry.BlockedReason
+        ) {
+            if (!authorized) return false;
+        } catch {
+            return false;
+        }
+
         try ITIP20(token).transfer(to, amount) returns (bool ok) {
             return ok;
         } catch {
