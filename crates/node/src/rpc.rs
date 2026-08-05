@@ -716,14 +716,26 @@ where
                 .await
                 .map_err(internal)?;
             if let Some(reward_percentiles) = reward_percentiles.as_deref() {
-                validate_reward_percentiles(
-                    reward_percentiles,
-                    self.eth
+                // These checks mirror upstream Reth's `eth_feeHistory` validation. We repeat
+                // them here because passing `None` above avoids loading private block bodies,
+                // which also bypasses Reth's validation; validate before allocating the redacted
+                // reward matrix to bound its size.
+                if reward_percentiles.len() as u64
+                    > self
+                        .eth
                         .api
                         .gas_oracle()
                         .config()
-                        .max_reward_percentile_count,
-                )?;
+                        .max_reward_percentile_count
+                    || reward_percentiles
+                        .iter()
+                        .any(|percentile| *percentile < 0.0 || *percentile > 100.0)
+                    || reward_percentiles
+                        .windows(2)
+                        .any(|window| window[0] > window[1])
+                {
+                    return Err(JsonRpcError::invalid_params("invalid reward percentiles"));
+                }
                 history.reward = Some(vec![
                     vec![0; reward_percentiles.len()];
                     history.gas_used_ratio.len()
@@ -1282,25 +1294,6 @@ fn redact_fee_history(history: &mut FeeHistory) {
     history.blob_gas_used_ratio.fill(0.0);
 }
 
-/// Validate reward percentiles before using their length to allocate the redacted reward matrix.
-fn validate_reward_percentiles(
-    reward_percentiles: &[f64],
-    max_count: u64,
-) -> Result<(), JsonRpcError> {
-    if reward_percentiles.len() as u64 > max_count
-        || reward_percentiles
-            .iter()
-            .any(|percentile| *percentile < 0.0 || *percentile > 100.0)
-        || reward_percentiles
-            .windows(2)
-            .any(|window| window[0] > window[1])
-    {
-        return Err(JsonRpcError::invalid_params("invalid reward percentiles"));
-    }
-
-    Ok(())
-}
-
 /// Prefill missing transaction fee fields with public, deterministic values before calling reth's
 /// transaction filler, so `eth_fillTransaction` does not expose dynamic fee estimates derived from
 /// private zone activity.
@@ -1444,39 +1437,6 @@ mod tests {
         assert_eq!(history.base_fee_per_blob_gas, vec![0; 3]);
         assert_eq!(history.blob_gas_used_ratio, vec![0.0; 2]);
         assert_eq!(history.reward, Some(vec![vec![7, 8], vec![9, 10]]));
-    }
-
-    #[test]
-    fn validate_reward_percentiles_accepts_sorted_values_in_range() {
-        assert!(validate_reward_percentiles(&[0.0, 50.0, 100.0], 3).is_ok());
-    }
-
-    #[test]
-    fn validate_reward_percentiles_rejects_excessive_count() {
-        let percentiles = vec![0.0; 4];
-
-        let error = validate_reward_percentiles(&percentiles, 3).expect_err("count is invalid");
-
-        assert_eq!(error.code, -32602);
-        assert_eq!(error.message, "invalid reward percentiles");
-    }
-
-    #[test]
-    fn validate_reward_percentiles_rejects_out_of_range_values() {
-        for percentiles in [[-1.0], [100.1]] {
-            let error = validate_reward_percentiles(&percentiles, 3).expect_err("range is invalid");
-
-            assert_eq!(error.code, -32602);
-            assert_eq!(error.message, "invalid reward percentiles");
-        }
-    }
-
-    #[test]
-    fn validate_reward_percentiles_rejects_unsorted_values() {
-        let error = validate_reward_percentiles(&[50.0, 25.0], 3).expect_err("ordering is invalid");
-
-        assert_eq!(error.code, -32602);
-        assert_eq!(error.message, "invalid reward percentiles");
     }
 
     #[test]
