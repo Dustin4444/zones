@@ -176,6 +176,10 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
         builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
 
+        // Clone L1 connection details for the checker before they are moved into ZoneNode.
+        let checker_l1_rpc_url = args.l1_rpc_url.clone();
+        let checker_portal_address = args.portal_address;
+
         let mut node = ZoneNode::new(
             args.l1_rpc_url,
             args.portal_address,
@@ -230,7 +234,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             }
             CheckerMode::Observe => {
                 info!(target: "reth::cli", "Checker ExEx enabled (observe mode)");
-                let checker = CheckerExEx::new();
+                let checker = CheckerExEx::new(checker_l1_rpc_url, checker_portal_address);
                 builder
                     .node(node)
                     .install_exex("zone-checker", async move |ctx| Ok(checker.run(ctx)))
