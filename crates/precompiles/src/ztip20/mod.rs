@@ -9,7 +9,7 @@
 //! finalized Tempo L1 state.
 
 use alloy_primitives::Address;
-use alloy_sol_types::{SolError, SolInterface};
+use alloy_sol_types::{SolCall, SolError, SolInterface};
 use tempo_precompiles::tip20::{IRolesAuth, ITIP20};
 use tempo_zone_contracts::Unauthorized;
 
