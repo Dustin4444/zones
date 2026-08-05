@@ -3,18 +3,26 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
+mod l2_facts;
+
 use std::fmt;
 use std::str::FromStr;
 
 use alloy_consensus::BlockHeader as _;
-use alloy_eips::{BlockHashOrNumber, BlockNumHash};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use eyre::WrapErr as _;
 use futures::TryStreamExt as _;
 use reth_exex::{ExExContext, ExExNotification};
-use reth_node_api::{FullNodeComponents, NodePrimitives};
-use reth_storage_api::{AccountReader, BlockReader, StateProviderFactory};
-use tracing::info;
+use reth_node_api::{BlockBody as _, FullNodeComponents, NodePrimitives};
+use reth_storage_api::{AccountReader, StateProviderFactory};
+use tracing::{error, info};
+
+use l2_facts::{extract_l2_facts, log_l2_facts};
+
+// ---------------------------------------------------------------------------
+// CLI mode
+// ---------------------------------------------------------------------------
 
 /// Runtime mode for the checker ExEx.
 ///
@@ -25,8 +33,9 @@ pub enum CheckerMode {
     /// Checker is not installed.
     #[default]
     Off,
-    /// Checker runs in observe-only mode: logs block identity and confirms
-    /// receipts/state availability, but does not enforce anything.
+    /// Checker runs in observe-only mode: logs block identity, confirms
+    /// receipts/state availability, and extracts L2 bridge facts — but does
+    /// not enforce anything.
     Observe,
 }
 
@@ -64,11 +73,16 @@ impl CheckerMode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ExEx
+// ---------------------------------------------------------------------------
+
 /// The checker execution extension.
 ///
 /// A fieldless struct — the checker holds no runtime state between
-/// notifications. It logs observations and confirms data availability as
-/// canonical L2 notifications arrive, then acknowledges the processed height.
+/// notifications. It logs observations, confirms data availability, and
+/// extracts L2 bridge facts as canonical L2 notifications arrive, then
+/// acknowledges the processed height.
 pub struct CheckerExEx;
 
 impl CheckerExEx {
@@ -86,14 +100,24 @@ impl CheckerExEx {
     pub async fn run<Node>(self, mut ctx: ExExContext<Node>) -> eyre::Result<()>
     where
         Node: FullNodeComponents,
-        Node::Provider: BlockReader + StateProviderFactory,
+        Node::Provider: StateProviderFactory,
     {
         info!(target: "zone::checker", "Checker ExEx started");
         let provider = ctx.provider().clone();
+        let mut acknowledgements_blocked = false;
 
         while let Some(notification) = ctx.notifications.try_next().await? {
-            let tip = process_notification(&notification, &provider).await?;
-            ctx.send_finished_height(tip)?;
+            match process_notification(&notification, &provider).await {
+                Ok(tip) if !acknowledgements_blocked => ctx.send_finished_height(tip)?,
+                Ok(_) => {}
+                Err(error) => {
+                    // Observation failures must not terminate the Zone node. Keep the ExEx
+                    // pruning watermark behind the failed notification so restart/replay can
+                    // inspect it again instead of silently losing the gap.
+                    acknowledgements_blocked = true;
+                    error!(target: "zone::checker", %error, "L2 bridge fact extraction failed");
+                }
+            }
         }
 
         info!(target: "zone::checker", "Checker ExEx notification stream closed");
@@ -104,23 +128,26 @@ impl CheckerExEx {
 /// Process a single canonical L2 ExEx notification and return the finished-height tip.
 ///
 /// Committed and reorged-in blocks are processed oldest-to-newest; each has its
-/// receipts and exact post-state confirmed before being logged. Reverted and
-/// reorged-out blocks are processed newest-to-oldest and are logged but not
-/// checked — their data is no longer canonical.
+/// receipts and exact post-state confirmed and its L2 bridge facts extracted
+/// before being logged. Reverted and reorged-out blocks are processed
+/// newest-to-oldest and are logged but not checked — their receipts are no
+/// longer canonical.
 async fn process_notification<N, P>(
     notification: &ExExNotification<N>,
     provider: &P,
 ) -> eyre::Result<BlockNumHash>
 where
     N: NodePrimitives,
-    P: BlockReader + StateProviderFactory,
+    P: StateProviderFactory,
 {
     match notification {
         ExExNotification::ChainCommitted { new } => {
-            for (&number, block) in new.blocks() {
+            ensure_receipt_sets(new)?;
+            for (block, receipts) in new.blocks_and_receipts() {
+                let number = block.header().number();
                 let hash = block.hash();
                 let parent_hash = block.header().parent_hash();
-                confirm_receipts_and_state(provider, hash)?;
+                process_canonical_block(provider, number, hash, receipts)?;
                 info!(target: "zone::checker", number, %hash, %parent_hash, "Committed block observed");
             }
             let tip = new.tip();
@@ -139,17 +166,21 @@ where
             ))
         }
         ExExNotification::ChainReorged { old, new } => {
-            // Roll back the old fork newest-to-oldest.
+            // Roll back the old fork newest-to-oldest. Reorged-out blocks are
+            // not fact-checked — their receipts are no longer canonical.
             for (&number, block) in old.blocks().iter().rev() {
                 let hash = block.hash();
                 let parent_hash = block.header().parent_hash();
                 info!(target: "zone::checker", number, %hash, %parent_hash, "Reorged-out block observed");
             }
-            // Apply the new fork oldest-to-newest, confirming data availability.
-            for (&number, block) in new.blocks() {
+            // Apply the new fork oldest-to-newest using the same extraction
+            // path as ordinary committed blocks.
+            ensure_receipt_sets(new)?;
+            for (block, receipts) in new.blocks_and_receipts() {
+                let number = block.header().number();
                 let hash = block.hash();
                 let parent_hash = block.header().parent_hash();
-                confirm_receipts_and_state(provider, hash)?;
+                process_canonical_block(provider, number, hash, receipts)?;
                 info!(target: "zone::checker", number, %hash, %parent_hash, "Reorged-in block observed");
             }
             let tip = new.tip();
@@ -158,46 +189,83 @@ where
     }
 }
 
-/// Confirm that receipts and exact post-state are available for a committed or
-/// reorged-in block.
-///
-/// Both lookups use the exact block hash (never the block number) to pin the
-/// result to the specific notified block and avoid checking state from the
-/// wrong fork or head. Missing receipts or state is an error — the checker
-/// must not acknowledge a height it cannot verify.
-fn confirm_receipts_and_state<P>(provider: &P, hash: B256) -> eyre::Result<()>
+/// Ensure every notified block has its corresponding execution receipt set.
+fn ensure_receipt_sets<N>(chain: &reth_execution_types::Chain<N>) -> eyre::Result<()>
 where
-    P: BlockReader + StateProviderFactory,
+    N: NodePrimitives,
 {
-    provider
-        .receipts_by_block(BlockHashOrNumber::Hash(hash))
-        .wrap_err_with(|| format!("failed to fetch receipts for block {hash}"))?
-        .ok_or_else(|| eyre::eyre!("receipts missing for block {hash}"))?;
+    let receipt_sets = chain.block_receipts_iter().count();
+    if receipt_sets != chain.blocks().len() {
+        eyre::bail!(
+            "notification has {} blocks but {receipt_sets} receipt sets",
+            chain.blocks().len()
+        );
+    }
+    for (block, receipts) in chain.blocks_and_receipts() {
+        let transactions = block.body().transactions().len();
+        if receipts.len() != transactions {
+            eyre::bail!(
+                "block {} has {transactions} transactions but {} receipts",
+                block.header().number(),
+                receipts.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Confirm exact post-state for a canonical (committed or reorged-in) block,
+/// extract L2 bridge facts from notification-local receipts, and log a summary.
+///
+/// The state lookup uses the exact block hash to avoid checking the wrong fork
+/// or head. Receipts come directly from the ExEx notification's executed chain.
+fn process_canonical_block<P, R>(
+    provider: &P,
+    number: u64,
+    hash: B256,
+    receipts: &[R],
+) -> eyre::Result<()>
+where
+    P: StateProviderFactory,
+    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
+{
     let state = provider
         .state_by_block_hash(hash)
         .wrap_err_with(|| format!("failed to obtain state for block {hash}"))?;
     state
         .basic_account(&Address::ZERO)
         .wrap_err_with(|| format!("failed to read state for block {hash}"))?;
+
+    let facts = extract_l2_facts(number, hash, receipts)?;
+    log_l2_facts(&facts);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{BlockBody, Header};
-    use alloy_primitives::U256;
+    use alloy_consensus::{BlockBody, Header, SignableTransaction as _, TxLegacy};
+    use alloy_primitives::{Log, Signature, U256};
+    use alloy_sol_types::SolEvent as _;
     use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives, Receipt};
-    use reth_execution_types::Chain;
+    use reth_execution_types::{Chain, ExecutionOutcome};
     use reth_primitives_traits::{RecoveredBlock, SealedBlock};
     use reth_provider::test_utils::MockEthProvider;
     use std::{collections::BTreeMap, sync::Arc};
+    use tempo_zone_contracts::{IZoneInbox, ZONE_INBOX_ADDRESS};
 
     #[test]
     fn checker_mode_parse_display_default() {
         assert_eq!(CheckerMode::default(), CheckerMode::Off);
         assert_eq!("off".parse::<CheckerMode>().unwrap(), CheckerMode::Off);
-        assert_eq!("OBSERVE".parse::<CheckerMode>().unwrap(), CheckerMode::Observe);
+        assert_eq!(
+            "OBSERVE".parse::<CheckerMode>().unwrap(),
+            CheckerMode::Observe
+        );
         assert!("enforce".parse::<CheckerMode>().is_err());
         assert_eq!(CheckerMode::Off.to_string(), "off");
         assert_eq!(CheckerMode::Observe.to_string(), "observe");
@@ -212,12 +280,56 @@ mod tests {
             difficulty: U256::ZERO,
             ..Default::default()
         };
-        let block = EthBlock::new(header, BlockBody::default());
+        let transaction =
+            TxLegacy::default().into_signed(Signature::new(U256::from(1), U256::from(1), false));
+        let block = EthBlock::new(
+            header,
+            BlockBody {
+                transactions: vec![transaction.into()],
+                ..Default::default()
+            },
+        );
         RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![])
     }
 
     fn make_chain(blocks: Vec<Block>) -> Arc<Chain<EthPrimitives>> {
+        let first_block = blocks
+            .first()
+            .map(|block| block.header().number())
+            .unwrap_or(0);
+        let receipts = blocks.iter().map(|_| vec![anchor_receipt()]).collect();
+        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
+            Default::default(),
+            receipts,
+            first_block,
+            Default::default(),
+        );
+        Arc::new(Chain::new(blocks, outcome, BTreeMap::new()))
+    }
+
+    fn make_chain_without_receipts(blocks: Vec<Block>) -> Arc<Chain<EthPrimitives>> {
         Arc::new(Chain::new(blocks, Default::default(), BTreeMap::new()))
+    }
+
+    /// A minimal receipt with a valid `TempoAdvanced` anchor so the block
+    /// passes fact extraction.
+    fn anchor_receipt() -> Receipt {
+        let event = IZoneInbox::TempoAdvanced {
+            tempoBlockHash: B256::repeat_byte(0x10),
+            tempoBlockNumber: 100,
+            depositsProcessed: U256::ZERO,
+            newProcessedDepositQueueHash: B256::ZERO,
+            lastProcessedDepositNumber: 0,
+        };
+        Receipt {
+            tx_type: Default::default(),
+            success: true,
+            cumulative_gas_used: 0,
+            logs: vec![Log {
+                address: ZONE_INBOX_ADDRESS,
+                data: event.encode_log_data(),
+            }],
+        }
     }
 
     fn setup_provider(blocks: &[(&Block, Vec<Receipt>)]) -> MockEthProvider {
@@ -237,7 +349,12 @@ mod tests {
         let b1 = make_block(1, B256::repeat_byte(1));
         let b2 = make_block(2, b1.hash());
         let b3 = make_block(3, b2.hash());
-        let provider = setup_provider(&[(&b1, vec![]), (&b2, vec![]), (&b3, vec![])]);
+        let r = anchor_receipt();
+        let provider = setup_provider(&[
+            (&b1, vec![r.clone()]),
+            (&b2, vec![r.clone()]),
+            (&b3, vec![r]),
+        ]);
         let notification = ExExNotification::ChainCommitted {
             new: make_chain(vec![b1, b2, b3.clone()]),
         };
@@ -270,7 +387,12 @@ mod tests {
         let new1 = make_block(1, parent);
         let new2 = make_block(2, new1.hash());
         let new3 = make_block(3, new2.hash());
-        let provider = setup_provider(&[(&new1, vec![]), (&new2, vec![]), (&new3, vec![])]);
+        let r = anchor_receipt();
+        let provider = setup_provider(&[
+            (&new1, vec![r.clone()]),
+            (&new2, vec![r.clone()]),
+            (&new3, vec![r]),
+        ]);
         let notification = ExExNotification::ChainReorged {
             old: make_chain(vec![old1, old2]),
             new: make_chain(vec![new1, new2, new3.clone()]),
@@ -284,59 +406,55 @@ mod tests {
     #[tokio::test]
     async fn missing_receipts_is_error() {
         let b1 = make_block(1, B256::repeat_byte(5));
-        // Provider has the block but no receipts.
         let provider = MockEthProvider::<EthPrimitives>::new();
         let notification = ExExNotification::ChainCommitted {
-            new: make_chain(vec![b1]),
+            new: make_chain_without_receipts(vec![b1]),
         };
         let result = process_notification(&notification, &provider).await;
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("receipts"),
-            "error should mention receipts: {msg}"
+            result.unwrap_err().to_string().contains("receipt"),
+            "error should mention receipts"
         );
     }
 
     #[tokio::test]
-    async fn missing_state_is_error() {
+    async fn receipt_count_must_match_transaction_count() {
         let b1 = make_block(1, B256::repeat_byte(6));
-        // Provider has receipts but state_by_block_hash returns an error for unknown hashes.
-        let provider = setup_provider(&[(&b1, vec![])]);
-        let notification = ExExNotification::ChainCommitted {
-            new: make_chain(vec![b1]),
+        let provider = setup_provider(&[(&b1, vec![anchor_receipt()])]);
+        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
+            Default::default(),
+            vec![vec![anchor_receipt(), anchor_receipt()]],
+            1,
+            Default::default(),
+        );
+        let notification: ExExNotification<EthPrimitives> = ExExNotification::ChainCommitted {
+            new: Arc::new(Chain::new(vec![b1], outcome, BTreeMap::new())),
         };
-        let result = process_notification(&notification, &provider).await;
-        // MockEthProvider may or may not error on state depending on internals,
-        // but receipts should succeed; if state fails the whole thing must error.
-        if let Err(e) = result {
-            assert!(
-                e.to_string().contains("state") || e.to_string().contains("block"),
-                "error should relate to state: {e}"
-            );
-        }
+
+        let error = process_notification(&notification, &provider)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1 transactions but 2 receipts"));
     }
 
     #[tokio::test]
-    async fn multi_block_commit_processed_successfully() {
+    async fn multi_block_commit_with_facts() {
         let b1 = make_block(1, B256::repeat_byte(7));
         let b2 = make_block(2, b1.hash());
         let b3 = make_block(3, b2.hash());
-        let b4 = make_block(4, b3.hash());
-        let b5 = make_block(5, b4.hash());
+        let r = anchor_receipt();
         let provider = setup_provider(&[
-            (&b1, vec![]),
-            (&b2, vec![]),
-            (&b3, vec![]),
-            (&b4, vec![]),
-            (&b5, vec![]),
+            (&b1, vec![r.clone()]),
+            (&b2, vec![r.clone()]),
+            (&b3, vec![r]),
         ]);
         let notification = ExExNotification::ChainCommitted {
-            new: make_chain(vec![b1, b2, b3, b4, b5.clone()]),
+            new: make_chain(vec![b1, b2, b3.clone()]),
         };
         let tip = process_notification(&notification, &provider)
             .await
             .unwrap();
-        assert_eq!(tip, BlockNumHash::new(5, b5.hash()));
+        assert_eq!(tip, BlockNumHash::new(3, b3.hash()));
     }
 }

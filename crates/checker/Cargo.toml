@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 # reth
 reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-execution-types.workspace = true
 reth-node-api.workspace = true
 reth-storage-api.workspace = true
 
@@ -21,6 +22,10 @@ reth-storage-api.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+
+# zones
+tempo-zone-contracts = { workspace = true, features = ["std"] }
 
 # misc
 eyre.workspace = true
@@ -30,7 +35,6 @@ tracing.workspace = true
 [dev-dependencies]
 alloy-consensus = { workspace = true, features = ["std"] }
 reth-ethereum-primitives.workspace = true
-reth-execution-types.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std", "test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
