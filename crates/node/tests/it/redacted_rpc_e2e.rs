@@ -1,6 +1,6 @@
-//! End-to-end tests for the private zone RPC server.
+//! End-to-end tests for the redacted zone RPC server.
 //!
-//! These tests launch a zone node with a private RPC server and verify:
+//! These tests launch a zone node with a redacted RPC server and verify:
 //! - Authentication enforcement (missing/invalid tokens, wrong chain ID)
 //! - Public method access
 //! - Balance & state privacy (users only see their own data)
@@ -8,8 +8,8 @@
 //! - Method tier enforcement (restricted/disabled/unknown methods)
 
 use crate::utils::{
-    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, now_secs, start_zone_with_private_rpc,
-    start_zone_with_private_rpc_l1, start_zone_with_private_rpc_l1_with_encryption,
+    DEFAULT_TIMEOUT, TEST_MNEMONIC, TIP20_TX_GAS, now_secs, start_zone_with_redacted_rpc,
+    start_zone_with_redacted_rpc_l1, start_zone_with_redacted_rpc_l1_with_encryption,
 };
 use alloy::{
     primitives::{Address, B256, TxKind, U256, address, hex},
@@ -25,13 +25,13 @@ use p256::ecdsa::SigningKey as P256SigningKey;
 use rand::thread_rng;
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
-use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
+use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TEMPO_T1_BASE_FEE};
 use tempo_contracts::precompiles::{
-    INonce, ITIP20 as ContractTip20,
+    IAccountKeychain, INonce, IStorageCredits, ITIP20 as ContractTip20,
     account_keychain::IAccountKeychain::{SignatureType as KeyInfoSignatureType, getKeyCall},
 };
 use tempo_precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS, STORAGE_CREDITS_ADDRESS,
     tip20::ITIP20 as PrecompileTip20,
 };
 use tempo_primitives::{
@@ -169,10 +169,10 @@ fn assert_redacted_block(block: &Value) {
     }
 }
 
-type PrivateRpcWs =
+type RedactedRpcWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn private_rpc_ws_url(http_url: &url::Url) -> eyre::Result<url::Url> {
+fn redacted_rpc_ws_url(http_url: &url::Url) -> eyre::Result<url::Url> {
     let mut ws_url = http_url.clone();
     let target_scheme = if ws_url.scheme() == "https" {
         "wss"
@@ -189,8 +189,8 @@ fn jsonrpc_with_params(method: &str, params: Value, id: u64) -> String {
     json!({"jsonrpc":"2.0","method":method,"params":params,"id":id}).to_string()
 }
 
-async fn connect_private_rpc_ws(url: &url::Url, auth_token: &str) -> eyre::Result<PrivateRpcWs> {
-    let ws_url = private_rpc_ws_url(url)?;
+async fn connect_redacted_rpc_ws(url: &url::Url, auth_token: &str) -> eyre::Result<RedactedRpcWs> {
+    let ws_url = redacted_rpc_ws_url(url)?;
     let mut req = ws_url.as_str().into_client_request()?;
     req.headers_mut().insert(
         "x-authorization-token",
@@ -202,7 +202,7 @@ async fn connect_private_rpc_ws(url: &url::Url, auth_token: &str) -> eyre::Resul
     Ok(ws)
 }
 
-async fn ws_next_json(ws: &mut PrivateRpcWs) -> eyre::Result<Value> {
+async fn ws_next_json(ws: &mut RedactedRpcWs) -> eyre::Result<Value> {
     let Some(msg) = tokio::time::timeout(DEFAULT_TIMEOUT, ws.next())
         .await
         .map_err(|_| eyre::eyre!("timed out waiting for websocket message"))?
@@ -218,7 +218,7 @@ async fn ws_next_json(ws: &mut PrivateRpcWs) -> eyre::Result<Value> {
     }
 }
 
-async fn ws_subscribe(ws: &mut PrivateRpcWs, params: Value) -> eyre::Result<String> {
+async fn ws_subscribe(ws: &mut RedactedRpcWs, params: Value) -> eyre::Result<String> {
     ws.send(Message::Text(
         jsonrpc_with_params("eth_subscribe", params, 1).into(),
     ))
@@ -231,7 +231,7 @@ async fn ws_subscribe(ws: &mut PrivateRpcWs, params: Value) -> eyre::Result<Stri
 }
 
 async fn ws_collect_messages_until_quiet(
-    ws: &mut PrivateRpcWs,
+    ws: &mut RedactedRpcWs,
     duration: Duration,
 ) -> eyre::Result<Vec<Value>> {
     let mut messages = Vec::new();
@@ -254,7 +254,7 @@ async fn ws_collect_messages_until_quiet(
 async fn test_auth_rejection() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
 
     // No auth header → 401
     let (status, _) = ctx
@@ -286,7 +286,7 @@ async fn test_auth_rejection() -> eyre::Result<()> {
 async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
     let user_signer = PrivateKeySigner::random();
     let fee_payer = PrivateKeySigner::random();
     ctx.inject_deposit(
@@ -331,12 +331,12 @@ async fn test_send_raw_transaction_requires_enabled_token_balance() -> eyre::Res
     Ok(())
 }
 
-/// Real P256 and WebAuthn auth tokens are accepted by the private RPC.
+/// Real P256 and WebAuthn auth tokens are accepted by the redacted RPC.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let p256_signer = P256SigningKey::random(&mut thread_rng());
     let webauthn_signer = P256SigningKey::random(&mut thread_rng());
 
@@ -365,7 +365,7 @@ async fn test_non_secp_auth_tokens() -> eyre::Result<()> {
 async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let p256_signer = P256SigningKey::random(&mut thread_rng());
     let webauthn_signer = P256SigningKey::random(&mut thread_rng());
 
@@ -393,7 +393,7 @@ async fn test_invalid_non_secp_auth_tokens_are_rejected() -> eyre::Result<()> {
 async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
     let root_signer = PrivateKeySigner::random();
     let access_signer = P256SigningKey::random(&mut thread_rng());
 
@@ -445,7 +445,7 @@ async fn test_keychain_auth_tokens_v1_and_v2() -> eyre::Result<()> {
 async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
 
     let missing_root = PrivateKeySigner::random();
     let missing_access = P256SigningKey::random(&mut thread_rng());
@@ -538,15 +538,15 @@ async fn test_keychain_auth_rejection_cases() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Public methods (blockNumber, chainId, gasPrice) work for both sequencer and users.
+/// Public methods work for both sequencer and users without leaking private fee activity.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_public_methods() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let user_signer = PrivateKeySigner::random();
 
-    for method in ["eth_blockNumber", "eth_chainId", "eth_gasPrice"] {
+    for method in ["eth_blockNumber", "eth_chainId"] {
         let seq_resp = ctx.call_as_sequencer(method, serde_json::json!([])).await?;
         assert!(
             seq_resp.get("result").is_some() && seq_resp.get("error").is_none(),
@@ -562,6 +562,18 @@ async fn test_public_methods() -> eyre::Result<()> {
         );
     }
 
+    for (method, expected) in [
+        ("eth_gasPrice", U256::from(TEMPO_T1_BASE_FEE)),
+        ("eth_maxPriorityFeePerGas", U256::ZERO),
+    ] {
+        for response in [
+            ctx.call_as_sequencer(method, json!([])).await?,
+            ctx.call_as_user(method, json!([]), &user_signer).await?,
+        ] {
+            assert_eq!(response["result"], json!(format!("{expected:#x}")));
+        }
+    }
+
     Ok(())
 }
 
@@ -570,7 +582,7 @@ async fn test_public_methods() -> eyre::Result<()> {
 async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
     let owner_signer = PrivateKeySigner::random();
     let other_signer = PrivateKeySigner::random();
 
@@ -642,7 +654,7 @@ async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
 async fn test_balance_privacy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
 
     let depositor = address!("0x0000000000000000000000000000000000001111");
     let recipient = address!("0x0000000000000000000000000000000000005678");
@@ -694,7 +706,7 @@ async fn test_balance_privacy() -> eyre::Result<()> {
 async fn test_tip20_eth_call_privacy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
 
     let owner_signer = MnemonicBuilder::<English>::default()
         .phrase(TEST_MNEMONIC)
@@ -918,6 +930,79 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
             "Multicall3 must not expose {label}: {forwarded}"
         );
     }
+    Ok(())
+}
+
+/// TIP-20 permit nonce reads are owner-scoped at the precompile boundary, including calls forwarded
+/// through Multicall3.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tip20_nonce_eth_call_privacy() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
+    let owner_signer = PrivateKeySigner::random();
+    let owner = owner_signer.address();
+    let outsider_signer = PrivateKeySigner::random();
+    let nonce_call = PrecompileTip20::noncesCall { owner };
+    let calldata = nonce_call.abi_encode();
+
+    let outsider = ctx
+        .call_as_user(
+            "eth_call",
+            json!([{
+                "to": format!("{PATH_USD_ADDRESS:#x}"),
+                "data": format!("0x{}", hex::encode(&calldata)),
+            }, "latest"]),
+            &outsider_signer,
+        )
+        .await?;
+    let outsider_error = outsider["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        outsider_error.contains(&format!("0x{}", hex::encode(Unauthorized::SELECTOR))),
+        "non-owner nonces(owner) should revert with Unauthorized(): {outsider}"
+    );
+
+    let owner_response = ctx
+        .call_as_user(
+            "eth_call",
+            json!([{
+                "to": format!("{PATH_USD_ADDRESS:#x}"),
+                "data": format!("0x{}", hex::encode(&calldata)),
+            }, "latest"]),
+            &owner_signer,
+        )
+        .await?;
+    let owner_bytes = hex::decode(
+        owner_response["result"]
+            .as_str()
+            .expect("owner nonce read should return hex")
+            .trim_start_matches("0x"),
+    )?;
+    assert_eq!(
+        PrecompileTip20::noncesCall::abi_decode_returns(&owner_bytes)?,
+        U256::ZERO
+    );
+
+    let multicall = IMulticall3::aggregateCall {
+        calls: vec![IMulticall3::Call {
+            target: PATH_USD_ADDRESS,
+            callData: calldata.into(),
+        }],
+    };
+    let forwarded = ctx
+        .call_as_user(
+            "eth_call",
+            json!([{
+                "to": format!("{:#x}", alloy_provider::MULTICALL3_ADDRESS),
+                "data": format!("0x{}", hex::encode(multicall.abi_encode())),
+            }, "latest"]),
+            &outsider_signer,
+        )
+        .await?;
+    assert!(
+        forwarded.get("result").is_none() && forwarded.get("error").is_some(),
+        "Multicall3 must not expose another owner's TIP-20 nonce: {forwarded}"
+    );
 
     Ok(())
 }
@@ -928,7 +1013,7 @@ async fn test_account_indexed_system_getters_are_private() -> eyre::Result<()> {
 async fn test_zone_inbox_refunds_eth_call_privacy() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc_l1().await?;
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
 
     let owner_signer = PrivateKeySigner::random();
     let owner = owner_signer.address();
@@ -1014,12 +1099,116 @@ async fn test_zone_inbox_refunds_eth_call_privacy() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Account-indexed native getters enforce privacy inside the EVM so direct and helper-forwarded
+/// calls cannot read another account's NonceManager, AccountKeychain, or StorageCredits state.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_native_account_getter_eth_call_privacy() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
+    let owner_signer = PrivateKeySigner::random();
+    let owner = owner_signer.address();
+    let outsider_signer = PrivateKeySigner::random();
+    let key_id = Address::repeat_byte(0x55);
+
+    let calls = [
+        (
+            NONCE_PRECOMPILE_ADDRESS,
+            INonce::getNonceCall {
+                account: owner,
+                nonceKey: U256::from(1),
+            }
+            .abi_encode(),
+            "NonceManager.getNonce",
+        ),
+        (
+            ACCOUNT_KEYCHAIN_ADDRESS,
+            IAccountKeychain::getKeyCall {
+                account: owner,
+                keyId: key_id,
+            }
+            .abi_encode(),
+            "AccountKeychain.getKey",
+        ),
+        (
+            STORAGE_CREDITS_ADDRESS,
+            IStorageCredits::balanceOfCall { account: owner }.abi_encode(),
+            "StorageCredits.balanceOf",
+        ),
+    ];
+
+    for (target, calldata, label) in calls {
+        let direct = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{target:#x}"),
+                        "data": format!("0x{}", hex::encode(&calldata)),
+                    },
+                    "latest"
+                ]),
+                &outsider_signer,
+            )
+            .await?;
+        let direct_error = direct["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            direct_error.contains(&format!("0x{}", hex::encode(Unauthorized::SELECTOR))),
+            "outsider direct {label} should revert with Unauthorized(): {direct}"
+        );
+
+        let own = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{target:#x}"),
+                        "data": format!("0x{}", hex::encode(&calldata)),
+                    },
+                    "latest"
+                ]),
+                &owner_signer,
+            )
+            .await?;
+        assert!(
+            own["result"].as_str().is_some(),
+            "owner direct {label} should retain normal eth_call behavior: {own}"
+        );
+
+        let multicall = IMulticall3::aggregateCall {
+            calls: vec![IMulticall3::Call {
+                target,
+                callData: calldata.into(),
+            }],
+        };
+        let forwarded = ctx
+            .call_as_user(
+                "eth_call",
+                json!([
+                    {
+                        "to": format!("{:#x}", alloy_provider::MULTICALL3_ADDRESS),
+                        "data": format!("0x{}", hex::encode(multicall.abi_encode())),
+                    },
+                    "latest"
+                ]),
+                &outsider_signer,
+            )
+            .await?;
+        assert!(
+            forwarded.get("result").is_none() && forwarded.get("error").is_some(),
+            "Multicall3 must not expose another account through {label}: {forwarded}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Simulation methods reject contract creation and override extensions.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let user_signer = PrivateKeySigner::random();
     let simulation_target = format!("{:#x}", Address::repeat_byte(0x11));
 
@@ -1097,7 +1286,7 @@ async fn test_simulation_validation_rejects_create_and_overrides() -> eyre::Resu
 async fn test_block_access_control() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
     ctx.inject_empty_block().await?;
 
     let user_signer = PrivateKeySigner::random();
@@ -1147,7 +1336,7 @@ async fn test_block_access_control() -> eyre::Result<()> {
 async fn test_method_tiers() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let user_signer = PrivateKeySigner::random();
 
     // Restricted methods → -32005 for all callers
@@ -1217,7 +1406,7 @@ async fn test_method_tiers() -> eyre::Result<()> {
 async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let mut ctx = start_zone_with_private_rpc().await?;
+    let mut ctx = start_zone_with_redacted_rpc().await?;
     let owner_signer = MnemonicBuilder::<English>::default()
         .phrase(TEST_MNEMONIC)
         .build()?;
@@ -1240,7 +1429,7 @@ async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
     .await?;
 
     let owner_token = ctx.user_token(&owner_signer);
-    let mut owner_ws = connect_private_rpc_ws(&ctx.private_rpc_url, &owner_token).await?;
+    let mut owner_ws = connect_redacted_rpc_ws(&ctx.redacted_rpc_url, &owner_token).await?;
 
     owner_ws
         .send(Message::Text(
@@ -1327,10 +1516,10 @@ async fn test_ws_logs_subscription_is_sender_scoped() -> eyre::Result<()> {
 async fn test_ws_pending_transaction_subscriptions_are_disabled() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc().await?;
+    let ctx = start_zone_with_redacted_rpc().await?;
     let user_signer = PrivateKeySigner::random();
     let user_token = ctx.user_token(&user_signer);
-    let mut user_ws = connect_private_rpc_ws(&ctx.private_rpc_url, &user_token).await?;
+    let mut user_ws = connect_redacted_rpc_ws(&ctx.redacted_rpc_url, &user_token).await?;
 
     for (id, params) in [
         (1, json!(["newPendingTransactions"])),
@@ -1360,7 +1549,7 @@ async fn test_ws_pending_transaction_subscriptions_are_disabled() -> eyre::Resul
 async fn test_zone_metadata_methods() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc_l1().await?;
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
     let user_signer = PrivateKeySigner::random();
 
     let auth_info = ctx
@@ -1418,7 +1607,7 @@ async fn test_zone_metadata_methods() -> eyre::Result<()> {
 async fn test_zone_get_zone_info_returns_all_enabled_tokens() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc_l1().await?;
+    let ctx = start_zone_with_redacted_rpc_l1().await?;
     let user_signer = PrivateKeySigner::random();
     let alpha_salt = B256::with_last_byte(0x44);
     let alpha_token = ctx
@@ -1467,7 +1656,7 @@ fn encryption_public_key(secret_key: &k256::SecretKey) -> (String, u8) {
 async fn test_zone_get_encryption_key_reads_latest_l1_key() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let ctx = start_zone_with_private_rpc_l1_with_encryption().await?;
+    let ctx = start_zone_with_redacted_rpc_l1_with_encryption().await?;
     let portal_address = ctx.portal_address();
     let caller = ctx.l1().user_signer();
 

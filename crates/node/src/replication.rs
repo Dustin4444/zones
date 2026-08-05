@@ -1,6 +1,7 @@
 //! Node-side leader block replication and follower import.
 
 use alloy_consensus::BlockHeader as _;
+use alloy_eips::NumHash;
 use alloy_primitives::B256;
 use alloy_provider::DynProvider;
 use alloy_rlp::Decodable as _;
@@ -19,9 +20,13 @@ use std::{
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use zone_l1::{L1BlockTracker, L1PortalEvents, TempoStateExt as _};
-use zone_p2p::{P2pCommand, P2pEvent, Role};
+use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt as _};
+use zone_p2p::{
+    BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
+    P2pPeerId, PeerTip,
+};
 use zone_payload::{
     ZonePayloadTypes,
     abi::{IZoneInbox, ZONE_INBOX_ADDRESS},
@@ -42,9 +47,10 @@ use crate::settlement_attestation::build_settlement_attestation;
 #[derive(Clone)]
 pub(crate) struct AttestationContext {
     pub(crate) domain: AttestationDomain,
-    pub(crate) signer: PrivateKeySigner,
+    /// `None` on an rpc-only member: it holds no individual key and never signs.
+    pub(crate) signer: Option<PrivateKeySigner>,
     pub(crate) addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-    pub(crate) store: Option<AttestationStore>,
+    pub(crate) store: AttestationStore,
     pub(crate) l1_provider: DynProvider<TempoNetwork>,
     pub(crate) anchor_config: BatchAnchorConfig,
 }
@@ -52,9 +58,9 @@ pub(crate) struct AttestationContext {
 impl AttestationContext {
     pub(crate) fn new(
         domain: AttestationDomain,
-        signer: PrivateKeySigner,
+        signer: Option<PrivateKeySigner>,
         addresses: HashMap<zone_p2p::P2pPeerId, alloy_primitives::Address>,
-        store: Option<AttestationStore>,
+        store: AttestationStore,
         l1_provider: DynProvider<TempoNetwork>,
         anchor_config: BatchAnchorConfig,
     ) -> Self {
@@ -84,6 +90,8 @@ pub(crate) struct EncodedPersistedBlock {
 /// Interface used by the replication task to keep track of blocks that are persisted vs broadcast
 pub(crate) trait PersistedBlockSource: Clone + Send + Sync + 'static {
     fn last_block_number(&self) -> eyre::Result<u64>;
+    /// The canonical head, which may be ahead of the persisted head (reth persists lazily).
+    fn canonical_block_number(&self) -> eyre::Result<u64>;
     fn persisted_block_stream(&self) -> BoxStream<'static, PersistedTip>;
     fn encoded_block_by_number(&self, number: u64) -> eyre::Result<EncodedPersistedBlock>;
 }
@@ -94,6 +102,10 @@ where
 {
     fn last_block_number(&self) -> eyre::Result<u64> {
         Ok(BlockNumReader::last_block_number(self)?)
+    }
+
+    fn canonical_block_number(&self) -> eyre::Result<u64> {
+        Ok(BlockNumReader::best_block_number(self)?)
     }
 
     fn persisted_block_stream(&self) -> BoxStream<'static, PersistedTip> {
@@ -118,9 +130,12 @@ where
     }
 }
 
-/// Broadcast every newly persisted leader block in canonical order.
-pub(crate) async fn broadcast_persisted_blocks<P>(provider: P, commands: mpsc::Sender<P2pCommand>)
-where
+/// Broadcast every newly persisted leader block in canonical order until cancelled.
+pub(crate) async fn broadcast_persisted_blocks<P>(
+    provider: P,
+    commands: mpsc::Sender<P2pCommand>,
+    stop: CancellationToken,
+) where
     P: PersistedBlockSource,
 {
     // Handle race conditions carefully at startup. Read before subscribing, then reconcile after subscribing.
@@ -150,7 +165,38 @@ where
         return;
     }
 
-    while let Some(persisted_tip) = persisted.next().await {
+    loop {
+        let persisted_tip = tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                // The block generation is stopping (leader demotion). Flush all persisted
+                // blocks to ensure the new leader can take over properly.
+                match provider.canonical_block_number() {
+                    Ok(canonical) => {
+                        if let Err(err) = broadcast_persisted_range(
+                            &provider,
+                            &commands,
+                            &mut last_broadcast,
+                            canonical,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!(target: "zone::p2p", %err, "Failed flushing canonical zone blocks on stop");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(target: "zone::p2p", %err, "Failed reading the canonical zone head for the stop flush");
+                    }
+                }
+                debug!(target: "zone::p2p", "Persisted block broadcaster stopped");
+                return;
+            }
+            tip = persisted.next() => match tip {
+                Some(tip) => tip,
+                None => break,
+            },
+        };
         if persisted_tip.number < last_broadcast {
             tracing::error!(
                 target: "zone::p2p",
@@ -213,21 +259,10 @@ const BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const BLOCK_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PENDING_BLOCKS: usize = 128;
 const BACKFILL_PAGE_SIZE: u64 = 64;
-const BACKFILL_SERVE_QUEUE_CAPACITY: usize = 8;
-
-struct BackfillRequest {
-    peer: zone_p2p::P2pPeerId,
-    request_id: u64,
-    start: u64,
-}
-
-struct BackfillServerTask(tokio::task::JoinHandle<()>);
-
-impl Drop for BackfillServerTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
+/// Bounds queued requests at the process-lifetime backfill server. Requesters keep at most
+/// one request outstanding per peer, so manifest size bounds the live queue depth; the
+/// headroom absorbs requests arriving before the server task starts.
+pub(crate) const BACKFILL_SERVE_QUEUE_CAPACITY: usize = 128;
 
 /// Keep track of the backfill exactly. We'll buffer any live blocks received
 /// during backfill.
@@ -266,24 +301,60 @@ impl BackfillProgress {
             || first_pending.is_some_and(|number| number > best.saturating_add(1));
     }
 
-    fn request(&self, best: u64) -> Option<P2pCommand> {
-        self.needed.then(|| P2pCommand::RequestBackfill {
+    fn request(&self, best: u64) -> Option<BackfillCommand> {
+        self.needed.then(|| BackfillCommand::Request {
             start: best.saturating_add(1),
         })
     }
 
-    fn probe_after_inactivity(&mut self, best: u64) -> P2pCommand {
+    fn probe_after_inactivity(&mut self, best: u64) -> BackfillCommand {
         self.needed = true;
-        P2pCommand::RequestBackfill {
+        BackfillCommand::Request {
             start: best.saturating_add(1),
         }
     }
 }
 
+/// A peer block awaiting import, with its provenance.
+///
+/// `live_sender` is the broadcast sender for live blocks and `None` for
+/// backfilled blocks.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPeerBlock {
+    encoded: Vec<u8>,
+    live_sender: Option<P2pPeerId>,
+}
+
+/// Latest tip evidence advertised by each peer, with observation time.
+///
+/// Fed by backfill completions on the follower sync loop and consumed by the status RPC.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeerTipRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<HashMap<P2pPeerId, (PeerTip, std::time::Instant)>>>,
+}
+
+impl PeerTipRegistry {
+    pub(crate) fn record(&self, peer: P2pPeerId, tip: PeerTip) {
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .insert(peer, (tip, std::time::Instant::now()));
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(P2pPeerId, PeerTip, std::time::Instant)> {
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .iter()
+            .map(|(peer, (tip, at))| (peer.clone(), *tip, *at))
+            .collect()
+    }
+}
+
 fn buffer_pending_block(
-    pending: &mut BTreeMap<u64, Vec<u8>>,
+    pending: &mut BTreeMap<u64, PendingPeerBlock>,
     number: u64,
-    block: Vec<u8>,
+    block: PendingPeerBlock,
 ) -> Option<u64> {
     if pending.contains_key(&number) {
         return None;
@@ -320,13 +391,16 @@ fn encoded_block_number(encoded: &[u8]) -> eyre::Result<u64> {
 
 fn serve_backfill_page<P>(
     provider: &P,
-    commands: &mpsc::Sender<P2pCommand>,
+    commands: &mpsc::Sender<BackfillCommand>,
     peer: zone_p2p::P2pPeerId,
     request_id: u64,
     start: u64,
 ) -> eyre::Result<()>
 where
-    P: BlockNumReader + BlockReader<Block = Block>,
+    P: BlockNumReader
+        + BlockReader<Block = Block>
+        + HeaderProvider<Header = TempoHeader>
+        + StateProviderFactory,
 {
     let tip = provider.best_block_number()?;
     let end = tip.min(start.saturating_add(BACKFILL_PAGE_SIZE.saturating_sub(1)));
@@ -335,29 +409,55 @@ where
             eyre::eyre!("canonical block {number} is missing while serving backfill")
         })?;
         commands
-            .blocking_send(P2pCommand::SendBackfillBlock {
+            .blocking_send(BackfillCommand::SendBlock {
                 peer: peer.clone(),
                 request_id,
                 block: alloy_rlp::encode(block),
             })
             .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     }
+    // Advertise the tip
+    let tip_header = provider
+        .sealed_header(tip)?
+        .ok_or_else(|| eyre::eyre!("canonical head {tip} is missing while serving backfill"))?;
+    let tempo = provider
+        .state_by_block_hash(tip_header.hash())?
+        .tempo_num_hash()?;
     commands
-        .blocking_send(P2pCommand::CompleteBackfill {
+        .blocking_send(BackfillCommand::Complete {
             peer,
             request_id,
-            tip,
+            tip: PeerTip {
+                zone_height: tip,
+                zone_hash: tip_header.hash(),
+                tempo_block_number: tempo.number,
+                tempo_block_hash: tempo.hash,
+            },
         })
         .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     Ok(())
 }
 
-async fn serve_backfill_requests<P>(
+/// Serve block backfill requests for the process lifetime.
+///
+/// Backfill serving is role-neutral: leaders, followers, and fenced nodes all serve the
+/// same canonical provider. Running one server outside the role generations means a
+/// generation switch can never drop or abandon an accepted request, which would suppress
+/// the requesting peer until its response timeout and stall a leadership handoff.
+/// Exits when the request channel closes.
+pub(crate) async fn serve_backfill_requests<P>(
     provider: P,
-    commands: mpsc::Sender<P2pCommand>,
+    commands: mpsc::Sender<BackfillCommand>,
     mut requests: mpsc::Receiver<BackfillRequest>,
 ) where
-    P: BlockNumReader + BlockReader<Block = Block> + Clone + Send + Sync + 'static,
+    P: BlockNumReader
+        + BlockReader<Block = Block>
+        + HeaderProvider<Header = TempoHeader>
+        + StateProviderFactory
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     // One worker deliberately serializes page construction and sending, bounding serving
     // concurrency independently of the block import loop.
@@ -383,20 +483,18 @@ async fn serve_backfill_requests<P>(
     }
 }
 
-/// Run role-appropriate block replication.
+/// Collect and verify follower settlement signatures on the leader, without ever
+/// requesting or importing peer blocks.
 ///
-/// Leaders are deliberately serve-only: [`ZoneEngine`](crate::ZoneEngine) is their sole
-/// chain-head writer. Leader recovery is deferred to a future startup recovery phase, before the
-/// zone engine starts. Followers serve catch-up requests and import live/backfilled blocks in
-/// canonical order.
-pub(crate) async fn run_block_sync<P>(
-    role: Role,
+/// While this runs, [`ZoneEngine`](crate::ZoneEngine) is the sole chain-head
+/// writer. Backfill requests are served by the process-lifetime
+/// [`serve_backfill_requests`] task, never by role generations. The loop exits
+/// when `stop` fires.
+pub(crate) async fn collect_follower_settlement_signatures<P>(
     provider: P,
-    engine: ConsensusEngineHandle<ZonePayloadTypes>,
-    events: mpsc::Receiver<P2pEvent>,
-    commands: mpsc::Sender<P2pCommand>,
-    l1_block_tracker: L1BlockTracker,
+    mut events: mpsc::Receiver<P2pEvent>,
     attestation: AttestationContext,
+    stop: CancellationToken,
 ) where
     P: BlockNumReader
         + BlockReader<Block = Block>
@@ -408,47 +506,13 @@ pub(crate) async fn run_block_sync<P>(
         + Sync
         + 'static,
 {
-    match role {
-        Role::Leader => run_leader_backfill_server(provider, events, commands, attestation).await,
-        Role::Follower => {
-            run_follower_block_sync(
-                provider,
-                engine,
-                events,
-                commands,
-                l1_block_tracker,
-                attestation,
-            )
-            .await
-        }
-    }
-}
-
-/// Leader will serve follower backfill requests (without ever requesting or importing peer blocks).
-async fn run_leader_backfill_server<P>(
-    provider: P,
-    mut events: mpsc::Receiver<P2pEvent>,
-    commands: mpsc::Sender<P2pCommand>,
-    attestation: AttestationContext,
-) where
-    P: BlockNumReader
-        + BlockReader<Block = Block>
-        + HeaderProvider<Header = TempoHeader>
-        + ReceiptProvider
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
-    let mut backfill_server = BackfillServerTask(tokio::spawn(serve_backfill_requests(
-        provider.clone(),
-        commands,
-        backfill_request_rx,
-    )));
-
     loop {
         tokio::select! {
+            biased;
+            () = stop.cancelled() => {
+                debug!(target: "zone::p2p", "Leader settlement signature collection stopped");
+                return;
+            }
             event = events.recv() => {
                 let Some(event) = event else {
                     debug!(target: "zone::p2p", "P2P event channel closed");
@@ -456,11 +520,6 @@ async fn run_leader_backfill_server<P>(
                 };
                 match event {
                     P2pEvent::Started { .. } => {}
-                    P2pEvent::BackfillRequested { peer, request_id, start } => {
-                        if let Err(err) = backfill_requests.try_send(BackfillRequest { peer, request_id, start }) {
-                            tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
-                        }
-                    }
                     P2pEvent::SettlementSignatureReceived { follower, signature } => {
                         let result = async {
                             let signed = SignedSettlementAttestation::decode(&signature)?;
@@ -480,8 +539,7 @@ async fn run_leader_backfill_server<P>(
                                 Some((signed.attestation.anchorBlockNumber, signed.attestation.anchorBlockHash)),
                             ).await?.ok_or_eyre("signed block is not a batch boundary")?;
                             eyre::ensure!(signed.attestation == expected, "settlement signature does not match leader state");
-                            let (_, signatures) = attestation.store.as_ref()
-                                .expect("leader must have an attestation store")
+                            let (_, signatures) = attestation.store
                                 .insert_settlement(attestation.domain, signer, signed);
                             Ok::<_, eyre::Report>((height, signer, signatures))
                         }.await;
@@ -491,8 +549,6 @@ async fn run_leader_backfill_server<P>(
                         }
                     }
                     P2pEvent::BlockReceived { .. }
-                    | P2pEvent::BackfillBlockReceived { .. }
-                    | P2pEvent::BackfillCompleted { .. }
                     | P2pEvent::TransactionReceived { .. }
                     | P2pEvent::SettlementProposalReceived { .. } => {
                         // A leader never follows peer chain heads. Keeping this explicit ensures
@@ -501,25 +557,31 @@ async fn run_leader_backfill_server<P>(
                     }
                 }
             }
-            result = &mut backfill_server.0 => {
-                match result {
-                    Ok(()) => tracing::error!(target: "zone::p2p", "Block backfill server stopped unexpectedly"),
-                    Err(err) => tracing::error!(target: "zone::p2p", %err, "Block backfill server task failed"),
-                }
-                return;
-            }
         }
     }
 }
 
-/// Serve catch-up requests and import live/backfilled blocks in canonical order on a follower.
-async fn run_follower_block_sync<P>(
+/// Import live/backfilled blocks in canonical order on a follower.
+///
+/// Live blocks are only imported from the leader when the sender equals
+/// `schedule.leader_for(the block's embedded anchor)`. We do this because if there are accidentally
+/// two leaders (split brain) for a block, we need to decide to import the correct one.
+///
+/// Backfilled blocks carry no producer claim and are judged by
+/// parent/anchor/execution/conflict validation alone. The loop exits when `stop` fires.
+pub(crate) async fn run_follower_block_sync<P>(
     provider: P,
     engine: ConsensusEngineHandle<ZonePayloadTypes>,
     mut events: mpsc::Receiver<P2pEvent>,
     commands: mpsc::Sender<P2pCommand>,
+    backfill_commands: mpsc::Sender<BackfillCommand>,
+    mut backfill_responses: mpsc::Receiver<BackfillResponse>,
     l1_block_tracker: L1BlockTracker,
+    deposit_queue: DepositQueue,
     attestation: AttestationContext,
+    schedule: LeadershipSchedule,
+    peer_tips: PeerTipRegistry,
+    stop: CancellationToken,
 ) where
     P: BlockNumReader
         + BlockReader<Block = Block>
@@ -533,16 +595,8 @@ async fn run_follower_block_sync<P>(
 {
     // Keep track of all live blocks if we end up needing a backfill, so we can immediately catchup
     // This is capped to `MAX_PENDING_BLOCKS`.
-    let mut pending = BTreeMap::<u64, Vec<u8>>::new();
+    let mut pending = BTreeMap::<u64, PendingPeerBlock>::new();
     let mut backfill = BackfillProgress::new();
-    let (backfill_requests, backfill_request_rx) = mpsc::channel(BACKFILL_SERVE_QUEUE_CAPACITY);
-
-    // Serve backfill requests in a separate task to avoid competing the live blocks
-    let mut backfill_server = BackfillServerTask(tokio::spawn(serve_backfill_requests(
-        provider.clone(),
-        commands.clone(),
-        backfill_request_rx,
-    )));
 
     // Always probe on startup to see if we're behind
     let mut retry = tokio::time::interval(BACKFILL_RETRY_INTERVAL);
@@ -554,6 +608,60 @@ async fn run_follower_block_sync<P>(
 
     loop {
         tokio::select! {
+        biased;
+            () = stop.cancelled() => {
+                debug!(target: "zone::p2p", "Follower block sync stopped");
+                return;
+            }
+            response = backfill_responses.recv() => {
+                let Some(response) = response else {
+                    debug!(target: "zone::p2p", "Backfill response channel closed");
+                    return;
+                };
+                match response {
+                    BackfillResponse::Block { block, .. } => {
+                        let number = match encoded_block_number(&block) {
+                            Ok(number) => number,
+                            Err(err) => {
+                                tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block");
+                                continue;
+                            }
+                        };
+                        inactivity
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
+                        process_follower_block(
+                            &provider,
+                            &engine,
+                            &l1_block_tracker,
+                            &deposit_queue,
+                            &schedule,
+                            &mut pending,
+                            &mut backfill,
+                            number,
+                            block,
+                            None,
+                        )
+                        .await;
+                    }
+                    BackfillResponse::Completed { peer, tip } => {
+                        peer_tips.record(peer.clone(), tip);
+                        let best = match provider.best_block_number() {
+                            Ok(best) => best,
+                            Err(err) => {
+                                tracing::error!(target: "zone::p2p", %err, "Failed reading local head after backfill response");
+                                continue;
+                            }
+                        };
+                        backfill.complete(
+                            tip.zone_height,
+                            best,
+                            pending.first_key_value().map(|(&number, _)| number),
+                        );
+                        debug!(target: "zone::p2p", %peer, best, tip_height = tip.zone_height, tip_hash = ?tip.zone_hash, backfill_needed = backfill.needed, "Completed block backfill response page");
+                    }
+                }
+            }
             event = events.recv() => {
                 let Some(event) = event else {
                     debug!(target: "zone::p2p", "P2P event channel closed");
@@ -576,14 +684,24 @@ async fn run_follower_block_sync<P>(
                             ).await?.ok_or_eyre("proposed block is not a batch boundary")?;
                             eyre::ensure!(proposal == expected, "settlement proposal does not match follower state");
 
+                            // Unreachable on an rpc-only member: the P2P layer never routes a
+                            // proposal to one. Fails closed rather than panicking if it ever does.
+                            let signer = attestation.signer.as_ref().ok_or_eyre(
+                                "this node holds no individual secp256k1 key, so it cannot sign a settlement attestation",
+                            )?;
                             let signed = SignedSettlementAttestation::sign(
                                 proposal,
                                 attestation.domain,
-                                &attestation.signer,
+                                signer,
                             )?;
 
-                            // Return the signed settlement attestation back to the leader
-                            commands.send(P2pCommand::SendSettlementSignature(signed.encode()))
+                            // Return the signed settlement attestation to the peer that
+                            // proposed it. During a scheduled handoff that is the outgoing
+                            // leader, not the most recently observed one.
+                            commands.send(P2pCommand::SendSettlementSignature {
+                                leader: leader.clone(),
+                                signature: signed.encode(),
+                            })
                                 .await
                                 .wrap_err("P2P command channel closed")?;
                             Ok::<_, eyre::Report>(height)
@@ -593,82 +711,36 @@ async fn run_follower_block_sync<P>(
                             Err(err) => tracing::warn!(target: "zone::p2p", %leader, %err, "Rejected settlement proposal"),
                         }
                     }
-                    P2pEvent::BackfillRequested { peer, request_id, start } => {
-                        if let Err(err) = backfill_requests.try_send(BackfillRequest { peer, request_id, start }) {
-                            tracing::warn!(target: "zone::p2p", %err, start, queue_capacity = BACKFILL_SERVE_QUEUE_CAPACITY, "Dropped block backfill request because the serving queue is unavailable");
-                        }
-                    }
-                    P2pEvent::BlockReceived { block, .. }
-                    | P2pEvent::BackfillBlockReceived { block, .. } => {
-                        match encoded_block_number(&block) {
-                            Ok(number) => {
-                                inactivity
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
-                                let best = match provider.best_block_number() {
-                                    Ok(best) => best,
-                                    Err(err) => {
-                                        tracing::error!(target: "zone::p2p", %err, "Failed reading local head");
-                                        continue;
-                                    }
-                                };
-                                if number <= best {
-                                    if let Err(err) = import_peer_block(
-                                        &provider,
-                                        &engine,
-                                        &l1_block_tracker,
-                                        &block,
-                                    ).await {
-                                        tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
-                                    }
-                                    continue;
-                                }
-                                backfill.observe_block(number, best);
-                                if let Some(dropped) = buffer_pending_block(&mut pending, number, block) {
-                                    tracing::warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
-                                }
-                                if number > best.saturating_add(1) {
-                                    info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
-                                }
-                                if let Err(err) = drain_pending_blocks(
-                                    &provider,
-                                    &engine,
-                                    &l1_block_tracker,
-                                    &mut pending,
-                                ).await {
-                                    tracing::error!(target: "zone::p2p", %err, "Rejected peer block while draining backfill");
-                                    backfill.needed = true;
-                                } else {
-                                    let best = match provider.best_block_number() {
-                                        Ok(best) => best,
-                                        Err(err) => {
-                                            tracing::error!(target: "zone::p2p", %err, "Failed reading local head after importing peer blocks");
-                                            continue;
-                                        }
-                                    };
-                                    backfill.refresh_after_import(
-                                        best,
-                                        pending.first_key_value().map(|(&number, _)| number),
-                                    );
-                                }
+                    P2pEvent::BlockReceived { .. } => {
+                        let (block, live_sender) = match event {
+                            P2pEvent::BlockReceived { leader_ed25519_public_key, block } => {
+                                (block, Some(leader_ed25519_public_key))
                             }
-                            Err(err) => tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block"),
-                        }
-                    }
-                    P2pEvent::BackfillCompleted { peer, tip } => {
-                        let best = match provider.best_block_number() {
-                            Ok(best) => best,
+                            _ => unreachable!("outer match arm restricts the event kind"),
+                        };
+                        let number = match encoded_block_number(&block) {
+                            Ok(number) => number,
                             Err(err) => {
-                                tracing::error!(target: "zone::p2p", %err, "Failed reading local head after backfill response");
+                                tracing::error!(target: "zone::p2p", %err, "Rejected malformed peer block");
                                 continue;
                             }
                         };
-                        backfill.complete(
-                            tip,
-                            best,
-                            pending.first_key_value().map(|(&number, _)| number),
-                        );
-                        debug!(target: "zone::p2p", %peer, best, tip, backfill_needed = backfill.needed, "Completed block backfill response page");
+                        inactivity
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + BLOCK_INACTIVITY_TIMEOUT);
+                        process_follower_block(
+                            &provider,
+                            &engine,
+                            &l1_block_tracker,
+                            &deposit_queue,
+                            &schedule,
+                            &mut pending,
+                            &mut backfill,
+                            number,
+                            block,
+                            live_sender,
+                        )
+                        .await;
                     }
                     P2pEvent::TransactionReceived { .. } => {
                         debug!(target: "zone::p2p", "Ignoring unexpected transaction event in follower block sync");
@@ -689,7 +761,7 @@ async fn run_follower_block_sync<P>(
 
                 // retry the backfill
                 if let Some(command) = backfill.request(best)
-                    && commands.send(command).await.is_err()
+                    && backfill_commands.send(command).await.is_err()
                 {
                     debug!(target: "zone::p2p", "P2P command channel closed");
                     return;
@@ -710,19 +782,91 @@ async fn run_follower_block_sync<P>(
                 };
                 let command = backfill.probe_after_inactivity(best);
                 info!(target: "zone::p2p", best, "No peer block received recently; probing for backfill");
-                if commands.send(command).await.is_err() {
+                if backfill_commands.send(command).await.is_err() {
                     debug!(target: "zone::p2p", "P2P command channel closed");
                     return;
                 }
             }
-            result = &mut backfill_server.0 => {
-                match result {
-                    Ok(()) => tracing::error!(target: "zone::p2p", "Block backfill server stopped unexpectedly"),
-                    Err(err) => tracing::error!(target: "zone::p2p", %err, "Block backfill server task failed"),
-                }
+        }
+    }
+}
+
+async fn process_follower_block<P>(
+    provider: &P,
+    engine: &ConsensusEngineHandle<ZonePayloadTypes>,
+    l1_block_tracker: &L1BlockTracker,
+    deposit_queue: &DepositQueue,
+    schedule: &LeadershipSchedule,
+    pending: &mut BTreeMap<u64, PendingPeerBlock>,
+    backfill: &mut BackfillProgress,
+    number: u64,
+    block: Vec<u8>,
+    live_sender: Option<P2pPeerId>,
+) where
+    P: BlockNumReader
+        + BlockReader<Block = Block>
+        + HeaderProvider<Header = TempoHeader>
+        + StateProviderFactory
+        + ReceiptProvider
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let best = match provider.best_block_number() {
+        Ok(best) => best,
+        Err(err) => {
+            tracing::error!(target: "zone::p2p", %err, "Failed reading local head");
+            return;
+        }
+    };
+    let peer_block = PendingPeerBlock {
+        encoded: block,
+        live_sender,
+    };
+    if number <= best {
+        if let Err(err) = import_peer_block(
+            provider,
+            engine,
+            l1_block_tracker,
+            deposit_queue,
+            schedule,
+            &peer_block,
+        )
+        .await
+        {
+            tracing::error!(target: "zone::p2p", %err, "Rejected duplicate or conflicting peer block");
+        }
+        return;
+    }
+    backfill.observe_block(number, best);
+    if let Some(dropped) = buffer_pending_block(pending, number, peer_block) {
+        tracing::warn!(target: "zone::p2p", dropped, pending_limit = MAX_PENDING_BLOCKS, "Dropped far-future peer block because the pending block buffer is full");
+    }
+    if number > best.saturating_add(1) {
+        info!(target: "zone::p2p", local_head = best, received = number, "Detected zone block gap; requesting backfill");
+    }
+    if let Err(err) = drain_pending_blocks(
+        provider,
+        engine,
+        l1_block_tracker,
+        deposit_queue,
+        schedule,
+        pending,
+    )
+    .await
+    {
+        tracing::error!(target: "zone::p2p", %err, "Rejected peer block while draining backfill");
+        backfill.needed = true;
+    } else {
+        let best = match provider.best_block_number() {
+            Ok(best) => best,
+            Err(err) => {
+                tracing::error!(target: "zone::p2p", %err, "Failed reading local head after importing peer blocks");
                 return;
             }
-        }
+        };
+        backfill.refresh_after_import(best, pending.first_key_value().map(|(&number, _)| number));
     }
 }
 
@@ -730,7 +874,9 @@ async fn drain_pending_blocks<P>(
     provider: &P,
     engine: &ConsensusEngineHandle<ZonePayloadTypes>,
     l1_block_tracker: &L1BlockTracker,
-    pending: &mut BTreeMap<u64, Vec<u8>>,
+    deposit_queue: &DepositQueue,
+    schedule: &LeadershipSchedule,
+    pending: &mut BTreeMap<u64, PendingPeerBlock>,
 ) -> eyre::Result<()>
 where
     P: reth_storage_api::BlockNumReader
@@ -746,7 +892,15 @@ where
         let Some(block) = pending.remove(&next) else {
             return Ok(());
         };
-        import_peer_block(provider, engine, l1_block_tracker, &block).await?;
+        import_peer_block(
+            provider,
+            engine,
+            l1_block_tracker,
+            deposit_queue,
+            schedule,
+            &block,
+        )
+        .await?;
     }
 }
 
@@ -754,7 +908,9 @@ async fn import_peer_block<P>(
     provider: &P,
     engine: &ConsensusEngineHandle<ZonePayloadTypes>,
     l1_block_tracker: &L1BlockTracker,
-    encoded: &[u8],
+    deposit_queue: &DepositQueue,
+    schedule: &LeadershipSchedule,
+    peer_block: &PendingPeerBlock,
 ) -> eyre::Result<()>
 where
     P: BlockNumReader
@@ -766,7 +922,7 @@ where
         + 'static,
 {
     // Check the received block
-    let mut input = encoded;
+    let mut input = peer_block.encoded.as_slice();
     let block = Block::decode(&mut input)
         .map_err(|err| eyre::eyre!("invalid RLP-encoded zone block: {err}"))?;
     if !input.is_empty() {
@@ -820,23 +976,39 @@ where
         .tempo_num_hash()?;
     validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, block_number)?;
     let anchor = l1_header.num_hash();
-    loop {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            l1_block_tracker.wait_for_portal_events(anchor),
-        )
-        .await
-        {
-            Ok(observed) => break portal_inputs.validate(&observed?)?,
-            Err(_) => warn!(
-                target: "zone::p2p",
-                block_number,
-                l1_block = anchor.number,
-                l1_hash = ?anchor.hash,
-                "Peer block import is waiting for local L1 observation of its anchor"
-            ),
-        }
-    }
+
+    // Anchor-aware fence for live blocks: the sender must
+    // be the scheduled leader of the block's anchor. This stops an honest stale
+    // leader's broadcast from splitting followers.
+    // Backfilled blocks carry no producer claim and are judged by parent/anchor/execution/conflict
+    // validation only.
+    //
+    // Check once before waiting to reject an already-known invalid sender without blocking the
+    // import loop. `wait_for_validated_peer_anchor` checks again after observing the anchor:
+    // the anchor itself may finalize a leadership transition that changes its assigned producer.
+    validate_live_block_sender(
+        schedule,
+        peer_block.live_sender.as_ref(),
+        anchor.number,
+        block_number,
+    )?;
+    let observed = wait_for_validated_peer_anchor(
+        l1_block_tracker,
+        schedule,
+        &portal_inputs,
+        peer_block.live_sender.as_ref(),
+        anchor,
+        block_number,
+    )
+    .await?;
+
+    // The subscriber normally enqueues immediately after recording this observation. Enqueueing
+    // here as well closes that small scheduling window and makes follower import self-contained;
+    // the queue treats the subscriber's later enqueue as a duplicate. This is peer-driven, so a
+    // gap must surface as a rejected block rather than aborting the node.
+    deposit_queue
+        .try_enqueue_sealed(l1_header, observed)
+        .wrap_err_with(|| format!("cannot queue the anchor of block {block_number}"))?;
 
     // 4. All txns in the block execute properly
     let payload = ZonePayloadTypes::block_to_payload(block, None);
@@ -854,11 +1026,79 @@ where
         );
     }
 
-    // Mirror the leader engine only after the block is canonical locally.
+    // Mirror the leader engine only after the block is canonical locally. The block cannot be
+    // un-imported at this point, so the observation must be released unconditionally — leaving it
+    // behind would stall the subscriber once the lookahead window fills. Advancing the queue is
+    // likewise tolerant of drift; it fails only on a genuine hash conflict.
     l1_block_tracker.prune_through(anchor.number);
+    deposit_queue
+        .confirm_through(anchor)
+        .wrap_err_with(|| format!("cannot advance the deposit queue past block {block_number}"))?;
+    schedule.record_applied_anchor(anchor.number);
 
     info!(target: "zone::p2p", block_number, ?hash, "Imported canonical leader block");
     Ok(())
+}
+
+fn validate_live_block_sender(
+    schedule: &LeadershipSchedule,
+    live_sender: Option<&P2pPeerId>,
+    anchor_number: u64,
+    block_number: u64,
+) -> eyre::Result<()> {
+    let Some(sender) = live_sender else {
+        return Ok(());
+    };
+    match schedule.leader_for(anchor_number) {
+        Some(record) if &record.leader == sender => Ok(()),
+        Some(record) => eyre::bail!(
+            "live block {block_number} for anchor {anchor_number} was broadcast by {sender}, but \
+             the schedule assigns that anchor to {} (epoch {})",
+            record.leader,
+            record.epoch,
+        ),
+        None => eyre::bail!(
+            "live block {block_number} embeds anchor {anchor_number} which no retained leadership \
+             record governs",
+        ),
+    }
+}
+
+async fn wait_for_validated_peer_anchor(
+    l1_block_tracker: &L1BlockTracker,
+    schedule: &LeadershipSchedule,
+    portal_inputs: &AdvanceTempoPortalInputs,
+    live_sender: Option<&P2pPeerId>,
+    anchor: NumHash,
+    block_number: u64,
+) -> eyre::Result<L1PortalEvents> {
+    let observed = loop {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            l1_block_tracker.wait_for_portal_events(anchor),
+        )
+        .await
+        {
+            Ok(observed) => {
+                let observed = observed?;
+                portal_inputs.validate(&observed)?;
+                break observed;
+            }
+            Err(_) => warn!(
+                target: "zone::p2p",
+                block_number,
+                l1_block = anchor.number,
+                l1_hash = ?anchor.hash,
+                "Peer block import is waiting for local L1 observation of its anchor"
+            ),
+        }
+    };
+
+    // The L1 subscriber publishes any transition finalized by this anchor before recording the
+    // anchor in the tracker. Re-read the schedule now so the pre-wait decision cannot authorize a
+    // sender that this anchor demoted.
+    validate_live_block_sender(schedule, live_sender, anchor.number, block_number)?;
+    Ok(observed)
 }
 
 struct AdvanceTempoPortalInputs {
@@ -954,14 +1194,17 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use alloy_eips::NumHash;
     use futures::{StreamExt as _, stream};
 
     use super::{
-        BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS, PersistedBlockSource,
-        PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
+        AdvanceTempoPortalInputs, BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS,
+        PersistedBlockSource, PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
+        validate_live_block_sender, wait_for_validated_peer_anchor,
     };
     use alloy_primitives::B256;
-    use zone_p2p::P2pCommand;
+    use zone_l1::{L1BlockTracker, L1PortalEvents};
+    use zone_p2p::{BackfillCommand, LeadershipSchedule, LeadershipState, P2pCommand};
 
     #[derive(Clone)]
     struct StartupRaceSource {
@@ -977,6 +1220,10 @@ mod tests {
             } else {
                 self.tip.number
             })
+        }
+
+        fn canonical_block_number(&self) -> eyre::Result<u64> {
+            Ok(self.tip.number)
         }
 
         fn persisted_block_stream(&self) -> futures::stream::BoxStream<'static, PersistedTip> {
@@ -1236,6 +1483,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revalidates_live_sender_after_anchor_observation() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+        const ANCHOR_NUMBER: u64 = 10;
+        const ZONE_BLOCK_NUMBER: u64 = 7;
+
+        let outgoing = PrivateKey::from_seed(1).public_key();
+        let incoming = PrivateKey::from_seed(2).public_key();
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(1, outgoing.clone(), 0));
+        let tracker = L1BlockTracker::default();
+        let anchor = NumHash::new(ANCHOR_NUMBER, B256::repeat_byte(0x10));
+
+        // The sender is valid under the pre-observation schedule.
+        validate_live_block_sender(&schedule, Some(&outgoing), ANCHOR_NUMBER, ZONE_BLOCK_NUMBER)
+            .unwrap();
+
+        let waiter = {
+            let schedule = schedule.clone();
+            let tracker = tracker.clone();
+            let outgoing = outgoing.clone();
+            tokio::spawn(async move {
+                let portal_inputs = AdvanceTempoPortalInputs {
+                    deposits: vec![],
+                    enabled_tokens: vec![],
+                };
+                wait_for_validated_peer_anchor(
+                    &tracker,
+                    &schedule,
+                    &portal_inputs,
+                    Some(&outgoing),
+                    anchor,
+                    ZONE_BLOCK_NUMBER,
+                )
+                .await
+            })
+        };
+
+        // Match subscriber ordering: publish the transition finalized by H before H becomes
+        // observable to follower import.
+        schedule
+            .publish(LeadershipState::new(2, incoming.clone(), ANCHOR_NUMBER))
+            .unwrap();
+        tracker
+            .record_with_portal_events(anchor, L1PortalEvents::default())
+            .unwrap();
+
+        let error = waiter
+            .await
+            .expect("anchor waiter must not panic")
+            .expect_err("the post-observation sender check must reject the outgoing leader");
+        let message = error.to_string();
+        assert!(message.contains(&outgoing.to_string()));
+        assert!(message.contains(&incoming.to_string()));
+        assert!(message.contains("schedule assigns that anchor"));
+    }
+
+    #[test]
+    fn forced_recovery_reassigns_live_sender_for_missing_anchors() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+        let outgoing = PrivateKey::from_seed(1).public_key();
+        let incoming = PrivateKey::from_seed(2).public_key();
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(7, outgoing.clone(), 0));
+        schedule
+            .install_forced_recovery(8, incoming.clone(), B256::repeat_byte(0x11), 51)
+            .unwrap();
+        schedule
+            .publish(LeadershipState::new(8, incoming.clone(), 60))
+            .unwrap();
+
+        validate_live_block_sender(&schedule, Some(&incoming), 51, 11).unwrap();
+        let error = validate_live_block_sender(&schedule, Some(&outgoing), 51, 11)
+            .expect_err("the crashed leader must not remain authoritative in the recovery window");
+        assert!(error.to_string().contains(&incoming.to_string()));
+    }
+
+    #[tokio::test]
     async fn broadcasts_block_persisted_during_startup_reconciliation_once() {
         let source = StartupRaceSource {
             reads: Arc::new(AtomicUsize::new(0)),
@@ -1246,7 +1570,8 @@ mod tests {
         };
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(4);
 
-        broadcast_persisted_blocks(source, commands).await;
+        broadcast_persisted_blocks(source, commands, tokio_util::sync::CancellationToken::new())
+            .await;
 
         assert_eq!(
             command_rx.recv().await,
@@ -1262,7 +1587,7 @@ mod tests {
         let mut backfill = BackfillProgress::new();
         assert_eq!(
             backfill.request(LOCAL_HEAD),
-            Some(P2pCommand::RequestBackfill {
+            Some(BackfillCommand::Request {
                 start: LOCAL_HEAD + 1,
             })
         );
@@ -1279,7 +1604,7 @@ mod tests {
         // The retry starts at the missing N+1 rather than skipping to the received N+2.
         assert_eq!(
             backfill.request(LOCAL_HEAD),
-            Some(P2pCommand::RequestBackfill {
+            Some(BackfillCommand::Request {
                 start: LOCAL_HEAD + 1,
             })
         );
@@ -1295,16 +1620,47 @@ mod tests {
 
         assert_eq!(
             backfill.probe_after_inactivity(LOCAL_HEAD),
-            P2pCommand::RequestBackfill {
+            BackfillCommand::Request {
                 start: LOCAL_HEAD + 1,
             }
         );
         assert_eq!(
             backfill.request(LOCAL_HEAD),
-            Some(P2pCommand::RequestBackfill {
+            Some(BackfillCommand::Request {
                 start: LOCAL_HEAD + 1,
             })
         );
+    }
+
+    #[test]
+    fn peer_tip_registry_records_latest_tip() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+        use zone_p2p::PeerTip;
+
+        let registry = super::PeerTipRegistry::default();
+
+        let peer = PrivateKey::from_seed(1).public_key();
+        let tip = PeerTip {
+            zone_height: 7,
+            zone_hash: B256::repeat_byte(0x07),
+            tempo_block_number: 11,
+            tempo_block_hash: B256::repeat_byte(0x11),
+        };
+        registry.record(peer.clone(), tip);
+
+        // Re-advertising the same tip refreshes its observation timestamp.
+        registry.record(peer.clone(), tip);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, peer);
+        assert_eq!(snapshot[0].1, tip);
+    }
+
+    fn pending_block(payload: u64) -> super::PendingPeerBlock {
+        super::PendingPeerBlock {
+            encoded: vec![payload as u8],
+            live_sender: None,
+        }
     }
 
     #[test]
@@ -1312,7 +1668,7 @@ mod tests {
         let mut pending = std::collections::BTreeMap::new();
         for number in 100..100 + MAX_PENDING_BLOCKS as u64 {
             assert_eq!(
-                buffer_pending_block(&mut pending, number, vec![number as u8]),
+                buffer_pending_block(&mut pending, number, pending_block(number)),
                 None
             );
         }
@@ -1320,7 +1676,7 @@ mod tests {
 
         let farthest = 100 + MAX_PENDING_BLOCKS as u64 - 1;
         assert_eq!(
-            buffer_pending_block(&mut pending, 99, vec![99]),
+            buffer_pending_block(&mut pending, 99, pending_block(99)),
             Some(farthest)
         );
         assert_eq!(pending.len(), MAX_PENDING_BLOCKS);
@@ -1329,7 +1685,7 @@ mod tests {
 
         let farther = farthest + 1;
         assert_eq!(
-            buffer_pending_block(&mut pending, farther, vec![farther as u8]),
+            buffer_pending_block(&mut pending, farther, pending_block(farther)),
             Some(farther)
         );
         assert_eq!(pending.len(), MAX_PENDING_BLOCKS);

@@ -1,4 +1,4 @@
-//! Private RPC method handlers.
+//! Redacted RPC method handlers.
 //!
 //! Each handler calls the underlying EthApi via the [`ZoneRpcApi`] trait,
 //! which performs typed privacy redactions internally before serialization.
@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-/// Interface to the underlying reth EthApi for the private zone RPC.
+/// Interface to the underlying reth EthApi for the redacted zone RPC.
 ///
 /// Implementations are responsible for:
 /// - **Access control**: restricting responses based on the [`AuthContext`]
@@ -246,7 +246,7 @@ fn api_result(
     }
 }
 
-/// Dispatch a single JSON-RPC request through the private zone RPC pipeline.
+/// Dispatch a single JSON-RPC request through the redacted zone RPC pipeline.
 ///
 /// Enforces a strict whitelist of allowed methods (see [`classify_method`]) and
 /// rejects anything unknown or disabled. Individual handlers may apply
@@ -347,7 +347,7 @@ pub async fn dispatch(
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
                 id,
-                JsonRpcError::internal("method not yet implemented in private RPC"),
+                JsonRpcError::internal("method not yet implemented in redacted RPC"),
             )
         }
     }
@@ -791,7 +791,6 @@ mod tests {
         stub!(get_filter_changes, _id: FilterId, _auth: AuthContext);
         stub!(new_block_filter, _auth: AuthContext);
         stub!(uninstall_filter, _id: FilterId, _auth: AuthContext);
-
         fn zone_get_authorization_token_info(&self, auth: AuthContext) -> BoxFut<'_> {
             Box::pin(async move {
                 to_raw(&json!({
@@ -840,6 +839,23 @@ mod tests {
             "id": 1
         }))
         .expect("request should deserialize")
+    }
+
+    #[tokio::test]
+    async fn redacted_rpc_excludes_operator_sequencer_methods() {
+        use crate::types::classify_method;
+
+        // Both are served by the node's public HTTP module, not the private tiered
+        // dispatcher, so they must not classify and must not dispatch here.
+        assert_eq!(classify_method("zone_getSequencerInfo"), None);
+        assert_eq!(classify_method("zone_setLeader"), None);
+
+        let api = MockZoneRpcApi::default();
+        let excluded = dispatch(&request("zone_setLeader", json!([])), &auth(), &api).await;
+        assert_eq!(excluded.error.unwrap().code, -32601);
+
+        let excluded = dispatch(&request("zone_getSequencerInfo", json!([])), &auth(), &api).await;
+        assert_eq!(excluded.error.unwrap().code, -32601);
     }
 
     #[tokio::test]

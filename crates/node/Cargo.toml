@@ -72,7 +72,9 @@ alloy-sol-types.workspace = true
 # misc
 clap = { workspace = true, optional = true }
 eyre.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 futures.workspace = true
+jsonrpsee.workspace = true
 k256.workspace = true
 metrics.workspace = true
 serde_json.workspace = true
@@ -82,6 +84,8 @@ url = { version = "2", optional = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+zone-node = { path = ".", features = ["test-utils"] }
+
 alloy = { workspace = true, features = [
   "full",
   "genesis",

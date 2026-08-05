@@ -50,6 +50,9 @@ use tempo_alloy::rpc::TempoCallBuilderExt;
 
 const PROCESS_WITHDRAWAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Backoff before restarting the processing loop after an unexpected failure.
+const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
 // These planner allowances were calibrated against the current ZonePortal/ZoneMessenger bytecode.
 // Pre-refund T1 dev-L1 traces used 553,703, 1,068,088, and 1,348,063 gas for one, two, and four
 // successful simple items, and 1,347,339 gas around a callback. T3 Foundry traces used 1,026,857
@@ -351,13 +354,23 @@ impl WithdrawalProcessor {
     /// Run the processor loop. This method never returns under normal operation.
     ///
     /// Waits for a notification from the batch submitter (or a fallback timeout) before
-    /// checking the L1 withdrawal queue.
+    /// checking the L1 withdrawal queue. Returns `Ok(())` only when `shutdown` fires; the
+    /// token is observed at the wait boundary so an in-flight processing cycle completes
+    /// first.
     #[instrument(skip_all, fields(portal = %self.config.portal_address))]
-    pub async fn run(&mut self) -> eyre::Result<()> {
+    pub async fn run(
+        &mut self,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> eyre::Result<()> {
         info!(l1_rpc = %self.config.l1_rpc_url, "Withdrawal processor started");
 
         loop {
             tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    debug!("Withdrawal processor observed shutdown at the poll boundary");
+                    return Ok(());
+                }
                 _ = self.notify.notified() => {
                     debug!("Woken by batch submission notification");
                 }
@@ -732,14 +745,28 @@ pub fn spawn_withdrawal_processor(
     store: SharedWithdrawalStore,
     notify: Arc<Notify>,
     repair_notify: Arc<Notify>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut processor =
             WithdrawalProcessor::new(config, provider, store, notify, repair_notify);
         loop {
-            if let Err(e) = processor.run().await {
-                error!(error = %e, "Withdrawal processor failed, restarting in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            match processor.run(&shutdown).await {
+                Ok(()) => {
+                    info!("Withdrawal processor stopped");
+                    return;
+                }
+                Err(e) => {
+                    error!(error = %e, "Withdrawal processor failed, restarting in 5s");
+                    if shutdown
+                        .run_until_cancelled(tokio::time::sleep(RESTART_BACKOFF))
+                        .await
+                        .is_none()
+                    {
+                        info!("Withdrawal processor stopped");
+                        return;
+                    }
+                }
             }
         }
     })
@@ -1001,6 +1028,23 @@ mod tests {
         assert_eq!(
             compute_remaining_queue(&withdrawals, batches[1].end),
             B256::ZERO
+        );
+    }
+
+    #[test]
+    fn maximum_batch_fits_portal_bounceback_reserve() {
+        const PORTAL_BOUNCEBACK_RESERVE: usize = 20;
+
+        let withdrawals = simple_withdrawals(PORTAL_BOUNCEBACK_RESERVE);
+        let batches = build_withdrawal_batches(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 19);
+        assert_eq!(batches[1].len(), 1);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.len() <= PORTAL_BOUNCEBACK_RESERVE)
         );
     }
 

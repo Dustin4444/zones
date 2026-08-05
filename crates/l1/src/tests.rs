@@ -1,5 +1,5 @@
 use super::*;
-use crate::abi::DepositType;
+use crate::{abi::DepositType, subscriber::is_fenced_ingestion_error};
 use alloy_consensus::{Header, ReceiptWithBloom};
 use alloy_primitives::{Bloom, Bytes, address};
 use alloy_rpc_types_eth::{Header as RpcHeader, TransactionReceipt};
@@ -16,27 +16,27 @@ use tempo_primitives::{TempoReceipt, TempoTxType};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EncryptedDepositHashFixture {
+struct DepositHashFixture {
     previous_hash: String,
     expected_hash: String,
     single_value_tuple_hash: String,
-    deposit: EncryptedDepositFixture,
+    deposit: DepositFixture,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EncryptedDepositFixture {
+struct DepositFixture {
     token: String,
     sender: String,
     amount: u128,
     tempo_refund_recipient: String,
     key_index: u64,
-    encrypted: EncryptedDepositPayloadFixture,
+    encrypted: DepositPayloadFixture,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EncryptedDepositPayloadFixture {
+struct DepositPayloadFixture {
     ephemeral_pubkey_x: String,
     ephemeral_pubkey_y_parity: u8,
     ciphertext: String,
@@ -55,12 +55,12 @@ struct MalformedTempoHeadersFixture {
     extra_data_long_length_below_short_threshold: String,
 }
 
-fn encrypted_deposit_hash_fixture() -> EncryptedDepositHashFixture {
+fn deposit_hash_fixture() -> DepositHashFixture {
     serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../specs/ref-impls/test/fixtures/encryptedDepositHashChain.json"
+        "/../../specs/ref-impls/test/fixtures/depositHashChain.json"
     )))
-    .expect("encrypted deposit hash fixture JSON should decode")
+    .expect("deposit hash fixture JSON should decode")
 }
 
 fn malformed_tempo_headers_fixture() -> MalformedTempoHeadersFixture {
@@ -96,9 +96,9 @@ fn parse_fixture_fixed<const N: usize>(value: &str, name: &str) -> [u8; N] {
     out
 }
 
-impl EncryptedDepositFixture {
-    fn to_l1_deposit(&self) -> EncryptedDeposit {
-        EncryptedDeposit {
+impl DepositFixture {
+    fn to_l1_deposit(&self) -> Deposit {
+        Deposit {
             token: parse_fixture_address(&self.token),
             sender: parse_fixture_address(&self.sender),
             amount: self.amount,
@@ -114,60 +114,66 @@ impl EncryptedDepositFixture {
     }
 }
 
-fn make_deposit(amount: u128) -> L1Deposit {
-    L1Deposit::Regular(Deposit {
+fn make_withdrawal_bounce_back(amount: u128) -> L1Deposit {
+    L1Deposit::WithdrawalBounceBack(WithdrawalBounceBackDeposit {
         token: address!("0x0000000000000000000000000000000000001000"),
-        sender: address!("0x0000000000000000000000000000000000000001"),
         to: address!("0x0000000000000000000000000000000000000002"),
         amount,
         fee: 0,
-        tempo_refund_recipient: address!("0x0000000000000000000000000000000000000001"),
-        memo: B256::ZERO,
     })
 }
 
 struct SequenceLocalTempoCheckpointReader {
-    values: Mutex<VecDeque<u64>>,
-    last_value: u64,
+    values: Mutex<VecDeque<NumHash>>,
+    last_value: NumHash,
 }
 
 impl SequenceLocalTempoCheckpointReader {
     fn new(values: impl Into<VecDeque<u64>>) -> Self {
-        let values = values.into();
+        let values = values
+            .into()
+            .into_iter()
+            .map(|number| NumHash::new(number, B256::with_last_byte(1)))
+            .collect::<VecDeque<_>>();
         let last_value = values.back().copied().unwrap_or_default();
         Self {
             values: Mutex::new(values),
             last_value,
         }
     }
+
+    fn unanchored() -> Self {
+        Self {
+            values: Mutex::new(VecDeque::from([NumHash::default()])),
+            last_value: NumHash::default(),
+        }
+    }
 }
 
 impl LocalTempoCheckpointReader for SequenceLocalTempoCheckpointReader {
-    fn latest_tempo_block_number(&self) -> eyre::Result<u64> {
+    fn latest_tempo_checkpoint(&self) -> eyre::Result<NumHash> {
         let mut values = self.values.lock();
         Ok(values.pop_front().unwrap_or(self.last_value))
     }
 }
 
-fn test_subscriber(
-    local_state: Arc<dyn LocalTempoCheckpointReader>,
-    genesis_tempo_block_number: Option<u64>,
-) -> L1Subscriber {
+fn test_subscriber(local_state: Arc<dyn LocalTempoCheckpointReader>) -> L1Subscriber {
     let portal_address = address!("0x0000000000000000000000000000000000000ABC");
 
     L1Subscriber {
         config: L1SubscriberConfig {
             l1_rpc_url: "http://127.0.0.1:8545".to_owned(),
             portal_address,
-            genesis_tempo_block_number,
             enabled_tokens: crate::state::EnabledTokenRegistry::default(),
             l1_state_cache: crate::L1StateCache::new(),
             block_tracker: L1BlockTracker::default(),
             l1_fetch_concurrency: 1,
             retry_connection_interval: Duration::from_secs(1),
+            leadership_sink: None,
+            encryption_keys: None,
         },
         local_state,
-        deposit_queue: Some(DepositQueue::default()),
+        deposit_queue: DepositQueue::default(),
         subscriber_metrics: Default::default(),
     }
 }
@@ -189,7 +195,7 @@ async fn l1_block_tracker_waits_for_exact_observation() {
 async fn l1_block_tracker_returns_receipt_authenticated_portal_events() {
     let tracker = L1BlockTracker::default();
     let anchor = NumHash::new(10, B256::with_last_byte(0x10));
-    let events = L1PortalEvents::from_deposits(vec![make_deposit(100)]);
+    let events = L1PortalEvents::from_deposits(vec![make_withdrawal_bounce_back(100)]);
     tracker
         .record_with_portal_events(anchor, events.clone())
         .unwrap();
@@ -205,13 +211,18 @@ async fn l1_block_tracker_returns_receipt_authenticated_portal_events() {
 #[test]
 fn observed_portal_events_require_complete_advance_tempo_inputs() {
     let events = L1PortalEvents {
-        deposits: vec![make_deposit(100), make_deposit(200)],
+        deposits: vec![
+            make_withdrawal_bounce_back(100),
+            make_withdrawal_bounce_back(200),
+        ],
         enabled_tokens: vec![EnabledToken {
             token: address!("0x20C0000000000000000000000000000000000001"),
             name: "Alpha USD".to_owned(),
             symbol: "aUSD".to_owned(),
             currency: "USD".to_owned(),
         }],
+        encryption_key_rotations: vec![],
+        leader_transitions: vec![],
     };
     let deposits: Vec<_> = events
         .deposits
@@ -292,13 +303,13 @@ async fn l1_block_tracker_backpressures_at_one_hour_lookahead() {
     let consumed = 100;
     tracker.initialize_consumed_through(consumed);
 
-    for number in consumed + 1..=consumed + MAX_FOLLOWER_L1_LOOKAHEAD_BLOCKS {
+    for number in consumed + 1..=consumed + MAX_L1_LOOKAHEAD_BLOCKS {
         tracker
             .record(NumHash::new(number, B256::with_last_byte(number as u8)))
             .unwrap();
     }
 
-    let blocked_number = consumed + MAX_FOLLOWER_L1_LOOKAHEAD_BLOCKS + 1;
+    let blocked_number = consumed + MAX_L1_LOOKAHEAD_BLOCKS + 1;
     assert!(!tracker.has_capacity_for(blocked_number));
     assert_eq!(tracker.next_observation_number(), Some(blocked_number));
     assert!(
@@ -343,10 +354,8 @@ fn l1_block_tracker_rejects_first_observation_above_persisted_successor() {
 }
 
 #[test]
-fn observer_mode_applies_state_and_records_without_a_deposit_sink() {
-    let mut subscriber =
-        test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
-    subscriber.deposit_queue = None;
+fn subscriber_applies_state_and_records_observation() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
     let header = make_test_header(10);
     let sealed = seal(header);
     let anchor = sealed.num_hash();
@@ -374,7 +383,6 @@ fn observer_mode_applies_state_and_records_without_a_deposit_sink() {
         subscriber.config.block_tracker.observed_hash(10),
         Some(anchor.hash)
     );
-    assert!(subscriber.deposit_queue.is_none());
 }
 
 fn make_test_header(number: u64) -> TempoHeader {
@@ -634,10 +642,7 @@ fn assert_tempo_header_rejected(input: &[u8]) {
 
 #[test]
 fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new([0])),
-        Some(0),
-    );
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([0])));
     let slot = B256::with_last_byte(1);
     let value = B256::with_last_byte(2);
     let stable_account = address!("0x0000000000000000000000000000000000000ABC");
@@ -690,40 +695,36 @@ fn deposit_hash_chain(previous_hash: B256, deposits: &[L1Deposit]) -> B256 {
     })
 }
 
-#[tokio::test]
-async fn test_resolve_start_block_reads_live_local_state_each_time() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::from([
-            10, 11,
-        ]))),
-        None,
-    );
-    assert_eq!(subscriber.resolve_start_block().await.unwrap(), Some(11));
-    assert_eq!(subscriber.resolve_start_block().await.unwrap(), Some(12));
+#[test]
+fn test_resolve_start_block_reads_live_local_state_each_time() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new(
+        VecDeque::from([10, 11]),
+    )));
+    assert_eq!(subscriber.resolve_start_block().unwrap(), 11);
+    assert_eq!(subscriber.resolve_start_block().unwrap(), 12);
 }
 
-#[tokio::test]
-async fn test_resolve_start_block_falls_back_to_genesis_override_when_local_state_is_zero() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::from([0]))),
-        Some(42),
-    );
-    assert_eq!(subscriber.resolve_start_block().await.unwrap(), Some(43));
+#[test]
+fn test_resolve_start_block_accepts_block_zero_with_nonzero_hash() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([0])));
+    assert_eq!(subscriber.resolve_start_block().unwrap(), 1);
 }
 
-#[tokio::test]
-async fn test_resolve_start_block_skips_backfill_without_checkpoint() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::from([0]))),
-        None,
+#[test]
+fn test_resolve_start_block_rejects_unanchored_genesis() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::unanchored()));
+    assert!(
+        subscriber
+            .resolve_start_block()
+            .unwrap_err()
+            .to_string()
+            .contains("zone genesis is not anchored to an L1 block")
     );
-
-    assert_eq!(subscriber.resolve_start_block().await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() {
-    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])), None);
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
     let asserter = Asserter::new();
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
@@ -731,6 +732,7 @@ async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() 
     let header_10 = make_test_header(10);
     let header_11 = make_chained_header(11, header_hash(&header_10));
     let header_12 = make_chained_header(12, header_hash(&header_11));
+    let anchor_12 = seal(header_12.clone()).num_hash();
 
     // Initial sync through finalized block 10.
     asserter.push_success(&Some(header_response(header_10.clone())));
@@ -751,11 +753,7 @@ async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() 
         .expect_err("finite trigger stream should end the subscriber");
     assert!(err.to_string().contains("head notification stream ended"));
 
-    let blocks = subscriber
-        .deposit_queue
-        .as_ref()
-        .expect("leader test subscriber has a deposit queue")
-        .drain();
+    let blocks = subscriber.deposit_queue.drain();
     assert_eq!(
         blocks
             .iter()
@@ -763,15 +761,17 @@ async fn test_follow_finalized_uses_new_heads_to_sync_missing_finalized_range() 
             .collect::<Vec<_>>(),
         vec![10, 11, 12]
     );
+    assert_eq!(
+        subscriber.config.block_tracker.observed_hash(12),
+        Some(anchor_12.hash),
+        "a queue-backed subscriber must retain observations until its consumer prunes them"
+    );
     assert!(asserter.read_q().is_empty());
 }
 
 #[tokio::test]
 async fn test_head_triggers_falls_back_to_http_block_filter() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new([10])),
-        None,
-    );
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([10])));
     let asserter = Asserter::new();
     let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
         .connect_mocked_client(asserter.clone())
@@ -792,10 +792,7 @@ async fn test_head_triggers_falls_back_to_http_block_filter() {
 
 #[tokio::test]
 async fn test_sync_finalized_once_does_not_refetch_current_cursor() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new([10])),
-        None,
-    );
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([10])));
     let asserter = Asserter::new();
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
@@ -807,19 +804,12 @@ async fn test_sync_finalized_once_does_not_refetch_current_cursor() {
         .unwrap();
 
     assert_eq!(next, 11);
-    assert!(
-        subscriber
-            .deposit_queue
-            .as_ref()
-            .expect("leader test subscriber has a deposit queue")
-            .drain()
-            .is_empty()
-    );
+    assert!(subscriber.deposit_queue.drain().is_empty());
     assert!(asserter.read_q().is_empty());
 }
 
 #[test]
-fn test_push_log_decodes_bounce_back_as_regular_deposit() {
+fn test_push_log_decodes_withdrawal_bounce_back() {
     let portal_address = address!("0x0000000000000000000000000000000000000ABC");
     let fallback_nonce = 0xF1;
     let encoded_fallback_nonce = address!("0x00000000000000000000000000000000000000F1");
@@ -851,27 +841,18 @@ fn test_push_log_decodes_bounce_back_as_regular_deposit() {
         .expect("bounce-back should decode");
 
     assert_eq!(events.deposits.len(), 1, "should enqueue one deposit");
-    let L1Deposit::Regular(deposit) = &events.deposits[0] else {
-        panic!("bounce-back should be mapped to a regular deposit");
+    let L1Deposit::WithdrawalBounceBack(deposit) = &events.deposits[0] else {
+        panic!("bounce-back should be mapped to a withdrawal bounce-back entry");
     };
     assert_eq!(deposit.token, token);
-    assert_eq!(deposit.sender, portal_address);
     assert_eq!(deposit.to, encoded_fallback_nonce);
     assert_eq!(deposit.amount, event.amount);
     assert_eq!(deposit.fee, 0, "bounce-back deposits should be fee-free");
-    assert_eq!(
-        deposit.memo,
-        B256::ZERO,
-        "bounce-back deposits should clear memo"
-    );
 }
 
 #[test]
 fn confirmed_token_enabled_event_updates_registry() {
-    let subscriber = test_subscriber(
-        Arc::new(SequenceLocalTempoCheckpointReader::new(VecDeque::from([0]))),
-        None,
-    );
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([0])));
     let token = address!("0x20c0000000000000000000000000000000000001");
     let events = L1PortalEvents {
         enabled_tokens: vec![EnabledToken {
@@ -892,24 +873,18 @@ fn confirmed_token_enabled_event_updates_registry() {
 fn test_drain_returns_block_grouped_deposits() {
     let mut queue = PendingDeposits::default();
 
-    let d1 = L1Deposit::Regular(Deposit {
+    let d1 = L1Deposit::WithdrawalBounceBack(WithdrawalBounceBackDeposit {
         token: address!("0x0000000000000000000000000000000000001000"),
-        sender: address!("0x0000000000000000000000000000000000000001"),
         to: address!("0x0000000000000000000000000000000000000002"),
         amount: 100,
         fee: 0,
-        tempo_refund_recipient: address!("0x0000000000000000000000000000000000000001"),
-        memo: B256::ZERO,
     });
 
-    let d2 = L1Deposit::Regular(Deposit {
+    let d2 = L1Deposit::WithdrawalBounceBack(WithdrawalBounceBackDeposit {
         token: address!("0x0000000000000000000000000000000000001000"),
-        sender: address!("0x0000000000000000000000000000000000000003"),
         to: address!("0x0000000000000000000000000000000000000004"),
         amount: 200,
         fee: 0,
-        tempo_refund_recipient: address!("0x0000000000000000000000000000000000000003"),
-        memo: B256::ZERO,
     });
 
     let h10 = make_test_header(10);
@@ -932,20 +907,20 @@ fn test_drain_returns_block_grouped_deposits() {
 }
 
 #[test]
-fn test_encrypted_deposit_hash_chain() {
-    let fixture = encrypted_deposit_hash_fixture();
+fn test_deposit_hash_chain() {
+    let fixture = deposit_hash_fixture();
     let encrypted = fixture.deposit.to_l1_deposit();
     let previous_hash = parse_fixture_b256(&fixture.previous_hash);
 
-    let next_hash = deposit_hash_chain(previous_hash, &[L1Deposit::Encrypted(encrypted.clone())]);
+    let next_hash = deposit_hash_chain(previous_hash, &[L1Deposit::Deposit(encrypted.clone())]);
 
-    let abi_encrypted = abi::EncryptedDeposit {
+    let abi_deposit = abi::Deposit {
         token: encrypted.token,
         sender: encrypted.sender,
         amount: encrypted.amount,
         tempoRefundRecipient: encrypted.tempo_refund_recipient,
         keyIndex: encrypted.key_index,
-        encrypted: abi::EncryptedDepositPayload {
+        encrypted: abi::DepositPayload {
             ephemeralPubkeyX: encrypted.ephemeral_pubkey_x,
             ephemeralPubkeyYParity: encrypted.ephemeral_pubkey_y_parity,
             ciphertext: encrypted.ciphertext.clone().into(),
@@ -955,12 +930,12 @@ fn test_encrypted_deposit_hash_chain() {
     };
     let expected = parse_fixture_b256(&fixture.expected_hash);
     let tuple_value_hash =
-        keccak256((DepositType::Encrypted, abi_encrypted, previous_hash).abi_encode());
+        keccak256((DepositType::Deposit, abi_deposit, previous_hash).abi_encode());
     let single_value_tuple_hash = parse_fixture_b256(&fixture.single_value_tuple_hash);
 
     assert_eq!(
         next_hash, expected,
-        "encrypted deposit hash chain must match Solidity DepositQueueLib.enqueueEncrypted"
+        "deposit hash chain must match Solidity DepositQueueLib.enqueueDeposit"
     );
     assert_eq!(
         tuple_value_hash, single_value_tuple_hash,
@@ -968,28 +943,25 @@ fn test_encrypted_deposit_hash_chain() {
     );
     assert_ne!(
         expected, tuple_value_hash,
-        "single-value tuple encoding should not match Solidity abi.encode(...) for dynamic encrypted deposits"
+        "single-value tuple encoding should not match Solidity abi.encode(...) for dynamic deposits"
     );
     assert_ne!(next_hash, B256::ZERO, "hash should be non-zero");
 }
 
 #[test]
-fn test_mixed_deposit_hash_chain() {
+fn test_withdrawal_bounce_back_and_deposit_hash_chain() {
     let token = address!("0x0000000000000000000000000000000000001000");
     let sender = address!("0x0000000000000000000000000000000000001111");
     let recipient = address!("0x000000000000000000000000000000000000A11C");
 
-    let regular = Deposit {
+    let bounce_back = WithdrawalBounceBackDeposit {
         token,
-        sender,
         to: recipient,
         amount: 500_000,
         fee: 0,
-        tempo_refund_recipient: sender,
-        memo: B256::ZERO,
     };
 
-    let encrypted = EncryptedDeposit {
+    let encrypted = Deposit {
         token,
         sender,
         amount: 300_000,
@@ -1004,8 +976,8 @@ fn test_mixed_deposit_hash_chain() {
     };
 
     let deposits = vec![
-        L1Deposit::Regular(regular.clone()),
-        L1Deposit::Encrypted(encrypted.clone()),
+        L1Deposit::WithdrawalBounceBack(bounce_back.clone()),
+        L1Deposit::Deposit(encrypted.clone()),
     ];
 
     let next_hash = deposit_hash_chain(B256::ZERO, &deposits);
@@ -1013,14 +985,11 @@ fn test_mixed_deposit_hash_chain() {
     // Manually compute expected chain
     let hash_1 = keccak256(
         (
-            DepositType::Regular,
-            abi::Deposit {
-                token: regular.token,
-                sender: regular.sender,
-                to: regular.to,
-                amount: regular.amount,
-                tempoRefundRecipient: regular.tempo_refund_recipient,
-                memo: regular.memo,
+            DepositType::WithdrawalBounceBack,
+            abi::WithdrawalBounceBackDeposit {
+                token: bounce_back.token,
+                to: bounce_back.to,
+                amount: bounce_back.amount,
             },
             B256::ZERO,
         )
@@ -1029,14 +998,14 @@ fn test_mixed_deposit_hash_chain() {
 
     let hash_2 = keccak256(
         (
-            DepositType::Encrypted,
-            abi::EncryptedDeposit {
+            DepositType::Deposit,
+            abi::Deposit {
                 token: encrypted.token,
                 sender: encrypted.sender,
                 amount: encrypted.amount,
                 tempoRefundRecipient: encrypted.tempo_refund_recipient,
                 keyIndex: encrypted.key_index,
-                encrypted: abi::EncryptedDepositPayload {
+                encrypted: abi::DepositPayload {
                     ephemeralPubkeyX: encrypted.ephemeral_pubkey_x,
                     ephemeralPubkeyYParity: encrypted.ephemeral_pubkey_y_parity,
                     ciphertext: encrypted.ciphertext.into(),
@@ -1076,10 +1045,19 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         U256::ZERO,
     )
     .expect("encrypted deposit should be valid");
+    let encryption_keys = EncryptionKeyRing::new([sequencer_key.clone()]);
+    encryption_keys
+        .apply_rotation(&EncryptionKeyRotation {
+            x: seq_pub_x,
+            y_parity: seq_pub_y_parity,
+            key_index: U256::ZERO,
+            activation_block: block_number,
+        })
+        .unwrap();
 
     let block = L1BlockDeposits {
         header: seal(make_test_header(block_number)),
-        events: L1PortalEvents::from_deposits(vec![L1Deposit::Encrypted(EncryptedDeposit {
+        events: L1PortalEvents::from_deposits(vec![L1Deposit::Deposit(Deposit {
             token,
             sender,
             amount: 1_000_000,
@@ -1095,19 +1073,106 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
     };
 
     let prepared = block
-        .prepare(&sequencer_key, portal)
+        .prepare(&encryption_keys, portal)
         .await
         .expect("decrypted deposit should prepare without an engine-side policy read");
 
     assert_eq!(prepared.queued_deposits.len(), 1);
     assert_eq!(
         prepared.queued_deposits[0].depositType,
-        DepositType::Encrypted
+        DepositType::Deposit
     );
     assert_eq!(
         prepared.decryptions.len(),
         1,
         "successfully decrypted deposits must provide on-chain decryption data"
+    );
+}
+
+#[tokio::test]
+async fn deposits_select_the_private_key_by_portal_index() {
+    let token = address!("0x0000000000000000000000000000000000001000");
+    let sender = address!("0x0000000000000000000000000000000000001234");
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let old = k256::SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let current = k256::SecretKey::from_slice(&[0x22; 32]).unwrap();
+    let encryption_keys = EncryptionKeyRing::new([old.clone(), current.clone()]);
+    let mut deposits = Vec::new();
+    let mut expected_shared_secrets = Vec::new();
+
+    for (key_index, key, recipient) in [
+        (
+            U256::ZERO,
+            old,
+            address!("0x000000000000000000000000000000000000BEEF"),
+        ),
+        (
+            U256::from(1),
+            current,
+            address!("0x000000000000000000000000000000000000CAFE"),
+        ),
+    ] {
+        let public = key.public_key();
+        let (x, y_parity) = crate::precompiles::ecies::compressed_x_and_parity(public.as_affine());
+        encryption_keys
+            .apply_rotation(&EncryptionKeyRotation {
+                x,
+                y_parity,
+                key_index,
+                activation_block: key_index.to::<u64>() + 10,
+            })
+            .unwrap();
+        let encrypted = crate::precompiles::ecies::encrypt_deposit(
+            &x,
+            y_parity,
+            recipient,
+            B256::ZERO,
+            portal,
+            key_index,
+        )
+        .unwrap();
+        let decrypted = crate::precompiles::ecies::decrypt_deposit(
+            &key,
+            &encrypted.eph_pub_x,
+            encrypted.eph_pub_y_parity,
+            &encrypted.ciphertext,
+            &encrypted.nonce,
+            &encrypted.tag,
+            portal,
+            key_index,
+        )
+        .unwrap();
+        expected_shared_secrets.push(decrypted.proof.shared_secret);
+        deposits.push(L1Deposit::Deposit(Deposit {
+            token,
+            sender,
+            amount: 1_000_000,
+            fee: 0,
+            tempo_refund_recipient: sender,
+            key_index,
+            ephemeral_pubkey_x: encrypted.eph_pub_x,
+            ephemeral_pubkey_y_parity: encrypted.eph_pub_y_parity,
+            ciphertext: encrypted.ciphertext,
+            nonce: encrypted.nonce,
+            tag: encrypted.tag,
+        }));
+    }
+
+    let prepared = L1BlockDeposits {
+        header: seal(make_test_header(20)),
+        events: L1PortalEvents::from_deposits(deposits),
+    }
+    .prepare(&encryption_keys, portal)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        prepared
+            .decryptions
+            .iter()
+            .map(|decryption| decryption.sharedSecret)
+            .collect::<Vec<_>>(),
+        expected_shared_secrets
     );
 }
 
@@ -1137,6 +1202,86 @@ fn finalized_queue_tracks_tip_after_consumption() {
         make_chained_header(102, h101_hash),
         L1PortalEvents::default(),
     );
+}
+
+#[test]
+fn external_enqueue_reports_discontinuity_without_panicking() {
+    let queue = DepositQueue::new();
+    let h10 = make_test_header(10);
+    let h10_hash = header_hash(&h10);
+    assert!(
+        queue
+            .try_enqueue_sealed(seal(h10), L1PortalEvents::default())
+            .unwrap()
+    );
+
+    let err = queue
+        .try_enqueue_sealed(
+            seal(make_chained_header(12, h10_hash)),
+            L1PortalEvents::default(),
+        )
+        .expect_err("external input must report a gap");
+    assert!(
+        err.to_string()
+            .contains("non-contiguous finalized L1 block")
+    );
+}
+
+#[test]
+fn external_enqueue_accepts_duplicate_producers() {
+    let queue = DepositQueue::new();
+    let h10 = make_test_header(10);
+    let h11 = make_chained_header(11, header_hash(&h10));
+    let h12 = make_chained_header(12, header_hash(&h11));
+    let duplicate = seal(h10);
+    assert!(
+        queue
+            .try_enqueue_sealed(duplicate.clone(), L1PortalEvents::default())
+            .unwrap()
+    );
+    for header in [h11, h12] {
+        queue
+            .try_enqueue_sealed(seal(header), L1PortalEvents::default())
+            .unwrap();
+    }
+    assert!(
+        !queue
+            .try_enqueue_sealed(duplicate, L1PortalEvents::default())
+            .unwrap()
+    );
+    assert_eq!(queue.peek().unwrap().header.number(), 10);
+}
+
+#[test]
+fn confirm_through_is_idempotent_and_drains_stale_entries() {
+    let queue = DepositQueue::new();
+    let h10 = make_test_header(10);
+    let h11 = make_chained_header(11, header_hash(&h10));
+    let h12 = make_chained_header(12, header_hash(&h11));
+    let anchor = seal(h12.clone()).num_hash();
+    for header in [h10, h11, h12] {
+        queue
+            .try_enqueue_sealed(seal(header), L1PortalEvents::default())
+            .unwrap();
+    }
+
+    queue.confirm_through(anchor).unwrap();
+    assert!(queue.peek().is_none());
+    queue.confirm_through(anchor).unwrap();
+}
+
+#[test]
+fn confirm_through_rejects_a_conflicting_anchor() {
+    let queue = DepositQueue::new();
+    queue
+        .try_enqueue_sealed(seal(make_test_header(10)), L1PortalEvents::default())
+        .unwrap();
+
+    let err = queue
+        .confirm_through(NumHash::new(10, B256::repeat_byte(0xab)))
+        .expect_err("a different hash at the same height must fail");
+    assert!(err.to_string().contains("deposit queue holds L1 block 10"));
+    assert_eq!(queue.peek().unwrap().header.number(), 10);
 }
 
 #[test]
@@ -1285,4 +1430,336 @@ fn finalized_queue_rejects_confirmation_mismatch_without_mutation() {
             .hash(),
         h10_hash
     );
+}
+
+fn leader_updated_log(
+    portal: Address,
+    previous: Address,
+    new_leader: Address,
+    epoch: u64,
+    activation: u64,
+) -> Log {
+    let event = crate::abi::ZonePortal::LeaderUpdated {
+        previousLeader: previous,
+        newLeader: new_leader,
+        epoch,
+        activationTempoBlock: activation,
+    };
+    Log {
+        inner: alloy_primitives::Log {
+            address: portal,
+            data: event.encode_log_data(),
+        },
+        ..Default::default()
+    }
+}
+
+fn encryption_key_updated_log(
+    portal: Address,
+    x: B256,
+    y_parity: u8,
+    key_index: U256,
+    activation_block: u64,
+) -> Log {
+    let event = crate::abi::ZonePortal::SequencerEncryptionKeyUpdated {
+        x,
+        yParity: y_parity,
+        keyIndex: key_index,
+        activationBlock: activation_block,
+    };
+    Log {
+        inner: alloy_primitives::Log {
+            address: portal,
+            data: event.encode_log_data(),
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn decodes_encryption_key_rotation_into_portal_events() {
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let x = B256::repeat_byte(0x42);
+    let mut events = L1PortalEvents::default();
+
+    events
+        .push_log(
+            &encryption_key_updated_log(portal, x, 0x03, U256::from(7), 77),
+            77,
+        )
+        .unwrap();
+
+    assert_eq!(
+        events.encryption_key_rotations,
+        vec![EncryptionKeyRotation {
+            x,
+            y_parity: 0x03,
+            key_index: U256::from(7),
+            activation_block: 77,
+        }]
+    );
+}
+
+#[test]
+fn decodes_leader_updated_into_portal_events() {
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let previous = address!("0x0000000000000000000000000000000000001111");
+    let new_leader = address!("0x0000000000000000000000000000000000002222");
+
+    let mut events = L1PortalEvents::default();
+    events
+        .push_log(&leader_updated_log(portal, previous, new_leader, 4, 77), 77)
+        .unwrap();
+
+    assert_eq!(
+        events.leader_transitions,
+        vec![LeaderTransition {
+            previous_leader: previous,
+            new_leader,
+            epoch: 4,
+            activation_tempo_block: 77,
+        }]
+    );
+    let transition = events.final_leader_transition().unwrap().unwrap();
+    assert_eq!(transition.new_leader, new_leader);
+    assert_eq!(transition.epoch, 4);
+}
+
+#[test]
+fn rejects_multiple_leader_transitions_in_one_block() {
+    let portal = address!("0x0000000000000000000000000000000000000ABC");
+    let a = address!("0x0000000000000000000000000000000000001111");
+    let b = address!("0x0000000000000000000000000000000000002222");
+    let c = address!("0x0000000000000000000000000000000000003333");
+
+    let mut events = L1PortalEvents::default();
+    events
+        .push_log(&leader_updated_log(portal, a, b, 4, 77), 77)
+        .unwrap();
+    events
+        .push_log(&leader_updated_log(portal, b, c, 5, 77), 77)
+        .unwrap();
+
+    let err = events.final_leader_transition().unwrap_err();
+    assert!(err.to_string().contains("at most one"));
+}
+
+fn make_receipt_with_logs(
+    block_number: u64,
+    block_hash: B256,
+    logs: Vec<Log>,
+) -> TempoTransactionReceipt {
+    let mut bloom = Bloom::ZERO;
+    for log in &logs {
+        bloom.accrue_log(&log.inner);
+    }
+    TempoTransactionReceipt {
+        inner: TransactionReceipt {
+            inner: ReceiptWithBloom::new(
+                TempoReceipt {
+                    tx_type: TempoTxType::Legacy,
+                    success: true,
+                    cumulative_gas_used: 21_000,
+                    logs,
+                },
+                bloom,
+            ),
+            transaction_hash: B256::with_last_byte(0xaa),
+            transaction_index: Some(0),
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            gas_used: 21_000,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        },
+        fee_token: None,
+        fee_payer: Address::ZERO,
+    }
+}
+
+fn corrupt_recognized_portal_log(portal: Address) -> Log {
+    Log {
+        inner: alloy_primitives::Log {
+            address: portal,
+            data: alloy_primitives::LogData::new_unchecked(
+                vec![crate::abi::ZonePortal::LeaderUpdated::SIGNATURE_HASH],
+                Bytes::from_static(b"garbage"),
+            ),
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn extract_events_fails_closed_on_corrupt_recognized_portal_log() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
+    let portal = subscriber.config.portal_address;
+
+    // A recognized topic0 with garbage payload must fence the whole block, never be skipped.
+    let corrupt = corrupt_recognized_portal_log(portal);
+    let receipt = make_receipt_with_logs(10, B256::with_last_byte(0x10), vec![corrupt]);
+
+    let err = subscriber.extract_events(10, &[receipt]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("failed to decode a portal event in L1 block 10")
+    );
+
+    // Unknown signatures are still skipped: a pre-upgrade contract event cannot fence us.
+    let unknown = Log {
+        inner: alloy_primitives::Log {
+            address: portal,
+            data: alloy_primitives::LogData::new_unchecked(
+                vec![B256::with_last_byte(0x77)],
+                Bytes::from_static(b"whatever"),
+            ),
+        },
+        ..Default::default()
+    };
+    let receipt = make_receipt_with_logs(10, B256::with_last_byte(0x10), vec![unknown]);
+    let (events, _) = subscriber.extract_events(10, &[receipt]).unwrap();
+    assert!(events.deposits.is_empty());
+    assert!(events.leader_transitions.is_empty());
+}
+
+#[tokio::test]
+async fn sync_classifies_corrupt_recognized_portal_log_as_fenced() {
+    let subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
+    let portal = subscriber.config.portal_address;
+    let queue = subscriber.deposit_queue.clone();
+
+    let receipt =
+        make_receipt_with_logs(10, B256::ZERO, vec![corrupt_recognized_portal_log(portal)]);
+    let mut header_10 = make_test_header(10);
+    header_10.inner.receipts_root = calculate_test_receipts_root(std::slice::from_ref(&receipt));
+    header_10.inner.logs_bloom = *receipt.inner.inner.bloom_ref();
+
+    let asserter = Asserter::new();
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    asserter.push_success(&Some(header_response(header_10)));
+    asserter.push_success(&Some(vec![receipt]));
+
+    let err = subscriber
+        .sync_finalized_once(&l1_provider, 10)
+        .await
+        .unwrap_err();
+    assert!(is_fenced_ingestion_error(&err));
+    assert_eq!(queue.last_enqueued(), None);
+    assert_eq!(subscriber.config.block_tracker.latest(), None);
+}
+
+#[test]
+fn ordinary_subscriber_errors_remain_retryable() {
+    assert!(!is_fenced_ingestion_error(&eyre::eyre!(
+        "transient L1 RPC failure"
+    )));
+}
+
+#[derive(Debug)]
+struct RecordingLeadershipSink {
+    queue: DepositQueue,
+    seen: parking_lot::Mutex<Vec<(LeaderTransition, Option<NumHash>)>>,
+    fail: bool,
+}
+
+impl LeadershipSink for RecordingLeadershipSink {
+    fn apply_leader_transition(&self, transition: &LeaderTransition) -> eyre::Result<()> {
+        if self.fail {
+            eyre::bail!("injected leadership sink failure");
+        }
+        self.seen
+            .lock()
+            .push((transition.clone(), self.queue.last_enqueued()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn sync_applies_leadership_transition_before_enqueueing_the_activation_block() {
+    let mut subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
+    let portal = subscriber.config.portal_address;
+    let queue = subscriber.deposit_queue.clone();
+    let sink = Arc::new(RecordingLeadershipSink {
+        queue: queue.clone(),
+        seen: parking_lot::Mutex::new(Vec::new()),
+        fail: false,
+    });
+    subscriber.config.leadership_sink = Some(sink.clone());
+
+    let new_leader = address!("0x0000000000000000000000000000000000002222");
+    let log = leader_updated_log(portal, Address::ZERO, new_leader, 2, 10);
+    let mut header_10 = make_test_header(10);
+    let receipt = make_receipt_with_logs(10, B256::ZERO, vec![log]);
+    header_10.inner.receipts_root = calculate_test_receipts_root(std::slice::from_ref(&receipt));
+    header_10.inner.logs_bloom = *receipt.inner.inner.bloom_ref();
+
+    let asserter = Asserter::new();
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    asserter.push_success(&Some(vec![receipt]));
+
+    assert_eq!(
+        subscriber
+            .sync_finalized_once(&l1_provider, 10)
+            .await
+            .unwrap(),
+        11
+    );
+
+    let seen = sink.seen.lock();
+    assert_eq!(seen.len(), 1);
+    let (transition, queue_tip_at_apply) = &seen[0];
+    assert_eq!(transition.new_leader, new_leader);
+    assert_eq!(transition.epoch, 2);
+    assert_eq!(transition.activation_tempo_block, 10);
+    assert_eq!(
+        *queue_tip_at_apply, None,
+        "the transition must be applied before the activation block is enqueued"
+    );
+    assert_eq!(queue.last_enqueued().unwrap().number, 10);
+}
+
+#[tokio::test]
+async fn sync_fences_the_block_when_the_leadership_sink_rejects_the_transition() {
+    let mut subscriber = test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::new([9])));
+    let portal = subscriber.config.portal_address;
+    let queue = subscriber.deposit_queue.clone();
+    subscriber.config.leadership_sink = Some(Arc::new(RecordingLeadershipSink {
+        queue: queue.clone(),
+        seen: parking_lot::Mutex::new(Vec::new()),
+        fail: true,
+    }));
+
+    let new_leader = address!("0x0000000000000000000000000000000000002222");
+    let log = leader_updated_log(portal, Address::ZERO, new_leader, 2, 10);
+    let mut header_10 = make_test_header(10);
+    let receipt = make_receipt_with_logs(10, B256::ZERO, vec![log]);
+    header_10.inner.receipts_root = calculate_test_receipts_root(std::slice::from_ref(&receipt));
+    header_10.inner.logs_bloom = *receipt.inner.inner.bloom_ref();
+
+    let asserter = Asserter::new();
+    let l1_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    asserter.push_success(&Some(header_response(header_10.clone())));
+    asserter.push_success(&Some(vec![receipt]));
+
+    let err = subscriber
+        .sync_finalized_once(&l1_provider, 10)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("leadership transition"));
+    assert!(is_fenced_ingestion_error(&err));
+
+    // Nothing was enqueued and no observation advanced: the block is fenced, not half-applied.
+    assert_eq!(queue.last_enqueued(), None);
+    assert_eq!(subscriber.config.block_tracker.latest(), None);
 }
