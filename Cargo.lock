@@ -13712,6 +13712,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
+ "alloy-sol-types",
  "eyre",
  "futures",
  "reth-ethereum-primitives",
@@ -13721,6 +13722,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-provider",
  "reth-storage-api",
+ "tempo-zone-contracts",
  "tokio",
  "tracing",
 ]
