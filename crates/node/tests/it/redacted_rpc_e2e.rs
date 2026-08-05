@@ -577,6 +577,31 @@ async fn test_public_methods() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Excessive reward percentile requests are rejected before the redacted reward matrix is built.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fee_history_rejects_excessive_reward_percentiles() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let ctx = start_zone_with_redacted_rpc().await?;
+    let user_signer = PrivateKeySigner::random();
+    let response = ctx
+        .call_as_user(
+            "eth_feeHistory",
+            json!([1, "latest", vec![0.0_f64; 101]]),
+            &user_signer,
+        )
+        .await?;
+
+    assert_eq!(response["error"]["code"].as_i64(), Some(-32602));
+    assert_eq!(
+        response["error"]["message"].as_str(),
+        Some("invalid reward percentiles"),
+        "excessive reward percentile request should be rejected: {response}",
+    );
+
+    Ok(())
+}
+
 /// Filter ownership is scoped to the creating account, and uninstall removes follow-up access.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_filter_ownership_and_uninstall_cleanup() -> eyre::Result<()> {
