@@ -7,8 +7,10 @@ just live-bench
 ```
 
 The command first builds and provisions one persistent local Tempo dev L1, private
-Zone, and set of current Earn fixtures. It also prepares the reusable account
-balances, approvals, and private-RPC authorization map. It opens
+Zone, and set of current Earn fixtures. The local Portal uses open account and
+gateway access, so setup does not install per-address closed-loop roles. It also
+prepares the reusable account balances, approvals, and private-RPC authorization
+map. It opens
 `http://127.0.0.1:4179` only after that setup is ready. Each **Go** button then runs
 only the selected real `txgen-tempo` scenario and reports its p99 latency, gas, and
 fees.

@@ -513,7 +513,6 @@ class LocalBenchmark:
             sequencer_key,
             "--dev.token",
             DLUSD,
-            "--dev.access-mode",
         ]
         zone_command.extend(
             (
@@ -547,7 +546,7 @@ class LocalBenchmark:
 
         self.stage(
             "topology",
-            f"Deploying Earn fixtures and authorizing {len(allowed)} benchmark accounts",
+            "Deploying Earn fixtures for the open-access Portal",
         )
         allowed_file = self.run_dir / "allowed-accounts"
         allowed_file.write_text("\n".join(allowed) + "\n")

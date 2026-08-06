@@ -278,14 +278,11 @@ impl DeployNeobankFixtures {
                 == portal_admin_address,
             "PORTAL_ADMIN_KEY does not control the configured ZonePortal"
         );
-        ensure!(
-            admin_portal
-                .isAccessEnforced()
-                .call()
-                .await
-                .wrap_err("failed querying ZonePortal access mode")?,
-            "ZonePortal access enforcement must be enabled before deploying fixtures"
-        );
+        let access_enforced = admin_portal
+            .isAccessEnforced()
+            .call()
+            .await
+            .wrap_err("failed querying ZonePortal access mode")?;
         ensure!(
             admin_portal
                 .isGatewayOpen()
@@ -471,9 +468,6 @@ impl DeployNeobankFixtures {
             "BridgeWalletFixture",
         )
         .await?;
-        let role_assignments =
-            portal_role_assignments(&allowed_accounts, bridge_wallet, earn_router, messenger)?;
-
         if !admin_portal
             .isTokenEnabled(earn_share)
             .call()
@@ -491,13 +485,27 @@ impl DeployNeobankFixtures {
                 .wrap_err("failed waiting for EarnShare enablement receipt")?;
             check(&receipt, "enable EarnShare on ZonePortal")?;
         }
-        configure_closed_loop_portal(
-            &admin_provider,
-            self.portal,
-            self.pathusd,
-            &role_assignments,
-        )
-        .await?;
+        if access_enforced {
+            let role_assignments =
+                portal_role_assignments(&allowed_accounts, bridge_wallet, earn_router, messenger)?;
+            configure_closed_loop_portal(
+                &admin_provider,
+                self.portal,
+                self.pathusd,
+                &role_assignments,
+            )
+            .await?;
+        } else {
+            ensure!(
+                admin_portal
+                    .isGatewayOpen()
+                    .call()
+                    .await
+                    .wrap_err("failed verifying open ZonePortal gateway mode")?,
+                "open-access benchmark Portal unexpectedly enforces gateway registration"
+            );
+            println!("ZonePortal is open; skipping per-address role assignments");
+        }
 
         let metadata = FixtureMetadata {
             portal: self.portal.to_string(),
@@ -546,7 +554,14 @@ impl DeployNeobankFixtures {
         println!("  Earn fees:               {earn_fees}");
         println!("  Contribution controller: {contribution_controller}");
         println!("  Bridge wallet:           {bridge_wallet}");
-        println!("  Portal policy:           closed-loop enforcement enabled");
+        println!(
+            "  Portal policy:           {}",
+            if access_enforced {
+                "closed-loop enforcement enabled"
+            } else {
+                "open access; no account or gateway allowlist"
+            }
+        );
         println!("  Metadata:                {}", self.output.display());
         Ok(())
     }
