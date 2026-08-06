@@ -15,18 +15,16 @@ use super::*;
 use crate::{
     model::{
         constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
-        events::{L2ProtocolEvent, Outbox},
+        events::{Inbox, L2ProtocolEvent, Outbox},
     },
-    observe::{
-        error::{
-            AcquisitionError, AcquisitionSource, DataSource, EnvelopeRule, MismatchValue,
-            ObservationError, OutputField, ProtocolChain,
-        },
-        state::ZonePostStateOutputs,
+    observe::error::{
+        AcquisitionError, AcquisitionSource, DataSource, EnvelopeRule, ObservationError,
+        ProtocolChain,
     },
 };
 
 const ZONE_NUMBER: u64 = 9;
+const ZONE_PARENT_HASH: B256 = B256::repeat_byte(0x19);
 
 fn imported_header() -> TempoHeader {
     TempoHeader {
@@ -121,7 +119,7 @@ fn receipt(success: bool, logs: Vec<Log>) -> TempoReceipt<Log> {
     }
 }
 
-fn required_advance_logs(hash_override: Option<B256>) -> Vec<Log> {
+fn advance_logs(hash_override: Option<B256>) -> Vec<Log> {
     let header = imported_header();
     let hash = hash_override.unwrap_or_else(|| header.hash_slow());
     vec![
@@ -156,6 +154,7 @@ fn recovered_block(
         header: TempoHeader {
             inner: Header {
                 number: ZONE_NUMBER,
+                parent_hash: ZONE_PARENT_HASH,
                 ..Default::default()
             },
             ..Default::default()
@@ -168,42 +167,13 @@ fn recovered_block(
     RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), senders)
 }
 
-fn post_state(block_hash: B256) -> ZonePostStateOutputs {
-    let header = imported_header();
-    ZonePostStateOutputs::for_test(
-        block_hash,
-        header.hash_slow(),
-        header.inner.number,
-        B256::repeat_byte(0x41),
-        12,
-        B256::repeat_byte(0x51),
-        3,
-    )
-}
-
-fn observe_with_state<R>(
-    block: &RecoveredBlock<Block>,
-    receipts: &[R],
-    post_state: ZonePostStateOutputs,
-) -> Result<L2BlockObservation, ObservationError>
-where
-    R: alloy_consensus::TxReceipt<Log = Log>,
-{
-    super::observe_l2_block(block, receipts, |_| Ok(post_state))
-}
-
-fn basic_fixture() -> (
-    RecoveredBlock<Block>,
-    Vec<TempoReceipt<Log>>,
-    ZonePostStateOutputs,
-) {
+fn basic_fixture() -> (RecoveredBlock<Block>, Vec<TempoReceipt<Log>>) {
     let block = recovered_block(
         vec![advance_transaction(ZONE_INBOX_ADDRESS)],
         vec![Address::ZERO],
     );
-    let receipts = vec![receipt(true, required_advance_logs(None))];
-    let state = post_state(block.hash());
-    (block, receipts, state)
+    let receipts = vec![receipt(true, advance_logs(None))];
+    (block, receipts)
 }
 
 fn tempo_gas_rate_updated_log() -> Log {
@@ -218,7 +188,7 @@ fn withdrawal_requested_log() -> Log {
         address: ZONE_OUTBOX_ADDRESS,
         data: IZoneOutbox::WithdrawalRequested {
             withdrawalIndex: 4,
-            sender: Address::repeat_byte(0x44),
+            sender: Address::repeat_byte(0x45),
             token: Address::repeat_byte(0x55),
             to: Address::repeat_byte(0x66),
             amount: 100,
@@ -241,20 +211,18 @@ fn observe_user_logs(logs: Vec<Log>) -> (B256, L2BlockObservation) {
         vec![advance, user],
         vec![Address::ZERO, Address::repeat_byte(0x44)],
     );
-    let receipts = vec![
-        receipt(true, required_advance_logs(None)),
-        receipt(true, logs),
-    ];
-    let observation = observe_with_state(&block, &receipts, post_state(block.hash())).unwrap();
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, logs)];
+    let observation = observe_l2_block(&block, &receipts).unwrap();
     (user_hash, observation)
 }
 
 #[test]
-fn observes_header_derived_input_and_output_only_tempo_event() {
-    let (block, receipts, state) = basic_fixture();
-    let observation = observe_with_state(&block, &receipts, state).unwrap();
+fn observes_decoded_header_input_and_ordered_protocol_events() {
+    let (block, receipts) = basic_fixture();
+    let observation = observe_l2_block(&block, &receipts).unwrap();
 
     assert_eq!(observation.block_hash, block.hash());
+    assert_eq!(observation.parent_hash(), ZONE_PARENT_HASH);
     assert_eq!(
         observation.inputs.advance_tempo.imported_header().hash(),
         imported_header().hash_slow()
@@ -263,8 +231,20 @@ fn observes_header_derived_input_and_output_only_tempo_event() {
 }
 
 #[test]
-fn tempo_advanced_and_exact_state_cursors_are_retained_without_cross_comparison() {
-    let (block, mut receipts, state) = basic_fixture();
+fn authenticated_inputs_do_not_require_matching_event_outputs() {
+    let (block, _) = basic_fixture();
+    let observation = observe_l2_block(&block, &[receipt(true, Vec::new())]).unwrap();
+
+    assert_eq!(
+        observation.inputs.advance_tempo.imported_header().hash(),
+        imported_header().hash_slow()
+    );
+    assert!(observation.outcomes.events.is_empty());
+}
+
+#[test]
+fn tempo_advanced_cursor_is_retained_for_later_evaluation() {
+    let (block, mut receipts) = basic_fixture();
     receipts[0].logs[1] = Log {
         address: ZONE_INBOX_ADDRESS,
         data: IZoneInbox::TempoAdvanced {
@@ -277,11 +257,7 @@ fn tempo_advanced_and_exact_state_cursors_are_retained_without_cross_comparison(
         .encode_log_data(),
     };
 
-    let observation = observe_with_state(&block, &receipts, state).unwrap();
-    assert_eq!(
-        observation.outcomes.post_state.processed_cursor_for_test(),
-        (B256::repeat_byte(0x41), 12)
-    );
+    let observation = observe_l2_block(&block, &receipts).unwrap();
     assert!(matches!(
         &observation.outcomes.events[1].event,
         L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(event))
@@ -291,24 +267,25 @@ fn tempo_advanced_and_exact_state_cursors_are_retained_without_cross_comparison(
 }
 
 #[test]
-fn forged_tempo_advanced_cannot_replace_the_calldata_header() {
-    let (block, mut receipts, state) = basic_fixture();
+fn mismatched_tempo_advanced_is_retained_independently_from_calldata() {
+    let (block, mut receipts) = basic_fixture();
     let forged_hash = B256::repeat_byte(0xee);
-    receipts[0].logs = required_advance_logs(Some(forged_hash));
+    receipts[0].logs = advance_logs(Some(forged_hash));
 
-    let error = observe_with_state(&block, &receipts, state).unwrap_err();
+    let observation = observe_l2_block(&block, &receipts).unwrap();
+    assert_eq!(
+        observation.inputs.advance_tempo.imported_header().hash(),
+        imported_header().hash_slow()
+    );
     assert!(matches!(
-        error,
-        ObservationError::OutputMismatch {
-            field: OutputField::TempoAdvancedHash,
-            expected: MismatchValue::Hash(expected),
-            actual: MismatchValue::Hash(actual),
-        } if expected == imported_header().hash_slow() && actual == forged_hash
+        &observation.outcomes.events[1].event,
+        L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(event))
+            if event.tempoBlockHash == forged_hash
     ));
 }
 
 #[test]
-fn enabled_token_outputs_match_by_order_with_typed_field_failures() {
+fn mismatched_enabled_token_output_is_retained_for_later_evaluation() {
     let block = recovered_block(
         vec![advance_transaction_with_tokens(
             ZONE_INBOX_ADDRESS,
@@ -321,61 +298,58 @@ fn enabled_token_outputs_match_by_order_with_typed_field_failures() {
         )],
         vec![Address::ZERO],
     );
-    let mut logs = required_advance_logs(None);
+    let mut logs = advance_logs(None);
     logs.push(token_enabled_log("TKN"));
     let mut receipts = vec![receipt(true, logs)];
 
-    let observation = observe_with_state(&block, &receipts, post_state(block.hash())).unwrap();
+    let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(observation.inputs.advance_tempo.enabled_tokens().len(), 1);
 
     receipts[0].logs[2] = token_enabled_log("BAD");
+    let observation = observe_l2_block(&block, &receipts).unwrap();
+    assert_eq!(
+        observation.inputs.advance_tempo.enabled_tokens()[0].symbol,
+        "TKN"
+    );
     assert!(matches!(
-        observe_with_state(&block, &receipts, post_state(block.hash())),
-        Err(ObservationError::OutputMismatch {
-            field: OutputField::TokenEnabledSymbol { index: 0 },
-            expected: MismatchValue::Text(expected),
-            actual: MismatchValue::Text(actual),
-        }) if expected == "TKN" && actual == "BAD"
+        &observation.outcomes.events[2].event,
+        L2ProtocolEvent::Inbox(Inbox::InboxEvents::TokenEnabled(event))
+            if event.symbol == "BAD"
     ));
 }
 
 #[test]
-fn cardinality_errors_are_structural() {
-    let (block, receipts, state) = basic_fixture();
-    let error = observe_with_state(&block, &Vec::<TempoReceipt<Log>>::new(), state).unwrap_err();
+fn notification_cardinality_errors_are_acquisition_failures() {
+    let (block, receipts) = basic_fixture();
+    let error = observe_l2_block(&block, &Vec::<TempoReceipt<Log>>::new()).unwrap_err();
     assert!(matches!(
         error,
-        ObservationError::InvalidEnvelope {
-            rule: EnvelopeRule::TransactionReceiptCardinality,
+        ObservationError::Acquisition(AcquisitionError::Inconsistent {
+            kind: AcquisitionSource::ZoneNotificationReceipts,
             ..
-        }
+        })
     ));
 
     let without_sender = recovered_block(vec![advance_transaction(ZONE_INBOX_ADDRESS)], vec![]);
-    let error = observe_with_state(
-        &without_sender,
-        &receipts,
-        post_state(without_sender.hash()),
-    )
-    .unwrap_err();
+    let error = observe_l2_block(&without_sender, &receipts).unwrap_err();
     assert!(matches!(
         error,
-        ObservationError::InvalidEnvelope {
-            rule: EnvelopeRule::TransactionSenderCardinality,
+        ObservationError::Acquisition(AcquisitionError::Inconsistent {
+            kind: AcquisitionSource::ZoneNotificationBlock,
             ..
-        }
+        })
     ));
 }
 
 #[test]
 fn opening_envelope_requires_system_identity_destination_and_success() {
-    let receipts = vec![receipt(true, required_advance_logs(None))];
+    let receipts = vec![receipt(true, advance_logs(None))];
     let wrong_sender = recovered_block(
         vec![advance_transaction(ZONE_INBOX_ADDRESS)],
         vec![Address::repeat_byte(1)],
     );
     assert!(matches!(
-        observe_with_state(&wrong_sender, &receipts, post_state(wrong_sender.hash())),
+        observe_l2_block(&wrong_sender, &receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::AdvanceSystemCaller,
             ..
@@ -387,74 +361,21 @@ fn opening_envelope_requires_system_identity_destination_and_success() {
         vec![Address::ZERO],
     );
     assert!(matches!(
-        observe_with_state(
-            &wrong_destination,
-            &receipts,
-            post_state(wrong_destination.hash())
-        ),
+        observe_l2_block(&wrong_destination, &receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::AdvanceDestination,
             ..
         })
     ));
 
-    let (block, _, state) = basic_fixture();
+    let (block, _) = basic_fixture();
     assert!(matches!(
-        observe_with_state(&block, &[receipt(false, vec![])], state),
+        observe_l2_block(&block, &[receipt(false, vec![])]),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::AdvanceSuccess,
             ..
         })
     ));
-}
-
-#[test]
-fn deterministic_envelope_validation_precedes_exact_state_acquisition() {
-    let block = recovered_block(
-        vec![advance_transaction(Address::repeat_byte(2))],
-        vec![Address::ZERO],
-    );
-    let receipts = vec![receipt(true, required_advance_logs(None))];
-    let mut state_requested = false;
-
-    let error = super::observe_l2_block(&block, &receipts, |_| {
-        state_requested = true;
-        Err(AcquisitionError::missing(AcquisitionSource::ExactZoneState, block.hash()).into())
-    })
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ObservationError::InvalidEnvelope {
-            rule: EnvelopeRule::AdvanceDestination,
-            ..
-        }
-    ));
-    assert!(!state_requested);
-}
-
-#[test]
-fn deterministic_event_validation_precedes_exact_state_acquisition() {
-    let (block, mut receipts, _) = basic_fixture();
-    let forged_hash = B256::repeat_byte(0xee);
-    receipts[0].logs = required_advance_logs(Some(forged_hash));
-    let mut state_requested = false;
-
-    let error = super::observe_l2_block(&block, &receipts, |_| {
-        state_requested = true;
-        Err(AcquisitionError::missing(AcquisitionSource::ExactZoneState, block.hash()).into())
-    })
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ObservationError::OutputMismatch {
-            field: OutputField::TempoAdvancedHash,
-            expected: MismatchValue::Hash(expected),
-            actual: MismatchValue::Hash(actual),
-        } if expected == imported_header().hash_slow() && actual == forged_hash
-    ));
-    assert!(!state_requested);
 }
 
 #[test]
@@ -471,6 +392,7 @@ fn outcomes_preserve_config_before_operation_order() {
             receipt_log_index: 0,
             block_log_index: 2,
             transaction_hash: user_hash,
+            transaction_sender: Address::repeat_byte(0x44),
         }
     );
     assert_eq!(
@@ -480,15 +402,21 @@ fn outcomes_preserve_config_before_operation_order() {
             receipt_log_index: 1,
             block_log_index: 3,
             transaction_hash: user_hash,
+            transaction_sender: Address::repeat_byte(0x44),
         }
     );
     assert!(matches!(
         user_events[0].event(),
         L2ProtocolEvent::Outbox(Outbox::OutboxEvents::TempoGasRateUpdated(_))
     ));
+    assert_eq!(
+        user_events[1].position().transaction_sender(),
+        Address::repeat_byte(0x44)
+    );
     assert!(matches!(
         user_events[1].event(),
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(_))
+        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(event))
+            if event.sender == Address::repeat_byte(0x45)
     ));
 }
 
@@ -506,6 +434,7 @@ fn outcomes_preserve_operation_before_config_order() {
             receipt_log_index: 0,
             block_log_index: 2,
             transaction_hash: user_hash,
+            transaction_sender: Address::repeat_byte(0x44),
         }
     );
     assert_eq!(
@@ -515,6 +444,7 @@ fn outcomes_preserve_operation_before_config_order() {
             receipt_log_index: 1,
             block_log_index: 3,
             transaction_hash: user_hash,
+            transaction_sender: Address::repeat_byte(0x44),
         }
     );
     assert!(matches!(
@@ -529,7 +459,7 @@ fn outcomes_preserve_operation_before_config_order() {
 
 #[test]
 fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
-    let (block, mut receipts, state) = basic_fixture();
+    let (block, mut receipts) = basic_fixture();
     receipts[0].logs.insert(
         0,
         Log {
@@ -537,10 +467,10 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             data: LogData::new_unchecked(vec![B256::repeat_byte(0xaa)], Bytes::new()),
         },
     );
-    let observation = observe_with_state(&block, &receipts, state).unwrap();
+    let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(observation.outcomes.events.len(), 2);
 
-    let (block, mut receipts, state) = basic_fixture();
+    let (block, mut receipts) = basic_fixture();
     let transaction_hash = *block.body().transactions[0].tx_hash();
     receipts[0].logs.insert(
         0,
@@ -550,7 +480,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
         },
     );
     assert!(matches!(
-        observe_with_state(&block, &receipts, state),
+        observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent {
             chain: ProtocolChain::ZoneL2,
             transaction_index: 0,
@@ -562,7 +492,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             && matches!(error.as_ref(), crate::model::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 
-    let (block, mut receipts, state) = basic_fixture();
+    let (block, mut receipts) = basic_fixture();
     receipts[0].logs.insert(
         0,
         Log {
@@ -574,7 +504,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
         },
     );
     assert!(matches!(
-        observe_with_state(&block, &receipts, state),
+        observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
             if matches!(error.as_ref(), crate::model::events::ProtocolEventError::MalformedProtocolEvent { .. })
     ));
@@ -582,7 +512,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
 
 #[test]
 fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
-    let (block, mut receipts, state) = basic_fixture();
+    let (block, mut receipts) = basic_fixture();
     receipts[0].logs.insert(
         0,
         Log {
@@ -596,21 +526,20 @@ fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
         },
     );
     assert!(matches!(
-        observe_with_state(&block, &receipts, state),
+        observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
             if matches!(error.as_ref(), crate::model::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 }
 
 #[test]
-fn finalization_is_unique_final_and_retains_independent_event_and_state_outputs() {
+fn finalization_is_unique_final_and_retains_its_event_output() {
     let advance = advance_transaction(ZONE_INBOX_ADDRESS);
     let finalize = finalization_transaction(ZONE_NUMBER);
     let finalize_hash = *finalize.tx_hash();
     let block = recovered_block(vec![advance, finalize], vec![Address::ZERO, Address::ZERO]);
-    let state = post_state(block.hash());
     let receipts = vec![
-        receipt(true, required_advance_logs(None)),
+        receipt(true, advance_logs(None)),
         receipt(
             true,
             vec![Log {
@@ -623,14 +552,10 @@ fn finalization_is_unique_final_and_retains_independent_event_and_state_outputs(
             }],
         ),
     ];
-    let observation = observe_with_state(&block, &receipts, state).unwrap();
+    let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(
         observation.inputs.finalization.unwrap().transaction_hash,
         finalize_hash
-    );
-    assert_eq!(
-        observation.outcomes.post_state.withdrawal_cursor_for_test(),
-        (B256::repeat_byte(0x51), 3)
     );
     assert!(matches!(
         &observation.outcomes.events.last().unwrap().event,
@@ -649,12 +574,9 @@ fn finalization_rejects_wrong_block_number_and_position() {
         ],
         vec![Address::ZERO, Address::ZERO],
     );
-    let receipts = vec![
-        receipt(true, required_advance_logs(None)),
-        receipt(true, vec![]),
-    ];
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     assert!(matches!(
-        observe_with_state(&wrong_number, &receipts, post_state(wrong_number.hash())),
+        observe_l2_block(&wrong_number, &receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationBlockNumber,
             ..
@@ -670,12 +592,12 @@ fn finalization_rejects_wrong_block_number_and_position() {
         vec![Address::ZERO, Address::ZERO, Address::repeat_byte(3)],
     );
     let receipts = vec![
-        receipt(true, required_advance_logs(None)),
+        receipt(true, advance_logs(None)),
         receipt(true, vec![]),
         receipt(true, vec![]),
     ];
     assert!(matches!(
-        observe_with_state(&misplaced, &receipts, post_state(misplaced.hash())),
+        observe_l2_block(&misplaced, &receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationPosition,
             ..
@@ -685,12 +607,7 @@ fn finalization_rejects_wrong_block_number_and_position() {
 
 #[test]
 fn finalization_requires_system_identity_destination_and_success() {
-    let finalization_receipts = || {
-        vec![
-            receipt(true, required_advance_logs(None)),
-            receipt(true, vec![]),
-        ]
-    };
+    let finalization_receipts = || vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
 
     let wrong_sender = recovered_block(
         vec![
@@ -700,11 +617,7 @@ fn finalization_requires_system_identity_destination_and_success() {
         vec![Address::ZERO, Address::repeat_byte(1)],
     );
     assert!(matches!(
-        observe_with_state(
-            &wrong_sender,
-            &finalization_receipts(),
-            post_state(wrong_sender.hash())
-        ),
+        observe_l2_block(&wrong_sender, &finalization_receipts()),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::SystemIdentity,
             ..
@@ -722,11 +635,7 @@ fn finalization_requires_system_identity_destination_and_success() {
         vec![Address::ZERO, Address::ZERO],
     );
     assert!(matches!(
-        observe_with_state(
-            &wrong_destination,
-            &finalization_receipts(),
-            post_state(wrong_destination.hash())
-        ),
+        observe_l2_block(&wrong_destination, &finalization_receipts()),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationDestination,
             ..
@@ -740,27 +649,11 @@ fn finalization_requires_system_identity_destination_and_success() {
         ],
         vec![Address::ZERO, Address::ZERO],
     );
-    let failed_receipts = vec![
-        receipt(true, required_advance_logs(None)),
-        receipt(false, vec![]),
-    ];
+    let failed_receipts = vec![receipt(true, advance_logs(None)), receipt(false, vec![])];
     assert!(matches!(
-        observe_with_state(&failed, &failed_receipts, post_state(failed.hash())),
+        observe_l2_block(&failed, &failed_receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationSuccess,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn exact_state_is_bound_to_the_observed_zone_hash() {
-    let (block, receipts, state) = basic_fixture();
-    let state = state.with_block_hash_for_test(B256::repeat_byte(0xdd));
-    assert!(matches!(
-        observe_with_state(&block, &receipts, state),
-        Err(ObservationError::OutputMismatch {
-            field: OutputField::StateBlockBinding,
             ..
         })
     ));
@@ -775,12 +668,9 @@ fn malformed_finalization_calldata_has_its_own_error_class() {
         ],
         vec![Address::ZERO, Address::ZERO],
     );
-    let receipts = vec![
-        receipt(true, required_advance_logs(None)),
-        receipt(true, vec![]),
-    ];
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     assert!(matches!(
-        observe_with_state(&block, &receipts, post_state(block.hash())),
+        observe_l2_block(&block, &receipts),
         Err(ObservationError::MalformedAuthenticatedData {
             kind: DataSource::FinalizationCalldata,
             ..

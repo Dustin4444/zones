@@ -108,6 +108,16 @@ impl DecodedAdvanceTempo {
     pub(crate) fn enabled_tokens(&self) -> &[IZoneInbox::EnabledToken] {
         &self.enabled_tokens
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(imported_header: ImportedTempoHeader) -> Self {
+        Self {
+            imported_header,
+            deposits: Vec::new(),
+            decryptions: Vec::new(),
+            enabled_tokens: Vec::new(),
+        }
+    }
 }
 
 /// Authenticated inputs carried by the optional final system transaction.

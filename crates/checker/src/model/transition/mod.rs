@@ -23,7 +23,8 @@ use super::{
     encoding::DepositQueueMember,
     input::{ImportedTempoBlockInput, TokenEnable, ZoneBlockInput, ZoneDepositPrefixInput},
     output::{
-        ExpectedImportedTempoBlock, ExpectedOutputs, ExpectedZoneBlock, ExpectedZoneDepositPrefix,
+        ExpectedImportedTempoBlock, ExpectedOutputs, ExpectedPostZoneState, ExpectedZoneBlock,
+        ExpectedZoneDepositPrefix,
     },
     ownership::{
         BatchId, BatchOwner, DepositId, DepositOwner, FallbackId, FallbackOwner, InboxRefundId,
@@ -190,12 +191,35 @@ impl<'a, K: Ord + Copy, V> Iterator for OwnerOverlay<'a, K, V> {
     }
 }
 
-/// Complete Zone-block commit capsule. It retains its exact parent cut so the
-/// mutation cannot be detached and applied to a different or newer state.
+/// Complete Zone-block candidate. It retains its exact parent cut throughout
+/// transition and comparison; callers release its sparse update only at the
+/// checker commit boundary.
 pub(crate) struct CompletedTransition<'a> {
     parent: &'a ModelState,
     delta: LogicalDelta,
     expected: ExpectedOutputs,
+}
+
+/// Sparse mutations released only after a complete candidate transition.
+///
+/// The checker applies this value to the still-current parent only after every
+/// external comparison succeeds. Keeping the update typed avoids cloning the
+/// authoritative lifecycle maps on every verified block.
+#[must_use = "a candidate update must be applied exactly once to its still-current parent"]
+pub(crate) struct ModelStateUpdate {
+    delta: LogicalDelta,
+}
+
+impl ModelStateUpdate {
+    /// Apply to the exact parent from which this update was projected.
+    ///
+    /// Rust module visibility cannot grant this sibling-module method only to
+    /// `check::pipeline`; the private `CandidateCommit` there is the sole
+    /// production owner. Persistence must add an explicit tip/generation guard
+    /// before it allows an update to outlive that immediate commit boundary.
+    pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
+        apply_delta(state, self.delta);
+    }
 }
 
 impl<'a> ModelTransition<'a> {
@@ -366,6 +390,12 @@ impl<'a> ModelTransition<'a> {
 }
 
 impl<'a> ImportedTempoTransition<'a> {
+    /// Independently derived Portal outputs available before any external
+    /// collateral call or Zone transition is attempted.
+    pub(crate) const fn expected(&self) -> &ExpectedImportedTempoBlock {
+        &self.expected
+    }
+
     /// Read-only post-L1/pre-Zone cut used by the collateral check in Goal 5.
     pub(crate) fn created_portal(&self) -> Option<&CreatedPortalState> {
         self.candidate.portal().created()
@@ -441,6 +471,26 @@ impl CompletedTransition<'_> {
         &self.expected
     }
 
+    /// Zone state at the post-Zone candidate cut used by fixed commitment
+    /// comparisons.
+    pub(crate) fn zone(&self) -> &ZoneState {
+        self.delta.zone.as_ref().unwrap_or(&self.parent.zone)
+    }
+
+    pub(crate) fn expected_post_zone_state(
+        &self,
+        tempo_block_hash: alloy_primitives::B256,
+        tempo_block_number: u64,
+    ) -> ExpectedPostZoneState {
+        let zone = self.zone();
+        ExpectedPostZoneState::new(
+            tempo_block_hash,
+            tempo_block_number,
+            zone.processed_deposit_cursor(),
+            zone.last_batch(),
+        )
+    }
+
     /// Token state at the post-Zone candidate cut used by Goal 5 supply checks.
     pub(crate) fn token(&self, token: Address) -> Option<&TokenState> {
         self.delta
@@ -454,16 +504,20 @@ impl CompletedTransition<'_> {
         TokenViewIter::new(self.parent, &self.delta)
     }
 
+    /// Release the sparse candidate only after callers finish all comparisons.
+    pub(crate) fn into_state_update(self) -> ModelStateUpdate {
+        ModelStateUpdate { delta: self.delta }
+    }
+
     #[cfg(test)]
     pub(crate) fn materialize_for_test(self) -> (ModelState, ExpectedOutputs) {
         let mut state = self.parent.clone();
-        apply_delta_for_test(&mut state, self.delta);
+        apply_delta(&mut state, self.delta);
         (state, self.expected)
     }
 }
 
-#[cfg(test)]
-fn apply_delta_for_test(state: &mut ModelState, delta: LogicalDelta) {
+fn apply_delta(state: &mut ModelState, delta: LogicalDelta) {
     if let Some(portal) = delta.portal {
         state.portal = portal;
     }
@@ -471,21 +525,17 @@ fn apply_delta_for_test(state: &mut ModelState, delta: LogicalDelta) {
         state.zone = zone;
     }
     state.tokens.extend(delta.tokens);
-    apply_sparse_map_delta_for_test(&mut state.pending_deposits, delta.pending_deposits);
-    apply_sparse_map_delta_for_test(&mut state.withdrawals, delta.withdrawals);
-    apply_sparse_map_delta_for_test(&mut state.batches, delta.batches);
-    apply_sparse_map_delta_for_test(&mut state.fallback_owners, delta.fallback_owners);
-    apply_sparse_map_delta_for_test(&mut state.portal_refunds, delta.portal_refunds);
-    apply_sparse_map_delta_for_test(&mut state.portal_refund_totals, delta.portal_refund_totals);
-    apply_sparse_map_delta_for_test(&mut state.inbox_refunds, delta.inbox_refunds);
-    apply_sparse_map_delta_for_test(&mut state.inbox_refund_totals, delta.inbox_refund_totals);
+    apply_sparse_map_delta(&mut state.pending_deposits, delta.pending_deposits);
+    apply_sparse_map_delta(&mut state.withdrawals, delta.withdrawals);
+    apply_sparse_map_delta(&mut state.batches, delta.batches);
+    apply_sparse_map_delta(&mut state.fallback_owners, delta.fallback_owners);
+    apply_sparse_map_delta(&mut state.portal_refunds, delta.portal_refunds);
+    apply_sparse_map_delta(&mut state.portal_refund_totals, delta.portal_refund_totals);
+    apply_sparse_map_delta(&mut state.inbox_refunds, delta.inbox_refunds);
+    apply_sparse_map_delta(&mut state.inbox_refund_totals, delta.inbox_refund_totals);
 }
 
-#[cfg(test)]
-fn apply_sparse_map_delta_for_test<K: Ord, V>(
-    state: &mut BTreeMap<K, V>,
-    delta: BTreeMap<K, Option<V>>,
-) {
+fn apply_sparse_map_delta<K: Ord, V>(state: &mut BTreeMap<K, V>, delta: BTreeMap<K, Option<V>>) {
     for (key, value) in delta {
         match value {
             Some(value) => {

@@ -6,6 +6,7 @@
 //! follow Goal 0 in `DESIGN.md`.
 
 pub(crate) mod accounting;
+pub(crate) mod adapter;
 pub(crate) mod constants;
 pub(crate) mod encoding;
 pub(crate) mod events;

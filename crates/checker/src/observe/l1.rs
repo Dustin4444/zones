@@ -18,7 +18,10 @@ use super::{
 
 mod authentication;
 mod calls;
+mod collateral;
 mod events;
+
+pub(crate) use collateral::acquire_portal_collateral;
 
 #[cfg(test)]
 mod tests;
@@ -32,8 +35,6 @@ pub(crate) struct L1EventPosition {
     transaction_hash: B256,
 }
 
-// Goal 1 freezes this read-only adapter API before the pure model consumes it.
-#[allow(dead_code)]
 impl L1EventPosition {
     pub(crate) fn transaction_index(&self) -> usize {
         self.transaction_index
@@ -59,8 +60,6 @@ pub(crate) struct OrderedL1Outcome {
     event: L1ProtocolEvent,
 }
 
-// Goal 1 freezes this read-only adapter API before the pure model consumes it.
-#[allow(dead_code)]
 impl OrderedL1Outcome {
     pub(crate) fn position(&self) -> L1EventPosition {
         self.position
@@ -81,8 +80,6 @@ pub(crate) struct L1TransactionObservation {
     outcomes: Vec<OrderedL1Outcome>,
 }
 
-// Goal 1 freezes transaction identity before the pure model consumes it.
-#[allow(dead_code)]
 impl L1TransactionObservation {
     pub(crate) fn transaction_index(&self) -> usize {
         self.transaction_index
@@ -106,6 +103,7 @@ impl L1TransactionObservation {
 pub(crate) struct L1BlockObservation {
     block_number: u64,
     block_hash: B256,
+    portal_address: Address,
     protocol_transactions: Vec<L1TransactionObservation>,
 }
 
@@ -118,8 +116,74 @@ impl L1BlockObservation {
         self.block_hash
     }
 
+    pub(crate) fn portal_address(&self) -> Address {
+        self.portal_address
+    }
+
     pub(crate) fn protocol_transactions(&self) -> &[L1TransactionObservation] {
         &self.protocol_transactions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        block_number: u64,
+        block_hash: B256,
+        portal_address: Address,
+        transactions: Vec<(B256, Vec<L1ProtocolEvent>)>,
+    ) -> Self {
+        Self::with_calls_for_test(
+            block_number,
+            block_hash,
+            portal_address,
+            transactions
+                .into_iter()
+                .map(|(hash, events)| (hash, None, events))
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_calls_for_test(
+        block_number: u64,
+        block_hash: B256,
+        portal_address: Address,
+        transactions: Vec<(B256, Option<DecodedPortalCall>, Vec<L1ProtocolEvent>)>,
+    ) -> Self {
+        let mut block_log_index = 0;
+        let protocol_transactions = transactions
+            .into_iter()
+            .enumerate()
+            .map(
+                |(transaction_index, (transaction_hash, direct_call, events))| {
+                    let outcomes = events
+                        .into_iter()
+                        .enumerate()
+                        .map(|(receipt_log_index, event)| {
+                            let position = L1EventPosition {
+                                transaction_index,
+                                receipt_log_index,
+                                block_log_index,
+                                transaction_hash,
+                            };
+                            block_log_index += 1;
+                            OrderedL1Outcome { position, event }
+                        })
+                        .collect();
+                    L1TransactionObservation {
+                        transaction_index,
+                        transaction_hash,
+                        direct_call,
+                        outcomes,
+                    }
+                },
+            )
+            .collect();
+        Self {
+            block_number,
+            block_hash,
+            portal_address,
+            protocol_transactions,
+        }
     }
 }
 
@@ -170,6 +234,7 @@ where
     Ok(L1BlockObservation {
         block_number: imported.number(),
         block_hash: imported.hash(),
+        portal_address: portal,
         protocol_transactions,
     })
 }

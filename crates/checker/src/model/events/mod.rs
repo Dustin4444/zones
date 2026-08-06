@@ -27,7 +27,7 @@ pub(crate) use inbox::Inbox;
 pub(crate) use outbox::Outbox;
 pub(crate) use tempo_state::TempoState;
 
-pub(crate) use portal::PortalModelEvent;
+pub(crate) use portal::{Portal, PortalModelEvent};
 
 /// A strictly decoded, model-driving L1 protocol event.
 #[derive(Debug, PartialEq, Eq)]

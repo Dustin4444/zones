@@ -18,6 +18,17 @@ impl TokenAccounting {
         withdrawal_liability: U256::ZERO,
     };
 
+    /// Minimum Portal balance required at the post-L1/pre-Zone cut.
+    ///
+    /// This is intentionally a direct checked fold over the three authoritative
+    /// accounting components, not an entry in a generic invariant registry.
+    pub(crate) fn collateral_requirement(self) -> Result<U256, AccountingError> {
+        self.supply
+            .checked_add(self.deposit_liability)
+            .and_then(|total| total.checked_add(self.withdrawal_liability))
+            .ok_or(AccountingError::Overflow(Component::CollateralRequirement))
+    }
+
     /// Apply one post-enablement row from DESIGN section 5.5 with checked
     /// arithmetic. Enablement itself is handled by [`apply_token_accounting`]
     /// because map presence, not zero aggregate values, proves uniqueness.
@@ -135,6 +146,7 @@ pub(crate) enum Component {
     DepositLiability,
     WithdrawalLiability,
     WithdrawalBurn,
+    CollateralRequirement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -298,6 +310,17 @@ mod tests {
                 }
             ),
             Err(AccountingError::Overflow(Component::WithdrawalBurn))
+        );
+
+        assert_eq!(a(10, 20, 30).collateral_requirement(), Ok(U256::from(60)));
+        assert_eq!(
+            TokenAccounting {
+                supply: U256::MAX,
+                deposit_liability: U256::ONE,
+                withdrawal_liability: U256::ZERO,
+            }
+            .collateral_requirement(),
+            Err(AccountingError::Overflow(Component::CollateralRequirement))
         );
     }
 }

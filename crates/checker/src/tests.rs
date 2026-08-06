@@ -10,6 +10,7 @@ use alloy_transport::mock::Asserter;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+use reth_storage_api::{StateProviderBox, errors::provider::ProviderResult};
 use tempo_alloy::{
     TempoNetwork,
     rpc::{TempoHeaderResponse, TempoTransactionReceipt},
@@ -32,10 +33,23 @@ use crate::{
     observe::AcquisitionError,
 };
 
+mod pipeline;
+
 const PORTAL: Address = Address::repeat_byte(0x42);
 const L1_NUMBER: u64 = 100;
-
 type TestProvider = MockEthProvider<TempoPrimitives>;
+type L1RpcBlock = alloy_rpc_types_eth::Block<
+    alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
+    TempoHeaderResponse,
+>;
+
+struct UnavailableZoneState;
+
+impl ExactStateLookup for UnavailableZoneState {
+    fn state_by_exact_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
+        Err(reth_storage_api::errors::provider::ProviderError::StateForHashNotFound(block_hash))
+    }
+}
 
 #[test]
 fn checker_mode_parse_display_default() {
@@ -73,13 +87,19 @@ fn acknowledgement_state_never_crosses_the_first_observation_gap() {
 }
 
 fn imported_header(number: u64) -> TempoHeader {
+    imported_child_header(number, B256::ZERO)
+}
+
+fn imported_child_header(number: u64, parent_hash: B256) -> TempoHeader {
     let receipts_root = alloy_consensus::proofs::calculate_receipt_root::<
         alloy_consensus::ReceiptWithBloom<tempo_primitives::TempoReceipt<Log>>,
     >(&[]);
     TempoHeader {
         inner: Header {
             number,
+            parent_hash,
             receipts_root,
+            base_fee_per_gas: Some(0),
             ..Default::default()
         },
         ..Default::default()
@@ -102,22 +122,7 @@ fn zone_block_with_marker(
     imported: &TempoHeader,
     fork_marker: u8,
 ) -> RecoveredBlock<Block> {
-    let calldata = IZoneInbox::advanceTempoCall {
-        header: encode_header(imported),
-        deposits: Vec::new(),
-        decryptions: Vec::new(),
-        enabledTokens: Vec::new(),
-    }
-    .abi_encode();
-    let advance = TempoTxEnvelope::Legacy(Signed::new_unhashed(
-        TxLegacy {
-            gas_limit: 0,
-            to: ZONE_INBOX_ADDRESS.into(),
-            input: calldata.into(),
-            ..Default::default()
-        },
-        TEMPO_SYSTEM_TX_SIGNATURE,
-    ));
+    let advance = advance_transaction(imported);
     let block = Block {
         header: TempoHeader {
             inner: Header {
@@ -134,6 +139,25 @@ fn zone_block_with_marker(
         },
     };
     RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::ZERO])
+}
+
+fn advance_transaction(imported: &TempoHeader) -> TempoTxEnvelope {
+    let calldata = IZoneInbox::advanceTempoCall {
+        header: encode_header(imported),
+        deposits: Vec::new(),
+        decryptions: Vec::new(),
+        enabledTokens: Vec::new(),
+    }
+    .abi_encode();
+    TempoTxEnvelope::Legacy(Signed::new_unhashed(
+        TxLegacy {
+            gas_limit: 0,
+            to: ZONE_INBOX_ADDRESS.into(),
+            input: calldata.into(),
+            ..Default::default()
+        },
+        TEMPO_SYSTEM_TX_SIGNATURE,
+    ))
 }
 
 fn zone_receipt(imported: &TempoHeader) -> TempoReceipt {
@@ -214,12 +238,11 @@ fn zone_state(imported: &TempoHeader) -> TestProvider {
     provider
 }
 
-fn l1_provider(imported: &TempoHeader) -> DynProvider<TempoNetwork> {
-    let hash = imported.hash_slow();
-    let block = alloy_rpc_types_eth::Block {
+fn l1_rpc_block(imported: &TempoHeader) -> L1RpcBlock {
+    alloy_rpc_types_eth::Block {
         header: TempoHeaderResponse {
             inner: RpcHeader {
-                hash,
+                hash: imported.hash_slow(),
                 inner: imported.clone(),
                 total_difficulty: None,
                 size: None,
@@ -232,9 +255,12 @@ fn l1_provider(imported: &TempoHeader) -> DynProvider<TempoNetwork> {
                 Vec::new(),
             ),
         withdrawals: None,
-    };
+    }
+}
+
+fn l1_provider(imported: &TempoHeader) -> DynProvider<TempoNetwork> {
     let asserter = Asserter::new();
-    asserter.push_success(&Some(block));
+    asserter.push_success(&Some(l1_rpc_block(imported)));
     asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
     ProviderBuilder::new_with_network::<TempoNetwork>()
         .connect_mocked_client(asserter)
@@ -260,6 +286,26 @@ async fn committed_notification_wires_zone_and_imported_tempo_observers() {
 }
 
 #[tokio::test]
+async fn exact_zone_state_gap_blocks_live_observation_acknowledgement() {
+    let imported = imported_header(L1_NUMBER);
+    let block = zone_block(1, B256::repeat_byte(0x19), &imported);
+    let notification = ExExNotification::ChainCommitted {
+        new: chain(vec![block], vec![vec![zone_receipt(&imported)]]),
+    };
+    let mut l1 = Some(l1_provider(&imported));
+
+    assert!(matches!(
+        process_notification(&notification, &UnavailableZoneState, &mut l1, "", PORTAL).await,
+        Err(ObservationError::Acquisition(
+            AcquisitionError::Unavailable {
+                kind: AcquisitionSource::ExactZoneState,
+                ..
+            }
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn notification_receipt_set_gap_preserves_acquisition_class() {
     let imported = imported_header(L1_NUMBER);
     let block = zone_block(1, B256::repeat_byte(0x22), &imported);
@@ -273,7 +319,7 @@ async fn notification_receipt_set_gap_preserves_acquisition_class() {
     let mut l1 = None;
 
     assert!(matches!(
-        process_notification(&notification, &TestProvider::new(), &mut l1, "", PORTAL).await,
+        process_notification(&notification, &TestProvider::new(), &mut l1, "", PORTAL,).await,
         Err(ObservationError::Acquisition(
             AcquisitionError::Inconsistent {
                 kind: AcquisitionSource::ZoneNotificationReceipts,

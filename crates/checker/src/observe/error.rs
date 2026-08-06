@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256};
 
 use crate::model::events::ProtocolEventError;
 
@@ -19,8 +19,12 @@ pub(crate) enum AcquisitionSource {
     L1Transaction,
     #[error("Zone notification receipts")]
     ZoneNotificationReceipts,
+    #[error("Zone notification block data")]
+    ZoneNotificationBlock,
     #[error("exact Zone state")]
     ExactZoneState,
+    #[error("exact Portal collateral")]
+    PortalCollateral,
 }
 
 /// Location of an envelope violation without inventing transaction zero for
@@ -100,10 +104,6 @@ impl AcquisitionError {
 pub(crate) enum EnvelopeRule {
     #[error("only non-genesis blocks have observation envelopes")]
     NonGenesis,
-    #[error("transaction and receipt cardinality differ")]
-    TransactionReceiptCardinality,
-    #[error("transaction and recovered-sender cardinality differ")]
-    TransactionSenderCardinality,
     #[error("advanceTempo is missing")]
     AdvancePresent,
     #[error("advanceTempo caller is not the protocol system caller")]
@@ -154,75 +154,6 @@ pub(crate) enum PortalCallFamily {
     ProcessWithdrawals,
 }
 
-/// Output relationship checked without consulting mutable model state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum OutputField {
-    #[error("exact-state block binding")]
-    StateBlockBinding,
-    #[error("TempoAdvanced event count")]
-    TempoAdvancedCount,
-    #[error("TempoAdvanced transaction position")]
-    TempoAdvancedPosition,
-    #[error("TempoAdvanced.tempoBlockHash")]
-    TempoAdvancedHash,
-    #[error("TempoAdvanced.tempoBlockNumber")]
-    TempoAdvancedNumber,
-    #[error("TempoAdvanced.depositsProcessed")]
-    TempoAdvancedDepositCount,
-    #[error("exact TempoState.tempoBlockHash")]
-    ExactTempoHash,
-    #[error("exact TempoState.tempoBlockNumber")]
-    ExactTempoNumber,
-    #[error("TempoBlockFinalized event count")]
-    TempoFinalizedCount,
-    #[error("TempoBlockFinalized transaction position")]
-    TempoFinalizedPosition,
-    #[error("TempoBlockFinalized.blockHash")]
-    TempoFinalizedHash,
-    #[error("TempoBlockFinalized.blockNumber")]
-    TempoFinalizedNumber,
-    #[error("TempoBlockFinalized.stateRoot")]
-    TempoFinalizedStateRoot,
-    #[error("TokenEnabled event count")]
-    TokenEnabledCount,
-    #[error("TokenEnabled[{index}] transaction position")]
-    TokenEnabledPosition { index: usize },
-    #[error("TokenEnabled[{index}].token")]
-    TokenEnabledToken { index: usize },
-    #[error("TokenEnabled[{index}].name")]
-    TokenEnabledName { index: usize },
-    #[error("TokenEnabled[{index}].symbol")]
-    TokenEnabledSymbol { index: usize },
-    #[error("TokenEnabled[{index}].currency")]
-    TokenEnabledCurrency { index: usize },
-    #[error("BatchFinalized event count")]
-    BatchFinalizedCount,
-    #[error("BatchFinalized containing transaction")]
-    BatchFinalizedTransaction,
-}
-
-/// Typed values retained for implementation-output mismatches.
-///
-/// Formatting happens only when the error is displayed; later finding code can
-/// consume hashes, counts, positions, and ABI words without parsing strings.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum MismatchValue {
-    #[error("{0}")]
-    Hash(B256),
-    #[error("{0}")]
-    Address(Address),
-    #[error("{0}")]
-    Number(u64),
-    #[error("{0}")]
-    Count(usize),
-    #[error("{0}")]
-    TransactionIndex(usize),
-    #[error("{0}")]
-    Word(U256),
-    #[error("{0:?}")]
-    Text(String),
-}
-
 /// Reconciliation failures between authenticated Portal events and the one
 /// selectively fetched top-level transaction body.
 #[derive(Debug, thiserror::Error)]
@@ -262,12 +193,6 @@ pub(crate) enum ObservationError {
     },
     #[error("malformed authenticated {kind}: {detail}")]
     MalformedAuthenticatedData { kind: DataSource, detail: String },
-    #[error("implementation output mismatch for {field}: expected {expected}, got {actual}")]
-    OutputMismatch {
-        field: OutputField,
-        expected: MismatchValue,
-        actual: MismatchValue,
-    },
     #[error(
         "{chain} protocol-event failure at transaction {transaction_index} ({transaction_hash}), receipt log {receipt_log_index}, block log {block_log_index}: {error}"
     )]
@@ -289,18 +214,6 @@ impl ObservationError {
         Self::MalformedAuthenticatedData {
             kind,
             detail: detail.to_string(),
-        }
-    }
-
-    pub(crate) fn output_mismatch(
-        field: OutputField,
-        expected: MismatchValue,
-        actual: MismatchValue,
-    ) -> Self {
-        Self::OutputMismatch {
-            field,
-            expected,
-            actual,
         }
     }
 

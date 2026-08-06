@@ -5,8 +5,52 @@ use alloy_primitives::{Address, B256, Bytes};
 use super::{
     encoding::{OrdinaryDeposit, UserWithdrawalIdentity, UserWithdrawalRequest},
     ownership::{BatchId, DepositId, WithdrawalId},
-    state::ZoneProcessedDepositCursor,
+    state::{ZoneLastBatch, ZoneProcessedDepositCursor},
 };
+
+/// Fixed implementation state expected after one complete Zone transition.
+///
+/// Tempo identity comes from the authenticated imported header; Inbox and
+/// Outbox commitments come only from the post-Zone logical candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedPostZoneState {
+    tempo_block_hash: B256,
+    tempo_block_number: u64,
+    processed_deposit: ZoneProcessedDepositCursor,
+    last_batch: ZoneLastBatch,
+}
+
+impl ExpectedPostZoneState {
+    pub(crate) const fn new(
+        tempo_block_hash: B256,
+        tempo_block_number: u64,
+        processed_deposit: ZoneProcessedDepositCursor,
+        last_batch: ZoneLastBatch,
+    ) -> Self {
+        Self {
+            tempo_block_hash,
+            tempo_block_number,
+            processed_deposit,
+            last_batch,
+        }
+    }
+
+    pub(crate) const fn tempo_block_hash(self) -> B256 {
+        self.tempo_block_hash
+    }
+
+    pub(crate) const fn tempo_block_number(self) -> u64 {
+        self.tempo_block_number
+    }
+
+    pub(crate) const fn processed_deposit(self) -> ZoneProcessedDepositCursor {
+        self.processed_deposit
+    }
+
+    pub(crate) const fn last_batch(self) -> ZoneLastBatch {
+        self.last_batch
+    }
+}
 
 mod settlement;
 
@@ -76,6 +120,11 @@ impl ExpectedImportedTempoBlock {
 
     pub(crate) fn operations(&self) -> &[ExpectedImportedTempoOperation] {
         &self.operations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_deposit_append_for_test(&mut self, id: DepositId, queue_hash: B256) {
+        self.push_deposit_append(ExpectedDepositAppend::new(id, queue_hash));
     }
 }
 
@@ -477,5 +526,19 @@ impl ExpectedOutputs {
 
     pub(crate) const fn zone_block(&self) -> &ExpectedZoneBlock {
         &self.zone_block
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new(
+            ExpectedImportedTempoBlock::default(),
+            ExpectedZoneDepositPrefix::new(
+                Vec::new(),
+                Vec::new(),
+                0,
+                ZoneProcessedDepositCursor::ZERO,
+            ),
+            ExpectedZoneBlock::default(),
+        )
     }
 }
