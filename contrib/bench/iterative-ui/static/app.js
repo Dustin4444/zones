@@ -147,16 +147,10 @@ function renderCard(id, canRun, anyRunning) {
     // show just the measured value (+ its end-to-end journey for context).
     const single = Boolean(summary) && Number(summary.completed) <= 1;
     const latencySub = card.querySelector('[data-metric="latency-sub"]');
-    const confP99 = summary ? (summary.tempoConfirmP99Ms ?? summary.p99Ms) : null;
-    const confP50 = summary ? (summary.tempoConfirmP50Ms ?? summary.p50Ms) : null;
-    setMetric(card, "p99", summary ? formatDuration(confP99) : "—",
-      single ? "Tempo confirm" : "P99 Tempo confirm");
+    setMetric(card, "p99", summary ? formatDuration(summary.p99Ms) : "—",
+      single ? "Latency" : "P99 latency");
     if (latencySub) {
-      latencySub.textContent = !summary
-        ? ""
-        : single
-          ? `e2e ${formatDuration(summary.p99Ms)}`
-          : `p50 ${formatDuration(confP50)} · e2e ${formatDuration(summary.p99Ms)}`;
+      latencySub.textContent = summary && !single ? `p50 ${formatDuration(summary.p50Ms)}` : "";
     }
     setMetric(card, "cost", summary ? formatUsd(summary.meanJourneyCostUsd) : "—",
       single ? "Fee (USD)" : "Avg fee (USD)");

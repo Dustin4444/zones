@@ -178,17 +178,6 @@ FRIENDLY_STEP_NAMES = {
     "offramp_processed": "Funds received on L1",
 }
 
-# The Zone-side confirmation step per scenario: when the transaction is
-# confirmed on Tempo, BEFORE any L1 cross-chain settlement wait. This is the
-# honest "per-tx Tempo speed" headline; the end-to-end latency (which includes
-# L1 finality) is reported alongside it as context.
-TEMPO_CONFIRM_STEP = {
-    "neobank-encrypted-deposit": "onramp.zone_deposit.processed",
-    "neobank-earn-deposit": "earn_deposit.request_result",
-    "neobank-private-withdrawal": "earn_redeem.request_result",
-    "neobank-zone-withdrawal": "offramp_result",
-}
-
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -445,18 +434,6 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
     receipt_count = sum(
         int((metric.get("gas_used") or {}).get("count", 0)) for metric in raw_receipts
     )
-    confirm_step = TEMPO_CONFIRM_STEP.get(str(report.get("scenario", "")))
-    confirm_latency = (
-        steps_by_name.get(confirm_step, {}).get("command_latency")
-        or steps_by_name.get(confirm_step, {}).get("latency")
-        or {}
-    ) if confirm_step else {}
-    tempo_confirm_p99 = safe_number(confirm_latency.get("p99_ms")) or safe_number(
-        latency.get("p99_ms")
-    )
-    tempo_confirm_p50 = safe_number(confirm_latency.get("p50_ms")) or safe_number(
-        latency.get("p50_ms")
-    )
     return {
         "scenario": report.get("scenario", "neobank-private-zone-flow"),
         "reportVersion": int(report.get("version", 0)),
@@ -476,8 +453,6 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
             "p50Ms": safe_number(latency.get("p50_ms")),
             "p95Ms": safe_number(latency.get("p95_ms")),
             "p99Ms": safe_number(latency.get("p99_ms")),
-            "tempoConfirmP50Ms": tempo_confirm_p50,
-            "tempoConfirmP99Ms": tempo_confirm_p99,
             "meanJourneyCostUsd": total_fees / completed / 1e18 if completed else 0.0,
             "totalRunCostUsd": total_fees / 1e18,
             "meanJourneyGas": total_gas / completed if completed else 0.0,
