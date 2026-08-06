@@ -29,7 +29,7 @@ diagnostic `message`.
 Set `SPF_VSOCK_PORT` or pass `--port` to change the port. The maximum request payload defaults to
 512 MiB and can be changed with `SPF_MAX_REQUEST_BYTES` or `--max-request-bytes`.
 
-## Image and EIF
+## Images and EIF
 
 Build the OCI image with:
 
@@ -48,3 +48,29 @@ nitro-cli build-enclave \
 
 Retain the PCR measurements printed by `build-enclave` for future attestation policy. Attestation
 exchange and the parent-side vsock client are intentionally outside this service.
+
+The payload image cannot launch an enclave by itself. The release workflow therefore loads the
+payload into Docker, converts it to an EIF with the Nitro CLI, and embeds the EIF in a separate
+parent image published as `ghcr.io/tempoxyz/tempo-zone-prover-runner`. That runner contains the
+Nitro CLI and launches the EIF in non-debug mode; it is the image to schedule on a Nitro-enabled
+Kubernetes node.
+
+To build the same artifacts locally:
+
+```console
+docker buildx bake \
+  --load \
+  --set tempo-zone-prover.tags=tempo-zone-prover:eif-source \
+  tempo-zone-prover
+PROVER_IMAGE=tempo-zone-prover:eif-source ./scripts/build-prover-eif.sh
+docker buildx bake \
+  --load \
+  --set tempo-zone-prover-runner.tags=tempo-zone-prover-runner:local \
+  tempo-zone-prover-runner
+```
+
+The EIF and its PCR measurements are written under `target/tempo-zone-prover-eif/`. CI uploads
+the measurements as an artifact named for the source commit. The runner accepts
+`ENCLAVE_CPU_COUNT`, `ENCLAVE_MEMORY_MIB`, `ENCLAVE_CID`, and `ENCLAVE_NAME`; their defaults are
+`2`, `512`, `16`, and `tempo-zone-prover`. The parent-side request client or proxy is still
+intentionally outside this image.

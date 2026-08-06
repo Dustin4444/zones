@@ -6,6 +6,10 @@ variable "VERGEN_GIT_SHA_SHORT" {
   default = ""
 }
 
+variable "PROVER_EIF_CONTEXT" {
+  default = "./target/tempo-zone-prover-eif"
+}
+
 group "default" {
   targets = ["tempo-zone", "tempo-zone-prover", "tempo-zone-xtask"]
 }
@@ -63,6 +67,19 @@ target "tempo-zone-prover" {
   args = {
     CHEF_IMAGE = "chef"
     RUST_PROFILE = "release"
+  }
+  platforms = ["linux/amd64"]
+}
+
+# The EIF is generated from tempo-zone-prover before this target is built. It is
+# intentionally separate from the default group because BuildKit cannot create
+# an EIF without access to a Docker daemon running the Nitro CLI builder.
+target "tempo-zone-prover-runner" {
+  inherits = ["docker-metadata"]
+  dockerfile = "Dockerfile.prover-runner"
+  context = "."
+  contexts = {
+    prover-eif = "${PROVER_EIF_CONTEXT}"
   }
   platforms = ["linux/amd64"]
 }

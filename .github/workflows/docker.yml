@@ -96,6 +96,24 @@ jobs:
             type=sha,prefix=sha-
             type=ref,event=pr
 
+      - name: Docker metadata for tempo-zone-prover-runner
+        id: meta-tempo-zone-prover-runner
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ${{ env.REGISTRY }}/tempo-zone-prover-runner
+          bake-target: tempo-zone-prover-runner
+          tags: |
+            type=schedule,pattern=nightly
+            type=raw,value=nightly,enable=${{ github.event.inputs.nightly == 'true' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=stable,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=edge,branch=main
+            type=sha,prefix=sha-
+            type=ref,event=pr
+
       - name: Log in to Container Registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
@@ -125,6 +143,43 @@ jobs:
         env:
           VERGEN_GIT_SHA: ${{ github.sha }}
           VERGEN_GIT_SHA_SHORT: ${{ steps.shortsha.outputs.shortsha }}
+
+      # EIF creation needs the payload in the runner's local Docker image
+      # store because Nitro CLI builds through /var/run/docker.sock.
+      - name: Load tempo-zone-prover payload for EIF build
+        uses: depot/bake-action@1d58c2668346981089b088b7ef36755b206b20e9 # v1.13.0
+        with:
+          files: |
+            docker-bake.hcl
+            ${{ steps.meta-tempo-zone-prover.outputs.bake-file }}
+          targets: tempo-zone-prover
+          set: tempo-zone-prover.tags=tempo-zone-prover:eif-source
+          project: 0c6tg19qsp
+          load: true
+
+      - name: Build tempo-zone-prover EIF
+        run: ./scripts/build-prover-eif.sh
+        env:
+          PROVER_IMAGE: tempo-zone-prover:eif-source
+
+      - name: Build and push tempo-zone-prover-runner
+        uses: depot/bake-action@1d58c2668346981089b088b7ef36755b206b20e9 # v1.13.0
+        with:
+          files: |
+            docker-bake.hcl
+            ${{ steps.meta-tempo-zone-prover-runner.outputs.bake-file }}
+          targets: tempo-zone-prover-runner
+          project: 0c6tg19qsp
+          push: ${{ github.event_name != 'pull_request' }}
+          no-cache: ${{ github.event_name == 'schedule' }}
+          pull: ${{ github.event_name == 'schedule' }}
+
+      - name: Upload tempo-zone-prover PCR measurements
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tempo-zone-prover-measurements-${{ steps.shortsha.outputs.shortsha }}
+          path: target/tempo-zone-prover-eif/measurements.json
+          if-no-files-found: error
 
       - name: Publish Zones CI event
         if: >-
