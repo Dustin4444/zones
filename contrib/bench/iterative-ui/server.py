@@ -341,31 +341,12 @@ class BenchmarkController:
         self.state_file = state_dir / "state.json"
         self.topology_env = topology_env or {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.state = self._load_state()
-        self.state.setdefault("scenarioResults", {})
+        self.state = self._initial_state()
         self.state["server"] = self.server_info()
-        if self.state.get("status") in {
-            "queued",
-            "running",
-            "processing",
-            "cancelling",
-        }:
-            self.state.update(
-                status="interrupted",
-                stage="interrupted",
-                message="The local benchmark process stopped",
-                error="The UI server exited before its local benchmark completed; run the scenario again.",
-            )
-            self._persist()
+        self._persist()
 
-    def _load_state(self) -> dict[str, Any]:
-        if self.state_file.is_file():
-            try:
-                loaded = json.loads(self.state_file.read_text())
-                if isinstance(loaded, dict) and loaded.get("version") == STATE_VERSION:
-                    return loaded
-            except (OSError, json.JSONDecodeError):
-                pass
+    @staticmethod
+    def _initial_state() -> dict[str, Any]:
         return {
             "version": STATE_VERSION,
             "status": "idle",
@@ -866,10 +847,16 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
             ["bash", "contrib/bench/run-neobank-private-flow.sh"],
             cwd=root,
             env=prepare_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
             check=False,
         )
         if prepared.returncode != 0:
-            raise RuntimeError("persistent scenario balance and approval setup failed")
+            raise RuntimeError(
+                "persistent scenario balance and approval setup failed:\n"
+                + prepared.stdout[-5000:]
+            )
 
         topology.stage(
             "topology", "Preparing reusable Earn vault shares for fast redemptions"
@@ -907,10 +894,16 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
             ["bash", "contrib/bench/run-neobank-private-flow.sh"],
             cwd=root,
             env=redemption_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
             check=False,
         )
         if redemption_prepared.returncode != 0:
-            raise RuntimeError("persistent Earn redemption setup failed")
+            raise RuntimeError(
+                "persistent Earn redemption setup failed:\n"
+                + redemption_prepared.stdout[-5000:]
+            )
         environment.update(
             {
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
