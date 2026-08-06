@@ -325,9 +325,13 @@ Use pinned Reth APIs rather than libmdbx:
 
 ## 4. Trust boundary and source-of-truth audit
 
-The code should preserve separate Rust types for `AuthenticatedInput`,
+The integrated code must preserve separate concrete Rust types for `AuthenticatedInput`,
 `AuthenticatedOutcome`, `ExpectedOutput`, and `Finding`. This makes it difficult to use an output
-to choose the input it confirms.
+to choose the input it confirms. Goal 0 freezes the role table below; Goal 1 introduces the
+authenticated input/outcome types in the adapters that can actually establish those claims, later
+pure-model goals introduce expected-output types, and the reporting/persistence goals own the
+concrete finding type. Do not use a generic crate-wide wrapper constructor that can relabel an
+arbitrary value as authenticated.
 
 | Transition/check | Authenticated model input | Implementation output checked or branch outcome | Independently derived expectation | Unavailable or deliberately trusted data |
 |---|---|---|---|---|
@@ -1084,7 +1088,8 @@ checker tests/fixtures, and updates to checker documentation. Avoid changing nod
 - Checker-owned ABI preimage encoders and hashes for ordinary deposits, withdrawal bounce-back
   deposits, withdrawal queue members, sender tags, and queue folds.
 - Exact `S/D/W` transition table and checked arithmetic.
-- A source-of-truth classification on every input/outcome type.
+- The section 4 source-of-truth roles and rule-to-role mapping as the contract for the concrete
+  observation, model-output, and finding types introduced by their owning goals.
 - The literal address-and-topic event classification from section 7.2, including strict event
   decoding, the pinned native rejection exclusion, and unknown-event fail-closed behavior.
 - Fixed vectors generated independently from literal byte strings or a small standalone script
@@ -1149,6 +1154,9 @@ source-classified block observations.
   error classification.
 - Ordered L2 transaction/log outcomes, containing transaction hashes, finalization calldata, and
   the fixed exact-hash Zone commitment/supply outputs from section 7.1.
+- Concrete observation types that keep authenticated model inputs distinct from authenticated
+  implementation outcomes, with construction owned by the authenticating adapters rather than a
+  generic relabeling wrapper.
 
 **Out of scope.** Mutable model state, persistence, lifecycle decisions, and generic retry loops.
 

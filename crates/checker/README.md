@@ -14,7 +14,16 @@ verifies its identity and receipt root, and decodes ZonePortal L1 events.
 The approved target architecture is the closed-system logical protocol model in
 [`DESIGN.md`](DESIGN.md). Its Codex `/goal` milestones are review boundaries, not
 independently deployable partial checkers. The current implementation described
-below predates that target and remains an observe-only skeleton.
+below is the runtime skeleton that predates that target and remains observe-only.
+
+Goal 0 now freezes the checker-owned pure model vocabulary, literal protocol
+constants, ABI/queue encodings, fee arithmetic, exact-state layouts, typed
+lifecycle ownership and concrete owner fixtures, invalid-state-resistant
+withdrawal and batch construction, the `S/D/W` table, and the version-pinned
+event surface. The independent vector and source inventory is in
+[`MODEL_VECTORS.md`](MODEL_VECTORS.md). These pure primitives are not yet
+connected to the ExEx or the existing fact pipeline; that integration belongs
+to later goals.
 
 Both L2 and L1 facts are temporary: they are constructed while processing a
 notification, used to produce log summaries, and then discarded. No
@@ -188,9 +197,10 @@ Zone checker
   5. report findings
 ```
 
-Steps 1–4 are implemented (L2 fact extraction, exact L1 fact extraction, and
-the token-enabled cross-layer invariant). The remaining steps are planned for
-later milestones.
+The current runtime implements L2 fact extraction, exact L1 fact extraction,
+and the token-enabled cross-layer invariant. It does not yet commit checker
+state or report durable model findings. Goal 0's pure model is intentionally
+not wired into these runtime steps.
 
 ## Staged direction
 
