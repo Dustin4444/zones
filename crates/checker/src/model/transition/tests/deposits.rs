@@ -6,7 +6,10 @@ use super::support::*;
 use crate::model::{
     accounting::{Component, TokenAccounting},
     encoding::{DepositQueueMember, sender_tag},
-    input::{AuthenticatedDepositOutcome, ImportedTempoBlockInput, ZoneDepositPrefixInput},
+    input::{
+        AuthenticatedDepositOutcome, AuthenticatedWithdrawalOutcome, ImportedTempoBlockInput,
+        ZoneDepositPrefixInput,
+    },
     output::ExpectedDepositOutcome,
     ownership::{
         DepositId, FallbackId, InboxRefundId, InboxRefundOwner, PendingWithdrawal,
@@ -19,11 +22,13 @@ use crate::model::{
 fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
     let token = token(0x31);
     let mut state = created_state(token);
-    let members = vec![
-        DepositQueueMember::Ordinary(ordinary(token, 0x41, 10)),
-        DepositQueueMember::Ordinary(ordinary(token, 0x42, 20)),
-    ];
-    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
+    let deposits = vec![ordinary(token, 0x41, 10), ordinary(token, 0x42, 20)];
+    let members = ordinary_members(&deposits);
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(&deposits),
+    );
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let minted = |seed| AuthenticatedDepositOutcome::OrdinaryMinted {
         recipient: Address::repeat_byte(seed),
@@ -104,9 +109,13 @@ fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
 fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
     let token = token(0x32);
     let mut ordinary_state = created_state(token);
-    let ordinary = DepositQueueMember::Ordinary(ordinary(token, 0x61, 10));
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&ordinary)));
+    let deposit = ordinary(token, 0x61, 10);
+    let ordinary = DepositQueueMember::Ordinary(deposit.clone());
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&deposit)),
+    );
     commit(&mut ordinary_state, &imported, &empty_zone()).unwrap();
     let wrong = ZoneDepositPrefixInput::new(
         vec![],
@@ -128,28 +137,32 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
         })
     );
 
-    let mut bounce_state = created_state(token);
-    seed_fallback(&mut bounce_state, 4, 9, token, 10);
-    bounce_state.set_token_accounting_for_test(
-        token,
-        TokenAccounting {
-            supply: U256::ZERO,
-            deposit_liability: U256::ZERO,
-            withdrawal_liability: U256::from(10),
-        },
+    let mut bounce_state = funded_state(token, U256::from(10));
+    let (_, withdrawals) = prepare_submitted_users(&mut bounce_state, 1, &[(0x62, 10, 0)]);
+    let (withdrawal, preimage) = &withdrawals[0];
+    let bounce = DepositQueueMember::WithdrawalBounceBack(bounce(
+        preimage.token(),
+        preimage.fallback_nonce(),
+        preimage.amount(),
+    ));
+    let imported = ImportedTempoBlockInput::new(
+        2,
+        alloy_primitives::U256::ZERO,
+        vec![withdrawals_processed(
+            vec![preimage.clone()],
+            B256::ZERO,
+            vec![AuthenticatedWithdrawalOutcome::UserBounced],
+        )],
     );
-    let bounce = DepositQueueMember::WithdrawalBounceBack(bounce(token, 9, 10));
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&bounce)));
-    commit(&mut bounce_state, &imported, &empty_zone()).unwrap();
     let wrong = ZoneDepositPrefixInput::new(
         vec![],
         vec![bounce],
         vec![AuthenticatedDepositOutcome::OrdinaryFailed],
     );
+    let before = bounce_state.clone();
     assert_eq!(
         ModelTransition::new(&bounce_state)
-            .apply_imported_tempo_block(&empty_import())
+            .apply_imported_tempo_block(&imported)
             .unwrap()
             .apply_zone_block(&advance_only_block(&wrong))
             .err(),
@@ -159,6 +172,8 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
             actual: DepositOutcomeKind::OrdinaryFailed,
         })
     );
+    assert_eq!(bounce_state, before);
+    assert!(bounce_state.withdrawal(*withdrawal).is_some());
 }
 
 #[test]
@@ -167,8 +182,11 @@ fn failed_ordinary_deposit_creates_only_the_zero_rule_withdrawal_owner() {
     let mut state = created_state(token);
     let ordinary = ordinary(token, 0x70, 500);
     let member = DepositQueueMember::Ordinary(ordinary.clone());
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&ordinary)),
+    );
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
@@ -235,11 +253,13 @@ fn failed_ordinary_deposit_creates_only_the_zero_rule_withdrawal_owner() {
 fn multiple_failed_deposits_share_literal_nonce_zero_but_not_identity() {
     let token = token(0x34);
     let mut state = created_state(token);
-    let members = vec![
-        DepositQueueMember::Ordinary(ordinary(token, 0x71, 10)),
-        DepositQueueMember::Ordinary(ordinary(token, 0x72, 20)),
-    ];
-    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
+    let deposits = vec![ordinary(token, 0x71, 10), ordinary(token, 0x72, 20)];
+    let members = ordinary_members(&deposits);
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(&deposits),
+    );
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
@@ -259,9 +279,13 @@ fn multiple_failed_deposits_share_literal_nonce_zero_but_not_identity() {
 fn failed_deposit_withdrawal_index_overflow_is_atomic() {
     let token = token(0x35);
     let mut state = created_state(token);
-    let member = DepositQueueMember::Ordinary(ordinary(token, 0x73, 10));
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
+    let deposit = ordinary(token, 0x73, 10);
+    let member = DepositQueueMember::Ordinary(deposit.clone());
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&deposit)),
+    );
     commit(&mut state, &imported, &empty_zone()).unwrap();
     state.set_next_withdrawal_index_for_test(u64::MAX);
     let before = state.clone();
@@ -284,23 +308,36 @@ fn failed_deposit_withdrawal_index_overflow_is_atomic() {
 #[test]
 fn bounce_back_mint_and_pending_paths_consume_fallbacks_and_preserve_origin() {
     let token = token(0x36);
-    let mut state = created_state(token);
-    let minted_withdrawal = seed_fallback(&mut state, 8, 11, token, 300);
-    let pending_withdrawal = seed_fallback(&mut state, 9, 12, token, 400);
-    state.set_token_accounting_for_test(
-        token,
-        TokenAccounting {
-            supply: U256::ZERO,
-            deposit_liability: U256::ZERO,
-            withdrawal_liability: U256::from(700),
-        },
+    let mut state = funded_state(token, U256::from(700));
+    let (_, withdrawals) =
+        prepare_submitted_users(&mut state, 1, &[(0x71, 300, 0), (0x72, 400, 0)]);
+    let minted_withdrawal = withdrawals[0].0;
+    let pending_withdrawal = withdrawals[1].0;
+    let members = withdrawals
+        .iter()
+        .map(|(_, preimage)| {
+            DepositQueueMember::WithdrawalBounceBack(bounce(
+                preimage.token(),
+                preimage.fallback_nonce(),
+                preimage.amount(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let imported = ImportedTempoBlockInput::new(
+        2,
+        alloy_primitives::U256::ZERO,
+        vec![withdrawals_processed(
+            withdrawals
+                .iter()
+                .map(|(_, preimage)| preimage.clone())
+                .collect(),
+            B256::ZERO,
+            vec![
+                AuthenticatedWithdrawalOutcome::UserBounced,
+                AuthenticatedWithdrawalOutcome::UserBounced,
+            ],
+        )],
     );
-    let members = vec![
-        DepositQueueMember::WithdrawalBounceBack(bounce(token, 11, 300)),
-        DepositQueueMember::WithdrawalBounceBack(bounce(token, 12, 400)),
-    ];
-    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
-    commit(&mut state, &imported, &empty_zone()).unwrap();
     let minted_recipient = Address::repeat_byte(0x81);
     let pending_recipient = Address::repeat_byte(0x82);
     let zone = ZoneDepositPrefixInput::new(
@@ -315,7 +352,7 @@ fn bounce_back_mint_and_pending_paths_consume_fallbacks_and_preserve_origin() {
             },
         ],
     );
-    let expected = commit(&mut state, &empty_import(), &zone).unwrap();
+    let expected = commit(&mut state, &imported, &zone).unwrap();
     let outputs = expected.zone_deposit_prefix().deposit_outcomes();
     let ExpectedDepositOutcome::WithdrawalBounceBackMinted(minted) = &outputs[0] else {
         panic!("wrong expected minted outcome")
@@ -328,12 +365,12 @@ fn bounce_back_mint_and_pending_paths_consume_fallbacks_and_preserve_origin() {
     assert_eq!(pending.token(), token);
     assert_eq!(pending.amount(), 400);
 
-    for nonce in [11, 12] {
+    for (_, preimage) in &withdrawals {
         assert!(
             state
                 .fallback_owner(FallbackId {
                     zone_id: ZONE_ID,
-                    fallback_nonce: NonZeroU64::new(nonce).unwrap(),
+                    fallback_nonce: NonZeroU64::new(preimage.fallback_nonce()).unwrap(),
                 })
                 .is_none()
         );
@@ -366,26 +403,31 @@ fn bounce_back_mint_and_pending_paths_consume_fallbacks_and_preserve_origin() {
 #[test]
 fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bounds() {
     let token = token(0x37);
-    let mut pending_state = created_state(token);
-    let withdrawal = seed_fallback(&mut pending_state, 10, 13, token, 5);
-    pending_state.set_token_accounting_for_test(
-        token,
-        TokenAccounting {
-            supply: U256::ZERO,
-            deposit_liability: U256::ZERO,
-            withdrawal_liability: U256::from(5),
-        },
-    );
-    let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, 13, 5));
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
-    commit(&mut pending_state, &imported, &empty_zone()).unwrap();
+    let mut pending_state = funded_state(token, U256::from(5));
+    let (_, withdrawals) = prepare_submitted_users(&mut pending_state, 1, &[(0x73, 5, 0)]);
+    let (withdrawal, preimage) = &withdrawals[0];
+    let member = DepositQueueMember::WithdrawalBounceBack(bounce(
+        preimage.token(),
+        preimage.fallback_nonce(),
+        preimage.amount(),
+    ));
+    commit_imported(
+        &mut pending_state,
+        2,
+        U256::ZERO,
+        vec![withdrawals_processed(
+            vec![preimage.clone()],
+            B256::ZERO,
+            vec![AuthenticatedWithdrawalOutcome::UserBounced],
+        )],
+    )
+    .unwrap();
     let recipient = Address::repeat_byte(0x91);
     pending_state.seed_inbox_refund_for_test(
         InboxRefundId {
             token,
             recipient,
-            user_withdrawal: withdrawal,
+            user_withdrawal: *withdrawal,
         },
         InboxRefundOwner::Pending {
             amount: NonZeroU128::new(1).unwrap(),
@@ -407,13 +449,26 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
         })
     );
 
-    let mut underflow = created_state(token);
-    seed_fallback(&mut underflow, 11, 14, token, 5);
+    let mut underflow = funded_state(token, U256::from(5));
+    let (_, withdrawals) = prepare_submitted_users(&mut underflow, 1, &[(0x74, 5, 0)]);
+    let (_, preimage) = &withdrawals[0];
+    let member = DepositQueueMember::WithdrawalBounceBack(bounce(
+        preimage.token(),
+        preimage.fallback_nonce(),
+        preimage.amount(),
+    ));
+    commit_imported(
+        &mut underflow,
+        2,
+        U256::ZERO,
+        vec![withdrawals_processed(
+            vec![preimage.clone()],
+            B256::ZERO,
+            vec![AuthenticatedWithdrawalOutcome::UserBounced],
+        )],
+    )
+    .unwrap();
     underflow.set_token_accounting_for_test(token, TokenAccounting::ZERO);
-    let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, 14, 5));
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
-    commit(&mut underflow, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
         vec![member],
@@ -437,23 +492,27 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
 fn zero_bounce_back_recipient_rejects_both_branches_without_exposing_candidate_changes() {
     for pending in [false, true] {
         let token = token(if pending { 0x39 } else { 0x38 });
-        let nonce = if pending { 16 } else { 15 };
-        let withdrawal_index = if pending { 13 } else { 12 };
         let amount = 7;
-        let mut state = created_state(token);
-        let withdrawal = seed_fallback(&mut state, withdrawal_index, nonce, token, amount);
-        state.set_token_accounting_for_test(
-            token,
-            TokenAccounting {
-                supply: U256::ZERO,
-                deposit_liability: U256::ZERO,
-                withdrawal_liability: U256::from(amount),
-            },
-        );
+        let mut state = funded_state(token, U256::from(amount));
+        let (_, withdrawals) = prepare_submitted_users(&mut state, 1, &[(0x75, amount, 0)]);
+        let (withdrawal, preimage) = &withdrawals[0];
+        let member = DepositQueueMember::WithdrawalBounceBack(bounce(
+            preimage.token(),
+            preimage.fallback_nonce(),
+            preimage.amount(),
+        ));
+        commit_imported(
+            &mut state,
+            2,
+            U256::ZERO,
+            vec![withdrawals_processed(
+                vec![preimage.clone()],
+                B256::ZERO,
+                vec![AuthenticatedWithdrawalOutcome::UserBounced],
+            )],
+        )
+        .unwrap();
         let before = state.clone();
-        let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, nonce, amount));
-        let imported =
-            ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
         let outcome = if pending {
             AuthenticatedDepositOutcome::WithdrawalBounceBackPending {
                 recipient: Address::ZERO,
@@ -467,7 +526,7 @@ fn zero_bounce_back_recipient_rejects_both_branches_without_exposing_candidate_c
 
         assert_eq!(
             ModelTransition::new(&state)
-                .apply_imported_tempo_block(&imported)
+                .apply_imported_tempo_block(&empty_import())
                 .unwrap()
                 .apply_zone_block(&advance_only_block(&zone))
                 .err(),

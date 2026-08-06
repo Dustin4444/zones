@@ -618,6 +618,8 @@ pub(crate) enum ProcessedWithdrawalQueue {
 pub(crate) enum WithdrawalQueueError {
     #[error("an empty withdrawal prefix must not acquire queue state")]
     EmptyPrefixUsesNoQueueState,
+    #[error("the all-ones sentinel is not a processable current queue")]
+    SentinelCannotBeCurrentQueue,
     #[error("the all-ones sentinel is not a valid caller-supplied suffix")]
     SentinelCannotBeSuppliedAsSuffix,
     #[error("withdrawal queue commitment mismatch: expected {expected}, got {actual}")]
@@ -641,6 +643,9 @@ pub(crate) fn process_nonempty_withdrawal_prefix(
 ) -> Result<ProcessedWithdrawalQueue, WithdrawalQueueError> {
     if withdrawals.is_empty() {
         return Err(WithdrawalQueueError::EmptyPrefixUsesNoQueueState);
+    }
+    if current_queue == EMPTY_WITHDRAWAL_QUEUE_SENTINEL {
+        return Err(WithdrawalQueueError::SentinelCannotBeCurrentQueue);
     }
     if remaining_queue == EMPTY_WITHDRAWAL_QUEUE_SENTINEL {
         return Err(WithdrawalQueueError::SentinelCannotBeSuppliedAsSuffix);
@@ -894,6 +899,14 @@ mod tests {
         assert_eq!(
             process_nonempty_withdrawal_prefix(current, &[], B256::ZERO),
             Err(WithdrawalQueueError::EmptyPrefixUsesNoQueueState)
+        );
+        assert_eq!(
+            process_nonempty_withdrawal_prefix(
+                EMPTY_WITHDRAWAL_QUEUE_SENTINEL,
+                &withdrawals()[..1],
+                B256::ZERO,
+            ),
+            Err(WithdrawalQueueError::SentinelCannotBeCurrentQueue)
         );
     }
 

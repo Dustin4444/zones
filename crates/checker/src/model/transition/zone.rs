@@ -2,13 +2,13 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::U256;
 
-use super::{ModelError, ModelTransition, require_zone_token};
+use super::{ModelError, ModelTransition, refunds, require_zone_token};
 use crate::model::{
     accounting::{AccountingTransition, apply_token_accounting},
     encoding::UserWithdrawalIdentity,
     fees::withdrawal_fee,
     input::{UserWithdrawalInput, ZoneOperation},
-    output::ExpectedWithdrawalRequested,
+    output::{ExpectedWithdrawalRequested, ExpectedZoneOperation},
     ownership::{
         FallbackId, FallbackOwner, PendingWithdrawal, UserPendingWithdrawal, WithdrawalId,
         WithdrawalOwner,
@@ -18,7 +18,7 @@ use crate::model::{
 pub(super) fn apply_operations(
     candidate: &mut ModelTransition<'_>,
     operations: &[ZoneOperation],
-) -> Result<Vec<ExpectedWithdrawalRequested>, ModelError> {
+) -> Result<Vec<ExpectedZoneOperation>, ModelError> {
     let mut withdrawals_this_block = 0_u32;
     let mut expected = Vec::new();
 
@@ -35,11 +35,14 @@ pub(super) fn apply_operations(
                 candidate.set_zone(zone);
             }
             ZoneOperation::UserWithdrawalAccepted(input) => {
-                expected.push(accept_user_withdrawal(
-                    candidate,
-                    input,
-                    &mut withdrawals_this_block,
-                )?);
+                expected.push(ExpectedZoneOperation::WithdrawalRequested(Box::new(
+                    accept_user_withdrawal(candidate, input, &mut withdrawals_this_block)?,
+                )));
+            }
+            ZoneOperation::InboxRefundClaimed(input) => {
+                expected.push(ExpectedZoneOperation::RefundClaimed(refunds::claim_inbox(
+                    candidate, *input,
+                )?));
             }
         }
     }

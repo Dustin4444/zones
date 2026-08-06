@@ -1,16 +1,12 @@
-use std::num::{NonZeroU64, NonZeroU128};
-
 use alloy_primitives::{Address, B256, U256, address};
 
 use super::support::*;
 use crate::model::{
     accounting::{AccountingError, Component, TokenAccounting},
-    encoding::DepositQueueMember,
     input::{
         ImportedTempoBlockInput, ImportedTempoOperation, PortalCreationInput,
         ZoneDepositPrefixInput,
     },
-    ownership::{DepositId, FallbackId, FallbackOwner},
     state::{
         ModelState, PortalDepositCursor, PortalIdentity, PortalLifecycle, TokenPhase,
         portal_address_for_zone,
@@ -31,7 +27,11 @@ fn portal_address_derivation_and_creation_install_literal_zero_state() {
 
     let initial = token(0x11);
     let mut state = ModelState::awaiting_creation(identity(initial));
-    let imported = ImportedTempoBlockInput::new(0, vec![creation_operation(initial)]);
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        vec![creation_operation(initial)],
+    );
     let zone = ZoneDepositPrefixInput::new(vec![enable(initial, "INIT")], Vec::new(), Vec::new());
     let expected = commit(&mut state, &imported, &zone).unwrap();
 
@@ -78,6 +78,7 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
     let wrong_identity = PortalIdentity::new(portal(), ZONE_ID + 1, initial);
     let input = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::Create(PortalCreationInput::new(
             wrong_identity,
             enable(initial, "INIT"),
@@ -99,6 +100,7 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
     let bad_state = ModelState::awaiting_creation(bad_config);
     let input = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::Create(PortalCreationInput::new(
             bad_config,
             enable(initial, "INIT"),
@@ -116,6 +118,7 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
 
     let input = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::Create(PortalCreationInput::new(
             identity(initial),
             enable(token(0x13), "WRONG"),
@@ -136,7 +139,11 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
 fn creation_cannot_repeat_and_all_pre_creation_operations_fail_on_lifecycle_first() {
     let initial = token(0x14);
     let state = created_state(initial);
-    let duplicate = ImportedTempoBlockInput::new(0, vec![creation_operation(initial)]);
+    let duplicate = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        vec![creation_operation(initial)],
+    );
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&duplicate)
@@ -148,12 +155,11 @@ fn creation_cannot_repeat_and_all_pre_creation_operations_fail_on_lifecycle_firs
         ImportedTempoOperation::TokenEnabled(enable(token(0x15), "B")),
         ImportedTempoOperation::BouncebackGasUpdated(7),
         ImportedTempoOperation::OrdinaryDepositAppended(ordinary(initial, 0xff, 1)),
-        ImportedTempoOperation::WithdrawalBounceBackAppended(bounce(initial, 9, 1)),
     ];
     for operation in premature_cases {
         let awaiting = ModelState::awaiting_creation(identity(initial));
         let before = awaiting.clone();
-        let input = ImportedTempoBlockInput::new(0, vec![operation]);
+        let input = ImportedTempoBlockInput::new(0, alloy_primitives::U256::ZERO, vec![operation]);
         assert_eq!(
             ModelTransition::new(&awaiting)
                 .apply_imported_tempo_block(&input)
@@ -170,13 +176,13 @@ fn token_enablement_is_exact_block_ordered_and_preserves_same_block_liability() 
     let second = token(0x22);
     let third = token(0x23);
     let mut state = created_state(initial);
-    let member = DepositQueueMember::Ordinary(ordinary(second, 0x31, 700));
+    let deposit = ordinary(second, 0x31, 700);
     let mut operations = vec![
         ImportedTempoOperation::TokenEnabled(enable(second, "B")),
         ImportedTempoOperation::TokenEnabled(enable(third, "C")),
     ];
-    operations.extend(append_operations(std::slice::from_ref(&member)));
-    let imported = ImportedTempoBlockInput::new(0, operations);
+    operations.extend(ordinary_append_operations(std::slice::from_ref(&deposit)));
+    let imported = ImportedTempoBlockInput::new(0, alloy_primitives::U256::ZERO, operations);
     let reversed = ZoneDepositPrefixInput::new(
         vec![enable(third, "C"), enable(second, "B")],
         vec![],
@@ -219,6 +225,7 @@ fn token_enablement_is_exact_block_ordered_and_preserves_same_block_liability() 
 
     let duplicate = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::TokenEnabled(enable(second, "B"))],
     );
     assert_eq!(
@@ -239,16 +246,17 @@ fn collateral_and_supply_token_views_merge_parent_replacements_and_new_tokens_in
         &mut state,
         &ImportedTempoBlockInput::new(
             0,
+            alloy_primitives::U256::ZERO,
             vec![ImportedTempoOperation::TokenEnabled(enable(high, "HIGH"))],
         ),
         &ZoneDepositPrefixInput::new(vec![enable(high, "HIGH")], vec![], vec![]),
     )
     .unwrap();
 
-    let member = DepositQueueMember::Ordinary(ordinary(low, 0x41, 77));
-    let mut operations = append_operations(std::slice::from_ref(&member));
+    let deposit = ordinary(low, 0x41, 77);
+    let mut operations = ordinary_append_operations(std::slice::from_ref(&deposit));
     operations.push(ImportedTempoOperation::TokenEnabled(enable(middle, "MID")));
-    let imported = ImportedTempoBlockInput::new(0, operations);
+    let imported = ImportedTempoBlockInput::new(0, alloy_primitives::U256::ZERO, operations);
     let post_l1 = ModelTransition::new(&state)
         .apply_imported_tempo_block(&imported)
         .unwrap();
@@ -303,6 +311,7 @@ fn zone_enablement_must_equal_enables_from_this_imported_block() {
     let state = created_state(initial);
     let imported = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::TokenEnabled(enable(second, "B"))],
     );
 
@@ -341,6 +350,7 @@ fn same_block_config_updates_retain_event_order() {
     let apply = |updates: Vec<u64>| {
         let input = ImportedTempoBlockInput::new(
             0,
+            alloy_primitives::U256::ZERO,
             updates
                 .into_iter()
                 .map(ImportedTempoOperation::BouncebackGasUpdated)
@@ -360,9 +370,12 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
     let state = created_state(initial);
     let before = state.clone();
 
-    let zero_refund = DepositQueueMember::Ordinary(ordinary(initial, 0xff, 1));
-    let input =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&zero_refund)));
+    let zero_refund = ordinary(initial, 0xff, 1);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&zero_refund)),
+    );
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&input)
@@ -380,8 +393,12 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
             withdrawal_liability: U256::ZERO,
         },
     );
-    let member = DepositQueueMember::Ordinary(ordinary(initial, 0x43, 1));
-    let input = ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
+    let deposit = ordinary(initial, 0x43, 1);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&deposit)),
+    );
     assert_eq!(
         ModelTransition::new(&liability_overflow)
             .apply_imported_tempo_block(&input)
@@ -395,6 +412,7 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
     overflow.set_portal_deposit_cursor_for_test(PortalDepositCursor::new(B256::ZERO, u64::MAX));
     let input = ImportedTempoBlockInput::new(
         0,
+        alloy_primitives::U256::ZERO,
         vec![ImportedTempoOperation::OrdinaryDepositAppended(ordinary(
             initial, 0x42, 1,
         ))],
@@ -405,75 +423,4 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
             .err(),
         Some(ModelError::PortalDepositNumberOverflow)
     );
-}
-
-#[test]
-fn withdrawal_bounce_back_append_requires_and_retains_one_matching_fallback_owner() {
-    let initial = token(0x27);
-    let mut state = created_state(initial);
-    let bounce = bounce(initial, 9, 400);
-    let member = DepositQueueMember::WithdrawalBounceBack(bounce);
-    let imported =
-        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
-    assert_eq!(
-        ModelTransition::new(&state)
-            .apply_imported_tempo_block(&imported)
-            .err(),
-        Some(ModelError::FallbackOwnerMissing { fallback_nonce: 9 })
-    );
-
-    let withdrawal = seed_fallback(&mut state, 3, 9, initial, 400);
-    commit(&mut state, &imported, &empty_zone()).unwrap();
-    assert_eq!(
-        state.fallback_owner(FallbackId {
-            zone_id: ZONE_ID,
-            fallback_nonce: NonZeroU64::new(9).unwrap(),
-        }),
-        Some(&FallbackOwner::BounceBackQueued {
-            withdrawal,
-            token: initial,
-            amount: NonZeroU128::new(400).unwrap(),
-            deposit: DepositId {
-                portal: portal(),
-                deposit_number: NonZeroU64::new(1).unwrap(),
-            },
-        })
-    );
-
-    let second = ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
-    assert_eq!(
-        ModelTransition::new(&state)
-            .apply_imported_tempo_block(&second)
-            .err(),
-        Some(ModelError::WithdrawalBounceBackAlreadyPending {
-            withdrawal_index: withdrawal.withdrawal_index,
-        })
-    );
-}
-
-#[test]
-fn withdrawal_bounce_back_append_rejects_mismatched_owner_fields_atomically() {
-    let enabled_token = token(0x28);
-    let mismatch_cases = [
-        (token(0x29), 400, enabled_token, 400),
-        (enabled_token, 401, enabled_token, 400),
-    ];
-
-    for (owner_token, owner_amount, deposit_token, deposit_amount) in mismatch_cases {
-        let mut state = created_state(enabled_token);
-        seed_fallback(&mut state, 4, 10, owner_token, owner_amount);
-        let before = state.clone();
-        let member =
-            DepositQueueMember::WithdrawalBounceBack(bounce(deposit_token, 10, deposit_amount));
-        let imported =
-            ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
-
-        assert_eq!(
-            ModelTransition::new(&state)
-                .apply_imported_tempo_block(&imported)
-                .err(),
-            Some(ModelError::FallbackOwnerMismatch { fallback_nonce: 10 })
-        );
-        assert_eq!(state, before);
-    }
 }

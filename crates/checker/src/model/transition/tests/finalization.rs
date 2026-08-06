@@ -11,7 +11,7 @@ use crate::model::{
         AuthenticatedDepositOutcome, BatchFinalizationInput, ImportedTempoBlockInput,
         ZoneBlockContext, ZoneBlockInput, ZoneDepositPrefixInput, ZoneOperation,
     },
-    ownership::{BatchId, BatchOwner, PendingWithdrawal, WithdrawalId, WithdrawalOwner},
+    ownership::{BatchId, PendingWithdrawal, WithdrawalId, WithdrawalOwner},
     state::ZoneLastBatch,
     transition::ModelError,
 };
@@ -75,7 +75,7 @@ fn state_with_pending_users(reveals: Vec<Bytes>) -> crate::model::state::ModelSt
         .collect();
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(10, Vec::new()),
+        &ImportedTempoBlockInput::new(10, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             B256::repeat_byte(0xa0),
             20,
@@ -86,16 +86,6 @@ fn state_with_pending_users(reveals: Vec<Bytes>) -> crate::model::state::ModelSt
     )
     .unwrap();
     state
-}
-
-fn finalized_batch(
-    state: &crate::model::state::ModelState,
-    batch: BatchId,
-) -> &crate::model::ownership::FinalizedBatchState {
-    let Some(BatchOwner::Finalized(batch)) = state.batch(batch) else {
-        panic!("fixture batch must be finalized")
-    };
-    batch
 }
 
 #[test]
@@ -113,7 +103,7 @@ fn mixed_user_failed_and_revealed_withdrawals_finalize_as_one_fixed_batch() {
 
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(40, Vec::new()),
+        &ImportedTempoBlockInput::new(40, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             B256::repeat_byte(0xa1),
             41,
@@ -130,9 +120,13 @@ fn mixed_user_failed_and_revealed_withdrawals_finalize_as_one_fixed_batch() {
     )
     .unwrap();
 
-    let failed = DepositQueueMember::Ordinary(ordinary(token, 0x41, 9));
-    let imported =
-        ImportedTempoBlockInput::new(77, append_operations(std::slice::from_ref(&failed)));
+    let failed_deposit = ordinary(token, 0x41, 9);
+    let failed = DepositQueueMember::Ordinary(failed_deposit.clone());
+    let imported = ImportedTempoBlockInput::new(
+        77,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&failed_deposit)),
+    );
     let reveal = reveal_key(0x52);
     let cipher = encrypted_sender(0x63);
     let zone = block(
@@ -213,7 +207,7 @@ fn empty_batches_advance_index_retain_ranges_and_update_the_exact_last_batch_pai
     let first_hash = B256::repeat_byte(0xc1);
     let first = commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(500, Vec::new()),
+        &ImportedTempoBlockInput::new(500, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             first_hash,
             60,
@@ -233,7 +227,7 @@ fn empty_batches_advance_index_retain_ranges_and_update_the_exact_last_batch_pai
     let second_hash = B256::repeat_byte(0xc2);
     let second = commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(501, Vec::new()),
+        &ImportedTempoBlockInput::new(501, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             second_hash,
             61,
@@ -307,7 +301,7 @@ fn finalization_rejects_block_count_and_sender_cardinality_mismatches_atomically
     for (input, expected_error) in cases {
         let result = apply_full_block(
             &state,
-            &ImportedTempoBlockInput::new(11, Vec::new()),
+            &ImportedTempoBlockInput::new(11, alloy_primitives::U256::ZERO, Vec::new()),
             &block(
                 B256::repeat_byte(0xa1),
                 21,
@@ -335,7 +329,7 @@ fn mixed_sender_shape_reorder_fails_but_the_positionally_correct_vector_finalize
     assert_eq!(
         apply_full_block(
             &state,
-            &ImportedTempoBlockInput::new(12, Vec::new()),
+            &ImportedTempoBlockInput::new(12, alloy_primitives::U256::ZERO, Vec::new()),
             &wrong,
         )
         .err(),
@@ -356,7 +350,7 @@ fn mixed_sender_shape_reorder_fails_but_the_positionally_correct_vector_finalize
     );
     let (next, _) = apply_full_block(
         &state,
-        &ImportedTempoBlockInput::new(12, Vec::new()),
+        &ImportedTempoBlockInput::new(12, alloy_primitives::U256::ZERO, Vec::new()),
         &correct,
     )
     .unwrap();
@@ -386,13 +380,13 @@ fn same_shape_encrypted_senders_remain_opaque_and_are_not_order_authenticated() 
 
     let (ordered, ordered_expected) = apply_full_block(
         &state,
-        &ImportedTempoBlockInput::new(14, Vec::new()),
+        &ImportedTempoBlockInput::new(14, alloy_primitives::U256::ZERO, Vec::new()),
         &finalize(vec![first.clone(), second.clone()]),
     )
     .unwrap();
     let (swapped, swapped_expected) = apply_full_block(
         &state,
-        &ImportedTempoBlockInput::new(14, Vec::new()),
+        &ImportedTempoBlockInput::new(14, alloy_primitives::U256::ZERO, Vec::new()),
         &finalize(vec![second.clone(), first.clone()]),
     )
     .unwrap();
@@ -437,7 +431,7 @@ fn a_late_encrypted_sender_failure_discards_earlier_in_place_finalizations() {
     assert_eq!(
         apply_full_block(
             &state,
-            &ImportedTempoBlockInput::new(13, Vec::new()),
+            &ImportedTempoBlockInput::new(13, alloy_primitives::U256::ZERO, Vec::new()),
             &input,
         )
         .err(),
@@ -468,7 +462,7 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
     let anchor_hash = B256::repeat_byte(0xd0);
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(400, Vec::new()),
+        &ImportedTempoBlockInput::new(400, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             anchor_hash,
             70,
@@ -479,10 +473,15 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
     )
     .unwrap();
 
-    let first = DepositQueueMember::Ordinary(ordinary(token, 0x61, 10));
+    let first_deposit = ordinary(token, 0x61, 10);
+    let first = DepositQueueMember::Ordinary(first_deposit.clone());
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(501, append_operations(std::slice::from_ref(&first))),
+        &ImportedTempoBlockInput::new(
+            501,
+            alloy_primitives::U256::ZERO,
+            ordinary_append_operations(std::slice::from_ref(&first_deposit)),
+        ),
         &block(
             B256::repeat_byte(0xd1),
             71,
@@ -512,11 +511,16 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
         0
     );
 
-    let second = DepositQueueMember::Ordinary(ordinary(token, 0x62, 20));
+    let second_deposit = ordinary(token, 0x62, 20);
+    let second = DepositQueueMember::Ordinary(second_deposit.clone());
     let second_cursor = second.hash_after(first.hash_after(B256::ZERO));
     let expected = commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(9_999, append_operations(std::slice::from_ref(&second))),
+        &ImportedTempoBlockInput::new(
+            9_999,
+            alloy_primitives::U256::ZERO,
+            ordinary_append_operations(std::slice::from_ref(&second_deposit)),
+        ),
         &block(
             B256::repeat_byte(0xd2),
             72,
@@ -555,7 +559,7 @@ fn later_batches_leave_prior_finalized_rows_and_ranges_untouched_exactly_once() 
     let mut state = state_with_pending_users(vec![Bytes::new()]);
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(20, Vec::new()),
+        &ImportedTempoBlockInput::new(20, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             B256::repeat_byte(0xe1),
             30,
@@ -579,7 +583,7 @@ fn later_batches_leave_prior_finalized_rows_and_ranges_untouched_exactly_once() 
     let token = token(0x91);
     commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(21, Vec::new()),
+        &ImportedTempoBlockInput::new(21, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             B256::repeat_byte(0xe2),
             31,
@@ -624,7 +628,7 @@ fn later_batches_leave_prior_finalized_rows_and_ranges_untouched_exactly_once() 
     assert_eq!(
         apply_full_block(
             &state,
-            &ImportedTempoBlockInput::new(22, Vec::new()),
+            &ImportedTempoBlockInput::new(22, alloy_primitives::U256::ZERO, Vec::new()),
             &replay,
         )
         .err(),
@@ -649,7 +653,7 @@ fn batch_index_overflow_invalid_range_and_owner_collision_fail_atomically() {
     assert_eq!(
         apply_full_block(
             &overflow,
-            &ImportedTempoBlockInput::new(30, Vec::new()),
+            &ImportedTempoBlockInput::new(30, alloy_primitives::U256::ZERO, Vec::new()),
             &block(
                 B256::repeat_byte(0xf1),
                 80,
@@ -669,7 +673,7 @@ fn batch_index_overflow_invalid_range_and_owner_collision_fail_atomically() {
     assert_eq!(
         apply_full_block(
             &invalid_range,
-            &ImportedTempoBlockInput::new(31, Vec::new()),
+            &ImportedTempoBlockInput::new(31, alloy_primitives::U256::ZERO, Vec::new()),
             &block(
                 B256::repeat_byte(0xf2),
                 81,
@@ -686,7 +690,7 @@ fn batch_index_overflow_invalid_range_and_owner_collision_fail_atomically() {
     let mut collision = created_state(token);
     commit_full_block(
         &mut collision,
-        &ImportedTempoBlockInput::new(32, Vec::new()),
+        &ImportedTempoBlockInput::new(32, alloy_primitives::U256::ZERO, Vec::new()),
         &block(
             B256::repeat_byte(0xf3),
             82,
@@ -701,7 +705,7 @@ fn batch_index_overflow_invalid_range_and_owner_collision_fail_atomically() {
     assert_eq!(
         apply_full_block(
             &collision,
-            &ImportedTempoBlockInput::new(33, Vec::new()),
+            &ImportedTempoBlockInput::new(33, alloy_primitives::U256::ZERO, Vec::new()),
             &block(
                 B256::repeat_byte(0xf4),
                 83,

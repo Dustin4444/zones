@@ -42,6 +42,11 @@ pub(crate) const EMPTY_WITHDRAWAL_QUEUE_SENTINEL: B256 =
 /// Pinned source: `specs/ref-impls/src/libraries/WithdrawalQueueLib.sol:11-13`.
 pub(crate) const NO_WITHDRAWAL_QUEUE_INDEX: U256 = U256::MAX;
 
+/// Maximum number of non-empty batch slots retained by the Portal withdrawal ring.
+///
+/// Pinned source: `specs/ref-impls/src/libraries/WithdrawalQueueLib.sol:15-16`.
+pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: U256 = U256::from_limbs([100, 0, 0, 0]);
+
 /// Fixed gas charged in addition to a user's callback gas limit.
 ///
 /// Pinned source: `crates/precompiles/src/outbox/mod.rs:33` and
@@ -177,6 +182,7 @@ mod tests {
         );
         assert_eq!(EMPTY_WITHDRAWAL_QUEUE_SENTINEL, B256::repeat_byte(0xff));
         assert_eq!(NO_WITHDRAWAL_QUEUE_INDEX, U256::MAX);
+        assert_eq!(WITHDRAWAL_QUEUE_CAPACITY, U256::from(100));
         assert_eq!(WITHDRAWAL_BASE_GAS, 50_000);
         assert_eq!(MAX_CALLBACK_DATA_SIZE, 1_024);
         assert_eq!(MAX_DEPOSITS_PER_TEMPO_BLOCK, 230);

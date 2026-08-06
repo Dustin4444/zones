@@ -18,7 +18,8 @@ use super::{
         },
         state::{TokenPhase, ZoneProcessedDepositCursor},
     },
-    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, queue_member, require_zone_token,
+    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, queue_member, refunds,
+    require_zone_token,
 };
 
 pub(super) fn apply_zone_prefix(
@@ -307,17 +308,13 @@ fn withdrawal_bounce_back(
                     recipient,
                     user_withdrawal: withdrawal,
                 };
-                if candidate.inbox_refund(refund).is_some() {
-                    return Err(ModelError::InboxRefundCollision {
-                        withdrawal_index: withdrawal.withdrawal_index,
-                    });
-                }
-                candidate.set_inbox_refund(
+                refunds::create_inbox_credit(
+                    candidate,
                     refund,
-                    Some(InboxRefundOwner::Pending {
+                    InboxRefundOwner::Pending {
                         amount: preimage.amount(),
-                    }),
-                );
+                    },
+                )?;
                 ExpectedDepositOutcome::WithdrawalBounceBackPending(
                     ExpectedWithdrawalBounceBack::new(preimage.token(), preimage.amount().get()),
                 )

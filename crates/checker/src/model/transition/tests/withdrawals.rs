@@ -10,26 +10,30 @@ use crate::model::{
         AuthenticatedDepositOutcome, ImportedTempoBlockInput, ZoneBlockContext, ZoneBlockInput,
         ZoneDepositPrefixInput, ZoneOperation,
     },
-    output::ExpectedDepositOutcome,
+    output::{
+        ExpectedDepositOutcome, ExpectedOutputs, ExpectedWithdrawalRequested, ExpectedZoneOperation,
+    },
     ownership::{FallbackId, FallbackOwner, WithdrawalId, WithdrawalIdentity, WithdrawalOwner},
     state::ModelState,
     transition::ModelError,
 };
 
-fn funded_state(token: Address, supply: U256) -> ModelState {
-    let mut state = created_state(token);
-    state.set_token_accounting_for_test(
-        token,
-        TokenAccounting {
-            supply,
-            ..TokenAccounting::ZERO
-        },
-    );
-    state
-}
-
 fn withdrawal(token: Address, seed: u8, amount: u128) -> ZoneOperation {
     ZoneOperation::user_withdrawal_accepted(user_withdrawal(token, seed, amount, 0, Bytes::new()))
+}
+
+fn expected_user_withdrawals(expected: &ExpectedOutputs) -> Vec<&ExpectedWithdrawalRequested> {
+    expected
+        .zone_block()
+        .operations()
+        .iter()
+        .map(|operation| match operation {
+            ExpectedZoneOperation::WithdrawalRequested(withdrawal) => withdrawal.as_ref(),
+            ExpectedZoneOperation::RefundClaimed(_) => {
+                panic!("withdrawal-only fixture produced a refund expectation")
+            }
+        })
+        .collect()
 }
 
 fn assert_block_rejected_atomically(
@@ -67,7 +71,8 @@ fn ordered_gas_rate_updates_drive_each_fee_and_persist_the_last_rate() {
     )
     .unwrap();
 
-    let [first, second] = expected.zone_block().user_withdrawals() else {
+    let withdrawals = expected_user_withdrawals(&expected);
+    let [first, second] = withdrawals.as_slice() else {
         panic!("two withdrawal expectations required")
     };
     assert_eq!(first.withdrawal().withdrawal_index, 0);
@@ -158,7 +163,7 @@ fn withdrawal_cap_toggle_matrix_preserves_only_nonzero_mode_counts() {
         let expected = commit_block(&mut accepted, 1, case.operations.clone(), None)
             .unwrap_or_else(|error| panic!("{}: {error}", case.name));
         assert_eq!(
-            expected.zone_block().user_withdrawals().len(),
+            expected_user_withdrawals(&expected).len(),
             case.expected_count,
             "{}",
             case.name
@@ -198,12 +203,12 @@ fn withdrawal_cap_counter_resets_at_the_next_zone_block() {
         None,
     )
     .unwrap();
-    assert_eq!(first.zone_block().user_withdrawals().len(), 1);
+    assert_eq!(expected_user_withdrawals(&first).len(), 1);
 
     let second = commit_block(&mut state, 8, vec![withdrawal(token, 0x20, 1)], None).unwrap();
-    assert_eq!(second.zone_block().user_withdrawals().len(), 1);
+    assert_eq!(expected_user_withdrawals(&second).len(), 1);
     assert_eq!(
-        second.zone_block().user_withdrawals()[0]
+        expected_user_withdrawals(&second)[0]
             .withdrawal()
             .withdrawal_index,
         1
@@ -234,7 +239,7 @@ fn sponsored_fee_burn_uses_u256_when_principal_plus_fee_exceeds_u128() {
     )
     .unwrap();
 
-    assert_eq!(expected.zone_block().user_withdrawals()[0].fee(), fee);
+    assert_eq!(expected_user_withdrawals(&expected)[0].fee(), fee);
     assert!(total_burn > U256::from(u128::MAX));
     assert_eq!(
         state.token(token).unwrap().accounting(),
@@ -258,7 +263,8 @@ fn user_withdrawals_derive_unique_indices_nonces_and_recipient_free_fallbacks() 
     )
     .unwrap();
 
-    let [first, second] = expected.zone_block().user_withdrawals() else {
+    let withdrawals = expected_user_withdrawals(&expected);
+    let [first, second] = withdrawals.as_slice() else {
         panic!("two withdrawal expectations required")
     };
     assert_eq!(first.withdrawal().withdrawal_index, 0);
@@ -366,10 +372,13 @@ fn withdrawal_identity_overflows_collisions_and_accounting_errors_are_atomic() {
 fn failed_deposit_uses_the_shared_index_but_not_the_user_cap_or_nonce() {
     let token = token(0x87);
     let ordinary = ordinary(token, 0x71, 9);
-    let member = DepositQueueMember::Ordinary(ordinary);
+    let member = DepositQueueMember::Ordinary(ordinary.clone());
     let mut state = created_state(token);
-    let imported =
-        ImportedTempoBlockInput::new(1, append_operations(std::slice::from_ref(&member)));
+    let imported = ImportedTempoBlockInput::new(
+        1,
+        alloy_primitives::U256::ZERO,
+        ordinary_append_operations(std::slice::from_ref(&ordinary)),
+    );
     commit(&mut state, &imported, &empty_zone()).unwrap();
     state.set_token_accounting_for_test(
         token,
@@ -397,7 +406,7 @@ fn failed_deposit_uses_the_shared_index_but_not_the_user_cap_or_nonce() {
     );
     let expected = commit_full_block(
         &mut state,
-        &ImportedTempoBlockInput::new(2, Vec::new()),
+        &ImportedTempoBlockInput::new(2, alloy_primitives::U256::ZERO, Vec::new()),
         &accepted_input,
     )
     .unwrap();
@@ -407,7 +416,8 @@ fn failed_deposit_uses_the_shared_index_but_not_the_user_cap_or_nonce() {
     else {
         panic!("one failed-deposit expectation required")
     };
-    let [user] = expected.zone_block().user_withdrawals() else {
+    let withdrawals = expected_user_withdrawals(&expected);
+    let [user] = withdrawals.as_slice() else {
         panic!("one user-withdrawal expectation required")
     };
     assert_eq!(failed.first().withdrawal().withdrawal_index, 0);
@@ -439,7 +449,7 @@ fn failed_deposit_uses_the_shared_index_but_not_the_user_cap_or_nonce() {
     assert_eq!(
         commit_full_block(
             &mut rejected,
-            &ImportedTempoBlockInput::new(2, Vec::new()),
+            &ImportedTempoBlockInput::new(2, alloy_primitives::U256::ZERO, Vec::new()),
             &rejected_input,
         ),
         Err(ModelError::WithdrawalBlockCapExceeded { limit: 1 })

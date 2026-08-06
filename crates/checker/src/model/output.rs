@@ -8,6 +8,14 @@ use super::{
     state::ZoneProcessedDepositCursor,
 };
 
+mod settlement;
+
+pub(crate) use settlement::{
+    ExpectedBatchSubmission, ExpectedDepositRefund, ExpectedProcessedWithdrawal,
+    ExpectedRefundClaim, ExpectedUserWithdrawalBounce, ExpectedUserWithdrawalDelivery,
+    ExpectedWithdrawalBounceBackAppend, ExpectedWithdrawalProcessed, ExpectedWithdrawalProcessing,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExpectedDepositAppend {
     id: DepositId,
@@ -28,18 +36,46 @@ impl ExpectedDepositAppend {
     }
 }
 
+/// One independently derived Portal output sequence in authenticated L1
+/// operation order. An enum prevents regrouping heterogeneous events by kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpectedImportedTempoOperation {
+    DepositAppended(ExpectedDepositAppend),
+    BatchSubmitted(ExpectedBatchSubmission),
+    WithdrawalsProcessed(ExpectedWithdrawalProcessing),
+    RefundClaimed(ExpectedRefundClaim),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ExpectedImportedTempoBlock {
-    deposit_appends: Vec<ExpectedDepositAppend>,
+    operations: Vec<ExpectedImportedTempoOperation>,
 }
 
 impl ExpectedImportedTempoBlock {
     pub(super) fn push_deposit_append(&mut self, append: ExpectedDepositAppend) {
-        self.deposit_appends.push(append);
+        self.operations
+            .push(ExpectedImportedTempoOperation::DepositAppended(append));
     }
 
-    pub(crate) fn deposit_appends(&self) -> &[ExpectedDepositAppend] {
-        &self.deposit_appends
+    pub(super) fn push_batch_submission(&mut self, submission: ExpectedBatchSubmission) {
+        self.operations
+            .push(ExpectedImportedTempoOperation::BatchSubmitted(submission));
+    }
+
+    pub(super) fn push_withdrawal_processing(&mut self, processing: ExpectedWithdrawalProcessing) {
+        self.operations
+            .push(ExpectedImportedTempoOperation::WithdrawalsProcessed(
+                processing,
+            ));
+    }
+
+    pub(super) fn push_refund_claim(&mut self, claim: ExpectedRefundClaim) {
+        self.operations
+            .push(ExpectedImportedTempoOperation::RefundClaimed(claim));
+    }
+
+    pub(crate) fn operations(&self) -> &[ExpectedImportedTempoOperation] {
+        &self.operations
     }
 }
 
@@ -376,25 +412,31 @@ impl ExpectedBatchFinalized {
 /// Expectations produced by ordered post-advance operations and optional
 /// finalization. Failed-deposit requests remain in the preceding prefix output
 /// because the native Outbox emits them during `advanceTempo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpectedZoneOperation {
+    WithdrawalRequested(Box<ExpectedWithdrawalRequested>),
+    RefundClaimed(ExpectedRefundClaim),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ExpectedZoneBlock {
-    user_withdrawals: Vec<ExpectedWithdrawalRequested>,
+    operations: Vec<ExpectedZoneOperation>,
     finalized_batch: Option<ExpectedBatchFinalized>,
 }
 
 impl ExpectedZoneBlock {
     pub(super) fn new(
-        user_withdrawals: Vec<ExpectedWithdrawalRequested>,
+        operations: Vec<ExpectedZoneOperation>,
         finalized_batch: Option<ExpectedBatchFinalized>,
     ) -> Self {
         Self {
-            user_withdrawals,
+            operations,
             finalized_batch,
         }
     }
 
-    pub(crate) fn user_withdrawals(&self) -> &[ExpectedWithdrawalRequested] {
-        &self.user_withdrawals
+    pub(crate) fn operations(&self) -> &[ExpectedZoneOperation] {
+        &self.operations
     }
 
     pub(crate) const fn finalized_batch(&self) -> Option<ExpectedBatchFinalized> {
@@ -403,7 +445,7 @@ impl ExpectedZoneBlock {
 }
 
 /// Complete expectations for one atomic imported-Tempo plus Zone-block
-/// transition. Production receives this type only after every Goal 3 stage
+/// transition. Production receives this type only after every model stage
 /// succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedOutputs {
