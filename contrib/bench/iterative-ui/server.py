@@ -24,8 +24,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-STATE_VERSION = 6
+STATE_VERSION = 7
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# txgen prints e.g. "scenario execution progress: started=42 completed=30
+# in_flight=12 maximum_in_flight=50" on a periodic cadence. Parse it to drive
+# live UI updates as transactions flow in.
+PROGRESS_PATTERN = re.compile(
+    r"scenario execution progress:\s*started=(\d+)\s+completed=(\d+)"
+    r"\s+in_flight=(\d+)\s+maximum_in_flight=(\d+)"
+)
 ACCOUNT_START = 16
 TOPOLOGY_ACCOUNT_CAPACITY = int(
     os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "50")
@@ -169,6 +176,17 @@ FRIENDLY_STEP_NAMES = {
     "offramp": "Request withdrawal to L1",
     "offramp_result": "Withdrawal accepted by Zone",
     "offramp_processed": "Funds received on L1",
+}
+
+# The Zone-side confirmation step per scenario: when the transaction is
+# confirmed on Tempo, BEFORE any L1 cross-chain settlement wait. This is the
+# honest "per-tx Tempo speed" headline; the end-to-end latency (which includes
+# L1 finality) is reported alongside it as context.
+TEMPO_CONFIRM_STEP = {
+    "neobank-encrypted-deposit": "onramp.zone_deposit.processed",
+    "neobank-earn-deposit": "earn_deposit.request_result",
+    "neobank-private-withdrawal": "earn_redeem.request_result",
+    "neobank-zone-withdrawal": "offramp_result",
 }
 
 
@@ -427,6 +445,18 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
     receipt_count = sum(
         int((metric.get("gas_used") or {}).get("count", 0)) for metric in raw_receipts
     )
+    confirm_step = TEMPO_CONFIRM_STEP.get(str(report.get("scenario", "")))
+    confirm_latency = (
+        steps_by_name.get(confirm_step, {}).get("command_latency")
+        or steps_by_name.get(confirm_step, {}).get("latency")
+        or {}
+    ) if confirm_step else {}
+    tempo_confirm_p99 = safe_number(confirm_latency.get("p99_ms")) or safe_number(
+        latency.get("p99_ms")
+    )
+    tempo_confirm_p50 = safe_number(confirm_latency.get("p50_ms")) or safe_number(
+        latency.get("p50_ms")
+    )
     return {
         "scenario": report.get("scenario", "neobank-private-zone-flow"),
         "reportVersion": int(report.get("version", 0)),
@@ -446,6 +476,8 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
             "p50Ms": safe_number(latency.get("p50_ms")),
             "p95Ms": safe_number(latency.get("p95_ms")),
             "p99Ms": safe_number(latency.get("p99_ms")),
+            "tempoConfirmP50Ms": tempo_confirm_p50,
+            "tempoConfirmP99Ms": tempo_confirm_p99,
             "meanJourneyCostUsd": total_fees / completed / 1e18 if completed else 0.0,
             "totalRunCostUsd": total_fees / 1e18,
             "meanJourneyGas": total_gas / completed if completed else 0.0,
@@ -488,6 +520,7 @@ class BenchmarkController:
             "message": "Ready to run locally",
             "run": None,
             "result": None,
+            "progress": None,
             "scenarioResults": {},
             "history": [],
             "error": None,
@@ -556,6 +589,15 @@ class BenchmarkController:
                         "startedAt": utc_now(),
                     },
                     "result": None,
+                    "progress": {
+                        "phase": "starting",
+                        "total": config["count"],
+                        "started": 0,
+                        "completed": 0,
+                        "inFlight": 0,
+                        "maxInFlight": config["concurrency"],
+                        "elapsedMs": 0.0,
+                    },
                     "error": None,
                 }
             )
@@ -652,6 +694,7 @@ class BenchmarkController:
             }
         )
         recent: deque[str] = deque(maxlen=30)
+        run_started = time.monotonic()
         try:
             process = subprocess.Popen(
                 ["bash", "contrib/bench/run-neobank-private-flow.sh"],
@@ -677,6 +720,9 @@ class BenchmarkController:
                 if line:
                     print(line, flush=True)
                     recent.append(line)
+                    self._maybe_update_progress(
+                        line, config["count"], run_started
+                    )
             return_code = process.wait()
             with self.lock:
                 self.process = None
@@ -686,6 +732,7 @@ class BenchmarkController:
                         status="interrupted",
                         stage="interrupted",
                         message="Local benchmark stopped",
+                        progress=None,
                         error=None,
                     )
                     return
@@ -715,11 +762,36 @@ class BenchmarkController:
                 status="failed",
                 stage="failed",
                 message="Local benchmark failed",
+                progress=None,
                 error=str(error),
             )
         finally:
             with self.lock:
                 self.process = None
+
+    def _maybe_update_progress(
+        self, line: str, total: int, run_started: float
+    ) -> None:
+        """Parse a txgen progress line and publish it for the live UI."""
+        match = PROGRESS_PATTERN.search(line)
+        if not match:
+            return
+        started, completed, in_flight, max_in_flight = (
+            int(value) for value in match.groups()
+        )
+        with self.lock:
+            if self.state.get("run") is None:
+                return
+            self.state["progress"] = {
+                "phase": "executing",
+                "total": total,
+                "started": started,
+                "completed": completed,
+                "inFlight": in_flight,
+                "maxInFlight": max_in_flight,
+                "elapsedMs": (time.monotonic() - run_started) * 1000.0,
+            }
+            self._persist()
 
     def _complete(self, result: dict[str, Any]) -> None:
         with self.lock:
@@ -746,6 +818,7 @@ class BenchmarkController:
                     "message": "Real local results ready",
                     "run": run_record,
                     "result": result,
+                    "progress": None,
                     "scenarioResults": scenario_results,
                     "history": [history_entry, *self.state.get("history", [])][:8],
                     "error": None,
