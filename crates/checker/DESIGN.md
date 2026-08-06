@@ -1272,7 +1272,8 @@ sender tag.
   failures.
 - Mixed user/failed-deposit batch fixed vector.
 - Empty batch advances batch index but has zero queue hash.
-- Missing/extra/reordered `encryptedSenders` and wrong final transaction fail.
+- Missing/extra `encryptedSenders`, shape-incompatible reordering, and wrong final transaction
+  fail. Same-shape ciphertexts remain opaque and are not independently order-authenticated.
 
 **Validation.** `cargo test -p zone-checker model` and `cargo fmt --check`.
 

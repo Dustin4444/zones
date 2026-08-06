@@ -3,8 +3,8 @@
 use alloy_primitives::{Address, B256, Bytes};
 
 use super::{
-    encoding::OrdinaryDeposit,
-    ownership::{DepositId, WithdrawalId},
+    encoding::{OrdinaryDeposit, UserWithdrawalIdentity, UserWithdrawalRequest},
+    ownership::{BatchId, DepositId, WithdrawalId},
     state::ZoneProcessedDepositCursor,
 };
 
@@ -139,6 +139,28 @@ pub(crate) struct ExpectedWithdrawalRequested {
 }
 
 impl ExpectedWithdrawalRequested {
+    pub(super) fn for_user(
+        withdrawal: WithdrawalId,
+        identity: UserWithdrawalIdentity,
+        request: &UserWithdrawalRequest,
+        fee: u128,
+        reveal_to: Bytes,
+    ) -> Self {
+        Self {
+            withdrawal,
+            sender: identity.sender(),
+            token: request.token(),
+            to: request.to(),
+            amount: request.principal().get(),
+            fee,
+            memo: request.memo(),
+            gas_limit: request.gas_limit().get(),
+            fallback_nonce: identity.fallback_nonce().get(),
+            data: request.callback_data().clone(),
+            reveal_to,
+        }
+    }
+
     pub(super) fn for_failed_deposit(withdrawal: WithdrawalId, deposit: &OrdinaryDeposit) -> Self {
         Self {
             withdrawal,
@@ -328,22 +350,78 @@ impl ExpectedZoneDepositPrefix {
     }
 }
 
-/// Complete Goal 2 expectations. Typestate construction makes both stages
-/// mandatory and keeps authenticated branch values out of these fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedBatchFinalized {
+    batch: BatchId,
+    withdrawal_queue_hash: B256,
+}
+
+impl ExpectedBatchFinalized {
+    pub(super) const fn new(batch: BatchId, withdrawal_queue_hash: B256) -> Self {
+        Self {
+            batch,
+            withdrawal_queue_hash,
+        }
+    }
+
+    pub(crate) const fn batch(&self) -> BatchId {
+        self.batch
+    }
+
+    pub(crate) const fn withdrawal_queue_hash(&self) -> B256 {
+        self.withdrawal_queue_hash
+    }
+}
+
+/// Expectations produced by ordered post-advance operations and optional
+/// finalization. Failed-deposit requests remain in the preceding prefix output
+/// because the native Outbox emits them during `advanceTempo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedZoneBlock {
+    user_withdrawals: Vec<ExpectedWithdrawalRequested>,
+    finalized_batch: Option<ExpectedBatchFinalized>,
+}
+
+impl ExpectedZoneBlock {
+    pub(super) fn new(
+        user_withdrawals: Vec<ExpectedWithdrawalRequested>,
+        finalized_batch: Option<ExpectedBatchFinalized>,
+    ) -> Self {
+        Self {
+            user_withdrawals,
+            finalized_batch,
+        }
+    }
+
+    pub(crate) fn user_withdrawals(&self) -> &[ExpectedWithdrawalRequested] {
+        &self.user_withdrawals
+    }
+
+    pub(crate) const fn finalized_batch(&self) -> Option<ExpectedBatchFinalized> {
+        self.finalized_batch
+    }
+}
+
+/// Complete expectations for one atomic imported-Tempo plus Zone-block
+/// transition. Production receives this type only after every Goal 3 stage
+/// succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedOutputs {
     imported_tempo_block: ExpectedImportedTempoBlock,
     zone_deposit_prefix: ExpectedZoneDepositPrefix,
+    zone_block: ExpectedZoneBlock,
 }
 
 impl ExpectedOutputs {
     pub(super) const fn new(
         imported_tempo_block: ExpectedImportedTempoBlock,
         zone_deposit_prefix: ExpectedZoneDepositPrefix,
+        zone_block: ExpectedZoneBlock,
     ) -> Self {
         Self {
             imported_tempo_block,
             zone_deposit_prefix,
+            zone_block,
         }
     }
 
@@ -353,5 +431,9 @@ impl ExpectedOutputs {
 
     pub(crate) const fn zone_deposit_prefix(&self) -> &ExpectedZoneDepositPrefix {
         &self.zone_deposit_prefix
+    }
+
+    pub(crate) const fn zone_block(&self) -> &ExpectedZoneBlock {
+        &self.zone_block
     }
 }

@@ -33,7 +33,7 @@ fn multiple_tempo_appends_and_zone_prefixes_reproduce_every_cursor() {
         DepositQueueMember::Ordinary(ordinary(token, 0x54, 40)),
     ];
 
-    let imported = ImportedTempoBlockInput::new(append_operations(&first_block));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&first_block));
     let expected = commit(&mut state, &imported, &empty_zone()).unwrap();
     let first_expected = expected.imported_tempo_block().deposit_appends();
     let first_hash = first_block[0].hash_after(B256::ZERO);
@@ -48,7 +48,7 @@ fn multiple_tempo_appends_and_zone_prefixes_reproduce_every_cursor() {
     );
     assert_eq!(state.zone().processed_deposit_cursor().number(), 0);
 
-    let imported = ImportedTempoBlockInput::new(append_operations(&second_block));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&second_block));
     let expected = commit(&mut state, &imported, &empty_zone()).unwrap();
     let second_expected = expected.imported_tempo_block().deposit_appends();
     let third_hash = second_block[0].hash_after(second_hash);
@@ -112,7 +112,7 @@ fn empty_partial_and_full_catch_up_are_one_algorithm_and_split_equivalent() {
         DepositQueueMember::Ordinary(ordinary(token, 0x62, 20)),
         DepositQueueMember::Ordinary(ordinary(token, 0x63, 30)),
     ];
-    let imported = ImportedTempoBlockInput::new(append_operations(&members));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
     commit(&mut base, &imported, &empty_zone()).unwrap();
 
     let mut split = base.clone();
@@ -142,7 +142,7 @@ fn identical_consecutive_preimages_remain_distinct_numbered_queue_members() {
     let mut state = created_state(token);
     let member = DepositQueueMember::Ordinary(ordinary(token, 0x70, 5));
     let members = vec![member.clone(), member];
-    let imported = ImportedTempoBlockInput::new(append_operations(&members));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     assert_eq!(state.pending_deposits().len(), 2);
     let zone = ZoneDepositPrefixInput::new(vec![], members, minted_outcomes(2, 0x80));
@@ -156,7 +156,8 @@ fn same_candidate_ordinary_append_and_mint_reads_through_then_closes_the_owner()
     let token = token(0x44);
     let mut state = created_state(token);
     let member = DepositQueueMember::Ordinary(ordinary(token, 0x71, 55));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     let zone = ZoneDepositPrefixInput::new(
         vec![],
         vec![member.clone()],
@@ -228,7 +229,7 @@ fn same_candidate_bounce_append_outcomes_replace_each_owner_exactly_once() {
 
         let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, nonce, amount));
         let imported =
-            ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+            ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
         let outcome = if pending {
             AuthenticatedDepositOutcome::WithdrawalBounceBackPending { recipient }
         } else {

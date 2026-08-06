@@ -23,7 +23,7 @@ fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
         DepositQueueMember::Ordinary(ordinary(token, 0x41, 10)),
         DepositQueueMember::Ordinary(ordinary(token, 0x42, 20)),
     ];
-    let imported = ImportedTempoBlockInput::new(append_operations(&members));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let minted = |seed| AuthenticatedDepositOutcome::OrdinaryMinted {
         recipient: Address::repeat_byte(seed),
@@ -61,7 +61,7 @@ fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
             ModelTransition::new(&state)
                 .apply_imported_tempo_block(&empty_import())
                 .unwrap()
-                .apply_zone_deposit_prefix(&input)
+                .apply_zone_block(&advance_only_block(&input))
                 .err(),
             Some(expected_error)
         );
@@ -83,7 +83,7 @@ fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&replay)
+            .apply_zone_block(&advance_only_block(&replay))
             .err(),
         Some(ModelError::DepositPrefixMismatch { number: 2 })
     );
@@ -94,7 +94,7 @@ fn prefix_rejects_skip_reorder_replay_unknown_and_count_mismatch_atomically() {
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&replay)
+            .apply_zone_block(&advance_only_block(&replay))
             .err(),
         Some(ModelError::PendingDepositMissing { number: 3 })
     );
@@ -105,7 +105,8 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
     let token = token(0x32);
     let mut ordinary_state = created_state(token);
     let ordinary = DepositQueueMember::Ordinary(ordinary(token, 0x61, 10));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&ordinary)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&ordinary)));
     commit(&mut ordinary_state, &imported, &empty_zone()).unwrap();
     let wrong = ZoneDepositPrefixInput::new(
         vec![],
@@ -118,7 +119,7 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
         ModelTransition::new(&ordinary_state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&wrong)
+            .apply_zone_block(&advance_only_block(&wrong))
             .err(),
         Some(ModelError::DepositOutcomeKindMismatch {
             number: 1,
@@ -138,7 +139,8 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
         },
     );
     let bounce = DepositQueueMember::WithdrawalBounceBack(bounce(token, 9, 10));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&bounce)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&bounce)));
     commit(&mut bounce_state, &imported, &empty_zone()).unwrap();
     let wrong = ZoneDepositPrefixInput::new(
         vec![],
@@ -149,7 +151,7 @@ fn ordinary_and_bounce_back_outcomes_are_not_interchangeable() {
         ModelTransition::new(&bounce_state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&wrong)
+            .apply_zone_block(&advance_only_block(&wrong))
             .err(),
         Some(ModelError::DepositOutcomeKindMismatch {
             number: 1,
@@ -165,7 +167,8 @@ fn failed_ordinary_deposit_creates_only_the_zero_rule_withdrawal_owner() {
     let mut state = created_state(token);
     let ordinary = ordinary(token, 0x70, 500);
     let member = DepositQueueMember::Ordinary(ordinary.clone());
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
@@ -236,7 +239,7 @@ fn multiple_failed_deposits_share_literal_nonce_zero_but_not_identity() {
         DepositQueueMember::Ordinary(ordinary(token, 0x71, 10)),
         DepositQueueMember::Ordinary(ordinary(token, 0x72, 20)),
     ];
-    let imported = ImportedTempoBlockInput::new(append_operations(&members));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
@@ -257,7 +260,8 @@ fn failed_deposit_withdrawal_index_overflow_is_atomic() {
     let token = token(0x35);
     let mut state = created_state(token);
     let member = DepositQueueMember::Ordinary(ordinary(token, 0x73, 10));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     state.set_next_withdrawal_index_for_test(u64::MAX);
     let before = state.clone();
@@ -270,7 +274,7 @@ fn failed_deposit_withdrawal_index_overflow_is_atomic() {
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&zone)
+            .apply_zone_block(&advance_only_block(&zone))
             .err(),
         Some(ModelError::WithdrawalIndexOverflow)
     );
@@ -295,7 +299,7 @@ fn bounce_back_mint_and_pending_paths_consume_fallbacks_and_preserve_origin() {
         DepositQueueMember::WithdrawalBounceBack(bounce(token, 11, 300)),
         DepositQueueMember::WithdrawalBounceBack(bounce(token, 12, 400)),
     ];
-    let imported = ImportedTempoBlockInput::new(append_operations(&members));
+    let imported = ImportedTempoBlockInput::new(0, append_operations(&members));
     commit(&mut state, &imported, &empty_zone()).unwrap();
     let minted_recipient = Address::repeat_byte(0x81);
     let pending_recipient = Address::repeat_byte(0x82);
@@ -373,7 +377,8 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
         },
     );
     let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, 13, 5));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     commit(&mut pending_state, &imported, &empty_zone()).unwrap();
     let recipient = Address::repeat_byte(0x91);
     pending_state.seed_inbox_refund_for_test(
@@ -395,7 +400,7 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
         ModelTransition::new(&pending_state)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&zone)
+            .apply_zone_block(&advance_only_block(&zone))
             .err(),
         Some(ModelError::InboxRefundCollision {
             withdrawal_index: withdrawal.withdrawal_index,
@@ -406,7 +411,8 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
     seed_fallback(&mut underflow, 11, 14, token, 5);
     underflow.set_token_accounting_for_test(token, TokenAccounting::ZERO);
     let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, 14, 5));
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     commit(&mut underflow, &imported, &empty_zone()).unwrap();
     let zone = ZoneDepositPrefixInput::new(
         vec![],
@@ -419,7 +425,7 @@ fn bounce_back_pending_rejects_duplicate_credit_and_mint_checks_accounting_bound
         ModelTransition::new(&underflow)
             .apply_imported_tempo_block(&empty_import())
             .unwrap()
-            .apply_zone_deposit_prefix(&zone)
+            .apply_zone_block(&advance_only_block(&zone))
             .err(),
         Some(ModelError::Accounting(
             crate::model::accounting::AccountingError::Underflow(Component::WithdrawalLiability)
@@ -447,7 +453,7 @@ fn zero_bounce_back_recipient_rejects_both_branches_without_exposing_candidate_c
         let before = state.clone();
         let member = DepositQueueMember::WithdrawalBounceBack(bounce(token, nonce, amount));
         let imported =
-            ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+            ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
         let outcome = if pending {
             AuthenticatedDepositOutcome::WithdrawalBounceBackPending {
                 recipient: Address::ZERO,
@@ -463,7 +469,7 @@ fn zero_bounce_back_recipient_rejects_both_branches_without_exposing_candidate_c
             ModelTransition::new(&state)
                 .apply_imported_tempo_block(&imported)
                 .unwrap()
-                .apply_zone_deposit_prefix(&zone)
+                .apply_zone_block(&advance_only_block(&zone))
                 .err(),
             Some(ModelError::ZeroBounceBackRecipient {
                 withdrawal_index: withdrawal.withdrawal_index,
