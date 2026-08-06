@@ -142,7 +142,9 @@ a { color: inherit; text-decoration: none; }
 .titleband h1 { margin: clamp(6px, 1vh, 12px) 0 0; font-size: clamp(38px, 6.2vh, 82px); font-weight: 600; letter-spacing: -0.035em; line-height: 0.98; }
 .titleband-meta { text-align: right; }
 .titleband-meta p { margin: 0; color: var(--fg-secondary); font-size: clamp(13px, 1.5vh, 17px); line-height: 1.5; }
-.branch-label { font-family: var(--font-mono); }
+.net-label { font-family: var(--font-mono); }
+.commit-link { color: var(--accent); font-family: var(--font-mono); }
+.commit-link:hover { text-decoration: underline; }
 
 /* ---------------------------------------------------------------- lanes */
 
@@ -261,15 +263,12 @@ a { color: inherit; text-decoration: none; }
 .progress-sub { display: flex; justify-content: space-between; gap: 12px; color: var(--fg-secondary); font-family: var(--font-mono); font-size: clamp(13px, 1.6vh, 18px); font-variant-numeric: tabular-nums; }
 .progress-sub b { color: var(--fg); font-weight: 500; }
 
-/* Steps — a compact pipeline strip; dots turn accent/green as they measure. */
-.card-steps { display: flex; gap: clamp(6px, 0.6vw, 12px); margin: 0; padding: 0; list-style: none; }
-.card-steps li { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 6px; }
-.card-steps li i { width: 100%; height: 4px; border-radius: 999px; background: var(--border); }
-.card-steps li strong { color: var(--fg-secondary); font-family: var(--font-mono); font-size: clamp(11px, 1.3vh, 15px); font-weight: 500; font-variant-numeric: tabular-nums; }
-.card-steps li b { display: none; }
-.card-steps li[data-status="completed"] i { background: var(--accent); }
+/* Steps — compact per-step breakdown: short label + measured latency. */
+.card-steps { display: flex; gap: clamp(6px, 0.7vw, 16px); margin: 0; padding-top: clamp(8px, 1.4vh, 16px); border-top: 1px solid var(--border); list-style: none; }
+.card-steps li { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: clamp(2px, 0.5vh, 5px); text-align: center; }
+.card-steps li b { color: var(--fg-secondary); font-size: clamp(10px, 1.2vh, 13px); font-weight: 500; line-height: 1.15; }
+.card-steps li strong { color: var(--fg-secondary); font-family: var(--font-mono); font-size: clamp(12px, 1.5vh, 16px); font-weight: 500; font-variant-numeric: tabular-nums; }
 .card-steps li[data-status="completed"] strong { color: var(--fg); }
-.is-complete .card-steps li[data-status="completed"] i { background: var(--positive); }
 
 /* ---------------------------------------------------------------- toast */
 

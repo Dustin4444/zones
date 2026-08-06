@@ -7,33 +7,34 @@ const fallbackScenarioNames = {
 };
 const scenarioStepLabels = {
   deposit: [
-    ["onramp.encryption", "Encrypt deposit"],
-    ["onramp.enqueued", "Deposit accepted in Portal"],
-    ["onramp.zone_deposit.processed", "Funds available in Zone"],
+    ["onramp.encryption", "Encrypt deposit", "Encrypt"],
+    ["onramp.enqueued", "Deposit accepted in Portal", "Accepted"],
+    ["onramp.zone_deposit.processed", "Funds available in Zone", "In Zone"],
   ],
   earn_deposit: [
-    ["earn_deposit.encryption", "Encrypt withdrawal"],
-    ["earn_deposit.request_result", "Withdrawal confirmed in Zone"],
-    ["earn_deposit.l1_processed_locator", "Process on Tempo + deposit into Earn vault"],
-    ["earn_deposit.zone_return.processed", "Vault shares into Zone"],
+    ["earn_deposit.encryption", "Encrypt withdrawal", "Encrypt"],
+    ["earn_deposit.request_result", "Withdrawal confirmed in Zone", "Zone tx"],
+    ["earn_deposit.l1_processed_locator", "Process on Tempo + deposit into Earn vault", "To vault"],
+    ["earn_deposit.zone_return.processed", "Vault shares into Zone", "Shares"],
   ],
   earn_redeem: [
-    ["earn_redeem.encryption", "Encrypt withdrawal"],
-    ["earn_redeem.request_result", "Withdrawal confirmed in Zone"],
-    ["earn_redeem.l1_processed_locator", "Process on Tempo + redeem from Earn vault"],
-    ["earn_redeem.zone_return.processed", "Redeemed funds into Zone"],
+    ["earn_redeem.encryption", "Encrypt withdrawal", "Encrypt"],
+    ["earn_redeem.request_result", "Withdrawal confirmed in Zone", "Zone tx"],
+    ["earn_redeem.l1_processed_locator", "Process on Tempo + redeem from Earn vault", "Redeem"],
+    ["earn_redeem.zone_return.processed", "Redeemed funds into Zone", "Funds"],
   ],
   withdraw: [
-    ["offramp", "Request Zone withdrawal"],
-    ["offramp_result", "Zone accepts withdrawal"],
-    ["offramp_processed", "Funds arrive on L1"],
+    ["offramp", "Request Zone withdrawal", "Request"],
+    ["offramp_result", "Zone accepts withdrawal", "Accepted"],
+    ["offramp_processed", "Funds arrive on L1", "On L1"],
   ],
 };
 const activeStates = new Set(["queued", "running", "processing", "cancelling"]);
 
 const elements = {
   connectionPill: document.querySelector("#connection-pill"),
-  branchLabel: document.querySelector("#branch-label"),
+  networkLabel: document.querySelector("#network-label"),
+  commitLink: document.querySelector("#commit-link"),
   configCount: document.querySelector("#config-count"),
   launchNote: document.querySelector("#launch-note"),
   toast: document.querySelector("#toast"),
@@ -107,7 +108,18 @@ function renderConnection(server = {}) {
   elements.connectionPill.querySelector("span").textContent = ready
     ? "Local runner ready"
     : "Local tools missing";
-  if (elements.branchLabel) elements.branchLabel.textContent = server.branch || "Unknown branch";
+  const net = server.network || {};
+  if (elements.networkLabel) {
+    elements.networkLabel.textContent = (net.l1ChainId || net.zoneChainId)
+      ? `Local devnet · L1 #${net.l1ChainId ?? "?"} · Zone #${net.zoneChainId ?? "?"}`
+      : "Local devnet";
+  }
+  if (elements.commitLink) {
+    const label = server.commit ? `commit ${server.commit}${server.dirty ? "*" : ""}` : "commit —";
+    elements.commitLink.textContent = server.commitUrl ? `${label} ↗` : label;
+    if (server.commitUrl) elements.commitLink.href = server.commitUrl;
+    else elements.commitLink.removeAttribute("href");
+  }
   elements.launchNote.textContent = ready
     ? (activeStates.has(state?.status) ? state.message : "Local Tempo + private Zone")
     : `Missing: ${(server.missingTools || []).join(", ")}`;
@@ -219,12 +231,12 @@ function renderCardSteps(card, id, result, running) {
     running ? [] : (result?.steps || []).map((step) => [step.name, step]),
   );
   list.replaceChildren();
-  for (const [name, label] of scenarioStepLabels[id]) {
+  for (const [name, label, short] of scenarioStepLabels[id]) {
     const step = measured.get(name);
     const item = createElement("li");
     item.dataset.status = step ? "completed" : "queued";
     item.title = label;
-    item.append(createElement("i"), createElement("strong", "", step ? formatDuration(step.p99Ms) : "—"));
+    item.append(createElement("b", "", short), createElement("strong", "", step ? formatDuration(step.p99Ms) : "—"));
     list.append(item);
   }
 }

@@ -475,6 +475,7 @@ class BenchmarkController:
         self.root = root
         self.state_dir = state_dir
         self.branch = branch
+        self.git = git_meta(root)
         self.lock = threading.RLock()
         self.worker: threading.Thread | None = None
         self.process: subprocess.Popen[str] | None = None
@@ -527,6 +528,19 @@ class BenchmarkController:
         missing = [name for name in required if shutil.which(name) is None]
         return {
             "branch": self.branch,
+            "commit": self.git["commitShort"],
+            "commitFull": self.git["commit"],
+            "commitUrl": self.git["commitUrl"],
+            "repoUrl": self.git["repoUrl"],
+            "dirty": self.git["dirty"],
+            "network": {
+                "kind": "local devnet",
+                "l1ChainId": self.topology_env.get("ZONES_BENCH_EXPECTED_L1_CHAIN_ID"),
+                "zoneChainId": self.topology_env.get("ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID"),
+                "zoneId": self.topology_env.get("ZONES_BENCH_EXPECTED_ZONE_ID"),
+                "l1Rpc": self.topology_env.get("L1_RPC_URL"),
+                "zoneRpc": self.topology_env.get("ZONE_RPC_URL"),
+            },
             "localReady": not missing and bool(self.topology_env),
             "missingTools": missing,
             "runnerLabel": "Persistent local Tempo + private Zone",
@@ -908,6 +922,28 @@ def current_branch(root: Path) -> str:
     if not branch or not BRANCH_PATTERN.fullmatch(branch) or ".." in branch:
         return "local-worktree"
     return branch
+
+
+def git_meta(root: Path) -> dict[str, Any]:
+    """Resolve the repo's current commit and a clickable GitHub URL for it."""
+    def run(args: list[str]) -> str:
+        try:
+            return run_command(["git", *args], root).stdout.strip()
+        except Exception:
+            return ""
+    commit = run(["rev-parse", "HEAD"])
+    repo = run(["config", "--get", "remote.origin.url"])
+    if repo.startswith("git@github.com:"):
+        repo = "https://github.com/" + repo[len("git@github.com:"):]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    return {
+        "commit": commit,
+        "commitShort": commit[:8],
+        "commitUrl": f"{repo}/commit/{commit}" if repo and commit else "",
+        "repoUrl": repo,
+        "dirty": bool(run(["status", "--porcelain"])),
+    }
 
 
 def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]]:
