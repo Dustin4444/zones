@@ -33,7 +33,8 @@ const activeStates = new Set(["queued", "running", "processing", "cancelling"]);
 
 const elements = {
   connectionPill: document.querySelector("#connection-pill"),
-  networkLabel: document.querySelector("#network-label"),
+  netZone: document.querySelector("#net-zone"),
+  netL1: document.querySelector("#net-l1"),
   commitLink: document.querySelector("#commit-link"),
   configCount: document.querySelector("#config-count"),
   launchNote: document.querySelector("#launch-note"),
@@ -46,6 +47,7 @@ let pollTimer = null;
 let toastTimer = null;
 let tickTimer = null;
 let liveTick = null; // { scenario, startedAt, total, completed }
+const ranThisSession = new Set(); // reveal results only for runs started here
 
 function scenarioName(id) {
   const definition = state?.server?.scenarios?.find((scenario) => scenario.id === id);
@@ -109,19 +111,29 @@ function renderConnection(server = {}) {
     ? "Local runner ready"
     : "Local tools missing";
   const net = server.network || {};
-  if (elements.networkLabel) {
-    elements.networkLabel.textContent = (net.l1ChainId || net.zoneChainId)
-      ? `Local devnet · L1 #${net.l1ChainId ?? "?"} · Zone #${net.zoneChainId ?? "?"}`
-      : "Local devnet";
+  const hostport = (u) => (u ? String(u).replace(/^\w+:\/\//, "") : "");
+  if (elements.netZone) {
+    elements.netZone.textContent = net.zoneChainId
+      ? `Zone #${net.zoneId ?? "?"} · chain ${net.zoneChainId}${net.zoneRpc ? " · " + hostport(net.zoneRpc) : ""}`
+      : "";
+  }
+  if (elements.netL1) {
+    elements.netL1.textContent = net.l1ChainId
+      ? `L1 · chain ${net.l1ChainId}${net.l1Rpc ? " · " + hostport(net.l1Rpc) : ""}`
+      : "";
   }
   if (elements.commitLink) {
-    const label = server.commit ? `commit ${server.commit}${server.dirty ? "*" : ""}` : "commit —";
-    elements.commitLink.textContent = server.commitUrl ? `${label} ↗` : label;
-    if (server.commitUrl) elements.commitLink.href = server.commitUrl;
-    else elements.commitLink.removeAttribute("href");
+    if (server.commit && server.commitUrl) {
+      elements.commitLink.textContent = `zones@${server.commit}${server.dirty ? "*" : ""} ↗`;
+      elements.commitLink.href = server.commitUrl;
+      elements.commitLink.style.display = "";
+    } else {
+      elements.commitLink.textContent = "";
+      elements.commitLink.style.display = "none";
+    }
   }
   elements.launchNote.textContent = ready
-    ? (activeStates.has(state?.status) ? state.message : "Local Tempo + private Zone")
+    ? (activeStates.has(state?.status) ? state.message : "local devnet · ephemeral")
     : `Missing: ${(server.missingTools || []).join(", ")}`;
   return ready;
 }
@@ -142,6 +154,24 @@ function renderCard(id, canRun, anyRunning) {
   const failed = isCurrent && ["failed", "interrupted"].includes(state.status);
   const result = entry?.result;
   const summary = result?.summary;
+
+  if (!ranThisSession.has(id)) {
+    // Fresh page load: keep it empty; do not surface persisted results.
+    card.classList.toggle("is-selected", selectedScenario === id);
+    card.classList.remove("is-running", "is-complete", "is-failed");
+    card.querySelector(".scenario-status").textContent = "Ready";
+    clearProgress(card);
+    setMetric(card, "p99", "—", "Latency");
+    const sub = card.querySelector('[data-metric="latency-sub"]');
+    if (sub) sub.textContent = "";
+    setMetric(card, "cost", "—", "Avg fee (USD)");
+    setMetric(card, "gas", "—", "Avg gas used");
+    renderCardSteps(card, id, null, false);
+    const btn = card.querySelector(".go-button");
+    btn.disabled = anyRunning || !canRun;
+    btn.querySelector("span").textContent = "GO";
+    return;
+  }
 
   card.classList.toggle("is-selected", selectedScenario === id);
   card.classList.toggle("is-running", running);
@@ -245,7 +275,7 @@ function renderScenarioConnectors(anyRunning) {
   document.querySelectorAll(".connector").forEach((connector, index) => {
     const previous = scenarioOrder[index];
     const next = scenarioOrder[index + 1];
-    connector.classList.toggle("is-lit", Boolean(state.scenarioResults?.[previous]));
+    connector.classList.toggle("is-lit", ranThisSession.has(previous) && Boolean(state.scenarioResults?.[previous]));
     connector.classList.toggle("is-active", anyRunning && state.run?.scenario === next);
   });
 }
@@ -273,6 +303,7 @@ function render(nextState) {
     && (anyRunning || (activeStates.has(priorStatus) && state.status === "completed"))
   ) selectedScenario = state.run.scenario;
   if (!anyRunning) liveTick = null;
+  if (anyRunning && state.run?.scenario) ranThisSession.add(state.run.scenario);
   for (const id of scenarioOrder) renderCard(id, canRun, anyRunning);
   renderScenarioConnectors(anyRunning);
 
@@ -308,6 +339,7 @@ async function poll() {
 
 async function runScenario(id) {
   selectedScenario = id;
+  ranThisSession.add(id);
   try {
     const count = Number(elements.configCount.value || 50);
     const nextState = await request("/api/runs", {
