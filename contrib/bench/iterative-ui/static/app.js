@@ -147,11 +147,10 @@ function renderCard(id, canRun, anyRunning) {
     // show just the measured value (+ its end-to-end journey for context).
     const single = Boolean(summary) && Number(summary.completed) <= 1;
     const latencySub = card.querySelector('[data-metric="latency-sub"]');
-    setMetric(card, "p99", summary ? formatDuration(summary.p99Ms) : "—",
-      single ? "Latency" : "P99 latency");
-    if (latencySub) {
-      latencySub.textContent = summary && !single ? `p50 ${formatDuration(summary.p50Ms)}` : "";
-    }
+    // All N txs land in one block, so p50==p99 (sub-ms spread) — show one
+    // honest latency number instead of a redundant percentile split.
+    setMetric(card, "p99", summary ? formatDuration(summary.p99Ms) : "—", "Latency");
+    if (latencySub) latencySub.textContent = "";
     setMetric(card, "cost", summary ? formatUsd(summary.meanJourneyCostUsd) : "—",
       single ? "Fee (USD)" : "Avg fee (USD)");
     setMetric(card, "gas", summary ? formatGas(summary.meanJourneyGas) : "—",
