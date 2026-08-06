@@ -106,17 +106,15 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config["scenario"], "deposit")
         self.assertEqual(config["preset"], "encrypted-deposit")
         self.assertEqual(config["count"], 100)
-        self.assertEqual(config["rate"], 20)
-        self.assertEqual(config["concurrency"], 12)
-        self.assertEqual(config["accounts"], 12)
+        self.assertEqual(config["rate"], 0)
+        self.assertEqual(config["concurrency"], 100)
+        self.assertEqual(config["accounts"], 100)
 
-    def test_accounts_must_cover_effective_concurrency(self) -> None:
+    def test_count_cannot_exceed_prepared_account_pool(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, "accounts must be between 10 and 10000"
+            ValueError, "count must be between 1 and 100"
         ):
-            SERVER.BenchmarkController._validate_config(
-                {"accounts": 5, "concurrency": 10, "count": 10}
-            )
+            SERVER.BenchmarkController._validate_config({"count": 101})
 
     def test_single_transaction_uses_one_account(self) -> None:
         config = SERVER.BenchmarkController._validate_config(
@@ -124,6 +122,14 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(config["concurrency"], 1)
         self.assertEqual(config["accounts"], 1)
+
+    def test_selected_count_controls_all_at_once_concurrency(self) -> None:
+        config = SERVER.BenchmarkController._validate_config(
+            {"count": 50, "concurrency": 1, "rate": 1}
+        )
+        self.assertEqual(config["concurrency"], 50)
+        self.assertEqual(config["accounts"], 50)
+        self.assertEqual(config["rate"], 0)
 
     def test_each_card_maps_to_a_standalone_preset(self) -> None:
         expected = {

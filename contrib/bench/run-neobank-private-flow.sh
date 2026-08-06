@@ -12,11 +12,11 @@ source "$bench_dir/scenario-reporting.sh"
 die() { echo "error: $*" >&2; exit 1; }
 need() { [[ -n "${!1:-}" ]] || die "$1 must be set"; }
 uint() { [[ "${!1:-}" =~ ^[0-9]+$ ]] || die "$1 must be an unsigned integer"; }
-positive_rate() {
+nonnegative_rate() {
     local value="${!1:-}"
     if ! [[ "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] ||
-        ! awk -v value="$value" 'BEGIN { exit !(value > 0 && value <= 999999999) }'; then
-        die "$1 must be a positive decimal no greater than 999999999"
+        ! awk -v value="$value" 'BEGIN { exit !(value >= 0 && value <= 999999999) }'; then
+        die "$1 must be a non-negative decimal no greater than 999999999"
     fi
 }
 bigint_eval() {
@@ -198,7 +198,7 @@ for name in ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_ACCOUNT_START ZONES_BE
     ZONES_BENCH_ADMISSION_SEED_AMOUNT ZONES_BENCH_RECIPIENT_ACCOUNT_START \
     ZONES_BENCH_RECIPIENT_ACCOUNT_END
 do uint "$name"; done
-positive_rate ZONES_BENCH_TPS
+nonnegative_rate ZONES_BENCH_TPS
 (( 10#$ZONES_BENCH_ACCOUNTS > 0 && 10#$ZONES_BENCH_COUNT > 0 )) || die "accounts and count must be positive"
 (( 10#$ZONES_BENCH_MAX_CONCURRENT > 0 )) || die "max concurrency must be positive"
 (( 10#$ZONES_BENCH_SAMPLE_INSTANCES > 0 )) ||
@@ -750,8 +750,19 @@ esac
 stage_start private_flow
 scenario_report_args=()
 build_scenario_report_args "$ZONES_BENCH_REPORT"
-"$txgen_bin" scenario run --scenario "$scenario_path" --count "$ZONES_BENCH_COUNT" \
-    --starts-per-second "$ZONES_BENCH_TPS" --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT" --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT" \
+scenario_command=(
+    "$txgen_bin" scenario run
+    --scenario "$scenario_path"
+    --count "$ZONES_BENCH_COUNT"
+)
+if awk -v value="$ZONES_BENCH_TPS" 'BEGIN { exit !(value > 0) }'; then
+    scenario_command+=(--starts-per-second "$ZONES_BENCH_TPS")
+fi
+scenario_command+=(
+    --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT"
+    --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT"
+)
+"${scenario_command[@]}" \
     --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" --seed "$ZONES_BENCH_SEED" \
     --sample-instances "$sample_instances" "${scenario_report_args[@]}"
 stage_end private_flow

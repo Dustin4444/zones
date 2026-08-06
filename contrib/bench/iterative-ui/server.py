@@ -26,7 +26,7 @@ STATE_VERSION = 6
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 ACCOUNT_START = 16
 TOPOLOGY_ACCOUNT_CAPACITY = int(
-    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "12")
+    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "100")
 )
 if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 100:
     raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 100")
@@ -411,7 +411,7 @@ class BenchmarkController:
                 {
                     "status": "queued",
                     "stage": "benchmark",
-                    "message": f"Starting {config['count']} real {config['preset']} transactions",
+                    "message": f"Starting {config['count']} real {config['preset']} transactions at once",
                     "run": {
                         "id": run_id,
                         "url": None,
@@ -460,31 +460,24 @@ class BenchmarkController:
                 raise ValueError(f"{name} must be between {minimum} and {maximum}")
             return value
 
-        count = integer("count", 100, 1, 1_000)
-        requested_concurrency = integer(
-            "concurrency",
-            min(12, TOPOLOGY_ACCOUNT_CAPACITY),
+        count = integer(
+            "count",
+            min(100, TOPOLOGY_ACCOUNT_CAPACITY),
             1,
             TOPOLOGY_ACCOUNT_CAPACITY,
         )
-        concurrency = min(requested_concurrency, count)
-        accounts = integer("accounts", concurrency, concurrency, 10_000)
+        concurrency = count
+        accounts = count
         scenario = str(raw.get("scenario", "deposit"))
         definition = SCENARIOS.get(scenario)
         if definition is None:
             raise ValueError(f"Unknown benchmark scenario: {scenario}")
-        try:
-            rate = float(raw.get("rate", 20))
-        except (TypeError, ValueError) as error:
-            raise ValueError("rate must be a number") from error
-        if not 0.1 <= rate <= 1_000:
-            raise ValueError("rate must be between 0.1 and 1000")
         return {
             "scenario": scenario,
             "preset": definition["preset"],
             "count": count,
             "accounts": accounts,
-            "rate": rate,
+            "rate": 0,
             "concurrency": concurrency,
         }
 
@@ -532,7 +525,7 @@ class BenchmarkController:
                 self.state.update(
                     status="running",
                     stage="benchmark",
-                    message=f"Running {config['count']} real {config['preset']} transactions",
+                    message=f"Running {config['count']} real {config['preset']} transactions concurrently",
                 )
                 self._persist()
             assert process.stdout is not None
@@ -847,16 +840,10 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
             ["bash", "contrib/bench/run-neobank-private-flow.sh"],
             cwd=root,
             env=prepare_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
             check=False,
         )
         if prepared.returncode != 0:
-            raise RuntimeError(
-                "persistent scenario balance and approval setup failed:\n"
-                + prepared.stdout[-5000:]
-            )
+            raise RuntimeError("persistent scenario balance and approval setup failed")
 
         topology.stage(
             "topology", "Preparing reusable Earn vault shares for fast redemptions"
@@ -894,16 +881,10 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
             ["bash", "contrib/bench/run-neobank-private-flow.sh"],
             cwd=root,
             env=redemption_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
             check=False,
         )
         if redemption_prepared.returncode != 0:
-            raise RuntimeError(
-                "persistent Earn redemption setup failed:\n"
-                + redemption_prepared.stdout[-5000:]
-            )
+            raise RuntimeError("persistent Earn redemption setup failed")
         environment.update(
             {
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",

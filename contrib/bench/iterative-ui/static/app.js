@@ -35,10 +35,6 @@ const elements = {
   connectionPill: document.querySelector("#connection-pill"),
   branchLabel: document.querySelector("#branch-label"),
   configCount: document.querySelector("#config-count"),
-  configRate: document.querySelector("#config-rate"),
-  configConcurrency: document.querySelector("#config-concurrency"),
-  settingsToggle: document.querySelector("#settings-toggle"),
-  settingsForm: document.querySelector("#settings-form"),
   launchNote: document.querySelector("#launch-note"),
   historySection: document.querySelector("#history-section"),
   historyList: document.querySelector("#history-list"),
@@ -232,14 +228,11 @@ async function runScenario(id) {
   selectedScenario = id;
   try {
     const count = Number(elements.configCount.value || 100);
-    const concurrency = Number(elements.configConcurrency.value || 12);
     const nextState = await request("/api/runs", {
       method: "POST",
       body: JSON.stringify({
         scenario: id,
         count,
-        rate: elements.configRate.value,
-        concurrency,
       }),
     });
     render(nextState);
@@ -263,13 +256,6 @@ document.querySelectorAll(".scenario-card").forEach((card) => {
   card.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); }
   });
-});
-
-elements.settingsToggle.addEventListener("click", () => {
-  const expanded = elements.settingsToggle.getAttribute("aria-expanded") === "true";
-  elements.settingsToggle.setAttribute("aria-expanded", String(!expanded));
-  elements.settingsForm.hidden = expanded;
-  elements.settingsToggle.textContent = expanded ? "Edit" : "Done";
 });
 
 poll();
