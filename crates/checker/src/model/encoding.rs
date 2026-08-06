@@ -132,6 +132,10 @@ impl OrdinaryDeposit {
         self.token
     }
 
+    pub(crate) const fn sender(&self) -> Address {
+        self.sender
+    }
+
     pub(crate) const fn amount(&self) -> u128 {
         self.amount
     }
