@@ -294,7 +294,7 @@ fn fixtures() -> Vec<(&'static str, ModelValue)> {
 
 fn golden_model(value: &ModelValue) -> Vec<u8> {
     let mut out = Golden::default();
-    out.byte(0x01);
+    out.byte(0x02);
     match value {
         ModelValue::PortalConfig { bounceback_gas } => {
             out.byte(0x00);

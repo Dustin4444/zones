@@ -380,8 +380,7 @@ fn activate_finding_transaction<TX: DbTxMut + DbTx>(
     gate: &mut WriteGate,
 ) -> StoreResult<WriteOutcome> {
     let zone = read_tip(tx, MetaKey::VerifiedZoneTip)?;
-    let tempo = read_tip(tx, MetaKey::ImportedTempoTip)?;
-    validate_finding_anchor(key, record, alert.last_verified_parent, zone, tempo)?;
+    validate_finding_anchor(key, record, alert.last_verified_parent, zone)?;
     if tx.get::<CheckerCanonical>(key.zone_height)?.is_some() {
         return Err(StoreError::FindingConflict { key });
     }
@@ -395,8 +394,20 @@ fn activate_finding_transaction<TX: DbTxMut + DbTx>(
             })
         };
     }
-    if tx.get::<CheckerFindings>(key)?.is_some() {
-        return Err(StoreError::FindingConflict { key });
+    if let Some(mut existing) = tx.get::<CheckerFindings>(key)? {
+        if existing.status() != FindingStatus::Orphaned {
+            return Err(StoreError::FindingConflict { key });
+        }
+        existing.mark_canonical();
+        if &existing != record {
+            return Err(StoreError::FindingConflict { key });
+        }
+        tx.put::<CheckerFindings>(key, existing)?;
+        gate.wrote()?;
+        tx.cursor_write::<CheckerMeta>()?
+            .insert(MetaKey::ActiveAlert, &MetaValue::ActiveAlert(alert))?;
+        gate.wrote()?;
+        return Ok(WriteOutcome::Applied);
     }
     tx.cursor_write::<CheckerFindings>()?.insert(key, record)?;
     gate.wrote()?;
@@ -446,7 +457,6 @@ fn orphan_finding_transaction<TX: DbTxMut + DbTx>(
 pub(super) fn validate_metadata_and_findings<TX: DbTx>(
     tx: &TX,
     zone_tip: BlockNumHash,
-    tempo_tip: BlockNumHash,
 ) -> StoreResult<()> {
     let active = read_active_alert(tx)?;
     let expected_metadata = 8 + usize::from(active.is_some());
@@ -476,13 +486,7 @@ pub(super) fn validate_metadata_and_findings<TX: DbTx>(
             if alert.finding != key {
                 return Err(StoreError::FindingConflict { key });
             }
-            validate_finding_anchor(
-                key,
-                &record,
-                alert.last_verified_parent,
-                zone_tip,
-                tempo_tip,
-            )?;
+            validate_finding_anchor(key, &record, alert.last_verified_parent, zone_tip)?;
         }
     }
     if canonical_findings != usize::from(active.is_some()) {
@@ -629,14 +633,10 @@ fn validate_finding_anchor(
     record: &FindingRecord,
     supplied_parent: BlockNumHash,
     zone: BlockNumHash,
-    tempo: BlockNumHash,
 ) -> StoreResult<()> {
     if supplied_parent != zone
         || zone.number.checked_add(1) != Some(key.zone_height)
         || record.zone_parent_hash() != zone.hash
-        || record
-            .imported_tempo()
-            .is_some_and(|tip| tempo.number.checked_add(1) != Some(tip.number))
     {
         return Err(StoreError::FindingParent { key, parent: zone });
     }

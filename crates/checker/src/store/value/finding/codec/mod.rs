@@ -28,8 +28,12 @@ impl CheckedCompact for FindingRecord {
         let imported = decode_optional_tip(input)?;
         let status = decode_status(input)?;
         let kind = decode_kind(input)?;
-        Self::new(parent, imported, status, kind)
-            .ok_or_else(|| invalid("finding kind", "invalid leaf code or protocol chain"))
+        Self::new(parent, imported, status, kind).ok_or_else(|| {
+            invalid(
+                "finding kind",
+                "location or imported Tempo evidence violates the finding family",
+            )
+        })
     }
 }
 

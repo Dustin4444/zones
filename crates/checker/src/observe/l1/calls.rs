@@ -10,8 +10,8 @@ use super::{
     super::{
         abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
         error::{
-            AcquisitionError, AcquisitionSource, ObservationError, PortalCallError,
-            PortalCallFamily,
+            AcquisitionError, AcquisitionSource, AuthenticatedTransaction, ObservationError,
+            PortalCallError, PortalCallFamily, ProtocolChain,
         },
     },
     ensure_acquisition_equal,
@@ -41,7 +41,9 @@ where
 
     let envelope: &TempoTxEnvelope = transaction.as_ref();
     let calldata = sole_portal_calldata(envelope, portal, transaction_hash)?;
-    let decoded = decode_portal_call(calldata)?;
+    let coordinate =
+        AuthenticatedTransaction::new(ProtocolChain::TempoL1, transaction_index, transaction_hash);
+    let decoded = decode_portal_call(calldata, coordinate)?;
     let actual = decoded.family();
     if actual != expected {
         return Err(PortalCallError::FamilyMismatch {

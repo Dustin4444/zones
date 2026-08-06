@@ -2,73 +2,91 @@
 
 use std::time::Duration;
 
-use alloy_eips::BlockNumHash;
 use futures::TryStreamExt as _;
 use reth_exex::{ExExContext, ExExHead};
 use reth_node_api::{FullNodeComponents, NodeTypes};
-use reth_storage_api::{BlockHashReader, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use tempo_primitives::TempoPrimitives;
 use tracing::{error, info, warn};
 
 use crate::{metrics::CheckerRuntimeMetrics, observe::ExactStateLookup, store::db::CheckerStore};
 
-use super::{
-    LiveChecker, RuntimeError, RuntimeResult,
-    apply::{L1Client, ReadyToAcknowledge},
-};
+use super::{LiveChecker, RuntimeResult, apply::L1Client, state::ReadyToAcknowledge};
 
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub(crate) struct RuntimeStatus {
     metrics: CheckerRuntimeMetrics,
+    #[cfg(test)]
+    active_alert: bool,
 }
 
 impl RuntimeStatus {
     pub(crate) fn new() -> Self {
         let metrics = CheckerRuntimeMetrics::default();
         metrics.healthy.set(0.0);
-        Self { metrics }
+        metrics.active_alert.set(0.0);
+        Self {
+            metrics,
+            #[cfg(test)]
+            active_alert: false,
+        }
     }
 
-    fn mark_started(&self) {
-        self.metrics.healthy.set(1.0);
+    pub(crate) fn mark_started(&mut self, alerting: bool) {
+        self.record_ready_state(alerting, false);
     }
 
     fn mark_stopped(&self) {
         self.metrics.healthy.set(0.0);
     }
 
-    fn record_retry(&self) {
-        self.metrics.healthy.set(0.0);
+    pub(crate) fn record_retry(&mut self, alerting: bool) {
+        self.record_unhealthy(alerting);
         self.metrics.operational_retries_total.increment(1);
     }
 
-    fn record_recovery(&self) {
-        self.metrics.operational_recoveries_total.increment(1);
-        self.metrics.healthy.set(1.0);
+    fn record_terminal(&mut self, alerting: bool) {
+        self.record_unhealthy(alerting);
+    }
+
+    fn record_ready(&mut self, ready: ReadyToAcknowledge, recovered: bool) {
+        self.record_ready_state(ready.is_alerting(), recovered);
+    }
+
+    fn record_ready_state(&mut self, alerting: bool, recovered: bool) {
+        self.record_alert(alerting);
+        self.metrics.healthy.set(if alerting { 0.0 } else { 1.0 });
+        if recovered && !alerting {
+            self.metrics.operational_recoveries_total.increment(1);
+        }
+    }
+
+    fn record_unhealthy(&mut self, alerting: bool) {
+        self.record_alert(alerting);
+        self.metrics.healthy.set(0.0);
+    }
+
+    fn record_alert(&mut self, alerting: bool) {
+        #[cfg(test)]
+        {
+            self.active_alert = alerting;
+        }
+        self.metrics
+            .active_alert
+            .set(if alerting { 1.0 } else { 0.0 });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_alerting(&self) -> bool {
+        self.active_alert
     }
 }
 
 impl Drop for RuntimeStatus {
     fn drop(&mut self) {
         self.mark_stopped();
-    }
-}
-
-pub(crate) fn validate_local_canonical_tip<P>(provider: &P, tip: BlockNumHash) -> RuntimeResult<()>
-where
-    P: BlockHashReader + ?Sized,
-{
-    let actual = provider
-        .block_hash(tip.number)
-        .map_err(|source| RuntimeError::LocalCanonicalRead { tip, source })?;
-    match actual {
-        None => Err(RuntimeError::MissingLocalCanonical(tip)),
-        Some(actual) if actual != tip.hash => {
-            Err(RuntimeError::LocalCanonicalConflict { tip, actual })
-        }
-        Some(_) => Ok(()),
     }
 }
 
@@ -79,7 +97,7 @@ pub(crate) async fn process_retained_notification<S>(
     notification: &reth_exex::ExExNotification<TempoPrimitives>,
     zone_state: &S,
     l1_client: &mut L1Client,
-    status: &RuntimeStatus,
+    status: &mut RuntimeStatus,
 ) -> RuntimeResult<ReadyToAcknowledge>
 where
     S: ExactStateLookup + ?Sized,
@@ -92,8 +110,9 @@ where
             .await
         {
             Ok(ready) => {
-                if retry_attempt != 0 {
-                    status.record_recovery();
+                let recovered = retry_attempt != 0;
+                status.record_ready(ready, recovered);
+                if recovered && !ready.is_alerting() {
                     info!(
                         target: "zone::checker",
                         attempts = retry_attempt,
@@ -107,7 +126,7 @@ where
                 retry_attempt = retry_attempt.saturating_add(1);
                 let delay = next_delay;
                 next_delay = next_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
-                status.record_retry();
+                status.record_retry(checker.is_alerting());
                 warn!(
                     target: "zone::checker",
                     attempt = retry_attempt,
@@ -117,7 +136,10 @@ where
                 );
                 tokio::time::sleep(delay).await;
             }
-            Err(failure) => return Err(failure),
+            Err(failure) => {
+                status.record_terminal(checker.is_alerting());
+                return Err(failure);
+            }
         }
     }
 }
@@ -133,21 +155,20 @@ pub(crate) async fn run_persistent<Node>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockHashReader + StateProviderFactory,
+    Node::Provider: BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
-    let status = RuntimeStatus::new();
+    let mut status = RuntimeStatus::new();
     let mut checker = LiveChecker::from_store(store)?;
-    // Construction loaded the mirror from this exact durable store cut.
-    let durable_tip = checker.mirror_tip();
-    validate_local_canonical_tip(ctx.provider(), durable_tip)?;
-    ctx.catch_up_notifications_with_head(ExExHead::new(durable_tip))?;
-    ctx.send_finished_height(durable_tip)?;
-    status.mark_started();
+    let startup = checker.reconcile_startup(ctx.provider())?;
+    ctx.catch_up_notifications_with_head(ExExHead::new(startup.tip()))?;
+    ctx.send_finished_height(startup.tip())?;
+    status.mark_started(startup.is_alerting());
 
     info!(
         target: "zone::checker",
-        tip = ?durable_tip,
+        tip = ?startup.tip(),
+        alerting = startup.is_alerting(),
         "Persistent checker resumed from durable state"
     );
 
@@ -159,7 +180,7 @@ where
             &notification,
             &zone_provider,
             &mut l1_client,
-            &status,
+            &mut status,
         )
         .await
         {

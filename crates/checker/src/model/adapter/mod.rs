@@ -8,14 +8,14 @@ mod l1;
 mod l2;
 
 pub(crate) use l1::{
-    ImportedProjectionError, ObservedDepositAppend, ObservedDepositRefund, ObservedImportedOutput,
-    ObservedProcessedWithdrawal, ObservedSubmittedBatch, ObservedWithdrawalProcessed,
-    ObservedWithdrawalProcessing, project_imported,
+    ImportedEventKind, ImportedProjectionError, ObservedDepositAppend, ObservedDepositRefund,
+    ObservedImportedOutput, ObservedProcessedWithdrawal, ObservedSubmittedBatch,
+    ObservedWithdrawalProcessed, ObservedWithdrawalProcessing, project_imported,
 };
 pub(crate) use l2::{
-    ObservedBatchFinalized, ObservedDepositFailed, ObservedDepositOutcome,
+    DepositInputKind, ObservedBatchFinalized, ObservedDepositFailed, ObservedDepositOutcome,
     ObservedDepositProcessed, ObservedRefundClaimed, ObservedTempoAdvanced,
     ObservedTempoBlockFinalized, ObservedTokenEnabled, ObservedWithdrawalBounceBackPending,
     ObservedWithdrawalBounceBackProcessed, ObservedWithdrawalRequested, ObservedZoneOperation,
-    ObservedZoneOutputs, ZoneProjectionError, project_zone,
+    ObservedZoneOutputs, ZoneEventKind, ZoneProjectionError, project_zone,
 };

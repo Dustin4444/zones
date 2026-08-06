@@ -5,7 +5,7 @@
 // schema types remain unreachable outside `zone-checker` by construction.
 #![allow(unreachable_pub)]
 
-pub(super) const SCHEMA_VERSION: u8 = 1;
+pub(super) const SCHEMA_VERSION: u8 = 2;
 
 mod codec;
 pub(crate) mod db;
@@ -16,4 +16,5 @@ pub(crate) mod operations;
 pub(crate) mod schema;
 #[cfg(test)]
 mod tests;
+mod unwind;
 pub(crate) mod value;

@@ -1,6 +1,7 @@
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, U256};
 use reth_exex::ExExNotification;
+use reth_storage_api::{StateProviderBox, errors::provider::ProviderResult};
 use tempfile::TempDir;
 use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt};
 
@@ -16,6 +17,7 @@ use crate::{
         accounting::TokenAccounting,
         state::{ModelState, PortalIdentity, portal_address_for_zone},
     },
+    observe::ExactStateLookup,
     runtime::{L1Client, LiveChecker, RuntimeError},
     store::{
         db::{CheckerStore, Initialization},
@@ -24,6 +26,7 @@ use crate::{
     },
 };
 
+mod alert;
 mod atomicity;
 mod loop_retry;
 mod replay;
@@ -123,4 +126,23 @@ fn live_initialization() -> Initialization {
             },
         ),
     )
+}
+
+struct TwoBlockState {
+    first_hash: B256,
+    first: TestProvider,
+    second_hash: B256,
+    second: TestProvider,
+}
+
+impl ExactStateLookup for TwoBlockState {
+    fn state_by_exact_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
+        if block_hash == self.first_hash {
+            return self.first.state_by_exact_block_hash(block_hash);
+        }
+        if block_hash == self.second_hash {
+            return self.second.state_by_exact_block_hash(block_hash);
+        }
+        Err(reth_storage_api::errors::provider::ProviderError::StateForHashNotFound(block_hash))
+    }
 }

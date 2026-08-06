@@ -2,6 +2,27 @@ use alloy_consensus::Header;
 use alloy_primitives::Address;
 
 use super::*;
+use crate::observe::ProtocolChain;
+
+fn l2_transaction(index: usize) -> AuthenticatedTransaction {
+    AuthenticatedTransaction::new(ProtocolChain::ZoneL2, index, B256::repeat_byte(0xa1))
+}
+
+fn l1_transaction(index: usize) -> AuthenticatedTransaction {
+    AuthenticatedTransaction::new(ProtocolChain::TempoL1, index, B256::repeat_byte(0xb1))
+}
+
+fn decode_advance(calldata: &[u8]) -> Result<DecodedAdvanceTempo, ObservationError> {
+    decode_advance_tempo(calldata, l2_transaction(0))
+}
+
+fn decode_finalize(calldata: &[u8]) -> Result<DecodedFinalization, ObservationError> {
+    decode_finalization(calldata, l2_transaction(1))
+}
+
+fn decode_portal(calldata: &[u8]) -> Result<DecodedPortalCall, ObservationError> {
+    decode_portal_call(calldata, l1_transaction(2))
+}
 
 fn header_bytes(number: u64) -> Bytes {
     let header = TempoHeader {
@@ -99,8 +120,21 @@ fn assert_malformed<T: core::fmt::Debug>(
     expected: DataSource,
 ) {
     match result {
-        Err(ObservationError::MalformedAuthenticatedData { kind, .. }) => {
-            assert_eq!(kind, expected)
+        Err(ObservationError::MalformedAuthenticatedData {
+            kind, transaction, ..
+        }) => {
+            assert_eq!(kind, expected);
+            let expected_transaction = match expected {
+                DataSource::FinalizationCalldata => l2_transaction(1),
+                DataSource::AdvanceTempoCalldata
+                | DataSource::AdvanceHeaderRlp
+                | DataSource::OrdinaryDepositData
+                | DataSource::WithdrawalBounceBackData => l2_transaction(0),
+                DataSource::ProcessWithdrawalsCalldata
+                | DataSource::SubmitBatchCalldata
+                | DataSource::PortalTransactionCalldata => l1_transaction(2),
+            };
+            assert_eq!(transaction, expected_transaction);
         }
         other => panic!("expected malformed {expected}, got {other:?}"),
     }
@@ -108,7 +142,7 @@ fn assert_malformed<T: core::fmt::Debug>(
 
 #[test]
 fn advance_tempo_round_trips_canonical_header_and_calldata() {
-    let decoded = decode_advance_tempo(&advance_call()).unwrap();
+    let decoded = decode_advance(&advance_call()).unwrap();
     assert_eq!(decoded.imported_header.number(), 7);
     assert!(decoded.deposits.is_empty());
 }
@@ -150,7 +184,7 @@ fn advance_tempo_round_trips_every_dynamic_input_family() {
     }
     .abi_encode();
 
-    let decoded = decode_advance_tempo(&calldata).unwrap();
+    let decoded = decode_advance(&calldata).unwrap();
     assert!(decoded.deposits[0].as_ordinary().is_some());
     assert!(decoded.deposits[1].as_withdrawal_bounce_back().is_some());
     assert_eq!(decoded.decryptions.len(), 1);
@@ -162,11 +196,25 @@ fn ordinary_deposit_data_is_exactly_bounded_before_outer_decode() {
     let mut oversized = ordinary_deposit().abi_encode();
     assert_eq!(oversized.len(), ORDINARY_DEPOSIT_ENCODED_SIZE);
     oversized.extend([0; WORD]);
+    let expected_evidence = AuthenticatedDataEvidence::from_bytes(&oversized);
     let calldata = advance_with_ordinary_deposit_data(oversized);
 
-    assert_malformed(
-        decode_advance_tempo(&calldata),
-        DataSource::OrdinaryDepositData,
+    let Err(ObservationError::MalformedAuthenticatedData {
+        kind,
+        transaction,
+        evidence,
+        ..
+    }) = decode_advance(&calldata)
+    else {
+        panic!("expected malformed ordinary deposit data");
+    };
+    assert_eq!(kind, DataSource::OrdinaryDepositData);
+    assert_eq!(transaction, l2_transaction(0));
+    assert_eq!(evidence, expected_evidence);
+    assert_ne!(
+        evidence,
+        AuthenticatedDataEvidence::from_bytes(&calldata),
+        "nested evidence must hash depositData, not the outer advanceTempo calldata"
     );
 }
 
@@ -192,7 +240,7 @@ fn ordinary_deposit_nested_offsets_and_lengths_fail_in_borrowed_preflight() {
         set_usize_word(&mut malformed, offset, value);
         assert_eq!(malformed.len(), ORDINARY_DEPOSIT_ENCODED_SIZE);
         assert_malformed(
-            decode_advance_tempo(&advance_with_ordinary_deposit_data(malformed)),
+            decode_advance(&advance_with_ordinary_deposit_data(malformed)),
             DataSource::OrdinaryDepositData,
         );
     }
@@ -202,10 +250,7 @@ fn ordinary_deposit_nested_offsets_and_lengths_fail_in_borrowed_preflight() {
 fn advance_tempo_rejects_trailing_abi_bytes() {
     let mut calldata = advance_call();
     calldata.extend([0_u8; WORD]);
-    assert_malformed(
-        decode_advance_tempo(&calldata),
-        DataSource::AdvanceTempoCalldata,
-    );
+    assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
 }
 
 #[test]
@@ -224,10 +269,7 @@ fn advance_tempo_rejects_noncanonical_header_rlp() {
         enabledTokens: Vec::new(),
     }
     .abi_encode();
-    assert_malformed(
-        decode_advance_tempo(&calldata),
-        DataSource::AdvanceHeaderRlp,
-    );
+    assert_malformed(decode_advance(&calldata), DataSource::AdvanceHeaderRlp);
 }
 
 #[test]
@@ -241,10 +283,7 @@ fn advance_tempo_rejects_trailing_header_rlp() {
         enabledTokens: Vec::new(),
     }
     .abi_encode();
-    assert_malformed(
-        decode_advance_tempo(&calldata),
-        DataSource::AdvanceHeaderRlp,
-    );
+    assert_malformed(decode_advance(&calldata), DataSource::AdvanceHeaderRlp);
 }
 
 #[test]
@@ -257,20 +296,14 @@ fn dynamic_array_protocol_caps_are_checked_before_generated_decode() {
         let payload = &mut calldata[SELECTOR..];
         let array = usize_word(payload, head_word * WORD);
         set_usize_word(payload, array, maximum + 1);
-        assert_malformed(
-            decode_advance_tempo(&calldata),
-            DataSource::AdvanceTempoCalldata,
-        );
+        assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
     }
 
     let mut calldata = submit_batch_call(Vec::new());
     let payload = &mut calldata[SELECTOR..];
     let signatures = usize_word(payload, 12 * WORD);
     set_usize_word(payload, signatures, MAX_SEQUENCERS + 1);
-    assert_malformed(
-        decode_portal_call(&calldata),
-        DataSource::SubmitBatchCalldata,
-    );
+    assert_malformed(decode_portal(&calldata), DataSource::SubmitBatchCalldata);
 }
 
 #[test]
@@ -278,30 +311,21 @@ fn abi_offsets_lengths_and_element_tables_fail_closed_before_decode() {
     for bad_offset in [4 * WORD + 1, advance_call().len() - SELECTOR] {
         let mut calldata = advance_call();
         set_usize_word(&mut calldata[SELECTOR..], 0, bad_offset);
-        assert_malformed(
-            decode_advance_tempo(&calldata),
-            DataSource::AdvanceTempoCalldata,
-        );
+        assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
     }
 
     let mut calldata = advance_call();
     let payload = &mut calldata[SELECTOR..];
     let header = usize_word(payload, 0);
     set_usize_word(payload, header, payload.len());
-    assert_malformed(
-        decode_advance_tempo(&calldata),
-        DataSource::AdvanceTempoCalldata,
-    );
+    assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
 
     let mut calldata = submit_batch_call(vec![Bytes::from_static(b"signature")]);
     let payload = &mut calldata[SELECTOR..];
     let signatures = usize_word(payload, 12 * WORD);
     let signature_table = signatures + WORD;
     set_usize_word(payload, signature_table, payload.len());
-    assert_malformed(
-        decode_portal_call(&calldata),
-        DataSource::SubmitBatchCalldata,
-    );
+    assert_malformed(decode_portal(&calldata), DataSource::SubmitBatchCalldata);
 }
 
 #[test]
@@ -315,7 +339,7 @@ fn finalization_decodes_count_block_and_structural_sender_lengths() {
         ],
     }
     .abi_encode();
-    let decoded = decode_finalization(&call).unwrap();
+    let decoded = decode_finalize(&call).unwrap();
     assert_eq!(decoded.count, 2);
     assert_eq!(decoded.block_number, 9);
     assert_eq!(decoded.encrypted_senders[0].len(), 0);
@@ -334,7 +358,7 @@ fn finalization_rejects_count_and_dynamic_length_mismatches() {
     }
     .abi_encode();
     assert_malformed(
-        decode_finalization(&count_mismatch),
+        decode_finalize(&count_mismatch),
         DataSource::FinalizationCalldata,
     );
 
@@ -345,7 +369,7 @@ fn finalization_rejects_count_and_dynamic_length_mismatches() {
     }
     .abi_encode();
     assert_malformed(
-        decode_finalization(&malformed_length),
+        decode_finalize(&malformed_length),
         DataSource::FinalizationCalldata,
     );
 }
@@ -367,10 +391,7 @@ fn process_withdrawals_callback_is_bounded_before_decode() {
         remainingQueue: B256::ZERO,
     }
     .abi_encode();
-    assert_malformed(
-        decode_portal_call(&call),
-        DataSource::ProcessWithdrawalsCalldata,
-    );
+    assert_malformed(decode_portal(&call), DataSource::ProcessWithdrawalsCalldata);
 }
 
 #[test]
@@ -390,7 +411,7 @@ fn nonempty_process_withdrawals_round_trips_canonically() {
         remainingQueue: B256::repeat_byte(9),
     }
     .abi_encode();
-    let decoded = decode_portal_call(&call).unwrap();
+    let decoded = decode_portal(&call).unwrap();
     assert!(decoded.is_nonempty_process_withdrawals());
 }
 
@@ -398,10 +419,5 @@ fn nonempty_process_withdrawals_round_trips_canonically() {
 fn submit_batch_round_trips_every_dynamic_input_family() {
     let call = submit_batch_call(vec![Bytes::from_static(b"signature")]);
 
-    assert!(
-        decode_portal_call(&call)
-            .unwrap()
-            .as_submit_batch()
-            .is_some()
-    );
+    assert!(decode_portal(&call).unwrap().as_submit_batch().is_some());
 }

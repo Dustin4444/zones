@@ -29,8 +29,9 @@ use crate::{
     observe::{
         abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
         error::{
-            AcquisitionError, AcquisitionSource, DataSource, ObservationError, PortalCallError,
-            PortalCallFamily,
+            AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence,
+            AuthenticatedTransaction, DataSource, ObservationError, PortalCallError,
+            PortalCallFamily, ProtocolChain,
         },
     },
 };
@@ -602,10 +603,13 @@ fn direct_portal_call_requires_one_top_level_target_for_legacy_and_aa() {
         calldata.as_ref()
     );
     assert!(
-        decode_portal_call(calls::sole_portal_calldata(&direct, PORTAL, B256::ZERO).unwrap())
-            .unwrap()
-            .as_submit_batch()
-            .is_some()
+        decode_portal_call(
+            calls::sole_portal_calldata(&direct, PORTAL, B256::ZERO).unwrap(),
+            AuthenticatedTransaction::new(ProtocolChain::TempoL1, 0, B256::ZERO),
+        )
+        .unwrap()
+        .as_submit_batch()
+        .is_some()
     );
 
     let wrong_target = legacy_call(EXTERNAL, calldata.clone());
@@ -853,6 +857,7 @@ async fn eventful_empty_process_withdrawals_fails_closed() {
 async fn eventful_malformed_direct_calldata_fails_closed() {
     let mut malformed = submit_batch_calldata().to_vec();
     malformed.push(0);
+    let evidence = AuthenticatedDataEvidence::from_bytes(&malformed);
     let envelope = legacy_call(PORTAL, malformed.into());
     let tx_hash = envelope.trie_hash();
     let batch_event = batch_submitted_log(0, 0);
@@ -870,8 +875,12 @@ async fn eventful_malformed_direct_calldata_fails_closed() {
         observe_l1(&provider, &imported, PORTAL).await,
         Err(ObservationError::MalformedAuthenticatedData {
             kind: DataSource::SubmitBatchCalldata,
+            transaction,
+            evidence: actual_evidence,
             ..
-        })
+        }) if transaction
+            == AuthenticatedTransaction::new(ProtocolChain::TempoL1, 0, tx_hash)
+            && actual_evidence == evidence
     ));
 }
 

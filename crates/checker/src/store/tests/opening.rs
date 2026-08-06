@@ -326,21 +326,25 @@ fn enter_live_rejects_a_settlement_hash_conflict_without_mutating_metadata() {
 }
 
 #[test]
-fn stable_version_row_reports_mismatch_before_decoding_incompatible_metadata() {
+fn old_version_row_reports_rebuild_before_decoding_incompatible_finding() {
     let (directory, initialization, store) = open_test_store(BootstrapPhase::ZoneReplay);
     let tx = store.database().tx_mut().unwrap();
-    assert_eq!(MetaValue::Version(2).compress(), [0, 0, 0, 0, 2]);
-    tx.put::<CheckerMeta>(MetaKey::Version, MetaValue::Version(2))
+    assert_eq!(MetaValue::Version(1).compress(), [0, 0, 0, 0, 1]);
+    tx.put::<CheckerMeta>(MetaKey::Version, MetaValue::Version(1))
         .unwrap();
 
-    let mut incompatible = tx
-        .get::<CheckerMeta>(MetaKey::Contracts)
-        .unwrap()
-        .unwrap()
-        .compress();
-    incompatible[0] = 2;
-    tx.put::<RawTable<CheckerMeta>>(
-        RawKey::new(MetaKey::Contracts),
+    let record = FindingRecord::new(
+        hash(0x91),
+        Some(tip(11, 0x92)),
+        FindingStatus::Canonical,
+        FindingKind::MissingSupply(Address::repeat_byte(0x93)),
+    )
+    .unwrap();
+    let mut incompatible = record.compress();
+    incompatible[0] = 1;
+    assert!(FindingRecord::decompress(&incompatible).is_err());
+    tx.put::<RawTable<CheckerFindings>>(
+        RawKey::new(FindingKey::new(1, hash(0x94), 0)),
         RawValue::from_vec(incompatible),
     )
     .unwrap();
@@ -351,15 +355,15 @@ fn stable_version_row_reports_mismatch_before_decoding_incompatible_metadata() {
         let error = CheckerStore::open(directory.path(), initialization.clone()).unwrap_err();
         let StoreError::VersionMismatch {
             path,
-            expected: 1,
-            actual: 2,
+            expected: 2,
+            actual: 1,
             rebuild_path,
         } = error
         else {
             panic!("unexpected version error: {error:?}");
         };
         assert_eq!(path, directory.path().join("checker"));
-        assert_eq!(rebuild_path, directory.path().join("checker-v1"));
+        assert_eq!(rebuild_path, directory.path().join("checker-v2"));
     }
 }
 
@@ -542,8 +546,8 @@ fn malformed_batch_range_fails_reopen_without_panicking() {
 
 #[test]
 fn bootstrap_codec_rejects_phase_cursor_combinations_the_sum_type_cannot_represent() {
-    let zone_replay_without_cursor = vec![1, 0x05, 0x01, 0x00];
-    let mut live_with_cursor = vec![1, 0x05, 0x02, 0x01];
+    let zone_replay_without_cursor = vec![2, 0x05, 0x01, 0x00];
+    let mut live_with_cursor = vec![2, 0x05, 0x02, 0x01];
     live_with_cursor.extend_from_slice(&10_u64.to_be_bytes());
     live_with_cursor.extend_from_slice(hash(0x41).as_slice());
 

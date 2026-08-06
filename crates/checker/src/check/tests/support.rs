@@ -31,8 +31,8 @@ use crate::{
         },
     },
     observe::{
-        DecodedPortalCall, L1BlockObservation, L2BlockObservation, decode_portal_call,
-        observe_l2_block,
+        AuthenticatedTransaction, DecodedPortalCall, L1BlockObservation, L2BlockObservation,
+        ProtocolChain, decode_portal_call, observe_l2_block,
     },
 };
 
@@ -163,7 +163,11 @@ pub(super) fn factory_event<E: SolEvent>(event: E) -> L1ProtocolEvent {
 }
 
 pub(super) fn direct_call<C: SolCall>(call: &C) -> DecodedPortalCall {
-    decode_portal_call(&call.abi_encode()).unwrap()
+    decode_portal_call(
+        &call.abi_encode(),
+        AuthenticatedTransaction::new(ProtocolChain::TempoL1, 0, B256::ZERO),
+    )
+    .unwrap()
 }
 
 pub(super) fn l1_transaction(

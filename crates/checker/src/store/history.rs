@@ -127,11 +127,7 @@ impl CheckerStore {
         let tx = self.db.tx()?;
         let result = (|| {
             let current = read_snapshot(&tx, self.identity, self.path())?;
-            validate_metadata_and_findings(
-                &tx,
-                current.verified_zone_tip,
-                current.imported_tempo_tip,
-            )?;
+            validate_metadata_and_findings(&tx, current.verified_zone_tip)?;
             validate_canonical_table(
                 &tx,
                 current.verified_zone_tip,
@@ -149,11 +145,7 @@ impl CheckerStore {
         let tx = self.db.tx()?;
         let result = (|| {
             let current = read_snapshot(&tx, self.identity, self.path())?;
-            validate_metadata_and_findings(
-                &tx,
-                current.verified_zone_tip,
-                current.imported_tempo_tip,
-            )?;
+            validate_metadata_and_findings(&tx, current.verified_zone_tip)?;
             validate_canonical_table(
                 &tx,
                 current.verified_zone_tip,
@@ -420,6 +412,18 @@ fn unwind_changeset<TX: DbTx>(
     let height = child_zone.number;
     let hash = child_zone.hash;
     let group = read_changeset_group(tx, height, hash)?;
+    restore_changeset_rows(tx, child_zone, child_tempo, &group, rows)
+}
+
+pub(super) fn restore_changeset_rows<TX: DbTx>(
+    tx: &TX,
+    child_zone: BlockNumHash,
+    child_tempo: BlockNumHash,
+    group: &[(ChangesetKey, BeforeImage)],
+    rows: &mut ModelRows,
+) -> StoreResult<BlockBeforeImage> {
+    let height = child_zone.number;
+    let hash = child_zone.hash;
     let Some((_, BeforeImage::Block(block))) = group.first() else {
         return invalid_changeset(height, hash, "ordinal zero is not block metadata");
     };
@@ -459,12 +463,22 @@ fn unwind_changeset<TX: DbTx>(
     Ok(block)
 }
 
-fn read_changeset_group<TX: DbTx>(
+pub(super) fn read_changeset_group<TX: DbTx>(
     tx: &TX,
     height: u64,
     hash: B256,
 ) -> StoreResult<Vec<(ChangesetKey, BeforeImage)>> {
     let mut cursor = tx.cursor_read::<CheckerChangesets>()?;
+    if let Some((key, _)) = cursor.seek(ChangesetKey::new(height, B256::ZERO, 0))?
+        && key.zone_height == height
+        && key.block_hash != hash
+    {
+        return invalid_changeset(
+            height,
+            hash,
+            "changeset height contains a conflicting block hash",
+        );
+    }
     let metadata_key = ChangesetKey::new(height, hash, 0);
     let Some((key, metadata)) = cursor.seek(metadata_key)? else {
         return Err(StoreError::MissingChangeset {
@@ -496,9 +510,13 @@ fn read_changeset_group<TX: DbTx>(
     }
     if let Some((key, _)) = cursor.next()?
         && key.zone_height == height
-        && key.block_hash == hash
     {
-        return invalid_changeset(height, hash, "changeset has surplus mutation rows");
+        let reason = if key.block_hash == hash {
+            "changeset has surplus mutation rows"
+        } else {
+            "changeset height contains a conflicting block hash"
+        };
+        return invalid_changeset(height, hash, reason);
     }
     Ok(rows)
 }
@@ -731,13 +749,17 @@ fn require_parent_links<TX: DbTx>(
     Ok(())
 }
 
-fn required_canonical<TX: DbTx>(tx: &TX, height: u64) -> StoreResult<B256> {
+pub(super) fn required_canonical<TX: DbTx>(tx: &TX, height: u64) -> StoreResult<B256> {
     tx.get::<CheckerCanonical>(height)?
         .map(CanonicalHash::into_inner)
         .ok_or(StoreError::MissingCanonical { height })
 }
 
-fn invalid_changeset<T>(height: u64, hash: B256, reason: &'static str) -> StoreResult<T> {
+pub(super) fn invalid_changeset<T>(
+    height: u64,
+    hash: B256,
+    reason: &'static str,
+) -> StoreResult<T> {
     Err(StoreError::InvalidChangeset {
         height,
         hash,

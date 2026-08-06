@@ -32,6 +32,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+use super::{schema::FindingKey, value::FindingRecord};
+
 const CHECKER_DIRECTORY: &str = "checker";
 
 #[derive(Debug, Clone)]
@@ -243,6 +246,13 @@ impl CheckerStore {
     pub(crate) fn active_alert(&self) -> StoreResult<Option<ActiveAlert>> {
         let tx = self.db.tx()?;
         let result = read_active_alert(&tx);
+        finish_read(tx, result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finding(&self, key: FindingKey) -> StoreResult<Option<FindingRecord>> {
+        let tx = self.db.tx()?;
+        let result = tx.get::<CheckerFindings>(key).map_err(StoreError::from);
         finish_read(tx, result)
     }
 

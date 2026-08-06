@@ -14,6 +14,10 @@ use super::{
 };
 use crate::store::value::finding::types::MAX_RECORD_SIZE;
 
+fn imported_tip() -> BlockNumHash {
+    BlockNumHash::new(8, hash(0xbb))
+}
+
 #[test]
 fn construction_rejects_bad_chain_combinations() {
     let invalid = [
@@ -52,6 +56,221 @@ fn construction_rejects_bad_chain_combinations() {
         FindingKind::BatchFinalizedMismatch(l1(), summary(1), summary(2)),
     ];
     for kind in invalid {
+        assert!(
+            FindingRecord::new(
+                hash(1),
+                Some(imported_tip()),
+                FindingStatus::Canonical,
+                kind
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn construction_rejects_locations_that_do_not_match_the_finding_leaf() {
+    let invalid = [
+        FindingKind::InvalidEnvelope(
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 1, hash(1)),
+            StoredEnvelopeRule::NonGenesis,
+        ),
+        FindingKind::InvalidEnvelope(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredEnvelopeRule::AdvanceSuccess,
+        ),
+        FindingKind::MalformedAuthenticatedData(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredDataSource::AdvanceHeaderRlp,
+            summary(1),
+        ),
+        FindingKind::UnsupportedProtocolEvent(
+            ChainLocation::transaction(StoredProtocolChain::TempoL1, 1, hash(1)),
+            Address::repeat_byte(1),
+            None,
+        ),
+        FindingKind::PortalCallViolation(
+            l1(),
+            StoredPortalCallError::UnsupportedNestedPortalCall,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 1),
+            StoredImportedProjectionError::MissingBaseFee,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 1),
+            StoredImportedProjectionError::OutcomeCoordinateMismatch,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::block(StoredProtocolChain::TempoL1),
+            StoredImportedProjectionError::InvalidCreationGrammar,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 1),
+            StoredImportedProjectionError::InvalidDepositKeyParity,
+            summary(1),
+        ),
+        FindingKind::ZoneProjectionViolation(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredZoneProjectionError::ReorderedTempoBlockFinalized,
+            summary(1),
+        ),
+        FindingKind::ZoneProjectionViolation(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredZoneProjectionError::InvalidWithdrawalRequest,
+            summary(1),
+        ),
+        FindingKind::ZoneProjectionViolation(
+            l2(),
+            StoredZoneProjectionError::MissingTempoBlockFinalized,
+            summary(1),
+        ),
+        FindingKind::ModelViolation(l2(), StoredModelError::PortalNotCreated, None, summary(1)),
+        FindingKind::ImportedOutputMismatch(
+            0,
+            ChainLocation::block(StoredProtocolChain::TempoL1),
+            summary(1),
+            summary(2),
+        ),
+        FindingKind::TempoBlockFinalizedMismatch(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            summary(1),
+            summary(2),
+        ),
+        FindingKind::BatchFinalizedMismatch(
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 1, hash(1)),
+            summary(1),
+            summary(2),
+        ),
+    ];
+
+    for kind in invalid {
+        assert!(
+            FindingRecord::new(
+                hash(1),
+                Some(imported_tip()),
+                FindingStatus::Canonical,
+                kind
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn only_pre_import_l2_failures_may_omit_the_imported_tip() {
+    let early_envelope_failures = [
+        (
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredEnvelopeRule::NonGenesis,
+        ),
+        (
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredEnvelopeRule::AdvancePresent,
+        ),
+        (
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 0, hash(1)),
+            StoredEnvelopeRule::AdvanceSystemCaller,
+        ),
+        (
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 0, hash(1)),
+            StoredEnvelopeRule::AdvanceDestination,
+        ),
+        (
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 0, hash(1)),
+            StoredEnvelopeRule::AdvanceSuccess,
+        ),
+    ];
+    for (location, leaf) in early_envelope_failures {
+        assert!(
+            FindingRecord::new(
+                hash(1),
+                None,
+                FindingStatus::Canonical,
+                FindingKind::InvalidEnvelope(location, leaf),
+            )
+            .is_some()
+        );
+    }
+
+    let early_data_failures = [
+        StoredDataSource::AdvanceTempoCalldata,
+        StoredDataSource::AdvanceHeaderRlp,
+        StoredDataSource::OrdinaryDepositData,
+        StoredDataSource::WithdrawalBounceBackData,
+    ];
+    for source in early_data_failures {
+        assert!(
+            FindingRecord::new(
+                hash(1),
+                None,
+                FindingStatus::Canonical,
+                FindingKind::MalformedAuthenticatedData(
+                    ChainLocation::transaction(StoredProtocolChain::ZoneL2, 0, hash(1)),
+                    source,
+                    summary(1),
+                ),
+            )
+            .is_some()
+        );
+    }
+
+    let late_l2_failures = [
+        FindingKind::InvalidEnvelope(
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 1, hash(1)),
+            StoredEnvelopeRule::SystemIdentity,
+        ),
+        FindingKind::MalformedAuthenticatedData(
+            ChainLocation::transaction(StoredProtocolChain::ZoneL2, 1, hash(1)),
+            StoredDataSource::FinalizationCalldata,
+            summary(1),
+        ),
+        FindingKind::MalformedProtocolEvent(l2(), Address::repeat_byte(1), hash(1), summary(1)),
+        FindingKind::MissingSupply(Address::repeat_byte(1)),
+    ];
+    for kind in late_l2_failures {
+        assert!(FindingRecord::new(hash(1), None, FindingStatus::Canonical, kind).is_none());
+    }
+}
+
+#[test]
+fn tempo_locations_require_an_authenticated_imported_tip() {
+    let kinds = [
+        FindingKind::MalformedAuthenticatedData(
+            ChainLocation::transaction(StoredProtocolChain::TempoL1, 1, hash(1)),
+            StoredDataSource::PortalTransactionCalldata,
+            summary(1),
+        ),
+        FindingKind::UnsupportedProtocolEvent(l1(), Address::repeat_byte(1), None),
+        FindingKind::PortalCallViolation(
+            ChainLocation::transaction_hash(StoredProtocolChain::TempoL1, hash(1)),
+            StoredPortalCallError::ConflictingFamilies,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 1),
+            StoredImportedProjectionError::InvalidCreationGrammar,
+            summary(1),
+        ),
+        FindingKind::ImportedProjectionViolation(
+            ChainLocation::block_log_index(StoredProtocolChain::TempoL1, 1),
+            StoredImportedProjectionError::InvalidDepositKeyParity,
+            summary(1),
+        ),
+        FindingKind::ImportedOutputMismatch(
+            0,
+            ChainLocation::transaction(StoredProtocolChain::TempoL1, 1, hash(1)),
+            summary(1),
+            summary(2),
+        ),
+        FindingKind::ImportedOutputMismatch(0, l1(), summary(1), summary(2)),
+    ];
+
+    for kind in kinds {
         assert!(FindingRecord::new(hash(1), None, FindingStatus::Canonical, kind).is_none());
     }
 }
@@ -59,7 +278,7 @@ fn construction_rejects_bad_chain_combinations() {
 #[test]
 fn envelope_and_kind_tags_fail_closed() {
     let bytes = record(FindingKind::ImportedProjectionViolation(
-        l1(),
+        ChainLocation::block(StoredProtocolChain::TempoL1),
         StoredImportedProjectionError::MissingBaseFee,
         summary(2),
     ))
@@ -91,7 +310,7 @@ fn envelope_and_kind_tags_fail_closed() {
 fn malformed_optional_model_keys_fail_closed() {
     let value = FindingRecord::new(
         hash(1),
-        None,
+        Some(imported_tip()),
         FindingStatus::Canonical,
         FindingKind::ModelViolation(
             ChainLocation::block(StoredProtocolChain::ZoneL2),
@@ -102,31 +321,31 @@ fn malformed_optional_model_keys_fail_closed() {
     )
     .unwrap();
     let bytes = value.compress();
-    assert_eq!(&bytes[35..42], &[0x0d, 0x01, 0x02, 0x00, 0x01, 0x09, 0x40]);
+    assert_eq!(&bytes[75..82], &[0x0d, 0x01, 0x02, 0x00, 0x01, 0x09, 0x40]);
 
     let mut bad_presence = bytes.clone();
-    bad_presence[39] = 0xff;
+    bad_presence[79] = 0xff;
     assert!(FindingRecord::decompress(&bad_presence).is_err());
 
     let mut zero_length = bytes.clone();
-    zero_length[40] = 0;
+    zero_length[80] = 0;
     assert!(FindingRecord::decompress(&zero_length).is_err());
 
     let mut truncated_length = bytes.clone();
-    truncated_length[40] = 0xff;
+    truncated_length[80] = 0xff;
     assert!(FindingRecord::decompress(&truncated_length).is_err());
 
     let mut short_key = bytes.clone();
-    short_key[40] = 8;
+    short_key[80] = 8;
     assert!(FindingRecord::decompress(&short_key).is_err());
 
     let mut unknown_key = bytes;
-    unknown_key[41] = 0xff;
+    unknown_key[81] = 0xff;
     assert!(FindingRecord::decompress(&unknown_key).is_err());
 
     let singleton = FindingRecord::new(
         hash(1),
-        None,
+        Some(imported_tip()),
         FindingStatus::Canonical,
         FindingKind::ModelViolation(
             ChainLocation::block(StoredProtocolChain::ZoneL2),
@@ -137,10 +356,50 @@ fn malformed_optional_model_keys_fail_closed() {
     )
     .unwrap();
     let mut noncanonical_singleton = singleton.compress();
-    assert_eq!(&noncanonical_singleton[39..42], &[0x01, 0x01, 0x00]);
-    noncanonical_singleton[40] = 2;
-    noncanonical_singleton.insert(42, 0);
+    assert_eq!(&noncanonical_singleton[79..82], &[0x01, 0x01, 0x00]);
+    noncanonical_singleton[80] = 2;
+    noncanonical_singleton.insert(82, 0);
     assert!(FindingRecord::decompress(&noncanonical_singleton).is_err());
+}
+
+#[test]
+fn semantically_invalid_wire_records_fail_closed() {
+    let mut missing_required_tip = record(FindingKind::PortalCallViolation(
+        ChainLocation::transaction_hash(StoredProtocolChain::TempoL1, hash(1)),
+        StoredPortalCallError::ConflictingFamilies,
+        summary(1),
+    ))
+    .compress();
+    missing_required_tip[33] = 0;
+    missing_required_tip.drain(34..74);
+    assert!(FindingRecord::decompress(&missing_required_tip).is_err());
+
+    let mut wrong_imported_projection_shape = record(FindingKind::ImportedProjectionViolation(
+        ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 1),
+        StoredImportedProjectionError::InvalidCreationGrammar,
+        summary(1),
+    ))
+    .compress();
+    wrong_imported_projection_shape[76] = StoredImportedProjectionError::MissingBaseFee.wire_tag();
+    assert!(FindingRecord::decompress(&wrong_imported_projection_shape).is_err());
+
+    let mut wrong_zone_projection_shape = record(FindingKind::ZoneProjectionViolation(
+        l2(),
+        StoredZoneProjectionError::ReorderedTempoBlockFinalized,
+        summary(1),
+    ))
+    .compress();
+    wrong_zone_projection_shape[76] =
+        StoredZoneProjectionError::MissingTempoBlockFinalized.wire_tag();
+    assert!(FindingRecord::decompress(&wrong_zone_projection_shape).is_err());
+
+    let mut wrong_envelope_shape = record(FindingKind::InvalidEnvelope(
+        ChainLocation::transaction(StoredProtocolChain::ZoneL2, 0, hash(1)),
+        StoredEnvelopeRule::AdvanceSuccess,
+    ))
+    .compress();
+    wrong_envelope_shape[76] = StoredEnvelopeRule::NonGenesis.wire_tag();
+    assert!(FindingRecord::decompress(&wrong_envelope_shape).is_err());
 }
 
 #[test]
@@ -171,12 +430,11 @@ fn summaries_and_record_accessors_are_stable() {
 
 #[test]
 fn optional_topic_tags_fail_closed() {
-    let location = ChainLocation::block(StoredProtocolChain::TempoL1);
     let bytes = FindingRecord::new(
         B256::repeat_byte(1),
-        None,
+        Some(imported_tip()),
         FindingStatus::Canonical,
-        FindingKind::UnsupportedProtocolEvent(location, Address::repeat_byte(2), None),
+        FindingKind::UnsupportedProtocolEvent(l1(), Address::repeat_byte(2), None),
     )
     .unwrap()
     .compress();

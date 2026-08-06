@@ -394,10 +394,10 @@ mod tests {
     #[test]
     fn version_bytes_are_golden_and_strict() {
         let bytes = MetaValue::Version(u32::from(SCHEMA_VERSION)).compress();
-        assert_eq!(bytes, vec![0, 0, 0, 0, 1]);
+        assert_eq!(bytes, vec![0, 0, 0, 0, 2]);
         assert_eq!(
-            MetaValue::decompress(&[0, 0, 0, 0, 2]).unwrap(),
-            MetaValue::Version(2)
+            MetaValue::decompress(&[0, 0, 0, 0, 1]).unwrap(),
+            MetaValue::Version(1)
         );
 
         let mut trailing = bytes;

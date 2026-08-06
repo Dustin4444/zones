@@ -250,7 +250,7 @@ async fn exact_state_finding_leaves_model_and_both_tips_at_the_parent() {
 
     assert!(matches!(
         error,
-        CheckError::Finding(finding)
+        CheckError::Finding { finding, .. }
             if matches!(
                 finding.as_ref(),
                 Finding::FixedState(FixedStateFinding::TempoBlockHash {
@@ -301,7 +301,7 @@ async fn configured_creation_block_without_creation_is_a_finding_before_acquisit
 
     assert!(matches!(
         error,
-        CheckError::Finding(finding)
+        CheckError::Finding { finding, .. }
             if matches!(
                 finding.as_ref(),
                 Finding::PortalCreationMissing { block_hash }
@@ -337,7 +337,7 @@ async fn l1_observation_portal_must_match_the_configured_model_identity() {
 
     assert!(matches!(
         error,
-        CheckError::Finding(finding)
+        CheckError::Finding { finding, .. }
             if matches!(
                 finding.as_ref(),
                 Finding::PortalObservationIdentityMismatch {
@@ -396,7 +396,7 @@ async fn collateral_uses_the_pre_zone_cut_before_same_block_burns_can_hide_a_def
 
     assert!(matches!(
         error,
-        CheckError::Finding(finding)
+        CheckError::Finding { finding, .. }
             if matches!(
                 finding.as_ref(),
                 Finding::CollateralDeficit {
@@ -453,7 +453,7 @@ async fn post_zone_supply_detects_unauthorized_mint_and_burn_and_keeps_the_paren
 
         assert!(matches!(
             error,
-            CheckError::Finding(finding)
+            CheckError::Finding { finding, .. }
                 if matches!(
                     finding.as_ref(),
                     Finding::SupplyMismatch {
@@ -497,7 +497,7 @@ async fn malformed_l2_envelope_is_an_atomic_observation_finding() {
 
     assert!(matches!(
         error,
-        CheckError::Finding(finding)
+        CheckError::Finding { finding, .. }
             if matches!(
                 finding.as_ref(),
                 Finding::Observation(observation)

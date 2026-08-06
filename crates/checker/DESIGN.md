@@ -865,8 +865,12 @@ The model remains frozen at the last verified parent. Descendants are semantical
 The checker is alerting, not enforcing: it must not pin pruning or affect core node operation after
 an actual divergence is authenticated.
 
-`UnsupportedProtocolVersion`, `UnsupportedProtocolEvent`, and `UnsupportedNestedPortalCall` use the
-same path. Unknown successful behavior must never be guessed or skipped.
+The pinned release-one protocol exposes no authenticated protocol-version discriminator, so the
+checker cannot soundly manufacture an `UnsupportedProtocolVersion` finding. Version-incompatible
+successful behavior reaches the same alert path as `UnsupportedProtocolEvent`,
+`UnsupportedNestedPortalCall`, or malformed authenticated data. Adding a real version field later
+requires an explicit adapter rule and a new checker model version; unknown behavior must never be
+guessed or skipped.
 
 ## 10. Bootstrap, backfill, restart, repair, and model upgrades
 
@@ -1478,7 +1482,7 @@ best-effort behavior.
 - Critical logs, sticky metrics, unhealthy readiness/status.
 - Continued ExEx acknowledgement in alert mode without descendant checking.
 - Startup and reorg recovery when an alerting block remains or is removed.
-- `UnsupportedProtocolVersion` and nested-call behavior.
+- Version-incompatible event behavior and nested-call behavior, with no invented version signal.
 
 **Out of scope.** Enforcement, auto-repair of a canonical divergence, and custom acknowledgement
 cursors absent API evidence.

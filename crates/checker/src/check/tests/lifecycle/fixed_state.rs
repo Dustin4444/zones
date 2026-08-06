@@ -87,7 +87,7 @@ async fn each_exact_commitment_mismatch_is_typed_and_keeps_the_verified_parent_a
 }
 
 fn matches_slot(error: &CheckError, slot: FixedSlot) -> bool {
-    let CheckError::Finding(finding) = error else {
+    let CheckError::Finding { finding, .. } = error else {
         return false;
     };
     matches!(

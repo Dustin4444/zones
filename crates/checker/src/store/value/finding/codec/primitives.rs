@@ -36,6 +36,18 @@ pub(super) fn encode_location(out: &mut Encoder, location: ChainLocation) {
             out.u64(receipt_log_index);
             out.u64(block_log_index);
         }
+        LocationKind::TransactionIndex(index) => {
+            out.u8(0x03);
+            out.u64(index);
+        }
+        LocationKind::TransactionHash(hash) => {
+            out.u8(0x04);
+            out.hash(hash);
+        }
+        LocationKind::BlockLogIndex(index) => {
+            out.u8(0x05);
+            out.u64(index);
+        }
     }
 }
 
@@ -53,6 +65,18 @@ pub(super) fn decode_location(input: &mut Decoder<'_>) -> Result<ChainLocation, 
             input.u64("finding transaction index")?,
             input.hash("finding transaction hash")?,
             input.u64("finding receipt log index")?,
+            input.u64("finding block log index")?,
+        )),
+        0x03 => Ok(ChainLocation::transaction_index(
+            chain,
+            input.u64("finding transaction index")?,
+        )),
+        0x04 => Ok(ChainLocation::transaction_hash(
+            chain,
+            input.hash("finding transaction hash")?,
+        )),
+        0x05 => Ok(ChainLocation::block_log_index(
+            chain,
             input.u64("finding block log index")?,
         )),
         tag => Err(CodecError::UnknownTag {

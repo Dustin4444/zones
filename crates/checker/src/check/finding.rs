@@ -1,5 +1,6 @@
 //! Typed acquisition failures and deterministic candidate findings.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, U256};
 
 use crate::{
@@ -16,8 +17,8 @@ use crate::{
         transition::ModelError,
     },
     observe::{
-        AcquisitionError, DataSource, EnvelopeLocation, EnvelopeRule, ObservationError,
-        PortalCallError, ProtocolChain,
+        AcquisitionError, AuthenticatedDataEvidence, AuthenticatedTransaction, DataSource,
+        EnvelopeLocation, EnvelopeRule, ObservationError, PortalCallError, ProtocolChain,
     },
 };
 
@@ -27,13 +28,34 @@ use crate::{
 pub(crate) enum CheckError {
     #[error(transparent)]
     Acquisition(#[from] AcquisitionError),
-    #[error(transparent)]
-    Finding(Box<Finding>),
+    #[error("{finding}")]
+    Finding {
+        #[source]
+        finding: Box<Finding>,
+        imported_tempo: Option<BlockNumHash>,
+    },
 }
 
 impl From<Finding> for CheckError {
     fn from(finding: Finding) -> Self {
-        Self::Finding(Box::new(finding))
+        Self::Finding {
+            finding: Box::new(finding),
+            imported_tempo: None,
+        }
+    }
+}
+
+impl CheckError {
+    /// Attach the exact imported Tempo coordinate once the Zone envelope has
+    /// been authenticated. Acquisition failures never become findings.
+    pub(crate) fn with_imported_tempo(self, imported_tempo: BlockNumHash) -> Self {
+        match self {
+            Self::Finding { finding, .. } => Self::Finding {
+                finding,
+                imported_tempo: Some(imported_tempo),
+            },
+            acquisition @ Self::Acquisition(_) => acquisition,
+        }
     }
 }
 
@@ -44,9 +66,17 @@ impl From<ObservationError> for CheckError {
             ObservationError::InvalidEnvelope { location, rule } => {
                 ObservationFinding::InvalidEnvelope { location, rule }
             }
-            ObservationError::MalformedAuthenticatedData { kind, detail } => {
-                ObservationFinding::MalformedAuthenticatedData { kind, detail }
-            }
+            ObservationError::MalformedAuthenticatedData {
+                kind,
+                transaction,
+                evidence,
+                detail,
+            } => ObservationFinding::MalformedAuthenticatedData {
+                kind,
+                transaction,
+                evidence,
+                detail,
+            },
             ObservationError::ProtocolEvent {
                 chain,
                 transaction_index,
@@ -77,8 +107,13 @@ pub(crate) enum ObservationFinding {
         location: EnvelopeLocation,
         rule: EnvelopeRule,
     },
-    #[error("malformed authenticated {kind}: {detail}")]
-    MalformedAuthenticatedData { kind: DataSource, detail: String },
+    #[error("malformed authenticated {kind} in {transaction}: {detail}")]
+    MalformedAuthenticatedData {
+        kind: DataSource,
+        transaction: AuthenticatedTransaction,
+        evidence: AuthenticatedDataEvidence,
+        detail: String,
+    },
     #[error(
         "{chain} protocol-event failure at transaction {transaction_index} ({transaction_hash}), receipt log {receipt_log_index}, block log {block_log_index}: {error}"
     )]
@@ -226,6 +261,29 @@ pub(crate) struct TempoBlockFinalizedExpectation {
     pub(in crate::check) state_root: B256,
 }
 
+impl TempoBlockFinalizedExpectation {
+    #[cfg(test)]
+    pub(crate) const fn for_test(block_hash: B256, block_number: u64, state_root: B256) -> Self {
+        Self {
+            block_hash,
+            block_number,
+            state_root,
+        }
+    }
+
+    pub(crate) const fn block_hash(self) -> B256 {
+        self.block_hash
+    }
+
+    pub(crate) const fn block_number(self) -> u64 {
+        self.block_number
+    }
+
+    pub(crate) const fn state_root(self) -> B256 {
+        self.state_root
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TempoAdvancedExpectation {
     pub(in crate::check) block_hash: B256,
@@ -233,6 +291,45 @@ pub(crate) struct TempoAdvancedExpectation {
     pub(in crate::check) deposits_processed: U256,
     pub(in crate::check) processed_deposit_hash: B256,
     pub(in crate::check) processed_deposit_number: u64,
+}
+
+impl TempoAdvancedExpectation {
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        block_hash: B256,
+        block_number: u64,
+        deposits_processed: U256,
+        processed_deposit_hash: B256,
+        processed_deposit_number: u64,
+    ) -> Self {
+        Self {
+            block_hash,
+            block_number,
+            deposits_processed,
+            processed_deposit_hash,
+            processed_deposit_number,
+        }
+    }
+
+    pub(crate) const fn block_hash(self) -> B256 {
+        self.block_hash
+    }
+
+    pub(crate) const fn block_number(self) -> u64 {
+        self.block_number
+    }
+
+    pub(crate) const fn deposits_processed(self) -> U256 {
+        self.deposits_processed
+    }
+
+    pub(crate) const fn processed_deposit_hash(self) -> B256 {
+        self.processed_deposit_hash
+    }
+
+    pub(crate) const fn processed_deposit_number(self) -> u64 {
+        self.processed_deposit_number
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
