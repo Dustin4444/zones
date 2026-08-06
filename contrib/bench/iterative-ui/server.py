@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,14 @@ if not 1 <= REDEMPTION_RUNS_PER_ACCOUNT <= 1_000:
     raise ValueError(
         "ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT must be between 1 and 1000"
     )
+
+
+def benchmark_seed(run_id: str) -> int:
+    """Return a stable, unique txgen seed for an interactive run."""
+    digest = hashlib.sha256(run_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
 PHASES = (
     {
         "id": "deposit",
@@ -503,6 +512,7 @@ class BenchmarkController:
                     output_dir / "scenario.rendered.yml"
                 ),
                 "ZONES_BENCH_RUN_ID": run_id,
+                "ZONES_BENCH_SEED": str(benchmark_seed(run_id)),
                 "ZONES_BENCH_SAMPLE_INSTANCES": str(min(10, config["count"])),
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
                 "RUNNER_TEMP": str(temporary_dir),

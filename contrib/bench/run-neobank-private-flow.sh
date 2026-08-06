@@ -84,6 +84,7 @@ ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX="${ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX:-4}"
 ZONES_BENCH_COUNT="${ZONES_BENCH_COUNT:-100}"
 ZONES_BENCH_TPS="${ZONES_BENCH_TPS:-20}"
 ZONES_BENCH_MAX_CONCURRENT="${ZONES_BENCH_MAX_CONCURRENT:-12}"
+ZONES_BENCH_MAX_RPC_IN_FLIGHT="${ZONES_BENCH_MAX_RPC_IN_FLIGHT:-32}"
 ZONES_BENCH_DEPOSIT_AMOUNT="${ZONES_BENCH_DEPOSIT_AMOUNT:-2000000}"
 ZONES_BENCH_ACTIVITY_AMOUNT="${ZONES_BENCH_ACTIVITY_AMOUNT:-1}"
 ZONES_BENCH_WITHDRAWAL_AMOUNT="${ZONES_BENCH_WITHDRAWAL_AMOUNT:-1000000}"
@@ -186,7 +187,8 @@ esac
     "$(printf '%s' "$expected_base_token" | tr '[:upper:]' '[:lower:]')" ]] ||
     die "ZONES_BENCH_TOKEN must match the $base_token_label token for $ZONES_BENCH_NEOBANK_PRESET"
 for name in ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_ACCOUNT_START ZONES_BENCH_ACCOUNTS ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX ZONES_BENCH_COUNT \
-    ZONES_BENCH_MAX_CONCURRENT ZONES_BENCH_DEPOSIT_AMOUNT ZONES_BENCH_ACTIVITY_AMOUNT \
+    ZONES_BENCH_MAX_CONCURRENT ZONES_BENCH_MAX_RPC_IN_FLIGHT \
+    ZONES_BENCH_DEPOSIT_AMOUNT ZONES_BENCH_ACTIVITY_AMOUNT \
     ZONES_BENCH_WITHDRAWAL_AMOUNT ZONES_BENCH_BOOTSTRAP_DEPOSIT_AMOUNT \
     ZONES_BENCH_CALLBACK_GAS_LIMIT ZONES_BENCH_SAMPLE_INSTANCES ZONES_BENCH_SEED \
     ZONES_BENCH_ACCOUNT_END ZONES_BENCH_CONTROL_ACCOUNT_END \
@@ -201,6 +203,7 @@ do uint "$name"; done
 nonnegative_rate ZONES_BENCH_TPS
 (( 10#$ZONES_BENCH_ACCOUNTS > 0 && 10#$ZONES_BENCH_COUNT > 0 )) || die "accounts and count must be positive"
 (( 10#$ZONES_BENCH_MAX_CONCURRENT > 0 )) || die "max concurrency must be positive"
+(( 10#$ZONES_BENCH_MAX_RPC_IN_FLIGHT > 0 )) || die "max RPC concurrency must be positive"
 (( 10#$ZONES_BENCH_SAMPLE_INSTANCES > 0 )) ||
     die "sample instances must be positive"
 sample_instances="$ZONES_BENCH_SAMPLE_INSTANCES"
@@ -502,7 +505,7 @@ run_setup_scenario() {
     echo "neobank stage=start run_id=$ZONES_BENCH_RUN_ID preset=$ZONES_BENCH_NEOBANK_PRESET stage=$stage${context:+ $context}"
     "$txgen_bin" scenario run \
         --scenario "$scenario" --count "$count" --starts-per-second 0 \
-        --max-in-flight "$concurrency" --max-rpc-in-flight "$concurrency" \
+        --max-in-flight "$concurrency" --max-rpc-in-flight "$ZONES_BENCH_MAX_RPC_IN_FLIGHT" \
         --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" \
         --seed "$ZONES_BENCH_SEED" --report "$report"
     assert_scenario_report "$report" "$count" "$stage"
@@ -621,7 +624,8 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "rewards-redemption" ]]; then
     "$txgen_bin" scenario run \
         --scenario "$neobank_specs/rewards-position-scenario.yml" \
         --count "$ZONES_BENCH_ACCOUNTS" \
-        --max-in-flight "$position_concurrency" --max-rpc-in-flight "$position_concurrency" \
+        --max-in-flight "$position_concurrency" \
+        --max-rpc-in-flight "$ZONES_BENCH_MAX_RPC_IN_FLIGHT" \
         --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" \
         --seed "$ZONES_BENCH_SEED" \
         --report "$ZONES_BENCH_OUTPUT/rewards-position-report.json"
@@ -688,7 +692,8 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "private-withdrawal" ||
         "$txgen_bin" scenario run \
             --scenario "$neobank_specs/swapped-redemption-position-scenario.yml" \
             --count "$ZONES_BENCH_ACCOUNTS" \
-            --max-in-flight "$position_concurrency" --max-rpc-in-flight "$position_concurrency" \
+            --max-in-flight "$position_concurrency" \
+            --max-rpc-in-flight "$ZONES_BENCH_MAX_RPC_IN_FLIGHT" \
             --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" \
             --seed "$ZONES_BENCH_SEED" \
             --report "$ZONES_BENCH_OUTPUT/swapped-redemption-position-report.json"
@@ -760,7 +765,7 @@ if awk -v value="$ZONES_BENCH_TPS" 'BEGIN { exit !(value > 0) }'; then
 fi
 scenario_command+=(
     --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT"
-    --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT"
+    --max-rpc-in-flight "$ZONES_BENCH_MAX_RPC_IN_FLIGHT"
 )
 "${scenario_command[@]}" \
     --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" --seed "$ZONES_BENCH_SEED" \

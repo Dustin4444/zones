@@ -101,6 +101,12 @@ class ReportConversionTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_each_interactive_run_gets_a_stable_unique_seed(self) -> None:
+        first = SERVER.benchmark_seed("1786022762762-deposit")
+        self.assertEqual(first, SERVER.benchmark_seed("1786022762762-deposit"))
+        self.assertNotEqual(first, SERVER.benchmark_seed("1786022762763-deposit"))
+        self.assertNotEqual(first, SERVER.benchmark_seed("1786022762762-earn_deposit"))
+
     def test_defaults_are_presentation_defaults(self) -> None:
         config = SERVER.BenchmarkController._validate_config({})
         self.assertEqual(config["scenario"], "deposit")

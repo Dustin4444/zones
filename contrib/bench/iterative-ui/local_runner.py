@@ -25,6 +25,10 @@ TIP403_REGISTRY = "0x403c000000000000000000000000000000000000"
 TOKEN_TRANSFER_POLICIES_SLOT = 4
 DEV_FAUCET_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 ACCOUNT_START = 16
+# Startup preloads 10,000 vault-share redemptions (10,000,000,000 units).
+# Keep the same amount available for interactive Earn deposits instead of
+# exhausting the dLUSD-side reserve while preparing those redemptions.
+FIXTURE_LIQUIDITY = 20_000_000_000
 
 
 class LocalBenchmark:
@@ -579,7 +583,7 @@ class LocalBenchmark:
                 "--swap-mechanism",
                 "direct-swap",
                 "--liquidity",
-                "10000000000",
+                str(FIXTURE_LIQUIDITY),
                 "--allowed-accounts-file",
                 allowed_file,
                 "--specs-out",
@@ -668,7 +672,7 @@ class LocalBenchmark:
                 "ZONES_BENCH_SAMPLE_INSTANCES": str(min(10, self.args.count)),
                 "ZONES_BENCH_STEP_TIMEOUT": "10m",
                 "ZONES_BENCH_SWAP_MECHANISM": "direct-swap",
-                "ZONES_BENCH_SWAP_LIQUIDITY": "10000000000",
+                "ZONES_BENCH_SWAP_LIQUIDITY": str(FIXTURE_LIQUIDITY),
                 "ZONES_BENCH_EARN_REVISION": earn_revision,
                 "ZONES_BENCH_TEMPO_REF": TEMPO_REF,
                 "ZONES_BENCH_TXGEN_REF": TXGEN_REF,
