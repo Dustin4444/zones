@@ -43,6 +43,10 @@ TOTAL_TOPOLOGY_ACCOUNTS = TOPOLOGY_ACCOUNT_CAPACITY * 2
 # otherwise-successful setup look partially failed. This only paces untimed
 # initialization and does not change the concurrency selected in the UI.
 TOPOLOGY_SETUP_MAX_IN_FLIGHT = min(32, TOTAL_TOPOLOGY_ACCOUNTS)
+# The redemption preload is a full L1 -> Zone -> Earn -> Zone journey, not a
+# simple approval. Keeping a smaller number of these multi-chain observers in
+# flight avoids a txgen log-observation race when all 50 deposits land together.
+REDEMPTION_SETUP_MAX_IN_FLIGHT = min(16, TOPOLOGY_ACCOUNT_CAPACITY)
 REDEMPTION_RUNS_PER_ACCOUNT = int(
     os.environ.get("ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT", "100")
 )
@@ -1005,7 +1009,9 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
                     REDEMPTION_ACCOUNT_START + TOPOLOGY_ACCOUNT_CAPACITY
                 ),
                 "ZONES_BENCH_TPS": "1",
-                "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_MAX_CONCURRENT": str(
+                    REDEMPTION_SETUP_MAX_IN_FLIGHT
+                ),
                 "ZONES_BENCH_OUTPUT": str(redemption_output),
                 "ZONES_BENCH_REPORT": str(redemption_dir / "unused-report.json"),
                 "ZONES_BENCH_RENDERED_SCENARIO": str(
