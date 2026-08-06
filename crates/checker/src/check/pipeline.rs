@@ -1,4 +1,4 @@
-//! Explicit one-block in-memory checker pipeline.
+//! Staged one-block preparation and the checker's in-memory model mirror.
 
 use std::time::{Duration, Instant};
 
@@ -30,11 +30,7 @@ use crate::{
     },
 };
 
-/// Temporary authoritative state for Goal 5.
-///
-/// This type is deliberately not wired into the ExEx. It has no durable state
-/// or unwind path, so callers must supply explicit verified Zone/Tempo tips and
-/// the configured Portal creation block hash.
+/// One loaded checker cut used to prepare a block without mutating its parent.
 pub(crate) struct InMemoryChecker {
     model: ModelState,
     portal_creation_block_hash: B256,
@@ -55,10 +51,35 @@ impl CheckTimings {
     }
 }
 
-struct CandidateCommit {
+/// Fully checked, provider-free logical delta for one exact parent cut.
+pub(crate) struct PreparedBlock {
     state_update: ModelStateUpdate,
-    zone_tip: BlockNumHash,
-    tempo_tip: BlockNumHash,
+    parent_zone_tip: BlockNumHash,
+    parent_tempo_tip: BlockNumHash,
+    child_zone_tip: BlockNumHash,
+    child_tempo_tip: BlockNumHash,
+}
+
+impl PreparedBlock {
+    pub(crate) const fn state_update(&self) -> &ModelStateUpdate {
+        &self.state_update
+    }
+
+    pub(crate) const fn parent_zone_tip(&self) -> BlockNumHash {
+        self.parent_zone_tip
+    }
+
+    pub(crate) const fn parent_tempo_tip(&self) -> BlockNumHash {
+        self.parent_tempo_tip
+    }
+
+    pub(crate) const fn child_zone_tip(&self) -> BlockNumHash {
+        self.child_zone_tip
+    }
+
+    pub(crate) const fn child_tempo_tip(&self) -> BlockNumHash {
+        self.child_tempo_tip
+    }
 }
 
 impl InMemoryChecker {
@@ -99,8 +120,9 @@ impl InMemoryChecker {
 
     /// Authenticate a canonical block and run the complete in-memory check.
     ///
-    /// This is the Goal 5 observation-to-finding boundary. It remains separate
-    /// from the ExEx loop until durable state and unwind exist.
+    /// This convenience path is retained for non-persistent pipeline scenarios.
+    /// The live runtime calls [`Self::prepare_observed_block`] and adopts only
+    /// after its store commit succeeds.
     pub(crate) async fn observe_and_check_block<P, S>(
         &mut self,
         l1_provider: &P,
@@ -108,6 +130,28 @@ impl InMemoryChecker {
         block: &RecoveredBlock<Block>,
         receipts: &[TempoReceipt],
     ) -> Result<(), CheckError>
+    where
+        P: Provider<TempoNetwork>,
+        S: ExactStateLookup + ?Sized,
+    {
+        let prepared = self
+            .prepare_observed_block(l1_provider, zone_state, block, receipts)
+            .await?;
+        self.apply_prepared(prepared);
+        Ok(())
+    }
+
+    /// Authenticate and fully check a block without changing the loaded parent.
+    ///
+    /// The returned value owns every logical mutation needed by persistence and
+    /// contains no provider handle or borrowed observation.
+    pub(crate) async fn prepare_observed_block<P, S>(
+        &self,
+        l1_provider: &P,
+        zone_state: &S,
+        block: &RecoveredBlock<Block>,
+        receipts: &[TempoReceipt],
+    ) -> Result<PreparedBlock, CheckError>
     where
         P: Provider<TempoNetwork>,
         S: ExactStateLookup + ?Sized,
@@ -144,7 +188,7 @@ impl InMemoryChecker {
         self.metrics
             .observation_duration_seconds
             .record(observation_started.elapsed().as_secs_f64());
-        self.check_block(l1_provider, zone_state, &l1, &l2).await
+        self.prepare_block(l1_provider, zone_state, &l1, &l2).await
     }
 
     /// Check and atomically materialize one already-authenticated child of the
@@ -163,25 +207,31 @@ impl InMemoryChecker {
         P: Provider<TempoNetwork>,
         S: ExactStateLookup + ?Sized,
     {
+        let prepared = self.prepare_block(l1_provider, zone_state, l1, l2).await?;
+        self.apply_prepared(prepared);
+        Ok(())
+    }
+
+    /// Check an already-authenticated child without mutating the loaded parent.
+    pub(crate) async fn prepare_block<P, S>(
+        &self,
+        l1_provider: &P,
+        zone_state: &S,
+        l1: &L1BlockObservation,
+        l2: &L2BlockObservation,
+    ) -> Result<PreparedBlock, CheckError>
+    where
+        P: Provider<TempoNetwork>,
+        S: ExactStateLookup + ?Sized,
+    {
         self.metrics
             .latest_observed_zone_height
             .set(l2.block_number() as f64);
         let check_started = Instant::now();
         let mut timings = CheckTimings::default();
-        let candidate = self
+        let result = self
             .check_candidate(l1_provider, zone_state, l1, l2, &mut timings)
             .await;
-        let result = match candidate {
-            Ok(candidate) => {
-                candidate
-                    .state_update
-                    .apply_to_current_parent(&mut self.model);
-                self.zone_tip = candidate.zone_tip;
-                self.tempo_tip = candidate.tempo_tip;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        };
         let transition = check_started
             .elapsed()
             .saturating_sub(timings.acquisition());
@@ -189,8 +239,28 @@ impl InMemoryChecker {
         self.metrics
             .transition_duration_seconds
             .record(transition.as_secs_f64());
-        self.record_result(l2.block_number(), &result);
+        if let Err(error) = &result {
+            self.record_error(l2.block_number(), error);
+        }
         result
+    }
+
+    /// Apply a candidate to the exact in-memory parent that prepared it.
+    pub(crate) fn apply_prepared(&mut self, prepared: PreparedBlock) {
+        assert_eq!(
+            self.zone_tip, prepared.parent_zone_tip,
+            "prepared Zone parent changed before application"
+        );
+        assert_eq!(
+            self.tempo_tip, prepared.parent_tempo_tip,
+            "prepared Tempo parent changed before application"
+        );
+        prepared
+            .state_update
+            .apply_to_current_parent(&mut self.model);
+        self.zone_tip = prepared.child_zone_tip;
+        self.tempo_tip = prepared.child_tempo_tip;
+        self.record_passed(self.zone_tip.number);
     }
 
     async fn check_candidate<P, S>(
@@ -200,7 +270,7 @@ impl InMemoryChecker {
         l1: &L1BlockObservation,
         l2: &L2BlockObservation,
         timings: &mut CheckTimings,
-    ) -> Result<CandidateCommit, CheckError>
+    ) -> Result<PreparedBlock, CheckError>
     where
         P: Provider<TempoNetwork>,
         S: ExactStateLookup + ?Sized,
@@ -293,10 +363,12 @@ impl InMemoryChecker {
         reconcile_post_zone_state(expected_post_state, completed.tokens(), &actual_post_state)?;
         let state_update = completed.into_state_update();
 
-        Ok(CandidateCommit {
+        Ok(PreparedBlock {
             state_update,
-            zone_tip: BlockNumHash::new(l2.block_number(), l2.block_hash()),
-            tempo_tip: BlockNumHash::new(imported_header.number(), imported_header.hash()),
+            parent_zone_tip: self.zone_tip,
+            parent_tempo_tip: self.tempo_tip,
+            child_zone_tip: BlockNumHash::new(l2.block_number(), l2.block_hash()),
+            child_tempo_tip: BlockNumHash::new(imported_header.number(), imported_header.hash()),
         })
     }
 
@@ -342,24 +414,32 @@ impl InMemoryChecker {
         Ok(())
     }
 
-    fn finish_observation_error(
+    fn finish_observation_error<T>(
         &self,
         block_number: u64,
         error: ObservationError,
-    ) -> Result<(), CheckError> {
-        let result = Err(error.into());
-        self.record_result(block_number, &result);
-        result
+    ) -> Result<T, CheckError> {
+        let error = error.into();
+        self.record_error(block_number, &error);
+        Err(error)
     }
 
-    fn record_result(&self, observed_number: u64, result: &Result<(), CheckError>) {
-        match result {
-            Ok(()) => self.metrics.passed_blocks_total.increment(1),
-            Err(CheckError::Acquisition(_)) => {
+    fn record_error(&self, observed_number: u64, error: &CheckError) {
+        match error {
+            CheckError::Acquisition(_) => {
                 self.metrics.acquisition_failures_total.increment(1);
             }
-            Err(CheckError::Finding(_)) => self.metrics.findings_total.increment(1),
+            CheckError::Finding(_) => self.metrics.findings_total.increment(1),
         }
+        self.record_progress(observed_number);
+    }
+
+    fn record_passed(&self, observed_number: u64) {
+        self.metrics.passed_blocks_total.increment(1);
+        self.record_progress(observed_number);
+    }
+
+    fn record_progress(&self, observed_number: u64) {
         self.metrics
             .latest_checked_zone_height
             .set(self.zone_tip.number as f64);

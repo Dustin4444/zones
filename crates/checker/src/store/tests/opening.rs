@@ -1,6 +1,82 @@
 use super::*;
 use crate::store::model_state::assemble_model;
 
+#[test]
+fn existing_open_never_initializes_missing_or_empty_state() {
+    let directory = TempDir::new().unwrap();
+    let checker_path = directory.path().join("checker");
+    assert!(matches!(
+        CheckerStore::open_existing(directory.path(), identity()),
+        Err(StoreError::EmptyExistingDatabase { path }) if path == checker_path
+    ));
+    assert!(!checker_path.exists());
+
+    let mut invalid = initialization(BootstrapPhase::Live);
+    invalid.verified_zone_tip = tip(1, 0x51);
+    assert!(matches!(
+        CheckerStore::open(directory.path(), invalid),
+        Err(StoreError::InvalidInitialization(_))
+    ));
+    assert!(checker_path.exists());
+    assert!(matches!(
+        CheckerStore::open_existing(directory.path(), identity()),
+        Err(StoreError::EmptyExistingDatabase { path }) if path == checker_path
+    ));
+}
+
+#[test]
+fn existing_open_does_not_turn_a_junk_directory_into_an_mdbx_environment() {
+    let directory = TempDir::new().unwrap();
+    let checker_path = directory.path().join("checker");
+    std::fs::create_dir(&checker_path).unwrap();
+    let marker = checker_path.join("not-a-database");
+    std::fs::write(&marker, b"leave me alone").unwrap();
+    let before = std::fs::read_dir(&checker_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    assert!(CheckerStore::open_existing(directory.path(), identity()).is_err());
+
+    let after = std::fs::read_dir(&checker_path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    assert_eq!(std::fs::read(marker).unwrap(), b"leave me alone");
+}
+
+#[test]
+fn existing_open_validates_identity_and_preserves_configured_creation_hash() {
+    let (directory, initialization, store) = open_test_store(BootstrapPhase::Live);
+    let expected = store.load_current().unwrap();
+    let expected_creation_hash = initialization.identity.portal_creation_block_hash();
+    drop(store);
+
+    let reopened = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
+    assert_eq!(reopened.load_current().unwrap(), expected);
+    assert_eq!(
+        reopened.portal_creation_block_hash(),
+        expected_creation_hash,
+        "runtime configuration must come from the validated durable identity"
+    );
+    drop(reopened);
+
+    assert!(matches!(
+        CheckerStore::open_existing(
+            directory.path(),
+            identity_with_portal(Address::repeat_byte(0x41)),
+        ),
+        Err(StoreError::IdentityMismatch {
+            key: MetaKey::Contracts,
+            ..
+        })
+    ));
+
+    let reopened = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
+    assert_eq!(reopened.load_current().unwrap(), expected);
+}
+
 fn initialization_with_terminal_settlement(
     phase: BootstrapPhase,
     tempo_height: u64,
