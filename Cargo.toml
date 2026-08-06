@@ -7,6 +7,7 @@ publish = false
 
 [workspace]
 members = [
+  "bin/tempo-zone-spf",
   "bin/tempo-zone",
   "crates/chainspec",
   "crates/contracts",
@@ -19,6 +20,7 @@ members = [
   "crates/primitives",
   "crates/rpc",
   "crates/sequencer",
+  "crates/spf",
   "xtask",
 ]
 
@@ -126,6 +128,7 @@ zone-precompiles = { path = "crates/precompiles", default-features = false }
 zone-primitives = { path = "crates/primitives", default-features = false }
 zone-rpc = { path = "crates/rpc" }
 zone-sequencer = { path = "crates/sequencer" }
+zone-spf = { path = "crates/spf" }
 
 # reth
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
@@ -160,7 +163,12 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da", default-features = false, features = [
+  "std",
+] }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da", default-features = false, features = [
+  "std",
+] }
 revm = { version = "41.0.0", features = [
   "optional_fee_charge",
 ], default-features = false }
@@ -233,6 +241,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 tokio-tungstenite = "0.28"
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = "1.9.0"
 
 # Keep Commonware aligned with the revision used by upstream Tempo. Cargo does

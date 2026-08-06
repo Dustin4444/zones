@@ -11634,6 +11634,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempo-zone-spf"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "clap",
+ "const-hex",
+ "eyre",
+ "futures",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempo-alloy",
+ "tempo-chainspec",
+ "tempo-primitives",
+ "tempo-zone-contracts",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zone-chainspec",
+ "zone-precompiles",
+ "zone-primitives",
+ "zone-rpc",
+ "zone-spf",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13794,6 +13829,36 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "zone-spf"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-sol-types",
+ "reth-chainspec",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-storage-api",
+ "reth-trie-common",
+ "reth-trie-sparse",
+ "revm",
+ "serde",
+ "tempo-chainspec",
+ "tempo-evm",
+ "tempo-primitives",
+ "tempo-revm",
+ "tempo-zone-contracts",
+ "thiserror 2.0.18",
+ "zone-chainspec",
+ "zone-evm",
+ "zone-precompiles",
+ "zone-primitives",
 ]
 
 [[package]]
