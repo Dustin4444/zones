@@ -658,8 +658,10 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "private-withdrawal" ||
       "$ZONES_BENCH_NEOBANK_PRESET" == "swapped-redemption" ]]; then
     initial_share_supply="$(read_l1_uint "$ZONES_BENCH_EARN_VAULT" 'totalEarnShares()(uint256)')"
     initial_earn_supply="$(read_l1_uint "$ZONES_BENCH_EARN_TOKEN" 'totalSupply()(uint256)')"
-    [[ "$initial_share_supply" == 0 && "$initial_earn_supply" == 0 ]] ||
-        die "$ZONES_BENCH_NEOBANK_PRESET position setup requires zero initial EarnToken supply"
+    if [[ "${ZONES_BENCH_PERSISTENT_TOPOLOGY:-0}" != 1 ]]; then
+        [[ "$initial_share_supply" == 0 && "$initial_earn_supply" == 0 ]] ||
+            die "$ZONES_BENCH_NEOBANK_PRESET position setup requires zero initial EarnToken supply"
+    fi
 
     stage_start redemption_position_setup
     position_concurrency="$ZONES_BENCH_MAX_CONCURRENT"
@@ -681,13 +683,19 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "private-withdrawal" ||
     stage_start redemption_position_check
     positioned_share_supply="$(read_l1_uint "$ZONES_BENCH_EARN_VAULT" 'totalEarnShares()(uint256)')"
     positioned_earn_supply="$(read_l1_uint "$ZONES_BENCH_EARN_TOKEN" 'totalSupply()(uint256)')"
-    [[ "$positioned_share_supply" == "$swapped_redemption_total_position" ]] ||
-        die "$ZONES_BENCH_NEOBANK_PRESET share supply $positioned_share_supply does not equal $swapped_redemption_total_position"
-    [[ "$positioned_earn_supply" == "$swapped_redemption_total_position" ]] ||
-        die "$ZONES_BENCH_NEOBANK_PRESET EarnToken supply $positioned_earn_supply does not equal $swapped_redemption_total_position"
-    verify_reward_zone_balances \
-        seeded "$swapped_redemption_total_position" \
-        "$swapped_redemption_position_per_account"
+    expected_positioned_share_supply="$(bigint_eval \
+        "$initial_share_supply + $swapped_redemption_total_position")"
+    expected_positioned_earn_supply="$(bigint_eval \
+        "$initial_earn_supply + $swapped_redemption_total_position")"
+    [[ "$positioned_share_supply" == "$expected_positioned_share_supply" ]] ||
+        die "$ZONES_BENCH_NEOBANK_PRESET share supply $positioned_share_supply does not equal $expected_positioned_share_supply"
+    [[ "$positioned_earn_supply" == "$expected_positioned_earn_supply" ]] ||
+        die "$ZONES_BENCH_NEOBANK_PRESET EarnToken supply $positioned_earn_supply does not equal $expected_positioned_earn_supply"
+    if [[ "${ZONES_BENCH_PERSISTENT_TOPOLOGY:-0}" != 1 ]]; then
+        verify_reward_zone_balances \
+            seeded "$swapped_redemption_total_position" \
+            "$swapped_redemption_position_per_account"
+    fi
     stage_end redemption_position_check
 fi
 
@@ -753,14 +761,20 @@ if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "private-withdrawal" ||
     stage_start redemption_postcondition
     final_share_supply="$(read_l1_uint "$ZONES_BENCH_EARN_VAULT" 'totalEarnShares()(uint256)')"
     final_earn_supply="$(read_l1_uint "$ZONES_BENCH_EARN_TOKEN" 'totalSupply()(uint256)')"
-    [[ "$final_share_supply" == "$swapped_redemption_expected_remaining" ]] ||
-        die "terminal $ZONES_BENCH_NEOBANK_PRESET share supply $final_share_supply does not equal $swapped_redemption_expected_remaining"
-    [[ "$final_earn_supply" == "$swapped_redemption_expected_remaining" ]] ||
-        die "terminal $ZONES_BENCH_NEOBANK_PRESET EarnToken supply $final_earn_supply does not equal $swapped_redemption_expected_remaining"
-    verify_reward_zone_balances \
-        distributed_remaining "$swapped_redemption_expected_remaining" \
-        "$ZONES_BENCH_WITHDRAWAL_AMOUNT" \
-        "$swapped_redemption_position_per_account"
+    expected_final_share_supply="$(bigint_eval \
+        "$initial_share_supply + $swapped_redemption_expected_remaining")"
+    expected_final_earn_supply="$(bigint_eval \
+        "$initial_earn_supply + $swapped_redemption_expected_remaining")"
+    [[ "$final_share_supply" == "$expected_final_share_supply" ]] ||
+        die "terminal $ZONES_BENCH_NEOBANK_PRESET share supply $final_share_supply does not equal $expected_final_share_supply"
+    [[ "$final_earn_supply" == "$expected_final_earn_supply" ]] ||
+        die "terminal $ZONES_BENCH_NEOBANK_PRESET EarnToken supply $final_earn_supply does not equal $expected_final_earn_supply"
+    if [[ "${ZONES_BENCH_PERSISTENT_TOPOLOGY:-0}" != 1 ]]; then
+        verify_reward_zone_balances \
+            distributed_remaining "$swapped_redemption_expected_remaining" \
+            "$ZONES_BENCH_WITHDRAWAL_AMOUNT" \
+            "$swapped_redemption_position_per_account"
+    fi
     stage_end redemption_postcondition
 fi
 

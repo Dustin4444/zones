@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local UI server for real, isolated Tempo Zone benchmark scenarios."""
+"""Local UI server for benchmarks against one persistent Tempo Zone topology."""
 
 from __future__ import annotations
 
@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-STAGE_PREFIX = "LIVE_BENCH_STAGE "
+ACCOUNT_START = 16
+TOPOLOGY_ACCOUNT_CAPACITY = 100
 PHASES = (
     {
         "id": "deposit",
@@ -312,7 +313,13 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
 
 
 class BenchmarkController:
-    def __init__(self, root: Path, state_dir: Path, branch: str):
+    def __init__(
+        self,
+        root: Path,
+        state_dir: Path,
+        branch: str,
+        topology_env: dict[str, str] | None = None,
+    ):
         self.root = root
         self.state_dir = state_dir
         self.branch = branch
@@ -321,7 +328,7 @@ class BenchmarkController:
         self.process: subprocess.Popen[str] | None = None
         self.cancel_requested = False
         self.state_file = state_dir / "state.json"
-        self.runner = Path(__file__).with_name("local_runner.py")
+        self.topology_env = topology_env or {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state = self._load_state()
         self.state.setdefault("scenarioResults", {})
@@ -386,9 +393,10 @@ class BenchmarkController:
         missing = [name for name in required if shutil.which(name) is None]
         return {
             "branch": self.branch,
-            "localReady": not missing,
+            "localReady": not missing and bool(self.topology_env),
             "missingTools": missing,
-            "runnerLabel": "Local Tempo + private Zone",
+            "runnerLabel": "Persistent local Tempo + private Zone",
+            "accountCapacity": TOPOLOGY_ACCOUNT_CAPACITY,
             "scenarios": [
                 {"id": scenario_id, **definition}
                 for scenario_id, definition in SCENARIOS.items()
@@ -410,8 +418,8 @@ class BenchmarkController:
             self.state.update(
                 {
                     "status": "queued",
-                    "stage": "build",
-                    "message": "Preparing the real local benchmark",
+                    "stage": "benchmark",
+                    "message": f"Starting {config['count']} real {config['preset']} transactions",
                     "run": {
                         "id": run_id,
                         "url": None,
@@ -486,30 +494,36 @@ class BenchmarkController:
     def _run_local(self, config: dict[str, Any], run_id: str) -> None:
         destination = self.state_dir / "runs" / run_id
         report = destination / "report-neobank-e2e.json"
-        destination.mkdir(parents=True, exist_ok=True)
-        command = [
-            "python3",
-            str(self.runner),
-            "--preset",
-            str(config["preset"]),
-            "--count",
-            str(config["count"]),
-            "--accounts",
-            str(config["accounts"]),
-            "--rate",
-            str(config["rate"]),
-            "--concurrency",
-            str(config["concurrency"]),
-            "--run-dir",
-            str(destination),
-            "--report",
-            str(report),
-        ]
+        output_dir = destination / "output"
+        temporary_dir = destination / "tmp"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        temporary_dir.mkdir(exist_ok=True)
+        env = dict(self.topology_env)
+        env.update(
+            {
+                "ZONES_BENCH_NEOBANK_PRESET": str(config["preset"]),
+                "ZONES_BENCH_COUNT": str(config["count"]),
+                "ZONES_BENCH_ACCOUNTS": str(config["accounts"]),
+                "ZONES_BENCH_ACCOUNT_END": str(ACCOUNT_START + config["accounts"]),
+                "ZONES_BENCH_TPS": str(config["rate"]),
+                "ZONES_BENCH_MAX_CONCURRENT": str(config["concurrency"]),
+                "ZONES_BENCH_OUTPUT": str(output_dir),
+                "ZONES_BENCH_REPORT": str(report),
+                "ZONES_BENCH_RENDERED_SCENARIO": str(
+                    output_dir / "scenario.rendered.yml"
+                ),
+                "ZONES_BENCH_RUN_ID": run_id,
+                "ZONES_BENCH_SAMPLE_INSTANCES": str(min(10, config["count"])),
+                "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
+                "RUNNER_TEMP": str(temporary_dir),
+            }
+        )
         recent: deque[str] = deque(maxlen=30)
         try:
             process = subprocess.Popen(
-                command,
+                ["bash", "contrib/bench/run-neobank-private-flow.sh"],
                 cwd=self.root,
+                env=env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -518,7 +532,11 @@ class BenchmarkController:
             )
             with self.lock:
                 self.process = process
-                self.state.update(status="running")
+                self.state.update(
+                    status="running",
+                    stage="benchmark",
+                    message=f"Running {config['count']} real {config['preset']} transactions",
+                )
                 self._persist()
             assert process.stdout is not None
             for raw_line in process.stdout:
@@ -526,18 +544,6 @@ class BenchmarkController:
                 if line:
                     print(line, flush=True)
                     recent.append(line)
-                if line.startswith(STAGE_PREFIX):
-                    try:
-                        progress = json.loads(line[len(STAGE_PREFIX) :])
-                    except json.JSONDecodeError:
-                        continue
-                    self._update(
-                        status="processing"
-                        if progress.get("stage") == "results"
-                        else "running",
-                        stage=str(progress.get("stage", "benchmark")),
-                        message=str(progress.get("message", "Running locally")),
-                    )
             return_code = process.wait()
             with self.lock:
                 self.process = None
@@ -550,17 +556,25 @@ class BenchmarkController:
                         error=None,
                     )
                     return
-                useful = [
-                    line for line in recent if not line.startswith("LIVE_BENCH_STAGE")
-                ]
                 detail = (
-                    "\n".join(useful[-12:])
-                    or f"local runner exited with code {return_code}"
+                    "\n".join(recent)[-5000:]
+                    or f"benchmark exited with code {return_code}"
                 )
                 raise RuntimeError(detail)
             if not report.is_file():
                 raise RuntimeError("The local txgen run did not produce a report")
-            result = report_to_result(json.loads(report.read_text()))
+            parsed = json.loads(report.read_text())
+            if (
+                int(parsed.get("completed", 0)) != config["count"]
+                or int(parsed.get("failed", 0)) != 0
+            ):
+                raise RuntimeError("txgen did not complete every requested transaction")
+            self._update(
+                status="processing",
+                stage="results",
+                message="Reading latency, gas, and fee results",
+            )
+            result = report_to_result(parsed)
             self._complete(result)
         except Exception as error:
             self._update(
@@ -714,6 +728,45 @@ def current_branch(root: Path) -> str:
     return branch
 
 
+def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]]:
+    """Build and provision the one topology shared by every button click."""
+    import importlib.util
+
+    runner_path = Path(__file__).with_name("local_runner.py")
+    spec = importlib.util.spec_from_file_location(
+        "iterative_bench_local_runner", runner_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load local topology runner: {runner_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    topology_dir = state_dir / "topologies" / str(int(time.time() * 1000))
+    topology_args = argparse.Namespace(
+        preset="encrypted-deposit",
+        count=1,
+        accounts=TOPOLOGY_ACCOUNT_CAPACITY,
+        rate=1.0,
+        concurrency=1,
+        run_dir=topology_dir,
+        report=topology_dir / "unused-report.json",
+    )
+    topology = module.LocalBenchmark(topology_args)
+    try:
+        tempo, txgen, specs_out, earn_revision = topology.prepare()
+        if not txgen.is_file():
+            raise RuntimeError("txgen-tempo was not installed")
+        environment, _ = topology.topology(tempo, specs_out, earn_revision)
+        print(
+            f"Persistent topology ready with {TOPOLOGY_ACCOUNT_CAPACITY} authorized accounts.",
+            flush=True,
+        )
+        return topology, environment
+    except BaseException:
+        topology.stop()
+        raise
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Launch the real local neobank benchmark UI"
@@ -731,27 +784,39 @@ def main() -> None:
     state_dir = Path(
         os.environ.get("ITERATIVE_BENCH_STATE_DIR", root / "target" / "iterative-bench")
     )
-    controller = BenchmarkController(root, state_dir, current_branch(root))
-    handler = type(
-        "ConfiguredIterativeBenchHandler",
-        (IterativeBenchHandler,),
-        {"controller": controller, "static_dir": static_dir},
-    )
-    server = ThreadingHTTPServer((arguments.host, arguments.port), handler)
-    url = f"http://{arguments.host}:{arguments.port}"
-    print(f"Real local benchmark UI: {url}")
-    print(
-        "Each Go button starts an isolated Tempo L1 + private Zone and runs txgen locally."
-    )
-    if not arguments.no_open and os.environ.get("ITERATIVE_BENCH_NO_OPEN") != "1":
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    topology = None
+    controller = None
+    server = None
     try:
+        print(
+            "Preparing the persistent Tempo L1, private Zone, and Earn fixtures...",
+            flush=True,
+        )
+        topology, topology_env = provision_topology(root, state_dir)
+        controller = BenchmarkController(
+            root, state_dir, current_branch(root), topology_env=topology_env
+        )
+        handler = type(
+            "ConfiguredIterativeBenchHandler",
+            (IterativeBenchHandler,),
+            {"controller": controller, "static_dir": static_dir},
+        )
+        server = ThreadingHTTPServer((arguments.host, arguments.port), handler)
+        url = f"http://{arguments.host}:{arguments.port}"
+        print(f"Real local benchmark UI ready: {url}", flush=True)
+        print("Each Go button now runs only its selected scenario.", flush=True)
+        if not arguments.no_open and os.environ.get("ITERATIVE_BENCH_NO_OPEN") != "1":
+            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         print("\nStopping local benchmark UI")
     finally:
-        controller.shutdown()
-        server.server_close()
+        if controller is not None:
+            controller.shutdown()
+        if server is not None:
+            server.server_close()
+        if topology is not None:
+            topology.stop()
 
 
 if __name__ == "__main__":
