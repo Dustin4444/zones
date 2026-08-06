@@ -16,7 +16,7 @@ use zone_p2p::{P2pConfig, Role};
 use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 
 use crate::{
-    ZoneNode, ZonePrivateRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
+    ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 use zone_sequencer::{
@@ -144,7 +144,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             // Replicate only durable blocks. Persist every block immediately so followers can
             // acknowledge each block without waiting for Reth's in-memory buffer to fill.
             builder.config_mut().engine.persistence_threshold = 0;
-            builder.config_mut().engine.memory_block_buffer_target = 0;
+            builder.config_mut().engine.memory_block_buffer_target = Some(0);
         }
         // Every promotable node constructs all the sequencer resources: activation is gated at
         // runtime by the leadership schedule, so a quorum follower must be able to become a
@@ -167,6 +167,8 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         } else {
             None
         };
+        let additional_decryption_keys =
+            load_decryption_keys(args.deposit_decryption_keys_file.as_deref()).await?;
 
         builder.config_mut().network.discovery.disable_discovery = true;
         builder.config_mut().rpc.disable_auth_server = true;
@@ -180,13 +182,16 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             Duration::from_millis(args.l1_retry_connection_interval_ms),
         )
         .with_withdrawal_batch_interval_blocks(args.zone_batch_interval_blocks)
-        .with_private_rpc(ZonePrivateRpcConfig {
-            private_rpc_port: args.private_rpc_port,
+        .with_redacted_rpc(ZoneRedactedRpcConfig {
+            redacted_rpc_port: args.redacted_rpc_port,
             zone_id: args.zone_id,
             max_auth_token_validity: Duration::from_secs(
-                args.private_rpc_max_auth_token_validity_secs,
+                args.redacted_rpc_max_auth_token_validity_secs,
             ),
         });
+        if !additional_decryption_keys.is_empty() {
+            node = node.with_deposit_decryption_keys(additional_decryption_keys);
+        }
 
         if should_sequence_blocks {
             let sequencer_signer = sequencer_signer
@@ -255,6 +260,40 @@ async fn load_sequencer_signer(
         .map_err(|_| eyre::eyre!("invalid sequencer key from {source}"))
 }
 
+async fn load_decryption_keys(
+    key_file: Option<&std::path::Path>,
+) -> eyre::Result<Vec<k256::SecretKey>> {
+    let Some(path) = key_file else {
+        return Ok(Vec::new());
+    };
+    let path = path.to_path_buf();
+    let display_path = path.display().to_string();
+    let contents = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+        .await
+        .map_err(|err| eyre::eyre!("decryption key reader task failed for {display_path}: {err}"))?
+        .map_err(|err| eyre::eyre!("failed to read decryption keys from {display_path}: {err}"))?;
+    let contents = Zeroizing::new(contents);
+    let mut keys = Vec::new();
+    for (line_index, value) in contents.lines().enumerate() {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let signer = value.parse::<PrivateKeySigner>().map_err(|_| {
+            eyre::eyre!(
+                "invalid decryption key on line {} of {display_path}",
+                line_index + 1
+            )
+        })?;
+        keys.push(k256::SecretKey::from(signer.credential()));
+    }
+    eyre::ensure!(
+        !keys.is_empty(),
+        "decryption key file {display_path} contains no keys"
+    );
+    Ok(keys)
+}
+
 /// Tempo Zone CLI arguments.
 #[derive(Debug, Clone, Args)]
 pub struct ZoneArgs {
@@ -295,6 +334,14 @@ pub struct ZoneArgs {
         conflicts_with = "sequencer_key"
     )]
     pub sequencer_key_file: Option<PathBuf>,
+
+    /// File containing additional deposit decryption keys, one hex key per line.
+    #[arg(
+        long = "deposit-decryption-keys-file",
+        env = "DEPOSIT_DECRYPTION_KEYS_FILE",
+        value_name = "PATH"
+    )]
+    pub deposit_decryption_keys_file: Option<PathBuf>,
 
     /// Path to the static multi-sequencer manifest. Its presence activates
     /// multi-sequencer mode and makes the manifest authoritative for role selection.
@@ -418,25 +465,26 @@ pub struct ZoneArgs {
     )]
     pub l1_retry_connection_interval_ms: u64,
 
-    /// Zone ID used for chain identity and private RPC authentication.
+    /// Zone ID used for chain identity and redacted RPC authentication.
     #[arg(long = "zone.id", env = "ZONE_ID", default_value_t = 0)]
     pub zone_id: u32,
 
-    /// Port for the private zone RPC server (0 for OS-assigned).
+    /// Port for the redacted zone RPC server (0 for OS-assigned).
     #[arg(
-        long = "private-rpc.port",
-        env = "PRIVATE_RPC_PORT",
+        long = "redacted-rpc.port",
+        alias = "private-rpc.port",
+        env = "REDACTED_RPC_PORT",
         default_value_t = 8544
     )]
-    pub private_rpc_port: u16,
+    pub redacted_rpc_port: u16,
 
-    /// Maximum auth token validity window the private RPC accepts, in seconds.
+    /// Maximum auth token validity window the redacted RPC accepts, in seconds.
     #[arg(
-        long = "private-rpc.max-auth-token-validity-secs",
-        env = "PRIVATE_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS",
+        long = "redacted-rpc.max-auth-token-validity-secs",
+        env = "REDACTED_RPC_MAX_AUTH_TOKEN_VALIDITY_SECS",
         default_value_t = DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS
     )]
-    pub private_rpc_max_auth_token_validity_secs: u64,
+    pub redacted_rpc_max_auth_token_validity_secs: u64,
 
     /// Enable the Zone node in sequencer mode. This advances block production and submits
     /// withdrawal batches.
@@ -511,8 +559,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Role, ZoneArgs, ZoneCli, load_sequencer_signer, sequencer_enabled, validate_l1_rpc_url,
-        validate_portal_address,
+        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
+        validate_l1_rpc_url, validate_portal_address,
     };
     use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
@@ -611,6 +659,34 @@ mod tests {
             "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
                 .parse::<alloy_primitives::Address>()
                 .unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loads_additional_decryption_keys_one_per_line() {
+        let path =
+            std::env::temp_dir().join(format!("tempo-zone-decryption-keys-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                "0000000000000000000000000000000000000000000000000000000000000001\n",
+                "\n",
+                "0000000000000000000000000000000000000000000000000000000000000002\n"
+            ),
+        )
+        .unwrap();
+
+        let keys = load_decryption_keys(Some(&path)).await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0].to_bytes().as_slice(),
+            alloy_primitives::B256::with_last_byte(1).as_slice()
+        );
+        assert_eq!(
+            keys[1].to_bytes().as_slice(),
+            alloy_primitives::B256::with_last_byte(2).as_slice()
         );
     }
 
@@ -744,6 +820,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.zone.zone_poll_interval_secs, 3);
+    }
+
+    #[test]
+    fn private_rpc_port_alias_is_accepted() {
+        let common = [
+            "tempo-zone",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+        ];
+
+        let redacted = ZoneArgsParser::try_parse_from(
+            common.into_iter().chain(["--redacted-rpc.port", "9544"]),
+        )
+        .unwrap();
+        let private = ZoneArgsParser::try_parse_from(
+            common.into_iter().chain(["--private-rpc.port", "9544"]),
+        )
+        .unwrap();
+
+        assert_eq!(redacted.zone.redacted_rpc_port, 9544);
+        assert_eq!(private.zone.redacted_rpc_port, 9544);
     }
 
     #[test]
