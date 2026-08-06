@@ -373,6 +373,45 @@ class LocalBenchmark:
             f"processed={observed}, target={target}"
         )
 
+    def wait_zone_settlement_caught_up(
+        self,
+        zone_rpc: str,
+        l1_rpc: str,
+        portal: str,
+        *,
+        max_zone_block_lag: int,
+        timeout: float = 180,
+    ) -> None:
+        """Wait until the Portal's finalized Zone block is near the live Zone head."""
+        deadline = time.monotonic() + timeout
+        zone_head = 0
+        finalized_zone_block = 0
+        consecutive_ready = 0
+        while time.monotonic() < deadline:
+            zone_head = int(str(self.rpc(zone_rpc, "eth_blockNumber")), 16)
+            encoded_hash = self.rpc(
+                l1_rpc,
+                "eth_call",
+                [{"to": portal, "data": "0xf22a195e"}, "latest"],
+            )
+            portal_hash = "0x" + str(encoded_hash).removeprefix("0x")[-64:]
+            finalized = self.rpc(
+                zone_rpc, "eth_getBlockByHash", [portal_hash, False]
+            )
+            if isinstance(finalized, dict) and finalized.get("number"):
+                finalized_zone_block = int(str(finalized["number"]), 16)
+                if zone_head - finalized_zone_block <= max_zone_block_lag:
+                    consecutive_ready += 1
+                    if consecutive_ready >= 2:
+                        return
+                else:
+                    consecutive_ready = 0
+            time.sleep(0.25)
+        raise RuntimeError(
+            "the Zone did not drain its L1 settlement backlog; "
+            f"zone_head={zone_head}, finalized_zone_block={finalized_zone_block}"
+        )
+
     def topology(
         self, tempo: Path, specs_out: Path, earn_revision: str
     ) -> tuple[dict[str, str], Path]:
@@ -528,9 +567,11 @@ class LocalBenchmark:
                 str(redacted_port),
                 "--",
                 "--zone.batch-interval-blocks",
-                "5",
+                "3",
                 "--withdrawal-poll-interval-secs",
                 "1",
+                "--withdrawal-max-in-flight-batches",
+                "32",
                 "--engine.disable-sparse-trie-cache-pruning",
             )
         )
@@ -681,9 +722,9 @@ class LocalBenchmark:
                 "ZONES_BENCH_OUTBOX": "0x1c00000000000000000000000000000000000002",
                 "ZONES_BENCH_L1_GAS_LIMIT": "500000000",
                 "ZONES_BENCH_L1_GENERAL_GAS_LIMIT": "500000000",
-                "ZONES_BENCH_WITHDRAWAL_MAX_BATCH_GAS": "100000000",
-                "ZONES_BENCH_WITHDRAWAL_MAX_IN_FLIGHT_BATCHES": "4",
-                "ZONES_BENCH_ZONE_BATCH_INTERVAL_BLOCKS": "5",
+                "ZONES_BENCH_WITHDRAWAL_MAX_BATCH_GAS": "10000000",
+                "ZONES_BENCH_WITHDRAWAL_MAX_IN_FLIGHT_BATCHES": "32",
+                "ZONES_BENCH_ZONE_BATCH_INTERVAL_BLOCKS": "3",
                 "ZONES_BENCH_WITHDRAWAL_POLL_INTERVAL_SECS": "1",
                 "ZONES_BENCH_SETUP_SETTLEMENT_TIMEOUT_SECS": "120",
                 "ZONES_BENCH_DRAIN_TIMEOUT": "120",

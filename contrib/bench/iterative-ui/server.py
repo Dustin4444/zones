@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.request
 import webbrowser
 from collections import deque
 from datetime import datetime, timezone
@@ -31,6 +32,11 @@ TOPOLOGY_ACCOUNT_CAPACITY = int(
 )
 if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 100:
     raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 100")
+# Redemption fixture preparation exercises the Earn deposit path. Keep it on a
+# disjoint account pool so the deposit card measures the same unwarmed path as
+# the canonical end-to-end benchmark.
+REDEMPTION_ACCOUNT_START = ACCOUNT_START + TOPOLOGY_ACCOUNT_CAPACITY
+TOTAL_TOPOLOGY_ACCOUNTS = TOPOLOGY_ACCOUNT_CAPACITY * 2
 REDEMPTION_RUNS_PER_ACCOUNT = int(
     os.environ.get("ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT", "100")
 )
@@ -186,6 +192,115 @@ def safe_number(value: Any, fallback: float = 0.0) -> float:
 
 def fee_to_usd(value: Any) -> float:
     return safe_number(value) / 1_000_000_000_000_000_000
+
+
+OBSERVED_L1_RECEIPT_STEPS = {
+    "earn_deposit.l1_processed_locator",
+    "earn_redeem.l1_processed_locator",
+    "offramp_processed",
+}
+
+
+def metric_distribution(values: list[int]) -> dict[str, float | int]:
+    """Build the same compact distribution shape emitted by txgen."""
+    ordered = sorted(values)
+
+    def percentile(fraction: float) -> float:
+        index = max(
+            0,
+            min(
+                len(ordered) - 1,
+                int(fraction * len(ordered) + 0.999999) - 1,
+            ),
+        )
+        return float(ordered[index])
+
+    return {
+        "count": len(ordered),
+        "min": float(ordered[0]),
+        "mean": sum(ordered) / len(ordered),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+    }
+
+
+def add_observed_l1_receipts(report: dict[str, Any], rpc_url: str) -> None:
+    """Add sequencer-submitted L1 completion receipts to end-to-end gas and fees."""
+    hashes_by_step: dict[str, set[str]] = {}
+    for instance in report.get("sampled_instances") or []:
+        for step in instance.get("steps") or []:
+            name = str(step.get("name", ""))
+            if name not in OBSERVED_L1_RECEIPT_STEPS:
+                continue
+            for milestone in step.get("milestones") or []:
+                tx_hash = milestone.get("transaction_hash")
+                if milestone.get("chain") == "l1" and isinstance(tx_hash, str):
+                    hashes_by_step.setdefault(name, set()).add(tx_hash)
+
+    hashes = sorted(
+        {
+            tx_hash
+            for step_hashes in hashes_by_step.values()
+            for tx_hash in step_hashes
+        }
+    )
+    if not hashes:
+        return
+    request = urllib.request.Request(
+        rpc_url,
+        data=json.dumps(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_getTransactionReceipt",
+                    "params": [tx_hash],
+                }
+                for index, tx_hash in enumerate(hashes)
+            ]
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+    if not isinstance(payload, list):
+        raise RuntimeError("L1 receipt query returned an invalid JSON-RPC batch")
+    receipts = {
+        hashes[int(item["id"])]: item.get("result")
+        for item in payload
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), int)
+        and 0 <= int(item["id"]) < len(hashes)
+    }
+
+    metrics = report.setdefault("receipt_metrics", [])
+    for step_name, step_hashes in hashes_by_step.items():
+        gas_values: list[int] = []
+        price_values: list[int] = []
+        fee_values: list[int] = []
+        for tx_hash in step_hashes:
+            receipt = receipts.get(tx_hash)
+            if not isinstance(receipt, dict):
+                raise RuntimeError(f"L1 completion receipt is unavailable: {tx_hash}")
+            gas = int(str(receipt.get("gasUsed", "0x0")), 16)
+            price = int(str(receipt.get("effectiveGasPrice", "0x0")), 16)
+            gas_values.append(gas)
+            price_values.append(price)
+            fee_values.append(gas * price)
+        metrics.append(
+            {
+                "labels": {
+                    "chain": "l1",
+                    "input": "sequencer_completion",
+                    "step": step_name,
+                },
+                "gas_used": metric_distribution(gas_values),
+                "effective_gas_price": metric_distribution(price_values),
+                "fee_paid": metric_distribution(fee_values),
+            }
+        )
 
 
 def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
@@ -497,13 +612,19 @@ class BenchmarkController:
         temporary_dir = destination / "tmp"
         output_dir.mkdir(parents=True, exist_ok=True)
         temporary_dir.mkdir(exist_ok=True)
+        account_start = (
+            REDEMPTION_ACCOUNT_START
+            if config["scenario"] == "earn_redeem"
+            else ACCOUNT_START
+        )
         env = dict(self.topology_env)
         env.update(
             {
                 "ZONES_BENCH_NEOBANK_PRESET": str(config["preset"]),
                 "ZONES_BENCH_COUNT": str(config["count"]),
                 "ZONES_BENCH_ACCOUNTS": str(config["accounts"]),
-                "ZONES_BENCH_ACCOUNT_END": str(ACCOUNT_START + config["accounts"]),
+                "ZONES_BENCH_ACCOUNT_START": str(account_start),
+                "ZONES_BENCH_ACCOUNT_END": str(account_start + config["accounts"]),
                 "ZONES_BENCH_TPS": str(config["rate"]),
                 "ZONES_BENCH_MAX_CONCURRENT": str(config["concurrency"]),
                 "ZONES_BENCH_OUTPUT": str(output_dir),
@@ -513,7 +634,9 @@ class BenchmarkController:
                 ),
                 "ZONES_BENCH_RUN_ID": run_id,
                 "ZONES_BENCH_SEED": str(benchmark_seed(run_id)),
-                "ZONES_BENCH_SAMPLE_INSTANCES": str(min(10, config["count"])),
+                # Every sampled milestone is needed to account for the real L1
+                # completion receipts that txgen observes but does not submit.
+                "ZONES_BENCH_SAMPLE_INSTANCES": str(config["count"]),
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
                 "RUNNER_TEMP": str(temporary_dir),
             }
@@ -574,6 +697,7 @@ class BenchmarkController:
                 stage="results",
                 message="Reading latency, gas, and fee results",
             )
+            add_observed_l1_receipts(parsed, env["L1_RPC_URL"])
             result = report_to_result(parsed)
             self._complete(result)
         except Exception as error:
@@ -745,7 +869,7 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
     topology_args = argparse.Namespace(
         preset="encrypted-deposit",
         count=1,
-        accounts=TOPOLOGY_ACCOUNT_CAPACITY,
+        accounts=TOTAL_TOPOLOGY_ACCOUNTS,
         rate=1.0,
         concurrency=1,
         run_dir=topology_dir,
@@ -757,7 +881,6 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         if not txgen.is_file():
             raise RuntimeError("txgen-tempo was not installed")
         environment, _ = topology.topology(tempo, specs_out, earn_revision)
-
         auth_dir = topology_dir / "auth"
         auth_dir.mkdir(mode=0o700)
         auth_map = auth_dir / "zone-auth.json"
@@ -810,7 +933,7 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         auth_entries = json.loads(auth_map.read_text())
         if (
             not isinstance(auth_entries, dict)
-            or len(auth_entries) != TOPOLOGY_ACCOUNT_CAPACITY
+            or len(auth_entries) != TOTAL_TOPOLOGY_ACCOUNTS
         ):
             raise RuntimeError(
                 "persistent private-Zone authorization map is incomplete"
@@ -829,10 +952,10 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         prepare_env.update(
             {
                 "ZONES_BENCH_NEOBANK_PRESET": "earn-deposit",
-                "ZONES_BENCH_COUNT": str(TOPOLOGY_ACCOUNT_CAPACITY),
-                "ZONES_BENCH_ACCOUNTS": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_COUNT": str(TOTAL_TOPOLOGY_ACCOUNTS),
+                "ZONES_BENCH_ACCOUNTS": str(TOTAL_TOPOLOGY_ACCOUNTS),
                 "ZONES_BENCH_TPS": "1",
-                "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_MAX_CONCURRENT": str(TOTAL_TOPOLOGY_ACCOUNTS),
                 "ZONES_BENCH_OUTPUT": str(prepare_output),
                 "ZONES_BENCH_REPORT": str(prepare_dir / "unused-report.json"),
                 "ZONES_BENCH_RENDERED_SCENARIO": str(
@@ -871,6 +994,10 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
                     TOPOLOGY_ACCOUNT_CAPACITY * REDEMPTION_RUNS_PER_ACCOUNT
                 ),
                 "ZONES_BENCH_ACCOUNTS": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_ACCOUNT_START": str(REDEMPTION_ACCOUNT_START),
+                "ZONES_BENCH_ACCOUNT_END": str(
+                    REDEMPTION_ACCOUNT_START + TOPOLOGY_ACCOUNT_CAPACITY
+                ),
                 "ZONES_BENCH_TPS": "1",
                 "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_ACCOUNT_CAPACITY),
                 "ZONES_BENCH_OUTPUT": str(redemption_output),
@@ -895,6 +1022,15 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         )
         if redemption_prepared.returncode != 0:
             raise RuntimeError("persistent Earn redemption setup failed")
+        topology.stage(
+            "topology", "Draining Zone settlement before enabling benchmark controls"
+        )
+        topology.wait_zone_settlement_caught_up(
+            environment["ZONE_RPC_URL"],
+            environment["L1_RPC_URL"],
+            environment["L1_PORTAL_ADDRESS"],
+            max_zone_block_lag=3,
+        )
         environment.update(
             {
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
@@ -904,7 +1040,9 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
             }
         )
         print(
-            f"Persistent topology ready with {TOPOLOGY_ACCOUNT_CAPACITY} authorized accounts.",
+            "Persistent topology ready with "
+            f"{TOTAL_TOPOLOGY_ACCOUNTS} authorized accounts across isolated "
+            "deposit and redemption pools.",
             flush=True,
         )
         return topology, environment

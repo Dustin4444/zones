@@ -1,6 +1,9 @@
 import importlib.util
+import io
+import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("server.py")
@@ -52,6 +55,50 @@ def receipt(name: str, gas: float, fee: float) -> dict:
 
 
 class ReportConversionTests(unittest.TestCase):
+    def test_adds_observed_l1_completion_gas_to_the_real_report(self) -> None:
+        report = {
+            "sampled_instances": [
+                {
+                    "steps": [
+                        {
+                            "name": "earn_deposit.l1_processed_locator",
+                            "milestones": [
+                                {
+                                    "chain": "l1",
+                                    "transaction_hash": "0xabc",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ],
+            "receipt_metrics": [receipt("earn_deposit.request", 1_000_000, 0)],
+        }
+        response = io.BytesIO(
+            json.dumps(
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "result": {
+                            "gasUsed": hex(600_000),
+                            "effectiveGasPrice": hex(2),
+                        },
+                    }
+                ]
+            ).encode()
+        )
+
+        with mock.patch.object(SERVER.urllib.request, "urlopen", return_value=response):
+            SERVER.add_observed_l1_receipts(report, "http://l1.invalid")
+
+        completion = report["receipt_metrics"][1]
+        self.assertEqual(completion["gas_used"]["mean"], 600_000)
+        self.assertEqual(completion["fee_paid"]["mean"], 1_200_000)
+        self.assertEqual(
+            completion["labels"]["step"], "earn_deposit.l1_processed_locator"
+        )
+
     def test_converts_four_action_journey(self) -> None:
         report = {
             "version": 2,
