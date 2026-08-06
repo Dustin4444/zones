@@ -1,0 +1,357 @@
+//! Typed failures at the authenticated observation boundary.
+
+use std::fmt;
+
+use alloy_primitives::{Address, B256, U256};
+
+use crate::model::events::ProtocolEventError;
+
+/// External or notification-local source required for a complete view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AcquisitionSource {
+    #[error("L1 RPC connection")]
+    L1Rpc,
+    #[error("exact L1 block")]
+    L1Block,
+    #[error("complete L1 receipts")]
+    L1Receipts,
+    #[error("selected L1 transaction")]
+    L1Transaction,
+    #[error("Zone notification receipts")]
+    ZoneNotificationReceipts,
+    #[error("exact Zone state")]
+    ExactZoneState,
+}
+
+/// Location of an envelope violation without inventing transaction zero for
+/// block-level failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum EnvelopeLocation {
+    #[error("at block level")]
+    Block,
+    #[error("at transaction {0}")]
+    Transaction(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ProtocolChain {
+    #[error("Tempo L1")]
+    TempoL1,
+    #[error("Zone L2")]
+    ZoneL2,
+}
+
+/// A failure to acquire a complete, internally consistent authenticated view.
+///
+/// Remote absence/unavailability can be retried. A structurally inconsistent
+/// in-process notification may not become valid on retry, but it remains an
+/// acquisition failure rather than a protocol finding. No variant is converted
+/// into a zero/default observation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AcquisitionError {
+    #[error("{kind} is unavailable: {detail}")]
+    Unavailable {
+        kind: AcquisitionSource,
+        detail: String,
+    },
+    #[error("{kind} is missing: {identity}")]
+    Missing {
+        kind: AcquisitionSource,
+        identity: String,
+    },
+    #[error("inconsistent {kind}: expected {expected}, got {actual}")]
+    Inconsistent {
+        kind: AcquisitionSource,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl AcquisitionError {
+    pub(crate) fn unavailable(kind: AcquisitionSource, error: impl fmt::Display) -> Self {
+        Self::Unavailable {
+            kind,
+            detail: error.to_string(),
+        }
+    }
+
+    pub(crate) fn missing(kind: AcquisitionSource, identity: impl fmt::Display) -> Self {
+        Self::Missing {
+            kind,
+            identity: identity.to_string(),
+        }
+    }
+
+    pub(crate) fn inconsistent(
+        kind: AcquisitionSource,
+        expected: impl fmt::Display,
+        actual: impl fmt::Display,
+    ) -> Self {
+        Self::Inconsistent {
+            kind,
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        }
+    }
+}
+
+/// Protocol envelope rule enforced directly from canonical L2 data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum EnvelopeRule {
+    #[error("only non-genesis blocks have observation envelopes")]
+    NonGenesis,
+    #[error("transaction and receipt cardinality differ")]
+    TransactionReceiptCardinality,
+    #[error("transaction and recovered-sender cardinality differ")]
+    TransactionSenderCardinality,
+    #[error("advanceTempo is missing")]
+    AdvancePresent,
+    #[error("advanceTempo caller is not the protocol system caller")]
+    AdvanceSystemCaller,
+    #[error("advanceTempo destination is not ZoneInbox")]
+    AdvanceDestination,
+    #[error("advanceTempo receipt is unsuccessful")]
+    AdvanceSuccess,
+    #[error("zero-sender and system-signature identity disagree")]
+    SystemIdentity,
+    #[error("finalizeWithdrawalBatch is not the unique final transaction")]
+    FinalizationPosition,
+    #[error("final system transaction destination is not ZoneOutbox")]
+    FinalizationDestination,
+    #[error("finalizeWithdrawalBatch receipt is unsuccessful")]
+    FinalizationSuccess,
+    #[error("finalization blockNumber does not equal the Zone block")]
+    FinalizationBlockNumber,
+}
+
+/// Authenticated byte surface whose canonical encoding is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum DataSource {
+    #[error("advanceTempo calldata")]
+    AdvanceTempoCalldata,
+    #[error("advanceTempo header RLP")]
+    AdvanceHeaderRlp,
+    #[error("ordinary depositData")]
+    OrdinaryDepositData,
+    #[error("withdrawal bounce-back depositData")]
+    WithdrawalBounceBackData,
+    #[error("finalizeWithdrawalBatch calldata")]
+    FinalizationCalldata,
+    #[error("processWithdrawals calldata")]
+    ProcessWithdrawalsCalldata,
+    #[error("submitBatch calldata")]
+    SubmitBatchCalldata,
+    #[error("Portal transaction calldata")]
+    PortalTransactionCalldata,
+}
+
+/// Top-level Portal call family implied by authenticated receipt outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PortalCallFamily {
+    #[error("submitBatch")]
+    SubmitBatch,
+    #[error("processWithdrawals")]
+    ProcessWithdrawals,
+}
+
+/// Output relationship checked without consulting mutable model state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum OutputField {
+    #[error("exact-state block binding")]
+    StateBlockBinding,
+    #[error("TempoAdvanced event count")]
+    TempoAdvancedCount,
+    #[error("TempoAdvanced transaction position")]
+    TempoAdvancedPosition,
+    #[error("TempoAdvanced.tempoBlockHash")]
+    TempoAdvancedHash,
+    #[error("TempoAdvanced.tempoBlockNumber")]
+    TempoAdvancedNumber,
+    #[error("TempoAdvanced.depositsProcessed")]
+    TempoAdvancedDepositCount,
+    #[error("exact TempoState.tempoBlockHash")]
+    ExactTempoHash,
+    #[error("exact TempoState.tempoBlockNumber")]
+    ExactTempoNumber,
+    #[error("TempoBlockFinalized event count")]
+    TempoFinalizedCount,
+    #[error("TempoBlockFinalized transaction position")]
+    TempoFinalizedPosition,
+    #[error("TempoBlockFinalized.blockHash")]
+    TempoFinalizedHash,
+    #[error("TempoBlockFinalized.blockNumber")]
+    TempoFinalizedNumber,
+    #[error("TempoBlockFinalized.stateRoot")]
+    TempoFinalizedStateRoot,
+    #[error("TokenEnabled event count")]
+    TokenEnabledCount,
+    #[error("TokenEnabled[{index}] transaction position")]
+    TokenEnabledPosition { index: usize },
+    #[error("TokenEnabled[{index}].token")]
+    TokenEnabledToken { index: usize },
+    #[error("TokenEnabled[{index}].name")]
+    TokenEnabledName { index: usize },
+    #[error("TokenEnabled[{index}].symbol")]
+    TokenEnabledSymbol { index: usize },
+    #[error("TokenEnabled[{index}].currency")]
+    TokenEnabledCurrency { index: usize },
+    #[error("BatchFinalized event count")]
+    BatchFinalizedCount,
+    #[error("BatchFinalized containing transaction")]
+    BatchFinalizedTransaction,
+}
+
+/// Typed values retained for implementation-output mismatches.
+///
+/// Formatting happens only when the error is displayed; later finding code can
+/// consume hashes, counts, positions, and ABI words without parsing strings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MismatchValue {
+    #[error("{0}")]
+    Hash(B256),
+    #[error("{0}")]
+    Address(Address),
+    #[error("{0}")]
+    Number(u64),
+    #[error("{0}")]
+    Count(usize),
+    #[error("{0}")]
+    TransactionIndex(usize),
+    #[error("{0}")]
+    Word(U256),
+    #[error("{0:?}")]
+    Text(String),
+}
+
+/// Reconciliation failures between authenticated Portal events and the one
+/// selectively fetched top-level transaction body.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PortalCallError {
+    #[error(
+        "unsupported nested or ambiguous Portal call in transaction {transaction_hash}: target {target:?}"
+    )]
+    UnsupportedNestedPortalCall {
+        transaction_hash: B256,
+        target: Option<Address>,
+    },
+    #[error("conflicting Portal call families implied by transaction {transaction_hash}")]
+    ConflictingFamilies { transaction_hash: B256 },
+    #[error(
+        "Portal calldata/event mismatch in transaction {transaction_hash}: expected {expected}, got {actual}"
+    )]
+    FamilyMismatch {
+        transaction_hash: B256,
+        expected: PortalCallFamily,
+        actual: PortalCallFamily,
+    },
+    #[error(
+        "processWithdrawals transaction {transaction_hash} emitted processing outcomes with an empty withdrawal array"
+    )]
+    EmptyProcessWithOutcomes { transaction_hash: B256 },
+}
+
+/// Deterministic failure after canonical data has crossed the adapter boundary.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ObservationError {
+    #[error(transparent)]
+    Acquisition(#[from] AcquisitionError),
+    #[error("invalid protocol envelope {location}: {rule}")]
+    InvalidEnvelope {
+        location: EnvelopeLocation,
+        rule: EnvelopeRule,
+    },
+    #[error("malformed authenticated {kind}: {detail}")]
+    MalformedAuthenticatedData { kind: DataSource, detail: String },
+    #[error("implementation output mismatch for {field}: expected {expected}, got {actual}")]
+    OutputMismatch {
+        field: OutputField,
+        expected: MismatchValue,
+        actual: MismatchValue,
+    },
+    #[error(
+        "{chain} protocol-event failure at transaction {transaction_index} ({transaction_hash}), receipt log {receipt_log_index}, block log {block_log_index}: {error}"
+    )]
+    ProtocolEvent {
+        chain: ProtocolChain,
+        transaction_index: usize,
+        receipt_log_index: usize,
+        block_log_index: usize,
+        transaction_hash: B256,
+        #[source]
+        error: Box<ProtocolEventError>,
+    },
+    #[error(transparent)]
+    PortalCall(#[from] PortalCallError),
+}
+
+impl ObservationError {
+    pub(crate) fn malformed(kind: DataSource, detail: impl fmt::Display) -> Self {
+        Self::MalformedAuthenticatedData {
+            kind,
+            detail: detail.to_string(),
+        }
+    }
+
+    pub(crate) fn output_mismatch(
+        field: OutputField,
+        expected: MismatchValue,
+        actual: MismatchValue,
+    ) -> Self {
+        Self::OutputMismatch {
+            field,
+            expected,
+            actual,
+        }
+    }
+
+    pub(crate) const fn invalid_envelope(transaction_index: usize, rule: EnvelopeRule) -> Self {
+        Self::InvalidEnvelope {
+            location: EnvelopeLocation::Transaction(transaction_index),
+            rule,
+        }
+    }
+
+    pub(crate) const fn invalid_block_envelope(rule: EnvelopeRule) -> Self {
+        Self::InvalidEnvelope {
+            location: EnvelopeLocation::Block,
+            rule,
+        }
+    }
+
+    pub(crate) fn protocol_event(
+        chain: ProtocolChain,
+        transaction_index: usize,
+        receipt_log_index: usize,
+        block_log_index: usize,
+        transaction_hash: B256,
+        error: ProtocolEventError,
+    ) -> Self {
+        Self::ProtocolEvent {
+            chain,
+            transaction_index,
+            receipt_log_index,
+            block_log_index,
+            transaction_hash,
+            error: Box::new(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acquisition_and_protocol_failures_remain_distinct() {
+        let error = AcquisitionError::missing(AcquisitionSource::L1Block, "0x01");
+        let observation: ObservationError = error.into();
+        assert!(matches!(
+            observation,
+            ObservationError::Acquisition(AcquisitionError::Missing { .. })
+        ));
+        assert!(matches!(
+            ObservationError::invalid_envelope(0, EnvelopeRule::AdvanceSystemCaller),
+            ObservationError::InvalidEnvelope { .. }
+        ));
+    }
+}

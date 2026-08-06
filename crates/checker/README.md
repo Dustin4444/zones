@@ -1,244 +1,144 @@
 # zone-checker
 
-An observe-only L2 checker execution extension (ExEx) for the Tempo Zone node.
+An observe-only execution extension for authenticating the Zone and Tempo data
+that the checker model will consume.
 
-## Purpose
+The approved architecture and release gate are in [`DESIGN.md`](DESIGN.md).
+The checker-owned protocol vectors frozen by Goal 0 are inventoried in
+[`MODEL_VECTORS.md`](MODEL_VECTORS.md).
 
-The checker is an Reth ExEx that runs in-process alongside the Zone node. It
-receives canonical L2 block notifications from the node's execution pipeline,
-reads receipts from the executed chain in each notification, decodes Zone
-Inbox/Outbox bridge events, constructs typed per-block L2 facts, and then
-independently fetches the exact Tempo/L1 block anchored by `TempoAdvanced`,
-verifies its identity and receipt root, and decodes ZonePortal L1 events.
+## Current status
 
-The approved target architecture is the closed-system logical protocol model in
-[`DESIGN.md`](DESIGN.md). Its Codex `/goal` milestones are review boundaries, not
-independently deployable partial checkers. The current implementation described
-below is the runtime skeleton that predates that target and remains observe-only.
+Goals 0 and 1 are implemented:
 
-Goal 0 now freezes the checker-owned pure model vocabulary, literal protocol
-constants, ABI/queue encodings, fee arithmetic, exact-state layouts, typed
-lifecycle ownership and concrete owner fixtures, invalid-state-resistant
-withdrawal and batch construction, the `S/D/W` table, and the version-pinned
-event surface. The independent vector and source inventory is in
-[`MODEL_VECTORS.md`](MODEL_VECTORS.md). These pure primitives are not yet
-connected to the ExEx or the existing fact pipeline; that integration belongs
-to later goals.
+- Goal 0 defines checker-owned protocol constants, encodings, event types, and
+  lifecycle vocabulary.
+- Goal 1 establishes the ephemeral authenticated-observation boundary.
 
-Both L2 and L1 facts are temporary: they are constructed while processing a
-notification, used to produce log summaries, and then discarded. No
-persistence exists yet.
+This is not deployable protocol coverage. There is no mutable model,
+persistence, restart/reorg recovery, lifecycle comparison, finding storage, or
+enforcement. In particular, the Goal 1 exact-state API requires an explicit
+checker-owned enabled-token set, but runtime orchestration has no model from
+which to obtain that set yet. It therefore observes the six fixed commitments
+with an empty supply set. Goal 5 connects the complete model-owned token set and
+per-token supply comparisons.
 
-## Current milestone: token-enabled cross-layer invariant (Milestone 4)
+`--checker.mode` remains `off` by default. `observe` is a diagnostic development
+mode, not a shadow-release recommendation.
 
-The checker now:
+## Authenticated observation boundary
 
-- Receives canonical L2 commit, revert, and reorg notifications.
-- Processes committed and reorged-in blocks oldest-to-newest; reverted and
-  reorged-out blocks newest-to-oldest.
-- Confirms that notification-local receipts and exact post-state are available
-  for each committed or reorged-in block. Post-state is queried by exact hash.
-- Extracts L2 bridge facts from canonical Zone Inbox/Outbox receipt logs.
-- Reads the `TempoAdvanced` anchor (exact Tempo/L1 block hash and number).
-- Fetches that exact L1 block by hash (never by latest/head), verifies its
-  returned hash and number match the anchor, and fetches receipts by exact L1
-  block hash.
-- Validates transaction/receipt cardinality and recomputes the receipts root
-  and logs bloom against the L1 header.
-- Independently extracts ordered ZonePortal L1 facts from successful-receipt
-  logs emitted by the configured Portal address.
-- Logs one concise `"L2 bridge facts extracted"` and `"L1 Portal facts extracted"`
-  summary per block.
-- Acknowledges the finished height only after the complete notification has
-  been processed.
-- Logs extraction failures without terminating the Zone node. After a failure,
-  it stops advancing its pruning watermark so a restart can replay the gap.
+The observer keeps authenticated inputs separate from authenticated
+implementation outcomes. Observations live only while one canonical block is
+processed. Raw data is decoded into typed in-memory observations, but those
+observations are never persisted.
 
-### L2 facts extracted
+| Data | Authentication or trust source | Missing or inconsistent data |
+|---|---|---|
+| Imported Tempo header, deposits, decryptions, enabled tokens | Canonical `advanceTempo` calldata in the first Zone system transaction; exact ABI and header-RLP round trips | Malformed authenticated data |
+| Optional finalization count, block number, encrypted senders | Canonical `finalizeWithdrawalBatch` calldata in the unique final Zone system transaction | Invalid envelope or malformed authenticated data |
+| Zone protocol outcomes and containing transaction hashes | Ordered successful notification-local receipts paired with the canonical recovered block | Missing/inconsistent notification receipt sets are acquisition failures; per-block cardinality is an invalid envelope; protocol events fail closed |
+| Six fixed Zone commitments and selected token supplies | In-process `state_by_block_hash` at the exact canonical Zone hash | Retryable acquisition failure; an unwritten slot of an existing account is canonical EVM zero |
+| Ordered Tempo protocol outcomes | Complete receipt set authenticated against the receipt root and logs bloom in the imported header | Retryable acquisition failure or fail-closed protocol-event error |
+| Direct `submitBatch` and non-empty `processWithdrawals` inputs | Selectively fetched transaction body, bound by hash/block/index metadata, with exactly one top-level call to the configured Portal | Retryable acquisition failure, malformed calldata, or `UnsupportedNestedPortalCall` |
 
-From `ZoneInbox.TempoAdvanced` (required block anchor, exactly one per
-non-genesis block):
+Implementation events never choose the inputs they confirm. In particular,
+`TempoAdvanced` is compared with the imported header derived from
+`advanceTempo`; it is not an L1 block anchor.
 
-- Tempo/L1 block hash and number
-- Deposits processed count
-- Processed deposit queue hash
-- Last processed deposit number
+### Zone block checks
 
-From the Zone Inbox:
+For each non-genesis canonical Zone block, the observer:
 
-- `DepositProcessed` / `DepositFailed` — deposit hash, token, amount, disposition
-- `WithdrawalBounceBackProcessed` / `WithdrawalBounceBackPending` — token,
-  amount, disposition (kept distinct from ordinary deposits)
-- `RefundClaimed` — token, amount
-- `TokenEnabled` — token address
+1. Requires equal transaction, recovered-sender, and receipt cardinalities.
+2. Requires the first transaction to be the successful system call to the
+   Inbox and canonically decodes `advanceTempo`.
+3. Allows at most one later system transaction, requires it to be the
+   successful final transaction to the Outbox, and canonically decodes
+   `finalizeWithdrawalBatch`.
+4. Retains supported protocol logs in transaction/receipt order with the
+   containing transaction hash.
+5. Compares input-confirming fields in `TempoAdvanced`, `TempoBlockFinalized`,
+   `TokenEnabled`, and optional `BatchFinalized` with authenticated calldata.
+   It retains queue/cursor events and exact post-state independently; Goal 5
+   supplies the model-owned expectations used to compare them.
 
-From the Zone Outbox:
+Dynamic ABI counts, offsets, and byte lengths are checked before generated
+decoders allocate. Calldata and Tempo-header RLP must re-encode byte-for-byte,
+with no trailing data.
 
-- `WithdrawalRequested` — withdrawal index, token, principal amount, fee
-  (preserved separately)
-- `BatchFinalized` — withdrawal queue hash, batch index (at most one per block)
+Goal 1 checks only the finalization relationships defined without mutable model
+state: canonical shape, count versus sender-array length, sender length, Zone
+block number, envelope position, successful receipt, event presence, and
+containing transaction. Pending-count and reveal-mode relationships are model
+rules introduced by later goals and are not guessed here.
 
-### L1 facts extracted
+### Tempo block checks
 
-From `ZonePortal` on the exact Tempo/L1 block anchored by `TempoAdvanced`:
+The Tempo adapter takes only the imported header decoded above. It:
 
-- `DepositMade` — token, net amount, fee, refund recipient, deposit number,
-  deposit queue hash
-- `TokenEnabled` — token address, name, symbol, currency
-- `BatchSubmitted` — withdrawal batch index, queue index, queue hash, next
-  block hash, last processed deposit number
-- `WithdrawalProcessed` — recipient, sender tag, token, amount, callback success
-- `WithdrawalBounceBack` — token, amount, fallback nonce, deposit number,
-  deposit queue hash (distinct from `DepositMade`)
-- `DepositBounceBack` — refund recipient, token, amount, bounce-back fee
-- `DepositBounceBackPending` — refund recipient, token, amount, bounce-back fee
-- `RefundClaimed` — recipient, token, amount
+1. Fetches the exact block by the imported hash using hash-only transaction
+   bodies.
+2. Checks the RPC-reported hash, locally computed hash, number, and complete
+   fetched header identity against the imported header.
+3. Fetches every receipt for that exact hash and checks cardinality plus every
+   receipt's block hash, block number, transaction index, and transaction hash.
+4. Recomputes the receipt root and aggregate logs bloom against the imported
+   header, never against values selected from the fetched response.
+5. Classifies successful protocol logs in receipt-vector order. Known
+   non-model events decode and are dropped; unknown or malformed events from a
+   protocol emitter fail closed; unrelated emitters are ignored.
+6. Fetches a transaction body only when an authenticated `BatchSubmitted` or
+   withdrawal-processing outcome requires direct calldata.
 
-### Why bounce-backs are not ordinary deposits
+An eventful nested or ambiguous Portal call is unsupported. A required direct
+transaction must contain exactly one top-level Tempo call and that call must
+target the configured Portal. An empty `processWithdrawals` has no protocol
+outcome and creates no transaction-fetch requirement.
 
-Withdrawal bounce-backs recycle existing Portal backing that was already
-escrowed on L1. They do not introduce new external backing the way a user
-deposit does. Collapsing them into `DepositMade` would double-count backing in
-later solvency accounting, so they are kept as a distinct typed category.
+The configured L1 archive RPC remains an explicit trust boundary for
+receipt-to-transaction metadata after receipt-root authentication. Goal 1 does
+not fetch every transaction body or recompute the transaction root.
 
-### Temporary facts
+## Failure classes
 
-Both L2 and L1 facts exist only during block processing. They are constructed,
-used to produce log summaries, and then discarded. No persistence exists yet.
+- Acquisition failures cover unavailable, absent, or internally inconsistent
+  notification, RPC, transaction, receipt, or exact-state data. Remote failures
+  can be retried; an inconsistent in-process notification is still an
+  operational acquisition failure rather than a protocol finding. No
+  acquisition failure becomes a zero/default observation.
+- Invalid envelopes cover caller, destination, position, success, cardinality,
+  and finalization block-number rules.
+- Malformed authenticated data covers non-canonical or structurally unsafe ABI
+  and RLP.
+- Protocol-event errors fail closed for malformed known events, unknown topics
+  from protocol emitters, and explicitly unsupported native events such as
+  `DepositRejected`; they retain chain, transaction hash/index, and receipt and
+  block log coordinates.
+- Portal-call reconciliation errors cover nested or ambiguous calls,
+  conflicting event-implied call families, calldata/event family mismatches,
+  and eventful empty `processWithdrawals` bodies.
+- Output mismatches report implementation outputs that disagree with an
+  authenticated input or required envelope relationship. Goal 1 never treats
+  one implementation output as the independent expectation for another.
 
-### Token-enabled cross-layer invariant (Milestone 4)
+## Runtime behavior
 
-After extracting L2 and L1 facts for each committed or reorged-in block, the
-checker evaluates one cross-layer invariant:
+| Mode | Behavior |
+|---|---|
+| `off` | Default. The checker ExEx is not installed. |
+| `observe` | Authenticate and log ephemeral Goal 1 observations. Do not persist, enforce, or claim complete coverage. |
 
-> The ordered token addresses from successful `ZonePortal.TokenEnabled` events
-> on the anchored L1 block must exactly match the ordered token addresses from
-> `ZoneInbox.TokenEnabled` events on the L2 block.
+Committed and reorged-in blocks are observed oldest-to-newest. Reverted and
+reorged-out blocks are logged newest-to-oldest but are not re-observed after
+they leave the canonical chain. A failed observation does not terminate the
+Zone node; it permanently holds the ExEx pruning acknowledgement behind the
+gap for the remainder of that process. Generic retry and durable recovery are
+later goals.
 
-This invariant is valid at the single anchored L1/L2 block boundary because
-the Zone payload builder passes the L1 `enabled_tokens` sequence directly into
-`advanceTempo`, which iterates in order and emits one L2 `TokenEnabled` per
-input token. A failure in any enablement reverts the entire `advanceTempo`
-call, so a successfully committed block must have emitted exactly the L1
-sequence.
+## Validation
 
-**Evaluation result** is a dedicated `TokenEnabledCheck`:
-
-- `Pass` — the ordered sequences match.
-- `Mismatch { expected, observed }` — the L1 and L2 sequences differ (missing,
-  unexpected, duplicate, different address, or reordered).
-
-**Logging:**
-
-- Non-empty match: `info!` with `"Token-enabled invariant passed"`, including
-  `token_count`, L2 block number/hash, and L1 block number/hash.
-- Empty match (`[] == []`): `debug!` only — most blocks enable no tokens, so an
-  info log per block would be noise.
-- Mismatch: `warn!` with expected and observed sequences.
-
-**Observe-only semantics:** A mismatch is logged but does not fail notification
-processing or withhold the ExEx acknowledgement. The checker continues
-observing subsequent notifications. Extraction and authentication failures
-(missing L1 block, receipt root mismatch, decoding errors, etc.) retain their
-existing behaviour: the notification returns an error and the pruning watermark
-is not advanced.
-
-**No generic framework:** The invariant lives in the dedicated `invariants`
-module with its own typed result. There is no generic invariant dispatch,
-registry, or trait.
-
-### What is not implemented
-
-- **Persistence** — no MDBX, SQLite, or other storage. Facts are discarded
-  after logging.
-- **Restart/rebuild state** — the checker re-derives facts from notifications
-  on each run.
-- **L1/L2 accounting correlation** — L2 and L1 facts are extracted
-  independently. Only the token-enabled sequence is cross-checked; no solvency
-  or deposit/withdrawal correlation exists yet.
-- **Other invariants** — only the token-enabled ordering check is implemented.
-  Solvency, deposit matching, and withdrawal accounting remain future work.
-- **Per-user accounting** — no user balances or ledgers.
-- **Enforcement** — the checker does not block proposal, settlement, or any
-  node operation. Withholding `FinishedHeight` only freezes the ExEx pruning
-  watermark; it does not prevent L2 block production, settlement signing, signer
-  acknowledgement, or batch submission/finalization. Actual enforcement would
-  require integrating invariant results into the proposal, signer-acknowledgement,
-  or settlement-signing path — a separate architectural step.
-- **Metrics** — no metrics are emitted.
-
-## Modes
-
-| Mode | Behaviour |
-|------|-----------|
-| `off` | Default. The checker ExEx is not installed. The node runs without any checker overhead. |
-| `observe` | The checker ExEx is installed. It logs observations, verifies data availability, extracts L2 and L1 facts, but does not enforce findings. |
-
-Modes are selected via the Zone CLI argument `--checker.mode <off|observe>` or
-the `CHECKER_MODE` environment variable.
-
-## Intended architecture
-
-```text
-Tempo L1 blocks/events
-         │
-         ▼
-Zone L1 subscriber + sequencer
-         │ produces canonical L2 blocks
-         ▼
-Zone node / Reth
-         │ ExEx notifications
-         ▼
-Zone checker
-  1. extract L2 facts
-  2. fetch exact L1 facts
-  3. derive/check invariants
-  4. commit checker state
-  5. report findings
+```sh
+cargo test -p zone-checker
+cargo fmt --check
 ```
-
-The current runtime implements L2 fact extraction, exact L1 fact extraction,
-and the token-enabled cross-layer invariant. It does not yet commit checker
-state or report durable model findings. Goal 0's pure model is intentionally
-not wired into these runtime steps.
-
-## Staged direction
-
-1. **Observe L2 notifications** (Milestone 1) — receive canonical block
-   notifications, verify receipt/state availability, log observations.
-2. **Extract Zone L2 facts** (Milestone 2) — decode Zone Inbox/Outbox events
-   from canonical L2 receipts and construct typed per-block facts.
-3. **Fetch exact Tempo L1 facts** (Milestone 3) — fetch the exact L1 block
-   anchored by `TempoAdvanced`, verify its identity and receipt root, and
-   independently extract ZonePortal L1 facts.
-4. **Evaluate cross-layer invariants** (current, Milestone 4) — compare
-   extracted L2 and L1 facts. The token-enabled ordering invariant is the
-   first; additional invariants (solvency, deposit/withdrawal matching) are
-   planned.
-5. **Persist derived state** — store checker-derived state for restart/rebuild.
-6. **Report findings** — surface invariant violations and checker status.
-   Enforcement (blocking proposals or settlement) is considered only after
-   reporting is proven reliable, and requires integrating invariant results
-   into the proposal/signer/settlement path.
-
-## Reorg handling and acknowledgement ordering
-
-The checker processes reorg notifications by first rolling back the old fork
-newest-to-oldest, then applying the new fork oldest-to-newest. Reverted and
-reorged-out blocks are logged but not fact-checked — their receipts are no
-longer canonical. Reorged-in blocks use the same extraction path as ordinary
-committed blocks.
-
-The ExEx acknowledges a height to Reth (`send_finished_height`) only after the
-entire notification has been processed. This prevents Reth from pruning or
-advancing past a block the checker has not yet observed.
-
-## L1 connection
-
-The checker establishes its own read-only Tempo L1 provider connection using
-the node's existing `--l1.rpc-url` and `--l1.portal-address` CLI arguments.
-The connection is established lazily on the first notification that needs it,
-so a temporarily unavailable L1 RPC at startup does not prevent the ExEx from
-running. L1 provider failures during notification processing are logged and
-the pruning watermark is held back; the ExEx continues observing later
-notifications.

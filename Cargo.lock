@@ -13720,7 +13720,6 @@ dependencies = [
  "alloy-transport",
  "eyre",
  "futures",
- "reth-ethereum-primitives",
  "reth-execution-types",
  "reth-exex",
  "reth-node-api",
