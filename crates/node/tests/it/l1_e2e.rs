@@ -19,7 +19,8 @@ use alloy_consensus::Transaction;
 use eyre::WrapErr as _;
 use futures::future::try_join_all;
 use std::{collections::HashMap, time::Duration};
-use tempo_precompiles::PATH_USD_ADDRESS;
+use tempo_contracts::precompiles::ITIP403Registry;
+use tempo_precompiles::{PATH_USD_ADDRESS, TIP403_REGISTRY_ADDRESS};
 use tempo_zone_contracts::{
     IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
     ZonePortal, ZonePortal::Role as PortalRole,
@@ -225,6 +226,45 @@ async fn test_dev_provisioner_replays_initial_token_event() -> eyre::Result<()> 
         "custom initial token should be initialized from TokenEnabled"
     );
 
+    Ok(())
+}
+
+/// The native ZoneFactory requires a TIP-403 binding, so dev provisioning must migrate
+/// pathUSD's legacy token-local policy before creating the zone.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dev_provisioner_migrates_initial_token_policy() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let l1 = L1TestNode::start_without_initial_token_policy().await?;
+    let registry = ITIP403Registry::new(TIP403_REGISTRY_ADDRESS, l1.provider());
+    assert!(
+        !registry
+            .tokenTransferPolicyId(PATH_USD_ADDRESS)
+            .call()
+            .await?
+            .isSet
+    );
+
+    provision_zone(ProvisionConfig {
+        l1_rpc_url: l1.ws_url().to_string(),
+        dev_key: l1.dev_signer(),
+        factory: None,
+        initial_token: PATH_USD_ADDRESS,
+        is_access_open: true,
+        is_gateway_enforced: false,
+        zone_gateways: Vec::new(),
+        allowed_accounts: Vec::new(),
+        rpc_url: String::new(),
+    })
+    .await?;
+
+    assert!(
+        registry
+            .tokenTransferPolicyId(PATH_USD_ADDRESS)
+            .call()
+            .await?
+            .isSet
+    );
     Ok(())
 }
 

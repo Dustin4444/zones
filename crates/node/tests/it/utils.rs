@@ -283,6 +283,21 @@ fn install_native_zone_factory(genesis: &mut Genesis, owner: Address) -> eyre::R
     Ok(())
 }
 
+fn remove_native_zone_initial_token_policy(genesis: &mut Genesis) {
+    let token_policy_slot = keccak256(
+        (
+            PATH_USD_ADDRESS,
+            tip403_registry_slots::TOKEN_TRANSFER_POLICIES,
+        )
+            .abi_encode(),
+    );
+    let _ = genesis
+        .alloc
+        .get_mut(&TIP403_REGISTRY_ADDRESS)
+        .and_then(|account| account.storage.as_mut())
+        .and_then(|storage| storage.remove(&token_policy_slot));
+}
+
 /// Dummy L1 URL used when no real L1 is needed.
 ///
 /// The launch helper recognizes this sentinel and replaces it with a local RPC
@@ -2603,6 +2618,11 @@ impl L1TestNode {
         Self::start_with(|_| {}).await
     }
 
+    /// Start an L1 dev node with the legacy pathUSD policy layout and no TIP-403 binding.
+    pub(crate) async fn start_without_initial_token_policy() -> eyre::Result<Self> {
+        Self::start_with_policy(false, |_| {}).await
+    }
+
     /// Start an L1 dev node, applying a closure to customise the [`NodeConfig`]
     /// before launch.
     ///
@@ -2618,12 +2638,22 @@ impl L1TestNode {
     pub(crate) async fn start_with(
         f: impl FnOnce(&mut NodeConfig<TempoChainSpec>),
     ) -> eyre::Result<Self> {
+        Self::start_with_policy(true, f).await
+    }
+
+    async fn start_with_policy(
+        include_initial_token_policy: bool,
+        f: impl FnOnce(&mut NodeConfig<TempoChainSpec>),
+    ) -> eyre::Result<Self> {
         let tasks = Runtime::test();
 
         let genesis: serde_json::Value =
             serde_json::from_str(include_str!("../assets/test-genesis.json"))?;
         let mut genesis = serde_json::from_value(genesis)?;
         install_native_zone_factory(&mut genesis, l1_dev_signer().address())?;
+        if !include_initial_token_policy {
+            remove_native_zone_initial_token_policy(&mut genesis);
+        }
         let chain_spec = TempoChainSpec::from_genesis(genesis);
 
         let mut node_config = NodeConfig::new(Arc::new(chain_spec))
