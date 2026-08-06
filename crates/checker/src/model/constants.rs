@@ -26,6 +26,11 @@ pub(crate) const ZONE_OUTBOX_ADDRESS: Address =
 pub(crate) const ZONE_FACTORY_ADDRESS: Address =
     address!("0x5af2000000000000000000000000000000000000");
 
+/// Native ZoneFactory portal-address prefix.
+///
+/// Pinned source: `tempo@9161413:crates/primitives/src/address.rs:77`.
+pub(crate) const ZONE_PORTAL_ADDRESS_PREFIX: [u8; 12] = [0x5a, 0xd0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// The tail value used while folding a non-empty withdrawal queue.
 ///
 /// Pinned source: `specs/ref-impls/src/libraries/WithdrawalQueueLib.sol:6-8`.
@@ -165,6 +170,10 @@ mod tests {
         assert_eq!(
             ZONE_FACTORY_ADDRESS,
             address!("5af2000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            ZONE_PORTAL_ADDRESS_PREFIX,
+            [0x5a, 0xd0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(EMPTY_WITHDRAWAL_QUEUE_SENTINEL, B256::repeat_byte(0xff));
         assert_eq!(NO_WITHDRAWAL_QUEUE_INDEX, U256::MAX);

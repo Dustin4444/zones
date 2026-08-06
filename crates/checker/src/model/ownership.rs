@@ -413,6 +413,14 @@ pub(crate) enum FallbackOwner {
         token: Address,
         amount: NonZeroU128,
     },
+    /// One Portal bounce-back deposit is queued while the fallback remains
+    /// open for the Inbox to consume.
+    BounceBackQueued {
+        withdrawal: WithdrawalId,
+        token: Address,
+        amount: NonZeroU128,
+        deposit: DepositId,
+    },
 }
 
 /// Per-origin contribution to the Portal's recipient-aggregated refund map.
@@ -830,24 +838,33 @@ mod tests {
         let user_finalized = user_pending.finalize(Bytes::new()).unwrap();
         let finalized_user_open = ConcreteOwners {
             withdrawal: Some((withdrawal, WithdrawalOwner::Finalized(user_finalized))),
-            fallback: Some((fallback_id, fallback_owner.clone())),
+            fallback: Some((fallback_id, fallback_owner)),
             ..Default::default()
         };
         assert!(finalized_user_open.fallback.is_some());
         let bounce_preimage =
             WithdrawalBounceBackDeposit::new(token, nonce, NonZeroU128::new(500).unwrap());
+        let bounce_deposit = DepositId {
+            portal: deposit.portal,
+            deposit_number: NonZeroU64::new(deposit.deposit_number.get() + 1).unwrap(),
+        };
         let bounced_open = ConcreteOwners {
             deposit: Some((
-                DepositId {
-                    portal: deposit.portal,
-                    deposit_number: NonZeroU64::new(deposit.deposit_number.get() + 1).unwrap(),
-                },
+                bounce_deposit,
                 DepositOwner::PendingWithdrawalBounceBack {
                     withdrawal,
                     preimage: bounce_preimage,
                 },
             )),
-            fallback: Some((fallback_id, fallback_owner)),
+            fallback: Some((
+                fallback_id,
+                FallbackOwner::BounceBackQueued {
+                    withdrawal,
+                    token,
+                    amount: NonZeroU128::new(500).unwrap(),
+                    deposit: bounce_deposit,
+                },
+            )),
             ..Default::default()
         };
         assert!(bounced_open.withdrawal.is_none() && bounced_open.fallback.is_some());
@@ -857,6 +874,12 @@ mod tests {
             unreachable!()
         };
         assert_eq!(preimage.fallback_nonce(), fallback_id.fallback_nonce);
+        let (_, FallbackOwner::BounceBackQueued { deposit, .. }) =
+            bounced_open.fallback.as_ref().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*deposit, bounce_deposit);
 
         // Bounce-back mint deletes both remaining owners; pending bounce-back
         // instead replaces them with one per-origin Inbox credit, then claim

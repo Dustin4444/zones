@@ -10,8 +10,12 @@ pub(crate) mod constants;
 pub(crate) mod encoding;
 pub(crate) mod events;
 pub(crate) mod fees;
+mod input;
+pub(crate) mod output;
 pub(crate) mod ownership;
+pub(crate) mod state;
 pub(crate) mod state_layout;
+pub(crate) mod transition;
 
 #[cfg(test)]
 mod test_vectors;

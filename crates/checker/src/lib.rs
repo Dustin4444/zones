@@ -3,8 +3,8 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod observe;
-// Goals 0 and 1 freeze pure model vocabulary and authenticated observations
-// before later goals connect them through a mutable transition model.
+// Goals 0-2 freeze pure model transitions and authenticated observations
+// before later goals compare and persist candidate state.
 #[allow(dead_code)]
 mod model;
 
