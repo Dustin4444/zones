@@ -1,8 +1,8 @@
 //! Checker-owned semantic inputs and authenticated branch outcomes.
 
-// Construction stays inside the pure-model boundary. Goal 5 will add the
-// narrow projection from Goal 1's adapter-owned observation types; do not make
-// these constructors a crate-wide authenticated-value relabeling API.
+// Construction stays inside the pure-model boundary. `model::adapter` owns the
+// narrow projection from adapter-authenticated observations; these
+// constructors are not a crate-wide authenticated-value relabeling API.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 

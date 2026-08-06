@@ -1,6 +1,6 @@
 //! Exact post-block Zone state acquisition.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
 use reth_storage_api::{
@@ -14,13 +14,12 @@ use crate::{
         OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS, TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS,
         decode_full_word_hash, decode_low_u64, tip20_total_supply_access,
     },
-    observe::error::{AcquisitionError, AcquisitionSource, ObservationError},
+    observe::error::{AcquisitionError, AcquisitionSource},
 };
 
 /// Protocol commitments read from state after one exact Zone block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ZonePostStateOutputs {
-    block_hash: B256,
     tempo_block_hash: B256,
     tempo_block_number: u64,
     processed_deposit_queue_hash: B256,
@@ -32,10 +31,6 @@ pub(crate) struct ZonePostStateOutputs {
 }
 
 impl ZonePostStateOutputs {
-    pub(crate) fn block_hash(&self) -> B256 {
-        self.block_hash
-    }
-
     pub(crate) fn tempo_block_hash(&self) -> B256 {
         self.tempo_block_hash
     }
@@ -66,7 +61,6 @@ impl ZonePostStateOutputs {
 
     #[cfg(test)]
     pub(crate) fn for_test(
-        block_hash: B256,
         tempo_block_hash: B256,
         tempo_block_number: u64,
         processed_deposit_queue_hash: B256,
@@ -75,7 +69,6 @@ impl ZonePostStateOutputs {
         withdrawal_batch_index: u64,
     ) -> Self {
         Self {
-            block_hash,
             tempo_block_hash,
             tempo_block_number,
             processed_deposit_queue_hash,
@@ -87,22 +80,9 @@ impl ZonePostStateOutputs {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_block_hash_for_test(mut self, block_hash: B256) -> Self {
-        self.block_hash = block_hash;
+    pub(crate) fn with_token_supply_for_test(mut self, token: Address, supply: U256) -> Self {
+        self.token_supplies.insert(token, supply);
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn processed_cursor_for_test(&self) -> (B256, u64) {
-        (
-            self.processed_deposit_queue_hash,
-            self.processed_deposit_number,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn withdrawal_cursor_for_test(&self) -> (B256, u64) {
-        (self.withdrawal_queue_hash, self.withdrawal_batch_index)
     }
 }
 
@@ -128,12 +108,10 @@ pub(crate) fn acquire_zone_post_state<P: ExactStateLookup + ?Sized>(
     provider: &P,
     block_hash: B256,
     tokens: &[Address],
-) -> Result<ZonePostStateOutputs, ObservationError> {
+) -> Result<ZonePostStateOutputs, AcquisitionError> {
     let state = provider
         .state_by_exact_block_hash(block_hash)
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::ExactZoneState, error))?;
-
-    require_accounts(state.as_ref(), block_hash, tokens)?;
 
     let token_supplies = tokens
         .iter()
@@ -145,7 +123,6 @@ pub(crate) fn acquire_zone_post_state<P: ExactStateLookup + ?Sized>(
         .collect::<Result<BTreeMap<_, _>, _>>()?;
 
     Ok(ZonePostStateOutputs {
-        block_hash,
         tempo_block_hash: decode_full_word_hash(read_storage(
             state.as_ref(),
             TEMPO_BLOCK_HASH_ACCESS,
@@ -174,50 +151,19 @@ pub(crate) fn acquire_zone_post_state<P: ExactStateLookup + ?Sized>(
     })
 }
 
-fn require_accounts(
-    state: &dyn StateProvider,
-    block_hash: B256,
-    tokens: &[Address],
-) -> Result<(), ObservationError> {
-    let fixed_accounts = [
-        TEMPO_BLOCK_HASH_ACCESS.address,
-        INBOX_PROCESSED_DEPOSIT_HASH_ACCESS.address,
-        OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS.address,
-    ];
-    let mut required_accounts = BTreeSet::new();
-    required_accounts.extend(fixed_accounts);
-    required_accounts.extend(tokens.iter().copied());
-
-    for address in required_accounts {
-        let account = state.basic_account(&address).map_err(|error| {
-            AcquisitionError::unavailable(AcquisitionSource::ExactZoneState, error)
-        })?;
-        if account.is_none() {
-            return Err(AcquisitionError::missing(
-                AcquisitionSource::ExactZoneState,
-                format!("{address} at {block_hash}"),
-            )
-            .into());
-        }
-    }
-
-    Ok(())
-}
-
 fn read_storage(
     state: &dyn StateProvider,
     access: ExactStateAccess,
-) -> Result<U256, ObservationError> {
+) -> Result<U256, AcquisitionError> {
     let value = state
         .storage(access.address, access.storage_key())
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::ExactZoneState, error))?;
     Ok(canonical_evm_storage_value(value))
 }
 
-/// A storage-trie omission means the slot's canonical EVM value is zero.
-///
-/// Callers must first establish that the containing account exists. This is a
-/// consensus interpretation of an unwritten slot, not a missing-data fallback.
+/// An absent account or storage-trie omission has canonical EVM value zero.
+/// The exact state provider has already established that the requested block
+/// is available, so this is consensus interpretation rather than a fallback.
 fn canonical_evm_storage_value(value: Option<U256>) -> U256 {
     match value {
         Some(value) => value,
@@ -349,7 +295,6 @@ mod tests {
         assert_eq!(
             outputs,
             ZonePostStateOutputs {
-                block_hash,
                 tempo_block_hash: b256!(
                     "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
                 ),
@@ -374,46 +319,20 @@ mod tests {
     fn exact_state_lookup_failure_is_unavailable() {
         assert!(matches!(
             acquire_zone_post_state(&UnavailableExactState, B256::repeat_byte(0xee), &[]),
-            Err(ObservationError::Acquisition(
-                AcquisitionError::Unavailable {
-                    kind: AcquisitionSource::ExactZoneState,
-                    ..
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn absent_protocol_or_token_account_is_retryable_acquisition_failure() {
-        let block_hash = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-
-        let missing_protocol =
-            acquire_zone_post_state(&TestProvider::new(), block_hash, &[]).unwrap_err();
-        assert!(matches!(
-            missing_protocol,
-            ObservationError::Acquisition(AcquisitionError::Missing {
+            Err(AcquisitionError::Unavailable {
                 kind: AcquisitionSource::ExactZoneState,
                 ..
             })
         ));
+    }
 
-        let provider = TestProvider::new();
-        add_empty_fixed_accounts(&provider);
-        let missing_token = address!("20c00000000000000000000000000000000000cc");
-        let error = acquire_zone_post_state(&provider, block_hash, &[missing_token]).unwrap_err();
-        match error {
-            ObservationError::Acquisition(error) => match error {
-                AcquisitionError::Missing {
-                    kind: AcquisitionSource::ExactZoneState,
-                    identity,
-                } => {
-                    assert!(identity.contains(&missing_token.to_string()));
-                    assert!(identity.contains(&block_hash.to_string()));
-                }
-                other => panic!("expected missing-account error, got {other:?}"),
-            },
-            other => panic!("expected missing-account acquisition error, got {other:?}"),
-        }
+    #[test]
+    fn absent_protocol_and_token_accounts_have_canonical_evm_zero_state() {
+        let block_hash = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let token = address!("20c00000000000000000000000000000000000cc");
+        let outputs = acquire_zone_post_state(&TestProvider::new(), block_hash, &[token]).unwrap();
+
+        assert_zero_outputs(&outputs, token);
     }
 
     #[test]
@@ -426,6 +345,10 @@ mod tests {
         let outputs =
             acquire_zone_post_state(&provider, B256::repeat_byte(0xcc), &[token]).unwrap();
 
+        assert_zero_outputs(&outputs, token);
+    }
+
+    fn assert_zero_outputs(outputs: &ZonePostStateOutputs, token: Address) {
         assert_eq!(outputs.tempo_block_hash, B256::ZERO);
         assert_eq!(outputs.tempo_block_number, 0);
         assert_eq!(outputs.processed_deposit_queue_hash, B256::ZERO);

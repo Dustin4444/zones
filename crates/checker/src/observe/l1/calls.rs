@@ -6,13 +6,16 @@ use alloy_provider::Provider;
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::TempoTxEnvelope;
 
-use super::super::{
-    abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
-    error::{
-        AcquisitionError, AcquisitionSource, ObservationError, PortalCallError, PortalCallFamily,
+use super::{
+    super::{
+        abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
+        error::{
+            AcquisitionError, AcquisitionSource, ObservationError, PortalCallError,
+            PortalCallFamily,
+        },
     },
+    ensure_acquisition_equal,
 };
-use super::ensure_acquisition_equal;
 
 type TempoTransactionResponse = <TempoNetwork as alloy_network::Network>::TransactionResponse;
 

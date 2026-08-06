@@ -218,13 +218,18 @@ impl PortalLifecycle {
         }
     }
 
+    /// Configured identity remains authoritative before and after creation.
+    pub(crate) const fn identity(&self) -> PortalIdentity {
+        match self {
+            Self::AwaitingCreation { expected } => *expected,
+            Self::Created(portal) => portal.identity,
+        }
+    }
+
     /// Configured Zone identity is valid before the Portal creation block;
     /// Portal address and token operations must still use [`Self::created`].
     pub(crate) const fn zone_id(&self) -> u32 {
-        match self {
-            Self::AwaitingCreation { expected } => expected.zone_id,
-            Self::Created(portal) => portal.identity.zone_id,
-        }
+        self.identity().zone_id
     }
 }
 
@@ -253,6 +258,11 @@ impl TokenState {
 
     pub(crate) const fn is_zone_enabled(&self) -> bool {
         matches!(self.phase, TokenPhase::ZoneEnabled)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(phase: TokenPhase, accounting: TokenAccounting) -> Self {
+        Self { phase, accounting }
     }
 }
 
@@ -297,6 +307,14 @@ impl ZoneLastBatch {
 
     pub(crate) const fn withdrawal_batch_index(&self) -> u64 {
         self.withdrawal_batch_index
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(withdrawal_queue_hash: B256, withdrawal_batch_index: u64) -> Self {
+        Self {
+            withdrawal_queue_hash,
+            withdrawal_batch_index,
+        }
     }
 }
 
@@ -471,8 +489,37 @@ impl ModelState {
 
 #[cfg(test)]
 impl ModelState {
+    pub(crate) fn created_with_zone_token_for_test(
+        identity: PortalIdentity,
+        accounting: TokenAccounting,
+    ) -> Self {
+        let mut state = Self::awaiting_creation(identity);
+        state.portal = PortalLifecycle::Created(Box::new(CreatedPortalState {
+            identity,
+            config: PortalConfig::INITIAL,
+            deposit_cursor: PortalDepositCursor::ZERO,
+            settlement: PortalSettlementState::ZERO,
+        }));
+        state.tokens.insert(
+            identity.initial_token(),
+            TokenState {
+                phase: TokenPhase::ZoneEnabled,
+                accounting,
+            },
+        );
+        state
+    }
+
     pub(crate) fn seed_fallback_owner_for_test(&mut self, id: FallbackId, owner: FallbackOwner) {
         assert!(self.fallback_owners.insert(id, owner).is_none());
+    }
+
+    pub(crate) fn seed_pending_deposit_for_test(&mut self, id: DepositId, owner: DepositOwner) {
+        assert!(self.pending_deposits.insert(id, owner).is_none());
+    }
+
+    pub(crate) fn seed_token_for_test(&mut self, token: Address, state: TokenState) {
+        assert!(self.tokens.insert(token, state).is_none());
     }
 
     pub(crate) fn set_token_accounting_for_test(
@@ -507,6 +554,17 @@ impl ModelState {
 
     pub(crate) fn set_last_fallback_nonce_for_test(&mut self, nonce: u64) {
         self.zone.last_fallback_nonce = nonce;
+    }
+
+    pub(crate) fn set_zone_config_for_test(
+        &mut self,
+        tempo_gas_rate: u128,
+        max_withdrawals_per_block: u32,
+    ) {
+        self.zone.config = ZoneConfig {
+            tempo_gas_rate,
+            max_withdrawals_per_block,
+        };
     }
 
     pub(crate) fn set_last_batch_for_test(&mut self, last_batch: ZoneLastBatch) {

@@ -1,10 +1,14 @@
-//! Observe-only Zone checker execution extension.
+//! Zone checker observation runtime and staged in-memory evaluator.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+#[allow(dead_code)]
+mod check;
+#[allow(dead_code)]
+mod metrics;
 mod observe;
-// Goals 0-2 freeze pure model transitions and authenticated observations
-// before later goals compare and persist candidate state.
+// Goals 0-5 authenticate, project, compare, and apply candidates in memory.
+// Persistence and live evaluator wiring remain deliberately deferred.
 #[allow(dead_code)]
 mod model;
 
@@ -25,8 +29,8 @@ use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
 use tracing::{error, info};
 
 use observe::{
-    AcquisitionError, AcquisitionSource, L1BlockObservation, L2BlockObservation, ObservationError,
-    acquire_zone_post_state, observe_l1, observe_l2_block,
+    AcquisitionError, AcquisitionSource, ExactStateLookup, L1BlockObservation, L2BlockObservation,
+    ObservationError, ZonePostStateOutputs, acquire_zone_post_state, observe_l1, observe_l2_block,
 };
 
 /// Runtime mode for the checker ExEx.
@@ -123,14 +127,14 @@ impl CheckerExEx {
         Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     {
         info!(target: "zone::checker", "Checker ExEx started");
-        let provider = ctx.provider().clone();
+        let zone_provider = ctx.provider().clone();
         let mut l1_provider: Option<DynProvider<TempoNetwork>> = None;
         let mut acknowledgements = AcknowledgementState::default();
 
         while let Some(notification) = ctx.notifications.try_next().await? {
             let observation = process_notification(
                 &notification,
-                &provider,
+                &zone_provider,
                 &mut l1_provider,
                 &self.l1_rpc_url,
                 self.portal_address,
@@ -152,24 +156,24 @@ impl CheckerExEx {
 
 async fn process_notification<P>(
     notification: &ExExNotification<TempoPrimitives>,
-    provider: &P,
+    zone_provider: &P,
     l1_provider: &mut Option<DynProvider<TempoNetwork>>,
     l1_rpc_url: &str,
     portal_address: Address,
 ) -> Result<BlockNumHash, ObservationError>
 where
-    P: StateProviderFactory,
+    P: ExactStateLookup + ?Sized,
 {
     match notification {
         ExExNotification::ChainCommitted { new } => {
-            observe_chain(new, provider, l1_provider, l1_rpc_url, portal_address).await?;
+            observe_chain(new, zone_provider, l1_provider, l1_rpc_url, portal_address).await?;
             let tip = new.tip();
             Ok(BlockNumHash::new(tip.header().number(), tip.hash()))
         }
         ExExNotification::ChainReverted { old } => Ok(log_reverted_chain(old, "Reverted")),
         ExExNotification::ChainReorged { old, new } => {
             log_reverted_chain(old, "Reorged-out");
-            observe_chain(new, provider, l1_provider, l1_rpc_url, portal_address).await?;
+            observe_chain(new, zone_provider, l1_provider, l1_rpc_url, portal_address).await?;
             let tip = new.tip();
             Ok(BlockNumHash::new(tip.header().number(), tip.hash()))
         }
@@ -178,19 +182,19 @@ where
 
 async fn observe_chain<P>(
     chain: &Chain<TempoPrimitives>,
-    provider: &P,
+    zone_provider: &P,
     l1_provider: &mut Option<DynProvider<TempoNetwork>>,
     l1_rpc_url: &str,
     portal_address: Address,
 ) -> Result<(), ObservationError>
 where
-    P: StateProviderFactory,
+    P: ExactStateLookup + ?Sized,
 {
     let receipt_sets = chain.block_receipts_iter().count();
     validate_notification_receipt_sets(chain.blocks().len(), receipt_sets)?;
     for (block, receipts) in chain.blocks_and_receipts() {
         if let Err(error) = process_canonical_block(
-            provider,
+            zone_provider,
             l1_provider,
             l1_rpc_url,
             portal_address,
@@ -252,7 +256,7 @@ fn log_reverted_chain(chain: &Chain<TempoPrimitives>, kind: &'static str) -> Blo
 }
 
 async fn process_canonical_block<P>(
-    provider: &P,
+    zone_provider: &P,
     l1_provider: &mut Option<DynProvider<TempoNetwork>>,
     l1_rpc_url: &str,
     portal_address: Address,
@@ -260,14 +264,13 @@ async fn process_canonical_block<P>(
     receipts: &[TempoReceipt],
 ) -> Result<(), ObservationError>
 where
-    P: StateProviderFactory,
+    P: ExactStateLookup + ?Sized,
 {
-    // Goal 1 owns the exact-hash acquisition API. The complete enabled-token
-    // set is model state introduced later, so this nondeployable milestone
-    // intentionally requests no supply slots from runtime orchestration yet.
-    let l2 = observe_l2_block(block, receipts, |block_hash| {
-        acquire_zone_post_state(provider, block_hash, &[])
-    })?;
+    let l2 = observe_l2_block(block, receipts)?;
+    // Goal 1 keeps exact-hash fixed-state acquisition on the wired observe-only
+    // path. The complete enabled-token set belongs to the Goal 5 model, so the
+    // diagnostic runtime intentionally requests no supply slots yet.
+    let post_state = acquire_zone_post_state(zone_provider, block.hash(), &[])?;
 
     if l1_provider.is_none() {
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -287,16 +290,19 @@ where
     )
     .await?;
 
-    log_observation(&l2, &l1);
+    log_observation(&l2, &l1, &post_state);
     Ok(())
 }
 
-fn log_observation(l2: &L2BlockObservation, l1: &L1BlockObservation) {
+fn log_observation(
+    l2: &L2BlockObservation,
+    l1: &L1BlockObservation,
+    post_state: &ZonePostStateOutputs,
+) {
     let l2_inputs = l2.inputs();
     let advance = l2_inputs.advance_tempo();
     let finalization = l2_inputs.finalization();
     let l2_outputs = l2.outcomes();
-    let state = l2_outputs.post_state();
     let l1_transactions = l1.protocol_transactions();
     let l1_outcomes = l1_transactions
         .iter()
@@ -343,13 +349,13 @@ fn log_observation(l2: &L2BlockObservation, l1: &L1BlockObservation) {
             .map(|value| value.input().encrypted_senders().len())
             .unwrap_or(0),
         finalization_transaction_hash = ?finalization.map(|value| value.transaction_hash()),
-        exact_supply_count = state.token_supplies().len(),
-        exact_tempo_hash = %state.tempo_block_hash(),
-        exact_tempo_number = state.tempo_block_number(),
-        exact_deposit_hash = %state.processed_deposit_queue_hash(),
-        exact_deposit_number = state.processed_deposit_number(),
-        exact_withdrawal_hash = %state.withdrawal_queue_hash(),
-        exact_withdrawal_index = state.withdrawal_batch_index(),
+        exact_supply_count = post_state.token_supplies().len(),
+        exact_tempo_hash = %post_state.tempo_block_hash(),
+        exact_tempo_number = post_state.tempo_block_number(),
+        exact_deposit_hash = %post_state.processed_deposit_queue_hash(),
+        exact_deposit_number = post_state.processed_deposit_number(),
+        exact_withdrawal_hash = %post_state.withdrawal_queue_hash(),
+        exact_withdrawal_index = post_state.withdrawal_batch_index(),
         "Authenticated block observation complete"
     );
 }

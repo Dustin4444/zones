@@ -15,6 +15,7 @@ workspace = true
 # reth
 reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-execution-types.workspace = true
+reth-metrics.workspace = true
 reth-node-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-storage-api.workspace = true
@@ -30,6 +31,7 @@ alloy-sol-types.workspace = true
 
 # tempo
 tempo-alloy.workspace = true
+tempo-contracts.workspace = true
 tempo-primitives.workspace = true
 
 # zones
@@ -38,6 +40,7 @@ tempo-zone-contracts = { workspace = true, features = ["std"] }
 # misc
 eyre.workspace = true
 futures.workspace = true
+metrics.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

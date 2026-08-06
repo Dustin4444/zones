@@ -1,7 +1,7 @@
 # zone-checker
 
-An observe-only execution extension for authenticating the Zone and Tempo data
-that the checker model will consume.
+A checker crate containing the live observe-only execution extension and the
+non-wired in-memory evaluator used to validate the complete Goal 5 pipeline.
 
 The approved architecture and release gate are in [`DESIGN.md`](DESIGN.md).
 The checker-owned protocol vectors frozen by Goal 0 are inventoried in
@@ -9,19 +9,24 @@ The checker-owned protocol vectors frozen by Goal 0 are inventoried in
 
 ## Current status
 
-Goals 0 and 1 are implemented:
+Goals 0 through 5 are implemented:
 
 - Goal 0 defines checker-owned protocol constants, encodings, event types, and
   lifecycle vocabulary.
 - Goal 1 establishes the ephemeral authenticated-observation boundary.
+- Goals 2 through 4 implement the complete pure Portal, Zone-deposit,
+  withdrawal, batch, processing, bounce-back, and refund lifecycle model.
+- Goal 5 projects authenticated observations into that model, compares typed
+  implementation outputs, reads exact post-Zone commitments and supply, checks
+  post-L1/pre-Zone collateral, and commits passing candidates in memory.
 
-This is not deployable protocol coverage. There is no mutable model,
-persistence, restart/reorg recovery, lifecycle comparison, finding storage, or
-enforcement. In particular, the Goal 1 exact-state API requires an explicit
-checker-owned enabled-token set, but runtime orchestration has no model from
-which to obtain that set yet. It therefore observes the six fixed commitments
-with an empty supply set. Goal 5 connects the complete model-owned token set and
-per-token supply comparisons.
+This is still not deployable protocol coverage. The Goal 5 evaluator is an
+explicit `InMemoryChecker`; it is deliberately not wired into the ExEx until
+durable state and exact unwind exist. There is no persistence, restart/reorg
+recovery, finding storage, or enforcement. The live Goal 1 diagnostic path
+continues to acquire the six fixed commitments at the exact Zone block hash,
+but has no authoritative model-owned token set and therefore requests no
+supply slots. The in-memory Goal 5 path reads every enabled token supply.
 
 `--checker.mode` remains `off` by default. `observe` is a diagnostic development
 mode, not a shadow-release recommendation.
@@ -37,18 +42,21 @@ observations are never persisted.
 |---|---|---|
 | Imported Tempo header, deposits, decryptions, enabled tokens | Canonical `advanceTempo` calldata in the first Zone system transaction; exact ABI and header-RLP round trips | Malformed authenticated data |
 | Optional finalization count, block number, encrypted senders | Canonical `finalizeWithdrawalBatch` calldata in the unique final Zone system transaction | Invalid envelope or malformed authenticated data |
-| Zone protocol outcomes and containing transaction hashes | Ordered successful notification-local receipts paired with the canonical recovered block | Missing/inconsistent notification receipt sets are acquisition failures; per-block cardinality is an invalid envelope; protocol events fail closed |
-| Six fixed Zone commitments and selected token supplies | In-process `state_by_block_hash` at the exact canonical Zone hash | Retryable acquisition failure; an unwritten slot of an existing account is canonical EVM zero |
+| Zone protocol outcomes and containing transaction hashes | Ordered successful notification-local receipts paired with the canonical recovered block | Missing or internally inconsistent notification block/receipt data is an acquisition failure; protocol events fail closed |
+| Six fixed Zone commitments and model-selected token supplies | In-process `state_by_block_hash` at the exact canonical Zone hash | Retryable acquisition failure; an absent account or unwritten slot has canonical EVM value zero after the exact block state is acquired |
 | Ordered Tempo protocol outcomes | Complete receipt set authenticated against the receipt root and logs bloom in the imported header | Retryable acquisition failure or fail-closed protocol-event error |
 | Direct `submitBatch` and non-empty `processWithdrawals` inputs | Selectively fetched transaction body, bound by hash/block/index metadata, with exactly one top-level call to the configured Portal | Retryable acquisition failure, malformed calldata, or `UnsupportedNestedPortalCall` |
 
-Implementation events never choose the inputs they confirm. In particular,
-`TempoAdvanced` is compared with the imported header derived from
-`advanceTempo`; it is not an L1 block anchor.
+Implementation events never choose an independently knowable input or
+commitment. In particular, `TempoAdvanced` is compared with the imported
+header derived from `advanceTempo`; it is not an L1 block anchor. Outcome-only
+branches and private recipients come from their authenticated events, while
+the model independently checks the required identity movement, queue update,
+ownership, and `S/D/W` accounting.
 
 ### Zone block checks
 
-For each non-genesis canonical Zone block, the observer:
+For each non-genesis canonical Zone block, the observation layer:
 
 1. Requires equal transaction, recovered-sender, and receipt cardinalities.
 2. Requires the first transaction to be the successful system call to the
@@ -58,20 +66,26 @@ For each non-genesis canonical Zone block, the observer:
    `finalizeWithdrawalBatch`.
 4. Retains supported protocol logs in transaction/receipt order with the
    containing transaction hash.
-5. Compares input-confirming fields in `TempoAdvanced`, `TempoBlockFinalized`,
-   `TokenEnabled`, and optional `BatchFinalized` with authenticated calldata.
-   It retains queue/cursor events and exact post-state independently; Goal 5
-   supplies the model-owned expectations used to compare them.
+5. Retains model-driving inputs and implementation outcomes as distinct typed
+   values.
+
+The explicit Goal 5 evaluator then compares `TempoAdvanced`,
+`TempoBlockFinalized`, `TokenEnabled`, deposit outcomes, Zone operations, and
+optional `BatchFinalized` against model-owned expectations. It reads the six
+fixed commitments and every enabled token's literal slot-8 supply after the
+Zone block. Before applying the Zone transition, it checks one
+exact-imported-block Portal balance per Portal-enabled token against the
+checked `S + D + W` requirement.
 
 Dynamic ABI counts, offsets, and byte lengths are checked before generated
 decoders allocate. Calldata and Tempo-header RLP must re-encode byte-for-byte,
 with no trailing data.
 
-Goal 1 checks only the finalization relationships defined without mutable model
-state: canonical shape, count versus sender-array length, sender length, Zone
-block number, envelope position, successful receipt, event presence, and
-containing transaction. Pending-count and reveal-mode relationships are model
-rules introduced by later goals and are not guessed here.
+The observation layer checks only finalization relationships defined without
+mutable model state: canonical shape, count versus sender-array length, sender
+length, Zone block number, envelope position, and successful receipt. The Goal
+5 projection/model layer checks event grammar, pending-count, reveal-mode,
+batch identity, and exact output commitments.
 
 ### Tempo block checks
 
@@ -107,8 +121,8 @@ not fetch every transaction body or recompute the transaction root.
   can be retried; an inconsistent in-process notification is still an
   operational acquisition failure rather than a protocol finding. No
   acquisition failure becomes a zero/default observation.
-- Invalid envelopes cover caller, destination, position, success, cardinality,
-  and finalization block-number rules.
+- Invalid envelopes cover caller, destination, position, success, and
+  finalization block-number rules.
 - Malformed authenticated data covers non-canonical or structurally unsafe ABI
   and RLP.
 - Protocol-event errors fail closed for malformed known events, unknown topics
@@ -118,16 +132,16 @@ not fetch every transaction body or recompute the transaction root.
 - Portal-call reconciliation errors cover nested or ambiguous calls,
   conflicting event-implied call families, calldata/event family mismatches,
   and eventful empty `processWithdrawals` bodies.
-- Output mismatches report implementation outputs that disagree with an
-  authenticated input or required envelope relationship. Goal 1 never treats
-  one implementation output as the independent expectation for another.
+- Dedicated typed findings report observation, continuity, model-transition,
+  Portal/Zone output, fixed-state, supply, and collateral mismatches. There is
+  no generic invariant or value registry.
 
 ## Runtime behavior
 
 | Mode | Behavior |
 |---|---|
 | `off` | Default. The checker ExEx is not installed. |
-| `observe` | Authenticate and log ephemeral Goal 1 observations. Do not persist, enforce, or claim complete coverage. |
+| `observe` | Authenticate and log ephemeral Goal 1 observations, including exact fixed-state acquisition. Do not run the Goal 5 model, persist, enforce, or claim complete coverage. |
 
 Committed and reorged-in blocks are observed oldest-to-newest. Reverted and
 reorged-out blocks are logged newest-to-oldest but are not re-observed after
@@ -140,5 +154,6 @@ later goals.
 
 ```sh
 cargo test -p zone-checker
+cargo clippy -p zone-checker --all-targets -- -D warnings
 cargo fmt --check
 ```
