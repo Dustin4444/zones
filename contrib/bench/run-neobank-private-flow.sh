@@ -478,7 +478,9 @@ done
 mkdir -p "$ZONES_BENCH_OUTPUT" "$(dirname "$ZONES_BENCH_RENDERED_SCENARIO")"
 secret_dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/zones-neobank-auth.XXXXXX")"
 chmod 700 "$secret_dir"
-export ZONES_BENCH_ZONE_AUTH_MAP="$secret_dir/zone-auth.json"
+if [[ "${ZONES_BENCH_SKIP_AUTH_SETUP:-0}" != 1 ]]; then
+    export ZONES_BENCH_ZONE_AUTH_MAP="$secret_dir/zone-auth.json"
+fi
 auth_pid=""
 cleanup() {
     local status=$?
@@ -539,56 +541,70 @@ stage_start render_scenario
     die "txgen did not render the selected neobank scenario"
 stage_end render_scenario
 
-# The bootstrap scenario approves the control account before depositing the
-# Zone fee token to the sequencer.
-run_setup_scenario \
-    bootstrap "$bootstrap_scenario" 1 \
-    "$ZONES_BENCH_OUTPUT/bootstrap-report.json"
+if [[ "${ZONES_BENCH_SKIP_COMMON_SETUP:-0}" != 1 ]]; then
+    # The bootstrap scenario approves the control account before depositing the
+    # Zone fee token to the sequencer.
+    run_setup_scenario \
+        bootstrap "$bootstrap_scenario" 1 \
+        "$ZONES_BENCH_OUTPUT/bootstrap-report.json"
 
-run_setup_scenario \
-    portal_approval "$portal_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
-    "$ZONES_BENCH_OUTPUT/portal-approval-report.json" "approval_round=portal"
+    run_setup_scenario \
+        portal_approval "$portal_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
+        "$ZONES_BENCH_OUTPUT/portal-approval-report.json" "approval_round=portal"
+fi
 
 # The auth map is intentionally mode 0600 and is never copied to benchmark artifacts.
 # Build it before any Zone funding scenario: those scenarios observe the private
 # Zone and therefore need the same per-sender authorization as the measured run.
 stage_start auth_token_map
-"$txgen_bin" auth-token-map --spec "$neobank_specs/zone-flow.yml" --pool users \
-    --zone-id "$ZONES_BENCH_EXPECTED_ZONE_ID" \
-    --chain-id "$ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID" \
-    --ttl-secs "$ZONES_BENCH_AUTH_TTL_SECS" \
-    --refresh-before-secs "$ZONES_BENCH_AUTH_REFRESH_SECS" \
-    --watch --output "$secret_dir/zone-auth.json" >"$secret_dir/auth-token-map.log" 2>&1 &
-auth_pid=$!
-for _ in $(seq 1 60); do [[ -f "$secret_dir/zone-auth.json" ]] && break; sleep 1; done
-[[ -f "$secret_dir/zone-auth.json" ]] || die "timed out creating private Zone auth map"
+if [[ "${ZONES_BENCH_SKIP_AUTH_SETUP:-0}" != 1 ]]; then
+    "$txgen_bin" auth-token-map --spec "$neobank_specs/zone-flow.yml" --pool users \
+        --zone-id "$ZONES_BENCH_EXPECTED_ZONE_ID" \
+        --chain-id "$ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID" \
+        --ttl-secs "$ZONES_BENCH_AUTH_TTL_SECS" \
+        --refresh-before-secs "$ZONES_BENCH_AUTH_REFRESH_SECS" \
+        --watch --output "$secret_dir/zone-auth.json" >"$secret_dir/auth-token-map.log" 2>&1 &
+    auth_pid=$!
+    for _ in $(seq 1 60); do [[ -f "$ZONES_BENCH_ZONE_AUTH_MAP" ]] && break; sleep 1; done
+fi
+[[ -f "${ZONES_BENCH_ZONE_AUTH_MAP:?persistent Zone auth map is required}" ]] ||
+    die "timed out creating private Zone auth map"
 jq -e 'to_entries | all(.[]; (.key | type) == "string" and (.value | type) == "string")' \
-    "$secret_dir/zone-auth.json" >/dev/null ||
+    "$ZONES_BENCH_ZONE_AUTH_MAP" >/dev/null ||
     die "private Zone auth map is malformed"
-jq -S 'keys | sort' "$secret_dir/zone-auth.json" >"$ZONES_BENCH_OUTPUT/accounts.json"
-jq -e --argjson expected "$ZONES_BENCH_ACCOUNTS" '
-    length == $expected and
-    all(.[]; type == "string") and
-    (unique | length) == $expected
-' "$ZONES_BENCH_OUTPUT/accounts.json" >/dev/null ||
-    die "auth map did not derive the expected unique benchmark account pool"
+if [[ "${ZONES_BENCH_SKIP_AUTH_SETUP:-0}" != 1 ]]; then
+    jq -S 'keys | sort' "$ZONES_BENCH_ZONE_AUTH_MAP" >"$ZONES_BENCH_OUTPUT/accounts.json"
+    jq -e --argjson expected "$ZONES_BENCH_ACCOUNTS" '
+        length == $expected and
+        all(.[]; type == "string") and
+        (unique | length) == $expected
+    ' "$ZONES_BENCH_OUTPUT/accounts.json" >/dev/null ||
+        die "auth map did not derive the expected unique benchmark account pool"
+fi
 stage_end auth_token_map
 
-# Deposit-only never submits a user transaction to the Zone. Every other preset
-# seeds the enabled-token balance required by current Zone txpool admission.
-case "$ZONES_BENCH_NEOBANK_PRESET" in
-    encrypted-deposit) ;;
-    earn-deposit|zone-withdrawal) fund_zone_accounts ;;
-    *) seed_zone_admission_balances ;;
-esac
+if [[ "${ZONES_BENCH_SKIP_COMMON_SETUP:-0}" != 1 ]]; then
+    # Deposit-only never submits a user transaction to the Zone. Every other preset
+    # seeds the enabled-token balance required by current Zone txpool admission.
+    case "$ZONES_BENCH_NEOBANK_PRESET" in
+        encrypted-deposit) ;;
+        earn-deposit|zone-withdrawal) fund_zone_accounts ;;
+        *) seed_zone_admission_balances ;;
+    esac
 
-# Approvals are untimed. Deposit-only submits no user Zone transaction.
-# The fixed scenario approves both enabled assets for each leased account.
-if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" ]]; then
-    run_setup_scenario \
-        zone_approvals "$zone_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
-        "$ZONES_BENCH_OUTPUT/zone-approvals-report.json" \
-        "approval_round=base_and_earn"
+    # Approvals are untimed. Deposit-only submits no user Zone transaction.
+    # The fixed scenario approves both enabled assets for each leased account.
+    if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" ]]; then
+        run_setup_scenario \
+            zone_approvals "$zone_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
+            "$ZONES_BENCH_OUTPUT/zone-approvals-report.json" \
+            "approval_round=base_and_earn"
+    fi
+fi
+
+if [[ "${ZONES_BENCH_PREPARE_ONLY:-0}" == 1 ]]; then
+    echo "neobank persistent setup ready"
+    exit 0
 fi
 
 if [[ "$ZONES_BENCH_NEOBANK_PRESET" == "rewards-redemption" ]]; then

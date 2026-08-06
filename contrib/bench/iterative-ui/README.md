@@ -7,14 +7,20 @@ just live-bench
 ```
 
 The command first builds and provisions one persistent local Tempo dev L1, private
-Zone, and set of current Earn fixtures. It opens `http://127.0.0.1:4179` only after
-that topology is ready. Each **Go** button then runs only the selected real
-`txgen-tempo` scenario and reports its p99 latency, gas, and fees.
+Zone, and set of current Earn fixtures. It also prepares the reusable account
+balances, approvals, and private-RPC authorization map. It opens
+`http://127.0.0.1:4179` only after that setup is ready. Each **Go** button then runs
+only the selected real `txgen-tempo` scenario and reports its p99 latency, gas, and
+fees.
 
 The four buttons are independent: onramp, Earn vault deposit, Earn vault redeem,
 and offramp. They all reuse the running topology until `just live-bench` stops.
 The transaction input and advanced rate/concurrency controls are configurable;
-transactions reuse a pre-authorized 100-account pool as needed.
+transactions reuse the pre-authorized account pool as needed.
+
+The pool defaults to 100 accounts and can be changed at startup with
+`ITERATIVE_BENCH_ACCOUNT_CAPACITY`; the UI keeps transaction count, start rate,
+and concurrency configurable for each run.
 
 The first run can take several minutes while Rust binaries and the pinned txgen are
 built and the persistent topology is provisioned. Runtime data and logs are written

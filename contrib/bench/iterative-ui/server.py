@@ -25,7 +25,11 @@ from urllib.parse import urlparse
 STATE_VERSION = 6
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 ACCOUNT_START = 16
-TOPOLOGY_ACCOUNT_CAPACITY = 100
+TOPOLOGY_ACCOUNT_CAPACITY = int(
+    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "100")
+)
+if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 100:
+    raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 100")
 PHASES = (
     {
         "id": "deposit",
@@ -469,7 +473,12 @@ class BenchmarkController:
             return value
 
         count = integer("count", 100, 1, 1_000)
-        requested_concurrency = integer("concurrency", 12, 1, 100)
+        requested_concurrency = integer(
+            "concurrency",
+            min(12, TOPOLOGY_ACCOUNT_CAPACITY),
+            1,
+            TOPOLOGY_ACCOUNT_CAPACITY,
+        )
         concurrency = min(requested_concurrency, count)
         accounts = integer("accounts", concurrency, concurrency, 10_000)
         scenario = str(raw.get("scenario", "deposit"))
@@ -741,7 +750,7 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    topology_dir = state_dir / "topologies" / str(int(time.time() * 1000))
+    topology_dir = (state_dir / "topologies" / str(int(time.time() * 1000))).resolve()
     topology_args = argparse.Namespace(
         preset="encrypted-deposit",
         count=1,
@@ -757,6 +766,110 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         if not txgen.is_file():
             raise RuntimeError("txgen-tempo was not installed")
         environment, _ = topology.topology(tempo, specs_out, earn_revision)
+
+        auth_dir = topology_dir / "auth"
+        auth_dir.mkdir(mode=0o700)
+        auth_map = auth_dir / "zone-auth.json"
+        auth_env = dict(environment)
+        auth_env.update(
+            {
+                "ZONES_BENCH_MNEMONIC": Path(environment["ZONES_BENCH_MNEMONIC_FILE"])
+                .read_text()
+                .strip(),
+                "ZONES_BENCH_ACTIVITY_AMOUNT": "1",
+                "ZONES_BENCH_WITHDRAWAL_AMOUNT": "1000000",
+                "ZONES_BENCH_CALLBACK_GAS_LIMIT": "10000000",
+                "ZONES_BENCH_ZONE_MAX_FEE_PER_GAS": "10000000000",
+                "ZONES_BENCH_ZONE_MAX_PRIORITY_FEE_PER_GAS": "0",
+            }
+        )
+        topology.stage(
+            "topology", "Starting the persistent private-Zone authorization map"
+        )
+        topology.start_process(
+            "auth-token-map",
+            [
+                txgen,
+                "auth-token-map",
+                "--spec",
+                root / "contrib" / "bench" / "neobank" / "zone-flow.yml",
+                "--pool",
+                "users",
+                "--zone-id",
+                environment["ZONES_BENCH_EXPECTED_ZONE_ID"],
+                "--chain-id",
+                environment["ZONES_BENCH_EXPECTED_ZONE_CHAIN_ID"],
+                "--ttl-secs",
+                "600",
+                "--refresh-before-secs",
+                "60",
+                "--watch",
+                "--output",
+                auth_map,
+            ],
+            env=auth_env,
+        )
+        deadline = time.monotonic() + 30
+        while not auth_map.is_file() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not auth_map.is_file():
+            raise RuntimeError(
+                "persistent private-Zone authorization map was not created"
+            )
+        auth_entries = json.loads(auth_map.read_text())
+        if (
+            not isinstance(auth_entries, dict)
+            or len(auth_entries) != TOPOLOGY_ACCOUNT_CAPACITY
+        ):
+            raise RuntimeError(
+                "persistent private-Zone authorization map is incomplete"
+            )
+        environment["ZONES_BENCH_ZONE_AUTH_MAP"] = str(auth_map)
+
+        topology.stage(
+            "topology", "Preparing balances and approvals for every scenario"
+        )
+        prepare_dir = topology_dir / "scenario-setup"
+        prepare_output = prepare_dir / "output"
+        prepare_tmp = prepare_dir / "tmp"
+        prepare_output.mkdir(parents=True)
+        prepare_tmp.mkdir()
+        prepare_env = dict(environment)
+        prepare_env.update(
+            {
+                "ZONES_BENCH_NEOBANK_PRESET": "earn-deposit",
+                "ZONES_BENCH_COUNT": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_ACCOUNTS": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_TPS": "1",
+                "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_OUTPUT": str(prepare_output),
+                "ZONES_BENCH_REPORT": str(prepare_dir / "unused-report.json"),
+                "ZONES_BENCH_RENDERED_SCENARIO": str(
+                    prepare_output / "scenario.rendered.yml"
+                ),
+                "ZONES_BENCH_RUN_ID": "persistent-topology-setup",
+                "ZONES_BENCH_SAMPLE_INSTANCES": "1",
+                "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
+                "ZONES_BENCH_PREPARE_ONLY": "1",
+                "ZONES_BENCH_SKIP_AUTH_SETUP": "1",
+                "RUNNER_TEMP": str(prepare_tmp),
+            }
+        )
+        prepared = subprocess.run(
+            ["bash", "contrib/bench/run-neobank-private-flow.sh"],
+            cwd=root,
+            env=prepare_env,
+            check=False,
+        )
+        if prepared.returncode != 0:
+            raise RuntimeError("persistent scenario balance and approval setup failed")
+        environment.update(
+            {
+                "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
+                "ZONES_BENCH_SKIP_COMMON_SETUP": "1",
+                "ZONES_BENCH_SKIP_AUTH_SETUP": "1",
+            }
+        )
         print(
             f"Persistent topology ready with {TOPOLOGY_ACCOUNT_CAPACITY} authorized accounts.",
             flush=True,
