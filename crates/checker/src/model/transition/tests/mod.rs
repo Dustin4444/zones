@@ -1,6 +1,10 @@
 mod deposits;
 mod finalization;
 mod portal;
+mod processing;
+mod refund_invariants;
+mod refunds;
 mod scenarios;
+mod submission;
 mod support;
 mod withdrawals;

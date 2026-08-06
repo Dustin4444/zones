@@ -10,16 +10,17 @@ use super::{
         output::{ExpectedDepositAppend, ExpectedImportedTempoBlock},
         ownership::{DepositId, DepositOwner, FallbackId, FallbackOwner},
         state::{
-            CreatedPortalState, PortalConfig, PortalDepositCursor, PortalLifecycle, TokenPhase,
-            TokenState, portal_address_for_zone,
+            CreatedPortalState, PortalConfig, PortalDepositCursor, PortalLifecycle,
+            PortalSettlementState, TokenPhase, TokenState, portal_address_for_zone,
         },
     },
-    ModelError, ModelTransition,
+    ModelError, ModelTransition, processing, refunds, submission,
 };
 
 pub(super) fn apply_operation(
     candidate: &mut ModelTransition<'_>,
     operation: &ImportedTempoOperation,
+    block_base_fee: U256,
     block_token_enables: &mut Vec<TokenEnable>,
     expected: &mut ExpectedImportedTempoBlock,
 ) -> Result<(), ModelError> {
@@ -34,14 +35,29 @@ pub(super) fn apply_operation(
         ImportedTempoOperation::BouncebackGasUpdated(bounceback_gas) => {
             let mut portal = require_created(candidate)?.clone();
             portal.config.bounceback_gas = *bounceback_gas;
-            candidate.set_portal(PortalLifecycle::Created(portal));
+            candidate.set_portal(PortalLifecycle::Created(Box::new(portal)));
             Ok(())
         }
         ImportedTempoOperation::OrdinaryDepositAppended(input) => {
-            append_ordinary(candidate, input, expected)
+            let append = append_ordinary(candidate, input)?;
+            expected.push_deposit_append(append);
+            Ok(())
         }
-        ImportedTempoOperation::WithdrawalBounceBackAppended(input) => {
-            append_withdrawal_bounce_back(candidate, *input, expected)
+        ImportedTempoOperation::BatchSubmitted(input) => {
+            expected.push_batch_submission(submission::apply(candidate, input)?);
+            Ok(())
+        }
+        ImportedTempoOperation::WithdrawalsProcessed(input) => {
+            expected.push_withdrawal_processing(processing::apply(
+                candidate,
+                input,
+                block_base_fee,
+            )?);
+            Ok(())
+        }
+        ImportedTempoOperation::PortalRefundClaimed(input) => {
+            expected.push_refund_claim(refunds::claim_portal(candidate, *input)?);
+            Ok(())
         }
     }
 }
@@ -75,11 +91,12 @@ fn apply_creation(
         });
     }
 
-    candidate.set_portal(PortalLifecycle::Created(CreatedPortalState {
+    candidate.set_portal(PortalLifecycle::Created(Box::new(CreatedPortalState {
         identity: expected_identity,
         config: PortalConfig::INITIAL,
         deposit_cursor: PortalDepositCursor::ZERO,
-    }));
+        settlement: PortalSettlementState::ZERO,
+    })));
     enable_portal_token(candidate, input.initial_token_enable(), block_token_enables)
 }
 
@@ -106,11 +123,10 @@ fn enable_portal_token(
     Ok(())
 }
 
-fn append_ordinary(
+pub(super) fn append_ordinary(
     candidate: &mut ModelTransition<'_>,
     input: &super::super::encoding::OrdinaryDeposit,
-    expected: &mut ExpectedImportedTempoBlock,
-) -> Result<(), ModelError> {
+) -> Result<ExpectedDepositAppend, ModelError> {
     require_created(candidate)?;
     if input.tempo_refund_recipient().is_zero() {
         return Err(ModelError::ZeroTempoRefundRecipient);
@@ -137,15 +153,13 @@ fn append_ordinary(
             preimage: input.clone(),
         }),
     );
-    expected.push_deposit_append(ExpectedDepositAppend::new(id, queue_hash));
-    Ok(())
+    Ok(ExpectedDepositAppend::new(id, queue_hash))
 }
 
-fn append_withdrawal_bounce_back(
+pub(super) fn append_withdrawal_bounce_back(
     candidate: &mut ModelTransition<'_>,
     input: super::super::encoding::WithdrawalBounceBackDeposit,
-    expected: &mut ExpectedImportedTempoBlock,
-) -> Result<(), ModelError> {
+) -> Result<ExpectedDepositAppend, ModelError> {
     let zone_id = require_created(candidate)?.identity.zone_id();
     if candidate.token(input.token()).is_none() {
         return Err(ModelError::TokenNotPortalEnabled {
@@ -198,8 +212,7 @@ fn append_withdrawal_bounce_back(
             deposit: id,
         }),
     );
-    expected.push_deposit_append(ExpectedDepositAppend::new(id, queue_hash));
-    Ok(())
+    Ok(ExpectedDepositAppend::new(id, queue_hash))
 }
 
 fn append_member(
@@ -222,11 +235,11 @@ fn append_member(
         return Err(ModelError::DepositOwnerCollision { number });
     }
     portal.deposit_cursor = PortalDepositCursor::new(queue_hash, number);
-    candidate.set_portal(PortalLifecycle::Created(portal));
+    candidate.set_portal(PortalLifecycle::Created(Box::new(portal)));
     Ok((id, queue_hash))
 }
 
-fn require_created<'a>(
+pub(super) fn require_created<'a>(
     candidate: &'a ModelTransition<'_>,
 ) -> Result<&'a CreatedPortalState, ModelError> {
     candidate

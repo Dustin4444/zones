@@ -1,15 +1,14 @@
 //! Checker-owned semantic inputs and authenticated branch outcomes.
 
-// Goal 2 keeps construction inside the pure-model boundary. Goal 5 will add
-// the narrow projection from Goal 1's adapter-owned observation types; do not
-// make these constructors a crate-wide authenticated-value relabeling API.
+// Construction stays inside the pure-model boundary. Goal 5 will add the
+// narrow projection from Goal 1's adapter-owned observation types; do not make
+// these constructors a crate-wide authenticated-value relabeling API.
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 
 use super::{
-    encoding::{
-        DepositQueueMember, OrdinaryDeposit, UserWithdrawalRequest, WithdrawalBounceBackDeposit,
-    },
+    encoding::{DepositQueueMember, OrdinaryDeposit, UserWithdrawalRequest, Withdrawal},
+    ownership::DepositCursor,
     state::PortalIdentity,
 };
 
@@ -79,6 +78,189 @@ impl PortalCreationInput {
     }
 }
 
+/// Block-hash pair supplied by one authenticated `submitBatch` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchBlockTransitionInput {
+    previous: B256,
+    next: B256,
+}
+
+impl BatchBlockTransitionInput {
+    pub(super) const fn new(previous: B256, next: B256) -> Self {
+        Self { previous, next }
+    }
+
+    pub(super) const fn previous(&self) -> B256 {
+        self.previous
+    }
+
+    pub(super) const fn next(&self) -> B256 {
+        self.next
+    }
+}
+
+/// Processed-deposit cursor pair supplied by one authenticated `submitBatch` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchDepositTransitionInput {
+    previous: DepositCursor,
+    next: DepositCursor,
+}
+
+impl BatchDepositTransitionInput {
+    pub(super) const fn new(previous: DepositCursor, next: DepositCursor) -> Self {
+        Self { previous, next }
+    }
+
+    pub(super) const fn previous(&self) -> DepositCursor {
+        self.previous
+    }
+
+    pub(super) const fn next(&self) -> DepositCursor {
+        self.next
+    }
+}
+
+/// Settlement fields from one authenticated direct `submitBatch` call.
+///
+/// Proof, quorum, verifier, and anchoring data are intentionally absent: the
+/// release-one model trusts their successful execution and independently
+/// checks only the fields that advance logical settlement state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchSubmissionInput {
+    tempo_block_number: u64,
+    block_transition: BatchBlockTransitionInput,
+    deposit_transition: BatchDepositTransitionInput,
+    withdrawal_queue_hash: B256,
+    next_zone_height: U256,
+}
+
+impl BatchSubmissionInput {
+    pub(super) const fn new(
+        tempo_block_number: u64,
+        block_transition: BatchBlockTransitionInput,
+        deposit_transition: BatchDepositTransitionInput,
+        withdrawal_queue_hash: B256,
+        next_zone_height: U256,
+    ) -> Self {
+        Self {
+            tempo_block_number,
+            block_transition,
+            deposit_transition,
+            withdrawal_queue_hash,
+            next_zone_height,
+        }
+    }
+
+    pub(super) const fn tempo_block_number(&self) -> u64 {
+        self.tempo_block_number
+    }
+
+    pub(super) const fn block_transition(&self) -> BatchBlockTransitionInput {
+        self.block_transition
+    }
+
+    pub(super) const fn deposit_transition(&self) -> BatchDepositTransitionInput {
+        self.deposit_transition
+    }
+
+    pub(super) const fn withdrawal_queue_hash(&self) -> B256 {
+        self.withdrawal_queue_hash
+    }
+
+    pub(super) const fn next_zone_height(&self) -> U256 {
+        self.next_zone_height
+    }
+}
+
+/// Authenticated aggregate refund-claim event fields.
+///
+/// Recipient and token select the per-origin owner prefix. The model derives
+/// the aggregate independently and requires it to equal `amount`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefundClaimInput {
+    recipient: Address,
+    token: Address,
+    amount: u128,
+}
+
+impl RefundClaimInput {
+    pub(super) const fn new(recipient: Address, token: Address, amount: u128) -> Self {
+        Self {
+            recipient,
+            token,
+            amount,
+        }
+    }
+
+    pub(super) const fn recipient(&self) -> Address {
+        self.recipient
+    }
+
+    pub(super) const fn token(&self) -> Address {
+        self.token
+    }
+
+    pub(super) const fn amount(&self) -> u128 {
+        self.amount
+    }
+}
+
+/// Authenticated implementation branch for one calldata withdrawal.
+///
+/// Callback-created ordinary deposits are retained in their exact nested log
+/// order. Every other field of the terminal Portal event is derived from the
+/// finalized withdrawal and returned as an expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthenticatedWithdrawalOutcome {
+    UserDelivered {
+        callback_deposits: Vec<OrdinaryDeposit>,
+    },
+    UserBounced,
+    FailedDepositPaid,
+    FailedDepositPending,
+}
+
+impl AuthenticatedWithdrawalOutcome {
+    pub(super) fn user_delivered(callback_deposits: Vec<OrdinaryDeposit>) -> Self {
+        Self::UserDelivered { callback_deposits }
+    }
+}
+
+/// One authenticated direct `processWithdrawals` call and its per-member
+/// branch outcomes. The transition checks the two vectors have equal length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WithdrawalProcessingInput {
+    withdrawals: Vec<Withdrawal>,
+    remaining_queue: B256,
+    outcomes: Vec<AuthenticatedWithdrawalOutcome>,
+}
+
+impl WithdrawalProcessingInput {
+    pub(super) fn new(
+        withdrawals: Vec<Withdrawal>,
+        remaining_queue: B256,
+        outcomes: Vec<AuthenticatedWithdrawalOutcome>,
+    ) -> Self {
+        Self {
+            withdrawals,
+            remaining_queue,
+            outcomes,
+        }
+    }
+
+    pub(super) fn withdrawals(&self) -> &[Withdrawal] {
+        &self.withdrawals
+    }
+
+    pub(super) const fn remaining_queue(&self) -> B256 {
+        self.remaining_queue
+    }
+
+    pub(super) fn outcomes(&self) -> &[AuthenticatedWithdrawalOutcome] {
+        &self.outcomes
+    }
+}
+
 /// One authenticated Portal operation in exact receipt/log order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ImportedTempoOperation {
@@ -86,26 +268,38 @@ pub(crate) enum ImportedTempoOperation {
     TokenEnabled(TokenEnable),
     BouncebackGasUpdated(u64),
     OrdinaryDepositAppended(OrdinaryDeposit),
-    WithdrawalBounceBackAppended(WithdrawalBounceBackDeposit),
+    BatchSubmitted(Box<BatchSubmissionInput>),
+    WithdrawalsProcessed(Box<WithdrawalProcessingInput>),
+    PortalRefundClaimed(RefundClaimInput),
 }
 
 /// Ordered model-driving operations from one authenticated Tempo block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportedTempoBlockInput {
     tempo_block_number: u64,
+    base_fee: U256,
     operations: Vec<ImportedTempoOperation>,
 }
 
 impl ImportedTempoBlockInput {
-    pub(super) fn new(tempo_block_number: u64, operations: Vec<ImportedTempoOperation>) -> Self {
+    pub(super) fn new(
+        tempo_block_number: u64,
+        base_fee: U256,
+        operations: Vec<ImportedTempoOperation>,
+    ) -> Self {
         Self {
             tempo_block_number,
+            base_fee,
             operations,
         }
     }
 
     pub(super) const fn tempo_block_number(&self) -> u64 {
         self.tempo_block_number
+    }
+
+    pub(super) const fn base_fee(&self) -> U256 {
+        self.base_fee
     }
 
     pub(super) fn operations(&self) -> &[ImportedTempoOperation] {
@@ -229,6 +423,7 @@ pub(crate) enum ZoneOperation {
     TempoGasRateUpdated(u128),
     MaxWithdrawalsPerBlockUpdated(u32),
     UserWithdrawalAccepted(Box<UserWithdrawalInput>),
+    InboxRefundClaimed(RefundClaimInput),
 }
 
 impl ZoneOperation {
