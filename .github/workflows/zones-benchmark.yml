@@ -395,7 +395,7 @@ jobs:
           INPUT_SETUP_SETTLEMENT_TIMEOUT_SECS: ${{ steps.request.outputs.setup-settlement-timeout-secs || inputs.setup-settlement-timeout-secs || '120' }}
           INPUT_DRAIN_TIMEOUT: ${{ steps.request.outputs.drain-timeout || inputs.drain-timeout || '300' }}
           INPUT_SEED: ${{ steps.request.outputs.seed || inputs.seed || '' }}
-          INPUT_TEMPO_REF: a55a6395567f529f03fa88bc457584fa8ed89af8
+          INPUT_TEMPO_REF: a80c1438241e9edd67d8a96c6c07d3697fcf77d8
           INPUT_TXGEN_REF: 072877b673f60b5f559f17da098296f1841b6732
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
