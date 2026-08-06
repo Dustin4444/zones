@@ -8,8 +8,8 @@ use super::{
     accounting::TokenAccounting,
     constants::{INITIAL_CONFIG, ZONE_PORTAL_ADDRESS_PREFIX},
     ownership::{
-        DepositId, DepositOwner, FallbackId, FallbackOwner, InboxRefundId, InboxRefundOwner,
-        WithdrawalId, WithdrawalOwner,
+        BatchId, BatchOwner, DepositId, DepositOwner, FallbackId, FallbackOwner, InboxRefundId,
+        InboxRefundOwner, WithdrawalId, WithdrawalOwner,
     },
 };
 
@@ -155,6 +155,15 @@ impl PortalLifecycle {
             Self::Created(portal) => Some(portal),
         }
     }
+
+    /// Configured Zone identity is valid before the Portal creation block;
+    /// Portal address and token operations must still use [`Self::created`].
+    pub(crate) const fn zone_id(&self) -> u32 {
+        match self {
+            Self::AwaitingCreation { expected } => expected.zone_id,
+            Self::Created(portal) => portal.identity.zone_id,
+        }
+    }
 }
 
 /// A token is always Portal-enabled before it can become Zone-enabled.
@@ -185,20 +194,123 @@ impl TokenState {
     }
 }
 
-/// Zone-side monotonic state needed by the deposit-prefix transition.
+/// Ordered Outbox configuration active at the current verified cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZoneConfig {
+    pub(super) tempo_gas_rate: u128,
+    pub(super) max_withdrawals_per_block: u32,
+}
+
+impl ZoneConfig {
+    pub(crate) const INITIAL: Self = Self {
+        tempo_gas_rate: INITIAL_CONFIG.tempo_gas_rate,
+        max_withdrawals_per_block: INITIAL_CONFIG.max_withdrawals_per_block,
+    };
+
+    pub(crate) const fn tempo_gas_rate(&self) -> u128 {
+        self.tempo_gas_rate
+    }
+
+    pub(crate) const fn max_withdrawals_per_block(&self) -> u32 {
+        self.max_withdrawals_per_block
+    }
+}
+
+/// Exact native Outbox `lastBatch` pair at the verified cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZoneLastBatch {
+    pub(super) withdrawal_queue_hash: B256,
+    pub(super) withdrawal_batch_index: u64,
+}
+
+impl ZoneLastBatch {
+    pub(crate) const ZERO: Self = Self {
+        withdrawal_queue_hash: B256::ZERO,
+        withdrawal_batch_index: 0,
+    };
+
+    pub(crate) const fn withdrawal_queue_hash(&self) -> B256 {
+        self.withdrawal_queue_hash
+    }
+
+    pub(crate) const fn withdrawal_batch_index(&self) -> u64 {
+        self.withdrawal_batch_index
+    }
+}
+
+/// Immutable start anchor of the currently accumulating withdrawal batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchStart {
+    pub(super) first_zone_parent_hash: B256,
+    pub(super) first_processed_deposit: ZoneProcessedDepositCursor,
+    pub(super) first_withdrawal_index: u64,
+}
+
+impl BatchStart {
+    /// The Portal's initial block/deposit transition anchors are literal zero;
+    /// they are not inferred from the local Zone genesis block.
+    pub(crate) const INITIAL: Self = Self {
+        first_zone_parent_hash: B256::ZERO,
+        first_processed_deposit: ZoneProcessedDepositCursor::ZERO,
+        first_withdrawal_index: 0,
+    };
+
+    pub(crate) const fn first_zone_parent_hash(&self) -> B256 {
+        self.first_zone_parent_hash
+    }
+
+    pub(crate) const fn first_processed_deposit(&self) -> ZoneProcessedDepositCursor {
+        self.first_processed_deposit
+    }
+
+    pub(crate) const fn first_withdrawal_index(&self) -> u64 {
+        self.first_withdrawal_index
+    }
+}
+
+/// Zone-side configuration, counters, and current batch accumulator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ZoneState {
+    pub(super) config: ZoneConfig,
     pub(super) processed_deposit_cursor: ZoneProcessedDepositCursor,
     pub(super) next_withdrawal_index: u64,
+    pub(super) last_fallback_nonce: u64,
+    pub(super) last_batch: ZoneLastBatch,
+    pub(super) batch_start: BatchStart,
 }
 
 impl ZoneState {
+    pub(crate) const INITIAL: Self = Self {
+        config: ZoneConfig::INITIAL,
+        processed_deposit_cursor: ZoneProcessedDepositCursor::ZERO,
+        next_withdrawal_index: 0,
+        last_fallback_nonce: 0,
+        last_batch: ZoneLastBatch::ZERO,
+        batch_start: BatchStart::INITIAL,
+    };
+
+    pub(crate) const fn config(&self) -> ZoneConfig {
+        self.config
+    }
+
     pub(crate) const fn processed_deposit_cursor(&self) -> ZoneProcessedDepositCursor {
         self.processed_deposit_cursor
     }
 
     pub(crate) const fn next_withdrawal_index(&self) -> u64 {
         self.next_withdrawal_index
+    }
+
+    pub(crate) const fn last_fallback_nonce(&self) -> u64 {
+        self.last_fallback_nonce
+    }
+
+    pub(crate) const fn last_batch(&self) -> ZoneLastBatch {
+        self.last_batch
+    }
+
+    pub(crate) const fn batch_start(&self) -> BatchStart {
+        self.batch_start
     }
 }
 
@@ -210,6 +322,7 @@ pub(crate) struct ModelState {
     pub(super) tokens: BTreeMap<Address, TokenState>,
     pub(super) pending_deposits: BTreeMap<DepositId, DepositOwner>,
     pub(super) withdrawals: BTreeMap<WithdrawalId, WithdrawalOwner>,
+    pub(super) batches: BTreeMap<BatchId, BatchOwner>,
     pub(super) fallback_owners: BTreeMap<FallbackId, FallbackOwner>,
     pub(super) inbox_refunds: BTreeMap<InboxRefundId, InboxRefundOwner>,
 }
@@ -218,13 +331,11 @@ impl ModelState {
     pub(crate) fn awaiting_creation(expected: PortalIdentity) -> Self {
         Self {
             portal: PortalLifecycle::AwaitingCreation { expected },
-            zone: ZoneState {
-                processed_deposit_cursor: ZoneProcessedDepositCursor::ZERO,
-                next_withdrawal_index: 0,
-            },
+            zone: ZoneState::INITIAL,
             tokens: BTreeMap::new(),
             pending_deposits: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
+            batches: BTreeMap::new(),
             fallback_owners: BTreeMap::new(),
             inbox_refunds: BTreeMap::new(),
         }
@@ -252,6 +363,14 @@ impl ModelState {
 
     pub(crate) fn withdrawal(&self, id: WithdrawalId) -> Option<&WithdrawalOwner> {
         self.withdrawals.get(&id)
+    }
+
+    pub(crate) fn withdrawals(&self) -> &BTreeMap<WithdrawalId, WithdrawalOwner> {
+        &self.withdrawals
+    }
+
+    pub(crate) fn batch(&self, id: BatchId) -> Option<&BatchOwner> {
+        self.batches.get(&id)
     }
 
     pub(crate) fn fallback_owner(&self, id: FallbackId) -> Option<&FallbackOwner> {
@@ -289,6 +408,22 @@ impl ModelState {
 
     pub(crate) fn set_next_withdrawal_index_for_test(&mut self, next: u64) {
         self.zone.next_withdrawal_index = next;
+    }
+
+    pub(crate) fn set_last_fallback_nonce_for_test(&mut self, nonce: u64) {
+        self.zone.last_fallback_nonce = nonce;
+    }
+
+    pub(crate) fn set_last_batch_for_test(&mut self, last_batch: ZoneLastBatch) {
+        self.zone.last_batch = last_batch;
+    }
+
+    pub(crate) fn seed_withdrawal_for_test(&mut self, id: WithdrawalId, owner: WithdrawalOwner) {
+        assert!(self.withdrawals.insert(id, owner).is_none());
+    }
+
+    pub(crate) fn seed_batch_for_test(&mut self, id: BatchId, owner: BatchOwner) {
+        assert!(self.batches.insert(id, owner).is_none());
     }
 
     pub(crate) fn seed_inbox_refund_for_test(

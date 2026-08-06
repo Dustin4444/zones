@@ -1,7 +1,9 @@
 //! Pure read-through transition overlay and typed logical delta.
 
 mod deposits;
+mod finalization;
 mod portal;
+mod zone;
 
 use std::{
     cmp::Ordering,
@@ -13,12 +15,15 @@ use alloy_primitives::Address;
 
 use super::{
     accounting::AccountingError,
-    encoding::DepositQueueMember,
-    input::{ImportedTempoBlockInput, TokenEnable, ZoneDepositPrefixInput},
-    output::{ExpectedImportedTempoBlock, ExpectedOutputs},
+    encoding::{DepositQueueMember, WithdrawalDataError},
+    fees::FeeError,
+    input::{ImportedTempoBlockInput, TokenEnable, ZoneBlockInput, ZoneDepositPrefixInput},
+    output::{
+        ExpectedImportedTempoBlock, ExpectedOutputs, ExpectedZoneBlock, ExpectedZoneDepositPrefix,
+    },
     ownership::{
-        DepositId, DepositOwner, FallbackId, FallbackOwner, InboxRefundId, InboxRefundOwner,
-        WithdrawalId, WithdrawalOwner,
+        BatchId, BatchOwner, BatchStateError, DepositId, DepositOwner, FallbackId, FallbackOwner,
+        InboxRefundId, InboxRefundOwner, WithdrawalId, WithdrawalOwner,
     },
     state::{CreatedPortalState, ModelState, PortalLifecycle, TokenState, ZoneState},
 };
@@ -102,12 +107,42 @@ pub(crate) enum ModelError {
     WithdrawalIndexOverflow,
     #[error("withdrawal index {withdrawal_index} already has an open owner")]
     WithdrawalOwnerCollision { withdrawal_index: u64 },
+    #[error("withdrawal cap {limit} was exceeded in this Zone block")]
+    WithdrawalBlockCapExceeded { limit: u32 },
+    #[error("fallback nonce overflow")]
+    FallbackNonceOverflow,
+    #[error("fallback nonce {fallback_nonce} already has an open owner")]
+    FallbackOwnerCollision { fallback_nonce: u64 },
+    #[error("finalization block number mismatch: expected {expected}, got {actual}")]
+    FinalizationBlockNumberMismatch { expected: u64, actual: u64 },
+    #[error("finalization count mismatch: expected {expected}, got {actual}")]
+    FinalizationCountMismatch { expected: u64, actual: usize },
+    #[error(
+        "finalization encrypted-sender count mismatch: declared {declared}, got {actual} entries"
+    )]
+    FinalizationSenderCountMismatch { declared: usize, actual: usize },
+    #[error("current batch withdrawal range is invalid: first {first}, next {next}")]
+    InvalidBatchWithdrawalRange { first: u64, next: u64 },
+    #[error("withdrawal {withdrawal_index} is missing from the current batch range")]
+    WithdrawalOwnerMissing { withdrawal_index: u64 },
+    #[error("withdrawal {withdrawal_index} was already finalized")]
+    WithdrawalAlreadyFinalized { withdrawal_index: u64 },
+    #[error("withdrawal batch index overflow")]
+    WithdrawalBatchIndexOverflow,
+    #[error("withdrawal batch index {withdrawal_batch_index} already has an open owner")]
+    BatchOwnerCollision { withdrawal_batch_index: u64 },
     #[error("Inbox refund credit already exists for withdrawal {withdrawal_index}")]
     InboxRefundCollision { withdrawal_index: u64 },
     #[error("withdrawal {withdrawal_index} bounce-back outcome recipient is zero")]
     ZeroBounceBackRecipient { withdrawal_index: u64 },
     #[error(transparent)]
     Accounting(#[from] AccountingError),
+    #[error(transparent)]
+    Fee(#[from] FeeError),
+    #[error(transparent)]
+    WithdrawalData(#[from] WithdrawalDataError),
+    #[error(transparent)]
+    BatchState(#[from] BatchStateError),
 }
 
 /// Typed final mutations for one candidate block. Owner maps use `None` for a
@@ -120,6 +155,7 @@ struct LogicalDelta {
     tokens: BTreeMap<Address, TokenState>,
     pending_deposits: BTreeMap<DepositId, Option<DepositOwner>>,
     withdrawals: BTreeMap<WithdrawalId, Option<WithdrawalOwner>>,
+    batches: BTreeMap<BatchId, Option<BatchOwner>>,
     fallback_owners: BTreeMap<FallbackId, Option<FallbackOwner>>,
     inbox_refunds: BTreeMap<InboxRefundId, Option<InboxRefundOwner>>,
 }
@@ -132,6 +168,7 @@ impl LogicalDelta {
             tokens: BTreeMap::new(),
             pending_deposits: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
+            batches: BTreeMap::new(),
             fallback_owners: BTreeMap::new(),
             inbox_refunds: BTreeMap::new(),
         }
@@ -146,9 +183,10 @@ pub(crate) struct ModelTransition<'a> {
 }
 
 /// Post-Tempo candidate retained for the collateral cut. This phase cannot
-/// release a committable delta until its matching Zone prefix is applied.
+/// release a committable delta until its complete matching Zone block applies.
 pub(crate) struct ImportedTempoTransition<'a> {
     candidate: ModelTransition<'a>,
+    tempo_block_number: u64,
     token_enables: Vec<TokenEnable>,
     expected: ExpectedImportedTempoBlock,
 }
@@ -191,7 +229,7 @@ impl<'a> Iterator for TokenViewIter<'a> {
     }
 }
 
-/// Complete Goal 2 commit capsule. It retains its exact parent cut so the
+/// Complete Zone-block commit capsule. It retains its exact parent cut so the
 /// mutation cannot be detached and applied to a different or newer state.
 pub(crate) struct CompletedTransition<'a> {
     parent: &'a ModelState,
@@ -218,6 +256,7 @@ impl<'a> ModelTransition<'a> {
         }
         Ok(ImportedTempoTransition {
             candidate: self,
+            tempo_block_number: input.tempo_block_number(),
             token_enables,
             expected,
         })
@@ -274,6 +313,18 @@ impl<'a> ModelTransition<'a> {
         self.delta.withdrawals.insert(id, owner);
     }
 
+    fn batch(&self, id: BatchId) -> Option<&BatchOwner> {
+        match self.delta.batches.get(&id) {
+            Some(Some(owner)) => Some(owner),
+            Some(None) => None,
+            None => self.parent.batches.get(&id),
+        }
+    }
+
+    fn set_batch(&mut self, id: BatchId, owner: Option<BatchOwner>) {
+        self.delta.batches.insert(id, owner);
+    }
+
     fn fallback_owner(&self, id: FallbackId) -> Option<&FallbackOwner> {
         match self.delta.fallback_owners.get(&id) {
             Some(Some(owner)) => Some(owner),
@@ -315,10 +366,36 @@ impl<'a> ImportedTempoTransition<'a> {
         TokenViewIter::new(self.candidate.parent, &self.candidate.delta)
     }
 
-    pub(crate) fn apply_zone_deposit_prefix(
+    pub(crate) fn apply_zone_block(
         mut self,
-        input: &ZoneDepositPrefixInput,
+        input: &ZoneBlockInput,
     ) -> Result<CompletedTransition<'a>, ModelError> {
+        let zone_deposit_prefix = self.apply_deposit_stage(input.advance())?;
+        let user_withdrawals = zone::apply_operations(&mut self.candidate, input.operations())?;
+        let finalized_batch = match input.finalization() {
+            Some(finalization) => Some(finalization::apply(
+                &mut self.candidate,
+                input.context(),
+                self.tempo_block_number,
+                finalization,
+            )?),
+            None => None,
+        };
+        Ok(CompletedTransition {
+            parent: self.candidate.parent,
+            delta: self.candidate.delta,
+            expected: ExpectedOutputs::new(
+                self.expected,
+                zone_deposit_prefix,
+                ExpectedZoneBlock::new(user_withdrawals, finalized_batch),
+            ),
+        })
+    }
+
+    fn apply_deposit_stage(
+        &mut self,
+        input: &ZoneDepositPrefixInput,
+    ) -> Result<ExpectedZoneDepositPrefix, ModelError> {
         if self.token_enables.len() != input.enabled_tokens().len() {
             return Err(ModelError::ZoneTokenEnableCountMismatch {
                 expected: self.token_enables.len(),
@@ -340,12 +417,7 @@ impl<'a> ImportedTempoTransition<'a> {
             }
         }
 
-        let zone_expected = deposits::apply_zone_prefix(&mut self.candidate, input)?;
-        Ok(CompletedTransition {
-            parent: self.candidate.parent,
-            delta: self.candidate.delta,
-            expected: ExpectedOutputs::new(self.expected, zone_expected),
-        })
+        deposits::apply_zone_prefix(&mut self.candidate, input)
     }
 }
 
@@ -386,6 +458,7 @@ fn apply_delta_for_test(state: &mut ModelState, delta: LogicalDelta) {
     state.tokens.extend(delta.tokens);
     apply_owner_delta_for_test(&mut state.pending_deposits, delta.pending_deposits);
     apply_owner_delta_for_test(&mut state.withdrawals, delta.withdrawals);
+    apply_owner_delta_for_test(&mut state.batches, delta.batches);
     apply_owner_delta_for_test(&mut state.fallback_owners, delta.fallback_owners);
     apply_owner_delta_for_test(&mut state.inbox_refunds, delta.inbox_refunds);
 }
@@ -416,6 +489,20 @@ fn queue_member(owner: &DepositOwner) -> DepositQueueMember {
             DepositQueueMember::WithdrawalBounceBack(*preimage)
         }
     }
+}
+
+fn require_zone_token(
+    candidate: &ModelTransition<'_>,
+    token: Address,
+) -> Result<TokenState, ModelError> {
+    let state = candidate
+        .token(token)
+        .cloned()
+        .ok_or(ModelError::TokenNotPortalEnabled { token })?;
+    if !state.is_zone_enabled() {
+        return Err(ModelError::TokenNotZoneEnabled { token });
+    }
+    Ok(state)
 }
 
 #[cfg(test)]

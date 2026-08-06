@@ -18,7 +18,7 @@ use super::{
         },
         state::{TokenPhase, ZoneProcessedDepositCursor},
     },
-    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, queue_member,
+    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, queue_member, require_zone_token,
 };
 
 pub(super) fn apply_zone_prefix(
@@ -327,20 +327,6 @@ fn withdrawal_bounce_back(
     candidate.set_token(preimage.token(), token_state);
 
     Ok(expected)
-}
-
-fn require_zone_token(
-    candidate: &ModelTransition<'_>,
-    token: Address,
-) -> Result<super::super::state::TokenState, ModelError> {
-    let state = candidate
-        .token(token)
-        .cloned()
-        .ok_or(ModelError::TokenNotPortalEnabled { token })?;
-    if !state.is_zone_enabled() {
-        return Err(ModelError::TokenNotZoneEnabled { token });
-    }
-    Ok(state)
 }
 
 fn owner_kind(owner: &DepositOwner) -> DepositKind {

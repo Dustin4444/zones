@@ -447,12 +447,24 @@ impl UserWithdrawalRequest {
         self.token
     }
 
+    pub(crate) const fn to(&self) -> Address {
+        self.to
+    }
+
     pub(crate) const fn principal(&self) -> NonZeroU128 {
         self.amount
     }
 
+    pub(crate) const fn memo(&self) -> B256 {
+        self.memo
+    }
+
     pub(crate) const fn gas_limit(&self) -> WithdrawalGasLimit {
         self.gas_limit
+    }
+
+    pub(crate) fn callback_data(&self) -> &Bytes {
+        self.callback_data.as_bytes()
     }
 }
 

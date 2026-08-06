@@ -209,6 +209,22 @@ impl PendingWithdrawal {
             },
         }
     }
+
+    /// Consume either origin while preserving its distinct encrypted-sender
+    /// contract. Failed deposits always require the literal empty value.
+    pub(crate) fn finalize(
+        self,
+        encrypted_sender: Bytes,
+    ) -> Result<FinalizedWithdrawal, WithdrawalDataError> {
+        match self {
+            Self::User(pending) => pending.finalize(encrypted_sender),
+            Self::FailedDeposit(pending) if encrypted_sender.is_empty() => Ok(pending.finalize()),
+            Self::FailedDeposit(_) => Err(WithdrawalDataError::InvalidEncryptedSenderLength {
+                actual: encrypted_sender.len(),
+                expected: 0,
+            }),
+        }
+    }
 }
 
 /// Complete finalized withdrawal owner, including its immutable origin.

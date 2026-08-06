@@ -1,16 +1,17 @@
 use std::num::{NonZeroU64, NonZeroU128};
 
-use alloy_primitives::{Address, B256, FixedBytes, U256};
+use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 
 use super::super::{ModelError, ModelTransition};
 use crate::model::{
     encoding::{
         CompressedYParity, DepositPayload, DepositQueueMember, OrdinaryDeposit,
-        WithdrawalBounceBackDeposit,
+        UserWithdrawalRequest, WithdrawalBounceBackDeposit,
     },
     input::{
-        ImportedTempoBlockInput, ImportedTempoOperation, PortalCreationInput, TokenEnable,
-        ZoneDepositPrefixInput,
+        BatchFinalizationInput, ImportedTempoBlockInput, ImportedTempoOperation,
+        PortalCreationInput, TokenEnable, UserWithdrawalInput, ZoneBlockContext, ZoneBlockInput,
+        ZoneDepositPrefixInput, ZoneOperation,
     },
     output::ExpectedOutputs,
     ownership::{FallbackId, FallbackOwner, WithdrawalId},
@@ -73,7 +74,7 @@ pub(super) fn creation_operation(initial_token: Address) -> ImportedTempoOperati
 
 pub(super) fn created_state(initial_token: Address) -> ModelState {
     let mut state = ModelState::awaiting_creation(identity(initial_token));
-    let imported = ImportedTempoBlockInput::new(vec![creation_operation(initial_token)]);
+    let imported = ImportedTempoBlockInput::new(0, vec![creation_operation(initial_token)]);
     let zone =
         ZoneDepositPrefixInput::new(vec![enable(initial_token, "INIT")], Vec::new(), Vec::new());
     commit(&mut state, &imported, &zone).unwrap();
@@ -101,18 +102,98 @@ pub(super) fn commit(
 ) -> Result<ExpectedOutputs, ModelError> {
     let completed = ModelTransition::new(state)
         .apply_imported_tempo_block(imported)?
-        .apply_zone_deposit_prefix(zone)?;
+        .apply_zone_block(&advance_only_block(zone))?;
     let (next, expected) = completed.materialize_for_test();
     *state = next;
     Ok(expected)
 }
 
 pub(super) fn empty_import() -> ImportedTempoBlockInput {
-    ImportedTempoBlockInput::default()
+    ImportedTempoBlockInput::new(0, Vec::new())
 }
 
 pub(super) fn empty_zone() -> ZoneDepositPrefixInput {
     ZoneDepositPrefixInput::default()
+}
+
+pub(super) fn advance_only_block(advance: &ZoneDepositPrefixInput) -> ZoneBlockInput {
+    ZoneBlockInput::new(
+        ZoneBlockContext::new(B256::ZERO, 0),
+        advance.clone(),
+        Vec::new(),
+        None,
+    )
+}
+
+pub(super) fn user_withdrawal(
+    token: Address,
+    seed: u8,
+    amount: u128,
+    gas_limit: u64,
+    reveal_to: Bytes,
+) -> UserWithdrawalInput {
+    UserWithdrawalInput::new(
+        Address::repeat_byte(seed),
+        B256::repeat_byte(seed.wrapping_add(1)),
+        UserWithdrawalRequest::new(
+            token,
+            Address::repeat_byte(seed.wrapping_add(2)),
+            amount,
+            B256::repeat_byte(seed.wrapping_add(3)),
+            gas_limit,
+            Bytes::from(vec![seed; usize::from(seed % 3)]),
+        )
+        .unwrap(),
+        reveal_to,
+    )
+}
+
+pub(super) fn zone_block(
+    block_number: u64,
+    operations: Vec<ZoneOperation>,
+    finalization: Option<BatchFinalizationInput>,
+) -> ZoneBlockInput {
+    ZoneBlockInput::new(
+        ZoneBlockContext::new(B256::repeat_byte(block_number as u8), block_number),
+        ZoneDepositPrefixInput::default(),
+        operations,
+        finalization,
+    )
+}
+
+pub(super) fn commit_block(
+    state: &mut ModelState,
+    block_number: u64,
+    operations: Vec<ZoneOperation>,
+    finalization: Option<BatchFinalizationInput>,
+) -> Result<ExpectedOutputs, ModelError> {
+    let imported = ImportedTempoBlockInput::new(block_number, Vec::new());
+    commit_full_block(
+        state,
+        &imported,
+        &zone_block(block_number, operations, finalization),
+    )
+}
+
+pub(super) fn apply_full_block(
+    state: &ModelState,
+    imported: &ImportedTempoBlockInput,
+    zone: &ZoneBlockInput,
+) -> Result<(ModelState, ExpectedOutputs), ModelError> {
+    let completed = ModelTransition::new(state)
+        .apply_imported_tempo_block(imported)?
+        .apply_zone_block(zone)?;
+    Ok(completed.materialize_for_test())
+}
+
+pub(super) fn commit_full_block(
+    state: &mut ModelState,
+    imported: &ImportedTempoBlockInput,
+    zone: &ZoneBlockInput,
+) -> Result<ExpectedOutputs, ModelError> {
+    let (next, expected) = apply_full_block(state, imported, zone)?;
+    *state = next;
+    Ok(expected)
 }
 
 pub(super) fn seed_fallback(

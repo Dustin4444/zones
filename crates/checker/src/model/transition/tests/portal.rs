@@ -31,7 +31,7 @@ fn portal_address_derivation_and_creation_install_literal_zero_state() {
 
     let initial = token(0x11);
     let mut state = ModelState::awaiting_creation(identity(initial));
-    let imported = ImportedTempoBlockInput::new(vec![creation_operation(initial)]);
+    let imported = ImportedTempoBlockInput::new(0, vec![creation_operation(initial)]);
     let zone = ZoneDepositPrefixInput::new(vec![enable(initial, "INIT")], Vec::new(), Vec::new());
     let expected = commit(&mut state, &imported, &zone).unwrap();
 
@@ -41,6 +41,23 @@ fn portal_address_derivation_and_creation_install_literal_zero_state() {
     assert_eq!(portal.identity(), identity(initial));
     assert_eq!(portal.config().bounceback_gas(), 0);
     assert_eq!(portal.deposit_cursor(), PortalDepositCursor::ZERO);
+    assert_eq!(state.zone().config().tempo_gas_rate(), 0);
+    assert_eq!(state.zone().config().max_withdrawals_per_block(), 0);
+    assert_eq!(state.zone().last_fallback_nonce(), 0);
+    assert_eq!(
+        state.zone().last_batch().withdrawal_queue_hash(),
+        B256::ZERO
+    );
+    assert_eq!(state.zone().last_batch().withdrawal_batch_index(), 0);
+    assert_eq!(
+        state.zone().batch_start().first_zone_parent_hash(),
+        B256::ZERO
+    );
+    assert_eq!(
+        state.zone().batch_start().first_processed_deposit(),
+        crate::model::state::ZoneProcessedDepositCursor::ZERO
+    );
+    assert_eq!(state.zone().batch_start().first_withdrawal_index(), 0);
     let token = state.token(initial).unwrap();
     assert_eq!(token.accounting(), TokenAccounting::ZERO);
     assert_eq!(token.phase(), TokenPhase::ZoneEnabled);
@@ -59,9 +76,13 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
     let base = ModelState::awaiting_creation(identity(initial));
 
     let wrong_identity = PortalIdentity::new(portal(), ZONE_ID + 1, initial);
-    let input = ImportedTempoBlockInput::new(vec![ImportedTempoOperation::Create(
-        PortalCreationInput::new(wrong_identity, enable(initial, "INIT")),
-    )]);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::Create(PortalCreationInput::new(
+            wrong_identity,
+            enable(initial, "INIT"),
+        ))],
+    );
     let before = base.clone();
     assert_eq!(
         ModelTransition::new(&base)
@@ -76,9 +97,13 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
 
     let bad_config = PortalIdentity::new(Address::repeat_byte(0x99), ZONE_ID, initial);
     let bad_state = ModelState::awaiting_creation(bad_config);
-    let input = ImportedTempoBlockInput::new(vec![ImportedTempoOperation::Create(
-        PortalCreationInput::new(bad_config, enable(initial, "INIT")),
-    )]);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::Create(PortalCreationInput::new(
+            bad_config,
+            enable(initial, "INIT"),
+        ))],
+    );
     assert_eq!(
         ModelTransition::new(&bad_state)
             .apply_imported_tempo_block(&input)
@@ -89,9 +114,13 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
         })
     );
 
-    let input = ImportedTempoBlockInput::new(vec![ImportedTempoOperation::Create(
-        PortalCreationInput::new(identity(initial), enable(token(0x13), "WRONG")),
-    )]);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::Create(PortalCreationInput::new(
+            identity(initial),
+            enable(token(0x13), "WRONG"),
+        ))],
+    );
     assert_eq!(
         ModelTransition::new(&base)
             .apply_imported_tempo_block(&input)
@@ -107,7 +136,7 @@ fn creation_is_atomic_and_checks_configured_identity_and_initial_token() {
 fn creation_cannot_repeat_and_all_pre_creation_operations_fail_on_lifecycle_first() {
     let initial = token(0x14);
     let state = created_state(initial);
-    let duplicate = ImportedTempoBlockInput::new(vec![creation_operation(initial)]);
+    let duplicate = ImportedTempoBlockInput::new(0, vec![creation_operation(initial)]);
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&duplicate)
@@ -124,7 +153,7 @@ fn creation_cannot_repeat_and_all_pre_creation_operations_fail_on_lifecycle_firs
     for operation in premature_cases {
         let awaiting = ModelState::awaiting_creation(identity(initial));
         let before = awaiting.clone();
-        let input = ImportedTempoBlockInput::new(vec![operation]);
+        let input = ImportedTempoBlockInput::new(0, vec![operation]);
         assert_eq!(
             ModelTransition::new(&awaiting)
                 .apply_imported_tempo_block(&input)
@@ -147,7 +176,7 @@ fn token_enablement_is_exact_block_ordered_and_preserves_same_block_liability() 
         ImportedTempoOperation::TokenEnabled(enable(third, "C")),
     ];
     operations.extend(append_operations(std::slice::from_ref(&member)));
-    let imported = ImportedTempoBlockInput::new(operations);
+    let imported = ImportedTempoBlockInput::new(0, operations);
     let reversed = ZoneDepositPrefixInput::new(
         vec![enable(third, "C"), enable(second, "B")],
         vec![],
@@ -157,7 +186,7 @@ fn token_enablement_is_exact_block_ordered_and_preserves_same_block_liability() 
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&imported)
             .unwrap()
-            .apply_zone_deposit_prefix(&reversed)
+            .apply_zone_block(&advance_only_block(&reversed))
             .err(),
         Some(ModelError::ZoneTokenEnableMismatch {
             index: 0,
@@ -188,9 +217,10 @@ fn token_enablement_is_exact_block_ordered_and_preserves_same_block_liability() 
         vec![(second, "B"), (third, "C")]
     );
 
-    let duplicate = ImportedTempoBlockInput::new(vec![ImportedTempoOperation::TokenEnabled(
-        enable(second, "B"),
-    )]);
+    let duplicate = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::TokenEnabled(enable(second, "B"))],
+    );
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&duplicate)
@@ -207,9 +237,10 @@ fn collateral_and_supply_token_views_merge_parent_replacements_and_new_tokens_in
     let mut state = created_state(low);
     commit(
         &mut state,
-        &ImportedTempoBlockInput::new(vec![ImportedTempoOperation::TokenEnabled(enable(
-            high, "HIGH",
-        ))]),
+        &ImportedTempoBlockInput::new(
+            0,
+            vec![ImportedTempoOperation::TokenEnabled(enable(high, "HIGH"))],
+        ),
         &ZoneDepositPrefixInput::new(vec![enable(high, "HIGH")], vec![], vec![]),
     )
     .unwrap();
@@ -217,7 +248,7 @@ fn collateral_and_supply_token_views_merge_parent_replacements_and_new_tokens_in
     let member = DepositQueueMember::Ordinary(ordinary(low, 0x41, 77));
     let mut operations = append_operations(std::slice::from_ref(&member));
     operations.push(ImportedTempoOperation::TokenEnabled(enable(middle, "MID")));
-    let imported = ImportedTempoBlockInput::new(operations);
+    let imported = ImportedTempoBlockInput::new(0, operations);
     let post_l1 = ModelTransition::new(&state)
         .apply_imported_tempo_block(&imported)
         .unwrap();
@@ -242,11 +273,11 @@ fn collateral_and_supply_token_views_merge_parent_replacements_and_new_tokens_in
     );
 
     let completed = post_l1
-        .apply_zone_deposit_prefix(&ZoneDepositPrefixInput::new(
+        .apply_zone_block(&advance_only_block(&ZoneDepositPrefixInput::new(
             vec![enable(middle, "MID")],
             vec![],
             vec![],
-        ))
+        )))
         .unwrap();
     assert_eq!(
         completed
@@ -270,16 +301,17 @@ fn zone_enablement_must_equal_enables_from_this_imported_block() {
     let initial = token(0x23);
     let second = token(0x24);
     let state = created_state(initial);
-    let imported = ImportedTempoBlockInput::new(vec![ImportedTempoOperation::TokenEnabled(
-        enable(second, "B"),
-    )]);
+    let imported = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::TokenEnabled(enable(second, "B"))],
+    );
 
     let transition = ModelTransition::new(&state)
         .apply_imported_tempo_block(&imported)
         .unwrap();
     assert_eq!(
         transition
-            .apply_zone_deposit_prefix(&ZoneDepositPrefixInput::default())
+            .apply_zone_block(&advance_only_block(&ZoneDepositPrefixInput::default()))
             .err(),
         Some(ModelError::ZoneTokenEnableCountMismatch {
             expected: 1,
@@ -292,7 +324,7 @@ fn zone_enablement_must_equal_enables_from_this_imported_block() {
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&imported)
             .unwrap()
-            .apply_zone_deposit_prefix(&wrong)
+            .apply_zone_block(&advance_only_block(&wrong))
             .err(),
         Some(ModelError::ZoneTokenEnableMismatch {
             index: 0,
@@ -308,6 +340,7 @@ fn same_block_config_updates_retain_event_order() {
     let base = created_state(initial);
     let apply = |updates: Vec<u64>| {
         let input = ImportedTempoBlockInput::new(
+            0,
             updates
                 .into_iter()
                 .map(ImportedTempoOperation::BouncebackGasUpdated)
@@ -328,7 +361,8 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
     let before = state.clone();
 
     let zero_refund = DepositQueueMember::Ordinary(ordinary(initial, 0xff, 1));
-    let input = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&zero_refund)));
+    let input =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&zero_refund)));
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&input)
@@ -347,7 +381,7 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
         },
     );
     let member = DepositQueueMember::Ordinary(ordinary(initial, 0x43, 1));
-    let input = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let input = ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     assert_eq!(
         ModelTransition::new(&liability_overflow)
             .apply_imported_tempo_block(&input)
@@ -359,10 +393,12 @@ fn portal_append_rejects_invalid_value_and_cursor_overflow_without_mutating_pare
 
     let mut overflow = state;
     overflow.set_portal_deposit_cursor_for_test(PortalDepositCursor::new(B256::ZERO, u64::MAX));
-    let input =
-        ImportedTempoBlockInput::new(vec![ImportedTempoOperation::OrdinaryDepositAppended(
-            ordinary(initial, 0x42, 1),
-        )]);
+    let input = ImportedTempoBlockInput::new(
+        0,
+        vec![ImportedTempoOperation::OrdinaryDepositAppended(ordinary(
+            initial, 0x42, 1,
+        ))],
+    );
     assert_eq!(
         ModelTransition::new(&overflow)
             .apply_imported_tempo_block(&input)
@@ -377,7 +413,8 @@ fn withdrawal_bounce_back_append_requires_and_retains_one_matching_fallback_owne
     let mut state = created_state(initial);
     let bounce = bounce(initial, 9, 400);
     let member = DepositQueueMember::WithdrawalBounceBack(bounce);
-    let imported = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let imported =
+        ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&imported)
@@ -403,7 +440,7 @@ fn withdrawal_bounce_back_append_requires_and_retains_one_matching_fallback_owne
         })
     );
 
-    let second = ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+    let second = ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
     assert_eq!(
         ModelTransition::new(&state)
             .apply_imported_tempo_block(&second)
@@ -429,7 +466,7 @@ fn withdrawal_bounce_back_append_rejects_mismatched_owner_fields_atomically() {
         let member =
             DepositQueueMember::WithdrawalBounceBack(bounce(deposit_token, 10, deposit_amount));
         let imported =
-            ImportedTempoBlockInput::new(append_operations(std::slice::from_ref(&member)));
+            ImportedTempoBlockInput::new(0, append_operations(std::slice::from_ref(&member)));
 
         assert_eq!(
             ModelTransition::new(&state)
