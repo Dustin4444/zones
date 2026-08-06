@@ -7,7 +7,7 @@ zone_dev_genesis_tmp := "./target/zone-dev-genesis"
 
 [group('bench')]
 [doc('Launches the interactive neobank private Zone benchmark UI')]
-iterative-bench:
+live-bench:
     python3 contrib/bench/iterative-ui/server.py
 
 [group('deps')]

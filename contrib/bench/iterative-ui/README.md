@@ -5,7 +5,7 @@ follows the real GitHub Actions job, downloads its txgen report, and presents ea
 part of the neobank private Zone journey as latency, throughput, gas, and fee results.
 
 ```sh
-just iterative-bench
+just live-bench
 ```
 
 The command opens `http://127.0.0.1:4179`. It requires an authenticated GitHub
@@ -16,7 +16,7 @@ server and are never sent to the browser.
 For a presentation rehearsal that does not dispatch GitHub Actions:
 
 ```sh
-ITERATIVE_BENCH_DEMO=1 just iterative-bench
+ITERATIVE_BENCH_DEMO=1 just live-bench
 ```
 
 The UI exposes four independent Go buttons: deposit from L1 into a private Zone,
