@@ -115,7 +115,7 @@ class ConfigurationTests(unittest.TestCase):
             ValueError, "accounts must be between 10 and 10000"
         ):
             SERVER.BenchmarkController._validate_config(
-                {"accounts": 5, "concurrency": 20, "count": 10}
+                {"accounts": 5, "concurrency": 10, "count": 10}
             )
 
     def test_single_transaction_uses_one_account(self) -> None:

@@ -152,7 +152,7 @@ a { color: inherit; }
 
 .transaction-count { display: block; }
 .transaction-input { display: flex !important; align-items: baseline; gap: 8px; margin-top: 7px; }
-.transaction-input input {
+.transaction-input select {
   width: 92px;
   height: 43px;
   padding: 0 10px;
@@ -164,7 +164,7 @@ a { color: inherit; }
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 22px;
 }
-.transaction-input input:focus { border-color: rgba(216, 255, 95, 0.55); }
+.transaction-input select:focus { border-color: rgba(216, 255, 95, 0.55); }
 .transaction-input strong { color: var(--muted); font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; font-weight: 500; text-transform: lowercase; }
 
 .controls-heading button {

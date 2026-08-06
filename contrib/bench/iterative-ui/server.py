@@ -26,10 +26,17 @@ STATE_VERSION = 6
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 ACCOUNT_START = 16
 TOPOLOGY_ACCOUNT_CAPACITY = int(
-    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "100")
+    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "12")
 )
 if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 100:
     raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 100")
+REDEMPTION_RUNS_PER_ACCOUNT = int(
+    os.environ.get("ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT", "100")
+)
+if not 1 <= REDEMPTION_RUNS_PER_ACCOUNT <= 1_000:
+    raise ValueError(
+        "ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT must be between 1 and 1000"
+    )
 PHASES = (
     {
         "id": "deposit",
@@ -863,11 +870,53 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
         )
         if prepared.returncode != 0:
             raise RuntimeError("persistent scenario balance and approval setup failed")
+
+        topology.stage(
+            "topology", "Preparing reusable Earn vault shares for fast redemptions"
+        )
+        redemption_dir = topology_dir / "redemption-setup"
+        redemption_output = redemption_dir / "output"
+        redemption_tmp = redemption_dir / "tmp"
+        redemption_output.mkdir(parents=True)
+        redemption_tmp.mkdir()
+        redemption_env = dict(environment)
+        redemption_env.update(
+            {
+                "ZONES_BENCH_NEOBANK_PRESET": "private-withdrawal",
+                "ZONES_BENCH_COUNT": str(
+                    TOPOLOGY_ACCOUNT_CAPACITY * REDEMPTION_RUNS_PER_ACCOUNT
+                ),
+                "ZONES_BENCH_ACCOUNTS": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_TPS": "1",
+                "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_ACCOUNT_CAPACITY),
+                "ZONES_BENCH_OUTPUT": str(redemption_output),
+                "ZONES_BENCH_REPORT": str(redemption_dir / "unused-report.json"),
+                "ZONES_BENCH_RENDERED_SCENARIO": str(
+                    redemption_output / "scenario.rendered.yml"
+                ),
+                "ZONES_BENCH_RUN_ID": "persistent-redemption-setup",
+                "ZONES_BENCH_SAMPLE_INSTANCES": "1",
+                "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
+                "ZONES_BENCH_PREPARE_REDEMPTION_ONLY": "1",
+                "ZONES_BENCH_SKIP_COMMON_SETUP": "1",
+                "ZONES_BENCH_SKIP_AUTH_SETUP": "1",
+                "RUNNER_TEMP": str(redemption_tmp),
+            }
+        )
+        redemption_prepared = subprocess.run(
+            ["bash", "contrib/bench/run-neobank-private-flow.sh"],
+            cwd=root,
+            env=redemption_env,
+            check=False,
+        )
+        if redemption_prepared.returncode != 0:
+            raise RuntimeError("persistent Earn redemption setup failed")
         environment.update(
             {
                 "ZONES_BENCH_PERSISTENT_TOPOLOGY": "1",
                 "ZONES_BENCH_SKIP_COMMON_SETUP": "1",
                 "ZONES_BENCH_SKIP_AUTH_SETUP": "1",
+                "ZONES_BENCH_SKIP_REDEMPTION_SETUP": "1",
             }
         )
         print(

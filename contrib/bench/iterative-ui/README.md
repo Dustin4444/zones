@@ -15,10 +15,10 @@ fees.
 
 The four buttons are independent: onramp, Earn vault deposit, Earn vault redeem,
 and offramp. They all reuse the running topology until `just live-bench` stops.
-The transaction input and advanced rate/concurrency controls are configurable;
-transactions reuse the pre-authorized account pool as needed.
+The transaction selector and advanced rate/concurrency controls are configurable;
+transactions reuse the pre-authorized worker pool as needed.
 
-The pool defaults to 100 accounts and can be changed at startup with
+The pool defaults to 12 concurrent accounts and can be changed at startup with
 `ITERATIVE_BENCH_ACCOUNT_CAPACITY`; the UI keeps transaction count, start rate,
 and concurrency configurable for each run.
 
