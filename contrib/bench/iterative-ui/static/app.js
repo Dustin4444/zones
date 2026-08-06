@@ -48,6 +48,16 @@ let toastTimer = null;
 let tickTimer = null;
 let liveTick = null; // { scenario, startedAt, total, completed }
 const ranThisSession = new Set(); // reveal results only for runs started here
+// Static fallback so the commit link + devnet identity render before the
+// server reports them; the running server overrides these with live values.
+const BUILD_META = {
+  repoUrl: "https://github.com/tempoxyz/zones",
+  commit: "6760944c",
+  commitUrl: "https://github.com/tempoxyz/zones/commit/6760944c8490942927ab34686e38516ebef9e6d7",
+  zoneId: "1",
+  zoneChainId: "421700001",
+  l1ChainId: "1337",
+};
 
 function scenarioName(id) {
   const definition = state?.server?.scenarios?.find((scenario) => scenario.id === id);
@@ -112,23 +122,29 @@ function renderConnection(server = {}) {
     : "Local tools missing";
   const net = server.network || {};
   const hostport = (u) => (u ? String(u).replace(/^\w+:\/\//, "") : "");
+  const zoneChainId = net.zoneChainId || BUILD_META.zoneChainId;
+  const zoneId = net.zoneId || BUILD_META.zoneId;
+  const zoneRpc = net.zoneRpc || BUILD_META.zoneRpc;
+  const l1ChainId = net.l1ChainId || BUILD_META.l1ChainId;
+  const l1Rpc = net.l1Rpc || BUILD_META.l1Rpc;
+  const commit = server.commit || BUILD_META.commit;
+  const commitUrl = server.commitUrl || BUILD_META.commitUrl;
   if (elements.netZone) {
-    elements.netZone.textContent = net.zoneChainId
-      ? `Zone #${net.zoneId ?? "?"} · chain ${net.zoneChainId}${net.zoneRpc ? " · " + hostport(net.zoneRpc) : ""}`
+    elements.netZone.textContent = zoneChainId
+      ? `Zone #${zoneId ?? "?"} · chain ${zoneChainId}${zoneRpc ? " · " + hostport(zoneRpc) : ""}`
       : "";
   }
   if (elements.netL1) {
-    elements.netL1.textContent = net.l1ChainId
-      ? `L1 · chain ${net.l1ChainId}${net.l1Rpc ? " · " + hostport(net.l1Rpc) : ""}`
+    elements.netL1.textContent = l1ChainId
+      ? `L1 · chain ${l1ChainId}${l1Rpc ? " · " + hostport(l1Rpc) : ""}`
       : "";
   }
   if (elements.commitLink) {
-    if (server.commit && server.commitUrl) {
-      elements.commitLink.textContent = `zones@${server.commit}${server.dirty ? "*" : ""} ↗`;
-      elements.commitLink.href = server.commitUrl;
+    if (commit && commitUrl) {
+      elements.commitLink.textContent = `zones@${commit}${server.dirty ? "*" : ""} ↗`;
+      elements.commitLink.href = commitUrl;
       elements.commitLink.style.display = "";
     } else {
-      elements.commitLink.textContent = "";
       elements.commitLink.style.display = "none";
     }
   }
