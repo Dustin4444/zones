@@ -1,6 +1,6 @@
 [package]
 name = "zone-checker"
-description = "Observe-only Zone L2 checker ExEx"
+description = "Observe-only Tempo Zone checker ExEx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ workspace = true
 reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-execution-types.workspace = true
 reth-node-api.workspace = true
+reth-primitives-traits.workspace = true
 reth-storage-api.workspace = true
 
 # alloy
@@ -24,10 +25,12 @@ alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider = { workspace = true, features = ["ws"] }
+alloy-rlp.workspace = true
 alloy-sol-types.workspace = true
 
 # tempo
 tempo-alloy.workspace = true
+tempo-primitives.workspace = true
 
 # zones
 tempo-zone-contracts = { workspace = true, features = ["std"] }
@@ -40,11 +43,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 alloy-consensus = { workspace = true, features = ["std"] }
-alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-transport.workspace = true
-reth-ethereum-primitives.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std", "test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
-tempo-primitives.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,92 +1,59 @@
-//! Observe-only Zone L2 checker ExEx.
+//! Observe-only Zone checker execution extension.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![allow(clippy::needless_borrows_for_generic_args)]
 
-mod invariants;
-mod l1_facts;
-mod l2_facts;
-// Goal 0 deliberately freezes the pure model before Goal 1 wires it into the
-// observation/runtime path. Keep the exception scoped to that staged module.
+mod observe;
+// Goals 0 and 1 freeze pure model vocabulary and authenticated observations
+// before later goals connect them through a mutable transition model.
 #[allow(dead_code)]
 mod model;
 
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use alloy_consensus::BlockHeader as _;
-use alloy_consensus::Sealable as _;
-use alloy_eips::{BlockId, BlockNumHash};
-use alloy_network::{BlockResponse as _, primitives::HeaderResponse as _};
-use alloy_primitives::{Address, B256};
-use alloy_provider::{DynProvider, Provider, ProviderBuilder};
-use eyre::WrapErr as _;
+use alloy_eips::BlockNumHash;
+use alloy_primitives::Address;
+use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use futures::TryStreamExt as _;
+use reth_execution_types::Chain;
 use reth_exex::{ExExContext, ExExNotification};
-use reth_node_api::{BlockBody as _, FullNodeComponents, NodePrimitives};
-use reth_storage_api::{AccountReader, StateProviderFactory};
+use reth_node_api::{FullNodeComponents, NodeTypes};
+use reth_primitives_traits::RecoveredBlock;
+use reth_storage_api::StateProviderFactory;
 use tempo_alloy::TempoNetwork;
+use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
 use tracing::{error, info};
 
-use l1_facts::{authenticate_l1_block, extract_l1_facts, log_l1_facts, verify_l1_receipts};
-use l2_facts::{extract_l2_facts, log_l2_facts};
-
-use invariants::check_token_enabled_invariant;
-
-// ---------------------------------------------------------------------------
-
-/// Strictly decode a known event and reject non-canonical encodings that a
-/// permissive ABI decoder could otherwise normalize.
-///
-/// Shared by both L1 and L2 fact extraction so decoding semantics stay
-/// identical across layers.
-pub(crate) fn decode_event<E: alloy_sol_types::SolEvent>(
-    log: &alloy_primitives::Log,
-    name: &str,
-    block: u64,
-) -> eyre::Result<E> {
-    let event = E::decode_log_validate(log)
-        .wrap_err_with(|| format!("malformed {name} in block {block}"))?;
-    eyre::ensure!(
-        event.data.encode_log_data() == log.data,
-        "non-canonical {name} encoding in block {block}"
-    );
-    Ok(event.data)
-}
-
-// ---------------------------------------------------------------------------
-// CLI mode
-// ---------------------------------------------------------------------------
+use observe::{
+    AcquisitionError, AcquisitionSource, L1BlockObservation, L2BlockObservation, ObservationError,
+    acquire_zone_post_state, observe_l1, observe_l2_block,
+};
 
 /// Runtime mode for the checker ExEx.
-///
-/// Controls whether the checker is installed in the node builder.
-/// Defaults to [`CheckerMode::Off`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CheckerMode {
     /// Checker is not installed.
     #[default]
     Off,
-    /// Checker runs in observe-only mode: logs block identity, confirms
-    /// receipts/state availability, and extracts L2 bridge facts — but does
-    /// not enforce anything.
+    /// Checker authenticates ephemeral observations but does not enforce or
+    /// persist model findings.
     Observe,
 }
 
 impl fmt::Display for CheckerMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Off => f.write_str("off"),
-            Self::Observe => f.write_str("observe"),
-        }
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+        })
     }
 }
 
 impl FromStr for CheckerMode {
     type Err = eyre::Report;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
             "off" => Ok(Self::Off),
             "observe" => Ok(Self::Observe),
             other => Err(eyre::eyre!(
@@ -97,37 +64,46 @@ impl FromStr for CheckerMode {
 }
 
 impl CheckerMode {
-    /// Parse a checker mode from a string, returning a result compatible with
-    /// clap's value parser interface.
-    ///
-    /// This avoids coupling the checker crate to clap while allowing the CLI
-    /// layer to use it as a `value_parser`.
-    pub fn parse(s: &str) -> Result<Self, eyre::Report> {
-        s.parse()
+    /// Parse a mode without coupling this crate to clap.
+    pub fn parse(value: &str) -> Result<Self, eyre::Report> {
+        value.parse()
     }
 }
 
-// ---------------------------------------------------------------------------
-// ExEx
-// ---------------------------------------------------------------------------
-
-/// The checker execution extension.
-///
-/// The checker holds no runtime state between notifications. It logs
-/// observations, confirms data availability, extracts L2 bridge facts, and
-/// independently fetches/extracts the exact anchored Tempo/L1 Portal facts as
-/// canonical L2 notifications arrive, then acknowledges the processed height.
+/// Authenticated-observation ExEx configuration.
 pub struct CheckerExEx {
-    /// Read-only Tempo L1 RPC URL for fetching exact L1 blocks anchored by
-    /// `TempoAdvanced`. Passed from the node's `--l1.rpc-url`.
     l1_rpc_url: String,
-    /// ZonePortal contract address on L1, from `--l1.portal-address`.
     portal_address: Address,
 }
 
+/// Sticky acknowledgement state for the first incomplete observation gap.
+///
+/// Goal 1 has no durable retry loop, so a later successful notification must
+/// never advance Reth's pruning watermark past an earlier unobserved block.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AcknowledgementState {
+    #[default]
+    Open,
+    Blocked,
+}
+
+impl AcknowledgementState {
+    fn record(
+        &mut self,
+        observation: Result<BlockNumHash, ObservationError>,
+    ) -> Result<Option<BlockNumHash>, ObservationError> {
+        match observation {
+            Err(error) => {
+                *self = Self::Blocked;
+                Err(error)
+            }
+            Ok(_) if *self == Self::Blocked => Ok(None),
+            Ok(tip) => Ok(Some(tip)),
+        }
+    }
+}
+
 impl CheckerExEx {
-    /// Create a checker ExEx instance with the given L1 RPC URL and portal
-    /// address.
     pub fn new(l1_rpc_url: String, portal_address: Address) -> Self {
         Self {
             l1_rpc_url,
@@ -135,48 +111,36 @@ impl CheckerExEx {
         }
     }
 
-    /// Run the ExEx until its notification stream closes.
+    /// Run until the notification stream closes.
     ///
-    /// Each notification is fully processed — committed blocks oldest-to-newest,
-    /// reverted blocks newest-to-oldest, reorgs roll-back-then-apply — before
-    /// `send_finished_height` is called. This prevents Reth from pruning or
-    /// advancing past a block the checker has not yet observed.
-    ///
-    /// The L1 provider connection is established lazily on the first
-    /// notification that needs it, so a temporarily unavailable L1 RPC at
-    /// startup does not prevent the ExEx from running.
+    /// An observation failure keeps the pruning watermark behind the gap but
+    /// does not terminate the Zone node. Retry and durable model state belong
+    /// to later design goals.
     pub async fn run<Node>(self, mut ctx: ExExContext<Node>) -> eyre::Result<()>
     where
         Node: FullNodeComponents,
         Node::Provider: StateProviderFactory,
+        Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     {
         info!(target: "zone::checker", "Checker ExEx started");
         let provider = ctx.provider().clone();
-
-        // Lazily-established read-only Tempo L1 provider. Connected on first
-        // canonical block so a startup L1 outage does not terminate the ExEx.
         let mut l1_provider: Option<DynProvider<TempoNetwork>> = None;
-
-        let mut acknowledgements_blocked = false;
+        let mut acknowledgements = AcknowledgementState::default();
 
         while let Some(notification) = ctx.notifications.try_next().await? {
-            match process_notification(
+            let observation = process_notification(
                 &notification,
                 &provider,
                 &mut l1_provider,
                 &self.l1_rpc_url,
                 self.portal_address,
             )
-            .await
-            {
-                Ok(tip) if !acknowledgements_blocked => ctx.send_finished_height(tip)?,
-                Ok(_) => {}
+            .await;
+            match acknowledgements.record(observation) {
+                Ok(Some(tip)) => ctx.send_finished_height(tip)?,
+                Ok(None) => {}
                 Err(error) => {
-                    // Observation failures must not terminate the Zone node. Keep the ExEx
-                    // pruning watermark behind the failed notification so restart/replay can
-                    // inspect it again instead of silently losing the gap.
-                    acknowledgements_blocked = true;
-                    error!(target: "zone::checker", %error, "L2/L1 fact extraction failed");
+                    error!(target: "zone::checker", %error, "authenticated observation failed");
                 }
             }
         }
@@ -186,675 +150,209 @@ impl CheckerExEx {
     }
 }
 
-/// Process a single canonical L2 ExEx notification and return the finished-height tip.
-///
-/// Committed and reorged-in blocks are processed oldest-to-newest; each has its
-/// receipts and exact post-state confirmed, its L2 bridge facts extracted, and
-/// its anchored Tempo/L1 block independently fetched and fact-extracted.
-/// Reverted and reorged-out blocks are processed newest-to-oldest and are
-/// logged but not checked — their receipts are no longer canonical.
-async fn process_notification<N, P>(
-    notification: &ExExNotification<N>,
+async fn process_notification<P>(
+    notification: &ExExNotification<TempoPrimitives>,
     provider: &P,
     l1_provider: &mut Option<DynProvider<TempoNetwork>>,
     l1_rpc_url: &str,
     portal_address: Address,
-) -> eyre::Result<BlockNumHash>
+) -> Result<BlockNumHash, ObservationError>
 where
-    N: NodePrimitives,
     P: StateProviderFactory,
 {
     match notification {
         ExExNotification::ChainCommitted { new } => {
-            ensure_receipt_sets(new)?;
-            for (block, receipts) in new.blocks_and_receipts() {
-                let number = block.header().number();
-                let hash = block.hash();
-                let parent_hash = block.header().parent_hash();
-                process_canonical_block(
-                    provider,
-                    l1_provider,
-                    l1_rpc_url,
-                    portal_address,
-                    number,
-                    hash,
-                    receipts,
-                )
-                .await?;
-                info!(target: "zone::checker", number, %hash, %parent_hash, "Committed block observed");
-            }
+            observe_chain(new, provider, l1_provider, l1_rpc_url, portal_address).await?;
             let tip = new.tip();
             Ok(BlockNumHash::new(tip.header().number(), tip.hash()))
         }
-        ExExNotification::ChainReverted { old } => {
-            for (&number, block) in old.blocks().iter().rev() {
-                let hash = block.hash();
-                let parent_hash = block.header().parent_hash();
-                info!(target: "zone::checker", number, %hash, %parent_hash, "Reverted block observed");
-            }
-            let (&lowest_num, lowest_block) = old.blocks().iter().next().expect("non-empty chain");
-            Ok(BlockNumHash::new(
-                lowest_num.saturating_sub(1),
-                lowest_block.header().parent_hash(),
-            ))
-        }
+        ExExNotification::ChainReverted { old } => Ok(log_reverted_chain(old, "Reverted")),
         ExExNotification::ChainReorged { old, new } => {
-            // Roll back the old fork newest-to-oldest. Reorged-out blocks are
-            // not fact-checked — their receipts are no longer canonical.
-            for (&number, block) in old.blocks().iter().rev() {
-                let hash = block.hash();
-                let parent_hash = block.header().parent_hash();
-                info!(target: "zone::checker", number, %hash, %parent_hash, "Reorged-out block observed");
-            }
-            // Apply the new fork oldest-to-newest using the same extraction
-            // path as ordinary committed blocks.
-            ensure_receipt_sets(new)?;
-            for (block, receipts) in new.blocks_and_receipts() {
-                let number = block.header().number();
-                let hash = block.hash();
-                let parent_hash = block.header().parent_hash();
-                process_canonical_block(
-                    provider,
-                    l1_provider,
-                    l1_rpc_url,
-                    portal_address,
-                    number,
-                    hash,
-                    receipts,
-                )
-                .await?;
-                info!(target: "zone::checker", number, %hash, %parent_hash, "Reorged-in block observed");
-            }
+            log_reverted_chain(old, "Reorged-out");
+            observe_chain(new, provider, l1_provider, l1_rpc_url, portal_address).await?;
             let tip = new.tip();
             Ok(BlockNumHash::new(tip.header().number(), tip.hash()))
         }
     }
 }
 
-/// Ensure every notified block has its corresponding execution receipt set.
-fn ensure_receipt_sets<N>(chain: &reth_execution_types::Chain<N>) -> eyre::Result<()>
-where
-    N: NodePrimitives,
-{
-    let receipt_sets = chain.block_receipts_iter().count();
-    if receipt_sets != chain.blocks().len() {
-        eyre::bail!(
-            "notification has {} blocks but {receipt_sets} receipt sets",
-            chain.blocks().len()
-        );
-    }
-    for (block, receipts) in chain.blocks_and_receipts() {
-        let transactions = block.body().transactions().len();
-        if receipts.len() != transactions {
-            eyre::bail!(
-                "block {} has {transactions} transactions but {} receipts",
-                block.header().number(),
-                receipts.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Confirm exact post-state for a canonical (committed or reorged-in) block,
-/// extract L2 bridge facts from notification-local receipts, then fetch the
-/// exact Tempo/L1 block anchored by `TempoAdvanced`, verify its identity and
-/// receipt root, and independently extract ZonePortal L1 facts.
-///
-/// The state lookup uses the exact block hash to avoid checking the wrong fork
-/// or head. Receipts come directly from the ExEx notification's executed chain.
-/// The L1 block is fetched by the exact anchor hash (never by latest/head) so
-/// the checker reads the same Tempo block the sequencer imported. The L1
-/// provider connection is established lazily on first use so an L1 outage at
-/// startup does not terminate the ExEx.
-async fn process_canonical_block<P, R>(
+async fn observe_chain<P>(
+    chain: &Chain<TempoPrimitives>,
     provider: &P,
     l1_provider: &mut Option<DynProvider<TempoNetwork>>,
     l1_rpc_url: &str,
     portal_address: Address,
-    number: u64,
-    hash: B256,
-    receipts: &[R],
-) -> eyre::Result<()>
+) -> Result<(), ObservationError>
 where
     P: StateProviderFactory,
-    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
-    let state = provider
-        .state_by_block_hash(hash)
-        .wrap_err_with(|| format!("failed to obtain state for block {hash}"))?;
-    state
-        .basic_account(&Address::ZERO)
-        .wrap_err_with(|| format!("failed to read state for block {hash}"))?;
+    let receipt_sets = chain.block_receipts_iter().count();
+    validate_notification_receipt_sets(chain.blocks().len(), receipt_sets)?;
+    for (block, receipts) in chain.blocks_and_receipts() {
+        if let Err(error) = process_canonical_block(
+            provider,
+            l1_provider,
+            l1_rpc_url,
+            portal_address,
+            block,
+            receipts,
+        )
+        .await
+        {
+            error!(
+                target: "zone::checker",
+                number = block.header().number(),
+                hash = %block.hash(),
+                %error,
+                "Canonical block observation failed"
+            );
+            return Err(error);
+        }
+        info!(
+            target: "zone::checker",
+            number = block.header().number(),
+            hash = %block.hash(),
+            parent_hash = %block.header().parent_hash(),
+            "Canonical block observed"
+        );
+    }
+    Ok(())
+}
 
-    let l2_facts = extract_l2_facts(number, hash, receipts)?;
-    log_l2_facts(&l2_facts);
+fn validate_notification_receipt_sets(
+    block_count: usize,
+    receipt_set_count: usize,
+) -> Result<(), AcquisitionError> {
+    if block_count != receipt_set_count {
+        return Err(AcquisitionError::inconsistent(
+            AcquisitionSource::ZoneNotificationReceipts,
+            format_args!("{block_count} block receipt sets"),
+            format_args!("{receipt_set_count} block receipt sets"),
+        ));
+    }
+    Ok(())
+}
 
-    // Fetch the exact Tempo/L1 block anchored by TempoAdvanced.
-    let anchor = l2_facts.l1_anchor();
-    let l1_hash = anchor.tempo_block_hash;
-    let l1_number = anchor.tempo_block_number;
+fn log_reverted_chain(chain: &Chain<TempoPrimitives>, kind: &'static str) -> BlockNumHash {
+    for (&number, block) in chain.blocks().iter().rev() {
+        info!(
+            target: "zone::checker",
+            number,
+            hash = %block.hash(),
+            parent_hash = %block.header().parent_hash(),
+            kind,
+            "Noncanonical block observed"
+        );
+    }
+    let (&lowest_number, lowest_block) = chain.blocks().iter().next().expect("non-empty chain");
+    BlockNumHash::new(
+        lowest_number.saturating_sub(1),
+        lowest_block.header().parent_hash(),
+    )
+}
 
-    // Connect to L1 lazily — only when we actually need to fetch an anchored
-    // block. This keeps the ExEx running even if L1 is temporarily unavailable.
+async fn process_canonical_block<P>(
+    provider: &P,
+    l1_provider: &mut Option<DynProvider<TempoNetwork>>,
+    l1_rpc_url: &str,
+    portal_address: Address,
+    block: &RecoveredBlock<Block>,
+    receipts: &[TempoReceipt],
+) -> Result<(), ObservationError>
+where
+    P: StateProviderFactory,
+{
+    // Goal 1 owns the exact-hash acquisition API. The complete enabled-token
+    // set is model state introduced later, so this nondeployable milestone
+    // intentionally requests no supply slots from runtime orchestration yet.
+    let l2 = observe_l2_block(block, receipts, |block_hash| {
+        acquire_zone_post_state(provider, block_hash, &[])
+    })?;
+
     if l1_provider.is_none() {
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect(l1_rpc_url)
             .await
-            .wrap_err("checker failed to connect to L1 RPC")?
+            .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Rpc, error))?
             .erased();
         *l1_provider = Some(provider);
     }
-    let l1 = l1_provider
+    let l1_provider = l1_provider
         .as_ref()
-        .expect("L1 provider was just initialized");
+        .expect("L1 provider initialized immediately above");
+    let l1 = observe_l1(
+        l1_provider,
+        l2.inputs().advance_tempo().imported_header(),
+        portal_address,
+    )
+    .await?;
 
-    let block = l1
-        .get_block_by_hash(l1_hash)
-        .await
-        .wrap_err_with(|| format!("failed to fetch L1 block {l1_number} ({l1_hash})"))?
-        .ok_or_else(|| eyre::eyre!("L1 block {l1_number} ({l1_hash}) not found"))?;
-
-    let fetched_hash = block.header().hash();
-    let computed_hash = block.header().as_ref().hash_slow();
-    let fetched_number = block.header().number();
-    authenticate_l1_block(
-        l1_hash,
-        l1_number,
-        fetched_hash,
-        computed_hash,
-        fetched_number,
-    )?;
-
-    let transaction_hashes = block.transactions().hashes().collect::<Vec<_>>();
-    let expected_receipts_root = block.header().receipts_root();
-    let expected_logs_bloom = block.header().logs_bloom();
-
-    let receipts = l1
-        .get_block_receipts(BlockId::hash(l1_hash))
-        .await
-        .wrap_err_with(|| format!("failed to fetch L1 receipts for block {l1_number} ({l1_hash})"))?
-        .ok_or_else(|| eyre::eyre!("no receipts for L1 block {l1_number} ({l1_hash})"))?;
-
-    verify_l1_receipts(
-        BlockNumHash::new(l1_number, l1_hash),
-        expected_receipts_root,
-        expected_logs_bloom,
-        &transaction_hashes,
-        &receipts,
-    )?;
-
-    let l1_facts = extract_l1_facts(l1_number, l1_hash, portal_address, &receipts)?;
-    log_l1_facts(&l1_facts, portal_address);
-
-    // Cross-layer invariant (observe-only — violations are logged, not enforced).
-    check_token_enabled_invariant(
-        &l1_facts,
-        &l2_facts,
-        BlockNumHash::new(number, hash),
-        BlockNumHash::new(l1_number, l1_hash),
-    );
-
+    log_observation(&l2, &l1);
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+fn log_observation(l2: &L2BlockObservation, l1: &L1BlockObservation) {
+    let l2_inputs = l2.inputs();
+    let advance = l2_inputs.advance_tempo();
+    let finalization = l2_inputs.finalization();
+    let l2_outputs = l2.outcomes();
+    let state = l2_outputs.post_state();
+    let l1_transactions = l1.protocol_transactions();
+    let l1_outcomes = l1_transactions
+        .iter()
+        .map(|transaction| transaction.outcomes().len())
+        .sum::<usize>();
+    let submit_batch_calls = l1_transactions
+        .iter()
+        .filter_map(|transaction| transaction.direct_call())
+        .filter(|call| call.as_submit_batch().is_some())
+        .count();
+    let process_withdrawal_calls = l1_transactions
+        .iter()
+        .filter_map(|transaction| transaction.direct_call())
+        .filter(|call| call.as_process_withdrawals().is_some())
+        .count();
+    let ordinary_deposits = advance
+        .deposits()
+        .iter()
+        .filter(|deposit| deposit.as_ordinary().is_some())
+        .count();
+    let withdrawal_bounce_backs = advance
+        .deposits()
+        .iter()
+        .filter(|deposit| deposit.as_withdrawal_bounce_back().is_some())
+        .count();
+    info!(
+        target: "zone::checker",
+        zone_block_number = l2.block_number(),
+        zone_block_hash = %l2.block_hash(),
+        tempo_block_number = l1.block_number(),
+        tempo_block_hash = %l1.block_hash(),
+        advance_transaction_hash = %l2_inputs.advance_transaction_hash(),
+        l2_outcomes = l2_outputs.events().len(),
+        l1_outcomes,
+        submit_batch_calls,
+        process_withdrawal_calls,
+        ordinary_deposits,
+        withdrawal_bounce_backs,
+        decryptions = advance.decryptions().len(),
+        enabled_tokens = advance.enabled_tokens().len(),
+        has_finalization = finalization.is_some(),
+        finalized_withdrawals = finalization.map(|value| value.input().count()).unwrap_or(0),
+        encrypted_senders = finalization
+            .map(|value| value.input().encrypted_senders().len())
+            .unwrap_or(0),
+        finalization_transaction_hash = ?finalization.map(|value| value.transaction_hash()),
+        exact_supply_count = state.token_supplies().len(),
+        exact_tempo_hash = %state.tempo_block_hash(),
+        exact_tempo_number = state.tempo_block_number(),
+        exact_deposit_hash = %state.processed_deposit_queue_hash(),
+        exact_deposit_number = state.processed_deposit_number(),
+        exact_withdrawal_hash = %state.withdrawal_queue_hash(),
+        exact_withdrawal_index = state.withdrawal_batch_index(),
+        "Authenticated block observation complete"
+    );
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_consensus::{BlockBody, Header, SignableTransaction as _, TxLegacy};
-    use alloy_primitives::{Log, Signature, U256};
-    use alloy_provider::ProviderBuilder;
-    use alloy_rpc_types_eth::{BlockTransactions, Header as RpcHeader};
-    use alloy_sol_types::SolEvent as _;
-    use alloy_transport::mock::Asserter;
-    use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives, Receipt};
-    use reth_execution_types::{Chain, ExecutionOutcome};
-    use reth_primitives_traits::{RecoveredBlock, SealedBlock};
-    use reth_provider::test_utils::MockEthProvider;
-    use std::{collections::BTreeMap, sync::Arc};
-    use tempo_alloy::TempoNetwork;
-    use tempo_alloy::rpc::{TempoHeaderResponse, TempoTransactionReceipt};
-    use tempo_primitives::{TempoHeader, TempoTxEnvelope};
-    use tempo_zone_contracts::{IZoneInbox, ZONE_INBOX_ADDRESS};
-
-    /// L1 anchor values used by `anchor_receipt()`.
-    const L1_NUMBER: u64 = 100;
-    const PORTAL: Address = Address::repeat_byte(0x42);
-
-    fn empty_l1_header() -> TempoHeader {
-        let receipts_root = alloy_consensus::proofs::calculate_receipt_root::<
-            alloy_consensus::ReceiptWithBloom<
-                tempo_primitives::TempoReceipt<alloy_primitives::Log>,
-            >,
-        >(&[]);
-        TempoHeader {
-            inner: Header {
-                number: L1_NUMBER,
-                receipts_root,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn checker_mode_parse_display_default() {
-        assert_eq!(CheckerMode::default(), CheckerMode::Off);
-        assert_eq!("off".parse::<CheckerMode>().unwrap(), CheckerMode::Off);
-        assert_eq!(
-            "OBSERVE".parse::<CheckerMode>().unwrap(),
-            CheckerMode::Observe
-        );
-        assert!("enforce".parse::<CheckerMode>().is_err());
-        assert_eq!(CheckerMode::Off.to_string(), "off");
-        assert_eq!(CheckerMode::Observe.to_string(), "observe");
-    }
-
-    type Block = RecoveredBlock<EthBlock>;
-
-    fn make_block(number: u64, parent_hash: B256) -> Block {
-        let header = Header {
-            number,
-            parent_hash,
-            difficulty: U256::ZERO,
-            ..Default::default()
-        };
-        let transaction =
-            TxLegacy::default().into_signed(Signature::new(U256::from(1), U256::from(1), false));
-        let block = EthBlock::new(
-            header,
-            BlockBody {
-                transactions: vec![transaction.into()],
-                ..Default::default()
-            },
-        );
-        RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![])
-    }
-
-    fn make_chain(blocks: Vec<Block>) -> Arc<Chain<EthPrimitives>> {
-        let first_block = blocks
-            .first()
-            .map(|block| block.header().number())
-            .unwrap_or(0);
-        let receipts = blocks.iter().map(|_| vec![anchor_receipt()]).collect();
-        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
-            Default::default(),
-            receipts,
-            first_block,
-            Default::default(),
-        );
-        Arc::new(Chain::new(blocks, outcome, BTreeMap::new()))
-    }
-
-    /// Like `make_chain` but with custom per-block receipt sets.
-    fn make_chain_with_receipts(
-        blocks: Vec<Block>,
-        receipt_sets: Vec<Vec<Receipt>>,
-    ) -> Arc<Chain<EthPrimitives>> {
-        let first_block = blocks
-            .first()
-            .map(|block| block.header().number())
-            .unwrap_or(0);
-        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
-            Default::default(),
-            receipt_sets,
-            first_block,
-            Default::default(),
-        );
-        Arc::new(Chain::new(blocks, outcome, BTreeMap::new()))
-    }
-
-    fn make_chain_without_receipts(blocks: Vec<Block>) -> Arc<Chain<EthPrimitives>> {
-        Arc::new(Chain::new(blocks, Default::default(), BTreeMap::new()))
-    }
-
-    /// A minimal receipt with a valid `TempoAdvanced` anchor so the block
-    /// passes fact extraction.
-    fn anchor_receipt() -> Receipt {
-        let l1_hash = empty_l1_header().hash_slow();
-        let event = IZoneInbox::TempoAdvanced {
-            tempoBlockHash: l1_hash,
-            tempoBlockNumber: L1_NUMBER,
-            depositsProcessed: U256::ZERO,
-            newProcessedDepositQueueHash: B256::ZERO,
-            lastProcessedDepositNumber: 0,
-        };
-        Receipt {
-            tx_type: Default::default(),
-            success: true,
-            cumulative_gas_used: 0,
-            logs: vec![Log {
-                address: ZONE_INBOX_ADDRESS,
-                data: event.encode_log_data(),
-            }],
-        }
-    }
-
-    fn setup_provider(blocks: &[(&Block, Vec<Receipt>)]) -> MockEthProvider {
-        let provider = MockEthProvider::new();
-        for (block, receipts) in blocks {
-            let hash = block.hash();
-            let number = block.header().number();
-            provider.add_block(hash, (*block).clone().into_sealed_block().unseal());
-            provider.extend_headers([(hash, block.header().clone())]);
-            provider.add_receipts(number, receipts.clone());
-        }
-        provider
-    }
-
-    /// Build a mock L1 provider that responds to `get_block_by_hash` and
-    /// `get_block_receipts` for the anchor L1 block.  The block has zero
-    /// transactions and empty receipts, with a receipts root that matches.
-    fn mock_l1_provider(call_count: usize) -> DynProvider<TempoNetwork> {
-        let asserter = Asserter::new();
-        let tempo_header = empty_l1_header();
-        let header = TempoHeaderResponse {
-            inner: RpcHeader {
-                hash: tempo_header.hash_slow(),
-                inner: tempo_header,
-                total_difficulty: None,
-                size: None,
-            },
-            timestamp_millis: 0,
-        };
-
-        let block = alloy_rpc_types_eth::Block {
-            header,
-            uncles: vec![],
-            transactions:
-                BlockTransactions::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Hashes(
-                    vec![],
-                ),
-            withdrawals: None,
-        };
-
-        for _ in 0..call_count {
-            asserter.push_success(&Some(block.clone()));
-            asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
-        }
-
-        ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_mocked_client(asserter)
-            .erased()
-    }
-
-    #[tokio::test]
-    async fn commit_returns_new_canonical_tip() {
-        let b1 = make_block(1, B256::repeat_byte(1));
-        let b2 = make_block(2, b1.hash());
-        let b3 = make_block(3, b2.hash());
-        let r = anchor_receipt();
-        let provider = setup_provider(&[
-            (&b1, vec![r.clone()]),
-            (&b2, vec![r.clone()]),
-            (&b3, vec![r]),
-        ]);
-        let mut l1 = Some(mock_l1_provider(3));
-        let notification = ExExNotification::ChainCommitted {
-            new: make_chain(vec![b1, b2, b3.clone()]),
-        };
-        let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-            .await
-            .unwrap();
-        assert_eq!(tip, BlockNumHash::new(3, b3.hash()));
-    }
-
-    #[tokio::test]
-    async fn revert_returns_height_before_reverted_range() {
-        let parent = B256::repeat_byte(3);
-        let b1 = make_block(1, parent);
-        let b2 = make_block(2, b1.hash());
-        let b3 = make_block(3, b2.hash());
-        let notification = ExExNotification::ChainReverted {
-            old: make_chain(vec![b1, b2, b3]),
-        };
-        // Reverted blocks don't touch the L1 provider.
-        let mut l1 = Some(mock_l1_provider(0));
-        let tip = process_notification(
-            &notification,
-            &MockEthProvider::<EthPrimitives>::new(),
-            &mut l1,
-            "",
-            PORTAL,
-        )
-        .await
-        .unwrap();
-        assert_eq!(tip, BlockNumHash::new(0, parent));
-    }
-
-    #[tokio::test]
-    async fn reorg_returns_new_canonical_tip() {
-        let parent = B256::repeat_byte(4);
-        let old1 = make_block(1, parent);
-        let old2 = make_block(2, old1.hash());
-        let new1 = make_block(1, parent);
-        let new2 = make_block(2, new1.hash());
-        let new3 = make_block(3, new2.hash());
-        let r = anchor_receipt();
-        let provider = setup_provider(&[
-            (&new1, vec![r.clone()]),
-            (&new2, vec![r.clone()]),
-            (&new3, vec![r]),
-        ]);
-        let mut l1 = Some(mock_l1_provider(3));
-        let notification = ExExNotification::ChainReorged {
-            old: make_chain(vec![old1, old2]),
-            new: make_chain(vec![new1, new2, new3.clone()]),
-        };
-        let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-            .await
-            .unwrap();
-        assert_eq!(tip, BlockNumHash::new(3, new3.hash()));
-    }
-
-    #[tokio::test]
-    async fn extraction_error_fails_notification() {
-        let b1 = make_block(1, B256::repeat_byte(5));
-        let provider = MockEthProvider::<EthPrimitives>::new();
-        let mut l1 = Some(mock_l1_provider(0));
-        let notification = ExExNotification::ChainCommitted {
-            new: make_chain_without_receipts(vec![b1]),
-        };
-        let result = process_notification(&notification, &provider, &mut l1, "", PORTAL).await;
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("receipt"),
-            "error should mention receipts"
-        );
-    }
-
-    #[tokio::test]
-    async fn receipt_count_must_match_transaction_count() {
-        let b1 = make_block(1, B256::repeat_byte(6));
-        let provider = setup_provider(&[(&b1, vec![anchor_receipt()])]);
-        let mut l1 = Some(mock_l1_provider(0));
-        let outcome: ExecutionOutcome<Receipt> = ExecutionOutcome::new(
-            Default::default(),
-            vec![vec![anchor_receipt(), anchor_receipt()]],
-            1,
-            Default::default(),
-        );
-        let notification: ExExNotification<EthPrimitives> = ExExNotification::ChainCommitted {
-            new: Arc::new(Chain::new(vec![b1], outcome, BTreeMap::new())),
-        };
-
-        let error = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("1 transactions but 2 receipts"));
-    }
-
-    #[tokio::test]
-    async fn multi_block_commit_with_facts() {
-        let b1 = make_block(1, B256::repeat_byte(7));
-        let b2 = make_block(2, b1.hash());
-        let b3 = make_block(3, b2.hash());
-        let r = anchor_receipt();
-        let provider = setup_provider(&[
-            (&b1, vec![r.clone()]),
-            (&b2, vec![r.clone()]),
-            (&b3, vec![r]),
-        ]);
-        let mut l1 = Some(mock_l1_provider(3));
-        let notification = ExExNotification::ChainCommitted {
-            new: make_chain(vec![b1, b2, b3.clone()]),
-        };
-        let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-            .await
-            .unwrap();
-        assert_eq!(tip, BlockNumHash::new(3, b3.hash()));
-    }
-
-    // --- Invariant engine tests ---
-
-    /// A receipt with a `TempoAdvanced` anchor pointing at a specific L1
-    /// hash/number, plus an optional `TokenEnabled` L2 event.
-    fn receipt_with_anchor_and_token(
-        l1_hash: B256,
-        l1_number: u64,
-        token: Option<Address>,
-    ) -> Receipt {
-        let mut logs = vec![Log {
-            address: ZONE_INBOX_ADDRESS,
-            data: IZoneInbox::TempoAdvanced {
-                tempoBlockHash: l1_hash,
-                tempoBlockNumber: l1_number,
-                depositsProcessed: U256::ZERO,
-                newProcessedDepositQueueHash: B256::ZERO,
-                lastProcessedDepositNumber: 0,
-            }
-            .encode_log_data(),
-        }];
-        if let Some(token) = token {
-            logs.push(Log {
-                address: ZONE_INBOX_ADDRESS,
-                data: IZoneInbox::TokenEnabled {
-                    token,
-                    name: "T".into(),
-                    symbol: "T".into(),
-                    currency: "USD".into(),
-                }
-                .encode_log_data(),
-            });
-        }
-        Receipt {
-            tx_type: Default::default(),
-            success: true,
-            cumulative_gas_used: 0,
-            logs,
-        }
-    }
-
-    /// Build a TempoHeader with a given number and empty receipts, returning
-    /// both the header and its computed hash so the anchor and mock stay
-    /// consistent.
-    fn l1_header_for(number: u64) -> (TempoHeader, B256) {
-        let receipts_root = alloy_consensus::proofs::calculate_receipt_root::<
-            alloy_consensus::ReceiptWithBloom<
-                tempo_primitives::TempoReceipt<alloy_primitives::Log>,
-            >,
-        >(&[]);
-        let header = TempoHeader {
-            inner: Header {
-                number,
-                receipts_root,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let hash = header.hash_slow();
-        (header, hash)
-    }
-
-    /// Mock L1 provider for a list of (header, hash) anchors, each with empty
-    /// receipts.  Responses are pushed in the order given.
-    fn mock_l1_for_anchors(anchors: &[(TempoHeader, B256)]) -> DynProvider<TempoNetwork> {
-        let asserter = Asserter::new();
-        for (header, hash) in anchors {
-            let resp = TempoHeaderResponse {
-                inner: RpcHeader {
-                    hash: *hash,
-                    inner: header.clone(),
-                    total_difficulty: None,
-                    size: None,
-                },
-                timestamp_millis: 0,
-            };
-            let block = alloy_rpc_types_eth::Block {
-                header: resp,
-                uncles: vec![],
-                transactions:
-                    BlockTransactions::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Hashes(
-                        vec![],
-                    ),
-                withdrawals: None,
-            };
-            asserter.push_success(&Some(block));
-            asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
-        }
-        ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_mocked_client(asserter)
-            .erased()
-    }
-
-    #[tokio::test]
-    async fn violation_does_not_fail_notification() {
-        // L2 has a TokenEnabled event, but L1 has none — invariant mismatch.
-        // The notification should still return Ok (observe-only).
-        let (l1_header, l1_hash) = l1_header_for(L1_NUMBER);
-        let b1 = make_block(1, B256::repeat_byte(0x01));
-        let r = receipt_with_anchor_and_token(l1_hash, L1_NUMBER, Some(Address::repeat_byte(0xaa)));
-        let provider = setup_provider(&[(&b1, vec![r.clone()])]);
-        // L1 mock has no TokenEnabled events (empty receipts).
-        let mut l1 = Some(mock_l1_for_anchors(&[(l1_header, l1_hash)]));
-        let notification = ExExNotification::ChainCommitted {
-            new: make_chain_with_receipts(vec![b1.clone()], vec![vec![r]]),
-        };
-        let result = process_notification(&notification, &provider, &mut l1, "", PORTAL).await;
-        assert!(
-            result.is_ok(),
-            "violation should not fail notification: {:?}",
-            result.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn reorged_in_block_uses_its_own_anchor() {
-        // Two reorged-in blocks with different L1 anchors. If the checker
-        // used the wrong anchor, authentication would fail.
-        let (l1_header_a, l1_hash_a) = l1_header_for(200);
-        let (l1_header_b, l1_hash_b) = l1_header_for(201);
-
-        let parent = B256::repeat_byte(0x04);
-        let old1 = make_block(1, parent);
-        let old2 = make_block(2, old1.hash());
-
-        let new1 = make_block(1, parent);
-        let new2 = make_block(2, new1.hash());
-
-        let r_a = receipt_with_anchor_and_token(l1_hash_a, 200, None);
-        let r_b = receipt_with_anchor_and_token(l1_hash_b, 201, None);
-
-        let provider = setup_provider(&[(&new1, vec![r_a.clone()]), (&new2, vec![r_b.clone()])]);
-
-        // Mock responds with the correct block for each anchor.
-        // Reorged-in blocks are processed oldest-to-newest: new1 then new2.
-        let mut l1 = Some(mock_l1_for_anchors(&[
-            (l1_header_a, l1_hash_a),
-            (l1_header_b, l1_hash_b),
-        ]));
-
-        let notification = ExExNotification::ChainReorged {
-            old: make_chain(vec![old1, old2]),
-            new: make_chain_with_receipts(vec![new1, new2.clone()], vec![vec![r_a], vec![r_b]]),
-        };
-        let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-            .await
-            .unwrap();
-        assert_eq!(tip, BlockNumHash::new(2, new2.hash()));
-    }
-}
+mod tests;

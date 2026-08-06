@@ -53,6 +53,16 @@ pub(crate) const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
 /// Pinned source: `crates/precompiles/src/outbox/mod.rs:32`.
 pub(crate) const MAX_CALLBACK_DATA_SIZE: usize = 1_024;
 
+/// Maximum deposits imported from one Tempo block.
+///
+/// Pinned source: `specs/ref-impls/src/tempo/ZonePortal.sol:62`.
+pub(crate) const MAX_DEPOSITS_PER_TEMPO_BLOCK: usize = 230;
+
+/// Maximum token enablements imported from one Tempo block.
+///
+/// Pinned source: `specs/ref-impls/src/tempo/ZonePortal.sol:67`.
+pub(crate) const MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK: usize = 8;
+
 /// Maximum UTF-8 byte length of an enabled token name.
 ///
 /// Pinned source: `specs/ref-impls/src/tempo/ZonePortal.sol:72`.
@@ -160,6 +170,8 @@ mod tests {
         assert_eq!(NO_WITHDRAWAL_QUEUE_INDEX, U256::MAX);
         assert_eq!(WITHDRAWAL_BASE_GAS, 50_000);
         assert_eq!(MAX_CALLBACK_DATA_SIZE, 1_024);
+        assert_eq!(MAX_DEPOSITS_PER_TEMPO_BLOCK, 230);
+        assert_eq!(MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, 8);
         assert_eq!(MAX_TOKEN_NAME_BYTES, 64);
         assert_eq!(MAX_TOKEN_SYMBOL_BYTES, 31);
         assert_eq!(MAX_TOKEN_CURRENCY_BYTES, 31);
