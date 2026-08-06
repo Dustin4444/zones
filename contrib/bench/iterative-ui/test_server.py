@@ -158,16 +158,16 @@ class ConfigurationTests(unittest.TestCase):
         config = SERVER.BenchmarkController._validate_config({})
         self.assertEqual(config["scenario"], "deposit")
         self.assertEqual(config["preset"], "encrypted-deposit")
-        self.assertEqual(config["count"], 100)
+        self.assertEqual(config["count"], 50)
         self.assertEqual(config["rate"], 0)
-        self.assertEqual(config["concurrency"], 100)
-        self.assertEqual(config["accounts"], 100)
+        self.assertEqual(config["concurrency"], 50)
+        self.assertEqual(config["accounts"], 50)
 
     def test_count_cannot_exceed_prepared_account_pool(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, "count must be between 1 and 100"
+            ValueError, "count must be between 1 and 50"
         ):
-            SERVER.BenchmarkController._validate_config({"count": 101})
+            SERVER.BenchmarkController._validate_config({"count": 51})
 
     def test_single_transaction_uses_one_account(self) -> None:
         config = SERVER.BenchmarkController._validate_config(

@@ -227,7 +227,7 @@ async function poll() {
 async function runScenario(id) {
   selectedScenario = id;
   try {
-    const count = Number(elements.configCount.value || 100);
+    const count = Number(elements.configCount.value || 50);
     const nextState = await request("/api/runs", {
       method: "POST",
       body: JSON.stringify({

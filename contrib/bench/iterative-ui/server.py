@@ -28,15 +28,21 @@ STATE_VERSION = 6
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 ACCOUNT_START = 16
 TOPOLOGY_ACCOUNT_CAPACITY = int(
-    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "100")
+    os.environ.get("ITERATIVE_BENCH_ACCOUNT_CAPACITY", "50")
 )
-if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 100:
-    raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 100")
+if not 1 <= TOPOLOGY_ACCOUNT_CAPACITY <= 50:
+    raise ValueError("ITERATIVE_BENCH_ACCOUNT_CAPACITY must be between 1 and 50")
 # Redemption fixture preparation exercises the Earn deposit path. Keep it on a
 # disjoint account pool so the deposit card measures the same unwarmed path as
 # the canonical end-to-end benchmark.
 REDEMPTION_ACCOUNT_START = ACCOUNT_START + TOPOLOGY_ACCOUNT_CAPACITY
 TOTAL_TOPOLOGY_ACCOUNTS = TOPOLOGY_ACCOUNT_CAPACITY * 2
+# Setup is deliberately bounded below the full topology's fan-out. Tempo can
+# include every approval in one block, but txgen then asks the local node to
+# observe every receipt and canonical block at once; that burst can make the
+# otherwise-successful setup look partially failed. This only paces untimed
+# initialization and does not change the concurrency selected in the UI.
+TOPOLOGY_SETUP_MAX_IN_FLIGHT = min(32, TOTAL_TOPOLOGY_ACCOUNTS)
 REDEMPTION_RUNS_PER_ACCOUNT = int(
     os.environ.get("ITERATIVE_BENCH_REDEMPTION_RUNS_PER_ACCOUNT", "100")
 )
@@ -586,7 +592,7 @@ class BenchmarkController:
 
         count = integer(
             "count",
-            min(100, TOPOLOGY_ACCOUNT_CAPACITY),
+            min(50, TOPOLOGY_ACCOUNT_CAPACITY),
             1,
             TOPOLOGY_ACCOUNT_CAPACITY,
         )
@@ -955,7 +961,7 @@ def provision_topology(root: Path, state_dir: Path) -> tuple[Any, dict[str, str]
                 "ZONES_BENCH_COUNT": str(TOTAL_TOPOLOGY_ACCOUNTS),
                 "ZONES_BENCH_ACCOUNTS": str(TOTAL_TOPOLOGY_ACCOUNTS),
                 "ZONES_BENCH_TPS": "1",
-                "ZONES_BENCH_MAX_CONCURRENT": str(TOTAL_TOPOLOGY_ACCOUNTS),
+                "ZONES_BENCH_MAX_CONCURRENT": str(TOPOLOGY_SETUP_MAX_IN_FLIGHT),
                 "ZONES_BENCH_OUTPUT": str(prepare_output),
                 "ZONES_BENCH_REPORT": str(prepare_dir / "unused-report.json"),
                 "ZONES_BENCH_RENDERED_SCENARIO": str(
