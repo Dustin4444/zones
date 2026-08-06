@@ -20,6 +20,7 @@ import {
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT,
     QueuedDeposit,
     WithdrawalBounceBackDeposit,
     ZONE_OUTBOX
@@ -138,6 +139,35 @@ contract ZoneInboxTest is Test {
 
         // State should remain at bytes32(0)
         assertEq(inbox.processedDepositQueueHash(), bytes32(0));
+    }
+
+    function test_advanceTempo_acceptsLeadershipActivationAsFirstHeader() public {
+        tempoState.setMockStorageValue(
+            mockPortal,
+            PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT,
+            bytes32(uint256(GENESIS_TEMPO_BLOCK_NUMBER + 1))
+        );
+
+        vm.prank(sequencer);
+        inbox.advanceTempo(
+            new bytes[](2), new QueuedDeposit[](0), new DecryptionData[](0), new EnabledToken[](0)
+        );
+        assertEq(tempoState.tempoBlockNumber(), GENESIS_TEMPO_BLOCK_NUMBER + 2);
+    }
+
+    function test_advanceTempo_revertsWhenRangeCrossesLeadershipActivation() public {
+        tempoState.setMockStorageValue(
+            mockPortal,
+            PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT,
+            bytes32(uint256(GENESIS_TEMPO_BLOCK_NUMBER + 2))
+        );
+
+        vm.prank(sequencer);
+        vm.expectRevert(IZoneInbox.LeaderTransitionCrossed.selector);
+        inbox.advanceTempo(
+            new bytes[](2), new QueuedDeposit[](0), new DecryptionData[](0), new EnabledToken[](0)
+        );
+        assertEq(tempoState.tempoBlockNumber(), GENESIS_TEMPO_BLOCK_NUMBER);
     }
 
     function test_advanceTempo_singleDeposit() public {
@@ -891,6 +921,24 @@ contract ZoneInboxTest is Test {
 
         vm.prank(sequencer);
         _advanceTempoQueued(new QueuedDeposit[](0), new DecryptionData[](0), enabledTokens);
+    }
+
+    function test_advanceTempo_multiHeaderRangeAcceptsAccumulatedTokenEnablements() public {
+        EnabledToken[] memory enabledTokens = new EnabledToken[](9);
+        for (uint256 i = 0; i < enabledTokens.length; i++) {
+            address token = address(uint160(0x800 + i));
+            vm.etch(token, hex"00");
+            _mockTokenActivation(token);
+            enabledTokens[i] =
+                EnabledToken({ token: token, name: "Token", symbol: "TOK", currency: "USD" });
+        }
+
+        vm.prank(sequencer);
+        inbox.advanceTempo(
+            new bytes[](2), new QueuedDeposit[](0), new DecryptionData[](0), enabledTokens
+        );
+
+        assertEq(tempoState.tempoBlockNumber(), GENESIS_TEMPO_BLOCK_NUMBER + 2);
     }
 
     /// @notice Claiming with no refund returns zero and mints nothing.

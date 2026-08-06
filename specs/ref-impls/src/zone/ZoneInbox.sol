@@ -18,6 +18,7 @@ import {
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT,
     QueuedDeposit,
     WithdrawalBounceBackDeposit,
     ZONE_OUTBOX
@@ -215,8 +216,24 @@ contract ZoneInbox is IZoneInbox {
     {
         if (msg.sender != address(0)) revert OnlySequencer();
 
-        // Step 1: Advance Tempo state (validates chain continuity internally)
+        // Step 1: Advance Tempo state (validates chain continuity internally).
+        uint64 firstTempoBlock = _tempoState.tempoBlockNumber() + 1;
         _tempoState.finalizeTempo(headers);
+        uint64 finalTempoBlock = _tempoState.tempoBlockNumber();
+
+        // A leadership activation block may start a range but cannot appear inside one.
+        if (firstTempoBlock < finalTempoBlock) {
+            uint64 activation = uint64(
+                uint256(
+                    _tempoState.readTempoStorageSlot(
+                        tempoPortal, PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT
+                    )
+                )
+            );
+            if (firstTempoBlock < activation && activation <= finalTempoBlock) {
+                revert LeaderTransitionCrossed();
+            }
+        }
 
         // Activate new tokens directly in the Inbox.
         for (uint256 i = 0; i < enabledTokens.length; i++) {

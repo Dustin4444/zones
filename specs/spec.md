@@ -323,7 +323,7 @@ The admin manages which TIP-20 tokens are available on the zone (see [Access Con
 - `pauseDeposits(token)`: Pause new deposits for a token. Does not affect withdrawals.
 - `resumeDeposits(token)`: Resume deposits for a previously paused token.
 
-The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The admin can halt deposits but cannot disable withdrawals for an enabled token. To keep the mandatory zone-side `advanceTempo()` call within its fixed system gas budget, each portal accepts at most `MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK` (8) token enablements in one Tempo block, including the initial token enabled during portal creation. Metadata copied into the zone is bounded by encoded byte length: 64 bytes for `name` and 31 bytes each for `symbol` and `currency`. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
+The portal maintains a `TokenConfig` per token with an `enabled` flag and a configurable `depositsActive` flag, along with an append-only `enabledTokens` list. The admin can halt deposits but cannot disable withdrawals for an enabled token. To bound the token activation work originating in any one Tempo block, each portal accepts at most `MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK` (8) token enablements in that block, including the initial token enabled during portal creation. The counter resets each Tempo block, allowing enablements to accumulate during sequencer downtime and be imported across multiple catch-up Zone blocks. Metadata copied into the zone is bounded by encoded byte length: 64 bytes for `name` and 31 bytes each for `symbol` and `currency`. Note that token issuers can independently restrict transfers via TIP-403 policies, which may cause withdrawals to fail and bounce back (see [Withdrawal Failures and Bounce-Back](#withdrawal-failures-and-bounce-back)).
 
 ### Gas Rate Configuration
 
@@ -1946,7 +1946,7 @@ interface IZoneInbox {
 }
 ```
 
-`EnabledToken` carries token metadata (`token`, `name`, `symbol`, `currency`) for direct activation of zone-side TIP-20 precompiles by `ZoneInbox`. `ZonePortal` admits at most 8 such activations per Tempo block and rejects metadata whose encoded byte length exceeds 64 bytes for `name` or 31 bytes for `symbol` or `currency`.
+`EnabledToken` carries token metadata (`token`, `name`, `symbol`, `currency`) for direct activation of zone-side TIP-20 precompiles by `ZoneInbox`. `ZonePortal` admits at most 8 such activations per Tempo block and rejects metadata whose encoded byte length exceeds 64 bytes for `name` or 31 bytes for `symbol` or `currency`. The reference `ZoneInbox` does not impose an additional token-count cap across a multi-header range; operators can split accumulated activation work across catch-up Zone blocks.
 
 ### IZoneOutbox
 

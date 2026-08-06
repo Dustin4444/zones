@@ -1117,6 +1117,7 @@ interface IZoneInbox {
     error MissingDecryptionData();
     error ExtraDecryptionData();
     error InvalidSharedSecretProof();
+    error LeaderTransitionCrossed();
     error Unauthorized();
 
     /// @notice The Tempo portal address (for reading deposit queue hash)
@@ -1141,7 +1142,8 @@ interface IZoneInbox {
     ///      3. Validates the resulting hash chain equals Tempo's currentDepositQueueHash
     ///
     ///      The system transaction is all-or-nothing and must process every pending deposit
-    ///      through the final queue head. A mismatch reverts the complete call.
+    ///      through the final queue head. A mismatch reverts the complete call. Every imported
+    ///      header must belong to one leadership epoch; an activation block may only start a range.
     ///
     ///      For user deposits, the sequencer provides DecryptionData with the
     ///      ECDH shared secret and proof. ZoneInbox derives (to, memo) onchain.
