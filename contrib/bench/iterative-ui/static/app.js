@@ -238,7 +238,6 @@ async function runScenario(id) {
       body: JSON.stringify({
         scenario: id,
         count,
-        accounts: Math.max(100, count, concurrency),
         rate: elements.configRate.value,
         concurrency,
       }),

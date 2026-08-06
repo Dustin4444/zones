@@ -68,7 +68,9 @@ class ReportConversionTests(unittest.TestCase):
                 step("onramp.submission", "l1", "submit", 100, 150),
                 step("onramp.zone_deposit.processed", "zone", "wait_log", 500, 700),
                 step("earn_deposit.request", "zone", "submit", 100, 150),
-                step("earn_deposit.zone_return.processed", "zone", "wait_log", 700, 900),
+                step(
+                    "earn_deposit.zone_return.processed", "zone", "wait_log", 700, 900
+                ),
                 step("earn_redeem.request", "zone", "submit", 100, 150),
                 step("earn_redeem.zone_return.processed", "zone", "wait_log", 700, 900),
                 step("l1_before_offramp", "l1", "checkpoint", 10, 20),
@@ -91,9 +93,10 @@ class ReportConversionTests(unittest.TestCase):
         self.assertEqual(result["summary"]["p99Ms"], 3_900)
         self.assertEqual(result["summary"]["journeysPerMinute"], 30)
         self.assertAlmostEqual(result["summary"]["meanJourneyCostUsd"], 0.00002)
-        self.assertEqual([phase["id"] for phase in result["phases"]], [
-            "deposit", "earn_deposit", "earn_redeem", "withdraw"
-        ])
+        self.assertEqual(
+            [phase["id"] for phase in result["phases"]],
+            ["deposit", "earn_deposit", "earn_redeem", "withdraw"],
+        )
         self.assertNotIn("private_transfer", {item["name"] for item in result["steps"]})
 
 
@@ -105,13 +108,22 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(config["count"], 100)
         self.assertEqual(config["rate"], 20)
         self.assertEqual(config["concurrency"], 12)
-        self.assertEqual(config["accounts"], 100)
+        self.assertEqual(config["accounts"], 12)
 
-    def test_accounts_must_cover_concurrency(self) -> None:
-        with self.assertRaisesRegex(ValueError, "accounts must be between 20 and 10000"):
+    def test_accounts_must_cover_effective_concurrency(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "accounts must be between 10 and 10000"
+        ):
             SERVER.BenchmarkController._validate_config(
-                {"accounts": 10, "concurrency": 20, "count": 10}
+                {"accounts": 5, "concurrency": 20, "count": 10}
             )
+
+    def test_single_transaction_uses_one_account(self) -> None:
+        config = SERVER.BenchmarkController._validate_config(
+            {"count": 1, "concurrency": 12}
+        )
+        self.assertEqual(config["concurrency"], 1)
+        self.assertEqual(config["accounts"], 1)
 
     def test_each_card_maps_to_a_standalone_preset(self) -> None:
         expected = {
@@ -122,7 +134,9 @@ class ConfigurationTests(unittest.TestCase):
         }
         for scenario, preset in expected.items():
             with self.subTest(scenario=scenario):
-                config = SERVER.BenchmarkController._validate_config({"scenario": scenario})
+                config = SERVER.BenchmarkController._validate_config(
+                    {"scenario": scenario}
+                )
                 self.assertEqual(config["preset"], preset)
 
     def test_unknown_scenario_is_rejected(self) -> None:

@@ -244,7 +244,7 @@ class LocalBenchmark:
 
     def start_process(
         self, name: str, argv: list[str | Path], *, env: dict[str, str] | None = None
-    ) -> None:
+    ) -> subprocess.Popen[bytes]:
         log = (self.logs / f"{name}.log").open("wb")
         process = subprocess.Popen(
             [str(item) for item in argv],
@@ -260,6 +260,7 @@ class LocalBenchmark:
             log.flush()
             tail = (self.logs / f"{name}.log").read_text(errors="replace")[-4000:]
             raise RuntimeError(f"{name} stopped during startup:\n{tail}")
+        return process
 
     def rpc(self, url: str, method: str, params: list[Any] | None = None) -> Any:
         body = json.dumps(
@@ -274,10 +275,30 @@ class LocalBenchmark:
             raise RuntimeError(f"{method}: {payload['error']}")
         return payload.get("result")
 
-    def wait_rpc(self, url: str, label: str, timeout: float = 90) -> None:
+    def wait_rpc(
+        self,
+        url: str,
+        label: str,
+        timeout: float = 90,
+        process: subprocess.Popen[bytes] | None = None,
+    ) -> None:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
+            if process is not None and process.poll() is not None:
+                log_path = self.logs / f"{label.lower().replace(' ', '-')}.log"
+                if label == "Tempo L1":
+                    log_path = self.logs / "tempo.log"
+                elif label == "private Zone":
+                    log_path = self.logs / "zone.log"
+                tail = (
+                    log_path.read_text(errors="replace")[-4000:]
+                    if log_path.is_file()
+                    else ""
+                )
+                raise RuntimeError(
+                    f"{label} stopped during startup with code {process.returncode}:\n{tail}"
+                )
             try:
                 if self.rpc(url, "eth_chainId"):
                     return
@@ -415,7 +436,7 @@ class LocalBenchmark:
         l1_http_port, l1_ws_port, l1_p2p_port, l1_auth_port = self.reserve_ports(4)
         l1_http = f"http://127.0.0.1:{l1_http_port}"
         l1_ws = f"ws://127.0.0.1:{l1_ws_port}"
-        self.start_process(
+        tempo_process = self.start_process(
             "tempo",
             [
                 self.root / "target" / "release" / "tempo",
@@ -468,7 +489,7 @@ class LocalBenchmark:
                 l1_http,
             ],
         )
-        self.wait_rpc(l1_http, "Tempo L1")
+        self.wait_rpc(l1_http, "Tempo L1", process=tempo_process)
 
         self.stage("topology", f"Funding {self.args.accounts} real benchmark accounts")
         for account in [control_address, sequencer_address, *users]:
@@ -494,8 +515,6 @@ class LocalBenchmark:
             DLUSD,
             "--dev.access-mode",
         ]
-        for account in allowed:
-            zone_command.extend(("--dev.allowed-account", account))
         zone_command.extend(
             (
                 "--datadir",
@@ -514,8 +533,8 @@ class LocalBenchmark:
         )
         zone_env = dict(os.environ)
         zone_env["DEV_KEY"] = sequencer_key
-        self.start_process("zone", zone_command, env=zone_env)
-        self.wait_rpc(zone_http, "private Zone", timeout=180)
+        zone_process = self.start_process("zone", zone_command, env=zone_env)
+        self.wait_rpc(zone_http, "private Zone", timeout=60, process=zone_process)
 
         zone_json = self.run_dir / "zone" / "zone.json"
         deadline = time.monotonic() + 30
@@ -526,7 +545,10 @@ class LocalBenchmark:
         zone = json.loads(zone_json.read_text())
         portal = str(zone["portal"])
 
-        self.stage("topology", "Deploying the real Earn vault fixtures")
+        self.stage(
+            "topology",
+            f"Deploying Earn fixtures and authorizing {len(allowed)} benchmark accounts",
+        )
         allowed_file = self.run_dir / "allowed-accounts"
         allowed_file.write_text("\n".join(allowed) + "\n")
         allowed_file.chmod(0o600)

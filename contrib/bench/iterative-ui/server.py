@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-STATE_VERSION = 4
+STATE_VERSION = 5
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 STAGE_PREFIX = "LIVE_BENCH_STAGE "
 PHASES = (
@@ -461,10 +461,9 @@ class BenchmarkController:
             return value
 
         count = integer("count", 100, 1, 1_000)
-        concurrency = integer("concurrency", 12, 1, 100)
-        accounts = integer(
-            "accounts", max(100, count, concurrency), max(count, concurrency), 10_000
-        )
+        requested_concurrency = integer("concurrency", 12, 1, 100)
+        concurrency = min(requested_concurrency, count)
+        accounts = integer("accounts", concurrency, concurrency, 10_000)
         scenario = str(raw.get("scenario", "deposit"))
         definition = SCENARIOS.get(scenario)
         if definition is None:
