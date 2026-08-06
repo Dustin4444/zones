@@ -20,7 +20,6 @@ use alloy_primitives::{Address, U256};
 
 use super::{
     constants::WITHDRAWAL_QUEUE_CAPACITY,
-    encoding::DepositQueueMember,
     input::{ImportedTempoBlockInput, TokenEnable, ZoneBlockInput, ZoneDepositPrefixInput},
     output::{
         ExpectedImportedTempoBlock, ExpectedOutputs, ExpectedPostZoneState, ExpectedZoneBlock,
@@ -39,9 +38,53 @@ pub(crate) use error::{
     ModelError, WithdrawalOriginKind, WithdrawalProcessingOutcomeKind,
 };
 
-/// Typed final mutations for one candidate block. Owner and sparse aggregate
-/// maps use `None` for deletion, matching the eventual persistent key/value
-/// delta without a generic key/value registry.
+#[cfg(test)]
+pub(crate) mod test_inputs {
+    use alloy_primitives::{B256, U256};
+
+    pub(crate) use super::super::input::{AuthenticatedDepositOutcome, ImportedTempoOperation};
+
+    use super::super::{
+        encoding::DepositQueueMember,
+        input::{
+            ImportedTempoBlockInput, TokenEnable, ZoneBlockContext, ZoneBlockInput,
+            ZoneDepositPrefixInput,
+        },
+    };
+
+    pub(crate) fn imported_block(
+        number: u64,
+        base_fee: U256,
+        operations: Vec<ImportedTempoOperation>,
+    ) -> ImportedTempoBlockInput {
+        ImportedTempoBlockInput::new(number, base_fee, operations)
+    }
+
+    pub(crate) fn deposit_prefix(
+        enabled_tokens: Vec<TokenEnable>,
+        deposits: Vec<DepositQueueMember>,
+        outcomes: Vec<AuthenticatedDepositOutcome>,
+    ) -> ZoneDepositPrefixInput {
+        ZoneDepositPrefixInput::new(enabled_tokens, deposits, outcomes)
+    }
+
+    pub(crate) fn zone_block(
+        block_hash: B256,
+        block_number: u64,
+        advance: ZoneDepositPrefixInput,
+    ) -> ZoneBlockInput {
+        ZoneBlockInput::new(
+            ZoneBlockContext::new(block_hash, block_number),
+            advance,
+            Vec::new(),
+            None,
+        )
+    }
+}
+
+/// Typed final mutations for one candidate block. Owner maps use `None` for
+/// deletion, matching the eventual persistent key/value delta without a
+/// generic key/value registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogicalDelta {
     portal: Option<PortalLifecycle>,
@@ -52,9 +95,26 @@ struct LogicalDelta {
     batches: BTreeMap<BatchId, Option<BatchOwner>>,
     fallback_owners: BTreeMap<FallbackId, Option<FallbackOwner>>,
     portal_refunds: BTreeMap<PortalRefundId, Option<PortalRefundOwner>>,
-    portal_refund_totals: BTreeMap<RefundAccount, Option<u128>>,
     inbox_refunds: BTreeMap<InboxRefundId, Option<InboxRefundOwner>>,
-    inbox_refund_totals: BTreeMap<RefundAccount, Option<u128>>,
+    /// Sparse updates to the non-authoritative in-memory index. Persistence
+    /// deliberately visits only the origin mutations above.
+    derived_portal_refund_totals: BTreeMap<RefundAccount, u128>,
+    derived_inbox_refund_totals: BTreeMap<RefundAccount, u128>,
+}
+
+/// Borrowed, closed mutation vocabulary exposed only at the persistence
+/// boundary. The logical model remains typed; no generic key/value registry
+/// can feed transitions or bypass their lifecycle checks.
+pub(crate) enum LogicalMutationRef<'a> {
+    Portal(&'a PortalLifecycle),
+    Zone(&'a ZoneState),
+    Token(Address, &'a TokenState),
+    PendingDeposit(DepositId, Option<&'a DepositOwner>),
+    Withdrawal(WithdrawalId, Option<&'a WithdrawalOwner>),
+    Batch(BatchId, Option<&'a BatchOwner>),
+    FallbackOwner(FallbackId, Option<&'a FallbackOwner>),
+    PortalRefund(PortalRefundId, Option<&'a PortalRefundOwner>),
+    InboxRefund(InboxRefundId, Option<&'a InboxRefundOwner>),
 }
 
 impl LogicalDelta {
@@ -68,9 +128,9 @@ impl LogicalDelta {
             batches: BTreeMap::new(),
             fallback_owners: BTreeMap::new(),
             portal_refunds: BTreeMap::new(),
-            portal_refund_totals: BTreeMap::new(),
             inbox_refunds: BTreeMap::new(),
-            inbox_refund_totals: BTreeMap::new(),
+            derived_portal_refund_totals: BTreeMap::new(),
+            derived_inbox_refund_totals: BTreeMap::new(),
         }
     }
 }
@@ -210,6 +270,16 @@ pub(crate) struct ModelStateUpdate {
     delta: LogicalDelta,
 }
 
+/// Sparse Portal-side mutations produced before any Zone operation runs.
+///
+/// This phase-specific capability exists only for pre-genesis L1 bootstrap;
+/// it cannot contain a Zone transition or be mistaken for a complete live
+/// block update.
+#[must_use = "an imported Tempo update must be persisted against its exact bootstrap parent"]
+pub(crate) struct ImportedTempoStateUpdate {
+    delta: LogicalDelta,
+}
+
 impl ModelStateUpdate {
     /// Apply to the exact parent from which this update was projected.
     ///
@@ -220,6 +290,63 @@ impl ModelStateUpdate {
     pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
         apply_delta(state, self.delta);
     }
+
+    /// Visit each final typed mutation without exposing the private delta or
+    /// cloning the complete parent model.
+    pub(crate) fn try_visit_mutations<'a, E>(
+        &'a self,
+        visitor: impl FnMut(LogicalMutationRef<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit_delta(&self.delta, visitor)
+    }
+}
+
+impl ImportedTempoStateUpdate {
+    pub(crate) fn try_visit_mutations<'a, E>(
+        &'a self,
+        visitor: impl FnMut(LogicalMutationRef<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit_delta(&self.delta, visitor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
+        apply_delta(state, self.delta);
+    }
+}
+
+fn visit_delta<'a, E>(
+    delta: &'a LogicalDelta,
+    mut visitor: impl FnMut(LogicalMutationRef<'a>) -> Result<(), E>,
+) -> Result<(), E> {
+    if let Some(portal) = &delta.portal {
+        visitor(LogicalMutationRef::Portal(portal))?;
+    }
+    if let Some(zone) = &delta.zone {
+        visitor(LogicalMutationRef::Zone(zone))?;
+    }
+    for (token, value) in &delta.tokens {
+        visitor(LogicalMutationRef::Token(*token, value))?;
+    }
+    for (id, value) in &delta.pending_deposits {
+        visitor(LogicalMutationRef::PendingDeposit(*id, value.as_ref()))?;
+    }
+    for (id, value) in &delta.withdrawals {
+        visitor(LogicalMutationRef::Withdrawal(*id, value.as_ref()))?;
+    }
+    for (id, value) in &delta.batches {
+        visitor(LogicalMutationRef::Batch(*id, value.as_ref()))?;
+    }
+    for (id, value) in &delta.fallback_owners {
+        visitor(LogicalMutationRef::FallbackOwner(*id, value.as_ref()))?;
+    }
+    for (id, value) in &delta.portal_refunds {
+        visitor(LogicalMutationRef::PortalRefund(*id, value.as_ref()))?;
+    }
+    for (id, value) in &delta.inbox_refunds {
+        visitor(LogicalMutationRef::InboxRefund(*id, value.as_ref()))?;
+    }
+    Ok(())
 }
 
 impl<'a> ModelTransition<'a> {
@@ -349,17 +476,21 @@ impl<'a> ModelTransition<'a> {
     }
 
     fn portal_refund_total(&self, account: RefundAccount) -> u128 {
-        match self.delta.portal_refund_totals.get(&account) {
-            Some(Some(total)) => *total,
-            Some(None) => 0,
-            None => self.parent.portal_refund_total(account),
-        }
+        self.delta
+            .derived_portal_refund_totals
+            .get(&account)
+            .copied()
+            .unwrap_or_else(|| self.parent.derived_portal_refund_total(account))
     }
 
     fn set_portal_refund_total(&mut self, account: RefundAccount, total: u128) {
-        self.delta
-            .portal_refund_totals
-            .insert(account, (total != 0).then_some(total));
+        if total == self.parent.derived_portal_refund_total(account) {
+            self.delta.derived_portal_refund_totals.remove(&account);
+        } else {
+            self.delta
+                .derived_portal_refund_totals
+                .insert(account, total);
+        }
     }
 
     fn inbox_refund(&self, id: InboxRefundId) -> Option<&InboxRefundOwner> {
@@ -375,17 +506,21 @@ impl<'a> ModelTransition<'a> {
     }
 
     fn inbox_refund_total(&self, account: RefundAccount) -> u128 {
-        match self.delta.inbox_refund_totals.get(&account) {
-            Some(Some(total)) => *total,
-            Some(None) => 0,
-            None => self.parent.inbox_refund_total(account),
-        }
+        self.delta
+            .derived_inbox_refund_totals
+            .get(&account)
+            .copied()
+            .unwrap_or_else(|| self.parent.derived_inbox_refund_total(account))
     }
 
     fn set_inbox_refund_total(&mut self, account: RefundAccount, total: u128) {
-        self.delta
-            .inbox_refund_totals
-            .insert(account, (total != 0).then_some(total));
+        if total == self.parent.derived_inbox_refund_total(account) {
+            self.delta.derived_inbox_refund_totals.remove(&account);
+        } else {
+            self.delta
+                .derived_inbox_refund_totals
+                .insert(account, total);
+        }
     }
 }
 
@@ -409,6 +544,16 @@ impl<'a> ImportedTempoTransition<'a> {
     /// All Portal-enabled tokens at the collateral cut, in address order.
     pub(crate) fn tokens(&self) -> TokenViewIter<'_> {
         TokenViewIter::new(self.candidate.parent, &self.candidate.delta)
+    }
+
+    /// Release only the Portal-side cut used by pre-genesis archive replay.
+    /// Applying any Zone input consumes this type and yields the distinct live
+    /// [`ModelStateUpdate`] capability instead.
+    pub(crate) fn into_bootstrap_state_update(self) -> ImportedTempoStateUpdate {
+        debug_assert!(self.candidate.delta.zone.is_none());
+        ImportedTempoStateUpdate {
+            delta: self.candidate.delta,
+        }
     }
 
     pub(crate) fn apply_zone_block(
@@ -530,9 +675,13 @@ fn apply_delta(state: &mut ModelState, delta: LogicalDelta) {
     apply_sparse_map_delta(&mut state.batches, delta.batches);
     apply_sparse_map_delta(&mut state.fallback_owners, delta.fallback_owners);
     apply_sparse_map_delta(&mut state.portal_refunds, delta.portal_refunds);
-    apply_sparse_map_delta(&mut state.portal_refund_totals, delta.portal_refund_totals);
     apply_sparse_map_delta(&mut state.inbox_refunds, delta.inbox_refunds);
-    apply_sparse_map_delta(&mut state.inbox_refund_totals, delta.inbox_refund_totals);
+    state.apply_derived_refund_total_updates(
+        delta.derived_portal_refund_totals,
+        delta.derived_inbox_refund_totals,
+    );
+    #[cfg(test)]
+    state.assert_derived_refund_totals_consistent();
 }
 
 fn apply_sparse_map_delta<K: Ord, V>(state: &mut BTreeMap<K, V>, delta: BTreeMap<K, Option<V>>) {
@@ -544,17 +693,6 @@ fn apply_sparse_map_delta<K: Ord, V>(state: &mut BTreeMap<K, V>, delta: BTreeMap
             None => {
                 state.remove(&key);
             }
-        }
-    }
-}
-
-fn queue_member(owner: &DepositOwner) -> DepositQueueMember {
-    match owner {
-        DepositOwner::PendingOrdinary { preimage } => {
-            DepositQueueMember::Ordinary(preimage.clone())
-        }
-        DepositOwner::PendingWithdrawalBounceBack { preimage, .. } => {
-            DepositQueueMember::WithdrawalBounceBack(*preimage)
         }
     }
 }

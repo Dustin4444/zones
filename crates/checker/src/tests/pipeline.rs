@@ -1,4 +1,5 @@
 use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_sol_types::{SolCall as _, SolEvent as _};
@@ -20,7 +21,7 @@ use super::{
 use crate::{
     check::{
         finding::{CheckError, Finding, FixedStateFinding, ObservationFinding},
-        pipeline::{InMemoryChecker, VerifiedTip},
+        pipeline::InMemoryChecker,
     },
     model::{
         accounting::TokenAccounting,
@@ -180,8 +181,8 @@ fn checker_for_empty_child(
     InMemoryChecker::new(
         ModelState::awaiting_creation(identity),
         creation_hash,
-        VerifiedTip::new(0, zone_parent),
-        VerifiedTip::new(imported.inner.number - 1, imported.inner.parent_hash),
+        BlockNumHash::new(0, zone_parent),
+        BlockNumHash::new(imported.inner.number - 1, imported.inner.parent_hash),
     )
 }
 
@@ -192,10 +193,10 @@ fn assert_checker_at_parent(
     tempo_parent: B256,
 ) {
     assert_eq!(checker.model(), model);
-    assert_eq!(checker.zone_tip(), VerifiedTip::new(0, zone_parent));
+    assert_eq!(checker.zone_tip(), BlockNumHash::new(0, zone_parent));
     assert_eq!(
         checker.tempo_tip(),
-        VerifiedTip::new(L1_NUMBER - 1, tempo_parent)
+        BlockNumHash::new(L1_NUMBER - 1, tempo_parent)
     );
 }
 
@@ -257,8 +258,8 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
     let mut checker = InMemoryChecker::new(
         model,
         B256::repeat_byte(0xcc),
-        VerifiedTip::new(0, zone_parent),
-        VerifiedTip::new(L1_NUMBER - 1, tempo_parent),
+        BlockNumHash::new(0, zone_parent),
+        BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
     );
     let exact_state = exact_zone_state_with_supply(&imported, token, committed_supply);
 
@@ -279,10 +280,10 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
             withdrawal_liability: U256::from(10),
         }
     );
-    let next_imported = imported_child_header(L1_NUMBER + 1, first_tempo_tip.hash());
+    let next_imported = imported_child_header(L1_NUMBER + 1, first_tempo_tip.hash);
     let next_block = zone_block(
-        first_zone_tip.number() + 1,
-        first_zone_tip.hash(),
+        first_zone_tip.number + 1,
+        first_zone_tip.hash,
         &next_imported,
     );
     let next_receipt = zone_receipt(&next_imported);
@@ -297,7 +298,7 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
     )
     .await
     .unwrap();
-    assert_eq!(next_l2.parent_hash(), first_zone_tip.hash());
+    assert_eq!(next_l2.parent_hash(), first_zone_tip.hash);
     assert_eq!(
         next_l2
             .inputs()
@@ -306,7 +307,7 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
             .header()
             .inner
             .parent_hash,
-        first_tempo_tip.hash()
+        first_tempo_tip.hash
     );
     let next_exact_state = exact_zone_state_with_supply(&next_imported, token, committed_supply);
 
@@ -318,11 +319,11 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
     assert_eq!(checker.model(), &committed_model);
     assert_eq!(
         checker.zone_tip(),
-        VerifiedTip::new(next_l2.block_number(), next_l2.block_hash())
+        BlockNumHash::new(next_l2.block_number(), next_l2.block_hash())
     );
     assert_eq!(
         checker.tempo_tip(),
-        VerifiedTip::new(next_imported.inner.number, next_imported.hash_slow())
+        BlockNumHash::new(next_imported.inner.number, next_imported.hash_slow())
     );
 }
 
@@ -402,7 +403,7 @@ async fn configured_creation_block_without_creation_is_a_finding_before_acquisit
                     if *block_hash == imported.hash_slow()
             )
     ));
-    assert_eq!(checker.zone_tip(), VerifiedTip::new(0, zone_parent));
+    assert_eq!(checker.zone_tip(), BlockNumHash::new(0, zone_parent));
 }
 
 #[tokio::test]
@@ -440,7 +441,7 @@ async fn l1_observation_portal_must_match_the_configured_model_identity() {
                 } if *actual_expected == expected
             )
     ));
-    assert_eq!(checker.zone_tip(), VerifiedTip::new(0, zone_parent));
+    assert_eq!(checker.zone_tip(), BlockNumHash::new(0, zone_parent));
 }
 
 #[tokio::test]
@@ -479,8 +480,8 @@ async fn collateral_uses_the_pre_zone_cut_before_same_block_burns_can_hide_a_def
     let mut checker = InMemoryChecker::new(
         model.clone(),
         B256::repeat_byte(0xcc),
-        VerifiedTip::new(0, zone_parent),
-        VerifiedTip::new(L1_NUMBER - 1, tempo_parent),
+        BlockNumHash::new(0, zone_parent),
+        BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
     );
 
     let error = checker
@@ -536,8 +537,8 @@ async fn post_zone_supply_detects_unauthorized_mint_and_burn_and_keeps_the_paren
         let mut checker = InMemoryChecker::new(
             model.clone(),
             B256::repeat_byte(0xcc),
-            VerifiedTip::new(0, zone_parent),
-            VerifiedTip::new(L1_NUMBER - 1, tempo_parent),
+            BlockNumHash::new(0, zone_parent),
+            BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
         );
 
         let error = checker

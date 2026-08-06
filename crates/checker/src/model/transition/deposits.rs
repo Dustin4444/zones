@@ -18,8 +18,7 @@ use super::{
         },
         state::{TokenPhase, ZoneProcessedDepositCursor},
     },
-    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, queue_member, refunds,
-    require_zone_token,
+    DepositKind, DepositOutcomeKind, ModelError, ModelTransition, refunds, require_zone_token,
 };
 
 pub(super) fn apply_zone_prefix(
@@ -99,7 +98,7 @@ fn consume_one(
         .pending_deposit(id)
         .cloned()
         .ok_or(ModelError::PendingDepositMissing { number })?;
-    let expected_member = queue_member(&owner);
+    let expected_member = owner.queue_member();
     if &expected_member != supplied {
         return Err(ModelError::DepositPrefixMismatch { number });
     }

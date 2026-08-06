@@ -19,7 +19,8 @@ use crate::model::{
     output::ExpectedOutputs,
     ownership::{
         BatchId, BatchOwner, DepositId, FallbackId, FallbackOwner, FinalizedBatchState,
-        WithdrawalId, WithdrawalIdentity, WithdrawalOwner,
+        InboxRefundId, InboxRefundOwner, PortalRefundId, PortalRefundOwner, WithdrawalId,
+        WithdrawalIdentity, WithdrawalOwner,
     },
     state::{ModelState, PortalIdentity, portal_address_for_zone},
 };
@@ -128,12 +129,7 @@ pub(super) fn commit(
     imported: &ImportedTempoBlockInput,
     zone: &ZoneDepositPrefixInput,
 ) -> Result<ExpectedOutputs, ModelError> {
-    let completed = ModelTransition::new(state)
-        .apply_imported_tempo_block(imported)?
-        .apply_zone_block(&advance_only_block(zone))?;
-    let (next, expected) = completed.materialize_for_test();
-    *state = next;
-    Ok(expected)
+    commit_full_block(state, imported, &advance_only_block(zone))
 }
 
 pub(super) fn empty_import() -> ImportedTempoBlockInput {
@@ -276,6 +272,43 @@ pub(super) fn deposit_id(number: u64) -> DepositId {
         portal: portal(),
         deposit_number: NonZeroU64::new(number).unwrap(),
     }
+}
+
+pub(super) fn portal_refund_id(
+    token: Address,
+    recipient: Address,
+    deposit_number: u64,
+) -> PortalRefundId {
+    PortalRefundId {
+        token,
+        recipient,
+        failed_deposit: deposit_id(deposit_number),
+    }
+}
+
+pub(super) fn inbox_refund_id(
+    token: Address,
+    recipient: Address,
+    withdrawal_index: u64,
+) -> InboxRefundId {
+    InboxRefundId {
+        token,
+        recipient,
+        user_withdrawal: withdrawal_id(withdrawal_index),
+    }
+}
+
+pub(super) fn seed_portal_credit(state: &mut ModelState, id: PortalRefundId, amount: u128) {
+    state.seed_portal_refund_for_test(id, PortalRefundOwner::Pending { amount });
+}
+
+pub(super) fn seed_inbox_credit(state: &mut ModelState, id: InboxRefundId, amount: u128) {
+    state.seed_inbox_refund_for_test(
+        id,
+        InboxRefundOwner::Pending {
+            amount: NonZeroU128::new(amount).unwrap(),
+        },
+    );
 }
 
 pub(super) fn funded_state(token: Address, supply: U256) -> ModelState {

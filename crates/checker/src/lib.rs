@@ -6,11 +6,11 @@
 mod check;
 #[allow(dead_code)]
 mod metrics;
-mod observe;
-// Goals 0-5 authenticate, project, compare, and apply candidates in memory.
-// Persistence and live evaluator wiring remain deliberately deferred.
 #[allow(dead_code)]
 mod model;
+mod observe;
+#[allow(dead_code)]
+mod store;
 
 use std::{fmt, str::FromStr};
 

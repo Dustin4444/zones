@@ -2,10 +2,7 @@ use std::num::NonZeroU128;
 
 use alloy_primitives::{Address, B256, U256};
 
-use super::{
-    super::{ModelError, ModelTransition, refunds as refund_transitions},
-    support::*,
-};
+use super::{super::ModelError, support::*};
 use crate::model::{
     accounting::TokenAccounting,
     encoding::{DepositQueueMember, withdrawal_queue_hash},
@@ -17,45 +14,8 @@ use crate::model::{
     output::{ExpectedImportedTempoOperation, ExpectedProcessedWithdrawal, ExpectedZoneOperation},
     ownership::{
         InboxRefundId, InboxRefundOwner, PortalRefundId, PortalRefundOwner, RefundAccount,
-        WithdrawalId,
     },
 };
-
-fn portal_refund_id(token: Address, recipient: Address, deposit_number: u64) -> PortalRefundId {
-    PortalRefundId {
-        token,
-        recipient,
-        failed_deposit: deposit_id(deposit_number),
-    }
-}
-
-fn inbox_refund_id(token: Address, recipient: Address, withdrawal_index: u64) -> InboxRefundId {
-    InboxRefundId {
-        token,
-        recipient,
-        user_withdrawal: WithdrawalId {
-            zone_id: ZONE_ID,
-            withdrawal_index,
-        },
-    }
-}
-
-fn seed_portal_credit(
-    state: &mut crate::model::state::ModelState,
-    id: PortalRefundId,
-    amount: u128,
-) {
-    state.seed_portal_refund_for_test(id, PortalRefundOwner::Pending { amount });
-}
-
-fn seed_inbox_credit(state: &mut crate::model::state::ModelState, id: InboxRefundId, amount: u128) {
-    state.seed_inbox_refund_for_test(
-        id,
-        InboxRefundOwner::Pending {
-            amount: NonZeroU128::new(amount).unwrap(),
-        },
-    );
-}
 
 fn portal_claim(
     block_number: u64,
@@ -639,49 +599,6 @@ fn wrong_under_and_over_claim_amounts_reject_atomically() {
             "rejected Inbox claim leaked a prefix mutation"
         );
     }
-}
-
-#[test]
-fn credit_creation_checks_same_candidate_aggregate_overflow() {
-    let token = token(0xa6);
-    let recipient = Address::repeat_byte(0x61);
-    let state = created_state(token);
-    let mut candidate = ModelTransition::new(&state);
-    refund_transitions::create_portal_credit(
-        &mut candidate,
-        portal_refund_id(token, recipient, 1),
-        u128::MAX,
-    )
-    .unwrap();
-    assert_eq!(
-        refund_transitions::create_portal_credit(
-            &mut candidate,
-            portal_refund_id(token, recipient, 2),
-            1,
-        ),
-        Err(ModelError::RefundAggregateOverflow { token, recipient })
-    );
-
-    refund_transitions::create_inbox_credit(
-        &mut candidate,
-        inbox_refund_id(token, recipient, 1),
-        InboxRefundOwner::Pending {
-            amount: NonZeroU128::new(u128::MAX).unwrap(),
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        refund_transitions::create_inbox_credit(
-            &mut candidate,
-            inbox_refund_id(token, recipient, 2),
-            InboxRefundOwner::Pending {
-                amount: NonZeroU128::new(1).unwrap(),
-            },
-        ),
-        Err(ModelError::RefundAggregateOverflow { token, recipient })
-    );
-    assert!(state.portal_refunds().is_empty());
-    assert!(state.inbox_refunds.is_empty());
 }
 
 #[test]

@@ -267,24 +267,6 @@ pub(crate) enum ModelError {
     #[error("refund aggregate overflow for token {token} recipient {recipient}")]
     RefundAggregateOverflow { token: Address, recipient: Address },
     #[error(
-        "Portal refund aggregate state mismatch for token {token} recipient {recipient}: expected {expected}, got {actual} from origins"
-    )]
-    PortalRefundAggregateStateMismatch {
-        token: Address,
-        recipient: Address,
-        expected: u128,
-        actual: u128,
-    },
-    #[error(
-        "Inbox refund aggregate state mismatch for token {token} recipient {recipient}: expected {expected}, got {actual} from origins"
-    )]
-    InboxRefundAggregateStateMismatch {
-        token: Address,
-        recipient: Address,
-        expected: u128,
-        actual: u128,
-    },
-    #[error(
         "refund claim mismatch for token {token} recipient {recipient}: expected {expected}, got {actual}"
     )]
     RefundClaimAmountMismatch {

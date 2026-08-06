@@ -1,4 +1,5 @@
 use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, Log, Signature, U256, keccak256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_rlp::Encodable as _;
@@ -15,10 +16,7 @@ use tempo_primitives::{
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState, ZONE_FACTORY_ADDRESS, ZonePortal};
 
 use crate::{
-    check::{
-        finding::CheckError,
-        pipeline::{InMemoryChecker, VerifiedTip},
-    },
+    check::{finding::CheckError, pipeline::InMemoryChecker},
     model::{
         accounting::TokenAccounting,
         constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
@@ -273,11 +271,11 @@ pub(super) async fn run_valid_block(
     result.unwrap();
     assert_eq!(
         checker.zone_tip(),
-        VerifiedTip::new(l2.block_number(), l2.block_hash())
+        BlockNumHash::new(l2.block_number(), l2.block_hash())
     );
     assert_eq!(
         checker.tempo_tip(),
-        VerifiedTip::new(imported.inner.number, imported.hash_slow())
+        BlockNumHash::new(imported.inner.number, imported.hash_slow())
     );
     checker
 }
@@ -307,8 +305,8 @@ pub(super) async fn run_block(
     let mut checker = InMemoryChecker::new(
         model,
         creation_hash,
-        VerifiedTip::new(ZONE_NUMBER - 1, ZONE_PARENT),
-        VerifiedTip::new(TEMPO_NUMBER - 1, TEMPO_PARENT),
+        BlockNumHash::new(ZONE_NUMBER - 1, ZONE_PARENT),
+        BlockNumHash::new(TEMPO_NUMBER - 1, TEMPO_PARENT),
     );
     let result = checker
         .check_block(&provider, &exact_provider, &l1, l2)

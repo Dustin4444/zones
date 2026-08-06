@@ -2,6 +2,9 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use std::num::NonZeroU64;
+
 use alloy_primitives::{Address, B256, U256};
 
 use super::{
@@ -12,6 +15,7 @@ use super::{
         InboxRefundId, InboxRefundOwner, PortalRefundId, PortalRefundOwner, RefundAccount,
         WithdrawalId, WithdrawalOwner,
     },
+    validation::{AuthoritativeStateError, validate_authoritative},
 };
 
 /// Immutable identity expected from the configured creation transaction.
@@ -62,6 +66,10 @@ impl PortalConfig {
     pub(crate) const INITIAL: Self = Self {
         bounceback_gas: INITIAL_CONFIG.bounceback_gas,
     };
+
+    pub(crate) const fn new(bounceback_gas: u64) -> Self {
+        Self { bounceback_gas }
+    }
 
     pub(crate) const fn bounceback_gas(&self) -> u64 {
         self.bounceback_gas
@@ -120,6 +128,26 @@ impl PortalSettlementState {
         withdrawal_queue_head: U256::ZERO,
         withdrawal_queue_tail: U256::ZERO,
     };
+
+    pub(crate) const fn new(
+        withdrawal_batch_index: u64,
+        block_hash: B256,
+        last_synced_tempo_block_number: u64,
+        last_submitted_deposit_cursor: DepositCursor,
+        zone_height: U256,
+        withdrawal_queue_head: U256,
+        withdrawal_queue_tail: U256,
+    ) -> Self {
+        Self {
+            withdrawal_batch_index,
+            block_hash,
+            last_synced_tempo_block_number,
+            last_submitted_deposit_cursor,
+            zone_height,
+            withdrawal_queue_head,
+            withdrawal_queue_tail,
+        }
+    }
 
     pub(crate) const fn withdrawal_batch_index(&self) -> u64 {
         self.withdrawal_batch_index
@@ -186,6 +214,20 @@ pub(crate) struct CreatedPortalState {
 }
 
 impl CreatedPortalState {
+    pub(crate) const fn new(
+        identity: PortalIdentity,
+        config: PortalConfig,
+        deposit_cursor: PortalDepositCursor,
+        settlement: PortalSettlementState,
+    ) -> Self {
+        Self {
+            identity,
+            config,
+            deposit_cursor,
+            settlement,
+        }
+    }
+
     pub(crate) const fn identity(&self) -> PortalIdentity {
         self.identity
     }
@@ -248,6 +290,10 @@ pub(crate) struct TokenState {
 }
 
 impl TokenState {
+    pub(crate) const fn new(phase: TokenPhase, accounting: TokenAccounting) -> Self {
+        Self { phase, accounting }
+    }
+
     pub(crate) const fn phase(&self) -> TokenPhase {
         self.phase
     }
@@ -279,6 +325,13 @@ impl ZoneConfig {
         max_withdrawals_per_block: INITIAL_CONFIG.max_withdrawals_per_block,
     };
 
+    pub(crate) const fn new(tempo_gas_rate: u128, max_withdrawals_per_block: u32) -> Self {
+        Self {
+            tempo_gas_rate,
+            max_withdrawals_per_block,
+        }
+    }
+
     pub(crate) const fn tempo_gas_rate(&self) -> u128 {
         self.tempo_gas_rate
     }
@@ -300,6 +353,13 @@ impl ZoneLastBatch {
         withdrawal_queue_hash: B256::ZERO,
         withdrawal_batch_index: 0,
     };
+
+    pub(crate) const fn new(withdrawal_queue_hash: B256, withdrawal_batch_index: u64) -> Self {
+        Self {
+            withdrawal_queue_hash,
+            withdrawal_batch_index,
+        }
+    }
 
     pub(crate) const fn withdrawal_queue_hash(&self) -> B256 {
         self.withdrawal_queue_hash
@@ -335,6 +395,18 @@ impl BatchStart {
         first_withdrawal_index: 0,
     };
 
+    pub(crate) const fn new(
+        first_zone_parent_hash: B256,
+        first_processed_deposit: ZoneProcessedDepositCursor,
+        first_withdrawal_index: u64,
+    ) -> Self {
+        Self {
+            first_zone_parent_hash,
+            first_processed_deposit,
+            first_withdrawal_index,
+        }
+    }
+
     pub(crate) const fn first_zone_parent_hash(&self) -> B256 {
         self.first_zone_parent_hash
     }
@@ -369,6 +441,24 @@ impl ZoneState {
         batch_start: BatchStart::INITIAL,
     };
 
+    pub(crate) const fn new(
+        config: ZoneConfig,
+        processed_deposit_cursor: ZoneProcessedDepositCursor,
+        next_withdrawal_index: u64,
+        last_fallback_nonce: u64,
+        last_batch: ZoneLastBatch,
+        batch_start: BatchStart,
+    ) -> Self {
+        Self {
+            config,
+            processed_deposit_cursor,
+            next_withdrawal_index,
+            last_fallback_nonce,
+            last_batch,
+            batch_start,
+        }
+    }
+
     pub(crate) const fn config(&self) -> ZoneConfig {
         self.config
     }
@@ -394,7 +484,98 @@ impl ZoneState {
     }
 }
 
-/// Authoritative materialized state at one verified logical cut.
+/// Deterministic acceleration index derived exclusively from open refund
+/// origins. It is rebuilt after persistence decoding and never appears in
+/// [`ModelStateParts`] or the checker database schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DerivedRefundTotals {
+    portal: BTreeMap<RefundAccount, u128>,
+    inbox: BTreeMap<RefundAccount, u128>,
+}
+
+impl DerivedRefundTotals {
+    fn from_origins(
+        portal_refunds: &BTreeMap<PortalRefundId, PortalRefundOwner>,
+        inbox_refunds: &BTreeMap<InboxRefundId, InboxRefundOwner>,
+    ) -> Self {
+        let mut totals = Self::default();
+        for (id, owner) in portal_refunds {
+            let PortalRefundOwner::Pending { amount } = owner;
+            totals.add_portal(
+                RefundAccount {
+                    token: id.token,
+                    recipient: id.recipient,
+                },
+                *amount,
+            );
+        }
+        for (id, owner) in inbox_refunds {
+            let InboxRefundOwner::Pending { amount } = owner;
+            totals.add_inbox(
+                RefundAccount {
+                    token: id.token,
+                    recipient: id.recipient,
+                },
+                amount.get(),
+            );
+        }
+        totals
+    }
+
+    fn portal(&self, account: RefundAccount) -> u128 {
+        self.portal.get(&account).copied().unwrap_or_default()
+    }
+
+    fn inbox(&self, account: RefundAccount) -> u128 {
+        self.inbox.get(&account).copied().unwrap_or_default()
+    }
+
+    fn add_portal(&mut self, account: RefundAccount, amount: u128) {
+        Self::add(&mut self.portal, account, amount)
+    }
+
+    fn add_inbox(&mut self, account: RefundAccount, amount: u128) {
+        Self::add(&mut self.inbox, account, amount)
+    }
+
+    fn add(totals: &mut BTreeMap<RefundAccount, u128>, account: RefundAccount, amount: u128) {
+        let total = totals
+            .get(&account)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(amount)
+            .expect("refund aggregate overflow must be rejected before index update");
+        if total != 0 {
+            totals.insert(account, total);
+        }
+    }
+
+    fn apply_updates(
+        &mut self,
+        portal: BTreeMap<RefundAccount, u128>,
+        inbox: BTreeMap<RefundAccount, u128>,
+    ) {
+        Self::apply_ledger_updates(&mut self.portal, portal);
+        Self::apply_ledger_updates(&mut self.inbox, inbox);
+    }
+
+    fn apply_ledger_updates(
+        totals: &mut BTreeMap<RefundAccount, u128>,
+        updates: BTreeMap<RefundAccount, u128>,
+    ) {
+        for (account, total) in updates {
+            if total == 0 {
+                totals.remove(&account);
+            } else {
+                totals.insert(account, total);
+            }
+        }
+    }
+}
+
+/// Authoritative materialized state at one verified logical cut. The refund
+/// total index is derived acceleration data; refund origins remain the sole
+/// authoritative refund representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelState {
     pub(super) portal: PortalLifecycle,
@@ -405,9 +586,24 @@ pub(crate) struct ModelState {
     pub(super) batches: BTreeMap<BatchId, BatchOwner>,
     pub(super) fallback_owners: BTreeMap<FallbackId, FallbackOwner>,
     pub(super) portal_refunds: BTreeMap<PortalRefundId, PortalRefundOwner>,
-    pub(super) portal_refund_totals: BTreeMap<RefundAccount, u128>,
     pub(super) inbox_refunds: BTreeMap<InboxRefundId, InboxRefundOwner>,
-    pub(super) inbox_refund_totals: BTreeMap<RefundAccount, u128>,
+    derived_refund_totals: DerivedRefundTotals,
+}
+
+/// Semantic parts accepted at the model reconstruction boundary.
+///
+/// Storage adapters may populate this value, but only [`ModelState::from_parts`]
+/// can turn it into authoritative state.
+pub(crate) struct ModelStateParts {
+    pub(crate) portal: PortalLifecycle,
+    pub(crate) zone: ZoneState,
+    pub(crate) tokens: BTreeMap<Address, TokenState>,
+    pub(crate) pending_deposits: BTreeMap<DepositId, DepositOwner>,
+    pub(crate) withdrawals: BTreeMap<WithdrawalId, WithdrawalOwner>,
+    pub(crate) batches: BTreeMap<BatchId, BatchOwner>,
+    pub(crate) fallback_owners: BTreeMap<FallbackId, FallbackOwner>,
+    pub(crate) portal_refunds: BTreeMap<PortalRefundId, PortalRefundOwner>,
+    pub(crate) inbox_refunds: BTreeMap<InboxRefundId, InboxRefundOwner>,
 }
 
 impl ModelState {
@@ -421,10 +617,53 @@ impl ModelState {
             batches: BTreeMap::new(),
             fallback_owners: BTreeMap::new(),
             portal_refunds: BTreeMap::new(),
-            portal_refund_totals: BTreeMap::new(),
             inbox_refunds: BTreeMap::new(),
-            inbox_refund_totals: BTreeMap::new(),
+            derived_refund_totals: DerivedRefundTotals::default(),
         }
+    }
+
+    pub(crate) fn from_parts(parts: ModelStateParts) -> Result<Self, AuthoritativeStateError> {
+        let mut state = Self {
+            portal: parts.portal,
+            zone: parts.zone,
+            tokens: parts.tokens,
+            pending_deposits: parts.pending_deposits,
+            withdrawals: parts.withdrawals,
+            batches: parts.batches,
+            fallback_owners: parts.fallback_owners,
+            portal_refunds: parts.portal_refunds,
+            inbox_refunds: parts.inbox_refunds,
+            derived_refund_totals: DerivedRefundTotals::default(),
+        };
+        validate_authoritative(&state)?;
+        state.derived_refund_totals =
+            DerivedRefundTotals::from_origins(&state.portal_refunds, &state.inbox_refunds);
+        Ok(state)
+    }
+
+    pub(super) fn derived_portal_refund_total(&self, account: RefundAccount) -> u128 {
+        self.derived_refund_totals.portal(account)
+    }
+
+    pub(super) fn derived_inbox_refund_total(&self, account: RefundAccount) -> u128 {
+        self.derived_refund_totals.inbox(account)
+    }
+
+    pub(super) fn apply_derived_refund_total_updates(
+        &mut self,
+        portal: BTreeMap<RefundAccount, u128>,
+        inbox: BTreeMap<RefundAccount, u128>,
+    ) {
+        self.derived_refund_totals.apply_updates(portal, inbox);
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_derived_refund_totals_consistent(&self) {
+        assert_eq!(
+            self.derived_refund_totals,
+            DerivedRefundTotals::from_origins(&self.portal_refunds, &self.inbox_refunds),
+            "maintained refund-total index drifted from authoritative origins"
+        );
     }
 
     pub(crate) const fn portal(&self) -> &PortalLifecycle {
@@ -437,6 +676,10 @@ impl ModelState {
 
     pub(crate) fn token(&self, token: Address) -> Option<&TokenState> {
         self.tokens.get(&token)
+    }
+
+    pub(crate) fn tokens(&self) -> &BTreeMap<Address, TokenState> {
+        &self.tokens
     }
 
     pub(crate) fn pending_deposit(&self, id: DepositId) -> Option<&DepositOwner> {
@@ -459,8 +702,16 @@ impl ModelState {
         self.batches.get(&id)
     }
 
+    pub(crate) fn batches(&self) -> &BTreeMap<BatchId, BatchOwner> {
+        &self.batches
+    }
+
     pub(crate) fn fallback_owner(&self, id: FallbackId) -> Option<&FallbackOwner> {
         self.fallback_owners.get(&id)
+    }
+
+    pub(crate) fn fallback_owners(&self) -> &BTreeMap<FallbackId, FallbackOwner> {
+        &self.fallback_owners
     }
 
     pub(crate) fn portal_refund(&self, id: PortalRefundId) -> Option<&PortalRefundOwner> {
@@ -471,19 +722,68 @@ impl ModelState {
         &self.portal_refunds
     }
 
+    #[cfg(test)]
     pub(crate) fn portal_refund_total(&self, account: RefundAccount) -> u128 {
-        self.portal_refund_totals
-            .get(&account)
-            .copied()
-            .unwrap_or(0)
+        let portal = self.portal.identity().portal();
+        let lower = PortalRefundId {
+            token: account.token,
+            recipient: account.recipient,
+            failed_deposit: DepositId {
+                portal,
+                deposit_number: NonZeroU64::MIN,
+            },
+        };
+        let upper = PortalRefundId {
+            token: account.token,
+            recipient: account.recipient,
+            failed_deposit: DepositId {
+                portal,
+                deposit_number: NonZeroU64::new(u64::MAX).expect("u64::MAX is nonzero"),
+            },
+        };
+        self.portal_refunds
+            .range(lower..=upper)
+            .try_fold(0_u128, |total, (_, owner)| {
+                let PortalRefundOwner::Pending { amount } = owner;
+                total.checked_add(*amount)
+            })
+            .expect("authoritative Portal refund credits cannot overflow")
     }
 
     pub(crate) fn inbox_refund(&self, id: InboxRefundId) -> Option<&InboxRefundOwner> {
         self.inbox_refunds.get(&id)
     }
 
+    pub(crate) fn inbox_refunds(&self) -> &BTreeMap<InboxRefundId, InboxRefundOwner> {
+        &self.inbox_refunds
+    }
+
+    #[cfg(test)]
     pub(crate) fn inbox_refund_total(&self, account: RefundAccount) -> u128 {
-        self.inbox_refund_totals.get(&account).copied().unwrap_or(0)
+        let zone_id = self.portal.zone_id();
+        let lower = InboxRefundId {
+            token: account.token,
+            recipient: account.recipient,
+            user_withdrawal: WithdrawalId {
+                zone_id,
+                withdrawal_index: 0,
+            },
+        };
+        let upper = InboxRefundId {
+            token: account.token,
+            recipient: account.recipient,
+            user_withdrawal: WithdrawalId {
+                zone_id,
+                withdrawal_index: u64::MAX,
+            },
+        };
+        self.inbox_refunds
+            .range(lower..=upper)
+            .try_fold(0_u128, |total, (_, owner)| {
+                let InboxRefundOwner::Pending { amount } = owner;
+                total.checked_add(amount.get())
+            })
+            .expect("authoritative Inbox refund credits cannot overflow")
     }
 }
 
@@ -540,6 +840,13 @@ impl ModelState {
         portal.deposit_cursor = cursor;
     }
 
+    pub(crate) fn set_zone_processed_deposit_cursor_for_test(
+        &mut self,
+        cursor: ZoneProcessedDepositCursor,
+    ) {
+        self.zone.processed_deposit_cursor = cursor;
+    }
+
     pub(crate) fn set_portal_withdrawal_queue_for_test(&mut self, head: U256, tail: U256) {
         let PortalLifecycle::Created(portal) = &mut self.portal else {
             panic!("fixture portal must be created")
@@ -584,18 +891,16 @@ impl ModelState {
         id: InboxRefundId,
         owner: InboxRefundOwner,
     ) {
-        let amount = match &owner {
-            InboxRefundOwner::Pending { amount } => amount.get(),
-        };
-        assert!(self.inbox_refunds.insert(id, owner).is_none());
-        add_refund_total_for_test(
-            &mut self.inbox_refund_totals,
+        assert!(!self.inbox_refunds.contains_key(&id));
+        let InboxRefundOwner::Pending { amount } = &owner;
+        self.derived_refund_totals.add_inbox(
             RefundAccount {
                 token: id.token,
                 recipient: id.recipient,
             },
-            amount,
+            amount.get(),
         );
+        assert!(self.inbox_refunds.insert(id, owner).is_none());
     }
 
     pub(crate) fn seed_portal_refund_for_test(
@@ -603,32 +908,15 @@ impl ModelState {
         id: PortalRefundId,
         owner: PortalRefundOwner,
     ) {
-        let amount = match &owner {
-            PortalRefundOwner::Pending { amount } => *amount,
-        };
-        assert!(self.portal_refunds.insert(id, owner).is_none());
-        add_refund_total_for_test(
-            &mut self.portal_refund_totals,
+        assert!(!self.portal_refunds.contains_key(&id));
+        let PortalRefundOwner::Pending { amount } = &owner;
+        self.derived_refund_totals.add_portal(
             RefundAccount {
                 token: id.token,
                 recipient: id.recipient,
             },
-            amount,
+            *amount,
         );
+        assert!(self.portal_refunds.insert(id, owner).is_none());
     }
-}
-
-#[cfg(test)]
-fn add_refund_total_for_test(
-    totals: &mut BTreeMap<RefundAccount, u128>,
-    account: RefundAccount,
-    amount: u128,
-) {
-    if amount == 0 {
-        return;
-    }
-    let total = totals.entry(account).or_default();
-    *total = total
-        .checked_add(amount)
-        .expect("fixture refund aggregate must fit u128");
 }

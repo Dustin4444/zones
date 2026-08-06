@@ -17,6 +17,7 @@ pub(crate) mod ownership;
 pub(crate) mod state;
 pub(crate) mod state_layout;
 pub(crate) mod transition;
+pub(crate) mod validation;
 
 #[cfg(test)]
 mod test_vectors;

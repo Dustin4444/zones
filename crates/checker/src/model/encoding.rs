@@ -67,6 +67,14 @@ impl CompressedYParity {
     const fn as_u8(self) -> u8 {
         self as u8
     }
+
+    pub(crate) const fn from_u8(value: u8) -> Result<Self, WithdrawalDataError> {
+        match value {
+            0x02 => Ok(Self::Even),
+            0x03 => Ok(Self::Odd),
+            actual => Err(WithdrawalDataError::InvalidRevealToPrefix { actual }),
+        }
+    }
 }
 
 /// Encrypted payload embedded in an ordinary Portal deposit. Its fixed-size
@@ -95,6 +103,26 @@ impl DepositPayload {
             nonce,
             tag,
         }
+    }
+
+    pub(crate) const fn ephemeral_pubkey_x(&self) -> B256 {
+        self.ephemeral_pubkey_x
+    }
+
+    pub(crate) const fn ephemeral_pubkey_y_parity(&self) -> u8 {
+        self.ephemeral_pubkey_y_parity.as_u8()
+    }
+
+    pub(crate) const fn ciphertext(&self) -> FixedBytes<ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE> {
+        self.ciphertext
+    }
+
+    pub(crate) const fn nonce(&self) -> FixedBytes<12> {
+        self.nonce
+    }
+
+    pub(crate) const fn tag(&self) -> FixedBytes<16> {
+        self.tag
     }
 }
 
@@ -142,6 +170,14 @@ impl OrdinaryDeposit {
 
     pub(crate) const fn tempo_refund_recipient(&self) -> Address {
         self.tempo_refund_recipient
+    }
+
+    pub(crate) const fn key_index(&self) -> U256 {
+        self.key_index
+    }
+
+    pub(crate) const fn encrypted(&self) -> &DepositPayload {
+        &self.encrypted
     }
 }
 

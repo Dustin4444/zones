@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use alloy_consensus::BlockHeader as _;
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use alloy_provider::Provider;
 use reth_primitives_traits::RecoveredBlock;
@@ -29,27 +30,6 @@ use crate::{
     },
 };
 
-/// One exact verified chain position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VerifiedTip {
-    number: u64,
-    hash: B256,
-}
-
-impl VerifiedTip {
-    pub(crate) const fn new(number: u64, hash: B256) -> Self {
-        Self { number, hash }
-    }
-
-    pub(crate) const fn number(self) -> u64 {
-        self.number
-    }
-
-    pub(crate) const fn hash(self) -> B256 {
-        self.hash
-    }
-}
-
 /// Temporary authoritative state for Goal 5.
 ///
 /// This type is deliberately not wired into the ExEx. It has no durable state
@@ -58,8 +38,8 @@ impl VerifiedTip {
 pub(crate) struct InMemoryChecker {
     model: ModelState,
     portal_creation_block_hash: B256,
-    zone_tip: VerifiedTip,
-    tempo_tip: VerifiedTip,
+    zone_tip: BlockNumHash,
+    tempo_tip: BlockNumHash,
     metrics: CheckerMetrics,
 }
 
@@ -77,16 +57,16 @@ impl CheckTimings {
 
 struct CandidateCommit {
     state_update: ModelStateUpdate,
-    zone_tip: VerifiedTip,
-    tempo_tip: VerifiedTip,
+    zone_tip: BlockNumHash,
+    tempo_tip: BlockNumHash,
 }
 
 impl InMemoryChecker {
     pub(crate) fn new(
         model: ModelState,
         portal_creation_block_hash: B256,
-        zone_tip: VerifiedTip,
-        tempo_tip: VerifiedTip,
+        zone_tip: BlockNumHash,
+        tempo_tip: BlockNumHash,
     ) -> Self {
         let metrics = CheckerMetrics::default();
         metrics
@@ -109,11 +89,11 @@ impl InMemoryChecker {
         &self.model
     }
 
-    pub(crate) const fn zone_tip(&self) -> VerifiedTip {
+    pub(crate) const fn zone_tip(&self) -> BlockNumHash {
         self.zone_tip
     }
 
-    pub(crate) const fn tempo_tip(&self) -> VerifiedTip {
+    pub(crate) const fn tempo_tip(&self) -> BlockNumHash {
         self.tempo_tip
     }
 
@@ -315,8 +295,8 @@ impl InMemoryChecker {
 
         Ok(CandidateCommit {
             state_update,
-            zone_tip: VerifiedTip::new(l2.block_number(), l2.block_hash()),
-            tempo_tip: VerifiedTip::new(imported_header.number(), imported_header.hash()),
+            zone_tip: BlockNumHash::new(l2.block_number(), l2.block_hash()),
+            tempo_tip: BlockNumHash::new(imported_header.number(), imported_header.hash()),
         })
     }
 
