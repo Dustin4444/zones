@@ -5,6 +5,11 @@ zone_rpc := env("ZONE_RPC_URL", "http://localhost:8546")
 zone_http_port := env("ZONE_HTTP_PORT", "8546")
 zone_dev_genesis_tmp := "./target/zone-dev-genesis"
 
+[group('bench')]
+[doc('Launches the interactive neobank private Zone benchmark UI')]
+iterative-bench:
+    python3 contrib/bench/iterative-ui/server.py
+
 [group('deps')]
 install-cross:
     cargo install cross --git https://github.com/cross-rs/cross

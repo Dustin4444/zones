@@ -32,73 +32,27 @@ chains:
     workload: ./zone-flow.yml
 
 scenario:
-  name: neobank-private-zone-flow
+  name: neobank-zone-withdrawal
   execution: dag
   timeout: 10m
 
   bindings:
     account:
       account: { pool: users, select: lease }
-    onramp_action_id:
-      bytes32: { random_bytes: 32 }
-    earn_deposit_action_id:
-      bytes32: { random_bytes: 32 }
-    earn_redeem_action_id:
-      bytes32: { random_bytes: 32 }
     offramp_action_id:
       bytes32: { random_bytes: 32 }
 
   steps:
-    - use: encrypted-zone-entry
-      as: onramp
-      with:
-        sender: { var: account.ref }
-        sender_address: { var: account.address }
-        recipient: { var: account.address }
-        token: "${ZONES_BENCH_DLUSD}"
-        fee_token: "${ZONES_BENCH_DLUSD}"
-        amount: ${ZONES_BENCH_DEPOSIT_AMOUNT}
-        memo: { var: onramp_action_id }
-
-    - use: earn-deposit-and-return
-      as: earn_deposit
-      depends_on: [onramp.zone_deposit.processed]
-      with:
-        sender: { var: account.ref }
-        sender_address: { var: account.address }
-        recipient: { var: account.address }
-        input_token: "${ZONES_BENCH_DLUSD}"
-        fee_token: "${ZONES_BENCH_DLUSD}"
-        amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
-        min_vault_assets: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
-        min_vault_shares: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
-        action_id: { var: earn_deposit_action_id }
-        fallback_recipient: { var: account.address }
-        refund_recipient: { var: account.address }
-
-    - use: earn-redeem-and-return
-      as: earn_redeem
-      depends_on: [earn_deposit.zone_return.processed]
-      with:
-        sender: { var: account.ref }
-        sender_address: { var: account.address }
-        recipient: { var: account.address }
-        output_token: "${ZONES_BENCH_DLUSD}"
-        fee_token: "${ZONES_BENCH_DLUSD}"
-        amount: { var: earn_deposit.zone_return.processed.args.amount }
-        min_vault_assets: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
-        min_output_amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
-        action_id: { var: earn_redeem_action_id }
-        fallback_recipient: { var: account.address }
-        refund_recipient: { var: account.address }
-
     - id: l1_before_offramp
-      depends_on: [earn_redeem.zone_return.processed]
       checkpoint: { chain: l1 }
       save: l1_before_offramp
 
+    - id: zone_before_offramp
+      checkpoint: { chain: zone }
+      save: zone_before_offramp
+
     - id: offramp
-      depends_on: [l1_before_offramp, earn_redeem.zone_return.processed]
+      depends_on: [l1_before_offramp, zone_before_offramp]
       submit:
         chain: zone
         template: offramp
@@ -109,7 +63,7 @@ scenario:
             args:
               - "${ZONES_BENCH_DLUSD}"
               - "${ZONES_BENCH_BRIDGE_WALLET}"
-              - { var: earn_redeem.zone_return.processed.args.amount }
+              - ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
               - { var: offramp_action_id }
               - 0
               - { var: account.address }
@@ -118,10 +72,10 @@ scenario:
       save: offramp
 
     - id: offramp_result
-      depends_on: [earn_redeem.zone_return.processed, offramp]
+      depends_on: [zone_before_offramp, offramp]
       wait_log:
         chain: zone
-        from_block: { var: earn_redeem.zone_return.processed.block_number }
+        from_block: { var: zone_before_offramp.block_number }
         transaction_hash: { var: offramp.tx_hash }
         sender: { var: offramp.sender }
         address: "${ZONES_BENCH_OUTBOX}"
@@ -131,7 +85,7 @@ scenario:
           sender: { var: account.address }
           token: "${ZONES_BENCH_DLUSD}"
           to: "${ZONES_BENCH_BRIDGE_WALLET}"
-          amount: { var: earn_redeem.zone_return.processed.args.amount }
+          amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
           fee: 0
           memo: { var: offramp_action_id }
           gasLimit: 0
@@ -156,13 +110,11 @@ scenario:
               types: [address, bytes32]
               values: [{ var: account.address }, { var: offramp.tx_hash }]
           token: "${ZONES_BENCH_DLUSD}"
-          amount: { var: earn_redeem.zone_return.processed.args.amount }
+          amount: ${ZONES_BENCH_WITHDRAWAL_AMOUNT}
           callbackSuccess: true
         max_block_range: 1000
       save: offramp_processed
 
     - id: journey_complete
-      depends_on:
-        - offramp_result
-        - offramp_processed
+      depends_on: [offramp_result, offramp_processed]
       checkpoint: { chain: l1 }

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Run each part of the neobank private Zone flow live." />
+    <title>Tempo — Scenario Runner</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="grid-bg" aria-hidden="true"></div>
+
+    <header class="topbar shell">
+      <a class="brand" href="/" aria-label="Tempo Scenario Runner home">
+        <svg viewBox="0 0 107 25" aria-hidden="true">
+          <path d="M8.1 23.7H1.8L7.6 5.8H.2L1.8.5h20.8L20.9 5.8h-7L8.1 23.7Zm23.4 0H16.6L24.1.5h14.8l-1.4 4.4h-8.6l-1.6 5h8.3l-1.4 4.4h-8.3l-1.6 5h8.5l-1.4 4.4Zm6.7 0h-5L40.7.5h8.4l-.3 12.5L56.9.5H66l-7.5 23.2h-6.2l5.1-15.8L47 23.7h-3.7l.1-15.9-5.2 15.9ZM73.1 4.8l-2.5 7.5h.7c1.5 0 2.8-.4 3.8-1.1 1-.7 1.7-1.8 2-3.1.3-1.2.2-2-.4-2.5-.5-.5-1.5-.8-2.8-.8h-.8Zm-6.1 18.9h-6.3L68.2.5h7.6c1.8 0 3.3.3 4.6.9 1.2.6 2.2 1.4 2.8 2.4.6 1.1.8 2.3.6 3.7-.3 1.8-1 3.4-2.1 4.8-1.1 1.3-2.6 2.4-4.4 3.1-1.8.8-3.8 1.1-6 1.1h-2L67 23.7Zm31.7-1.5c-2 1.3-4.3 1.9-6.6 1.9h-.1c-2.1 0-3.8-.5-5.2-1.4-1.5-1-2.5-2.2-3.1-3.8-.6-1.7-.7-3.4-.4-5.3.4-2.4 1.3-4.7 2.7-6.7 1.3-2 3.1-3.7 5.2-4.9 2-1.2 4.3-1.8 6.7-1.8h.1c2.1 0 3.9.4 5.3 1.4 1.4.9 2.4 2.2 3 3.8.6 1.6.7 3.4.4 5.3-.4 2.4-1.3 4.6-2.7 6.7-1.4 2-3.1 3.6-5.2 4.8Zm-8.6-4c.5 1.1 1.5 1.6 2.9 1.6h.1c1.1 0 2.1-.4 3-1.3 1-.8 1.9-2 2.5-3.4.7-1.5 1.2-3.1 1.6-4.9.3-1.7.2-3.1-.4-4.1-.5-1.1-1.5-1.6-2.8-1.6h-.1c-1.1 0-2.1.4-3.1 1.3-1 .8-1.8 2-2.5 3.5-.7 1.4-1.2 3-1.5 4.7-.4 1.8-.3 3.2.3 4.2Z" />
+        </svg>
+        <span></span>
+        <strong>Scenario runner</strong>
+      </a>
+      <div class="topbar-right">
+        <a id="workflow-link" href="#" target="_blank" rel="noreferrer">Workflow ↗</a>
+        <div id="connection-pill" class="connection-pill" data-ready="false">
+          <i></i><span>Connecting</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="intro">
+        <div>
+          <p class="eyebrow">Neobank private Zone flow</p>
+          <h1>Tempo Zones Bench</h1>
+        </div>
+      </section>
+
+      <section class="runner" aria-labelledby="runner-heading">
+        <div class="section-title">
+          <div><h2 id="runner-heading">Deel Earn Flow</h2></div>
+          <aside class="controls">
+            <div class="controls-heading">
+              <label class="transaction-count">
+                <span>Transactions</span>
+                <span class="transaction-input"><input id="config-count" type="number" min="1" max="1000" value="100" /><strong>txs</strong></span>
+              </label>
+              <button id="settings-toggle" type="button" aria-expanded="false">Edit</button>
+            </div>
+            <form id="settings-form" hidden>
+              <label><span>Starts / sec</span><input id="config-rate" type="number" min="0.1" max="1000" step="0.1" value="20" /></label>
+              <label><span>At once</span><input id="config-concurrency" type="number" min="1" max="100" value="12" /></label>
+              <label><span>L1 state</span><select id="config-bloat"><option value="0">Fresh</option><option value="1" selected>1 GiB</option><option value="10">10 GiB</option><option value="100">100 GiB</option></select></label>
+            </form>
+            <p id="launch-note">Dedicated bare-metal benchmark host</p>
+          </aside>
+        </div>
+        <div class="scenario-flow">
+          <article class="scenario-card" data-scenario="deposit" tabindex="0">
+            <div class="scenario-main">
+            <div class="card-top"><span class="scenario-number">01</span><span class="scenario-status">Ready</span></div>
+            <div class="route"><span>L1 wallet</span><i>→</i><span>Private Zone</span></div>
+            <h3>Onramp to Zone</h3>
+            <p>Move dLUSD from the customer’s L1 wallet into the private Zone.</p>
+            <button class="go-button" data-run="deposit" type="button"><span>GO</span><i>▶</i></button>
+            </div>
+            <div class="card-metrics">
+              <div><span>P99 latency</span><strong data-metric="p99">—</strong></div>
+              <div><span>Avg fee (USD)</span><strong data-metric="cost">—</strong></div>
+              <div><span>Avg gas used</span><strong data-metric="gas">—</strong></div>
+            </div>
+            <div class="card-steps"><div><span>Scenario steps</span><span>Latency</span></div><ol data-card-steps></ol></div>
+          </article>
+
+          <div class="connector" aria-hidden="true"><span></span><i>↓</i></div>
+
+          <article class="scenario-card" data-scenario="earn_deposit" tabindex="0">
+            <div class="scenario-main">
+            <div class="card-top"><span class="scenario-number">02</span><span class="scenario-status">Ready</span></div>
+            <div class="route"><span>Zone</span><i>↔</i><span>Earn Vault</span></div>
+            <h3>Private Earn Vault Deposit</h3>
+            <p>Send Zone funds into Earn on L1 and return the vault shares.</p>
+            <button class="go-button" data-run="earn_deposit" type="button"><span>GO</span><i>▶</i></button>
+            </div>
+            <div class="card-metrics">
+              <div><span>P99 latency</span><strong data-metric="p99">—</strong></div>
+              <div><span>Avg fee (USD)</span><strong data-metric="cost">—</strong></div>
+              <div><span>Avg gas used</span><strong data-metric="gas">—</strong></div>
+            </div>
+            <div class="card-steps"><div><span>Scenario steps</span><span>Latency</span></div><ol data-card-steps></ol></div>
+          </article>
+
+          <div class="connector" aria-hidden="true"><span></span><i>↓</i></div>
+
+          <article class="scenario-card" data-scenario="earn_redeem" tabindex="0">
+            <div class="scenario-main">
+            <div class="card-top"><span class="scenario-number">03</span><span class="scenario-status">Ready</span></div>
+            <div class="route"><span>Earn Vault</span><i>↔</i><span>Zone</span></div>
+            <h3>Private Earn Vault Redeem</h3>
+            <p>Redeem the vault shares and return dLUSD to the private Zone.</p>
+            <button class="go-button" data-run="earn_redeem" type="button"><span>GO</span><i>▶</i></button>
+            </div>
+            <div class="card-metrics">
+              <div><span>P99 latency</span><strong data-metric="p99">—</strong></div>
+              <div><span>Avg fee (USD)</span><strong data-metric="cost">—</strong></div>
+              <div><span>Avg gas used</span><strong data-metric="gas">—</strong></div>
+            </div>
+            <div class="card-steps"><div><span>Scenario steps</span><span>Latency</span></div><ol data-card-steps></ol></div>
+          </article>
+
+          <div class="connector" aria-hidden="true"><span></span><i>↓</i></div>
+
+          <article class="scenario-card" data-scenario="withdraw" tabindex="0">
+            <div class="scenario-main">
+            <div class="card-top"><span class="scenario-number">04</span><span class="scenario-status">Ready</span></div>
+            <div class="route"><span>Private Zone</span><i>→</i><span>L1 wallet</span></div>
+            <h3>Offramp back to Tempo</h3>
+            <p>Move dLUSD out of the private Zone and back to the customer’s L1 wallet.</p>
+            <button class="go-button" data-run="withdraw" type="button"><span>GO</span><i>▶</i></button>
+            </div>
+            <div class="card-metrics">
+              <div><span>P99 latency</span><strong data-metric="p99">—</strong></div>
+              <div><span>Avg fee (USD)</span><strong data-metric="cost">—</strong></div>
+              <div><span>Avg gas used</span><strong data-metric="gas">—</strong></div>
+            </div>
+            <div class="card-steps"><div><span>Scenario steps</span><span>Latency</span></div><ol data-card-steps></ol></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="history-section" class="history" hidden>
+        <div class="section-title compact"><div><p class="eyebrow">Session</p><h2>Run history</h2></div><p>Every click, newest first.</p></div>
+        <div id="history-list" class="history-list"></div>
+      </section>
+    </main>
+
+    <footer class="shell"><span>Tempo Engineering</span><span id="branch-label">Loading branch…</span></footer>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

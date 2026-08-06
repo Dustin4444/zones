@@ -13,7 +13,9 @@ on:
         default: full-journey
         options:
           - encrypted-deposit
+          - earn-deposit
           - private-withdrawal
+          - zone-withdrawal
           - full-journey
           - slippage-bounce
           - swapped-lifecycle
@@ -237,8 +239,8 @@ jobs:
 
           neobank_preset="$INPUT_PRESET"
           case "$neobank_preset" in
-            encrypted-deposit|private-withdrawal|full-journey|slippage-bounce|\
-            swapped-lifecycle|swapped-redemption) ;;
+            encrypted-deposit|earn-deposit|private-withdrawal|zone-withdrawal|\
+            full-journey|slippage-bounce|swapped-lifecycle|swapped-redemption) ;;
             *) echo "::error::unsupported neobank preset: $neobank_preset"; exit 1 ;;
           esac
           leases_per_journey=1

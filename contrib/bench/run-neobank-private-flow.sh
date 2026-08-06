@@ -129,6 +129,12 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
         ;;
+    earn-deposit)
+        scenario_file=earn-deposit-scenario.yml
+        base_token_label=dlusd
+        expected_base_token="$ZONES_BENCH_DLUSD"
+        leases_per_journey=1
+        ;;
     full-journey)
         scenario_file=private-flow-scenario.yml
         base_token_label=dlusd
@@ -137,6 +143,12 @@ case "$ZONES_BENCH_NEOBANK_PRESET" in
         ;;
     private-withdrawal)
         scenario_file=private-withdrawal-scenario.yml
+        base_token_label=dlusd
+        expected_base_token="$ZONES_BENCH_DLUSD"
+        leases_per_journey=1
+        ;;
+    zone-withdrawal)
+        scenario_file=zone-withdrawal-scenario.yml
         base_token_label=dlusd
         expected_base_token="$ZONES_BENCH_DLUSD"
         leases_per_journey=1
@@ -501,6 +513,16 @@ seed_zone_admission_balances() {
     echo "Zone admission seed verified: $total/$total exact encrypted deposits processed"
 }
 
+fund_zone_accounts() {
+    local funding_report="$ZONES_BENCH_OUTPUT/zone-funding-report.json"
+    local total=$((10#$ZONES_BENCH_ACCOUNTS))
+
+    run_setup_scenario \
+        zone_funding "$neobank_specs/encrypted-deposit-scenario.yml" \
+        "$total" "$funding_report"
+    echo "Zone funding verified: $total/$total exact encrypted deposits processed"
+}
+
 stage_start render_scenario
 "$txgen_bin" scenario render \
     --scenario "$scenario_path" \
@@ -521,9 +543,11 @@ run_setup_scenario \
 
 # Deposit-only never submits a user transaction to the Zone. Every other preset
 # seeds the enabled-token balance required by current Zone txpool admission.
-if [[ "$ZONES_BENCH_NEOBANK_PRESET" != "encrypted-deposit" ]]; then
-    seed_zone_admission_balances
-fi
+case "$ZONES_BENCH_NEOBANK_PRESET" in
+    encrypted-deposit) ;;
+    earn-deposit|zone-withdrawal) fund_zone_accounts ;;
+    *) seed_zone_admission_balances ;;
+esac
 
 # The auth map is intentionally mode 0600 and is never copied to benchmark artifacts.
 stage_start auth_token_map
