@@ -6,6 +6,10 @@
 mod invariants;
 mod l1_facts;
 mod l2_facts;
+// Goal 0 deliberately freezes the pure model before Goal 1 wires it into the
+// observation/runtime path. Keep the exception scoped to that staged module.
+#[allow(dead_code)]
+mod model;
 
 use std::fmt;
 use std::str::FromStr;

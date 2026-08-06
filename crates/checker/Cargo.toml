@@ -35,6 +35,7 @@ tempo-zone-contracts = { workspace = true, features = ["std"] }
 # misc
 eyre.workspace = true
 futures.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

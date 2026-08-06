@@ -13483,6 +13483,7 @@ dependencies = [
  "tempo-alloy",
  "tempo-primitives",
  "tempo-zone-contracts",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
