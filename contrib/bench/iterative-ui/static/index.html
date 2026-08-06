@@ -20,7 +20,6 @@
         <strong>Scenario runner</strong>
       </a>
       <div class="topbar-right">
-        <a id="workflow-link" href="#" target="_blank" rel="noreferrer">Workflow ↗</a>
         <div id="connection-pill" class="connection-pill" data-ready="false">
           <i></i><span>Connecting</span>
         </div>
@@ -49,9 +48,8 @@
             <form id="settings-form" hidden>
               <label><span>Starts / sec</span><input id="config-rate" type="number" min="0.1" max="1000" step="0.1" value="20" /></label>
               <label><span>At once</span><input id="config-concurrency" type="number" min="1" max="100" value="12" /></label>
-              <label><span>L1 state</span><select id="config-bloat"><option value="0">Fresh</option><option value="1" selected>1 GiB</option><option value="10">10 GiB</option><option value="100">100 GiB</option></select></label>
             </form>
-            <p id="launch-note">Dedicated bare-metal benchmark host</p>
+            <p id="launch-note">Local Tempo + private Zone</p>
           </aside>
         </div>
         <div class="scenario-flow">
@@ -76,7 +74,7 @@
           <article class="scenario-card" data-scenario="earn_deposit" tabindex="0">
             <div class="scenario-main">
             <div class="card-top"><span class="scenario-number">02</span><span class="scenario-status">Ready</span></div>
-            <div class="route"><span>Zone</span><i>↔</i><span>Earn Vault</span></div>
+            <div class="route"><span>Earn Vault</span><i>↔</i><span>Zone</span></div>
             <h3>Private Earn Vault Deposit</h3>
             <p>Send Zone funds into Earn on L1 and return the vault shares.</p>
             <button class="go-button" data-run="earn_deposit" type="button"><span>GO</span><i>▶</i></button>

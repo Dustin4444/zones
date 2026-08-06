@@ -4,9 +4,7 @@
 # in argv. The endpoint is credential-free; authentication stays in txgen's
 # CLICKHOUSE_USER and CLICKHOUSE_PASSWORD environment variables.
 build_scenario_report_args() {
-    local destination_name="$1"
-    local json_report="$2"
-    local -n destination="$destination_name"
+    local json_report="$1"
     local name pair metadata_name environment_name
     local -a configuration_metadata=(
         "accounts:ZONES_BENCH_ACCOUNTS"
@@ -33,7 +31,7 @@ build_scenario_report_args() {
         "earn-revision:ZONES_BENCH_EARN_REVISION"
     )
 
-    destination=(--report "$json_report")
+    scenario_report_args=(--report "$json_report")
     if [[ -z "${CLICKHOUSE_URL:-}" ]]; then
         if [[ "${ZONES_BENCH_REQUIRE_CLICKHOUSE:-0}" == 1 ]]; then
             echo "error: CLICKHOUSE_URL is required for this benchmark run" >&2
@@ -53,37 +51,37 @@ build_scenario_report_args() {
         fi
     done
 
-    destination+=(
+    scenario_report_args+=(
         --report "clickhouse:$CLICKHOUSE_URL"
         --metadata "git-sha=$ZONES_BENCH_ZONES_REF"
         --metadata "git-ref=$ZONES_BENCH_GIT_REF"
         --metadata "phase=$ZONES_BENCH_PHASE"
     )
-    destination+=(--metadata "neobank-preset=$ZONES_BENCH_NEOBANK_PRESET")
+    scenario_report_args+=(--metadata "neobank-preset=$ZONES_BENCH_NEOBANK_PRESET")
     [[ -z "${ZONES_BENCH_SWAP_MECHANISM:-}" ]] ||
-        destination+=(--metadata "swap-mechanism=$ZONES_BENCH_SWAP_MECHANISM")
+        scenario_report_args+=(--metadata "swap-mechanism=$ZONES_BENCH_SWAP_MECHANISM")
     [[ -z "${ZONES_BENCH_SWAP_LIQUIDITY:-}" ]] ||
-        destination+=(--metadata "swap-liquidity=$ZONES_BENCH_SWAP_LIQUIDITY")
+        scenario_report_args+=(--metadata "swap-liquidity=$ZONES_BENCH_SWAP_LIQUIDITY")
     [[ -z "${ZONES_BENCH_CALLBACK_GAS_LIMIT:-}" ]] ||
-        destination+=(--metadata "callback-gas-limit=$ZONES_BENCH_CALLBACK_GAS_LIMIT")
+        scenario_report_args+=(--metadata "callback-gas-limit=$ZONES_BENCH_CALLBACK_GAS_LIMIT")
     [[ -z "${ZONES_BENCH_RECIPIENT_MODE:-}" ]] ||
-        destination+=(--metadata "recipient-mode=$ZONES_BENCH_RECIPIENT_MODE")
+        scenario_report_args+=(--metadata "recipient-mode=$ZONES_BENCH_RECIPIENT_MODE")
     for pair in "${configuration_metadata[@]}"; do
         metadata_name="${pair%%:*}"
         environment_name="${pair#*:}"
         [[ -z "${!environment_name:-}" ]] ||
-            destination+=(--metadata "$metadata_name=${!environment_name}")
+            scenario_report_args+=(--metadata "$metadata_name=${!environment_name}")
     done
     [[ -z "${ZONES_BENCH_RUN_ID:-}" ]] ||
-        destination+=(--metadata "zones-run-id=$ZONES_BENCH_RUN_ID")
+        scenario_report_args+=(--metadata "zones-run-id=$ZONES_BENCH_RUN_ID")
     [[ -z "${ZONES_BENCH_BLOAT_GIB:-}" ]] ||
-        destination+=(--metadata "state-bloat-gib=$ZONES_BENCH_BLOAT_GIB")
+        scenario_report_args+=(--metadata "state-bloat-gib=$ZONES_BENCH_BLOAT_GIB")
     [[ -z "${ZONES_BENCH_GITHUB_REPOSITORY:-}" ]] ||
-        destination+=(--metadata "github-repository=$ZONES_BENCH_GITHUB_REPOSITORY")
+        scenario_report_args+=(--metadata "github-repository=$ZONES_BENCH_GITHUB_REPOSITORY")
     [[ -z "${ZONES_BENCH_GITHUB_RUN_ID:-}" ]] ||
-        destination+=(--metadata "github-run-id=$ZONES_BENCH_GITHUB_RUN_ID")
+        scenario_report_args+=(--metadata "github-run-id=$ZONES_BENCH_GITHUB_RUN_ID")
     [[ -z "${ZONES_BENCH_GITHUB_WORKFLOW:-}" ]] ||
-        destination+=(--metadata "github-workflow-file=$ZONES_BENCH_GITHUB_WORKFLOW")
+        scenario_report_args+=(--metadata "github-workflow-file=$ZONES_BENCH_GITHUB_WORKFLOW")
     [[ -z "${ZONES_BENCH_GITHUB_PR_NUMBER:-}" ]] ||
-        destination+=(--metadata "github-pr-number=$ZONES_BENCH_GITHUB_PR_NUMBER")
+        scenario_report_args+=(--metadata "github-pr-number=$ZONES_BENCH_GITHUB_PR_NUMBER")
 }

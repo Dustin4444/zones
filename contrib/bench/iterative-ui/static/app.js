@@ -32,13 +32,11 @@ const scenarioStepLabels = {
 const activeStates = new Set(["queued", "running", "processing", "cancelling"]);
 
 const elements = {
-  workflowLink: document.querySelector("#workflow-link"),
   connectionPill: document.querySelector("#connection-pill"),
   branchLabel: document.querySelector("#branch-label"),
   configCount: document.querySelector("#config-count"),
   configRate: document.querySelector("#config-rate"),
   configConcurrency: document.querySelector("#config-concurrency"),
-  configBloat: document.querySelector("#config-bloat"),
   settingsToggle: document.querySelector("#settings-toggle"),
   settingsForm: document.querySelector("#settings-form"),
   launchNote: document.querySelector("#launch-note"),
@@ -90,22 +88,14 @@ function showToast(message) {
 }
 
 function renderConnection(server = {}) {
-  const ready = Boolean(server.authenticated && server.remoteBranchAvailable);
+  const ready = Boolean(server.localReady);
   elements.connectionPill.dataset.ready = String(ready);
   const label = elements.connectionPill.querySelector("span");
-  if (server.demoMode) label.textContent = "Presentation mode";
-  else if (!server.authenticated) label.textContent = "GitHub login needed";
-  else if (!server.remoteBranchAvailable) label.textContent = "Push branch to run";
-  else label.textContent = "Runner ready";
-  elements.workflowLink.href = server.workflowUrl || "#";
+  label.textContent = ready ? "Local runner ready" : "Local tools missing";
   elements.branchLabel.textContent = server.branch || "Unknown branch";
-  elements.launchNote.textContent = server.demoMode
-    ? "Presentation mode · safe to press Go repeatedly"
-    : !server.authenticated
-      ? "Run `gh auth login` in this terminal first"
-      : !server.remoteBranchAvailable
-        ? `Push ${server.branch || "this branch"} before a live run`
-        : "Dedicated bare-metal benchmark host";
+  elements.launchNote.textContent = ready
+    ? (activeStates.has(state?.status) ? state.message : "Local Tempo + private Zone")
+    : `Missing: ${(server.missingTools || []).join(", ")}`;
   return ready;
 }
 
@@ -214,6 +204,9 @@ function render(nextState) {
   if (priorStatus && activeStates.has(priorStatus) && state.status === "completed") {
     document.querySelector(`[data-scenario="${selectedScenario}"]`)?.focus({ preventScroll: true });
   }
+  if (priorStatus && activeStates.has(priorStatus) && state.status === "failed") {
+    showToast(state.error || "Local benchmark failed");
+  }
 }
 
 async function request(path, options = {}) {
@@ -248,7 +241,6 @@ async function runScenario(id) {
         accounts: Math.max(100, count, concurrency),
         rate: elements.configRate.value,
         concurrency,
-        stateBloat: elements.configBloat.value,
       }),
     });
     render(nextState);

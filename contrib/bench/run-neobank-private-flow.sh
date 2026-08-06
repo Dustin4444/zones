@@ -44,7 +44,12 @@ load_benchmark_mnemonic() {
     [[ -r "$ZONES_BENCH_MNEMONIC_FILE" ]] ||
         die "ZONES_BENCH_MNEMONIC_FILE must be readable"
 
-    mode="$(stat -c '%a' -- "$ZONES_BENCH_MNEMONIC_FILE")"
+    if mode="$(stat -c '%a' -- "$ZONES_BENCH_MNEMONIC_FILE" 2>/dev/null)"; then
+        :
+    else
+        mode="$(stat -f '%Lp' -- "$ZONES_BENCH_MNEMONIC_FILE" 2>/dev/null)" ||
+            die "could not validate ZONES_BENCH_MNEMONIC_FILE permissions"
+    fi
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] ||
         die "could not validate ZONES_BENCH_MNEMONIC_FILE permissions"
     (( (8#$mode & 8#077) == 0 )) ||
@@ -177,7 +182,8 @@ case "$ZONES_BENCH_SWAP_MECHANISM" in
     direct-swap) ;;
     *) die "current Earn only supports ZONES_BENCH_SWAP_MECHANISM=direct-swap" ;;
 esac
-[[ "${ZONES_BENCH_TOKEN,,}" == "${expected_base_token,,}" ]] ||
+[[ "$(printf '%s' "$ZONES_BENCH_TOKEN" | tr '[:upper:]' '[:lower:]')" == \
+    "$(printf '%s' "$expected_base_token" | tr '[:upper:]' '[:lower:]')" ]] ||
     die "ZONES_BENCH_TOKEN must match the $base_token_label token for $ZONES_BENCH_NEOBANK_PRESET"
 for name in ZONES_BENCH_CONTROL_ACCOUNT_INDEX ZONES_BENCH_ACCOUNT_START ZONES_BENCH_ACCOUNTS ZONES_BENCH_SEQUENCER_ACCOUNT_INDEX ZONES_BENCH_COUNT \
     ZONES_BENCH_MAX_CONCURRENT ZONES_BENCH_DEPOSIT_AMOUNT ZONES_BENCH_ACTIVITY_AMOUNT \
@@ -371,13 +377,15 @@ verify_reward_zone_balances() {
     expected_total="$(bigint_eval "$expected_total")"
     expected_unit="$(bigint_eval "$expected_unit")"
     maximum_unit="$(bigint_eval "$maximum_unit")"
-    mapfile -t accounts < <(jq -er '.[] | select(type == "string")' "$accounts_file")
+    while IFS= read -r address; do
+        accounts+=("$address")
+    done < <(jq -er '.[] | select(type == "string")' "$accounts_file")
     (( ${#accounts[@]} == 10#$ZONES_BENCH_ACCOUNTS )) ||
         die "account list contains ${#accounts[@]} accounts, expected $ZONES_BENCH_ACCOUNTS"
 
     for address in "${accounts[@]}"; do
         request_id=$((request_id + 1))
-        normalized_address="${address,,}"
+        normalized_address="$(printf '%s' "$address" | tr '[:upper:]' '[:lower:]')"
         authorization="$(jq -er --arg address "$normalized_address" \
             '.[$address] | select(type == "string" and length > 0)' \
             "$ZONES_BENCH_ZONE_AUTH_MAP")" ||
@@ -541,15 +549,9 @@ run_setup_scenario \
     portal_approval "$portal_approval_scenario" "$ZONES_BENCH_ACCOUNTS" \
     "$ZONES_BENCH_OUTPUT/portal-approval-report.json" "approval_round=portal"
 
-# Deposit-only never submits a user transaction to the Zone. Every other preset
-# seeds the enabled-token balance required by current Zone txpool admission.
-case "$ZONES_BENCH_NEOBANK_PRESET" in
-    encrypted-deposit) ;;
-    earn-deposit|zone-withdrawal) fund_zone_accounts ;;
-    *) seed_zone_admission_balances ;;
-esac
-
 # The auth map is intentionally mode 0600 and is never copied to benchmark artifacts.
+# Build it before any Zone funding scenario: those scenarios observe the private
+# Zone and therefore need the same per-sender authorization as the measured run.
 stage_start auth_token_map
 "$txgen_bin" auth-token-map --spec "$neobank_specs/zone-flow.yml" --pool users \
     --zone-id "$ZONES_BENCH_EXPECTED_ZONE_ID" \
@@ -571,6 +573,14 @@ jq -e --argjson expected "$ZONES_BENCH_ACCOUNTS" '
 ' "$ZONES_BENCH_OUTPUT/accounts.json" >/dev/null ||
     die "auth map did not derive the expected unique benchmark account pool"
 stage_end auth_token_map
+
+# Deposit-only never submits a user transaction to the Zone. Every other preset
+# seeds the enabled-token balance required by current Zone txpool admission.
+case "$ZONES_BENCH_NEOBANK_PRESET" in
+    encrypted-deposit) ;;
+    earn-deposit|zone-withdrawal) fund_zone_accounts ;;
+    *) seed_zone_admission_balances ;;
+esac
 
 # Approvals are untimed. Deposit-only submits no user Zone transaction.
 # The fixed scenario approves both enabled assets for each leased account.
@@ -705,7 +715,7 @@ esac
 
 stage_start private_flow
 scenario_report_args=()
-build_scenario_report_args scenario_report_args "$ZONES_BENCH_REPORT"
+build_scenario_report_args "$ZONES_BENCH_REPORT"
 "$txgen_bin" scenario run --scenario "$scenario_path" --count "$ZONES_BENCH_COUNT" \
     --starts-per-second "$ZONES_BENCH_TPS" --max-in-flight "$ZONES_BENCH_MAX_CONCURRENT" --max-rpc-in-flight "$ZONES_BENCH_MAX_CONCURRENT" \
     --failure-policy fail-fast --step-timeout "$ZONES_BENCH_STEP_TIMEOUT" --seed "$ZONES_BENCH_SEED" \

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Local control room for the production-shaped neobank benchmark.
-
-The browser never receives GitHub credentials. This server uses the authenticated
-`gh` CLI to dispatch the existing benchmark workflow, follows its real job
-steps, downloads the txgen artifact, and converts it into presentation-friendly
-latency, throughput, gas, and fee data.
-"""
+"""Local UI server for real, isolated Tempo Zone benchmark scenarios."""
 
 from __future__ import annotations
 
@@ -15,23 +9,22 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from collections import deque
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-
-REPOSITORY = "tempoxyz/zones"
-WORKFLOW = "zones-benchmark.yml"
-WORKFLOW_URL = f"https://github.com/{REPOSITORY}/actions/workflows/{WORKFLOW}"
-STATE_VERSION = 3
+STATE_VERSION = 4
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+STAGE_PREFIX = "LIVE_BENCH_STAGE "
 PHASES = (
     {
         "id": "deposit",
@@ -97,7 +90,7 @@ SCENARIOS = {
         "title": "Deposit into Earn",
         "shortTitle": "Private Earn Vault Deposit",
         "description": "Send Zone funds into Earn on L1 and return the vault shares.",
-        "route": "Zone ↔ Earn Vault",
+        "route": "Earn Vault ↔ Zone",
         "preset": "earn-deposit",
         "phase": "earn_deposit",
     },
@@ -141,23 +134,13 @@ FRIENDLY_STEP_NAMES = {
     "offramp_processed": "Funds received on L1",
 }
 
-DISPLAY_JOB_STEPS = {
-    "Resolve configuration": ("request", "Validate benchmark request"),
-    "Build real L1 and Zone binaries": ("build", "Build L1 and Zone"),
-    "Build neobank fixture contracts": ("build", "Build Earn fixtures"),
-    "Prepare or restore persistent Tempo L1 baseline": ("topology", "Restore realistic L1 state"),
-    "Provision topology and run neobank workload": ("benchmark", "Run live customer journeys"),
-    "Publish benchmark results": ("results", "Calculate latency and throughput"),
-    "Upload specs, logs, and reports": ("results", "Package p99 and fee results"),
-}
-
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def run_command(
-    args: list[str], cwd: Path, timeout: float = 60.0, check: bool = True
+    args: list[str], cwd: Path, timeout: float = 60.0
 ) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         args,
@@ -168,18 +151,12 @@ def run_command(
         timeout=timeout,
         check=False,
     )
-    if check and completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "command failed"
+    if completed.returncode != 0:
+        detail = (
+            completed.stderr.strip() or completed.stdout.strip() or "command failed"
+        )
         raise RuntimeError(f"{args[0]} failed: {detail}")
     return completed
-
-
-def read_json_command(args: list[str], cwd: Path, timeout: float = 60.0) -> Any:
-    output = run_command(args, cwd=cwd, timeout=timeout).stdout
-    try:
-        return json.loads(output)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"{args[0]} returned invalid JSON: {error}") from error
 
 
 def safe_number(value: Any, fallback: float = 0.0) -> float:
@@ -187,12 +164,11 @@ def safe_number(value: Any, fallback: float = 0.0) -> float:
 
 
 def fee_to_usd(value: Any) -> float:
-    # Benchmark fees are paid in an 18-decimal USD-denominated fee token.
     return safe_number(value) / 1_000_000_000_000_000_000
 
 
 def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
-    """Convert a txgen scenario report into the small UI result contract."""
+    """Convert an actual txgen scenario report into the UI result contract."""
     latency = report.get("client_observed_e2e_latency") or report.get(
         "total_scenario_latency", {}
     )
@@ -204,7 +180,6 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
         if completed > 0 and completed_rate > 0
         else elapsed_ms / 1_000
     )
-
     raw_steps = report.get("steps") or []
     raw_receipts = report.get("receipt_metrics") or []
     receipts_by_step = {
@@ -230,7 +205,9 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": step.get("id") or name,
                 "name": name,
-                "label": FRIENDLY_STEP_NAMES.get(name, name.replace("_", " ").replace(".", " · ")),
+                "label": FRIENDLY_STEP_NAMES.get(
+                    name, name.replace("_", " ").replace(".", " · ")
+                ),
                 "chain": step.get("chain") or "local",
                 "kind": step.get("kind") or "unknown",
                 "success": int(step.get("success", 0)),
@@ -256,12 +233,12 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
         critical_mean_ms = sum(
             safe_number(
                 (
-                    steps_by_name.get(step_name, {}).get("command_latency")
-                    or steps_by_name.get(step_name, {}).get("latency")
+                    steps_by_name.get(name, {}).get("command_latency")
+                    or steps_by_name.get(name, {}).get("latency")
                     or {}
                 ).get("mean_ms")
             )
-            for step_name in phase["critical"]
+            for name in phase["critical"]
         )
         terminal = next(
             (step for step in phase_steps if step["name"] == phase["terminal"]), None
@@ -274,7 +251,7 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
                 for prefix in phase["prefixes"]
             )
         ]
-        total_phase_fees = sum(
+        phase_fees = sum(
             safe_number((metric.get("fee_paid") or {}).get("mean"))
             * int((metric.get("fee_paid") or {}).get("count", 0))
             for metric in phase_receipts
@@ -286,7 +263,7 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
                 "eyebrow": phase["eyebrow"],
                 "averageMs": critical_mean_ms,
                 "terminalP99Ms": terminal["p99Ms"] if terminal else 0.0,
-                "meanCostUsd": total_phase_fees / completed / 1e18 if completed else 0.0,
+                "meanCostUsd": phase_fees / completed / 1e18 if completed else 0.0,
                 "steps": phase_steps,
             }
         )
@@ -304,7 +281,6 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
     receipt_count = sum(
         int((metric.get("gas_used") or {}).get("count", 0)) for metric in raw_receipts
     )
-
     return {
         "scenario": report.get("scenario", "neobank-private-zone-flow"),
         "reportVersion": int(report.get("version", 0)),
@@ -336,25 +312,31 @@ def report_to_result(report: dict[str, Any]) -> dict[str, Any]:
 
 
 class BenchmarkController:
-    def __init__(self, root: Path, state_dir: Path, branch: str, demo: bool = False):
+    def __init__(self, root: Path, state_dir: Path, branch: str):
         self.root = root
         self.state_dir = state_dir
         self.branch = branch
-        self.demo = demo
         self.lock = threading.RLock()
         self.worker: threading.Thread | None = None
-        self._server_info_cache: dict[str, Any] | None = None
-        self._server_info_checked_at = 0.0
+        self.process: subprocess.Popen[str] | None = None
+        self.cancel_requested = False
         self.state_file = state_dir / "state.json"
+        self.runner = Path(__file__).with_name("local_runner.py")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state = self._load_state()
         self.state.setdefault("scenarioResults", {})
         self.state["server"] = self.server_info()
-        if self.state.get("status") in {"queued", "running"}:
-            self.state["status"] = "interrupted"
-            self.state["error"] = (
-                "The local UI stopped while the remote run was active. Open the linked "
-                "Actions run or start a new benchmark."
+        if self.state.get("status") in {
+            "queued",
+            "running",
+            "processing",
+            "cancelling",
+        }:
+            self.state.update(
+                status="interrupted",
+                stage="interrupted",
+                message="The local benchmark process stopped",
+                error="The UI server exited before its local benchmark completed; run the scenario again.",
             )
             self._persist()
 
@@ -370,7 +352,7 @@ class BenchmarkController:
             "version": STATE_VERSION,
             "status": "idle",
             "stage": "ready",
-            "message": "Ready for a live benchmark",
+            "message": "Ready to run locally",
             "run": None,
             "result": None,
             "scenarioResults": {},
@@ -395,101 +377,76 @@ class BenchmarkController:
             self.state["server"] = self.server_info()
             return copy.deepcopy(self.state)
 
-    def server_info(self, force: bool = False) -> dict[str, Any]:
-        if (
-            not force
-            and self._server_info_cache is not None
-            and time.monotonic() - self._server_info_checked_at < 15
-        ):
-            return copy.deepcopy(self._server_info_cache)
-        remote_branch = False
-        authenticated = False
-        if not self.demo:
-            remote_branch = (
-                run_command(
-                    [
-                        "git",
-                        "show-ref",
-                        "--verify",
-                        "--quiet",
-                        f"refs/remotes/origin/{self.branch}",
-                    ],
-                    self.root,
-                    timeout=15,
-                    check=False,
-                ).returncode
-                == 0
-            )
-            authenticated = (
-                run_command(["gh", "auth", "status"], self.root, timeout=15, check=False).returncode
-                == 0
-            )
-        info = {
-            "repository": REPOSITORY,
+    def server_info(self) -> dict[str, Any]:
+        required = ["cargo", "forge", "cast", "jq", "curl", "bc", "git"]
+        if not (
+            self.root / "target" / "live-bench" / "deps" / "earn" / ".git"
+        ).is_dir():
+            required.append("gh")
+        missing = [name for name in required if shutil.which(name) is None]
+        return {
             "branch": self.branch,
-            "workflowUrl": WORKFLOW_URL,
-            "remoteBranchAvailable": remote_branch or self.demo,
-            "authenticated": authenticated or self.demo,
-            "demoMode": self.demo,
+            "localReady": not missing,
+            "missingTools": missing,
+            "runnerLabel": "Local Tempo + private Zone",
             "scenarios": [
                 {"id": scenario_id, **definition}
                 for scenario_id, definition in SCENARIOS.items()
             ],
         }
-        self._server_info_cache = info
-        self._server_info_checked_at = time.monotonic()
-        return copy.deepcopy(info)
 
     def start(self, raw_config: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise ValueError("A benchmark is already running")
             config = self._validate_config(raw_config)
-            info = self.server_info(force=True)
-            if not info["authenticated"]:
-                raise ValueError("GitHub CLI is not authenticated; run `gh auth login` first")
-            if not info["remoteBranchAvailable"]:
+            info = self.server_info()
+            if not info["localReady"]:
                 raise ValueError(
-                    f"Branch `{self.branch}` is not on origin yet; push it before "
-                    "starting the remote benchmark"
+                    "Missing local tools: " + ", ".join(info["missingTools"])
                 )
+            run_id = f"{int(time.time() * 1000)}-{config['scenario']}"
+            self.cancel_requested = False
             self.state.update(
                 {
                     "status": "queued",
-                    "stage": "request",
-                    "message": "Sending benchmark request",
+                    "stage": "build",
+                    "message": "Preparing the real local benchmark",
                     "run": {
-                        "id": None,
+                        "id": run_id,
                         "url": None,
                         "branch": self.branch,
                         "config": config,
                         "scenario": config["scenario"],
                         "preset": config["preset"],
                         "startedAt": utc_now(),
-                        "actionSteps": [],
                     },
                     "result": None,
                     "error": None,
                 }
             )
             self._persist()
-            target = self._run_demo if self.demo else self._dispatch_and_follow
-            self.worker = threading.Thread(target=target, args=(config,), daemon=True)
+            self.worker = threading.Thread(
+                target=self._run_local, args=(config, run_id), daemon=True
+            )
             self.worker.start()
             return copy.deepcopy(self.state)
 
     def cancel(self) -> dict[str, Any]:
         with self.lock:
-            run_id = (self.state.get("run") or {}).get("id")
-            if not run_id:
-                raise ValueError("There is no dispatched run to cancel")
-        if not self.demo:
-            run_command(
-                ["gh", "run", "cancel", str(run_id), "--repo", REPOSITORY],
-                self.root,
-                timeout=30,
+            if not self.worker or not self.worker.is_alive():
+                raise ValueError("There is no local benchmark to cancel")
+            self.cancel_requested = True
+            process = self.process
+            self.state.update(
+                status="cancelling", message="Stopping the local benchmark"
             )
-        self._update(status="cancelling", message="Cancelling the benchmark")
+            self._persist()
+        if process and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
         return self.snapshot()
 
     @staticmethod
@@ -518,9 +475,6 @@ class BenchmarkController:
             raise ValueError("rate must be a number") from error
         if not 0.1 <= rate <= 1_000:
             raise ValueError("rate must be between 0.1 and 1000")
-        state_bloat = str(raw.get("stateBloat", "1"))
-        if state_bloat not in {"0", "1", "10", "100"}:
-            raise ValueError("stateBloat must be 0, 1, 10, or 100")
         return {
             "scenario": scenario,
             "preset": definition["preset"],
@@ -528,153 +482,111 @@ class BenchmarkController:
             "accounts": accounts,
             "rate": rate,
             "concurrency": concurrency,
-            "stateBloat": state_bloat,
         }
 
-    def _dispatch_and_follow(self, config: dict[str, Any]) -> None:
+    def _run_local(self, config: dict[str, Any], run_id: str) -> None:
+        destination = self.state_dir / "runs" / run_id
+        report = destination / "report-neobank-e2e.json"
+        destination.mkdir(parents=True, exist_ok=True)
+        command = [
+            "python3",
+            str(self.runner),
+            "--preset",
+            str(config["preset"]),
+            "--count",
+            str(config["count"]),
+            "--accounts",
+            str(config["accounts"]),
+            "--rate",
+            str(config["rate"]),
+            "--concurrency",
+            str(config["concurrency"]),
+            "--run-dir",
+            str(destination),
+            "--report",
+            str(report),
+        ]
+        recent: deque[str] = deque(maxlen=30)
         try:
-            previous = {
-                int(run["databaseId"])
-                for run in self._list_dispatch_runs()
-                if run.get("databaseId")
-            }
-            dispatched_at = datetime.now(timezone.utc)
-            command = [
-                "gh",
-                "workflow",
-                "run",
-                WORKFLOW,
-                "--repo",
-                REPOSITORY,
-                "--ref",
-                self.branch,
-                "--field",
-                f"preset={config['preset']}",
-                "--field",
-                f"accounts={config['accounts']}",
-                "--field",
-                f"count={config['count']}",
-                "--field",
-                f"tps={config['rate']}",
-                "--field",
-                f"max-concurrent={config['concurrency']}",
-                "--field",
-                f"state-bloat-gib={config['stateBloat']}",
-            ]
-            run_command(command, self.root, timeout=30)
-            self._update(message="Waiting for a benchmark runner")
-            run = self._find_new_run(previous, dispatched_at)
-            run_id = int(run["databaseId"])
+            process = subprocess.Popen(
+                command,
+                cwd=self.root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                start_new_session=True,
+            )
             with self.lock:
-                self.state["run"].update(
-                    {"id": run_id, "url": run.get("url"), "headSha": run.get("headSha")}
-                )
+                self.process = process
+                self.state.update(status="running")
                 self._persist()
-            self._follow_run(run_id)
-        except Exception as error:  # surfaced verbatim to the local operator
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                line = raw_line.rstrip()
+                if line:
+                    print(line, flush=True)
+                    recent.append(line)
+                if line.startswith(STAGE_PREFIX):
+                    try:
+                        progress = json.loads(line[len(STAGE_PREFIX) :])
+                    except json.JSONDecodeError:
+                        continue
+                    self._update(
+                        status="processing"
+                        if progress.get("stage") == "results"
+                        else "running",
+                        stage=str(progress.get("stage", "benchmark")),
+                        message=str(progress.get("message", "Running locally")),
+                    )
+            return_code = process.wait()
+            with self.lock:
+                self.process = None
+            if return_code != 0:
+                if self.cancel_requested or return_code in (130, -signal.SIGINT):
+                    self._update(
+                        status="interrupted",
+                        stage="interrupted",
+                        message="Local benchmark stopped",
+                        error=None,
+                    )
+                    return
+                useful = [
+                    line for line in recent if not line.startswith("LIVE_BENCH_STAGE")
+                ]
+                detail = (
+                    "\n".join(useful[-12:])
+                    or f"local runner exited with code {return_code}"
+                )
+                raise RuntimeError(detail)
+            if not report.is_file():
+                raise RuntimeError("The local txgen run did not produce a report")
+            result = report_to_result(json.loads(report.read_text()))
+            self._complete(result)
+        except Exception as error:
             self._update(
                 status="failed",
                 stage="failed",
-                message="Benchmark failed",
+                message="Local benchmark failed",
                 error=str(error),
             )
-
-    def _list_dispatch_runs(self) -> list[dict[str, Any]]:
-        data = read_json_command(
-            [
-                "gh",
-                "run",
-                "list",
-                "--repo",
-                REPOSITORY,
-                "--workflow",
-                WORKFLOW,
-                "--branch",
-                self.branch,
-                "--event",
-                "workflow_dispatch",
-                "--limit",
-                "20",
-                "--json",
-                "databaseId,status,conclusion,createdAt,url,headBranch,headSha",
-            ],
-            self.root,
-        )
-        return data if isinstance(data, list) else []
-
-    def _find_new_run(
-        self, previous: set[int], dispatched_at: datetime
-    ) -> dict[str, Any]:
-        deadline = time.monotonic() + 60
-        earliest = dispatched_at - timedelta(seconds=10)
-        while time.monotonic() < deadline:
-            for run in self._list_dispatch_runs():
-                run_id = int(run.get("databaseId", 0))
-                created = datetime.fromisoformat(str(run["createdAt"]).replace("Z", "+00:00"))
-                if run_id not in previous and created >= earliest:
-                    return run
-            time.sleep(2)
-        raise RuntimeError("GitHub accepted the dispatch, but the new Actions run did not appear")
-
-    def _follow_run(self, run_id: int) -> None:
-        while True:
-            run = read_json_command(
-                [
-                    "gh",
-                    "run",
-                    "view",
-                    str(run_id),
-                    "--repo",
-                    REPOSITORY,
-                    "--json",
-                    "databaseId,status,conclusion,url,createdAt,updatedAt,headSha,jobs",
-                ],
-                self.root,
-            )
-            action_steps, stage, message = self._action_progress(run)
+        finally:
             with self.lock:
-                self.state["status"] = (
-                    "running" if run.get("status") != "completed" else "processing"
-                )
-                self.state["stage"] = stage
-                self.state["message"] = message
-                self.state["run"].update(
-                    {
-                        "url": run.get("url"),
-                        "headSha": run.get("headSha"),
-                        "actionSteps": action_steps,
-                        "githubStatus": run.get("status"),
-                        "githubConclusion": run.get("conclusion"),
-                    }
-                )
-                self._persist()
-            if run.get("status") == "completed":
-                if run.get("conclusion") != "success":
-                    raise RuntimeError(
-                        "GitHub Actions finished with "
-                        f"{run.get('conclusion') or 'an unknown failure'}; open the run for logs"
-                    )
-                break
-            time.sleep(3)
+                self.process = None
 
-        self._update(stage="results", message="Downloading the txgen report")
-        result = self._download_and_parse(run_id)
+    def _complete(self, result: dict[str, Any]) -> None:
         with self.lock:
             run_record = copy.deepcopy(self.state["run"])
             run_record["finishedAt"] = utc_now()
             history_entry = {
                 "id": run_record.get("id"),
-                "url": run_record.get("url"),
-                "headSha": run_record.get("headSha"),
+                "url": None,
                 "startedAt": run_record.get("startedAt"),
                 "finishedAt": run_record.get("finishedAt"),
                 "config": run_record.get("config"),
                 "scenario": run_record.get("scenario"),
                 "summary": result.get("summary"),
             }
-            history = [history_entry] + [
-                item for item in self.state.get("history", []) if item.get("id") != run_id
-            ]
             scenario_results = copy.deepcopy(self.state.get("scenarioResults", {}))
             scenario_results[run_record["scenario"]] = {
                 "run": run_record,
@@ -684,282 +596,25 @@ class BenchmarkController:
                 {
                     "status": "completed",
                     "stage": "complete",
-                    "message": "Results ready",
+                    "message": "Real local results ready",
                     "run": run_record,
                     "result": result,
                     "scenarioResults": scenario_results,
-                    "history": history[:8],
+                    "history": [history_entry, *self.state.get("history", [])][:8],
                     "error": None,
                 }
             )
             self._persist()
 
-    @staticmethod
-    def _action_progress(run: dict[str, Any]) -> tuple[list[dict[str, Any]], str, str]:
-        visible: list[dict[str, Any]] = []
-        for job in run.get("jobs") or []:
-            for step in job.get("steps") or []:
-                name = step.get("name")
-                if name not in DISPLAY_JOB_STEPS:
-                    continue
-                stage, label = DISPLAY_JOB_STEPS[name]
-                visible.append(
-                    {
-                        "stage": stage,
-                        "name": label,
-                        "status": step.get("status"),
-                        "conclusion": step.get("conclusion"),
-                    }
-                )
-        active = next((step for step in visible if step["status"] == "in_progress"), None)
-        if active:
-            return visible, active["stage"], active["name"]
-        pending = next((step for step in visible if step["status"] == "queued"), None)
-        if pending:
-            return visible, pending["stage"], f"Up next: {pending['name']}"
-        if run.get("status") == "queued":
-            return visible, "request", "Waiting for a benchmark runner"
-        return visible, "request", "Preparing benchmark"
-
-    def _download_and_parse(self, run_id: int) -> dict[str, Any]:
-        artifacts = read_json_command(
-            ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{run_id}/artifacts"],
-            self.root,
-        ).get("artifacts", [])
-        preset = (self.state.get("run") or {}).get("preset")
-        expected_prefix = f"zones-benchmark-neobank-{preset}-{run_id}-"
-        artifact = next(
-            (
-                item
-                for item in artifacts
-                if str(item.get("name", "")).startswith(expected_prefix)
-                and not item.get("expired", False)
-            ),
-            None,
-        )
-        if artifact is None:
-            raise RuntimeError("The successful workflow did not upload its benchmark artifact")
-        destination = self.state_dir / "runs" / str(run_id)
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.mkdir(parents=True)
-        run_command(
-            [
-                "gh",
-                "run",
-                "download",
-                str(run_id),
-                "--repo",
-                REPOSITORY,
-                "--name",
-                str(artifact["name"]),
-                "--dir",
-                str(destination),
-            ],
-            self.root,
-            timeout=180,
-        )
-        reports = list(destination.rglob("report-neobank-e2e.json"))
-        if len(reports) != 1:
-            raise RuntimeError(f"Expected one txgen report in the artifact, found {len(reports)}")
-        report = json.loads(reports[0].read_text())
-        result = report_to_result(report)
-        result["artifactName"] = artifact["name"]
-        return result
-
-    def _run_demo(self, config: dict[str, Any]) -> None:
-        try:
-            fake_id = int(time.time())
-            with self.lock:
-                self.state["run"].update(
-                    {
-                        "id": fake_id,
-                        "url": WORKFLOW_URL,
-                        "headSha": "demo",
-                    }
-                )
-                self._persist()
-            labels = (
-                ("build", "Build L1 and Zone"),
-                ("topology", "Start the private Zone"),
-                ("benchmark", "Run live customer journeys"),
-                ("results", "Calculate p99 and fees"),
-            )
-            action_steps: list[dict[str, Any]] = []
-            for stage, label in labels:
-                action_steps.append(
-                    {"stage": stage, "name": label, "status": "in_progress", "conclusion": None}
-                )
-                self._update(
-                    status="running",
-                    stage=stage,
-                    message=label,
-                    run={
-                        **self.state["run"],
-                        "actionSteps": copy.deepcopy(action_steps),
-                    },
-                )
-                time.sleep(0.45)
-                action_steps[-1].update(status="completed", conclusion="success")
-            result = demo_result(config)
-            with self.lock:
-                run_record = copy.deepcopy(self.state["run"])
-                run_record["actionSteps"] = action_steps
-                run_record["finishedAt"] = utc_now()
-                history_entry = {
-                    "id": run_record.get("id"),
-                    "url": run_record.get("url"),
-                    "headSha": run_record.get("headSha"),
-                    "startedAt": run_record.get("startedAt"),
-                    "finishedAt": run_record.get("finishedAt"),
-                    "config": run_record.get("config"),
-                    "scenario": run_record.get("scenario"),
-                    "summary": result.get("summary"),
-                }
-                scenario_results = copy.deepcopy(self.state.get("scenarioResults", {}))
-                scenario_results[run_record["scenario"]] = {
-                    "run": run_record,
-                    "result": result,
-                }
-                self.state.update(
-                    {
-                        "status": "completed",
-                        "stage": "complete",
-                        "message": "Demo results ready",
-                        "run": run_record,
-                        "result": result,
-                        "scenarioResults": scenario_results,
-                        "history": [history_entry, *self.state.get("history", [])][:8],
-                        "error": None,
-                    }
-                )
-                self._persist()
-        except Exception as error:
-            self._update(status="failed", stage="failed", message="Demo failed", error=str(error))
-
-
-def demo_result(config: dict[str, Any]) -> dict[str, Any]:
-    step_values = (
-        ("onramp.encryption", "l1", "invoke", 0.43, 0.60, 0.0, 0.0),
-        ("onramp.submission", "l1", "submit", 0.27, 0.53, 95_051.0, 0.00005703),
-        ("onramp.enqueued", "l1", "wait_log", 368.0, 564.0, 0.0, 0.0),
-        ("onramp.zone_deposit.processed", "zone", "wait_log", 411.0, 517.0, 0.0, 0.0),
-        ("earn_deposit.encryption", "l1", "invoke", 0.55, 0.94, 0.0, 0.0),
-        ("earn_deposit.request", "zone", "submit", 0.50, 0.88, 1_229_232.0, 0.0),
-        ("earn_deposit.request_result", "zone", "wait_log", 684.0, 1498.0, 0.0, 0.0),
-        ("earn_deposit.l1_processed_locator", "l1", "wait_log", 1740.0, 2555.0, 0.0, 0.0),
-        ("earn_deposit.l1_result", "l1", "wait_log", 2.02, 7.75, 0.0, 0.0),
-        ("earn_deposit.zone_return.processed", "zone", "wait_log", 375.0, 512.0, 0.0, 0.0),
-        ("earn_redeem.encryption", "l1", "invoke", 0.58, 1.26, 0.0, 0.0),
-        ("earn_redeem.request", "zone", "submit", 0.52, 0.83, 692_645.0, 0.0),
-        ("earn_redeem.request_result", "zone", "wait_log", 675.0, 1007.0, 0.0, 0.0),
-        ("earn_redeem.l1_processed_locator", "l1", "wait_log", 1692.0, 2062.0, 0.0, 0.0),
-        ("earn_redeem.l1_result", "l1", "wait_log", 1.84, 4.92, 0.0, 0.0),
-        ("earn_redeem.zone_return.processed", "zone", "wait_log", 424.0, 513.0, 0.0, 0.0),
-        ("offramp", "zone", "submit", 0.47, 0.70, 162_759.0, 0.0),
-        ("offramp_result", "zone", "wait_log", 684.0, 1015.0, 0.0, 0.0),
-        ("offramp_processed", "l1", "wait_log", 1709.0, 2067.0, 0.0, 0.0),
-    )
-    steps = [
-        {
-            "id": name,
-            "name": name,
-            "label": FRIENDLY_STEP_NAMES.get(name, name),
-            "chain": chain,
-            "kind": kind,
-            "success": config["count"],
-            "failed": 0,
-            "meanMs": mean,
-            "p50Ms": mean,
-            "p95Ms": p99 * 0.9,
-            "p99Ms": p99,
-            "meanGas": gas,
-            "p99Gas": gas * 1.05 if gas else 0.0,
-            "meanCostUsd": cost,
-            "p99CostUsd": cost,
-        }
-        for name, chain, kind, mean, p99, gas, cost in step_values
-    ]
-    phase_values = (
-        ("deposit", "Deposit into the Zone", "L1 → private Zone", 780.0, 517.0, 0.00005703),
-        ("earn_deposit", "Put funds into Earn", "Zone → L1 Earn → Zone", 2119.0, 512.0, 0.0),
-        (
-            "earn_redeem",
-            "Redeem vault shares",
-            "Zone → L1 redeem → Zone",
-            2119.0,
-            513.0,
-            0.0,
-        ),
-        ("withdraw", "Withdraw back to L1", "Private Zone → L1 wallet", 1709.0, 2067.0, 0.0),
-    )
-    phases = []
-    for phase_id, title, eyebrow, average, p99, cost in phase_values:
-        phase_definition = next(phase for phase in PHASES if phase["id"] == phase_id)
-        phases.append(
-            {
-                "id": phase_id,
-                "title": title,
-                "eyebrow": eyebrow,
-                "averageMs": average,
-                "terminalP99Ms": p99,
-                "meanCostUsd": cost,
-                "steps": [
-                    step
-                    for step in steps
-                    if any(
-                        step["name"].startswith(prefix)
-                        for prefix in phase_definition["prefixes"]
-                    )
-                ],
-            }
-        )
-    scenario_id = config["scenario"]
-    definition = SCENARIOS[scenario_id]
-    selected_phase = next(phase for phase in phases if phase["id"] == definition["phase"])
-    selected_steps = selected_phase["steps"]
-    demo_stats = {
-        "deposit": {"rate": 10.8, "mean": 780.0, "p50": 782.0, "p95": 1031.0, "p99": 1084.0},
-        "earn_deposit": {"rate": 4.1, "mean": 2119.0, "p50": 2128.0, "p95": 2824.0, "p99": 3068.0},
-        "earn_redeem": {"rate": 4.0, "mean": 2119.0, "p50": 2132.0, "p95": 2861.0, "p99": 3072.0},
-        "withdraw": {"rate": 5.7, "mean": 1709.0, "p50": 1556.0, "p95": 2066.0, "p99": 2067.0},
-    }[scenario_id]
-    mean_gas = sum(step["meanGas"] for step in selected_steps)
-    mean_cost = selected_phase["meanCostUsd"]
-    elapsed_seconds = config["count"] / demo_stats["rate"]
-    return {
-        "scenario": definition["preset"],
-        "reportVersion": 2,
-        "summary": {
-            "started": config["count"],
-            "completed": config["count"],
-            "failed": 0,
-            "timedOut": 0,
-            "elapsedSeconds": elapsed_seconds,
-            "journeysPerSecond": demo_stats["rate"],
-            "journeysPerMinute": demo_stats["rate"] * 60,
-            "submitTps": config["count"] / elapsed_seconds,
-            "submittedTransactions": config["count"],
-            "receiptCount": config["count"],
-            "maximumInFlight": config["concurrency"],
-            "meanMs": demo_stats["mean"],
-            "p50Ms": demo_stats["p50"],
-            "p95Ms": demo_stats["p95"],
-            "p99Ms": demo_stats["p99"],
-            "meanJourneyCostUsd": mean_cost,
-            "totalRunCostUsd": mean_cost * config["count"],
-            "meanJourneyGas": mean_gas,
-            "totalGas": mean_gas * config["count"],
-        },
-        "phases": [selected_phase],
-        "steps": selected_steps,
-        "configuration": {
-            "requested_instances": config["count"],
-            "starts_per_second": config["rate"],
-            "maximum_in_flight": config["concurrency"],
-        },
-        "demo": True,
-    }
+    def shutdown(self) -> None:
+        with self.lock:
+            process = self.process
+            self.cancel_requested = True
+        if process and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
 
 
 class IterativeBenchHandler(BaseHTTPRequestHandler):
@@ -1003,10 +658,15 @@ class IterativeBenchHandler(BaseHTTPRequestHandler):
             origin = self.headers.get("Origin")
             host = self.headers.get("Host")
             if origin and urlparse(origin).netloc != host:
-                self._json({"error": "Cross-origin requests are not allowed"}, HTTPStatus.FORBIDDEN)
+                self._json(
+                    {"error": "Cross-origin requests are not allowed"},
+                    HTTPStatus.FORBIDDEN,
+                )
                 return
             if path == "/api/runs":
-                self._json(self.controller.start(self._request_json()), HTTPStatus.ACCEPTED)
+                self._json(
+                    self.controller.start(self._request_json()), HTTPStatus.ACCEPTED
+                )
                 return
             if path == "/api/runs/cancel":
                 self._json(self.controller.cancel(), HTTPStatus.ACCEPTED)
@@ -1049,30 +709,30 @@ class IterativeBenchHandler(BaseHTTPRequestHandler):
 
 
 def current_branch(root: Path) -> str:
-    override = os.environ.get("ITERATIVE_BENCH_REF")
-    branch = override or run_command(["git", "branch", "--show-current"], root).stdout.strip()
+    branch = run_command(["git", "branch", "--show-current"], root).stdout.strip()
     if not branch or not BRANCH_PATTERN.fullmatch(branch) or ".." in branch:
-        raise RuntimeError(f"Unsafe or unavailable Git branch name: {branch!r}")
+        return "local-worktree"
     return branch
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch the iterative neobank benchmark UI")
-    parser.add_argument("--host", default=os.environ.get("ITERATIVE_BENCH_HOST", "127.0.0.1"))
+    parser = argparse.ArgumentParser(
+        description="Launch the real local neobank benchmark UI"
+    )
+    parser.add_argument(
+        "--host", default=os.environ.get("ITERATIVE_BENCH_HOST", "127.0.0.1")
+    )
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("ITERATIVE_BENCH_PORT", "4179"))
     )
     parser.add_argument("--no-open", action="store_true")
     arguments = parser.parse_args()
-
     root = Path(__file__).resolve().parents[3]
     static_dir = Path(__file__).resolve().parent / "static"
     state_dir = Path(
         os.environ.get("ITERATIVE_BENCH_STATE_DIR", root / "target" / "iterative-bench")
     )
-    demo = os.environ.get("ITERATIVE_BENCH_DEMO") == "1"
-    controller = BenchmarkController(root, state_dir, current_branch(root), demo=demo)
-
+    controller = BenchmarkController(root, state_dir, current_branch(root))
     handler = type(
         "ConfiguredIterativeBenchHandler",
         (IterativeBenchHandler,),
@@ -1080,19 +740,18 @@ def main() -> None:
     )
     server = ThreadingHTTPServer((arguments.host, arguments.port), handler)
     url = f"http://{arguments.host}:{arguments.port}"
-    print(f"Iterative benchmark UI: {url}")
-    print(f"Workflow ref: {controller.branch}")
-    if demo:
-        print("Demo mode enabled; no GitHub workflow will be dispatched.")
-    elif not controller.server_info()["remoteBranchAvailable"]:
-        print(f"Note: push `{controller.branch}` to origin before pressing Run live benchmark.")
+    print(f"Real local benchmark UI: {url}")
+    print(
+        "Each Go button starts an isolated Tempo L1 + private Zone and runs txgen locally."
+    )
     if not arguments.no_open and os.environ.get("ITERATIVE_BENCH_NO_OPEN") != "1":
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
-        print("\nStopping iterative benchmark UI")
+        print("\nStopping local benchmark UI")
     finally:
+        controller.shutdown()
         server.server_close()
 
 

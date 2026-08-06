@@ -1,25 +1,26 @@
-# Iterative neobank benchmark
+# Local neobank benchmark UI
 
-This local scenario runner dispatches the existing `zones-benchmark.yml` workflow,
-follows the real GitHub Actions job, downloads its txgen report, and presents each
-part of the neobank private Zone journey as latency, throughput, gas, and fee results.
+Run the benchmark UI with:
 
 ```sh
 just live-bench
 ```
 
-The command opens `http://127.0.0.1:4179`. It requires an authenticated GitHub
-CLI (`gh auth login`) and the current branch must already exist on `origin`, since
-the remote workflow checks out that exact ref. Credentials stay in the local
-server and are never sent to the browser.
+The command opens `http://127.0.0.1:4179`. Each **Go** button performs an actual
+local benchmark. It builds compatible release binaries, starts an isolated Tempo
+dev L1 and private Zone, deploys the current Earn fixtures, runs the selected
+`txgen-tempo` preset, and reports the resulting p99 latency, gas, and fees.
 
-For a presentation rehearsal that does not dispatch GitHub Actions:
+The four buttons are independent: onramp, Earn vault deposit, Earn vault redeem,
+and offramp. Every click starts from a fresh local chain, so setup and prerequisite
+funding are outside the measured scenario. The transaction input is the real txgen
+journey count.
 
-```sh
-ITERATIVE_BENCH_DEMO=1 just live-bench
-```
+The first run can take several minutes while Rust binaries and the pinned txgen are
+built. Later runs reuse those build artifacts. Runtime data and logs are written to
+`target/iterative-bench/runs/`; the UI does not dispatch GitHub Actions and has no
+synthetic-results mode.
 
-The UI exposes four independent Go buttons: deposit from L1 into a private Zone,
-deposit into Earn and return, redeem and return, and withdraw from the Zone to L1.
-Setup needed to fund each standalone scenario is untimed, so the displayed numbers
-only describe the operation selected on the card.
+Required local tools are Rust/Cargo, Foundry (`forge` and `cast`), `git`, `gh`,
+`jq`, `curl`, and `bc`. `gh` is only needed on the first run to clone the private
+Earn fixture repository.
