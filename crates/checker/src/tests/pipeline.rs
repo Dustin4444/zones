@@ -1,22 +1,18 @@
-use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
+use alloy_consensus::{Header, Sealable as _};
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
-use alloy_sol_types::{SolCall as _, SolEvent as _};
 use alloy_transport::mock::Asserter;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::{StateProviderBox, errors::provider::ProviderResult};
-use tempo_alloy::{TempoNetwork, rpc::TempoTransactionReceipt};
-use tempo_contracts::precompiles::ITIP20;
-use tempo_primitives::{
-    Block, BlockBody, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
-};
-use tempo_zone_contracts::IZoneOutbox;
+use tempo_alloy::TempoNetwork;
+use tempo_primitives::{Block, BlockBody, TempoHeader, TempoPrimitives};
 
 use super::{
-    L1_NUMBER, L1RpcBlock, PORTAL, advance_transaction, imported_child_header, l1_provider,
-    l1_rpc_block, zone_block, zone_receipt,
+    L1_NUMBER, L1RpcBlock, PORTAL, exact_zone_state_with_supply, imported_child_header,
+    l1_provider, l1_provider_with_collateral, user_withdrawal_receipt, zone_block,
+    zone_block_with_user_withdrawal, zone_receipt,
 };
 use crate::{
     check::{
@@ -25,11 +21,10 @@ use crate::{
     },
     model::{
         accounting::TokenAccounting,
-        constants::ZONE_OUTBOX_ADDRESS,
         state::{ModelState, PortalIdentity, portal_address_for_zone},
         state_layout::{
             INBOX_PROCESSED_DEPOSIT_HASH_ACCESS, OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS,
-            TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS, tip20_total_supply_access,
+            TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS,
         },
     },
     observe::{
@@ -39,82 +34,6 @@ use crate::{
 };
 
 type TestStateProvider = MockEthProvider<TempoPrimitives>;
-
-fn zone_block_with_user_withdrawal(
-    number: u64,
-    parent_hash: B256,
-    imported: &TempoHeader,
-    sender: Address,
-) -> RecoveredBlock<Block> {
-    let user = TempoTxEnvelope::Legacy(Signed::new_unhashed(
-        TxLegacy {
-            to: ZONE_OUTBOX_ADDRESS.into(),
-            ..Default::default()
-        },
-        Signature::new(U256::ONE, U256::from(2), false),
-    ));
-    let block = Block {
-        header: TempoHeader {
-            inner: Header {
-                number,
-                parent_hash,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        body: BlockBody {
-            transactions: vec![advance_transaction(imported), user],
-            ..Default::default()
-        },
-    };
-    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::ZERO, sender])
-}
-
-fn user_withdrawal_receipt(sender: Address, token: Address) -> TempoReceipt {
-    TempoReceipt {
-        tx_type: TempoTxType::Legacy,
-        success: true,
-        cumulative_gas_used: 0,
-        logs: vec![
-            Log {
-                address: ZONE_OUTBOX_ADDRESS,
-                data: IZoneOutbox::TempoGasRateUpdated { tempoGasRate: 1 }.encode_log_data(),
-            },
-            Log {
-                address: ZONE_OUTBOX_ADDRESS,
-                data: IZoneOutbox::WithdrawalRequested {
-                    withdrawalIndex: 0,
-                    sender,
-                    token,
-                    to: Address::repeat_byte(0x54),
-                    amount: 10,
-                    fee: 50_000,
-                    memo: B256::ZERO,
-                    gasLimit: 0,
-                    fallbackNonce: 1,
-                    data: Bytes::new(),
-                    revealTo: Bytes::new(),
-                }
-                .encode_log_data(),
-            },
-        ],
-    }
-}
-
-fn l1_provider_with_collateral(
-    imported: &TempoHeader,
-    collateral: U256,
-) -> DynProvider<TempoNetwork> {
-    let asserter = Asserter::new();
-    asserter.push_success(&Some(l1_rpc_block(imported)));
-    asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
-    asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
-        &collateral,
-    )));
-    ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_mocked_client(asserter)
-        .erased()
-}
 
 fn l1_provider_missing_block() -> DynProvider<TempoNetwork> {
     let asserter = Asserter::new();
@@ -146,20 +65,6 @@ fn exact_zone_state(imported: &TempoHeader, tempo_hash: B256) -> TestStateProvid
     provider.add_account(
         OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS.address,
         ExtendedAccount::new(0, U256::ZERO),
-    );
-    provider
-}
-
-fn exact_zone_state_with_supply(
-    imported: &TempoHeader,
-    token: Address,
-    supply: U256,
-) -> TestStateProvider {
-    let provider = exact_zone_state(imported, imported.hash_slow());
-    provider.add_account(
-        token,
-        ExtendedAccount::new(0, U256::ZERO)
-            .extend_storage([(tip20_total_supply_access(token).storage_key(), supply)]),
     );
     provider
 }

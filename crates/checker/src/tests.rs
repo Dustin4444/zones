@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, Log, U256};
+use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256};
 use alloy_provider::ProviderBuilder;
 use alloy_rlp::Encodable as _;
 use alloy_rpc_types_eth::{BlockTransactions, Header as RpcHeader};
@@ -15,25 +15,27 @@ use tempo_alloy::{
     TempoNetwork,
     rpc::{TempoHeaderResponse, TempoTransactionReceipt},
 };
+use tempo_contracts::precompiles::ITIP20;
 use tempo_primitives::{
     BlockBody, TempoHeader, TempoTxEnvelope, TempoTxType,
     transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE,
 };
-use tempo_zone_contracts::{IZoneInbox, TempoState};
+use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
 
 use super::*;
 use crate::{
     model::{
-        constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS},
+        constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
         state_layout::{
             INBOX_PROCESSED_DEPOSIT_HASH_ACCESS, OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS,
-            TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS,
+            TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS, tip20_total_supply_access,
         },
     },
     observe::AcquisitionError,
 };
 
 mod pipeline;
+mod runtime;
 
 const PORTAL: Address = Address::repeat_byte(0x42);
 const L1_NUMBER: u64 = 100;
@@ -116,6 +118,47 @@ fn zone_block(number: u64, parent_hash: B256, imported: &TempoHeader) -> Recover
     zone_block_with_marker(number, parent_hash, imported, 0)
 }
 
+fn zone_block_with_user_withdrawal(
+    number: u64,
+    parent_hash: B256,
+    imported: &TempoHeader,
+    sender: Address,
+) -> RecoveredBlock<Block> {
+    zone_block_with_user_withdrawal_marker(number, parent_hash, imported, sender, 0)
+}
+
+fn zone_block_with_user_withdrawal_marker(
+    number: u64,
+    parent_hash: B256,
+    imported: &TempoHeader,
+    sender: Address,
+    fork_marker: u8,
+) -> RecoveredBlock<Block> {
+    let user = TempoTxEnvelope::Legacy(Signed::new_unhashed(
+        TxLegacy {
+            to: ZONE_OUTBOX_ADDRESS.into(),
+            ..Default::default()
+        },
+        Signature::new(U256::ONE, U256::from(2), false),
+    ));
+    let block = Block {
+        header: TempoHeader {
+            inner: Header {
+                number,
+                parent_hash,
+                extra_data: Bytes::from(vec![fork_marker]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        body: BlockBody {
+            transactions: vec![advance_transaction(imported), user],
+            ..Default::default()
+        },
+    };
+    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::ZERO, sender])
+}
+
 fn zone_block_with_marker(
     number: u64,
     parent_hash: B256,
@@ -191,6 +234,37 @@ fn zone_receipt(imported: &TempoHeader) -> TempoReceipt {
     }
 }
 
+fn user_withdrawal_receipt(sender: Address, token: Address) -> TempoReceipt {
+    TempoReceipt {
+        tx_type: TempoTxType::Legacy,
+        success: true,
+        cumulative_gas_used: 0,
+        logs: vec![
+            Log {
+                address: ZONE_OUTBOX_ADDRESS,
+                data: IZoneOutbox::TempoGasRateUpdated { tempoGasRate: 1 }.encode_log_data(),
+            },
+            Log {
+                address: ZONE_OUTBOX_ADDRESS,
+                data: IZoneOutbox::WithdrawalRequested {
+                    withdrawalIndex: 0,
+                    sender,
+                    token,
+                    to: Address::repeat_byte(0x54),
+                    amount: 10,
+                    fee: 50_000,
+                    memo: B256::ZERO,
+                    gasLimit: 0,
+                    fallbackNonce: 1,
+                    data: Bytes::new(),
+                    revealTo: Bytes::new(),
+                }
+                .encode_log_data(),
+            },
+        ],
+    }
+}
+
 fn chain(
     blocks: Vec<RecoveredBlock<Block>>,
     receipt_sets: Vec<Vec<TempoReceipt>>,
@@ -238,6 +312,19 @@ fn zone_state(imported: &TempoHeader) -> TestProvider {
     provider
 }
 
+fn exact_zone_state_with_supply(
+    imported: &TempoHeader,
+    token: Address,
+    supply: U256,
+) -> TestProvider {
+    let provider = zone_state(imported);
+    provider.add_account(
+        token,
+        account_with_storage([(tip20_total_supply_access(token).storage_key(), supply)]),
+    );
+    provider
+}
+
 fn l1_rpc_block(imported: &TempoHeader) -> L1RpcBlock {
     alloy_rpc_types_eth::Block {
         header: TempoHeaderResponse {
@@ -262,6 +349,29 @@ fn l1_provider(imported: &TempoHeader) -> DynProvider<TempoNetwork> {
     let asserter = Asserter::new();
     asserter.push_success(&Some(l1_rpc_block(imported)));
     asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
+    ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_mocked_client(asserter)
+        .erased()
+}
+
+fn l1_provider_with_collateral(
+    imported: &TempoHeader,
+    collateral: U256,
+) -> DynProvider<TempoNetwork> {
+    l1_provider_with_collateral_sequence(&[(imported, collateral)])
+}
+
+fn l1_provider_with_collateral_sequence(
+    blocks: &[(&TempoHeader, U256)],
+) -> DynProvider<TempoNetwork> {
+    let asserter = Asserter::new();
+    for (imported, collateral) in blocks {
+        asserter.push_success(&Some(l1_rpc_block(imported)));
+        asserter.push_success(&Some(Vec::<TempoTransactionReceipt>::new()));
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            collateral,
+        )));
+    }
     ProviderBuilder::new_with_network::<TempoNetwork>()
         .connect_mocked_client(asserter)
         .erased()

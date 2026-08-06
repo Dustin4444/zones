@@ -80,6 +80,10 @@ impl StoreIdentity {
         self.zone_genesis_hash
     }
 
+    pub(crate) const fn portal_creation_block_hash(self) -> B256 {
+        self.portal_creation_block_hash
+    }
+
     pub(crate) fn metadata(self) -> [(MetaKey, MetaValue); 5] {
         [
             (

@@ -34,6 +34,8 @@ pub(crate) enum StoreError {
         #[source]
         source: eyre::Report,
     },
+    #[error("checker database at {path} does not exist or contains no durable state")]
+    EmptyExistingDatabase { path: PathBuf },
     #[error(transparent)]
     Database(#[from] DatabaseError),
     #[error(transparent)]
@@ -91,6 +93,14 @@ pub(crate) enum StoreError {
     #[error("canonical Zone height {height} conflicts: expected {expected}, found {actual}")]
     CanonicalConflict {
         height: u64,
+        expected: B256,
+        actual: B256,
+    },
+    #[error(
+        "Zone block {child:?} has parent hash {actual}, expected current verified hash {expected}"
+    )]
+    CandidateParentConflict {
+        child: BlockNumHash,
         expected: B256,
         actual: B256,
     },

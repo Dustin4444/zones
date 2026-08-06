@@ -10,6 +10,8 @@ mod metrics;
 mod model;
 mod observe;
 #[allow(dead_code)]
+mod runtime;
+#[allow(dead_code)]
 mod store;
 
 use std::{fmt, str::FromStr};

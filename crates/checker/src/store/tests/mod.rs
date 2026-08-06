@@ -28,7 +28,7 @@ use crate::model::{
 };
 
 use super::{
-    db::{CheckerStore, Initialization, RefundCredit},
+    db::{CheckerStore, Initialization, LiveBlock, RefundCredit},
     error::StoreError,
     history::BlockCommit,
     model_state::{flatten_model, model_bytes},
@@ -49,6 +49,7 @@ mod bootstrap;
 mod findings;
 mod history;
 mod opening;
+mod preflight;
 mod refunds;
 
 #[derive(Debug, Clone, Copy)]

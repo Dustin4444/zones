@@ -165,7 +165,7 @@ impl CheckerStore {
     }
 
     #[cfg(test)]
-    pub(super) fn apply_block_aborting_after(
+    pub(crate) fn apply_block_aborting_after(
         &self,
         commit: BlockCommit,
         writes: usize,

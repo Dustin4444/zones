@@ -9,9 +9,11 @@ use std::{
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, U256};
 use reth_db::{
-    Database, DatabaseEnv,
+    Database, DatabaseEnv, DatabaseEnvKind,
     cursor::{DbCursorRO, DbCursorRW},
+    is_database_empty,
     mdbx::{DatabaseArguments, init_db_for},
+    open_db_read_only,
     transaction::{DbTx, DbTxMut},
 };
 
@@ -67,6 +69,21 @@ pub(crate) struct StoreSnapshot {
     pub(crate) active_alert: Option<ActiveAlert>,
     pub(crate) model: ModelState,
     pub(crate) model_rows: ModelRows,
+}
+
+/// Durable preflight classification of a Zone block offered to the live checker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LiveBlock {
+    /// The exact next child, paired with the authoritative parent tips.
+    Next {
+        verified_zone_tip: BlockNumHash,
+        imported_tempo_tip: BlockNumHash,
+    },
+    /// A retained canonical block that requires no model acquisition or write.
+    AlreadyCanonical {
+        /// The current durable tip to acknowledge, which may be newer than the child.
+        verified_zone_tip: BlockNumHash,
+    },
 }
 
 /// Fixed-size durable state needed to guard a sparse commit.
@@ -148,13 +165,78 @@ impl CheckerStore {
         Ok(store)
     }
 
+    /// Open an initialized checker database without creating tables or state.
+    pub(crate) fn open_existing(
+        data_dir: impl AsRef<Path>,
+        identity: StoreIdentity,
+    ) -> StoreResult<Self> {
+        let path = data_dir.as_ref().join(CHECKER_DIRECTORY);
+        if is_database_empty(&path) {
+            return Err(StoreError::EmptyExistingDatabase { path });
+        }
+        let probe = open_db_read_only(&path, DatabaseArguments::default()).map_err(|source| {
+            StoreError::Open {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let probe = Self {
+            db: Arc::new(probe),
+            identity,
+            path: path.clone(),
+        };
+        let tx = probe.db.tx()?;
+        let empty = all_tables_empty(&tx);
+        let empty = finish_read(tx, empty)?;
+        if empty {
+            return Err(StoreError::EmptyExistingDatabase { path });
+        }
+        // Fail on identity, version, or codec corruption before an RW open can
+        // acquire/create storage locks or perform environment recovery.
+        probe.validate_restart()?;
+        drop(probe);
+
+        let db = DatabaseEnv::open(&path, DatabaseEnvKind::RW, DatabaseArguments::default())
+            .map_err(|source| StoreError::Open {
+                path: path.clone(),
+                source: source.into(),
+            })?;
+        let store = Self {
+            db: Arc::new(db),
+            identity,
+            path,
+        };
+        // Validate after reopening read/write so a replaced environment can
+        // never bypass the read-only probe.
+        store.validate_restart()?;
+        Ok(store)
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) const fn portal_creation_block_hash(&self) -> B256 {
+        self.identity.portal_creation_block_hash()
     }
 
     pub(crate) fn load_current(&self) -> StoreResult<StoreSnapshot> {
         let tx = self.db.tx()?;
         let result = read_snapshot(&tx, self.identity, &self.path);
+        finish_read(tx, result)
+    }
+
+    /// Classify a live Zone candidate against one authoritative read transaction.
+    ///
+    /// Retained canonical blocks remain acknowledgeable while bootstrap or an
+    /// alert prevents new work. Only an exact next child reaches acquisition.
+    pub(crate) fn preflight_live_block(
+        &self,
+        child: BlockNumHash,
+        parent_hash: B256,
+    ) -> StoreResult<LiveBlock> {
+        let tx = self.db.tx()?;
+        let result = preflight_live_block(&tx, self.identity, &self.path, child, parent_hash);
         finish_read(tx, result)
     }
 
@@ -195,6 +277,61 @@ impl CheckerStore {
     pub(super) fn database(&self) -> &DatabaseEnv {
         &self.db
     }
+}
+
+fn preflight_live_block<TX: DbTx>(
+    tx: &TX,
+    identity: StoreIdentity,
+    path: &Path,
+    child: BlockNumHash,
+    parent_hash: B256,
+) -> StoreResult<LiveBlock> {
+    let head = read_head(tx, identity, path)?;
+    if child.number <= head.verified_zone_tip.number {
+        let canonical = tx
+            .get::<CheckerCanonical>(child.number)?
+            .ok_or(StoreError::MissingCanonical {
+                height: child.number,
+            })?
+            .into_inner();
+        if canonical != child.hash {
+            return Err(StoreError::CanonicalConflict {
+                height: child.number,
+                expected: child.hash,
+                actual: canonical,
+            });
+        }
+        return Ok(LiveBlock::AlreadyCanonical {
+            verified_zone_tip: head.verified_zone_tip,
+        });
+    }
+    if head.bootstrap != BootstrapState::Live {
+        return Err(StoreError::InvalidBootstrapProgress(
+            "live block preflight requires live bootstrap state",
+        ));
+    }
+    if let Some(alert) = head.active_alert {
+        return Err(StoreError::ActiveAlert(alert.finding));
+    }
+    if head.verified_zone_tip.number.checked_add(1) != Some(child.number) {
+        return Err(StoreError::NonAdjacent {
+            chain: "Zone",
+            parent: head.verified_zone_tip,
+            child,
+        });
+    }
+    if parent_hash != head.verified_zone_tip.hash {
+        return Err(StoreError::CandidateParentConflict {
+            child,
+            expected: head.verified_zone_tip.hash,
+            actual: parent_hash,
+        });
+    }
+
+    Ok(LiveBlock::Next {
+        verified_zone_tip: head.verified_zone_tip,
+        imported_tempo_tip: head.imported_tempo_tip,
+    })
 }
 
 pub(super) fn finish_read<T, TX: DbTx>(tx: TX, result: StoreResult<T>) -> StoreResult<T> {

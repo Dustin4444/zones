@@ -283,10 +283,9 @@ pub(crate) struct ImportedTempoStateUpdate {
 impl ModelStateUpdate {
     /// Apply to the exact parent from which this update was projected.
     ///
-    /// Rust module visibility cannot grant this sibling-module method only to
-    /// `check::pipeline`; the private `CandidateCommit` there is the sole
-    /// production owner. Persistence must add an explicit tip/generation guard
-    /// before it allows an update to outlive that immediate commit boundary.
+    /// The checker pipeline verifies exact parent ownership before calling this
+    /// method. The persistent runtime additionally commits through the store's
+    /// tip/generation guard before applying the update to its mirror.
     pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
         apply_delta(state, self.delta);
     }
