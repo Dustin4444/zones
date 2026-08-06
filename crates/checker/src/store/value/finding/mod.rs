@@ -6,6 +6,7 @@
 
 mod codec;
 pub(crate) mod leaf;
+mod projection;
 pub(crate) mod types;
 
 #[cfg(test)]

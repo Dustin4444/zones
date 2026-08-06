@@ -23,6 +23,9 @@ mod error;
 mod processing;
 
 #[cfg(test)]
+mod semantic_fixtures;
+
+#[cfg(test)]
 mod tests;
 
 pub(crate) use actual::{
@@ -31,7 +34,7 @@ pub(crate) use actual::{
     ObservedSubmittedBatch, ObservedUserWithdrawalBounce, ObservedUserWithdrawalDelivery,
     ObservedWithdrawalBounceBackAppend, ObservedWithdrawalProcessed, ObservedWithdrawalProcessing,
 };
-pub(crate) use error::ImportedProjectionError;
+pub(crate) use error::{ImportedEventKind, ImportedProjectionError};
 
 use error::event_kind;
 use processing::project_withdrawal_processing;

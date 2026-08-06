@@ -18,8 +18,8 @@ use crate::{
         events::{Inbox, L2ProtocolEvent, Outbox},
     },
     observe::error::{
-        AcquisitionError, AcquisitionSource, DataSource, EnvelopeRule, ObservationError,
-        ProtocolChain,
+        AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
+        DataSource, EnvelopeRule, ObservationError, ProtocolChain,
     },
 };
 
@@ -479,16 +479,23 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             data: LogData::new_unchecked(vec![B256::repeat_byte(0xff)], Bytes::new()),
         },
     );
+    let (error, imported_tempo) = observe_l2_block_with_context(&block, &receipts)
+        .unwrap_err()
+        .into_parts();
+    assert_eq!(
+        imported_tempo,
+        Some(BlockNumHash::new(100, imported_header().hash_slow()))
+    );
     assert!(matches!(
-        observe_l2_block(&block, &receipts),
-        Err(ObservationError::ProtocolEvent {
+        error,
+        ObservationError::ProtocolEvent {
             chain: ProtocolChain::ZoneL2,
             transaction_index: 0,
             receipt_log_index: 0,
             block_log_index: 0,
             transaction_hash: actual_hash,
             error,
-        }) if actual_hash == transaction_hash
+        } if actual_hash == transaction_hash
             && matches!(error.as_ref(), crate::model::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 
@@ -669,11 +676,17 @@ fn malformed_finalization_calldata_has_its_own_error_class() {
         vec![Address::ZERO, Address::ZERO],
     );
     let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
+    let transaction_hash = *block.body().transactions[1].tx_hash();
+    let evidence = AuthenticatedDataEvidence::from_bytes(b"bad");
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::MalformedAuthenticatedData {
             kind: DataSource::FinalizationCalldata,
+            transaction,
+            evidence: actual_evidence,
             ..
-        })
+        }) if transaction
+            == AuthenticatedTransaction::new(ProtocolChain::ZoneL2, 1, transaction_hash)
+            && actual_evidence == evidence
     ));
 }

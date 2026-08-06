@@ -26,7 +26,8 @@ use crate::{
     },
     observe::{
         ExactStateLookup, L1BlockObservation, L2BlockObservation, ObservationError,
-        acquire_portal_collateral, acquire_zone_post_state, observe_l1, observe_l2_block,
+        acquire_portal_collateral, acquire_zone_post_state, observe_l1,
+        observe_l2_block_with_context,
     },
 };
 
@@ -58,6 +59,14 @@ pub(crate) struct PreparedBlock {
     parent_tempo_tip: BlockNumHash,
     child_zone_tip: BlockNumHash,
     child_tempo_tip: BlockNumHash,
+}
+
+/// Locally authenticated Zone candidate whose continuity has been checked,
+/// but whose imported Tempo block has not yet been acquired.
+pub(crate) struct ObservedZoneCandidate {
+    l2: L2BlockObservation,
+    observation_duration: Duration,
+    continuity_duration: Duration,
 }
 
 impl PreparedBlock {
@@ -121,8 +130,9 @@ impl InMemoryChecker {
     /// Authenticate a canonical block and run the complete in-memory check.
     ///
     /// This convenience path is retained for non-persistent pipeline scenarios.
-    /// The live runtime calls [`Self::prepare_observed_block`] and adopts only
-    /// after its store commit succeeds.
+    /// The live runtime uses [`Self::observe_zone_candidate`] before opening a
+    /// remote connection, then finishes the candidate and adopts it only after
+    /// its store commit succeeds.
     pub(crate) async fn observe_and_check_block<P, S>(
         &mut self,
         l1_provider: &P,
@@ -156,39 +166,105 @@ impl InMemoryChecker {
         P: Provider<TempoNetwork>,
         S: ExactStateLookup + ?Sized,
     {
+        let candidate = self.observe_zone_candidate(block, receipts)?;
+        self.prepare_observed_candidate(l1_provider, zone_state, candidate)
+            .await
+    }
+
+    /// Authenticate the notification-local Zone surface and validate both
+    /// chain continuities before any remote L1 connection is required.
+    pub(crate) fn observe_zone_candidate<R>(
+        &self,
+        block: &RecoveredBlock<Block>,
+        receipts: &[R],
+    ) -> Result<ObservedZoneCandidate, CheckError>
+    where
+        R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
+    {
         let block_number = block.header().number();
         self.metrics
             .latest_observed_zone_height
             .set(block_number as f64);
         let observation_started = Instant::now();
-        let l2 = match observe_l2_block(block, receipts) {
+        let l2 = match observe_l2_block_with_context(block, receipts) {
             Ok(observation) => observation,
-            Err(error) => {
+            Err(failure) => {
                 self.metrics
                     .observation_duration_seconds
                     .record(observation_started.elapsed().as_secs_f64());
-                return self.finish_observation_error(block_number, error);
+                let (error, imported_tempo) = failure.into_parts();
+                return self.finish_observation_error(block_number, error, imported_tempo);
             }
         };
+        let imported_tempo = l2.imported_tempo();
+        let observation_duration = observation_started.elapsed();
+        let transition_started = Instant::now();
+        if let Err(finding) = self.check_continuity(&l2) {
+            self.metrics
+                .observation_duration_seconds
+                .record(observation_duration.as_secs_f64());
+            self.metrics
+                .transition_duration_seconds
+                .record(transition_started.elapsed().as_secs_f64());
+            let error = CheckError::from(finding).with_imported_tempo(imported_tempo);
+            self.record_error(block_number, &error);
+            return Err(error);
+        }
+        Ok(ObservedZoneCandidate {
+            l2,
+            observation_duration,
+            continuity_duration: transition_started.elapsed(),
+        })
+    }
+
+    /// Authenticate the imported Tempo block and finish a locally validated
+    /// candidate through the ordinary model and exact-state checks.
+    pub(crate) async fn prepare_observed_candidate<P, S>(
+        &self,
+        l1_provider: &P,
+        zone_state: &S,
+        candidate: ObservedZoneCandidate,
+    ) -> Result<PreparedBlock, CheckError>
+    where
+        P: Provider<TempoNetwork>,
+        S: ExactStateLookup + ?Sized,
+    {
+        let ObservedZoneCandidate {
+            l2,
+            observation_duration,
+            continuity_duration,
+        } = candidate;
+        let imported_tempo = l2.imported_tempo();
+        let imported_header = l2.inputs().advance_tempo().imported_header();
+        let l1_observation_started = Instant::now();
         let l1 = match observe_l1(
             l1_provider,
-            l2.inputs().advance_tempo().imported_header(),
+            imported_header,
             self.model.portal().identity().portal(),
         )
         .await
         {
             Ok(observation) => observation,
             Err(error) => {
-                self.metrics
-                    .observation_duration_seconds
-                    .record(observation_started.elapsed().as_secs_f64());
-                return self.finish_observation_error(block_number, error);
+                self.metrics.observation_duration_seconds.record(
+                    observation_duration
+                        .saturating_add(l1_observation_started.elapsed())
+                        .as_secs_f64(),
+                );
+                return self.finish_observation_error(
+                    l2.block_number(),
+                    error,
+                    Some(imported_tempo),
+                );
             }
         };
-        self.metrics
-            .observation_duration_seconds
-            .record(observation_started.elapsed().as_secs_f64());
-        self.prepare_block(l1_provider, zone_state, &l1, &l2).await
+        self.metrics.observation_duration_seconds.record(
+            observation_duration
+                .saturating_add(l1_observation_started.elapsed())
+                .as_secs_f64(),
+        );
+        self.prepare_continuous_block(l1_provider, zone_state, &l1, &l2, continuity_duration)
+            .await
     }
 
     /// Check and atomically materialize one already-authenticated child of the
@@ -227,14 +303,49 @@ impl InMemoryChecker {
         self.metrics
             .latest_observed_zone_height
             .set(l2.block_number() as f64);
+        let continuity_started = Instant::now();
+        if let Err(finding) = self.check_continuity(l2) {
+            self.metrics
+                .transition_duration_seconds
+                .record(continuity_started.elapsed().as_secs_f64());
+            let imported_tempo = l2.imported_tempo();
+            let error = CheckError::from(finding).with_imported_tempo(imported_tempo);
+            self.record_error(l2.block_number(), &error);
+            return Err(error);
+        }
+        self.prepare_continuous_block(
+            l1_provider,
+            zone_state,
+            l1,
+            l2,
+            continuity_started.elapsed(),
+        )
+        .await
+    }
+
+    async fn prepare_continuous_block<P, S>(
+        &self,
+        l1_provider: &P,
+        zone_state: &S,
+        l1: &L1BlockObservation,
+        l2: &L2BlockObservation,
+        prior_transition: Duration,
+    ) -> Result<PreparedBlock, CheckError>
+    where
+        P: Provider<TempoNetwork>,
+        S: ExactStateLookup + ?Sized,
+    {
         let check_started = Instant::now();
         let mut timings = CheckTimings::default();
+        let imported_tempo = l2.imported_tempo();
         let result = self
-            .check_candidate(l1_provider, zone_state, l1, l2, &mut timings)
-            .await;
+            .finish_continuous_block(l1_provider, zone_state, l1, l2, &mut timings)
+            .await
+            .map_err(|error| error.with_imported_tempo(imported_tempo));
         let transition = check_started
             .elapsed()
-            .saturating_sub(timings.acquisition());
+            .saturating_sub(timings.acquisition())
+            .saturating_add(prior_transition);
 
         self.metrics
             .transition_duration_seconds
@@ -263,7 +374,7 @@ impl InMemoryChecker {
         self.record_passed(self.zone_tip.number);
     }
 
-    async fn check_candidate<P, S>(
+    async fn finish_continuous_block<P, S>(
         &self,
         l1_provider: &P,
         zone_state: &S,
@@ -275,7 +386,6 @@ impl InMemoryChecker {
         P: Provider<TempoNetwork>,
         S: ExactStateLookup + ?Sized,
     {
-        self.check_continuity(l2)?;
         let expected_portal = self.model.portal().identity().portal();
         if l1.portal_address() != expected_portal {
             return Err(Finding::PortalObservationIdentityMismatch {
@@ -418,8 +528,12 @@ impl InMemoryChecker {
         &self,
         block_number: u64,
         error: ObservationError,
+        imported_tempo: Option<BlockNumHash>,
     ) -> Result<T, CheckError> {
-        let error = error.into();
+        let mut error = CheckError::from(error);
+        if let Some(imported_tempo) = imported_tempo {
+            error = error.with_imported_tempo(imported_tempo);
+        }
         self.record_error(block_number, &error);
         Err(error)
     }
@@ -429,7 +543,7 @@ impl InMemoryChecker {
             CheckError::Acquisition(_) => {
                 self.metrics.acquisition_failures_total.increment(1);
             }
-            CheckError::Finding(_) => self.metrics.findings_total.increment(1),
+            CheckError::Finding { .. } => self.metrics.findings_total.increment(1),
         }
         self.record_progress(observed_number);
     }

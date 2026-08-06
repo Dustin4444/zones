@@ -5,6 +5,9 @@ mod error;
 mod projection;
 
 #[cfg(test)]
+mod semantic_fixtures;
+
+#[cfg(test)]
 mod tests;
 
 pub(crate) use actual::{
@@ -14,7 +17,7 @@ pub(crate) use actual::{
     ObservedWithdrawalBounceBackProcessed, ObservedWithdrawalRequested, ObservedZoneEventPosition,
     ObservedZoneOperation, ObservedZoneOutputs, ZoneProjection,
 };
-pub(crate) use error::{DepositInputKind, ZoneProjectionError};
+pub(crate) use error::{DepositInputKind, ZoneEventKind, ZoneProjectionError};
 pub(crate) use projection::project_zone;
 
 use error::event_kind;

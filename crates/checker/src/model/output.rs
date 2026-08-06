@@ -54,6 +54,9 @@ impl ExpectedPostZoneState {
 
 mod settlement;
 
+#[cfg(test)]
+mod semantic_fixtures;
+
 pub(crate) use settlement::{
     ExpectedBatchSubmission, ExpectedDepositRefund, ExpectedProcessedWithdrawal,
     ExpectedRefundClaim, ExpectedUserWithdrawalBounce, ExpectedUserWithdrawalDelivery,

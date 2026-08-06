@@ -12,6 +12,9 @@ pub(crate) mod encoding;
 pub(crate) mod events;
 pub(crate) mod fees;
 mod input;
+
+#[cfg(test)]
+pub(crate) use input::TokenEnable;
 pub(crate) mod output;
 pub(crate) mod ownership;
 pub(crate) mod state;

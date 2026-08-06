@@ -52,4 +52,6 @@ pub(crate) struct CheckerRuntimeMetrics {
     pub(crate) operational_recoveries_total: Counter,
     /// Whether the checker is currently healthy (`1`) or operationally blocked (`0`).
     pub(crate) healthy: Gauge,
+    /// Whether one durable canonical finding currently freezes model progress.
+    pub(crate) active_alert: Gauge,
 }

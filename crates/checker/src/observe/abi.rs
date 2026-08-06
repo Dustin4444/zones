@@ -14,13 +14,49 @@ use crate::model::constants::{
     MAX_TOKEN_SYMBOL_BYTES, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
 };
 
-use super::error::{DataSource, ObservationError, PortalCallFamily};
+use super::error::{
+    AuthenticatedDataEvidence, AuthenticatedTransaction, DataSource, ObservationError,
+    PortalCallFamily,
+};
 
 const WORD: usize = 32;
 const SELECTOR: usize = 4;
 // `ZonePortal.Deposit` is one top-level offset, a six-word tuple head,
 // a five-word encrypted-payload head, and a three-word ciphertext tail.
 const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
+
+#[derive(Debug)]
+struct AbiError {
+    source: DataSource,
+    evidence: AuthenticatedDataEvidence,
+    detail: String,
+}
+
+impl AbiError {
+    fn into_observation(self, transaction: AuthenticatedTransaction) -> ObservationError {
+        ObservationError::malformed(self.source, transaction, self.evidence, self.detail)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Surface<'a> {
+    source: DataSource,
+    bytes: &'a [u8],
+}
+
+impl<'a> Surface<'a> {
+    const fn new(source: DataSource, bytes: &'a [u8]) -> Self {
+        Self { source, bytes }
+    }
+
+    fn malformed(self, detail: impl core::fmt::Display) -> AbiError {
+        AbiError {
+            source: self.source,
+            evidence: AuthenticatedDataEvidence::from_bytes(self.bytes),
+            detail: detail.to_string(),
+        }
+    }
+}
 
 /// Canonical Tempo header supplied by the opening Zone system transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +222,7 @@ impl DecodedPortalCall {
 /// Every helper checks integer conversion and range arithmetic before a
 /// generated decoder can allocate from an attacker-controlled length word.
 struct Bounds<'a> {
-    source: DataSource,
+    surface: Surface<'a>,
     data: &'a [u8],
 }
 
@@ -195,44 +231,41 @@ impl<'a> Bounds<'a> {
         source: DataSource,
         calldata: &'a [u8],
         selector: &[u8; SELECTOR],
-    ) -> Result<Self, ObservationError> {
+    ) -> Result<Self, AbiError> {
+        let surface = Surface::new(source, calldata);
         if !calldata.starts_with(selector) {
-            return Err(ObservationError::malformed(
-                source,
-                "wrong function selector",
-            ));
+            return Err(surface.malformed("wrong function selector"));
         }
         Ok(Self {
-            source,
+            surface,
             data: &calldata[SELECTOR..],
         })
     }
 
-    fn ensure_head(&self, words: usize) -> Result<(), ObservationError> {
-        let bytes = checked_mul(words, WORD, self.source)?;
+    fn ensure_head(&self, words: usize) -> Result<(), AbiError> {
+        let bytes = checked_mul(words, WORD, self.surface)?;
         if self.data.len() < bytes {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("ABI head needs {bytes} bytes, got {}", self.data.len()),
-            ));
+            return Err(self.surface.malformed(format!(
+                "ABI head needs {bytes} bytes, got {}",
+                self.data.len()
+            )));
         }
         Ok(())
     }
 
-    fn word(&self, offset: usize) -> Result<&'a [u8], ObservationError> {
-        let end = checked_add(offset, WORD, self.source)?;
+    fn word(&self, offset: usize) -> Result<&'a [u8], AbiError> {
+        let end = checked_add(offset, WORD, self.surface)?;
         self.data.get(offset..end).ok_or_else(|| {
-            ObservationError::malformed(self.source, format!("word at byte {offset} is truncated"))
+            self.surface
+                .malformed(format!("word at byte {offset} is truncated"))
         })
     }
 
-    fn usize_word(&self, offset: usize) -> Result<usize, ObservationError> {
+    fn usize_word(&self, offset: usize) -> Result<usize, AbiError> {
         let value = U256::from_be_slice(self.word(offset)?);
         usize::try_from(value).map_err(|_| {
-            ObservationError::malformed(
-                self.source,
-                format!("word at byte {offset} does not fit usize"),
-            )
+            self.surface
+                .malformed(format!("word at byte {offset} does not fit usize"))
         })
     }
 
@@ -241,21 +274,20 @@ impl<'a> Bounds<'a> {
         base: usize,
         word_index: usize,
         minimum_head_words: usize,
-    ) -> Result<usize, ObservationError> {
+    ) -> Result<usize, AbiError> {
         let word_offset = checked_add(
             base,
-            checked_mul(word_index, WORD, self.source)?,
-            self.source,
+            checked_mul(word_index, WORD, self.surface)?,
+            self.surface,
         )?;
         let relative = self.usize_word(word_offset)?;
-        let minimum = checked_mul(minimum_head_words, WORD, self.source)?;
+        let minimum = checked_mul(minimum_head_words, WORD, self.surface)?;
         if relative < minimum || relative % WORD != 0 {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("invalid dynamic offset {relative} at byte {word_offset}"),
-            ));
+            return Err(self.surface.malformed(format!(
+                "invalid dynamic offset {relative} at byte {word_offset}"
+            )));
         }
-        let absolute = checked_add(base, relative, self.source)?;
+        let absolute = checked_add(base, relative, self.surface)?;
         self.word(absolute)?;
         Ok(absolute)
     }
@@ -267,23 +299,21 @@ impl<'a> Bounds<'a> {
         minimum_head_words: usize,
         maximum: usize,
         field: &'static str,
-    ) -> Result<&'a [u8], ObservationError> {
+    ) -> Result<&'a [u8], AbiError> {
         let start = self.relative(base, word_index, minimum_head_words)?;
         let length = self.usize_word(start)?;
         if length > maximum {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} length {length} exceeds {maximum}"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} length {length} exceeds {maximum}")));
         }
-        let data_start = checked_add(start, WORD, self.source)?;
-        let padded = padded_length(length, self.source)?;
-        let data_end = checked_add(data_start, padded, self.source)?;
+        let data_start = checked_add(start, WORD, self.surface)?;
+        let padded = padded_length(length, self.surface)?;
+        let data_end = checked_add(data_start, padded, self.surface)?;
         if data_end > self.data.len() {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} length {length} exceeds calldata"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} length {length} exceeds calldata")));
         }
         Ok(&self.data[data_start..data_start + length])
     }
@@ -295,21 +325,23 @@ impl<'a> Bounds<'a> {
         start: usize,
         maximum: usize,
         field: &'static str,
-    ) -> Result<&'a [u8], ObservationError> {
+    ) -> Result<&'a [u8], AbiError> {
         let length = self.usize_word(start)?;
         if length > maximum {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} length {length} exceeds {maximum}"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} length {length} exceeds {maximum}")));
         }
-        let data_start = checked_add(start, WORD, self.source)?;
-        let data_end = checked_add(data_start, padded_length(length, self.source)?, self.source)?;
+        let data_start = checked_add(start, WORD, self.surface)?;
+        let data_end = checked_add(
+            data_start,
+            padded_length(length, self.surface)?,
+            self.surface,
+        )?;
         if data_end > self.data.len() {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} length {length} exceeds calldata"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} length {length} exceeds calldata")));
         }
         Ok(&self.data[data_start..data_start + length])
     }
@@ -321,16 +353,15 @@ impl<'a> Bounds<'a> {
         minimum_head_words: usize,
         maximum_count: usize,
         field: &'static str,
-    ) -> Result<(usize, usize), ObservationError> {
+    ) -> Result<(usize, usize), AbiError> {
         let array = self.relative(base, word_index, minimum_head_words)?;
         let count = self.usize_word(array)?;
         if count > maximum_count {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} count {count} exceeds {maximum_count}"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} count {count} exceeds {maximum_count}")));
         }
-        Ok((checked_add(array, WORD, self.source)?, count))
+        Ok((checked_add(array, WORD, self.surface)?, count))
     }
 
     fn dynamic_element(
@@ -338,21 +369,20 @@ impl<'a> Bounds<'a> {
         array_head: usize,
         count: usize,
         index: usize,
-    ) -> Result<usize, ObservationError> {
-        let table_bytes = checked_mul(count, WORD, self.source)?;
+    ) -> Result<usize, AbiError> {
+        let table_bytes = checked_mul(count, WORD, self.surface)?;
         let entry = checked_add(
             array_head,
-            checked_mul(index, WORD, self.source)?,
-            self.source,
+            checked_mul(index, WORD, self.surface)?,
+            self.surface,
         )?;
         let relative = self.usize_word(entry)?;
         if relative < table_bytes || relative % WORD != 0 {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("invalid array element offset {relative} at index {index}"),
-            ));
+            return Err(self.surface.malformed(format!(
+                "invalid array element offset {relative} at index {index}"
+            )));
         }
-        let absolute = checked_add(array_head, relative, self.source)?;
+        let absolute = checked_add(array_head, relative, self.surface)?;
         self.word(absolute)?;
         Ok(absolute)
     }
@@ -365,56 +395,49 @@ impl<'a> Bounds<'a> {
         element_words: usize,
         maximum_count: usize,
         field: &'static str,
-    ) -> Result<usize, ObservationError> {
+    ) -> Result<usize, AbiError> {
         let array = self.relative(base, word_index, minimum_head_words)?;
         let count = self.usize_word(array)?;
         if count > maximum_count {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} count {count} exceeds {maximum_count}"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} count {count} exceeds {maximum_count}")));
         }
-        let body = checked_add(array, WORD, self.source)?;
-        let words = checked_mul(count, element_words, self.source)?;
-        let end = checked_add(body, checked_mul(words, WORD, self.source)?, self.source)?;
+        let body = checked_add(array, WORD, self.surface)?;
+        let words = checked_mul(count, element_words, self.surface)?;
+        let end = checked_add(body, checked_mul(words, WORD, self.surface)?, self.surface)?;
         if end > self.data.len() {
-            return Err(ObservationError::malformed(
-                self.source,
-                format!("{field} count {count} exceeds calldata"),
-            ));
+            return Err(self
+                .surface
+                .malformed(format!("{field} count {count} exceeds calldata")));
         }
         Ok(count)
     }
 }
 
-fn checked_add(a: usize, b: usize, source: DataSource) -> Result<usize, ObservationError> {
+fn checked_add(a: usize, b: usize, surface: Surface<'_>) -> Result<usize, AbiError> {
     a.checked_add(b)
-        .ok_or_else(|| ObservationError::malformed(source, "ABI range addition overflow"))
+        .ok_or_else(|| surface.malformed("ABI range addition overflow"))
 }
 
-fn checked_mul(a: usize, b: usize, source: DataSource) -> Result<usize, ObservationError> {
+fn checked_mul(a: usize, b: usize, surface: Surface<'_>) -> Result<usize, AbiError> {
     a.checked_mul(b)
-        .ok_or_else(|| ObservationError::malformed(source, "ABI range multiplication overflow"))
+        .ok_or_else(|| surface.malformed("ABI range multiplication overflow"))
 }
 
-fn padded_length(length: usize, source: DataSource) -> Result<usize, ObservationError> {
-    checked_add(length, WORD - 1, source).map(|length| length / WORD * WORD)
+fn padded_length(length: usize, surface: Surface<'_>) -> Result<usize, AbiError> {
+    checked_add(length, WORD - 1, surface).map(|length| length / WORD * WORD)
 }
 
-fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), ObservationError> {
+fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), AbiError> {
+    let surface = Surface::new(DataSource::OrdinaryDepositData, data);
     if data.len() != ORDINARY_DEPOSIT_ENCODED_SIZE {
-        return Err(ObservationError::malformed(
-            DataSource::OrdinaryDepositData,
-            format!(
-                "encoded deposit length {}, expected {ORDINARY_DEPOSIT_ENCODED_SIZE}",
-                data.len()
-            ),
-        ));
+        return Err(surface.malformed(format!(
+            "encoded deposit length {}, expected {ORDINARY_DEPOSIT_ENCODED_SIZE}",
+            data.len()
+        )));
     }
-    let bounds = Bounds {
-        source: DataSource::OrdinaryDepositData,
-        data,
-    };
+    let bounds = Bounds { surface, data };
     bounds.ensure_head(1)?;
     let deposit = bounds.relative(0, 0, 1)?;
     let encrypted = bounds.relative(deposit, 5, 6)?;
@@ -426,18 +449,16 @@ fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), ObservationError> {
         "ciphertext",
     )?;
     if ciphertext.len() != ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE {
-        return Err(ObservationError::malformed(
-            DataSource::OrdinaryDepositData,
-            format!(
-                "ciphertext length {}, expected {ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE}",
-                ciphertext.len()
-            ),
-        ));
+        return Err(surface.malformed(format!(
+            "ciphertext length {}, expected {ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE}",
+            ciphertext.len()
+        )));
     }
     Ok(())
 }
 
-fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), ObservationError> {
+fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
+    let surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
     let bounds = Bounds::from_call(
         DataSource::AdvanceTempoCalldata,
         calldata,
@@ -456,14 +477,12 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), ObservationError> {
         match kind {
             0 => {
                 if data.len() != 3 * WORD {
-                    return Err(ObservationError::malformed(
-                        DataSource::AdvanceTempoCalldata,
-                        format!(
+                    return Err(Surface::new(DataSource::WithdrawalBounceBackData, data)
+                        .malformed(format!(
                             "withdrawal bounce-back depositData length {}, expected {}",
                             data.len(),
                             3 * WORD
-                        ),
-                    ));
+                        )));
                 }
             }
             1 => {
@@ -471,10 +490,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), ObservationError> {
                 preflight_ordinary_deposit(data)?;
             }
             other => {
-                return Err(ObservationError::malformed(
-                    DataSource::AdvanceTempoCalldata,
-                    format!("unsupported deposit discriminator {other}"),
-                ));
+                return Err(surface.malformed(format!("unsupported deposit discriminator {other}")));
             }
         }
     }
@@ -482,12 +498,9 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), ObservationError> {
     let decryption_count =
         bounds.static_array(0, 2, 4, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "decryptions")?;
     if decryption_count != ordinary_count {
-        return Err(ObservationError::malformed(
-            DataSource::AdvanceTempoCalldata,
-            format!(
+        return Err(surface.malformed(format!(
                 "decryption count {decryption_count} does not match ordinary deposit count {ordinary_count}"
-            ),
-        ));
+            )));
     }
 
     let (token_head, token_count) =
@@ -503,33 +516,31 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), ObservationError> {
 
 pub(crate) fn decode_advance_tempo(
     calldata: &[u8],
+    transaction: AuthenticatedTransaction,
 ) -> Result<DecodedAdvanceTempo, ObservationError> {
+    decode_advance_tempo_inner(calldata).map_err(|error| error.into_observation(transaction))
+}
+
+fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError> {
+    let advance_surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
     preflight_advance_tempo(calldata)?;
     let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-        .map_err(|error| ObservationError::malformed(DataSource::AdvanceTempoCalldata, error))?;
+        .map_err(|error| advance_surface.malformed(error))?;
     if call.abi_encode() != calldata {
-        return Err(ObservationError::malformed(
-            DataSource::AdvanceTempoCalldata,
-            "encoding is non-canonical or has trailing bytes",
-        ));
+        return Err(advance_surface.malformed("encoding is non-canonical or has trailing bytes"));
     }
 
+    let header_surface = Surface::new(DataSource::AdvanceHeaderRlp, call.header.as_ref());
     let mut remaining = call.header.as_ref();
-    let header = TempoHeader::decode(&mut remaining)
-        .map_err(|error| ObservationError::malformed(DataSource::AdvanceHeaderRlp, error))?;
+    let header =
+        TempoHeader::decode(&mut remaining).map_err(|error| header_surface.malformed(error))?;
     if !remaining.is_empty() {
-        return Err(ObservationError::malformed(
-            DataSource::AdvanceHeaderRlp,
-            format!("{} trailing bytes", remaining.len()),
-        ));
+        return Err(header_surface.malformed(format!("{} trailing bytes", remaining.len())));
     }
     let mut canonical_header = Vec::with_capacity(header.length());
     header.encode(&mut canonical_header);
     if canonical_header.as_slice() != call.header.as_ref() {
-        return Err(ObservationError::malformed(
-            DataSource::AdvanceHeaderRlp,
-            "non-canonical encoding",
-        ));
+        return Err(header_surface.malformed("non-canonical encoding"));
     }
     let imported_header = ImportedTempoHeader::new(header);
 
@@ -537,42 +548,39 @@ pub(crate) fn decode_advance_tempo(
     for queued in call.deposits {
         let deposit = match queued.depositType {
             IZoneInbox::DepositType::WithdrawalBounceBack => {
+                let surface = Surface::new(
+                    DataSource::WithdrawalBounceBackData,
+                    queued.depositData.as_ref(),
+                );
                 let decoded = IZoneInbox::WithdrawalBounceBackDeposit::abi_decode_validate(
                     &queued.depositData,
                 )
-                .map_err(|error| {
-                    ObservationError::malformed(DataSource::WithdrawalBounceBackData, error)
-                })?;
+                .map_err(|error| surface.malformed(error))?;
                 if decoded.abi_encode() != queued.depositData {
-                    return Err(ObservationError::malformed(
-                        DataSource::WithdrawalBounceBackData,
-                        "encoding is non-canonical or has trailing bytes",
-                    ));
+                    return Err(
+                        surface.malformed("encoding is non-canonical or has trailing bytes")
+                    );
                 }
                 ImportedDeposit {
                     kind: ImportedDepositKind::WithdrawalBounceBack(decoded),
                 }
             }
             IZoneInbox::DepositType::Deposit => {
+                let surface =
+                    Surface::new(DataSource::OrdinaryDepositData, queued.depositData.as_ref());
                 let decoded = ZonePortal::Deposit::abi_decode_validate(&queued.depositData)
-                    .map_err(|error| {
-                        ObservationError::malformed(DataSource::OrdinaryDepositData, error)
-                    })?;
+                    .map_err(|error| surface.malformed(error))?;
                 if decoded.abi_encode() != queued.depositData {
-                    return Err(ObservationError::malformed(
-                        DataSource::OrdinaryDepositData,
-                        "encoding is non-canonical or has trailing bytes",
-                    ));
+                    return Err(
+                        surface.malformed("encoding is non-canonical or has trailing bytes")
+                    );
                 }
                 ImportedDeposit {
                     kind: ImportedDepositKind::Ordinary(decoded),
                 }
             }
             _ => {
-                return Err(ObservationError::malformed(
-                    DataSource::AdvanceTempoCalldata,
-                    "unsupported deposit discriminator",
-                ));
+                return Err(advance_surface.malformed("unsupported deposit discriminator"));
             }
         };
         deposits.push(deposit);
@@ -586,7 +594,8 @@ pub(crate) fn decode_advance_tempo(
     })
 }
 
-fn preflight_finalization(calldata: &[u8]) -> Result<(), ObservationError> {
+fn preflight_finalization(calldata: &[u8]) -> Result<(), AbiError> {
+    let surface = Surface::new(DataSource::FinalizationCalldata, calldata);
     let bounds = Bounds::from_call(
         DataSource::FinalizationCalldata,
         calldata,
@@ -597,23 +606,19 @@ fn preflight_finalization(calldata: &[u8]) -> Result<(), ObservationError> {
     let maximum = bounds.data.len() / WORD;
     let (sender_head, sender_count) = bounds.dynamic_array(0, 2, 3, maximum, "encryptedSenders")?;
     if count != sender_count {
-        return Err(ObservationError::malformed(
-            DataSource::FinalizationCalldata,
-            format!("count {count} does not match encryptedSenders length {sender_count}"),
-        ));
+        return Err(surface.malformed(format!(
+            "count {count} does not match encryptedSenders length {sender_count}"
+        )));
     }
     for index in 0..sender_count {
         let sender = bounds.dynamic_element(sender_head, sender_count, index)?;
         let bytes =
             bounds.direct_bytes(sender, AUTHENTICATED_WITHDRAWAL_SIZE, "encrypted sender")?;
         if !matches!(bytes.len(), 0 | AUTHENTICATED_WITHDRAWAL_SIZE) {
-            return Err(ObservationError::malformed(
-                DataSource::FinalizationCalldata,
-                format!(
+            return Err(surface.malformed(format!(
                     "encrypted sender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_SIZE}",
                     bytes.len()
-                ),
-            ));
+                )));
         }
     }
     Ok(())
@@ -621,19 +626,21 @@ fn preflight_finalization(calldata: &[u8]) -> Result<(), ObservationError> {
 
 pub(crate) fn decode_finalization(
     calldata: &[u8],
+    transaction: AuthenticatedTransaction,
 ) -> Result<DecodedFinalization, ObservationError> {
+    decode_finalization_inner(calldata).map_err(|error| error.into_observation(transaction))
+}
+
+fn decode_finalization_inner(calldata: &[u8]) -> Result<DecodedFinalization, AbiError> {
+    let surface = Surface::new(DataSource::FinalizationCalldata, calldata);
     preflight_finalization(calldata)?;
     let call = IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode_validate(calldata)
-        .map_err(|error| ObservationError::malformed(DataSource::FinalizationCalldata, error))?;
+        .map_err(|error| surface.malformed(error))?;
     if call.abi_encode() != calldata {
-        return Err(ObservationError::malformed(
-            DataSource::FinalizationCalldata,
-            "encoding is non-canonical or has trailing bytes",
-        ));
+        return Err(surface.malformed("encoding is non-canonical or has trailing bytes"));
     }
-    let count = usize::try_from(call.count).map_err(|_| {
-        ObservationError::malformed(DataSource::FinalizationCalldata, "count overflows usize")
-    })?;
+    let count =
+        usize::try_from(call.count).map_err(|_| surface.malformed("count overflows usize"))?;
     Ok(DecodedFinalization {
         count,
         block_number: call.blockNumber,
@@ -641,7 +648,8 @@ pub(crate) fn decode_finalization(
     })
 }
 
-fn preflight_process_withdrawals(calldata: &[u8]) -> Result<(), ObservationError> {
+fn preflight_process_withdrawals(calldata: &[u8]) -> Result<(), AbiError> {
+    let surface = Surface::new(DataSource::ProcessWithdrawalsCalldata, calldata);
     let bounds = Bounds::from_call(
         DataSource::ProcessWithdrawalsCalldata,
         calldata,
@@ -662,19 +670,16 @@ fn preflight_process_withdrawals(calldata: &[u8]) -> Result<(), ObservationError
             "encryptedSender",
         )?;
         if !matches!(encrypted.len(), 0 | AUTHENTICATED_WITHDRAWAL_SIZE) {
-            return Err(ObservationError::malformed(
-                DataSource::ProcessWithdrawalsCalldata,
-                format!(
+            return Err(surface.malformed(format!(
                     "encryptedSender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_SIZE}",
                     encrypted.len()
-                ),
-            ));
+                )));
         }
     }
     Ok(())
 }
 
-fn preflight_submit_batch(calldata: &[u8]) -> Result<(), ObservationError> {
+fn preflight_submit_batch(calldata: &[u8]) -> Result<(), AbiError> {
     let bounds = Bounds::from_call(
         DataSource::SubmitBatchCalldata,
         calldata,
@@ -693,40 +698,41 @@ fn preflight_submit_batch(calldata: &[u8]) -> Result<(), ObservationError> {
     Ok(())
 }
 
-pub(crate) fn decode_portal_call(calldata: &[u8]) -> Result<DecodedPortalCall, ObservationError> {
+pub(crate) fn decode_portal_call(
+    calldata: &[u8],
+    transaction: AuthenticatedTransaction,
+) -> Result<DecodedPortalCall, ObservationError> {
+    decode_portal_call_inner(calldata).map_err(|error| error.into_observation(transaction))
+}
+
+fn decode_portal_call_inner(calldata: &[u8]) -> Result<DecodedPortalCall, AbiError> {
     if calldata.starts_with(&ZonePortal::submitBatchCall::SELECTOR) {
+        let surface = Surface::new(DataSource::SubmitBatchCalldata, calldata);
         preflight_submit_batch(calldata)?;
         let call = ZonePortal::submitBatchCall::abi_decode_validate(calldata)
-            .map_err(|error| ObservationError::malformed(DataSource::SubmitBatchCalldata, error))?;
+            .map_err(|error| surface.malformed(error))?;
         if call.abi_encode() != calldata {
-            return Err(ObservationError::malformed(
-                DataSource::SubmitBatchCalldata,
-                "encoding is non-canonical or has trailing bytes",
-            ));
+            return Err(surface.malformed("encoding is non-canonical or has trailing bytes"));
         }
         Ok(DecodedPortalCall {
             kind: DecodedPortalCallKind::SubmitBatch(Box::new(call)),
         })
     } else if calldata.starts_with(&ZonePortal::processWithdrawalsCall::SELECTOR) {
+        let surface = Surface::new(DataSource::ProcessWithdrawalsCalldata, calldata);
         preflight_process_withdrawals(calldata)?;
-        let call =
-            ZonePortal::processWithdrawalsCall::abi_decode_validate(calldata).map_err(|error| {
-                ObservationError::malformed(DataSource::ProcessWithdrawalsCalldata, error)
-            })?;
+        let call = ZonePortal::processWithdrawalsCall::abi_decode_validate(calldata)
+            .map_err(|error| surface.malformed(error))?;
         if call.abi_encode() != calldata {
-            return Err(ObservationError::malformed(
-                DataSource::ProcessWithdrawalsCalldata,
-                "encoding is non-canonical or has trailing bytes",
-            ));
+            return Err(surface.malformed("encoding is non-canonical or has trailing bytes"));
         }
         Ok(DecodedPortalCall {
             kind: DecodedPortalCallKind::ProcessWithdrawals(call),
         })
     } else {
-        Err(ObservationError::malformed(
-            DataSource::PortalTransactionCalldata,
-            "selector does not match its authenticated protocol events",
-        ))
+        Err(
+            Surface::new(DataSource::PortalTransactionCalldata, calldata)
+                .malformed("selector does not match its authenticated protocol events"),
+        )
     }
 }
 

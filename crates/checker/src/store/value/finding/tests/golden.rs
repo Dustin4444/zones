@@ -7,7 +7,10 @@ use reth_codecs::{Compress, Decompress};
 use crate::store::schema::ModelKey;
 
 use super::{
-    super::super::{FindingKind, FindingRecord, FindingStatus},
+    super::super::{
+        FindingKind, FindingRecord, FindingStatus, StoredEnvelopeRule,
+        StoredImportedProjectionError, StoredPortalCallError,
+    },
     fixtures::{hash, kinds, record},
 };
 use crate::store::value::finding::StoredProtocolChain;
@@ -48,7 +51,7 @@ impl Golden {
 
 fn golden_record(value: &FindingRecord) -> Vec<u8> {
     let mut out = Golden::default();
-    out.byte(0x01);
+    out.byte(0x02);
     out.hash(value.zone_parent_hash);
     match value.imported_tempo {
         None => out.byte(0x00),
@@ -222,6 +225,18 @@ fn golden_location(out: &mut Golden, value: ChainLocation) {
             out.u64(receipt_log_index);
             out.u64(block_log_index);
         }
+        LocationKind::TransactionIndex(index) => {
+            out.byte(0x03);
+            out.u64(index);
+        }
+        LocationKind::TransactionHash(hash) => {
+            out.byte(0x04);
+            out.hash(hash);
+        }
+        LocationKind::BlockLogIndex(index) => {
+            out.byte(0x05);
+            out.u64(index);
+        }
     }
 }
 
@@ -373,12 +388,43 @@ fn every_finding_code_has_complete_independent_golden_bytes() {
 }
 
 #[test]
+fn partial_authenticated_locations_have_independent_golden_bytes() {
+    let values = [
+        record(FindingKind::ImportedProjectionViolation(
+            ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 7),
+            StoredImportedProjectionError::InvalidCreationGrammar,
+            FindingSummary::new(1, hash(1)),
+        )),
+        record(FindingKind::PortalCallViolation(
+            ChainLocation::transaction_hash(StoredProtocolChain::TempoL1, hash(8)),
+            StoredPortalCallError::ConflictingFamilies,
+            FindingSummary::new(1, hash(1)),
+        )),
+        record(FindingKind::ImportedProjectionViolation(
+            ChainLocation::block_log_index(StoredProtocolChain::TempoL1, 9),
+            StoredImportedProjectionError::InvalidDepositKeyParity,
+            FindingSummary::new(1, hash(1)),
+        )),
+    ];
+
+    for value in values {
+        let expected = golden_record(&value);
+        let actual = value.clone().compress();
+        assert_eq!(actual, expected);
+        assert_eq!(FindingRecord::decompress(&actual).unwrap(), value);
+    }
+}
+
+#[test]
 fn record_envelope_variants_have_complete_golden_bytes() {
     let mut value = FindingRecord::new(
         hash(0x11),
         None,
         FindingStatus::Canonical,
-        FindingKind::PortalCreationMissing(hash(0x22)),
+        FindingKind::InvalidEnvelope(
+            ChainLocation::block(StoredProtocolChain::ZoneL2),
+            StoredEnvelopeRule::NonGenesis,
+        ),
     )
     .unwrap();
     assert_eq!(value.clone().compress(), golden_record(&value));

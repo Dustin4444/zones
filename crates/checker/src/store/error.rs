@@ -70,6 +70,11 @@ pub(crate) enum StoreError {
         expected: Box<ParentTips>,
         actual: Box<ParentTips>,
     },
+    #[error("cannot unwind Zone block {expected:?}: current verified tip is {actual:?}")]
+    UnwindTipMismatch {
+        expected: BlockNumHash,
+        actual: BlockNumHash,
+    },
     #[error("non-adjacent {chain} child: parent {parent:?}, child {child:?}")]
     NonAdjacent {
         chain: &'static str,

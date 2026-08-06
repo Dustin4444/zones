@@ -14,6 +14,12 @@ pub(super) const MAX_RECORD_SIZE: usize = 2_048;
 pub(super) enum LocationKind {
     Block,
     Transaction(u64, B256),
+    /// The authenticated error retained an index but not the transaction body/hash.
+    TransactionIndex(u64),
+    /// The authenticated error retained a hash but not its ordered block index.
+    TransactionHash(B256),
+    /// The authenticated error retained only its block-global log index.
+    BlockLogIndex(u64),
     Log {
         transaction_index: u64,
         transaction_hash: B256,
@@ -22,7 +28,8 @@ pub(super) enum LocationKind {
     },
 }
 
-/// A complete block, transaction, or receipt-log coordinate.
+/// The authenticated block, transaction, or log coordinates available at the
+/// failure site. Partial transaction/log variants never invent missing fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainLocation {
     pub(super) chain: StoredProtocolChain,
@@ -41,6 +48,27 @@ impl ChainLocation {
         Self {
             chain,
             kind: LocationKind::Transaction(index, hash),
+        }
+    }
+
+    pub(crate) const fn transaction_index(chain: StoredProtocolChain, index: u64) -> Self {
+        Self {
+            chain,
+            kind: LocationKind::TransactionIndex(index),
+        }
+    }
+
+    pub(crate) const fn transaction_hash(chain: StoredProtocolChain, hash: B256) -> Self {
+        Self {
+            chain,
+            kind: LocationKind::TransactionHash(hash),
+        }
+    }
+
+    pub(crate) const fn block_log_index(chain: StoredProtocolChain, block_log_index: u64) -> Self {
+        Self {
+            chain,
+            kind: LocationKind::BlockLogIndex(block_log_index),
         }
     }
 
@@ -75,6 +103,36 @@ impl ChainLocation {
                 transaction_hash,
                 ..
             } => Some((transaction_index, transaction_hash)),
+            LocationKind::TransactionIndex(_)
+            | LocationKind::TransactionHash(_)
+            | LocationKind::BlockLogIndex(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn transaction_index_coordinate(self) -> Option<u64> {
+        match self.kind {
+            LocationKind::Transaction(index, _) | LocationKind::TransactionIndex(index) => {
+                Some(index)
+            }
+            LocationKind::Log {
+                transaction_index, ..
+            } => Some(transaction_index),
+            LocationKind::Block
+            | LocationKind::TransactionHash(_)
+            | LocationKind::BlockLogIndex(_) => None,
+        }
+    }
+
+    pub(crate) const fn transaction_hash_coordinate(self) -> Option<B256> {
+        match self.kind {
+            LocationKind::Transaction(_, hash) | LocationKind::TransactionHash(hash) => Some(hash),
+            LocationKind::Log {
+                transaction_hash, ..
+            } => Some(transaction_hash),
+            LocationKind::Block
+            | LocationKind::TransactionIndex(_)
+            | LocationKind::BlockLogIndex(_) => None,
         }
     }
 
@@ -85,8 +143,50 @@ impl ChainLocation {
                 block_log_index,
                 ..
             } => Some((receipt_log_index, block_log_index)),
-            LocationKind::Block | LocationKind::Transaction(..) => None,
+            LocationKind::Block
+            | LocationKind::Transaction(..)
+            | LocationKind::TransactionIndex(_)
+            | LocationKind::TransactionHash(_)
+            | LocationKind::BlockLogIndex(_) => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn block_log_index_coordinate(self) -> Option<u64> {
+        match self.kind {
+            LocationKind::BlockLogIndex(index) => Some(index),
+            LocationKind::Log {
+                block_log_index, ..
+            } => Some(block_log_index),
+            LocationKind::Block
+            | LocationKind::Transaction(..)
+            | LocationKind::TransactionIndex(_)
+            | LocationKind::TransactionHash(_) => None,
+        }
+    }
+
+    fn is_block_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::Block)
+    }
+
+    fn is_transaction_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::Transaction(..))
+    }
+
+    fn is_transaction_index_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::TransactionIndex(_))
+    }
+
+    fn is_transaction_hash_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::TransactionHash(_))
+    }
+
+    fn is_block_log_index_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::BlockLogIndex(_))
+    }
+
+    fn is_log_on(self, chain: StoredProtocolChain) -> bool {
+        self.chain() == chain && matches!(self.kind, LocationKind::Log { .. })
     }
 }
 
@@ -208,34 +308,200 @@ impl FindingKind {
         }
     }
 
-    pub(super) fn is_valid(&self) -> bool {
+    fn has_valid_location(&self) -> bool {
         match self {
-            Self::InvalidEnvelope(location, _) => location.chain() == StoredProtocolChain::ZoneL2,
+            Self::InvalidEnvelope(location, leaf) => match leaf {
+                StoredEnvelopeRule::NonGenesis | StoredEnvelopeRule::AdvancePresent => {
+                    location.is_block_on(StoredProtocolChain::ZoneL2)
+                }
+                StoredEnvelopeRule::AdvanceSystemCaller
+                | StoredEnvelopeRule::AdvanceDestination
+                | StoredEnvelopeRule::AdvanceSuccess
+                | StoredEnvelopeRule::SystemIdentity
+                | StoredEnvelopeRule::FinalizationPosition
+                | StoredEnvelopeRule::FinalizationDestination
+                | StoredEnvelopeRule::FinalizationSuccess
+                | StoredEnvelopeRule::FinalizationBlockNumber => {
+                    location.is_transaction_on(StoredProtocolChain::ZoneL2)
+                }
+            },
             Self::MalformedAuthenticatedData(location, source, _) => {
-                location.chain() == source.chain()
+                location.is_transaction_on(source.chain())
+            }
+            Self::UnsupportedProtocolEvent(location, ..)
+            | Self::MalformedProtocolEvent(location, ..) => {
+                location.is_log_on(StoredProtocolChain::TempoL1)
+                    || location.is_log_on(StoredProtocolChain::ZoneL2)
             }
             Self::PortalCallViolation(location, _, _) => {
-                location.chain() == StoredProtocolChain::TempoL1
+                location.is_transaction_hash_on(StoredProtocolChain::TempoL1)
             }
-            Self::ImportedProjectionViolation(location, _, _) => {
-                location.chain() == StoredProtocolChain::TempoL1
+            Self::ImportedProjectionViolation(location, leaf, _) => {
+                valid_imported_projection_location(*location, *leaf)
             }
-            Self::ZoneProjectionViolation(location, _, _) => {
-                location.chain() == StoredProtocolChain::ZoneL2
+            Self::ZoneProjectionViolation(location, leaf, _) => {
+                valid_zone_projection_location(*location, *leaf)
             }
-            Self::ModelViolation(..) => true,
+            Self::ModelViolation(location, ..) => location.is_block_on(StoredProtocolChain::ZoneL2),
             Self::ImportedOutputMismatch(_, location, ..) => {
-                location.chain() == StoredProtocolChain::TempoL1
+                location.is_transaction_on(StoredProtocolChain::TempoL1)
+                    || location.is_log_on(StoredProtocolChain::TempoL1)
             }
             Self::TempoBlockFinalizedMismatch(location, ..)
             | Self::TokenEnableMismatch(_, location, ..)
             | Self::DepositOutcomeMismatch(_, location, ..)
             | Self::TempoAdvancedMismatch(location, ..)
-            | Self::ZoneOperationMismatch(_, location, ..)
-            | Self::BatchFinalizedMismatch(location, ..) => {
-                location.chain() == StoredProtocolChain::ZoneL2
+            | Self::ZoneOperationMismatch(_, location, ..) => {
+                location.is_log_on(StoredProtocolChain::ZoneL2)
             }
-            _ => true,
+            Self::BatchFinalizedMismatch(location, ..) => {
+                location.is_block_on(StoredProtocolChain::ZoneL2)
+                    || location.is_log_on(StoredProtocolChain::ZoneL2)
+            }
+            Self::ZoneContinuity(..)
+            | Self::TempoContinuity(..)
+            | Self::PortalObservationIdentityMismatch(..)
+            | Self::PortalCreationBlockMismatch(..)
+            | Self::PortalCreationMissing(_)
+            | Self::ImportedOutputCountMismatch(..)
+            | Self::TokenEnableCountMismatch(..)
+            | Self::DepositOutcomeCountMismatch(..)
+            | Self::ZoneOperationCountMismatch(..)
+            | Self::TempoBlockHashMismatch(..)
+            | Self::TempoBlockNumberMismatch(..)
+            | Self::ProcessedDepositHashMismatch(..)
+            | Self::ProcessedDepositNumberMismatch(..)
+            | Self::WithdrawalQueueHashMismatch(..)
+            | Self::WithdrawalBatchIndexMismatch(..)
+            | Self::CollateralDeficit(..)
+            | Self::MissingSupply(_)
+            | Self::SupplyMismatch(..) => true,
+        }
+    }
+
+    fn requires_imported_tempo(&self) -> bool {
+        match self {
+            Self::InvalidEnvelope(_, leaf) => !matches!(
+                leaf,
+                StoredEnvelopeRule::NonGenesis
+                    | StoredEnvelopeRule::AdvancePresent
+                    | StoredEnvelopeRule::AdvanceSystemCaller
+                    | StoredEnvelopeRule::AdvanceDestination
+                    | StoredEnvelopeRule::AdvanceSuccess
+            ),
+            Self::MalformedAuthenticatedData(_, source, _) => !matches!(
+                source,
+                StoredDataSource::AdvanceTempoCalldata
+                    | StoredDataSource::AdvanceHeaderRlp
+                    | StoredDataSource::OrdinaryDepositData
+                    | StoredDataSource::WithdrawalBounceBackData
+            ),
+            Self::UnsupportedProtocolEvent(..)
+            | Self::MalformedProtocolEvent(..)
+            | Self::PortalCallViolation(..)
+            | Self::ZoneContinuity(..)
+            | Self::TempoContinuity(..)
+            | Self::PortalObservationIdentityMismatch(..)
+            | Self::PortalCreationBlockMismatch(..)
+            | Self::PortalCreationMissing(_)
+            | Self::ImportedProjectionViolation(..)
+            | Self::ZoneProjectionViolation(..)
+            | Self::ModelViolation(..)
+            | Self::ImportedOutputCountMismatch(..)
+            | Self::ImportedOutputMismatch(..)
+            | Self::TempoBlockFinalizedMismatch(..)
+            | Self::TokenEnableCountMismatch(..)
+            | Self::TokenEnableMismatch(..)
+            | Self::DepositOutcomeCountMismatch(..)
+            | Self::DepositOutcomeMismatch(..)
+            | Self::TempoAdvancedMismatch(..)
+            | Self::ZoneOperationCountMismatch(..)
+            | Self::ZoneOperationMismatch(..)
+            | Self::BatchFinalizedMismatch(..)
+            | Self::TempoBlockHashMismatch(..)
+            | Self::TempoBlockNumberMismatch(..)
+            | Self::ProcessedDepositHashMismatch(..)
+            | Self::ProcessedDepositNumberMismatch(..)
+            | Self::WithdrawalQueueHashMismatch(..)
+            | Self::WithdrawalBatchIndexMismatch(..)
+            | Self::CollateralDeficit(..)
+            | Self::MissingSupply(_)
+            | Self::SupplyMismatch(..) => true,
+        }
+    }
+
+    pub(super) fn is_valid(&self, imported_tempo: Option<BlockNumHash>) -> bool {
+        self.has_valid_location() && (!self.requires_imported_tempo() || imported_tempo.is_some())
+    }
+}
+
+fn valid_imported_projection_location(
+    location: ChainLocation,
+    leaf: StoredImportedProjectionError,
+) -> bool {
+    match leaf {
+        StoredImportedProjectionError::MissingBaseFee
+        | StoredImportedProjectionError::BlockHashMismatch
+        | StoredImportedProjectionError::BlockNumberMismatch => {
+            location.is_block_on(StoredProtocolChain::TempoL1)
+        }
+        StoredImportedProjectionError::OutcomeCoordinateMismatch => {
+            location.is_transaction_on(StoredProtocolChain::TempoL1)
+        }
+        StoredImportedProjectionError::TransactionOrderMismatch
+        | StoredImportedProjectionError::InvalidCreationGrammar
+        | StoredImportedProjectionError::InvalidSubmitBatchGrammar
+        | StoredImportedProjectionError::DirectCallRequired
+        | StoredImportedProjectionError::UnexpectedEvent
+        | StoredImportedProjectionError::InvalidWithdrawalPreimage
+        | StoredImportedProjectionError::MissingWithdrawalOutcome
+        | StoredImportedProjectionError::UnexpectedWithdrawalOutcome
+        | StoredImportedProjectionError::WithdrawalCallbackSuccessMismatch
+        | StoredImportedProjectionError::ExtraWithdrawalOutcomes => {
+            location.is_transaction_index_on(StoredProtocolChain::TempoL1)
+        }
+        StoredImportedProjectionError::InvalidDepositCiphertextLength
+        | StoredImportedProjectionError::InvalidDepositKeyParity => {
+            location.is_block_log_index_on(StoredProtocolChain::TempoL1)
+        }
+    }
+}
+
+fn valid_zone_projection_location(
+    location: ChainLocation,
+    leaf: StoredZoneProjectionError,
+) -> bool {
+    match leaf {
+        StoredZoneProjectionError::ReorderedTempoBlockFinalized
+        | StoredZoneProjectionError::ReorderedTokenEnabled
+        | StoredZoneProjectionError::ReorderedDepositOutcome
+        | StoredZoneProjectionError::ReorderedDepositFailed
+        | StoredZoneProjectionError::ReorderedTempoAdvanced
+        | StoredZoneProjectionError::ExtraAdvanceEvent
+        | StoredZoneProjectionError::AdvanceTransactionHashMismatch
+        | StoredZoneProjectionError::UnexpectedPostAdvanceEvent
+        | StoredZoneProjectionError::BatchFinalizedWithoutEnvelope
+        | StoredZoneProjectionError::BatchFinalizedWrongTransaction
+        | StoredZoneProjectionError::ReorderedBatchFinalized
+        | StoredZoneProjectionError::ExtraFinalizationEvent => {
+            location.is_log_on(StoredProtocolChain::ZoneL2)
+        }
+        StoredZoneProjectionError::InvalidWithdrawalRequest
+        | StoredZoneProjectionError::MissingBatchFinalized => {
+            location.is_transaction_on(StoredProtocolChain::ZoneL2)
+        }
+        StoredZoneProjectionError::MissingTempoBlockFinalized
+        | StoredZoneProjectionError::MissingTokenEnabled
+        | StoredZoneProjectionError::MissingDepositOutcome
+        | StoredZoneProjectionError::MissingDepositFailed
+        | StoredZoneProjectionError::MissingTempoAdvanced
+        | StoredZoneProjectionError::InvalidDepositKeyParity
+        | StoredZoneProjectionError::InvalidDepositCiphertextLength
+        | StoredZoneProjectionError::InvalidBounceBackRecipient
+        | StoredZoneProjectionError::ZeroBounceBackNonce
+        | StoredZoneProjectionError::ZeroBounceBackAmount
+        | StoredZoneProjectionError::UnsupportedDepositKind => {
+            location.is_block_on(StoredProtocolChain::ZoneL2)
         }
     }
 }
@@ -256,7 +522,7 @@ impl FindingRecord {
         status: FindingStatus,
         kind: FindingKind,
     ) -> Option<Self> {
-        kind.is_valid().then_some(Self {
+        kind.is_valid(imported_tempo).then_some(Self {
             zone_parent_hash,
             imported_tempo,
             status,
@@ -282,5 +548,9 @@ impl FindingRecord {
 
     pub(crate) fn mark_orphaned(&mut self) {
         self.status = FindingStatus::Orphaned;
+    }
+
+    pub(crate) fn mark_canonical(&mut self) {
+        self.status = FindingStatus::Canonical;
     }
 }

@@ -36,6 +36,16 @@ impl TokenEnable {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        token: Address,
+        name: impl Into<String>,
+        symbol: impl Into<String>,
+        currency: impl Into<String>,
+    ) -> Self {
+        Self::new(token, name, symbol, currency)
+    }
+
     pub(crate) const fn token(&self) -> Address {
         self.token
     }

@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, keccak256};
 
 use crate::model::events::ProtocolEventError;
 
@@ -43,6 +43,66 @@ pub(crate) enum ProtocolChain {
     TempoL1,
     #[error("Zone L2")]
     ZoneL2,
+}
+
+/// Exact authenticated transaction containing a malformed protocol byte
+/// surface. Observation wrappers attach this after the byte decoder returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{chain} transaction {transaction_index} ({transaction_hash})")]
+pub(crate) struct AuthenticatedTransaction {
+    chain: ProtocolChain,
+    transaction_index: usize,
+    transaction_hash: B256,
+}
+
+impl AuthenticatedTransaction {
+    pub(crate) const fn new(
+        chain: ProtocolChain,
+        transaction_index: usize,
+        transaction_hash: B256,
+    ) -> Self {
+        Self {
+            chain,
+            transaction_index,
+            transaction_hash,
+        }
+    }
+
+    pub(crate) const fn chain(self) -> ProtocolChain {
+        self.chain
+    }
+
+    pub(crate) const fn transaction_index(self) -> usize {
+        self.transaction_index
+    }
+
+    pub(crate) const fn transaction_hash(self) -> B256 {
+        self.transaction_hash
+    }
+}
+
+/// Stable digest of the authenticated bytes that failed strict decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthenticatedDataEvidence {
+    length: u64,
+    hash: B256,
+}
+
+impl AuthenticatedDataEvidence {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            length: u64::try_from(bytes.len()).expect("slice length must fit u64"),
+            hash: keccak256(bytes),
+        }
+    }
+
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) const fn hash(self) -> B256 {
+        self.hash
+    }
 }
 
 /// A failure to acquire a complete, internally consistent authenticated view.
@@ -145,6 +205,21 @@ pub(crate) enum DataSource {
     PortalTransactionCalldata,
 }
 
+impl DataSource {
+    pub(crate) const fn chain(self) -> ProtocolChain {
+        match self {
+            Self::AdvanceTempoCalldata
+            | Self::AdvanceHeaderRlp
+            | Self::OrdinaryDepositData
+            | Self::WithdrawalBounceBackData
+            | Self::FinalizationCalldata => ProtocolChain::ZoneL2,
+            Self::ProcessWithdrawalsCalldata
+            | Self::SubmitBatchCalldata
+            | Self::PortalTransactionCalldata => ProtocolChain::TempoL1,
+        }
+    }
+}
+
 /// Top-level Portal call family implied by authenticated receipt outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum PortalCallFamily {
@@ -191,8 +266,13 @@ pub(crate) enum ObservationError {
         location: EnvelopeLocation,
         rule: EnvelopeRule,
     },
-    #[error("malformed authenticated {kind}: {detail}")]
-    MalformedAuthenticatedData { kind: DataSource, detail: String },
+    #[error("malformed authenticated {kind} in {transaction}: {detail}")]
+    MalformedAuthenticatedData {
+        kind: DataSource,
+        transaction: AuthenticatedTransaction,
+        evidence: AuthenticatedDataEvidence,
+        detail: String,
+    },
     #[error(
         "{chain} protocol-event failure at transaction {transaction_index} ({transaction_hash}), receipt log {receipt_log_index}, block log {block_log_index}: {error}"
     )]
@@ -210,9 +290,17 @@ pub(crate) enum ObservationError {
 }
 
 impl ObservationError {
-    pub(crate) fn malformed(kind: DataSource, detail: impl fmt::Display) -> Self {
+    pub(crate) fn malformed(
+        kind: DataSource,
+        transaction: AuthenticatedTransaction,
+        evidence: AuthenticatedDataEvidence,
+        detail: impl fmt::Display,
+    ) -> Self {
+        debug_assert_eq!(kind.chain(), transaction.chain());
         Self::MalformedAuthenticatedData {
             kind,
+            transaction,
+            evidence,
             detail: detail.to_string(),
         }
     }

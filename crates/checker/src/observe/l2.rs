@@ -1,6 +1,7 @@
 //! Canonical Zone block observation from one in-process Reth notification.
 
 use alloy_consensus::{BlockHeader as _, Transaction as _, transaction::TxHashRef as _};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use reth_primitives_traits::RecoveredBlock;
 use tempo_primitives::{Block, TempoTxEnvelope};
@@ -12,7 +13,10 @@ use crate::model::{
 
 use super::{
     abi::{DecodedAdvanceTempo, DecodedFinalization, decode_advance_tempo, decode_finalization},
-    error::{AcquisitionError, AcquisitionSource, EnvelopeRule, ObservationError, ProtocolChain},
+    error::{
+        AcquisitionError, AcquisitionSource, AuthenticatedTransaction, EnvelopeRule,
+        ObservationError, ProtocolChain,
+    },
 };
 
 #[cfg(test)]
@@ -149,6 +153,13 @@ impl L2BlockObservation {
         &self.outcomes
     }
 
+    /// Exact Tempo block authenticated by this Zone block's `advanceTempo`
+    /// envelope.
+    pub(crate) fn imported_tempo(&self) -> BlockNumHash {
+        let imported = self.inputs.advance_tempo().imported_header();
+        BlockNumHash::new(imported.number(), imported.hash())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         block_number: u64,
@@ -187,6 +198,37 @@ impl L2BlockObservation {
     }
 }
 
+/// Observation failure plus the imported Tempo coordinate once `advanceTempo`
+/// has been authenticated. Later Zone-envelope and event failures must retain
+/// that coordinate for durable diagnostics.
+#[derive(Debug)]
+pub(crate) struct L2ObservationFailure {
+    error: Box<ObservationError>,
+    imported_tempo: Option<BlockNumHash>,
+}
+
+impl L2ObservationFailure {
+    pub(crate) fn into_parts(self) -> (ObservationError, Option<BlockNumHash>) {
+        (*self.error, self.imported_tempo)
+    }
+
+    fn with_imported_tempo(error: ObservationError, imported_tempo: BlockNumHash) -> Self {
+        Self {
+            error: Box::new(error),
+            imported_tempo: Some(imported_tempo),
+        }
+    }
+}
+
+impl From<ObservationError> for L2ObservationFailure {
+    fn from(error: ObservationError) -> Self {
+        Self {
+            error: Box::new(error),
+            imported_tempo: None,
+        }
+    }
+}
+
 /// Observe one canonical non-genesis Zone block.
 ///
 /// Transactions, recovered senders, and receipts all come from the same Reth
@@ -200,31 +242,41 @@ pub(crate) fn observe_l2_block<R>(
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
+    observe_l2_block_with_context(block, receipts).map_err(|failure| failure.into_parts().0)
+}
+
+/// Observe one Zone block while retaining how far authenticated envelope
+/// decoding progressed if it fails.
+pub(crate) fn observe_l2_block_with_context<R>(
+    block: &RecoveredBlock<Block>,
+    receipts: &[R],
+) -> Result<L2BlockObservation, L2ObservationFailure>
+where
+    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
+{
     let block_number = block.header().number();
     let block_hash = block.hash();
     let parent_hash = block.header().parent_hash();
     if block_number == 0 {
-        return Err(ObservationError::invalid_block_envelope(
-            EnvelopeRule::NonGenesis,
-        ));
+        return Err(ObservationError::invalid_block_envelope(EnvelopeRule::NonGenesis).into());
     }
 
     let transactions = &block.body().transactions;
     let senders = block.senders();
     if transactions.len() != receipts.len() {
-        return Err(AcquisitionError::inconsistent(
+        return Err(ObservationError::from(AcquisitionError::inconsistent(
             AcquisitionSource::ZoneNotificationReceipts,
             transactions.len(),
             receipts.len(),
-        )
+        ))
         .into());
     }
     if transactions.len() != senders.len() {
-        return Err(AcquisitionError::inconsistent(
+        return Err(ObservationError::from(AcquisitionError::inconsistent(
             AcquisitionSource::ZoneNotificationBlock,
             transactions.len(),
             senders.len(),
-        )
+        ))
         .into());
     }
 
@@ -232,86 +284,88 @@ where
         .first()
         .ok_or_else(|| ObservationError::invalid_block_envelope(EnvelopeRule::AdvancePresent))?;
     if !first.is_system_tx() || senders[0] != Address::ZERO {
-        return Err(ObservationError::invalid_envelope(
-            0,
-            EnvelopeRule::AdvanceSystemCaller,
-        ));
+        return Err(
+            ObservationError::invalid_envelope(0, EnvelopeRule::AdvanceSystemCaller).into(),
+        );
     }
     if first.to() != Some(ZONE_INBOX_ADDRESS) {
-        return Err(ObservationError::invalid_envelope(
-            0,
-            EnvelopeRule::AdvanceDestination,
-        ));
+        return Err(ObservationError::invalid_envelope(0, EnvelopeRule::AdvanceDestination).into());
     }
     if !receipts[0].status() {
-        return Err(ObservationError::invalid_envelope(
-            0,
-            EnvelopeRule::AdvanceSuccess,
-        ));
+        return Err(ObservationError::invalid_envelope(0, EnvelopeRule::AdvanceSuccess).into());
     }
-    let advance_tempo = decode_advance_tempo(first.input())?;
+    let advance_coordinate =
+        AuthenticatedTransaction::new(ProtocolChain::ZoneL2, 0, *first.tx_hash());
+    let advance_tempo = decode_advance_tempo(first.input(), advance_coordinate)?;
+    let imported_header = advance_tempo.imported_header();
+    let imported_tempo = BlockNumHash::new(imported_header.number(), imported_header.hash());
 
-    let mut finalization = None;
-    for (index, ((transaction, sender), receipt)) in transactions
-        .iter()
-        .zip(senders)
-        .zip(receipts)
-        .enumerate()
-        .skip(1)
-    {
-        if !transaction.is_system_tx() && *sender != Address::ZERO {
-            continue;
+    let finish = || -> Result<L2BlockObservation, ObservationError> {
+        let mut finalization = None;
+        for (index, ((transaction, sender), receipt)) in transactions
+            .iter()
+            .zip(senders)
+            .zip(receipts)
+            .enumerate()
+            .skip(1)
+        {
+            if !transaction.is_system_tx() && *sender != Address::ZERO {
+                continue;
+            }
+            if !transaction.is_system_tx() || *sender != Address::ZERO {
+                return Err(ObservationError::invalid_envelope(
+                    index,
+                    EnvelopeRule::SystemIdentity,
+                ));
+            }
+            if index + 1 != transactions.len() {
+                return Err(ObservationError::invalid_envelope(
+                    index,
+                    EnvelopeRule::FinalizationPosition,
+                ));
+            }
+            if transaction.to() != Some(ZONE_OUTBOX_ADDRESS) {
+                return Err(ObservationError::invalid_envelope(
+                    index,
+                    EnvelopeRule::FinalizationDestination,
+                ));
+            }
+            if !receipt.status() {
+                return Err(ObservationError::invalid_envelope(
+                    index,
+                    EnvelopeRule::FinalizationSuccess,
+                ));
+            }
+            let coordinate =
+                AuthenticatedTransaction::new(ProtocolChain::ZoneL2, index, *transaction.tx_hash());
+            let input = decode_finalization(transaction.input(), coordinate)?;
+            if input.block_number() != block_number {
+                return Err(ObservationError::invalid_envelope(
+                    index,
+                    EnvelopeRule::FinalizationBlockNumber,
+                ));
+            }
+            finalization = Some(FinalizationEnvelope {
+                transaction_hash: *transaction.tx_hash(),
+                input,
+            });
         }
-        if !transaction.is_system_tx() || *sender != Address::ZERO {
-            return Err(ObservationError::invalid_envelope(
-                index,
-                EnvelopeRule::SystemIdentity,
-            ));
-        }
-        if index + 1 != transactions.len() {
-            return Err(ObservationError::invalid_envelope(
-                index,
-                EnvelopeRule::FinalizationPosition,
-            ));
-        }
-        if transaction.to() != Some(ZONE_OUTBOX_ADDRESS) {
-            return Err(ObservationError::invalid_envelope(
-                index,
-                EnvelopeRule::FinalizationDestination,
-            ));
-        }
-        if !receipt.status() {
-            return Err(ObservationError::invalid_envelope(
-                index,
-                EnvelopeRule::FinalizationSuccess,
-            ));
-        }
-        let input = decode_finalization(transaction.input())?;
-        if input.block_number() != block_number {
-            return Err(ObservationError::invalid_envelope(
-                index,
-                EnvelopeRule::FinalizationBlockNumber,
-            ));
-        }
-        finalization = Some(FinalizationEnvelope {
-            transaction_hash: *transaction.tx_hash(),
-            input,
-        });
-    }
 
-    let events = ordered_l2_events(transactions, senders, receipts)?;
+        let events = ordered_l2_events(transactions, senders, receipts)?;
 
-    Ok(L2BlockObservation {
-        block_number,
-        block_hash,
-        parent_hash,
-        inputs: L2AuthenticatedInputs {
-            advance_transaction_hash: *first.tx_hash(),
-            advance_tempo,
-            finalization,
-        },
-        outcomes: L2AuthenticatedOutcomes { events },
-    })
+        Ok(L2BlockObservation {
+            block_number,
+            block_hash,
+            parent_hash,
+            inputs: L2AuthenticatedInputs {
+                advance_transaction_hash: *first.tx_hash(),
+                advance_tempo,
+                finalization,
+            },
+            outcomes: L2AuthenticatedOutcomes { events },
+        })
+    };
+    finish().map_err(|error| L2ObservationFailure::with_imported_tempo(error, imported_tempo))
 }
 
 fn ordered_l2_events<R>(

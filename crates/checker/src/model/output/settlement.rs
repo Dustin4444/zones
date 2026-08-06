@@ -8,6 +8,9 @@ use crate::model::{
     ownership::{BatchId, DepositId, WithdrawalId},
 };
 
+#[cfg(test)]
+mod semantic_fixtures;
+
 /// Exact `BatchSubmitted` fields derived from the next finalized batch and
 /// the modeled Portal queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

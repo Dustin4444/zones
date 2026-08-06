@@ -1,7 +1,6 @@
 //! Failures at the persistent checker orchestration boundary.
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::B256;
 use reth_storage_api::errors::provider::ProviderError;
 
 use crate::{check::finding::CheckError, observe::AcquisitionError, store::error::StoreError};
@@ -14,20 +13,35 @@ pub(crate) enum RuntimeError {
     Check(#[from] CheckError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("persistent checker does not accept {0} notifications")]
-    UnsupportedNotification(&'static str),
-    #[error("committed ExEx notification contains no blocks")]
-    EmptyCommittedChain,
+    #[error("{0} ExEx notification contains no blocks")]
+    EmptyNotificationChain(&'static str),
+    #[error("invalid {kind} ExEx notification chain: {reason}")]
+    InvalidNotificationChain {
+        kind: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "durable checker tip {tip:?} is on neither the reverted fragment nor its common ancestor"
+    )]
+    ReorgProgressConflict { tip: BlockNumHash },
     #[error("failed to read local canonical hash for durable checker tip {tip:?}")]
     LocalCanonicalRead {
         tip: BlockNumHash,
         #[source]
         source: ProviderError,
     },
-    #[error("local canonical chain is missing durable checker tip {0:?}")]
-    MissingLocalCanonical(BlockNumHash),
-    #[error("local canonical hash at durable checker height {tip:?} differs: found {actual}")]
-    LocalCanonicalConflict { tip: BlockNumHash, actual: B256 },
+    #[error("failed to read the local canonical Zone head")]
+    LocalCanonicalHeadRead {
+        #[source]
+        source: ProviderError,
+    },
+    #[error("local canonical Zone head {head:?} is below active finding {finding:?}")]
+    CanonicalHeadBehindAlert {
+        head: BlockNumHash,
+        finding: BlockNumHash,
+    },
+    #[error("checker Zone genesis {tip:?} is not the local canonical genesis")]
+    NonCanonicalGenesis { tip: BlockNumHash },
 }
 
 impl RuntimeError {

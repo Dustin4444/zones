@@ -51,7 +51,7 @@ pub(super) fn kinds() -> Vec<(&'static str, FindingKind)> {
         (
             "malformed authenticated data",
             FindingKind::MalformedAuthenticatedData(
-                l1(),
+                ChainLocation::transaction(StoredProtocolChain::TempoL1, 2, hash(2)),
                 StoredDataSource::PortalTransactionCalldata,
                 summary(1),
             ),
@@ -62,11 +62,7 @@ pub(super) fn kinds() -> Vec<(&'static str, FindingKind)> {
         ),
         (
             "unsupported event with topic",
-            FindingKind::UnsupportedProtocolEvent(
-                ChainLocation::transaction(StoredProtocolChain::ZoneL2, 1, hash(1)),
-                address(2),
-                Some(hash(2)),
-            ),
+            FindingKind::UnsupportedProtocolEvent(l2(), address(2), Some(hash(2))),
         ),
         (
             "malformed event",
@@ -75,7 +71,7 @@ pub(super) fn kinds() -> Vec<(&'static str, FindingKind)> {
         (
             "portal call",
             FindingKind::PortalCallViolation(
-                l1(),
+                ChainLocation::transaction_hash(StoredProtocolChain::TempoL1, hash(4)),
                 StoredPortalCallError::EmptyProcessWithOutcomes,
                 summary(4),
             ),
@@ -103,7 +99,7 @@ pub(super) fn kinds() -> Vec<(&'static str, FindingKind)> {
         (
             "imported projection",
             FindingKind::ImportedProjectionViolation(
-                l1(),
+                ChainLocation::transaction_index(StoredProtocolChain::TempoL1, 2),
                 StoredImportedProjectionError::ExtraWithdrawalOutcomes,
                 summary(5),
             ),
@@ -111,19 +107,24 @@ pub(super) fn kinds() -> Vec<(&'static str, FindingKind)> {
         (
             "zone projection",
             FindingKind::ZoneProjectionViolation(
-                l2(),
+                ChainLocation::block(StoredProtocolChain::ZoneL2),
                 StoredZoneProjectionError::UnsupportedDepositKind,
                 summary(6),
             ),
         ),
         (
             "model violation without key",
-            FindingKind::ModelViolation(l2(), StoredModelError::PortalQueueId, None, summary(7)),
+            FindingKind::ModelViolation(
+                ChainLocation::block(StoredProtocolChain::ZoneL2),
+                StoredModelError::PortalQueueId,
+                None,
+                summary(7),
+            ),
         ),
         (
             "model violation with key",
             FindingKind::ModelViolation(
-                l2(),
+                ChainLocation::block(StoredProtocolChain::ZoneL2),
                 StoredModelError::WithdrawalQueue,
                 Some(ModelKey::Withdrawal(9)),
                 summary(8),
