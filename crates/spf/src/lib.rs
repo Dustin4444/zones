@@ -7,12 +7,9 @@
 use alloy_consensus::{BlockHeader as _, Sealable as _};
 use alloy_primitives::{B256, U256, keccak256};
 use alloy_rlp::Decodable as _;
-use reth_evm::execute::BlockAssemblerInput;
-use reth_primitives_traits::SealedHeader;
-use reth_storage_api::noop::NoopProvider;
 use revm::{Database as _, database::State, database_interface::bal::EvmDatabaseError};
-use tempo_evm::{TempoBlockAssembler, TempoEvmConfig};
-use tempo_primitives::{TempoHeader, TempoPrimitives};
+use tempo_evm::TempoEvmConfig;
+use tempo_primitives::TempoHeader;
 use zone_precompiles::tempo_state::slots as tempo_state_slots;
 use zone_primitives::constants::{
     TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_HASH_SLOT,
@@ -164,31 +161,7 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
             }
         };
 
-        let state_root = zone_state.database.state_root(&zone_state.bundle_state)?;
-        let execution_context = executed_block.execution_context;
-        let state_provider = NoopProvider::<tempo_chainspec::TempoChainSpec, TempoPrimitives>::new(
-            config.zone_chain_spec.inner.clone(),
-        );
-        let sealed_parent = SealedHeader::new_unhashed(previous_header.clone());
-        let assembled = TempoBlockAssembler::new(config.zone_chain_spec.inner.clone())
-            .assemble_block(
-                BlockAssemblerInput::<TempoEvmConfig, TempoHeader>::new(
-                    executed_block.evm_env,
-                    execution_context,
-                    &sealed_parent,
-                    executed_block.transactions,
-                    &executed_block.output,
-                    &zone_state.bundle_state,
-                    &state_provider,
-                    state_root,
-                    None,
-                ),
-                None,
-                None,
-                None,
-            )
-            .map_err(|_| Error::BlockAssembly { block_index })?;
-        previous_header = assembled.header;
+        previous_header = executed_block.block.header().clone();
     }
 
     // These reads see the final execution overlay rather than just the parent
