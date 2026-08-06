@@ -11,6 +11,11 @@ Inbox/Outbox bridge events, constructs typed per-block L2 facts, and then
 independently fetches the exact Tempo/L1 block anchored by `TempoAdvanced`,
 verifies its identity and receipt root, and decodes ZonePortal L1 events.
 
+The approved target architecture is the closed-system logical protocol model in
+[`DESIGN.md`](DESIGN.md). Its Codex `/goal` milestones are review boundaries, not
+independently deployable partial checkers. The current implementation described
+below predates that target and remains an observe-only skeleton.
+
 Both L2 and L1 facts are temporary: they are constructed while processing a
 notification, used to produce log summaries, and then discarded. No
 persistence exists yet.
