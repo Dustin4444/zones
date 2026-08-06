@@ -165,12 +165,7 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
         };
 
         let state_root = zone_state.database.state_root(&zone_state.bundle_state)?;
-        let gas_limit = executed_block.evm_env.block_env.inner.gas_limit;
-        let execution_context = execution::evm::next_block_execution_context(
-            config.zone_chain_spec.as_ref(),
-            block,
-            gas_limit,
-        );
+        let execution_context = executed_block.execution_context;
         let state_provider = NoopProvider::<tempo_chainspec::TempoChainSpec, TempoPrimitives>::new(
             config.zone_chain_spec.inner.clone(),
         );

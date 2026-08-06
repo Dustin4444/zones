@@ -13703,7 +13703,6 @@ dependencies = [
  "reth-storage-api",
  "reth-transaction-pool",
  "serde",
- "tempo-evm",
  "tempo-node",
  "tempo-payload-types",
  "tempo-primitives",
