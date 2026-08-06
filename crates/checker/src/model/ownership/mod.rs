@@ -7,8 +7,8 @@ use alloy_primitives::{Address, Bytes, U256};
 use super::{
     constants::NO_WITHDRAWAL_QUEUE_INDEX,
     encoding::{
-        OrdinaryDeposit, SenderReveal, UserWithdrawalIdentity, UserWithdrawalRequest, Withdrawal,
-        WithdrawalBounceBackDeposit, WithdrawalDataError,
+        DepositQueueMember, OrdinaryDeposit, SenderReveal, UserWithdrawalIdentity,
+        UserWithdrawalRequest, Withdrawal, WithdrawalBounceBackDeposit, WithdrawalDataError,
     },
 };
 
@@ -125,6 +125,18 @@ pub(crate) enum DepositOwner {
     },
 }
 
+impl DepositOwner {
+    /// Recover the exact Portal queue member represented by this open owner.
+    pub(crate) fn queue_member(&self) -> DepositQueueMember {
+        match self {
+            Self::PendingOrdinary { preimage } => DepositQueueMember::Ordinary(preimage.clone()),
+            Self::PendingWithdrawalBounceBack { preimage, .. } => {
+                DepositQueueMember::WithdrawalBounceBack(*preimage)
+            }
+        }
+    }
+}
+
 /// Origin retained after finalization; failed deposits use their unique
 /// deposit identity rather than the reusable public nonce zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +184,24 @@ impl UserPendingWithdrawal {
             preimage,
         })
     }
+
+    pub(crate) const fn parts(
+        &self,
+    ) -> (UserWithdrawalIdentity, &UserWithdrawalRequest, SenderReveal) {
+        (self.identity, &self.request, self.sender_reveal)
+    }
+
+    pub(crate) const fn from_parts(
+        identity: UserWithdrawalIdentity,
+        request: UserWithdrawalRequest,
+        sender_reveal: SenderReveal,
+    ) -> Self {
+        Self {
+            identity,
+            request,
+            sender_reveal,
+        }
+    }
 }
 
 /// Failed-deposit pending withdrawal. Its shape deliberately has no gas,
@@ -197,6 +227,20 @@ impl FailedDepositPendingWithdrawal {
         }
     }
 
+    pub(crate) const fn from_parts(
+        deposit: DepositId,
+        token: Address,
+        to: Address,
+        amount: u128,
+    ) -> Self {
+        Self {
+            deposit,
+            token,
+            to,
+            amount,
+        }
+    }
+
     /// Failed-deposit literal zero fields are supplied only here.
     pub(crate) fn finalize(self) -> FinalizedWithdrawal {
         FinalizedWithdrawal {
@@ -205,6 +249,10 @@ impl FailedDepositPendingWithdrawal {
             },
             preimage: Withdrawal::for_failed_deposit(self.token, self.to, self.amount),
         }
+    }
+
+    pub(crate) const fn parts(&self) -> (DepositId, Address, Address, u128) {
+        (self.deposit, self.token, self.to, self.amount)
     }
 }
 

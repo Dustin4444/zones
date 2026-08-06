@@ -29,14 +29,14 @@ pub(super) fn create_portal_credit(
         token: id.token,
         recipient: id.recipient,
     };
-    let total = candidate
-        .portal_refund_total(account)
+    let total = candidate.portal_refund_total(account);
+    let next_total = total
         .checked_add(amount)
         .ok_or(ModelError::RefundAggregateOverflow {
             token: id.token,
             recipient: id.recipient,
         })?;
-    candidate.set_portal_refund_total(account, total);
+    candidate.set_portal_refund_total(account, next_total);
     candidate.set_portal_refund(id, Some(PortalRefundOwner::Pending { amount }));
     Ok(())
 }
@@ -56,14 +56,15 @@ pub(super) fn create_inbox_credit(
         token: id.token,
         recipient: id.recipient,
     };
-    let total = candidate
-        .inbox_refund_total(account)
-        .checked_add(amount.get())
-        .ok_or(ModelError::RefundAggregateOverflow {
-            token: id.token,
-            recipient: id.recipient,
-        })?;
-    candidate.set_inbox_refund_total(account, total);
+    let total = candidate.inbox_refund_total(account);
+    let next_total =
+        total
+            .checked_add(amount.get())
+            .ok_or(ModelError::RefundAggregateOverflow {
+                token: id.token,
+                recipient: id.recipient,
+            })?;
+    candidate.set_inbox_refund_total(account, next_total);
     candidate.set_inbox_refund(id, Some(InboxRefundOwner::Pending { amount }));
     Ok(())
 }
@@ -76,16 +77,7 @@ pub(super) fn claim_portal(
         token: input.token(),
         recipient: input.recipient(),
     };
-    let expected = candidate.portal_refund_total(account);
-    let (actual, credits) = portal_claim_snapshot(candidate, account)?;
-    if actual != expected {
-        return Err(ModelError::PortalRefundAggregateStateMismatch {
-            token: account.token,
-            recipient: account.recipient,
-            expected,
-            actual,
-        });
-    }
+    let (expected, credits) = portal_claim_snapshot(candidate, account)?;
     require_claim_amount(input, expected)?;
 
     if expected != 0 {
@@ -123,16 +115,7 @@ pub(super) fn claim_inbox(
         token: input.token(),
         recipient: input.recipient(),
     };
-    let expected = candidate.inbox_refund_total(account);
-    let (actual, credits) = inbox_claim_snapshot(candidate, account)?;
-    if actual != expected {
-        return Err(ModelError::InboxRefundAggregateStateMismatch {
-            token: account.token,
-            recipient: account.recipient,
-            expected,
-            actual,
-        });
-    }
+    let (expected, credits) = inbox_claim_snapshot(candidate, account)?;
     require_claim_amount(input, expected)?;
 
     if expected != 0 {

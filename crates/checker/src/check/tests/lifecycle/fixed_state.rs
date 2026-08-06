@@ -77,11 +77,11 @@ async fn each_exact_commitment_mismatch_is_typed_and_keeps_the_verified_parent_a
         assert_eq!(checker.model(), &model);
         assert_eq!(
             checker.zone_tip(),
-            crate::check::pipeline::VerifiedTip::new(ZONE_NUMBER - 1, ZONE_PARENT)
+            alloy_eips::BlockNumHash::new(ZONE_NUMBER - 1, ZONE_PARENT)
         );
         assert_eq!(
             checker.tempo_tip(),
-            crate::check::pipeline::VerifiedTip::new(TEMPO_NUMBER - 1, TEMPO_PARENT)
+            alloy_eips::BlockNumHash::new(TEMPO_NUMBER - 1, TEMPO_PARENT)
         );
     }
 }

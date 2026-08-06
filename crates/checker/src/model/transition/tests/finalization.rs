@@ -478,7 +478,7 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
     commit_full_block(
         &mut state,
         &ImportedTempoBlockInput::new(
-            501,
+            401,
             alloy_primitives::U256::ZERO,
             ordinary_append_operations(std::slice::from_ref(&first_deposit)),
         ),
@@ -517,7 +517,7 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
     let expected = commit_full_block(
         &mut state,
         &ImportedTempoBlockInput::new(
-            9_999,
+            402,
             alloy_primitives::U256::ZERO,
             ordinary_append_operations(std::slice::from_ref(&second_deposit)),
         ),
@@ -546,7 +546,7 @@ fn multi_block_batch_preserves_its_start_and_uses_the_imported_tempo_number_once
     assert_eq!(boundary.first_processed_deposit.number, 0);
     assert_eq!(boundary.final_processed_deposit.hash, second_cursor);
     assert_eq!(boundary.final_processed_deposit.number, 2);
-    assert_eq!(boundary.final_imported_tempo_block_number, 9_999);
+    assert_eq!(boundary.final_imported_tempo_block_number, 402);
     assert_ne!(
         boundary.final_imported_tempo_block_number,
         boundary.final_zone_height

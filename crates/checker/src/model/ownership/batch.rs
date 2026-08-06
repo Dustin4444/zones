@@ -47,10 +47,35 @@ impl BatchMembers {
                 withdrawal_queue_hash: B256::ZERO,
             });
         }
-        if first_withdrawal_index
-            .checked_add(member_count - 1)
-            .is_none()
-        {
+        if first_withdrawal_index.checked_add(member_count).is_none() {
+            return Err(BatchStateError::WithdrawalRangeOverflow {
+                first_withdrawal_index,
+                member_count,
+            });
+        }
+        let withdrawal_queue_hash = withdrawal_queue_hash(withdrawals);
+        if withdrawal_queue_hash.is_zero() {
+            return Err(BatchStateError::NonEmptyBatchHasNoQueueCommitment);
+        }
+        Ok(Self {
+            first_withdrawal_index,
+            member_count,
+            withdrawal_queue_hash,
+        })
+    }
+
+    pub(crate) fn from_parts(
+        first_withdrawal_index: u64,
+        member_count: u64,
+        withdrawal_queue_hash: B256,
+    ) -> Result<Self, BatchStateError> {
+        if member_count == 0 && !withdrawal_queue_hash.is_zero() {
+            return Err(BatchStateError::EmptyBatchHasQueueCommitment);
+        }
+        if member_count > 0 && withdrawal_queue_hash.is_zero() {
+            return Err(BatchStateError::NonEmptyBatchHasNoQueueCommitment);
+        }
+        if first_withdrawal_index.checked_add(member_count).is_none() {
             return Err(BatchStateError::WithdrawalRangeOverflow {
                 first_withdrawal_index,
                 member_count,
@@ -59,7 +84,7 @@ impl BatchMembers {
         Ok(Self {
             first_withdrawal_index,
             member_count,
-            withdrawal_queue_hash: withdrawal_queue_hash(withdrawals),
+            withdrawal_queue_hash,
         })
     }
 
@@ -69,6 +94,11 @@ impl BatchMembers {
 
     pub(crate) const fn member_count(&self) -> u64 {
         self.member_count
+    }
+
+    /// Exclusive end of the validated withdrawal-member range.
+    pub(crate) const fn withdrawal_range_end(&self) -> u64 {
+        self.first_withdrawal_index + self.member_count
     }
 
     pub(crate) const fn withdrawal_queue_hash(&self) -> B256 {
@@ -126,6 +156,9 @@ impl SubmittedBatchState {
             return Err(BatchStateError::EmptyBatchCannotBeSubmitted);
         }
         let remaining_queue_hash = batch.members.withdrawal_queue_hash;
+        if remaining_queue_hash.is_zero() {
+            return Err(BatchStateError::SubmittedBatchHasNoRemainingQueue);
+        }
         Ok(Self {
             batch,
             portal_queue,
@@ -153,6 +186,9 @@ impl SubmittedBatchState {
                 ordinal: next_processing_ordinal,
                 member_count,
             });
+        }
+        if remaining_queue_hash.is_zero() {
+            return Err(BatchStateError::SubmittedBatchHasNoRemainingQueue);
         }
         self.next_processing_ordinal = next_processing_ordinal;
         self.remaining_queue_hash = remaining_queue_hash;
@@ -182,6 +218,12 @@ pub(crate) enum BatchStateError {
     MemberCountOverflow { actual: usize },
     #[error("an empty finalized batch cannot enter the submitted queue")]
     EmptyBatchCannotBeSubmitted,
+    #[error("an empty finalized batch cannot carry a withdrawal queue commitment")]
+    EmptyBatchHasQueueCommitment,
+    #[error("a non-empty finalized batch must carry a withdrawal queue commitment")]
+    NonEmptyBatchHasNoQueueCommitment,
+    #[error("an open submitted batch must retain a nonzero remaining queue commitment")]
+    SubmittedBatchHasNoRemainingQueue,
     #[error("processing ordinal did not advance: current {current}, next {next}")]
     ProcessingOrdinalDidNotAdvance { current: u64, next: u64 },
     #[error("processing ordinal {ordinal} is outside member count {member_count}")]

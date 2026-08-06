@@ -259,6 +259,14 @@ fn model_batch_phases_exclude_empty_submission_and_exhausted_open_cursor() {
         SubmittedBatchState::new(empty, queue),
         Err(BatchStateError::EmptyBatchCannotBeSubmitted)
     );
+    assert_eq!(
+        BatchMembers::from_parts(8, 0, B256::repeat_byte(0x19)),
+        Err(BatchStateError::EmptyBatchHasQueueCommitment)
+    );
+    assert_eq!(
+        BatchMembers::from_parts(8, 1, B256::ZERO),
+        Err(BatchStateError::NonEmptyBatchHasNoQueueCommitment)
+    );
 
     let withdrawals = batch_withdrawals();
     let finalized = FinalizedBatchState::new(
@@ -289,6 +297,10 @@ fn model_batch_phases_exclude_empty_submission_and_exhausted_open_cursor() {
             member_count: 2,
         })
     );
+    assert_eq!(
+        submitted.clone().advance_partial(1, B256::ZERO),
+        Err(BatchStateError::SubmittedBatchHasNoRemainingQueue)
+    );
     let partial_queue = B256::repeat_byte(0x22);
     let partial = submitted.advance_partial(1, partial_queue).unwrap();
     assert_eq!(partial.next_processing_ordinal(), 1);
@@ -313,6 +325,13 @@ fn model_batch_phases_exclude_empty_submission_and_exhausted_open_cursor() {
         Err(BatchStateError::WithdrawalRangeOverflow {
             first_withdrawal_index: u64::MAX,
             member_count: 2,
+        })
+    );
+    assert_eq!(
+        BatchMembers::from_parts(u64::MAX, 1, B256::repeat_byte(0x24)),
+        Err(BatchStateError::WithdrawalRangeOverflow {
+            first_withdrawal_index: u64::MAX,
+            member_count: 1,
         })
     );
 }
