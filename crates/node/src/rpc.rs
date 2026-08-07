@@ -12,8 +12,9 @@ use std::{
 };
 
 use alloy_consensus::BlockHeader;
+use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
-use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
@@ -35,7 +36,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{EthApiError, logs_utils};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
-use reth_trie_common::ExecutionWitnessMode;
+use reth_trie_common::{ExecutionWitnessMode, HashedStorage};
 use tempo_alloy::{
     TempoNetwork,
     provider::ext::TempoProviderExt as _,
@@ -265,6 +266,7 @@ where
                 let _ = block_executor
                     .execute_with_state_closure(&block, |statedb: &State<_>| {
                         witness_record.record_executed_state(statedb, mode);
+                        record_block_hash_storage_proofs(&mut witness_record, statedb);
                     })
                     .map_err(|error| EthApiError::Internal(error.into()))?;
 
@@ -285,6 +287,31 @@ where
             })
             .await
             .map_err(|error| operator_rpc_error(internal(error)))
+    }
+}
+
+/// Add EIP-2935 history-contract storage paths for every BLOCKHASH value read during replay.
+///
+/// Reth records these reads in REVM's block-hash cache and normally proves them with ancestor
+/// headers. Zones already commit the EIP-2935 history contract in state, so adding the matching
+/// storage targets lets the SPF authenticate the same values against the parent state root.
+fn record_block_hash_storage_proofs<DB>(witness: &mut ExecutionWitnessRecord, state: &State<DB>) {
+    let block_hashes = state.block_hashes.iter().collect::<Vec<_>>();
+    if block_hashes.is_empty() {
+        return;
+    }
+
+    let history_storage = witness
+        .hashed_state
+        .storages
+        .entry(keccak256(HISTORY_STORAGE_ADDRESS))
+        .or_insert_with(|| HashedStorage::new(false));
+    for (number, hash) in block_hashes {
+        let slot = U256::from(number % HISTORY_SERVE_WINDOW as u64);
+        history_storage.storage.insert(
+            keccak256(slot.to_be_bytes::<32>()),
+            U256::from_be_bytes(hash.0),
+        );
     }
 }
 
@@ -1414,6 +1441,30 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_block_hashes_as_eip2935_storage_targets() {
+        let number = 42;
+        let hash = B256::repeat_byte(0x42);
+        let mut state = State::builder()
+            .with_database(revm::database::EmptyDB::default())
+            .build();
+        state.block_hashes.insert(number, hash);
+        let mut witness = ExecutionWitnessRecord::default();
+
+        record_block_hash_storage_proofs(&mut witness, &state);
+
+        let storage = witness
+            .hashed_state
+            .storages
+            .get(&keccak256(HISTORY_STORAGE_ADDRESS))
+            .unwrap();
+        let slot = U256::from(number % HISTORY_SERVE_WINDOW as u64);
+        assert_eq!(
+            storage.storage.get(&keccak256(slot.to_be_bytes::<32>())),
+            Some(&U256::from_be_bytes(hash.0))
+        );
+    }
 
     #[test]
     fn zone_execution_witness_serializes_tempo_reads() {
