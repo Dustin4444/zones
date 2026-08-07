@@ -268,6 +268,26 @@ fn operator_rpc_error(error: JsonRpcError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(error.code as i32, error.message, error.data)
 }
 
+async fn zone_sequencers(
+    portal_address: Address,
+    l1_provider: &DynProvider<TempoNetwork>,
+) -> Result<Vec<Address>, JsonRpcError> {
+    let portal = ZonePortal::new(portal_address, l1_provider);
+    let count = portal.sequencerCount().call().await.map_err(internal)?;
+    let count = count.to::<usize>();
+    let mut sequencers = Vec::with_capacity(count);
+    for index in 0..count {
+        sequencers.push(
+            portal
+                .sequencerAt(U256::from(index))
+                .call()
+                .await
+                .map_err(internal)?,
+        );
+    }
+    Ok(sequencers)
+}
+
 /// Builds the Zone metadata shared by the operator and redacted RPC surfaces.
 ///
 /// The caller supplies the local Zone's processed Tempo block number; the
@@ -296,7 +316,7 @@ async fn zone_info(
     let portal = ZonePortal::new(portal_address, l1_provider);
     let (zone_tokens, sequencers, is_access_enforced, is_gateway_open) = tokio::try_join!(
         async { portal.enabled_tokens().await.map_err(internal) },
-        async { portal.sequencers().await.map_err(internal) },
+        zone_sequencers(portal_address, l1_provider),
         async { portal.isAccessEnforced().call().await.map_err(internal) },
         async { portal.isGatewayOpen().call().await.map_err(internal) },
     )?;
