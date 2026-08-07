@@ -292,44 +292,12 @@ fn operator_rpc_error(error: JsonRpcError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(error.code as i32, error.message, error.data)
 }
 
-async fn zone_tokens(
-    portal_address: Address,
-    l1_provider: &DynProvider<TempoNetwork>,
-) -> Result<Vec<Address>, JsonRpcError> {
-    if portal_address.is_zero() {
-        return Ok(vec![ZONE_TOKEN_ADDRESS]);
-    }
-
-    ZonePortal::new(portal_address, l1_provider)
-        .enabled_tokens()
-        .await
-        .map_err(internal)
-}
-
-async fn zone_sequencers(
-    portal_address: Address,
-    l1_provider: &DynProvider<TempoNetwork>,
-) -> Result<Vec<Address>, JsonRpcError> {
-    let portal = ZonePortal::new(portal_address, l1_provider);
-    let count = portal.sequencerCount().call().await.map_err(internal)?;
-    let count = count.to::<usize>();
-    let mut sequencers = Vec::with_capacity(count);
-    for index in 0..count {
-        sequencers.push(
-            portal
-                .sequencerAt(U256::from(index))
-                .call()
-                .await
-                .map_err(internal)?,
-        );
-    }
-    Ok(sequencers)
-}
-
 /// Builds the Zone metadata shared by the operator and redacted RPC surfaces.
 ///
 /// The caller supplies the local Zone's processed Tempo block number; the
 /// remaining dynamic fields are read directly from the ZonePortal on Tempo L1.
+/// A zero portal address (running without an L1 portal) reports static
+/// defaults without touching L1.
 async fn zone_info(
     zone_id: u32,
     chain_id: u64,
@@ -337,24 +305,24 @@ async fn zone_info(
     tempo_block_number: u64,
     l1_provider: &DynProvider<TempoNetwork>,
 ) -> Result<ZoneInfoResponse, JsonRpcError> {
+    if portal_address.is_zero() {
+        return Ok(ZoneInfoResponse {
+            zone_id: U64::from(zone_id),
+            is_access_enforced: false,
+            is_gateway_open: true,
+            zone_tokens: vec![ZONE_TOKEN_ADDRESS],
+            sequencers: Vec::new(),
+            chain_id: U64::from(chain_id),
+            tempo_block_number: U64::from(tempo_block_number),
+        });
+    }
+
     let portal = ZonePortal::new(portal_address, l1_provider);
     let (zone_tokens, sequencers, is_access_enforced, is_gateway_open) = tokio::try_join!(
-        zone_tokens(portal_address, l1_provider),
-        zone_sequencers(portal_address, l1_provider),
-        async {
-            if portal_address.is_zero() {
-                Ok(false)
-            } else {
-                portal.isAccessEnforced().call().await.map_err(internal)
-            }
-        },
-        async {
-            if portal_address.is_zero() {
-                Ok(true)
-            } else {
-                portal.isGatewayOpen().call().await.map_err(internal)
-            }
-        },
+        async { portal.enabled_tokens().await.map_err(internal) },
+        async { portal.sequencers().await.map_err(internal) },
+        async { portal.isAccessEnforced().call().await.map_err(internal) },
+        async { portal.isGatewayOpen().call().await.map_err(internal) },
     )?;
 
     Ok(ZoneInfoResponse {
@@ -1510,6 +1478,26 @@ mod tests {
         assert!(methods.contains("zone_getZoneInfo"));
         assert!(methods.contains("zone_getEncryptionKey"));
         assert!(!methods.contains("zone_getAuthorizationTokenInfo"));
+    }
+
+    #[tokio::test]
+    async fn zone_info_reports_defaults_without_portal() {
+        // The provider is unreachable; a zero portal must not touch L1 at all.
+        let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().expect("valid URL"))
+            .erased();
+
+        let info = zone_info(1, 42431, Address::ZERO, 7, &l1_provider)
+            .await
+            .expect("portal-less zone info should not require L1");
+
+        assert_eq!(info.zone_id, U64::from(1));
+        assert!(!info.is_access_enforced);
+        assert!(info.is_gateway_open);
+        assert_eq!(info.zone_tokens, vec![ZONE_TOKEN_ADDRESS]);
+        assert!(info.sequencers.is_empty());
+        assert_eq!(info.chain_id, U64::from(42431));
+        assert_eq!(info.tempo_block_number, U64::from(7));
     }
 
     #[test]

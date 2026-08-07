@@ -340,6 +340,24 @@ impl<P: alloy_provider::Provider<N>, N: alloy_network::Network>
         futures::future::try_join_all(futs).await
     }
 
+    /// Returns all sequencer addresses currently registered on this [`ZonePortal`].
+    ///
+    /// Calls [`sequencerCount`](ZonePortal::sequencerCountCall) followed by
+    /// [`sequencerAt`](ZonePortal::sequencerAtCall) for each index concurrently.
+    pub async fn sequencers(
+        &self,
+    ) -> Result<alloc::vec::Vec<alloy_primitives::Address>, alloy_contract::Error> {
+        let count = self.sequencerCount().call().await?;
+        let futs: alloc::vec::Vec<_> = (0..count.to::<u64>())
+            .map(|i| async move {
+                self.sequencerAt(alloy_primitives::U256::from(i))
+                    .call()
+                    .await
+            })
+            .collect();
+        futures::future::try_join_all(futs).await
+    }
+
     /// Fetches the active sequencer encryption key and its index from one L1 snapshot.
     ///
     /// Reads the current L1 block number, then pins an atomic
