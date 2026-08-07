@@ -77,8 +77,8 @@ pub struct CheckerConfig {
     pub portal_creation_block_hash: B256,
     /// ZoneFactory Zone ID bound to the local Zone chain ID.
     pub zone_id: u32,
-    /// Optional exact checker database path for fresh-path rebuilds.
-    pub database_path: Option<PathBuf>,
+    /// Checker database path.
+    pub database_path: PathBuf,
     /// Maximum wall-clock time for one authenticated block acquisition attempt.
     pub acquisition_timeout: Duration,
 }

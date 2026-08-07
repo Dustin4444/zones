@@ -230,48 +230,11 @@ The zone node stores data in `/tmp/tempo-zone-<name>/`.
 
 #### Enable the observe-only Zone checker
 
-The checker independently authenticates imported Tempo transaction envelopes
-and receipts, reconstructs the complete bridge lifecycle, and durably records
-verified progress or findings. It is off by default. Before enabling it, build
-an identity-bound checkpoint locally from the Zone database and an
-archive-capable Tempo RPC:
-
-```bash
-ZONE_JSON=generated/my-zone/zone.json
-
-tempo-zone checker build-checkpoint \
-  --checker.database-path /var/lib/tempo-zone/checker \
-  --checker.portal-creation-block-hash "$(jq -er '.portalCreationBlockHash' "$ZONE_JSON")" \
-  -- \
-  --chain generated/my-zone/genesis.json \
-  --datadir /var/lib/tempo-zone \
-  --l1.rpc-url "$L1_RPC_URL" \
-  --l1.portal-address "$(jq -er '.portal' "$ZONE_JSON")" \
-  --zone.id "$(jq -er '.zoneId' "$ZONE_JSON")"
-```
-
-Then start the node with the same identity and checkpoint path:
-
-```bash
-tempo-zone \
-  --chain generated/my-zone/genesis.json \
-  --datadir /var/lib/tempo-zone \
-  --checker.mode observe \
-  --checker.database-path /var/lib/tempo-zone/checker \
-  --checker.portal-creation-block-hash "$(jq -er '.portalCreationBlockHash' "$ZONE_JSON")" \
-  --l1.rpc-url "$L1_RPC_URL" \
-  --l1.portal-address "$(jq -er '.portal' "$ZONE_JSON")" \
-  --zone.id "$(jq -er '.zoneId' "$ZONE_JSON")"
-```
-
-Use each command's `--help` output for additional required node arguments.
-Do not import an unverified third-party checkpoint. The checker needs complete
-historical Tempo envelopes/receipts and hash-pinned Portal balance reads, plus
-the local canonical Zone history and exact-hash state. These state reads are
-not independently proven with state-trie proofs. Missing history becomes an
-explicit retry, disabled checker, or durable coverage gap; unchecked blocks
-are never reported as verified. Schema changes require building a fresh
-checkpoint path rather than modifying an old database in place.
+The checker is off by default. Observe mode requires a local, identity-bound
+checkpoint and an explicit `--checker.database-path`. Build the checkpoint from
+the Zone database and an archive-capable Tempo RPC; do not import an unverified
+third-party checkpoint. See the [checker README](../crates/checker/README.md)
+for setup, data requirements, failure behavior, and trust limits.
 
 ### 6. Interact with the Zone
 

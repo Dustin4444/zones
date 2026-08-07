@@ -1,4 +1,4 @@
-//! Concrete archive bootstrap for the checker store.
+//! Archive bootstrap for the checker store.
 
 use std::path::Path;
 
@@ -64,7 +64,7 @@ where
         },
     ] = creation_projection.facts.operations.as_slice()
     else {
-        eyre::bail!("creation block must contain exactly one Create operation");
+        eyre::bail!("creation block must contain one portal creation operation");
     };
     let expected_identity = PortalIdentity {
         portal: config.portal_address,
@@ -73,7 +73,7 @@ where
     };
     if *identity != expected_identity || initial_token.token != local.initial_token() {
         eyre::bail!(
-            "authenticated creation identity does not match configuration and Zone genesis"
+            "authenticated creation identity does not match configuration and zone genesis"
         );
     }
 
@@ -82,17 +82,20 @@ where
         FreshHistory::PortalPresentAtGenesisAnchor => {
             let path = prove_ancestry(&l1_provider, anchor_header, &creation_header).await?;
             for header in path {
-                let observation = if header.hash() == creation_tip.hash {
-                    // Reuse the already authenticated creation body.
-                    &creation_observation
+                if header.hash() == creation_tip.hash {
+                    replay_one(
+                        &mut state,
+                        &creation_observation,
+                        &header,
+                        &config,
+                        &l1_provider,
+                    )
+                    .await?;
                 } else {
-                    // The owned value must outlive projection and application.
-                    let acquired = observe_l1(&l1_provider, &header, config.portal_address).await?;
-                    let observation = acquired;
+                    let observation =
+                        observe_l1(&l1_provider, &header, config.portal_address).await?;
                     replay_one(&mut state, &observation, &header, &config, &l1_provider).await?;
-                    continue;
-                };
-                replay_one(&mut state, observation, &header, &config, &l1_provider).await?;
+                }
             }
             let tokens = state.rows().keys().filter_map(|key| match key {
                 zone_checker_kernel::StateKey::Token(token) => Some(*token),
@@ -103,8 +106,7 @@ where
             state.apply(&handoff)?;
         }
         FreshHistory::PortalCreatedAfterGenesisAnchor => {
-            // Reverse topology proof: the anchor must be an exact ancestor of
-            // creation, while the checkpoint remains AwaitingCreation.
+            // Prove that the genesis anchor precedes portal creation.
             prove_ancestry(&l1_provider, creation_header, &anchor_header).await?;
             validate_zero_genesis_supply(
                 zone_provider,
@@ -155,7 +157,7 @@ async fn replay_one(
     let candidate = apply_imported(state, &projection.facts)?;
     let expected_effects = candidate.expected_effects();
     if projection.effects != expected_effects {
-        eyre::bail!("authenticated imported effects differ from checker candidate");
+        eyre::bail!("authenticated imported effects differ from expected effects");
     }
     for (token, accounting) in candidate.expected_accounting()? {
         let actual = acquire_portal_collateral(
@@ -169,7 +171,7 @@ async fn replay_one(
             .collateral()
             .is_none_or(|required| actual < required)
         {
-            eyre::bail!("imported-cut collateral is insufficient for token {token}");
+            eyre::bail!("imported collateral is insufficient for token {token}");
         }
     }
     *state = candidate.into_state();

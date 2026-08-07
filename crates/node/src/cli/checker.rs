@@ -10,7 +10,7 @@ use zone_checker::{CheckerConfig, CheckerMode};
 
 use super::{NodeAction, ZoneArgs, run_node};
 
-/// Offline, read-only checker operator commands.
+/// Checker database commands.
 #[derive(Debug, Parser)]
 #[command(name = "checker", about = "Prepare a durable checker database")]
 pub struct CheckerCommand {
@@ -80,7 +80,7 @@ pub struct CheckerArgs {
     )]
     pub portal_creation_block_hash: Option<B256>,
 
-    /// Override the path to the checker's dedicated database.
+    /// Path to the checker's dedicated database.
     #[arg(
         long = "checker.database-path",
         env = "CHECKER_DATABASE_PATH",
@@ -99,7 +99,7 @@ pub struct CheckerArgs {
 }
 
 impl CheckerArgs {
-    /// Validate the selected mode and construct its complete runtime config.
+    /// Validate the selected mode and build its runtime configuration.
     pub(super) fn config(
         &self,
         l1_rpc_url: &str,
@@ -137,12 +137,15 @@ impl CheckerArgs {
                     self.acquisition_timeout_secs != 0,
                     "--checker.acquisition-timeout-secs must be nonzero"
                 );
+                let database_path = self.database_path.clone().ok_or_else(|| {
+                    eyre::eyre!("--checker.database-path is required with --checker.mode observe")
+                })?;
                 Ok(Some(CheckerConfig {
                     l1_rpc_url: l1_rpc_url.to_owned(),
                     portal_address,
                     portal_creation_block_hash,
                     zone_id,
-                    database_path: self.database_path.clone(),
+                    database_path,
                     acquisition_timeout: Duration::from_secs(self.acquisition_timeout_secs),
                 }))
             }
@@ -187,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_builds_the_complete_runtime_config() {
+    fn observe_builds_runtime_config() {
         let args = parse([
             "tempo-zone",
             "--checker.mode",
@@ -209,8 +212,26 @@ mod tests {
             CREATION_HASH.parse::<B256>().unwrap()
         );
         assert_eq!(config.zone_id, 7);
-        assert_eq!(config.database_path, Some(PathBuf::from("checker-test-db")));
+        assert_eq!(config.database_path, PathBuf::from("checker-test-db"));
         assert_eq!(config.acquisition_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn observe_requires_a_database_path() {
+        let args = parse([
+            "tempo-zone",
+            "--checker.mode",
+            "observe",
+            "--checker.portal-creation-block-hash",
+            CREATION_HASH,
+        ]);
+
+        let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--checker.database-path is required")
+        );
     }
 
     #[test]

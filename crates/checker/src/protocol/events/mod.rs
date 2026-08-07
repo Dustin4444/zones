@@ -1,9 +1,7 @@
 //! Version-pinned protocol event surface owned by the checker.
 //!
-//! L1 and L2 classification are deliberately separate. Each classifier first
-//! matches a literal `(emitter, topic0)` pair and only then invokes the
-//! checker-owned ABI decoder. This is not a production ABI adapter or an
-//! extensible event registry: an unknown topic from a protocol emitter fails
+//! L1 and L2 classifiers match a literal `(emitter, topic0)` pair before using
+//! the checker-owned ABI decoder. Unknown topics from protocol emitters fail
 //! closed.
 
 use alloy_primitives::{Address, B256, Log};
@@ -34,8 +32,7 @@ pub(crate) use portal::PortalModelEvent;
 pub(crate) enum L1ProtocolEvent {
     Portal(PortalModelEvent),
     FactoryZoneCreated(Factory::ZoneCreated),
-    /// A listed event whose payload was strictly decoded and then discarded
-    /// because it cannot change the release-one model.
+    /// A listed event that cannot change checker state.
     KnownNonModel,
 }
 

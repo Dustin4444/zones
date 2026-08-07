@@ -16,9 +16,8 @@ use super::{
 // Checker-owned Portal event ABI.
 //
 // Pinned source: `specs/ref-impls/src/interfaces/IZone.sol:504-605,652`.
-// The production Rust ABI mirror currently omits `DepositsPaused`,
-// `DepositsResumed`, and `RpcUrlUpdated`; keeping these definitions here is
-// intentional.
+// The production Rust ABI mirror omits `DepositsPaused`, `DepositsResumed`,
+// and `RpcUrlUpdated`, so the checker defines them here.
 alloy_sol_types::sol! {
     #[derive(Debug, PartialEq, Eq)]
     contract Portal {
@@ -116,8 +115,7 @@ alloy_sol_types::sol! {
     }
 }
 
-// Independent topic0 literals. These are intentionally not defined through
-// `SolEvent::SIGNATURE_HASH`; tests compare the two authorities.
+// Independent topic0 literals. Tests compare them with `SolEvent::SIGNATURE_HASH`.
 pub(super) const DEPOSIT_MADE_TOPIC: B256 =
     b256!("51046223e5e0abca942f13a8f3d1c8dfd59c8b6c4f3e64fc2f5bf453767a97ca");
 pub(super) const TOKEN_ENABLED_TOPIC: B256 =
@@ -161,7 +159,7 @@ pub(super) const DEPOSITS_RESUMED_TOPIC: B256 =
 pub(super) const RPC_URL_UPDATED_TOPIC: B256 =
     b256!("f4e00967b25e707df96d88676243b33be84847ef27615af8ef91290b52294fc6");
 
-/// Decoded Portal payloads allowed to drive or check the release-one model.
+/// Decoded Portal payloads that may drive or check the model.
 ///
 /// Known non-model variants never enter this enum, so downstream transition
 /// code does not need unreachable match arms for them.

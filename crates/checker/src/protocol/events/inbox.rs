@@ -8,10 +8,9 @@ use super::{
 // Checker-owned native ZoneInbox event ABI.
 //
 // The seven supported events are pinned to
-// `crates/contracts/src/precompiles/zone_inbox.rs:57-90`. `DepositRejected`
-// is defined only to pin its excluded topic from the stale Solidity reference
-// (`specs/ref-impls/src/interfaces/IZone.sol:1089-1096`); it is never decoded
-// into a supported outcome.
+// `crates/contracts/src/precompiles/zone_inbox.rs:57-90`. The Solidity
+// interface also declares `DepositRejected`; its topic is pinned so the
+// checker rejects it.
 alloy_sol_types::sol! {
     #[derive(Debug, PartialEq, Eq)]
     enum DepositType {
@@ -93,9 +92,7 @@ pub(super) fn decode(log: &Log) -> Result<Inbox::InboxEvents, ProtocolEventError
         | WITHDRAWAL_BOUNCE_BACK_PENDING_TOPIC
         | REFUND_CLAIMED_TOPIC
         | TOKEN_ENABLED_TOPIC => {}
-        // The written spec and stale Solidity Inbox retain this event, but the
-        // pinned native `advanceTempo` ABI has no `rejected` flag. Never decode
-        // this topic into the failed-deposit branch.
+        // The native `advanceTempo` ABI cannot authenticate this outcome.
         DEPOSIT_REJECTED_TOPIC => return Err(unsupported(log)),
         _ => return Err(unsupported(log)),
     }

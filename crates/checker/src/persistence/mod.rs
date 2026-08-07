@@ -30,11 +30,11 @@ pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PersistenceError {
-    #[error("checker persistence open error: {0}")]
+    #[error("database open failed: {0}")]
     Open(#[from] eyre::Report),
-    #[error("checker persistence database error: {0}")]
+    #[error("database error: {0}")]
     Database(#[from] reth_db::DatabaseError),
-    #[error("checker persistence codec error: {0}")]
+    #[error("database codec error: {0}")]
     Codec(#[from] codec::CodecError),
     #[error(
         "incompatible checker schema: expected {expected}, actual {actual}; rebuild at {rebuild_path}"
@@ -44,11 +44,11 @@ pub(crate) enum PersistenceError {
         actual: u32,
         rebuild_path: PathBuf,
     },
-    #[error("checker identity mismatch")]
+    #[error("database identity mismatch")]
     Identity,
-    #[error("stale checker snapshot")]
+    #[error("stale database snapshot")]
     StaleSnapshot,
-    #[error("invalid checker persistence: {0}")]
+    #[error("invalid checker database: {0}")]
     Invalid(String),
     #[cfg(test)]
     #[error("injected transaction abort")]
@@ -63,24 +63,6 @@ pub(crate) struct Persistence {
     abort_next_write: AtomicBool,
 }
 
-pub(crate) trait PriorSnapshot {
-    fn resolve(self, store: &Persistence) -> Result<Snapshot>;
-}
-impl PriorSnapshot for &Snapshot {
-    fn resolve(self, _store: &Persistence) -> Result<Snapshot> {
-        Ok(self.clone())
-    }
-}
-#[cfg(test)]
-impl PriorSnapshot for Identity {
-    fn resolve(self, store: &Persistence) -> Result<Snapshot> {
-        if self != store.identity {
-            return Err(PersistenceError::Identity);
-        }
-        store.load()
-    }
-}
-
 impl Persistence {
     /// Read the authenticated identity from an existing checker database.
     /// This never creates or repairs a database and is intended for runtime
@@ -91,9 +73,9 @@ impl Persistence {
         let db = open_db_read_only(path, DatabaseArguments::default())?;
         let tx = db.tx()?;
         let value = tx
-            .get::<Meta>(MetaKey::State)?
-            .ok_or_else(|| invalid("missing Meta singleton"))?;
-        let MetaValue::State(meta) = value else {
+            .get::<Meta>(MetaKey::Metadata)?
+            .ok_or_else(|| invalid("metadata row is missing"))?;
+        let MetaValue::Metadata(meta) = value else {
             return Err(invalid("metadata type mismatch"));
         };
         validate_metadata(&meta)?;
@@ -159,7 +141,10 @@ impl Persistence {
             },
         )?;
         tx.put::<Meta>(MetaKey::Version, MetaValue::Version(SCHEMA_VERSION))?;
-        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta.clone())))?;
+        tx.put::<Meta>(
+            MetaKey::Metadata,
+            MetaValue::Metadata(Box::new(meta.clone())),
+        )?;
         tx.commit()?;
         Ok((this, Snapshot { meta, state }))
     }
@@ -182,9 +167,9 @@ impl Persistence {
         let identity = self.identity;
         let tx = self.db.tx()?;
         let meta = tx
-            .get::<Meta>(MetaKey::State)?
-            .ok_or_else(|| invalid("missing Meta singleton"))?;
-        let MetaValue::State(meta) = meta else {
+            .get::<Meta>(MetaKey::Metadata)?
+            .ok_or_else(|| invalid("metadata row is missing"))?;
+        let MetaValue::Metadata(meta) = meta else {
             return Err(invalid("metadata type mismatch"));
         };
         let meta = *meta;
@@ -269,14 +254,13 @@ impl Persistence {
         Ok(Snapshot { meta, state })
     }
 
-    pub(crate) fn apply<P: PriorSnapshot>(
+    pub(crate) fn apply(
         &self,
-        prior: P,
+        prior: &Snapshot,
         entry: JournalEntry,
         acknowledged: BlockNumHash,
         coverage: Coverage,
     ) -> Result<Snapshot> {
-        let prior = prior.resolve(self)?;
         let mut candidate = prior.state.clone();
         candidate
             .apply(&entry.delta)
@@ -284,7 +268,7 @@ impl Persistence {
         validate_state(&candidate, self.identity)?;
         codec::encode(&entry)?;
         let candidate_state = candidate.clone();
-        self.write(&prior, candidate_state, |tx, meta| {
+        self.write(prior, candidate_state, |tx, meta| {
             if entry.zone.number
                 != meta
                     .verified_zone_tip
@@ -295,7 +279,7 @@ impl Persistence {
                 || entry.imported_tempo.number <= meta.imported_tempo_tip.number
                 || entry.imported_tempo_parent != meta.imported_tempo_tip
             {
-                return Err(invalid("wrong next journal parent or height"));
+                return Err(invalid("journal parent or height mismatch"));
             }
             validate_coverage_advance(meta, entry.zone, acknowledged, &coverage)?;
             if tx.get::<Journal>(entry.zone.number)?.is_some() {
@@ -347,16 +331,13 @@ impl Persistence {
         self.checkpoint_current(&prior)
     }
 
-    pub(crate) fn record_finding<P: PriorSnapshot>(
+    pub(crate) fn record_finding(
         &self,
-        prior: P,
+        prior: &Snapshot,
         key: FindingKey,
         finding: Finding,
     ) -> Result<Snapshot> {
-        let prior = prior.resolve(self)?;
-        validate_finding(key, &finding, None)?;
-        codec::encode(&finding)?;
-        self.write(&prior, prior.state.clone(), |tx, meta| {
+        self.write(prior, prior.state.clone(), |tx, meta| {
             if finding.zone.number
                 != meta
                     .verified_zone_tip
@@ -369,6 +350,7 @@ impl Persistence {
                 return Err(invalid("finding is not at the next verified coordinate"));
             }
             validate_finding(key, &finding, Some(meta))?;
+            codec::encode(&finding)?;
             if let Some(old) = tx.get::<Findings>(key)? {
                 let mut old_identity = old.clone();
                 old_identity.summary.clear();
@@ -388,15 +370,14 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn record_gap<P: PriorSnapshot>(
+    pub(crate) fn record_gap(
         &self,
-        prior: P,
+        prior: &Snapshot,
         first_unchecked: BlockNumHash,
         acknowledged_through: BlockNumHash,
         reason: CoverageGapReason,
     ) -> Result<Snapshot> {
-        let prior = prior.resolve(self)?;
-        self.write(&prior, prior.state.clone(), |_tx, meta| {
+        self.write(prior, prior.state.clone(), |_tx, meta| {
             if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
                 || acknowledged_through.number < first_unchecked.number
                 || acknowledged_through.number < meta.acknowledged_zone_tip.number
@@ -424,25 +405,13 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn reorg<P: PriorSnapshot>(
-        &self,
-        prior: P,
-        ancestor: BlockNumHash,
-    ) -> Result<Snapshot> {
-        let prior = prior.resolve(self)?;
+    pub(crate) fn reorg(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         if ancestor.number > prior.meta.verified_zone_tip.number {
             if ancestor.number > prior.meta.acknowledged_zone_tip.number {
                 return Err(invalid("reorg ancestor exceeds acknowledged history"));
             }
-            return self.write(&prior, prior.state.clone(), |_tx, meta| {
-                if let Some(key) = meta.active_finding {
-                    if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
-                        return Err(invalid("conflicting evidence at finding height"));
-                    }
-                    if key.zone.number > ancestor.number {
-                        meta.active_finding = None;
-                    }
-                }
+            return self.write(prior, prior.state.clone(), |_tx, meta| {
+                update_active_finding(meta, ancestor)?;
                 let Coverage::Gap {
                     first_unchecked,
                     reason,
@@ -468,7 +437,7 @@ impl Persistence {
             });
         }
         let snapshot = self.reconstruct_at(ancestor)?;
-        self.write(&prior, snapshot.state.clone(), |tx, meta| {
+        self.write(prior, snapshot.state.clone(), |tx, meta| {
             let mut cursor = tx.cursor_write::<Journal>()?;
             while let Some((height, _)) = cursor.last()? {
                 if height <= ancestor.number {
@@ -484,25 +453,17 @@ impl Persistence {
             }
             meta.coverage = match &meta.coverage {
                 Coverage::Gap {
-                    first_unchecked, ..
+                    first_unchecked,
+                    reason,
+                    ..
                 } if first_unchecked.number <= ancestor.number => Coverage::Gap {
                     first_unchecked: *first_unchecked,
                     acknowledged_through: ancestor,
-                    reason: match &meta.coverage {
-                        Coverage::Gap { reason, .. } => reason.clone(),
-                        Coverage::Complete => unreachable!(),
-                    },
+                    reason: reason.clone(),
                 },
                 _ => Coverage::Complete,
             };
-            if let Some(key) = meta.active_finding {
-                if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
-                    return Err(invalid("conflicting evidence at finding height"));
-                }
-                if key.zone.number > ancestor.number {
-                    meta.active_finding = None;
-                }
-            }
+            update_active_finding(meta, ancestor)?;
             Ok(())
         })
     }
@@ -511,9 +472,9 @@ impl Persistence {
         let identity = self.identity;
         let tx = self.db.tx()?;
         let meta = tx
-            .get::<Meta>(MetaKey::State)?
-            .ok_or_else(|| invalid("missing Meta"))?;
-        let MetaValue::State(meta) = meta else {
+            .get::<Meta>(MetaKey::Metadata)?
+            .ok_or_else(|| invalid("metadata row is missing"))?;
+        let MetaValue::Metadata(meta) = meta else {
             return Err(invalid("metadata type mismatch"));
         };
         let meta = *meta;
@@ -582,9 +543,9 @@ impl Persistence {
     {
         let tx = self.db.tx_mut()?;
         let meta = tx
-            .get::<Meta>(MetaKey::State)?
-            .ok_or_else(|| invalid("missing Meta"))?;
-        let MetaValue::State(meta) = meta else {
+            .get::<Meta>(MetaKey::Metadata)?
+            .ok_or_else(|| invalid("metadata row is missing"))?;
+        let MetaValue::Metadata(meta) = meta else {
             return Err(invalid("metadata type mismatch"));
         };
         let mut meta = *meta;
@@ -600,7 +561,10 @@ impl Persistence {
             tx.abort();
             return Err(e);
         }
-        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta.clone())))?;
+        tx.put::<Meta>(
+            MetaKey::Metadata,
+            MetaValue::Metadata(Box::new(meta.clone())),
+        )?;
         #[cfg(test)]
         if self.abort_next_write.swap(false, Ordering::SeqCst) {
             tx.abort();
@@ -621,7 +585,7 @@ fn probe(path: &Path) -> Result<()> {
     let tx = db.tx()?;
     let raw = tx
         .get::<Meta>(MetaKey::Version)?
-        .ok_or_else(|| invalid("missing Meta"))?;
+        .ok_or_else(|| invalid("schema version is missing"))?;
     let MetaValue::Version(actual) = raw else {
         return Err(invalid("schema version type mismatch"));
     };
@@ -641,6 +605,19 @@ fn schema_error(actual: u32, path: &Path) -> PersistenceError {
 fn invalid(message: impl Into<String>) -> PersistenceError {
     PersistenceError::Invalid(message.into())
 }
+
+fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<()> {
+    if let Some(key) = meta.active_finding {
+        if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
+            return Err(invalid("conflicting evidence at finding height"));
+        }
+        if key.zone.number > ancestor.number {
+            meta.active_finding = None;
+        }
+    }
+    Ok(())
+}
+
 fn validate_state(state: &State, identity: Identity) -> Result<()> {
     State::from_rows(state.rows().clone()).map_err(|e| invalid(e.to_string()))?;
     validate(state).map_err(|e| invalid(format!("invariant {e:?}")))?;

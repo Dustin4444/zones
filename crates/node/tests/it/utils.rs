@@ -1448,10 +1448,7 @@ impl ZoneTestNode {
             }
         };
         if let Some(config) = checker_checkpoint {
-            let path = config
-                .database_path
-                .clone()
-                .ok_or_else(|| eyre::eyre!("checkpoint builder requires a database path"))?;
+            let path = config.database_path.clone();
             zone_checker::build_checkpoint(config, chain_id, node_handle.node.provider(), path)
                 .await?;
         }

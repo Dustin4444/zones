@@ -55,38 +55,35 @@ fn observation_failure(error: ObservationError) -> Failure {
             evidence,
             ..
         } => Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::ViolationCategory::Observation,
+            category: zone_checker_kernel::FindingCategory::Observation,
             code: 110,
             location: Some(zone_checker_kernel::FindingLocation::Operation(
                 transaction.transaction_index() as u32,
             )),
             expected: None,
-            actual: Some(zone_checker_kernel::FindingData::Bytes {
+            actual: Some(zone_checker_kernel::Datum::Bytes {
                 length: evidence.length(),
                 digest: evidence.digest(),
             }),
         })),
-        ObservationError::InvalidEnvelope { .. } => Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::ViolationCategory::Observation,
-            code: 120,
-            location: Some(zone_checker_kernel::FindingLocation::Block),
-            expected: None,
-            actual: Some(zone_checker_kernel::FindingData::Code(120)),
-        })),
+        ObservationError::InvalidEnvelope { .. } => Some(Box::new(kernel_failure(
+            120,
+            zone_checker_kernel::FindingCategory::Observation,
+        ))),
         ObservationError::ProtocolEvent {
             transaction_index, ..
         } => Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::ViolationCategory::Observation,
+            category: zone_checker_kernel::FindingCategory::Observation,
             code: 130,
             location: Some(zone_checker_kernel::FindingLocation::Operation(
                 *transaction_index as u32,
             )),
             expected: None,
-            actual: Some(zone_checker_kernel::FindingData::Code(130)),
+            actual: Some(zone_checker_kernel::Datum::Code(130)),
         })),
         ObservationError::PortalCall(_) => Some(Box::new(kernel_failure(
             140,
-            zone_checker_kernel::ViolationCategory::Observation,
+            zone_checker_kernel::FindingCategory::Observation,
         ))),
         ObservationError::Acquisition(_) => None,
     };
@@ -138,11 +135,19 @@ fn validate(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<Vec<BlockNumHa
 impl PlannedNotification for ExExNotification<TempoPrimitives> {
     fn plan(&self) -> Result<NotificationPlan, Failure> {
         match self {
-            Self::ChainCommitted { new } => plan(None, Some(new)),
-            Self::ChainReverted { old } => plan(Some(old), None),
+            Self::ChainCommitted { new } => finish_plan(
+                Vec::new(),
+                validate(new, "committed")?,
+                fragment_ancestor(new)?,
+            ),
+            Self::ChainReverted { old } => finish_plan(
+                validate(old, "reverted")?,
+                Vec::new(),
+                fragment_ancestor(old)?,
+            ),
             Self::ChainReorged { old, new } => {
-                validate(old, "reverted")?;
-                validate(new, "replacement")?;
+                let reverted = validate(old, "reverted")?;
+                let applied = validate(new, "replacement")?;
                 let old_first = old.blocks().values().next().expect("validated nonempty");
                 let new_first = new.blocks().values().next().expect("validated nonempty");
                 if old_first.number() != new_first.number()
@@ -150,64 +155,47 @@ impl PlannedNotification for ExExNotification<TempoPrimitives> {
                 {
                     return Err(malformed("reorg fragments have different common ancestors"));
                 }
-                plan(Some(old), Some(new))
+                finish_plan(reverted, applied, fragment_ancestor(old)?)
             }
         }
     }
 }
 
-fn plan(
-    old: Option<&Chain<TempoPrimitives>>,
-    new: Option<&Chain<TempoPrimitives>>,
-) -> Result<NotificationPlan, Failure> {
-    let reverted = old
-        .map(|c| validate(c, "reverted"))
-        .transpose()?
-        .unwrap_or_default();
-    let applied = new
-        .map(|c| validate(c, "applied"))
-        .transpose()?
-        .unwrap_or_default();
-    let first = new
-        .or(old)
-        .and_then(|c| c.blocks().values().next())
-        .ok_or_else(|| malformed("empty notification"))?;
-    let ancestor = BlockNumHash {
+fn fragment_ancestor(chain: &Chain<TempoPrimitives>) -> Result<BlockNumHash, Failure> {
+    let first = chain.blocks().values().next().expect("validated nonempty");
+    Ok(BlockNumHash {
         number: first
             .number()
             .checked_sub(1)
             .ok_or_else(|| malformed("fragment starts at genesis"))?,
         hash: first.parent_hash(),
-    };
+    })
+}
+
+fn finish_plan(
+    reverted: Vec<BlockNumHash>,
+    applied: Vec<BlockNumHash>,
+    ancestor: BlockNumHash,
+) -> Result<NotificationPlan, Failure> {
     let acknowledge = applied.last().copied().unwrap_or(ancestor);
-    Ok(NotificationPlan {
+    NotificationPlan {
         reverted,
         ancestor,
         applied,
         acknowledge,
-    })
+    }
+    .validate()
 }
 
-pub(crate) struct NotificationFragments<'a> {
-    pub applied: Option<&'a Chain<TempoPrimitives>>,
-}
-
-pub(crate) fn fragments(
+fn applied_chain(
     notification: &ExExNotification<TempoPrimitives>,
-) -> Result<NotificationFragments<'_>, Failure> {
-    let (applied, chain, kind) = match notification {
-        ExExNotification::ChainCommitted { new } => (Some(new), new, "committed"),
-        ExExNotification::ChainReverted { old } => (None, old, "reverted"),
-        ExExNotification::ChainReorged { old, new } => {
-            notification.plan().and_then(NotificationPlan::validate)?;
-            let _ = old;
-            (Some(new), new, "replacement")
+) -> Option<&Chain<TempoPrimitives>> {
+    match notification {
+        ExExNotification::ChainCommitted { new } | ExExNotification::ChainReorged { new, .. } => {
+            Some(new)
         }
-    };
-    validate(chain, kind)?;
-    Ok(NotificationFragments {
-        applied: applied.map(|chain| chain.as_ref()),
-    })
+        ExExNotification::ChainReverted { .. } => None,
+    }
 }
 
 fn enabled_tokens(state: &State) -> BTreeSet<Address> {
@@ -308,7 +296,7 @@ where
             message: error.to_string(),
             finding: Some(Box::new(kernel_failure(
                 2,
-                zone_checker_kernel::ViolationCategory::Invariant,
+                zone_checker_kernel::FindingCategory::Invariant,
             ))),
         })?;
     // Collateral belongs to the exact post-import/pre-Zone cut. Zone
@@ -322,24 +310,17 @@ where
                 message: error.to_string(),
                 finding: Some(Box::new(kernel_failure(
                     3,
-                    zone_checker_kernel::ViolationCategory::CollateralMismatch,
+                    zone_checker_kernel::FindingCategory::CollateralMismatch,
                 ))),
             })?;
+    let imported_tip = observation.l1.last().expect("nonempty imported range");
     let mut collateral = BTreeMap::new();
     for (token, accounting) in imported_accounting {
         let balance = acquire_portal_collateral(
             l1_provider,
             token,
-            observation
-                .l1
-                .last()
-                .expect("nonempty imported range")
-                .portal_address(),
-            observation
-                .l1
-                .last()
-                .expect("nonempty imported range")
-                .block_hash(),
+            imported_tip.portal_address(),
+            imported_tip.block_hash(),
         )
         .await
         .map_err(|error| observation_failure(error.into()))?;
@@ -351,15 +332,15 @@ where
             return Err(Failure {
                 class: FailureClass::AuthenticatedDivergence,
                 gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
-                message: "imported-cut collateral is insufficient".into(),
+                message: "imported collateral is insufficient".into(),
                 finding: Some(Box::new(zone_checker_kernel::Finding {
-                    category: zone_checker_kernel::ViolationCategory::CollateralMismatch,
+                    category: zone_checker_kernel::FindingCategory::CollateralMismatch,
                     code: 4,
                     location: Some(zone_checker_kernel::FindingLocation::State(
                         zone_checker_kernel::StateKey::Token(token),
                     )),
-                    expected: Some(zone_checker_kernel::FindingData::U256(required)),
-                    actual: Some(zone_checker_kernel::FindingData::U256(balance)),
+                    expected: Some(zone_checker_kernel::Datum::U256(required)),
+                    actual: Some(zone_checker_kernel::Datum::U256(balance)),
                 })),
             });
         }
@@ -371,14 +352,14 @@ where
 
 fn kernel_failure(
     code: u16,
-    category: zone_checker_kernel::ViolationCategory,
+    category: zone_checker_kernel::FindingCategory,
 ) -> zone_checker_kernel::Finding {
     zone_checker_kernel::Finding {
         category,
         code,
         location: Some(zone_checker_kernel::FindingLocation::Block),
         expected: None,
-        actual: Some(zone_checker_kernel::FindingData::Code(code)),
+        actual: Some(zone_checker_kernel::Datum::Code(code)),
     }
 }
 
@@ -408,8 +389,6 @@ impl ObservationPipeline<ExExNotification<TempoPrimitives>> for PreparedPipeline
     }
 }
 
-/// Concrete one-loop checker ExEx runtime. It opens only an already complete
-/// checkpoint and keeps the durable acknowledged watermark authoritative.
 pub(crate) async fn run<Node>(config: CheckerConfig, mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
@@ -420,10 +399,7 @@ where
         !config.acquisition_timeout.is_zero(),
         "checker acquisition timeout must be nonzero"
     );
-    let path = config
-        .database_path
-        .as_deref()
-        .ok_or_else(|| eyre::eyre!("checker runtime requires an explicit checkpoint path"))?;
+    let path = config.database_path.as_path();
     let identity = Persistence::inspect_identity(path)?;
     validate_runtime_identity(&config, ctx.config.chain.chain().id(), identity)?;
     let (store, snapshot) = Persistence::open(path, identity)?;
@@ -451,14 +427,11 @@ where
         if let Some(index) = runtime.next_applied_index(&store)?
             && prepared.block.is_none()
         {
-            let parts = fragments(
-                runtime
-                    .current()
-                    .expect("applied index requires a current notification"),
-            )
-            .map_err(|f| eyre::eyre!(f.message))?;
-            let chain = parts
-                .applied
+            let (notification, plan) = runtime
+                .current()
+                .expect("applied index requires a current notification");
+            debug_assert!(!plan.applied.is_empty());
+            let chain = applied_chain(notification)
                 .ok_or_else(|| eyre::eyre!("missing applied fragment"))?;
             let chain = chain.clone();
             let provider = ctx.provider().clone();
@@ -492,10 +465,6 @@ where
                             notification,
                         )? {
                             RuntimeAction::None => {}
-                            RuntimeAction::Acknowledge(height) => {
-                                ctx.send_finished_height(num_hash(height))?;
-                                eyre::bail!("checker disabled after bounded FIFO overflow");
-                            }
                             RuntimeAction::AcknowledgeAndTerminate(height) => {
                                 ctx.send_finished_height(num_hash(height))?;
                                 eyre::bail!("checker disabled after bounded FIFO overflow");
@@ -503,9 +472,9 @@ where
                             RuntimeAction::Terminal => {
                                 eyre::bail!("checker rejected notification during acquisition");
                             }
-                            RuntimeAction::AwaitNotification | RuntimeAction::RetryAt(_) => {
-                                unreachable!("enqueue cannot request driver waiting")
-                            }
+                            RuntimeAction::Acknowledge(_)
+                            | RuntimeAction::AwaitNotification
+                            | RuntimeAction::RetryAt(_) => unreachable!("invalid enqueue action"),
                         },
                         Ok(None) | Err(_) => {
                             record_local_canonical_suffix(
@@ -554,18 +523,15 @@ where
         match next {
             Ok(Some(notification)) => {
                 match runtime.push_or_record_overflow(&store, notification)? {
-                    RuntimeAction::Acknowledge(height) => {
-                        ctx.send_finished_height(num_hash(height))?;
-                    }
                     RuntimeAction::AcknowledgeAndTerminate(height) => {
                         ctx.send_finished_height(num_hash(height))?;
                         eyre::bail!("checker disabled after bounded FIFO overflow");
                     }
                     RuntimeAction::Terminal => eyre::bail!("checker disabled"),
                     RuntimeAction::None => {}
-                    RuntimeAction::AwaitNotification | RuntimeAction::RetryAt(_) => {
-                        unreachable!("enqueue cannot request driver waiting")
-                    }
+                    RuntimeAction::Acknowledge(_)
+                    | RuntimeAction::AwaitNotification
+                    | RuntimeAction::RetryAt(_) => unreachable!("invalid enqueue action"),
                 }
             }
             Ok(None) | Err(_) => {
@@ -615,9 +581,9 @@ fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
     if let RuntimeAction::AcknowledgeAndTerminate(_) =
         runtime.record_stream_failure(store, &suffix)?
     {
-        // Stream failure has no functioning acknowledgement path. The durable
-        // watermark is intentionally retained for startup resend.
+        // The stream cannot accept an acknowledgement. Startup will resend the
+        // durable watermark.
         return Ok(());
     }
-    eyre::bail!("could not persist truthful canonical stream gap")
+    eyre::bail!("failed to persist canonical stream gap")
 }

@@ -45,7 +45,31 @@ fn map(e: Box<bincode::ErrorKind>) -> CodecError {
         CodecError::Malformed(e.to_string())
     }
 }
-macro_rules! value_codec {($($t:ty),+)=>{$(impl Compress for $t {type Compressed=Vec<u8>;fn compress_to_buf<B:bytes::BufMut+AsMut<[u8]>>(&self,b:&mut B){b.put_slice(&encode(self).expect("bounded persistence value"));}} impl Decompress for $t {fn decompress(v:&[u8])->Result<Self,DecompressError>{decode(v).map_err(|e|DecompressError::new(std::io::Error::other(e)))}})+};}
+
+macro_rules! value_codec {
+    ($($value:ty),+ $(,)?) => {
+        $(
+            impl Compress for $value {
+                type Compressed = Vec<u8>;
+
+                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+                    let encoded = encode(self)
+                        .expect("persistence values are validated before database writes");
+                    buf.put_slice(&encoded);
+                }
+            }
+
+            impl Decompress for $value {
+                fn decompress(value: &[u8]) -> Result<Self, DecompressError> {
+                    decode(value).map_err(|error| {
+                        DecompressError::new(std::io::Error::other(error))
+                    })
+                }
+            }
+        )+
+    };
+}
+
 value_codec!(super::Checkpoint, super::JournalEntry, super::Finding);
 
 impl Compress for super::MetaValue {
@@ -56,9 +80,9 @@ impl Compress for super::MetaValue {
                 buf.put_u8(0);
                 buf.put_slice(&version.to_be_bytes());
             }
-            Self::State(metadata) => {
+            Self::Metadata(metadata) => {
                 buf.put_u8(1);
-                buf.put_slice(&encode(metadata).expect("bounded persistence metadata"));
+                buf.put_slice(&encode(metadata).expect("metadata has a fixed encoded size"));
             }
         }
     }
@@ -72,7 +96,7 @@ impl Decompress for super::MetaValue {
             ))),
             Some((1, body)) => decode(body)
                 .map(Box::new)
-                .map(Self::State)
+                .map(Self::Metadata)
                 .map_err(|error| DecompressError::new(std::io::Error::other(error))),
             _ => Err(DecompressError::new(std::io::Error::other(
                 "invalid metadata tag or version width",

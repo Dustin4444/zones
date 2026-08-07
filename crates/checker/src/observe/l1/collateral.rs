@@ -10,9 +10,8 @@ use crate::observe::error::{AcquisitionError, AcquisitionSource};
 
 /// Read one token's Portal balance at the exact imported Tempo block.
 ///
-/// The caller deliberately issues one call per model-owned enabled token. A
-/// timeout, missing archive state, or call failure is acquisition failure, not
-/// a zero balance and not a protocol finding.
+/// A timeout, missing archive state, or call failure is an acquisition failure,
+/// not a zero balance or protocol finding.
 pub(crate) async fn acquire_portal_collateral<P>(
     provider: &P,
     token: Address,

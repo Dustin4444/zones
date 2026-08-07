@@ -1,6 +1,6 @@
 [package]
 name = "zone-checker-kernel"
-description = "Independent compact semantic kernel for the Tempo Zone checker"
+description = "Independent semantic kernel for the Tempo Zone checker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -14,7 +14,7 @@ use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
 
 use super::*;
 use crate::{
-    observe::abi::ObservationZoneInbox,
+    observe::abi::MultiHeaderZoneInbox,
     observe::error::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, EnvelopeRule, ObservationError, ProtocolChain,
@@ -53,13 +53,13 @@ fn advance_transaction_with_tokens(
     to: Address,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 ) -> TempoTxEnvelope {
-    let calldata = ObservationZoneInbox::advanceTempoCall {
+    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
         headers: vec![encode_header(&imported_header())],
         deposits: Vec::new(),
         decryptions: Vec::new(),
         enabledTokens: enabled_tokens
             .into_iter()
-            .map(|t| ObservationZoneInbox::EnabledToken {
+            .map(|t| MultiHeaderZoneInbox::EnabledToken {
                 token: t.token,
                 name: t.name,
                 symbol: t.symbol,

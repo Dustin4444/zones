@@ -32,7 +32,7 @@ struct FakeNotification {
 impl PlannedNotification for FakeNotification {
     fn plan(&self) -> Result<NotificationPlan, Failure> {
         if let Some(plan) = &self.plan {
-            return Ok(plan.clone());
+            return plan.clone().validate();
         }
         let applied = self
             .coordinates
@@ -47,12 +47,13 @@ impl PlannedNotification for FakeNotification {
             hash: coordinate(first.number - 1, 0x10).hash,
         };
         let acknowledge = *applied.last().unwrap();
-        Ok(NotificationPlan {
+        NotificationPlan {
             reverted: vec![],
             ancestor,
             applied,
             acknowledge,
-        })
+        }
+        .validate()
     }
 }
 
@@ -128,8 +129,8 @@ pub(crate) fn create() -> (TempDir, Persistence) {
     (directory, store)
 }
 
-/// Assemble observed outputs field-by-field. This intentionally does not use
-/// an observation adapter, so these tests exercise the runtime/kernel seam.
+/// Build observed outputs without the observation adapter to test the
+/// runtime/kernel boundary.
 fn outputs(candidate: &Candidate) -> AuthenticatedOutputs {
     AuthenticatedOutputs {
         effects: candidate.expected_effects.to_vec(),
@@ -306,7 +307,7 @@ fn durable_gap_recovers_across_separate_notifications() {
     let all = blocks(&store.load().unwrap().state, 1, 3, 0x10);
     store
         .record_gap(
-            identity(),
+            &store.load().unwrap(),
             all[0].zone,
             all[2].zone,
             CoverageGapReason::MissingReceipts,
@@ -445,7 +446,7 @@ fn restart_catchup_containing_active_finding_never_authenticates() {
         .unwrap();
     store
         .record_gap(
-            identity(),
+            &store.load().unwrap(),
             coordinate(1, 0x10),
             coordinate(3, 0x10),
             CoverageGapReason::NotCheckedAncestorDivergence,
@@ -486,7 +487,7 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
         .unwrap();
     store
         .record_gap(
-            identity(),
+            &store.load().unwrap(),
             coordinate(1, 0x10),
             coordinate(3, 0x10),
             CoverageGapReason::NotCheckedAncestorDivergence,
@@ -546,7 +547,7 @@ fn malformed_coordinates_are_terminal_without_ack() {
 }
 
 #[test]
-fn builder_refuses_unrelated_nonempty_path_and_replay_reopens_identically() {
+fn builder_rejects_existing_target_and_reopens_completed_checkpoint() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("unrelated"), b"occupied").unwrap();
     let config = || BuildConfig {

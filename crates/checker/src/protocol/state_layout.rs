@@ -1,8 +1,7 @@
 //! Checker-owned fixed Zone storage access layouts.
 //!
 //! These keys and decoders are expected-value inputs for later exact-state
-//! comparisons. They intentionally do not import the production precompile
-//! layout modules.
+//! comparisons. They do not import production precompile layouts.
 
 use alloy_primitives::{Address, B256, U256};
 

@@ -15,13 +15,13 @@ pub(crate) enum AcquisitionSource {
     L1Receipts,
     #[error("complete L1 transactions")]
     L1Transaction,
-    #[error("Zone notification receipts")]
+    #[error("zone notification receipts")]
     ZoneNotificationReceipts,
-    #[error("Zone notification block data")]
+    #[error("zone notification block data")]
     ZoneNotificationBlock,
-    #[error("exact Zone state")]
+    #[error("exact zone state")]
     ExactZoneState,
-    #[error("exact Portal collateral")]
+    #[error("exact portal collateral")]
     PortalCollateral,
 }
 
@@ -215,7 +215,7 @@ pub(crate) enum DataSource {
     ProcessWithdrawalsCalldata,
     #[error("submitBatch calldata")]
     SubmitBatchCalldata,
-    #[error("Portal transaction calldata")]
+    #[error("portal transaction calldata")]
     PortalTransactionCalldata,
 }
 
@@ -248,16 +248,16 @@ pub(crate) enum PortalCallFamily {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PortalCallError {
     #[error(
-        "unsupported nested or ambiguous Portal call in transaction {transaction_hash}: target {target:?}"
+        "unsupported nested or ambiguous portal call in transaction {transaction_hash}: target {target:?}"
     )]
     UnsupportedNestedPortalCall {
         transaction_hash: B256,
         target: Option<Address>,
     },
-    #[error("conflicting Portal call families implied by transaction {transaction_hash}")]
+    #[error("conflicting portal call families in transaction {transaction_hash}")]
     ConflictingFamilies { transaction_hash: B256 },
     #[error(
-        "Portal calldata/event mismatch in transaction {transaction_hash}: expected {expected}, got {actual}"
+        "portal calldata/event mismatch in transaction {transaction_hash}: expected {expected}, got {actual}"
     )]
     FamilyMismatch {
         transaction_hash: B256,

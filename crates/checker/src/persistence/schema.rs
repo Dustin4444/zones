@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum MetaKey {
     Version,
-    State,
+    Metadata,
 }
 impl Encode for MetaKey {
     type Encoded = [u8; 1];
     fn encode(self) -> Self::Encoded {
         [match self {
             Self::Version => 0,
-            Self::State => 1,
+            Self::Metadata => 1,
         }]
     }
 }
@@ -23,7 +23,7 @@ impl Decode for MetaKey {
     fn decode(v: &[u8]) -> Result<Self, DatabaseError> {
         match v {
             [0] => Ok(Self::Version),
-            [1] => Ok(Self::State),
+            [1] => Ok(Self::Metadata),
             _ => Err(DatabaseError::Decode),
         }
     }
