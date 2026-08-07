@@ -315,8 +315,8 @@ impl<P: alloy_provider::Provider<N>, N: alloy_network::Network>
 {
     /// Returns all token addresses currently enabled for bridging on this [`ZonePortal`].
     ///
-    /// Calls [`enabledTokenCount`](ZonePortal::enabledTokenCountCall) followed by
-    /// [`enabledTokenAt`](ZonePortal::enabledTokenAtCall) for each index concurrently.
+    /// Equivalent to [`enabled_tokens_at`](Self::enabled_tokens_at) pinned to the `latest`
+    /// block tag.
     pub async fn enabled_tokens(
         &self,
     ) -> Result<alloc::vec::Vec<alloy_primitives::Address>, alloy_contract::Error> {
@@ -329,20 +329,45 @@ impl<P: alloy_provider::Provider<N>, N: alloy_network::Network>
     /// Callers that pair the returned token list with other historical L1 reads
     /// should use this instead of [`enabled_tokens`](Self::enabled_tokens), so
     /// future `TokenEnabled` events are not mixed into older state snapshots.
+    ///
+    /// Issues two RPC requests regardless of registry size: an
+    /// [`enabledTokenCount`](ZonePortal::enabledTokenCountCall) read, then one Multicall3
+    /// `aggregate` batching an [`enabledTokenAt`](ZonePortal::enabledTokenAtCall) call per
+    /// index. The batch executes as a single EVM call, so all index reads observe the same
+    /// state snapshot; only the count read can race the batch when `block_id` is a moving tag
+    /// like `latest`. If any index read reverts, the whole call errors.
+    ///
+    /// Requires Multicall3 at the canonical
+    /// [`MULTICALL3_ADDRESS`](alloy_provider::MULTICALL3_ADDRESS) on the portal's chain; all
+    /// Tempo networks predeploy it at genesis.
     pub async fn enabled_tokens_at(
         &self,
         block_id: alloy_rpc_types_eth::BlockId,
     ) -> Result<alloc::vec::Vec<alloy_primitives::Address>, alloy_contract::Error> {
-        let count = self.enabledTokenCount().block(block_id).call().await?;
-        let futs: alloc::vec::Vec<_> = (0..count.to::<u64>())
-            .map(|i| async move {
-                self.enabledTokenAt(alloy_primitives::U256::from(i))
-                    .block(block_id)
-                    .call()
-                    .await
-            })
-            .collect();
-        futures::future::try_join_all(futs).await
+        let count = self
+            .enabledTokenCount()
+            .block(block_id)
+            .call()
+            .await?
+            .to::<u64>();
+        if count == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+        let mut multicall = self
+            .provider()
+            .multicall()
+            .dynamic::<ZonePortal::enabledTokenAtCall>()
+            .block(block_id);
+        for i in 0..count {
+            multicall = multicall.add_dynamic(self.enabledTokenAt(alloy_primitives::U256::from(i)));
+        }
+        multicall.aggregate().await.map_err(|err| match err {
+            alloy_provider::MulticallError::TransportError(err) => err.into(),
+            alloy_provider::MulticallError::DecodeError(err) => err.into(),
+            err => {
+                alloy_provider::transport::TransportErrorKind::custom_str(&err.to_string()).into()
+            }
+        })
     }
 
     /// Returns all sequencer addresses currently registered on this [`ZonePortal`].
@@ -427,7 +452,7 @@ impl<P: alloy_provider::Provider<N>, N: alloy_network::Network>
 mod tests {
     use super::*;
     use alloy_primitives::U256;
-    use alloy_provider::ProviderBuilder;
+    use alloy_provider::{ProviderBuilder, bindings::IMulticall3};
     use alloy_sol_types::SolCall;
     use alloy_transport::mock::Asserter;
 
@@ -453,6 +478,33 @@ mod tests {
         assert_eq!(key.x, expected.x);
         assert_eq!(key.yParity, expected.yParity);
         assert_eq!(key_index, expected.keyIndex);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabled_tokens_at_batches_index_reads_through_multicall() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let tokens = [Address::repeat_byte(0xaa), Address::repeat_byte(0xbb)];
+
+        asserter.push_success(&Bytes::from(U256::from(tokens.len()).abi_encode()));
+        asserter.push_success(&Bytes::from(
+            IMulticall3::aggregateCall::abi_encode_returns(&IMulticall3::aggregateReturn {
+                blockNumber: U256::ZERO,
+                returnData: tokens
+                    .iter()
+                    .map(|token| token.abi_encode().into())
+                    .collect(),
+            }),
+        ));
+
+        let portal = ZonePortal::new(Address::ZERO, &provider);
+        let enabled = portal
+            .enabled_tokens_at(alloy_rpc_types_eth::BlockId::latest())
+            .await
+            .unwrap();
+
+        assert_eq!(enabled, tokens);
         assert!(asserter.read_q().is_empty());
     }
 }
