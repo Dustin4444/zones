@@ -665,7 +665,7 @@ For withdrawals with `gasLimit > 0`, enforced gateway mode requires `to` to have
 
 Receiving contracts must implement `IWithdrawalReceiver` and return `onWithdrawalReceived.selector` to confirm successful handling. Receivers authenticate the call by checking `msg.sender == ZONE_MESSENGER_ADDRESS` and can use the `sourcePortal` callback argument to identify the originating portal.
 
-The reference `SwapAndDepositRouter` is a shared depositor: every target portal records the router, rather than the source-zone account, as the downstream deposit sender. Because the client chooses the [sender witness](#authenticated-withdrawals) before constructing the withdrawal and already knows the router, source portal, and sender, it can derive the callback-bound nonce in advance:
+The reference `SwapAndDepositRouter` is a shared depositor: target portals record the router, rather than the source-zone account, as the downstream deposit sender. Because the client chooses the [sender witness](#authenticated-withdrawals) before constructing the withdrawal, it can derive the routed nonce in advance:
 
 ```
 senderTag = keccak256(abi.encode(SENDER_TAG_DOMAIN, sourcePortal, sender, senderWitness))
@@ -673,11 +673,9 @@ routerWithdrawalId = keccak256(abi.encode(router, sourcePortal, senderTag))
 routedDepositNonce = bytes12(routerWithdrawalId)
 ```
 
-The messenger authenticates `sourcePortal`, while `senderTag` is committed by the source withdrawal and bound to the actual Zone caller through its domain-separated hash. The router address scopes the resulting identity to one callback application. The router consumes the full 32-byte `routerWithdrawalId` as its replay nullifier, and any synchronous callback failure rolls back this write.
+The router recomputes this identity from the authenticated `sourcePortal` and `senderTag`, consumes its full 32 bytes as a replay nullifier, and overwrites the submitted payload nonce with `routedDepositNonce`. A payload copied to another withdrawal, source portal, or router is therefore checked under a different nonce and fails GCM authentication. A direct portal call likewise fails because encrypted deposits bind the portal caller into HKDF. A reverted callback also rolls back the nullifier write.
 
-The client encrypts the routed payload using `routedDepositNonce`. The router independently recomputes that nonce from the actual callback arguments and overwrites the submitted nonce before depositing. A ciphertext copied to another sender tag, source portal, or router is therefore checked under a different nonce and fails GCM authentication on the target Zone; a direct portal call also fails because encrypted deposits independently bind the target-portal caller into HKDF.
-
-AES-GCM requires nonce uniqueness for each AES key, not nonce randomness. Direct deposits use fresh random 96-bit nonces; routed deposits use the deterministic 96-bit hash prefix above. Distinct withdrawal identities are not mathematically guaranteed to have distinct 96-bit prefixes, but the prefixes behave as random values. Each ECIES payload normally also uses a fresh ephemeral key and therefore a fresh AES key, making prefix collisions across different keys harmless. If an ephemeral key is accidentally reused, the collision risk is the same as for random 96-bit nonces (approximately `q(q-1) / 2^97` among `q` uses, or `2^96` work to target a particular nonce).
+AES-GCM nonces must be unique per key, but need not be random. Direct deposits use random 96-bit nonces; routed deposits use the deterministic hash prefix above. Routed payloads normally use fresh ephemeral keys and therefore fresh AES keys; if an ephemeral key is reused, the derived nonce has the same collision security as a random 96-bit nonce.
 
 A callback target is untrusted, so the messenger reads at most the single word a `bytes4` return occupies and discards a failing callback's revert data instead of propagating it. Copying an oversized response or revert blob would charge quadratic memory-expansion gas to the messenger and to the portal's delivery frame, letting one withdrawal consume far more than the `gasLimit` it declared and priced under `WITHDRAWAL_BASE_GAS`, and thereby starve the remaining items in a `processWithdrawals` batch. Bounding the copy keeps realized delivery cost within `gasLimit` plus fixed overhead, which is what the block-gas-limit headroom above and the sequencer's batch planner both assume.
 
