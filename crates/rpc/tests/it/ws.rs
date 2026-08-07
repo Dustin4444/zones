@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy_primitives::{Address, b256};
 use alloy_signer::SignerSync;
@@ -40,6 +47,7 @@ struct MockZoneRpcApi {
     key_lookup_error: Option<&'static str>,
     ws_subscriptions_enabled: bool,
     blocking_rpc_started: Option<Arc<Notify>>,
+    block_number_calls: AtomicUsize,
 }
 
 impl MockZoneRpcApi {
@@ -60,6 +68,7 @@ impl MockZoneRpcApi {
             key_lookup_error: None,
             ws_subscriptions_enabled: false,
             blocking_rpc_started: None,
+            block_number_calls: AtomicUsize::new(0),
         }
     }
 
@@ -80,6 +89,7 @@ impl MockZoneRpcApi {
             key_lookup_error: Some(message),
             ws_subscriptions_enabled: false,
             blocking_rpc_started: None,
+            block_number_calls: AtomicUsize::new(0),
         }
     }
 
@@ -89,6 +99,7 @@ impl MockZoneRpcApi {
             key_lookup_error: None,
             ws_subscriptions_enabled: true,
             blocking_rpc_started: None,
+            block_number_calls: AtomicUsize::new(0),
         }
     }
 
@@ -128,6 +139,7 @@ impl ZoneRpcApi for MockZoneRpcApi {
     }
 
     fn block_number(&self) -> BoxFut<'_> {
+        self.block_number_calls.fetch_add(1, Ordering::Relaxed);
         Box::pin(async { zone_rpc::types::to_raw(&"0x42") })
     }
 
@@ -316,6 +328,20 @@ impl TestContext {
     fn ws_url(&self) -> String {
         format!("ws://{}", self.addr)
     }
+
+    fn http_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+async fn post_rpc(ctx: &TestContext, body: impl Into<reqwest::Body>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(ctx.http_url())
+        .header("x-authorization-token", ctx.build_token())
+        .body(body)
+        .send()
+        .await
+        .expect("HTTP RPC request failed")
 }
 
 /// Build a JSON-RPC request string.
@@ -488,6 +514,132 @@ async fn ws_batch_request() {
 }
 
 #[tokio::test]
+async fn http_rejects_invalid_or_missing_jsonrpc_versions() {
+    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let requests = [
+        json!({"jsonrpc":"1.0","method":"eth_blockNumber","params":[],"id":1}),
+        json!({"jsonrpc":2.0,"method":"eth_blockNumber","params":[],"id":1}),
+        json!({"method":"eth_blockNumber","params":[],"id":1}),
+    ];
+
+    for request in requests {
+        let response = post_rpc(&ctx, request.to_string()).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], -32600);
+        assert_eq!(body["id"], Value::Null);
+    }
+}
+
+#[tokio::test]
+async fn http_omits_notification_responses() {
+    let api = Arc::new(MockZoneRpcApi::default());
+    let ctx = TestContext::start_shared(api.clone()).await;
+
+    let notification = json!({
+        "jsonrpc":"2.0",
+        "method":"eth_blockNumber",
+        "params":[]
+    });
+    let response = post_rpc(&ctx, notification.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(response.bytes().await.unwrap().is_empty());
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 1);
+
+    let null_id_request = json!({
+        "jsonrpc":"2.0",
+        "method":"eth_blockNumber",
+        "params":[],
+        "id":null
+    });
+    let response = post_rpc(&ctx, null_id_request.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["id"], Value::Null);
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 2);
+
+    let mixed_batch = json!([
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]},
+        {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":2}
+    ]);
+    let response = post_rpc(&ctx, mixed_batch.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let responses = body.as_array().unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["id"], 2);
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 3);
+
+    let all_notifications = json!([
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]},
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]}
+    ]);
+    let response = post_rpc(&ctx, all_notifications.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(response.bytes().await.unwrap().is_empty());
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 5);
+}
+
+#[tokio::test]
+async fn ws_omits_notification_responses() {
+    let api = Arc::new(MockZoneRpcApi::default());
+    let ctx = TestContext::start_shared(api.clone()).await;
+    let mut ws = connect_with_header(&ctx).await;
+
+    let notification = json!({
+        "jsonrpc":"2.0",
+        "method":"eth_blockNumber",
+        "params":[]
+    });
+    ws.send(tungstenite::Message::Text(notification.to_string().into()))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), ws.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 1);
+
+    let mixed_batch = json!([
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]},
+        {"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":2}
+    ]);
+    ws.send(tungstenite::Message::Text(mixed_batch.to_string().into()))
+        .await
+        .unwrap();
+    let response = parse_response(ws.next().await.unwrap().unwrap());
+    let responses = response.as_array().unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["id"], 2);
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 2);
+
+    let all_notifications = json!([
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]},
+        {"jsonrpc":"2.0","method":"eth_blockNumber","params":[]}
+    ]);
+    ws.send(tungstenite::Message::Text(
+        all_notifications.to_string().into(),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), ws.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 4);
+
+    ws.send(tungstenite::Message::Text(
+        jsonrpc("eth_blockNumber", 9).into(),
+    ))
+    .await
+    .unwrap();
+    let response = parse_response(ws.next().await.unwrap().unwrap());
+    assert_eq!(response["id"], 9);
+    assert_eq!(api.block_number_calls.load(Ordering::Relaxed), 5);
+}
+
+#[tokio::test]
 async fn ws_invalid_json() {
     let ctx = TestContext::start(MockZoneRpcApi::default()).await;
     let mut ws = connect_with_header(&ctx).await;
@@ -655,7 +807,11 @@ async fn ws_subscribe_rejects_invalid_param_shapes() {
     let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
-    for (id, params) in [(1, json!(["newHeads", false])), (2, json!(["logs", false]))] {
+    for (id, params) in [
+        (1, json!(["newHeads", false])),
+        (2, json!(["logs", false])),
+        (3, json!(["newHeads", null, true])),
+    ] {
         ws.send(tungstenite::Message::Text(
             jsonrpc_with_params("eth_subscribe", params, id).into(),
         ))

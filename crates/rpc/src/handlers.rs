@@ -3,7 +3,7 @@
 //! Each handler calls the underlying EthApi via the [`ZoneRpcApi`] trait,
 //! which performs typed privacy redactions internally before serialization.
 
-use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U64, keccak256};
 use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, Filter, FilterId, state::StateOverride};
 use serde_json::{Value, value::RawValue};
 use tempo_alloy::rpc::TempoTransactionRequest;
@@ -224,7 +224,112 @@ impl<'de> serde::Deserialize<'de> for CallParams {
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
                 let block = seq.next_element::<Option<BlockId>>()?.flatten();
                 let state_override = seq.next_element::<Option<StateOverride>>()?.flatten();
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(4, &self));
+                }
                 Ok(CallParams(request, block, state_override))
+            }
+        }
+        deserializer.deserialize_seq(Vis)
+    }
+}
+
+/// Params for `eth_feeHistory`: `[blockCount, newestBlock, rewardPercentiles?]`.
+struct FeeHistoryParams(U64, BlockNumberOrTag, Option<Vec<f64>>);
+
+struct QuantityU64(U64);
+
+impl<'de> serde::Deserialize<'de> for QuantityU64 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl serde::de::Visitor<'_> for Vis {
+            type Value = QuantityU64;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a canonical 0x-prefixed Ethereum quantity")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let Some(digits) = value.strip_prefix("0x") else {
+                    return Err(E::invalid_value(serde::de::Unexpected::Str(value), &self));
+                };
+                if digits.is_empty()
+                    || (digits.len() > 1 && digits.starts_with('0'))
+                    || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(E::invalid_value(serde::de::Unexpected::Str(value), &self));
+                }
+
+                value
+                    .parse::<U64>()
+                    .map(QuantityU64)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+        }
+        deserializer.deserialize_str(Vis)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FeeHistoryParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl<'de> serde::de::Visitor<'de> for Vis {
+            type Value = FeeHistoryParams;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("[blockCount, newestBlock, rewardPercentiles?]")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let block_count = seq
+                    .next_element::<QuantityU64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let newest_block = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let reward_percentiles = seq.next_element::<Option<Vec<f64>>>()?.flatten();
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(4, &self));
+                }
+                Ok(FeeHistoryParams(
+                    block_count.0,
+                    newest_block,
+                    reward_percentiles,
+                ))
+            }
+        }
+        deserializer.deserialize_seq(Vis)
+    }
+}
+
+/// Params for account state queries: `[address, block?]`.
+struct AccountBlockParams(Address, Option<BlockId>);
+
+impl<'de> serde::Deserialize<'de> for AccountBlockParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl<'de> serde::de::Visitor<'de> for Vis {
+            type Value = AccountBlockParams;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("[address, block?]")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let address = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let block = seq.next_element::<Option<BlockId>>()?.flatten();
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(3, &self));
+                }
+                Ok(AccountBlockParams(address, block))
             }
         }
         deserializer.deserialize_seq(Vis)
@@ -276,26 +381,37 @@ pub async fn dispatch(
     // Raw params JSON — handlers deserialize directly, no intermediate Vec<Value>.
     let raw = req.params.as_deref().map(|p| p.get()).unwrap_or("[]");
 
+    macro_rules! no_params {
+        ($response:expr) => {
+            match parse_params::<[Value; 0]>(raw, &id, "expected no parameters") {
+                Ok(_) => $response,
+                Err(response) => response,
+            }
+        };
+    }
+
     match req.method.as_str() {
         // Simple passthrough methods (no params, no auth scoping)
-        "eth_blockNumber" => api_result(id, "eth_blockNumber", api.block_number().await),
-        "eth_chainId" => api_result(id, "eth_chainId", api.chain_id().await),
-        "eth_gasPrice" => api_result(id, "eth_gasPrice", api.gas_price().await),
-        "eth_maxPriorityFeePerGas" => api_result(
+        "eth_blockNumber" => {
+            no_params!(api_result(id, "eth_blockNumber", api.block_number().await))
+        }
+        "eth_chainId" => no_params!(api_result(id, "eth_chainId", api.chain_id().await)),
+        "eth_gasPrice" => no_params!(api_result(id, "eth_gasPrice", api.gas_price().await)),
+        "eth_maxPriorityFeePerGas" => no_params!(api_result(
             id,
             "eth_maxPriorityFeePerGas",
             api.max_priority_fee_per_gas().await,
-        ),
-        "net_version" => api_result(id, "net_version", api.net_version().await),
-        "net_listening" => api_result(id, "net_listening", crate::types::to_raw(&true)),
-        "eth_syncing" => api_result(id, "eth_syncing", api.syncing().await),
-        "eth_coinbase" => api_result(id, "eth_coinbase", api.coinbase().await),
+        )),
+        "net_version" => no_params!(api_result(id, "net_version", api.net_version().await)),
+        "net_listening" => no_params!(api_result(id, "net_listening", crate::types::to_raw(&true))),
+        "eth_syncing" => no_params!(api_result(id, "eth_syncing", api.syncing().await)),
+        "eth_coinbase" => no_params!(api_result(id, "eth_coinbase", api.coinbase().await)),
         "web3_sha3" => handle_web3_sha3(id, raw).await,
-        "web3_clientVersion" => api_result(
+        "web3_clientVersion" => no_params!(api_result(
             id,
             "web3_clientVersion",
             crate::types::to_raw(&"tempo-zone/v0.1.0"),
-        ),
+        )),
 
         // Fee history
         "eth_feeHistory" => handle_fee_history(id, raw, api).await,
@@ -326,23 +442,23 @@ pub async fn dispatch(
         "eth_newFilter" => handle_new_filter(id, raw, auth, api).await,
         "eth_getFilterLogs" => handle_get_filter_logs(id, raw, auth, api).await,
         "eth_getFilterChanges" => handle_get_filter_changes(id, raw, auth, api).await,
-        "eth_newBlockFilter" => handle_new_block_filter(id, auth, api).await,
+        "eth_newBlockFilter" => no_params!(handle_new_block_filter(id, auth, api).await),
         "eth_uninstallFilter" => handle_uninstall_filter(id, raw, auth, api).await,
-        "zone_getAuthorizationTokenInfo" => api_result(
+        "zone_getAuthorizationTokenInfo" => no_params!(api_result(
             id,
             "zone_getAuthorizationTokenInfo",
             api.zone_get_authorization_token_info(auth.clone()).await,
-        ),
-        "zone_getZoneInfo" => api_result(
+        )),
+        "zone_getZoneInfo" => no_params!(api_result(
             id,
             "zone_getZoneInfo",
             api.zone_get_zone_info(auth.clone()).await,
-        ),
-        "zone_getEncryptionKey" => api_result(
+        )),
+        "zone_getEncryptionKey" => no_params!(api_result(
             id,
             "zone_getEncryptionKey",
             api.zone_get_encryption_key(auth.clone()).await,
-        ),
+        )),
         _ => {
             // Method is whitelisted but not yet implemented via direct API
             JsonRpcResponse::error(
@@ -570,8 +686,8 @@ async fn handle_send_raw_transaction_sync(
 
 /// Handle `eth_feeHistory`. Public method, no auth scoping needed.
 async fn handle_fee_history(id: Value, raw: &str, api: &dyn ZoneRpcApi) -> JsonRpcResponse {
-    let (block_count, newest_block, reward_percentiles) =
-        match parse_params::<(u64, BlockNumberOrTag, Option<Vec<f64>>)>(
+    let FeeHistoryParams(block_count, newest_block, reward_percentiles) =
+        match parse_params::<FeeHistoryParams>(
             raw,
             &id,
             "expected [blockCount, newestBlock, rewardPercentiles?]",
@@ -583,7 +699,7 @@ async fn handle_fee_history(id: Value, raw: &str, api: &dyn ZoneRpcApi) -> JsonR
     api_result(
         id,
         "eth_feeHistory",
-        api.fee_history(block_count, newest_block, reward_percentiles)
+        api.fee_history(block_count.to::<u64>(), newest_block, reward_percentiles)
             .await,
     )
 }
@@ -596,8 +712,8 @@ async fn handle_get_balance(
     auth: &AuthContext,
     api: &dyn ZoneRpcApi,
 ) -> JsonRpcResponse {
-    let (address, block) =
-        match parse_params::<(Address, Option<BlockId>)>(raw, &id, "expected [address, block?]") {
+    let AccountBlockParams(address, block) =
+        match parse_params::<AccountBlockParams>(raw, &id, "expected [address, block?]") {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -617,8 +733,8 @@ async fn handle_get_transaction_count(
     auth: &AuthContext,
     api: &dyn ZoneRpcApi,
 ) -> JsonRpcResponse {
-    let (address, block) =
-        match parse_params::<(Address, Option<BlockId>)>(raw, &id, "expected [address, block?]") {
+    let AccountBlockParams(address, block) =
+        match parse_params::<AccountBlockParams>(raw, &id, "expected [address, block?]") {
             Ok(v) => v,
             Err(resp) => return resp,
         };
@@ -753,7 +869,9 @@ mod tests {
     use crate::types::to_raw;
 
     #[derive(Default)]
-    struct MockZoneRpcApi;
+    struct MockZoneRpcApi {
+        fee_history_block_counts: parking_lot::Mutex<Vec<u64>>,
+    }
 
     macro_rules! stub {
         ($method:ident $(, $arg:ident : $ty:ty)*) => {
@@ -773,9 +891,33 @@ mod tests {
         stub!(net_version);
         stub!(gas_price);
         stub!(max_priority_fee_per_gas);
-        stub!(fee_history, _block_count: u64, _newest_block: BlockNumberOrTag, _reward_percentiles: Option<Vec<f64>>);
-        stub!(get_balance, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
-        stub!(get_transaction_count, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
+        fn fee_history(
+            &self,
+            block_count: u64,
+            _newest_block: BlockNumberOrTag,
+            _reward_percentiles: Option<Vec<f64>>,
+        ) -> BoxFut<'_> {
+            self.fee_history_block_counts.lock().push(block_count);
+            Box::pin(async move { to_raw(&json!({"oldestBlock": "0x0"})) })
+        }
+
+        fn get_balance(
+            &self,
+            _address: Address,
+            _block: Option<BlockId>,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move { to_raw(&"0x1") })
+        }
+
+        fn get_transaction_count(
+            &self,
+            _address: Address,
+            _block: Option<BlockId>,
+            _auth: AuthContext,
+        ) -> BoxFut<'_> {
+            Box::pin(async move { to_raw(&"0x2") })
+        }
         stub!(block_by_number, _number: BlockNumberOrTag, _full: bool, _auth: AuthContext);
         stub!(block_by_hash, _hash: B256, _full: bool, _auth: AuthContext);
         stub!(transaction_by_hash, _hash: B256, _auth: AuthContext);
@@ -903,6 +1045,107 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(sha3.result.as_ref().unwrap().get()).unwrap(),
             "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
+    }
+
+    #[tokio::test]
+    async fn fee_history_decodes_quantity_and_optional_reward_percentiles() {
+        let cases = [
+            (json!(["0x10", "latest"]), Some(16)),
+            (json!(["0x0", "latest", null]), Some(0)),
+            (json!(["0x2", "latest", [25.0, 75.0]]), Some(2)),
+            (json!(["0x", "latest"]), None),
+            (json!(["0x00", "latest"]), None),
+            (json!([16, "latest"]), None),
+            (json!(["16", "latest"]), None),
+            (json!(["not-a-quantity", "latest"]), None),
+            (json!(["0x10000000000000000", "latest"]), None),
+            (json!(["0x10", "latest", [], true]), None),
+        ];
+
+        for (params, expected_block_count) in cases {
+            let api = MockZoneRpcApi::default();
+            let params_label = params.to_string();
+            let response = dispatch(&request("eth_feeHistory", params), &auth(), &api).await;
+
+            match expected_block_count {
+                Some(expected) => {
+                    assert!(response.error.is_none());
+                    assert_eq!(api.fee_history_block_counts.lock().as_slice(), &[expected]);
+                }
+                None => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| panic!("accepted invalid params: {params_label}"));
+                    assert_eq!(error.code, -32602, "{params_label}");
+                    assert!(api.fee_history_block_counts.lock().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn account_block_parameters_are_optional_but_bounded() {
+        let address = format!("{:#x}", Address::repeat_byte(0x11));
+        let cases = [
+            (json!([address]), true),
+            (json!([address, null]), true),
+            (json!([address, "latest"]), true),
+            (json!([address, "latest", true]), false),
+        ];
+
+        for method in ["eth_getBalance", "eth_getTransactionCount"] {
+            for (params, is_valid) in &cases {
+                let api = MockZoneRpcApi::default();
+                let response = dispatch(&request(method, params.clone()), &auth(), &api).await;
+                if *is_valid {
+                    assert!(response.error.is_none(), "{method} rejected {params}");
+                } else {
+                    assert_eq!(response.error.unwrap().code, -32602);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_param_methods_reject_non_empty_params() {
+        let api = MockZoneRpcApi::default();
+        for method in [
+            "eth_blockNumber",
+            "eth_chainId",
+            "eth_gasPrice",
+            "eth_maxPriorityFeePerGas",
+            "net_version",
+            "net_listening",
+            "eth_syncing",
+            "eth_coinbase",
+            "web3_clientVersion",
+            "eth_newBlockFilter",
+            "zone_getAuthorizationTokenInfo",
+            "zone_getZoneInfo",
+            "zone_getEncryptionKey",
+        ] {
+            let response = dispatch(&request(method, json!(["unexpected"])), &auth(), &api).await;
+            assert_eq!(response.error.unwrap().code, -32602, "{method}");
+        }
+
+        let without_params: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "net_listening",
+            "id": 1
+        }))
+        .unwrap();
+        assert!(
+            dispatch(&without_params, &auth(), &api)
+                .await
+                .error
+                .is_none()
+        );
+        assert!(
+            dispatch(&request("net_listening", json!([])), &auth(), &api)
+                .await
+                .error
+                .is_none()
         );
     }
 

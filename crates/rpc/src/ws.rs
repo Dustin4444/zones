@@ -36,7 +36,8 @@ use tracing::warn;
 use crate::{
     auth::{self, AuthContext, AuthError},
     server::{
-        MAX_BATCH_SIZE, RpcState, authenticate_token, dispatch_request, validate_keychain_key_info,
+        ParsedRpcRequest, ParsedRpcText, RpcState, authenticate_token, dispatch_request,
+        parse_rpc_text, validate_keychain_key_info,
     },
     subscription::WsSubscriptionStream,
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, to_raw},
@@ -120,11 +121,35 @@ impl WsSession {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SubscribeParams(
-    SubscriptionKind,
-    #[serde(default)] Option<SubscriptionParams>,
-);
+struct SubscribeParams(SubscriptionKind, Option<SubscriptionParams>);
+
+impl<'de> serde::Deserialize<'de> for SubscribeParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Vis;
+        impl<'de> serde::de::Visitor<'de> for Vis {
+            type Value = SubscribeParams;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("[subscription, params?]")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let kind = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let params = seq.next_element::<Option<SubscriptionParams>>()?.flatten();
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(3, &self));
+                }
+                Ok(SubscribeParams(kind, params))
+            }
+        }
+        deserializer.deserialize_seq(Vis)
+    }
+}
 
 fn success_response<T: serde::Serialize>(id: Value, result: &T) -> JsonRpcResponse {
     match to_raw(result) {
@@ -369,71 +394,46 @@ async fn process_ws_text(
     auth: &AuthContext,
     state: &Arc<RpcState>,
     session: &mut WsSession,
-) -> (String, Vec<PendingSubscription>) {
-    let trimmed = text.trim_start();
-
-    if trimmed.starts_with('[') {
-        match serde_json::from_str::<Vec<JsonRpcRequest>>(trimmed) {
-            Ok(requests) if requests.is_empty() => (
-                serde_json::to_string(&JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError::parse_error("empty batch"),
-                ))
-                .expect("JsonRpcResponse serialization is infallible"),
-                Vec::new(),
+) -> (Option<String>, Vec<PendingSubscription>) {
+    match parse_rpc_text(text) {
+        ParsedRpcText::Error(response)
+        | ParsedRpcText::Single(ParsedRpcRequest::Invalid(response)) => (
+            Some(
+                serde_json::to_string(&response)
+                    .expect("JsonRpcResponse serialization is infallible"),
             ),
-            Ok(requests) if requests.len() > MAX_BATCH_SIZE => (
-                serde_json::to_string(&JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError::invalid_params(format!(
-                        "batch too large ({} > {MAX_BATCH_SIZE})",
-                        requests.len()
-                    )),
-                ))
-                .expect("JsonRpcResponse serialization is infallible"),
-                Vec::new(),
-            ),
-            Ok(requests) => {
-                let mut responses = Vec::with_capacity(requests.len());
-                let mut pending_subscriptions = Vec::new();
-                for req in &requests {
-                    let result = dispatch_ws_request(req, auth, state, session).await;
-                    responses.push(result.response);
-                    pending_subscriptions.extend(result.pending_subscriptions);
-                }
-                (
-                    serde_json::to_string(&responses)
-                        .expect("JsonRpcResponse serialization is infallible"),
-                    pending_subscriptions,
-                )
-            }
-            Err(err) => (
-                serde_json::to_string(&JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError::parse_error(format!("parse error: {err}")),
-                ))
-                .expect("JsonRpcResponse serialization is infallible"),
-                Vec::new(),
-            ),
+            Vec::new(),
+        ),
+        ParsedRpcText::Single(ParsedRpcRequest::Request(request)) => {
+            let is_notification = request.is_notification();
+            let result = dispatch_ws_request(&request, auth, state, session).await;
+            let response = (!is_notification).then(|| {
+                serde_json::to_string(&result.response)
+                    .expect("JsonRpcResponse serialization is infallible")
+            });
+            (response, result.pending_subscriptions)
         }
-    } else {
-        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(request) => {
-                let result = dispatch_ws_request(&request, auth, state, session).await;
-                (
-                    serde_json::to_string(&result.response)
-                        .expect("JsonRpcResponse serialization is infallible"),
-                    result.pending_subscriptions,
-                )
+        ParsedRpcText::Batch(requests) => {
+            let mut responses = Vec::with_capacity(requests.len());
+            let mut pending_subscriptions = Vec::new();
+            for request in requests {
+                match request {
+                    ParsedRpcRequest::Invalid(response) => responses.push(response),
+                    ParsedRpcRequest::Request(request) => {
+                        let is_notification = request.is_notification();
+                        let result = dispatch_ws_request(&request, auth, state, session).await;
+                        if !is_notification {
+                            responses.push(result.response);
+                        }
+                        pending_subscriptions.extend(result.pending_subscriptions);
+                    }
+                }
             }
-            Err(err) => (
-                serde_json::to_string(&JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcError::parse_error(format!("parse error: {err}")),
-                ))
-                .expect("JsonRpcResponse serialization is infallible"),
-                Vec::new(),
-            ),
+            let response = (!responses.is_empty()).then(|| {
+                serde_json::to_string(&responses)
+                    .expect("JsonRpcResponse serialization is infallible")
+            });
+            (response, pending_subscriptions)
         }
     }
 }
@@ -589,7 +589,9 @@ async fn handle_ws_session(
             let (response_json, pending_subscriptions) =
                 process_ws_text(&text, &auth, &state, &mut session).await;
 
-            if !try_queue_notification(&notifications, &close_session, response_json) {
+            if let Some(response_json) = response_json
+                && !try_queue_notification(&notifications, &close_session, response_json)
+            {
                 break;
             }
 

@@ -39,7 +39,7 @@ pub struct TempoStorageRead {
 }
 
 /// A JSON-RPC 2.0 request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct JsonRpcRequest {
     /// The JSON-RPC version (must be "2.0").
     pub jsonrpc: String,
@@ -49,6 +49,60 @@ pub struct JsonRpcRequest {
     pub params: Option<Box<serde_json::value::RawValue>>,
     /// The request ID.
     pub id: Value,
+    /// Whether the request omitted its ID and is therefore a notification.
+    is_notification: bool,
+}
+
+#[derive(Default)]
+enum RequestId {
+    #[default]
+    Missing,
+    Present(Value),
+}
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireRequest {
+            jsonrpc: String,
+            method: String,
+            params: Option<Box<RawValue>>,
+            #[serde(default)]
+            id: RequestId,
+        }
+
+        let WireRequest {
+            jsonrpc,
+            method,
+            params,
+            id,
+        } = WireRequest::deserialize(deserializer)?;
+        let (id, is_notification) = match id {
+            RequestId::Missing => (Value::Null, true),
+            RequestId::Present(id) => (id, false),
+        };
+
+        Ok(Self {
+            jsonrpc,
+            method,
+            params,
+            id,
+            is_notification,
+        })
+    }
+}
+
+impl JsonRpcRequest {
+    /// Returns true when the request omitted the `id` member.
+    pub fn is_notification(&self) -> bool {
+        self.is_notification
+    }
 }
 
 /// A JSON-RPC 2.0 response.
@@ -107,6 +161,15 @@ impl std::fmt::Display for JsonRpcError {
 }
 
 impl JsonRpcError {
+    /// Invalid request (-32600).
+    pub fn invalid_request() -> Self {
+        Self {
+            code: -32600,
+            message: "Invalid Request".to_string(),
+            data: None,
+        }
+    }
+
     /// Method not found (-32601).
     pub fn method_not_found() -> Self {
         Self {

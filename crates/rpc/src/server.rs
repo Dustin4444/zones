@@ -35,6 +35,7 @@ use crate::{
     types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
     ws::handle_ws_upgrade,
 };
+use serde_json::value::RawValue;
 
 /// Maximum number of requests in a single JSON-RPC batch.
 pub(crate) const MAX_BATCH_SIZE: usize = 100;
@@ -86,6 +87,7 @@ pub async fn start_redacted_rpc(
 
 /// Result of processing a JSON-RPC text payload (single or batch).
 pub(crate) enum RpcResult {
+    NoResponse,
     Single(JsonRpcResponse),
     Batch(Vec<JsonRpcResponse>),
 }
@@ -93,8 +95,85 @@ pub(crate) enum RpcResult {
 impl IntoResponse for RpcResult {
     fn into_response(self) -> axum::response::Response {
         match self {
+            Self::NoResponse => StatusCode::NO_CONTENT.into_response(),
             Self::Single(resp) => axum::Json(resp).into_response(),
             Self::Batch(resps) => axum::Json(resps).into_response(),
+        }
+    }
+}
+
+/// Parsed request entry. Invalid batch members retain their own error response.
+pub(crate) enum ParsedRpcRequest {
+    Request(JsonRpcRequest),
+    Invalid(JsonRpcResponse),
+}
+
+/// Parsed JSON-RPC payload shared by HTTP and WebSocket transports.
+pub(crate) enum ParsedRpcText {
+    Single(ParsedRpcRequest),
+    Batch(Vec<ParsedRpcRequest>),
+    Error(JsonRpcResponse),
+}
+
+fn parse_request(raw: &str) -> ParsedRpcRequest {
+    match serde_json::from_str::<JsonRpcRequest>(raw) {
+        Ok(request) if request.jsonrpc == "2.0" => ParsedRpcRequest::Request(request),
+        Ok(_) | Err(_) => ParsedRpcRequest::Invalid(JsonRpcResponse::error(
+            serde_json::Value::Null,
+            JsonRpcError::invalid_request(),
+        )),
+    }
+}
+
+/// Parse a JSON-RPC text payload and validate its request shape and version.
+pub(crate) fn parse_rpc_text(text: &str) -> ParsedRpcText {
+    let trimmed = text.trim_start();
+
+    if trimmed.starts_with('[') {
+        match serde_json::from_str::<Vec<Box<RawValue>>>(trimmed) {
+            Ok(requests) if requests.is_empty() => ParsedRpcText::Error(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error("empty batch"),
+            )),
+            Ok(requests) if requests.len() > MAX_BATCH_SIZE => {
+                ParsedRpcText::Error(JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    JsonRpcError::invalid_params(format!(
+                        "batch too large ({} > {MAX_BATCH_SIZE})",
+                        requests.len()
+                    )),
+                ))
+            }
+            Ok(requests) => ParsedRpcText::Batch(
+                requests
+                    .iter()
+                    .map(|request| parse_request(request.get()))
+                    .collect(),
+            ),
+            Err(err) => ParsedRpcText::Error(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error(format!("parse error: {err}")),
+            )),
+        }
+    } else {
+        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(request) if request.jsonrpc == "2.0" => {
+                ParsedRpcText::Single(ParsedRpcRequest::Request(request))
+            }
+            Ok(_) => ParsedRpcText::Single(ParsedRpcRequest::Invalid(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::invalid_request(),
+            ))),
+            Err(request_err) => match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(_) => ParsedRpcText::Single(ParsedRpcRequest::Invalid(JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    JsonRpcError::invalid_request(),
+                ))),
+                Err(_) => ParsedRpcText::Error(JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    JsonRpcError::parse_error(format!("parse error: {request_err}")),
+                )),
+            },
         }
     }
 }
@@ -106,42 +185,37 @@ pub(crate) async fn process_rpc_text(
     auth: &AuthContext,
     api: &dyn ZoneRpcApi,
 ) -> RpcResult {
-    let trimmed = text.trim_start();
-
-    if trimmed.starts_with('[') {
-        match serde_json::from_str::<Vec<JsonRpcRequest>>(trimmed) {
-            Ok(requests) if requests.is_empty() => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error("empty batch"),
-            )),
-            Ok(requests) if requests.len() > MAX_BATCH_SIZE => {
-                RpcResult::Single(JsonRpcResponse::error(
-                    serde_json::Value::Null,
-                    JsonRpcError::invalid_params(format!(
-                        "batch too large ({} > {MAX_BATCH_SIZE})",
-                        requests.len()
-                    )),
-                ))
+    match parse_rpc_text(text) {
+        ParsedRpcText::Error(response) => RpcResult::Single(response),
+        ParsedRpcText::Single(ParsedRpcRequest::Invalid(response)) => RpcResult::Single(response),
+        ParsedRpcText::Single(ParsedRpcRequest::Request(request)) => {
+            let is_notification = request.is_notification();
+            let response = dispatch_request(&request, auth, api).await;
+            if is_notification {
+                RpcResult::NoResponse
+            } else {
+                RpcResult::Single(response)
             }
-            Ok(requests) => {
-                let mut responses = Vec::with_capacity(requests.len());
-                for req in &requests {
-                    responses.push(dispatch_request(req, auth, api).await);
+        }
+        ParsedRpcText::Batch(requests) => {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                match request {
+                    ParsedRpcRequest::Invalid(response) => responses.push(response),
+                    ParsedRpcRequest::Request(request) => {
+                        let is_notification = request.is_notification();
+                        let response = dispatch_request(&request, auth, api).await;
+                        if !is_notification {
+                            responses.push(response);
+                        }
+                    }
                 }
+            }
+            if responses.is_empty() {
+                RpcResult::NoResponse
+            } else {
                 RpcResult::Batch(responses)
             }
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
-        }
-    } else {
-        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(request) => RpcResult::Single(dispatch_request(&request, auth, api).await),
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
         }
     }
 }
