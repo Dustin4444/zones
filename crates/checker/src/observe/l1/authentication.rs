@@ -4,11 +4,14 @@ use std::time::{Duration, Instant};
 
 use alloy_consensus::{BlockHeader as _, Sealable as _};
 use alloy_eips::BlockId;
-use alloy_network::{BlockResponse as _, ReceiptResponse as _, primitives::HeaderResponse as _};
+use alloy_network::{
+    BlockResponse as _, ReceiptResponse as _, TransactionResponse as _,
+    primitives::HeaderResponse as _,
+};
 use alloy_primitives::{B256, Bloom};
 use alloy_provider::Provider;
 use tempo_alloy::{TempoNetwork, rpc::TempoTransactionReceipt};
-use tempo_primitives::TempoHeader;
+use tempo_primitives::{TempoHeader, TempoTxEnvelope};
 
 use super::super::{
     abi::ImportedTempoHeader,
@@ -17,8 +20,11 @@ use super::super::{
 
 pub(super) struct AuthenticatedBlock {
     header: ImportedTempoHeader,
-    pub(super) transaction_hashes: Vec<B256>,
+    pub(super) transactions: Vec<TempoTransactionResponse>,
 }
+
+pub(super) type TempoTransactionResponse =
+    <TempoNetwork as alloy_network::Network>::TransactionResponse;
 
 /// Acquire and authenticate the header for one operator-selected exact hash.
 pub(crate) async fn acquire_l1_header<P>(
@@ -52,7 +58,7 @@ where
 {
     let block = provider
         .get_block_by_hash(block_hash)
-        .hashes()
+        .full()
         .await
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Block, error))?
         .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Block, block_hash))?;
@@ -65,9 +71,25 @@ where
         fetched_header.hash_slow(),
     )?;
 
+    let transactions = block
+        .transactions()
+        .as_transactions()
+        .ok_or_else(|| {
+            AcquisitionError::inconsistent(
+                AcquisitionSource::L1Transaction,
+                "complete transaction envelopes",
+                "transaction hashes only",
+            )
+        })?
+        .to_vec();
+    authenticate_transactions(
+        &ImportedTempoHeader::new(fetched_header.clone()),
+        &transactions,
+    )?;
+
     Ok(AuthenticatedBlock {
         header: ImportedTempoHeader::new(fetched_header.clone()),
-        transaction_hashes: block.transactions().hashes().collect(),
+        transactions,
     })
 }
 
@@ -86,8 +108,57 @@ where
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Receipts, error))?
         .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Receipts, imported.hash()))?;
     let fetch_duration = fetch_started.elapsed();
-    authenticate_receipts(imported, &block.transaction_hashes, &receipts)?;
+    let transaction_hashes = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.tx_hash())
+        .collect::<Vec<_>>();
+    authenticate_receipts(imported, &transaction_hashes, &receipts)?;
     Ok((receipts, fetch_duration))
+}
+
+pub(super) fn authenticate_transactions(
+    imported: &ImportedTempoHeader,
+    transactions: &[TempoTransactionResponse],
+) -> Result<(), ObservationError> {
+    let mut envelopes = Vec::<TempoTxEnvelope>::with_capacity(transactions.len());
+    for (index, transaction) in transactions.iter().enumerate() {
+        let envelope: &TempoTxEnvelope = transaction.as_ref();
+        let computed_hash = alloy_eips::Encodable2718::trie_hash(envelope);
+        ensure_acquisition_equal(
+            AcquisitionSource::L1Transaction,
+            format_args!("transaction {index} locally computed hash"),
+            computed_hash,
+            transaction.tx_hash(),
+        )?;
+        ensure_acquisition_equal(
+            AcquisitionSource::L1Transaction,
+            format_args!("transaction {index} block hash"),
+            Some(imported.hash()),
+            transaction.block_hash(),
+        )?;
+        ensure_acquisition_equal(
+            AcquisitionSource::L1Transaction,
+            format_args!("transaction {index} block number"),
+            Some(imported.number()),
+            transaction.block_number(),
+        )?;
+        ensure_acquisition_equal(
+            AcquisitionSource::L1Transaction,
+            format_args!("transaction {index} index"),
+            Some(index as u64),
+            transaction.transaction_index(),
+        )?;
+        envelopes.push(envelope.clone());
+    }
+
+    let computed_root = alloy_consensus::proofs::calculate_transaction_root(&envelopes);
+    ensure_acquisition_equal(
+        AcquisitionSource::L1Transaction,
+        "transactions root",
+        imported.header().transactions_root(),
+        computed_root,
+    )
 }
 
 fn authenticate_header_hash(

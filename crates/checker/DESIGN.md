@@ -44,8 +44,8 @@ canonical Zone block + receipts + exact post-state
                          ▼
               authenticated observation adapter
                          │
-        imported Tempo header + receipt-root-checked logs
-        + selectively fetched direct Portal transaction inputs
+        imported Tempo header + transaction-root-authenticated envelopes
+        + receipt-root-checked logs and direct Portal inputs
                          │
                          ▼
             checker-owned pure logical transition
@@ -655,21 +655,17 @@ For the header supplied by `advanceTempo`:
 
 1. compute its hash from its RLP bytes;
 2. fetch that exact header/block by hash and require exact identity and number;
-3. fetch the complete ordered receipt set;
-4. require transaction/receipt cardinality metadata to be coherent;
-5. recompute the receipt root and logs bloom against the imported header;
-6. decode successful Portal/factory logs from authenticated receipts;
-7. selectively fetch only transactions containing model-relevant Portal events whose calldata
-   is required (`submitBatch` and non-empty `processWithdrawals`);
-8. require their RPC-reported block hash/number/index and transaction target to match the direct
-   Portal transaction expected by the receipt metadata;
-9. canonically decode calldata with no trailing bytes and verify the transaction selector matches
+3. fetch every full transaction envelope, locally hash each envelope, reconstruct
+   `transactions_root`, and compare it with the imported header;
+4. fetch the complete ordered receipt set;
+5. require transaction/receipt cardinality, hash, block, and index metadata to be coherent;
+6. recompute the receipt root and logs bloom against the imported header;
+7. decode successful Portal/factory logs from authenticated receipts;
+8. decode required `submitBatch` and non-empty `processWithdrawals` calldata directly from the
+   transaction-root-authenticated envelope at the receipt's local index;
+9. require the transaction target to match the direct Portal call expected by the receipt;
+10. canonically decode calldata with no trailing bytes and verify the transaction selector matches
    its events.
-
-Release one deliberately trusts the configured L1 archive RPC to bind those selectively fetched
-transactions to the authenticated block. It does not fetch all transaction bodies or recompute the
-transaction root. Receipt-root verification remains mandatory because it authenticates the event
-stream. This trust shortcut must be visible in health/config documentation.
 
 ### 7.4 Evidence lifetime
 
@@ -1616,7 +1612,6 @@ Release one claims to detect logical/specification divergence in:
 Release one does **not** claim to prove:
 
 - arbitrary Portal storage integrity beyond authenticated events/call inputs and exact balance;
-- the L1 transaction root or proof-bind selectively fetched Portal calldata;
 - Chaum-Pedersen, AES-GCM, or encrypted-sender validity;
 - the private recipient of a successful deposit mint;
 - that a bounce-back mint/refund recipient equals the withdrawal-time `zoneFallbackRecipient`;
@@ -1632,8 +1627,7 @@ Release one does **not** claim to prove:
 The checker trusts:
 
 - the in-process core node for canonical Zone blocks/receipts and exact-hash Zone state;
-- the configured L1 archive RPC for selectively fetched transaction binding, exact-block Portal
-  balance calls, and data availability;
+- the configured L1 archive RPC for exact-block Portal balance calls and data availability;
 - archive availability for repair, upgrades, and detailed diagnostics.
 
 ## 15. Test strategy
@@ -1702,7 +1696,7 @@ Do not use property tests as a substitute for independent literal vectors.
 There are no open architecture decisions for release one. The following are locked:
 
 1. Deposit processing is one contiguous-prefix rule; full catch-up is an empty-suffix case.
-2. Model-driving Portal settlement calls are direct; selective calldata binding trusts L1 RPC.
+2. Model-driving Portal settlement calls are direct and their calldata is transaction-root bound.
 3. Bootstrap requires configured Portal creation block hash and authenticated `ZoneCreated`.
 4. Zone supply uses local exact-hash literal slot 8 without MPT proofs.
 5. Persistence is current state, canonical progress, before-images, and compact findings only.
