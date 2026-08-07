@@ -791,7 +791,7 @@ async fn test_access_and_gateway_modes_are_mutable_and_independent() -> eyre::Re
         .await?;
 
     let router = l1.deploy_router(factory).await?;
-    let callback = WithdrawalArgs::cross_zone_via_router(
+    let mut callback = WithdrawalArgs::cross_zone_via_router(
         &l1,
         100_000,
         router,
@@ -819,6 +819,7 @@ async fn test_access_and_gateway_modes_are_mutable_and_independent() -> eyre::Re
         .withdraw_with(callback.clone())
         .await
         .wrap_err("callback should pass after opening gateway mode")?;
+    callback.sender_witness = B256::random();
 
     let closed_access_block = l1.set_access_mode_on_portal(portal_address, true).await?;
     zone.wait_for_l2_tempo_finalized(closed_access_block, L1_TIMEOUT)
@@ -835,6 +836,7 @@ async fn test_access_and_gateway_modes_are_mutable_and_independent() -> eyre::Re
         .withdraw_with(callback.clone())
         .await
         .wrap_err("callback should still pass after reclosing account access")?;
+    callback.sender_witness = B256::random();
 
     let enforced_gateway_block = l1.set_gateway_mode_on_portal(portal_address, true).await?;
     zone.wait_for_l2_tempo_finalized(enforced_gateway_block, L1_TIMEOUT)
