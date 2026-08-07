@@ -1,5 +1,8 @@
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, U256};
+
+#[cfg(test)]
+use alloy_primitives::keccak256;
 
 use crate::store::schema::ModelKey;
 
@@ -136,6 +139,7 @@ impl ChainLocation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn log_coordinate(self) -> Option<(u64, u64)> {
         match self.kind {
             LocationKind::Log {
@@ -209,6 +213,7 @@ impl FindingSummary {
     }
 
     /// Hash canonical semantic bytes, never `Debug` or `Display` output.
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             length: u64::try_from(bytes.len()).expect("slice length must fit u64"),
@@ -216,10 +221,12 @@ impl FindingSummary {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn length(self) -> u64 {
         self.length
     }
 
+    #[cfg(test)]
     pub(crate) const fn hash(self) -> B256 {
         self.hash
     }
@@ -534,6 +541,7 @@ impl FindingRecord {
         self.zone_parent_hash
     }
 
+    #[cfg(test)]
     pub(crate) const fn imported_tempo(&self) -> Option<BlockNumHash> {
         self.imported_tempo
     }
@@ -542,6 +550,7 @@ impl FindingRecord {
         self.status
     }
 
+    #[cfg(test)]
     pub(crate) const fn kind(&self) -> &FindingKind {
         &self.kind
     }

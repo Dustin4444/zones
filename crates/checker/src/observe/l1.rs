@@ -13,7 +13,7 @@ use crate::model::events::L1ProtocolEvent;
 
 use super::{
     abi::{DecodedPortalCall, ImportedTempoHeader},
-    error::{AcquisitionError, AcquisitionSource, ObservationError},
+    error::ObservationError,
 };
 
 mod authentication;
@@ -21,6 +21,7 @@ mod calls;
 mod collateral;
 mod events;
 
+pub(crate) use authentication::acquire_l1_header;
 pub(crate) use collateral::acquire_portal_collateral;
 
 #[cfg(test)]
@@ -237,24 +238,4 @@ where
         portal_address: portal,
         protocol_transactions,
     })
-}
-
-fn ensure_acquisition_equal<T>(
-    source: AcquisitionSource,
-    field: impl core::fmt::Display,
-    expected: T,
-    actual: T,
-) -> Result<(), ObservationError>
-where
-    T: PartialEq + core::fmt::Debug,
-{
-    if expected != actual {
-        return Err(AcquisitionError::inconsistent(
-            source,
-            format!("{field} {expected:?}"),
-            format!("{field} {actual:?}"),
-        )
-        .into());
-    }
-    Ok(())
 }

@@ -1,6 +1,6 @@
-use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
+use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy, TxReceipt as _};
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, Bytes, FixedBytes, Log, Signature, U256, keccak256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, FixedBytes, Log, Signature, U256, keccak256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_rlp::Encodable as _;
 use alloy_sol_types::{SolCall, SolEvent, SolValue as _};
@@ -235,11 +235,17 @@ pub(super) fn zone_observation(
         receipts.push(receipt(vec![finalization.event]));
     }
 
+    let receipts_root = TempoReceipt::calculate_receipt_root_no_memo(&receipts);
+    let logs_bloom = receipts
+        .iter()
+        .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom());
     let block = Block {
         header: TempoHeader {
             inner: Header {
                 number: ZONE_NUMBER,
                 parent_hash: ZONE_PARENT,
+                receipts_root,
+                logs_bloom,
                 ..Default::default()
             },
             ..Default::default()
@@ -306,9 +312,14 @@ pub(super) async fn run_block(
     } else {
         B256::repeat_byte(0xcc)
     };
+    let creation_number = if creation_block {
+        TEMPO_NUMBER
+    } else {
+        TEMPO_NUMBER + 1
+    };
     let mut checker = InMemoryChecker::new(
         model,
-        creation_hash,
+        BlockNumHash::new(creation_number, creation_hash),
         BlockNumHash::new(ZONE_NUMBER - 1, ZONE_PARENT),
         BlockNumHash::new(TEMPO_NUMBER - 1, TEMPO_PARENT),
     );

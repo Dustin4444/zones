@@ -3,7 +3,6 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_transport::mock::Asserter;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::{StateProviderBox, errors::provider::ProviderResult};
 use tempo_alloy::TempoNetwork;
@@ -11,7 +10,7 @@ use tempo_primitives::{Block, BlockBody, TempoHeader, TempoPrimitives};
 
 use super::{
     L1_NUMBER, L1RpcBlock, PORTAL, exact_zone_state_with_supply, imported_child_header,
-    l1_provider, l1_provider_with_collateral, user_withdrawal_receipt, zone_block,
+    l1_provider, l1_provider_with_collateral, seal_zone_block, user_withdrawal_receipt, zone_block,
     zone_block_with_user_withdrawal, zone_receipt,
 };
 use crate::{
@@ -80,12 +79,12 @@ impl ExactStateLookup for UnavailableExactState {
 fn checker_for_empty_child(
     imported: &TempoHeader,
     zone_parent: B256,
-    creation_hash: B256,
+    creation_block: BlockNumHash,
 ) -> InMemoryChecker {
     let identity = PortalIdentity::new(portal_address_for_zone(7), 7, Address::repeat_byte(0x77));
     InMemoryChecker::new(
         ModelState::awaiting_creation(identity),
-        creation_hash,
+        creation_block,
         BlockNumHash::new(0, zone_parent),
         BlockNumHash::new(imported.inner.number - 1, imported.inner.parent_hash),
     )
@@ -146,7 +145,7 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
         },
     );
     let parent_model = model.clone();
-    let block = zone_block_with_user_withdrawal(1, zone_parent, &imported, sender);
+    let block = zone_block_with_user_withdrawal(1, zone_parent, &imported, sender, token);
     let receipts = [
         zone_receipt(&imported),
         user_withdrawal_receipt(sender, token),
@@ -162,7 +161,7 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
     .unwrap();
     let mut checker = InMemoryChecker::new(
         model,
-        B256::repeat_byte(0xcc),
+        BlockNumHash::new(L1_NUMBER, B256::repeat_byte(0xcc)),
         BlockNumHash::new(0, zone_parent),
         BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
     );
@@ -238,7 +237,11 @@ async fn exact_state_finding_leaves_model_and_both_tips_at_the_parent() {
     let zone_parent = B256::repeat_byte(0xa1);
     let imported = imported_child_header(L1_NUMBER, tempo_parent);
     let (l2, l1, l1_provider) = empty_observations(&imported, zone_parent).await;
-    let mut checker = checker_for_empty_child(&imported, zone_parent, B256::repeat_byte(0xcc));
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER + 1, B256::repeat_byte(0xcc)),
+    );
     let parent_model = checker.model().clone();
     let wrong_hash = B256::repeat_byte(0xee);
     let exact_state = exact_zone_state(&imported, wrong_hash);
@@ -268,7 +271,11 @@ async fn exact_state_acquisition_failure_is_not_a_finding_and_is_atomic() {
     let zone_parent = B256::repeat_byte(0xb1);
     let imported = imported_child_header(L1_NUMBER, tempo_parent);
     let (l2, l1, l1_provider) = empty_observations(&imported, zone_parent).await;
-    let mut checker = checker_for_empty_child(&imported, zone_parent, B256::repeat_byte(0xcc));
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER + 1, B256::repeat_byte(0xcc)),
+    );
     let parent_model = checker.model().clone();
 
     let error = checker
@@ -292,7 +299,11 @@ async fn configured_creation_block_without_creation_is_a_finding_before_acquisit
     let zone_parent = B256::repeat_byte(0xc1);
     let imported = imported_child_header(L1_NUMBER, tempo_parent);
     let (l2, l1, l1_provider) = empty_observations(&imported, zone_parent).await;
-    let mut checker = checker_for_empty_child(&imported, zone_parent, imported.hash_slow());
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER, imported.hash_slow()),
+    );
 
     let error = checker
         .check_block(&l1_provider, &UnavailableExactState, &l1, &l2)
@@ -312,6 +323,64 @@ async fn configured_creation_block_without_creation_is_a_finding_before_acquisit
 }
 
 #[tokio::test]
+async fn sibling_at_the_authenticated_creation_height_is_a_finding() {
+    let tempo_parent = B256::repeat_byte(0xc2);
+    let zone_parent = B256::repeat_byte(0xc3);
+    let imported = imported_child_header(L1_NUMBER, tempo_parent);
+    let expected_hash = B256::repeat_byte(0xc4);
+    let (l2, l1, l1_provider) = empty_observations(&imported, zone_parent).await;
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER, expected_hash),
+    );
+
+    let error = checker
+        .check_block(&l1_provider, &UnavailableExactState, &l1, &l2)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckError::Finding {
+            finding,
+            imported_tempo: Some(actual),
+        } if matches!(
+            finding.as_ref(),
+            Finding::PortalCreationMissing { block_hash } if *block_hash == expected_hash
+        ) && actual == BlockNumHash::new(L1_NUMBER, imported.hash_slow())
+    ));
+}
+
+#[tokio::test]
+async fn awaiting_creation_cannot_advance_past_the_authenticated_creation_height() {
+    let tempo_parent = B256::repeat_byte(0xc5);
+    let zone_parent = B256::repeat_byte(0xc6);
+    let imported = imported_child_header(L1_NUMBER, tempo_parent);
+    let expected_hash = B256::repeat_byte(0xc7);
+    let (l2, l1, l1_provider) = empty_observations(&imported, zone_parent).await;
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER - 1, expected_hash),
+    );
+
+    let error = checker
+        .check_block(&l1_provider, &UnavailableExactState, &l1, &l2)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckError::Finding { finding, .. }
+            if matches!(
+                finding.as_ref(),
+                Finding::PortalCreationMissing { block_hash } if *block_hash == expected_hash
+            )
+    ));
+}
+
+#[tokio::test]
 async fn l1_observation_portal_must_match_the_configured_model_identity() {
     let tempo_parent = B256::repeat_byte(0xd0);
     let zone_parent = B256::repeat_byte(0xd1);
@@ -327,7 +396,11 @@ async fn l1_observation_portal_must_match_the_configured_model_identity() {
     )
     .await
     .unwrap();
-    let mut checker = checker_for_empty_child(&imported, zone_parent, B256::repeat_byte(0xcc));
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER + 1, B256::repeat_byte(0xcc)),
+    );
     let expected = portal_address_for_zone(7);
 
     let error = checker
@@ -368,7 +441,7 @@ async fn collateral_uses_the_pre_zone_cut_before_same_block_burns_can_hide_a_def
             withdrawal_liability: U256::ZERO,
         },
     );
-    let block = zone_block_with_user_withdrawal(1, zone_parent, &imported, sender);
+    let block = zone_block_with_user_withdrawal(1, zone_parent, &imported, sender, token);
     let receipts = [
         zone_receipt(&imported),
         user_withdrawal_receipt(sender, token),
@@ -384,7 +457,7 @@ async fn collateral_uses_the_pre_zone_cut_before_same_block_burns_can_hide_a_def
     .unwrap();
     let mut checker = InMemoryChecker::new(
         model.clone(),
-        B256::repeat_byte(0xcc),
+        BlockNumHash::new(L1_NUMBER, B256::repeat_byte(0xcc)),
         BlockNumHash::new(0, zone_parent),
         BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
     );
@@ -441,7 +514,7 @@ async fn post_zone_supply_detects_unauthorized_mint_and_burn_and_keeps_the_paren
         let exact_state = exact_zone_state_with_supply(&imported, token, actual_supply);
         let mut checker = InMemoryChecker::new(
             model.clone(),
-            B256::repeat_byte(0xcc),
+            BlockNumHash::new(L1_NUMBER, B256::repeat_byte(0xcc)),
             BlockNumHash::new(0, zone_parent),
             BlockNumHash::new(L1_NUMBER - 1, tempo_parent),
         );
@@ -485,9 +558,13 @@ async fn malformed_l2_envelope_is_an_atomic_observation_finding() {
         },
         body: BlockBody::default(),
     };
-    let block = RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), Vec::new());
+    let block = seal_zone_block(block, Vec::new(), &[]);
     let l1_provider = l1_provider(&imported);
-    let mut checker = checker_for_empty_child(&imported, zone_parent, B256::repeat_byte(0xcc));
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER + 1, B256::repeat_byte(0xcc)),
+    );
     let parent_model = checker.model().clone();
 
     let error = checker
@@ -521,7 +598,11 @@ async fn l1_observation_acquisition_is_an_atomic_acquisition_error() {
     let block = zone_block(1, zone_parent, &imported);
     let receipt = zone_receipt(&imported);
     let l1_provider = l1_provider_missing_block();
-    let mut checker = checker_for_empty_child(&imported, zone_parent, B256::repeat_byte(0xcc));
+    let mut checker = checker_for_empty_child(
+        &imported,
+        zone_parent,
+        BlockNumHash::new(L1_NUMBER + 1, B256::repeat_byte(0xcc)),
+    );
     let parent_model = checker.model().clone();
 
     let error = checker

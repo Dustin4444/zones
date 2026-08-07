@@ -519,6 +519,7 @@ impl ExpectedOutputs {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn imported_tempo_block(&self) -> &ExpectedImportedTempoBlock {
         &self.imported_tempo_block
     }

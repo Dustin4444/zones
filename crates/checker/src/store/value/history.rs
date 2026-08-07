@@ -120,7 +120,7 @@ mod tests {
     use reth_codecs::{Compress, Decompress};
 
     use super::*;
-    use crate::store::value::ModelValue;
+    use crate::store::{SCHEMA_VERSION, value::ModelValue};
 
     #[test]
     fn block_metadata_has_golden_bytes_and_round_trips() {
@@ -130,7 +130,7 @@ mod tests {
             mutation_count: 3,
         });
         let bytes = value.clone().compress();
-        let mut golden = vec![2, 0];
+        let mut golden = vec![SCHEMA_VERSION, 0];
         golden.extend_from_slice(&1_u64.to_be_bytes());
         golden.extend_from_slice(&[0x11; 32]);
         golden.extend_from_slice(&2_u64.to_be_bytes());
@@ -147,7 +147,7 @@ mod tests {
             key: ModelKey::Token(alloy_primitives::Address::repeat_byte(0x33)),
             value: None,
         };
-        let mut absent_golden = vec![2, 1, 21, 0x20];
+        let mut absent_golden = vec![SCHEMA_VERSION, 1, 21, 0x20];
         absent_golden.extend_from_slice(&[0x33; 20]);
         absent_golden.push(0);
 
@@ -156,7 +156,25 @@ mod tests {
             value: Some(Box::new(ModelValue::ZoneNextWithdrawalIndex(7))),
         };
         let present_golden = vec![
-            2, 1, 1, 0x06, 1, 0, 0, 0, 10, 2, 0x06, 0, 0, 0, 0, 0, 0, 0, 7,
+            SCHEMA_VERSION,
+            1,
+            1,
+            0x06,
+            1,
+            0,
+            0,
+            0,
+            10,
+            SCHEMA_VERSION,
+            0x06,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            7,
         ];
 
         for (value, golden) in [(absent, absent_golden), (present, present_golden)] {
@@ -171,10 +189,10 @@ mod tests {
 
     #[test]
     fn before_image_rejects_unknown_tags_and_oversized_nested_values() {
-        assert!(BeforeImage::decompress(&[2, 0xff]).is_err());
-        assert!(BeforeImage::decompress(&[2, 1, 1, 0x06, 0xff]).is_err());
+        assert!(BeforeImage::decompress(&[SCHEMA_VERSION, 0xff]).is_err());
+        assert!(BeforeImage::decompress(&[SCHEMA_VERSION, 1, 1, 0x06, 0xff]).is_err());
 
-        let mut oversized = vec![2, 1, 1, 0x06, 1];
+        let mut oversized = vec![SCHEMA_VERSION, 1, 1, 0x06, 1];
         oversized.extend_from_slice(&(MAX_MODEL_VALUE_SIZE as u32 + 1).to_be_bytes());
         assert!(BeforeImage::decompress(&oversized).is_err());
 

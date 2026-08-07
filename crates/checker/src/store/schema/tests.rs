@@ -24,7 +24,7 @@ fn metadata_tags_are_golden_and_decode_strictly() {
         MetaKey::ZoneIdentity,
         MetaKey::L1ChainId,
         MetaKey::Contracts,
-        MetaKey::PortalCreationBlockHash,
+        MetaKey::PortalCreationBlock,
         MetaKey::Bootstrap,
         MetaKey::VerifiedZoneTip,
         MetaKey::ImportedTempoTip,

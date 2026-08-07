@@ -21,8 +21,6 @@ pub(super) enum CodecError {
         field: &'static str,
         reason: &'static str,
     },
-    #[error("{field} length {actual} exceeds the release-one u32 bound")]
-    LengthOverflow { field: &'static str, actual: usize },
 }
 
 impl From<TryFromIntError> for CodecError {
@@ -84,14 +82,6 @@ impl Encoder {
 
     pub(super) fn u8(&mut self, value: u8) {
         self.bytes.push(value);
-    }
-
-    pub(super) fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
-    }
-
-    pub(super) fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
     pub(super) fn u32(&mut self, value: u32) {
@@ -161,21 +151,6 @@ impl<'a> Decoder<'a> {
 
     pub(super) fn u8(&mut self, field: &'static str) -> Result<u8, CodecError> {
         Ok(self.take::<1>(field)?[0])
-    }
-
-    pub(super) fn bool(&mut self, field: &'static str) -> Result<bool, CodecError> {
-        match self.u8(field)? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(CodecError::Invalid {
-                field,
-                reason: "boolean tag is neither zero nor one",
-            }),
-        }
-    }
-
-    pub(super) fn u16(&mut self, field: &'static str) -> Result<u16, CodecError> {
-        Ok(u16::from_be_bytes(self.take(field)?))
     }
 
     pub(super) fn u32(&mut self, field: &'static str) -> Result<u32, CodecError> {

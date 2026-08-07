@@ -15,7 +15,7 @@ fn persistent_runtime_refuses_incomplete_bootstrap() {
     let store = CheckerStore::open(directory.path(), initialization).unwrap();
 
     assert!(matches!(
-        LiveChecker::from_store(store),
+        PersistentChecker::from_store(store),
         Err(RuntimeError::Store(StoreError::InvalidBootstrapProgress(
             "persistent live runtime requires completed bootstrap"
         )))
@@ -62,7 +62,7 @@ fn startup_at_a_canonical_alert_uses_the_node_head_without_replaying_descendants
     store
         .activate_finding(key, record, initialization.verified_zone_tip)
         .unwrap();
-    let mut checker = LiveChecker::from_store(store).unwrap();
+    let mut checker = PersistentChecker::from_store(store).unwrap();
     let descendant = BlockNumHash::new(2, B256::repeat_byte(0xa3));
     let head = BlockNumHash::new(3, B256::repeat_byte(0xa4));
     let canonical = canonical_hashes([
@@ -99,7 +99,7 @@ fn startup_orphans_a_removed_alert_and_resumes_from_verified_parent() {
     store
         .activate_finding(key, record, initialization.verified_zone_tip)
         .unwrap();
-    let mut checker = LiveChecker::from_store(store).unwrap();
+    let mut checker = PersistentChecker::from_store(store).unwrap();
     let canonical = canonical_hashes([(
         initialization.verified_zone_tip.number,
         initialization.verified_zone_tip.hash,

@@ -1,7 +1,7 @@
 # zone-checker
 
-A checker crate containing the live observe-only execution extension and the
-non-wired in-memory evaluator used to validate the complete Goal 5 pipeline.
+A durable, observe-only execution extension that independently reconstructs
+Portal and Zone state and records authenticated divergences.
 
 The approved architecture and release gate are in [`DESIGN.md`](DESIGN.md).
 The checker-owned protocol vectors frozen by Goal 0 are inventoried in
@@ -9,40 +9,128 @@ The checker-owned protocol vectors frozen by Goal 0 are inventoried in
 
 ## Current status
 
-Goals 0 through 5 are implemented:
+Goals 0 through 9 are implemented. Goals 0 through 5 define the authenticated
+observation boundary, pure lifecycle model, typed output checks, exact Zone
+state reads, and Portal collateral checks. Goals 6 through 8 add the dedicated
+checker database, commit-before-acknowledge processing, crash recovery, exact
+unwind, durable findings, and alert mode. Goal 9 adds authenticated archive
+bootstrap, resumable L1 and Zone replay, normal restart, and fresh-path rebuild.
 
-- Goal 0 defines checker-owned protocol constants, encodings, event types, and
-  lifecycle vocabulary.
-- Goal 1 establishes the ephemeral authenticated-observation boundary.
-- Goals 2 through 4 implement the complete pure Portal, Zone-deposit,
-  withdrawal, batch, processing, bounce-back, and refund lifecycle model.
-- Goal 5 projects authenticated observations into that model, compares typed
-  implementation outputs, reads exact post-Zone commitments and supply, checks
-  post-L1/pre-Zone collateral, and commits passing candidates in memory.
+The checker is alerting, not enforcing. `--checker.mode` remains `off` by
+default, and `observe` never changes consensus or blocks core-node progress
+after an authenticated finding. Goal 10's closed-system shadow-release and
+performance acceptance gate is not complete.
 
-This is still not deployable protocol coverage. The Goal 5 evaluator is an
-explicit `InMemoryChecker`; it is deliberately not wired into the ExEx until
-durable state and exact unwind exist. There is no persistence, restart/reorg
-recovery, finding storage, or enforcement. The live Goal 1 diagnostic path
-continues to acquire the six fixed commitments at the exact Zone block hash,
-but has no authoritative model-owned token set and therefore requests no
-supply slots. The in-memory Goal 5 path reads every enabled token supply.
+## Operator configuration
 
-`--checker.mode` remains `off` by default. `observe` is a diagnostic development
-mode, not a shadow-release recommendation.
+Observe mode requires the Zone's exact identity and an archive-capable L1 RPC:
+
+```sh
+ZONE_JSON=generated/my-zone/zone.json
+
+tempo-zone \
+  --checker.mode observe \
+  --checker.portal-creation-block-hash "$(jq -er '.portalCreationBlockHash' "$ZONE_JSON")" \
+  --l1.rpc-url wss://<tempo-archive-rpc> \
+  --l1.portal-address "$(jq -er '.portal' "$ZONE_JSON")" \
+  --zone.id "$(jq -er '.zoneId' "$ZONE_JSON")"
+```
+
+The creation hash must be the nonzero Tempo block hash containing the
+configured Portal's authenticated `ZoneFactory.ZoneCreated` event. `--zone.id`
+must be the factory Zone ID whose derived chain ID matches the local genesis.
+`just create-zone` writes the hash to `generated/<name>/zone.json`; the
+`tempo-zone dev` command writes the same field to its datadir's `zone.json`.
+The equivalent environment variables are `CHECKER_MODE`,
+`CHECKER_PORTAL_CREATION_BLOCK_HASH`, `L1_RPC_URL`, `L1_PORTAL_ADDRESS`, and
+`ZONE_ID`.
+
+By default, the checker opens `<resolved node data directory>/checker`. This is
+a dedicated MDBX database, separate from the node database. Override it with
+`--checker.database-path PATH` or `CHECKER_DATABASE_PATH`; the override is valid
+only in `observe` mode.
+
+### Bootstrap and restart
+
+A fresh database is initialized only after the checker validates the local
+canonical Zone genesis and its nonzero Tempo checkpoint, then authenticates the
+configured Portal creation block. It replays exact parent-linked Tempo history
+to the genesis anchor, or keeps the Portal-not-yet-created phase when creation
+follows that anchor. It replays Zone blocks from genesis through the canonical
+head using the ordinary live transition. Each L1 cursor and each Zone block is
+committed independently, so a crash resumes after the last durable block
+without a gap or double apply.
+
+A normal restart validates the database identity and version, loads its model,
+tips, and active alert, reconciles the durable Zone tip with the local canonical
+chain, and resumes. It does not replay from genesis. A canonical reorg unwinds
+exact before-images and applies the replacement blocks through the same path.
+
+### Archive requirements
+
+Bootstrap and repair require the configured Tempo RPC to retain exact blocks,
+complete receipts, selectively required transaction bodies, and historical
+Portal balance state from creation onward. The local Zone node must retain
+canonical block bodies and the historical execution state needed by Reth's
+backfill job from genesis onward. Catch-up re-executes those blocks to produce
+receipt sets; the checker authenticates each set against its Zone header before
+reading exact post-block state for comparisons. Missing, pruned, or internally
+inconsistent history is an explicit failure; the checker never substitutes a
+default record or a remote L2 state source.
+
+### Fresh-path rebuild
+
+Model-version changes and database corruption are repaired by archive replay
+into a new empty path. There are no in-place migrations.
+
+1. Stop the Zone node and preserve the old checker directory.
+2. Choose a nonexistent or empty path, such as a sibling `checker-v3`.
+3. Start the same Zone configuration with the fresh path:
+
+   ```sh
+   ZONE_JSON=generated/my-zone/zone.json
+
+   tempo-zone \
+     --checker.mode observe \
+     --checker.portal-creation-block-hash "$(jq -er '.portalCreationBlockHash' "$ZONE_JSON")" \
+     --checker.database-path /var/lib/tempo-zone/checker-v3 \
+     --l1.rpc-url wss://<tempo-archive-rpc> \
+     --l1.portal-address "$(jq -er '.portal' "$ZONE_JSON")" \
+     --zone.id "$(jq -er '.zoneId' "$ZONE_JSON")"
+   ```
+
+4. Wait for replay to reach the canonical Zone head and verify the configured
+   identity and reported health before making the new path permanent. The
+   `Durable checker started` log must show the expected `zone_id`,
+   `zone_chain_id`, `portal`, `portal_creation_block_hash`, and `database`.
+   At the configured Reth Prometheus endpoint, a caught-up, non-alerting checker
+   reports exactly:
+
+   ```text
+   tempo_zone_checker_runtime_healthy 1
+   tempo_zone_checker_runtime_active_alert 0
+   ```
+
+Startup refuses a zero creation hash, a zero Tempo checkpoint in Zone genesis,
+nonzero Inbox or Outbox protocol progress in Zone genesis, a creation event or
+database identity mismatch, unsupported database version, nonempty rebuild
+path, broken exact-hash ancestry, receipt authentication failure, or
+unavailable required archive history. Existing incompatible data is not
+modified or deleted.
 
 ## Authenticated observation boundary
 
 The observer keeps authenticated inputs separate from authenticated
-implementation outcomes. Observations live only while one canonical block is
-processed. Raw data is decoded into typed in-memory observations, but those
-observations are never persisted.
+implementation outcomes. Raw data is decoded into typed observations while one
+canonical block is processed, but those observations are never persisted. The
+database stores authoritative model state, exact unwind data, compact findings,
+bootstrap progress, and verified tips.
 
 | Data | Authentication or trust source | Missing or inconsistent data |
 |---|---|---|
 | Imported Tempo header, deposits, decryptions, enabled tokens | Canonical `advanceTempo` calldata in the first Zone system transaction; exact ABI and header-RLP round trips | Malformed authenticated data |
 | Optional finalization count, block number, encrypted senders | Canonical `finalizeWithdrawalBatch` calldata in the unique final Zone system transaction | Invalid envelope or malformed authenticated data |
-| Zone protocol outcomes and containing transaction hashes | Ordered successful notification-local receipts paired with the canonical recovered block | Missing or internally inconsistent notification block/receipt data is an acquisition failure; protocol events fail closed |
+| Zone protocol outcomes and containing transaction hashes | Complete ordered notification or backfill receipts authenticated against the canonical Zone header's receipt root and logs bloom, then paired with the recovered block | Missing or internally inconsistent notification block/receipt data is an acquisition failure; protocol events fail closed |
 | Six fixed Zone commitments and model-selected token supplies | In-process `state_by_block_hash` at the exact canonical Zone hash | Retryable acquisition failure; an absent account or unwritten slot has canonical EVM value zero after the exact block state is acquired |
 | Ordered Tempo protocol outcomes | Complete receipt set authenticated against the receipt root and logs bloom in the imported header | Retryable acquisition failure or fail-closed protocol-event error |
 | Direct `submitBatch` and non-empty `processWithdrawals` inputs | Selectively fetched transaction body, bound by hash/block/index metadata, with exactly one top-level call to the configured Portal | Retryable acquisition failure, malformed calldata, or `UnsupportedNestedPortalCall` |
@@ -69,7 +157,7 @@ For each non-genesis canonical Zone block, the observation layer:
 5. Retains model-driving inputs and implementation outcomes as distinct typed
    values.
 
-The explicit Goal 5 evaluator then compares `TempoAdvanced`,
+The checker then compares `TempoAdvanced`,
 `TempoBlockFinalized`, `TokenEnabled`, deposit outcomes, Zone operations, and
 optional `BatchFinalized` against model-owned expectations. It reads the six
 fixed commitments and every enabled token's literal slot-8 supply after the
@@ -83,8 +171,8 @@ with no trailing data.
 
 The observation layer checks only finalization relationships defined without
 mutable model state: canonical shape, count versus sender-array length, sender
-length, Zone block number, envelope position, and successful receipt. The Goal
-5 projection/model layer checks event grammar, pending-count, reveal-mode,
+length, Zone block number, envelope position, and successful receipt. The
+projection/model layer checks event grammar, pending-count, reveal-mode,
 batch identity, and exact output commitments.
 
 ### Tempo block checks
@@ -111,7 +199,7 @@ target the configured Portal. An empty `processWithdrawals` has no protocol
 outcome and creates no transaction-fetch requirement.
 
 The configured L1 archive RPC remains an explicit trust boundary for
-receipt-to-transaction metadata after receipt-root authentication. Goal 1 does
+receipt-to-transaction metadata after receipt-root authentication. It does
 not fetch every transaction body or recompute the transaction root.
 
 ## Failure classes
@@ -141,14 +229,14 @@ not fetch every transaction body or recompute the transaction root.
 | Mode | Behavior |
 |---|---|
 | `off` | Default. The checker ExEx is not installed. |
-| `observe` | Authenticate and log ephemeral Goal 1 observations, including exact fixed-state acquisition. Do not run the Goal 5 model, persist, enforce, or claim complete coverage. |
+| `observe` | Bootstrap or resume the durable model, authenticate canonical blocks, persist passing transitions and findings, and handle restart and reorg recovery. Never enforce protocol behavior. |
 
-Committed and reorged-in blocks are observed oldest-to-newest. Reverted and
-reorged-out blocks are logged newest-to-oldest but are not re-observed after
-they leave the canonical chain. A failed observation does not terminate the
-Zone node; it permanently holds the ExEx pruning acknowledgement behind the
-gap for the remainder of that process. Generic retry and durable recovery are
-later goals.
+Committed and reorged-in blocks are checked oldest-to-newest. Acquisition
+failures retain the current notification and retry without advancing durable
+progress. A deterministic divergence is committed once and enters alert mode:
+the model remains frozen at the last verified parent while the ExEx continues
+acknowledging descendants. If a reorg removes the finding, its record is marked
+orphaned and ordinary checking resumes from the verified parent.
 
 ## Validation
 

@@ -247,6 +247,9 @@ impl CreateZone {
                 receipt.transaction_hash
             ));
         }
+        let creation_block_hash = receipt
+            .block_hash()
+            .ok_or_else(|| eyre!("createZone receipt is missing its block hash"))?;
         let creation_block = receipt
             .block_number
             .ok_or_else(|| eyre!("createZone receipt is missing its block number"))?;
@@ -338,6 +341,7 @@ impl CreateZone {
             "sequencerThreshold": self.threshold,
             "sequencerSetVersion": sequencer_set_version,
             "tempoAnchorBlock": anchor_header.inner.number,
+            "portalCreationBlockHash": format!("{creation_block_hash}"),
             "zoneFactory": format!("{}", self.zone_factory),
             "rpcUrl": self.rpc_url,
         });
@@ -365,6 +369,7 @@ impl CreateZone {
             println!("  RPC URL: {}", self.rpc_url);
         }
         println!("  Tempo anchor block: {}", anchor_header.inner.number);
+        println!("  Portal creation block hash: {creation_block_hash}");
         println!(
             "  Genesis written to: {}",
             self.output.join("genesis.json").display()

@@ -43,7 +43,7 @@ async fn injected_commit_abort_preserves_parent_and_retry_applies_once() {
     assert_eq!(fixture.checker.current_snapshot_for_test(), parent);
 
     drop(fixture.checker);
-    fixture.checker = LiveChecker::from_store(
+    fixture.checker = PersistentChecker::from_store(
         CheckerStore::open_existing(fixture.directory.path(), fixture.initialization.identity)
             .unwrap(),
     )
@@ -76,6 +76,7 @@ async fn stale_prepared_candidate_cannot_overwrite_a_competing_child() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         sender,
+        fixture.token,
         1,
     );
     assert_ne!(winner_block.hash(), fixture.block.hash());
@@ -151,9 +152,10 @@ async fn commit_before_mirror_restart_reloads_and_acknowledges_without_provider_
     let identity = fixture.initialization.identity;
     let directory = fixture.directory;
     drop(fixture.checker);
-    let mut restarted =
-        LiveChecker::from_store(CheckerStore::open_existing(directory.path(), identity).unwrap())
-            .unwrap();
+    let mut restarted = PersistentChecker::from_store(
+        CheckerStore::open_existing(directory.path(), identity).unwrap(),
+    )
+    .unwrap();
     let mut disconnected = L1Client::new("not a URL".to_owned());
 
     let ready = restarted
@@ -315,6 +317,37 @@ async fn receipt_set_gap_is_retryable_and_never_reaches_provider_or_store() {
         )))
     ));
     assert_eq!(fixture.checker.current_snapshot_for_test(), parent);
+}
+
+#[tokio::test]
+async fn wrong_receipt_root_fails_before_projection_provider_or_store() {
+    let mut fixture = LiveFixture::new();
+    let parent = fixture.checker.current_snapshot_for_test();
+    let mut receipts = fixture.receipts.clone();
+    receipts[0].cumulative_gas_used += 1;
+    let notification = ExExNotification::ChainCommitted {
+        new: chain(vec![fixture.block.clone()], vec![receipts]),
+    };
+    let mut disconnected = L1Client::new("not a URL".to_owned());
+
+    assert!(matches!(
+        fixture
+            .checker
+            .process_notification_once(&notification, &UnavailableZoneState, &mut disconnected)
+            .await,
+        Err(RuntimeError::Check(CheckError::Acquisition(
+            AcquisitionError::Inconsistent {
+                kind: AcquisitionSource::ZoneNotificationReceipts,
+                expected,
+                ..
+            }
+        ))) if expected.contains("receipts root")
+    ));
+    assert_eq!(fixture.checker.current_snapshot_for_test(), parent);
+    assert_eq!(
+        fixture.checker.mirror_tip(),
+        fixture.initialization.verified_zone_tip
+    );
 }
 
 struct RoutedState {

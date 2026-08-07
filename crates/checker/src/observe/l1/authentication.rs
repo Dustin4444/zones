@@ -8,16 +8,25 @@ use alloy_provider::Provider;
 use tempo_alloy::{TempoNetwork, rpc::TempoTransactionReceipt};
 use tempo_primitives::TempoHeader;
 
-use super::{
-    super::{
-        abi::ImportedTempoHeader,
-        error::{AcquisitionError, AcquisitionSource, ObservationError},
-    },
-    ensure_acquisition_equal,
+use super::super::{
+    abi::ImportedTempoHeader,
+    error::{AcquisitionError, AcquisitionSource, ObservationError, ensure_acquisition_equal},
 };
 
 pub(super) struct AuthenticatedBlock {
+    header: ImportedTempoHeader,
     pub(super) transaction_hashes: Vec<B256>,
+}
+
+/// Acquire and authenticate the header for one operator-selected exact hash.
+pub(crate) async fn acquire_l1_header<P>(
+    provider: &P,
+    block_hash: B256,
+) -> Result<ImportedTempoHeader, ObservationError>
+where
+    P: Provider<TempoNetwork>,
+{
+    Ok(acquire_exact_block(provider, block_hash).await?.header)
 }
 
 pub(super) async fn acquire_block<P>(
@@ -27,23 +36,35 @@ pub(super) async fn acquire_block<P>(
 where
     P: Provider<TempoNetwork>,
 {
+    let block = acquire_exact_block(provider, imported.hash()).await?;
+    authenticate_imported_header(imported, &block.header)?;
+    Ok(block)
+}
+
+async fn acquire_exact_block<P>(
+    provider: &P,
+    block_hash: B256,
+) -> Result<AuthenticatedBlock, ObservationError>
+where
+    P: Provider<TempoNetwork>,
+{
     let block = provider
-        .get_block_by_hash(imported.hash())
+        .get_block_by_hash(block_hash)
         .hashes()
         .await
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Block, error))?
-        .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Block, imported.hash()))?;
+        .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Block, block_hash))?;
 
     let response_header = block.header();
     let fetched_header: &TempoHeader = response_header.as_ref();
-    authenticate_header(
-        imported,
+    authenticate_header_hash(
+        block_hash,
         response_header.hash(),
         fetched_header.hash_slow(),
-        fetched_header,
     )?;
 
     Ok(AuthenticatedBlock {
+        header: ImportedTempoHeader::new(fetched_header.clone()),
         transaction_hashes: block.transactions().hashes().collect(),
     })
 }
@@ -65,35 +86,40 @@ where
     Ok(receipts)
 }
 
-pub(super) fn authenticate_header(
-    imported: &ImportedTempoHeader,
-    reported_hash: B256,
-    computed_hash: B256,
-    fetched_header: &TempoHeader,
+fn authenticate_header_hash(
+    expected: B256,
+    reported: B256,
+    computed: B256,
 ) -> Result<(), ObservationError> {
     ensure_acquisition_equal(
         AcquisitionSource::L1Block,
         "reported block hash",
-        imported.hash(),
-        reported_hash,
+        expected,
+        reported,
     )?;
     ensure_acquisition_equal(
         AcquisitionSource::L1Block,
         "locally computed header hash",
-        imported.hash(),
-        computed_hash,
-    )?;
+        expected,
+        computed,
+    )
+}
+
+pub(super) fn authenticate_imported_header(
+    imported: &ImportedTempoHeader,
+    fetched: &ImportedTempoHeader,
+) -> Result<(), ObservationError> {
     ensure_acquisition_equal(
         AcquisitionSource::L1Block,
         "block number",
         imported.number(),
-        fetched_header.number(),
+        fetched.number(),
     )?;
-    if fetched_header != imported.header() {
+    if fetched.header() != imported.header() {
         return Err(AcquisitionError::inconsistent(
             AcquisitionSource::L1Block,
             format!("exact imported header {}", imported.hash()),
-            format!("different header with hash {computed_hash}"),
+            format!("different header with hash {}", fetched.hash()),
         )
         .into());
     }

@@ -10,7 +10,8 @@ mod l2;
 pub(crate) use l1::{
     ImportedEventKind, ImportedProjectionError, ObservedDepositAppend, ObservedDepositRefund,
     ObservedImportedOutput, ObservedProcessedWithdrawal, ObservedSubmittedBatch,
-    ObservedWithdrawalProcessed, ObservedWithdrawalProcessing, project_imported,
+    ObservedWithdrawalProcessed, ObservedWithdrawalProcessing, PortalCreationIdentityError,
+    project_imported,
 };
 pub(crate) use l2::{
     DepositInputKind, ObservedBatchFinalized, ObservedDepositFailed, ObservedDepositOutcome,

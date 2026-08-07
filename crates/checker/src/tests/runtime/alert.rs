@@ -22,6 +22,7 @@ async fn unsupported_successful_zone_event_enters_durable_alert_mode() {
             ),
         },
     );
+    fixture.block = with_zone_receipts(fixture.block, &fixture.receipts);
     assert!(matches!(
         crate::observe::observe_l2_block(&fixture.block, &fixture.receipts),
         Err(crate::observe::ObservationError::ProtocolEvent { .. })

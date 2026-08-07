@@ -3,10 +3,19 @@
 use alloy_primitives::{Address, B256, U256};
 
 use crate::model::{
-    input::ImportedTempoBlockInput,
-    state::ModelState,
+    input::{ImportedTempoBlockInput, ImportedTempoOperation},
+    state::{ModelState, PortalIdentity},
     transition::{ImportedTempoTransition, ModelError, ModelTransition},
 };
+
+/// The authenticated projection did not contain exactly one Portal creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PortalCreationIdentityError {
+    #[error("authenticated Tempo block does not contain a Portal creation")]
+    Missing,
+    #[error("authenticated Tempo block contains {count} Portal creations; expected exactly one")]
+    Multiple { count: usize },
+}
 
 /// Stable event coordinates copied from one authenticated receipt position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -327,12 +336,36 @@ pub(crate) struct ImportedProjection {
 }
 
 impl ImportedProjection {
+    #[cfg(test)]
     pub(crate) const fn input(&self) -> &ImportedTempoBlockInput {
         &self.input
     }
 
     pub(crate) fn outputs(&self) -> &[ObservedImportedOutput] {
         &self.outputs
+    }
+
+    /// Return the identity from the sole authenticated creation operation.
+    pub(crate) fn sole_portal_creation_identity(
+        &self,
+    ) -> Result<PortalIdentity, PortalCreationIdentityError> {
+        let mut identities = self.input.operations().iter().filter_map(|operation| {
+            let ImportedTempoOperation::Create(creation) = operation else {
+                return None;
+            };
+            Some(creation.identity())
+        });
+        let identity = identities
+            .next()
+            .ok_or(PortalCreationIdentityError::Missing)?;
+        let additional = identities.count();
+        if additional == 0 {
+            Ok(identity)
+        } else {
+            Err(PortalCreationIdentityError::Multiple {
+                count: additional + 1,
+            })
+        }
     }
 
     pub(crate) fn apply<'a>(

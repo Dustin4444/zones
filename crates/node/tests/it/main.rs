@@ -1,3 +1,4 @@
+mod checker_e2e;
 mod demo_asset_swap;
 mod demo_cross_zone;
 mod demo_shield_and_send;

@@ -35,6 +35,39 @@ fn every_unwind_write_fault_leaves_the_child_durable_after_reopen() {
 }
 
 #[test]
+fn every_zone_replay_unwind_fault_preserves_the_child_cursor_after_reopen() {
+    let (directory, initialization, mut store) = open_test_store(BootstrapPhase::ZoneReplay);
+    let parent = store.load_current().unwrap();
+    let token = initialization.identity.portal_identity().initial_token();
+    let (child_zone, _) = apply_token_child(
+        &store,
+        parent.verified_zone_tip,
+        parent.imported_tempo_tip,
+        0x86,
+        0x96,
+        token,
+        7,
+    );
+    let child = store.load_current().unwrap();
+    let child_history = durable_history(&store);
+
+    // Live unwind's six writes plus the rewound Zone-replay cursor.
+    for write in 1..=7 {
+        assert!(matches!(
+            store.unwind_tip_aborting_after(child_zone, write),
+            Err(StoreError::InjectedWriteFailure)
+        ));
+        drop(store);
+        store = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
+        assert_eq!(store.load_current().unwrap(), child);
+        assert_eq!(durable_history(&store), child_history);
+    }
+
+    store.unwind_tip(child_zone).unwrap();
+    assert_eq!(store.load_current().unwrap(), parent);
+}
+
+#[test]
 fn unwind_requires_the_exact_current_tip_and_rejects_active_alerts() {
     let (_directory, initialization, store) = open_test_store(BootstrapPhase::Live);
     let parent = store.load_current().unwrap();

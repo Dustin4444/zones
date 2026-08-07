@@ -8,8 +8,8 @@ use tempo_primitives::{Block, TempoHeader, TempoPrimitives, TempoReceipt};
 use super::{
     L1_NUMBER, TestProvider, UnavailableZoneState, chain, exact_zone_state_with_supply,
     imported_child_header, l1_provider_with_collateral, l1_provider_with_collateral_sequence,
-    user_withdrawal_receipt, zone_block, zone_block_with_marker, zone_block_with_user_withdrawal,
-    zone_block_with_user_withdrawal_marker, zone_receipt,
+    user_withdrawal_receipt, with_zone_receipts, zone_block, zone_block_with_marker,
+    zone_block_with_user_withdrawal, zone_block_with_user_withdrawal_marker, zone_receipt,
 };
 use crate::{
     check::pipeline::PreparedBlock,
@@ -18,7 +18,7 @@ use crate::{
         state::{ModelState, PortalIdentity, portal_address_for_zone},
     },
     observe::ExactStateLookup,
-    runtime::{L1Client, LiveChecker, RuntimeError},
+    runtime::{L1Client, PersistentChecker, RuntimeError},
     store::{
         db::{CheckerStore, Initialization},
         error::StoreError,
@@ -43,7 +43,7 @@ struct LiveFixture {
     imported: TempoHeader,
     block: reth_primitives_traits::RecoveredBlock<Block>,
     receipts: Vec<TempoReceipt>,
-    checker: LiveChecker,
+    checker: PersistentChecker,
 }
 
 impl LiveFixture {
@@ -58,6 +58,7 @@ impl LiveFixture {
             initialization.verified_zone_tip.hash,
             &imported,
             sender,
+            token,
         );
         let receipts = vec![
             zone_receipt(&imported),
@@ -67,7 +68,7 @@ impl LiveFixture {
         let store = CheckerStore::open(directory.path(), initialization.clone()).unwrap();
         drop(store);
         let store = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
-        let checker = LiveChecker::from_store(store).unwrap();
+        let checker = PersistentChecker::from_store(store).unwrap();
         Self {
             directory,
             initialization,
@@ -110,7 +111,7 @@ fn live_initialization() -> Initialization {
         portal_identity,
         31337,
         Address::repeat_byte(0x30),
-        B256::repeat_byte(0xcc),
+        BlockNumHash::new(1, B256::repeat_byte(0xcc)),
     );
     Initialization::new(
         identity,

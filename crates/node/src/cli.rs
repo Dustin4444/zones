@@ -1,5 +1,9 @@
 //! Tempo Zone CLI.
 
+mod checker;
+
+pub use checker::CheckerArgs;
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
@@ -19,7 +23,7 @@ use crate::{
     ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
-use zone_checker::{CheckerExEx, CheckerMode};
+use zone_checker::CheckerExEx;
 use zone_sequencer::{
     BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
     MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
@@ -108,7 +112,13 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
         validate_portal_address(args.portal_address)?;
-        args.validate_zone_id(builder.config().chain.genesis().config.chain_id)?;
+        let zone_chain_id = builder.config().chain.genesis().config.chain_id;
+        args.validate_zone_id(zone_chain_id)?;
+        let checker_config = args.checker.config(
+            &args.l1_rpc_url,
+            args.portal_address,
+            args.zone_id,
+        )?;
 
         let p2p_config = args
             .sequencer_manifest
@@ -176,10 +186,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
         builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
 
-        // Clone L1 connection details for the checker before they are moved into ZoneNode.
-        let checker_l1_rpc_url = args.l1_rpc_url.clone();
-        let checker_portal_address = args.portal_address;
-
         let mut node = ZoneNode::new(
             args.l1_rpc_url,
             args.portal_address,
@@ -223,21 +229,21 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             node = node.with_p2p(config);
         }
 
-        // Install or skip the checker ExEx based on the configured mode.
-        match args.checker_mode {
-            CheckerMode::Off => {
+        // Install the checker ExEx only when observe mode produced a runtime config.
+        match checker_config {
+            None => {
                 let handle = builder
                     .node(node)
                     .launch_with_debug_capabilities()
                     .await?;
                 handle.wait_for_node_exit().await
             }
-            CheckerMode::Observe => {
+            Some(config) => {
                 info!(target: "reth::cli", "Checker ExEx enabled (observe mode)");
-                let checker = CheckerExEx::new(checker_l1_rpc_url, checker_portal_address);
+                let checker = CheckerExEx::new(config);
                 builder
                     .node(node)
-                    .install_exex("zone-checker", async move |ctx| Ok(checker.run(ctx)))
+                    .install_exex("zone-checker", async move |ctx| checker.launch(ctx))
                     .launch_with_debug_capabilities()
                     .await?
                     .wait_for_node_exit()
@@ -519,14 +525,9 @@ pub struct ZoneArgs {
     )]
     pub enable_sequencer: bool,
 
-    /// Checker ExEx mode: `off` (default) or `observe`.
-    #[arg(
-        long = "checker.mode",
-        env = "CHECKER_MODE",
-        default_value = "off",
-        value_parser = zone_checker::CheckerMode::parse,
-    )]
-    pub checker_mode: zone_checker::CheckerMode,
+    /// Durable observe-only checker configuration.
+    #[command(flatten)]
+    pub checker: CheckerArgs,
 }
 
 impl ZoneArgs {
@@ -601,50 +602,6 @@ mod tests {
     struct ZoneArgsParser {
         #[command(flatten)]
         zone: ZoneArgs,
-    }
-
-    #[test]
-    fn checker_mode_defaults_to_off() {
-        let args = ZoneArgsParser::try_parse_from([
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-        ])
-        .unwrap()
-        .zone;
-        assert_eq!(args.checker_mode, zone_checker::CheckerMode::Off);
-    }
-
-    #[test]
-    fn checker_mode_observe_parses() {
-        let args = ZoneArgsParser::try_parse_from([
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-            "--checker.mode",
-            "observe",
-        ])
-        .unwrap()
-        .zone;
-        assert_eq!(args.checker_mode, zone_checker::CheckerMode::Observe);
-    }
-
-    #[test]
-    fn checker_mode_enforce_is_rejected() {
-        let result = ZoneArgsParser::try_parse_from([
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-            "--checker.mode",
-            "enforce",
-        ]);
-        assert!(result.is_err());
     }
 
     #[test]

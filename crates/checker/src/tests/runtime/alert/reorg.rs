@@ -31,6 +31,7 @@ async fn reorg_removing_alert_orphans_it_and_applies_replacement() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         sender,
+        fixture.token,
         0xb1,
     );
     let replacement_tip = BlockNumHash::new(1, replacement.hash());
@@ -98,6 +99,7 @@ async fn replacement_divergence_gets_a_new_key_and_retains_the_old_orphan() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         sender,
+        fixture.token,
         0xb2,
     );
     let replacement_tip = BlockNumHash::new(1, replacement.hash());
@@ -200,6 +202,7 @@ async fn reorg_below_frozen_parent_unwinds_verified_state_before_replacement() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         sender,
+        fixture.token,
         0xd1,
     );
     let replacement_second = zone_block(2, replacement_first.hash(), &second_imported);

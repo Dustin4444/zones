@@ -1,10 +1,12 @@
 //! Canonical Zone block observation from one in-process Reth notification.
 
-use alloy_consensus::{BlockHeader as _, Transaction as _, transaction::TxHashRef as _};
+use alloy_consensus::{
+    BlockHeader as _, Transaction as _, TxReceipt as _, transaction::TxHashRef as _,
+};
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bloom};
 use reth_primitives_traits::RecoveredBlock;
-use tempo_primitives::{Block, TempoTxEnvelope};
+use tempo_primitives::{Block, TempoReceipt, TempoTxEnvelope};
 
 use crate::model::{
     constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
@@ -15,7 +17,7 @@ use super::{
     abi::{DecodedAdvanceTempo, DecodedFinalization, decode_advance_tempo, decode_finalization},
     error::{
         AcquisitionError, AcquisitionSource, AuthenticatedTransaction, EnvelopeRule,
-        ObservationError, ProtocolChain,
+        ObservationError, ProtocolChain, ensure_acquisition_equal,
     },
 };
 
@@ -232,28 +234,24 @@ impl From<ObservationError> for L2ObservationFailure {
 /// Observe one canonical non-genesis Zone block.
 ///
 /// Transactions, recovered senders, and receipts all come from the same Reth
-/// notification. This layer authenticates transaction envelopes and strictly
-/// decodes protocol logs; the evaluator compares those independent inputs and
-/// outputs against model expectations.
-pub(crate) fn observe_l2_block<R>(
+/// notification or backfill result. This layer authenticates the complete
+/// receipt set against the block header, authenticates transaction envelopes,
+/// and strictly decodes protocol logs; the evaluator compares those independent
+/// inputs and outputs against model expectations.
+#[cfg(test)]
+pub(crate) fn observe_l2_block(
     block: &RecoveredBlock<Block>,
-    receipts: &[R],
-) -> Result<L2BlockObservation, ObservationError>
-where
-    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
-{
+    receipts: &[TempoReceipt],
+) -> Result<L2BlockObservation, ObservationError> {
     observe_l2_block_with_context(block, receipts).map_err(|failure| failure.into_parts().0)
 }
 
 /// Observe one Zone block while retaining how far authenticated envelope
 /// decoding progressed if it fails.
-pub(crate) fn observe_l2_block_with_context<R>(
+pub(crate) fn observe_l2_block_with_context(
     block: &RecoveredBlock<Block>,
-    receipts: &[R],
-) -> Result<L2BlockObservation, L2ObservationFailure>
-where
-    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
-{
+    receipts: &[TempoReceipt],
+) -> Result<L2BlockObservation, L2ObservationFailure> {
     let block_number = block.header().number();
     let block_hash = block.hash();
     let parent_hash = block.header().parent_hash();
@@ -279,6 +277,7 @@ where
         ))
         .into());
     }
+    authenticate_receipt_commitments(block, receipts)?;
 
     let first = transactions
         .first()
@@ -368,14 +367,34 @@ where
     finish().map_err(|error| L2ObservationFailure::with_imported_tempo(error, imported_tempo))
 }
 
-fn ordered_l2_events<R>(
+fn authenticate_receipt_commitments(
+    block: &RecoveredBlock<Block>,
+    receipts: &[TempoReceipt],
+) -> Result<(), ObservationError> {
+    let computed_root = TempoReceipt::calculate_receipt_root_no_memo(receipts);
+    ensure_acquisition_equal(
+        AcquisitionSource::ZoneNotificationReceipts,
+        "receipts root",
+        block.header().receipts_root(),
+        computed_root,
+    )?;
+
+    let computed_bloom = receipts
+        .iter()
+        .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom());
+    ensure_acquisition_equal(
+        AcquisitionSource::ZoneNotificationReceipts,
+        "logs bloom",
+        block.header().logs_bloom(),
+        computed_bloom,
+    )
+}
+
+fn ordered_l2_events(
     transactions: &[TempoTxEnvelope],
     senders: &[Address],
-    receipts: &[R],
-) -> Result<Vec<OrderedL2Outcome>, ObservationError>
-where
-    R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
-{
+    receipts: &[TempoReceipt],
+) -> Result<Vec<OrderedL2Outcome>, ObservationError> {
     let mut outcomes = Vec::new();
     let mut block_log_index = 0usize;
     for (transaction_index, ((transaction, sender), receipt)) in

@@ -265,6 +265,7 @@ pub(crate) enum PendingWithdrawal {
 }
 
 impl PendingWithdrawal {
+    #[cfg(test)]
     pub(crate) const fn identity(&self) -> WithdrawalIdentity {
         match self {
             Self::User(pending) => WithdrawalIdentity::User(pending.identity),

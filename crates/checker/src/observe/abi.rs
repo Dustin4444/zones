@@ -58,14 +58,14 @@ impl<'a> Surface<'a> {
     }
 }
 
-/// Canonical Tempo header supplied by the opening Zone system transaction.
+/// Canonical Tempo header selected at an authenticated observation boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportedTempoHeader {
     sealed: SealedHeader<TempoHeader>,
 }
 
 impl ImportedTempoHeader {
-    fn new(header: TempoHeader) -> Self {
+    pub(super) fn new(header: TempoHeader) -> Self {
         Self {
             sealed: SealedHeader::seal_slow(header),
         }
@@ -135,10 +135,6 @@ impl DecodedAdvanceTempo {
 
     pub(crate) fn deposits(&self) -> &[ImportedDeposit] {
         &self.deposits
-    }
-
-    pub(crate) fn decryptions(&self) -> &[IZoneInbox::DecryptionData] {
-        &self.decryptions
     }
 
     pub(crate) fn enabled_tokens(&self) -> &[IZoneInbox::EnabledToken] {

@@ -8,7 +8,9 @@ use super::{
 };
 use crate::model::{
     state::PortalIdentity,
-    transition::{ImportedTempoStateUpdate, LogicalMutationRef, ModelStateUpdate},
+    transition::{
+        ImportedTempoStateUpdate, LogicalMutationRef, ModelStateUpdate, ZoneGenesisStateUpdate,
+    },
 };
 
 pub(crate) type ModelRowChanges = BTreeMap<ModelKey, Option<ModelValue>>;
@@ -29,6 +31,16 @@ pub(crate) fn lower_update(
 pub(crate) fn lower_imported_update(
     identity: PortalIdentity,
     update: &ImportedTempoStateUpdate,
+) -> Result<ModelRowChanges, ModelPersistenceError> {
+    let mut changes = BTreeMap::new();
+    update.try_visit_mutations(|mutation| lower_one(identity, &mut changes, mutation))?;
+    Ok(changes)
+}
+
+/// Lower the one-time Zone-genesis token promotion into token rows only.
+pub(crate) fn lower_zone_genesis_update(
+    identity: PortalIdentity,
+    update: &ZoneGenesisStateUpdate,
 ) -> Result<ModelRowChanges, ModelPersistenceError> {
     let mut changes = BTreeMap::new();
     update.try_visit_mutations(|mutation| lower_one(identity, &mut changes, mutation))?;

@@ -9,17 +9,17 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 
-use crate::model::transition::ImportedTempoStateUpdate;
+use crate::model::transition::{ImportedTempoStateUpdate, ZoneGenesisStateUpdate};
 
 use super::{
     codec::validate_canonical,
     db::{
-        CheckerStore, StoreHead, finish_read, read_active_alert, read_head, read_snapshot,
+        CheckerStore, StoreProgress, finish_read, read_active_alert, read_head, read_snapshot,
         read_tip, validate_bootstrap_candidate, validate_bootstrap_coherence,
         validate_portal_settlement_change,
     },
     error::{StoreError, StoreResult},
-    model_state::update::{ModelRowChanges, lower_imported_update},
+    model_state::update::{ModelRowChanges, lower_imported_update, lower_zone_genesis_update},
     schema::{
         CheckerCanonical, CheckerFindings, CheckerMeta, CheckerModelState, FindingKey, MetaKey,
         ModelKey,
@@ -84,12 +84,7 @@ impl CheckerStore {
                 "L1 replay cursor does not match its expected tip",
             ));
         };
-        if cursor.is_some_and(|cursor| cursor != expected_tempo) {
-            return Err(StoreError::InvalidBootstrapProgress(
-                "L1 replay cursor does not match its expected tip",
-            ));
-        }
-        require_adjacent("Tempo bootstrap", expected_tempo, next_tempo)?;
+        validate_l1_replay_step(self.identity, cursor, expected_tempo, next_tempo)?;
         Ok(BootstrapCommit {
             expected_state,
             expected_tempo,
@@ -106,6 +101,7 @@ impl CheckerStore {
         &self,
         expected_state: BootstrapState,
         tempo_tip: BlockNumHash,
+        update: &ZoneGenesisStateUpdate,
     ) -> StoreResult<BootstrapCommit> {
         if expected_state != BootstrapState::l1_replay(Some(tempo_tip)) {
             return Err(StoreError::InvalidBootstrapProgress(
@@ -117,7 +113,10 @@ impl CheckerStore {
             expected_tempo: tempo_tip,
             next_state: BootstrapState::zone_replay(tempo_tip),
             next_tempo: tempo_tip,
-            changes: BTreeMap::new(),
+            changes: validate_changes(lower_zone_genesis_update(
+                self.identity.portal_identity(),
+                update,
+            )?)?,
         })
     }
 
@@ -179,12 +178,7 @@ impl CheckerStore {
                 "raw L1 replay cursor does not match its expected tip",
             ));
         };
-        if cursor.is_some_and(|cursor| cursor != expected_tempo) {
-            return Err(StoreError::InvalidBootstrapProgress(
-                "raw L1 replay cursor does not match its expected tip",
-            ));
-        }
-        require_adjacent("Tempo bootstrap", expected_tempo, next_tempo)?;
+        validate_l1_replay_step(self.identity, cursor, expected_tempo, next_tempo)?;
         Ok(BootstrapCommit {
             expected_state,
             expected_tempo,
@@ -263,6 +257,28 @@ impl CheckerStore {
         let result = orphan_finding_transaction(&tx, key, &mut gate);
         finish_write(tx, result)
     }
+}
+
+fn validate_l1_replay_step(
+    identity: StoreIdentity,
+    cursor: Option<BlockNumHash>,
+    expected_tempo: BlockNumHash,
+    next_tempo: BlockNumHash,
+) -> StoreResult<()> {
+    if cursor.is_some_and(|cursor| cursor != expected_tempo) {
+        return Err(StoreError::InvalidBootstrapProgress(
+            "L1 replay cursor does not match its expected tip",
+        ));
+    }
+    require_adjacent("Tempo bootstrap", expected_tempo, next_tempo)?;
+    let creation = identity.portal_creation_block();
+    if cursor.is_none() && next_tempo != creation {
+        return Err(StoreError::L1ReplayFirstBlockMismatch {
+            expected: creation,
+            actual: next_tempo,
+        });
+    }
+    Ok(())
 }
 
 struct PreparedBootstrap {
@@ -349,6 +365,23 @@ fn apply_bootstrap_transaction<TX: DbTxMut + DbTx>(
         MetaValue::ImportedTempoTip(commit.next_tempo),
     )?;
     gate.wrote()?;
+    let first_creation = matches!(
+        commit.expected_state,
+        BootstrapState::L1Replay { cursor: None }
+    );
+    let zone_genesis_handoff = matches!(
+        (commit.expected_state, commit.next_state),
+        (
+            BootstrapState::L1Replay { cursor: Some(_) },
+            BootstrapState::ZoneReplay { .. }
+        )
+    );
+    if first_creation || zone_genesis_handoff {
+        // Creation and the Zone-genesis handoff change complete persisted
+        // lifecycle phases. Validate each candidate once before commit; other
+        // L1 blocks retain the sparse O(changes) path.
+        let _validated = read_snapshot(tx, identity, path)?;
+    }
     Ok(WriteOutcome::Applied)
 }
 
@@ -357,14 +390,14 @@ fn read_bootstrap_candidate_head<TX: DbTx>(
     identity: StoreIdentity,
     path: &std::path::Path,
     candidate: BootstrapState,
-) -> StoreResult<StoreHead> {
+) -> StoreResult<StoreProgress> {
     if candidate != BootstrapState::Live {
         return read_head(tx, identity, path);
     }
 
     let snapshot = read_snapshot(tx, identity, path)?;
-    validate_bootstrap_candidate(tx, candidate, &snapshot)?;
-    Ok(StoreHead {
+    validate_bootstrap_candidate(tx, identity, candidate, &snapshot)?;
+    Ok(StoreProgress {
         verified_zone_tip: snapshot.verified_zone_tip,
         imported_tempo_tip: snapshot.imported_tempo_tip,
         bootstrap: snapshot.bootstrap,
@@ -667,16 +700,23 @@ pub(super) fn require_adjacent(
 
 #[derive(Debug)]
 pub(super) struct WriteGate {
+    #[cfg(test)]
     fail_after: Option<usize>,
     writes: usize,
 }
 
 impl WriteGate {
+    #[cfg(test)]
     pub(super) const fn new(fail_after: Option<usize>) -> Self {
         Self {
             fail_after,
             writes: 0,
         }
+    }
+
+    #[cfg(not(test))]
+    pub(super) const fn new(_: Option<usize>) -> Self {
+        Self { writes: 0 }
     }
 
     pub(super) fn wrote(&mut self) -> StoreResult<()> {

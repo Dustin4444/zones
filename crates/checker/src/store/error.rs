@@ -36,6 +36,8 @@ pub(crate) enum StoreError {
     },
     #[error("checker database at {path} does not exist or contains no durable state")]
     EmptyExistingDatabase { path: PathBuf },
+    #[error("refusing to initialize nonempty checker database path {path}")]
+    NonEmptyFreshDatabase { path: PathBuf },
     #[error(transparent)]
     Database(#[from] DatabaseError),
     #[error(transparent)]
@@ -124,6 +126,7 @@ pub(crate) enum StoreError {
         reason: &'static str,
     },
     #[error("historical target {target} is above current verified Zone height {current}")]
+    #[cfg(test)]
     FutureTarget { target: u64, current: u64 },
     #[error("bootstrap guard changed: expected {expected:?}, found {actual:?}")]
     BootstrapChanged {
@@ -139,6 +142,32 @@ pub(crate) enum StoreError {
     MetadataCardinality { expected: usize, actual: usize },
     #[error("invalid bootstrap progress: {0}")]
     InvalidBootstrapProgress(&'static str),
+    #[error(
+        "L1 replay must remain at exact Zone genesis {expected:?}, found verified tip {actual:?}"
+    )]
+    L1ReplayZoneTipMismatch {
+        expected: BlockNumHash,
+        actual: BlockNumHash,
+    },
+    #[error(
+        "unstarted L1 replay must begin immediately before Portal creation {creation:?}, found imported tip {actual:?}"
+    )]
+    L1ReplayStartHeightMismatch {
+        creation: BlockNumHash,
+        actual: BlockNumHash,
+    },
+    #[error(
+        "L1 replay cursor must include authenticated Portal creation {creation:?}, found {cursor:?}"
+    )]
+    L1ReplayCursorOutsideCreationHistory {
+        creation: BlockNumHash,
+        cursor: BlockNumHash,
+    },
+    #[error("first L1 replay block must be Portal creation {expected:?}, found {actual:?}")]
+    L1ReplayFirstBlockMismatch {
+        expected: BlockNumHash,
+        actual: BlockNumHash,
+    },
     #[error(
         "Portal settlement Tempo height {settlement_height} is above imported Tempo tip {imported_tip:?}"
     )]
@@ -161,8 +190,19 @@ pub(crate) enum StoreError {
         settlement_hash: B256,
         canonical_hash: B256,
     },
-    #[error("live checker state contains Portal-only token {token}")]
-    LiveModelHasPendingToken { token: Address },
+    #[error("checker {bootstrap:?} state contains token {token} in an impossible enablement phase")]
+    BootstrapTokenPhaseMismatch {
+        bootstrap: BootstrapState,
+        token: Address,
+    },
+    #[error(
+        "Portal creation progress is impossible: configured creation {creation:?}, imported tip {imported_tip:?}, model created={portal_created}"
+    )]
+    PortalCreationProgressMismatch {
+        creation: BlockNumHash,
+        imported_tip: BlockNumHash,
+        portal_created: bool,
+    },
     #[error("finding {key:?} conflicts with an existing durable finding")]
     FindingConflict { key: FindingKey },
     #[error("finding {key:?} must be canonical, found {status:?}")]

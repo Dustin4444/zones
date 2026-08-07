@@ -1,7 +1,8 @@
 use alloy_consensus::{
-    Header, Sealable as _, SignableTransaction as _, Signed, TxLegacy, transaction::TxHashRef as _,
+    Header, Sealable as _, SignableTransaction as _, Signed, TxLegacy, TxReceipt as _,
+    transaction::TxHashRef as _,
 };
-use alloy_primitives::{Address, B256, Bytes, Log, LogData, Signature, U256, b256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData, Signature, U256, b256};
 use alloy_rlp::Encodable as _;
 use alloy_sol_types::{SolCall as _, SolEvent as _};
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
@@ -149,12 +150,16 @@ fn advance_logs(hash_override: Option<B256>) -> Vec<Log> {
 fn recovered_block(
     transactions: Vec<TempoTxEnvelope>,
     senders: Vec<Address>,
+    receipts: &[TempoReceipt],
 ) -> RecoveredBlock<Block> {
+    let (receipts_root, logs_bloom) = receipt_commitments(receipts);
     let block = Block {
         header: TempoHeader {
             inner: Header {
                 number: ZONE_NUMBER,
                 parent_hash: ZONE_PARENT_HASH,
+                receipts_root,
+                logs_bloom,
                 ..Default::default()
             },
             ..Default::default()
@@ -167,12 +172,41 @@ fn recovered_block(
     RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), senders)
 }
 
+fn reseal_with_receipts(
+    block: RecoveredBlock<Block>,
+    receipts: &[TempoReceipt],
+) -> RecoveredBlock<Block> {
+    let (receipts_root, logs_bloom) = receipt_commitments(receipts);
+    reseal_with_commitments(block, receipts_root, logs_bloom)
+}
+
+fn reseal_with_commitments(
+    block: RecoveredBlock<Block>,
+    receipts_root: B256,
+    logs_bloom: Bloom,
+) -> RecoveredBlock<Block> {
+    let senders = block.senders().to_vec();
+    let mut block = block.into_block();
+    block.header.inner.receipts_root = receipts_root;
+    block.header.inner.logs_bloom = logs_bloom;
+    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), senders)
+}
+
+fn receipt_commitments(receipts: &[TempoReceipt]) -> (B256, Bloom) {
+    let receipts_root = TempoReceipt::calculate_receipt_root_no_memo(receipts);
+    let logs_bloom = receipts
+        .iter()
+        .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom());
+    (receipts_root, logs_bloom)
+}
+
 fn basic_fixture() -> (RecoveredBlock<Block>, Vec<TempoReceipt<Log>>) {
+    let receipts = vec![receipt(true, advance_logs(None))];
     let block = recovered_block(
         vec![advance_transaction(ZONE_INBOX_ADDRESS)],
         vec![Address::ZERO],
+        &receipts,
     );
-    let receipts = vec![receipt(true, advance_logs(None))];
     (block, receipts)
 }
 
@@ -207,11 +241,12 @@ fn observe_user_logs(logs: Vec<Log>) -> (B256, L2BlockObservation) {
     let advance = advance_transaction(ZONE_INBOX_ADDRESS);
     let user = user_transaction(0x77);
     let user_hash = *user.tx_hash();
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, logs)];
     let block = recovered_block(
         vec![advance, user],
         vec![Address::ZERO, Address::repeat_byte(0x44)],
+        &receipts,
     );
-    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, logs)];
     let observation = observe_l2_block(&block, &receipts).unwrap();
     (user_hash, observation)
 }
@@ -233,7 +268,9 @@ fn observes_decoded_header_input_and_ordered_protocol_events() {
 #[test]
 fn authenticated_inputs_do_not_require_matching_event_outputs() {
     let (block, _) = basic_fixture();
-    let observation = observe_l2_block(&block, &[receipt(true, Vec::new())]).unwrap();
+    let receipts = [receipt(true, Vec::new())];
+    let block = reseal_with_receipts(block, &receipts);
+    let observation = observe_l2_block(&block, &receipts).unwrap();
 
     assert_eq!(
         observation.inputs.advance_tempo.imported_header().hash(),
@@ -257,6 +294,7 @@ fn tempo_advanced_cursor_is_retained_for_later_evaluation() {
         .encode_log_data(),
     };
 
+    let block = reseal_with_receipts(block, &receipts);
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert!(matches!(
         &observation.outcomes.events[1].event,
@@ -272,6 +310,7 @@ fn mismatched_tempo_advanced_is_retained_independently_from_calldata() {
     let forged_hash = B256::repeat_byte(0xee);
     receipts[0].logs = advance_logs(Some(forged_hash));
 
+    let block = reseal_with_receipts(block, &receipts);
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(
         observation.inputs.advance_tempo.imported_header().hash(),
@@ -286,26 +325,25 @@ fn mismatched_tempo_advanced_is_retained_independently_from_calldata() {
 
 #[test]
 fn mismatched_enabled_token_output_is_retained_for_later_evaluation() {
-    let block = recovered_block(
-        vec![advance_transaction_with_tokens(
-            ZONE_INBOX_ADDRESS,
-            vec![IZoneInbox::EnabledToken {
-                token: Address::repeat_byte(0x71),
-                name: "Token".into(),
-                symbol: "TKN".into(),
-                currency: "USD".into(),
-            }],
-        )],
-        vec![Address::ZERO],
-    );
+    let transactions = vec![advance_transaction_with_tokens(
+        ZONE_INBOX_ADDRESS,
+        vec![IZoneInbox::EnabledToken {
+            token: Address::repeat_byte(0x71),
+            name: "Token".into(),
+            symbol: "TKN".into(),
+            currency: "USD".into(),
+        }],
+    )];
     let mut logs = advance_logs(None);
     logs.push(token_enabled_log("TKN"));
     let mut receipts = vec![receipt(true, logs)];
+    let block = recovered_block(transactions, vec![Address::ZERO], &receipts);
 
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(observation.inputs.advance_tempo.enabled_tokens().len(), 1);
 
     receipts[0].logs[2] = token_enabled_log("BAD");
+    let block = reseal_with_receipts(block, &receipts);
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(
         observation.inputs.advance_tempo.enabled_tokens()[0].symbol,
@@ -330,7 +368,11 @@ fn notification_cardinality_errors_are_acquisition_failures() {
         })
     ));
 
-    let without_sender = recovered_block(vec![advance_transaction(ZONE_INBOX_ADDRESS)], vec![]);
+    let without_sender = recovered_block(
+        vec![advance_transaction(ZONE_INBOX_ADDRESS)],
+        vec![],
+        &receipts,
+    );
     let error = observe_l2_block(&without_sender, &receipts).unwrap_err();
     assert!(matches!(
         error,
@@ -342,11 +384,38 @@ fn notification_cardinality_errors_are_acquisition_failures() {
 }
 
 #[test]
+fn receipt_root_and_bloom_are_authenticated_against_the_zone_header() {
+    let (block, receipts) = basic_fixture();
+    let (receipts_root, logs_bloom) = receipt_commitments(&receipts);
+
+    let wrong_root = reseal_with_commitments(block.clone(), B256::repeat_byte(0xa1), logs_bloom);
+    assert!(matches!(
+        observe_l2_block(&wrong_root, &receipts),
+        Err(ObservationError::Acquisition(AcquisitionError::Inconsistent {
+            kind: AcquisitionSource::ZoneNotificationReceipts,
+            expected,
+            ..
+        })) if expected.contains("receipts root")
+    ));
+
+    let wrong_bloom = reseal_with_commitments(block, receipts_root, Bloom::repeat_byte(0xb2));
+    assert!(matches!(
+        observe_l2_block(&wrong_bloom, &receipts),
+        Err(ObservationError::Acquisition(AcquisitionError::Inconsistent {
+            kind: AcquisitionSource::ZoneNotificationReceipts,
+            expected,
+            ..
+        })) if expected.contains("logs bloom")
+    ));
+}
+
+#[test]
 fn opening_envelope_requires_system_identity_destination_and_success() {
     let receipts = vec![receipt(true, advance_logs(None))];
     let wrong_sender = recovered_block(
         vec![advance_transaction(ZONE_INBOX_ADDRESS)],
         vec![Address::repeat_byte(1)],
+        &receipts,
     );
     assert!(matches!(
         observe_l2_block(&wrong_sender, &receipts),
@@ -359,6 +428,7 @@ fn opening_envelope_requires_system_identity_destination_and_success() {
     let wrong_destination = recovered_block(
         vec![advance_transaction(Address::repeat_byte(2))],
         vec![Address::ZERO],
+        &receipts,
     );
     assert!(matches!(
         observe_l2_block(&wrong_destination, &receipts),
@@ -369,8 +439,10 @@ fn opening_envelope_requires_system_identity_destination_and_success() {
     ));
 
     let (block, _) = basic_fixture();
+    let failed_receipts = [receipt(false, vec![])];
+    let block = reseal_with_receipts(block, &failed_receipts);
     assert!(matches!(
-        observe_l2_block(&block, &[receipt(false, vec![])]),
+        observe_l2_block(&block, &failed_receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::AdvanceSuccess,
             ..
@@ -467,6 +539,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             data: LogData::new_unchecked(vec![B256::repeat_byte(0xaa)], Bytes::new()),
         },
     );
+    let block = reseal_with_receipts(block, &receipts);
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(observation.outcomes.events.len(), 2);
 
@@ -479,6 +552,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             data: LogData::new_unchecked(vec![B256::repeat_byte(0xff)], Bytes::new()),
         },
     );
+    let block = reseal_with_receipts(block, &receipts);
     let (error, imported_tempo) = observe_l2_block_with_context(&block, &receipts)
         .unwrap_err()
         .into_parts();
@@ -510,6 +584,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             ),
         },
     );
+    let block = reseal_with_receipts(block, &receipts);
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
@@ -532,6 +607,7 @@ fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
             ),
         },
     );
+    let block = reseal_with_receipts(block, &receipts);
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
@@ -544,7 +620,6 @@ fn finalization_is_unique_final_and_retains_its_event_output() {
     let advance = advance_transaction(ZONE_INBOX_ADDRESS);
     let finalize = finalization_transaction(ZONE_NUMBER);
     let finalize_hash = *finalize.tx_hash();
-    let block = recovered_block(vec![advance, finalize], vec![Address::ZERO, Address::ZERO]);
     let receipts = vec![
         receipt(true, advance_logs(None)),
         receipt(
@@ -559,6 +634,11 @@ fn finalization_is_unique_final_and_retains_its_event_output() {
             }],
         ),
     ];
+    let block = recovered_block(
+        vec![advance, finalize],
+        vec![Address::ZERO, Address::ZERO],
+        &receipts,
+    );
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(
         observation.inputs.finalization.unwrap().transaction_hash,
@@ -574,14 +654,15 @@ fn finalization_is_unique_final_and_retains_its_event_output() {
 
 #[test]
 fn finalization_rejects_wrong_block_number_and_position() {
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     let wrong_number = recovered_block(
         vec![
             advance_transaction(ZONE_INBOX_ADDRESS),
             finalization_transaction(ZONE_NUMBER + 1),
         ],
         vec![Address::ZERO, Address::ZERO],
+        &receipts,
     );
-    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     assert!(matches!(
         observe_l2_block(&wrong_number, &receipts),
         Err(ObservationError::InvalidEnvelope {
@@ -590,6 +671,11 @@ fn finalization_rejects_wrong_block_number_and_position() {
         })
     ));
 
+    let misplaced_receipts = vec![
+        receipt(true, advance_logs(None)),
+        receipt(true, vec![]),
+        receipt(true, vec![]),
+    ];
     let misplaced = recovered_block(
         vec![
             advance_transaction(ZONE_INBOX_ADDRESS),
@@ -597,14 +683,10 @@ fn finalization_rejects_wrong_block_number_and_position() {
             user_transaction(0x71),
         ],
         vec![Address::ZERO, Address::ZERO, Address::repeat_byte(3)],
+        &misplaced_receipts,
     );
-    let receipts = vec![
-        receipt(true, advance_logs(None)),
-        receipt(true, vec![]),
-        receipt(true, vec![]),
-    ];
     assert!(matches!(
-        observe_l2_block(&misplaced, &receipts),
+        observe_l2_block(&misplaced, &misplaced_receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationPosition,
             ..
@@ -614,7 +696,7 @@ fn finalization_rejects_wrong_block_number_and_position() {
 
 #[test]
 fn finalization_requires_system_identity_destination_and_success() {
-    let finalization_receipts = || vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
+    let finalization_receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
 
     let wrong_sender = recovered_block(
         vec![
@@ -622,9 +704,10 @@ fn finalization_requires_system_identity_destination_and_success() {
             finalization_transaction(ZONE_NUMBER),
         ],
         vec![Address::ZERO, Address::repeat_byte(1)],
+        &finalization_receipts,
     );
     assert!(matches!(
-        observe_l2_block(&wrong_sender, &finalization_receipts()),
+        observe_l2_block(&wrong_sender, &finalization_receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::SystemIdentity,
             ..
@@ -640,23 +723,25 @@ fn finalization_requires_system_identity_destination_and_success() {
             ),
         ],
         vec![Address::ZERO, Address::ZERO],
+        &finalization_receipts,
     );
     assert!(matches!(
-        observe_l2_block(&wrong_destination, &finalization_receipts()),
+        observe_l2_block(&wrong_destination, &finalization_receipts),
         Err(ObservationError::InvalidEnvelope {
             rule: EnvelopeRule::FinalizationDestination,
             ..
         })
     ));
 
+    let failed_receipts = vec![receipt(true, advance_logs(None)), receipt(false, vec![])];
     let failed = recovered_block(
         vec![
             advance_transaction(ZONE_INBOX_ADDRESS),
             finalization_transaction(ZONE_NUMBER),
         ],
         vec![Address::ZERO, Address::ZERO],
+        &failed_receipts,
     );
-    let failed_receipts = vec![receipt(true, advance_logs(None)), receipt(false, vec![])];
     assert!(matches!(
         observe_l2_block(&failed, &failed_receipts),
         Err(ObservationError::InvalidEnvelope {
@@ -668,14 +753,15 @@ fn finalization_requires_system_identity_destination_and_success() {
 
 #[test]
 fn malformed_finalization_calldata_has_its_own_error_class() {
+    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     let block = recovered_block(
         vec![
             advance_transaction(ZONE_INBOX_ADDRESS),
             system_transaction(ZONE_OUTBOX_ADDRESS, Bytes::from_static(b"bad")),
         ],
         vec![Address::ZERO, Address::ZERO],
+        &receipts,
     );
-    let receipts = vec![receipt(true, advance_logs(None)), receipt(true, vec![])];
     let transaction_hash = *block.body().transactions[1].tx_hash();
     let evidence = AuthenticatedDataEvidence::from_bytes(b"bad");
     assert!(matches!(

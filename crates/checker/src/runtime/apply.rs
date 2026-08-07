@@ -15,7 +15,7 @@ use crate::{
     },
     observe::{AcquisitionError, AcquisitionSource, ExactStateLookup},
     store::{
-        db::LiveBlock,
+        db::CanonicalBlock,
         error::{ParentTips, StoreError},
         operations::WriteOutcome,
     },
@@ -24,7 +24,7 @@ use crate::{
 use super::{
     RuntimeResult,
     chain::ValidatedChain,
-    state::{LiveChecker, ReadyToAcknowledge},
+    state::{PersistentChecker, ReadyToAcknowledge},
 };
 
 /// Proof that the candidate's guarded MDBX transaction committed.
@@ -33,13 +33,33 @@ pub(crate) struct DurableBlock(PreparedBlock);
 /// One concrete, lazily connected Tempo provider for the retained notification.
 pub(crate) struct L1Client {
     rpc_url: String,
+    chain: ChainBinding,
     provider: Option<DynProvider<TempoNetwork>>,
+}
+
+#[derive(Clone, Copy)]
+enum ChainBinding {
+    Unbound,
+    Expected(u64),
+    Validated(u64),
 }
 
 impl L1Client {
     pub(crate) fn new(rpc_url: String) -> Self {
         Self {
             rpc_url,
+            chain: ChainBinding::Unbound,
+            provider: None,
+        }
+    }
+
+    /// Create a lazy client bound to the chain identity already stored in the
+    /// checker database. The first network use validates that identity before
+    /// exposing the provider to model acquisition.
+    pub(super) fn for_chain(rpc_url: String, expected_chain_id: u64) -> Self {
+        Self {
+            rpc_url,
+            chain: ChainBinding::Expected(expected_chain_id),
             provider: None,
         }
     }
@@ -48,25 +68,65 @@ impl L1Client {
     pub(crate) fn with_provider(provider: DynProvider<TempoNetwork>) -> Self {
         Self {
             rpc_url: String::new(),
+            chain: ChainBinding::Unbound,
             provider: Some(provider),
         }
     }
 
-    async fn provider(&mut self) -> RuntimeResult<DynProvider<TempoNetwork>> {
-        if let Some(provider) = &self.provider {
+    #[cfg(test)]
+    pub(crate) fn with_provider_for_chain(
+        provider: DynProvider<TempoNetwork>,
+        expected_chain_id: u64,
+    ) -> Self {
+        Self {
+            rpc_url: String::new(),
+            chain: ChainBinding::Expected(expected_chain_id),
+            provider: Some(provider),
+        }
+    }
+
+    /// Record the chain-ID read that authenticated a fresh database. The
+    /// connected provider can then be reused without a duplicate RPC call.
+    pub(super) fn bind_validated_chain_id(&mut self, chain_id: u64) {
+        self.chain = ChainBinding::Validated(chain_id);
+    }
+
+    pub(super) async fn provider(&mut self) -> RuntimeResult<DynProvider<TempoNetwork>> {
+        if !matches!(self.chain, ChainBinding::Expected(_))
+            && let Some(provider) = &self.provider
+        {
             return Ok(provider.clone());
         }
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect(&self.rpc_url)
-            .await
-            .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Rpc, error))?
-            .erased();
+
+        let provider = match &self.provider {
+            Some(provider) => provider.clone(),
+            None => ProviderBuilder::new_with_network::<TempoNetwork>()
+                .connect(&self.rpc_url)
+                .await
+                .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Rpc, error))?
+                .erased(),
+        };
+        if let ChainBinding::Expected(expected) | ChainBinding::Validated(expected) = self.chain {
+            let actual = provider
+                .get_chain_id()
+                .await
+                .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Rpc, error))?;
+            if actual != expected {
+                return Err(AcquisitionError::inconsistent(
+                    AcquisitionSource::L1Rpc,
+                    format_args!("chain ID {expected}"),
+                    format_args!("chain ID {actual}"),
+                )
+                .into());
+            }
+            self.chain = ChainBinding::Validated(expected);
+        }
         self.provider = Some(provider.clone());
         Ok(provider)
     }
 }
 
-impl LiveChecker {
+impl PersistentChecker {
     fn preflight_block(
         &mut self,
         block: &RecoveredBlock<Block>,
@@ -74,12 +134,12 @@ impl LiveChecker {
         let child = BlockNumHash::new(block.header().number(), block.hash());
         match self
             .store
-            .preflight_live_block(child, block.header().parent_hash())?
+            .preflight_block(child, block.header().parent_hash())?
         {
-            LiveBlock::AlreadyCanonical { verified_zone_tip } => {
+            CanonicalBlock::AlreadyCanonical { verified_zone_tip } => {
                 Ok(Some(ReadyToAcknowledge::verified(verified_zone_tip)))
             }
-            LiveBlock::Next {
+            CanonicalBlock::Next {
                 verified_zone_tip,
                 imported_tempo_tip,
             } => {
@@ -119,7 +179,7 @@ impl LiveChecker {
         }
         self.mirror = InMemoryChecker::new(
             snapshot.model,
-            self.store.portal_creation_block_hash(),
+            self.store.portal_creation_block(),
             snapshot.verified_zone_tip,
             snapshot.imported_tempo_tip,
         );
@@ -199,39 +259,12 @@ impl LiveChecker {
         // exact parent keeps that invariant out of the runtime error surface.
         let mut ready = ReadyToAcknowledge::verified(chain.base());
         for (block, receipts) in chain.inner().blocks_and_receipts() {
-            let block_ready = match self.preflight_block(block)? {
-                Some(ready) => ready,
-                None => {
-                    let observed = match self.observe_zone_candidate(block, receipts) {
-                        Ok(observed) => observed,
-                        Err(CheckError::Finding {
-                            finding,
-                            imported_tempo,
-                        }) => {
-                            self.activate_alert(block, imported_tempo, finding.as_ref())?;
-                            return Ok(ReadyToAcknowledge::alerted(chain.tip()));
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    let provider = l1_client.provider().await?;
-                    let candidate = match self
-                        .prepare_observed_candidate(&provider, zone_state, observed)
-                        .await
-                    {
-                        Ok(candidate) => candidate,
-                        Err(CheckError::Finding {
-                            finding,
-                            imported_tempo,
-                        }) => {
-                            self.activate_alert(block, imported_tempo, finding.as_ref())?;
-                            return Ok(ReadyToAcknowledge::alerted(chain.tip()));
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    let durable = self.commit_block(candidate)?;
-                    self.adopt_block(durable)
-                }
-            };
+            let block_ready = self
+                .process_canonical_block_once(block, receipts, zone_state, l1_client)
+                .await?;
+            if block_ready.is_alerting() {
+                return Ok(ReadyToAcknowledge::alerted(chain.tip()));
+            }
             info!(
                 target: "zone::checker",
                 number = block.header().number(),
@@ -243,6 +276,57 @@ impl LiveChecker {
         }
 
         Ok(ready)
+    }
+
+    /// Apply one exact canonical block through the same path used by live
+    /// notifications and archive Zone replay.
+    pub(super) async fn process_canonical_block_once<S>(
+        &mut self,
+        block: &RecoveredBlock<Block>,
+        receipts: &[TempoReceipt],
+        zone_state: &S,
+        l1_client: &mut L1Client,
+    ) -> RuntimeResult<ReadyToAcknowledge>
+    where
+        S: ExactStateLookup + ?Sized,
+    {
+        if let Some(ready) = self.preflight_block(block)? {
+            return Ok(ready);
+        }
+        let observed = match self.observe_zone_candidate(block, receipts) {
+            Ok(observed) => observed,
+            Err(CheckError::Finding {
+                finding,
+                imported_tempo,
+            }) => {
+                self.activate_alert(block, imported_tempo, finding.as_ref())?;
+                return Ok(ReadyToAcknowledge::alerted(BlockNumHash::new(
+                    block.header().number(),
+                    block.hash(),
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let provider = l1_client.provider().await?;
+        let candidate = match self
+            .prepare_observed_candidate(&provider, zone_state, observed)
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(CheckError::Finding {
+                finding,
+                imported_tempo,
+            }) => {
+                self.activate_alert(block, imported_tempo, finding.as_ref())?;
+                return Ok(ReadyToAcknowledge::alerted(BlockNumHash::new(
+                    block.header().number(),
+                    block.hash(),
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let durable = self.commit_block(candidate)?;
+        Ok(self.adopt_block(durable))
     }
 
     #[cfg(test)]

@@ -23,7 +23,7 @@ async fn alert_restart_and_descendant_commit_need_no_acquisition() {
     let identity = fixture.initialization.identity;
     drop(fixture.checker);
     let store = CheckerStore::open_existing(fixture.directory.path(), identity).unwrap();
-    fixture.checker = LiveChecker::from_store(store).unwrap();
+    fixture.checker = PersistentChecker::from_store(store).unwrap();
     assert!(fixture.checker.is_alerting());
 
     let second_imported = imported_child_header(L1_NUMBER + 1, fixture.imported.hash_slow());

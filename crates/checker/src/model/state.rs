@@ -682,6 +682,7 @@ impl ModelState {
         &self.tokens
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_deposit(&self, id: DepositId) -> Option<&DepositOwner> {
         self.pending_deposits.get(&id)
     }
@@ -698,6 +699,7 @@ impl ModelState {
         &self.withdrawals
     }
 
+    #[cfg(test)]
     pub(crate) fn batch(&self, id: BatchId) -> Option<&BatchOwner> {
         self.batches.get(&id)
     }
@@ -706,6 +708,7 @@ impl ModelState {
         &self.batches
     }
 
+    #[cfg(test)]
     pub(crate) fn fallback_owner(&self, id: FallbackId) -> Option<&FallbackOwner> {
         self.fallback_owners.get(&id)
     }
@@ -714,6 +717,7 @@ impl ModelState {
         &self.fallback_owners
     }
 
+    #[cfg(test)]
     pub(crate) fn portal_refund(&self, id: PortalRefundId) -> Option<&PortalRefundOwner> {
         self.portal_refunds.get(&id)
     }
@@ -750,6 +754,7 @@ impl ModelState {
             .expect("authoritative Portal refund credits cannot overflow")
     }
 
+    #[cfg(test)]
     pub(crate) fn inbox_refund(&self, id: InboxRefundId) -> Option<&InboxRefundOwner> {
         self.inbox_refunds.get(&id)
     }
@@ -831,6 +836,13 @@ impl ModelState {
             .get_mut(&token)
             .expect("fixture token must be enabled")
             .accounting = accounting;
+    }
+
+    pub(crate) fn set_token_phase_for_test(&mut self, token: Address, phase: TokenPhase) {
+        self.tokens
+            .get_mut(&token)
+            .expect("fixture token must exist")
+            .phase = phase;
     }
 
     pub(crate) fn set_portal_deposit_cursor_for_test(&mut self, cursor: PortalDepositCursor) {

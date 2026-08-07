@@ -28,7 +28,7 @@ This single command will:
 6. Build and start the zone node
 
 > `deploy-zone` uses the generated sequencer key as the portal admin too. It saves `sequencerKey`, `sequencerAddress`, `adminKey`, and `adminAddress` in `generated/<name>/zone.json`; `zone-up` reads the sequencer key automatically.
-> `zone.json` also stores `zoneFactory`, and `just deploy-router` appends `swapAndDepositRouter`.
+> `zone.json` also stores `zoneFactory` and the exact `portalCreationBlockHash`; `just deploy-router` appends `swapAndDepositRouter`.
 
 Once running, generate a user wallet and deposit some tokens:
 
@@ -177,7 +177,7 @@ just create-zone my-zone alphausd
 
 This creates `generated/my-zone/` containing:
 - **`genesis.json`** — Zone L2 genesis state (system contracts, fee token, etc.)
-- **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, `zoneFactory`, public `admin` / `sequencer` addresses, and optional saved keys/router metadata)
+- **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, exact `portalCreationBlockHash`, `zoneFactory`, public `admin` / `sequencer` addresses, and optional saved keys/router metadata)
 
 This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. The zone's fee token in genesis remains `pathUSD`.
 

@@ -2,6 +2,218 @@ use super::*;
 use crate::store::model_state::assemble_model;
 
 #[test]
+fn fresh_initialization_derives_literal_genesis_and_awaiting_creation_state() {
+    let identity = identity();
+    let creation_parent = tip(4, 0x41);
+    let l1 = Initialization::fresh(identity, FreshBootstrap::L1Replay { creation_parent });
+    assert_eq!(l1.bootstrap, BootstrapState::l1_replay(None));
+    assert_eq!(l1.imported_tempo_tip, creation_parent);
+    assert_eq!(l1.verified_zone_tip, tip(0, 0x10));
+    assert_eq!(
+        l1.model,
+        ModelState::awaiting_creation(identity.portal_identity())
+    );
+
+    let genesis_anchor = tip(9, 0x42);
+    let zone = Initialization::fresh(identity, FreshBootstrap::ZoneReplay { genesis_anchor });
+    assert_eq!(zone.bootstrap, BootstrapState::zone_replay(genesis_anchor));
+    assert_eq!(zone.imported_tempo_tip, genesis_anchor);
+    assert_eq!(zone.verified_zone_tip, l1.verified_zone_tip);
+    assert_eq!(zone.model, l1.model);
+}
+
+#[test]
+fn unstarted_l1_replay_requires_the_creation_parent_height() {
+    let directory = TempDir::new().unwrap();
+    let identity = identity();
+    let wrong_parent = tip(3, 0x41);
+    let initialization = Initialization::fresh(
+        identity,
+        FreshBootstrap::L1Replay {
+            creation_parent: wrong_parent,
+        },
+    );
+
+    assert!(matches!(
+        CheckerStore::open(directory.path(), initialization),
+        Err(StoreError::L1ReplayStartHeightMismatch { creation, actual })
+            if creation == identity.portal_creation_block() && actual == wrong_parent
+    ));
+    assert!(!CheckerStore::path_in(directory.path()).exists());
+}
+
+#[test]
+fn reopen_rejects_an_unstarted_l1_cursor_that_skips_creation() {
+    let directory = TempDir::new().unwrap();
+    let identity = identity();
+    let initialization = Initialization::fresh(
+        identity,
+        FreshBootstrap::L1Replay {
+            creation_parent: tip(4, 0x41),
+        },
+    );
+    let store = CheckerStore::open(directory.path(), initialization).unwrap();
+    let skipped_tip = tip(5, 0x50);
+    let tx = store.database().tx_mut().unwrap();
+    tx.put::<CheckerMeta>(
+        MetaKey::ImportedTempoTip,
+        MetaValue::ImportedTempoTip(skipped_tip),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert!(matches!(
+        store.load_current(),
+        Err(StoreError::L1ReplayStartHeightMismatch { creation, actual })
+            if creation == identity.portal_creation_block() && actual == skipped_tip
+    ));
+}
+
+#[test]
+fn l1_replay_cursor_cannot_precede_the_authenticated_creation() {
+    let directory = TempDir::new().unwrap();
+    let mut initialization = initialization(BootstrapPhase::L1Replay);
+    let cursor = tip(4, 0x4f);
+    initialization.bootstrap = BootstrapState::l1_replay(Some(cursor));
+    initialization.imported_tempo_tip = cursor;
+
+    assert!(matches!(
+        CheckerStore::open(directory.path(), initialization.clone()),
+        Err(StoreError::L1ReplayCursorOutsideCreationHistory { creation, cursor: actual })
+            if creation == initialization.identity.portal_creation_block() && actual == cursor
+    ));
+}
+
+#[test]
+fn portal_creation_phase_tracks_imported_progress_in_every_runtime_phase() {
+    let identity = identity();
+    let creation = identity.portal_creation_block();
+    assert_creation_progress_mismatch(Initialization::new(
+        identity,
+        BootstrapState::l1_replay(Some(creation)),
+        tip(0, 0x10),
+        creation,
+        ModelState::awaiting_creation(identity.portal_identity()),
+    ));
+
+    let mut created = initialization(BootstrapPhase::L1Replay);
+    created.bootstrap = BootstrapState::l1_replay(None);
+    created.imported_tempo_tip = tip(4, 0x4f);
+    assert_creation_progress_mismatch(created);
+
+    for bootstrap in [
+        BootstrapState::zone_replay(tip(4, 0x4f)),
+        BootstrapState::live(),
+    ] {
+        assert_creation_progress_mismatch(Initialization::new(
+            identity,
+            bootstrap,
+            tip(0, 0x10),
+            tip(4, 0x4f),
+            ModelState::created_with_zone_token_for_test(
+                identity.portal_identity(),
+                TokenAccounting::ZERO,
+            ),
+        ));
+    }
+    for bootstrap in [
+        BootstrapState::zone_replay(creation),
+        BootstrapState::live(),
+    ] {
+        assert_creation_progress_mismatch(Initialization::new(
+            identity,
+            bootstrap,
+            tip(0, 0x10),
+            creation,
+            ModelState::awaiting_creation(identity.portal_identity()),
+        ));
+    }
+
+    assert_creation_progress_mismatch(Initialization::new(
+        identity,
+        BootstrapState::live(),
+        tip(0, 0x10),
+        tip(creation.number, 0x51),
+        ModelState::created_with_zone_token_for_test(
+            identity.portal_identity(),
+            TokenAccounting::ZERO,
+        ),
+    ));
+}
+
+fn assert_creation_progress_mismatch(initialization: Initialization) {
+    let directory = TempDir::new().unwrap();
+    let creation = initialization.identity.portal_creation_block();
+    let imported_tip = initialization.imported_tempo_tip;
+    let portal_created = initialization.model.portal().created().is_some();
+    assert!(matches!(
+        CheckerStore::open(directory.path(), initialization),
+        Err(StoreError::PortalCreationProgressMismatch {
+            creation: actual_creation,
+            imported_tip: actual_tip,
+            portal_created: actual_created,
+        }) if actual_creation == creation
+            && actual_tip == imported_tip
+            && actual_created == portal_created
+    ));
+}
+
+#[test]
+fn l1_replay_rejects_a_verified_zone_tip_beyond_exact_genesis() {
+    let (directory, initialization, store) = open_test_store(BootstrapPhase::L1Replay);
+    let corrupt_tip = tip(1, 0x11);
+    let tx = store.database().tx_mut().unwrap();
+    tx.put::<CheckerMeta>(
+        MetaKey::VerifiedZoneTip,
+        MetaValue::VerifiedZoneTip(corrupt_tip),
+    )
+    .unwrap();
+    tx.put::<CheckerCanonical>(corrupt_tip.number, CanonicalHash::new(corrupt_tip.hash))
+        .unwrap();
+    tx.commit().unwrap();
+    drop(store);
+
+    assert!(matches!(
+        CheckerStore::open_existing(directory.path(), initialization.identity),
+        Err(StoreError::L1ReplayZoneTipMismatch { expected, actual })
+            if expected == tip(0, 0x10) && actual == corrupt_tip
+    ));
+}
+
+#[test]
+fn explicit_fresh_and_existing_paths_never_nest_or_overwrite() {
+    let directory = TempDir::new().unwrap();
+    let initialization = initialization(BootstrapPhase::ZoneReplay);
+    let primary_path = directory.path().join("primary-checker");
+    let primary = CheckerStore::create_fresh_at(&primary_path, initialization.clone()).unwrap();
+    let expected = primary.load_current().unwrap();
+    assert_eq!(primary.path(), primary_path);
+    drop(primary);
+
+    assert_eq!(
+        CheckerStore::inspect_identity_at(&primary_path).unwrap(),
+        initialization.identity
+    );
+    assert_eq!(
+        CheckerStore::inspect_existing_at(&primary_path, initialization.identity).unwrap(),
+        expected
+    );
+    assert!(matches!(
+        CheckerStore::create_fresh_at(&primary_path, initialization.clone()),
+        Err(StoreError::NonEmptyFreshDatabase { path }) if path == primary_path
+    ));
+
+    let rebuild_path = directory.path().join("checker-v2");
+    let rebuild = CheckerStore::create_fresh_at(&rebuild_path, initialization.clone()).unwrap();
+    assert_eq!(rebuild.path(), rebuild_path);
+    assert!(!rebuild_path.join("checker").exists());
+    drop(rebuild);
+
+    let primary = CheckerStore::open_existing_at(&primary_path, initialization.identity).unwrap();
+    assert_eq!(primary.load_current().unwrap(), expected);
+}
+
+#[test]
 fn existing_open_never_initializes_missing_or_empty_state() {
     let directory = TempDir::new().unwrap();
     let checker_path = directory.path().join("checker");
@@ -17,7 +229,10 @@ fn existing_open_never_initializes_missing_or_empty_state() {
         CheckerStore::open(directory.path(), invalid),
         Err(StoreError::InvalidInitialization(_))
     ));
-    assert!(checker_path.exists());
+    assert!(
+        !checker_path.exists(),
+        "invalid initialization must fail before MDBX creates the target path"
+    );
     assert!(matches!(
         CheckerStore::open_existing(directory.path(), identity()),
         Err(StoreError::EmptyExistingDatabase { path }) if path == checker_path
@@ -47,17 +262,17 @@ fn existing_open_does_not_turn_a_junk_directory_into_an_mdbx_environment() {
 }
 
 #[test]
-fn existing_open_validates_identity_and_preserves_configured_creation_hash() {
+fn existing_open_validates_identity_and_preserves_authenticated_creation_block() {
     let (directory, initialization, store) = open_test_store(BootstrapPhase::Live);
     let expected = store.load_current().unwrap();
-    let expected_creation_hash = initialization.identity.portal_creation_block_hash();
+    let expected_creation = initialization.identity.portal_creation_block();
     drop(store);
 
     let reopened = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
     assert_eq!(reopened.load_current().unwrap(), expected);
     assert_eq!(
-        reopened.portal_creation_block_hash(),
-        expected_creation_hash,
+        reopened.portal_creation_block(),
+        expected_creation,
         "runtime configuration must come from the validated durable identity"
     );
     drop(reopened);
@@ -72,6 +287,18 @@ fn existing_open_validates_identity_and_preserves_configured_creation_hash() {
             ..
         })
     ));
+    for wrong_creation in [tip(6, 0x50), tip(5, 0x51)] {
+        assert!(matches!(
+            CheckerStore::open_existing(
+                directory.path(),
+                identity_with_portal_and_creation(Address::repeat_byte(0x40), wrong_creation),
+            ),
+            Err(StoreError::IdentityMismatch {
+                key: MetaKey::PortalCreationBlock,
+                ..
+            })
+        ));
+    }
 
     let reopened = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
     assert_eq!(reopened.load_current().unwrap(), expected);
@@ -351,11 +578,16 @@ fn old_version_row_reports_rebuild_before_decoding_incompatible_finding() {
     tx.commit().unwrap();
     drop(store);
 
-    for _ in 0..2 {
-        let error = CheckerStore::open(directory.path(), initialization.clone()).unwrap_err();
+    let checker_path = CheckerStore::path_in(directory.path());
+    for error in [
+        CheckerStore::inspect_identity_at(&checker_path).unwrap_err(),
+        CheckerStore::inspect_existing_at(&checker_path, initialization.identity).unwrap_err(),
+        CheckerStore::open_existing_at(&checker_path, initialization.identity).unwrap_err(),
+        CheckerStore::open(directory.path(), initialization.clone()).unwrap_err(),
+    ] {
         let StoreError::VersionMismatch {
             path,
-            expected: 2,
+            expected: 3,
             actual: 1,
             rebuild_path,
         } = error
@@ -363,8 +595,41 @@ fn old_version_row_reports_rebuild_before_decoding_incompatible_finding() {
             panic!("unexpected version error: {error:?}");
         };
         assert_eq!(path, directory.path().join("checker"));
-        assert_eq!(rebuild_path, directory.path().join("checker-v2"));
+        assert_eq!(rebuild_path, directory.path().join("checker-v3"));
     }
+
+    let rebuild_path = directory.path().join("checker-v3");
+    let rebuilt = CheckerStore::create_fresh_at(&rebuild_path, initialization.clone()).unwrap();
+    assert_eq!(rebuilt.path(), rebuild_path);
+    drop(rebuilt);
+    assert!(matches!(
+        CheckerStore::inspect_existing_at(&checker_path, initialization.identity),
+        Err(StoreError::VersionMismatch {
+            expected: 3,
+            actual: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn old_version_at_a_custom_path_recommends_a_unique_sibling() {
+    let directory = TempDir::new().unwrap();
+    let initialization = initialization(BootstrapPhase::ZoneReplay);
+    let path = directory.path().join("zone-a-shadow");
+    let store = CheckerStore::create_fresh_at(&path, initialization).unwrap();
+    let tx = store.database().tx_mut().unwrap();
+    tx.put::<CheckerMeta>(MetaKey::Version, MetaValue::Version(1))
+        .unwrap();
+    tx.commit().unwrap();
+    drop(store);
+
+    let StoreError::VersionMismatch { rebuild_path, .. } =
+        CheckerStore::inspect_identity_at(&path).unwrap_err()
+    else {
+        panic!("expected incompatible version");
+    };
+    assert_eq!(rebuild_path, directory.path().join("zone-a-shadow-v3"));
 }
 
 #[test]
@@ -427,81 +692,130 @@ fn invalid_empty_initialization_aborts_without_leaving_partial_rows() {
         CheckerStore::open(directory.path(), mismatched_cursor),
         Err(StoreError::InvalidInitialization(_))
     ));
+    assert!(!CheckerStore::path_in(directory.path()).exists());
 
     CheckerStore::open(directory.path(), correct).unwrap();
 }
 
 #[test]
-fn replay_bootstraps_allow_pending_zone_tokens_with_only_deposit_liability() {
-    for phase in [BootstrapPhase::L1Replay, BootstrapPhase::ZoneReplay] {
+fn l1_replay_allows_pending_zone_tokens_with_only_deposit_liability() {
+    let directory = TempDir::new().unwrap();
+    let (initialization, token) = initialization_with_pending_token(BootstrapPhase::L1Replay);
+    let expected_bootstrap = initialization.bootstrap;
+    let store = CheckerStore::open(directory.path(), initialization).unwrap();
+    let current = store.load_current().unwrap();
+
+    assert_eq!(current.bootstrap, expected_bootstrap);
+    let pending = current.model.token(token).unwrap();
+    assert_eq!(pending.phase(), TokenPhase::PendingZoneEnable);
+    assert_eq!(
+        pending.accounting(),
+        TokenAccounting {
+            supply: U256::ZERO,
+            deposit_liability: U256::from(9),
+            withdrawal_liability: U256::ZERO,
+        }
+    );
+}
+
+#[test]
+fn zone_replay_and_live_initialization_reject_pending_zone_tokens() {
+    for phase in [BootstrapPhase::ZoneReplay, BootstrapPhase::Live] {
         let directory = TempDir::new().unwrap();
         let (initialization, token) = initialization_with_pending_token(phase);
         let expected_bootstrap = initialization.bootstrap;
-        let store = CheckerStore::open(directory.path(), initialization).unwrap();
-        let current = store.load_current().unwrap();
 
-        assert_eq!(current.bootstrap, expected_bootstrap);
-        let pending = current.model.token(token).unwrap();
-        assert_eq!(pending.phase(), TokenPhase::PendingZoneEnable);
-        assert_eq!(
-            pending.accounting(),
-            TokenAccounting {
-                supply: U256::ZERO,
-                deposit_liability: U256::from(9),
-                withdrawal_liability: U256::ZERO,
-            }
-        );
+        assert!(matches!(
+            CheckerStore::open(directory.path(), initialization),
+            Err(StoreError::BootstrapTokenPhaseMismatch {
+                bootstrap,
+                token: found,
+            }) if bootstrap == expected_bootstrap && found == token
+        ));
+        assert!(!CheckerStore::path_in(directory.path()).exists());
     }
 }
 
 #[test]
-fn live_initialization_and_restart_reject_pending_zone_tokens() {
+fn l1_replay_initialization_rejects_zone_enabled_tokens() {
     let directory = TempDir::new().unwrap();
-    let (live_initialization, token) = initialization_with_pending_token(BootstrapPhase::Live);
-    assert!(matches!(
-        CheckerStore::open(directory.path(), live_initialization),
-        Err(StoreError::LiveModelHasPendingToken { token: found }) if found == token
-    ));
-    // Rejection happens before any initial rows commit.
-    CheckerStore::open(directory.path(), initialization(BootstrapPhase::Live)).unwrap();
-
-    let directory = TempDir::new().unwrap();
-    let (initialization, token) = initialization_with_pending_token(BootstrapPhase::ZoneReplay);
-    let store = CheckerStore::open(directory.path(), initialization.clone()).unwrap();
-    let tx = store.database().tx_mut().unwrap();
-    tx.put::<CheckerMeta>(
-        MetaKey::Bootstrap,
-        MetaValue::Bootstrap(BootstrapState::live()),
-    )
-    .unwrap();
-    tx.commit().unwrap();
-    drop(store);
+    let mut initialization = initialization(BootstrapPhase::L1Replay);
+    let token = initialization.identity.portal_identity().initial_token();
+    initialization
+        .model
+        .set_token_phase_for_test(token, TokenPhase::ZoneEnabled);
 
     assert!(matches!(
         CheckerStore::open(directory.path(), initialization),
-        Err(StoreError::LiveModelHasPendingToken { token: found }) if found == token
+        Err(StoreError::BootstrapTokenPhaseMismatch {
+            bootstrap: BootstrapState::L1Replay { .. },
+            token: found,
+        }) if found == token
     ));
+    assert!(!CheckerStore::path_in(directory.path()).exists());
 }
 
 #[test]
 fn enter_live_rejects_pending_zone_tokens_without_mutation() {
     let directory = TempDir::new().unwrap();
-    let (initialization, token) = initialization_with_pending_token(BootstrapPhase::ZoneReplay);
+    let initialization = initialization(BootstrapPhase::ZoneReplay);
+    let token = initialization.identity.portal_identity().initial_token();
     let store = CheckerStore::open(directory.path(), initialization.clone()).unwrap();
+    let pending = pending_token_value();
+    let tx = store.database().tx_mut().unwrap();
+    tx.put::<CheckerModelState>(ModelKey::Token(token), pending.clone())
+        .unwrap();
+    tx.commit().unwrap();
     let commit = store
         .enter_live(initialization.bootstrap, initialization.imported_tempo_tip)
         .unwrap();
 
     assert!(matches!(
         store.apply_bootstrap(commit),
-        Err(StoreError::LiveModelHasPendingToken { token: found }) if found == token
+        Err(StoreError::BootstrapTokenPhaseMismatch {
+            bootstrap: BootstrapState::ZoneReplay { .. },
+            token: found,
+        }) if found == token
     ));
-    let current = store.load_current().unwrap();
-    assert_eq!(current.bootstrap, initialization.bootstrap);
+    let tx = store.database().tx().unwrap();
     assert_eq!(
-        current.model.token(token).unwrap().phase(),
-        TokenPhase::PendingZoneEnable
+        tx.get::<CheckerMeta>(MetaKey::Bootstrap).unwrap(),
+        Some(MetaValue::Bootstrap(initialization.bootstrap))
     );
+    assert_eq!(
+        tx.get::<CheckerModelState>(ModelKey::Token(token)).unwrap(),
+        Some(pending)
+    );
+    tx.commit().unwrap();
+}
+
+#[test]
+fn live_transition_and_restart_allow_a_portal_created_after_the_current_head() {
+    let directory = TempDir::new().unwrap();
+    let anchor = tip(10, 0x60);
+    let identity = identity_with_portal_and_creation(Address::repeat_byte(0x40), tip(11, 0x50));
+    let initialization = Initialization::fresh(
+        identity,
+        FreshBootstrap::ZoneReplay {
+            genesis_anchor: anchor,
+        },
+    );
+    let store = CheckerStore::open(directory.path(), initialization.clone()).unwrap();
+    let commit = store
+        .enter_live(initialization.bootstrap, initialization.imported_tempo_tip)
+        .unwrap();
+
+    assert_eq!(
+        store.apply_bootstrap(commit).unwrap(),
+        WriteOutcome::Applied
+    );
+    let expected = store.load_current().unwrap();
+    assert_eq!(expected.bootstrap, BootstrapState::live());
+    assert!(expected.model.portal().created().is_none());
+    drop(store);
+
+    let restarted = CheckerStore::open_existing(directory.path(), identity).unwrap();
+    assert_eq!(restarted.load_current().unwrap(), expected);
 }
 
 #[test]
@@ -546,8 +860,8 @@ fn malformed_batch_range_fails_reopen_without_panicking() {
 
 #[test]
 fn bootstrap_codec_rejects_phase_cursor_combinations_the_sum_type_cannot_represent() {
-    let zone_replay_without_cursor = vec![2, 0x05, 0x01, 0x00];
-    let mut live_with_cursor = vec![2, 0x05, 0x02, 0x01];
+    let zone_replay_without_cursor = vec![crate::store::SCHEMA_VERSION, 0x05, 0x01, 0x00];
+    let mut live_with_cursor = vec![crate::store::SCHEMA_VERSION, 0x05, 0x02, 0x01];
     live_with_cursor.extend_from_slice(&10_u64.to_be_bytes());
     live_with_cursor.extend_from_slice(hash(0x41).as_slice());
 
