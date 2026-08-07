@@ -633,6 +633,7 @@ pub(crate) struct ZoneTestLaunchConfig {
     p2p_config: Option<P2pConfig>,
     additional_decryption_keys: Vec<SecretKey>,
     checker: Option<CheckerExEx>,
+    checker_checkpoint: Option<zone_checker::CheckerConfig>,
 }
 
 impl ZoneTestLaunchConfig {
@@ -650,6 +651,7 @@ impl ZoneTestLaunchConfig {
             p2p_config: None,
             additional_decryption_keys: Vec::new(),
             checker: None,
+            checker_checkpoint: None,
         }
     }
 
@@ -683,6 +685,11 @@ impl ZoneTestLaunchConfig {
 
     pub(crate) fn with_checker(mut self, checker: CheckerExEx) -> Self {
         self.checker = Some(checker);
+        self
+    }
+
+    pub(crate) fn with_checker_checkpoint(mut self, config: zone_checker::CheckerConfig) -> Self {
+        self.checker_checkpoint = Some(config);
         self
     }
 }
@@ -1220,6 +1227,7 @@ impl ZoneTestNode {
             p2p_config,
             additional_decryption_keys,
             checker,
+            checker_checkpoint,
         } = config;
         let tasks = Runtime::test();
         let is_local_dummy_l1 = l1_ws_url == DUMMY_L1_URL;
@@ -1351,6 +1359,10 @@ impl ZoneTestNode {
         let builder = NodeBuilder::new(node_config)
             .testing_node(tasks.clone())
             .node(zone_node);
+        eyre::ensure!(
+            checker.is_none() || checker_checkpoint.is_none(),
+            "checker runtime and checkpoint builder are mutually exclusive"
+        );
         let node_handle = match checker {
             None => builder.launch_with_debug_capabilities().await?,
             Some(checker) => {
@@ -1360,6 +1372,14 @@ impl ZoneTestNode {
                     .await?
             }
         };
+        if let Some(config) = checker_checkpoint {
+            let path = config
+                .database_path
+                .clone()
+                .ok_or_else(|| eyre::eyre!("checkpoint builder requires a database path"))?;
+            zone_checker::build_checkpoint(config, chain_id, node_handle.node.provider(), path)
+                .await?;
+        }
 
         let mut engine_stop = None;
         if spawn_engine {

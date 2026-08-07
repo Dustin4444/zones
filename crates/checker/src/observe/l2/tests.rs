@@ -14,13 +14,13 @@ use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
 
 use super::*;
 use crate::{
-    model::{
-        constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
-        events::{Inbox, L2ProtocolEvent, Outbox},
-    },
     observe::error::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, EnvelopeRule, ObservationError, ProtocolChain,
+    },
+    protocol::{
+        constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
+        events::{Inbox, L2ProtocolEvent, Outbox},
     },
 };
 
@@ -570,7 +570,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             transaction_hash: actual_hash,
             error,
         } if actual_hash == transaction_hash
-            && matches!(error.as_ref(), crate::model::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
+            && matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 
     let (block, mut receipts) = basic_fixture();
@@ -588,7 +588,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
-            if matches!(error.as_ref(), crate::model::events::ProtocolEventError::MalformedProtocolEvent { .. })
+            if matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::MalformedProtocolEvent { .. })
     ));
 }
 
@@ -611,7 +611,7 @@ fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
-            if matches!(error.as_ref(), crate::model::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
+            if matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 }
 

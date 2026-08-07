@@ -7,6 +7,12 @@ pub(crate) struct BlockNumHash {
     pub number: u64,
     pub hash: B256,
 }
+
+impl From<BlockNumHash> for alloy_eips::BlockNumHash {
+    fn from(value: BlockNumHash) -> Self {
+        Self::new(value.number, value.hash)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChainCut {
     pub zone: BlockNumHash,

@@ -1,9 +1,4 @@
-//! Compact checkpoint and canonical-journal persistence.
-//!
-//! This is intentionally independent of the legacy `store`, which remains the
-//! production oracle during the compact rewrite.
-
-#![allow(dead_code)] // Compact runtime remains an internal shadow path until cutover.
+//! Checkpoint and canonical-journal persistence.
 
 mod codec;
 mod schema;
@@ -53,19 +48,19 @@ pub(crate) enum PersistenceError {
     Identity,
     #[error("invalid checker persistence: {0}")]
     Invalid(String),
+    #[cfg(test)]
     #[error("injected transaction abort")]
     InjectedAbort,
 }
 
 pub(crate) struct Persistence {
     db: Arc<DatabaseEnv>,
-    path: PathBuf,
     #[cfg(test)]
     abort_next_write: AtomicBool,
 }
 
 impl Persistence {
-    /// Read the authenticated identity from an existing compact database.
+    /// Read the authenticated identity from an existing checker database.
     /// This never creates or repairs a database and is intended for runtime
     /// preflight before opening the sole-writer handle.
     pub(crate) fn inspect_identity(path: impl AsRef<Path>) -> Result<Identity> {
@@ -84,6 +79,19 @@ impl Persistence {
         Ok(meta.identity)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn inspect_snapshot(path: impl AsRef<Path>) -> Result<Snapshot> {
+        let path = path.as_ref();
+        let identity = Self::inspect_identity(path)?;
+        let db = open_db_read_only(path, DatabaseArguments::default())?;
+        Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            abort_next_write: AtomicBool::new(false),
+        }
+        .load(identity)
+    }
+
     pub(crate) fn create(
         path: impl AsRef<Path>,
         identity: Identity,
@@ -98,7 +106,6 @@ impl Persistence {
         let db = init_db_for::<_, PersistenceTables>(&path, DatabaseArguments::default())?;
         let this = Self {
             db: Arc::new(db),
-            path,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -131,7 +138,6 @@ impl Persistence {
         let db = DatabaseEnv::open(&path, DatabaseEnvKind::RW, DatabaseArguments::default())?;
         let this = Self {
             db: Arc::new(db),
-            path,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -277,6 +283,7 @@ impl Persistence {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint(
         &self,
         identity: Identity,
@@ -657,7 +664,7 @@ fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>)
         || finding.evidence_len != evidence_len
         || finding.evidence_digest != evidence_digest
     {
-        return Err(invalid("finding is inconsistent or exceeds compact bounds"));
+        return Err(invalid("finding is inconsistent or exceeds codec bounds"));
     }
     if let Some(meta) = meta {
         let next = meta

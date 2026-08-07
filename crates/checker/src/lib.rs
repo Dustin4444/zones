@@ -2,20 +2,14 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-mod check;
-mod compact;
-mod compact_builder;
-mod compact_exex;
-mod compact_observe;
-#[cfg(test)]
-mod compact_tests;
-pub mod diagnostic;
-mod metrics;
-mod model;
+mod adapter;
+mod bootstrap;
+mod builder;
+mod exex;
 mod observe;
 pub(crate) mod persistence;
+mod protocol;
 mod runtime;
-mod store;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
@@ -26,14 +20,10 @@ use std::{fmt, future::Future, path::PathBuf, str::FromStr};
 use alloy_primitives::{Address, B256};
 use reth_exex::ExExContext;
 use reth_node_api::{FullNodeComponents, NodeTypes};
-use reth_storage_api::{BlockReader, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
 use tempo_primitives::{Block, TempoPrimitives};
 
-use observe::{AcquisitionError, AcquisitionSource};
-#[cfg(feature = "test-utils")]
-use test_utils::CheckerTestHooks;
-
-pub use compact_builder::build_compact_checkpoint;
+pub use builder::build_checkpoint;
 
 /// Runtime mode for the checker ExEx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,7 +31,7 @@ pub enum CheckerMode {
     /// Checker is not installed.
     #[default]
     Off,
-    /// Checker authenticates observations and persists its shadow model and
+    /// Checker authenticates observations and persists its semantic state and
     /// findings without affecting block execution.
     Observe,
 }
@@ -94,17 +84,11 @@ pub struct CheckerConfig {
 /// Durable checker ExEx configuration.
 pub struct CheckerExEx {
     config: CheckerConfig,
-    #[cfg(feature = "test-utils")]
-    test_hooks: CheckerTestHooks,
 }
 
 impl CheckerExEx {
     pub const fn new(config: CheckerConfig) -> Self {
-        Self {
-            config,
-            #[cfg(feature = "test-utils")]
-            test_hooks: CheckerTestHooks::disabled(),
-        }
+        Self { config }
     }
 
     /// Run deterministic local preflight in Reth's outer initializer, then
@@ -115,30 +99,11 @@ impl CheckerExEx {
     ) -> eyre::Result<impl Future<Output = eyre::Result<()>> + Send>
     where
         Node: FullNodeComponents,
-        Node::Provider: BlockReader<Block = Block> + StateProviderFactory,
+        Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
         Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     {
-        runtime::launch(
-            self.config,
-            #[cfg(feature = "test-utils")]
-            self.test_hooks,
-            ctx,
-        )
+        Ok(exex::run(self.config, ctx))
     }
-}
-
-pub(crate) fn validate_notification_receipt_sets(
-    block_count: usize,
-    receipt_set_count: usize,
-) -> Result<(), AcquisitionError> {
-    if block_count != receipt_set_count {
-        return Err(AcquisitionError::inconsistent(
-            AcquisitionSource::ZoneNotificationReceipts,
-            format_args!("{block_count} block receipt sets"),
-            format_args!("{receipt_set_count} block receipt sets"),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

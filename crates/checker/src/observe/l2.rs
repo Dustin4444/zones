@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256, Bloom};
 use reth_primitives_traits::RecoveredBlock;
 use tempo_primitives::{Block, TempoReceipt, TempoTxEnvelope};
 
-use crate::model::{
+use crate::protocol::{
     constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
     events::{L2ProtocolEvent, classify_l2_protocol_event},
 };
@@ -20,9 +20,6 @@ use super::{
         ObservationError, ProtocolChain, ensure_acquisition_equal,
     },
 };
-
-#[cfg(test)]
-use super::abi::ImportedTempoHeader;
 
 /// Canonical coordinates retained for every supported protocol log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,14 +34,6 @@ pub(crate) struct L2EventPosition {
 impl L2EventPosition {
     pub(crate) fn transaction_index(&self) -> usize {
         self.transaction_index
-    }
-
-    pub(crate) fn receipt_log_index(&self) -> usize {
-        self.receipt_log_index
-    }
-
-    pub(crate) fn block_log_index(&self) -> usize {
-        self.block_log_index
     }
 
     pub(crate) fn transaction_hash(&self) -> B256 {
@@ -153,50 +142,6 @@ impl L2BlockObservation {
 
     pub(crate) fn outcomes(&self) -> &L2AuthenticatedOutcomes {
         &self.outcomes
-    }
-
-    /// Exact Tempo block authenticated by this Zone block's `advanceTempo`
-    /// envelope.
-    pub(crate) fn imported_tempo(&self) -> BlockNumHash {
-        let imported = self.inputs.advance_tempo().imported_header();
-        BlockNumHash::new(imported.number(), imported.hash())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        block_number: u64,
-        block_hash: B256,
-        parent_hash: B256,
-        advance_transaction_hash: B256,
-        imported_header: ImportedTempoHeader,
-        events: Vec<L2ProtocolEvent>,
-    ) -> Self {
-        let advance_tempo = DecodedAdvanceTempo::empty_for_test(imported_header);
-        let events = events
-            .into_iter()
-            .enumerate()
-            .map(|(log_index, event)| OrderedL2Outcome {
-                position: L2EventPosition {
-                    transaction_index: 0,
-                    receipt_log_index: log_index,
-                    block_log_index: log_index,
-                    transaction_hash: advance_transaction_hash,
-                    transaction_sender: Address::ZERO,
-                },
-                event,
-            })
-            .collect();
-        Self {
-            block_number,
-            block_hash,
-            parent_hash,
-            inputs: L2AuthenticatedInputs {
-                advance_transaction_hash,
-                advance_tempo,
-                finalization: None,
-            },
-            outcomes: L2AuthenticatedOutcomes { events },
-        }
     }
 }
 

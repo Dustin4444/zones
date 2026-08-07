@@ -4,13 +4,11 @@ use std::fmt;
 
 use alloy_primitives::{Address, B256, keccak256};
 
-use crate::model::events::ProtocolEventError;
+use crate::protocol::events::ProtocolEventError;
 
 /// External or notification-local source required for a complete view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AcquisitionSource {
-    #[error("L1 RPC connection")]
-    L1Rpc,
     #[error("exact L1 block")]
     L1Block,
     #[error("complete L1 receipts")]
@@ -71,14 +69,6 @@ impl AuthenticatedTransaction {
     pub(crate) const fn chain(self) -> ProtocolChain {
         self.chain
     }
-
-    pub(crate) const fn transaction_index(self) -> usize {
-        self.transaction_index
-    }
-
-    pub(crate) const fn transaction_hash(self) -> B256 {
-        self.transaction_hash
-    }
 }
 
 /// Stable digest of the authenticated bytes that failed strict decoding.
@@ -94,14 +84,6 @@ impl AuthenticatedDataEvidence {
             length: u64::try_from(bytes.len()).expect("slice length must fit u64"),
             hash: keccak256(bytes),
         }
-    }
-
-    pub(crate) const fn length(self) -> u64 {
-        self.length
-    }
-
-    pub(crate) const fn hash(self) -> B256 {
-        self.hash
     }
 }
 

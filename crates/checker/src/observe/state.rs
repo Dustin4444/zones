@@ -8,13 +8,13 @@ use reth_storage_api::{
 };
 
 use crate::{
-    model::state_layout::{
+    observe::error::{AcquisitionError, AcquisitionSource},
+    protocol::state_layout::{
         ExactStateAccess, INBOX_PROCESSED_DEPOSIT_HASH_ACCESS,
         INBOX_PROCESSED_DEPOSIT_NUMBER_ACCESS, OUTBOX_LAST_BATCH_INDEX_ACCESS,
         OUTBOX_LAST_BATCH_QUEUE_HASH_ACCESS, TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS,
         decode_full_word_hash, decode_low_u64, tip20_total_supply_access,
     },
-    observe::error::{AcquisitionError, AcquisitionSource},
 };
 
 /// Protocol commitments read from state after one exact Zone block.
@@ -57,42 +57,6 @@ impl ZonePostStateOutputs {
 
     pub(crate) fn token_supplies(&self) -> &BTreeMap<Address, U256> {
         &self.token_supplies
-    }
-
-    #[cfg(feature = "test-utils")]
-    pub(crate) fn perturb_first_token_supply_for_test(&mut self) {
-        let supply = self
-            .token_supplies
-            .values_mut()
-            .next()
-            .expect("the test hook checks for an acquired token supply");
-        *supply ^= U256::ONE;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        tempo_block_hash: B256,
-        tempo_block_number: u64,
-        processed_deposit_queue_hash: B256,
-        processed_deposit_number: u64,
-        withdrawal_queue_hash: B256,
-        withdrawal_batch_index: u64,
-    ) -> Self {
-        Self {
-            tempo_block_hash,
-            tempo_block_number,
-            processed_deposit_queue_hash,
-            processed_deposit_number,
-            withdrawal_queue_hash,
-            withdrawal_batch_index,
-            token_supplies: BTreeMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_token_supply_for_test(mut self, token: Address, supply: U256) -> Self {
-        self.token_supplies.insert(token, supply);
-        self
     }
 }
 
