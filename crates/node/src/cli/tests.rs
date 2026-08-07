@@ -4,7 +4,7 @@ use clap::Parser as _;
 
 use super::{
     Role, ZoneArgs, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
-    validate_l1_rpc_url, validate_portal_address,
+    validate_l1_rpc_url, validate_p2p_transaction_size_limit, validate_portal_address,
 };
 use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
@@ -39,6 +39,21 @@ fn zone_id_must_match_genesis_chain_id() {
 
     assert!(args.validate_zone_id(expected).is_ok());
     assert!(args.validate_zone_id(expected + 1).is_err());
+}
+
+#[test]
+fn manifest_mode_rejects_a_txpool_limit_above_the_p2p_wire_limit() {
+    assert!(
+        validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE).is_ok()
+    );
+    assert!(
+        validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
+            .is_err()
+    );
+    assert!(
+        validate_p2p_transaction_size_limit(false, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
+            .is_ok()
+    );
 }
 
 #[test]

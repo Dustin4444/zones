@@ -16,7 +16,13 @@ use crate::{
     routing::{RoutingMembership, RoutingPolicy},
 };
 
+/// Hard limit for one backfill response generation.
 const BACKFILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Maximum time a peer may remain silent while holding a backfill reservation.
+///
+/// Commonware sender admission does not indicate whether a peer is connected. Each accepted block
+/// refreshes this timeout, so active responses remain reserved while offline peers are retried.
+const BACKFILL_RESPONSE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 type CommonwareSender = lookup::Sender<PublicKey, commonware_runtime::tokio::Context>;
 type CommonwareReceiver = lookup::Receiver<PublicKey>;
@@ -73,15 +79,24 @@ pub(crate) struct BackfillRuntimeChannels<Rq = CommonwareReceiver, Rs = Commonwa
     pub(crate) responses: mpsc::Sender<BackfillResponse>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    LeaderOnly,
+    Fallback,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OutstandingBackfill {
     request_id: u64,
     sent_at: Instant,
+    last_progress_at: Instant,
+    kind: RequestKind,
 }
 
 impl OutstandingBackfill {
     fn expired(&self, now: Instant) -> bool {
         now.duration_since(self.sent_at) >= BACKFILL_RESPONSE_TIMEOUT
+            || now.duration_since(self.last_progress_at) >= BACKFILL_RESPONSE_INACTIVITY_TIMEOUT
     }
 }
 
@@ -95,6 +110,7 @@ impl BackfillJob {
     fn begin_request(
         &mut self,
         peers: &[PublicKey],
+        kind: RequestKind,
         now: Instant,
     ) -> Option<(u64, Vec<PublicKey>)> {
         let request_peers = peers
@@ -118,20 +134,17 @@ impl BackfillJob {
                 OutstandingBackfill {
                     request_id,
                     sent_at: now,
+                    last_progress_at: now,
+                    kind,
                 },
             );
         }
         Some((request_id, request_peers))
     }
 
-    fn finish_send(&mut self, request_id: u64, sent: &[PublicKey]) {
+    fn finish_send(&mut self, request_id: u64, admitted: &[PublicKey]) {
         self.outstanding
-            .retain(|peer, request| request.request_id != request_id || sent.contains(peer));
-    }
-
-    fn cancel_request(&mut self, request_id: u64) {
-        self.outstanding
-            .retain(|_, request| request.request_id != request_id);
+            .retain(|peer, request| request.request_id != request_id || admitted.contains(peer));
     }
 
     fn accepts(&self, peer: &PublicKey, request_id: u64, now: Instant) -> bool {
@@ -140,16 +153,29 @@ impl BackfillJob {
             .is_some_and(|request| request.request_id == request_id && !request.expired(now))
     }
 
+    fn record_response(&mut self, peer: &PublicKey, request_id: u64, now: Instant) -> bool {
+        let Some(request) = self.outstanding.get_mut(peer) else {
+            return false;
+        };
+        if request.request_id != request_id || request.expired(now) {
+            return false;
+        }
+        request.last_progress_at = now;
+        true
+    }
+
     fn is_unresponsive(&self, peer: &PublicKey, now: Instant) -> bool {
         self.outstanding
             .get(peer)
             .is_some_and(|request| request.expired(now))
     }
 
-    fn is_pending(&self, peer: &PublicKey, now: Instant) -> bool {
+    fn should_wait_for_leader(&self, peer: &PublicKey, now: Instant) -> bool {
+        // Keep the leader exclusive while its response page is active. Each block refreshes the
+        // inactivity timeout; a silent leader yields to the fallback peers after one timeout.
         self.outstanding
             .get(peer)
-            .is_some_and(|request| !request.expired(now))
+            .is_some_and(|request| request.kind == RequestKind::LeaderOnly && !request.expired(now))
     }
 
     fn complete(&mut self, peer: &PublicKey, request_id: u64, now: Instant) -> bool {
@@ -243,10 +269,9 @@ where
                         return Ok(());
                     }
                 };
-                self.response_sender
-                    .send(Recipients::Some(vec![peer]), frame, true)
-                    .await
-                    .map_err(|err| eyre::eyre!("failed sending backfill block: {err}"))?;
+                let _ = self
+                    .response_sender
+                    .send(Recipients::Some(vec![peer]), frame, true);
                 Ok(())
             }
             BackfillCommand::Complete {
@@ -264,10 +289,9 @@ where
                 let frame = ResponseFrame::Complete { request_id, tip }
                     .encode()
                     .expect("completion frames have a fixed size");
-                self.response_sender
-                    .send(Recipients::Some(vec![peer]), frame, true)
-                    .await
-                    .map_err(|err| eyre::eyre!("failed completing block backfill: {err}"))?;
+                let _ = self
+                    .response_sender
+                    .send(Recipients::Some(vec![peer]), frame, true);
                 Ok(())
             }
         }
@@ -290,42 +314,54 @@ where
         }
         attempts.push(candidates);
 
+        // When a usable leader exists, `attempts` contains a leader-only pass followed
+        // by a pass over all eligible peers. If there's no leader, then go to the peers directly.
+        // The job prevents a peer from receiving duplicate requests while an earlier response
+        // is still in flight.
         for (attempt, sources) in attempts.into_iter().enumerate() {
-            let leader_only = leader_first && attempt == 0;
-            let request = self.job.begin_request(&sources, now);
+            let kind = if leader_first && attempt == 0 {
+                RequestKind::LeaderOnly
+            } else {
+                RequestKind::Fallback
+            };
+
+            // Reserve eligible peers and assign a request ID. Peers with a live outstanding
+            // request are skipped, so each peer has at most one active request.
+            let request = self.job.begin_request(&sources, kind, now);
             let Some((request_id, request_peers)) = request else {
-                debug!(target: "zone::p2p", start, sources = sources.len(), leader_only, "Skipping block backfill request because all eligible peers already have outstanding responses");
-                if leader_only
+                debug!(target: "zone::p2p", start, sources = sources.len(), leader_only = kind == RequestKind::LeaderOnly, "Skipping block backfill request because all eligible peers already have outstanding responses");
+                if kind == RequestKind::LeaderOnly
                     && leader
                         .as_ref()
-                        .is_some_and(|leader| self.job.is_pending(leader, now))
+                        .is_some_and(|leader| self.job.should_wait_for_leader(leader, now))
                 {
                     debug!(target: "zone::p2p", start, "Keeping the backfill leader as the sole source while its request is still pending");
                     break;
                 }
                 continue;
             };
+
+            // Send the request to the selected peers.
             let request_frame = RequestFrame { request_id, start }.encode().to_vec();
-            let sent = match self
-                .request_sender
-                .send(Recipients::Some(request_peers.clone()), request_frame, true)
-                .await
-            {
-                Ok(sent) => sent,
-                Err(err) => {
-                    self.job.cancel_request(request_id);
-                    return Err(eyre::eyre!("failed requesting block backfill: {err}"));
-                }
-            };
-            self.job.finish_send(request_id, &sent);
-            if sent.is_empty() {
-                debug!(target: "zone::p2p", request_id, start, requested = request_peers.len(), leader_only, "Block backfill request reached no peer");
+            let admitted = self.request_sender.send(
+                Recipients::Some(request_peers.clone()),
+                request_frame,
+                true,
+            );
+
+            self.job.finish_send(request_id, &admitted);
+            if admitted.is_empty() {
+                debug!(target: "zone::p2p", request_id, start, requested = request_peers.len(), leader_only = kind == RequestKind::LeaderOnly, "Block backfill request was not admitted for any peer");
+                // Try the next attempt, if one was constructed.
                 continue;
             }
-            if !leader_only {
+
+            // Record requests sent through the all-peers path. This path is used when no
+            // leader-only request is available (or when the attempt didn't reach a peer).
+            if kind == RequestKind::Fallback {
                 metrics::counter!("zone_p2p_backfill_requests_without_leader_total").increment(1);
             }
-            debug!(target: "zone::p2p", request_id, start, connected = sent.len(), requested = request_peers.len(), sources = sources.len(), leader_only, "Sent block backfill request");
+            debug!(target: "zone::p2p", request_id, start, admitted = admitted.len(), requested = request_peers.len(), sources = sources.len(), leader_only = kind == RequestKind::LeaderOnly, "Submitted block backfill request");
             break;
         }
         Ok(())
@@ -372,7 +408,7 @@ where
         let received_at = Instant::now();
         match frame {
             ResponseFrame::Block { request_id, block } => {
-                if !self.job.accepts(&peer, request_id, received_at) {
+                if !self.job.record_response(&peer, request_id, received_at) {
                     warn!(target: "zone::p2p", %peer, request_id, "Ignoring unsolicited or stale backfill block");
                     return Ok(());
                 }
@@ -398,7 +434,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKFILL_RESPONSE_TIMEOUT, BackfillJob};
+    use std::time::Duration;
+
+    use super::{BACKFILL_RESPONSE_INACTIVITY_TIMEOUT, BackfillJob, RequestKind};
     use crate::protocol::{PeerTip, ResponseFrame};
     use alloy_primitives::B256;
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -422,26 +460,29 @@ mod tests {
         let now = std::time::Instant::now();
         let mut job = BackfillJob::default();
         let (first, peers) = job
-            .begin_request(std::slice::from_ref(&leader), now)
+            .begin_request(std::slice::from_ref(&leader), RequestKind::LeaderOnly, now)
             .unwrap();
         job.finish_send(first, &peers);
-        assert!(!job.is_unresponsive(&leader, now + BACKFILL_RESPONSE_TIMEOUT / 2));
-        assert!(job.is_pending(&leader, now + BACKFILL_RESPONSE_TIMEOUT / 2));
-        assert!(job.is_unresponsive(&leader, now + BACKFILL_RESPONSE_TIMEOUT));
-        assert!(!job.is_pending(&leader, now + BACKFILL_RESPONSE_TIMEOUT));
-        assert!(!job.complete(&leader, first, now + BACKFILL_RESPONSE_TIMEOUT));
+        let before_timeout = now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT / 2;
+        let at_timeout = now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT;
+        assert!(!job.is_unresponsive(&leader, before_timeout));
+        assert!(job.accepts(&leader, first, before_timeout));
+        assert!(job.should_wait_for_leader(&leader, before_timeout));
+        assert!(job.is_unresponsive(&leader, at_timeout));
+        assert!(!job.complete(&leader, first, at_timeout));
         let (replacement, peers) = job
             .begin_request(
                 std::slice::from_ref(&leader),
-                now + BACKFILL_RESPONSE_TIMEOUT,
+                RequestKind::LeaderOnly,
+                at_timeout,
             )
             .unwrap();
         job.finish_send(replacement, &peers);
         assert_ne!(replacement, first);
-        assert!(!job.accepts(&leader, first, now + BACKFILL_RESPONSE_TIMEOUT));
-        assert!(!job.complete(&leader, first, now + BACKFILL_RESPONSE_TIMEOUT));
-        assert!(job.accepts(&leader, replacement, now + BACKFILL_RESPONSE_TIMEOUT));
-        assert!(job.complete(&leader, replacement, now + BACKFILL_RESPONSE_TIMEOUT));
+        assert!(!job.accepts(&leader, first, at_timeout));
+        assert!(!job.complete(&leader, first, at_timeout));
+        assert!(job.accepts(&leader, replacement, at_timeout));
+        assert!(job.complete(&leader, replacement, at_timeout));
     }
 
     #[test]
@@ -449,7 +490,9 @@ mod tests {
         let peer = peer(1);
         let now = std::time::Instant::now();
         let mut job = BackfillJob::default();
-        let (request_id, peers) = job.begin_request(std::slice::from_ref(&peer), now).unwrap();
+        let (request_id, peers) = job
+            .begin_request(std::slice::from_ref(&peer), RequestKind::Fallback, now)
+            .unwrap();
         job.finish_send(request_id, &peers);
 
         let mut malformed = vec![1];
@@ -472,5 +515,87 @@ mod tests {
                 tip: tip()
             })
         );
+    }
+
+    #[test]
+    fn leader_only_retry_does_not_fan_out_when_next_page_starts_before_timeout() {
+        let leader = peer(1);
+        let now = std::time::Instant::now();
+        let mut job = BackfillJob::default();
+        let (request_id, peers) = job
+            .begin_request(std::slice::from_ref(&leader), RequestKind::LeaderOnly, now)
+            .unwrap();
+        job.finish_send(request_id, &peers);
+
+        let responded_at = now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT / 2;
+        assert!(job.record_response(&leader, request_id, responded_at));
+
+        let retry_at =
+            now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT / 4;
+        // A partial response can advance the follower to the next page before the leader sends
+        // the completion for this one. Progress refreshes the leader reservation, so it still
+        // covers a retry after the original send would have timed out.
+        assert!(job.should_wait_for_leader(&leader, retry_at));
+        assert!(
+            job.begin_request(
+                std::slice::from_ref(&leader),
+                RequestKind::LeaderOnly,
+                retry_at,
+            )
+            .is_none()
+        );
+        assert!(job.should_wait_for_leader(&leader, retry_at));
+
+        let stalled_at = responded_at + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT;
+        assert!(job.is_unresponsive(&leader, stalled_at));
+        assert!(!job.should_wait_for_leader(&leader, stalled_at));
+    }
+
+    #[test]
+    fn fallback_retries_only_peers_silent_for_timeout() {
+        let active = peer(1);
+        let silent = peer(2);
+        let candidates = [active.clone(), silent.clone()];
+        let now = std::time::Instant::now();
+        let mut job = BackfillJob::default();
+        let (first, peers) = job
+            .begin_request(&candidates, RequestKind::Fallback, now)
+            .unwrap();
+        job.finish_send(first, &peers);
+
+        let responded_at = now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT / 2;
+        assert!(job.record_response(&active, first, responded_at));
+
+        let retry_at = now + BACKFILL_RESPONSE_INACTIVITY_TIMEOUT;
+        let (replacement, peers) = job
+            .begin_request(&candidates, RequestKind::Fallback, retry_at)
+            .unwrap();
+        assert_eq!(peers, vec![silent.clone()]);
+        job.finish_send(replacement, &peers);
+        assert!(job.accepts(&active, first, retry_at));
+        assert!(!job.accepts(&silent, first, retry_at));
+        assert!(job.accepts(&silent, replacement, retry_at));
+    }
+
+    #[test]
+    fn completed_fallback_page_reuses_backup_for_next_page() {
+        let leader = peer(1);
+        let backup = peer(2);
+        let candidates = [leader.clone(), backup.clone()];
+        let now = std::time::Instant::now();
+        let mut job = BackfillJob::default();
+        let (page_one, peers) = job
+            .begin_request(&candidates, RequestKind::Fallback, now)
+            .unwrap();
+        job.finish_send(page_one, &peers);
+        assert!(job.complete(&backup, page_one, now));
+
+        let retry_at = now + Duration::from_secs(1);
+        assert!(!job.should_wait_for_leader(&leader, retry_at));
+        let (page_two, peers) = job
+            .begin_request(&candidates, RequestKind::Fallback, retry_at)
+            .unwrap();
+        assert_eq!(peers, vec![backup.clone()]);
+        assert!(job.complete(&backup, page_two, retry_at));
     }
 }

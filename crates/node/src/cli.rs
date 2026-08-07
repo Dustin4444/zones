@@ -16,7 +16,7 @@ use reth_tracing::tracing::info;
 use zeroize::Zeroizing;
 use zone_chainspec::{ZoneChainSpec, ZoneChainSpecParser};
 use zone_evm::ZoneEvmConfig;
-use zone_p2p::{P2pConfig, Role};
+use zone_p2p::{MAX_TRANSACTION_MESSAGE_SIZE, P2pConfig, Role};
 use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
 
 use crate::{
@@ -186,6 +186,10 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
         }
 
         let manifest_mode = p2p_config.is_some();
+        validate_p2p_transaction_size_limit(
+            manifest_mode,
+            builder.config().txpool.max_tx_input_bytes,
+        )?;
         if manifest_mode {
             // Replicate only durable blocks. Persist every block immediately so followers can
             // acknowledge each block without waiting for Reth's in-memory buffer to fill.
@@ -627,6 +631,19 @@ fn prepend_log_filter(filter: &mut String, directives: &str) {
 /// restart, so they must not be given the shared sequencer key.
 fn sequencer_enabled(cli_flag: bool, p2p_config: Option<&P2pConfig>) -> bool {
     cli_flag || p2p_config.is_some_and(|config| !config.is_rpc_only())
+}
+
+fn validate_p2p_transaction_size_limit(
+    manifest_mode: bool,
+    max_tx_input_bytes: usize,
+) -> eyre::Result<()> {
+    if manifest_mode {
+        eyre::ensure!(
+            max_tx_input_bytes <= MAX_TRANSACTION_MESSAGE_SIZE,
+            "--txpool.max-tx-input-bytes ({max_tx_input_bytes}) exceeds the multi-sequencer P2P transaction limit ({MAX_TRANSACTION_MESSAGE_SIZE})"
+        );
+    }
+    Ok(())
 }
 
 fn validate_l1_rpc_url(l1_rpc_url: &str) -> eyre::Result<()> {

@@ -16,7 +16,7 @@ workspace = true
 reth-codecs.workspace = true
 reth-chainspec.workspace = true
 reth-db.workspace = true
-reth-exex = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-exex.workspace = true
 reth-execution-types.workspace = true
 reth-node-api.workspace = true
 reth-primitives-traits.workspace = true

@@ -24,17 +24,21 @@ use alloy_sol_types::SolCall;
 use eyre::WrapErr;
 use futures::StreamExt;
 use jsonrpsee::{RpcModule, core::RpcResult, proc_macros::rpc, types::ErrorObjectOwned};
+use reth_evm::{ConfigureEvm as _, execute::Executor as _};
 use reth_provider::{CanonStateSubscriptions, HeaderProvider};
+use reth_revm::{db::State, witness::ExecutionWitnessRecord};
 use reth_rpc::{EthFilter, eth::filter::EthFilterError};
 use reth_rpc_builder::EthHandlers;
 use reth_rpc_eth_api::{
     EthApiTypes, EthFilterApiServer, RpcConvert,
     helpers::{EthApiSpec, EthBlocks, EthCall, EthFees, EthState, EthTransactions, FullEthApi},
 };
-use reth_rpc_eth_types::logs_utils;
+use reth_rpc_eth_types::{EthApiError, logs_utils};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
+use reth_trie_common::ExecutionWitnessMode;
 use tempo_alloy::{
     TempoNetwork,
+    provider::ext::TempoProviderExt as _,
     rpc::{TempoCallBuilderExt as _, TempoHeaderResponse, TempoTransactionRequest},
 };
 use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TEMPO_T1_BASE_FEE};
@@ -42,22 +46,24 @@ use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS,
     account_keychain::IAccountKeychain::{self, KeyInfo, getKeyCall},
 };
-use tempo_primitives::TempoTxEnvelope;
+use tempo_primitives::{TempoPrimitives, TempoTxEnvelope};
 use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
-use zone_l1::TempoStateExt as _;
+use zone_l1::{TempoStateExt as _, state::EnabledTokenRegistry};
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
 use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
+use zone_evm::ZoneEvmConfig;
 use zone_p2p::{LeadershipSchedule, PeerTip, ZoneManifest};
 use zone_rpc::{
     auth::AuthContext,
     types::{
         ActiveLeaderInfo, AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, JsonRpcError,
         LocalSequencerInfo, PeerTipInfo, SequencerInfoResponse, SequencerPeerInfo,
-        SequencerProgress, SequencerReadiness, SetLeaderResponse, ZoneInfoResponse, internal,
+        SequencerProgress, SequencerReadiness, SetLeaderResponse,
+        TempoStorageRead as RpcTempoStorageRead, ZoneExecutionWitness, ZoneInfoResponse, internal,
         raw_null, raw_zero, to_raw,
     },
 };
@@ -213,6 +219,75 @@ where
     Ok(module)
 }
 
+/// Zone-specific debug API.
+#[derive(Clone)]
+pub(crate) struct ZoneDebugApi<E> {
+    eth_api: E,
+}
+
+impl<E> ZoneDebugApi<E> {
+    pub(crate) const fn new(eth_api: E) -> Self {
+        Self { eth_api }
+    }
+}
+
+#[jsonrpsee::core::async_trait]
+impl<E> ZoneDebugApiServer for ZoneDebugApi<E>
+where
+    E: FullEthApi<Evm = ZoneEvmConfig, Primitives = TempoPrimitives>,
+{
+    async fn zone_execution_witness(
+        &self,
+        block_id: BlockNumberOrTag,
+    ) -> RpcResult<ZoneExecutionWitness> {
+        let _permit = self
+            .eth_api
+            .tracing_task_guard()
+            .clone()
+            .acquire_owned()
+            .await;
+
+        let block = self
+            .eth_api
+            .recovered_block(block_id.into())
+            .await
+            .map_err(|error| operator_rpc_error(internal(error)))?
+            .ok_or_else(|| operator_rpc_error(internal(format!("block {block_id} not found"))))?;
+        let block_number = block.header().number();
+
+        self.eth_api
+            .spawn_with_state_at_block(block.parent_hash(), move |eth_api, mut db| {
+                let (evm_config, recorder) = eth_api.evm_config().with_l1_storage_recorder();
+                let block_executor = evm_config.executor(&mut db);
+                let mode = ExecutionWitnessMode::default();
+                let mut witness_record = ExecutionWitnessRecord::default();
+
+                let _ = block_executor
+                    .execute_with_state_closure(&block, |statedb: &State<_>| {
+                        witness_record.record_executed_state(statedb, mode);
+                    })
+                    .map_err(|error| EthApiError::Internal(error.into()))?;
+
+                let witness = witness_record
+                    .into_execution_witness(&db.database.0, eth_api.provider(), block_number, mode)
+                    .map_err(EthApiError::from)?;
+                Ok(ZoneExecutionWitness {
+                    execution_witness: witness,
+                    tempo_reads: recorder
+                        .take_reads()
+                        .into_iter()
+                        .map(|read| RpcTempoStorageRead {
+                            account: read.account,
+                            slot: read.slot,
+                        })
+                        .collect(),
+                })
+            })
+            .await
+            .map_err(|error| operator_rpc_error(internal(error)))
+    }
+}
+
 fn operator_rpc_error(error: JsonRpcError) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(error.code as i32, error.message, error.data)
 }
@@ -235,20 +310,10 @@ async fn zone_sequencers(
     portal_address: Address,
     l1_provider: &DynProvider<TempoNetwork>,
 ) -> Result<Vec<Address>, JsonRpcError> {
-    let portal = ZonePortal::new(portal_address, l1_provider);
-    let count = portal.sequencerCount().call().await.map_err(internal)?;
-    let count = count.to::<usize>();
-    let mut sequencers = Vec::with_capacity(count);
-    for index in 0..count {
-        sequencers.push(
-            portal
-                .sequencerAt(U256::from(index))
-                .call()
-                .await
-                .map_err(internal)?,
-        );
-    }
-    Ok(sequencers)
+    ZonePortal::new(portal_address, l1_provider)
+        .sequencers()
+        .await
+        .map_err(internal)
 }
 
 /// Builds the Zone metadata shared by the operator and redacted RPC surfaces.
@@ -468,29 +533,27 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
 ///
 /// This is the privacy enforcement layer for the zone's JSON-RPC surface.
 /// Only methods explicitly routed through [`ZoneRpcApi`] are reachable —
-/// everything else is rejected by the dispatcher's [`classify_method`]
-/// whitelist, so this struct effectively acts as an **enforced allowlist**
+/// everything else is rejected by the dispatcher's typed method registry,
+/// so this struct effectively acts as an **enforced allowlist**
 /// of Ethereum JSON-RPC endpoints.
 ///
 /// For every allowed endpoint it applies typed privacy checks *before*
 /// serializing to JSON:
 ///
 /// - **Block redaction** — zeroing `logsBloom` and clearing transaction
-///   lists for non-sequencer callers.
+///   lists on the redacted RPC.
 /// - **Sender-scoped access** — returning `null` for transactions and
 ///   receipts not owned by the authenticated caller.
 /// - **`from`-enforcement** — `eth_call` / `eth_estimateGas` may only
 ///   simulate from the authenticated account (`-32004` on mismatch,
-///   auto-set when omitted); state overrides are rejected for
-///   non-sequencer callers (`-32602`).
+///   auto-set when omitted); state overrides are rejected (`-32602`).
 /// - **Sender verification** — `eth_sendRawTransaction` checks that the
 ///   recovered transaction sender matches the authenticated account
 ///   (`-32003` on mismatch).
-///
-/// [`classify_method`]: zone_rpc::types::classify_method
 pub struct ZoneRpc<Api: EthApiTypes> {
     eth: EthHandlers<Api>,
     config: zone_rpc::RedactedRpcConfig,
+    enabled_tokens: EnabledTokenRegistry,
     l1_provider: DynProvider<TempoNetwork>,
     tempo_state: tempo_zone_contracts::TempoState::TempoStateInstance<
         DynProvider<TempoNetwork>,
@@ -506,6 +569,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
     pub async fn new(
         eth: EthHandlers<Api>,
         config: zone_rpc::RedactedRpcConfig,
+        enabled_tokens: EnabledTokenRegistry,
     ) -> eyre::Result<Self> {
         let l1_rpc_url = config.l1_rpc_url.clone();
         let zone_rpc_url = config.zone_rpc_url.clone();
@@ -529,6 +593,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         let rpc = Self {
             eth,
             config,
+            enabled_tokens,
             l1_provider,
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
@@ -593,8 +658,13 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         }
     }
 
-    async fn zone_tokens(&self) -> Result<Vec<Address>, JsonRpcError> {
-        zone_tokens(self.config.zone_portal, &self.l1_provider).await
+    fn zone_tokens(&self) -> Vec<Address> {
+        // Preserve the default token when running without an L1 portal.
+        if self.config.zone_portal.is_zero() {
+            return vec![ZONE_TOKEN_ADDRESS];
+        }
+
+        self.enabled_tokens.read().iter().copied().collect()
     }
 
     fn enforce_authorized(
@@ -677,6 +747,10 @@ where
         })
     }
 
+    fn client_version(&self) -> BoxFut<'_> {
+        Box::pin(async { to_raw(&crate::version::client_version()) })
+    }
+
     fn syncing(&self) -> BoxFut<'_> {
         Box::pin(async move {
             let status = EthApiSpec::sync_status(&self.eth.api).map_err(internal)?;
@@ -709,17 +783,10 @@ where
         reward_percentiles: Option<Vec<f64>>,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            // Avoid loading private block bodies to calculate reward percentiles.
-            let mut history = EthFees::fee_history(&self.eth.api, block_count, newest_block, None)
-                .await
-                .map_err(internal)?;
-            if let Some(reward_percentiles) = reward_percentiles.as_deref() {
-                history.reward = Some(vec![
-                    vec![0; reward_percentiles.len()];
-                    history.gas_used_ratio.len()
-                ]);
-            }
-
+            let mut history =
+                EthFees::fee_history(&self.eth.api, block_count, newest_block, reward_percentiles)
+                    .await
+                    .map_err(internal)?;
             // Redact gas fields (like `gas_used_ratio`) that can be used to guess tx counts
             redact_fee_history(&mut history);
             to_raw(&history)
@@ -917,7 +984,7 @@ where
 
     fn get_logs(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
             let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
@@ -930,7 +997,7 @@ where
 
     fn new_filter(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
             let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
@@ -1063,7 +1130,7 @@ where
             let provider = self.eth.api.provider().clone();
             let caller = auth.caller;
 
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
 
@@ -1223,23 +1290,44 @@ async fn set_leader(
         });
     }
 
-    // Relay with the individual key on the reserved admin-operations nonce lane and return
-    // immediately. Runtime recovery is configured separately in the manifest; this method only
-    // changes the ordinary on-chain leadership schedule when the operator invokes it.
-    let pending = portal
-        .setLeader(target, expected_epoch)
-        .nonce_key(zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY)
-        .send()
+    // Refetch the committed admin-lane nonce for every attempt. The provider's process-local
+    // nonce cache advances after a send, even when that transaction never lands, which would
+    // otherwise leave every retry queued behind an unfillable 2D-nonce gap.
+    let nonce = relayer
+        .get_transaction_count_with_nonce_key(
+            relayer_address,
+            zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY,
+        )
         .await
         .map_err(internal)?;
-    let tx_hash = *pending.tx_hash();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(30),
+        portal
+            .setLeader(target, expected_epoch)
+            .nonce_key(zone_sequencer::nonce_keys::ADMIN_OPS_NONCE_KEY)
+            .nonce(nonce)
+            .max_fee_per_gas(tempo_chainspec::constants::gas::TEMPO_T1_BASE_FEE as u128)
+            .max_priority_fee_per_gas(0)
+            .send_sync(),
+    )
+    .await
+    .map_err(|_| JsonRpcError::internal("setLeader confirmation timed out after 30 seconds"))?
+    .map_err(internal)?;
+    let tx_hash = receipt.transaction_hash();
+    if !receipt.status() {
+        metrics::counter!("zone_set_leader_submissions_total", "result" => "reverted").increment(1);
+        return Err(JsonRpcError::internal(format!(
+            "setLeader transaction {tx_hash} reverted on L1"
+        )));
+    }
     metrics::counter!("zone_set_leader_submissions_total", "result" => "submitted").increment(1);
     tracing::info!(
         target: "zone::rpc",
         %target,
         %tx_hash,
+        nonce,
         expected_epoch,
-        "Relayed setLeader to the ZonePortal"
+        "Confirmed setLeader on the ZonePortal"
     );
     Ok(SetLeaderResponse {
         status: "submitted".to_owned(),
@@ -1264,12 +1352,17 @@ fn redact_header(header: &mut TempoHeaderResponse) {
     inner.withdrawals_root = inner.withdrawals_root.map(|_| B256::ZERO);
 }
 
-/// Clear gas-related fields that leak the size (and therefore tx counts).
+/// Clear gas related fields that leak the size (and therefore tx counts)
 fn redact_fee_history(history: &mut FeeHistory) {
     history.base_fee_per_gas.fill(u128::from(TEMPO_T0_BASE_FEE));
     history.gas_used_ratio.fill(0.0);
     history.base_fee_per_blob_gas.fill(0);
     history.blob_gas_used_ratio.fill(0.0);
+    if let Some(rewards) = &mut history.reward {
+        for block_rewards in rewards {
+            block_rewards.fill(0);
+        }
+    }
 }
 
 /// Prefill missing transaction fee fields with public, deterministic values before calling reth's
@@ -1298,7 +1391,7 @@ fn apply_public_fee_policy(request: &mut TempoTransactionRequest) {
     }
 }
 
-/// Strip privacy-sensitive fields from a block for non-sequencer callers.
+/// Strip privacy-sensitive fields from a block returned by the redacted RPC.
 fn redact_block(block: &mut RpcBlock) {
     redact_header(&mut block.header);
     block.transactions = BlockTransactions::Hashes(Vec::new());
@@ -1320,6 +1413,23 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_execution_witness_serializes_tempo_reads() {
+        let account = Address::repeat_byte(0xaa);
+        let slot = B256::repeat_byte(0xbb);
+        let value = serde_json::to_value(ZoneExecutionWitness {
+            execution_witness: Default::default(),
+            tempo_reads: vec![RpcTempoStorageRead { account, slot }],
+        })
+        .unwrap();
+
+        assert!(value.get("state").is_some());
+        assert_eq!(
+            value["tempo_reads"],
+            serde_json::json!([{ "account": account, "slot": slot }])
+        );
+    }
 
     #[tokio::test]
     async fn operator_rpc_module_exposes_sequencer_methods_without_auth() {
@@ -1414,7 +1524,7 @@ mod tests {
         assert_eq!(history.gas_used_ratio, vec![0.0; 2]);
         assert_eq!(history.base_fee_per_blob_gas, vec![0; 3]);
         assert_eq!(history.blob_gas_used_ratio, vec![0.0; 2]);
-        assert_eq!(history.reward, Some(vec![vec![7, 8], vec![9, 10]]));
+        assert_eq!(history.reward, Some(vec![vec![0, 0], vec![0, 0]]));
     }
 
     #[test]

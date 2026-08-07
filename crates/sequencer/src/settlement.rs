@@ -27,7 +27,10 @@ use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
 use crate::{
     ZoneSequencerProvider,
-    abi::{self, BlockTransition, DepositQueueTransition, IZoneInbox, IZoneOutbox, ZonePortal},
+    abi::{
+        self, BlockTransition, DepositQueueTransition, EMPTY_SENTINEL, IZoneInbox, IZoneOutbox,
+        ZonePortal,
+    },
     attestation::{AttestationStore, SettlementAttestation, SettlementCertificate},
 };
 use alloy_consensus::{Transaction, TxReceipt as _, transaction::TxHashRef as _};
@@ -39,9 +42,10 @@ use alloy_rlp::Encodable;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolStruct, SolValue, eip712_domain};
-use eyre::{OptionExt as _, Result};
+use eyre::{OptionExt as _, Result, WrapErr as _};
 use futures::{StreamExt, TryStreamExt};
 use parking_lot::RwLock;
+use reth_storage_api::BlockNumReader;
 use schnellru::{ByLength, LruMap};
 use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderExt, rpc::TempoCallBuilderExt};
 use tempo_primitives::{Block, TempoReceipt};
@@ -69,6 +73,46 @@ pub(crate) const WITHDRAWAL_QUEUE_CAPACITY: u64 = 100;
 ///
 /// Native Zone reads no longer use this limit; it remains the bound for L1 portal log recovery.
 pub(crate) const LOG_QUERY_BLOCK_CHUNK: u64 = 5_000;
+
+/// Canonical local identity of the Zone block most recently accepted by the L1 portal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortalZoneAnchor {
+    pub block_hash: B256,
+    pub block_number: u64,
+}
+
+/// Read the L1 portal tip and resolve it against the local canonical Zone chain.
+///
+/// A zero portal hash denotes genesis. A non-zero hash must be present locally; silently treating
+/// a missing hash as genesis could replay already-submitted history and construct an invalid
+/// transition from state that the portal has superseded.
+pub async fn resolve_portal_zone_anchor<P>(
+    zone_provider: &P,
+    portal_address: Address,
+    l1_provider: &DynProvider<TempoNetwork>,
+) -> Result<PortalZoneAnchor>
+where
+    P: BlockNumReader,
+{
+    let block_hash = ZonePortal::new(portal_address, l1_provider)
+        .blockHash()
+        .call()
+        .await
+        .wrap_err("failed to read ZonePortal block hash")?;
+
+    let block_number = if block_hash.is_zero() {
+        0
+    } else {
+        zone_provider.block_number(block_hash)?.ok_or_eyre(format!(
+            "portal block hash {block_hash} is not canonical in the Zone node"
+        ))?
+    };
+
+    Ok(PortalZoneAnchor {
+        block_hash,
+        block_number,
+    })
+}
 
 /// EIP-2935 anchor limits used by the batch submitter.
 ///
@@ -160,6 +204,11 @@ pub struct BatchSubmitter {
     ancestry_header_cache: RwLock<LruMap<u64, CachedAncestryHeader>>,
 }
 impl BatchSubmitter {
+    /// Shared Tempo L1 provider backing portal reads and submissions.
+    pub(crate) const fn l1_provider(&self) -> &DynProvider<TempoNetwork> {
+        &self.l1_provider
+    }
+
     /// Create a batch submitter without a certificate signer.
     ///
     /// This is useful for read-only operations and tests. Batch submission returns an error.
@@ -1356,16 +1405,18 @@ fn resolve_pending_slots(
 
 /// Find the offset into `withdrawals` where the remaining hash chain matches
 /// `current_slot_hash`. Returns `Some(0)` if no withdrawals have been processed,
-/// `Some(n)` if n have been processed (n remaining), or `None` if no match is
-/// found.
-///
-/// Also checks `offset == len` (all consumed, hash chain = `B256::ZERO`).
+/// `Some(n)` if n have been processed, or `None` if no match is found.
 pub(crate) fn find_processed_offset(
     withdrawals: &[abi::Withdrawal],
     current_slot_hash: B256,
 ) -> Option<usize> {
-    for offset in 0..=withdrawals.len() {
-        let hash = abi::Withdrawal::queue_hash(&withdrawals[offset..]);
+    if current_slot_hash == B256::ZERO {
+        return Some(withdrawals.len());
+    }
+
+    let mut hash = EMPTY_SENTINEL;
+    for (offset, withdrawal) in withdrawals.iter().enumerate().rev() {
+        hash = withdrawal.hash_with_tail(hash);
         if hash == current_slot_hash {
             return Some(offset);
         }
@@ -1661,8 +1712,80 @@ mod tests {
     use alloy_sol_types::SolValue;
     use alloy_transport::mock::Asserter;
     use proptest::prelude::*;
+    use reth_provider::test_utils::MockEthProvider;
     use tempo_alloy::rpc::TempoHeaderResponse;
-    use tempo_primitives::TempoHeader;
+    use tempo_primitives::{Block, TempoHeader, TempoPrimitives};
+
+    fn mock_l1(asserter: Asserter) -> DynProvider<TempoNetwork> {
+        ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter)
+            .erased()
+    }
+
+    #[tokio::test]
+    async fn resolves_portal_hash_to_local_zone_height() {
+        let portal_hash = B256::repeat_byte(0x42);
+        let portal_height = 15_552_000;
+        let zone = MockEthProvider::<TempoPrimitives>::new();
+        let mut header = TempoHeader::default();
+        header.inner.number = portal_height;
+        zone.add_block(
+            portal_hash,
+            Block {
+                header,
+                body: Default::default(),
+            },
+        );
+
+        let l1 = Asserter::new();
+        l1.push_success(&Bytes::copy_from_slice(portal_hash.as_slice()));
+
+        let anchor =
+            resolve_portal_zone_anchor(&zone, Address::repeat_byte(0x11), &mock_l1(l1.clone()))
+                .await
+                .unwrap();
+
+        assert_eq!(anchor.block_hash, portal_hash);
+        assert_eq!(anchor.block_number, portal_height);
+        assert!(l1.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_portal_hash_resolves_to_genesis() {
+        let l1 = Asserter::new();
+        l1.push_success(&Bytes::copy_from_slice(B256::ZERO.as_slice()));
+
+        let anchor = resolve_portal_zone_anchor(
+            &MockEthProvider::<TempoPrimitives>::new(),
+            Address::repeat_byte(0x11),
+            &mock_l1(l1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(anchor.block_hash, B256::ZERO);
+        assert_eq!(anchor.block_number, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_noncanonical_portal_hash() {
+        let portal_hash = B256::repeat_byte(0x42);
+        let l1 = Asserter::new();
+        l1.push_success(&Bytes::copy_from_slice(portal_hash.as_slice()));
+
+        let err = resolve_portal_zone_anchor(
+            &MockEthProvider::<TempoPrimitives>::new(),
+            Address::repeat_byte(0x11),
+            &mock_l1(l1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("is not canonical in the Zone node")
+        );
+    }
 
     fn abi_word(value: impl SolValue) -> Bytes {
         value.abi_encode().into()
@@ -2117,55 +2240,45 @@ mod tests {
     }
 
     #[test]
-    fn find_offset_no_withdrawals_processed() {
-        let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
-        let w1 = test_withdrawal(address!("0x0000000000000000000000000000000000000002"), 200);
-        let withdrawals = vec![w0, w1];
-        let full_hash = abi::Withdrawal::queue_hash(&withdrawals);
-        assert_eq!(find_processed_offset(&withdrawals, full_hash), Some(0));
+    fn finds_processed_withdrawal_offset() {
+        let withdrawals = vec![
+            test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100),
+            test_withdrawal(address!("0x0000000000000000000000000000000000000002"), 200),
+            test_withdrawal(address!("0x0000000000000000000000000000000000000003"), 300),
+        ];
+        let cases = [
+            (
+                "full queue",
+                abi::Withdrawal::queue_hash(&withdrawals),
+                Some(0),
+            ),
+            (
+                "partial queue",
+                abi::Withdrawal::queue_hash(&withdrawals[1..]),
+                Some(1),
+            ),
+            (
+                "partial queue suffix",
+                abi::Withdrawal::queue_hash(&withdrawals[2..]),
+                Some(2),
+            ),
+            ("fully consumed", B256::ZERO, Some(withdrawals.len())),
+            ("corrupted hash", B256::repeat_byte(0xde), None),
+        ];
+
+        for (case, current_slot_hash, expected) in cases {
+            assert_eq!(
+                find_processed_offset(&withdrawals, current_slot_hash),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn find_offset_one_processed() {
-        let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
-        let w1 = test_withdrawal(address!("0x0000000000000000000000000000000000000002"), 200);
-        let withdrawals = vec![w0, w1];
-        let hash = abi::Withdrawal::queue_hash(&withdrawals[1..]);
-        assert_eq!(find_processed_offset(&withdrawals, hash), Some(1));
-    }
-
-    #[test]
-    fn find_offset_all_processed() {
-        let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
-        let withdrawals = vec![w0];
-        // B256::ZERO = queue_hash(&[]), meaning all withdrawals have been consumed.
-        assert_eq!(find_processed_offset(&withdrawals, B256::ZERO), Some(1));
-    }
-
-    #[test]
-    fn find_offset_no_match() {
-        let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
-        let withdrawals = vec![w0];
-        let random_hash = B256::from([0xdeu8; 32]);
-        assert_eq!(find_processed_offset(&withdrawals, random_hash), None);
-    }
-
-    #[test]
-    fn find_offset_single_withdrawal_unprocessed() {
-        let w = test_withdrawal(address!("0x0000000000000000000000000000000000000042"), 999);
-        let withdrawals = vec![w];
-        let hash = abi::Withdrawal::queue_hash(&withdrawals);
-        assert_eq!(find_processed_offset(&withdrawals, hash), Some(0));
-    }
-
-    #[test]
-    fn find_offset_partial_three_withdrawals() {
-        let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
-        let w1 = test_withdrawal(address!("0x0000000000000000000000000000000000000002"), 200);
-        let w2 = test_withdrawal(address!("0x0000000000000000000000000000000000000003"), 300);
-        let withdrawals = vec![w0, w1, w2];
-        let hash = abi::Withdrawal::queue_hash(&withdrawals[2..]);
-        assert_eq!(find_processed_offset(&withdrawals, hash), Some(2));
+    fn finds_processed_offset_for_empty_queue() {
+        assert_eq!(find_processed_offset(&[], B256::ZERO), Some(0));
+        assert_eq!(find_processed_offset(&[], EMPTY_SENTINEL), None);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod precompiles;
 mod redacted_rpc;
 mod redacted_rpc_e2e;
 mod restart_e2e;
+mod spf;
 mod stepping_e2e;
 mod tip403_policy;
 mod tip403_transfers;
