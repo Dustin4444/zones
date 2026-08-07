@@ -15,7 +15,7 @@ mod runtime;
 #[doc(hidden)]
 pub mod test_utils;
 
-use std::{fmt, future::Future, path::PathBuf, str::FromStr};
+use std::{fmt, future::Future, path::PathBuf, str::FromStr, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use reth_exex::ExExContext;
@@ -79,6 +79,8 @@ pub struct CheckerConfig {
     pub zone_id: u32,
     /// Optional exact checker database path for fresh-path rebuilds.
     pub database_path: Option<PathBuf>,
+    /// Maximum wall-clock time for one authenticated block acquisition attempt.
+    pub acquisition_timeout: Duration,
 }
 
 /// Durable checker ExEx configuration.

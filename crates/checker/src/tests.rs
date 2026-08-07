@@ -17,8 +17,8 @@ use crate::{
     },
     runtime::{
         AuthenticatedBlock, AuthenticatedOutputs, BuildConfig, Failure, FailureClass,
-        NotificationPlan, ObservationPipeline, ObservedEffect, PlannedNotification, RetryBudget,
-        Runtime, RuntimeAction, RuntimeState, build_checkpoint, compare_authenticated,
+        NotificationPlan, ObservationPipeline, PlannedNotification, RetryBudget, Runtime,
+        RuntimeAction, RuntimeState, build_checkpoint,
     },
 };
 
@@ -32,7 +32,7 @@ struct FakeNotification {
 impl PlannedNotification for FakeNotification {
     fn plan(&self) -> Result<NotificationPlan, Failure> {
         if let Some(plan) = &self.plan {
-            return plan.clone().validate();
+            return Ok(plan.clone());
         }
         let applied = self
             .coordinates
@@ -47,13 +47,12 @@ impl PlannedNotification for FakeNotification {
             hash: coordinate(first.number - 1, 0x10).hash,
         };
         let acknowledge = *applied.last().unwrap();
-        NotificationPlan {
+        Ok(NotificationPlan {
             reverted: vec![],
             ancestor,
             applied,
             acknowledge,
-        }
-        .validate()
+        })
     }
 }
 
@@ -72,10 +71,6 @@ impl ObservationPipeline<FakeNotification> for FakePipeline {
             .clone()
             .map(|blocks| blocks[index].clone())
             .map_err(failure)
-    }
-
-    fn compare(&mut self, block: &AuthenticatedBlock, expected: &Candidate) -> Result<(), Failure> {
-        compare_authenticated(block, expected)
     }
 }
 
@@ -121,7 +116,7 @@ fn anchor() -> ChainCut {
     }
 }
 
-fn create() -> (TempDir, Persistence) {
+pub(crate) fn create() -> (TempDir, Persistence) {
     let directory = tempfile::tempdir().unwrap();
     let (store, _) = Persistence::create(
         directory.path(),
@@ -137,11 +132,7 @@ fn create() -> (TempDir, Persistence) {
 /// an observation adapter, so these tests exercise the runtime/kernel seam.
 fn outputs(candidate: &Candidate) -> AuthenticatedOutputs {
     AuthenticatedOutputs {
-        effects: candidate
-            .expected_effects
-            .iter()
-            .map(ObservedEffect::from)
-            .collect(),
+        effects: candidate.expected_effects.to_vec(),
         state: ExpectedState {
             tempo_block_hash: candidate.expected_state.tempo_block_hash,
             tempo_block_number: candidate.expected_state.tempo_block_number,
@@ -149,7 +140,6 @@ fn outputs(candidate: &Candidate) -> AuthenticatedOutputs {
             processed_deposit_number: candidate.expected_state.processed_deposit_number,
             withdrawal_queue_hash: candidate.expected_state.withdrawal_queue_hash,
             withdrawal_batch_index: candidate.expected_state.withdrawal_batch_index,
-            collateral_requirement: candidate.expected_state.collateral_requirement,
         },
         supplies: candidate
             .expected_accounting
@@ -204,17 +194,21 @@ fn notification(blocks: Vec<AuthenticatedBlock>) -> FakeNotification {
     }
 }
 
-fn runtime(attempts: u32) -> Runtime<FakeNotification> {
-    Runtime::new(2, RetryBudget::new(attempts, Duration::from_secs(60)))
+fn runtime(store: &Persistence, attempts: u32) -> Runtime<FakeNotification> {
+    Runtime::new(
+        store.load().unwrap(),
+        2,
+        RetryBudget::new(attempts, Duration::from_secs(60)),
+    )
 }
 
 #[test]
 fn apply_abort_never_acknowledges_and_keeps_parent_tip() {
     let (_directory, store) = create();
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     runtime
         .push(notification(blocks(
-            &store.load(identity()).unwrap().state,
+            &store.load().unwrap().state,
             1,
             1,
             0x10,
@@ -225,19 +219,16 @@ fn apply_abort_never_acknowledges_and_keeps_parent_tip() {
         runtime.poll(&store, identity(), &mut FakePipeline, Instant::now()),
         Err(PersistenceError::InjectedAbort)
     ));
-    assert_eq!(
-        store.load(identity()).unwrap().meta.verified_zone_tip,
-        anchor().zone
-    );
+    assert_eq!(store.load().unwrap().meta.verified_zone_tip, anchor().zone);
 }
 
 #[test]
 fn committed_prefix_then_divergence_records_exact_second_gap_before_ack() {
     let (_directory, store) = create();
-    let mut values = blocks(&store.load(identity()).unwrap().state, 1, 2, 0x10);
+    let mut values = blocks(&store.load().unwrap().state, 1, 2, 0x10);
     values[1].outputs.state.tempo_block_number += 1;
     let second = values[1].zone;
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     runtime.push(notification(values)).unwrap();
     assert_eq!(
         runtime
@@ -245,15 +236,7 @@ fn committed_prefix_then_divergence_records_exact_second_gap_before_ack() {
             .unwrap(),
         RuntimeAction::None
     );
-    assert_eq!(
-        store
-            .load(identity())
-            .unwrap()
-            .meta
-            .verified_zone_tip
-            .number,
-        1
-    );
+    assert_eq!(store.load().unwrap().meta.verified_zone_tip.number, 1);
     assert_eq!(
         runtime
             .poll(&store, identity(), &mut FakePipeline, Instant::now())
@@ -261,7 +244,7 @@ fn committed_prefix_then_divergence_records_exact_second_gap_before_ack() {
         RuntimeAction::Acknowledge(second)
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.coverage,
+        store.load().unwrap().meta.coverage,
         Coverage::Gap {
             first_unchecked: second,
             acknowledged_through: second,
@@ -279,7 +262,7 @@ fn retry_spans_polls_accepts_fifo_and_exhaustion_names_full_suffix() {
         coordinates: Ok(coordinates.clone()),
         blocks: Err(FailureClass::TransientRetry),
     };
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     runtime.push(failing).unwrap();
     let now = Instant::now();
     assert!(matches!(
@@ -290,7 +273,7 @@ fn retry_spans_polls_accepts_fifo_and_exhaustion_names_full_suffix() {
     ));
     runtime
         .push(notification(blocks(
-            &store.load(identity()).unwrap().state,
+            &store.load().unwrap().state,
             3,
             1,
             0x10,
@@ -308,7 +291,7 @@ fn retry_spans_polls_accepts_fifo_and_exhaustion_names_full_suffix() {
         RuntimeAction::AcknowledgeAndTerminate(coordinate(3, 0x10))
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.coverage,
+        store.load().unwrap().meta.coverage,
         Coverage::Gap {
             first_unchecked: coordinates[0],
             acknowledged_through: coordinate(3, 0x10),
@@ -320,7 +303,7 @@ fn retry_spans_polls_accepts_fifo_and_exhaustion_names_full_suffix() {
 #[test]
 fn durable_gap_recovers_across_separate_notifications() {
     let (_directory, store) = create();
-    let all = blocks(&store.load(identity()).unwrap().state, 1, 3, 0x10);
+    let all = blocks(&store.load().unwrap().state, 1, 3, 0x10);
     store
         .record_gap(
             identity(),
@@ -329,7 +312,7 @@ fn durable_gap_recovers_across_separate_notifications() {
             CoverageGapReason::MissingReceipts,
         )
         .unwrap();
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     for block in &all {
         runtime.push(notification(vec![block.clone()])).unwrap();
     }
@@ -341,7 +324,7 @@ fn durable_gap_recovers_across_separate_notifications() {
             RuntimeAction::Acknowledge(_)
         ));
     }
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     assert_eq!(snapshot.meta.coverage, Coverage::Complete);
     assert_eq!(snapshot.meta.verified_zone_tip, all[2].zone);
     assert_eq!(snapshot.meta.acknowledged_zone_tip, all[2].zone);
@@ -350,8 +333,12 @@ fn durable_gap_recovers_across_separate_notifications() {
 #[test]
 fn overflow_and_stream_failure_are_durable_fail_open_apis() {
     let (directory, store) = create();
-    let state = store.load(identity()).unwrap().state;
-    let mut overflow_runtime = Runtime::new(1, RetryBudget::new(2, Duration::from_secs(1)));
+    let state = store.load().unwrap().state;
+    let mut overflow_runtime = Runtime::new(
+        store.load().unwrap(),
+        1,
+        RetryBudget::new(2, Duration::from_secs(1)),
+    );
     overflow_runtime
         .push(notification(blocks(&state, 1, 1, 0x10)))
         .unwrap();
@@ -361,12 +348,12 @@ fn overflow_and_stream_failure_are_durable_fail_open_apis() {
     let rejected = notification(blocks(&state, 3, 2, 0x10));
     assert_eq!(
         overflow_runtime
-            .push_or_record_overflow(&store, identity(), rejected)
+            .push_or_record_overflow(&store, rejected)
             .unwrap(),
         RuntimeAction::AcknowledgeAndTerminate(coordinate(4, 0x10))
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.coverage,
+        store.load().unwrap().meta.coverage,
         Coverage::Gap {
             first_unchecked: coordinate(1, 0x10),
             acknowledged_through: coordinate(4, 0x10),
@@ -380,20 +367,18 @@ fn overflow_and_stream_failure_are_durable_fail_open_apis() {
     );
 
     let (stream_directory, store) = create();
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     let suffix = [
         coordinate(1, 0x10),
         coordinate(2, 0x10),
         coordinate(3, 0x10),
     ];
     assert_eq!(
-        runtime
-            .record_stream_failure(&store, identity(), &suffix)
-            .unwrap(),
+        runtime.record_stream_failure(&store, &suffix).unwrap(),
         RuntimeAction::AcknowledgeAndTerminate(suffix[2])
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.coverage,
+        store.load().unwrap().meta.coverage,
         Coverage::Gap {
             first_unchecked: suffix[0],
             acknowledged_through: suffix[2],
@@ -415,10 +400,10 @@ fn overflow_and_stream_failure_are_durable_fail_open_apis() {
 #[test]
 fn finding_descendants_stay_alerting_and_reorg_recovers_before_replacement() {
     let (_directory, store) = create();
-    let state = store.load(identity()).unwrap().state;
+    let state = store.load().unwrap().state;
     let mut bad = blocks(&state, 1, 1, 0x10);
     bad[0].outputs.state.tempo_block_hash = B256::ZERO;
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     runtime.push(notification(bad)).unwrap();
     runtime
         .poll(&store, identity(), &mut FakePipeline, Instant::now())
@@ -434,11 +419,11 @@ fn finding_descendants_stay_alerting_and_reorg_recovers_before_replacement() {
     );
     assert_eq!(runtime.state(), RuntimeState::Alerting);
     assert!(
-        matches!(store.load(identity()).unwrap().meta.coverage, Coverage::Gap { reason: CoverageGapReason::NotCheckedAncestorDivergence, acknowledged_through, .. } if acknowledged_through == coordinate(3, 0x10))
+        matches!(store.load().unwrap().meta.coverage, Coverage::Gap { reason: CoverageGapReason::NotCheckedAncestorDivergence, acknowledged_through, .. } if acknowledged_through == coordinate(3, 0x10))
     );
-    runtime.reorg(&store, identity(), anchor().zone).unwrap();
+    runtime.reorg(&store, anchor().zone).unwrap();
     assert_eq!(runtime.state(), RuntimeState::Starting);
-    let mut replacement = blocks(&store.load(identity()).unwrap().state, 1, 1, 0x30);
+    let mut replacement = blocks(&store.load().unwrap().state, 1, 1, 0x30);
     replacement[0].parent = anchor().zone;
     runtime.push(notification(replacement)).unwrap();
     runtime
@@ -450,10 +435,10 @@ fn finding_descendants_stay_alerting_and_reorg_recovers_before_replacement() {
 #[test]
 fn restart_catchup_containing_active_finding_never_authenticates() {
     let (_directory, store) = create();
-    let state = store.load(identity()).unwrap().state;
+    let state = store.load().unwrap().state;
     let mut bad = blocks(&state, 1, 1, 0x10);
     bad[0].outputs.state.tempo_block_hash = B256::ZERO;
-    let mut first_runtime = runtime(2);
+    let mut first_runtime = runtime(&store, 2);
     first_runtime.push(notification(bad)).unwrap();
     first_runtime
         .poll(&store, identity(), &mut FakePipeline, Instant::now())
@@ -467,7 +452,7 @@ fn restart_catchup_containing_active_finding_never_authenticates() {
         )
         .unwrap();
 
-    let mut restarted = runtime(2);
+    let mut restarted = runtime(&store, 2);
     restarted
         .push(FakeNotification {
             plan: None,
@@ -491,10 +476,10 @@ fn restart_catchup_containing_active_finding_never_authenticates() {
 #[test]
 fn active_finding_rejects_same_height_wrong_ancestor_hash() {
     let (_directory, store) = create();
-    let state = store.load(identity()).unwrap().state;
+    let state = store.load().unwrap().state;
     let mut bad = blocks(&state, 1, 1, 0x10);
     bad[0].outputs.state.tempo_block_hash = B256::ZERO;
-    let mut runtime = runtime(2);
+    let mut runtime = runtime(&store, 2);
     runtime.push(notification(bad)).unwrap();
     runtime
         .poll(&store, identity(), &mut FakePipeline, Instant::now())
@@ -526,7 +511,7 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
         RuntimeAction::Terminal
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.acknowledged_zone_tip,
+        store.load().unwrap().meta.acknowledged_zone_tip,
         coordinate(3, 0x10)
     );
 }
@@ -539,22 +524,22 @@ fn malformed_coordinates_are_terminal_without_ack() {
         Ok(vec![]),
         Ok(vec![coordinate(1, 0x10), coordinate(3, 0x10)]),
     ] {
-        let mut runtime = runtime(2);
-        runtime
-            .push(FakeNotification {
-                plan: None,
-                coordinates,
-                blocks: Ok(vec![]),
-            })
-            .unwrap();
+        let mut runtime = runtime(&store, 2);
         assert_eq!(
             runtime
-                .poll(&store, identity(), &mut FakePipeline, Instant::now())
+                .push_or_record_overflow(
+                    &store,
+                    FakeNotification {
+                        plan: None,
+                        coordinates,
+                        blocks: Ok(vec![]),
+                    }
+                )
                 .unwrap(),
             RuntimeAction::Terminal
         );
         assert_eq!(
-            store.load(identity()).unwrap().meta.acknowledged_zone_tip,
+            store.load().unwrap().meta.acknowledged_zone_tip,
             anchor().zone
         );
     }
@@ -579,11 +564,12 @@ fn builder_refuses_unrelated_nonempty_path_and_replay_reopens_identically() {
     ));
 
     let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("checkpoint");
     let initial = State::awaiting(portal());
     let history = [notification(blocks(&initial, 1, 2, 0x10))];
     let snapshot = build_checkpoint(
         BuildConfig {
-            path: directory.path(),
+            path: &target,
             l1_chain_id: 1,
             zone_chain_id: 2,
             creation_block: identity().creation_block,
@@ -595,13 +581,14 @@ fn builder_refuses_unrelated_nonempty_path_and_replay_reopens_identically() {
         &mut FakePipeline,
     )
     .unwrap();
-    let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    let (_, reopened) = Persistence::open(&target, identity()).unwrap();
     assert_eq!(snapshot, reopened);
 }
 
 #[test]
 fn builder_unwinds_reorg_before_authenticating_replacement() {
     let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("checkpoint");
     let initial = State::awaiting(portal());
     let old = blocks(&initial, 1, 1, 0x10);
     let mut replacement = blocks(&initial, 1, 1, 0x30);
@@ -621,7 +608,7 @@ fn builder_unwinds_reorg_before_authenticating_replacement() {
     ];
     let snapshot = build_checkpoint(
         BuildConfig {
-            path: directory.path(),
+            path: &target,
             l1_chain_id: 1,
             zone_chain_id: 2,
             creation_block: identity().creation_block,

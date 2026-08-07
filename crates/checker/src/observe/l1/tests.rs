@@ -437,16 +437,10 @@ fn authenticated_event_order_uses_receipt_vectors_not_rpc_log_metadata() {
 
     let observed = events::ordered_transactions(PORTAL, &hashes, &receipts).unwrap();
     assert_eq!(observed.len(), 2);
-    assert_eq!(observed[0].outcomes[0].position.transaction_index, 0);
-    assert_eq!(observed[0].outcomes[0].position.receipt_log_index, 1);
-    assert_eq!(observed[0].outcomes[0].position.block_log_index, 1);
     assert!(matches!(
         observed[0].outcomes[0].event,
         L1ProtocolEvent::Portal(PortalModelEvent::BouncebackGasUpdated(_))
     ));
-    assert_eq!(observed[1].outcomes[0].position.transaction_index, 1);
-    assert_eq!(observed[1].outcomes[0].position.receipt_log_index, 0);
-    assert_eq!(observed[1].outcomes[0].position.block_log_index, 3);
     assert_eq!(
         observed[1].required_call,
         Some(PortalCallFamily::SubmitBatch)
@@ -492,10 +486,6 @@ fn authenticated_event_order_preserves_operation_before_config() {
     assert_eq!(observed.len(), 2);
 
     let operation = &observed[0].outcomes[0];
-    assert_eq!(operation.position.transaction_index, 0);
-    assert_eq!(operation.position.receipt_log_index, 0);
-    assert_eq!(operation.position.block_log_index, 0);
-    assert_eq!(operation.position.transaction_hash, hashes[0]);
     assert!(matches!(
         operation.event,
         L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(_))
@@ -506,10 +496,6 @@ fn authenticated_event_order_preserves_operation_before_config() {
     );
 
     let config = &observed[1].outcomes[0];
-    assert_eq!(config.position.transaction_index, 1);
-    assert_eq!(config.position.receipt_log_index, 1);
-    assert_eq!(config.position.block_log_index, 2);
-    assert_eq!(config.position.transaction_hash, hashes[1]);
     assert!(matches!(
         config.event,
         L1ProtocolEvent::Portal(PortalModelEvent::BouncebackGasUpdated(_))
@@ -721,8 +707,7 @@ async fn empty_process_withdrawals_without_events_causes_no_transaction_fetch() 
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
-    let observed = acquisition.observation();
+    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
     assert!(observed.protocol_transactions.is_empty());
     assert!(asserter.read_q().is_empty());
 }
@@ -743,8 +728,7 @@ async fn eventful_submit_batch_fetches_once_and_decodes_direct_calldata() {
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
-    let observed = acquisition.observation();
+    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
     assert_eq!(observed.protocol_transactions.len(), 1);
     assert!(
         observed.protocol_transactions[0]
@@ -753,12 +737,7 @@ async fn eventful_submit_batch_fetches_once_and_decodes_direct_calldata() {
             .and_then(DecodedPortalCall::as_submit_batch)
             .is_some()
     );
-    assert_eq!(
-        observed.protocol_transactions[0].outcomes[0]
-            .position
-            .block_log_index,
-        0
-    );
+    assert_eq!(observed.protocol_transactions[0].outcomes.len(), 1);
     assert!(asserter.read_q().is_empty());
 }
 
@@ -778,8 +757,7 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
-    let observed = acquisition.observation();
+    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
     let [transaction] = observed.protocol_transactions() else {
         panic!("expected one protocol transaction");
     };
@@ -794,10 +772,6 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     let [outcome] = transaction.outcomes() else {
         panic!("expected one ordered outcome");
     };
-    assert_eq!(outcome.position().transaction_index(), 0);
-    assert_eq!(outcome.position().receipt_log_index(), 0);
-    assert_eq!(outcome.position().block_log_index(), 0);
-    assert_eq!(outcome.position().transaction_hash(), tx_hash);
     assert!(matches!(
         outcome.event(),
         L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(_))

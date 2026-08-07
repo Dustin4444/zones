@@ -1,4 +1,4 @@
-use alloy_consensus::Header;
+use alloy_consensus::{Header, Sealable as _};
 use alloy_primitives::Address;
 
 use super::*;
@@ -37,7 +37,31 @@ fn header_bytes(number: u64) -> Bytes {
     encoded.into()
 }
 
+fn chained_header_bytes(number: u64, parent_hash: B256) -> Bytes {
+    let header = TempoHeader {
+        inner: Header {
+            number,
+            parent_hash,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut encoded = Vec::new();
+    header.encode(&mut encoded);
+    encoded.into()
+}
+
 fn advance_call() -> Vec<u8> {
+    ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header_bytes(7)],
+        deposits: Vec::new(),
+        decryptions: Vec::new(),
+        enabledTokens: Vec::new(),
+    }
+    .abi_encode()
+}
+
+fn legacy_advance_call() -> Vec<u8> {
     IZoneInbox::advanceTempoCall {
         header: header_bytes(7),
         deposits: Vec::new(),
@@ -65,16 +89,16 @@ fn ordinary_deposit() -> ZonePortal::Deposit {
 }
 
 fn advance_with_ordinary_deposit_data(deposit_data: Vec<u8>) -> Vec<u8> {
-    IZoneInbox::advanceTempoCall {
-        header: header_bytes(7),
-        deposits: vec![IZoneInbox::QueuedDeposit {
-            depositType: IZoneInbox::DepositType::Deposit,
+    ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header_bytes(7)],
+        deposits: vec![ObservationZoneInbox::QueuedDeposit {
+            depositType: ObservationZoneInbox::DepositType::Deposit,
             depositData: deposit_data.into(),
         }],
-        decryptions: vec![IZoneInbox::DecryptionData {
+        decryptions: vec![ObservationZoneInbox::DecryptionData {
             sharedSecret: B256::ZERO,
             sharedSecretYParity: 0,
-            cpProof: IZoneInbox::ChaumPedersenProof {
+            cpProof: ObservationZoneInbox::ChaumPedersenProof {
                 s: B256::ZERO,
                 c: B256::ZERO,
             },
@@ -143,8 +167,56 @@ fn assert_malformed<T: core::fmt::Debug>(
 #[test]
 fn advance_tempo_round_trips_canonical_header_and_calldata() {
     let decoded = decode_advance(&advance_call()).unwrap();
-    assert_eq!(decoded.imported_header.number(), 7);
+    assert_eq!(decoded.final_imported_header().number(), 7);
     assert!(decoded.deposits.is_empty());
+}
+
+#[test]
+fn legacy_single_header_call_normalizes_to_one_imported_header() {
+    let decoded = decode_advance(&legacy_advance_call()).unwrap();
+    assert_eq!(decoded.imported_headers().len(), 1);
+    assert_eq!(decoded.final_imported_header().number(), 7);
+}
+
+#[test]
+fn advance_tempo_retains_ordered_consecutive_headers() {
+    let first = header_bytes(7);
+    let mut cursor = first.as_ref();
+    let first_decoded = TempoHeader::decode(&mut cursor).unwrap();
+    let second = chained_header_bytes(8, first_decoded.hash_slow());
+    let calldata = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![first, second],
+        deposits: Vec::new(),
+        decryptions: Vec::new(),
+        enabledTokens: Vec::new(),
+    }
+    .abi_encode();
+
+    let decoded = decode_advance(&calldata).unwrap();
+    assert_eq!(decoded.imported_headers().len(), 2);
+    assert_eq!(decoded.imported_headers()[0].number(), 7);
+    assert_eq!(decoded.final_imported_header().number(), 8);
+}
+
+#[test]
+fn advance_tempo_rejects_empty_and_discontinuous_headers() {
+    let empty = ObservationZoneInbox::advanceTempoCall {
+        headers: Vec::new(),
+        deposits: Vec::new(),
+        decryptions: Vec::new(),
+        enabledTokens: Vec::new(),
+    }
+    .abi_encode();
+    assert_malformed(decode_advance(&empty), DataSource::AdvanceTempoCalldata);
+
+    let discontinuous = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header_bytes(7), chained_header_bytes(9, B256::ZERO)],
+        deposits: Vec::new(),
+        decryptions: Vec::new(),
+        enabledTokens: Vec::new(),
+    }
+    .abi_encode();
+    assert_malformed(decode_advance(&discontinuous), DataSource::AdvanceHeaderRlp);
 }
 
 #[test]
@@ -155,27 +227,27 @@ fn advance_tempo_round_trips_every_dynamic_input_family() {
         to: Address::repeat_byte(11),
         amount: 12,
     };
-    let calldata = IZoneInbox::advanceTempoCall {
-        header: header_bytes(7),
+    let calldata = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header_bytes(7)],
         deposits: vec![
-            IZoneInbox::QueuedDeposit {
-                depositType: IZoneInbox::DepositType::Deposit,
+            ObservationZoneInbox::QueuedDeposit {
+                depositType: ObservationZoneInbox::DepositType::Deposit,
                 depositData: ordinary.abi_encode().into(),
             },
-            IZoneInbox::QueuedDeposit {
-                depositType: IZoneInbox::DepositType::WithdrawalBounceBack,
+            ObservationZoneInbox::QueuedDeposit {
+                depositType: ObservationZoneInbox::DepositType::WithdrawalBounceBack,
                 depositData: bounce_back.abi_encode().into(),
             },
         ],
-        decryptions: vec![IZoneInbox::DecryptionData {
+        decryptions: vec![ObservationZoneInbox::DecryptionData {
             sharedSecret: B256::repeat_byte(13),
             sharedSecretYParity: 2,
-            cpProof: IZoneInbox::ChaumPedersenProof {
+            cpProof: ObservationZoneInbox::ChaumPedersenProof {
                 s: B256::repeat_byte(14),
                 c: B256::repeat_byte(15),
             },
         }],
-        enabledTokens: vec![IZoneInbox::EnabledToken {
+        enabledTokens: vec![ObservationZoneInbox::EnabledToken {
             token: Address::repeat_byte(16),
             name: "Token".into(),
             symbol: "TKN".into(),
@@ -262,8 +334,8 @@ fn advance_tempo_rejects_noncanonical_header_rlp() {
     let first_item = header.len() - cursor.len();
     assert_eq!(header[first_item], 0x80, "first Tempo header field is zero");
     header[first_item] = 0x00;
-    let calldata = IZoneInbox::advanceTempoCall {
-        header: header.into(),
+    let calldata = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header.into()],
         deposits: Vec::new(),
         decryptions: Vec::new(),
         enabledTokens: Vec::new(),
@@ -276,8 +348,8 @@ fn advance_tempo_rejects_noncanonical_header_rlp() {
 fn advance_tempo_rejects_trailing_header_rlp() {
     let mut header = header_bytes(7).to_vec();
     header.push(0x80);
-    let calldata = IZoneInbox::advanceTempoCall {
-        header: header.into(),
+    let calldata = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![header.into()],
         deposits: Vec::new(),
         decryptions: Vec::new(),
         enabledTokens: Vec::new(),
@@ -289,7 +361,7 @@ fn advance_tempo_rejects_trailing_header_rlp() {
 #[test]
 fn dynamic_array_protocol_caps_are_checked_before_generated_decode() {
     for (head_word, maximum) in [
-        (1, MAX_DEPOSITS_PER_TEMPO_BLOCK),
+        (1, MAX_UNPROCESSED_DEPOSITS),
         (3, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK),
     ] {
         let mut calldata = advance_call();

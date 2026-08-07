@@ -23,9 +23,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use zone_checker_kernel::{State, validate};
+use zone_checker_kernel::{Datum, Finding as FindingDetails, FindingLocation, State, validate};
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +46,8 @@ pub(crate) enum PersistenceError {
     },
     #[error("checker identity mismatch")]
     Identity,
+    #[error("stale checker snapshot")]
+    StaleSnapshot,
     #[error("invalid checker persistence: {0}")]
     Invalid(String),
     #[cfg(test)]
@@ -55,8 +57,28 @@ pub(crate) enum PersistenceError {
 
 pub(crate) struct Persistence {
     db: Arc<DatabaseEnv>,
+    identity: Identity,
+    checkpoint_interval: u64,
     #[cfg(test)]
     abort_next_write: AtomicBool,
+}
+
+pub(crate) trait PriorSnapshot {
+    fn resolve(self, store: &Persistence) -> Result<Snapshot>;
+}
+impl PriorSnapshot for &Snapshot {
+    fn resolve(self, _store: &Persistence) -> Result<Snapshot> {
+        Ok(self.clone())
+    }
+}
+#[cfg(test)]
+impl PriorSnapshot for Identity {
+    fn resolve(self, store: &Persistence) -> Result<Snapshot> {
+        if self != store.identity {
+            return Err(PersistenceError::Identity);
+        }
+        store.load()
+    }
 }
 
 impl Persistence {
@@ -86,10 +108,12 @@ impl Persistence {
         let db = open_db_read_only(path, DatabaseArguments::default())?;
         Self {
             db: Arc::new(db),
+            identity,
+            checkpoint_interval: 64,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         }
-        .load(identity)
+        .load()
     }
 
     pub(crate) fn create(
@@ -106,6 +130,8 @@ impl Persistence {
         let db = init_db_for::<_, PersistenceTables>(&path, DatabaseArguments::default())?;
         let this = Self {
             db: Arc::new(db),
+            identity,
+            checkpoint_interval: 64,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -125,11 +151,17 @@ impl Persistence {
         })?;
         codec::encode(&meta)?;
         let tx = this.db.tx_mut()?;
-        tx.put::<Checkpoints>(id, Checkpoint { cut, state })?;
+        tx.put::<Checkpoints>(
+            id,
+            Checkpoint {
+                cut,
+                state: state.clone(),
+            },
+        )?;
         tx.put::<Meta>(MetaKey::Version, MetaValue::Version(SCHEMA_VERSION))?;
-        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta)))?;
+        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta.clone())))?;
         tx.commit()?;
-        this.load(identity).map(|snapshot| (this, snapshot))
+        Ok((this, Snapshot { meta, state }))
     }
 
     pub(crate) fn open(path: impl AsRef<Path>, identity: Identity) -> Result<(Self, Snapshot)> {
@@ -138,13 +170,16 @@ impl Persistence {
         let db = DatabaseEnv::open(&path, DatabaseEnvKind::RW, DatabaseArguments::default())?;
         let this = Self {
             db: Arc::new(db),
+            identity,
+            checkpoint_interval: 64,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
-        this.load(identity).map(|snapshot| (this, snapshot))
+        this.load().map(|snapshot| (this, snapshot))
     }
 
-    pub(crate) fn load(&self, identity: Identity) -> Result<Snapshot> {
+    pub(crate) fn load(&self) -> Result<Snapshot> {
+        let identity = self.identity;
         let tx = self.db.tx()?;
         let meta = tx
             .get::<Meta>(MetaKey::State)?
@@ -162,23 +197,38 @@ impl Persistence {
             .ok_or_else(|| invalid("active checkpoint is missing"))?;
         validate_checkpoint(meta.active_checkpoint, &active, identity)?;
         let mut checkpoints = tx.cursor_read::<Checkpoints>()?;
-        let (bootstrap_id, bootstrap) = checkpoints
+        let bootstrap_id = checkpoints
             .first()?
+            .map(|(id, _)| id)
             .ok_or_else(|| invalid("bootstrap checkpoint is missing"))?;
-        validate_checkpoint(bootstrap_id, &bootstrap, identity)?;
-        for row in checkpoints.walk(None)? {
-            let (id, checkpoint) = row?;
-            validate_checkpoint(id, &checkpoint, identity)?;
-        }
-        let mut state = bootstrap.state.clone();
+        let mut state = active.state.clone();
         validate_state(&state, identity)?;
-        let mut tip = bootstrap.cut.zone;
-        let mut imported = bootstrap.cut.tempo;
-        if tip.number > meta.verified_zone_tip.number {
-            return Err(invalid("bootstrap exceeds verified tip"));
-        }
-        if meta.active_checkpoint == bootstrap_id && active != bootstrap {
-            return Err(invalid("active bootstrap checkpoint mismatch"));
+        let mut tip = active.cut.zone;
+        let mut imported = active.cut.tempo;
+        if meta.active_checkpoint != bootstrap_id {
+            let predecessor = if meta.active_checkpoint.height == bootstrap_id.height + 1 {
+                tx.get::<Checkpoints>(bootstrap_id)?.map(|cp| cp.cut)
+            } else {
+                tx.get::<Journal>(meta.active_checkpoint.height - 1)?
+                    .map(|entry| ChainCut {
+                        zone: entry.zone,
+                        tempo: entry.imported_tempo,
+                    })
+            };
+            let canonical = predecessor.is_some_and(|parent| {
+                tx.get::<Journal>(meta.active_checkpoint.height)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| {
+                        entry.zone == active.cut.zone
+                            && entry.imported_tempo == active.cut.tempo
+                            && entry.parent == parent.zone
+                            && entry.imported_tempo_parent == parent.tempo
+                    })
+            });
+            if !canonical {
+                return Err(invalid("active checkpoint is not on the canonical journal"));
+            }
         }
         for height in tip.number.saturating_add(1)..=meta.verified_zone_tip.number {
             let entry = tx
@@ -187,11 +237,7 @@ impl Persistence {
             if entry.zone.number != height
                 || entry.parent != tip
                 || entry.delta.validate().is_err()
-                || entry.imported_tempo.number
-                    != imported
-                        .number
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("tempo height overflow"))?
+                || entry.imported_tempo.number <= imported.number
                 || entry.imported_tempo_parent != imported
             {
                 return Err(invalid(format!("conflicting journal height {height}")));
@@ -201,14 +247,6 @@ impl Persistence {
                 .map_err(|e| invalid(e.to_string()))?;
             tip = entry.zone;
             imported = entry.imported_tempo;
-            if meta.active_checkpoint.height == height
-                && (meta.active_checkpoint.hash != tip.hash
-                    || active.cut.zone != tip
-                    || active.cut.tempo != imported
-                    || active.state != state)
-            {
-                return Err(invalid("active checkpoint is not on the canonical journal"));
-            }
         }
         if tip != meta.verified_zone_tip || imported != meta.imported_tempo_tip {
             return Err(invalid("journal does not reach verified tip"));
@@ -227,32 +265,26 @@ impl Persistence {
                 .ok_or_else(|| invalid("active finding row is missing"))?;
             validate_finding(key, &finding, Some(&meta))?;
         }
-        let mut findings = tx.cursor_read::<Findings>()?;
-        for row in findings.walk(None)? {
-            let (key, finding) = row?;
-            // Orphaned findings are immutable audit records. Only the active
-            // latch is required to sit at the next verified coordinate.
-            validate_finding(key, &finding, None)?;
-        }
         tx.commit()?;
         Ok(Snapshot { meta, state })
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn apply<P: PriorSnapshot>(
         &self,
-        identity: Identity,
+        prior: P,
         entry: JournalEntry,
         acknowledged: BlockNumHash,
         coverage: Coverage,
     ) -> Result<Snapshot> {
-        let prior = self.load(identity)?;
-        let mut candidate = prior.state;
+        let prior = prior.resolve(self)?;
+        let mut candidate = prior.state.clone();
         candidate
             .apply(&entry.delta)
             .map_err(|error| invalid(error.to_string()))?;
-        validate_state(&candidate, identity)?;
+        validate_state(&candidate, self.identity)?;
         codec::encode(&entry)?;
-        self.write(identity, |tx, meta| {
+        let candidate_state = candidate.clone();
+        self.write(&prior, candidate_state, |tx, meta| {
             if entry.zone.number
                 != meta
                     .verified_zone_tip
@@ -260,12 +292,7 @@ impl Persistence {
                     .checked_add(1)
                     .ok_or_else(|| invalid("height overflow"))?
                 || entry.parent != meta.verified_zone_tip
-                || entry.imported_tempo.number
-                    != meta
-                        .imported_tempo_tip
-                        .number
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("tempo height overflow"))?
+                || entry.imported_tempo.number <= meta.imported_tempo_tip.number
                 || entry.imported_tempo_parent != meta.imported_tempo_tip
             {
                 return Err(invalid("wrong next journal parent or height"));
@@ -279,6 +306,23 @@ impl Persistence {
             meta.imported_tempo_tip = entry.imported_tempo;
             meta.coverage = coverage;
             meta.acknowledged_zone_tip = acknowledged;
+            if entry
+                .zone
+                .number
+                .saturating_sub(meta.active_checkpoint.height)
+                >= self.checkpoint_interval
+            {
+                checkpoint_in_tx(tx, meta, &candidate)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_current(&self, prior: &Snapshot) -> Result<Snapshot> {
+        validate_state(&prior.state, self.identity)?;
+        self.write(prior, prior.state.clone(), |tx, meta| {
+            checkpoint_in_tx(tx, meta, &prior.state)?;
             Ok(())
         })
     }
@@ -290,40 +334,29 @@ impl Persistence {
         cut: ChainCut,
         state: State,
     ) -> Result<Snapshot> {
-        validate_state(&state, identity)?;
-        if self.load(identity)?.state != state {
-            return Err(invalid(
-                "checkpoint state is not the authoritative current state",
-            ));
+        if identity != self.identity {
+            return Err(PersistenceError::Identity);
         }
-        let checkpoint = Checkpoint { cut, state };
-        codec::encode(&checkpoint)?;
-        self.write(identity, |tx, meta| {
-            if cut.zone != meta.verified_zone_tip || cut.tempo != meta.imported_tempo_tip {
-                return Err(invalid("checkpoint is not current"));
-            }
-            let id = CheckpointId::from(cut.zone);
-            if let Some(existing) = tx.get::<Checkpoints>(id)? {
-                if existing != checkpoint {
-                    return Err(invalid("checkpoint identity is immutable"));
-                }
-            } else {
-                tx.put::<Checkpoints>(id, checkpoint.clone())?;
-            }
-            meta.active_checkpoint = id;
-            Ok(())
-        })
+        let prior = self.load()?;
+        if cut.zone != prior.meta.verified_zone_tip
+            || cut.tempo != prior.meta.imported_tempo_tip
+            || state != prior.state
+        {
+            return Err(invalid("checkpoint is not current"));
+        }
+        self.checkpoint_current(&prior)
     }
 
-    pub(crate) fn record_finding(
+    pub(crate) fn record_finding<P: PriorSnapshot>(
         &self,
-        identity: Identity,
+        prior: P,
         key: FindingKey,
         finding: Finding,
     ) -> Result<Snapshot> {
+        let prior = prior.resolve(self)?;
         validate_finding(key, &finding, None)?;
         codec::encode(&finding)?;
-        self.write(identity, |tx, meta| {
+        self.write(&prior, prior.state.clone(), |tx, meta| {
             if finding.zone.number
                 != meta
                     .verified_zone_tip
@@ -331,9 +364,7 @@ impl Persistence {
                     .checked_add(1)
                     .ok_or_else(|| invalid("height overflow"))?
                 || finding.parent != meta.verified_zone_tip
-                || finding.imported_tempo.is_some_and(|tempo| {
-                    tempo.number != meta.imported_tempo_tip.number.saturating_add(1)
-                })
+                || !valid_imported_finding_coordinate(&finding, meta.imported_tempo_tip)
             {
                 return Err(invalid("finding is not at the next verified coordinate"));
             }
@@ -357,14 +388,15 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn record_gap(
+    pub(crate) fn record_gap<P: PriorSnapshot>(
         &self,
-        identity: Identity,
+        prior: P,
         first_unchecked: BlockNumHash,
         acknowledged_through: BlockNumHash,
         reason: CoverageGapReason,
     ) -> Result<Snapshot> {
-        self.write(identity, |_tx, meta| {
+        let prior = prior.resolve(self)?;
+        self.write(&prior, prior.state.clone(), |_tx, meta| {
             if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
                 || acknowledged_through.number < first_unchecked.number
                 || acknowledged_through.number < meta.acknowledged_zone_tip.number
@@ -392,13 +424,17 @@ impl Persistence {
         })
     }
 
-    pub(crate) fn reorg(&self, identity: Identity, ancestor: BlockNumHash) -> Result<Snapshot> {
-        let current = self.load(identity)?;
-        if ancestor.number > current.meta.verified_zone_tip.number {
-            if ancestor.number > current.meta.acknowledged_zone_tip.number {
+    pub(crate) fn reorg<P: PriorSnapshot>(
+        &self,
+        prior: P,
+        ancestor: BlockNumHash,
+    ) -> Result<Snapshot> {
+        let prior = prior.resolve(self)?;
+        if ancestor.number > prior.meta.verified_zone_tip.number {
+            if ancestor.number > prior.meta.acknowledged_zone_tip.number {
                 return Err(invalid("reorg ancestor exceeds acknowledged history"));
             }
-            return self.write(identity, |_tx, meta| {
+            return self.write(&prior, prior.state.clone(), |_tx, meta| {
                 if let Some(key) = meta.active_finding {
                     if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
                         return Err(invalid("conflicting evidence at finding height"));
@@ -431,8 +467,8 @@ impl Persistence {
                 Ok(())
             });
         }
-        let snapshot = self.reconstruct_at(identity, ancestor)?;
-        self.write(identity, |tx, meta| {
+        let snapshot = self.reconstruct_at(ancestor)?;
+        self.write(&prior, snapshot.state.clone(), |tx, meta| {
             let mut cursor = tx.cursor_write::<Journal>()?;
             while let Some((height, _)) = cursor.last()? {
                 if height <= ancestor.number {
@@ -471,7 +507,8 @@ impl Persistence {
         })
     }
 
-    fn reconstruct_at(&self, identity: Identity, ancestor: BlockNumHash) -> Result<Snapshot> {
+    fn reconstruct_at(&self, ancestor: BlockNumHash) -> Result<Snapshot> {
+        let identity = self.identity;
         let tx = self.db.tx()?;
         let meta = tx
             .get::<Meta>(MetaKey::State)?
@@ -520,16 +557,9 @@ impl Persistence {
             if e.zone.number != h
                 || e.parent != tip
                 || e.imported_tempo_parent != imported
-                || e.imported_tempo.number
-                    != imported
-                        .number
-                        .checked_add(1)
-                        .ok_or_else(|| invalid("tempo height overflow"))?
+                || e.imported_tempo.number <= imported.number
             {
                 return Err(invalid("non-contiguous reorg journal"));
-            }
-            if e.parent != tip {
-                return Err(invalid("reorg journal parent mismatch"));
             }
             state.apply(&e.delta).map_err(|e| invalid(e.to_string()))?;
             tip = e.zone;
@@ -546,7 +576,7 @@ impl Persistence {
         Ok(Snapshot { meta: out, state })
     }
 
-    fn write<F>(&self, identity: Identity, f: F) -> Result<Snapshot>
+    fn write<F>(&self, prior: &Snapshot, state: State, f: F) -> Result<Snapshot>
     where
         F: FnOnce(&<DatabaseEnv as Database>::TXMut, &mut Metadata) -> Result<()>,
     {
@@ -558,22 +588,26 @@ impl Persistence {
             return Err(invalid("metadata type mismatch"));
         };
         let mut meta = *meta;
-        if meta.identity != identity {
+        if meta.identity != self.identity {
             tx.abort();
             return Err(PersistenceError::Identity);
+        }
+        if meta != prior.meta {
+            tx.abort();
+            return Err(PersistenceError::StaleSnapshot);
         }
         if let Err(e) = f(&tx, &mut meta) {
             tx.abort();
             return Err(e);
         }
-        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta)))?;
+        tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta.clone())))?;
         #[cfg(test)]
         if self.abort_next_write.swap(false, Ordering::SeqCst) {
             tx.abort();
             return Err(PersistenceError::InjectedAbort);
         }
         tx.commit()?;
-        self.load(identity)
+        Ok(Snapshot { meta, state })
     }
 
     #[cfg(test)]
@@ -633,33 +667,114 @@ fn validate_checkpoint(
     validate_state(&checkpoint.state, identity)
 }
 
-fn finding_evidence(expected: &[u8], actual: &[u8]) -> Result<(u32, alloy_primitives::B256)> {
+fn checkpoint_in_tx(
+    tx: &<DatabaseEnv as Database>::TXMut,
+    meta: &mut Metadata,
+    state: &State,
+) -> Result<()> {
+    let cut = ChainCut {
+        zone: meta.verified_zone_tip,
+        tempo: meta.imported_tempo_tip,
+    };
+    let id = CheckpointId::from(cut.zone);
+    let checkpoint = Checkpoint {
+        cut,
+        state: state.clone(),
+    };
+    codec::encode(&checkpoint)?;
+    if let Some(existing) = tx.get::<Checkpoints>(id)? {
+        if existing != checkpoint {
+            return Err(invalid("checkpoint identity is immutable"));
+        }
+    } else {
+        tx.put::<Checkpoints>(id, checkpoint)?;
+    }
+    meta.active_checkpoint = id;
+    Ok(())
+}
+
+fn canonical_datum(value: Option<&Datum>) -> Vec<u8> {
+    value.map(Datum::canonical_bytes).unwrap_or_default()
+}
+
+fn finding_evidence(details: &FindingDetails) -> Result<(u32, alloy_primitives::B256)> {
+    let expected = canonical_datum(details.expected.as_ref());
+    let actual = canonical_datum(details.actual.as_ref());
     let mut canonical = Vec::with_capacity(8 + expected.len() + actual.len());
     canonical.extend(
         u32::try_from(expected.len())
             .map_err(|_| invalid("expected too large"))?
             .to_be_bytes(),
     );
-    canonical.extend(expected);
+    canonical.extend(&expected);
     canonical.extend(
         u32::try_from(actual.len())
             .map_err(|_| invalid("actual too large"))?
             .to_be_bytes(),
     );
-    canonical.extend(actual);
+    canonical.extend(&actual);
     Ok((
         u32::try_from(canonical.len()).map_err(|_| invalid("evidence too large"))?,
         alloy_primitives::keccak256(canonical),
     ))
 }
 
+fn finding_operation(location: Option<&FindingLocation>) -> u32 {
+    match location {
+        Some(FindingLocation::Operation(operation))
+        | Some(FindingLocation::ImportedOperation(operation)) => *operation,
+        Some(FindingLocation::State(_) | FindingLocation::Block) | None => 0,
+    }
+}
+
+pub(crate) fn make_finding(
+    zone: BlockNumHash,
+    parent: BlockNumHash,
+    imported: Option<(BlockNumHash, BlockNumHash)>,
+    details: FindingDetails,
+    summary: String,
+) -> Result<(FindingKey, Finding)> {
+    let operation = finding_operation(details.location.as_ref());
+    let key = FindingKey {
+        zone,
+        operation,
+        code: details.code,
+    };
+    let (evidence_len, evidence_digest) = finding_evidence(&details)?;
+    let (imported_tempo, imported_tempo_parent) = imported.unzip();
+    let finding = Finding {
+        zone,
+        parent,
+        imported_tempo,
+        imported_tempo_parent,
+        details,
+        evidence_len,
+        evidence_digest,
+        summary,
+    };
+    validate_finding(key, &finding, None)?;
+    Ok((key, finding))
+}
+
+fn valid_imported_finding_coordinate(finding: &Finding, parent: BlockNumHash) -> bool {
+    match (finding.imported_tempo, finding.imported_tempo_parent) {
+        (None, None) => true,
+        (Some(imported), Some(imported_parent)) => {
+            imported.number > parent.number && imported_parent == parent
+        }
+        _ => false,
+    }
+}
+
 fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>) -> Result<()> {
-    let (evidence_len, evidence_digest) = finding_evidence(&finding.expected, &finding.actual)?;
+    let expected = canonical_datum(finding.details.expected.as_ref());
+    let actual = canonical_datum(finding.details.actual.as_ref());
+    let (evidence_len, evidence_digest) = finding_evidence(&finding.details)?;
     if finding.zone != key.zone
-        || finding.operation != key.operation
-        || finding.code != key.code
-        || finding.expected.len() > 256
-        || finding.actual.len() > 256
+        || finding_operation(finding.details.location.as_ref()) != key.operation
+        || finding.details.code != key.code
+        || expected.len() > 256
+        || actual.len() > 256
         || finding.summary.len() > 1_024
         || finding.evidence_len != evidence_len
         || finding.evidence_digest != evidence_digest
@@ -674,9 +789,7 @@ fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>)
             .ok_or_else(|| invalid("height overflow"))?;
         if finding.zone.number != next
             || finding.parent != meta.verified_zone_tip
-            || finding.imported_tempo.is_some_and(|tempo| {
-                tempo.number != meta.imported_tempo_tip.number.saturating_add(1)
-            })
+            || !valid_imported_finding_coordinate(finding, meta.imported_tempo_tip)
         {
             return Err(invalid("finding is not at the next verified coordinate"));
         }

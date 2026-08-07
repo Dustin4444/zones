@@ -21,7 +21,7 @@ use crate::{
     },
     observe::{acquire_l1_header, acquire_portal_collateral, observe_l1},
     persistence::{BlockNumHash, ChainCut},
-    runtime::{BuildConfig, project_expected_effect, publish_genesis_checkpoint},
+    runtime::{BuildConfig, publish_genesis_checkpoint},
 };
 
 /// Build and atomically publish a checkpoint at local Zone genesis.
@@ -48,9 +48,8 @@ where
     let creation_header =
         acquire_l1_header(&l1_provider, config.portal_creation_block_hash).await?;
     let creation_tip = header_tip(&creation_header);
-    let creation_observation = observe_l1(&l1_provider, &creation_header, config.portal_address)
-        .await?
-        .into_observation();
+    let creation_observation =
+        observe_l1(&l1_provider, &creation_header, config.portal_address).await?;
     let creation_projection = adapt_imported(
         &creation_observation,
         &creation_header,
@@ -89,7 +88,7 @@ where
                 } else {
                     // The owned value must outlive projection and application.
                     let acquired = observe_l1(&l1_provider, &header, config.portal_address).await?;
-                    let observation = acquired.into_observation();
+                    let observation = acquired;
                     replay_one(&mut state, &observation, &header, &config, &l1_provider).await?;
                     continue;
                 };
@@ -154,11 +153,7 @@ async fn replay_one(
     )
     .map_err(|failure| eyre::eyre!(failure.message))?;
     let candidate = apply_imported(state, &projection.facts)?;
-    let expected_effects = candidate
-        .expected_effects()
-        .iter()
-        .map(project_expected_effect)
-        .collect::<Vec<_>>();
+    let expected_effects = candidate.expected_effects();
     if projection.effects != expected_effects {
         eyre::bail!("authenticated imported effects differ from checker candidate");
     }

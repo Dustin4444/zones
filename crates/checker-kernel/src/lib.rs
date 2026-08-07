@@ -13,7 +13,7 @@ mod state;
 pub use apply::{
     Candidate, ImportedCandidate, ModelError, apply_genesis_handoff, apply_imported, apply_zone,
 };
-pub use effects::{ExpectedEffect, ExpectedState};
+pub use effects::{Effect, ExpectedState};
 pub use facts::{
     BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, DepositPayload, Finalization,
     ImportedFacts, ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, UserWithdrawal,
@@ -31,10 +31,7 @@ pub use state::{
     WithdrawalOwner, ZoneState,
 };
 
-pub use commitments::{
-    NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL, bounceback_deposit_hash, bounceback_fee,
-    sender_tag, withdrawal_fee, withdrawal_hash, withdrawal_queue_hash,
-};
+pub use commitments::{NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL};
 
 #[cfg(test)]
 mod tests;

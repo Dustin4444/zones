@@ -241,7 +241,7 @@ pub(crate) fn observe_l2_block_with_context(
     let advance_coordinate =
         AuthenticatedTransaction::new(ProtocolChain::ZoneL2, 0, *first.tx_hash());
     let advance_tempo = decode_advance_tempo(first.input(), advance_coordinate)?;
-    let imported_header = advance_tempo.imported_header();
+    let imported_header = advance_tempo.final_imported_header();
     let imported_tempo = BlockNumHash::new(imported_header.number(), imported_header.hash());
 
     let finish = || -> Result<L2BlockObservation, ObservationError> {

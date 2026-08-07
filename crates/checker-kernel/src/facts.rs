@@ -61,7 +61,6 @@ pub enum ImportedOperation {
 pub struct ImportedFacts {
     pub block_hash: B256,
     pub block_number: u64,
-    pub base_fee: U256,
     pub operations: Vec<ImportedOperation>,
 }
 
@@ -85,6 +84,7 @@ pub struct BatchSubmission {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawalProcessing {
+    pub base_fee: U256,
     pub withdrawals: Vec<crate::state::Withdrawal>,
     pub remaining_queue: B256,
     pub outcomes: Vec<WithdrawalOutcome>,
@@ -96,8 +96,12 @@ pub enum WithdrawalOutcome {
         callback_deposits: Vec<OrdinaryDeposit>,
     },
     UserBounced,
-    FailedDepositPaid,
-    FailedDepositPending,
+    FailedDepositPaid {
+        collected_fee: u128,
+    },
+    FailedDepositPending {
+        collected_fee: u128,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

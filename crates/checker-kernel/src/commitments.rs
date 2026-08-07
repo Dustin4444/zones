@@ -32,14 +32,20 @@ mod abi {
     }
 }
 
-pub fn sender_tag(sender: Address, transaction_hash: B256) -> B256 {
-    let mut value = [0u8; 52];
+pub(crate) fn sender_tag(sender: Address, transaction_hash: B256, fallback_nonce: u64) -> B256 {
+    let mut value = [0u8; 60];
     value[..20].copy_from_slice(sender.as_slice());
-    value[20..].copy_from_slice(transaction_hash.as_slice());
+    value[20..52].copy_from_slice(transaction_hash.as_slice());
+    value[52..].copy_from_slice(&fallback_nonce.to_be_bytes());
     keccak256(value)
 }
 
-pub fn withdrawal_hash(value: &Withdrawal, tail: B256) -> B256 {
+/// Failed-deposit withdrawals retain the Portal's legacy 52-byte zero preimage.
+pub(crate) fn failed_deposit_sender_tag() -> B256 {
+    keccak256([0u8; 52])
+}
+
+pub(crate) fn withdrawal_hash(value: &Withdrawal, tail: B256) -> B256 {
     let value = abi::Withdrawal {
         token: value.token,
         senderTag: value.sender_tag,
@@ -54,7 +60,7 @@ pub fn withdrawal_hash(value: &Withdrawal, tail: B256) -> B256 {
     keccak256((value, tail).abi_encode_params())
 }
 
-pub fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
+pub(crate) fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
     if values.is_empty() {
         return B256::ZERO;
     }
@@ -66,13 +72,13 @@ pub fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
         })
 }
 
-pub fn withdrawal_fee(gas_limit: u64, rate: u128) -> Option<u128> {
+pub(crate) fn withdrawal_fee(gas_limit: u64, rate: u128) -> Option<u128> {
     u128::from(50_000u64)
         .checked_add(u128::from(gas_limit))?
         .checked_mul(rate)
 }
 
-pub fn bounceback_fee(gas: u64, base_fee: U256, amount: u128) -> Option<u128> {
+pub(crate) fn bounceback_fee(gas: u64, base_fee: U256, amount: u128) -> Option<u128> {
     let scale = U256::from(1_000_000_000_000u64);
     let fee = U256::from(gas)
         .checked_mul(base_fee)?
@@ -99,7 +105,7 @@ pub(crate) fn ordinary_deposit_hash(deposit: &OrdinaryDeposit, previous: B256) -
     keccak256((abi::DepositType::Deposit, wire, previous).abi_encode_params())
 }
 
-pub fn bounceback_deposit_hash(deposit: BounceBackDeposit, previous: B256) -> B256 {
+pub(crate) fn bounceback_deposit_hash(deposit: BounceBackDeposit, previous: B256) -> B256 {
     let mut recipient = [0_u8; 20];
     recipient[12..].copy_from_slice(&deposit.fallback_nonce.get().to_be_bytes());
     let wire = abi::WithdrawalBounceBackDeposit {
