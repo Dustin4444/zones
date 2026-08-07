@@ -19,6 +19,7 @@ pub(crate) struct Identity {
     pub zone_id: u32,
     pub portal: Address,
     pub creation_block: B256,
+    pub creation_height: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct CheckpointId {
@@ -38,6 +39,9 @@ pub(crate) enum CoverageGapReason {
     MissingReceipts,
     MissingTempoData,
     ProviderUnavailable,
+    /// The notification is a descendant of a retained finding and therefore
+    /// cannot be checked until that finding is removed by a reorg.
+    NotCheckedAncestorDivergence,
     Other(u16),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +78,7 @@ pub(crate) struct JournalEntry {
     pub zone: BlockNumHash,
     pub parent: BlockNumHash,
     pub imported_tempo: BlockNumHash,
+    pub imported_tempo_parent: BlockNumHash,
     pub delta: StateDelta,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

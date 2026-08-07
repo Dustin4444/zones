@@ -3,6 +3,12 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod check;
+mod compact;
+mod compact_builder;
+mod compact_exex;
+mod compact_observe;
+#[cfg(test)]
+mod compact_tests;
 pub mod diagnostic;
 mod metrics;
 mod model;
@@ -26,6 +32,8 @@ use tempo_primitives::{Block, TempoPrimitives};
 use observe::{AcquisitionError, AcquisitionSource};
 #[cfg(feature = "test-utils")]
 use test_utils::CheckerTestHooks;
+
+pub use compact_builder::build_compact_checkpoint;
 
 /// Runtime mode for the checker ExEx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

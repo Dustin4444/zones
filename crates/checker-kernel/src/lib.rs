@@ -10,14 +10,18 @@ mod finding;
 mod invariants;
 mod state;
 
-pub use apply::{Candidate, ImportedCandidate, ModelError, apply_imported, apply_zone};
+pub use apply::{
+    Candidate, ImportedCandidate, ModelError, apply_genesis_handoff, apply_imported, apply_zone,
+};
 pub use effects::{ExpectedEffect, ExpectedState};
 pub use facts::{
     BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, DepositPayload, Finalization,
     ImportedFacts, ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, UserWithdrawal,
     WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
 };
-pub use finding::{Datum, Finding, FindingCategory, FindingLocation};
+pub use finding::{
+    Datum, Finding, FindingCategory, FindingData, FindingLocation, ViolationCategory,
+};
 pub use invariants::{InvariantCode, InvariantViolation, validate};
 pub use state::{
     BatchBoundary, BatchBoundaryStart, BatchId, BatchState, Cursor, DepositId, DepositOwner,

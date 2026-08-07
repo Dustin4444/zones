@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::num::NonZeroU64;
+use std::{collections::BTreeMap, num::NonZeroU64};
 
 use alloy_primitives::{Address, U256};
 
@@ -79,11 +78,65 @@ pub struct ImportedCandidate {
     block_number: u64,
 }
 
+impl ImportedCandidate {
+    /// Exact accounting after the imported Tempo block and before any Zone
+    /// inputs are applied. This is the collateral cut authenticated on Tempo.
+    pub fn expected_accounting(&self) -> Result<BTreeMap<Address, TokenAccounting>, ModelError> {
+        token_accounting(&Overlay::new(&self.state))
+    }
+
+    /// Effects independently predicted from the imported block alone.
+    pub fn expected_effects(&self) -> &[ExpectedEffect] {
+        &self.effects
+    }
+
+    /// Materialize the authenticated post-import state without applying a
+    /// synthetic Zone transition.
+    pub fn into_state(self) -> State {
+        self.state
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub delta: StateDelta,
     pub expected_effects: Vec<ExpectedEffect>,
     pub expected_state: ExpectedState,
+    /// Exact accounting for every token in the resulting overlay, including
+    /// unchanged token rows which therefore do not occur in `delta`.
+    pub expected_accounting: BTreeMap<Address, TokenAccounting>,
+}
+
+/// Promote the Portal-enabled token set proven at the Zone genesis anchor.
+///
+/// Genesis has no ordinary `advanceTempo` transition, so this is the only
+/// transition allowed to change token phase without matching imported
+/// `TokenEnabled` effects. The caller must independently authenticate zero
+/// genesis supply for this exact token set before applying the delta.
+pub fn apply_genesis_handoff(parent: &State) -> Result<StateDelta, ModelError> {
+    if !matches!(portal(&Overlay::new(parent))?, PortalState::Created { .. }) {
+        return Err(ModelError::PortalNotCreated);
+    }
+    let mut overlay = Overlay::new(parent);
+    let tokens = overlay
+        .range(
+            std::ops::Bound::Included(StateKey::Token(Address::ZERO)),
+            std::ops::Bound::Included(StateKey::Token(Address::repeat_byte(0xff))),
+        )
+        .map(|(key, value)| match (key, value) {
+            (StateKey::Token(address), StateValue::Token(token)) => {
+                Ok((address.to_owned(), *token))
+            }
+            _ => Err(ModelError::CorruptState),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (address, mut token) in tokens {
+        if token.phase == TokenPhase::PendingZoneEnable {
+            token.phase = TokenPhase::ZoneEnabled;
+            overlay.set(StateKey::Token(address), Some(StateValue::Token(token)));
+        }
+    }
+    Ok(overlay.finish())
 }
 
 pub fn apply_imported(
@@ -213,6 +266,7 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
             &mut effects,
         )?;
     }
+    let expected_accounting = token_accounting(&overlay)?;
     let expected_state = expected_state(&overlay, imported.block_hash, imported.block_number)?;
     let zone_delta = overlay.finish();
     let mut writes = imported
@@ -226,7 +280,25 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
         delta: StateDelta::from_sorted_writes(writes.into_iter().collect()),
         expected_effects: effects,
         expected_state,
+        expected_accounting,
     })
+}
+
+fn token_accounting(
+    overlay: &Overlay<'_>,
+) -> Result<BTreeMap<Address, TokenAccounting>, ModelError> {
+    overlay
+        .range(
+            std::ops::Bound::Included(StateKey::Token(Address::ZERO)),
+            std::ops::Bound::Included(StateKey::Token(Address::repeat_byte(0xff))),
+        )
+        .map(|(key, value)| match (key, value) {
+            (StateKey::Token(token), StateValue::Token(state)) => {
+                Ok((token.to_owned(), state.accounting))
+            }
+            _ => Err(ModelError::CorruptState),
+        })
+        .collect()
 }
 
 fn portal(overlay: &Overlay<'_>) -> Result<PortalState, ModelError> {

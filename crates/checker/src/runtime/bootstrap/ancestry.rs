@@ -14,12 +14,12 @@ use crate::{
 use super::error::BootstrapError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FreshHistory {
+pub(crate) enum FreshHistory {
     PortalPresentAtGenesisAnchor,
     PortalCreatedAfterGenesisAnchor,
 }
 
-pub(super) fn classify_fresh_history(creation: BlockNumHash, anchor: BlockNumHash) -> FreshHistory {
+pub(crate) fn classify_fresh_history(creation: BlockNumHash, anchor: BlockNumHash) -> FreshHistory {
     if creation.number <= anchor.number {
         FreshHistory::PortalPresentAtGenesisAnchor
     } else {
@@ -27,7 +27,7 @@ pub(super) fn classify_fresh_history(creation: BlockNumHash, anchor: BlockNumHas
     }
 }
 
-pub(super) async fn acquire_anchor_header(
+pub(crate) async fn acquire_anchor_header(
     provider: &DynProvider<TempoNetwork>,
     anchor: BlockNumHash,
 ) -> RuntimeResult<ImportedTempoHeader> {
@@ -50,7 +50,7 @@ pub(super) async fn acquire_anchor_header(
 /// Both endpoints have already been authenticated by exact hash. Retaining
 /// every acquired header lets replay consume this proof directly instead of
 /// fetching the same ancestry a second time.
-pub(super) async fn prove_ancestry(
+pub(crate) async fn prove_ancestry(
     provider: &DynProvider<TempoNetwork>,
     descendant: ImportedTempoHeader,
     ancestor: &ImportedTempoHeader,
@@ -142,6 +142,6 @@ pub(super) fn creation_parent(header: &ImportedTempoHeader) -> RuntimeResult<Blo
     Ok(BlockNumHash::new(number, header.header().parent_hash()))
 }
 
-pub(super) fn header_tip(header: &ImportedTempoHeader) -> BlockNumHash {
+pub(crate) fn header_tip(header: &ImportedTempoHeader) -> BlockNumHash {
     BlockNumHash::new(header.number(), header.hash())
 }

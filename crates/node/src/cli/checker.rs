@@ -1,14 +1,18 @@
 //! Checker CLI arguments and mode-dependent configuration.
 
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use alloy_primitives::{Address, B256};
 use clap::{Args, Parser, Subcommand};
 use eyre::WrapErr as _;
+use reth_ethereum::cli::Cli;
+use zone_chainspec::ZoneChainSpecParser;
 use zone_checker::{
     CheckerConfig, CheckerMode,
     diagnostic::{DiagnosticModelKey, diagnose_retained_model_change},
 };
+
+use super::{NodeAction, ZoneArgs, run_node};
 
 /// Offline, read-only checker operator commands.
 #[derive(Debug, Parser)]
@@ -20,8 +24,27 @@ pub struct CheckerCommand {
 
 #[derive(Debug, Subcommand)]
 enum CheckerSubcommand {
+    /// Build and atomically publish a compact checkpoint using a local Zone node.
+    BuildCheckpoint(CheckerBuildCheckpointArgs),
     /// Reconstruct one model key across a retained canonical Zone block.
     Diagnose(CheckerDiagnoseArgs),
+}
+
+/// Checker checkpoint destination and ordinary node arguments.
+#[derive(Debug, Args)]
+struct CheckerBuildCheckpointArgs {
+    /// L1 block hash containing the authenticated `ZoneCreated` event.
+    #[arg(long = "checker.portal-creation-block-hash", value_name = "HASH")]
+    portal_creation_block_hash: B256,
+
+    /// Destination path for the atomically published compact checkpoint.
+    #[arg(long = "checker.database-path", value_name = "PATH")]
+    database_path: PathBuf,
+
+    /// Standard node arguments after `--`, including `--chain`, `--datadir`,
+    /// `--l1.rpc-url`, `--l1.portal-address`, and `--zone.id`.
+    #[arg(last = true, required = true, value_name = "NODE_ARGS")]
+    node_args: Vec<OsString>,
 }
 
 /// Exact retained boundary and selected model key to inspect.
@@ -43,6 +66,18 @@ struct CheckerDiagnoseArgs {
 impl CheckerCommand {
     pub(super) fn run(self) -> eyre::Result<()> {
         match self.command {
+            CheckerSubcommand::BuildCheckpoint(args) => {
+                let cli = Cli::<ZoneChainSpecParser, ZoneArgs>::try_parse_from(
+                    std::iter::once(OsString::from("zone-node")).chain(args.node_args),
+                )?;
+                run_node(
+                    cli,
+                    NodeAction::BuildCheckpoint {
+                        portal_creation_block_hash: args.portal_creation_block_hash,
+                        database_path: args.database_path,
+                    },
+                )
+            }
             CheckerSubcommand::Diagnose(args) => {
                 let report = diagnose_retained_model_change(
                     args.database_path,
@@ -144,7 +179,7 @@ mod tests {
     use clap::Parser as _;
     use zone_checker::CheckerMode;
 
-    use super::{CheckerArgs, CheckerCommand};
+    use super::{CheckerArgs, CheckerCommand, CheckerSubcommand};
 
     const CREATION_HASH: &str =
         "0x1111111111111111111111111111111111111111111111111111111111111111";
@@ -301,6 +336,55 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn build_checkpoint_requires_checker_fields_and_trailing_node_arguments() {
+        let valid = CheckerCommand::try_parse_from([
+            "checker",
+            "build-checkpoint",
+            "--checker.portal-creation-block-hash",
+            CREATION_HASH,
+            "--checker.database-path",
+            "checkpoint",
+            "--",
+            "--chain",
+            "dev",
+            "--l1.rpc-url",
+            "ws://localhost:8546",
+            "--l1.portal-address",
+            "0x0000000000000000000000000000000000000001",
+            "--zone.id",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            valid.command,
+            CheckerSubcommand::BuildCheckpoint(_)
+        ));
+
+        for omitted in [
+            "--checker.portal-creation-block-hash",
+            "--checker.database-path",
+        ] {
+            let mut args = vec![
+                "checker",
+                "build-checkpoint",
+                "--checker.portal-creation-block-hash",
+                CREATION_HASH,
+                "--checker.database-path",
+                "checkpoint",
+                "--",
+                "--chain",
+                "dev",
+            ];
+            let index = args.iter().position(|arg| *arg == omitted).unwrap();
+            args.drain(index..=index + 1);
+            assert_eq!(
+                CheckerCommand::try_parse_from(args).unwrap_err().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
     }
 
     #[test]

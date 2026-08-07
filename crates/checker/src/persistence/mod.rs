@@ -3,7 +3,7 @@
 //! This is intentionally independent of the legacy `store`, which remains the
 //! production oracle during the compact rewrite.
 
-#![allow(dead_code)] // Wired into the production runtime in Milestone 5.
+#![allow(dead_code)] // Compact runtime remains an internal shadow path until cutover.
 
 mod codec;
 mod schema;
@@ -30,7 +30,7 @@ use std::{
 };
 use zone_checker_kernel::{State, validate};
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +65,25 @@ pub(crate) struct Persistence {
 }
 
 impl Persistence {
+    /// Read the authenticated identity from an existing compact database.
+    /// This never creates or repairs a database and is intended for runtime
+    /// preflight before opening the sole-writer handle.
+    pub(crate) fn inspect_identity(path: impl AsRef<Path>) -> Result<Identity> {
+        let path = path.as_ref();
+        probe(path)?;
+        let db = open_db_read_only(path, DatabaseArguments::default())?;
+        let tx = db.tx()?;
+        let value = tx
+            .get::<Meta>(MetaKey::State)?
+            .ok_or_else(|| invalid("missing Meta singleton"))?;
+        let MetaValue::State(meta) = value else {
+            return Err(invalid("metadata type mismatch"));
+        };
+        validate_metadata(&meta)?;
+        tx.commit()?;
+        Ok(meta.identity)
+    }
+
     pub(crate) fn create(
         path: impl AsRef<Path>,
         identity: Identity,
@@ -159,7 +178,15 @@ impl Persistence {
             let entry = tx
                 .get::<Journal>(height)?
                 .ok_or_else(|| invalid(format!("missing journal height {height}")))?;
-            if entry.zone.number != height || entry.parent != tip || entry.delta.validate().is_err()
+            if entry.zone.number != height
+                || entry.parent != tip
+                || entry.delta.validate().is_err()
+                || entry.imported_tempo.number
+                    != imported
+                        .number
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("tempo height overflow"))?
+                || entry.imported_tempo_parent != imported
             {
                 return Err(invalid(format!("conflicting journal height {height}")));
             }
@@ -192,12 +219,14 @@ impl Persistence {
             let finding = tx
                 .get::<Findings>(key)?
                 .ok_or_else(|| invalid("active finding row is missing"))?;
-            validate_finding(key, &finding)?;
+            validate_finding(key, &finding, Some(&meta))?;
         }
         let mut findings = tx.cursor_read::<Findings>()?;
         for row in findings.walk(None)? {
             let (key, finding) = row?;
-            validate_finding(key, &finding)?;
+            // Orphaned findings are immutable audit records. Only the active
+            // latch is required to sit at the next verified coordinate.
+            validate_finding(key, &finding, None)?;
         }
         tx.commit()?;
         Ok(Snapshot { meta, state })
@@ -225,6 +254,13 @@ impl Persistence {
                     .checked_add(1)
                     .ok_or_else(|| invalid("height overflow"))?
                 || entry.parent != meta.verified_zone_tip
+                || entry.imported_tempo.number
+                    != meta
+                        .imported_tempo_tip
+                        .number
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("tempo height overflow"))?
+                || entry.imported_tempo_parent != meta.imported_tempo_tip
             {
                 return Err(invalid("wrong next journal parent or height"));
             }
@@ -278,12 +314,33 @@ impl Persistence {
         key: FindingKey,
         finding: Finding,
     ) -> Result<Snapshot> {
-        validate_finding(key, &finding)?;
+        validate_finding(key, &finding, None)?;
         codec::encode(&finding)?;
         self.write(identity, |tx, meta| {
+            if finding.zone.number
+                != meta
+                    .verified_zone_tip
+                    .number
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("height overflow"))?
+                || finding.parent != meta.verified_zone_tip
+                || finding.imported_tempo.is_some_and(|tempo| {
+                    tempo.number != meta.imported_tempo_tip.number.saturating_add(1)
+                })
+            {
+                return Err(invalid("finding is not at the next verified coordinate"));
+            }
+            validate_finding(key, &finding, Some(meta))?;
             if let Some(old) = tx.get::<Findings>(key)? {
-                if old != finding {
+                let mut old_identity = old.clone();
+                old_identity.summary.clear();
+                let mut new_identity = finding.clone();
+                new_identity.summary.clear();
+                if old_identity != new_identity {
                     return Err(invalid("conflicting same-height finding evidence"));
+                }
+                if old.summary != finding.summary {
+                    tx.put::<Findings>(key, finding.clone())?;
                 }
             } else {
                 tx.put::<Findings>(key, finding.clone())?;
@@ -453,6 +510,17 @@ impl Persistence {
             let e = tx
                 .get::<Journal>(h)?
                 .ok_or_else(|| invalid("missing reorg journal"))?;
+            if e.zone.number != h
+                || e.parent != tip
+                || e.imported_tempo_parent != imported
+                || e.imported_tempo.number
+                    != imported
+                        .number
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("tempo height overflow"))?
+            {
+                return Err(invalid("non-contiguous reorg journal"));
+            }
             if e.parent != tip {
                 return Err(invalid("reorg journal parent mismatch"));
             }
@@ -502,7 +570,7 @@ impl Persistence {
     }
 
     #[cfg(test)]
-    fn inject_abort(&self) {
+    pub(crate) fn inject_abort(&self) {
         self.abort_next_write.store(true, Ordering::SeqCst);
     }
 }
@@ -558,15 +626,53 @@ fn validate_checkpoint(
     validate_state(&checkpoint.state, identity)
 }
 
-fn validate_finding(key: FindingKey, finding: &Finding) -> Result<()> {
+fn finding_evidence(expected: &[u8], actual: &[u8]) -> Result<(u32, alloy_primitives::B256)> {
+    let mut canonical = Vec::with_capacity(8 + expected.len() + actual.len());
+    canonical.extend(
+        u32::try_from(expected.len())
+            .map_err(|_| invalid("expected too large"))?
+            .to_be_bytes(),
+    );
+    canonical.extend(expected);
+    canonical.extend(
+        u32::try_from(actual.len())
+            .map_err(|_| invalid("actual too large"))?
+            .to_be_bytes(),
+    );
+    canonical.extend(actual);
+    Ok((
+        u32::try_from(canonical.len()).map_err(|_| invalid("evidence too large"))?,
+        alloy_primitives::keccak256(canonical),
+    ))
+}
+
+fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>) -> Result<()> {
+    let (evidence_len, evidence_digest) = finding_evidence(&finding.expected, &finding.actual)?;
     if finding.zone != key.zone
         || finding.operation != key.operation
         || finding.code != key.code
         || finding.expected.len() > 256
         || finding.actual.len() > 256
         || finding.summary.len() > 1_024
+        || finding.evidence_len != evidence_len
+        || finding.evidence_digest != evidence_digest
     {
         return Err(invalid("finding is inconsistent or exceeds compact bounds"));
+    }
+    if let Some(meta) = meta {
+        let next = meta
+            .verified_zone_tip
+            .number
+            .checked_add(1)
+            .ok_or_else(|| invalid("height overflow"))?;
+        if finding.zone.number != next
+            || finding.parent != meta.verified_zone_tip
+            || finding.imported_tempo.is_some_and(|tempo| {
+                tempo.number != meta.imported_tempo_tip.number.saturating_add(1)
+            })
+        {
+            return Err(invalid("finding is not at the next verified coordinate"));
+        }
     }
     Ok(())
 }
