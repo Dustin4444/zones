@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use http::StatusCode;
 use tracing::{error, warn};
 
 /// Errors during authorization token parsing/validation.

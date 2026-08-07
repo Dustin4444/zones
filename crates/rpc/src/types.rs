@@ -1,22 +1,9 @@
 //! JSON-RPC types for the redacted zone RPC.
 
-use std::{future::Future, pin::Pin};
-
 use alloy_primitives::{Address, B256, U64, U256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
-
-/// Shorthand for the boxed future returned by [`ZoneRpcApi`](crate::handlers::ZoneRpcApi) methods.
-///
-/// Returns pre-serialized JSON ([`RawValue`]) to avoid an intermediate
-/// `serde_json::Value` allocation — the result is embedded verbatim in
-/// the JSON-RPC response.
-pub type BoxFut<'a> =
-    Pin<Box<dyn Future<Output = Result<Box<RawValue>, JsonRpcError>> + Send + 'a>>;
-
-/// Shorthand for typed boxed futures returned by internal async helpers.
-pub type BoxEyreFut<'a, T> = Pin<Box<dyn Future<Output = eyre::Result<T>> + Send + 'a>>;
 
 /// Execution witness extended with the Tempo L1 storage slots read during Zone block replay.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,61 +25,11 @@ pub struct TempoStorageRead {
     pub slot: B256,
 }
 
-/// A JSON-RPC 2.0 request.
-#[derive(Debug, Clone, Deserialize)]
-pub struct JsonRpcRequest {
-    /// The JSON-RPC version (must be "2.0").
-    pub jsonrpc: String,
-    /// The method name.
-    pub method: String,
-    /// The parameters (raw JSON).
-    pub params: Option<Box<serde_json::value::RawValue>>,
-    /// The request ID.
-    pub id: Value,
-}
-
-/// A JSON-RPC 2.0 response.
-#[derive(Debug, Clone, Serialize)]
-pub struct JsonRpcResponse {
-    /// The JSON-RPC version.
-    pub jsonrpc: &'static str,
-    /// The result, if successful (embedded as pre-serialized JSON).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Box<RawValue>>,
-    /// The error, if failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-    /// The request ID.
-    pub id: Value,
-}
-
-impl JsonRpcResponse {
-    /// Create a successful response from a pre-serialized result.
-    pub fn success(id: Value, result: Box<RawValue>) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            result: Some(result),
-            error: None,
-            id,
-        }
-    }
-
-    /// Create an error response.
-    pub fn error(id: Value, error: JsonRpcError) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            result: None,
-            error: Some(error),
-            id,
-        }
-    }
-}
-
 /// A JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     /// The error code.
-    pub code: i64,
+    pub code: i32,
     /// The error message.
     pub message: String,
     /// Optional additional data.
@@ -106,16 +43,13 @@ impl std::fmt::Display for JsonRpcError {
     }
 }
 
-impl JsonRpcError {
-    /// Method not found (-32601).
-    pub fn method_not_found() -> Self {
-        Self {
-            code: -32601,
-            message: "Method not found".to_string(),
-            data: None,
-        }
+impl From<JsonRpcError> for jsonrpsee::types::ErrorObjectOwned {
+    fn from(error: JsonRpcError) -> Self {
+        Self::owned(error.code, error.message, error.data)
     }
+}
 
+impl JsonRpcError {
     /// Method disabled (-32006).
     pub fn method_disabled() -> Self {
         Self {
@@ -157,15 +91,6 @@ impl JsonRpcError {
         Self {
             code: -32004,
             message: "Account mismatch".to_string(),
-            data: None,
-        }
-    }
-
-    /// Parse error — invalid JSON (-32700).
-    pub fn parse_error(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32700,
-            message: msg.into(),
             data: None,
         }
     }

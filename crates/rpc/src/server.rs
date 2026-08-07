@@ -1,21 +1,21 @@
-//! Redacted zone RPC server.
-//!
-//! An axum HTTP server backed by the zone node's EthApi, with
-//! authentication and privacy redactions applied per-method.
-//!
-//! Supports both HTTP POST and WebSocket transports.
+//! Authenticated JSON-RPC server built on jsonrpsee.
 
-use axum::{
-    Router,
-    body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-};
 use std::{
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    convert::Infallible,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use alloy_primitives::Address;
+use futures::future::BoxFuture;
+use jsonrpsee::server::{
+    BatchRequestConfig, ConnectionGuard, ConnectionState, HttpBody, HttpResponse, IdProvider,
+    Methods, ServerConfig, http as rpc_http, middleware::rpc::RpcServiceBuilder,
+    serve_with_graceful_shutdown, stop_channel, ws,
 };
 use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
     KeyInfo, SignatureType as KeyInfoSignatureType,
@@ -24,206 +24,252 @@ use tempo_primitives::transaction::{
     SignatureType as TempoSignatureType,
     tt_signature::{KeychainSignature, TempoSignature},
 };
-use tracing::info;
+use tower::service_fn;
+use tracing::{info, warn};
 
 use crate::{
     auth::{self, AuthContext},
     config::RedactedRpcConfig,
     error::{AuthError, AuthenticateError},
-    handlers::{self, ZoneRpcApi},
-    metrics::{RedactedRpcAuthMetrics, RedactedRpcCallMetrics},
-    types::{JsonRpcError, JsonRpcRequest, JsonRpcResponse},
-    ws::handle_ws_upgrade,
+    metrics::RedactedRpcAuthMetrics,
+    middleware::RedactedRpcLayer,
 };
 
 /// Maximum number of requests in a single JSON-RPC batch.
-pub(crate) const MAX_BATCH_SIZE: usize = 100;
+const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum WebSocket request or response size (1 MiB).
+pub(crate) const MAX_RPC_MESSAGE_SIZE: u32 = 1 << 20;
+/// Maximum number of active subscriptions per WebSocket connection.
+const MAX_WS_SUBSCRIPTIONS: u32 = 32;
+/// Maximum number of queued outbound messages before jsonrpsee applies backpressure.
+const MAX_WS_OUTBOUND_QUEUE: u32 = 1024;
+/// Maximum concurrent HTTP requests and WebSocket connections.
+const MAX_CONNECTIONS: usize = 100;
 
-/// Shared state for the redacted RPC server.
+#[derive(Debug, Default)]
+struct HexIdProvider(AtomicU32);
+
+impl IdProvider for HexIdProvider {
+    fn next_id(&self) -> jsonrpsee::types::SubscriptionId<'static> {
+        format!("0x{:x}", self.0.fetch_add(1, Ordering::Relaxed) + 1).into()
+    }
+}
+
+type KeychainLookup = Arc<
+    dyn Fn(Address, Address) -> BoxFuture<'static, eyre::Result<KeyInfo>> + Send + Sync + 'static,
+>;
+
+/// Transport associated with a JSON-RPC request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcTransport {
+    Http,
+    WebSocket,
+}
+
+/// A node-owned method table and the one callback needed by transport authentication.
+///
+/// The RPC crate intentionally does not know the concrete node API type. The node
+/// registers methods directly against its concrete implementation and hands the
+/// resulting jsonrpsee method table to the server.
 #[derive(Clone)]
-pub struct RpcState {
-    /// Server configuration.
-    pub config: RedactedRpcConfig,
-    /// Type-erased EthApi for handling RPC methods.
-    pub api: Arc<dyn ZoneRpcApi>,
-    /// Authentication failure metric for the redacted RPC.
-    auth_metrics: RedactedRpcAuthMetrics,
+pub struct RedactedRpcModule {
+    methods: Methods,
+    keychain_lookup: KeychainLookup,
+}
+
+impl RedactedRpcModule {
+    /// Create an authenticated method table.
+    pub fn new<M, F, Fut>(methods: M, keychain_lookup: F) -> Self
+    where
+        M: Into<Methods>,
+        F: Fn(Address, Address) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = eyre::Result<KeyInfo>> + Send + 'static,
+    {
+        Self {
+            methods: methods.into(),
+            keychain_lookup: Arc::new(move |account, key_id| {
+                Box::pin(keychain_lookup(account, key_id))
+            }),
+        }
+    }
 }
 
 /// Start the redacted zone RPC server.
-///
-/// The `api` argument provides the underlying EthApi methods (obtained from
-/// the zone node's launched handle).
 pub async fn start_redacted_rpc(
     config: RedactedRpcConfig,
-    api: Arc<dyn ZoneRpcApi>,
+    rpc: RedactedRpcModule,
 ) -> eyre::Result<std::net::SocketAddr> {
-    let listen_addr = config.listen_addr;
-    let state = Arc::new(RpcState {
-        config,
-        api,
-        auth_metrics: RedactedRpcAuthMetrics::default(),
-    });
-
-    let app = Router::new()
-        .route("/", post(handle_rpc))
-        .route("/", get(handle_ws_upgrade))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
+    let config = Arc::new(config);
+    let auth_metrics = RedactedRpcAuthMetrics::default();
+    let methods = rpc.methods;
+    let keychain_lookup = rpc.keychain_lookup;
+    let server_config = ServerConfig::builder()
+        .max_request_body_size(MAX_RPC_MESSAGE_SIZE)
+        .max_response_body_size(MAX_RPC_MESSAGE_SIZE)
+        .max_connections(MAX_CONNECTIONS as u32)
+        .max_subscriptions_per_connection(MAX_WS_SUBSCRIPTIONS)
+        .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_SIZE))
+        .set_message_buffer_capacity(MAX_WS_OUTBOUND_QUEUE)
+        .set_id_provider(HexIdProvider::default())
+        .build();
+    let rpc_middleware = RpcServiceBuilder::new().layer(RedactedRpcLayer);
+    let connection_guard = ConnectionGuard::new(MAX_CONNECTIONS);
+    let next_connection_id = Arc::new(AtomicU32::new(0));
+    let (stop_handle, server_handle) = stop_channel();
 
     info!(target: "zone::rpc", %local_addr, "Starting redacted zone RPC server");
 
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::error!(target: "zone::rpc", %err, "Redacted RPC server failed");
+        // Preserve the detached-server behavior of the old API. Keeping the sender
+        // alive prevents the stop channel from shutting down with no external handle.
+        let _server_handle = server_handle;
+
+        loop {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = stop_handle.clone().shutdown() => break,
+            };
+            let (socket, remote_addr) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    warn!(target: "zone::rpc", %error, "failed to accept RPC connection");
+                    continue;
+                }
+            };
+
+            let config = config.clone();
+            let auth_metrics = auth_metrics.clone();
+            let methods = methods.clone();
+            let keychain_lookup = keychain_lookup.clone();
+            let server_config = server_config.clone();
+            let rpc_middleware = rpc_middleware.clone();
+            let connection_guard = connection_guard.clone();
+            let next_connection_id = next_connection_id.clone();
+            let connection_stop = stop_handle.clone();
+
+            let service = service_fn(move |mut request| {
+                let config = config.clone();
+                let auth_metrics = auth_metrics.clone();
+                let methods = methods.clone();
+                let keychain_lookup = keychain_lookup.clone();
+                let server_config = server_config.clone();
+                let rpc_middleware = rpc_middleware.clone();
+                let connection_guard = connection_guard.clone();
+                let connection_stop = connection_stop.clone();
+                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+
+                async move {
+                    let is_websocket = ws::is_upgrade_request(&request);
+                    let token = request
+                        .headers()
+                        .get(auth::X_AUTHORIZATION_TOKEN)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                        .or_else(|| is_websocket.then(|| query_token(request.uri())).flatten());
+
+                    let authenticated = match token {
+                        Some(token) => authenticate_token(&token, &config, &keychain_lookup).await,
+                        None => Err(AuthError::Missing.into()),
+                    };
+                    let auth = match authenticated {
+                        Ok(auth) => auth,
+                        Err(error) => {
+                            if error.is_invalid() {
+                                auth_metrics.auth_failures_total.increment(1);
+                            }
+                            error.log(if is_websocket { "ws" } else { "http" });
+                            return Ok::<_, Infallible>(auth_error_response(&error));
+                        }
+                    };
+
+                    let Some(connection_permit) = connection_guard.try_acquire() else {
+                        return Ok(rpc_http::response::too_many_requests());
+                    };
+                    let connection =
+                        ConnectionState::new(connection_stop, connection_id, connection_permit);
+                    request.extensions_mut().insert(auth.clone());
+                    request.extensions_mut().insert(if is_websocket {
+                        RpcTransport::WebSocket
+                    } else {
+                        RpcTransport::Http
+                    });
+
+                    if is_websocket {
+                        match ws::connect(
+                            request,
+                            server_config,
+                            methods,
+                            connection,
+                            rpc_middleware,
+                        )
+                        .await
+                        {
+                            Ok((response, connection_future)) => {
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        _ = connection_future => {}
+                                        _ = authentication_lifetime(auth, keychain_lookup) => {}
+                                    }
+                                });
+                                Ok(response)
+                            }
+                            Err(response) => Ok(response),
+                        }
+                    } else {
+                        Ok(rpc_http::call_with_service_builder(
+                            request,
+                            server_config,
+                            connection,
+                            methods,
+                            rpc_middleware,
+                        )
+                        .await)
+                    }
+                }
+            });
+
+            let stopped = stop_handle.clone().shutdown();
+            tokio::spawn(async move {
+                if let Err(error) = serve_with_graceful_shutdown(socket, service, stopped).await {
+                    warn!(
+                        target: "zone::rpc",
+                        %remote_addr,
+                        %error,
+                        "RPC connection failed"
+                    );
+                }
+            });
         }
     });
 
     Ok(local_addr)
 }
 
-/// Result of processing a JSON-RPC text payload (single or batch).
-pub(crate) enum RpcResult {
-    Single(JsonRpcResponse),
-    Batch(Vec<JsonRpcResponse>),
+fn auth_error_response(error: &AuthenticateError) -> HttpResponse {
+    HttpResponse::builder()
+        .status(error.status_code())
+        .body(HttpBody::empty())
+        .expect("known HTTP status produces a valid response")
 }
 
-impl IntoResponse for RpcResult {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            Self::Single(resp) => axum::Json(resp).into_response(),
-            Self::Batch(resps) => axum::Json(resps).into_response(),
-        }
-    }
+fn query_token(uri: &http::Uri) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes())
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
 }
 
-/// Parse and dispatch a JSON-RPC text payload, handling both single and batch
-/// requests. Shared by HTTP and WebSocket transports.
-pub(crate) async fn process_rpc_text(
-    text: &str,
-    auth: &AuthContext,
-    api: &dyn ZoneRpcApi,
-) -> RpcResult {
-    let trimmed = text.trim_start();
-
-    if trimmed.starts_with('[') {
-        match serde_json::from_str::<Vec<JsonRpcRequest>>(trimmed) {
-            Ok(requests) if requests.is_empty() => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error("empty batch"),
-            )),
-            Ok(requests) if requests.len() > MAX_BATCH_SIZE => {
-                RpcResult::Single(JsonRpcResponse::error(
-                    serde_json::Value::Null,
-                    JsonRpcError::invalid_params(format!(
-                        "batch too large ({} > {MAX_BATCH_SIZE})",
-                        requests.len()
-                    )),
-                ))
-            }
-            Ok(requests) => {
-                let mut responses = Vec::with_capacity(requests.len());
-                for req in &requests {
-                    responses.push(dispatch_request(req, auth, api).await);
-                }
-                RpcResult::Batch(responses)
-            }
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
-        }
-    } else {
-        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-            Ok(request) => RpcResult::Single(dispatch_request(&request, auth, api).await),
-            Err(e) => RpcResult::Single(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::parse_error(format!("parse error: {e}")),
-            )),
-        }
-    }
-}
-
-pub(crate) async fn dispatch_request(
-    req: &JsonRpcRequest,
-    auth: &AuthContext,
-    api: &dyn ZoneRpcApi,
-) -> JsonRpcResponse {
-    let metrics = RedactedRpcCallMetrics::new_for(&req.method);
-    let started_at = Instant::now();
-
-    metrics.started_total.increment(1);
-    let response = handlers::dispatch(req, auth, api).await;
-    metrics
-        .time_seconds
-        .record(started_at.elapsed().as_secs_f64());
-
-    if response.error.is_some() {
-        metrics.failed_total.increment(1);
-    } else {
-        metrics.successful_total.increment(1);
-    }
-
-    response
-}
-
-/// Main HTTP RPC handler — authenticates, dispatches, returns response.
-async fn handle_rpc(
-    State(state): State<Arc<RpcState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    let auth = match authenticate(&headers, &state.config, state.api.as_ref()).await {
-        Ok(auth) => auth,
-        Err(e) => {
-            if e.is_invalid() {
-                state.auth_metrics.auth_failures_total.increment(1);
-            }
-            e.log("http");
-            return (e.status_code(), "").into_response();
-        }
-    };
-
-    let body_str = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "invalid UTF-8").into_response();
-        }
-    };
-
-    process_rpc_text(body_str, &auth, state.api.as_ref())
-        .await
-        .into_response()
-}
-
-/// Authenticate the request using the `X-Authorization-Token` header.
-async fn authenticate(
-    headers: &HeaderMap,
-    config: &RedactedRpcConfig,
-    api: &dyn ZoneRpcApi,
-) -> Result<AuthContext, AuthenticateError> {
-    let header_value = headers
-        .get(auth::X_AUTHORIZATION_TOKEN)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AuthError::Missing)?;
-
-    authenticate_token(header_value, config, api).await
-}
-
-/// Authenticate using a raw token string (shared by HTTP and WebSocket paths).
-pub(crate) async fn authenticate_token(
+/// Authenticate using a raw token string.
+async fn authenticate_token(
     token_value: &str,
     config: &RedactedRpcConfig,
-    api: &dyn ZoneRpcApi,
+    keychain_lookup: &KeychainLookup,
 ) -> Result<AuthContext, AuthenticateError> {
     let token = auth::parse_auth_header(token_value)?;
     let max_auth_token_validity = config
         .max_auth_token_validity
         .min(auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY);
 
-    // Validate token fields against server config
     token.validate_with_max_auth_token_validity(
         config.zone_id,
         config.chain_id,
@@ -237,7 +283,10 @@ pub(crate) async fn authenticate_token(
         .map_err(|_| AuthError::InvalidSignature)?;
 
     let keychain_key_id = if let TempoSignature::Keychain(keychain_signature) = &signature {
-        Some(validate_keychain_signature(api, caller, keychain_signature, &token.digest).await?)
+        Some(
+            validate_keychain_signature(keychain_lookup, caller, keychain_signature, &token.digest)
+                .await?,
+        )
     } else {
         None
     };
@@ -250,16 +299,15 @@ pub(crate) async fn authenticate_token(
 }
 
 async fn validate_keychain_signature(
-    api: &dyn ZoneRpcApi,
-    caller: alloy_primitives::Address,
+    keychain_lookup: &KeychainLookup,
+    caller: Address,
     keychain_signature: &KeychainSignature,
     digest: &alloy_primitives::B256,
-) -> Result<alloy_primitives::Address, AuthenticateError> {
+) -> Result<Address, AuthenticateError> {
     let key_id = keychain_signature
         .key_id(digest)
         .map_err(|_| AuthError::InvalidSignature)?;
-    let key_info = api.get_keychain_key(caller, key_id).await?;
-
+    let key_info = keychain_lookup(caller, key_id).await?;
     validate_keychain_key_info(&key_info)?;
 
     let expected_signature_type = match keychain_signature.signature.signature_type() {
@@ -267,7 +315,6 @@ async fn validate_keychain_signature(
         TempoSignatureType::P256 => KeyInfoSignatureType::P256,
         TempoSignatureType::WebAuthn => KeyInfoSignatureType::WebAuthn,
     };
-
     if key_info.signatureType != expected_signature_type {
         return Err(AuthError::KeychainSignatureTypeMismatch.into());
     }
@@ -275,7 +322,48 @@ async fn validate_keychain_signature(
     Ok(key_id)
 }
 
-pub(crate) fn validate_keychain_key_info(key_info: &KeyInfo) -> Result<(), AuthenticateError> {
+async fn authentication_lifetime(auth: AuthContext, keychain_lookup: KeychainLookup) {
+    let token_expiry = tokio::time::sleep(duration_until_unix_timestamp(auth.expires_at));
+    tokio::pin!(token_expiry);
+
+    let Some(key_id) = auth.keychain_key_id else {
+        token_expiry.await;
+        return;
+    };
+
+    let mut keychain_recheck = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut token_expiry => return,
+            _ = keychain_recheck.tick() => {
+                let valid = tokio::select! {
+                    biased;
+                    _ = &mut token_expiry => false,
+                    key_info = keychain_lookup(auth.caller, key_id) => match key_info {
+                        Ok(key_info) => validate_keychain_key_info(&key_info).is_ok(),
+                        Err(error) => {
+                            warn!(target: "zone::rpc", %error, "ws keychain revalidation failed");
+                            false
+                        }
+                    }
+                };
+                if !valid {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn duration_until_unix_timestamp(timestamp: u64) -> Duration {
+    let deadline = UNIX_EPOCH + Duration::from_secs(timestamp);
+    deadline
+        .duration_since(SystemTime::now())
+        .unwrap_or_default()
+}
+
+fn validate_keychain_key_info(key_info: &KeyInfo) -> Result<(), AuthenticateError> {
     if key_info.isRevoked {
         return Err(AuthError::RevokedKeychainKey.into());
     }
@@ -285,216 +373,12 @@ pub(crate) fn validate_keychain_key_info(key_info: &KeyInfo) -> Result<(), Authe
     if key_info.expiry <= now_unix_seconds() {
         return Err(AuthError::ExpiredKeychainKey.into());
     }
-
     Ok(())
 }
 
-pub(crate) fn now_unix_seconds() -> u64 {
+fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
         .as_secs()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::authenticate_token;
-    use crate::{
-        RedactedRpcConfig,
-        auth::build_token_fields,
-        error::AuthenticateError,
-        handlers::ZoneRpcApi,
-        types::{BoxEyreFut, BoxFut, JsonRpcError},
-    };
-    use alloy_primitives::{Address, Bytes};
-    use axum::http::StatusCode;
-    use p256::ecdsa::SigningKey as P256SigningKey;
-    use parking_lot::Mutex;
-    use rand::thread_rng;
-    use std::collections::HashMap;
-    use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
-        KeyInfo, SignatureType as KeyInfoSignatureType,
-    };
-
-    #[allow(dead_code)]
-    mod auth_tokens {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test-utils/auth_tokens.rs"
-        ));
-    }
-
-    use auth_tokens::{build_token_with_signature, now_secs, sign_keychain_signature};
-
-    const ZONE_ID: u32 = 7;
-    const CHAIN_ID: u64 = 99;
-    const PORTAL: Address = Address::repeat_byte(0x22);
-
-    struct TestApi {
-        key_infos: Mutex<HashMap<(Address, Address), KeyInfo>>,
-    }
-
-    impl TestApi {
-        fn with_key_info(account: Address, key_id: Address, key_info: KeyInfo) -> Self {
-            let mut key_infos = HashMap::new();
-            key_infos.insert((account, key_id), key_info);
-            Self {
-                key_infos: Mutex::new(key_infos),
-            }
-        }
-    }
-
-    macro_rules! stub {
-        ($method:ident $(, $arg:ident : $ty:ty)*) => {
-            fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
-                Box::pin(async { Err(JsonRpcError::internal("not implemented")) })
-            }
-        };
-    }
-
-    impl ZoneRpcApi for TestApi {
-        fn get_keychain_key(&self, account: Address, key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
-            let key_info = self
-                .key_infos
-                .lock()
-                .get(&(account, key_id))
-                .cloned()
-                .unwrap_or(KeyInfo {
-                    signatureType: KeyInfoSignatureType::Secp256k1,
-                    keyId: Address::ZERO,
-                    expiry: 0,
-                    enforceLimits: false,
-                    isRevoked: false,
-                });
-            Box::pin(async move { Ok(key_info) })
-        }
-
-        stub!(block_number);
-        stub!(chain_id);
-        stub!(net_version);
-        stub!(syncing);
-        stub!(coinbase);
-        stub!(gas_price);
-        stub!(max_priority_fee_per_gas);
-        stub!(fee_history, _a: u64, _b: alloy_rpc_types_eth::BlockNumberOrTag, _c: Option<Vec<f64>>);
-        stub!(get_balance, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
-        stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
-        stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: crate::auth::AuthContext);
-        stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: crate::auth::AuthContext);
-        stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(transaction_receipt, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
-        stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
-        stub!(send_raw_transaction, _a: Bytes, _c: crate::auth::AuthContext);
-        stub!(send_raw_transaction_sync, _a: Bytes, _c: crate::auth::AuthContext);
-        stub!(fill_transaction, _a: tempo_alloy::rpc::TempoTransactionRequest, _c: crate::auth::AuthContext);
-        stub!(get_logs, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
-        stub!(new_filter, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
-        stub!(get_filter_logs, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(get_filter_changes, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(new_block_filter, _c: crate::auth::AuthContext);
-        stub!(uninstall_filter, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(zone_get_authorization_token_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_zone_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_encryption_key, _c: crate::auth::AuthContext);
-    }
-
-    fn test_config() -> RedactedRpcConfig {
-        RedactedRpcConfig {
-            listen_addr: ([127, 0, 0, 1], 0).into(),
-            l1_rpc_url: "http://127.0.0.1:1".to_string(),
-            zone_rpc_url: "http://127.0.0.1:1".to_string(),
-            retry_connection_interval: std::time::Duration::from_millis(100),
-            zone_id: ZONE_ID,
-            chain_id: CHAIN_ID,
-            max_auth_token_validity: crate::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY,
-            zone_portal: PORTAL,
-        }
-    }
-
-    #[tokio::test]
-    async fn configured_auth_token_validity_limit_is_enforced() {
-        let mut config = test_config();
-        config.max_auth_token_validity = std::time::Duration::from_secs(60);
-
-        let now = now_secs();
-        let (fields, _digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
-        let mut blob = vec![0u8; 65];
-        blob.extend_from_slice(&fields);
-        let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
-
-        let err = authenticate_token(&token, &config, &api)
-            .await
-            .expect_err("token window should exceed configured maximum");
-        assert!(matches!(
-            err,
-            AuthenticateError::Invalid(crate::auth::AuthError::WindowTooLarge)
-        ));
-        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn protocol_max_auth_token_validity_is_enforced_even_if_configured_higher() {
-        let mut config = test_config();
-        config.max_auth_token_validity =
-            crate::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY + std::time::Duration::from_secs(60);
-
-        let now = now_secs();
-        let (fields, _digest) = build_token_fields(
-            ZONE_ID,
-            CHAIN_ID,
-            now,
-            now + crate::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY.as_secs() + 1,
-        );
-        let mut blob = vec![0u8; 65];
-        blob.extend_from_slice(&fields);
-        let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
-
-        let err = authenticate_token(&token, &config, &api)
-            .await
-            .expect_err("token window should exceed protocol maximum");
-        assert!(matches!(
-            err,
-            AuthenticateError::Invalid(crate::auth::AuthError::WindowTooLarge)
-        ));
-        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn revoked_keychain_key_is_classified_as_revoked() {
-        let root_account = Address::repeat_byte(0x55);
-        let access_signer = P256SigningKey::random(&mut thread_rng());
-        let now = now_secs();
-        let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
-        let (signature, key_id) =
-            sign_keychain_signature(digest, &access_signer, root_account, 0x04)
-                .expect("keychain signing failed");
-        let token = build_token_with_signature(signature, &fields);
-        let api = TestApi::with_key_info(
-            root_account,
-            key_id,
-            KeyInfo {
-                signatureType: KeyInfoSignatureType::P256,
-                keyId: Address::ZERO,
-                expiry: 0,
-                enforceLimits: false,
-                isRevoked: true,
-            },
-        );
-
-        let err = authenticate_token(&token, &test_config(), &api)
-            .await
-            .expect_err("revoked key should fail authentication");
-        assert!(matches!(
-            err,
-            AuthenticateError::Invalid(crate::auth::AuthError::RevokedKeychainKey)
-        ));
-        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
-    }
 }

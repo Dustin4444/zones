@@ -80,6 +80,7 @@ futures.workspace = true
 jsonrpsee.workspace = true
 k256.workspace = true
 metrics.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

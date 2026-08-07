@@ -1,4 +1,4 @@
-//! [`ZoneRpcApi`] implementation backed by reth's EthApi.
+//! Redacted JSON-RPC methods backed by reth's EthApi.
 //!
 //! Re-exports the standalone `zone-rpc` crate so everything is accessible
 //! via `zone_node::rpc::*`.
@@ -13,17 +13,23 @@ use std::{
 
 use alloy_consensus::BlockHeader;
 use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
-use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
     FilterId, TransactionRequest,
+    pubsub::{Params as SubscriptionParams, SubscriptionKind},
     state::{EvmOverrides, StateOverride},
 };
 use alloy_sol_types::SolCall;
 use eyre::WrapErr;
 use futures::StreamExt;
-use jsonrpsee::{RpcModule, core::RpcResult, proc_macros::rpc, types::ErrorObjectOwned};
+use jsonrpsee::{
+    Extensions, PendingSubscriptionSink, RpcModule,
+    core::RpcResult,
+    proc_macros::rpc,
+    types::{ErrorObjectOwned, Params},
+};
 use reth_evm::{ConfigureEvm as _, execute::Executor as _};
 use reth_provider::{CanonStateSubscriptions, HeaderProvider};
 use reth_revm::{db::State, witness::ExecutionWitnessRecord};
@@ -36,6 +42,7 @@ use reth_rpc_eth_api::{
 use reth_rpc_eth_types::{EthApiError, logs_utils};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use reth_trie_common::ExecutionWitnessMode;
+use serde_json::value::RawValue;
 use tempo_alloy::{
     TempoNetwork,
     provider::ext::TempoProviderExt as _,
@@ -60,11 +67,10 @@ use zone_p2p::{LeadershipSchedule, PeerTip, ZoneManifest};
 use zone_rpc::{
     auth::AuthContext,
     types::{
-        ActiveLeaderInfo, AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, JsonRpcError,
-        LocalSequencerInfo, PeerTipInfo, SequencerInfoResponse, SequencerPeerInfo,
-        SequencerProgress, SequencerReadiness, SetLeaderResponse,
-        TempoStorageRead as RpcTempoStorageRead, ZoneExecutionWitness, ZoneInfoResponse, internal,
-        raw_null, raw_zero, to_raw,
+        ActiveLeaderInfo, AuthorizationTokenInfoResponse, JsonRpcError, LocalSequencerInfo,
+        PeerTipInfo, SequencerInfoResponse, SequencerPeerInfo, SequencerProgress,
+        SequencerReadiness, SetLeaderResponse, TempoStorageRead as RpcTempoStorageRead,
+        ZoneExecutionWitness, ZoneInfoResponse, internal, raw_null, raw_zero, to_raw,
     },
 };
 
@@ -289,7 +295,7 @@ where
 }
 
 fn operator_rpc_error(error: JsonRpcError) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(error.code as i32, error.message, error.data)
+    ErrorObjectOwned::owned(error.code, error.message, error.data)
 }
 
 async fn zone_tokens(
@@ -539,13 +545,12 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
     }
 }
 
-/// [`ZoneRpcApi`] implementation backed by reth's [`EthHandlers`].
+/// Redacted RPC implementation backed by reth's [`EthHandlers`].
 ///
 /// This is the privacy enforcement layer for the zone's JSON-RPC surface.
-/// Only methods explicitly routed through [`ZoneRpcApi`] are reachable —
-/// everything else is rejected by the dispatcher's [`classify_method`]
-/// whitelist, so this struct effectively acts as an **enforced allowlist**
-/// of Ethereum JSON-RPC endpoints.
+/// Only methods explicitly registered in [`Self::redacted_rpc_module`] are reachable —
+/// the registration table is the allowlist, while [`classify_method`] gives known
+/// restricted and disabled methods their explicit errors.
 ///
 /// For every allowed endpoint it applies typed privacy checks *before*
 /// serializing to JSON:
@@ -693,523 +698,860 @@ impl<Api> ZoneRpc<Api>
 where
     Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
 {
-    fn block_by_id(&self, id: BlockId) -> BoxFut<'_> {
-        Box::pin(async move {
-            let block = EthBlocks::rpc_block(&self.eth.api, id, false)
+    /// Build the authenticated RPC module consumed by the transport crate.
+    pub fn redacted_rpc_module(
+        self: Arc<Self>,
+    ) -> Result<RedactedRpcModule, jsonrpsee::core::RegisterMethodError> {
+        let mut module = RpcModule::from_arc(self.clone());
+
+        module.register_async_method("eth_blockNumber", |_, rpc, _| async move {
+            rpc.block_number().await
+        })?;
+        module.register_async_method(
+            "eth_chainId",
+            |_, rpc, _| async move { rpc.chain_id().await },
+        )?;
+        module.register_async_method("eth_gasPrice", |_, rpc, _| async move {
+            rpc.gas_price().await
+        })?;
+        module.register_async_method("eth_maxPriorityFeePerGas", |_, rpc, _| async move {
+            rpc.max_priority_fee_per_gas().await
+        })?;
+        module.register_async_method("net_version", |_, rpc, _| async move {
+            rpc.net_version().await
+        })?;
+        module.register_method("net_listening", |_, _, _| to_raw(&true))?;
+        module.register_async_method(
+            "eth_syncing",
+            |_, rpc, _| async move { rpc.syncing().await },
+        )?;
+        module.register_async_method(
+            "eth_coinbase",
+            |_, rpc, _| async move { rpc.coinbase().await },
+        )?;
+        module.register_method("web3_clientVersion", |_, _, _| to_raw(&"tempo-zone/v0.1.0"))?;
+        module.register_method("web3_sha3", |params, _, _| {
+            let (data,): (Bytes,) = parse_redacted_params(params, "expected [data]")?;
+            to_raw(&keccak256(data))
+        })?;
+
+        module.register_async_method("eth_feeHistory", |params, rpc, _| async move {
+            let (block_count, newest_block, reward_percentiles): (
+                U64,
+                BlockNumberOrTag,
+                Option<Vec<f64>>,
+            ) = parse_redacted_params(
+                params,
+                "expected [blockCount, newestBlock, rewardPercentiles?]",
+            )?;
+            rpc.fee_history(block_count.to(), newest_block, reward_percentiles)
                 .await
-                .map_err(internal)?;
+        })?;
+        module.register_async_method("eth_getBalance", |params, rpc, extensions| async move {
+            let (address, block) = parse_redacted_params(params, "expected [address, block?]")?;
+            rpc.get_balance(address, block, redacted_auth(&extensions)?)
+                .await
+        })?;
+        module.register_async_method(
+            "eth_getTransactionCount",
+            |params, rpc, extensions| async move {
+                let (address, block) = parse_redacted_params(params, "expected [address, block?]")?;
+                rpc.get_transaction_count(address, block, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_getBlockByNumber",
+            |params, rpc, extensions| async move {
+                let (number, full): (BlockNumberOrTag, bool) =
+                    parse_redacted_params(params, "expected [blockNumberOrTag, full]")?;
+                if full {
+                    return Err(JsonRpcError::sequencer_only());
+                }
+                rpc.block_by_number(
+                    normalize_block_number(number),
+                    full,
+                    redacted_auth(&extensions)?,
+                )
+                .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_getBlockByHash",
+            |params, rpc, extensions| async move {
+                let (hash, full): (B256, bool) =
+                    parse_redacted_params(params, "expected [blockHash, full]")?;
+                if full {
+                    return Err(JsonRpcError::sequencer_only());
+                }
+                rpc.block_by_hash(hash, full, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_getTransactionByHash",
+            |params, rpc, extensions| async move {
+                let (hash,) = parse_redacted_params(params, "expected [txHash]")?;
+                rpc.transaction_by_hash(hash, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_getTransactionReceipt",
+            |params, rpc, extensions| async move {
+                let (hash,) = parse_redacted_params(params, "expected [txHash]")?;
+                rpc.transaction_receipt(hash, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method("eth_call", |params, rpc, extensions| async move {
+            let CallParams(request, block, state_override) =
+                parse_redacted_params(params, "expected [request, block?, stateOverride?]")?;
+            rpc.call(request, block, state_override, redacted_auth(&extensions)?)
+                .await
+        })?;
+        module.register_async_method("eth_estimateGas", |params, rpc, extensions| async move {
+            let CallParams(request, block, state_override) =
+                parse_redacted_params(params, "expected [request, block?, stateOverride?]")?;
+            rpc.estimate_gas(request, block, state_override, redacted_auth(&extensions)?)
+                .await
+        })?;
+        module.register_async_method(
+            "eth_fillTransaction",
+            |params, rpc, extensions| async move {
+                let (request,) = parse_redacted_params(params, "expected [request]")?;
+                rpc.fill_transaction(request, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_sendRawTransaction",
+            |params, rpc, extensions| async move {
+                let (data,) = parse_redacted_params(params, "expected [data]")?;
+                rpc.send_raw_transaction(data, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method(
+            "eth_sendRawTransactionSync",
+            |params, rpc, extensions| async move {
+                let (data,) = parse_redacted_params(params, "expected [data]")?;
+                rpc.send_raw_transaction_sync(data, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method("eth_getLogs", |params, rpc, extensions| async move {
+            let (filter,) = parse_redacted_params(params, "expected [filter]")?;
+            rpc.get_logs(filter, redacted_auth(&extensions)?).await
+        })?;
+        module.register_async_method("eth_newFilter", |params, rpc, extensions| async move {
+            let (filter,) = parse_redacted_params(params, "expected [filter]")?;
+            rpc.new_filter(filter, redacted_auth(&extensions)?).await
+        })?;
+        module.register_async_method(
+            "eth_getFilterLogs",
+            |params, rpc, extensions| async move {
+                let (id,) = parse_redacted_params(params, "expected [filterId]")?;
+                rpc.get_filter_logs(id, redacted_auth(&extensions)?).await
+            },
+        )?;
+        module.register_async_method(
+            "eth_getFilterChanges",
+            |params, rpc, extensions| async move {
+                let (id,) = parse_redacted_params(params, "expected [filterId]")?;
+                rpc.get_filter_changes(id, redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method("eth_newBlockFilter", |_, rpc, extensions| async move {
+            rpc.new_block_filter(redacted_auth(&extensions)?).await
+        })?;
+        module.register_async_method(
+            "eth_uninstallFilter",
+            |params, rpc, extensions| async move {
+                let (id,) = parse_redacted_params(params, "expected [filterId]")?;
+                rpc.uninstall_filter(id, redacted_auth(&extensions)?).await
+            },
+        )?;
+        module.register_async_method(
+            "zone_getAuthorizationTokenInfo",
+            |_, rpc, extensions| async move {
+                rpc.zone_get_authorization_token_info(redacted_auth(&extensions)?)
+                    .await
+            },
+        )?;
+        module.register_async_method("zone_getZoneInfo", |_, rpc, extensions| async move {
+            rpc.zone_get_zone_info(redacted_auth(&extensions)?).await
+        })?;
+        module.register_async_method("zone_getEncryptionKey", |_, rpc, extensions| async move {
+            rpc.zone_get_encryption_key(redacted_auth(&extensions)?)
+                .await
+        })?;
+        module.register_subscription(
+            "eth_subscribe",
+            "eth_subscription",
+            "eth_unsubscribe",
+            handle_redacted_subscription::<Api>,
+        )?;
 
-            let Some(mut block) = block else {
-                return Ok(raw_null());
-            };
+        let keychain_rpc = self;
+        Ok(RedactedRpcModule::new(module, move |account, key_id| {
+            let rpc = keychain_rpc.clone();
+            async move { rpc.get_keychain_key(account, key_id).await }
+        }))
+    }
 
-            redact_block(&mut block);
+    async fn block_by_id(&self, id: BlockId) -> Result<Box<RawValue>, JsonRpcError> {
+        let block = EthBlocks::rpc_block(&self.eth.api, id, false)
+            .await
+            .map_err(internal)?;
 
-            to_raw(&block)
-        })
+        let Some(mut block) = block else {
+            return Ok(raw_null());
+        };
+
+        redact_block(&mut block);
+
+        to_raw(&block)
     }
 }
 
-impl<Api> zone_rpc::ZoneRpcApi for ZoneRpc<Api>
+fn parse_redacted_params<T: serde::de::DeserializeOwned>(
+    params: Params<'_>,
+    message: &'static str,
+) -> Result<T, JsonRpcError> {
+    params
+        .parse()
+        .map_err(|_| JsonRpcError::invalid_params(message))
+}
+
+fn redacted_auth(extensions: &Extensions) -> Result<AuthContext, JsonRpcError> {
+    extensions
+        .get::<AuthContext>()
+        .cloned()
+        .ok_or_else(|| JsonRpcError::internal("missing authenticated caller context"))
+}
+
+/// Params for `eth_call` / `eth_estimateGas`: `[request, block?, stateOverride?]`.
+struct CallParams(
+    TempoTransactionRequest,
+    Option<BlockId>,
+    Option<StateOverride>,
+);
+
+impl<'de> serde::Deserialize<'de> for CallParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = CallParams;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("[request, block?, stateOverride?]")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let request = sequence
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let block = sequence.next_element::<Option<BlockId>>()?.flatten();
+                let state_override = sequence.next_element::<Option<StateOverride>>()?.flatten();
+                Ok(CallParams(request, block, state_override))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RedactedSubscribeParams(
+    SubscriptionKind,
+    #[serde(default)] Option<SubscriptionParams>,
+);
+
+fn normalize_block_number(number: BlockNumberOrTag) -> BlockNumberOrTag {
+    if number.is_pending() {
+        BlockNumberOrTag::Latest
+    } else {
+        number
+    }
+}
+
+async fn handle_redacted_subscription<Api>(
+    params: Params<'static>,
+    pending: PendingSubscriptionSink,
+    rpc: Arc<ZoneRpc<Api>>,
+    extensions: Extensions,
+) where
+    Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
+{
+    let subscription = async {
+        let auth = redacted_auth(&extensions)?;
+        let RedactedSubscribeParams(kind, params) =
+            parse_redacted_params(params, "expected [subscription, params?]")?;
+
+        match kind {
+            SubscriptionKind::NewHeads => {
+                if !matches!(params, None | Some(SubscriptionParams::None)) {
+                    return Err(JsonRpcError::invalid_params(
+                        "eth_subscribe(newHeads) does not accept params",
+                    ));
+                }
+                rpc.ws_subscribe_new_heads(auth).await
+            }
+            SubscriptionKind::Logs => {
+                let filter = match params.unwrap_or_default() {
+                    SubscriptionParams::None => Filter::default(),
+                    SubscriptionParams::Logs(filter) => *filter,
+                    SubscriptionParams::Bool(_) | SubscriptionParams::TransactionReceipts(_) => {
+                        return Err(JsonRpcError::invalid_params(
+                            "eth_subscribe(logs) expects a filter object",
+                        ));
+                    }
+                };
+                rpc.ws_subscribe_logs(filter, auth).await
+            }
+            SubscriptionKind::NewPendingTransactions
+            | SubscriptionKind::Syncing
+            | SubscriptionKind::TransactionReceipts => Err(JsonRpcError::method_disabled()),
+        }
+    }
+    .await;
+
+    let mut subscription = match subscription {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            pending.reject(ErrorObjectOwned::from(error)).await;
+            return;
+        }
+    };
+    let sink = match pending.accept().await {
+        Ok(sink) => sink,
+        Err(_) => return,
+    };
+
+    while let Some(item) = subscription.next().await {
+        match item {
+            Ok(item) => {
+                if sink.send(item).await.is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "zone::rpc",
+                    subscription = ?sink.subscription_id(),
+                    %error,
+                    "subscription stream failed"
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl<Api> ZoneRpc<Api>
 where
     Api: FullEthApi + EthApiTypes<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
 {
-    fn get_keychain_key(&self, account: Address, key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
-        Box::pin(async move {
-            let request = TempoTransactionRequest {
-                inner: TransactionRequest {
-                    from: Some(account),
-                    to: Some(ACCOUNT_KEYCHAIN_ADDRESS.into()),
-                    input: getKeyCall {
-                        account,
-                        keyId: key_id,
-                    }
-                    .abi_encode()
-                    .into(),
-                    ..Default::default()
-                },
+    async fn get_keychain_key(&self, account: Address, key_id: Address) -> eyre::Result<KeyInfo> {
+        let request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                from: Some(account),
+                to: Some(ACCOUNT_KEYCHAIN_ADDRESS.into()),
+                input: getKeyCall {
+                    account,
+                    keyId: key_id,
+                }
+                .abi_encode()
+                .into(),
                 ..Default::default()
-            };
+            },
+            ..Default::default()
+        };
 
-            let output = EthCall::call(&self.eth.api, request, None, EvmOverrides::default())
-                .await
-                .wrap_err("AccountKeychain.getKey eth_call failed")?;
+        let output = EthCall::call(&self.eth.api, request, None, EvmOverrides::default())
+            .await
+            .wrap_err("AccountKeychain.getKey eth_call failed")?;
 
-            IAccountKeychain::getKeyCall::abi_decode_returns(output.as_ref()).map_err(Into::into)
-        })
+        IAccountKeychain::getKeyCall::abi_decode_returns(output.as_ref()).map_err(Into::into)
     }
 
-    fn block_number(&self) -> BoxFut<'_> {
-        Box::pin(async move {
-            let info = EthApiSpec::chain_info(&self.eth.api).map_err(internal)?;
-            to_raw(&U256::from(info.best_number))
-        })
+    async fn block_number(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        let info = EthApiSpec::chain_info(&self.eth.api).map_err(internal)?;
+        to_raw(&U256::from(info.best_number))
     }
 
-    fn chain_id(&self) -> BoxFut<'_> {
-        Box::pin(async move {
-            let chain_id = EthApiSpec::chain_id(&self.eth.api);
-            to_raw(&Some(chain_id))
-        })
+    async fn chain_id(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        let chain_id = EthApiSpec::chain_id(&self.eth.api);
+        to_raw(&Some(chain_id))
     }
 
-    fn net_version(&self) -> BoxFut<'_> {
-        Box::pin(async move {
-            let chain_id = EthApiSpec::chain_id(&self.eth.api);
-            to_raw(&chain_id.to_string())
-        })
+    async fn net_version(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        let chain_id = EthApiSpec::chain_id(&self.eth.api);
+        to_raw(&chain_id.to_string())
     }
 
-    fn syncing(&self) -> BoxFut<'_> {
-        Box::pin(async move {
-            let status = EthApiSpec::sync_status(&self.eth.api).map_err(internal)?;
-            to_raw(&status)
-        })
+    async fn syncing(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        let status = EthApiSpec::sync_status(&self.eth.api).map_err(internal)?;
+        to_raw(&status)
     }
 
-    fn coinbase(&self) -> BoxFut<'_> {
-        Box::pin(async move {
-            let header = EthBlocks::rpc_block_header(&self.eth.api, BlockId::latest())
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| JsonRpcError::internal("latest block not found"))?;
-            to_raw(&header.beneficiary())
-        })
+    async fn coinbase(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        let header = EthBlocks::rpc_block_header(&self.eth.api, BlockId::latest())
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| JsonRpcError::internal("latest block not found"))?;
+        to_raw(&header.beneficiary())
     }
 
-    fn gas_price(&self) -> BoxFut<'_> {
-        Box::pin(async move { to_raw(&U256::from(TEMPO_T1_BASE_FEE)) })
+    async fn gas_price(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        to_raw(&U256::from(TEMPO_T1_BASE_FEE))
     }
 
-    fn max_priority_fee_per_gas(&self) -> BoxFut<'_> {
-        Box::pin(async move { to_raw(&U256::ZERO) })
+    async fn max_priority_fee_per_gas(&self) -> Result<Box<RawValue>, JsonRpcError> {
+        to_raw(&U256::ZERO)
     }
 
-    fn fee_history(
+    async fn fee_history(
         &self,
         block_count: u64,
         newest_block: BlockNumberOrTag,
         reward_percentiles: Option<Vec<f64>>,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            let mut history =
-                EthFees::fee_history(&self.eth.api, block_count, newest_block, reward_percentiles)
-                    .await
-                    .map_err(internal)?;
-            // Redact gas fields (like `gas_used_ratio`) that can be used to guess tx counts
-            redact_fee_history(&mut history);
-            to_raw(&history)
-        })
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let mut history =
+            EthFees::fee_history(&self.eth.api, block_count, newest_block, reward_percentiles)
+                .await
+                .map_err(internal)?;
+        // Redact gas fields (like `gas_used_ratio`) that can be used to guess tx counts
+        redact_fee_history(&mut history);
+        to_raw(&history)
     }
 
-    fn get_balance(
+    async fn get_balance(
         &self,
         address: Address,
         block: Option<BlockId>,
         auth: AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
-            if address != auth.caller {
-                return Ok(raw_zero());
-            }
-            let balance = EthState::balance(&self.eth.api, address, block)
-                .await
-                .map_err(internal)?;
-            to_raw(&balance)
-        })
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
+        if address != auth.caller {
+            return Ok(raw_zero());
+        }
+        let balance = EthState::balance(&self.eth.api, address, block)
+            .await
+            .map_err(internal)?;
+        to_raw(&balance)
     }
 
-    fn get_transaction_count(
+    async fn get_transaction_count(
         &self,
         address: Address,
         block: Option<BlockId>,
         auth: AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
-            if address != auth.caller {
-                return Ok(raw_zero());
-            }
-            let count = EthState::transaction_count(&self.eth.api, address, block)
-                .await
-                .map_err(internal)?;
-            to_raw(&count)
-        })
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        // Silent dummy: non-caller addresses get "0x0" to avoid leaking account existence.
+        if address != auth.caller {
+            return Ok(raw_zero());
+        }
+        let count = EthState::transaction_count(&self.eth.api, address, block)
+            .await
+            .map_err(internal)?;
+        to_raw(&count)
     }
 
-    fn block_by_number(
+    async fn block_by_number(
         &self,
         number: BlockNumberOrTag,
         _full: bool,
         _auth: AuthContext,
-    ) -> BoxFut<'_> {
-        self.block_by_id(number.into())
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.block_by_id(number.into()).await
     }
 
-    fn block_by_hash(&self, hash: B256, _full: bool, _auth: AuthContext) -> BoxFut<'_> {
-        self.block_by_id(hash.into())
+    async fn block_by_hash(
+        &self,
+        hash: B256,
+        _full: bool,
+        _auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.block_by_id(hash.into()).await
     }
 
-    fn transaction_by_hash(&self, hash: B256, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let tx = EthTransactions::transaction_by_hash(&self.eth.api, hash)
-                .await
-                .map_err(internal)?
-                .map(|src| src.into_transaction(self.eth.api.converter()))
-                .transpose()
-                .map_err(internal)?;
+    async fn transaction_by_hash(
+        &self,
+        hash: B256,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let tx = EthTransactions::transaction_by_hash(&self.eth.api, hash)
+            .await
+            .map_err(internal)?
+            .map(|src| src.into_transaction(self.eth.api.converter()))
+            .transpose()
+            .map_err(internal)?;
 
-            let Some(mut tx) = tx else {
-                return Ok(raw_null());
-            };
+        let Some(mut tx) = tx else {
+            return Ok(raw_null());
+        };
 
-            if tx.from() != auth.caller {
-                return Ok(raw_null());
-            }
+        if tx.from() != auth.caller {
+            return Ok(raw_null());
+        }
 
-            // transaction_index leaks how many txns were in this block, so redact
-            tx.transaction_index = Some(0);
+        // transaction_index leaks how many txns were in this block, so redact
+        tx.transaction_index = Some(0);
 
-            to_raw(&tx)
-        })
+        to_raw(&tx)
     }
 
-    fn transaction_receipt(&self, hash: B256, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let receipt = EthTransactions::transaction_receipt(&self.eth.api, hash)
-                .await
-                .map_err(internal)?;
+    async fn transaction_receipt(
+        &self,
+        hash: B256,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let receipt = EthTransactions::transaction_receipt(&self.eth.api, hash)
+            .await
+            .map_err(internal)?;
 
-            let Some(mut receipt) = receipt else {
-                return Ok(raw_null());
-            };
+        let Some(mut receipt) = receipt else {
+            return Ok(raw_null());
+        };
 
-            if receipt.from() != auth.caller {
-                return Ok(raw_null());
-            }
+        if receipt.from() != auth.caller {
+            return Ok(raw_null());
+        }
 
-            receipt = zone_rpc::filter::filter_receipt_logs(receipt);
+        receipt = zone_rpc::filter::filter_receipt_logs(receipt);
 
-            to_raw(&receipt)
-        })
+        to_raw(&receipt)
     }
 
-    fn call(
+    async fn call(
         &self,
         mut request: TempoTransactionRequest,
         block: Option<BlockId>,
         state_override: Option<StateOverride>,
         auth: AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            if state_override.is_some() {
-                return Err(JsonRpcError::invalid_params("state overrides not allowed"));
-            }
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        if state_override.is_some() {
+            return Err(JsonRpcError::invalid_params("state overrides not allowed"));
+        }
 
-            self.enforce_authorized(&mut request, &auth)?;
+        self.enforce_authorized(&mut request, &auth)?;
 
-            let result = EthCall::call(
-                &self.eth.api,
-                request,
-                block,
-                EvmOverrides::state(state_override),
-            )
-            .await
-            .map_err(internal)?;
-            to_raw(&result)
-        })
+        let result = EthCall::call(
+            &self.eth.api,
+            request,
+            block,
+            EvmOverrides::state(state_override),
+        )
+        .await
+        .map_err(internal)?;
+        to_raw(&result)
     }
 
-    fn estimate_gas(
+    async fn estimate_gas(
         &self,
         mut request: TempoTransactionRequest,
         block: Option<BlockId>,
         state_override: Option<StateOverride>,
         auth: AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            if state_override.is_some() {
-                return Err(JsonRpcError::invalid_params("state overrides not allowed"));
-            }
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        if state_override.is_some() {
+            return Err(JsonRpcError::invalid_params("state overrides not allowed"));
+        }
 
-            self.enforce_authorized(&mut request, &auth)?;
+        self.enforce_authorized(&mut request, &auth)?;
 
-            let result = EthCall::estimate_gas_at(
-                &self.eth.api,
-                request,
-                block.unwrap_or_default(),
-                EvmOverrides::state(state_override),
-            )
+        let result = EthCall::estimate_gas_at(
+            &self.eth.api,
+            request,
+            block.unwrap_or_default(),
+            EvmOverrides::state(state_override),
+        )
+        .await
+        .map_err(internal)?;
+        to_raw(&result)
+    }
+
+    async fn send_raw_transaction(
+        &self,
+        data: Bytes,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+
+        let hash = EthTransactions::send_raw_transaction(&self.eth.api, data)
             .await
             .map_err(internal)?;
-            to_raw(&result)
-        })
+        to_raw(&hash)
     }
 
-    fn send_raw_transaction(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
+    async fn send_raw_transaction_sync(
+        &self,
+        data: Bytes,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
 
-            let hash = EthTransactions::send_raw_transaction(&self.eth.api, data)
-                .await
-                .map_err(internal)?;
-            to_raw(&hash)
-        })
+        let mut receipt = EthTransactions::send_raw_transaction_sync(&self.eth.api, data, None)
+            .await
+            .map_err(internal)?;
+
+        receipt = zone_rpc::filter::filter_receipt_logs(receipt);
+
+        to_raw(&receipt)
     }
 
-    fn send_raw_transaction_sync(&self, data: Bytes, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            zone_rpc::policy::verify_raw_tx_sender(&data, &auth)?;
-
-            let mut receipt = EthTransactions::send_raw_transaction_sync(&self.eth.api, data, None)
-                .await
-                .map_err(internal)?;
-
-            receipt = zone_rpc::filter::filter_receipt_logs(receipt);
-
-            to_raw(&receipt)
-        })
-    }
-
-    fn fill_transaction(
+    async fn fill_transaction(
         &self,
         mut request: TempoTransactionRequest,
         auth: AuthContext,
-    ) -> BoxFut<'_> {
-        Box::pin(async move {
-            self.enforce_authorized(&mut request, &auth)?;
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.enforce_authorized(&mut request, &auth)?;
 
-            // Prefill the users request so the `fill_transaction` doesnt leak dynamic fee estimates via
-            // missing fee fields.
-            apply_public_fee_policy(&mut request);
+        // Prefill the users request so the `fill_transaction` doesnt leak dynamic fee estimates via
+        // missing fee fields.
+        apply_public_fee_policy(&mut request);
 
-            let result = EthTransactions::fill_transaction(&self.eth.api, request)
-                .await
-                .map_err(internal)?;
-            to_raw(&result)
-        })
+        let result = EthTransactions::fill_transaction(&self.eth.api, request)
+            .await
+            .map_err(internal)?;
+        to_raw(&result)
     }
 
-    fn get_logs(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let zone_tokens = self.zone_tokens();
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
-            let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
-            let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
-            to_raw(&filtered)
-        })
+    async fn get_logs(
+        &self,
+        mut filter: Filter,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let zone_tokens = self.zone_tokens();
+        zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+        zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+        let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
+            .await
+            .map_err(internal)?;
+        let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
+        to_raw(&filtered)
     }
 
-    fn new_filter(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let zone_tokens = self.zone_tokens();
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
-            let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
-                .await
-                .map_err(internal)?;
-            self.filter_owners
-                .lock()
-                .await
-                .insert(id.clone(), auth.caller);
-            to_raw(&id)
-        })
+    async fn new_filter(
+        &self,
+        mut filter: Filter,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let zone_tokens = self.zone_tokens();
+        zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+        zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
+        let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
+            .await
+            .map_err(internal)?;
+        self.filter_owners
+            .lock()
+            .await
+            .insert(id.clone(), auth.caller);
+        to_raw(&id)
     }
 
-    fn get_filter_logs(&self, id: FilterId, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            self.ensure_filter_owner(&id, &auth).await?;
+    async fn get_filter_logs(
+        &self,
+        id: FilterId,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.ensure_filter_owner(&id, &auth).await?;
 
-            let logs = self
-                .filter()
-                .filter_logs(id)
-                .await
-                .map_err(map_eth_filter_error)?;
+        let logs = self
+            .filter()
+            .filter_logs(id)
+            .await
+            .map_err(map_eth_filter_error)?;
 
-            let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
-            to_raw(&filtered)
-        })
+        let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
+        to_raw(&filtered)
     }
 
-    fn get_filter_changes(&self, id: FilterId, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            self.ensure_filter_owner(&id, &auth).await?;
+    async fn get_filter_changes(
+        &self,
+        id: FilterId,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.ensure_filter_owner(&id, &auth).await?;
 
-            let changes = self
-                .filter()
-                .filter_changes(id)
-                .await
-                .map_err(map_eth_filter_error)?;
+        let changes = self
+            .filter()
+            .filter_changes(id)
+            .await
+            .map_err(map_eth_filter_error)?;
 
-            match changes {
-                FilterChanges::Logs(logs) => {
-                    let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
-                    to_raw(&FilterChanges::<
-                        alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                    >::Logs(filtered))
-                }
-                FilterChanges::Hashes(hashes) => to_raw(&FilterChanges::<
+        match changes {
+            FilterChanges::Logs(logs) => {
+                let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
+                to_raw(&FilterChanges::<
                     alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                >::Hashes(hashes)),
-                // Pending transaction filters are disabled — return empty if one somehow exists
-                FilterChanges::Transactions(_) => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
-                FilterChanges::Empty => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
+                >::Logs(filtered))
             }
-        })
-    }
-
-    fn new_block_filter(&self, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let id = EthFilterApiServer::new_block_filter(&self.eth.filter)
-                .await
-                .map_err(internal)?;
-            self.filter_owners
-                .lock()
-                .await
-                .insert(id.clone(), auth.caller);
-            to_raw(&id)
-        })
-    }
-
-    fn uninstall_filter(&self, id: FilterId, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            self.ensure_filter_owner(&id, &auth).await?;
-
-            let result = EthFilterApiServer::uninstall_filter(&self.eth.filter, id.clone())
-                .await
-                .map_err(internal)?;
-
-            if result || !self.filter_is_active(&id).await {
-                self.filter_owners.lock().await.remove(&id);
+            FilterChanges::Hashes(hashes) => to_raw(&FilterChanges::<
+                alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
+            >::Hashes(hashes)),
+            // Pending transaction filters are disabled — return empty if one somehow exists
+            FilterChanges::Transactions(_) => {
+                to_raw(&FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty)
             }
-
-            to_raw(&result)
-        })
+            FilterChanges::Empty => {
+                to_raw(&FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty)
+            }
+        }
     }
 
-    fn ws_subscribe_new_heads(&self, _auth: AuthContext) -> BoxWsSubscriptionFut<'_> {
-        Box::pin(async move {
-            let api = self.eth.api.clone();
-            let provider = self.eth.api.provider().clone();
-            let stream = provider
-                .canonical_state_stream()
-                .flat_map(move |new_chain| {
-                    let api = api.clone();
-                    let headers = new_chain
-                        .committed()
-                        .blocks_iter()
-                        .filter_map(move |block| {
-                            match api
-                                .converter()
-                                .convert_header(block.clone_sealed_header(), block.rlp_length())
-                            {
-                                Ok(header) => Some(header),
-                                Err(err) => {
-                                    tracing::error!(
-                                        target: "rpc",
-                                        %err,
-                                        "Failed to convert header"
-                                    );
-                                    None
-                                }
+    async fn new_block_filter(&self, auth: AuthContext) -> Result<Box<RawValue>, JsonRpcError> {
+        let id = EthFilterApiServer::new_block_filter(&self.eth.filter)
+            .await
+            .map_err(internal)?;
+        self.filter_owners
+            .lock()
+            .await
+            .insert(id.clone(), auth.caller);
+        to_raw(&id)
+    }
+
+    async fn uninstall_filter(
+        &self,
+        id: FilterId,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        self.ensure_filter_owner(&id, &auth).await?;
+
+        let result = EthFilterApiServer::uninstall_filter(&self.eth.filter, id.clone())
+            .await
+            .map_err(internal)?;
+
+        if result || !self.filter_is_active(&id).await {
+            self.filter_owners.lock().await.remove(&id);
+        }
+
+        to_raw(&result)
+    }
+
+    async fn ws_subscribe_new_heads(
+        &self,
+        _auth: AuthContext,
+    ) -> Result<WsSubscriptionStream, JsonRpcError> {
+        let api = self.eth.api.clone();
+        let provider = self.eth.api.provider().clone();
+        let stream = provider
+            .canonical_state_stream()
+            .flat_map(move |new_chain| {
+                let api = api.clone();
+                let headers = new_chain
+                    .committed()
+                    .blocks_iter()
+                    .filter_map(move |block| {
+                        match api
+                            .converter()
+                            .convert_header(block.clone_sealed_header(), block.rlp_length())
+                        {
+                            Ok(header) => Some(header),
+                            Err(err) => {
+                                tracing::error!(
+                                    target: "rpc",
+                                    %err,
+                                    "Failed to convert header"
+                                );
+                                None
                             }
-                        })
-                        .collect::<Vec<_>>();
-                    futures::stream::iter(headers)
-                })
-                .map(move |mut header| {
-                    redact_header(&mut header);
-                    to_raw(&header)
-                });
-            let stream: zone_rpc::WsSubscriptionStream = Box::pin(stream);
-            Ok(stream)
-        })
-    }
-
-    fn ws_subscribe_logs(&self, mut filter: Filter, auth: AuthContext) -> BoxWsSubscriptionFut<'_> {
-        Box::pin(async move {
-            let provider = self.eth.api.provider().clone();
-            let caller = auth.caller;
-
-            let zone_tokens = self.zone_tokens();
-            zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
-            zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
-
-            let stream = provider
-                .canonical_state_stream()
-                .flat_map(|canon_state| futures::stream::iter(canon_state.block_receipts()))
-                .flat_map(move |(block_receipts, removed)| {
-                    let all_logs = logs_utils::matching_block_logs_with_tx_hashes(
-                        &filter,
-                        block_receipts.block,
-                        block_receipts.timestamp,
-                        block_receipts
-                            .tx_receipts
-                            .iter()
-                            .map(|(tx, receipt)| (*tx, receipt)),
-                        removed,
-                    );
-                    futures::stream::iter(all_logs)
-                });
-
-            // Renumber `log_index` per-transaction so a log seen live over the
-            // subscription carries the same `(transactionHash, logIndex)` it would
-            // via `eth_getLogs`/`eth_getTransactionReceipt`.
-            // Logs arrive in block order grouped by tx, which is what `LogOrderingRedactor` needs.
-            let mut log_redactor = zone_rpc::filter::LogOrderingRedactor::default();
-            let stream = stream.filter_map(move |log| {
-                std::future::ready(
-                    zone_rpc::filter::is_log_visible(&log, &caller)
-                        .then(|| to_raw(&log_redactor.redact(log))),
-                )
-            });
-            let stream: zone_rpc::WsSubscriptionStream = Box::pin(stream);
-            Ok(stream)
-        })
-    }
-
-    fn zone_get_authorization_token_info(&self, auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            to_raw(&AuthorizationTokenInfoResponse {
-                account: auth.caller,
-                expires_at: U64::from(auth.expires_at),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                futures::stream::iter(headers)
             })
-        })
+            .map(move |mut header| {
+                redact_header(&mut header);
+                to_raw(&header)
+            });
+        Ok(Box::pin(stream))
     }
 
-    fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let tempo_block_number = self
-                .tempo_state
-                .tempoBlockNumber()
-                .call()
-                .await
-                .map_err(internal)?;
-            let info = zone_info(
-                self.config.zone_id,
-                self.config.chain_id,
-                self.config.zone_portal,
-                tempo_block_number,
-                &self.l1_provider,
+    async fn ws_subscribe_logs(
+        &self,
+        mut filter: Filter,
+        auth: AuthContext,
+    ) -> Result<WsSubscriptionStream, JsonRpcError> {
+        let provider = self.eth.api.provider().clone();
+        let caller = auth.caller;
+
+        let zone_tokens = self.zone_tokens();
+        zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
+        zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
+
+        let stream = provider
+            .canonical_state_stream()
+            .flat_map(|canon_state| futures::stream::iter(canon_state.block_receipts()))
+            .flat_map(move |(block_receipts, removed)| {
+                let all_logs = logs_utils::matching_block_logs_with_tx_hashes(
+                    &filter,
+                    block_receipts.block,
+                    block_receipts.timestamp,
+                    block_receipts
+                        .tx_receipts
+                        .iter()
+                        .map(|(tx, receipt)| (*tx, receipt)),
+                    removed,
+                );
+                futures::stream::iter(all_logs)
+            });
+
+        // Renumber `log_index` per-transaction so a log seen live over the
+        // subscription carries the same `(transactionHash, logIndex)` it would
+        // via `eth_getLogs`/`eth_getTransactionReceipt`.
+        // Logs arrive in block order grouped by tx, which is what `LogOrderingRedactor` needs.
+        let mut log_redactor = zone_rpc::filter::LogOrderingRedactor::default();
+        let stream = stream.filter_map(move |log| {
+            std::future::ready(
+                zone_rpc::filter::is_log_visible(&log, &caller)
+                    .then(|| to_raw(&log_redactor.redact(log))),
             )
-            .await?;
-            to_raw(&info)
+        });
+        Ok(Box::pin(stream))
+    }
+
+    async fn zone_get_authorization_token_info(
+        &self,
+        auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        to_raw(&AuthorizationTokenInfoResponse {
+            account: auth.caller,
+            expires_at: U64::from(auth.expires_at),
         })
     }
 
-    fn zone_get_encryption_key(&self, _auth: AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            let key = encryption_key(self.config.zone_portal, &self.l1_provider).await?;
-            to_raw(&key)
-        })
+    async fn zone_get_zone_info(&self, _auth: AuthContext) -> Result<Box<RawValue>, JsonRpcError> {
+        let tempo_block_number = self
+            .tempo_state
+            .tempoBlockNumber()
+            .call()
+            .await
+            .map_err(internal)?;
+        let info = zone_info(
+            self.config.zone_id,
+            self.config.chain_id,
+            self.config.zone_portal,
+            tempo_block_number,
+            &self.l1_provider,
+        )
+        .await?;
+        to_raw(&info)
+    }
+
+    async fn zone_get_encryption_key(
+        &self,
+        _auth: AuthContext,
+    ) -> Result<Box<RawValue>, JsonRpcError> {
+        let key = encryption_key(self.config.zone_portal, &self.l1_provider).await?;
+        to_raw(&key)
     }
 }
 

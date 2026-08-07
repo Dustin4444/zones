@@ -15,7 +15,7 @@ use crate::{
     },
     rpc::{
         OperatorZoneApi, SequencerRpcContext, ZoneApiServer as _, ZoneDebugApi, ZoneRpc,
-        ZoneRpcApi, operator_zone_rpc_module, rpc_connection_config, start_redacted_rpc,
+        operator_zone_rpc_module, rpc_connection_config, start_redacted_rpc,
     },
 };
 use alloy_primitives::{Address, U256};
@@ -1273,10 +1273,11 @@ where
             max_auth_token_validity: config.max_auth_token_validity,
             zone_portal: portal_address,
         };
-        let api: Arc<dyn ZoneRpcApi> = Arc::new(
+        let rpc = Arc::new(
             ZoneRpc::new(eth_handlers, redacted_rpc_config.clone(), enabled_tokens).await?,
         );
-        let local_addr = start_redacted_rpc(redacted_rpc_config, api).await?;
+        let module = rpc.redacted_rpc_module()?;
+        let local_addr = start_redacted_rpc(redacted_rpc_config, module).await?;
         info!(target: "reth::cli", %local_addr, "Redacted zone RPC server started");
 
         Ok(())

@@ -616,8 +616,7 @@ where
 /// - [`start_local_with_chain_id()`](Self::start_local_with_chain_id) — standalone with custom chain ID (multi-zone tests)
 /// - [`start_from_l1()`](Self::start_from_l1) — connected to a real [`L1TestNode`], genesis patched from L1 header
 /// - [`start()`](Self::start) — connected to an external L1 via WebSocket URL
-type RpcApiFuture =
-    Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>;
+type RpcApiFuture = Pin<Box<dyn Future<Output = eyre::Result<zone_node::rpc::RedactedRpcModule>>>>;
 type RpcApiFactory = dyn Fn(zone_node::rpc::RedactedRpcConfig) -> RpcApiFuture + Send + Sync;
 
 pub(crate) struct ZoneTestNode {
@@ -784,7 +783,7 @@ impl ZoneTestNode {
     pub(crate) async fn rpc_api(
         &self,
         config: zone_node::rpc::RedactedRpcConfig,
-    ) -> eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>> {
+    ) -> eyre::Result<zone_node::rpc::RedactedRpcModule> {
         (self.rpc_api_factory)(config).await
     }
 
@@ -1390,11 +1389,11 @@ impl ZoneTestNode {
             let eth_handlers = eth_handlers.clone();
             let enabled_tokens = rpc_enabled_tokens.clone();
             Box::pin(async move {
-                Ok(Arc::new(
-                    zone_node::rpc::ZoneRpc::new(eth_handlers, config, enabled_tokens).await?,
-                ) as Arc<dyn zone_node::rpc::ZoneRpcApi>)
+                Arc::new(zone_node::rpc::ZoneRpc::new(eth_handlers, config, enabled_tokens).await?)
+                    .redacted_rpc_module()
+                    .map_err(Into::into)
             })
-                as Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn zone_node::rpc::ZoneRpcApi>>>>>
+                as Pin<Box<dyn Future<Output = eyre::Result<zone_node::rpc::RedactedRpcModule>>>>
         });
 
         Ok(Self {
