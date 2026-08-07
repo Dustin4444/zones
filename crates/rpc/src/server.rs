@@ -379,12 +379,12 @@ mod tests {
         stub!(fee_history, _a: u64, _b: alloy_rpc_types_eth::BlockNumberOrTag, _c: Option<Vec<f64>>);
         stub!(get_balance, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
         stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
-        stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: crate::auth::AuthContext);
-        stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: crate::auth::AuthContext);
+        stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _c: crate::auth::AuthContext);
+        stub!(block_by_hash, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
         stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
         stub!(transaction_receipt, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
-        stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
+        stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
+        stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
         stub!(send_raw_transaction, _a: Bytes, _c: crate::auth::AuthContext);
         stub!(send_raw_transaction_sync, _a: Bytes, _c: crate::auth::AuthContext);
         stub!(fill_transaction, _a: tempo_alloy::rpc::TempoTransactionRequest, _c: crate::auth::AuthContext);

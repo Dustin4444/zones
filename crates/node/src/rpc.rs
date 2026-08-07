@@ -17,8 +17,7 @@ use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
-    FilterId, TransactionRequest,
-    state::{EvmOverrides, StateOverride},
+    FilterId, TransactionRequest, state::EvmOverrides,
 };
 use alloy_sol_types::SolCall;
 use eyre::WrapErr;
@@ -806,16 +805,11 @@ where
         })
     }
 
-    fn block_by_number(
-        &self,
-        number: BlockNumberOrTag,
-        _full: bool,
-        _auth: AuthContext,
-    ) -> BoxFut<'_> {
+    fn block_by_number(&self, number: BlockNumberOrTag, _auth: AuthContext) -> BoxFut<'_> {
         self.block_by_id(number.into())
     }
 
-    fn block_by_hash(&self, hash: B256, _full: bool, _auth: AuthContext) -> BoxFut<'_> {
+    fn block_by_hash(&self, hash: B256, _auth: AuthContext) -> BoxFut<'_> {
         self.block_by_id(hash.into())
     }
 
@@ -867,24 +861,14 @@ where
         &self,
         mut request: TempoTransactionRequest,
         block: Option<BlockId>,
-        state_override: Option<StateOverride>,
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            if state_override.is_some() {
-                return Err(JsonRpcError::invalid_params("state overrides not allowed"));
-            }
-
             self.enforce_authorized(&mut request, &auth)?;
 
-            let result = EthCall::call(
-                &self.eth.api,
-                request,
-                block,
-                EvmOverrides::state(state_override),
-            )
-            .await
-            .map_err(internal)?;
+            let result = EthCall::call(&self.eth.api, request, block, EvmOverrides::default())
+                .await
+                .map_err(internal)?;
             to_raw(&result)
         })
     }
@@ -893,21 +877,16 @@ where
         &self,
         mut request: TempoTransactionRequest,
         block: Option<BlockId>,
-        state_override: Option<StateOverride>,
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            if state_override.is_some() {
-                return Err(JsonRpcError::invalid_params("state overrides not allowed"));
-            }
-
             self.enforce_authorized(&mut request, &auth)?;
 
             let result = EthCall::estimate_gas_at(
                 &self.eth.api,
                 request,
                 block.unwrap_or_default(),
-                EvmOverrides::state(state_override),
+                EvmOverrides::default(),
             )
             .await
             .map_err(internal)?;

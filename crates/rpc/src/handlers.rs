@@ -84,15 +84,16 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     ) -> BoxFut<'_>;
 
     /// `eth_getBlockByNumber(number, full)` — returns a block by number.
-    fn block_by_number(
-        &self,
-        number: BlockNumberOrTag,
-        full: bool,
-        auth: AuthContext,
-    ) -> BoxFut<'_>;
+    ///
+    /// `full=true` is rejected by the dispatch layer, so implementations only
+    /// ever serve hash-only (redacted) blocks.
+    fn block_by_number(&self, number: BlockNumberOrTag, auth: AuthContext) -> BoxFut<'_>;
 
     /// `eth_getBlockByHash(hash, full)` — returns a block by hash.
-    fn block_by_hash(&self, hash: B256, full: bool, auth: AuthContext) -> BoxFut<'_>;
+    ///
+    /// `full=true` is rejected by the dispatch layer, so implementations only
+    /// ever serve hash-only (redacted) blocks.
+    fn block_by_hash(&self, hash: B256, auth: AuthContext) -> BoxFut<'_>;
 
     /// `eth_getTransactionByHash(hash)` — returns a transaction by hash.
     fn transaction_by_hash(&self, hash: B256, auth: AuthContext) -> BoxFut<'_>;
@@ -100,29 +101,27 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `eth_getTransactionReceipt(hash)` — returns a transaction receipt.
     fn transaction_receipt(&self, hash: B256, auth: AuthContext) -> BoxFut<'_>;
 
-    /// `eth_call(request, block, state_override)` — executes a call without
-    /// creating a transaction.
+    /// `eth_call(request, block)` — executes a call without creating a
+    /// transaction.
     ///
     /// Enforces that `from` equals the authenticated account (sets it if omitted,
-    /// rejects with `-32004` on mismatch). State/block overrides are rejected
-    /// with `-32602` for non-sequencer callers.
+    /// rejects with `-32004` on mismatch). State overrides are always rejected
+    /// with `-32602` by the dispatch layer, so implementations never see them.
     fn call(
         &self,
         request: TempoTransactionRequest,
         block: Option<BlockId>,
-        state_override: Option<StateOverride>,
         auth: AuthContext,
     ) -> BoxFut<'_>;
 
-    /// `eth_estimateGas(request, block, state_override)` — estimates gas for a transaction.
+    /// `eth_estimateGas(request, block)` — estimates gas for a transaction.
     ///
-    /// Same `from`-enforcement as [`call`](Self::call). State overrides are
-    /// rejected with `-32602` for non-sequencer callers.
+    /// Same `from`-enforcement and state-override rejection as
+    /// [`call`](Self::call).
     fn estimate_gas(
         &self,
         request: TempoTransactionRequest,
         block: Option<BlockId>,
-        state_override: Option<StateOverride>,
         auth: AuthContext,
     ) -> BoxFut<'_>;
 
@@ -387,7 +386,7 @@ async fn handle_get_block_by_number(
     api_result(
         id,
         "eth_getBlockByNumber",
-        api.block_by_number(number, full, auth.clone()).await,
+        api.block_by_number(number, auth.clone()).await,
     )
 }
 
@@ -410,7 +409,7 @@ async fn handle_get_block_by_hash(
     api_result(
         id,
         "eth_getBlockByHash",
-        api.block_by_hash(hash, full, auth.clone()).await,
+        api.block_by_hash(hash, auth.clone()).await,
     )
 }
 
@@ -473,11 +472,7 @@ async fn handle_call(
         );
     }
 
-    api_result(
-        id,
-        "eth_call",
-        api.call(request, block, state_override, auth.clone()).await,
-    )
+    api_result(id, "eth_call", api.call(request, block, auth.clone()).await)
 }
 
 /// Handle `eth_estimateGas`. Same `from`-enforcement as `eth_call`.
@@ -504,8 +499,7 @@ async fn handle_estimate_gas(
     api_result(
         id,
         "eth_estimateGas",
-        api.estimate_gas(request, block, state_override, auth.clone())
-            .await,
+        api.estimate_gas(request, block, auth.clone()).await,
     )
 }
 
@@ -776,12 +770,12 @@ mod tests {
         stub!(fee_history, _block_count: u64, _newest_block: BlockNumberOrTag, _reward_percentiles: Option<Vec<f64>>);
         stub!(get_balance, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
         stub!(get_transaction_count, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
-        stub!(block_by_number, _number: BlockNumberOrTag, _full: bool, _auth: AuthContext);
-        stub!(block_by_hash, _hash: B256, _full: bool, _auth: AuthContext);
+        stub!(block_by_number, _number: BlockNumberOrTag, _auth: AuthContext);
+        stub!(block_by_hash, _hash: B256, _auth: AuthContext);
         stub!(transaction_by_hash, _hash: B256, _auth: AuthContext);
         stub!(transaction_receipt, _hash: B256, _auth: AuthContext);
-        stub!(call, _request: TempoTransactionRequest, _block: Option<BlockId>, _state_override: Option<StateOverride>, _auth: AuthContext);
-        stub!(estimate_gas, _request: TempoTransactionRequest, _block: Option<BlockId>, _state_override: Option<StateOverride>, _auth: AuthContext);
+        stub!(call, _request: TempoTransactionRequest, _block: Option<BlockId>, _auth: AuthContext);
+        stub!(estimate_gas, _request: TempoTransactionRequest, _block: Option<BlockId>, _auth: AuthContext);
         stub!(send_raw_transaction, _data: Bytes, _auth: AuthContext);
         stub!(send_raw_transaction_sync, _data: Bytes, _auth: AuthContext);
         stub!(fill_transaction, _request: TempoTransactionRequest, _auth: AuthContext);
