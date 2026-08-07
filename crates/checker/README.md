@@ -44,7 +44,9 @@ tempo-zone \
 Use `tempo-zone checker build-checkpoint --help` for the exact CLI accepted by
 the current binary. The default checker database is the node's resolved
 checker directory; `--checker.database-path` selects an explicit dedicated
-path. `off` remains the default checker mode.
+path. `--checker.acquisition-timeout-secs` bounds each authenticated block
+acquisition attempt and defaults to 30 seconds. `off` remains the default
+checker mode.
 
 Checkpoint publication uses a sibling staging directory and validates the
 completed database before making it available. An existing incompatible

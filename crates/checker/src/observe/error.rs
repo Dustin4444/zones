@@ -69,6 +69,10 @@ impl AuthenticatedTransaction {
     pub(crate) const fn chain(self) -> ProtocolChain {
         self.chain
     }
+
+    pub(crate) const fn transaction_index(self) -> usize {
+        self.transaction_index
+    }
 }
 
 /// Stable digest of the authenticated bytes that failed strict decoding.
@@ -84,6 +88,14 @@ impl AuthenticatedDataEvidence {
             length: u64::try_from(bytes.len()).expect("slice length must fit u64"),
             hash: keccak256(bytes),
         }
+    }
+
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) const fn digest(self) -> B256 {
+        self.hash
     }
 }
 

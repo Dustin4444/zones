@@ -6,8 +6,8 @@ use reth_db::{
 };
 use tempfile::TempDir;
 use zone_checker_kernel::{
-    ImportedFacts, PortalIdentity, State, StateDelta, ZoneFacts, ZoneOperation, apply_imported,
-    apply_zone,
+    Datum, Finding as FindingDetails, FindingCategory, FindingLocation, ImportedFacts,
+    PortalIdentity, State, StateDelta, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
 };
 
 use super::{
@@ -71,7 +71,7 @@ fn create() -> (TempDir, Persistence) {
 }
 
 fn apply(store: &Persistence, number: u64, parent: BlockNumHash) -> BlockNumHash {
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     let candidate = apply_zone(
         apply_imported(&snapshot.state, &ImportedFacts::default()).unwrap(),
         &ZoneFacts {
@@ -92,33 +92,23 @@ fn apply(store: &Persistence, number: u64, parent: BlockNumHash) -> BlockNumHash
 }
 
 fn finding(zone: BlockNumHash) -> (FindingKey, Finding) {
-    let key = FindingKey {
+    super::make_finding(
         zone,
-        operation: 3,
-        code: 9,
-    };
-    let expected = vec![1, 2];
-    let actual = vec![3, 4];
-    let mut canonical = vec![];
-    canonical.extend((expected.len() as u32).to_be_bytes());
-    canonical.extend(&expected);
-    canonical.extend((actual.len() as u32).to_be_bytes());
-    canonical.extend(&actual);
-    let value = Finding {
-        zone,
-        parent: block(zone.number - 1, 0x10 + zone.number as u8 - 1),
-        imported_tempo: Some(block(zone.number, 0x20 + zone.number as u8)),
-        category: 2,
-        code: key.code,
-        location: 4,
-        operation: key.operation,
-        expected,
-        actual,
-        evidence_len: u32::try_from(canonical.len()).unwrap(),
-        evidence_digest: alloy_primitives::keccak256(canonical),
-        summary: "authenticated divergence".into(),
-    };
-    (key, value)
+        block(zone.number - 1, 0x10 + zone.number as u8 - 1),
+        Some((
+            block(zone.number, 0x20 + zone.number as u8),
+            block(zone.number - 1, 0x20 + zone.number as u8 - 1),
+        )),
+        FindingDetails {
+            category: FindingCategory::EffectMismatch,
+            code: 9,
+            location: Some(FindingLocation::ImportedOperation(3)),
+            expected: Some(Datum::Code(1)),
+            actual: Some(Datum::Code(2)),
+        },
+        "authenticated divergence".into(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -152,7 +142,7 @@ fn restart_replays_checkpoint_and_unbroken_journal_and_rejects_missing_rows() {
     let (directory, store) = create();
     let one = apply(&store, 1, bootstrap().zone);
     let two = apply(&store, 2, one);
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     store
         .checkpoint(
             identity(),
@@ -173,10 +163,36 @@ fn restart_replays_checkpoint_and_unbroken_journal_and_rejects_missing_rows() {
     cursor.seek_exact(3).unwrap();
     cursor.delete_current().unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
+}
+
+#[test]
+fn restart_and_reorg_replay_accept_multi_block_tempo_imports() {
+    let (directory, store) = create();
+    let prior = store.load().unwrap();
+    let zone = block(1, 0x11);
+    let imported = block(3, 0x23);
+    let snapshot = store
+        .apply(
+            &prior,
+            JournalEntry {
+                zone,
+                parent: bootstrap().zone,
+                imported_tempo: imported,
+                imported_tempo_parent: bootstrap().tempo,
+                delta: StateDelta::default(),
+            },
+            zone,
+            Coverage::Complete,
+        )
+        .unwrap();
+    drop(store);
+
+    let (store, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened, snapshot);
+    let reconstructed = store.reorg(&reopened, zone).unwrap();
+    assert_eq!(reconstructed.meta.imported_tempo_tip, imported);
+    assert_eq!(reconstructed.state, snapshot.state);
 }
 
 #[test]
@@ -193,26 +209,20 @@ fn restart_rejects_conflicting_and_surplus_journal_rows() {
     )
     .unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 
     let (_directory, store) = create();
     let tx = store.db.tx_mut().unwrap();
     tx.put::<Journal>(1, entry(1, one)).unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 }
 
 #[test]
-fn restart_rejects_corrupt_checkpoint_finding_and_pre_checkpoint_journal() {
+fn restart_checks_active_history_but_defers_orphan_audit_validation() {
     let (_directory, store) = create();
     let one = apply(&store, 1, bootstrap().zone);
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     store
         .checkpoint(
             identity(),
@@ -234,10 +244,7 @@ fn restart_rejects_corrupt_checkpoint_finding_and_pre_checkpoint_journal() {
     )
     .unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 
     let (_directory, store) = create();
     let bad_id = super::CheckpointId {
@@ -254,28 +261,22 @@ fn restart_rejects_corrupt_checkpoint_finding_and_pre_checkpoint_journal() {
     )
     .unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(store.load().is_ok());
 
     let (_directory, store) = create();
     let (key, mut value) = finding(block(1, 0x11));
-    value.code += 1;
+    value.details.code += 1;
     let tx = store.db.tx_mut().unwrap();
     tx.put::<Findings>(key, value).unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(store.load().is_ok());
 }
 
 #[test]
 fn reorg_before_after_and_across_checkpoints_reconstructs_exact_metadata() {
     let (_directory, store) = create();
     let one = apply(&store, 1, bootstrap().zone);
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     store
         .checkpoint(
             identity(),
@@ -305,7 +306,7 @@ fn reorg_before_after_and_across_checkpoints_reconstructs_exact_metadata() {
         0
     );
     assert_eq!(
-        store.load(identity()).unwrap().meta.verified_zone_tip,
+        store.load().unwrap().meta.verified_zone_tip,
         bootstrap().zone
     );
 }
@@ -322,15 +323,12 @@ fn same_height_finding_is_idempotent_but_conflicting_evidence_is_rejected() {
         .unwrap();
 
     let mut conflicting = value;
-    conflicting.actual.push(5);
+    conflicting.details.actual = Some(Datum::Code(5));
     assert!(matches!(
         store.record_finding(identity(), key, conflicting),
         Err(PersistenceError::Invalid(_))
     ));
-    assert_eq!(
-        store.load(identity()).unwrap().meta.active_finding,
-        Some(key)
-    );
+    assert_eq!(store.load().unwrap().meta.active_finding, Some(key));
 }
 
 #[test]
@@ -345,12 +343,9 @@ fn finding_identity_ignores_summary_but_separates_codes() {
     let mut other_key = key;
     other_key.code += 1;
     let mut other = finding(block(1, 0x11)).1;
-    other.code = other_key.code;
+    other.details.code = other_key.code;
     store.record_finding(identity(), other_key, other).unwrap();
-    assert_eq!(
-        store.load(identity()).unwrap().meta.active_finding,
-        Some(other_key)
-    );
+    assert_eq!(store.load().unwrap().meta.active_finding, Some(other_key));
 }
 
 #[test]
@@ -368,6 +363,40 @@ fn finding_rejects_forged_evidence_and_wrong_coordinates() {
     let mut wrong_parent = value;
     wrong_parent.parent.hash = B256::ZERO;
     assert!(store.record_finding(identity(), key, wrong_parent).is_err());
+}
+
+#[test]
+fn finding_retains_typed_state_location_and_multi_block_tempo_coordinate() {
+    let (_directory, store) = create();
+    let zone = block(1, 0x11);
+    let token = Address::repeat_byte(0x44);
+    let (key, value) = super::make_finding(
+        zone,
+        bootstrap().zone,
+        Some((block(3, 0x23), bootstrap().tempo)),
+        FindingDetails {
+            category: FindingCategory::StateMismatch,
+            code: 12,
+            location: Some(FindingLocation::State(
+                zone_checker_kernel::StateKey::Token(token),
+            )),
+            expected: Some(Datum::Address(token)),
+            actual: None,
+        },
+        "typed state evidence".into(),
+    )
+    .unwrap();
+    let prior = store.load().unwrap();
+    store.record_finding(&prior, key, value).unwrap();
+
+    let tx = store.db.tx().unwrap();
+    let persisted = tx.get::<Findings>(key).unwrap().unwrap();
+    assert_eq!(
+        persisted.details.location,
+        Some(FindingLocation::State(
+            zone_checker_kernel::StateKey::Token(token)
+        ))
+    );
 }
 
 #[test]
@@ -454,16 +483,13 @@ fn stale_orphan_cannot_be_installed_as_active_finding() {
     let replacement = apply(&store, 1, bootstrap().zone);
     assert_ne!(replacement, old);
 
-    let mut meta = store.load(identity()).unwrap().meta;
+    let mut meta = store.load().unwrap().meta;
     meta.active_finding = Some(key);
     let tx = store.db.tx_mut().unwrap();
     tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta)))
         .unwrap();
     tx.commit().unwrap();
-    assert!(matches!(
-        store.load(identity()),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 }
 
 #[test]
@@ -547,7 +573,7 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
 fn stale_checkpoint_from_an_orphaned_branch_is_skipped() {
     let (_directory, store) = create();
     let one_a = apply(&store, 1, bootstrap().zone);
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     store
         .checkpoint(
             identity(),
@@ -585,12 +611,12 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(
-        store.load(identity()).unwrap().meta.verified_zone_tip,
+        store.load().unwrap().meta.verified_zone_tip,
         bootstrap().zone
     );
 
     let one = apply(&store, 1, bootstrap().zone);
-    let snapshot = store.load(identity()).unwrap();
+    let snapshot = store.load().unwrap();
     store.inject_abort();
     assert!(matches!(
         store.checkpoint(
@@ -603,15 +629,7 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
         ),
         Err(PersistenceError::InjectedAbort)
     ));
-    assert_eq!(
-        store
-            .load(identity())
-            .unwrap()
-            .meta
-            .active_checkpoint
-            .height,
-        0
-    );
+    assert_eq!(store.load().unwrap().meta.active_checkpoint.height, 0);
 
     let two = apply(&store, 2, one);
     store.inject_abort();
@@ -619,7 +637,7 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
         store.reorg(identity(), one),
         Err(PersistenceError::InjectedAbort)
     ));
-    assert_eq!(store.load(identity()).unwrap().meta.verified_zone_tip, two);
+    assert_eq!(store.load().unwrap().meta.verified_zone_tip, two);
     drop(store);
     let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
     assert_eq!(reopened.meta.verified_zone_tip, two);
@@ -634,7 +652,7 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
         store.record_finding(identity(), key, value),
         Err(PersistenceError::InjectedAbort)
     ));
-    assert_eq!(store.load(identity()).unwrap().meta.active_finding, None);
+    assert_eq!(store.load().unwrap().meta.active_finding, None);
 
     store.inject_abort();
     assert!(matches!(
@@ -672,7 +690,7 @@ fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
         store.checkpoint(identity(), bootstrap(), conflicting),
         Err(PersistenceError::Invalid(_))
     ));
-    assert_eq!(store.load(identity()).unwrap().state, state());
+    assert_eq!(store.load().unwrap().state, state());
 }
 
 #[test]
@@ -706,7 +724,7 @@ fn checkpoint_size_and_bounded_journal_replay_are_measured() {
     for number in 1..=256 {
         parent = apply(&store, number, parent);
         if number % 64 == 0 {
-            let snapshot = store.load(identity()).unwrap();
+            let snapshot = store.load().unwrap();
             store
                 .checkpoint(
                     identity(),

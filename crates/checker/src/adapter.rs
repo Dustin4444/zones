@@ -20,14 +20,16 @@ use crate::{
     protocol::events::{
         Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalModelEvent, TempoState,
     },
-    runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass, ObservedEffect},
+    runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass},
 };
+
+use zone_checker_kernel::Effect;
 
 /// Synchronous input after all roots, envelopes, and exact state calls have
 /// already been authenticated by `observe`.
 pub(crate) struct PreauthenticatedObservation {
     pub l2: L2BlockObservation,
-    pub l1: L1BlockObservation,
+    pub l1: Vec<L1BlockObservation>,
     pub state: ZonePostStateOutputs,
     /// Exact Portal balances at the imported Tempo hash, by enabled token.
     pub collateral: BTreeMap<Address, U256>,
@@ -35,9 +37,15 @@ pub(crate) struct PreauthenticatedObservation {
     pub zone_id: u32,
 }
 
-#[track_caller]
-fn failure(message: impl Into<String>) -> Failure {
-    let code = u16::try_from(std::panic::Location::caller().line()).unwrap_or(u16::MAX);
+#[derive(Debug, Clone, Copy)]
+#[repr(u16)]
+pub(crate) enum AdapterFindingCode {
+    HeaderSequence = 100,
+    Grammar = 200,
+}
+
+fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
+    let code = code as u16;
     Failure {
         class: FailureClass::AuthenticatedDivergence,
         gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
@@ -53,14 +61,41 @@ fn failure(message: impl Into<String>) -> Failure {
 }
 
 pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
-    let imported = o.l2.inputs().advance_tempo().imported_header();
-    if (o.l1.block_hash(), o.l1.block_number()) != (imported.hash(), imported.number()) {
+    let headers = o.l2.inputs().advance_tempo().imported_headers();
+    if o.l1.len() != headers.len() {
         return Err(failure(
-            "L1 observation does not match authenticated advance header",
+            AdapterFindingCode::HeaderSequence,
+            "L1 observation count does not match authenticated advance headers",
         ));
     }
-    let projection = adapt_imported(&o.l1, imported, o.portal_creation_block_hash, o.zone_id)?;
-    let (imported_facts, mut imported_effects) = (projection.facts, projection.effects);
+    let mut imported_facts = ImportedFacts {
+        block_hash: headers
+            .last()
+            .expect("authenticated headers are nonempty")
+            .hash(),
+        block_number: headers
+            .last()
+            .expect("authenticated headers are nonempty")
+            .number(),
+        operations: Vec::new(),
+    };
+    let mut imported_effects = Vec::new();
+    for (observation, header) in o.l1.iter().zip(headers) {
+        if (observation.block_hash(), observation.block_number())
+            != (header.hash(), header.number())
+        {
+            return Err(failure(
+                AdapterFindingCode::HeaderSequence,
+                "L1 observation does not match authenticated advance header",
+            ));
+        }
+        let projection =
+            adapt_imported(observation, header, o.portal_creation_block_hash, o.zone_id)?;
+        imported_facts
+            .operations
+            .extend(projection.facts.operations);
+        imported_effects.extend(projection.effects);
+    }
     let (zone_facts, mut zone_effects) = zone_facts(o)?;
     imported_effects.append(&mut zone_effects);
     let state = ExpectedState {
@@ -70,10 +105,9 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
         processed_deposit_number: o.state.processed_deposit_number(),
         withdrawal_queue_hash: o.state.withdrawal_queue_hash(),
         withdrawal_batch_index: o.state.withdrawal_batch_index(),
-        // This field is not an observable commitment. Per-token collateral is
-        // checked below as a lower bound, never as an aggregate equality.
-        collateral_requirement: U256::ZERO,
     };
+    let first = headers.first().expect("authenticated headers are nonempty");
+    let final_observation = o.l1.last().expect("matched nonempty headers");
     Ok(AuthenticatedBlock {
         zone: BlockNumHash {
             number: o.l2.block_number(),
@@ -84,16 +118,17 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
             hash: o.l2.parent_hash(),
         },
         tempo: BlockNumHash {
-            number: o.l1.block_number(),
-            hash: o.l1.block_hash(),
+            number: final_observation.block_number(),
+            hash: final_observation.block_hash(),
         },
         tempo_parent: BlockNumHash {
-            number: o
-                .l1
-                .block_number()
-                .checked_sub(1)
-                .ok_or_else(|| failure("imported genesis has no parent"))?,
-            hash: imported.header().parent_hash(),
+            number: first.number().checked_sub(1).ok_or_else(|| {
+                failure(
+                    AdapterFindingCode::HeaderSequence,
+                    "imported genesis has no parent",
+                )
+            })?,
+            hash: first.header().parent_hash(),
         },
         imported: imported_facts,
         zone_facts,
@@ -111,7 +146,7 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
 /// manufacture a Zone step.
 pub(crate) struct ImportedProjection {
     pub facts: ImportedFacts,
-    pub effects: Vec<ObservedEffect>,
+    pub effects: Vec<Effect>,
 }
 
 pub(crate) fn adapt_imported(
@@ -122,6 +157,7 @@ pub(crate) fn adapt_imported(
 ) -> Result<ImportedProjection, Failure> {
     if (observation.block_hash(), observation.block_number()) != (header.hash(), header.number()) {
         return Err(failure(
+            AdapterFindingCode::Grammar,
             "L1 observation does not match authenticated header",
         ));
     }
@@ -140,12 +176,12 @@ fn token(token: Address, name: &str, symbol: &str, currency: &str) -> TokenEnabl
 }
 
 fn ordinary(d: &tempo_zone_contracts::ZonePortal::Deposit) -> Result<OrdinaryDeposit, Failure> {
-    let ciphertext: [u8; 64] = d
-        .encrypted
-        .ciphertext
-        .as_ref()
-        .try_into()
-        .map_err(|_| failure("authenticated deposit ciphertext is not 64 bytes"))?;
+    let ciphertext: [u8; 64] = d.encrypted.ciphertext.as_ref().try_into().map_err(|_| {
+        failure(
+            AdapterFindingCode::Grammar,
+            "authenticated deposit ciphertext is not 64 bytes",
+        )
+    })?;
     Ok(OrdinaryDeposit {
         token: d.token,
         sender: d.sender,
@@ -167,7 +203,7 @@ fn imported_facts(
     header: &crate::observe::ImportedTempoHeader,
     portal_creation_block_hash: B256,
     zone_id: u32,
-) -> Result<(ImportedFacts, Vec<ObservedEffect>), Failure> {
+) -> Result<(ImportedFacts, Vec<Effect>), Failure> {
     let mut operations = Vec::new();
     let mut effects = Vec::new();
     for tx in observation.protocol_transactions() {
@@ -179,6 +215,7 @@ fn imported_facts(
                     [L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(_))]
                 ) {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "submitBatch requires exactly one BatchSubmitted event",
                     ));
                 }
@@ -221,6 +258,14 @@ fn imported_facts(
                 effects.extend(processing_effects);
                 operations.push(ImportedOperation::ProcessWithdrawals(
                     WithdrawalProcessing {
+                        base_fee: U256::from(header.header().base_fee_per_gas().ok_or_else(
+                            || {
+                                failure(
+                                    AdapterFindingCode::Grammar,
+                                    "imported header missing base fee",
+                                )
+                            },
+                        )?),
                         withdrawals,
                         remaining_queue: call.remainingQueue,
                         outcomes,
@@ -240,6 +285,7 @@ fn imported_facts(
             )
         }) {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "direct-call event occurred outside its transaction envelope",
             ));
         }
@@ -255,6 +301,7 @@ fn imported_facts(
             )
         {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "creation requires exact TokenEnabled then ZoneCreated pair",
             ));
         }
@@ -270,6 +317,7 @@ fn imported_facts(
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
         {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "creation-block TokenEnabled must belong to the creation pair",
             ));
         }
@@ -279,6 +327,7 @@ fn imported_facts(
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
         {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "ZoneCreated occurred outside the configured creation block",
             ));
         }
@@ -299,7 +348,9 @@ fn imported_facts(
                             }
                             _ => None,
                         })
-                        .ok_or_else(|| failure("creation missing TokenEnabled"))?;
+                        .ok_or_else(|| {
+                            failure(AdapterFindingCode::Grammar, "creation missing TokenEnabled")
+                        })?;
                     operations.push(ImportedOperation::Create {
                         identity: PortalIdentity {
                             portal: *portal,
@@ -327,10 +378,12 @@ fn imported_facts(
                         .direct_call()
                         .is_none_or(|call| call.as_process_withdrawals().is_none()) =>
                 {
-                    let ciphertext: [u8; 64] =
-                        e.ciphertext.as_ref().try_into().map_err(|_| {
-                            failure("authenticated deposit ciphertext is not 64 bytes")
-                        })?;
+                    let ciphertext: [u8; 64] = e.ciphertext.as_ref().try_into().map_err(|_| {
+                        failure(
+                            AdapterFindingCode::Grammar,
+                            "authenticated deposit ciphertext is not 64 bytes",
+                        )
+                    })?;
                     let d = OrdinaryDeposit {
                         token: e.token,
                         sender: e.sender,
@@ -346,11 +399,12 @@ fn imported_facts(
                         },
                     };
                     operations.push(ImportedOperation::AppendDeposit(d));
-                    effects.push(ObservedEffect::DepositAppended {
+                    effects.push(Effect::DepositAppended {
                         id: zone_checker_kernel::DepositId {
                             portal: observation.portal_address(),
-                            number: NonZeroU64::new(e.depositNumber)
-                                .ok_or_else(|| failure("zero deposit number"))?,
+                            number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
+                                failure(AdapterFindingCode::Grammar, "zero deposit number")
+                            })?,
                         },
                         queue_hash: e.newCurrentDepositQueueHash,
                     });
@@ -361,18 +415,19 @@ fn imported_facts(
                         recipient: e.recipient,
                         amount: e.amount,
                     }));
-                    effects.push(ObservedEffect::RefundClaimed {
+                    effects.push(Effect::RefundClaimed {
                         token: e.token,
                         recipient: e.recipient,
                         amount: e.amount,
                     });
                 }
                 L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(e)) => {
-                    effects.push(ObservedEffect::BatchSubmitted {
+                    effects.push(Effect::BatchSubmitted {
                         id: zone_checker_kernel::BatchId {
                             zone_id,
-                            index: NonZeroU64::new(e.withdrawalBatchIndex)
-                                .ok_or_else(|| failure("zero batch index"))?,
+                            index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
+                                failure(AdapterFindingCode::Grammar, "zero batch index")
+                            })?,
                         },
                         queue_index: e.withdrawalQueueIndex,
                         processed_deposit_hash: e.nextProcessedDepositQueueHash,
@@ -398,21 +453,17 @@ fn imported_facts(
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}
                 L1ProtocolEvent::KnownNonModel | L1ProtocolEvent::Portal(_) => {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "protocol event was not consumed by exactly one grammar",
                     ));
                 }
             }
         }
     }
-    let base_fee = header
-        .header()
-        .base_fee_per_gas()
-        .ok_or_else(|| failure("imported header missing base fee"))?;
     Ok((
         ImportedFacts {
             block_hash: observation.block_hash(),
             block_number: observation.block_number(),
-            base_fee: U256::from(base_fee),
             operations,
         },
         effects,
@@ -423,19 +474,24 @@ fn parse_withdrawal_events(
     events: &[&L1ProtocolEvent],
     member_count: usize,
     portal: Address,
-) -> Result<(Vec<WithdrawalOutcome>, Vec<ObservedEffect>), Failure> {
+) -> Result<(Vec<WithdrawalOutcome>, Vec<Effect>), Failure> {
     let mut cursor = 0;
     let mut outcomes = Vec::with_capacity(member_count);
     let mut effects = Vec::new();
     for _ in 0..member_count {
-        let event = events
-            .get(cursor)
-            .ok_or_else(|| failure("processWithdrawals missing member outcome"))?;
+        let event = events.get(cursor).ok_or_else(|| {
+            failure(
+                AdapterFindingCode::Grammar,
+                "processWithdrawals missing member outcome",
+            )
+        })?;
         cursor += 1;
         match event {
             L1ProtocolEvent::Portal(PortalModelEvent::DepositBounceBack(e)) => {
-                outcomes.push(WithdrawalOutcome::FailedDepositPaid);
-                effects.push(ObservedEffect::FailedDepositRefunded {
+                outcomes.push(WithdrawalOutcome::FailedDepositPaid {
+                    collected_fee: e.bouncebackFee,
+                });
+                effects.push(Effect::FailedDepositRefunded {
                     recipient: e.tempoRefundRecipient,
                     token: e.token,
                     amount: e.amount,
@@ -444,8 +500,10 @@ fn parse_withdrawal_events(
                 });
             }
             L1ProtocolEvent::Portal(PortalModelEvent::DepositBounceBackPending(e)) => {
-                outcomes.push(WithdrawalOutcome::FailedDepositPending);
-                effects.push(ObservedEffect::FailedDepositRefunded {
+                outcomes.push(WithdrawalOutcome::FailedDepositPending {
+                    collected_fee: e.bouncebackFee,
+                });
+                effects.push(Effect::FailedDepositRefunded {
                     recipient: e.tempoRefundRecipient,
                     token: e.token,
                     amount: e.amount,
@@ -454,14 +512,18 @@ fn parse_withdrawal_events(
                 });
             }
             L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalBounceBack(e)) => {
-                effects.push(ObservedEffect::BounceBackAppended {
+                effects.push(Effect::BounceBackAppended {
                     fallback_nonce: e.fallbackNonce,
                     token: e.token,
                     amount: e.amount,
                     id: zone_checker_kernel::DepositId {
                         portal,
-                        number: NonZeroU64::new(e.depositNumber)
-                            .ok_or_else(|| failure("zero bounceback deposit number"))?,
+                        number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
+                            failure(
+                                AdapterFindingCode::Grammar,
+                                "zero bounceback deposit number",
+                            )
+                        })?,
                     },
                     queue_hash: e.newCurrentDepositQueueHash,
                 });
@@ -469,16 +531,18 @@ fn parse_withdrawal_events(
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "WithdrawalBounceBack must be followed by WithdrawalProcessed",
                     ));
                 };
                 cursor += 1;
                 if processed.callbackSuccess {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "bounce WithdrawalProcessed callbackSuccess must be false",
                     ));
                 }
-                effects.push(ObservedEffect::UserWithdrawalProcessed {
+                effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
                     sender_tag: processed.senderTag,
                     token: processed.token,
@@ -493,7 +557,10 @@ fn parse_withdrawal_events(
                 while let Some(deposit) = next.take() {
                     let ciphertext: [u8; 64] =
                         deposit.ciphertext.as_ref().try_into().map_err(|_| {
-                            failure("authenticated callback ciphertext is not 64 bytes")
+                            failure(
+                                AdapterFindingCode::Grammar,
+                                "authenticated callback ciphertext is not 64 bytes",
+                            )
                         })?;
                     callback_deposits.push(OrdinaryDeposit {
                         token: deposit.token,
@@ -509,11 +576,12 @@ fn parse_withdrawal_events(
                             tag: deposit.tag,
                         },
                     });
-                    effects.push(ObservedEffect::DepositAppended {
+                    effects.push(Effect::DepositAppended {
                         id: zone_checker_kernel::DepositId {
                             portal,
-                            number: NonZeroU64::new(deposit.depositNumber)
-                                .ok_or_else(|| failure("zero callback deposit number"))?,
+                            number: NonZeroU64::new(deposit.depositNumber).ok_or_else(|| {
+                                failure(AdapterFindingCode::Grammar, "zero callback deposit number")
+                            })?,
                         },
                         queue_hash: deposit.newCurrentDepositQueueHash,
                     });
@@ -528,16 +596,18 @@ fn parse_withdrawal_events(
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "callback deposits must be followed by WithdrawalProcessed",
                     ));
                 };
                 cursor += 1;
                 if !processed.callbackSuccess {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "callback WithdrawalProcessed callbackSuccess must be true",
                     ));
                 }
-                effects.push(ObservedEffect::UserWithdrawalProcessed {
+                effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
                     sender_tag: processed.senderTag,
                     token: processed.token,
@@ -549,10 +619,11 @@ fn parse_withdrawal_events(
             L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(processed)) => {
                 if !processed.callbackSuccess {
                     return Err(failure(
+                        AdapterFindingCode::Grammar,
                         "delivered WithdrawalProcessed callbackSuccess must be true",
                     ));
                 }
-                effects.push(ObservedEffect::UserWithdrawalProcessed {
+                effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
                     sender_tag: processed.senderTag,
                     token: processed.token,
@@ -563,21 +634,26 @@ fn parse_withdrawal_events(
                     callback_deposits: vec![],
                 });
             }
-            _ => return Err(failure("unexpected processWithdrawals member event")),
+            _ => {
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    "unexpected processWithdrawals member event",
+                ));
+            }
         }
     }
     if cursor != events.len() {
         return Err(failure(
+            AdapterFindingCode::Grammar,
             "processWithdrawals has extra or out-of-order events",
         ));
     }
     Ok((outcomes, effects))
 }
 
-fn zone_facts(
-    o: &PreauthenticatedObservation,
-) -> Result<(ZoneFacts, Vec<ObservedEffect>), Failure> {
+fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), Failure> {
     let advance = o.l2.inputs().advance_tempo();
+    let advance_hash = o.l2.inputs().advance_transaction_hash();
     validate_zone_event_grammar(o)?;
     let enabled_tokens = advance
         .enabled_tokens()
@@ -591,13 +667,19 @@ fn zone_facts(
         } else if let Some(d) = d.as_withdrawal_bounce_back() {
             let bytes = d.to.as_slice();
             if bytes[..12].iter().any(|byte| *byte != 0) {
-                return Err(failure("bounceback recipient has non-canonical high bytes"));
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    "bounceback recipient has non-canonical high bytes",
+                ));
             }
             if d.amount == 0 {
-                return Err(failure("zero bounceback amount"));
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    "zero bounceback amount",
+                ));
             }
             let nonce = NonZeroU64::new(u64::from_be_bytes(bytes[12..].try_into().unwrap()))
-                .ok_or_else(|| failure("zero bounceback nonce"))?;
+                .ok_or_else(|| failure(AdapterFindingCode::Grammar, "zero bounceback nonce"))?;
             deposits.push(Deposit::BounceBack(BounceBackDeposit {
                 token: d.token,
                 fallback_nonce: nonce,
@@ -611,7 +693,7 @@ fn zone_facts(
     for outcome in o.l2.outcomes().events() {
         match outcome.event() {
             L2ProtocolEvent::Inbox(Inbox::InboxEvents::TokenEnabled(e)) => {
-                effects.push(ObservedEffect::TokenEnabled {
+                effects.push(Effect::TokenEnabled {
                     token: e.token,
                     name: e.name.clone(),
                     symbol: e.symbol.clone(),
@@ -620,7 +702,7 @@ fn zone_facts(
             }
             L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositProcessed(e)) => {
                 outcomes.push(DepositOutcome::Minted);
-                effects.push(ObservedEffect::DepositProcessed {
+                effects.push(Effect::DepositProcessed {
                     deposit_hash: e.depositHash,
                     sender: e.sender,
                     token: e.token,
@@ -629,7 +711,7 @@ fn zone_facts(
             }
             L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositFailed(e)) => {
                 outcomes.push(DepositOutcome::Failed);
-                effects.push(ObservedEffect::DepositFailed {
+                effects.push(Effect::DepositFailed {
                     deposit_hash: e.depositHash,
                     sender: e.sender,
                     token: e.token,
@@ -640,7 +722,7 @@ fn zone_facts(
                 outcomes.push(DepositOutcome::BounceBackMinted {
                     recipient: e.zoneFallbackRecipient,
                 });
-                effects.push(ObservedEffect::BounceBackMinted {
+                effects.push(Effect::BounceBackMinted {
                     token: e.token,
                     amount: e.amount,
                 });
@@ -649,7 +731,7 @@ fn zone_facts(
                 outcomes.push(DepositOutcome::BounceBackPending {
                     recipient: e.zoneFallbackRecipient,
                 });
-                effects.push(ObservedEffect::BounceBackPending {
+                effects.push(Effect::BounceBackPending {
                     token: e.token,
                     amount: e.amount,
                 });
@@ -664,18 +746,20 @@ fn zone_facts(
             }
             L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(e)) => {
                 let sender = outcome.position().transaction_sender();
-                operations.push(ZoneOperation::AcceptWithdrawal(UserWithdrawal {
-                    sender,
-                    transaction_hash: outcome.position().transaction_hash(),
-                    token: e.token,
-                    to: e.to,
-                    amount: e.amount,
-                    memo: e.memo,
-                    gas_limit: e.gasLimit,
-                    callback_data: e.data.clone(),
-                    reveal_to: e.revealTo.clone(),
-                }));
-                effects.push(ObservedEffect::WithdrawalRequested {
+                if outcome.position().transaction_hash() != advance_hash {
+                    operations.push(ZoneOperation::AcceptWithdrawal(UserWithdrawal {
+                        sender,
+                        transaction_hash: outcome.position().transaction_hash(),
+                        token: e.token,
+                        to: e.to,
+                        amount: e.amount,
+                        memo: e.memo,
+                        gas_limit: e.gasLimit,
+                        callback_data: e.data.clone(),
+                        reveal_to: e.revealTo.clone(),
+                    }));
+                }
+                effects.push(Effect::WithdrawalRequested {
                     id: zone_checker_kernel::WithdrawalId {
                         zone_id: o.zone_id,
                         index: e.withdrawalIndex,
@@ -698,18 +782,19 @@ fn zone_facts(
                     recipient: e.recipient,
                     amount: e.amount,
                 }));
-                effects.push(ObservedEffect::RefundClaimed {
+                effects.push(Effect::RefundClaimed {
                     token: e.token,
                     recipient: e.recipient,
                     amount: e.amount,
                 });
             }
             L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(e)) => {
-                effects.push(ObservedEffect::BatchFinalized {
+                effects.push(Effect::BatchFinalized {
                     id: zone_checker_kernel::BatchId {
                         zone_id: o.zone_id,
-                        index: NonZeroU64::new(e.withdrawalBatchIndex)
-                            .ok_or_else(|| failure("zero finalized batch index"))?,
+                        index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
+                            failure(AdapterFindingCode::Grammar, "zero finalized batch index")
+                        })?,
                     },
                     queue_hash: e.withdrawalQueueHash,
                 })
@@ -746,7 +831,7 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
     let advance = o.l2.inputs().advance_tempo();
     let advance_hash = o.l2.inputs().advance_transaction_hash();
     let mut cursor = 0usize;
-    let imported = advance.imported_header();
+    let imported = advance.final_imported_header();
     match events.first().map(|outcome| outcome.event()) {
         Some(L2ProtocolEvent::TempoState(TempoState::TempoStateEvents::TempoBlockFinalized(
             event,
@@ -755,23 +840,27 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
             && event.stateRoot == imported.header().state_root() => {}
         _ => {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "TempoBlockFinalized fields do not match authenticated header",
             ));
         }
     }
     macro_rules! next_advance {
         ($expected:expr, $label:literal $(,)?) => {{
-            let outcome = events
-                .get(cursor)
-                .ok_or_else(|| failure(concat!("advance missing ", $label)))?;
+            let outcome = events.get(cursor).ok_or_else(|| {
+                failure(
+                    AdapterFindingCode::Grammar,
+                    concat!("advance missing ", $label),
+                )
+            })?;
             if outcome.position().transaction_index() != 0
                 || outcome.position().transaction_hash() != advance_hash
                 || !$expected(outcome.event())
             {
-                return Err(failure(format!(
-                    "advance expected {} at cursor {cursor}",
-                    $label
-                )));
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    format!("advance expected {} at cursor {cursor}", $label),
+                ));
             }
             cursor += 1;
         }};
@@ -798,15 +887,19 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
     }
     for (index, deposit) in advance.deposits().iter().enumerate() {
         if deposit.as_ordinary().is_some() {
-            let outcome = events
-                .get(cursor)
-                .ok_or_else(|| failure(format!("deposit {index} missing outcome")))?;
+            let outcome = events.get(cursor).ok_or_else(|| {
+                failure(
+                    AdapterFindingCode::Grammar,
+                    format!("deposit {index} missing outcome"),
+                )
+            })?;
             if outcome.position().transaction_index() != 0
                 || outcome.position().transaction_hash() != advance_hash
             {
-                return Err(failure(format!(
-                    "deposit {index} outcome belongs to wrong transaction"
-                )));
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    format!("deposit {index} outcome belongs to wrong transaction"),
+                ));
             }
             cursor += 1;
             match outcome.event() {
@@ -823,9 +916,10 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
                     );
                 }
                 _ => {
-                    return Err(failure(format!(
-                        "deposit {index} has invalid outcome grammar"
-                    )));
+                    return Err(failure(
+                        AdapterFindingCode::Grammar,
+                        format!("deposit {index} has invalid outcome grammar"),
+                    ));
                 }
             }
         } else if deposit.as_withdrawal_bounce_back().is_some() {
@@ -842,7 +936,10 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
                 "bounceback outcome",
             );
         } else {
-            return Err(failure(format!("deposit {index} has unsupported kind")));
+            return Err(failure(
+                AdapterFindingCode::Grammar,
+                format!("deposit {index} has unsupported kind"),
+            ));
         }
     }
     match events.get(cursor).map(|outcome| outcome.event()) {
@@ -855,6 +952,7 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
                     == u64::try_from(advance.deposits().len()).unwrap_or(u64::MAX) => {}
         _ => {
             return Err(failure(
+                AdapterFindingCode::Grammar,
                 "TempoAdvanced fields do not match authenticated input/state",
             ));
         }
@@ -872,7 +970,10 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
         .get(cursor)
         .is_some_and(|e| e.position().transaction_index() == 0)
     {
-        return Err(failure("extra event in advance transaction"));
+        return Err(failure(
+            AdapterFindingCode::Grammar,
+            "extra event in advance transaction",
+        ));
     }
 
     let final_hash = o.l2.inputs().finalization().map(|f| f.transaction_hash());
@@ -888,22 +989,31 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
                     | Outbox::OutboxEvents::WithdrawalRequested(_)
             ) | L2ProtocolEvent::Inbox(Inbox::InboxEvents::RefundClaimed(_))
         ) {
-            return Err(failure("unexpected post-advance protocol event"));
+            return Err(failure(
+                AdapterFindingCode::Grammar,
+                "unexpected post-advance protocol event",
+            ));
         }
         cursor += 1;
     }
     match final_hash {
         Some(hash) => {
-            let outcome = events
-                .get(cursor)
-                .ok_or_else(|| failure("finalization missing BatchFinalized"))?;
+            let outcome = events.get(cursor).ok_or_else(|| {
+                failure(
+                    AdapterFindingCode::Grammar,
+                    "finalization missing BatchFinalized",
+                )
+            })?;
             if outcome.position().transaction_hash() != hash
                 || !matches!(
                     outcome.event(),
                     L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(_))
                 )
             {
-                return Err(failure("finalization does not own BatchFinalized"));
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    "finalization does not own BatchFinalized",
+                ));
             }
             cursor += 1;
         }
@@ -914,12 +1024,18 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
             )
         }) =>
         {
-            return Err(failure("BatchFinalized has no finalization envelope"));
+            return Err(failure(
+                AdapterFindingCode::Grammar,
+                "BatchFinalized has no finalization envelope",
+            ));
         }
         None => {}
     }
     if cursor != events.len() {
-        return Err(failure("extra finalization or protocol events"));
+        return Err(failure(
+            AdapterFindingCode::Grammar,
+            "extra finalization or protocol events",
+        ));
     }
     Ok(())
 }

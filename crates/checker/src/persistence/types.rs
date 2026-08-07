@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
-use zone_checker_kernel::{State, StateDelta};
+use zone_checker_kernel::{Finding as FindingDetails, State, StateDelta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct BlockNumHash {
@@ -98,12 +98,8 @@ pub(crate) struct Finding {
     pub zone: BlockNumHash,
     pub parent: BlockNumHash,
     pub imported_tempo: Option<BlockNumHash>,
-    pub category: u16,
-    pub code: u16,
-    pub location: u16,
-    pub operation: u32,
-    pub expected: Vec<u8>,
-    pub actual: Vec<u8>,
+    pub imported_tempo_parent: Option<BlockNumHash>,
+    pub details: FindingDetails,
     pub evidence_len: u32,
     pub evidence_digest: B256,
     pub summary: String,

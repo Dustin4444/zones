@@ -14,6 +14,7 @@ use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
 
 use super::*;
 use crate::{
+    observe::abi::ObservationZoneInbox,
     observe::error::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, EnvelopeRule, ObservationError, ProtocolChain,
@@ -52,11 +53,19 @@ fn advance_transaction_with_tokens(
     to: Address,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 ) -> TempoTxEnvelope {
-    let calldata = IZoneInbox::advanceTempoCall {
-        header: encode_header(&imported_header()),
+    let calldata = ObservationZoneInbox::advanceTempoCall {
+        headers: vec![encode_header(&imported_header())],
         deposits: Vec::new(),
         decryptions: Vec::new(),
-        enabledTokens: enabled_tokens,
+        enabledTokens: enabled_tokens
+            .into_iter()
+            .map(|t| ObservationZoneInbox::EnabledToken {
+                token: t.token,
+                name: t.name,
+                symbol: t.symbol,
+                currency: t.currency,
+            })
+            .collect(),
     }
     .abi_encode();
     system_transaction(to, calldata.into())
@@ -259,7 +268,11 @@ fn observes_decoded_header_input_and_ordered_protocol_events() {
     assert_eq!(observation.block_hash, block.hash());
     assert_eq!(observation.parent_hash(), ZONE_PARENT_HASH);
     assert_eq!(
-        observation.inputs.advance_tempo.imported_header().hash(),
+        observation
+            .inputs
+            .advance_tempo
+            .final_imported_header()
+            .hash(),
         imported_header().hash_slow()
     );
     assert_eq!(observation.outcomes.events.len(), 2);
@@ -273,7 +286,11 @@ fn authenticated_inputs_do_not_require_matching_event_outputs() {
     let observation = observe_l2_block(&block, &receipts).unwrap();
 
     assert_eq!(
-        observation.inputs.advance_tempo.imported_header().hash(),
+        observation
+            .inputs
+            .advance_tempo
+            .final_imported_header()
+            .hash(),
         imported_header().hash_slow()
     );
     assert!(observation.outcomes.events.is_empty());
@@ -313,7 +330,11 @@ fn mismatched_tempo_advanced_is_retained_independently_from_calldata() {
     let block = reseal_with_receipts(block, &receipts);
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert_eq!(
-        observation.inputs.advance_tempo.imported_header().hash(),
+        observation
+            .inputs
+            .advance_tempo
+            .final_imported_header()
+            .hash(),
         imported_header().hash_slow()
     );
     assert!(matches!(

@@ -10,16 +10,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+#[cfg(test)]
+use alloy_primitives::B256;
+use alloy_primitives::{Address, U256, keccak256};
 use zone_checker_kernel::{
-    BatchId, DepositId, ExpectedEffect, ExpectedState, Finding as CompactFinding, FindingData,
-    FindingLocation, ImportedFacts, PortalIdentity, State, ViolationCategory, WithdrawalId,
-    ZoneFacts, apply_imported, apply_zone, validate,
+    Effect, ExpectedState, Finding as CompactFinding, FindingData, FindingLocation, ImportedFacts,
+    PortalIdentity, State, ViolationCategory, ZoneFacts, apply_imported, apply_zone, validate,
 };
 
 use crate::persistence::{
-    BlockNumHash, ChainCut, CoverageGapReason, Finding, FindingKey, Identity, JournalEntry,
-    Persistence, PersistenceError, Snapshot,
+    BlockNumHash, ChainCut, CoverageGapReason, Identity, JournalEntry, Persistence,
+    PersistenceError, Snapshot, make_finding,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,249 +76,13 @@ fn typed_failure(
 pub(crate) struct AuthenticatedOutputs {
     /// Constructed from authenticated receipts/state reads, never from the
     /// kernel candidate.
-    pub effects: Vec<ObservedEffect>,
+    pub effects: Vec<Effect>,
     pub state: ExpectedState,
     /// Exact token supplies read at this block, keyed by token address.
     pub supplies: std::collections::BTreeMap<alloy_primitives::Address, alloy_primitives::U256>,
     /// Exact Portal balance reads, keyed by token. These are collateral
     /// carriers, not model requirements; surplus is valid.
     pub collateral: std::collections::BTreeMap<Address, U256>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ObservedEffect {
-    TokenEnabled {
-        token: Address,
-        name: String,
-        symbol: String,
-        currency: String,
-    },
-    DepositAppended {
-        id: DepositId,
-        queue_hash: B256,
-    },
-    DepositProcessed {
-        deposit_hash: B256,
-        sender: Address,
-        token: Address,
-        amount: u128,
-    },
-    DepositFailed {
-        deposit_hash: B256,
-        sender: Address,
-        token: Address,
-        amount: u128,
-    },
-    WithdrawalRequested {
-        id: WithdrawalId,
-        sender: Address,
-        token: Address,
-        to: Address,
-        amount: u128,
-        fee: u128,
-        memo: B256,
-        gas_limit: u64,
-        fallback_nonce: u64,
-        callback_data: Bytes,
-        reveal_to: Bytes,
-    },
-    BatchFinalized {
-        id: BatchId,
-        queue_hash: B256,
-    },
-    BatchSubmitted {
-        id: BatchId,
-        queue_index: U256,
-        processed_deposit_hash: B256,
-        final_block_hash: B256,
-        queue_hash: B256,
-        processed_deposit_number: u64,
-    },
-    UserWithdrawalProcessed {
-        to: Address,
-        sender_tag: B256,
-        token: Address,
-        amount: u128,
-        callback_success: bool,
-    },
-    FailedDepositRefunded {
-        recipient: Address,
-        token: Address,
-        amount: u128,
-        fee: u128,
-        pending: bool,
-    },
-    BounceBackAppended {
-        fallback_nonce: u64,
-        token: Address,
-        amount: u128,
-        id: DepositId,
-        queue_hash: B256,
-    },
-    BounceBackMinted {
-        token: Address,
-        amount: u128,
-    },
-    BounceBackPending {
-        token: Address,
-        amount: u128,
-    },
-    RefundClaimed {
-        token: Address,
-        recipient: Address,
-        amount: u128,
-    },
-}
-
-pub(crate) fn project_expected_effect(e: &ExpectedEffect) -> ObservedEffect {
-    match e {
-        ExpectedEffect::TokenEnabled {
-            token,
-            name,
-            symbol,
-            currency,
-        } => ObservedEffect::TokenEnabled {
-            token: *token,
-            name: name.clone(),
-            symbol: symbol.clone(),
-            currency: currency.clone(),
-        },
-        ExpectedEffect::DepositAppended { id, queue_hash } => ObservedEffect::DepositAppended {
-            id: *id,
-            queue_hash: *queue_hash,
-        },
-        ExpectedEffect::DepositProcessed {
-            deposit_hash,
-            sender,
-            token,
-            amount,
-        } => ObservedEffect::DepositProcessed {
-            deposit_hash: *deposit_hash,
-            sender: *sender,
-            token: *token,
-            amount: *amount,
-        },
-        ExpectedEffect::DepositFailed {
-            deposit_hash,
-            sender,
-            token,
-            amount,
-        } => ObservedEffect::DepositFailed {
-            deposit_hash: *deposit_hash,
-            sender: *sender,
-            token: *token,
-            amount: *amount,
-        },
-        ExpectedEffect::WithdrawalRequested {
-            id,
-            sender,
-            token,
-            to,
-            amount,
-            fee,
-            memo,
-            gas_limit,
-            fallback_nonce,
-            callback_data,
-            reveal_to,
-        } => ObservedEffect::WithdrawalRequested {
-            id: *id,
-            sender: *sender,
-            token: *token,
-            to: *to,
-            amount: *amount,
-            fee: *fee,
-            memo: *memo,
-            gas_limit: *gas_limit,
-            fallback_nonce: *fallback_nonce,
-            callback_data: callback_data.clone(),
-            reveal_to: reveal_to.clone(),
-        },
-        ExpectedEffect::BatchFinalized { id, queue_hash } => ObservedEffect::BatchFinalized {
-            id: *id,
-            queue_hash: *queue_hash,
-        },
-        ExpectedEffect::BatchSubmitted {
-            id,
-            queue_index,
-            processed_deposit_hash,
-            final_block_hash,
-            queue_hash,
-            processed_deposit_number,
-        } => ObservedEffect::BatchSubmitted {
-            id: *id,
-            queue_index: *queue_index,
-            processed_deposit_hash: *processed_deposit_hash,
-            final_block_hash: *final_block_hash,
-            queue_hash: *queue_hash,
-            processed_deposit_number: *processed_deposit_number,
-        },
-        ExpectedEffect::UserWithdrawalProcessed {
-            to,
-            sender_tag,
-            token,
-            amount,
-            callback_success,
-            ..
-        } => ObservedEffect::UserWithdrawalProcessed {
-            to: *to,
-            sender_tag: *sender_tag,
-            token: *token,
-            amount: *amount,
-            callback_success: *callback_success,
-        },
-        ExpectedEffect::FailedDepositRefunded {
-            recipient,
-            token,
-            amount,
-            fee,
-            pending,
-            ..
-        } => ObservedEffect::FailedDepositRefunded {
-            recipient: *recipient,
-            token: *token,
-            amount: *amount,
-            fee: *fee,
-            pending: *pending,
-        },
-        ExpectedEffect::BounceBackAppended {
-            fallback_nonce,
-            token,
-            amount,
-            id,
-            queue_hash,
-        } => ObservedEffect::BounceBackAppended {
-            fallback_nonce: *fallback_nonce,
-            token: *token,
-            amount: *amount,
-            id: *id,
-            queue_hash: *queue_hash,
-        },
-        ExpectedEffect::BounceBackMinted { token, amount } => ObservedEffect::BounceBackMinted {
-            token: *token,
-            amount: *amount,
-        },
-        ExpectedEffect::BounceBackPending { token, amount } => ObservedEffect::BounceBackPending {
-            token: *token,
-            amount: *amount,
-        },
-        ExpectedEffect::RefundClaimed {
-            token,
-            recipient,
-            amount,
-        } => ObservedEffect::RefundClaimed {
-            token: *token,
-            recipient: *recipient,
-            amount: *amount,
-        },
-    }
-}
-
-#[cfg(test)]
-impl From<&ExpectedEffect> for ObservedEffect {
-    fn from(effect: &ExpectedEffect) -> Self {
-        project_expected_effect(effect)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -391,66 +156,89 @@ pub(crate) trait ObservationPipeline<N> {
         index: usize,
         parent_state: &State,
     ) -> Result<AuthenticatedBlock, Failure>;
-    fn compare(
-        &mut self,
-        block: &AuthenticatedBlock,
-        expected: &zone_checker_kernel::Candidate,
-    ) -> Result<(), Failure>;
 }
 
 pub(crate) fn compare_authenticated(
     block: &AuthenticatedBlock,
     candidate: &zone_checker_kernel::Candidate,
 ) -> Result<(), Failure> {
-    let effects: Vec<_> = candidate
-        .expected_effects
-        .iter()
-        .map(project_expected_effect)
-        .collect();
+    let effects = candidate.expected_effects.clone();
     let supplies = candidate
         .expected_accounting
         .iter()
         .map(|(token, a)| (*token, a.supply))
         .collect();
-    let collateral_ok = candidate
-        .expected_accounting
-        .iter()
-        .all(|(token, accounting)| {
-            accounting.collateral().is_some_and(|required| {
-                block
-                    .outputs
-                    .collateral
-                    .get(token)
-                    .is_some_and(|actual| *actual >= required)
-            })
-        });
     let observed = &block.outputs.state;
     let expected = &candidate.expected_state;
-    let commitments_match = observed.tempo_block_hash == expected.tempo_block_hash
-        && observed.tempo_block_number == expected.tempo_block_number
-        && observed.processed_deposit_hash == expected.processed_deposit_hash
-        && observed.processed_deposit_number == expected.processed_deposit_number
-        && observed.withdrawal_queue_hash == expected.withdrawal_queue_hash
-        && observed.withdrawal_batch_index == expected.withdrawal_batch_index;
-    let mismatch = if block.outputs.effects != effects {
-        Some((ViolationCategory::EffectMismatch, 1))
-    } else if !commitments_match {
-        Some((ViolationCategory::StateMismatch, 2))
-    } else if block.outputs.supplies != supplies {
-        Some((ViolationCategory::SupplyMismatch, 3))
-    } else if !collateral_ok {
-        Some((ViolationCategory::CollateralMismatch, 4))
-    } else {
-        None
-    };
-    if let Some((category, code)) = mismatch {
+    if block.outputs.effects != effects {
+        let index = block
+            .outputs
+            .effects
+            .iter()
+            .zip(&effects)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| block.outputs.effects.len().min(effects.len()));
+        let evidence = |effect: Option<&Effect>| {
+            effect.map(|value| {
+                let bytes = format!("{value:?}").into_bytes();
+                FindingData::Bytes {
+                    length: bytes.len() as u64,
+                    digest: keccak256(bytes),
+                }
+            })
+        };
         return Err(typed_failure(
-            category,
-            code,
-            Some(FindingLocation::Block),
-            Some(FindingData::Bool(true)),
-            Some(FindingData::Bool(false)),
+            ViolationCategory::EffectMismatch,
+            1,
+            Some(FindingLocation::Operation(index as u32)),
+            evidence(effects.get(index)),
+            evidence(block.outputs.effects.get(index)),
             "authenticated output differs from checker candidate",
+        ));
+    }
+    macro_rules! commitment {
+        ($field:ident, $datum:ident, $code:expr) => {
+            if observed.$field != expected.$field {
+                return Err(typed_failure(
+                    ViolationCategory::StateMismatch,
+                    $code,
+                    Some(FindingLocation::Block),
+                    Some(FindingData::$datum(expected.$field.into())),
+                    Some(FindingData::$datum(observed.$field.into())),
+                    "authenticated state commitment differs",
+                ));
+            }
+        };
+    }
+    commitment!(tempo_block_hash, Hash, 20);
+    commitment!(tempo_block_number, U64, 21);
+    commitment!(processed_deposit_hash, Hash, 22);
+    commitment!(processed_deposit_number, U64, 23);
+    commitment!(withdrawal_queue_hash, Hash, 24);
+    commitment!(withdrawal_batch_index, U64, 25);
+    if block.outputs.supplies != supplies {
+        let token = block
+            .outputs
+            .supplies
+            .keys()
+            .chain(supplies.keys())
+            .find(|token| block.outputs.supplies.get(*token) != supplies.get(*token))
+            .copied()
+            .expect("unequal maps have a differing key");
+        return Err(typed_failure(
+            ViolationCategory::SupplyMismatch,
+            30,
+            Some(FindingLocation::State(
+                zone_checker_kernel::StateKey::Token(token),
+            )),
+            supplies.get(&token).copied().map(FindingData::U256),
+            block
+                .outputs
+                .supplies
+                .get(&token)
+                .copied()
+                .map(FindingData::U256),
+            "authenticated token supply differs",
         ));
     }
     Ok(())
@@ -521,13 +309,19 @@ impl RetryBudget {
 
 /// Exactly one current notification and one bounded FIFO.
 pub(crate) struct Runtime<N> {
+    snapshot: Snapshot,
     state: RuntimeState,
-    current: Option<N>,
-    fifo: VecDeque<N>,
+    current: Option<QueuedNotification<N>>,
+    fifo: VecDeque<QueuedNotification<N>>,
     capacity: usize,
     budget: RetryBudget,
     retry: Option<RetryState>,
     current_unwound: bool,
+}
+
+struct QueuedNotification<N> {
+    notification: N,
+    plan: NotificationPlan,
 }
 
 struct RetryState {
@@ -547,8 +341,9 @@ pub(crate) enum RuntimeAction {
 }
 
 impl<N> Runtime<N> {
-    pub(crate) fn new(capacity: usize, budget: RetryBudget) -> Self {
+    pub(crate) fn new(snapshot: Snapshot, capacity: usize, budget: RetryBudget) -> Self {
         Self {
+            snapshot,
             state: RuntimeState::Starting,
             current: None,
             fifo: VecDeque::with_capacity(capacity),
@@ -563,28 +358,24 @@ impl<N> Runtime<N> {
         self.state
     }
     pub(crate) fn current(&self) -> Option<&N> {
-        self.current.as_ref()
+        self.current.as_ref().map(|queued| &queued.notification)
+    }
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
     }
 
     pub(crate) fn next_applied_index(
         &mut self,
         store: &Persistence,
-        identity: Identity,
-    ) -> Result<Option<usize>, PersistenceError>
-    where
-        N: PlannedNotification,
-    {
+    ) -> Result<Option<usize>, PersistenceError> {
         if self.state == RuntimeState::Disabled {
             return Ok(None);
         }
-        let Some(notification) = self.current.as_ref() else {
+        let Some(current) = self.current.as_ref() else {
             return Ok(None);
         };
-        let plan = notification
-            .plan()
-            .and_then(NotificationPlan::validate)
-            .map_err(|failure| PersistenceError::Invalid(failure.message))?;
-        let before = store.load(identity)?;
+        let plan = current.plan.clone();
+        let before = self.snapshot.clone();
         if let Some(active) = before.meta.active_finding
             && !plan.reverted.contains(&active.zone)
         {
@@ -593,13 +384,13 @@ impl<N> Runtime<N> {
             return Ok(None);
         }
         if !plan.reverted.is_empty() && !self.current_unwound {
-            self.reorg(store, identity, plan.ancestor)?;
+            self.reorg(store, plan.ancestor)?;
             self.current_unwound = true;
         }
         if plan.applied.is_empty() {
             return Ok(None);
         }
-        let snapshot = store.load(identity)?;
+        let snapshot = self.snapshot.clone();
         if snapshot.meta.active_finding.is_some()
             && snapshot.meta.acknowledged_zone_tip.number.checked_add(1)
                 == Some(plan.applied[0].number)
@@ -617,18 +408,31 @@ impl<N> Runtime<N> {
                 .map(|i| i + 1))
         }
     }
-    pub(crate) fn push(&mut self, notification: N) -> Result<(), N> {
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, notification: N) -> Result<(), N>
+    where
+        N: PlannedNotification,
+    {
+        let plan = match notification.plan().and_then(NotificationPlan::validate) {
+            Ok(plan) => plan,
+            Err(_) => return Err(notification),
+        };
+        self.enqueue(notification, plan)
+    }
+
+    fn enqueue(&mut self, notification: N, plan: NotificationPlan) -> Result<(), N> {
         if self.state == RuntimeState::Disabled {
             return Err(notification);
         }
+        let queued = QueuedNotification { notification, plan };
         if self.current.is_none() {
-            self.current = Some(notification);
+            self.current = Some(queued);
             Ok(())
         } else if self.fifo.len() < self.capacity {
-            self.fifo.push_back(notification);
+            self.fifo.push_back(queued);
             Ok(())
         } else {
-            Err(notification)
+            Err(queued.notification)
         }
     }
 
@@ -637,7 +441,6 @@ impl<N> Runtime<N> {
     pub(crate) fn push_or_record_overflow(
         &mut self,
         store: &Persistence,
-        identity: Identity,
         notification: N,
     ) -> Result<RuntimeAction, PersistenceError>
     where
@@ -646,34 +449,34 @@ impl<N> Runtime<N> {
         if self.state == RuntimeState::Disabled {
             return Ok(RuntimeAction::Terminal);
         }
+        let plan = match notification.plan().and_then(NotificationPlan::validate) {
+            Ok(plan) => plan,
+            Err(_) => {
+                self.state = RuntimeState::Disabled;
+                return Ok(RuntimeAction::Terminal);
+            }
+        };
         if self.current.is_none() || self.fifo.len() < self.capacity {
-            let accepted = self.push(notification);
+            let accepted = self.enqueue(notification, plan);
             debug_assert!(accepted.is_ok());
             return Ok(RuntimeAction::None);
         }
-        let plans = self
+        let mut plans = self
             .current
             .iter()
             .chain(self.fifo.iter())
-            .map(PlannedNotification::plan)
-            .collect::<Result<Vec<_>, _>>();
-        let Ok(mut plans) = plans else {
-            self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
-        };
-        let Ok(rejected) = notification.plan() else {
-            self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
-        };
-        plans.push(rejected);
-        let snapshot = store.load(identity)?;
+            .map(|queued| queued.plan.clone())
+            .collect::<Vec<_>>();
+        plans.push(plan);
+        let snapshot = self.snapshot.clone();
         let first_reaches_tip = plans.first().is_some_and(|plan| {
             plan.ancestor == snapshot.meta.verified_zone_tip
                 || plan.applied.contains(&snapshot.meta.verified_zone_tip)
         });
-        let valid = plans.iter().all(|plan| {
-            plan.reverted.is_empty() && !plan.applied.is_empty() && plan.clone().validate().is_ok()
-        }) && first_reaches_tip
+        let valid = plans
+            .iter()
+            .all(|plan| plan.reverted.is_empty() && !plan.applied.is_empty())
+            && first_reaches_tip
             && plans
                 .windows(2)
                 .all(|pair| pair[1].ancestor == pair[0].acknowledge);
@@ -701,7 +504,7 @@ impl<N> Runtime<N> {
             crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
             crate::persistence::Coverage::Complete => CoverageGapReason::ProviderUnavailable,
         };
-        store.record_gap(identity, first, last, reason)?;
+        self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
         self.current = None;
         self.fifo.clear();
@@ -712,7 +515,6 @@ impl<N> Runtime<N> {
     pub(crate) fn record_stream_failure(
         &mut self,
         store: &Persistence,
-        identity: Identity,
         canonical_suffix: &[BlockNumHash],
     ) -> Result<RuntimeAction, PersistenceError> {
         if canonical_suffix.is_empty()
@@ -723,7 +525,7 @@ impl<N> Runtime<N> {
             self.state = RuntimeState::Disabled;
             return Ok(RuntimeAction::Terminal);
         }
-        let snapshot = store.load(identity)?;
+        let snapshot = self.snapshot.clone();
         let (first, reason) = match &snapshot.meta.coverage {
             crate::persistence::Coverage::Complete => {
                 (canonical_suffix[0], CoverageGapReason::ProviderUnavailable)
@@ -741,7 +543,7 @@ impl<N> Runtime<N> {
             self.state = RuntimeState::Disabled;
             return Ok(RuntimeAction::Terminal);
         }
-        store.record_gap(identity, first, last, reason)?;
+        self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
         Ok(RuntimeAction::AcknowledgeAndTerminate(last))
     }
@@ -749,16 +551,16 @@ impl<N> Runtime<N> {
     pub(crate) fn reorg(
         &mut self,
         store: &Persistence,
-        identity: Identity,
         ancestor: BlockNumHash,
     ) -> Result<(), PersistenceError> {
-        let snapshot = store.reorg(identity, ancestor)?;
+        let snapshot = store.reorg(&self.snapshot, ancestor)?;
         self.retry = None;
         self.state = if snapshot.meta.active_finding.is_some() {
             RuntimeState::Alerting
         } else {
             RuntimeState::Starting
         };
+        self.snapshot = snapshot;
         Ok(())
     }
     fn advance(&mut self) {
@@ -775,24 +577,15 @@ impl<N> Runtime<N> {
         identity: Identity,
         pipeline: &mut P,
         now: Instant,
-    ) -> Result<RuntimeAction, PersistenceError>
-    where
-        N: PlannedNotification,
-    {
+    ) -> Result<RuntimeAction, PersistenceError> {
         if self.state == RuntimeState::Disabled {
             return Ok(RuntimeAction::Terminal);
         }
-        let Some(notification) = self.current.as_ref() else {
+        let Some(current) = self.current.as_ref() else {
             return Ok(RuntimeAction::None);
         };
-        let plan = match notification.plan().and_then(NotificationPlan::validate) {
-            Ok(value) => value,
-            _ => {
-                self.state = RuntimeState::Disabled;
-                return Ok(RuntimeAction::Terminal);
-            }
-        };
-        let before = store.load(identity)?;
+        let plan = current.plan.clone();
+        let before = self.snapshot.clone();
         if let Some(active) = before.meta.active_finding
             && !plan.reverted.contains(&active.zone)
         {
@@ -817,18 +610,18 @@ impl<N> Runtime<N> {
                 return Ok(RuntimeAction::Terminal);
             }
             if !plan.reverted.is_empty() && !self.current_unwound {
-                self.reorg(store, identity, plan.ancestor)?;
+                self.reorg(store, plan.ancestor)?;
                 self.current_unwound = true;
             }
-            let snapshot = store.load(identity)?;
+            let snapshot = self.snapshot.clone();
             let first = match snapshot.meta.coverage {
                 crate::persistence::Coverage::Gap {
                     first_unchecked, ..
                 } => first_unchecked,
                 crate::persistence::Coverage::Complete => active.zone,
             };
-            store.record_gap(
-                identity,
+            self.snapshot = store.record_gap(
+                &self.snapshot,
                 first,
                 plan.acknowledge,
                 CoverageGapReason::NotCheckedAncestorDivergence,
@@ -840,7 +633,7 @@ impl<N> Runtime<N> {
         // Canonical unwind is always durable before inspecting replacement
         // data. Repeating this after a crash is harmless.
         if !plan.reverted.is_empty() && !self.current_unwound {
-            self.reorg(store, identity, plan.ancestor)?;
+            self.reorg(store, plan.ancestor)?;
             self.current_unwound = true;
         }
         if plan.applied.is_empty() {
@@ -848,7 +641,7 @@ impl<N> Runtime<N> {
             return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
         }
         let coordinates = plan.applied;
-        let snapshot = store.load(identity)?;
+        let snapshot = self.snapshot.clone();
         // A finding may itself be in the unverified gap, so the durable tip
         // need not equal this notification's immediate ancestor. Descendant
         // notifications extend that same gap without touching providers.
@@ -862,8 +655,8 @@ impl<N> Runtime<N> {
                 } => *first_unchecked,
                 crate::persistence::Coverage::Complete => coordinates[0],
             };
-            store.record_gap(
-                identity,
+            self.snapshot = store.record_gap(
+                &self.snapshot,
                 gap_first,
                 plan.acknowledge,
                 CoverageGapReason::NotCheckedAncestorDivergence,
@@ -894,9 +687,8 @@ impl<N> Runtime<N> {
             } if coordinates[first] != *acknowledged_through => {
                 let next = coordinates.get(first + 1).copied().or_else(|| {
                     self.fifo.front().and_then(|next| {
-                        next.plan()
-                            .ok()
-                            .filter(|next_plan| next_plan.ancestor == plan.acknowledge)
+                        (next.plan.ancestor == plan.acknowledge)
+                            .then_some(&next.plan)
                             .and_then(|next_plan| next_plan.applied.first().copied())
                     })
                 });
@@ -917,9 +709,11 @@ impl<N> Runtime<N> {
             ));
         }
         let block = match pipeline.authenticate_at(
-            self.current
+            &self
+                .current
                 .as_ref()
-                .expect("current notification retained"),
+                .expect("current notification retained")
+                .notification,
             first,
             &snapshot.state,
         ) {
@@ -942,11 +736,7 @@ impl<N> Runtime<N> {
                     let mut last = *coordinates.last().unwrap();
                     let mut previous = plan.acknowledge;
                     for queued in &self.fifo {
-                        let queued = queued.plan().and_then(NotificationPlan::validate);
-                        let Ok(queued) = queued else {
-                            self.state = RuntimeState::Disabled;
-                            return Ok(RuntimeAction::Terminal);
-                        };
+                        let queued = &queued.plan;
                         if !queued.reverted.is_empty()
                             || queued.applied.is_empty()
                             || queued.ancestor != previous
@@ -961,7 +751,7 @@ impl<N> Runtime<N> {
                         crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
                         crate::persistence::Coverage::Complete => f.gap_reason,
                     };
-                    store.record_gap(identity, first, last, reason)?;
+                    self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
                     self.state = RuntimeState::Disabled;
                     self.current = None;
                     self.fifo.clear();
@@ -973,39 +763,22 @@ impl<N> Runtime<N> {
             Err(failure) if failure.class == FailureClass::AuthenticatedDivergence => {
                 let zone = coordinates[first];
                 let last = *coordinates.last().unwrap();
-                let snapshot = store.load(identity)?;
+                let snapshot = self.snapshot.clone();
                 let typed = failure.finding.ok_or_else(|| {
                     PersistenceError::Invalid(
                         "authenticated divergence missing typed finding".into(),
                     )
                 })?;
-                let (category, code, location, operation, expected, actual) = finding_parts(&typed);
-                let (evidence_len, digest) = evidence_identity(&expected, &actual)?;
-                let key = FindingKey {
+                let (key, finding) = make_finding(
                     zone,
-                    operation,
-                    code,
-                };
-                store.record_finding(
-                    identity,
-                    key,
-                    Finding {
-                        zone,
-                        parent: snapshot.meta.verified_zone_tip,
-                        imported_tempo: None,
-                        category,
-                        code,
-                        location,
-                        operation,
-                        expected,
-                        actual,
-                        evidence_len,
-                        evidence_digest: digest,
-                        summary: failure.message,
-                    },
+                    snapshot.meta.verified_zone_tip,
+                    None,
+                    *typed,
+                    failure.message,
                 )?;
-                store.record_gap(
-                    identity,
+                self.snapshot = store.record_finding(&self.snapshot, key, finding)?;
+                self.snapshot = store.record_gap(
+                    &self.snapshot,
                     zone,
                     last,
                     CoverageGapReason::NotCheckedAncestorDivergence,
@@ -1021,8 +794,8 @@ impl<N> Runtime<N> {
         };
         self.retry = None;
         if block.zone != coordinates[first] {
-            store.record_gap(
-                identity,
+            self.snapshot = store.record_gap(
+                &self.snapshot,
                 coordinates[first],
                 *coordinates.last().unwrap(),
                 CoverageGapReason::MissingReceipts,
@@ -1036,7 +809,7 @@ impl<N> Runtime<N> {
             .last()
             .expect("validated nonempty applied fragment");
         for block in std::slice::from_ref(&block) {
-            let snapshot = store.load(identity)?;
+            let snapshot = self.snapshot.clone();
             if snapshot.meta.active_finding.is_some() {
                 let first = match snapshot.meta.coverage {
                     crate::persistence::Coverage::Gap {
@@ -1044,8 +817,8 @@ impl<N> Runtime<N> {
                     } => first_unchecked,
                     crate::persistence::Coverage::Complete => block.zone,
                 };
-                store.record_gap(
-                    identity,
+                self.snapshot = store.record_gap(
+                    &self.snapshot,
                     first,
                     suffix_end,
                     CoverageGapReason::NotCheckedAncestorDivergence,
@@ -1054,9 +827,9 @@ impl<N> Runtime<N> {
                 break;
             }
             if let Err(failure) = validate_creation_coordinate(identity, &snapshot.state, block) {
-                self.persist_divergence(store, identity, block, failure)?;
-                store.record_gap(
-                    identity,
+                self.persist_divergence(store, block, failure)?;
+                self.snapshot = store.record_gap(
+                    &self.snapshot,
                     block.zone,
                     suffix_end,
                     CoverageGapReason::NotCheckedAncestorDivergence,
@@ -1071,7 +844,6 @@ impl<N> Runtime<N> {
                 Err(error) => {
                     self.persist_divergence(
                         store,
-                        identity,
                         block,
                         typed_failure(
                             ViolationCategory::Invariant,
@@ -1082,8 +854,8 @@ impl<N> Runtime<N> {
                             error.to_string(),
                         ),
                     )?;
-                    store.record_gap(
-                        identity,
+                    self.snapshot = store.record_gap(
+                        &self.snapshot,
                         block.zone,
                         suffix_end,
                         CoverageGapReason::NotCheckedAncestorDivergence,
@@ -1092,11 +864,11 @@ impl<N> Runtime<N> {
                     break;
                 }
             };
-            if let Err(failure) = pipeline.compare(block, &candidate) {
+            if let Err(failure) = compare_authenticated(block, &candidate) {
                 if failure.class == FailureClass::AuthenticatedDivergence {
-                    self.persist_divergence(store, identity, block, failure)?;
-                    store.record_gap(
-                        identity,
+                    self.persist_divergence(store, block, failure)?;
+                    self.snapshot = store.record_gap(
+                        &self.snapshot,
                         block.zone,
                         suffix_end,
                         CoverageGapReason::NotCheckedAncestorDivergence,
@@ -1104,7 +876,8 @@ impl<N> Runtime<N> {
                     self.state = RuntimeState::Alerting;
                 } else {
                     let first = block.zone;
-                    store.record_gap(identity, first, suffix_end, failure.gap_reason)?;
+                    self.snapshot =
+                        store.record_gap(&self.snapshot, first, suffix_end, failure.gap_reason)?;
                     self.state = RuntimeState::Disabled;
                 }
                 break;
@@ -1146,8 +919,8 @@ impl<N> Runtime<N> {
                     ..
                 } => *acknowledged_through,
             };
-            store.apply(
-                identity,
+            self.snapshot = store.apply(
+                &self.snapshot,
                 JournalEntry {
                     zone: block.zone,
                     parent: block.parent,
@@ -1163,7 +936,7 @@ impl<N> Runtime<N> {
             }
         }
         // Persistence above is the commit point; only now may the caller ack.
-        let ready = store.load(identity)?.meta.acknowledged_zone_tip;
+        let ready = self.snapshot.meta.acknowledged_zone_tip;
         if first + 1 == coordinates.len()
             || matches!(self.state, RuntimeState::Alerting | RuntimeState::Disabled)
         {
@@ -1182,101 +955,24 @@ impl<N> Runtime<N> {
     }
 
     fn persist_divergence(
-        &self,
+        &mut self,
         store: &Persistence,
-        identity: Identity,
         block: &AuthenticatedBlock,
         failure: Failure,
     ) -> Result<(), PersistenceError> {
         let typed = failure.finding.ok_or_else(|| {
             PersistenceError::Invalid("authenticated divergence missing typed finding".into())
         })?;
-        let (category, code, location, operation, expected, actual) = finding_parts(&typed);
-        let (evidence_len, evidence_digest) = evidence_identity(&expected, &actual)?;
-        let key = FindingKey {
-            zone: block.zone,
-            operation,
-            code,
-        };
-        store.record_finding(
-            identity,
-            key,
-            Finding {
-                zone: block.zone,
-                parent: block.parent,
-                imported_tempo: Some(block.tempo),
-                category,
-                code,
-                location,
-                operation,
-                expected,
-                actual,
-                evidence_len,
-                evidence_digest,
-                summary: failure.message,
-            },
+        let (key, finding) = make_finding(
+            block.zone,
+            block.parent,
+            Some((block.tempo, block.tempo_parent)),
+            *typed,
+            failure.message,
         )?;
+        self.snapshot = store.record_finding(&self.snapshot, key, finding)?;
         Ok(())
     }
-}
-
-fn finding_parts(finding: &CompactFinding) -> (u16, u16, u16, u32, Vec<u8>, Vec<u8>) {
-    let category = match finding.category {
-        ViolationCategory::Authentication => 1,
-        ViolationCategory::EffectMismatch => 2,
-        ViolationCategory::StateMismatch => 3,
-        ViolationCategory::Invariant => 4,
-        ViolationCategory::Unsupported => 5,
-        ViolationCategory::Observation => 6,
-        ViolationCategory::Continuity => 7,
-        ViolationCategory::CreationAnchor => 8,
-        ViolationCategory::SupplyMismatch => 9,
-        ViolationCategory::CollateralMismatch => 10,
-    };
-    let (location, operation) = match &finding.location {
-        None => (0, 0),
-        Some(FindingLocation::Block) => (1, 0),
-        Some(FindingLocation::Operation(op)) => (2, *op),
-        Some(FindingLocation::ImportedOperation(op)) => (3, *op),
-        Some(FindingLocation::State(_)) => (4, 0),
-    };
-    (
-        category,
-        finding.code,
-        location,
-        operation,
-        finding
-            .expected
-            .as_ref()
-            .map(FindingData::canonical_bytes)
-            .unwrap_or_default(),
-        finding
-            .actual
-            .as_ref()
-            .map(FindingData::canonical_bytes)
-            .unwrap_or_default(),
-    )
-}
-
-fn evidence_identity(expected: &[u8], actual: &[u8]) -> Result<(u32, B256), PersistenceError> {
-    let mut bytes = Vec::with_capacity(8 + expected.len() + actual.len());
-    bytes.extend(
-        u32::try_from(expected.len())
-            .map_err(|_| PersistenceError::Invalid("expected evidence too large".into()))?
-            .to_be_bytes(),
-    );
-    bytes.extend(expected);
-    bytes.extend(
-        u32::try_from(actual.len())
-            .map_err(|_| PersistenceError::Invalid("actual evidence too large".into()))?
-            .to_be_bytes(),
-    );
-    bytes.extend(actual);
-    Ok((
-        u32::try_from(bytes.len())
-            .map_err(|_| PersistenceError::Invalid("evidence too large".into()))?,
-        alloy_primitives::keccak256(bytes),
-    ))
 }
 
 /// Locally derives identity and replays every block through the exact same
@@ -1299,7 +995,7 @@ pub(crate) fn build_checkpoint<N: PlannedNotification, P: ObservationPipeline<N>
     pipeline: &mut P,
 ) -> Result<Snapshot, PersistenceError> {
     let target = config.path.to_path_buf();
-    if target.exists() && !directory_is_empty(&target)? {
+    if target.exists() {
         return Err(PersistenceError::Invalid(
             "checkpoint target is unrelated nonempty state".into(),
         ));
@@ -1327,11 +1023,6 @@ pub(crate) fn build_checkpoint<N: PlannedNotification, P: ObservationPipeline<N>
         Ok(snapshot) => {
             // MDBX handles were dropped by `build_checkpoint_in_place`; only a
             // fully reopened and validated image reaches this publication point.
-            if target.exists() {
-                fs::remove_dir(&target).map_err(|error| {
-                    PersistenceError::Invalid(format!("cannot replace empty target: {error}"))
-                })?;
-            }
             if let Err(error) = fs::rename(&staging, &target) {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(PersistenceError::Invalid(format!(
@@ -1354,7 +1045,7 @@ pub(crate) fn publish_genesis_checkpoint(
     state: State,
 ) -> Result<Snapshot, PersistenceError> {
     let target = config.path.to_path_buf();
-    if target.exists() && !directory_is_empty(&target)? {
+    if target.exists() {
         return Err(PersistenceError::Invalid(
             "checkpoint target is unrelated nonempty state".into(),
         ));
@@ -1392,11 +1083,6 @@ pub(crate) fn publish_genesis_checkpoint(
     })();
     match result {
         Ok(snapshot) => {
-            if target.exists() {
-                fs::remove_dir(&target).map_err(|error| {
-                    PersistenceError::Invalid(format!("cannot replace empty target: {error}"))
-                })?;
-            }
             fs::rename(&staging, &target).map_err(|error| {
                 let _ = fs::remove_dir_all(&staging);
                 PersistenceError::Invalid(format!("cannot atomically publish checkpoint: {error}"))
@@ -1408,15 +1094,6 @@ pub(crate) fn publish_genesis_checkpoint(
             Err(error)
         }
     }
-}
-
-fn directory_is_empty(path: &Path) -> Result<bool, PersistenceError> {
-    if !path.is_dir() {
-        return Ok(false);
-    }
-    fs::read_dir(path)
-        .map_err(|error| PersistenceError::Invalid(format!("cannot inspect target: {error}")))
-        .map(|mut entries| entries.next().is_none())
 }
 
 fn staging_path(target: &Path) -> Result<PathBuf, PersistenceError> {
@@ -1466,7 +1143,7 @@ fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
             .and_then(NotificationPlan::validate)
             .map_err(|f| PersistenceError::Invalid(format!("local replay plan: {}", f.message)))?;
         if !plan.reverted.is_empty() {
-            snapshot = store.reorg(identity, plan.ancestor)?;
+            snapshot = store.reorg(&snapshot, plan.ancestor)?;
         }
         for index in 0..plan.applied.len() {
             let block = pipeline
@@ -1480,11 +1157,11 @@ fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
                 &block.zone_facts,
             )
             .map_err(|e| PersistenceError::Invalid(e.to_string()))?;
-            pipeline.compare(&block, &candidate).map_err(|f| {
+            compare_authenticated(&block, &candidate).map_err(|f| {
                 PersistenceError::Invalid(format!("local replay comparison: {}", f.message))
             })?;
             snapshot = store.apply(
-                identity,
+                &snapshot,
                 JournalEntry {
                     zone: block.zone,
                     parent: block.parent,
@@ -1499,14 +1176,7 @@ fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
     }
     validate(&snapshot.state)
         .map_err(|e| PersistenceError::Invalid(format!("replay invariant {e:?}")))?;
-    let completed = store.checkpoint(
-        identity,
-        ChainCut {
-            zone: snapshot.meta.verified_zone_tip,
-            tempo: snapshot.meta.imported_tempo_tip,
-        },
-        snapshot.state,
-    )?;
+    let completed = store.checkpoint_current(&snapshot)?;
     drop(store);
     // A successful build is not publishable until an independent open has
     // replayed the journal and rerun all persistence/kernel invariants.
@@ -1523,15 +1193,10 @@ fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU64;
 
     #[test]
     fn observation_projection_omits_only_unavailable_carrier_ids() {
-        let processed = ExpectedEffect::UserWithdrawalProcessed {
-            id: WithdrawalId {
-                zone_id: 7,
-                index: 99,
-            },
+        let processed = Effect::UserWithdrawalProcessed {
             to: Address::repeat_byte(1),
             sender_tag: B256::repeat_byte(2),
             token: Address::repeat_byte(3),
@@ -1539,8 +1204,8 @@ mod tests {
             callback_success: true,
         };
         assert_eq!(
-            ObservedEffect::from(&processed),
-            ObservedEffect::UserWithdrawalProcessed {
+            processed,
+            Effect::UserWithdrawalProcessed {
                 to: Address::repeat_byte(1),
                 sender_tag: B256::repeat_byte(2),
                 token: Address::repeat_byte(3),
@@ -1549,11 +1214,7 @@ mod tests {
             }
         );
 
-        let refund = |number| ExpectedEffect::FailedDepositRefunded {
-            deposit: DepositId {
-                portal: Address::repeat_byte(5),
-                number: NonZeroU64::new(number).unwrap(),
-            },
+        let refund = |_number| Effect::FailedDepositRefunded {
             recipient: Address::repeat_byte(6),
             token: Address::repeat_byte(7),
             amount: 8,
@@ -1561,31 +1222,51 @@ mod tests {
             pending: false,
         };
         assert_eq!(
-            ObservedEffect::from(&refund(1)),
-            ObservedEffect::from(&refund(42)),
+            refund(1),
+            refund(42),
             "DepositBounceBack has no DepositId carrier"
         );
 
-        let mut mutated = ObservedEffect::from(&processed);
-        let ObservedEffect::UserWithdrawalProcessed { amount, .. } = &mut mutated else {
+        let mut mutated = processed.clone();
+        let Effect::UserWithdrawalProcessed { amount, .. } = &mut mutated else {
             unreachable!()
         };
         *amount += 1;
-        assert_ne!(mutated, ObservedEffect::from(&processed));
+        assert_ne!(mutated, processed);
     }
 
     #[test]
     fn bounded_fifo_keeps_one_current_and_order() {
-        let mut runtime = Runtime::new(2, RetryBudget::new(1, Duration::ZERO));
+        let (_directory, store) = crate::tests::create();
+        let mut runtime = Runtime::new(
+            store.load().unwrap(),
+            2,
+            RetryBudget::new(1, Duration::ZERO),
+        );
         assert_eq!(runtime.state(), RuntimeState::Starting);
-        assert!(runtime.push(1).is_ok());
-        assert!(runtime.push(2).is_ok());
-        assert!(runtime.push(3).is_ok());
-        assert_eq!(runtime.push(4), Err(4));
+        let plan = NotificationPlan {
+            reverted: vec![],
+            ancestor: BlockNumHash {
+                number: 0,
+                hash: B256::ZERO,
+            },
+            applied: vec![BlockNumHash {
+                number: 1,
+                hash: B256::repeat_byte(1),
+            }],
+            acknowledge: BlockNumHash {
+                number: 1,
+                hash: B256::repeat_byte(1),
+            },
+        };
+        assert!(runtime.enqueue(1, plan.clone()).is_ok());
+        assert!(runtime.enqueue(2, plan.clone()).is_ok());
+        assert!(runtime.enqueue(3, plan.clone()).is_ok());
+        assert_eq!(runtime.enqueue(4, plan), Err(4));
         runtime.advance();
-        assert_eq!(runtime.current, Some(2));
+        assert_eq!(runtime.current(), Some(&2));
         runtime.advance();
-        assert_eq!(runtime.current, Some(3));
+        assert_eq!(runtime.current(), Some(&3));
     }
     #[test]
     fn attempt_and_elapsed_budgets_are_both_terminal() {

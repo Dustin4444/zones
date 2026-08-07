@@ -37,10 +37,10 @@ pub(crate) const ZONE_FACTORY_ADDRESS: Address =
 /// Pinned source: `crates/precompiles/src/outbox/mod.rs:32`.
 pub(crate) const MAX_CALLBACK_DATA_SIZE: usize = 1_024;
 
-/// Maximum deposits imported from one Tempo block.
+/// Maximum deposits that may remain unprocessed in a Portal queue.
 ///
 /// Pinned source: `specs/ref-impls/src/tempo/ZonePortal.sol:62`.
-pub(crate) const MAX_DEPOSITS_PER_TEMPO_BLOCK: usize = 230;
+pub(crate) const MAX_UNPROCESSED_DEPOSITS: usize = 230;
 
 /// Maximum token enablements imported from one Tempo block.
 ///
@@ -117,7 +117,7 @@ mod tests {
             address!("5af2000000000000000000000000000000000000")
         );
         assert_eq!(MAX_CALLBACK_DATA_SIZE, 1_024);
-        assert_eq!(MAX_DEPOSITS_PER_TEMPO_BLOCK, 230);
+        assert_eq!(MAX_UNPROCESSED_DEPOSITS, 230);
         assert_eq!(MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, 8);
         assert_eq!(MAX_TOKEN_NAME_BYTES, 64);
         assert_eq!(MAX_TOKEN_SYMBOL_BYTES, 31);

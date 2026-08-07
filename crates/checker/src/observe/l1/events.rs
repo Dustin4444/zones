@@ -6,7 +6,7 @@ use tempo_alloy::rpc::TempoTransactionReceipt;
 
 use crate::protocol::events::{L1ProtocolEvent, PortalModelEvent, classify_l1_protocol_event};
 
-use super::{L1EventPosition, OrderedL1Outcome};
+use super::OrderedL1Outcome;
 use crate::observe::error::{ObservationError, PortalCallError, PortalCallFamily, ProtocolChain};
 
 pub(super) struct PendingTransaction {
@@ -35,12 +35,7 @@ pub(super) fn ordered_transactions(
         let mut required_call = None;
         let mut outcomes = Vec::new();
         for (receipt_log_index, log) in receipt.logs().iter().enumerate() {
-            let position = L1EventPosition {
-                transaction_index,
-                receipt_log_index,
-                block_log_index,
-                transaction_hash: *transaction_hash,
-            };
+            let log_index = block_log_index;
             block_log_index += 1;
 
             let Some(event) = classify_l1_protocol_event(portal, &log.inner).map_err(|error| {
@@ -48,7 +43,7 @@ pub(super) fn ordered_transactions(
                     ProtocolChain::TempoL1,
                     transaction_index,
                     receipt_log_index,
-                    position.block_log_index,
+                    log_index,
                     *transaction_hash,
                     error,
                 )
@@ -65,7 +60,7 @@ pub(super) fn ordered_transactions(
                 call_requirement(&event),
                 *transaction_hash,
             )?;
-            outcomes.push(OrderedL1Outcome { position, event });
+            outcomes.push(OrderedL1Outcome { event });
         }
 
         if !outcomes.is_empty() {

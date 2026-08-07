@@ -51,6 +51,7 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
         portal_creation_block_hash: provisioned.portal_creation_block_hash,
         zone_id: provisioned.zone_id,
         database_path: Some(path.clone()),
+        acquisition_timeout: Duration::from_secs(30),
     };
 
     // Build the identity-bound bootstrap checkpoint from a local Zone provider.

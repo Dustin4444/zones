@@ -6,7 +6,7 @@ use std::{
 };
 
 use alloy_consensus::BlockHeader as _;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use futures::TryStreamExt;
 use reth_chainspec::EthChainSpec as _;
@@ -17,19 +17,19 @@ use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
-use zone_checker_kernel::{State, StateKey, StateValue, TokenPhase, apply_imported, apply_zone};
+use zone_checker_kernel::{State, StateKey, StateValue, TokenPhase, apply_imported};
 
 use crate::{
     CheckerConfig,
     adapter::{PreauthenticatedObservation, adapt},
     observe::{
         AcquisitionError, ExactStateLookup, ObservationError, acquire_portal_collateral,
-        acquire_zone_post_state, observe_l1, observe_l2_block_with_context,
+        acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
     persistence::{BlockNumHash, CoverageGapReason, Identity, Persistence},
     runtime::{
         AuthenticatedBlock, Failure, FailureClass, NotificationPlan, ObservationPipeline,
-        PlannedNotification, RetryBudget, Runtime, RuntimeAction, compare_authenticated,
+        PlannedNotification, RetryBudget, Runtime, RuntimeAction,
     },
 };
 
@@ -49,6 +49,47 @@ fn observation_failure(error: ObservationError) -> Failure {
             FailureClass::AuthenticatedDivergence
         }
     };
+    let finding = match &error {
+        ObservationError::MalformedAuthenticatedData {
+            transaction,
+            evidence,
+            ..
+        } => Some(Box::new(zone_checker_kernel::Finding {
+            category: zone_checker_kernel::ViolationCategory::Observation,
+            code: 110,
+            location: Some(zone_checker_kernel::FindingLocation::Operation(
+                transaction.transaction_index() as u32,
+            )),
+            expected: None,
+            actual: Some(zone_checker_kernel::FindingData::Bytes {
+                length: evidence.length(),
+                digest: evidence.digest(),
+            }),
+        })),
+        ObservationError::InvalidEnvelope { .. } => Some(Box::new(zone_checker_kernel::Finding {
+            category: zone_checker_kernel::ViolationCategory::Observation,
+            code: 120,
+            location: Some(zone_checker_kernel::FindingLocation::Block),
+            expected: None,
+            actual: Some(zone_checker_kernel::FindingData::Code(120)),
+        })),
+        ObservationError::ProtocolEvent {
+            transaction_index, ..
+        } => Some(Box::new(zone_checker_kernel::Finding {
+            category: zone_checker_kernel::ViolationCategory::Observation,
+            code: 130,
+            location: Some(zone_checker_kernel::FindingLocation::Operation(
+                *transaction_index as u32,
+            )),
+            expected: None,
+            actual: Some(zone_checker_kernel::FindingData::Code(130)),
+        })),
+        ObservationError::PortalCall(_) => Some(Box::new(kernel_failure(
+            140,
+            zone_checker_kernel::ViolationCategory::Observation,
+        ))),
+        ObservationError::Acquisition(_) => None,
+    };
     Failure {
         class,
         gap_reason: match class {
@@ -60,15 +101,7 @@ fn observation_failure(error: ObservationError) -> Failure {
             FailureClass::ImmediateTerminal => CoverageGapReason::Other(2),
         },
         message: error.to_string(),
-        finding: (class == FailureClass::AuthenticatedDivergence).then_some(Box::new(
-            zone_checker_kernel::Finding {
-                category: zone_checker_kernel::ViolationCategory::Observation,
-                code: 1,
-                location: Some(zone_checker_kernel::FindingLocation::Block),
-                expected: None,
-                actual: Some(zone_checker_kernel::FindingData::Code(1)),
-            },
-        )),
+        finding,
     }
 }
 
@@ -147,13 +180,12 @@ fn plan(
         hash: first.parent_hash(),
     };
     let acknowledge = applied.last().copied().unwrap_or(ancestor);
-    NotificationPlan {
+    Ok(NotificationPlan {
         reverted,
         ancestor,
         applied,
         acknowledge,
-    }
-    .validate()
+    })
 }
 
 pub(crate) struct NotificationFragments<'a> {
@@ -167,7 +199,7 @@ pub(crate) fn fragments(
         ExExNotification::ChainCommitted { new } => (Some(new), new, "committed"),
         ExExNotification::ChainReverted { old } => (None, old, "reverted"),
         ExExNotification::ChainReorged { old, new } => {
-            notification.plan()?;
+            notification.plan().and_then(NotificationPlan::validate)?;
             let _ = old;
             (Some(new), new, "replacement")
         }
@@ -227,10 +259,10 @@ where
         .collect();
     let l2 = observe_l2_block_with_context(block.as_ref(), &receipts)
         .map_err(|failure| observation_failure(failure.into_parts().0))?;
-    let imported_header = l2.inputs().advance_tempo().imported_header();
-    let l1 = observe_l1(
+    let imported_headers = l2.inputs().advance_tempo().imported_headers();
+    let l1 = observe_l1_range(
         l1_provider,
-        imported_header,
+        imported_headers,
         parent
             .rows()
             .values()
@@ -260,7 +292,6 @@ where
     let state = acquire_zone_post_state(zone_state, block.hash(), &supplies)
         .map_err(|error| observation_failure(error.into()))?;
 
-    let l1 = l1.into_observation();
     let observation = PreauthenticatedObservation {
         l2,
         l1,
@@ -299,8 +330,16 @@ where
         let balance = acquire_portal_collateral(
             l1_provider,
             token,
-            observation.l1.portal_address(),
-            observation.l1.block_hash(),
+            observation
+                .l1
+                .last()
+                .expect("nonempty imported range")
+                .portal_address(),
+            observation
+                .l1
+                .last()
+                .expect("nonempty imported range")
+                .block_hash(),
         )
         .await
         .map_err(|error| observation_failure(error.into()))?;
@@ -308,30 +347,25 @@ where
             .collateral()
             .is_none_or(|required| balance < required)
         {
+            let required = accounting.collateral().unwrap_or(U256::ZERO);
             return Err(Failure {
                 class: FailureClass::AuthenticatedDivergence,
                 gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
                 message: "imported-cut collateral is insufficient".into(),
-                finding: Some(Box::new(kernel_failure(
-                    4,
-                    zone_checker_kernel::ViolationCategory::CollateralMismatch,
-                ))),
+                finding: Some(Box::new(zone_checker_kernel::Finding {
+                    category: zone_checker_kernel::ViolationCategory::CollateralMismatch,
+                    code: 4,
+                    location: Some(zone_checker_kernel::FindingLocation::State(
+                        zone_checker_kernel::StateKey::Token(token),
+                    )),
+                    expected: Some(zone_checker_kernel::FindingData::U256(required)),
+                    actual: Some(zone_checker_kernel::FindingData::U256(balance)),
+                })),
             });
         }
         collateral.insert(token, balance);
     }
-    let candidate =
-        apply_zone(imported_candidate, &result.zone_facts).map_err(|error| Failure {
-            class: FailureClass::AuthenticatedDivergence,
-            gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
-            message: error.to_string(),
-            finding: Some(Box::new(kernel_failure(
-                5,
-                zone_checker_kernel::ViolationCategory::Invariant,
-            ))),
-        })?;
     result.outputs.collateral = collateral;
-    compare_authenticated(&result, &candidate)?;
     Ok(result)
 }
 
@@ -372,14 +406,6 @@ impl ObservationPipeline<ExExNotification<TempoPrimitives>> for PreparedPipeline
                 })
             })
     }
-
-    fn compare(
-        &mut self,
-        block: &AuthenticatedBlock,
-        expected: &zone_checker_kernel::Candidate,
-    ) -> Result<(), Failure> {
-        compare_authenticated(block, expected)
-    }
 }
 
 /// Concrete one-loop checker ExEx runtime. It opens only an already complete
@@ -390,6 +416,10 @@ where
     Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
+    eyre::ensure!(
+        !config.acquisition_timeout.is_zero(),
+        "checker acquisition timeout must be nonzero"
+    );
     let path = config
         .database_path
         .as_deref()
@@ -413,12 +443,12 @@ where
     // at the verified cut so a durable gap can be reconstructed and closed.
     ctx.catch_up_notifications_with_head(ExExHead::new(num_hash(snapshot.meta.verified_zone_tip)))?;
 
-    let mut runtime = Runtime::new(32, RetryBudget::new(20, Duration::from_secs(30)));
+    let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
     let mut prepared = PreparedPipeline { block: None };
     let mut retry_at: Option<Instant> = None;
 
     loop {
-        if let Some(index) = runtime.next_applied_index(&store, identity)?
+        if let Some(index) = runtime.next_applied_index(&store)?
             && prepared.block.is_none()
         {
             let parts = fragments(
@@ -432,7 +462,7 @@ where
                 .ok_or_else(|| eyre::eyre!("missing applied fragment"))?;
             let chain = chain.clone();
             let provider = ctx.provider().clone();
-            let parent = store.load(identity)?.state;
+            let parent = runtime.snapshot().state.clone();
             let acquisition = acquire_applied_at(
                 &chain,
                 index,
@@ -443,7 +473,7 @@ where
                 config.zone_id,
             );
             tokio::pin!(acquisition);
-            let timeout = tokio::time::sleep(Duration::from_secs(2));
+            let timeout = tokio::time::sleep(config.acquisition_timeout);
             tokio::pin!(timeout);
             let acquired = loop {
                 tokio::select! {
@@ -459,7 +489,6 @@ where
                     next = ctx.notifications.try_next() => match next {
                         Ok(Some(notification)) => match runtime.push_or_record_overflow(
                             &store,
-                            identity,
                             notification,
                         )? {
                             RuntimeAction::None => {}
@@ -482,7 +511,6 @@ where
                             record_local_canonical_suffix(
                                 &mut runtime,
                                 &store,
-                                identity,
                                 &provider,
                             )?;
                             eyre::bail!("checker notification stream unavailable");
@@ -525,7 +553,7 @@ where
         };
         match next {
             Ok(Some(notification)) => {
-                match runtime.push_or_record_overflow(&store, identity, notification)? {
+                match runtime.push_or_record_overflow(&store, notification)? {
                     RuntimeAction::Acknowledge(height) => {
                         ctx.send_finished_height(num_hash(height))?;
                     }
@@ -541,7 +569,7 @@ where
                 }
             }
             Ok(None) | Err(_) => {
-                record_local_canonical_suffix(&mut runtime, &store, identity, ctx.provider())?;
+                record_local_canonical_suffix(&mut runtime, &store, ctx.provider())?;
                 eyre::bail!("checker notification stream unavailable");
             }
         }
@@ -570,10 +598,9 @@ const fn num_hash(value: BlockNumHash) -> alloy_eips::BlockNumHash {
 fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
     runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
     store: &Persistence,
-    identity: Identity,
     provider: &P,
 ) -> eyre::Result<()> {
-    let tip = store.load(identity)?.meta.verified_zone_tip;
+    let tip = runtime.snapshot().meta.verified_zone_tip;
     let head = provider.best_block_number()?;
     if head <= tip.number {
         eyre::bail!("notification stream failed without a reconstructable unchecked suffix");
@@ -586,7 +613,7 @@ fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
         suffix.push(BlockNumHash { number, hash });
     }
     if let RuntimeAction::AcknowledgeAndTerminate(_) =
-        runtime.record_stream_failure(store, identity, &suffix)?
+        runtime.record_stream_failure(store, &suffix)?
     {
         // Stream failure has no functioning acknowledgement path. The durable
         // watermark is intentionally retained for startup resend.

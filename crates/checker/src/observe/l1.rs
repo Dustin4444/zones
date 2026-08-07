@@ -27,50 +27,13 @@ pub(crate) use collateral::acquire_portal_collateral;
 #[cfg(test)]
 mod tests;
 
-/// Canonical coordinates retained for every model-driving L1 log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct L1EventPosition {
-    transaction_index: usize,
-    receipt_log_index: usize,
-    block_log_index: usize,
-    transaction_hash: B256,
-}
-
-impl L1EventPosition {
-    #[cfg(test)]
-    pub(crate) fn transaction_index(&self) -> usize {
-        self.transaction_index
-    }
-
-    #[cfg(test)]
-    pub(crate) fn receipt_log_index(&self) -> usize {
-        self.receipt_log_index
-    }
-
-    #[cfg(test)]
-    pub(crate) fn block_log_index(&self) -> usize {
-        self.block_log_index
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transaction_hash(&self) -> B256 {
-        self.transaction_hash
-    }
-}
-
 /// One strictly decoded implementation outcome in canonical block order.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OrderedL1Outcome {
-    position: L1EventPosition,
     event: L1ProtocolEvent,
 }
 
 impl OrderedL1Outcome {
-    #[cfg(test)]
-    pub(crate) fn position(&self) -> L1EventPosition {
-        self.position
-    }
-
     pub(crate) fn event(&self) -> &L1ProtocolEvent {
         &self.event
     }
@@ -115,23 +78,6 @@ pub(crate) struct L1BlockObservation {
     protocol_transactions: Vec<L1TransactionObservation>,
 }
 
-/// Authenticated L1 block data.
-#[derive(Debug)]
-pub(crate) struct L1BlockAcquisition {
-    observation: L1BlockObservation,
-}
-
-impl L1BlockAcquisition {
-    #[cfg(test)]
-    pub(crate) const fn observation(&self) -> &L1BlockObservation {
-        &self.observation
-    }
-
-    pub(crate) fn into_observation(self) -> L1BlockObservation {
-        self.observation
-    }
-}
-
 impl L1BlockObservation {
     pub(crate) fn block_number(&self) -> u64 {
         self.block_number
@@ -159,7 +105,7 @@ pub(crate) async fn observe_l1<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
     portal: Address,
-) -> Result<L1BlockAcquisition, ObservationError>
+) -> Result<L1BlockObservation, ObservationError>
 where
     P: Provider<TempoNetwork>,
 {
@@ -196,12 +142,26 @@ where
         });
     }
 
-    Ok(L1BlockAcquisition {
-        observation: L1BlockObservation {
-            block_number: imported.number(),
-            block_hash: imported.hash(),
-            portal_address: portal,
-            protocol_transactions,
-        },
+    Ok(L1BlockObservation {
+        block_number: imported.number(),
+        block_hash: imported.hash(),
+        portal_address: portal,
+        protocol_transactions,
     })
+}
+
+/// Authenticate every imported Tempo block independently, preserving import order.
+pub(crate) async fn observe_l1_range<P>(
+    provider: &P,
+    imported: &[ImportedTempoHeader],
+    portal: Address,
+) -> Result<Vec<L1BlockObservation>, ObservationError>
+where
+    P: Provider<TempoNetwork>,
+{
+    let mut observations = Vec::with_capacity(imported.len());
+    for header in imported {
+        observations.push(observe_l1(provider, header, portal).await?);
+    }
+    Ok(observations)
 }

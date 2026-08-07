@@ -5,10 +5,10 @@ use alloy_primitives::{Address, U256};
 use crate::{
     commitments::{
         NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL, bounceback_deposit_hash,
-        bounceback_fee, ordinary_deposit_hash, portal_address, sender_tag, withdrawal_fee,
-        withdrawal_hash, withdrawal_queue_hash,
+        bounceback_fee, failed_deposit_sender_tag, ordinary_deposit_hash, portal_address,
+        sender_tag, withdrawal_fee, withdrawal_hash, withdrawal_queue_hash,
     },
-    effects::{ExpectedEffect, ExpectedState},
+    effects::{Effect, ExpectedState},
     facts::{
         BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, Finalization, ImportedFacts,
         ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, WithdrawalOutcome,
@@ -71,7 +71,7 @@ pub enum ModelError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedCandidate {
     state: State,
-    effects: Vec<ExpectedEffect>,
+    effects: Vec<Effect>,
     delta: StateDelta,
     token_enables: Vec<TokenEnable>,
     block_hash: alloy_primitives::B256,
@@ -86,7 +86,7 @@ impl ImportedCandidate {
     }
 
     /// Effects independently predicted from the imported block alone.
-    pub fn expected_effects(&self) -> &[ExpectedEffect] {
+    pub fn expected_effects(&self) -> &[Effect] {
         &self.effects
     }
 
@@ -100,7 +100,7 @@ impl ImportedCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub delta: StateDelta,
-    pub expected_effects: Vec<ExpectedEffect>,
+    pub expected_effects: Vec<Effect>,
     pub expected_state: ExpectedState,
     /// Exact accounting for every token in the resulting overlay, including
     /// unchanged token rows which therefore do not occur in `delta`.
@@ -208,7 +208,7 @@ pub fn apply_imported(
                 submit_batch(&mut overlay, input, &mut effects)?
             }
             ImportedOperation::ProcessWithdrawals(input) => {
-                process_withdrawals(&mut overlay, input, facts.base_fee, &mut effects)?
+                process_withdrawals(&mut overlay, input, input.base_fee, &mut effects)?
             }
             ImportedOperation::ClaimPortalRefund(input) => {
                 claim_refund(&mut overlay, *input, true, &mut effects)?
@@ -246,7 +246,7 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
             StateKey::Token(enable.token),
             Some(StateValue::Token(token)),
         );
-        effects.push(ExpectedEffect::TokenEnabled {
+        effects.push(Effect::TokenEnabled {
             token: enable.token,
             name: enable.name.clone(),
             symbol: enable.symbol.clone(),
@@ -255,6 +255,11 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
     }
     for (deposit, outcome) in facts.deposits.iter().zip(&facts.outcomes) {
         consume_deposit(&mut overlay, deposit, *outcome, &mut effects)?;
+    }
+    if let PortalState::Created { deposit, .. } = portal(&overlay)?
+        && zone(&overlay)?.processed_deposit != deposit
+    {
+        return Err(ModelError::CommitmentMismatch);
     }
     apply_zone_operations(&mut overlay, &facts.operations, &mut effects)?;
     if let Some(finalization) = &facts.finalization {
@@ -342,7 +347,7 @@ fn enable_token(overlay: &mut Overlay<'_>, enable: &TokenEnable) -> Result<(), M
 fn append_deposit(
     overlay: &mut Overlay<'_>,
     input: &OrdinaryDeposit,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     if input.tempo_refund_recipient.is_zero() {
         return Err(ModelError::ZeroRefundRecipient);
@@ -385,7 +390,7 @@ fn append_deposit(
             settlement,
         })),
     );
-    effects.push(ExpectedEffect::DepositAppended {
+    effects.push(Effect::DepositAppended {
         id,
         queue_hash: hash,
     });
@@ -396,7 +401,7 @@ fn consume_deposit(
     overlay: &mut Overlay<'_>,
     supplied: &Deposit,
     outcome: DepositOutcome,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let mut zone = zone(overlay)?;
     let number = zone
@@ -461,7 +466,7 @@ fn consume_deposit(
                 .deposits
                 .checked_sub(U256::from(amount))
                 .ok_or(ModelError::Underflow)?;
-            effects.push(ExpectedEffect::DepositProcessed {
+            effects.push(Effect::DepositProcessed {
                 deposit_hash: hash,
                 sender: expected.sender,
                 token: expected.token,
@@ -491,7 +496,7 @@ fn consume_deposit(
                     },
                 )),
             );
-            effects.push(ExpectedEffect::WithdrawalRequested {
+            effects.push(Effect::WithdrawalRequested {
                 id: withdrawal,
                 sender: Address::ZERO,
                 token: expected.token,
@@ -504,7 +509,7 @@ fn consume_deposit(
                 callback_data: Default::default(),
                 reveal_to: Default::default(),
             });
-            effects.push(ExpectedEffect::DepositFailed {
+            effects.push(Effect::DepositFailed {
                 deposit_hash: hash,
                 sender: expected.sender,
                 token: expected.token,
@@ -542,7 +547,7 @@ fn consume_deposit(
                 .checked_sub(U256::from(amount))
                 .ok_or(ModelError::Underflow)?;
             overlay.set(StateKey::Fallback(fallback), None);
-            effects.push(ExpectedEffect::BounceBackMinted {
+            effects.push(Effect::BounceBackMinted {
                 token: owner_token,
                 amount,
             });
@@ -580,7 +585,7 @@ fn consume_deposit(
                 Some(StateValue::InboxRefund(RefundCredit { amount })),
             );
             overlay.set(StateKey::Fallback(fallback), None);
-            effects.push(ExpectedEffect::BounceBackPending {
+            effects.push(Effect::BounceBackPending {
                 token: owner_token,
                 amount,
             });
@@ -629,7 +634,7 @@ fn require_bounceback_owner(
 fn apply_zone_operations(
     overlay: &mut Overlay<'_>,
     operations: &[ZoneOperation],
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let mut accepted = 0u32;
     for operation in operations {
@@ -696,7 +701,7 @@ fn apply_zone_operations(
                 {
                     return Err(ModelError::WithdrawalCollision);
                 }
-                let tag = sender_tag(input.sender, input.transaction_hash);
+                let tag = sender_tag(input.sender, input.transaction_hash, fallback_nonce);
                 let data = Withdrawal {
                     token: input.token,
                     sender_tag: tag,
@@ -733,7 +738,7 @@ fn apply_zone_operations(
                 if limited {
                     accepted = accepted.checked_add(1).ok_or(ModelError::Overflow)?;
                 }
-                effects.push(ExpectedEffect::WithdrawalRequested {
+                effects.push(Effect::WithdrawalRequested {
                     id,
                     sender: input.sender,
                     token: input.token,
@@ -760,7 +765,7 @@ fn finalize(
     facts: &ZoneFacts,
     imported_block_number: u64,
     input: &Finalization,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let mut z = zone(overlay)?;
     let count = z
@@ -806,7 +811,7 @@ fn finalize(
             }) => (
                 Withdrawal {
                     token,
-                    sender_tag: sender_tag(Address::ZERO, alloy_primitives::B256::ZERO),
+                    sender_tag: failed_deposit_sender_tag(),
                     to: recipient,
                     amount,
                     memo: alloy_primitives::B256::ZERO,
@@ -869,14 +874,14 @@ fn finalize(
         withdrawal_index: z.next_withdrawal_index,
     };
     overlay.set(StateKey::Zone, Some(StateValue::Zone(z)));
-    effects.push(ExpectedEffect::BatchFinalized { id, queue_hash });
+    effects.push(Effect::BatchFinalized { id, queue_hash });
     Ok(())
 }
 
 fn submit_batch(
     overlay: &mut Overlay<'_>,
     input: &BatchSubmission,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let PortalState::Created {
         identity,
@@ -918,6 +923,7 @@ fn submit_batch(
         || settlement.submitted_deposit != boundary.first_deposit
         || input.next_zone_height <= settlement.zone_height
         || boundary.final_deposit.number > deposit.number
+        || (count != 0 && queue_hash == WITHDRAWAL_SENTINEL)
     {
         return Err(ModelError::CommitmentMismatch);
     }
@@ -958,7 +964,7 @@ fn submit_batch(
             settlement,
         })),
     );
-    effects.push(ExpectedEffect::BatchSubmitted {
+    effects.push(Effect::BatchSubmitted {
         id,
         queue_index,
         processed_deposit_hash: boundary.final_deposit.hash,
@@ -973,7 +979,7 @@ fn process_withdrawals(
     overlay: &mut Overlay<'_>,
     input: &WithdrawalProcessing,
     base_fee: U256,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     if input.withdrawals.len() != input.outcomes.len() {
         return Err(ModelError::DepositOutcomeCountMismatch);
@@ -1087,8 +1093,7 @@ fn process_withdrawals(
                     append_deposit(overlay, callback, effects)?;
                 }
                 overlay.set(StateKey::Fallback(fallback), None);
-                ExpectedEffect::UserWithdrawalProcessed {
-                    id: wid,
+                Effect::UserWithdrawalProcessed {
                     to: data.to,
                     sender_tag: data.sender_tag,
                     token: data.token,
@@ -1147,15 +1152,14 @@ fn process_withdrawals(
                         settlement: ps,
                     })),
                 );
-                effects.push(ExpectedEffect::BounceBackAppended {
+                effects.push(Effect::BounceBackAppended {
                     fallback_nonce: nonce.get(),
                     token: data.token,
                     amount: data.amount,
                     id: did,
                     queue_hash: hash,
                 });
-                ExpectedEffect::UserWithdrawalProcessed {
-                    id: wid,
+                Effect::UserWithdrawalProcessed {
                     to: data.to,
                     sender_tag: data.sender_tag,
                     token: data.token,
@@ -1163,33 +1167,41 @@ fn process_withdrawals(
                     callback_success: false,
                 }
             }
-            (WithdrawalOrigin::FailedDeposit { deposit }, WithdrawalOutcome::FailedDepositPaid) => {
-                let fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
+            (
+                WithdrawalOrigin::FailedDeposit { deposit: _ },
+                WithdrawalOutcome::FailedDepositPaid { collected_fee },
+            ) => {
+                let max_fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
                     .ok_or(ModelError::Overflow)?;
+                if *collected_fee != 0 && *collected_fee != max_fee {
+                    return Err(ModelError::CommitmentMismatch);
+                }
                 t.accounting.deposits = t
                     .accounting
                     .deposits
                     .checked_sub(U256::from(data.amount))
                     .ok_or(ModelError::Underflow)?;
-                ExpectedEffect::FailedDepositRefunded {
-                    deposit,
+                Effect::FailedDepositRefunded {
                     recipient: data.to,
                     token: data.token,
-                    amount: data.amount,
-                    fee,
+                    amount: data.amount - *collected_fee,
+                    fee: *collected_fee,
                     pending: false,
                 }
             }
             (
                 WithdrawalOrigin::FailedDeposit { deposit: failed },
-                WithdrawalOutcome::FailedDepositPending,
+                WithdrawalOutcome::FailedDepositPending { collected_fee },
             ) => {
-                let fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
+                let max_fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
                     .ok_or(ModelError::Overflow)?;
+                if *collected_fee != 0 && *collected_fee != max_fee {
+                    return Err(ModelError::CommitmentMismatch);
+                }
                 t.accounting.deposits = t
                     .accounting
                     .deposits
-                    .checked_sub(U256::from(fee))
+                    .checked_sub(U256::from(*collected_fee))
                     .ok_or(ModelError::Underflow)?;
                 let refund = PortalRefundId {
                     token: data.token,
@@ -1202,15 +1214,14 @@ fn process_withdrawals(
                 overlay.set(
                     StateKey::PortalRefund(refund),
                     Some(StateValue::PortalRefund(RefundCredit {
-                        amount: data.amount - fee,
+                        amount: data.amount - *collected_fee,
                     })),
                 );
-                ExpectedEffect::FailedDepositRefunded {
-                    deposit: failed,
+                Effect::FailedDepositRefunded {
                     recipient: data.to,
                     token: data.token,
-                    amount: data.amount,
-                    fee,
+                    amount: data.amount - *collected_fee,
+                    fee: *collected_fee,
                     pending: true,
                 }
             }
@@ -1292,7 +1303,7 @@ fn claim_refund(
     overlay: &mut Overlay<'_>,
     claim: RefundClaim,
     portal_side: bool,
-    effects: &mut Vec<ExpectedEffect>,
+    effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let PortalState::Created { identity, .. } = portal(overlay)? else {
         return Err(ModelError::PortalNotCreated);
@@ -1395,7 +1406,7 @@ fn claim_refund(
     for (key, _) in credits {
         overlay.set(key, None);
     }
-    effects.push(ExpectedEffect::RefundClaimed {
+    effects.push(Effect::RefundClaimed {
         token: claim.token,
         recipient: claim.recipient,
         amount: total,
@@ -1409,17 +1420,6 @@ fn expected_state(
     tempo_block_number: u64,
 ) -> Result<ExpectedState, ModelError> {
     let zone = zone(overlay)?;
-    let collateral_requirement = overlay
-        .range(
-            std::ops::Bound::Included(StateKey::Token(Address::ZERO)),
-            std::ops::Bound::Included(StateKey::Token(Address::repeat_byte(0xff))),
-        )
-        .try_fold(U256::ZERO, |total, (_, value)| match value {
-            StateValue::Token(token) => total
-                .checked_add(token.accounting.collateral().ok_or(ModelError::Overflow)?)
-                .ok_or(ModelError::Overflow),
-            _ => Err(ModelError::CorruptState),
-        })?;
     Ok(ExpectedState {
         tempo_block_hash,
         tempo_block_number,
@@ -1427,6 +1427,5 @@ fn expected_state(
         processed_deposit_number: zone.processed_deposit.number,
         withdrawal_queue_hash: zone.withdrawal_queue_hash,
         withdrawal_batch_index: zone.withdrawal_batch_index,
-        collateral_requirement,
     })
 }

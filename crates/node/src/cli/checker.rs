@@ -1,6 +1,6 @@
 //! Checker CLI arguments and mode-dependent configuration.
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use clap::{Args, Parser, Subcommand};
@@ -87,6 +87,15 @@ pub struct CheckerArgs {
         value_name = "PATH"
     )]
     pub database_path: Option<PathBuf>,
+
+    /// Maximum seconds for one authenticated checker acquisition attempt.
+    #[arg(
+        long = "checker.acquisition-timeout-secs",
+        env = "CHECKER_ACQUISITION_TIMEOUT_SECS",
+        default_value_t = 30,
+        value_name = "SECONDS"
+    )]
+    pub acquisition_timeout_secs: u64,
 }
 
 impl CheckerArgs {
@@ -124,12 +133,17 @@ impl CheckerArgs {
                     !portal_creation_block_hash.is_zero(),
                     "--checker.portal-creation-block-hash must be nonzero"
                 );
+                eyre::ensure!(
+                    self.acquisition_timeout_secs != 0,
+                    "--checker.acquisition-timeout-secs must be nonzero"
+                );
                 Ok(Some(CheckerConfig {
                     l1_rpc_url: l1_rpc_url.to_owned(),
                     portal_address,
                     portal_creation_block_hash,
                     zone_id,
                     database_path: self.database_path.clone(),
+                    acquisition_timeout: Duration::from_secs(self.acquisition_timeout_secs),
                 }))
             }
         }
@@ -138,7 +152,7 @@ impl CheckerArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use alloy_primitives::{Address, B256};
     use clap::Parser as _;
@@ -196,6 +210,7 @@ mod tests {
         );
         assert_eq!(config.zone_id, 7);
         assert_eq!(config.database_path, Some(PathBuf::from("checker-test-db")));
+        assert_eq!(config.acquisition_timeout, Duration::from_secs(30));
     }
 
     #[test]

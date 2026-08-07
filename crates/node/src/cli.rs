@@ -273,6 +273,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
                 portal_creation_block_hash,
                 zone_id: args.zone_id,
                 database_path: Some(database_path.clone()),
+                acquisition_timeout: Duration::from_secs(30),
             };
             let node_handle = builder
                 .node(node)

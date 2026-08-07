@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::{BatchId, DepositId, WithdrawalId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExpectedEffect {
+pub enum Effect {
     TokenEnabled {
         token: Address,
         name: String,
@@ -53,7 +53,6 @@ pub enum ExpectedEffect {
         processed_deposit_number: u64,
     },
     UserWithdrawalProcessed {
-        id: WithdrawalId,
         to: Address,
         sender_tag: B256,
         token: Address,
@@ -61,7 +60,6 @@ pub enum ExpectedEffect {
         callback_success: bool,
     },
     FailedDepositRefunded {
-        deposit: DepositId,
         recipient: Address,
         token: Address,
         amount: u128,
@@ -98,5 +96,4 @@ pub struct ExpectedState {
     pub processed_deposit_number: u64,
     pub withdrawal_queue_hash: B256,
     pub withdrawal_batch_index: u64,
-    pub collateral_requirement: U256,
 }

@@ -3,15 +3,15 @@
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{B256, Bytes, U256};
 use alloy_rlp::{Decodable as _, Encodable as _};
-use alloy_sol_types::{SolCall as _, SolValue as _};
+use alloy_sol_types::{SolCall as _, SolValue as _, sol};
 use reth_primitives_traits::SealedHeader;
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZonePortal};
 
 use crate::protocol::constants::{
     AUTHENTICATED_WITHDRAWAL_SIZE, ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE, MAX_CALLBACK_DATA_SIZE,
-    MAX_DEPOSITS_PER_TEMPO_BLOCK, MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES,
-    MAX_TOKEN_SYMBOL_BYTES, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
+    MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES,
+    MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, MAX_UNPROCESSED_DEPOSITS,
 };
 
 use super::error::{
@@ -25,11 +25,40 @@ const SELECTOR: usize = 4;
 // a five-word encrypted-payload head, and a three-word ciphertext tail.
 const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
 
+// Keep observation compatible while the generated production binding still
+// describes the former `bytes header` signature.
+sol! {
+    interface ObservationZoneInbox {
+        enum DepositType { WithdrawalBounceBack, Deposit }
+        struct QueuedDeposit { DepositType depositType; bytes depositData; }
+        struct ChaumPedersenProof { bytes32 s; bytes32 c; }
+        struct DecryptionData {
+            bytes32 sharedSecret;
+            uint8 sharedSecretYParity;
+            ChaumPedersenProof cpProof;
+        }
+        struct EnabledToken { address token; string name; string symbol; string currency; }
+        function advanceTempo(
+            bytes[] headers,
+            QueuedDeposit[] deposits,
+            DecryptionData[] decryptions,
+            EnabledToken[] enabledTokens
+        );
+    }
+}
+
 #[derive(Debug)]
 struct AbiError {
     source: DataSource,
     evidence: AuthenticatedDataEvidence,
     detail: String,
+}
+
+struct AdvanceCall {
+    headers: Vec<Bytes>,
+    deposits: Vec<(u8, Bytes)>,
+    decryptions: Vec<IZoneInbox::DecryptionData>,
+    enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 }
 
 impl AbiError {
@@ -122,15 +151,21 @@ impl ImportedDeposit {
 /// Authenticated inputs carried by `advanceTempo` calldata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedAdvanceTempo {
-    imported_header: ImportedTempoHeader,
+    imported_headers: Vec<ImportedTempoHeader>,
     deposits: Vec<ImportedDeposit>,
     decryptions: Vec<IZoneInbox::DecryptionData>,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 }
 
 impl DecodedAdvanceTempo {
-    pub(crate) fn imported_header(&self) -> &ImportedTempoHeader {
-        &self.imported_header
+    pub(crate) fn final_imported_header(&self) -> &ImportedTempoHeader {
+        self.imported_headers
+            .last()
+            .expect("decoded headers are nonempty")
+    }
+
+    pub(crate) fn imported_headers(&self) -> &[ImportedTempoHeader] {
+        &self.imported_headers
     }
 
     pub(crate) fn deposits(&self) -> &[ImportedDeposit] {
@@ -443,18 +478,34 @@ fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), AbiError> {
     Ok(())
 }
 
-fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
+fn preflight_advance_tempo(calldata: &[u8]) -> Result<bool, AbiError> {
     let surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let bounds = Bounds::from_call(
-        DataSource::AdvanceTempoCalldata,
-        calldata,
-        &IZoneInbox::advanceTempoCall::SELECTOR,
-    )?;
+    let legacy =
+        calldata.get(..SELECTOR) == Some(IZoneInbox::advanceTempoCall::SELECTOR.as_slice());
+    let selector = if legacy {
+        &IZoneInbox::advanceTempoCall::SELECTOR
+    } else {
+        &ObservationZoneInbox::advanceTempoCall::SELECTOR
+    };
+    let bounds = Bounds::from_call(DataSource::AdvanceTempoCalldata, calldata, selector)?;
     bounds.ensure_head(4)?;
-    bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
+    if legacy {
+        bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
+    } else {
+        let maximum_headers = bounds.data.len() / WORD;
+        let (header_head, header_count) =
+            bounds.dynamic_array(0, 0, 4, maximum_headers, "headers")?;
+        if header_count == 0 {
+            return Err(surface.malformed("headers must be nonempty"));
+        }
+        for index in 0..header_count {
+            let header = bounds.dynamic_element(header_head, header_count, index)?;
+            bounds.direct_bytes(header, bounds.data.len(), "header")?;
+        }
+    }
 
     let (deposit_head, deposit_count) =
-        bounds.dynamic_array(0, 1, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "deposits")?;
+        bounds.dynamic_array(0, 1, 4, MAX_UNPROCESSED_DEPOSITS, "deposits")?;
     let mut ordinary_count = 0usize;
     for index in 0..deposit_count {
         let deposit = bounds.dynamic_element(deposit_head, deposit_count, index)?;
@@ -482,7 +533,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
     }
 
     let decryption_count =
-        bounds.static_array(0, 2, 4, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "decryptions")?;
+        bounds.static_array(0, 2, 4, 4, MAX_UNPROCESSED_DEPOSITS, "decryptions")?;
     if decryption_count != ordinary_count {
         return Err(surface.malformed(format!(
                 "decryption count {decryption_count} does not match ordinary deposit count {ordinary_count}"
@@ -497,7 +548,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
         bounds.bytes_field(token, 2, 4, MAX_TOKEN_SYMBOL_BYTES, "token symbol")?;
         bounds.bytes_field(token, 3, 4, MAX_TOKEN_CURRENCY_BYTES, "token currency")?;
     }
-    Ok(())
+    Ok(legacy)
 }
 
 pub(crate) fn decode_advance_tempo(
@@ -509,40 +560,97 @@ pub(crate) fn decode_advance_tempo(
 
 fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError> {
     let advance_surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    preflight_advance_tempo(calldata)?;
-    let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-        .map_err(|error| advance_surface.malformed(error))?;
-    if call.abi_encode() != calldata {
-        return Err(advance_surface.malformed("encoding is non-canonical or has trailing bytes"));
-    }
+    let legacy = preflight_advance_tempo(calldata)?;
+    let call = if legacy {
+        let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
+            .map_err(|error| advance_surface.malformed(error))?;
+        if call.abi_encode() != calldata {
+            return Err(
+                advance_surface.malformed("encoding is non-canonical or has trailing bytes")
+            );
+        }
+        AdvanceCall {
+            headers: vec![call.header],
+            deposits: call
+                .deposits
+                .into_iter()
+                .map(|queued| (queued.depositType as u8, queued.depositData))
+                .collect(),
+            decryptions: call.decryptions,
+            enabled_tokens: call.enabledTokens,
+        }
+    } else {
+        let call = ObservationZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
+            .map_err(|error| advance_surface.malformed(error))?;
+        if call.abi_encode() != calldata {
+            return Err(
+                advance_surface.malformed("encoding is non-canonical or has trailing bytes")
+            );
+        }
+        AdvanceCall {
+            headers: call.headers,
+            deposits: call
+                .deposits
+                .into_iter()
+                .map(|queued| (queued.depositType as u8, queued.depositData))
+                .collect(),
+            decryptions: call
+                .decryptions
+                .into_iter()
+                .map(|d| IZoneInbox::DecryptionData {
+                    sharedSecret: d.sharedSecret,
+                    sharedSecretYParity: d.sharedSecretYParity,
+                    cpProof: IZoneInbox::ChaumPedersenProof {
+                        s: d.cpProof.s,
+                        c: d.cpProof.c,
+                    },
+                })
+                .collect(),
+            enabled_tokens: call
+                .enabledTokens
+                .into_iter()
+                .map(|t| IZoneInbox::EnabledToken {
+                    token: t.token,
+                    name: t.name,
+                    symbol: t.symbol,
+                    currency: t.currency,
+                })
+                .collect(),
+        }
+    };
 
-    let header_surface = Surface::new(DataSource::AdvanceHeaderRlp, call.header.as_ref());
-    let mut remaining = call.header.as_ref();
-    let header =
-        TempoHeader::decode(&mut remaining).map_err(|error| header_surface.malformed(error))?;
-    if !remaining.is_empty() {
-        return Err(header_surface.malformed(format!("{} trailing bytes", remaining.len())));
+    let mut imported_headers: Vec<ImportedTempoHeader> = Vec::with_capacity(call.headers.len());
+    for encoded in call.headers {
+        let header_surface = Surface::new(DataSource::AdvanceHeaderRlp, encoded.as_ref());
+        let mut remaining = encoded.as_ref();
+        let header =
+            TempoHeader::decode(&mut remaining).map_err(|error| header_surface.malformed(error))?;
+        if !remaining.is_empty() {
+            return Err(header_surface.malformed(format!("{} trailing bytes", remaining.len())));
+        }
+        let mut canonical = Vec::with_capacity(header.length());
+        header.encode(&mut canonical);
+        if canonical.as_slice() != encoded.as_ref() {
+            return Err(header_surface.malformed("non-canonical encoding"));
+        }
+        let imported = ImportedTempoHeader::new(header);
+        if let Some(previous) = imported_headers.last()
+            && (previous.number().checked_add(1) != Some(imported.number())
+                || imported.header().parent_hash() != previous.hash())
+        {
+            return Err(header_surface.malformed("headers are not exactly consecutive"));
+        }
+        imported_headers.push(imported);
     }
-    let mut canonical_header = Vec::with_capacity(header.length());
-    header.encode(&mut canonical_header);
-    if canonical_header.as_slice() != call.header.as_ref() {
-        return Err(header_surface.malformed("non-canonical encoding"));
-    }
-    let imported_header = ImportedTempoHeader::new(header);
 
     let mut deposits = Vec::with_capacity(call.deposits.len());
-    for queued in call.deposits {
-        let deposit = match queued.depositType {
-            IZoneInbox::DepositType::WithdrawalBounceBack => {
-                let surface = Surface::new(
-                    DataSource::WithdrawalBounceBackData,
-                    queued.depositData.as_ref(),
-                );
-                let decoded = IZoneInbox::WithdrawalBounceBackDeposit::abi_decode_validate(
-                    &queued.depositData,
-                )
-                .map_err(|error| surface.malformed(error))?;
-                if decoded.abi_encode() != queued.depositData {
+    for (kind, data) in call.deposits {
+        let deposit = match kind {
+            0 => {
+                let surface = Surface::new(DataSource::WithdrawalBounceBackData, data.as_ref());
+                let decoded = IZoneInbox::WithdrawalBounceBackDeposit::abi_decode_validate(&data)
+                    .map_err(|error| surface.malformed(error))?;
+                if decoded.abi_encode() != data {
                     return Err(
                         surface.malformed("encoding is non-canonical or has trailing bytes")
                     );
@@ -551,12 +659,11 @@ fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, Ab
                     kind: ImportedDepositKind::WithdrawalBounceBack(decoded),
                 }
             }
-            IZoneInbox::DepositType::Deposit => {
-                let surface =
-                    Surface::new(DataSource::OrdinaryDepositData, queued.depositData.as_ref());
-                let decoded = ZonePortal::Deposit::abi_decode_validate(&queued.depositData)
+            1 => {
+                let surface = Surface::new(DataSource::OrdinaryDepositData, data.as_ref());
+                let decoded = ZonePortal::Deposit::abi_decode_validate(&data)
                     .map_err(|error| surface.malformed(error))?;
-                if decoded.abi_encode() != queued.depositData {
+                if decoded.abi_encode() != data {
                     return Err(
                         surface.malformed("encoding is non-canonical or has trailing bytes")
                     );
@@ -573,10 +680,10 @@ fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, Ab
     }
 
     Ok(DecodedAdvanceTempo {
-        imported_header,
+        imported_headers,
         deposits,
         decryptions: call.decryptions,
-        enabled_tokens: call.enabledTokens,
+        enabled_tokens: call.enabled_tokens,
     })
 }
 
