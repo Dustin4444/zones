@@ -5,6 +5,8 @@
 //! that header, then selectively acquires only Portal transaction bodies whose
 //! calldata is needed by the model.
 
+use std::time::Duration;
+
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use tempo_alloy::TempoNetwork;
@@ -108,6 +110,31 @@ pub(crate) struct L1BlockObservation {
     protocol_transactions: Vec<L1TransactionObservation>,
 }
 
+/// Authenticated L1 block data paired with acquisition-only measurements.
+///
+/// Timings are deliberately kept outside [`L1BlockObservation`]: wall-clock
+/// metadata is neither authenticated nor part of observation equality.
+#[derive(Debug)]
+pub(crate) struct L1BlockAcquisition {
+    observation: L1BlockObservation,
+    receipt_fetch_duration: Duration,
+}
+
+impl L1BlockAcquisition {
+    pub(crate) const fn observation(&self) -> &L1BlockObservation {
+        &self.observation
+    }
+
+    pub(crate) const fn receipt_fetch_duration(&self) -> Duration {
+        self.receipt_fetch_duration
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_observation(self) -> L1BlockObservation {
+        self.observation
+    }
+}
+
 impl L1BlockObservation {
     pub(crate) fn block_number(&self) -> u64 {
         self.block_number
@@ -200,12 +227,13 @@ pub(crate) async fn observe_l1<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
     portal: Address,
-) -> Result<L1BlockObservation, ObservationError>
+) -> Result<L1BlockAcquisition, ObservationError>
 where
     P: Provider<TempoNetwork>,
 {
     let block = authentication::acquire_block(provider, imported).await?;
-    let receipts = authentication::acquire_receipts(provider, imported, &block).await?;
+    let (receipts, receipt_fetch_duration) =
+        authentication::acquire_receipts(provider, imported, &block).await?;
     let pending = events::ordered_transactions(portal, &block.transaction_hashes, &receipts)?;
 
     let mut protocol_transactions = Vec::with_capacity(pending.len());
@@ -232,10 +260,13 @@ where
         });
     }
 
-    Ok(L1BlockObservation {
-        block_number: imported.number(),
-        block_hash: imported.hash(),
-        portal_address: portal,
-        protocol_transactions,
+    Ok(L1BlockAcquisition {
+        observation: L1BlockObservation {
+            block_number: imported.number(),
+            block_hash: imported.hash(),
+            portal_address: portal,
+            protocol_transactions,
+        },
+        receipt_fetch_duration,
     })
 }

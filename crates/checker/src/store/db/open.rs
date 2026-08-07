@@ -127,6 +127,26 @@ impl CheckerStore {
         finish_read(tx, result)
     }
 
+    /// Open one initialized checker database through MDBX's read-only mode.
+    ///
+    /// Diagnostic callers trust the fully decoded identity stored in the
+    /// database and then validate the complete current cut before inspecting
+    /// retained history. This path never acquires a writer environment.
+    pub(crate) fn open_diagnostic_at(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let db = open_compatible_read_only_at(&path)?;
+        let tx = db.tx()?;
+        let identity = read_stored_identity(&tx);
+        let identity = finish_read(tx, identity)?;
+        let store = Self {
+            db: Arc::new(db),
+            identity,
+            path,
+        };
+        store.load_validated_snapshot()?;
+        Ok(store)
+    }
+
     /// Inspect one initialized checker database read-only and return its exact cut.
     pub(crate) fn inspect_existing_at(
         path: impl AsRef<Path>,

@@ -8,7 +8,7 @@ use tempo_primitives::TempoPrimitives;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use crate::observe::ExactStateLookup;
+use crate::{metrics::BlockProcessingPhase, observe::ExactStateLookup};
 
 use super::{retry::RetryBackoff, status::RuntimeStatus};
 use crate::runtime::{
@@ -40,6 +40,7 @@ pub(super) struct RetainedContext<'a, Z: ?Sized> {
     zone_state: &'a Z,
     l1_client: &'a mut L1Client,
     status: &'a mut RuntimeStatus,
+    processing_phase: BlockProcessingPhase,
 }
 
 impl<'a, Z: ?Sized> RetainedContext<'a, Z> {
@@ -48,12 +49,14 @@ impl<'a, Z: ?Sized> RetainedContext<'a, Z> {
         zone_state: &'a Z,
         l1_client: &'a mut L1Client,
         status: &'a mut RuntimeStatus,
+        processing_phase: BlockProcessingPhase,
     ) -> Self {
         Self {
             checker,
             zone_state,
             l1_client,
             status,
+            processing_phase,
         }
     }
 }
@@ -162,11 +165,12 @@ where
         zone_state,
         l1_client,
         status,
+        processing_phase,
     } = context;
     let mut retry = RetryBackoff::new();
     loop {
         match checker
-            .process_notification_once(notification, zone_state, l1_client)
+            .process_notification_in_phase(notification, zone_state, l1_client, processing_phase)
             .await
         {
             Ok(ready) => {

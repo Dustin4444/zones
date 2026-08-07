@@ -122,7 +122,8 @@ async fn empty_observations(
         portal_address_for_zone(7),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_observation();
     (l2, l1, provider)
 }
 
@@ -158,7 +159,8 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
         portal,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_observation();
     let mut checker = InMemoryChecker::new(
         model,
         BlockNumHash::new(L1_NUMBER, B256::repeat_byte(0xcc)),
@@ -176,6 +178,8 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
     let first_tempo_tip = checker.tempo_tip();
     let committed_model = checker.model().clone();
     assert_ne!(committed_model, parent_model);
+    // A user withdrawal retains both its withdrawal owner and fallback lookup.
+    assert_eq!(checker.open_lifecycle_record_count(), 2);
     assert_eq!(
         committed_model.token(token).unwrap().accounting(),
         TokenAccounting {
@@ -201,7 +205,8 @@ async fn committed_state_is_the_next_parent_and_sparse_followup_preserves_it() {
         portal,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_observation();
     assert_eq!(next_l2.parent_hash(), first_zone_tip.hash);
     assert_eq!(
         next_l2
@@ -395,7 +400,8 @@ async fn l1_observation_portal_must_match_the_configured_model_identity() {
         PORTAL,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_observation();
     let mut checker = checker_for_empty_child(
         &imported,
         zone_parent,
@@ -454,7 +460,8 @@ async fn collateral_uses_the_pre_zone_cut_before_same_block_burns_can_hide_a_def
         portal,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .into_observation();
     let mut checker = InMemoryChecker::new(
         model.clone(),
         BlockNumHash::new(L1_NUMBER, B256::repeat_byte(0xcc)),
@@ -510,7 +517,8 @@ async fn post_zone_supply_detects_unauthorized_mint_and_burn_and_keeps_the_paren
             portal,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_observation();
         let exact_state = exact_zone_state_with_supply(&imported, token, actual_supply);
         let mut checker = InMemoryChecker::new(
             model.clone(),

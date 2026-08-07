@@ -17,8 +17,10 @@ use tempo_primitives::{Block, TempoPrimitives};
 use tracing::info;
 
 use crate::CheckerConfig;
+#[cfg(test)]
+use crate::metrics::BlockProcessingPhase;
 #[cfg(feature = "test-utils")]
-use crate::test_utils::TestProgressObserver;
+use crate::test_utils::CheckerTestHooks;
 
 use super::state::ReadyToAcknowledge;
 #[cfg(test)]
@@ -38,7 +40,7 @@ use {
 /// return the non-resolving inner worker only after it succeeds.
 pub(crate) fn launch<Node>(
     config: CheckerConfig,
-    #[cfg(feature = "test-utils")] test_progress: TestProgressObserver,
+    #[cfg(feature = "test-utils")] test_hooks: CheckerTestHooks,
     ctx: ExExContext<Node>,
 ) -> eyre::Result<impl Future<Output = eyre::Result<()>> + Send>
 where
@@ -50,7 +52,7 @@ where
     Ok(run(
         config,
         #[cfg(feature = "test-utils")]
-        test_progress,
+        test_hooks,
         ctx,
     ))
 }
@@ -59,7 +61,7 @@ where
 /// `Ok` or `Err` from an inner ExEx as a critical-task panic.
 async fn run<Node>(
     config: CheckerConfig,
-    #[cfg(feature = "test-utils")] test_progress: TestProgressObserver,
+    #[cfg(feature = "test-utils")] mut test_hooks: CheckerTestHooks,
     mut ctx: ExExContext<Node>,
 ) -> eyre::Result<()>
 where
@@ -74,10 +76,12 @@ where
             return run_disabled(&mut ctx, &mut status, exit).await;
         }
     };
+    #[cfg(feature = "test-utils")]
+    test_hooks.wait_for_start().await;
     let exit = run_initialized(
         &config,
         #[cfg(feature = "test-utils")]
-        &test_progress,
+        &test_hooks,
         initialized,
         &mut ctx,
         &mut status,
@@ -124,7 +128,12 @@ where
     let mut stream = futures::stream::pending::<
         Result<ExExNotification<TempoPrimitives>, std::convert::Infallible>,
     >();
-    let retained = RetainedContext::new(checker, zone_state, l1_client, status);
+    let processing_phase = if operational {
+        BlockProcessingPhase::Live
+    } else {
+        BlockProcessingPhase::CatchUp
+    };
+    let retained = RetainedContext::new(checker, zone_state, l1_client, status, processing_phase);
     match process_retained(retained, &mut driver, &mut stream, notification).await {
         RetainedOutcome::Ready { ready, recovered } => {
             status.record_ready(ready, recovered, operational);

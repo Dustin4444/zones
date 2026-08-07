@@ -3,8 +3,62 @@
 use std::path::PathBuf;
 
 use alloy_primitives::{Address, B256};
-use clap::Args;
-use zone_checker::{CheckerConfig, CheckerMode};
+use clap::{Args, Parser, Subcommand};
+use eyre::WrapErr as _;
+use zone_checker::{
+    CheckerConfig, CheckerMode,
+    diagnostic::{DiagnosticModelKey, diagnose_retained_model_change},
+};
+
+/// Offline, read-only checker operator commands.
+#[derive(Debug, Parser)]
+#[command(name = "checker", about = "Inspect a durable checker database")]
+pub struct CheckerCommand {
+    #[command(subcommand)]
+    command: CheckerSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckerSubcommand {
+    /// Reconstruct one model key across a retained canonical Zone block.
+    Diagnose(CheckerDiagnoseArgs),
+}
+
+/// Exact retained boundary and selected model key to inspect.
+#[derive(Debug, Args)]
+struct CheckerDiagnoseArgs {
+    /// Exact checker MDBX path. Stop the Zone node first, or use a consistent copied database.
+    #[arg(long, value_name = "PATH")]
+    database_path: PathBuf,
+
+    /// Retained canonical Zone height whose parent/child boundary is shown.
+    #[arg(long, value_name = "HEIGHT")]
+    zone_height: u64,
+
+    /// Typed model key, for example `token:0x...` or `withdrawal:7`.
+    #[arg(long, value_name = "MODEL_KEY")]
+    key: DiagnosticModelKey,
+}
+
+impl CheckerCommand {
+    pub(super) fn run(self) -> eyre::Result<()> {
+        match self.command {
+            CheckerSubcommand::Diagnose(args) => {
+                let report = diagnose_retained_model_change(
+                    args.database_path,
+                    args.zone_height,
+                    args.key,
+                )
+                .wrap_err(
+                    "offline checker diagnosis failed; stop the Zone node before inspecting its \
+                     MDBX database, or diagnose a consistent copy",
+                )?;
+                print!("{report}");
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Durable observe-only checker arguments.
 #[derive(Debug, Clone, Args)]
@@ -90,7 +144,7 @@ mod tests {
     use clap::Parser as _;
     use zone_checker::CheckerMode;
 
-    use super::CheckerArgs;
+    use super::{CheckerArgs, CheckerCommand};
 
     const CREATION_HASH: &str =
         "0x1111111111111111111111111111111111111111111111111111111111111111";
@@ -217,5 +271,45 @@ mod tests {
     #[test]
     fn unknown_mode_is_rejected_by_clap() {
         assert!(Parser::try_parse_from(["tempo-zone", "--checker.mode", "enforce"]).is_err());
+    }
+
+    #[test]
+    fn diagnostic_command_requires_a_typed_key_and_retained_height() {
+        assert!(
+            CheckerCommand::try_parse_from([
+                "checker",
+                "diagnose",
+                "--database-path",
+                "checker-db",
+                "--zone-height",
+                "7",
+                "--key",
+                "withdrawal:4",
+            ])
+            .is_ok()
+        );
+        assert!(
+            CheckerCommand::try_parse_from([
+                "checker",
+                "diagnose",
+                "--database-path",
+                "checker-db",
+                "--zone-height",
+                "7",
+                "--key",
+                "withdrawal:not-a-number",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_help_requires_an_offline_or_copied_database() {
+        let error = CheckerCommand::try_parse_from(["checker", "diagnose", "--help"])
+            .expect_err("--help exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("Stop the Zone node first"));
+        assert!(help.contains("consistent copied database"));
     }
 }

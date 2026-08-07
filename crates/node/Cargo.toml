@@ -117,7 +117,10 @@ commonware-cryptography.workspace = true
 p256.workspace = true
 rand.workspace = true
 reth-ethereum = { workspace = true, features = ["node", "test-utils"] }
+reth-node-core.workspace = true
+reth-node-metrics.workspace = true
 reth-tracing.workspace = true
+metrics-exporter-prometheus.workspace = true
 reth-trie-common.workspace = true
 reqwest.workspace = true
 revm.workspace = true

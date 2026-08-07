@@ -32,6 +32,7 @@ impl PersistentChecker {
             last_verified_parent: parent,
         };
         self.phase = LivePhase::Alerting(alert);
+        self.metrics.refresh_database_allocation(self.store.path());
         error!(
             target: "zone::checker",
             zone_height = key.zone_height(),
@@ -49,6 +50,7 @@ impl PersistentChecker {
         };
         self.store.orphan_active_finding(alert.finding)?;
         self.phase = LivePhase::Verifying;
+        self.metrics.refresh_database_allocation(self.store.path());
         Ok(())
     }
 }

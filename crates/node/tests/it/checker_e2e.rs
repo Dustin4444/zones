@@ -10,7 +10,7 @@ use zone_checker::{
     CheckerConfig,
     test_utils::{
         CheckerBootstrapPhase, CheckerSnapshot, CheckerTokenPhase, checker_with_progress,
-        inspect_database as inspect_checker_database,
+        checker_with_progress_and_supply_mismatch, inspect_database as inspect_checker_database,
     },
 };
 use zone_node::dev::{ProvisionConfig, provision_zone};
@@ -182,6 +182,106 @@ async fn test_checker_bootstraps_and_restarts_from_durable_database() -> eyre::R
     drop(restarted_zone);
     let restarted_snapshot = inspect_checker_database(&checker_path)?;
     assert_live_snapshot(&restarted_snapshot, restarted_tip, restarted_tempo_tip);
+
+    Ok(())
+}
+
+/// A real reconciliation finding must not pin Reth's acknowledgement watermark:
+/// the alerting block and a later descendant both cross `send_finished_height`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_checker_alert_does_not_stall_zone_progress() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let l1 = L1TestNode::start_with(|config| config.dev.block_time = None).await?;
+    let provisioned = provision_zone(ProvisionConfig {
+        l1_rpc_url: l1.ws_url().to_string(),
+        dev_key: l1.dev_signer(),
+        factory: None,
+        initial_token: PATH_USD_ADDRESS,
+        is_access_open: true,
+        is_gateway_enforced: false,
+        zone_gateways: Vec::new(),
+        allowed_accounts: Vec::new(),
+        rpc_url: String::new(),
+    })
+    .await?;
+    let checker_directory = tempfile::tempdir()?;
+    let checker_path = checker_directory.path().join("checker-alert");
+    let checker_config = CheckerConfig {
+        l1_rpc_url: l1.http_url().to_string(),
+        portal_address: provisioned.portal,
+        portal_creation_block_hash: provisioned.portal_creation_block_hash,
+        zone_id: provisioned.zone_id,
+        database_path: Some(checker_path.clone()),
+    };
+    let (checker, mut progress, supply_mismatch) =
+        checker_with_progress_and_supply_mismatch(checker_config);
+    let launch = ZoneTestLaunchConfig::new(
+        l1.ws_url().to_string(),
+        provisioned.portal,
+        provisioned.chain_id,
+    )
+    .with_genesis(provisioned.genesis)
+    .with_sequencer_signer(l1.dev_signer())
+    .with_checker(checker);
+    let zone = ZoneTestNode::launch(launch).await?;
+
+    // First converge on the provisioned archive and observe its startup
+    // acknowledgement before arming a fault in the ordinary live path.
+    let initial_l1_target = l1.provider().get_block_number().await?;
+    wait_for_zone_to_finalize_l1(&zone, initial_l1_target).await?;
+    let initial_zone_number = zone.provider().get_block_number().await?;
+    let initial_zone_block = zone
+        .provider()
+        .get_block_by_number(BlockNumberOrTag::Number(initial_zone_number))
+        .await?
+        .ok_or_else(|| eyre::eyre!("initial Zone block {initial_zone_number} is missing"))?;
+    let initial_zone_tip = BlockNumHash::new(initial_zone_number, initial_zone_block.header.hash);
+    progress.wait_for(initial_zone_tip, L1_TIMEOUT).await?;
+    supply_mismatch.arm_next();
+
+    // The first later Tempo block raises the alert; the second is its
+    // descendant and must still advance the ExEx acknowledgement watermark.
+    l1.fund_user(l1.user_signer().address(), 1).await?;
+    l1.fund_user(l1.user_signer().address(), 1).await?;
+    let descendant_l1_target = l1.provider().get_block_number().await?;
+    wait_for_zone_to_finalize_l1(&zone, descendant_l1_target).await?;
+    let descendant_zone_number = zone.stop_engine().await?;
+    let descendant_zone_block = zone
+        .provider()
+        .get_block_by_number(BlockNumberOrTag::Number(descendant_zone_number))
+        .await?
+        .ok_or_else(|| eyre::eyre!("descendant Zone block {descendant_zone_number} is missing"))?;
+    let acknowledged_descendant =
+        BlockNumHash::new(descendant_zone_number, descendant_zone_block.header.hash);
+    progress
+        .wait_for(acknowledged_descendant, L1_TIMEOUT)
+        .await?;
+
+    zone.crash();
+    drop(zone);
+    let snapshot = inspect_checker_database(&checker_path)?;
+    assert!(
+        snapshot.active_alert,
+        "the one-shot supply mismatch did not persist an alert"
+    );
+    assert_eq!(
+        snapshot.verified_zone_tip, initial_zone_tip,
+        "the durable model advanced through the alerting block"
+    );
+    let alerting_height = snapshot
+        .verified_zone_tip
+        .number
+        .checked_add(1)
+        .expect("test Zone height must fit u64");
+    assert!(
+        acknowledged_descendant.number > alerting_height,
+        "no descendant crossed the ExEx acknowledgement boundary after the alert"
+    );
+    assert!(
+        acknowledged_descendant.number > initial_zone_number,
+        "the Zone node did not advance after the initial acknowledged cut"
+    );
 
     Ok(())
 }

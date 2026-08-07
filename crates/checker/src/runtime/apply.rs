@@ -1,5 +1,7 @@
 //! Staged acquire, check, durable commit, and mirror adoption.
 
+use std::time::Instant;
+
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockNumHash;
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
@@ -11,13 +13,14 @@ use tracing::info;
 use crate::{
     check::{
         finding::CheckError,
-        pipeline::{InMemoryChecker, ObservedZoneCandidate, PreparedBlock},
+        pipeline::{ObservedZoneCandidate, PreparedBlock},
     },
+    metrics::{BlockMetricSample, BlockProcessingPhase},
     observe::{AcquisitionError, AcquisitionSource, ExactStateLookup},
     store::{
         db::CanonicalBlock,
         error::{ParentTips, StoreError},
-        operations::WriteOutcome,
+        history::{AppliedBlockMetrics, BlockWriteResult},
     },
 };
 
@@ -28,7 +31,10 @@ use super::{
 };
 
 /// Proof that the candidate's guarded MDBX transaction committed.
-pub(crate) struct DurableBlock(PreparedBlock);
+pub(crate) struct DurableBlock {
+    prepared: PreparedBlock,
+    write_metrics: Option<AppliedBlockMetrics>,
+}
 
 /// One concrete, lazily connected Tempo provider for the retained notification.
 pub(crate) struct L1Client {
@@ -177,12 +183,7 @@ impl PersistentChecker {
             }
             .into());
         }
-        self.mirror = InMemoryChecker::new(
-            snapshot.model,
-            self.store.portal_creation_block(),
-            snapshot.verified_zone_tip,
-            snapshot.imported_tempo_tip,
-        );
+        self.replace_mirror_from_snapshot(snapshot);
         Ok(())
     }
 
@@ -236,13 +237,18 @@ impl PersistentChecker {
             prepared.child_tempo_tip(),
             prepared.state_update(),
         )?;
-        match self.store.apply_block(commit)? {
-            WriteOutcome::Applied | WriteOutcome::AlreadyApplied => Ok(DurableBlock(prepared)),
-        }
+        let write_metrics = match self.store.apply_block_measured(commit)? {
+            BlockWriteResult::Applied(metrics) => Some(metrics),
+            BlockWriteResult::AlreadyApplied => None,
+        };
+        Ok(DurableBlock {
+            prepared,
+            write_metrics,
+        })
     }
 
     pub(crate) fn adopt_block(&mut self, durable: DurableBlock) -> ReadyToAcknowledge {
-        self.mirror.apply_prepared(durable.0);
+        self.mirror.apply_prepared(durable.prepared);
         ReadyToAcknowledge::verified(self.mirror.zone_tip())
     }
 
@@ -251,6 +257,7 @@ impl PersistentChecker {
         chain: &ValidatedChain<'_>,
         zone_state: &S,
         l1_client: &mut L1Client,
+        processing_phase: BlockProcessingPhase,
     ) -> RuntimeResult<ReadyToAcknowledge>
     where
         S: ExactStateLookup + ?Sized,
@@ -260,7 +267,13 @@ impl PersistentChecker {
         let mut ready = ReadyToAcknowledge::verified(chain.base());
         for (block, receipts) in chain.inner().blocks_and_receipts() {
             let block_ready = self
-                .process_canonical_block_once(block, receipts, zone_state, l1_client)
+                .process_canonical_block_once(
+                    block,
+                    receipts,
+                    zone_state,
+                    l1_client,
+                    processing_phase,
+                )
                 .await?;
             if block_ready.is_alerting() {
                 return Ok(ReadyToAcknowledge::alerted(chain.tip()));
@@ -286,10 +299,12 @@ impl PersistentChecker {
         receipts: &[TempoReceipt],
         zone_state: &S,
         l1_client: &mut L1Client,
+        processing_phase: BlockProcessingPhase,
     ) -> RuntimeResult<ReadyToAcknowledge>
     where
         S: ExactStateLookup + ?Sized,
     {
+        let block_started = Instant::now();
         if let Some(ready) = self.preflight_block(block)? {
             return Ok(ready);
         }
@@ -326,7 +341,20 @@ impl PersistentChecker {
             Err(error) => return Err(error.into()),
         };
         let durable = self.commit_block(candidate)?;
-        Ok(self.adopt_block(durable))
+        let write_metrics = durable.write_metrics;
+        let ready = self.adopt_block(durable);
+        if let Some(write_metrics) = write_metrics {
+            self.metrics.record_block(BlockMetricSample {
+                phase: processing_phase,
+                block_duration: block_started.elapsed(),
+                transaction_duration: write_metrics.transaction_duration,
+                changeset_bytes: write_metrics.changeset_bytes,
+                model_rows: write_metrics.model_rows,
+                open_lifecycle_records: self.mirror.open_lifecycle_record_count(),
+                database_path: self.store.path(),
+            });
+        }
+        Ok(ready)
     }
 
     #[cfg(test)]
@@ -343,6 +371,9 @@ impl PersistentChecker {
             prepared.state_update(),
         )?;
         self.store.apply_block_aborting_after(commit, writes)?;
-        Ok(DurableBlock(prepared))
+        Ok(DurableBlock {
+            prepared,
+            write_metrics: None,
+        })
     }
 }

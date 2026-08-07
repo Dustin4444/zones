@@ -1,6 +1,12 @@
-//! Read-only checker database inspection for cross-crate integration tests.
+//! Checker inspection, acknowledgement, and fault controls for integration tests.
 
 use std::{collections::BTreeMap, path::Path};
+
+#[cfg(feature = "test-utils")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(feature = "test-utils")]
 use std::time::Duration;
@@ -15,23 +21,37 @@ use crate::{
     store::{db::CheckerStore, value::BootstrapState},
 };
 
-/// Integration-test signal emitted only after the durable cut is acknowledged.
 #[cfg(feature = "test-utils")]
-pub(crate) struct TestProgressObserver {
+use crate::observe::ZonePostStateOutputs;
+
+/// Integration-test hooks kept out of production checker configuration.
+#[cfg(feature = "test-utils")]
+pub(crate) struct CheckerTestHooks {
     sender: Option<tokio::sync::watch::Sender<Option<BlockNumHash>>>,
+    supply_observation_fault: SupplyObservationFault,
+    start_gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 #[cfg(feature = "test-utils")]
-impl TestProgressObserver {
+impl CheckerTestHooks {
     pub(crate) const fn disabled() -> Self {
-        Self { sender: None }
+        Self {
+            sender: None,
+            supply_observation_fault: SupplyObservationFault::disabled(),
+            start_gate: None,
+        }
     }
 
-    fn channel() -> (Self, tokio::sync::watch::Receiver<Option<BlockNumHash>>) {
+    fn channel(
+        supply_observation_fault: SupplyObservationFault,
+        start_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> (Self, tokio::sync::watch::Receiver<Option<BlockNumHash>>) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         (
             Self {
                 sender: Some(sender),
+                supply_observation_fault,
+                start_gate,
             },
             receiver,
         )
@@ -41,6 +61,75 @@ impl TestProgressObserver {
         if let Some(sender) = &self.sender {
             sender.send_replace(Some(tip));
         }
+    }
+
+    pub(crate) fn supply_observation_fault(&self) -> SupplyObservationFault {
+        self.supply_observation_fault.clone()
+    }
+
+    pub(crate) async fn wait_for_start(&mut self) {
+        if let Some(start_gate) = self.start_gate.take() {
+            let _ = start_gate.await;
+        }
+    }
+}
+
+/// Per-checker, one-shot perturbation of an acquired token supply.
+#[cfg(feature = "test-utils")]
+#[derive(Clone)]
+pub(crate) struct SupplyObservationFault {
+    armed: Option<Arc<AtomicBool>>,
+}
+
+#[cfg(feature = "test-utils")]
+impl SupplyObservationFault {
+    pub(crate) const fn disabled() -> Self {
+        Self { armed: None }
+    }
+
+    fn controllable() -> Self {
+        Self {
+            armed: Some(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    fn trigger(&self) -> SupplyMismatchTrigger {
+        SupplyMismatchTrigger {
+            armed: Arc::clone(
+                self.armed
+                    .as_ref()
+                    .expect("controllable test fault must have a trigger"),
+            ),
+        }
+    }
+
+    pub(crate) fn perturb(&self, state: &mut ZonePostStateOutputs) {
+        if state.token_supplies().is_empty() {
+            return;
+        }
+        if self
+            .armed
+            .as_ref()
+            .is_some_and(|armed| armed.swap(false, Ordering::AcqRel))
+        {
+            state.perturb_first_token_supply_for_test();
+        }
+    }
+}
+
+/// Arms one deterministic mismatch in the next acquired nonempty supply set.
+#[cfg(feature = "test-utils")]
+pub struct SupplyMismatchTrigger {
+    armed: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "test-utils")]
+impl SupplyMismatchTrigger {
+    pub fn arm_next(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::AcqRel),
+            "a supply mismatch is already armed"
+        );
     }
 }
 
@@ -76,12 +165,46 @@ impl CheckerProgress {
 /// Construct a checker ExEx paired with an acknowledgement receiver.
 #[cfg(feature = "test-utils")]
 pub fn checker_with_progress(config: CheckerConfig) -> (CheckerExEx, CheckerProgress) {
-    let (test_progress, receiver) = TestProgressObserver::channel();
+    checker_with_hooks(config, SupplyObservationFault::disabled(), None)
+}
+
+/// Construct a checker that initializes its durable genesis cut, then waits
+/// until the returned sender releases its operational notification loop.
+#[cfg(feature = "test-utils")]
+pub fn checker_with_paused_progress(
+    config: CheckerConfig,
+) -> (
+    CheckerExEx,
+    CheckerProgress,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (release, start_gate) = tokio::sync::oneshot::channel();
+    let (checker, progress) =
+        checker_with_hooks(config, SupplyObservationFault::disabled(), Some(start_gate));
+    (checker, progress, release)
+}
+
+/// Construct a test checker paired with acknowledgement and an explicit,
+/// per-instance supply-observation fault trigger.
+#[cfg(feature = "test-utils")]
+pub fn checker_with_progress_and_supply_mismatch(
+    config: CheckerConfig,
+) -> (CheckerExEx, CheckerProgress, SupplyMismatchTrigger) {
+    let fault = SupplyObservationFault::controllable();
+    let trigger = fault.trigger();
+    let (checker, progress) = checker_with_hooks(config, fault, None);
+    (checker, progress, trigger)
+}
+
+#[cfg(feature = "test-utils")]
+fn checker_with_hooks(
+    config: CheckerConfig,
+    supply_observation_fault: SupplyObservationFault,
+    start_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> (CheckerExEx, CheckerProgress) {
+    let (test_hooks, receiver) = CheckerTestHooks::channel(supply_observation_fault, start_gate);
     (
-        CheckerExEx {
-            config,
-            test_progress,
-        },
+        CheckerExEx { config, test_hooks },
         CheckerProgress { receiver },
     )
 }

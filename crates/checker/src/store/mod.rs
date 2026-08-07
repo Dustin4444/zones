@@ -9,6 +9,7 @@ pub(super) const SCHEMA_VERSION: u8 = 3;
 
 mod codec;
 pub(crate) mod db;
+pub(crate) mod diagnostic;
 pub(crate) mod error;
 pub(crate) mod history;
 pub(crate) mod model_state;

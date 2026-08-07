@@ -46,6 +46,7 @@ use super::{
 };
 
 mod bootstrap;
+mod diagnostic;
 mod findings;
 mod history;
 mod opening;

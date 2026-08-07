@@ -120,10 +120,10 @@ async fn replay_one_l1_block(
     portal: Address,
     block: &AuthenticatedBlock,
 ) {
-    let observation = observe_l1(provider, &block.header, portal).await.unwrap();
+    let acquisition = observe_l1(provider, &block.header, portal).await.unwrap();
     let prepared = checker
         .mirror
-        .prepare_imported_bootstrap(provider, &observation, &block.header)
+        .prepare_imported_bootstrap(provider, &acquisition, &block.header)
         .await
         .unwrap();
     let current = checker.store.load_current().unwrap();
