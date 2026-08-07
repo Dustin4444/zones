@@ -13907,6 +13907,7 @@ dependencies = [
  "rand 0.8.7",
  "reqwest",
  "reth-metrics",
+ "reth-rpc-eth-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -13,10 +13,11 @@ use std::{
 use alloy_primitives::Address;
 use futures::future::BoxFuture;
 use jsonrpsee::server::{
-    BatchRequestConfig, ConnectionGuard, ConnectionState, HttpBody, HttpResponse, IdProvider,
-    Methods, ServerConfig, http as rpc_http, middleware::rpc::RpcServiceBuilder,
+    BatchRequestConfig, ConnectionGuard, ConnectionState, HttpBody, HttpResponse, Methods,
+    ServerConfig, http as rpc_http, middleware::rpc::RpcServiceBuilder,
     serve_with_graceful_shutdown, stop_channel, ws,
 };
+use reth_rpc_eth_types::EthSubscriptionIdProvider;
 use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
     KeyInfo, SignatureType as KeyInfoSignatureType,
 };
@@ -45,15 +46,6 @@ const MAX_WS_SUBSCRIPTIONS: u32 = 32;
 const MAX_WS_OUTBOUND_QUEUE: u32 = 1024;
 /// Maximum concurrent HTTP requests and WebSocket connections.
 const MAX_CONNECTIONS: usize = 100;
-
-#[derive(Debug, Default)]
-struct HexIdProvider(AtomicU32);
-
-impl IdProvider for HexIdProvider {
-    fn next_id(&self) -> jsonrpsee::types::SubscriptionId<'static> {
-        format!("0x{:x}", self.0.fetch_add(1, Ordering::Relaxed) + 1).into()
-    }
-}
 
 type KeychainLookup = Arc<
     dyn Fn(Address, Address) -> BoxFuture<'static, eyre::Result<KeyInfo>> + Send + Sync + 'static,
@@ -112,7 +104,7 @@ pub async fn start_redacted_rpc(
         .max_subscriptions_per_connection(MAX_WS_SUBSCRIPTIONS)
         .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_SIZE))
         .set_message_buffer_capacity(MAX_WS_OUTBOUND_QUEUE)
-        .set_id_provider(HexIdProvider::default())
+        .set_id_provider(EthSubscriptionIdProvider::default())
         .build();
     let rpc_middleware = RpcServiceBuilder::new().layer(RedactedRpcLayer);
     let connection_guard = ConnectionGuard::new(MAX_CONNECTIONS);
