@@ -1,0 +1,82 @@
+use bincode::Options;
+use reth_codecs::{Compress, Decompress, DecompressError};
+use serde::{Serialize, de::DeserializeOwned};
+pub(crate) const MAX_VALUE_SIZE: u64 = 8 * 1024 * 1024;
+const ENVELOPE_VERSION: u8 = 1;
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CodecError {
+    #[error("value exceeds 8 MiB limit")]
+    Oversize,
+    #[error("unknown value envelope version {0}")]
+    Version(u8),
+    #[error("malformed value: {0}")]
+    Malformed(String),
+}
+fn options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_VALUE_SIZE - 1)
+}
+pub(crate) fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, CodecError> {
+    let mut out = vec![ENVELOPE_VERSION];
+    options().serialize_into(&mut out, v).map_err(map)?;
+    if out.len() as u64 > MAX_VALUE_SIZE {
+        return Err(CodecError::Oversize);
+    }
+    Ok(out)
+}
+pub(crate) fn decode<T: DeserializeOwned>(v: &[u8]) -> Result<T, CodecError> {
+    if v.len() as u64 > MAX_VALUE_SIZE {
+        return Err(CodecError::Oversize);
+    }
+    let (&version, body) = v
+        .split_first()
+        .ok_or_else(|| CodecError::Malformed("empty envelope".into()))?;
+    if version != ENVELOPE_VERSION {
+        return Err(CodecError::Version(version));
+    }
+    options().deserialize(body).map_err(map)
+}
+fn map(e: Box<bincode::ErrorKind>) -> CodecError {
+    if matches!(*e, bincode::ErrorKind::SizeLimit) {
+        CodecError::Oversize
+    } else {
+        CodecError::Malformed(e.to_string())
+    }
+}
+macro_rules! value_codec {($($t:ty),+)=>{$(impl Compress for $t {type Compressed=Vec<u8>;fn compress_to_buf<B:bytes::BufMut+AsMut<[u8]>>(&self,b:&mut B){b.put_slice(&encode(self).expect("bounded persistence value"));}} impl Decompress for $t {fn decompress(v:&[u8])->Result<Self,DecompressError>{decode(v).map_err(|e|DecompressError::new(std::io::Error::other(e)))}})+};}
+value_codec!(super::Checkpoint, super::JournalEntry, super::Finding);
+
+impl Compress for super::MetaValue {
+    type Compressed = Vec<u8>;
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        match self {
+            Self::Version(version) => {
+                buf.put_u8(0);
+                buf.put_slice(&version.to_be_bytes());
+            }
+            Self::State(metadata) => {
+                buf.put_u8(1);
+                buf.put_slice(&encode(metadata).expect("bounded persistence metadata"));
+            }
+        }
+    }
+}
+
+impl Decompress for super::MetaValue {
+    fn decompress(value: &[u8]) -> Result<Self, DecompressError> {
+        match value.split_first() {
+            Some((0, body)) if body.len() == 4 => Ok(Self::Version(u32::from_be_bytes(
+                body.try_into().expect("length checked"),
+            ))),
+            Some((1, body)) => decode(body)
+                .map(Box::new)
+                .map(Self::State)
+                .map_err(|error| DecompressError::new(std::io::Error::other(error))),
+            _ => Err(DecompressError::new(std::io::Error::other(
+                "invalid metadata tag or version width",
+            ))),
+        }
+    }
+}

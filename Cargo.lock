@@ -13471,6 +13471,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-sol-types",
  "alloy-transport",
+ "bincode",
  "bytes",
  "eyre",
  "futures",

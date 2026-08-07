@@ -345,11 +345,7 @@ impl State {
     }
 
     pub fn apply(&mut self, delta: &StateDelta) -> Result<(), StateFamilyError> {
-        for (key, value) in &delta.writes {
-            if value.as_ref().is_some_and(|value| !value.matches_key(key)) {
-                return Err(StateFamilyError { key: *key });
-            }
-        }
+        delta.validate()?;
         for (key, value) in &delta.writes {
             match value {
                 Some(value) => {
@@ -437,5 +433,18 @@ impl StateDelta {
 
     pub fn writes(&self) -> &[(StateKey, Option<StateValue>)] {
         &self.writes
+    }
+
+    pub fn validate(&self) -> Result<(), StateFamilyError> {
+        let mut previous = None;
+        for (key, value) in &self.writes {
+            if previous.is_some_and(|previous| previous >= *key)
+                || value.as_ref().is_some_and(|value| !value.matches_key(key))
+            {
+                return Err(StateFamilyError { key: *key });
+            }
+            previous = Some(*key);
+        }
+        Ok(())
     }
 }

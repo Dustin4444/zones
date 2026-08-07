@@ -41,9 +41,11 @@ tempo-primitives.workspace = true
 # zones
 tempo-zone-contracts = { workspace = true, features = ["std"] }
 zone-primitives = { workspace = true, features = ["std"] }
+zone-checker-kernel.workspace = true
 
 # misc
 bytes.workspace = true
+bincode.workspace = true
 eyre.workspace = true
 futures.workspace = true
 metrics.workspace = true
@@ -53,7 +55,6 @@ tracing.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-zone-checker-kernel.workspace = true
 alloy-consensus = { workspace = true, features = ["std"] }
 alloy-rpc-types-eth.workspace = true
 alloy-transport.workspace = true

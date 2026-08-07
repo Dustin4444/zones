@@ -206,6 +206,7 @@ commonware-utils = "=2026.4.0"
 # misc
 aes-gcm = "0.10.3"
 base64 = "0.22.1"
+bincode = "1.3.3"
 bytes = { version = "1.11.1", default-features = false }
 clap = { version = "4.5.45", features = ["derive"] }
 const-hex = { version = "1.15.0" }
