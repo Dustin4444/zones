@@ -15,7 +15,7 @@ pub(crate) enum AcquisitionSource {
     L1Block,
     #[error("complete L1 receipts")]
     L1Receipts,
-    #[error("selected L1 transaction")]
+    #[error("complete L1 transactions")]
     L1Transaction,
     #[error("Zone notification receipts")]
     ZoneNotificationReceipts,

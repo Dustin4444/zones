@@ -156,16 +156,25 @@ fn consensus_receipts(
 }
 
 fn anchor(
+    receipts: Vec<TempoTransactionReceipt>,
+) -> (ImportedTempoHeader, Vec<TempoTransactionReceipt>) {
+    anchor_with_transactions(receipts, &[])
+}
+
+fn anchor_with_transactions(
     mut receipts: Vec<TempoTransactionReceipt>,
+    transactions: &[TempoTxEnvelope],
 ) -> (ImportedTempoHeader, Vec<TempoTransactionReceipt>) {
     let consensus = consensus_receipts(&receipts);
     let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&consensus);
+    let transactions_root = alloy_consensus::proofs::calculate_transaction_root(transactions);
     let logs_bloom = consensus
         .iter()
         .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom_ref());
     let header = TempoHeader {
         inner: Header {
             number: BLOCK_NUMBER,
+            transactions_root,
             receipts_root,
             logs_bloom,
             ..Default::default()
@@ -183,8 +192,13 @@ fn anchor(
 
 fn block_response(
     imported: &ImportedTempoHeader,
-    transaction_hashes: Vec<B256>,
+    envelopes: Vec<TempoTxEnvelope>,
 ) -> Block<Transaction<TempoTxEnvelope>, TempoHeaderResponse> {
+    let transactions = envelopes
+        .into_iter()
+        .enumerate()
+        .map(|(index, envelope)| rpc_transaction(envelope, imported, index as u64))
+        .collect();
     Block {
         header: TempoHeaderResponse {
             inner: RpcHeader {
@@ -196,7 +210,7 @@ fn block_response(
             timestamp_millis: 0,
         },
         uncles: vec![],
-        transactions: BlockTransactions::Hashes(transaction_hashes),
+        transactions: BlockTransactions::Full(transactions),
         withdrawals: None,
     }
 }
@@ -627,13 +641,14 @@ fn direct_portal_call_requires_one_top_level_target_for_legacy_and_aa() {
 }
 
 #[test]
-fn selective_transaction_binding_checks_hash_block_number_and_index() {
-    let (imported, _) = anchor(vec![]);
+fn full_transaction_binding_checks_hash_block_number_index_and_root() {
     let envelope = legacy_call(PORTAL, submit_batch_calldata());
     let expected_hash = envelope.trie_hash();
-    let transaction = rpc_transaction(envelope, &imported, 3);
+    let (imported, _) = anchor_with_transactions(vec![], std::slice::from_ref(&envelope));
+    let transaction = rpc_transaction(envelope, &imported, 0);
     assert_eq!(transaction.tx_hash(), expected_hash);
-    calls::authenticate_transaction(&transaction, &imported, 3, expected_hash).unwrap();
+    authentication::authenticate_transactions(&imported, std::slice::from_ref(&transaction))
+        .unwrap();
 
     let mut mutations = Vec::new();
     let mut wrong_hash = transaction.clone();
@@ -649,23 +664,57 @@ fn selective_transaction_binding_checks_hash_block_number_and_index() {
     wrong_block_number.block_number = Some(imported.number() + 1);
     mutations.push(wrong_block_number);
     let mut wrong_index = transaction;
-    wrong_index.transaction_index = Some(4);
+    wrong_index.transaction_index = Some(1);
     mutations.push(wrong_index);
 
     for transaction in mutations {
         assert_inconsistent(
-            calls::authenticate_transaction(&transaction, &imported, 3, expected_hash).unwrap_err(),
+            authentication::authenticate_transactions(&imported, &[transaction]).unwrap_err(),
             AcquisitionSource::L1Transaction,
         );
     }
+}
+
+#[test]
+fn transaction_authentication_rejects_order_count_and_valid_uncommitted_portal_body() {
+    let first = legacy_call(PORTAL, submit_batch_calldata());
+    let second = legacy_call(PORTAL, process_withdrawals_calldata(true));
+    let (imported, _) = anchor_with_transactions(vec![], &[first.clone(), second.clone()]);
+    let transactions = vec![
+        rpc_transaction(first.clone(), &imported, 0),
+        rpc_transaction(second, &imported, 1),
+    ];
+    authentication::authenticate_transactions(&imported, &transactions).unwrap();
+
+    let mut reordered = transactions.clone();
+    reordered.swap(0, 1);
+    assert_inconsistent(
+        authentication::authenticate_transactions(&imported, &reordered).unwrap_err(),
+        AcquisitionSource::L1Transaction,
+    );
+    assert_inconsistent(
+        authentication::authenticate_transactions(&imported, &transactions[..1]).unwrap_err(),
+        AcquisitionSource::L1Transaction,
+    );
+
+    let fake_portal_body = legacy_call(PORTAL, process_withdrawals_calldata(false));
+    let (single_imported, _) = anchor_with_transactions(vec![], std::slice::from_ref(&first));
+    let fake = rpc_transaction(fake_portal_body, &single_imported, 0);
+    assert_inconsistent(
+        authentication::authenticate_transactions(&single_imported, &[fake]).unwrap_err(),
+        AcquisitionSource::L1Transaction,
+    );
 }
 
 #[tokio::test]
 async fn empty_process_withdrawals_without_events_causes_no_transaction_fetch() {
     let envelope = legacy_call(PORTAL, process_withdrawals_calldata(false));
     let tx_hash = envelope.trie_hash();
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![])]);
-    let block = block_response(&imported, vec![tx_hash]);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
@@ -683,13 +732,14 @@ async fn eventful_submit_batch_fetches_once_and_decodes_direct_calldata() {
     let envelope = legacy_call(PORTAL, submit_batch_calldata());
     let tx_hash = envelope.trie_hash();
     let batch_event = batch_submitted_log(0, 500);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![batch_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![batch_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
@@ -717,13 +767,14 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     let envelope = legacy_call(PORTAL, process_withdrawals_calldata(true));
     let tx_hash = envelope.trie_hash();
     let process_event = withdrawal_processed_log(0, 500);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![process_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![process_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
@@ -759,13 +810,14 @@ async fn eventful_submit_batch_rejects_wrong_target_direct_call() {
     let envelope = legacy_call(EXTERNAL, submit_batch_calldata());
     let tx_hash = envelope.trie_hash();
     let batch_event = batch_submitted_log(0, 500);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![batch_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![batch_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
@@ -784,13 +836,14 @@ async fn authenticated_event_and_direct_call_family_must_match() {
     let envelope = legacy_call(PORTAL, submit_batch_calldata());
     let tx_hash = envelope.trie_hash();
     let process_event = withdrawal_processed_log(0, 0);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![process_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![process_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
 
@@ -811,13 +864,14 @@ async fn eventful_empty_process_withdrawals_fails_closed() {
     let envelope = legacy_call(PORTAL, process_withdrawals_calldata(false));
     let tx_hash = envelope.trie_hash();
     let process_event = withdrawal_processed_log(0, 0);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![process_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![process_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
 
@@ -837,13 +891,14 @@ async fn eventful_malformed_direct_calldata_fails_closed() {
     let envelope = legacy_call(PORTAL, malformed.into());
     let tx_hash = envelope.trie_hash();
     let batch_event = batch_submitted_log(0, 0);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![batch_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let transaction = rpc_transaction(envelope, &imported, 0);
+    let (imported, receipts) = anchor_with_transactions(
+        vec![receipt(tx_hash, 0, true, vec![batch_event])],
+        std::slice::from_ref(&envelope),
+    );
+    let block = block_response(&imported, vec![envelope]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
     asserter.push_success(&Some(receipts));
-    asserter.push_success(&Some(transaction));
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
 
@@ -861,7 +916,7 @@ async fn eventful_malformed_direct_calldata_fails_closed() {
 }
 
 #[tokio::test]
-async fn missing_block_receipts_and_selected_transaction_are_source_classified() {
+async fn missing_block_receipts_and_incomplete_transaction_blocks_are_source_classified() {
     let (empty_imported, _) = anchor(vec![]);
     let asserter = Asserter::new();
     asserter
@@ -892,21 +947,21 @@ async fn missing_block_receipts_and_selected_transaction_are_source_classified()
 
     let envelope = legacy_call(PORTAL, submit_batch_calldata());
     let tx_hash = envelope.trie_hash();
-    let batch_event = batch_submitted_log(0, 0);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![batch_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
+    let (imported, _) = anchor_with_transactions(vec![], std::slice::from_ref(&envelope));
+    let mut block = block_response(&imported, vec![envelope]);
+    block.transactions = BlockTransactions::Hashes(vec![tx_hash]);
     let asserter = Asserter::new();
     asserter.push_success(&Some(block));
-    asserter.push_success(&Some(receipts));
-    asserter.push_success(&Option::<Transaction<TempoTxEnvelope>>::None);
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
     assert!(matches!(
         observe_l1(&provider, &imported, PORTAL).await,
-        Err(ObservationError::Acquisition(AcquisitionError::Missing {
-            kind: AcquisitionSource::L1Transaction,
-            ..
-        }))
+        Err(ObservationError::Acquisition(
+            AcquisitionError::Inconsistent {
+                kind: AcquisitionSource::L1Transaction,
+                ..
+            }
+        ))
     ));
 }
 
@@ -935,21 +990,5 @@ async fn transport_failures_are_unavailable_and_source_classified() {
             .await
             .unwrap_err(),
         AcquisitionSource::L1Receipts,
-    );
-
-    let envelope = legacy_call(PORTAL, submit_batch_calldata());
-    let tx_hash = envelope.trie_hash();
-    let batch_event = batch_submitted_log(0, 0);
-    let (imported, receipts) = anchor(vec![receipt(tx_hash, 0, true, vec![batch_event])]);
-    let block = block_response(&imported, vec![tx_hash]);
-    let asserter = Asserter::new();
-    asserter.push_success(&Some(block));
-    asserter.push_success(&Some(receipts));
-    asserter.push_failure_msg("transaction transport failure");
-    let provider =
-        ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
-    assert_unavailable(
-        observe_l1(&provider, &imported, PORTAL).await.unwrap_err(),
-        AcquisitionSource::L1Transaction,
     );
 }

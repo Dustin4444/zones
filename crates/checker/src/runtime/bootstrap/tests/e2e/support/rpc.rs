@@ -1,6 +1,6 @@
-use alloy_consensus::{Header, ReceiptWithBloom};
-use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, Bloom, Bytes, Log, U64, U256};
+use alloy_consensus::{Header, ReceiptWithBloom, Signed, TxLegacy, transaction::Recovered};
+use alloy_eips::{BlockNumHash, Encodable2718 as _};
+use alloy_primitives::{Address, B256, Bloom, Bytes, Log, Signature, U64, U256};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_rpc_types_eth::{
     Block, BlockTransactions, Header as RpcHeader, Log as RpcLog, Transaction, TransactionReceipt,
@@ -28,7 +28,14 @@ pub(crate) struct AuthenticatedBlock {
 
 impl AuthenticatedBlock {
     pub(crate) fn new(number: u64, parent_hash: B256, logs: Vec<Log>) -> Self {
-        let transaction_hash = B256::repeat_byte(number as u8);
+        let envelope = TempoTxEnvelope::Legacy(Signed::new_unhashed(
+            TxLegacy {
+                nonce: number,
+                ..Default::default()
+            },
+            Signature::test_signature(),
+        ));
+        let transaction_hash = envelope.trie_hash();
         let rpc_logs = logs
             .into_iter()
             .enumerate()
@@ -85,6 +92,9 @@ impl AuthenticatedBlock {
                 receipts_root: alloy_consensus::proofs::calculate_receipt_root(
                     std::slice::from_ref(&consensus),
                 ),
+                transactions_root: alloy_consensus::proofs::calculate_transaction_root(
+                    std::slice::from_ref(&envelope),
+                ),
                 logs_bloom: *consensus.bloom_ref(),
                 base_fee_per_gas: Some(1),
                 ..Default::default()
@@ -100,6 +110,14 @@ impl AuthenticatedBlock {
             log.block_hash = Some(hash);
             log.block_number = Some(number);
         }
+        let transaction = Transaction {
+            inner: Recovered::new_unchecked(envelope, Address::repeat_byte(0x11)),
+            block_hash: Some(hash),
+            block_number: Some(number),
+            transaction_index: Some(0),
+            effective_gas_price: None,
+            block_timestamp: None,
+        };
         let response = Block {
             header: TempoHeaderResponse {
                 inner: RpcHeader {
@@ -111,7 +129,7 @@ impl AuthenticatedBlock {
                 timestamp_millis: 0,
             },
             uncles: Vec::new(),
-            transactions: BlockTransactions::Hashes(vec![transaction_hash]),
+            transactions: BlockTransactions::Full(vec![transaction]),
             withdrawals: None,
         };
         Self {

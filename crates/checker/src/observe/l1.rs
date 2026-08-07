@@ -2,8 +2,8 @@
 //!
 //! The imported header is selected exclusively by `advanceTempo` calldata on
 //! L2. This adapter authenticates the complete ordered receipt stream against
-//! that header, then selectively acquires only Portal transaction bodies whose
-//! calldata is needed by the model.
+//! that header, authenticates every transaction envelope against the header's
+//! transaction root, and decodes needed Portal calldata from those envelopes.
 
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ impl OrderedL1Outcome {
     }
 }
 
-/// Authenticated outcomes and any selectively acquired direct Portal input for
+/// Authenticated outcomes and any directly decoded Portal input for
 /// one transaction. `direct_call` is absent when no model rule needs calldata.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct L1TransactionObservation {
@@ -218,11 +218,8 @@ impl L1BlockObservation {
 /// Observe the exact L1 block selected by the authenticated `advanceTempo`
 /// header.
 ///
-/// Receipt-root and bloom authentication completes before any event can cause
-/// a transaction-body fetch. The release-one design deliberately trusts the
-/// configured archive RPC to bind each selectively fetched body to the
-/// authenticated block; it does not fetch every body or recompute the
-/// transaction root.
+/// Full transaction-root, receipt-root, and bloom authentication completes
+/// before any envelope or event is used semantically.
 pub(crate) async fn observe_l1<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
@@ -234,22 +231,27 @@ where
     let block = authentication::acquire_block(provider, imported).await?;
     let (receipts, receipt_fetch_duration) =
         authentication::acquire_receipts(provider, imported, &block).await?;
-    let pending = events::ordered_transactions(portal, &block.transaction_hashes, &receipts)?;
+    let transaction_hashes = block
+        .transactions
+        .iter()
+        .map(alloy_network::TransactionResponse::tx_hash)
+        .collect::<Vec<_>>();
+    let pending = events::ordered_transactions(portal, &transaction_hashes, &receipts)?;
 
     let mut protocol_transactions = Vec::with_capacity(pending.len());
     for transaction in pending {
         let direct_call = match transaction.required_call {
-            Some(required) => Some(
-                calls::acquire_direct_portal_call(
-                    provider,
+            Some(required) => {
+                let envelope: &tempo_primitives::TempoTxEnvelope =
+                    block.transactions[transaction.transaction_index].as_ref();
+                Some(calls::decode_direct_portal_call(
+                    envelope,
                     portal,
-                    imported,
                     transaction.transaction_index,
                     transaction.transaction_hash,
                     required,
-                )
-                .await?,
-            ),
+                )?)
+            }
             None => None,
         };
         protocol_transactions.push(L1TransactionObservation {

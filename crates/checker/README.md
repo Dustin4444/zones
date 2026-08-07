@@ -70,7 +70,7 @@ exact before-images and applies the replacement blocks through the same path.
 ### Archive requirements
 
 Bootstrap and repair require the configured Tempo RPC to retain exact blocks,
-complete receipts, selectively required transaction bodies, and historical
+complete transaction envelopes, complete receipts, and historical
 Portal balance state from creation onward. The local Zone node must retain
 canonical block bodies and the historical execution state needed by Reth's
 backfill job from genesis onward. Catch-up re-executes those blocks to produce
@@ -197,20 +197,15 @@ The Tempo adapter takes only the imported header decoded above. It:
 An eventful nested or ambiguous Portal call is unsupported. A required direct
 transaction must contain exactly one top-level Tempo call and that call must
 target the configured Portal. An empty `processWithdrawals` has no protocol
-outcome and creates no transaction-fetch requirement.
-
-The configured L1 archive RPC remains an explicit trust boundary for
-receipt-to-transaction metadata after receipt-root authentication. It does
-not fetch every transaction body or recompute the transaction root.
+outcome and creates no calldata-decoding requirement.
 
 ### Operator trust and non-claims
 
-The configured L1 archive RPC is trusted for availability, exact-block Portal
-balance values, and the block/hash/index binding of selectively fetched
-transaction bodies. The checker authenticates the imported header and complete
-receipt vector against header commitments and locally hashes each selectively
-fetched body, but it does not obtain a transaction-root proof or an independent
-state-trie proof for collateral.
+The configured L1 archive RPC is trusted for availability and exact-block Portal
+balance values. The checker authenticates the imported header, locally hashes
+every full transaction envelope and reconstructs `transactions_root`, then
+authenticates the complete receipt vector and binds every receipt to that local
+hash order. It does not obtain an independent state-trie proof for collateral.
 
 The in-process Zone node is trusted to expose the canonical L2 chain, complete
 notification/backfill receipts, and exact historical state for canonical block
@@ -313,7 +308,7 @@ available.
 | `reth_tempo_zone_checker_model_rows` | Current physical rows in `CheckerModelState`, read from the committed MDBX table. |
 | `reth_tempo_zone_checker_open_lifecycle_records` | Current nonterminal deposit, withdrawal, batch, fallback, Portal-refund, and Inbox-refund owners. |
 | `reth_tempo_zone_checker_database_allocated_bytes` | Allocated bytes for regular files in the dedicated checker directory (`st_blocks * 512` on Unix; logical file length fallback on non-Unix). |
-| `reth_tempo_zone_checker_observation_duration_seconds` | Full authenticated L2 and L1 observation, including L1 block, receipt, and selectively required transaction RPC acquisition. |
+| `reth_tempo_zone_checker_observation_duration_seconds` | Full authenticated L2 and L1 observation, including complete L1 transaction envelopes and receipts. |
 | `reth_tempo_zone_checker_transition_duration_seconds` | Model and comparison work with separately timed collateral and exact-state acquisition subtracted. |
 | `reth_tempo_zone_checker_collateral_calls_total`, `reth_tempo_zone_checker_collateral_call_failures_total` | Per-token exact-block collateral attempts and failures. |
 | `reth_tempo_zone_checker_exact_state_reads_total`, `reth_tempo_zone_checker_exact_state_read_failures_total`, `reth_tempo_zone_checker_supply_tokens_requested_total` | Aggregate exact-state attempts/failures and token slots requested. |
