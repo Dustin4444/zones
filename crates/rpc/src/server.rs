@@ -299,19 +299,11 @@ pub(crate) fn now_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::authenticate_token;
-    use crate::{
-        RedactedRpcConfig,
-        auth::build_token_fields,
-        error::AuthenticateError,
-        handlers::ZoneRpcApi,
-        types::{BoxEyreFut, BoxFut, JsonRpcError},
-    };
-    use alloy_primitives::{Address, Bytes};
+    use crate::{RedactedRpcConfig, auth::build_token_fields, error::AuthenticateError};
+    use alloy_primitives::Address;
     use axum::http::StatusCode;
     use p256::ecdsa::SigningKey as P256SigningKey;
-    use parking_lot::Mutex;
     use rand::thread_rng;
-    use std::collections::HashMap;
     use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
         KeyInfo, SignatureType as KeyInfoSignatureType,
     };
@@ -326,78 +318,21 @@ mod tests {
 
     use auth_tokens::{build_token_with_signature, now_secs, sign_keychain_signature};
 
+    #[allow(dead_code)]
+    mod test_api {
+        use crate as rpc;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-utils/zone_rpc_api.rs"
+        ));
+    }
+
+    use test_api::TestZoneRpcApi as TestApi;
+
     const ZONE_ID: u32 = 7;
     const CHAIN_ID: u64 = 99;
     const PORTAL: Address = Address::repeat_byte(0x22);
-
-    struct TestApi {
-        key_infos: Mutex<HashMap<(Address, Address), KeyInfo>>,
-    }
-
-    impl TestApi {
-        fn with_key_info(account: Address, key_id: Address, key_info: KeyInfo) -> Self {
-            let mut key_infos = HashMap::new();
-            key_infos.insert((account, key_id), key_info);
-            Self {
-                key_infos: Mutex::new(key_infos),
-            }
-        }
-    }
-
-    macro_rules! stub {
-        ($method:ident $(, $arg:ident : $ty:ty)*) => {
-            fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
-                Box::pin(async { Err(JsonRpcError::internal("not implemented")) })
-            }
-        };
-    }
-
-    impl ZoneRpcApi for TestApi {
-        fn get_keychain_key(&self, account: Address, key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
-            let key_info = self
-                .key_infos
-                .lock()
-                .get(&(account, key_id))
-                .cloned()
-                .unwrap_or(KeyInfo {
-                    signatureType: KeyInfoSignatureType::Secp256k1,
-                    keyId: Address::ZERO,
-                    expiry: 0,
-                    enforceLimits: false,
-                    isRevoked: false,
-                });
-            Box::pin(async move { Ok(key_info) })
-        }
-
-        stub!(block_number);
-        stub!(chain_id);
-        stub!(net_version);
-        stub!(syncing);
-        stub!(coinbase);
-        stub!(gas_price);
-        stub!(max_priority_fee_per_gas);
-        stub!(fee_history, _a: u64, _b: alloy_rpc_types_eth::BlockNumberOrTag, _c: Option<Vec<f64>>);
-        stub!(get_balance, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
-        stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: crate::auth::AuthContext);
-        stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: crate::auth::AuthContext);
-        stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: crate::auth::AuthContext);
-        stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(transaction_receipt, _a: alloy_primitives::B256, _c: crate::auth::AuthContext);
-        stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
-        stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: crate::auth::AuthContext);
-        stub!(send_raw_transaction, _a: Bytes, _c: crate::auth::AuthContext);
-        stub!(send_raw_transaction_sync, _a: Bytes, _c: crate::auth::AuthContext);
-        stub!(fill_transaction, _a: tempo_alloy::rpc::TempoTransactionRequest, _c: crate::auth::AuthContext);
-        stub!(get_logs, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
-        stub!(new_filter, _a: alloy_rpc_types_eth::Filter, _c: crate::auth::AuthContext);
-        stub!(get_filter_logs, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(get_filter_changes, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(new_block_filter, _c: crate::auth::AuthContext);
-        stub!(uninstall_filter, _a: alloy_rpc_types_eth::FilterId, _c: crate::auth::AuthContext);
-        stub!(zone_get_authorization_token_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_zone_info, _c: crate::auth::AuthContext);
-        stub!(zone_get_encryption_key, _c: crate::auth::AuthContext);
-    }
 
     fn test_config() -> RedactedRpcConfig {
         RedactedRpcConfig {
@@ -422,9 +357,7 @@ mod tests {
         let mut blob = vec![0u8; 65];
         blob.extend_from_slice(&fields);
         let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
+        let api = TestApi::default();
 
         let err = authenticate_token(&token, &config, &api)
             .await
@@ -452,9 +385,7 @@ mod tests {
         let mut blob = vec![0u8; 65];
         blob.extend_from_slice(&fields);
         let token = alloy_primitives::hex::encode(blob);
-        let api = TestApi {
-            key_infos: Mutex::new(HashMap::new()),
-        };
+        let api = TestApi::default();
 
         let err = authenticate_token(&token, &config, &api)
             .await

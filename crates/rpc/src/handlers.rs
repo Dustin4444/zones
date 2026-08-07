@@ -750,78 +750,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::to_raw;
 
-    #[derive(Default)]
-    struct MockZoneRpcApi;
+    #[allow(dead_code)]
+    mod test_api {
+        use crate as rpc;
 
-    macro_rules! stub {
-        ($method:ident $(, $arg:ident : $ty:ty)*) => {
-            fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
-                Box::pin(async { Err(JsonRpcError::internal("not implemented")) })
-            }
-        };
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test-utils/zone_rpc_api.rs"
+        ));
     }
 
-    impl ZoneRpcApi for MockZoneRpcApi {
-        fn get_keychain_key(&self, _account: Address, _key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
-            Box::pin(async { Err(eyre::eyre!("not implemented")) })
-        }
-
-        stub!(block_number);
-        stub!(chain_id);
-        stub!(net_version);
-        stub!(gas_price);
-        stub!(max_priority_fee_per_gas);
-        stub!(fee_history, _block_count: u64, _newest_block: BlockNumberOrTag, _reward_percentiles: Option<Vec<f64>>);
-        stub!(get_balance, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
-        stub!(get_transaction_count, _address: Address, _block: Option<BlockId>, _auth: AuthContext);
-        stub!(block_by_number, _number: BlockNumberOrTag, _full: bool, _auth: AuthContext);
-        stub!(block_by_hash, _hash: B256, _full: bool, _auth: AuthContext);
-        stub!(transaction_by_hash, _hash: B256, _auth: AuthContext);
-        stub!(transaction_receipt, _hash: B256, _auth: AuthContext);
-        stub!(call, _request: TempoTransactionRequest, _block: Option<BlockId>, _state_override: Option<StateOverride>, _auth: AuthContext);
-        stub!(estimate_gas, _request: TempoTransactionRequest, _block: Option<BlockId>, _state_override: Option<StateOverride>, _auth: AuthContext);
-        stub!(send_raw_transaction, _data: Bytes, _auth: AuthContext);
-        stub!(send_raw_transaction_sync, _data: Bytes, _auth: AuthContext);
-        stub!(fill_transaction, _request: TempoTransactionRequest, _auth: AuthContext);
-        stub!(get_logs, _filter: Filter, _auth: AuthContext);
-        stub!(new_filter, _filter: Filter, _auth: AuthContext);
-        stub!(get_filter_logs, _id: FilterId, _auth: AuthContext);
-        stub!(get_filter_changes, _id: FilterId, _auth: AuthContext);
-        stub!(new_block_filter, _auth: AuthContext);
-        stub!(uninstall_filter, _id: FilterId, _auth: AuthContext);
-        fn zone_get_authorization_token_info(&self, auth: AuthContext) -> BoxFut<'_> {
-            Box::pin(async move {
-                to_raw(&json!({
-                    "account": auth.caller,
-                    "expiresAt": alloy_primitives::U64::from(auth.expires_at),
-                }))
-            })
-        }
-
-        fn syncing(&self) -> BoxFut<'_> {
-            Box::pin(async move { to_raw(&false) })
-        }
-
-        fn coinbase(&self) -> BoxFut<'_> {
-            Box::pin(async move { to_raw(&Address::repeat_byte(0xbb)) })
-        }
-
-        fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
-            Box::pin(async move {
-                to_raw(&json!({
-                    "zoneId": "0x1",
-                    "zoneTokens": [format!("{:#x}", Address::repeat_byte(0x11))],
-                    "sequencers": [format!("{:#x}", Address::repeat_byte(0x22))],
-                    "chainId": "0x2a",
-                    "tempoBlockNumber": "0x7",
-                }))
-            })
-        }
-
-        stub!(zone_get_encryption_key, _auth: AuthContext);
-    }
+    use test_api::TestZoneRpcApi as MockZoneRpcApi;
 
     fn auth() -> AuthContext {
         AuthContext {
@@ -850,7 +790,7 @@ mod tests {
         assert_eq!(classify_method("zone_getSequencerInfo"), None);
         assert_eq!(classify_method("zone_setLeader"), None);
 
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let excluded = dispatch(&request("zone_setLeader", json!([])), &auth(), &api).await;
         assert_eq!(excluded.error.unwrap().code, -32601);
 
@@ -860,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_zone_get_authorization_token_info() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let resp = dispatch(
             &request("zone_getAuthorizationTokenInfo", json!([])),
             &auth(),
@@ -880,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_allowed_compatibility_methods() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
 
         let syncing = dispatch(&request("eth_syncing", json!([])), &auth(), &api).await;
         assert_eq!(
@@ -908,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_zone_get_zone_info() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let resp = dispatch(&request("zone_getZoneInfo", json!([])), &auth(), &api).await;
 
         assert!(resp.error.is_none());
@@ -929,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_pending_transaction_filter_endpoint() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
 
         let resp = dispatch(
             &request("eth_newPendingTransactionFilter", json!([])),
@@ -944,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_state_override_for_eth_call() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let resp = dispatch(
             &request(
                 "eth_call",
@@ -967,7 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_state_override_for_estimate_gas() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let resp = dispatch(
             &request(
                 "eth_estimateGas",
@@ -990,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_extra_block_override_param_for_eth_call() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
         let resp = dispatch(
             &request(
                 "eth_call",
@@ -1013,7 +953,7 @@ mod tests {
     }
     #[tokio::test]
     async fn classifies_spec_disabled_and_restricted_methods() {
-        let api = MockZoneRpcApi::default();
+        let api = MockZoneRpcApi::for_handler_tests();
 
         for method in [
             "eth_getProof",

@@ -1,26 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, b256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use futures::{SinkExt, StreamExt, stream};
+use futures::{SinkExt, StreamExt};
 use p256::ecdsa::SigningKey as P256SigningKey;
-use parking_lot::Mutex;
 use rand::thread_rng;
 use serde_json::{Value, json};
-use tempo_contracts::precompiles::account_keychain::IAccountKeychain::{
-    KeyInfo, SignatureType as KeyInfoSignatureType,
-};
-use tokio::sync::Notify;
+use tempo_contracts::precompiles::account_keychain::IAccountKeychain::SignatureType as KeyInfoSignatureType;
 use tokio_tungstenite::{connect_async, tungstenite};
-use zone_rpc::{
-    RedactedRpcConfig,
-    auth::build_token_fields,
-    handlers::ZoneRpcApi,
-    start_redacted_rpc,
-    subscription::{BoxWsSubscriptionFut, WsSubscriptionStream},
-    types::{BoxEyreFut, BoxFut, JsonRpcError},
-};
+use zone_rpc::{RedactedRpcConfig, auth::build_token_fields, start_redacted_rpc};
 
 #[path = "../../test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -30,237 +19,17 @@ use auth_tokens::{
     sign_webauthn_signature,
 };
 
-// ---------------------------------------------------------------------------
-// Mock API
-// ---------------------------------------------------------------------------
+#[allow(dead_code)]
+mod test_api {
+    use zone_rpc as rpc;
 
-#[derive(Default)]
-struct MockZoneRpcApi {
-    key_infos: Mutex<HashMap<(Address, Address), KeyInfo>>,
-    key_lookup_error: Option<&'static str>,
-    ws_subscriptions_enabled: bool,
-    blocking_rpc_started: Option<Arc<Notify>>,
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test-utils/zone_rpc_api.rs"
+    ));
 }
 
-impl MockZoneRpcApi {
-    fn with_key(account: Address, key_id: Address, signature_type: KeyInfoSignatureType) -> Self {
-        let mut key_infos = HashMap::new();
-        key_infos.insert(
-            (account, key_id),
-            KeyInfo {
-                signatureType: signature_type,
-                keyId: key_id,
-                expiry: u64::MAX,
-                enforceLimits: false,
-                isRevoked: false,
-            },
-        );
-        Self {
-            key_infos: Mutex::new(key_infos),
-            key_lookup_error: None,
-            ws_subscriptions_enabled: false,
-            blocking_rpc_started: None,
-        }
-    }
-
-    fn with_key_and_blocking_request(
-        account: Address,
-        key_id: Address,
-        signature_type: KeyInfoSignatureType,
-    ) -> (Self, Arc<Notify>) {
-        let mut api = Self::with_key(account, key_id, signature_type);
-        let started = Arc::new(Notify::new());
-        api.blocking_rpc_started = Some(started.clone());
-        (api, started)
-    }
-
-    fn with_key_lookup_error(message: &'static str) -> Self {
-        Self {
-            key_infos: Mutex::new(HashMap::new()),
-            key_lookup_error: Some(message),
-            ws_subscriptions_enabled: false,
-            blocking_rpc_started: None,
-        }
-    }
-
-    fn with_ws_subscriptions() -> Self {
-        Self {
-            key_infos: Mutex::new(HashMap::new()),
-            key_lookup_error: None,
-            ws_subscriptions_enabled: true,
-            blocking_rpc_started: None,
-        }
-    }
-
-    fn revoke_key(&self, account: Address, key_id: Address) {
-        if let Some(key_info) = self.key_infos.lock().get_mut(&(account, key_id)) {
-            key_info.isRevoked = true;
-        }
-    }
-}
-
-macro_rules! stub {
-    ($method:ident $(, $arg:ident : $ty:ty)*) => {
-        fn $method(&self $(, $arg: $ty)*) -> BoxFut<'_> {
-            Box::pin(async { Err(JsonRpcError::internal("not implemented")) })
-        }
-    };
-}
-
-impl ZoneRpcApi for MockZoneRpcApi {
-    fn get_keychain_key(&self, account: Address, key_id: Address) -> BoxEyreFut<'_, KeyInfo> {
-        if let Some(message) = self.key_lookup_error {
-            return Box::pin(async move { Err(eyre::eyre!(message)) });
-        }
-        let key_info = self
-            .key_infos
-            .lock()
-            .get(&(account, key_id))
-            .cloned()
-            .unwrap_or(KeyInfo {
-                signatureType: KeyInfoSignatureType::Secp256k1,
-                keyId: Address::ZERO,
-                expiry: 0,
-                enforceLimits: false,
-                isRevoked: false,
-            });
-        Box::pin(async move { Ok(key_info) })
-    }
-
-    fn block_number(&self) -> BoxFut<'_> {
-        Box::pin(async { zone_rpc::types::to_raw(&"0x42") })
-    }
-
-    fn chain_id(&self) -> BoxFut<'_> {
-        Box::pin(async { zone_rpc::types::to_raw(&"0x1") })
-    }
-
-    stub!(net_version);
-    stub!(syncing);
-    stub!(coinbase);
-    stub!(gas_price);
-    stub!(max_priority_fee_per_gas);
-    stub!(fee_history, _a: u64, _b: alloy_rpc_types_eth::BlockNumberOrTag, _c: Option<Vec<f64>>);
-    stub!(get_balance, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: zone_rpc::auth::AuthContext);
-    stub!(get_transaction_count, _a: Address, _b: Option<alloy_rpc_types_eth::BlockId>, _c: zone_rpc::auth::AuthContext);
-    stub!(block_by_number, _a: alloy_rpc_types_eth::BlockNumberOrTag, _b: bool, _c: zone_rpc::auth::AuthContext);
-    stub!(block_by_hash, _a: alloy_primitives::B256, _b: bool, _c: zone_rpc::auth::AuthContext);
-    stub!(transaction_by_hash, _a: alloy_primitives::B256, _c: zone_rpc::auth::AuthContext);
-    stub!(transaction_receipt, _a: alloy_primitives::B256, _c: zone_rpc::auth::AuthContext);
-    stub!(call, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: zone_rpc::auth::AuthContext);
-    stub!(estimate_gas, _a: tempo_alloy::rpc::TempoTransactionRequest, _b: Option<alloy_rpc_types_eth::BlockId>, _c: Option<alloy_rpc_types_eth::state::StateOverride>, _d: zone_rpc::auth::AuthContext);
-    stub!(send_raw_transaction, _a: alloy_primitives::Bytes, _c: zone_rpc::auth::AuthContext);
-    fn send_raw_transaction_sync(
-        &self,
-        _data: alloy_primitives::Bytes,
-        _auth: zone_rpc::auth::AuthContext,
-    ) -> BoxFut<'_> {
-        let started = self.blocking_rpc_started.clone();
-        Box::pin(async move {
-            if let Some(started) = started {
-                started.notify_one();
-                std::future::pending::<()>().await;
-            }
-            Err(JsonRpcError::internal("not implemented"))
-        })
-    }
-    stub!(fill_transaction, _a: tempo_alloy::rpc::TempoTransactionRequest, _c: zone_rpc::auth::AuthContext);
-    stub!(get_logs, _a: alloy_rpc_types_eth::Filter, _c: zone_rpc::auth::AuthContext);
-    stub!(new_filter, _a: alloy_rpc_types_eth::Filter, _c: zone_rpc::auth::AuthContext);
-    stub!(get_filter_logs, _a: alloy_rpc_types_eth::FilterId, _c: zone_rpc::auth::AuthContext);
-    stub!(get_filter_changes, _a: alloy_rpc_types_eth::FilterId, _c: zone_rpc::auth::AuthContext);
-    stub!(new_block_filter, _c: zone_rpc::auth::AuthContext);
-    stub!(uninstall_filter, _a: alloy_rpc_types_eth::FilterId, _c: zone_rpc::auth::AuthContext);
-
-    fn ws_subscribe_new_heads(
-        &self,
-        _auth: zone_rpc::auth::AuthContext,
-    ) -> BoxWsSubscriptionFut<'_> {
-        let enabled = self.ws_subscriptions_enabled;
-        Box::pin(async move {
-            if !enabled {
-                return Err(JsonRpcError::method_disabled());
-            }
-
-            let stream = stream::iter(vec![zone_rpc::types::to_raw(&json!({
-                "hash": format!(
-                    "{:#x}",
-                    b256!("0x4444444444444444444444444444444444444444444444444444444444444444")
-                ),
-                "number": "0x42",
-                "parentHash": format!("{:#x}", alloy_primitives::B256::ZERO),
-                "logsBloom": format!("0x{}", "0".repeat(512)),
-                "gasUsed": "0x0",
-                "size": "0x0",
-                "transactionsRoot": format!("{:#x}", alloy_primitives::B256::ZERO),
-                "receiptsRoot": format!("{:#x}", alloy_primitives::B256::ZERO),
-                "stateRoot": format!("{:#x}", alloy_primitives::B256::ZERO),
-                "extraData": "0x",
-            }))]);
-            let stream: WsSubscriptionStream = Box::pin(stream);
-            Ok(stream)
-        })
-    }
-
-    fn ws_subscribe_logs(
-        &self,
-        _filter: alloy_rpc_types_eth::Filter,
-        _auth: zone_rpc::auth::AuthContext,
-    ) -> BoxWsSubscriptionFut<'_> {
-        let enabled = self.ws_subscriptions_enabled;
-        Box::pin(async move {
-            if !enabled {
-                return Err(JsonRpcError::method_disabled());
-            }
-
-            let stream = stream::iter(vec![zone_rpc::types::to_raw(&json!({
-                "address": format!("{:#x}", Address::ZERO),
-                "topics": [format!(
-                    "{:#x}",
-                    b256!("0x1111111111111111111111111111111111111111111111111111111111111111")
-                )],
-                "data": "0x",
-                "blockHash": format!(
-                    "{:#x}",
-                    b256!("0x2222222222222222222222222222222222222222222222222222222222222222")
-                ),
-                "blockNumber": "0x42",
-                "transactionHash": format!(
-                    "{:#x}",
-                    b256!("0x3333333333333333333333333333333333333333333333333333333333333333")
-                ),
-                "transactionIndex": "0x0",
-                "logIndex": "0x0",
-                "removed": false
-            }))]);
-            let stream: WsSubscriptionStream = Box::pin(stream);
-            Ok(stream)
-        })
-    }
-
-    fn zone_get_authorization_token_info(&self, auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            zone_rpc::types::to_raw(&serde_json::json!({
-                "account": auth.caller,
-                "expiresAt": alloy_primitives::U64::from(auth.expires_at),
-            }))
-        })
-    }
-
-    fn zone_get_zone_info(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
-        Box::pin(async move {
-            zone_rpc::types::to_raw(&serde_json::json!({
-                "zoneId": "0x1",
-                "zoneTokens": [format!("{:#x}", Address::repeat_byte(0x11))],
-                "chainId": "0x2a",
-            }))
-        })
-    }
-
-    fn zone_get_encryption_key(&self, _auth: zone_rpc::auth::AuthContext) -> BoxFut<'_> {
-        Box::pin(async { Err(zone_rpc::types::JsonRpcError::internal("not implemented")) })
-    }
-}
+use test_api::TestZoneRpcApi as MockZoneRpcApi;
 
 // ---------------------------------------------------------------------------
 // Test context
@@ -376,7 +145,7 @@ fn parse_response(msg: tungstenite::Message) -> Value {
 
 #[tokio::test]
 async fn ws_roundtrip_with_header_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -392,7 +161,7 @@ async fn ws_roundtrip_with_header_auth() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_query_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let token = ctx.build_token();
     let url = format!("{}/?token={token}", ctx.ws_url());
 
@@ -411,7 +180,7 @@ async fn ws_roundtrip_with_query_auth() {
 
 #[tokio::test]
 async fn ws_reject_no_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let result = connect_async(ctx.ws_url()).await;
     // Server should reject the upgrade — tungstenite surfaces this as an error
     // with the HTTP 401 status.
@@ -424,7 +193,7 @@ async fn ws_reject_no_auth() {
 
 #[tokio::test]
 async fn ws_reject_invalid_token() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let req = tungstenite::http::Request::builder()
         .uri(ctx.ws_url())
         .header("x-authorization-token", "deadbeef")
@@ -450,7 +219,7 @@ async fn ws_reject_invalid_token() {
 
 #[tokio::test]
 async fn ws_multiple_requests() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     for i in 1..=5 {
@@ -467,7 +236,7 @@ async fn ws_multiple_requests() {
 
 #[tokio::test]
 async fn ws_batch_request() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     let batch = serde_json::json!([
@@ -489,7 +258,7 @@ async fn ws_batch_request() {
 
 #[tokio::test]
 async fn ws_invalid_json() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text("{broken".into()))
@@ -502,7 +271,7 @@ async fn ws_invalid_json() {
 
 #[tokio::test]
 async fn ws_unknown_method() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(jsonrpc("eth_foobar", 1).into()))
@@ -516,7 +285,7 @@ async fn ws_unknown_method() {
 
 #[tokio::test]
 async fn ws_disabled_subscription_method() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -713,7 +482,7 @@ async fn ws_subscribe_rejects_too_many_active_subscriptions() {
 
 #[tokio::test]
 async fn ws_empty_batch() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text("[]".into()))
@@ -726,7 +495,7 @@ async fn ws_empty_batch() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_p256_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let signing_key = P256SigningKey::random(&mut thread_rng());
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
@@ -751,7 +520,7 @@ async fn ws_roundtrip_with_p256_auth() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_webauthn_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let signing_key = P256SigningKey::random(&mut thread_rng());
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
@@ -806,7 +575,7 @@ async fn ws_roundtrip_with_keychain_auth() {
 
 #[tokio::test]
 async fn ws_closes_when_auth_token_expires() {
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let now = now_secs();
     let token = ctx.build_token_expiring_at(now, now + 1);
     let mut ws = connect_with_token(&ctx.ws_url(), ctx.addr, &token)
@@ -884,7 +653,7 @@ async fn ws_closes_when_keychain_key_is_revoked_during_request() {
 async fn ws_reject_unauthorized_keychain_token() {
     let root_account = Address::repeat_byte(0x44);
     let access_signer = P256SigningKey::random(&mut thread_rng());
-    let ctx = TestContext::start(MockZoneRpcApi::default()).await;
+    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
     let (signature, _key_id) = sign_keychain_signature(digest, &access_signer, root_account, 0x04)
