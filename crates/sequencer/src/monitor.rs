@@ -54,6 +54,18 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Backoff before rebuilding the monitor after a start or run failure.
 const RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Complete Zone state confirmed by the ZonePortal.
+///
+/// These commitments describe one portal-accepted Zone height and must always
+/// be replaced together so batch construction cannot observe a partial update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubmissionCursor {
+    zone_height: u64,
+    block_hash: B256,
+    processed_deposit_hash: B256,
+    processed_deposit_number: u64,
+}
+
 /// Configuration for the [`ZoneMonitor`].
 #[derive(Debug, Clone)]
 pub struct ZoneMonitorConfig {
@@ -120,17 +132,8 @@ pub struct ZoneMonitor<P: ZoneSequencerProvider> {
     /// Notifier from the withdrawal processor when the current portal head slot
     /// is missing from the in-memory store and a full portal resync is needed.
     repair_notify: Arc<Notify>,
-    /// Last **Zone L2** block number that was successfully submitted to L1.
-    last_submitted_zone_block: u64,
-    /// Deposit queue hash from the previous block, used to construct the
-    /// [`DepositQueueTransition`](crate::abi::DepositQueueTransition) for each batch.
-    prev_processed_deposit_hash: B256,
-    /// Deposit counter from the previous batch, used to construct the
-    /// [`DepositQueueTransition`](crate::abi::DepositQueueTransition) for each batch.
-    prev_processed_deposit_number: u64,
-    /// Previous zone block hash, used as `prev_block_hash` in [`BatchData`].
-    /// Initialized from the portal's on-chain `blockHash()` at startup.
-    prev_zone_block_hash: B256,
+    /// Zone block and deposit commitments most recently confirmed by the portal.
+    submission_cursor: SubmissionCursor,
     /// Most recent canonical zone block observed from the node.
     latest_observed_zone_block: u64,
 }
@@ -186,30 +189,32 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         )
         .await
         .wrap_err("failed to resolve portal-confirmed zone block during zone monitor startup")?;
-        let prev_zone_block_hash = portal_anchor.block_hash;
-        let last_submitted_zone_block = portal_anchor.block_number;
         let previous_snapshot = Self::snapshot_at_or_genesis(
             &provider,
             config.inbox_address,
-            last_submitted_zone_block,
+            portal_anchor.block_number,
         )?;
-        let prev_processed_deposit_hash = previous_snapshot.processed_deposit_hash;
-        let prev_processed_deposit_number = previous_snapshot.processed_deposit_number;
+        let submission_cursor = SubmissionCursor {
+            zone_height: portal_anchor.block_number,
+            block_hash: portal_anchor.block_hash,
+            processed_deposit_hash: previous_snapshot.processed_deposit_hash,
+            processed_deposit_number: previous_snapshot.processed_deposit_number,
+        };
 
         info!(
-            last_submitted_zone_block,
-            %prev_zone_block_hash,
-            %prev_processed_deposit_hash,
-            prev_processed_deposit_number,
+            zone_height = submission_cursor.zone_height,
+            block_hash = %submission_cursor.block_hash,
+            processed_deposit_hash = %submission_cursor.processed_deposit_hash,
+            processed_deposit_number = submission_cursor.processed_deposit_number,
             "Initialized from portal state"
         );
 
         metrics
             .latest_zone_block_observed
-            .set(last_submitted_zone_block as f64);
+            .set(submission_cursor.zone_height as f64);
         metrics
             .latest_zone_block_submitted_to_l1
-            .set(last_submitted_zone_block as f64);
+            .set(submission_cursor.zone_height as f64);
         metrics.zone_to_l1_submission_lag_blocks.set(0.0);
 
         let monitor = Self {
@@ -220,11 +225,8 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             batch_submitter,
             withdrawal_notify,
             repair_notify,
-            last_submitted_zone_block,
-            prev_processed_deposit_hash,
-            prev_processed_deposit_number,
-            prev_zone_block_hash,
-            latest_observed_zone_block: last_submitted_zone_block,
+            submission_cursor,
+            latest_observed_zone_block: submission_cursor.zone_height,
         };
 
         // Restore pending withdrawal data from zone L2 events so the
@@ -403,23 +405,23 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
 
         for (idx, boundary) in boundaries.into_iter().enumerate() {
             let boundary_block = boundary.block_number;
-            if boundary_block <= self.last_submitted_zone_block {
+            if boundary_block <= self.submission_cursor.zone_height {
                 continue;
             }
-            let range_start = self.last_submitted_zone_block + 1;
+            let range_start = self.submission_cursor.zone_height + 1;
             info!(
                 batch = idx + 1,
                 zone_from = range_start,
                 zone_to = boundary_block,
                 "Submitting finalized zone batch"
             );
-            let before_submit = self.last_submitted_zone_block;
+            let before_submit = self.submission_cursor.zone_height;
             self.process_finalized_batch(range_start, boundary).await?;
-            if self.last_submitted_zone_block < boundary_block {
+            if self.submission_cursor.zone_height < boundary_block {
                 return Err(eyre::eyre!(
                     "zone batch boundary {boundary_block} remains unsubmitted after reconciliation \
                      (previous anchor {before_submit}, current anchor {})",
-                    self.last_submitted_zone_block
+                    self.submission_cursor.zone_height
                 ));
             }
         }
@@ -453,11 +455,11 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         let batch_data = BatchData {
             zone_height: to,
             tempo_block_number: end_state.tempo_block_number,
-            prev_block_hash: self.prev_zone_block_hash,
+            prev_block_hash: self.submission_cursor.block_hash,
             next_block_hash: end_state.block_hash,
-            prev_processed_deposit_hash: self.prev_processed_deposit_hash,
+            prev_processed_deposit_hash: self.submission_cursor.processed_deposit_hash,
             next_processed_deposit_hash: end_state.processed_deposit_hash,
-            prev_deposit_number: self.prev_processed_deposit_number,
+            prev_deposit_number: self.submission_cursor.processed_deposit_number,
             next_deposit_number: end_state.processed_deposit_number,
             withdrawal_queue_hash: finalized_batch.finalized_hash,
             withdrawal_batch_index: finalized_batch.finalized_index,
@@ -477,8 +479,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// backoff retry.
     ///
     /// On success:
-    /// - Advances `prev_zone_block_hash`, `prev_processed_deposit_hash`, and
-    ///   `last_submitted_zone_block` to reflect the submitted range.
+    /// - Replaces the complete portal-confirmed submission cursor for the submitted range.
     /// - Stores withdrawals under the receipt's assigned portal queue index when
     ///   the batch included withdrawals.
     /// - Signals the [`WithdrawalProcessor`](crate::withdrawals::WithdrawalProcessor)
@@ -554,7 +555,14 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.metrics
                         .batch_submit_latency_seconds
                         .record(submit_started.elapsed().as_secs_f64());
-                    let blocks_in_batch = last_zone_block - self.last_submitted_zone_block;
+                    let old_cursor = self.submission_cursor;
+                    let blocks_in_batch = last_zone_block - old_cursor.zone_height;
+                    let submission_cursor = SubmissionCursor {
+                        zone_height: last_zone_block,
+                        block_hash: batch_data.next_block_hash,
+                        processed_deposit_hash: batch_data.next_processed_deposit_hash,
+                        processed_deposit_number: batch_data.next_deposit_number,
+                    };
                     info!(
                         last_zone_block,
                         blocks_in_batch,
@@ -573,13 +581,10 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         .record(withdrawals.len() as f64);
 
                     // Only advance local state on success.
-                    self.prev_zone_block_hash = batch_data.next_block_hash;
-                    self.prev_processed_deposit_hash = batch_data.next_processed_deposit_hash;
-                    self.prev_processed_deposit_number = batch_data.next_deposit_number;
-                    self.last_submitted_zone_block = last_zone_block;
+                    self.submission_cursor = submission_cursor;
                     self.metrics
                         .latest_zone_block_submitted_to_l1
-                        .set(last_zone_block as f64);
+                        .set(submission_cursor.zone_height as f64);
                     self.update_submission_lag();
 
                     // Store withdrawals under the logical portal queue index assigned on-chain.
@@ -659,8 +664,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// anchor covers any batch boundary they were attempting to submit.
     async fn resync_from_portal(&mut self) -> Result<u64> {
         self.metrics.resync_from_portal_total.increment(1);
-        let old_hash = self.prev_zone_block_hash;
-        let old_last_submitted = self.last_submitted_zone_block;
+        let old_cursor = self.submission_cursor;
         let (
             store_batches_before_resync,
             store_first_slot_before_resync,
@@ -676,42 +680,43 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         )
         .await
         .wrap_err("failed to resolve portal-confirmed zone block during resync")?;
-        let portal_hash = portal_anchor.block_hash;
-        let last_submitted_zone_block = portal_anchor.block_number;
         let previous_snapshot = Self::snapshot_at_or_genesis(
             &self.provider,
             self.config.inbox_address,
-            last_submitted_zone_block,
+            portal_anchor.block_number,
         )
         .wrap_err("failed to read portal-confirmed zone commitments")?;
-        let deposit_hash = previous_snapshot.processed_deposit_hash;
-        let deposit_number = previous_snapshot.processed_deposit_number;
+        let submission_cursor = SubmissionCursor {
+            zone_height: portal_anchor.block_number,
+            block_hash: portal_anchor.block_hash,
+            processed_deposit_hash: previous_snapshot.processed_deposit_hash,
+            processed_deposit_number: previous_snapshot.processed_deposit_number,
+        };
 
         warn!(
-            old_prev_block_hash = %old_hash,
-            new_block_hash = %portal_hash,
-            old_last_submitted_zone_block = old_last_submitted,
-            new_last_submitted_zone_block = last_submitted_zone_block,
+            old_zone_height = old_cursor.zone_height,
+            new_zone_height = submission_cursor.zone_height,
+            old_block_hash = %old_cursor.block_hash,
+            new_block_hash = %submission_cursor.block_hash,
+            old_processed_deposit_hash = %old_cursor.processed_deposit_hash,
+            new_processed_deposit_hash = %submission_cursor.processed_deposit_hash,
+            old_processed_deposit_number = old_cursor.processed_deposit_number,
+            new_processed_deposit_number = submission_cursor.processed_deposit_number,
             store_batches_before_resync,
             store_first_slot_before_resync,
             store_last_slot_before_resync,
-            %deposit_hash,
-            deposit_number,
             "Resynced from portal and zone state"
         );
-        self.prev_zone_block_hash = portal_hash;
-        self.last_submitted_zone_block = last_submitted_zone_block;
+        self.submission_cursor = submission_cursor;
         // Rewind boundary discovery to the portal-confirmed anchor. The caller may only advance
-        // this cursor again after every discovered boundary is confirmed submitted.
-        self.latest_observed_zone_block = last_submitted_zone_block;
-        self.prev_processed_deposit_hash = deposit_hash;
-        self.prev_processed_deposit_number = deposit_number;
+        // this scan position again after every discovered boundary is confirmed submitted.
+        self.latest_observed_zone_block = submission_cursor.zone_height;
         self.metrics
             .latest_zone_block_submitted_to_l1
-            .set(last_submitted_zone_block as f64);
+            .set(submission_cursor.zone_height as f64);
         self.update_submission_lag();
         if let Some(store) = &self.config.attestation_store {
-            store.remove_submitted(last_submitted_zone_block);
+            store.remove_submitted(submission_cursor.zone_height);
         }
         if let Err(e) = self.restore_pending_withdrawals_from_chain().await {
             let (stale_store_batches, stale_store_first_slot, stale_store_last_slot) = {
@@ -729,7 +734,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             );
         }
 
-        Ok(last_submitted_zone_block)
+        Ok(submission_cursor.zone_height)
     }
 
     fn snapshot_at_or_genesis(
@@ -759,7 +764,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     fn update_submission_lag(&self) {
         self.metrics.zone_to_l1_submission_lag_blocks.set(
             self.latest_observed_zone_block
-                .saturating_sub(self.last_submitted_zone_block) as f64,
+                .saturating_sub(self.submission_cursor.zone_height) as f64,
         );
     }
 }
@@ -879,6 +884,7 @@ mod tests {
         hash: B256,
         number: u64,
         processed_deposit_hash: B256,
+        processed_deposit_number: u64,
     ) -> TestZoneProvider {
         let provider = TestZoneProvider::new();
         let event = abi::IZoneInbox::TempoAdvanced {
@@ -886,7 +892,7 @@ mod tests {
             tempoBlockNumber: 123,
             depositsProcessed: U256::ZERO,
             newProcessedDepositQueueHash: processed_deposit_hash,
-            lastProcessedDepositNumber: 0,
+            lastProcessedDepositNumber: processed_deposit_number,
         };
         let tx = TempoTxEnvelope::Legacy(Signed::new_unhashed(
             TxLegacy::default(),
@@ -954,12 +960,68 @@ mod tests {
             batch_submitter: BatchSubmitter::new(portal_address, l1_provider),
             withdrawal_notify: Arc::new(Notify::new()),
             repair_notify: Arc::new(Notify::new()),
-            last_submitted_zone_block: 10,
-            prev_processed_deposit_hash: B256::repeat_byte(0xaa),
-            prev_processed_deposit_number: 0,
-            prev_zone_block_hash: B256::repeat_byte(0xbb),
+            submission_cursor: SubmissionCursor {
+                zone_height: 10,
+                block_hash: B256::repeat_byte(0xbb),
+                processed_deposit_hash: B256::repeat_byte(0xaa),
+                processed_deposit_number: 5,
+            },
             latest_observed_zone_block: 50,
         }
+    }
+
+    #[tokio::test]
+    async fn new_initializes_submission_cursor_from_portal_confirmed_state() {
+        let l1 = Asserter::new();
+        let portal_address = Address::repeat_byte(0x11);
+        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
+        let confirmed_zone_block = 42;
+        let confirmed_deposit_hash = B256::repeat_byte(0x33);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
+        let config = ZoneMonitorConfig {
+            outbox_address: Address::repeat_byte(0x22),
+            inbox_address: Address::repeat_byte(0x33),
+            poll_interval: Duration::from_secs(1),
+            portal_address,
+            batch_anchor_config: BatchAnchorConfig::default(),
+            attestation_store: None,
+        };
+
+        l1.push_success(&abi_encode_b256(portal_hash));
+        l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(7),
+            abi_encode_u64(7),
+        ]));
+
+        let monitor = ZoneMonitor::new_with_provider(
+            config,
+            zone,
+            mock_provider(l1.clone()),
+            None,
+            SharedWithdrawalStore::new(),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
+        assert_eq!(monitor.latest_observed_zone_block, confirmed_zone_block);
+        assert!(l1.read_q().is_empty());
     }
 
     #[tokio::test]
@@ -1006,7 +1068,13 @@ mod tests {
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
-        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_multicall(vec![
@@ -1019,9 +1087,15 @@ mod tests {
         let anchor = monitor.resync_from_portal().await.unwrap();
 
         assert_eq!(anchor, confirmed_zone_block);
-        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
-        assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
-        assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1030,7 +1104,13 @@ mod tests {
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
-        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_multicall(vec![
@@ -1058,9 +1138,15 @@ mod tests {
 
         let store = monitor.withdrawal_store.lock();
         assert_eq!(store.batch_count(), 0);
-        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
-        assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
-        assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1069,7 +1155,13 @@ mod tests {
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
-        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_failure_msg("head read failed");
@@ -1096,9 +1188,15 @@ mod tests {
         assert_eq!(anchor, confirmed_zone_block);
         let store = monitor.withdrawal_store.lock();
         assert_eq!(store.batch_count(), 0);
-        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
-        assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
-        assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1107,7 +1205,13 @@ mod tests {
         let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
         let confirmed_zone_block = 42;
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
-        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_b256(portal_hash));
@@ -1135,12 +1239,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(monitor.prev_zone_block_hash, portal_hash);
-        assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
-        assert_eq!(monitor.prev_processed_deposit_hash, confirmed_deposit_hash);
-        assert_ne!(monitor.prev_zone_block_hash, batch_data.next_block_hash);
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
         assert_ne!(
-            monitor.prev_processed_deposit_hash,
+            monitor.submission_cursor.block_hash,
+            batch_data.next_block_hash
+        );
+        assert_ne!(
+            monitor.submission_cursor.processed_deposit_hash,
             batch_data.next_processed_deposit_hash
         );
         assert!(l1.read_q().is_empty());
@@ -1153,7 +1266,13 @@ mod tests {
         let confirmed_zone_block = 15;
         let pending_boundary = 20;
         let confirmed_deposit_hash = B256::repeat_byte(0x33);
-        let zone = mock_zone_provider(portal_hash, confirmed_zone_block, confirmed_deposit_hash);
+        let confirmed_deposit_number = 9;
+        let zone = mock_zone_provider(
+            portal_hash,
+            confirmed_zone_block,
+            confirmed_deposit_hash,
+            confirmed_deposit_number,
+        );
 
         l1.push_success(&abi_encode_b256(portal_hash));
         l1.push_success(&abi_encode_b256(portal_hash));
@@ -1186,7 +1305,15 @@ mod tests {
                 .to_string()
                 .contains("before pending batch boundary 20")
         );
-        assert_eq!(monitor.last_submitted_zone_block, confirmed_zone_block);
+        assert_eq!(
+            monitor.submission_cursor,
+            SubmissionCursor {
+                zone_height: confirmed_zone_block,
+                block_hash: portal_hash,
+                processed_deposit_hash: confirmed_deposit_hash,
+                processed_deposit_number: confirmed_deposit_number,
+            }
+        );
         assert_eq!(monitor.latest_observed_zone_block, confirmed_zone_block);
         assert!(l1.read_q().is_empty());
     }
@@ -1201,6 +1328,8 @@ mod tests {
         l1.push_failure_msg("resync unavailable");
 
         let mut monitor = test_monitor(l1.clone(), zone);
+        let original_cursor = monitor.submission_cursor;
+        let original_observed_height = monitor.latest_observed_zone_block;
         let batch_data = BatchData {
             zone_height: 20,
             tempo_block_number: 123,
@@ -1224,8 +1353,42 @@ mod tests {
                 .to_string()
                 .contains("failed to resolve portal-confirmed zone block during resync")
         );
-        assert_eq!(monitor.last_submitted_zone_block, 10);
-        assert_eq!(monitor.latest_observed_zone_block, 50);
+        assert_eq!(monitor.submission_cursor, original_cursor);
+        assert_eq!(monitor.latest_observed_zone_block, original_observed_height);
+        assert!(l1.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_resync_snapshot_read_preserves_cursor_and_observed_height() {
+        let l1 = Asserter::new();
+        let portal_hash = B256::from(U256::from(7).to_be_bytes::<32>());
+        let confirmed_zone_block = 42;
+        let zone = TestZoneProvider::new();
+        let mut header = TempoHeader::default();
+        header.inner.number = confirmed_zone_block;
+        zone.add_block(
+            portal_hash,
+            Block {
+                header,
+                body: Default::default(),
+            },
+        );
+
+        l1.push_success(&abi_encode_b256(portal_hash));
+
+        let mut monitor = test_monitor(l1.clone(), zone);
+        let original_cursor = monitor.submission_cursor;
+        let original_observed_height = monitor.latest_observed_zone_block;
+
+        let error = monitor.resync_from_portal().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read portal-confirmed zone commitments")
+        );
+        assert_eq!(monitor.submission_cursor, original_cursor);
+        assert_eq!(monitor.latest_observed_zone_block, original_observed_height);
         assert!(l1.read_q().is_empty());
     }
 }
