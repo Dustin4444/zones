@@ -13,16 +13,23 @@ mod state;
 pub use apply::{Candidate, ImportedCandidate, ModelError, apply_imported, apply_zone};
 pub use effects::{ExpectedEffect, ExpectedState};
 pub use facts::{
-    DepositOutcome, DepositPayload, ImportedFacts, ImportedOperation, OrdinaryDeposit, TokenEnable,
-    ZoneFacts,
+    BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, DepositPayload, Finalization,
+    ImportedFacts, ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, UserWithdrawal,
+    WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
 };
 pub use finding::{Datum, Finding, FindingCategory, FindingLocation};
 pub use invariants::{InvariantCode, InvariantViolation, validate};
 pub use state::{
-    BatchId, BatchState, Cursor, DepositId, DepositOwner, FallbackId, FallbackState, InboxRefundId,
-    PortalIdentity, PortalRefundId, PortalState, RefundCredit, State, StateDelta, StateFamilyError,
-    StateKey, StateValue, TokenAccounting, TokenPhase, TokenState, WithdrawalId, WithdrawalOwner,
-    ZoneState,
+    BatchBoundary, BatchBoundaryStart, BatchId, BatchState, Cursor, DepositId, DepositOwner,
+    FallbackId, FallbackState, InboxRefundId, PortalIdentity, PortalRefundId, PortalState,
+    RefundCredit, Settlement, State, StateDelta, StateFamilyError, StateKey, StateValue,
+    TokenAccounting, TokenPhase, TokenState, Withdrawal, WithdrawalId, WithdrawalOrigin,
+    WithdrawalOwner, ZoneState,
+};
+
+pub use commitments::{
+    NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL, bounceback_deposit_hash, bounceback_fee,
+    sender_tag, withdrawal_fee, withdrawal_hash, withdrawal_queue_hash,
 };
 
 #[cfg(test)]
