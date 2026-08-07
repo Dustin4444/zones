@@ -152,6 +152,7 @@ reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7
 reth-node-api = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
+reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fc3f7da" }
 reth-primitives-traits = { version = "0.5.2", default-features = false }
@@ -214,6 +215,7 @@ indicatif = "0.18"
 itertools = "0.14.0"
 jsonrpsee = { version = "0.26.0", features = ["server", "macros"] }
 metrics = "0.24.3"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 k256 = { version = "0.13.4", features = ["arithmetic", "ecdh"] }
 parking_lot = "0.12.4"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }

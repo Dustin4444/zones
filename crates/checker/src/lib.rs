@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 mod check;
+pub mod diagnostic;
 mod metrics;
 mod model;
 mod observe;
@@ -23,7 +24,7 @@ use tempo_primitives::{Block, TempoPrimitives};
 
 use observe::{AcquisitionError, AcquisitionSource};
 #[cfg(feature = "test-utils")]
-use test_utils::TestProgressObserver;
+use test_utils::CheckerTestHooks;
 
 /// Runtime mode for the checker ExEx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,7 +86,7 @@ pub struct CheckerConfig {
 pub struct CheckerExEx {
     config: CheckerConfig,
     #[cfg(feature = "test-utils")]
-    test_progress: TestProgressObserver,
+    test_hooks: CheckerTestHooks,
 }
 
 impl CheckerExEx {
@@ -93,7 +94,7 @@ impl CheckerExEx {
         Self {
             config,
             #[cfg(feature = "test-utils")]
-            test_progress: TestProgressObserver::disabled(),
+            test_hooks: CheckerTestHooks::disabled(),
         }
     }
 
@@ -111,7 +112,7 @@ impl CheckerExEx {
         runtime::launch(
             self.config,
             #[cfg(feature = "test-utils")]
-            self.test_progress,
+            self.test_hooks,
             ctx,
         )
     }

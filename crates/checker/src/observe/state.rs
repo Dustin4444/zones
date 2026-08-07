@@ -59,6 +59,16 @@ impl ZonePostStateOutputs {
         &self.token_supplies
     }
 
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn perturb_first_token_supply_for_test(&mut self) {
+        let supply = self
+            .token_supplies
+            .values_mut()
+            .next()
+            .expect("the test hook checks for an acquired token supply");
+        *supply ^= U256::ONE;
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         tempo_block_hash: B256,

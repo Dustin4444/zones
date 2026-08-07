@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use alloy_provider::{DynProvider, Provider as _};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use tempo_alloy::TempoNetwork;
@@ -20,8 +20,7 @@ use crate::{
         state::{ModelState, PortalIdentity},
     },
     observe::{
-        AcquisitionError, AcquisitionSource, ImportedTempoHeader, acquire_l1_header,
-        acquire_zone_post_state, observe_l1,
+        AcquisitionError, AcquisitionSource, ImportedTempoHeader, acquire_l1_header, observe_l1,
     },
     runtime::{PersistentChecker, RuntimeResult},
     store::{
@@ -37,6 +36,7 @@ use super::{
         prove_ancestry, prove_descendants_after,
     },
     error::BootstrapError,
+    genesis::{genesis_anchor, validate_zero_genesis_supply},
     validate_local_configuration,
 };
 
@@ -168,11 +168,15 @@ async fn authenticate_creation(
         .map_err(CheckError::from)?;
     let tip = BlockNumHash::new(header.number(), header.hash());
     let parent = creation_parent(&header)?;
-    let observation = observe_l1(l1_provider, &header, config.portal_address)
+    let acquisition = observe_l1(l1_provider, &header, config.portal_address)
         .await
         .map_err(CheckError::from)?;
-    let projection = project_imported(&observation, &header, config.portal_creation_block_hash)
-        .map_err(BootstrapError::from)?;
+    let projection = project_imported(
+        acquisition.observation(),
+        &header,
+        config.portal_creation_block_hash,
+    )
+    .map_err(BootstrapError::from)?;
     let portal_identity = projection
         .sole_portal_creation_identity()
         .map_err(BootstrapError::from)?;
@@ -188,7 +192,7 @@ async fn authenticate_creation(
         parent,
     );
     let prepared = validator
-        .prepare_imported_bootstrap(l1_provider, &observation, &header)
+        .prepare_imported_bootstrap(l1_provider, &acquisition, &header)
         .await?;
     Ok(AuthenticatedCreation {
         header,
@@ -294,12 +298,12 @@ async fn replay_l1_headers(
     headers: impl IntoIterator<Item = ImportedTempoHeader>,
 ) -> RuntimeResult<()> {
     for header in headers {
-        let observation = observe_l1(l1_provider, &header, config.portal_address)
+        let acquisition = observe_l1(l1_provider, &header, config.portal_address)
             .await
             .map_err(CheckError::from)?;
         let prepared = checker
             .mirror
-            .prepare_imported_bootstrap(l1_provider, &observation, &header)
+            .prepare_imported_bootstrap(l1_provider, &acquisition, &header)
             .await?;
         persist_imported_bootstrap(checker, prepared)?;
     }
@@ -355,54 +359,4 @@ where
         WriteOutcome::AlreadyApplied => checker.reload_mirror()?,
     }
     Ok(())
-}
-
-fn validate_zero_genesis_supply<P>(
-    zone_provider: &P,
-    zone_genesis_hash: B256,
-    tokens: impl IntoIterator<Item = Address>,
-) -> RuntimeResult<()>
-where
-    P: StateProviderFactory + ?Sized,
-{
-    let tokens = tokens.into_iter().collect::<Vec<_>>();
-    let outputs = acquire_zone_post_state(zone_provider, zone_genesis_hash, &tokens)?;
-    if let Some((&token, &actual)) = outputs
-        .token_supplies()
-        .iter()
-        .find(|(_, supply)| !supply.is_zero())
-    {
-        return Err(BootstrapError::NonzeroZoneGenesisSupply { token, actual }.into());
-    }
-    Ok(())
-}
-
-pub(super) fn genesis_anchor<P>(
-    zone_provider: &P,
-    zone_genesis: BlockNumHash,
-) -> RuntimeResult<BlockNumHash>
-where
-    P: StateProviderFactory + ?Sized,
-{
-    let outputs = acquire_zone_post_state(zone_provider, zone_genesis.hash, &[])?;
-    if outputs.tempo_block_hash().is_zero() {
-        return Err(BootstrapError::UnsupportedBootstrapStyle.into());
-    }
-    if !outputs.processed_deposit_queue_hash().is_zero()
-        || outputs.processed_deposit_number() != 0
-        || !outputs.withdrawal_queue_hash().is_zero()
-        || outputs.withdrawal_batch_index() != 0
-    {
-        return Err(BootstrapError::NonzeroZoneGenesisProgress {
-            processed_deposit_queue_hash: outputs.processed_deposit_queue_hash(),
-            processed_deposit_number: outputs.processed_deposit_number(),
-            withdrawal_queue_hash: outputs.withdrawal_queue_hash(),
-            withdrawal_batch_index: outputs.withdrawal_batch_index(),
-        }
-        .into());
-    }
-    Ok(BlockNumHash::new(
-        outputs.tempo_block_number(),
-        outputs.tempo_block_hash(),
-    ))
 }

@@ -9,17 +9,18 @@ The checker-owned protocol vectors frozen by Goal 0 are inventoried in
 
 ## Current status
 
-Goals 0 through 9 are implemented. Goals 0 through 5 define the authenticated
+Goals 0 through 10 are implemented. Goals 0 through 5 define the authenticated
 observation boundary, pure lifecycle model, typed output checks, exact Zone
 state reads, and Portal collateral checks. Goals 6 through 8 add the dedicated
 checker database, commit-before-acknowledge processing, crash recovery, exact
 unwind, durable findings, and alert mode. Goal 9 adds authenticated archive
 bootstrap, resumable L1 and Zone replay, normal restart, and fresh-path rebuild.
 
-The checker is alerting, not enforcing. `--checker.mode` remains `off` by
-default, and `observe` never changes consensus or blocks core-node progress
-after an authenticated finding. Goal 10's closed-system shadow-release and
-performance acceptance gate is not complete.
+Goal 10 adds the closed-system lifecycle/recovery matrix, operator health and
+diagnostic surfaces, and a reproducible real-node performance baseline. The
+checker is alerting, not enforcing. `--checker.mode` remains `off` by default,
+and `observe` never changes consensus or blocks core-node progress after an
+authenticated finding.
 
 ## Operator configuration
 
@@ -107,8 +108,8 @@ into a new empty path. There are no in-place migrations.
    reports exactly:
 
    ```text
-   tempo_zone_checker_runtime_healthy 1
-   tempo_zone_checker_runtime_active_alert 0
+   reth_tempo_zone_checker_runtime_healthy 1
+   reth_tempo_zone_checker_runtime_active_alert 0
    ```
 
 Startup refuses a zero creation hash, a zero Tempo checkpoint in Zone genesis,
@@ -202,6 +203,28 @@ The configured L1 archive RPC remains an explicit trust boundary for
 receipt-to-transaction metadata after receipt-root authentication. It does
 not fetch every transaction body or recompute the transaction root.
 
+### Operator trust and non-claims
+
+The configured L1 archive RPC is trusted for availability, exact-block Portal
+balance values, and the block/hash/index binding of selectively fetched
+transaction bodies. The checker authenticates the imported header and complete
+receipt vector against header commitments and locally hashes each selectively
+fetched body, but it does not obtain a transaction-root proof or an independent
+state-trie proof for collateral.
+
+The in-process Zone node is trusted to expose the canonical L2 chain, complete
+notification/backfill receipts, and exact historical state for canonical block
+hashes. There is no remote L2 fallback. Release one also does not validate
+AES-GCM, Chaum-Pedersen proofs, encrypted-sender validity, arbitrary token
+transfers, callbacks, or TIP-403 policy; prove independent finality or data
+availability; or enforce/stop consensus. It is an observe-only logical and
+accounting divergence detector within those explicit boundaries.
+
+In particular, it cannot verify a successful deposit mint's private recipient,
+or that a bounce-back mint/refund recipient equals the withdrawal-time
+`zoneFallbackRecipient`. It also does not prove arbitrary Portal storage beyond
+authenticated event/call inputs and the exact-block balance value it queries.
+
 ## Failure classes
 
 - Acquisition failures cover unavailable, absent, or internally inconsistent
@@ -238,10 +261,164 @@ the model remains frozen at the last verified parent while the ExEx continues
 acknowledging descendants. If a reorg removes the finding, its record is marked
 orphaned and ordinary checking resumes from the verified parent.
 
+### Health and critical logs
+
+Reth prefixes checker families with `reth_` at its Prometheus endpoint. In
+`off` mode the checker is not installed, so checker series are absent rather
+than reporting healthy. In `observe` mode the two status gauges have these
+exact meanings:
+
+| Runtime state | `reth_tempo_zone_checker_runtime_healthy` | `reth_tempo_zone_checker_runtime_active_alert` |
+|---|---:|---:|
+| Initial startup before durable state is loaded | 0 | 0 |
+| Archive replay, canonical catch-up, retry, or stream failure | 0 | Preserves the current alert state |
+| Caught up and following the live head | 1 | 0 |
+| Durable authenticated finding, including acknowledged descendants | 0 | 1 |
+| Terminal checker failure in fail-open acknowledgement mode | 0 | Preserves the current alert state |
+
+`active_alert` survives restart and remains set until a canonical reorg removes
+the finding. `healthy` returns to 1 only after acquisition recovers and the
+checker is again caught up and non-alerting. Alert on a missing series
+separately from a zero value when `observe` is expected.
+
+The `zone::checker` target emits stable operator messages:
+
+| Level | Message | Meaning |
+|---|---|---|
+| INFO | `Durable checker started` | Identity, DB path, durable tip, and alert state were loaded and catch-up was installed. |
+| INFO | `Checker archive replay reached live handoff` | Fresh or resumed Zone replay reached the canonical head. |
+| WARN | `Checker acquisition unavailable; retaining notification` | No state was committed or acknowledged past the gap; the exact notification is being retried. |
+| INFO | `Checker acquisition recovered` | A retained notification passed after one or more retries. |
+| ERROR | `Checker entered durable alert mode after an authenticated finding` | The first deterministic divergence was committed and the model was frozen at its parent. |
+| ERROR | `Checker disabled after a terminal failure; continuing fail-open acknowledgement` | Checker evaluation stopped, health is 0, and core-node progress continues. |
+
+### Metrics
+
+All checker metrics are fixed-cardinality: no token, address, block hash, or
+finding labels are emitted. Duration families are Prometheus summaries. The
+node's configured summary quantiles determine which `quantile` samples are
+available.
+
+| Exact exported family | Unit and semantics |
+|---|---|
+| `reth_tempo_zone_checker_live_block_duration_seconds` | End-to-end successful live-block time from durable preflight through MDBX commit, including exact L1 and local acquisition. Archive-backfill block samples are excluded. |
+| `reth_tempo_zone_checker_catch_up_block_duration_seconds` | The same boundary for successful Reth archive-backfill blocks. |
+| `reth_tempo_zone_checker_live_blocks_total`, `reth_tempo_zone_checker_catch_up_blocks_total` | Successful samples in the corresponding phase. Derive throughput from `rate`, not an in-process rate gauge. |
+| `reth_tempo_zone_checker_receipt_fetch_duration_seconds` | Successful `eth_getBlockReceipts` RPC boundary for the exact imported Tempo hash; receipt authentication follows before the sample is accepted. |
+| `reth_tempo_zone_checker_collateral_call_duration_seconds` | One exact-imported-block Portal balance call per Portal-enabled token. This is the per-token L1 read baseline. |
+| `reth_tempo_zone_checker_exact_state_read_duration_seconds` | One aggregate local Zone exact-hash acquisition per block, including six fixed slots and all requested token-supply slots. It is not a per-token metric. |
+| `reth_tempo_zone_checker_database_transaction_duration_seconds` | Successful checker MDBX write transaction from `tx_mut` through commit. No provider call occurs inside it. |
+| `reth_tempo_zone_checker_changeset_bytes` | Canonically encoded changeset key plus before-image bytes for one applied block. |
+| `reth_tempo_zone_checker_changeset_bytes_total` | Cumulative encoded changeset bytes, useful for rate and mean calculations. |
+| `reth_tempo_zone_checker_model_rows` | Current physical rows in `CheckerModelState`, read from the committed MDBX table. |
+| `reth_tempo_zone_checker_open_lifecycle_records` | Current nonterminal deposit, withdrawal, batch, fallback, Portal-refund, and Inbox-refund owners. |
+| `reth_tempo_zone_checker_database_allocated_bytes` | Allocated bytes for regular files in the dedicated checker directory (`st_blocks * 512` on Unix; logical file length fallback on non-Unix). |
+| `reth_tempo_zone_checker_observation_duration_seconds` | Full authenticated L2 and L1 observation, including L1 block, receipt, and selectively required transaction RPC acquisition. |
+| `reth_tempo_zone_checker_transition_duration_seconds` | Model and comparison work with separately timed collateral and exact-state acquisition subtracted. |
+| `reth_tempo_zone_checker_collateral_calls_total`, `reth_tempo_zone_checker_collateral_call_failures_total` | Per-token exact-block collateral attempts and failures. |
+| `reth_tempo_zone_checker_exact_state_reads_total`, `reth_tempo_zone_checker_exact_state_read_failures_total`, `reth_tempo_zone_checker_supply_tokens_requested_total` | Aggregate exact-state attempts/failures and token slots requested. |
+| `reth_tempo_zone_checker_latest_observed_zone_height`, `reth_tempo_zone_checker_latest_checked_zone_height`, `reth_tempo_zone_checker_model_lag_blocks` | Last attempted and last passing Zone heights plus their difference. Alert-mode descendants are acknowledgement-only and do not advance these gauges. |
+| `reth_tempo_zone_checker_passed_blocks_total`, `reth_tempo_zone_checker_acquisition_failures_total`, `reth_tempo_zone_checker_findings_total` | Passing blocks, acquisition failures, and deterministic findings. |
+| `reth_tempo_zone_checker_runtime_operational_retries_total`, `reth_tempo_zone_checker_runtime_operational_recoveries_total` | Retries include retained acquisition, stream-poll, and canonical-head attempts. Recoveries count only retained-notification acquisition gaps that later pass at the live head. |
+
+Useful PromQL expressions are:
+
+```promql
+# Live p50 and p95 (when those summary quantiles are configured)
+reth_tempo_zone_checker_live_block_duration_seconds{quantile="0.5"}
+reth_tempo_zone_checker_live_block_duration_seconds{quantile="0.95"}
+
+# Archive catch-up blocks per second
+rate(reth_tempo_zone_checker_catch_up_blocks_total[5m])
+
+# Per-token collateral-read and receipt-fetch p95
+reth_tempo_zone_checker_collateral_call_duration_seconds{quantile="0.95"}
+reth_tempo_zone_checker_receipt_fetch_duration_seconds{quantile="0.95"}
+
+# Mean encoded changeset bytes per applied block over five minutes
+rate(reth_tempo_zone_checker_changeset_bytes_total[5m])
+/
+(
+  rate(reth_tempo_zone_checker_live_blocks_total[5m])
+  + rate(reth_tempo_zone_checker_catch_up_blocks_total[5m])
+)
+
+# Page when observe mode is expected but unhealthy, absent, or alerting
+(reth_tempo_zone_checker_runtime_healthy != 1)
+or absent(reth_tempo_zone_checker_runtime_healthy)
+or (reth_tempo_zone_checker_runtime_active_alert == 1)
+```
+
+### Diagnosis and recovery
+
+The offline diagnostic reconstructs one typed model key immediately before and
+after a retained canonical Zone height and prints the canonical block and
+changeset coordinates needed to locate archive evidence. Stop the node first,
+or run it against a consistent copy of the checker directory:
+
+```sh
+tempo-zone checker diagnose \
+  --database-path /var/lib/tempo-zone/checker \
+  --zone-height 12345 \
+  --key token:0x0000000000000000000000000000000000000001
+```
+
+Run `tempo-zone checker diagnose --help` for the live CLI contract. Key
+selectors are the singleton names `portal-config`, `zone-config`,
+`portal-deposit-cursor`, `zone-processed-deposit-cursor`, `portal-settlement`,
+`zone-batch-accumulator`, `zone-next-withdrawal-index`, and
+`zone-last-fallback-nonce`; or one of:
+
+```text
+token:<address>
+pending-deposit:<number>
+withdrawal:<index>
+fallback-owner:<nonce>
+batch:<index>
+portal-refund-credit:<token>:<recipient>:<origin>
+inbox-refund-credit:<token>:<recipient>:<origin>
+```
+
+`withdrawal:<index>` and the Inbox-refund origin admit zero. Pending-deposit
+numbers, fallback nonces, batch indexes, and Portal-refund origins are nonzero.
+The report prints decoded and exact encoded before/after values; an unchanged
+key is explicit and has no changeset ordinal. `--zone-height` must select a
+retained, non-genesis canonical height; height 0 fails because it has no parent
+boundary.
+
+Use the failure class, not an in-place DB edit, to choose recovery:
+
+| Condition | Operator action |
+|---|---|
+| Retryable archive/RPC acquisition gap | Restore exact historical access or RPC availability. Leave the DB in place; the retained item retries without a default observation. |
+| Authenticated finding | Preserve the DB and inspect the reported key/block plus L1/L2 archive evidence. Descendants remain unchecked. A finding-removing canonical reorg is orphaned automatically. |
+| Terminal checker failure | Core-node progress is fail-open, but checker health stays 0. Correct the configuration/software/archive fault and restart before treating the node as shadow-covered. |
+| Unsupported model version or corruption | Follow the fresh-path rebuild procedure above. Never migrate, truncate, or delete the old DB in place. |
+
+The measured release-profile methodology and raw accepted samples are recorded
+in [`PERFORMANCE_BASELINE.md`](PERFORMANCE_BASELINE.md).
+
 ## Validation
 
 ```sh
-cargo test -p zone-checker
-cargo clippy -p zone-checker --all-targets -- -D warnings
+cargo +1.95.0 test -p zone-checker
+cargo +1.95.0 clippy -p zone-checker --all-targets -- -D warnings
+cargo +1.95.0 test -p zone-checker --all-targets --features test-utils
+cargo +1.95.0 clippy -p zone-checker --all-targets --features test-utils -- -D warnings
 cargo fmt --check
+cargo +1.95.0 test -p zone-node --features cli,test-utils --lib cli::
+cargo +1.95.0 test -p zone-node --features cli,test-utils --test it \
+  checker_e2e -- --nocapture --test-threads=1
+cargo +1.95.0 test -p zone-node --features cli,test-utils --test it \
+  test_zone_advances_with_real_l1 -- --nocapture --test-threads=1
+cargo +1.95.0 test --release -p zone-node --features cli,test-utils --test it \
+  test_checker_real_node_performance_baseline -- --ignored --nocapture --test-threads=1
 ```
+
+Named lifecycle and recovery evidence includes
+`release_one_lifecycle_matrix_reaches_all_six_terminals_without_lost_owners`,
+`every_open_owner_phase_survives_restart_rebuild_and_reorg`,
+`test_checker_bootstraps_and_restarts_from_durable_database`,
+`test_checker_alert_does_not_stall_zone_progress`,
+the tests in `check/tests/lifecycle/{creation_and_deposits,zone,settlement,refunds,fixed_state}.rs`,
+and the runtime `atomicity`, `loop_retry`, `replay`, `startup`, and `alert` suites.

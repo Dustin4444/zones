@@ -34,6 +34,7 @@ use crate::{
     observe::ExactStateLookup,
 };
 
+mod lifecycle_recovery;
 mod pipeline;
 mod runtime;
 

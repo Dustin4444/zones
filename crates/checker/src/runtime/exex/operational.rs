@@ -8,8 +8,8 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 #[cfg(feature = "test-utils")]
-use crate::test_utils::TestProgressObserver;
-use crate::{CheckerConfig, store::value::BootstrapState};
+use crate::test_utils::CheckerTestHooks;
+use crate::{CheckerConfig, metrics::BlockProcessingPhase, store::value::BootstrapState};
 
 use super::{
     RuntimeStatus,
@@ -53,7 +53,7 @@ enum NotificationFailure {
 
 pub(super) async fn run_initialized<Node>(
     config: &CheckerConfig,
-    #[cfg(feature = "test-utils")] test_progress: &TestProgressObserver,
+    #[cfg(feature = "test-utils")] test_hooks: &CheckerTestHooks,
     initialized: Initialized,
     ctx: &mut ExExContext<Node>,
     status: &mut RuntimeStatus,
@@ -69,6 +69,13 @@ where
         startup,
         path,
     } = initialized;
+    #[cfg(feature = "test-utils")]
+    let mut checker = checker;
+    #[cfg(feature = "test-utils")]
+    checker.install_supply_observation_fault(test_hooks.supply_observation_fault());
+    if let Err(failure) = checker.refresh_resource_metrics() {
+        return RuntimeExit::terminal(failure);
+    }
     let zone_provider = ctx.provider().clone();
     let mut state = match LoopState::new(checker, l1_client, startup, &zone_provider, status) {
         Ok(state) => state,
@@ -80,7 +87,7 @@ where
         return RuntimeExit::with_ack_and_driver(failure, startup.tip(), driver);
     }
     #[cfg(feature = "test-utils")]
-    test_progress.publish(startup.tip());
+    test_hooks.publish(startup.tip());
     state.record_operational(status, false);
     log_started(config, ctx, startup, &path);
 
@@ -108,7 +115,7 @@ where
             ctx,
             status,
             #[cfg(feature = "test-utils")]
-            test_progress,
+            test_hooks,
         )
         .await
         {
@@ -300,14 +307,25 @@ async fn process_notification<Node>(
     driver: &mut RetainedNotificationDriver<ExExNotification<TempoPrimitives>>,
     ctx: &mut ExExContext<Node>,
     status: &mut RuntimeStatus,
-    #[cfg(feature = "test-utils")] test_progress: &TestProgressObserver,
+    #[cfg(feature = "test-utils")] test_hooks: &CheckerTestHooks,
 ) -> Result<(), NotificationFailure>
 where
     Node: FullNodeComponents,
     Node::Provider: BlockReader<Block = Block> + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
-    let retained = RetainedContext::new(&mut state.checker, provider, &mut state.l1_client, status);
+    let processing_phase = if state.live && !state.catching_up {
+        BlockProcessingPhase::Live
+    } else {
+        BlockProcessingPhase::CatchUp
+    };
+    let retained = RetainedContext::new(
+        &mut state.checker,
+        provider,
+        &mut state.l1_client,
+        status,
+        processing_phase,
+    );
     let ready = match process_retained(retained, driver, &mut ctx.notifications, notification).await
     {
         RetainedOutcome::Ready { ready, recovered } => (ready, recovered),
@@ -332,7 +350,7 @@ where
         }
     })?;
     #[cfg(feature = "test-utils")]
-    test_progress.publish(ready.tip());
+    test_hooks.publish(ready.tip());
     Ok(())
 }
 

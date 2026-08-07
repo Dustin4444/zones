@@ -774,3 +774,8 @@ fn validated_portal_queue_len(head: U256, tail: U256) -> Result<U256, ModelError
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::lifecycle_recovery_scenario::{
+    LifecycleRecoveryScenario, RecoveryStep, lifecycle_recovery_scenario,
+};

@@ -5,6 +5,7 @@ use reth_storage_api::{BlockHashReader, BlockNumReader};
 
 use crate::{
     check::pipeline::InMemoryChecker,
+    metrics::CheckerOperationalMetrics,
     store::{
         db::{CheckerStore, StoreSnapshot},
         value::ActiveAlert,
@@ -61,6 +62,7 @@ pub(crate) struct PersistentChecker {
     pub(super) store: CheckerStore,
     pub(super) mirror: InMemoryChecker,
     pub(super) phase: LivePhase,
+    pub(super) metrics: CheckerOperationalMetrics,
 }
 
 impl PersistentChecker {
@@ -86,15 +88,19 @@ impl PersistentChecker {
     }
 
     pub(super) fn from_snapshot(store: CheckerStore, snapshot: StoreSnapshot) -> Self {
+        let model_rows = snapshot.model_rows.len();
         let phase = snapshot
             .active_alert
             .map_or(LivePhase::Verifying, LivePhase::Alerting);
         let mirror = mirror_from_snapshot(&store, snapshot);
-        Self {
+        let checker = Self {
             store,
             mirror,
             phase,
-        }
+            metrics: CheckerOperationalMetrics::default(),
+        };
+        checker.record_resource_metrics(model_rows);
+        checker
     }
 
     #[cfg(test)]
@@ -113,10 +119,45 @@ impl PersistentChecker {
         }
     }
 
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn install_supply_observation_fault(
+        &mut self,
+        fault: crate::test_utils::SupplyObservationFault,
+    ) {
+        self.mirror.install_supply_observation_fault(fault);
+    }
+
     pub(super) fn reload_mirror(&mut self) -> RuntimeResult<()> {
         let snapshot = self.store.load_current()?;
-        self.mirror = mirror_from_snapshot(&self.store, snapshot);
+        let model_rows = snapshot.model_rows.len();
+        self.replace_mirror_from_snapshot(snapshot);
+        self.record_resource_metrics(model_rows);
         Ok(())
+    }
+
+    pub(super) fn refresh_resource_metrics(&self) -> RuntimeResult<()> {
+        let snapshot = self.store.load_current()?;
+        self.record_resource_metrics(snapshot.model_rows.len());
+        Ok(())
+    }
+
+    fn record_resource_metrics(&self, model_rows: usize) {
+        self.metrics.record_resource_snapshot(
+            model_rows,
+            self.mirror.open_lifecycle_record_count(),
+            self.store.path(),
+        );
+    }
+
+    pub(super) fn replace_mirror_from_snapshot(&mut self, snapshot: StoreSnapshot) {
+        #[cfg(feature = "test-utils")]
+        let fault = self.mirror.supply_observation_fault();
+        let mirror = mirror_from_snapshot(&self.store, snapshot);
+        #[cfg(feature = "test-utils")]
+        let mut mirror = mirror;
+        #[cfg(feature = "test-utils")]
+        mirror.install_supply_observation_fault(fault);
+        self.mirror = mirror;
     }
 
     /// Reconcile durable progress with local canonical hashes before asking

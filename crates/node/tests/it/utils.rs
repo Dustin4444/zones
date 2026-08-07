@@ -666,7 +666,7 @@ impl ZoneTestLaunchConfig {
         self
     }
 
-    fn with_withdrawal_batch_interval(mut self, blocks: u64) -> Self {
+    pub(crate) fn with_withdrawal_batch_interval(mut self, blocks: u64) -> Self {
         self.withdrawal_batch_interval_blocks = blocks;
         self
     }

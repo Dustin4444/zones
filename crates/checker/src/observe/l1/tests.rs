@@ -672,7 +672,8 @@ async fn empty_process_withdrawals_without_events_causes_no_transaction_fetch() 
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let observed = acquisition.observation();
     assert!(observed.protocol_transactions.is_empty());
     assert!(asserter.read_q().is_empty());
 }
@@ -692,7 +693,8 @@ async fn eventful_submit_batch_fetches_once_and_decodes_direct_calldata() {
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let observed = acquisition.observation();
     assert_eq!(observed.protocol_transactions.len(), 1);
     assert!(
         observed.protocol_transactions[0]
@@ -725,7 +727,8 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     let provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter.clone());
 
-    let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let acquisition = observe_l1(&provider, &imported, PORTAL).await.unwrap();
+    let observed = acquisition.observation();
     let [transaction] = observed.protocol_transactions() else {
         panic!("expected one protocol transaction");
     };

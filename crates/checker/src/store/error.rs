@@ -126,8 +126,9 @@ pub(crate) enum StoreError {
         reason: &'static str,
     },
     #[error("historical target {target} is above current verified Zone height {current}")]
-    #[cfg(test)]
     FutureTarget { target: u64, current: u64 },
+    #[error("historical diagnostic target 0 has no preceding Zone block boundary")]
+    GenesisDiagnosticTarget,
     #[error("bootstrap guard changed: expected {expected:?}, found {actual:?}")]
     BootstrapChanged {
         expected: BootstrapState,

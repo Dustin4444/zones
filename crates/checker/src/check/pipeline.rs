@@ -9,6 +9,8 @@ use reth_primitives_traits::RecoveredBlock;
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoReceipt};
 
+#[cfg(feature = "test-utils")]
+use crate::test_utils::SupplyObservationFault;
 use crate::{
     check::{
         finding::{CheckError, Finding},
@@ -27,8 +29,8 @@ use crate::{
         },
     },
     observe::{
-        ExactStateLookup, L1BlockObservation, L2BlockObservation, ObservationError,
-        acquire_portal_collateral, acquire_zone_post_state, observe_l1,
+        ExactStateLookup, L1BlockAcquisition, L1BlockObservation, L2BlockObservation,
+        ObservationError, acquire_portal_collateral, acquire_zone_post_state, observe_l1,
         observe_l2_block_with_context,
     },
 };
@@ -40,6 +42,8 @@ pub(crate) struct InMemoryChecker {
     zone_tip: BlockNumHash,
     tempo_tip: BlockNumHash,
     metrics: CheckerMetrics,
+    #[cfg(feature = "test-utils")]
+    supply_observation_fault: SupplyObservationFault,
 }
 
 #[derive(Default)]
@@ -138,7 +142,19 @@ impl InMemoryChecker {
             zone_tip,
             tempo_tip,
             metrics,
+            #[cfg(feature = "test-utils")]
+            supply_observation_fault: SupplyObservationFault::disabled(),
         }
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn install_supply_observation_fault(&mut self, fault: SupplyObservationFault) {
+        self.supply_observation_fault = fault;
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn supply_observation_fault(&self) -> SupplyObservationFault {
+        self.supply_observation_fault.clone()
     }
 
     #[cfg(test)]
@@ -205,12 +221,13 @@ impl InMemoryChecker {
     pub(crate) async fn prepare_imported_bootstrap<P>(
         &self,
         l1_provider: &P,
-        observation: &L1BlockObservation,
+        acquisition: &L1BlockAcquisition,
         imported_header: &crate::observe::ImportedTempoHeader,
     ) -> Result<PreparedImportedBlock, CheckError>
     where
         P: Provider<TempoNetwork>,
     {
+        self.record_receipt_fetch(acquisition.receipt_fetch_duration());
         let imported_tempo = BlockNumHash::new(imported_header.number(), imported_header.hash());
         let result = async {
             self.check_tempo_continuity(imported_header)?;
@@ -218,7 +235,7 @@ impl InMemoryChecker {
             let imported = self
                 .prepare_imported_transition(
                     l1_provider,
-                    observation,
+                    acquisition.observation(),
                     imported_header,
                     &mut timings,
                 )
@@ -300,7 +317,7 @@ impl InMemoryChecker {
         let imported_tempo = l2.imported_tempo();
         let imported_header = l2.inputs().advance_tempo().imported_header();
         let l1_observation_started = Instant::now();
-        let l1 = match observe_l1(
+        let l1_acquisition = match observe_l1(
             l1_provider,
             imported_header,
             self.model.portal().identity().portal(),
@@ -321,13 +338,20 @@ impl InMemoryChecker {
                 );
             }
         };
+        self.record_receipt_fetch(l1_acquisition.receipt_fetch_duration());
         self.metrics.observation_duration_seconds.record(
             observation_duration
                 .saturating_add(l1_observation_started.elapsed())
                 .as_secs_f64(),
         );
-        self.prepare_continuous_block(l1_provider, zone_state, &l1, &l2, continuity_duration)
-            .await
+        self.prepare_continuous_block(
+            l1_provider,
+            zone_state,
+            l1_acquisition.observation(),
+            &l2,
+            continuity_duration,
+        )
+        .await
     }
 
     /// Check and atomically materialize one already-authenticated child of the
@@ -513,6 +537,11 @@ impl InMemoryChecker {
                 return Err(error.into());
             }
         };
+        #[cfg(feature = "test-utils")]
+        let mut actual_post_state = actual_post_state;
+        #[cfg(feature = "test-utils")]
+        self.supply_observation_fault
+            .perturb(&mut actual_post_state);
 
         reconcile_post_zone_state(expected_post_state, completed.tokens(), &actual_post_state)?;
         let state_update = completed.into_state_update();
@@ -679,5 +708,22 @@ impl InMemoryChecker {
         self.metrics
             .model_lag_blocks
             .set(observed_number.saturating_sub(self.zone_tip.number) as f64);
+    }
+
+    fn record_receipt_fetch(&self, duration: Duration) {
+        self.metrics
+            .receipt_fetch_duration_seconds
+            .record(duration.as_secs_f64());
+    }
+
+    /// Nonterminal lifecycle owners. Token/config/cursor rows are durable
+    /// model state but are not open lifecycle records.
+    pub(crate) fn open_lifecycle_record_count(&self) -> usize {
+        self.model.pending_deposits().len()
+            + self.model.withdrawals().len()
+            + self.model.batches().len()
+            + self.model.fallback_owners().len()
+            + self.model.portal_refunds().len()
+            + self.model.inbox_refunds().len()
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::history::BlockWriteResult;
 
 #[test]
 fn raw_test_commits_reject_duplicate_keys() {
@@ -113,10 +114,15 @@ fn block_commit_is_atomic_journals_first_images_and_reconstructs_deletion() {
         tx.commit().unwrap();
     }
 
+    let BlockWriteResult::Applied(metrics) = store.apply_block_measured(insert.clone()).unwrap()
+    else {
+        panic!("first insert must apply");
+    };
     assert_eq!(
-        store.apply_block(insert.clone()).unwrap(),
-        WriteOutcome::Applied
+        metrics.model_rows,
+        store.load_current().unwrap().model_rows.len()
     );
+    assert!(metrics.changeset_bytes > 0);
     assert_eq!(
         store.apply_block(insert).unwrap(),
         WriteOutcome::AlreadyApplied

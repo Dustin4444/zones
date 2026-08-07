@@ -1,5 +1,7 @@
 mod deposits;
 mod finalization;
+mod lifecycle_matrix;
+pub(crate) mod lifecycle_recovery_scenario;
 mod portal;
 mod processing;
 mod refund_invariants;

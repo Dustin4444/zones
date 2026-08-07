@@ -5,7 +5,9 @@ use alloy_eips::BlockNumHash;
 use reth_exex::ExExNotification;
 use tempo_primitives::TempoPrimitives;
 
-use crate::{observe::ExactStateLookup, validate_notification_receipt_sets};
+use crate::{
+    metrics::BlockProcessingPhase, observe::ExactStateLookup, validate_notification_receipt_sets,
+};
 
 use super::{
     RuntimeError, RuntimeResult,
@@ -15,11 +17,31 @@ use super::{
 };
 
 impl PersistentChecker {
+    #[cfg(test)]
     pub(crate) async fn process_notification_once<S>(
         &mut self,
         notification: &ExExNotification<TempoPrimitives>,
         zone_state: &S,
         l1_client: &mut L1Client,
+    ) -> RuntimeResult<ReadyToAcknowledge>
+    where
+        S: ExactStateLookup + ?Sized,
+    {
+        self.process_notification_in_phase(
+            notification,
+            zone_state,
+            l1_client,
+            BlockProcessingPhase::CatchUp,
+        )
+        .await
+    }
+
+    pub(super) async fn process_notification_in_phase<S>(
+        &mut self,
+        notification: &ExExNotification<TempoPrimitives>,
+        zone_state: &S,
+        l1_client: &mut L1Client,
+        processing_phase: BlockProcessingPhase,
     ) -> RuntimeResult<ReadyToAcknowledge>
     where
         S: ExactStateLookup + ?Sized,
@@ -32,7 +54,7 @@ impl PersistentChecker {
                     return Ok(ReadyToAcknowledge::alerted(new.tip()));
                 }
                 validate_receipts(&new)?;
-                self.process_committed_chain_once(&new, zone_state, l1_client)
+                self.process_committed_chain_once(&new, zone_state, l1_client, processing_phase)
                     .await
             }
             ExExNotification::ChainReverted { old } => {
@@ -41,7 +63,8 @@ impl PersistentChecker {
             }
             ExExNotification::ChainReorged { old, new } => {
                 let (old, new) = validate_reorg(old, new)?;
-                self.process_reorg(&old, &new, zone_state, l1_client).await
+                self.process_reorg(&old, &new, zone_state, l1_client, processing_phase)
+                    .await
             }
         }
     }
@@ -65,6 +88,7 @@ impl PersistentChecker {
         new: &ValidatedChain<'_>,
         zone_state: &S,
         l1_client: &mut L1Client,
+        processing_phase: BlockProcessingPhase,
     ) -> RuntimeResult<ReadyToAcknowledge>
     where
         S: ExactStateLookup + ?Sized,
@@ -88,7 +112,7 @@ impl PersistentChecker {
         validate_receipts(new)?;
         self.remove_reverted_alert(old)?;
         self.unwind_old_progress(old, Some(new))?;
-        self.process_committed_chain_once(new, zone_state, l1_client)
+        self.process_committed_chain_once(new, zone_state, l1_client, processing_phase)
             .await
     }
 

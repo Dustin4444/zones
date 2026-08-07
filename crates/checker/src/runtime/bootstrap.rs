@@ -2,6 +2,7 @@
 
 mod ancestry;
 pub(super) mod error;
+mod genesis;
 mod replay;
 
 use std::path::{Path, PathBuf};
@@ -27,7 +28,7 @@ use self::{
     ancestry::{
         FreshHistory, classify_fresh_history, header_tip, prove_ancestry, prove_descendants_after,
     },
-    replay::genesis_anchor,
+    genesis::genesis_anchor,
 };
 
 pub(super) use self::replay::{create_fresh, resume_l1_replay};
