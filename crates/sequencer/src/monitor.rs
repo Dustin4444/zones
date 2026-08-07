@@ -32,11 +32,9 @@ use tempo_alloy::TempoNetwork;
 use tokio::sync::Notify;
 use tracing::{error, info, instrument, warn};
 
-use alloy_sol_types::{ContractError, SolInterface as _};
-
 use crate::{
     AttestationStore, ZoneSequencerProvider,
-    abi::{self, NO_QUEUE_INDEX, ZonePortal},
+    abi::{self, NO_QUEUE_INDEX},
     resolve_portal_zone_anchor,
     settlement::{
         BatchAnchorConfig, BatchData, BatchSubmitter, FinalizedBatchLog, ZoneBlockSnapshot,
@@ -294,7 +292,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
         }
 
         match self.process_block_range(scan_from, latest_zone_block).await {
-            Ok(_) => self.record_observed_zone_block(latest_zone_block),
+            Ok(()) => self.record_observed_zone_block(latest_zone_block),
             Err(error) => {
                 error!(
                     from = scan_from,
@@ -380,16 +378,15 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     /// The monitor must walk those boundaries one at a time so the L2 outbox
     /// index and L1 portal index advance in lockstep.
     #[instrument(skip(self), fields(from, to))]
-    async fn process_block_range(&mut self, from: u64, to: u64) -> Result<bool> {
+    async fn process_block_range(&mut self, from: u64, to: u64) -> Result<()> {
         let block_count = to - from + 1;
         info!(from, to, block_count, "Processing zone block range");
 
         let boundaries =
-            fetch_finalized_batch_boundaries(&self.provider, self.config.outbox_address, from, to)
-                .await?;
+            fetch_finalized_batch_boundaries(&self.provider, self.config.outbox_address, from, to)?;
         if boundaries.is_empty() {
             info!(from, to, "No finalized batch boundaries ready to submit");
-            return Ok(false);
+            return Ok(());
         }
 
         info!(
@@ -424,7 +421,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             }
         }
 
-        Ok(true)
+        Ok(())
     }
 
     /// Process one boundary-aligned finalized batch.
@@ -435,9 +432,8 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
     ) -> Result<()> {
         let to = boundary.block_number;
         let finalized_batch =
-            fetch_finalized_batch(&self.provider, self.config.outbox_address, from, &boundary)
-                .await?;
-        let end_state = self.fetch_block_snapshot(to).await?;
+            fetch_finalized_batch(&self.provider, self.config.outbox_address, from, &boundary)?;
+        let end_state = read_zone_block_snapshot(&self.provider, self.config.inbox_address, to)?;
 
         if !finalized_batch.withdrawals.is_empty() {
             info!(
@@ -465,12 +461,6 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
 
         self.submit_batch_with_retry(&batch_data, to, finalized_batch.withdrawals)
             .await
-    }
-
-    /// Read the zone state at block `to`: tempo block number, processed deposit
-    /// queue hash, and block hash.
-    async fn fetch_block_snapshot(&self, to: u64) -> Result<ZoneBlockSnapshot> {
-        read_zone_block_snapshot(&self.provider, self.config.inbox_address, to)
     }
 
     /// Submit a `submitBatch` transaction to the ZonePortal on L1 with exponential
@@ -624,10 +614,8 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         delay *= 2;
                     } else {
                         self.metrics.batch_submit_failure_total.increment(1);
-                        let revert_reason = decode_portal_revert(&e);
                         error!(
                             error = %e,
-                            revert_reason,
                             last_zone_block,
                             tempo_block_number = batch_data.tempo_block_number,
                             prev_block_hash = %batch_data.prev_block_hash,
@@ -838,20 +826,6 @@ pub fn spawn_zone_monitor<P: ZoneSequencerProvider>(
             }
         }
     })
-}
-
-/// Try to decode a ZonePortal revert reason from an eyre error chain.
-///
-/// Extracts hex-encoded revert data from the error's display string and decodes
-/// it using alloy's `ContractError`, which handles standard `Revert(string)`,
-/// `Panic(uint256)`, and ZonePortal custom errors (`NotSequencer`, etc.).
-fn decode_portal_revert(err: &eyre::Report) -> Option<String> {
-    let msg = format!("{err}");
-    let start = msg.find("data: \"0x")? + "data: \"".len();
-    let end = msg[start..].find('"')? + start;
-    let bytes = alloy_primitives::hex::decode(&msg[start..end]).ok()?;
-    let error = ContractError::<ZonePortal::ZonePortalErrors>::abi_decode(&bytes).ok()?;
-    Some(error.to_string())
 }
 
 #[cfg(test)]

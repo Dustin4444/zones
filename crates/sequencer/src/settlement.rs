@@ -1012,7 +1012,7 @@ impl BatchSubmitter {
                 continue;
             };
             let withdrawals =
-                fetch_slot_withdrawals(zone_provider, outbox_address, zone_start, zone_end).await?;
+                fetch_slot_withdrawals(zone_provider, outbox_address, zone_start, zone_end)?;
             slot_withdrawals.insert(portal_slot, withdrawals);
         }
 
@@ -1487,7 +1487,7 @@ pub(crate) fn read_zone_block_snapshot<P: ZoneSequencerProvider>(
 ///
 /// This includes zero-withdrawal batches because they still advance the L2
 /// withdrawal batch index and therefore require a matching L1 `submitBatch`.
-pub(crate) async fn fetch_finalized_batch_boundaries<P: ZoneSequencerProvider>(
+pub(crate) fn fetch_finalized_batch_boundaries<P: ZoneSequencerProvider>(
     provider: &P,
     outbox_address: Address,
     from: u64,
@@ -1516,7 +1516,7 @@ pub(crate) async fn fetch_finalized_batch_boundaries<P: ZoneSequencerProvider>(
 /// Withdrawal structs are reconstructed from `WithdrawalRequested` logs in the
 /// supplied boundary-aligned range so the off-chain processor can service the
 /// portal queue.
-pub(crate) async fn fetch_finalized_batch<P: ZoneSequencerProvider>(
+pub(crate) fn fetch_finalized_batch<P: ZoneSequencerProvider>(
     zone_provider: &P,
     outbox_address: Address,
     from: u64,
@@ -1589,23 +1589,18 @@ pub(crate) async fn fetch_finalized_batch<P: ZoneSequencerProvider>(
 }
 
 /// Fetch `WithdrawalRequested` events for one portal queue slot.
-pub(crate) async fn fetch_slot_withdrawals(
+pub(crate) fn fetch_slot_withdrawals(
     zone_provider: &impl ZoneSequencerProvider,
     outbox_address: Address,
     from: u64,
     to: u64,
 ) -> Result<Vec<abi::Withdrawal>> {
-    let boundaries =
-        fetch_finalized_batch_boundaries(zone_provider, outbox_address, to, to).await?;
+    let boundaries = fetch_finalized_batch_boundaries(zone_provider, outbox_address, to, to)?;
     let target = boundaries
         .into_iter()
         .next()
         .ok_or_else(|| eyre::eyre!("zone block {to} does not contain a BatchFinalized boundary"))?;
-    Ok(
-        fetch_finalized_batch(zone_provider, outbox_address, from, &target)
-            .await?
-            .withdrawals,
-    )
+    Ok(fetch_finalized_batch(zone_provider, outbox_address, from, &target)?.withdrawals)
 }
 
 fn fetch_requested_withdrawal_logs<P: ZoneSequencerProvider>(
@@ -2493,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_hash_mismatch_skipped() {
+    fn resolve_hash_mismatch_is_rejected() {
         let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let withdrawals = vec![w0];
         let wrong_hash = B256::from([0xabu8; 32]);
@@ -2508,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_missing_event_skipped() {
+    fn resolve_missing_event_is_rejected() {
         let w0 = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let withdrawals = vec![w0];
 
@@ -2559,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_empty_withdrawals_vec_skipped() {
+    fn resolve_empty_withdrawals_vec_is_rejected() {
         let mut events = BTreeMap::new();
         events.insert(5, test_batch_event(B256::from([0x11u8; 32])));
 
@@ -2571,7 +2566,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_missing_withdrawals_data_skipped() {
+    fn resolve_missing_withdrawals_data_is_rejected() {
         let w = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let hash = abi::Withdrawal::queue_hash(std::slice::from_ref(&w));
 
@@ -2585,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_head_slot_corrupted_hash_skipped() {
+    fn resolve_head_slot_corrupted_hash_is_rejected() {
         let w = test_withdrawal(address!("0x0000000000000000000000000000000000000001"), 100);
         let withdrawals = vec![w];
         let full_hash = abi::Withdrawal::queue_hash(&withdrawals);
