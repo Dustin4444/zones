@@ -747,6 +747,10 @@ where
         })
     }
 
+    fn client_version(&self) -> BoxFut<'_> {
+        Box::pin(async { to_raw(&crate::version::client_version()) })
+    }
+
     fn syncing(&self) -> BoxFut<'_> {
         Box::pin(async move {
             let status = EthApiSpec::sync_status(&self.eth.api).map_err(internal)?;

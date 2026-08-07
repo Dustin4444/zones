@@ -38,6 +38,9 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
     /// `net_version` — returns the network ID as a decimal string.
     fn net_version(&self) -> BoxFut<'_>;
 
+    /// `web3_clientVersion` — returns the native node client version.
+    fn client_version(&self) -> BoxFut<'_>;
+
     /// `eth_syncing` — returns sync status from the upstream node.
     fn syncing(&self) -> BoxFut<'_>;
 
@@ -273,9 +276,7 @@ pub async fn dispatch(
         Method::EthSyncing => api_result(id, method, api.syncing().await),
         Method::EthCoinbase => api_result(id, method, api.coinbase().await),
         Method::Web3Sha3 => handle_web3_sha3(id, raw).await,
-        Method::Web3ClientVersion => {
-            api_result(id, method, crate::types::to_raw(&"tempo-zone/v0.1.0"))
-        }
+        Method::Web3ClientVersion => api_result(id, method, api.client_version().await),
 
         // Fee history
         Method::EthFeeHistory => handle_fee_history(id, raw, api).await,
@@ -748,6 +749,9 @@ mod tests {
         stub!(block_number);
         stub!(chain_id);
         stub!(net_version);
+        fn client_version(&self) -> BoxFut<'_> {
+            Box::pin(async { to_raw(&"tempo-zone/vtest/test-target") })
+        }
         stub!(gas_price);
         stub!(max_priority_fee_per_gas);
         stub!(fee_history, _block_count: u64, _newest_block: BlockNumberOrTag, _reward_percentiles: Option<Vec<f64>>);
@@ -873,6 +877,17 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(sha3.result.as_ref().unwrap().get()).unwrap(),
             "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatches_web3_client_version_from_api() {
+        let api = MockZoneRpcApi::default();
+        let response = dispatch(&request("web3_clientVersion", json!([])), &auth(), &api).await;
+
+        assert_eq!(
+            serde_json::from_str::<Value>(response.result.as_ref().unwrap().get()).unwrap(),
+            "tempo-zone/vtest/test-target"
         );
     }
 
