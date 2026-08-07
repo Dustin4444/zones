@@ -207,7 +207,7 @@ Use `release` profile for production (recommended). Omit it for debug builds dur
 The zone node will:
 - Listen on `http://localhost:8546` for JSON-RPC
 - Subscribe to L1 for deposit events and backfill from the genesis anchor block
-- Build one zone block per L1 block (catches up at full speed during sync)
+- Build zone blocks from contiguous finalized L1 ranges (batching headers during catch-up)
 - Submit batch proofs to L1 every 60s (or immediately when withdrawals are pending)
 - Process withdrawals from the zone back to L1
 

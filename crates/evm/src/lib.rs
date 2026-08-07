@@ -583,7 +583,7 @@ mod tests {
         let factory = ZoneEvmFactory::new(reader.clone(), portal);
         let mut evm = factory.create_evm(db, EvmEnv::default());
         let calldata = IZoneInbox::advanceTempoCall {
-            header: Bytes::from(child_rlp),
+            headers: vec![Bytes::from(child_rlp)],
             deposits: Vec::new(),
             decryptions: Vec::new(),
             enabledTokens: vec![IZoneInbox::EnabledToken {

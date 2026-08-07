@@ -1,14 +1,14 @@
 //! Zone payload builder.
 //!
-//! Builds zone blocks by executing `advanceTempo` system transactions (one per L1 block)
-//! followed by pool transactions and a withdrawal batch finalization.
+//! Builds zone blocks by executing one atomic `advanceTempo` system transaction for a contiguous
+//! L1 header range, followed by pool transactions and a withdrawal batch finalization.
 
 use crate::{
     WithdrawalRevealEncryptor,
     abi::{self, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
 };
 use alloy_consensus::{Signed, TxLegacy};
-use alloy_eips::eip4895::Withdrawals;
+use alloy_eips::{NumHash, eip4895::Withdrawals};
 use alloy_evm::Evm;
 use alloy_primitives::{Bytes, U256};
 use alloy_rlp::Encodable;
@@ -46,7 +46,7 @@ use tempo_transaction_pool::{
 use tracing::{error, info, warn};
 use zone_chainspec::ZoneChainSpec;
 use zone_evm::ZoneEvmConfig;
-use zone_l1::{PreparedL1Block, TempoStateExt};
+use zone_l1::{PreparedL1BlockRange, TempoStateExt, validate_l1_headers};
 use zone_precompiles::L1StateError;
 use zone_primitives::constants::MAX_RLP_BLOCK_SIZE;
 
@@ -172,15 +172,17 @@ where
         let start = Instant::now();
 
         let state_provider = self.provider.state_by_block_hash(parent_header.hash())?;
-        let prepared = attributes.l1_block();
-        validate_l1_continuity(state_provider.as_ref(), prepared)?;
-
+        let prepared = attributes.l1_block_range();
+        let final_l1_block = validate_l1_continuity(state_provider.as_ref(), prepared)?;
+        let l1_headers = prepared.headers.len();
         let total_deposits = prepared.queued_deposits.len();
+        let timestamp = attributes.timestamp();
 
         info!(
             target: "zone::payload",
             zone_block = parent_header.number() + 1,
-            l1_block = prepared.header.inner.number,
+            l1_block = final_l1_block.number,
+            l1_headers,
             deposits = total_deposits,
             enabled_tokens = prepared.enabled_tokens.len(),
             "Including advanceTempo system tx (chain continuity OK)"
@@ -200,7 +202,7 @@ where
 
         let next_block_env_attributes = TempoNextBlockEnvAttributes {
             inner: NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
+                timestamp,
                 suggested_fee_recipient: attributes.suggested_fee_recipient(),
                 prev_randao: attributes.prev_randao(),
                 gas_limit: block_gas_limit,
@@ -234,15 +236,16 @@ where
             PayloadBuilderError::Internal(err.into())
         })?;
 
-        // Execute advanceTempo system transaction — exactly one per zone block.
+        // Execute exactly one advanceTempo system transaction for the imported L1 range.
         builder
-            .execute_transaction(build_advance_tempo_tx(prepared))
+            .execute_transaction(build_advance_tempo_tx(attributes.l1_block_range))
             .map(|_| ())
             .map_err(PayloadBuilderError::evm)
             .map_err(|err| {
                 error!(
                     ?err,
-                    l1_block = prepared.header.inner.number,
+                    l1_block = final_l1_block.number,
+                    l1_headers,
                     deposits = total_deposits,
                     "advanceTempo system tx failed"
                 );
@@ -289,7 +292,7 @@ where
         } = builder.finish(&*state_provider, None)?;
 
         let requests = chain_spec
-            .is_prague_active_at_timestamp(attributes.timestamp())
+            .is_prague_active_at_timestamp(timestamp)
             .then_some(execution_result.requests.clone());
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -308,8 +311,9 @@ where
         let elapsed = start.elapsed();
         info!(
             number = sealed_block.number(),
-            l1_block = prepared.header.number(),
-            l1_hash = ?prepared.header.hash(),
+            l1_block = final_l1_block.number,
+            l1_hash = ?final_l1_block.hash,
+            l1_headers,
             hash = ?sealed_block.hash(),
             gas_used = sealed_block.gas_used(),
             deposits = total_deposits,
@@ -344,7 +348,7 @@ where
             execution_block_encoded,
         );
 
-        // Zone payloads are deterministic (one L1 block = one zone block), so freeze
+        // Zone payloads are deterministic (one imported L1 range = one zone block), so freeze
         // the payload to prevent reth from re-triggering try_build on the rebuild interval.
         // Without this, the next rebuild attempt would find the deposit queue empty.
         Ok(BuildOutcome::Freeze(payload))
@@ -374,55 +378,26 @@ where
     }
 }
 
-/// Validate that the prepared L1 block is the next block expected by TempoState.
+/// Validate that every prepared L1 header is the next contiguous range expected by TempoState.
 fn validate_l1_continuity(
     state_provider: &dyn StateProvider,
-    prepared: &PreparedL1Block,
-) -> Result<(), PayloadBuilderError> {
+    prepared: &PreparedL1BlockRange,
+) -> Result<NumHash, PayloadBuilderError> {
     let stored_l1 = state_provider
         .tempo_num_hash()
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
-    let expected_block_number = stored_l1.number + 1;
+    let expected_block_number = stored_l1.number.saturating_add(1);
 
     info!(
         target: "zone::payload",
         stored_l1_block_hash = %stored_l1.hash,
         expected_tempo_block_number = expected_block_number,
+        headers = prepared.headers.len(),
         "TempoState current state"
     );
 
-    if prepared.header.inner.number != expected_block_number {
-        error!(
-            target: "zone::payload",
-            got = prepared.header.inner.number,
-            expected = expected_block_number,
-            "L1 block number mismatch — chain continuity broken"
-        );
-        return Err(PayloadBuilderError::Internal(reth_errors::RethError::msg(
-            format!(
-                "L1 block number mismatch: got {} expected {expected_block_number}",
-                prepared.header.inner.number
-            ),
-        )));
-    }
-
-    if prepared.header.inner.parent_hash != stored_l1.hash {
-        error!(
-            target: "zone::payload",
-            got = %prepared.header.inner.parent_hash,
-            expected = %stored_l1.hash,
-            l1_block = prepared.header.inner.number,
-            "L1 parent hash mismatch — chain continuity broken"
-        );
-        return Err(PayloadBuilderError::Internal(reth_errors::RethError::msg(
-            format!(
-                "L1 parent hash mismatch at block {}: got {} expected {}",
-                prepared.header.inner.number, prepared.header.inner.parent_hash, stored_l1.hash
-            ),
-        )));
-    }
-
-    Ok(())
+    validate_l1_headers(&prepared.headers, stored_l1)
+        .map_err(|err| PayloadBuilderError::Internal(reth_errors::RethError::msg(err.to_string())))
 }
 
 /// Execute the best pool transactions until the iterator is exhausted or the build is cancelled.
@@ -667,28 +642,36 @@ where
     })
 }
 
-/// Build the `advanceTempo(header, deposits, decryptions, enabledTokens)` system transaction.
+/// Build the `advanceTempo(headers, deposits, decryptions, enabledTokens)` system transaction.
 ///
-/// This must be called **once per L1 block** at the start of a zone block (before user txs).
+/// This must be called **once per imported L1 range** at the start of a zone block (before user txs).
 /// It calls [`IZoneInbox.advanceTempo`](crate::abi::IZoneInbox) which atomically:
-/// - Advances the zone's view of Tempo by processing the L1 block header
+/// - Advances the zone's view of Tempo by processing the contiguous L1 header range
 /// - Activates newly-bridged TIP-20 tokens directly in the ZoneInbox precompile
 /// - Processes deposits from the queue (minting zone tokens to recipients)
 /// - Validates the deposit hash chain against Tempo state
 ///
-/// Takes a [`PreparedL1Block`] where all ECIES decryption and ABI encoding have
-/// already been performed. TIP-403 policy is enforced during `advanceTempo` when
-/// the deposits mint TIP-20 tokens.
-pub fn build_advance_tempo_tx(prepared: &PreparedL1Block) -> Recovered<TempoTxEnvelope> {
-    // RLP-encode the Tempo header
-    let mut header_rlp = Vec::new();
-    prepared.header.header().encode(&mut header_rlp);
+/// Takes a [`PreparedL1BlockRange`] where all ECIES decryption and ABI encoding have
+/// already been performed. Deposit, decryption, and token vectors are moved into the transaction
+/// to avoid cloning. TIP-403 policy is enforced during `advanceTempo` when deposits mint TIP-20
+/// tokens.
+pub fn build_advance_tempo_tx(prepared: PreparedL1BlockRange) -> Recovered<TempoTxEnvelope> {
+    // RLP-encode every Tempo header in canonical order.
+    let headers = prepared
+        .headers
+        .iter()
+        .map(|header| {
+            let mut header_rlp = Vec::new();
+            header.header().encode(&mut header_rlp);
+            Bytes::from(header_rlp)
+        })
+        .collect();
 
     let calldata = abi::IZoneInbox::advanceTempoCall {
-        header: Bytes::from(header_rlp),
-        deposits: prepared.queued_deposits.clone(),
-        decryptions: prepared.decryptions.clone(),
-        enabledTokens: prepared.enabled_tokens.clone(),
+        headers,
+        deposits: prepared.queued_deposits,
+        decryptions: prepared.decryptions,
+        enabledTokens: prepared.enabled_tokens,
     }
     .abi_encode();
 
@@ -728,7 +711,7 @@ mod tests {
     use tempo_transaction_pool::transaction::TempoPooledTransaction;
 
     use crate::abi::{self, DepositType, IZoneInbox};
-    use zone_l1::PreparedL1Block;
+    use zone_l1::PreparedL1BlockRange;
 
     #[test]
     fn withdrawal_batch_cadence_is_deterministic_from_block_number() {
@@ -864,10 +847,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Build a PreparedL1Block directly — this test validates
+        // Build a PreparedL1BlockRange directly — this test validates
         // `build_advance_tempo_tx` calldata encoding, not `prepare`.
-        let prepared = PreparedL1Block {
-            header: SealedHeader::seal_slow(header),
+        let prepared = PreparedL1BlockRange {
+            headers: vec![SealedHeader::seal_slow(header)],
             queued_deposits: vec![
                 abi::QueuedDeposit {
                     depositType: DepositType::WithdrawalBounceBack,
@@ -910,7 +893,7 @@ mod tests {
             enabled_tokens: vec![],
         };
 
-        let recovered_tx = super::build_advance_tempo_tx(&prepared);
+        let recovered_tx = super::build_advance_tempo_tx(prepared);
 
         // Decode the calldata to verify structure.
         let envelope = recovered_tx.inner();
@@ -921,6 +904,7 @@ mod tests {
         let decoded = IZoneInbox::advanceTempoCall::abi_decode(input)
             .expect("calldata should decode as advanceTempo");
 
+        assert_eq!(decoded.headers.len(), 1, "should have one imported header");
         // Should have 2 queued deposits
         assert_eq!(decoded.deposits.len(), 2, "should have 2 queued deposits");
 

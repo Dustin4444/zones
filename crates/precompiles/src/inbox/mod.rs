@@ -2,14 +2,12 @@
 //!
 //! The Inbox advances the Zone's finalized Tempo checkpoint and consumes the canonical L1 deposit
 //! queue. The implementation shares one execution-local [`L1State`] with `TempoState` and the
-//! Zone EVM database adapter: `finalizeTempo` selects the child anchor used by sequencer
+//! Zone EVM database adapter: `finalizeTempo` selects the range's final anchor for sequencer
 //! admission and every subsequent deposit, policy, and portal read.
 //!
-//! Runtime execution processes a contiguous prefix of the portal deposit queue and reads its
-//! canonical head at the selected child anchor. The batch proof, not this precompile, proves that
-//! the post-state processed hash is an ancestor of that head by validating the unprocessed suffix.
-//! Observing the head read in the execution witness is not sufficient without that explicit proof
-//! constraint.
+//! Runtime execution processes the complete contiguous deposit queue prefix supplied for the
+//! final imported Tempo root. The rebuilt hash must equal the canonical head at that root, so a
+//! partial catch-up range is rejected atomically.
 
 mod dispatch;
 
@@ -91,14 +89,23 @@ impl ZoneInbox {
 
         let mut tempo_state = TempoState::new();
 
-        // Step 1: Advance Tempo state and select the child anchor used by all L1-backed reads.
-        tempo_state.finalize_checkpoint(l1, call.header)?;
-        let tempo_block_number = tempo_state.tempo_block_number()?;
+        // Step 1: Validate and finalize the complete header range. The final header selects the
+        // single L1 anchor used by token activation and every deposit read below.
+        let (tempo_range, tempo_block_hash) =
+            tempo_state.finalize_checkpoints(l1, &call.headers)?;
+
+        // A range must belong to one leadership epoch. The activation block itself starts the new
+        // epoch and therefore may be the first header in a range, but never an interior header.
+        if !portal.is_zero() && tempo_range.start() < tempo_range.end() {
+            let activation = l1.read_portal(|portal| &portal.leader_activation_tempo_block)?;
+            if *tempo_range.start() < activation && activation <= *tempo_range.end() {
+                return Err(ZoneInboxError::leader_transition_crossed().into());
+            }
+        }
 
         self.enable_tokens(call.enabledTokens)?;
 
         // Step 2: Process deposits and build hash chain
-        let tempo_block_hash = tempo_state.tempo_block_hash()?;
         let mut current_hash = self.processed_deposit_queue_hash.read()?;
         let mut decryptions = call.decryptions.into_iter();
         let mut outbox = ZoneOutbox::new();
@@ -133,13 +140,10 @@ impl ZoneInbox {
 
         // Step 3: Bind the canonical Tempo queue head into the execution witness.
         //
-        // `current_hash` may be an ancestor of this value when the sequencer processes only a
-        // bounded prefix of pending deposits. The batch proof validates that hashing the
-        // unprocessed suffix from `current_hash` reaches `tempo_current_hash`; requiring equality
-        // here would incorrectly forbid partial processing.
-        //
-        // NOTE: A zero portal denotes the explicit no-L1 mode used by local development and offline
-        // execution. There is no canonical queue to bind in that mode.
+        // The final imported root is authoritative for this entire call. Requiring exact equality
+        // prevents a catch-up block from advancing Tempo while silently leaving deposits pending.
+        // A zero portal denotes the explicit no-L1 mode used by local development and offline
+        // execution, where there is no canonical queue to bind.
         if !portal.is_zero() {
             let tempo_current_hash = l1.read_portal(|portal| &portal.current_deposit_queue_hash)?;
             if tempo_current_hash != current_hash {
@@ -157,7 +161,7 @@ impl ZoneInbox {
 
         self.emit_event(ZoneInboxEvent::tempo_advanced(
             tempo_block_hash,
-            tempo_block_number,
+            *tempo_range.end(),
             U256::from(deposit_count),
             current_hash,
             processed_number,

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::RangeInclusive,
     path::Path,
 };
 
@@ -365,6 +366,26 @@ impl LeadershipSchedule {
             .read()
             .expect("poisoned")
             .leader_for(tempo_anchor)
+    }
+
+    /// Validates that a range remains under one known leadership record.
+    pub fn validate_range_leadership(
+        &self,
+        anchor_range: RangeInclusive<u64>,
+        zone_block: u64,
+    ) -> eyre::Result<()> {
+        // Backfills may outlive retained schedule records and rely on live sender checks.
+        let state = self.inner.read().expect("poisoned");
+        if let (Some(first_record), Some(final_record)) = (
+            state.leader_for(*anchor_range.start()),
+            state.leader_for(*anchor_range.end()),
+        ) {
+            eyre::ensure!(
+                first_record == final_record,
+                "peer block {zone_block} imports a range crossing a leader transition"
+            );
+        }
+        Ok(())
     }
 
     /// Returns the most recently observed record (status only, never a production permit).

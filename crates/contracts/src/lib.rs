@@ -116,7 +116,7 @@ mod tests {
         // Now test the full advanceTempo call encoding
         let header_bytes = Bytes::from(vec![0xc0]); // minimal RLP empty list
         let calldata = IZoneInbox::advanceTempoCall {
-            header: header_bytes,
+            headers: vec![header_bytes],
             deposits: vec![qd],
             decryptions: vec![],
             enabledTokens: vec![],

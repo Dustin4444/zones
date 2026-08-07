@@ -15,6 +15,9 @@ pub const NO_QUEUE_INDEX: U256 = U256::MAX;
 /// keeps the outer `processWithdrawals` transaction well below a 30M gas block.
 pub const MAX_WITHDRAWAL_GAS_LIMIT: u64 = 10_000_000;
 
+/// Maximum deposit entries that may remain outstanding on a ZonePortal.
+pub const MAX_UNPROCESSED_DEPOSITS: usize = 230;
+
 /// Maximum RLP-encoded block size.
 ///
 /// This follows EIP-7934's `MAX_BLOCK_SIZE - SAFETY_MARGIN` and matches

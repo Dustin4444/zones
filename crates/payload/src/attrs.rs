@@ -1,7 +1,7 @@
 //! Zone payload types.
 //!
 //! Owns the full payload attribute types for the zone, wrapping Ethereum
-//! payload attributes and adding L1 block data plus the millisecond timestamp
+//! payload attributes and adding an L1 header range plus the millisecond timestamp
 //! portion. This avoids pulling in Tempo-specific concepts the zone doesn't
 //! use (interrupts, subblocks, DKG extra-data).
 
@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use tempo_node::engine::TempoEngineValidator;
 use tempo_payload_types::{TempoBuiltPayload, TempoExecutionData};
 use tempo_primitives::{Block, TempoHeader};
-use zone_l1::PreparedL1Block;
+use zone_l1::PreparedL1BlockRange;
 
 /// Zone RPC payload attributes — the type that flows through FCU.
 ///
 /// Carries standard Ethereum attributes, a millisecond timestamp portion, and
-/// the prepared L1 block whose deposits should be included in this zone block.
+/// the prepared L1 range whose portal events should be included in this zone block.
 /// The L1 data is set by the ZoneEngine before sending
 /// FCU and is skipped during (de)serialisation since it only travels through
 /// in-process channels.
@@ -34,11 +34,10 @@ pub struct ZonePayloadAttributes {
     /// Milliseconds portion of the timestamp (0–999).
     pub timestamp_millis_part: u64,
 
-    /// Prepared L1 block to process in this zone block. Every zone block
-    /// processes exactly one L1 block via `advanceTempo`. Decryption and ABI
-    /// encoding have already been performed by the engine; TIP-403 policy is
+    /// Prepared contiguous L1 range to process in this zone block. Decryption and ABI encoding
+    /// have already been performed by the engine; TIP-403 policy is
     /// enforced during `advanceTempo` when the deposits mint TIP-20 tokens.
-    pub l1_block: PreparedL1Block,
+    pub l1_block_range: PreparedL1BlockRange,
 }
 
 impl reth_node_api::PayloadAttributes for ZonePayloadAttributes {
@@ -64,9 +63,9 @@ impl reth_node_api::PayloadAttributes for ZonePayloadAttributes {
 }
 
 impl ZonePayloadAttributes {
-    /// Returns a reference to the prepared L1 block data.
-    pub fn l1_block(&self) -> &PreparedL1Block {
-        &self.l1_block
+    /// Returns a reference to the prepared L1 range data.
+    pub fn l1_block_range(&self) -> &PreparedL1BlockRange {
+        &self.l1_block_range
     }
 
     /// Returns the extra data for the block header (always empty for zones).

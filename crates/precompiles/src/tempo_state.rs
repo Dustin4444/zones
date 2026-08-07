@@ -14,6 +14,7 @@ use alloy_evm::precompiles::DynPrecompile;
 use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rlp::Decodable as _;
 use alloy_sol_types::SolError;
+use core::ops::RangeInclusive;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     EncodePrecompileResult, charge_input_cost, dispatch, error::TempoPrecompileError,
@@ -65,64 +66,69 @@ impl TempoState {
                 "invalid Tempo genesis header RLP: trailing bytes after header".into(),
             ));
         }
-        self.write_checkpoint(header_rlp, header.number())?;
+        self.write_checkpoint(keccak256(header_rlp), header.number())?;
         Ok(())
     }
 
     fn write_checkpoint(
         &mut self,
-        header_rlp: &[u8],
+        block_hash: B256,
         block_number: u64,
-    ) -> tempo_precompiles::Result<B256> {
-        let block_hash = keccak256(header_rlp);
+    ) -> tempo_precompiles::Result<()> {
         self.tempo_block_hash.write(block_hash)?;
         self.tempo_block_number.write(block_number)?;
-        Ok(block_hash)
+        Ok(())
     }
 
     fn revert_error<E: SolError>(&self, error: E) -> PrecompileResult {
         Ok(self.storage.revert_output(error.abi_encode().into()))
     }
 
-    /// Validate and apply a finalized Tempo checkpoint transition.
+    /// Validate and apply a contiguous range of finalized Tempo checkpoints.
     ///
-    /// IMPORTANT: this operation only enforces local continuity: the decoded block number must
-    /// increment by one and its parent hash must match the previously stored Tempo hash.
-    ///
-    /// Canonicality is a separate proof obligation: the batch proof must bind the imported header
-    /// hash and state root to the canonical settlement anchor and authenticate every Tempo storage
-    /// read against that exact root.
-    ///
-    /// This typed operation is shared by the public `finalizeTempo` ABI and the native Inbox.
-    pub(crate) fn finalize_checkpoint<P>(
+    /// Every header is decoded and checked against the preceding header, but only the final
+    /// header is persisted and only one finalization event is emitted. The L1 storage anchor is
+    /// advanced after the complete range has validated, so all subsequent reads in the transaction
+    /// resolve against the final imported state root.
+    pub(crate) fn finalize_checkpoints<P>(
         &mut self,
         l1: &L1State<P>,
-        header_rlp: Bytes,
-    ) -> ZoneResult<()> {
-        let prev_block_hash = self.tempo_block_hash.read()?;
-        let prev_block_number = self.tempo_block_number.read()?;
-
-        let mut header_cursor = header_rlp.as_ref();
-        let header = TempoHeader::decode(&mut header_cursor)
-            .map_err(|_| TempoStateError::invalid_rlp_data())?;
-        if !header_cursor.is_empty() {
+        headers: &[Bytes],
+    ) -> ZoneResult<(RangeInclusive<u64>, B256)> {
+        if headers.is_empty() {
             return Err(TempoStateError::invalid_rlp_data().into());
         }
-        if header.parent_hash() != prev_block_hash {
-            return Err(TempoStateError::invalid_parent_hash().into());
-        }
-        if prev_block_number.checked_add(1) != Some(header.number()) {
-            return Err(TempoStateError::invalid_block_number().into());
+        let init_block_number = self.tempo_block_number()?;
+        let mut last_state_root = B256::ZERO;
+        let mut last_block_number = init_block_number;
+        let mut last_block_hash = self.tempo_block_hash()?;
+
+        for header_rlp in headers {
+            let mut header_cursor = header_rlp.as_ref();
+            let header = TempoHeader::decode(&mut header_cursor)
+                .map_err(|_| TempoStateError::invalid_rlp_data())?;
+            if !header_cursor.is_empty() {
+                return Err(TempoStateError::invalid_rlp_data().into());
+            }
+            if header.parent_hash() != last_block_hash {
+                return Err(TempoStateError::invalid_parent_hash().into());
+            }
+            if last_block_number.checked_add(1) != Some(header.number()) {
+                return Err(TempoStateError::invalid_block_number().into());
+            }
+            last_block_hash = keccak256(header_rlp);
+            last_block_number = header.number();
+            last_state_root = header.state_root();
         }
 
-        l1.advance_anchor(prev_block_number, header.number())?;
-        let tempo_block_hash = self.write_checkpoint(&header_rlp, header.number())?;
+        l1.advance_anchor(init_block_number, last_block_number)?;
+        self.write_checkpoint(last_block_hash, last_block_number)?;
         self.emit_event(TempoStateAbi::TempoBlockFinalized {
-            blockHash: tempo_block_hash,
-            blockNumber: header.number(),
-            stateRoot: header.state_root(),
+            blockHash: last_block_hash,
+            blockNumber: last_block_number,
+            stateRoot: last_state_root,
         })?;
-        Ok(())
+        Ok((init_block_number + 1..=last_block_number, last_block_hash))
     }
 
     fn apply_checkpoint<P>(
@@ -138,7 +144,8 @@ impl TempoState {
             return self.revert_error(TempoStateAbi::OnlyZoneInbox {});
         }
 
-        self.finalize_checkpoint(l1, call.header)
+        self.finalize_checkpoints(l1, &call.headers)
+            .map(|_| ())
             .encode_precompile_result(0, 0, |()| Bytes::new())
     }
 
@@ -244,23 +251,14 @@ mod tests {
             )
         }
 
-        fn finalize_raw(
-            &mut self,
-            caller: Address,
-            header: Bytes,
-            is_static: bool,
-        ) -> PrecompileResult {
-            let data = TempoStateAbi::finalizeTempoCall { header }.abi_encode();
-            self.call(caller, data, is_static)
-        }
-
         fn finalize(
             &mut self,
             caller: Address,
-            header: &TempoHeader,
+            headers: Vec<Bytes>,
             is_static: bool,
         ) -> PrecompileResult {
-            self.finalize_raw(caller, encode_header(header), is_static)
+            let data = TempoStateAbi::finalizeTempoCall { headers }.abi_encode();
+            self.call(caller, data, is_static)
         }
 
         fn assert_checkpoint(
@@ -335,9 +333,32 @@ mod tests {
         let mut harness = TempoStateHarness::new(&genesis)?;
         let child = child_header(genesis_hash, 1);
 
-        let output = harness.finalize(ZONE_INBOX_ADDRESS, &child, false)?;
+        let output = harness.finalize(ZONE_INBOX_ADDRESS, vec![encode_header(&child)], false)?;
         assert!(output.is_success());
         harness.assert_checkpoint(keccak256(encode_header(&child)), 1)
+    }
+
+    #[test]
+    fn finalize_tempo_commits_only_fully_valid_ranges() -> eyre::Result<()> {
+        let genesis = TempoHeader::default();
+        let genesis_hash = keccak256(encode_header(&genesis));
+        let mut harness = TempoStateHarness::new(&genesis)?;
+        let first = child_header(genesis_hash, 1);
+        let valid = child_header(keccak256(encode_header(&first)), 2);
+        let invalid = child_header(B256::ZERO, 2);
+
+        for (second, is_valid) in [(valid, true), (invalid, false)] {
+            let headers = vec![encode_header(&first), encode_header(&second)];
+            let output = harness.finalize(ZONE_INBOX_ADDRESS, headers, false)?;
+            if is_valid {
+                assert!(output.is_success());
+                harness.assert_checkpoint(keccak256(encode_header(&second)), 2)?;
+            } else {
+                assert!(output.is_revert());
+                harness.assert_checkpoint(genesis_hash, 0)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -346,8 +367,9 @@ mod tests {
         let genesis_hash = keccak256(encode_header(&genesis));
         let mut harness = TempoStateHarness::new(&genesis)?;
         let child = child_header(genesis_hash, 1);
+        let headers = vec![encode_header(&child)];
 
-        assert!(harness.finalize(Address::ZERO, &child, false)?.is_revert());
+        assert!(harness.finalize(Address::ZERO, headers, false)?.is_revert());
         harness.assert_checkpoint(genesis_hash, genesis.number())
     }
 
@@ -376,7 +398,7 @@ mod tests {
 
         assert!(
             harness
-                .finalize(ZONE_INBOX_ADDRESS, &child, true)?
+                .finalize(ZONE_INBOX_ADDRESS, vec![encode_header(&child)], true)?
                 .is_revert()
         );
         harness.assert_checkpoint(genesis_hash, genesis.number())
@@ -390,7 +412,7 @@ mod tests {
 
         assert!(
             harness
-                .finalize_raw(ZONE_INBOX_ADDRESS, Bytes::from(vec![0xff]), false)?
+                .finalize(ZONE_INBOX_ADDRESS, vec![Bytes::from(vec![0xff])], false)?
                 .is_revert()
         );
         harness.assert_checkpoint(genesis_hash, genesis.number())
@@ -406,7 +428,7 @@ mod tests {
 
         assert!(
             harness
-                .finalize_raw(ZONE_INBOX_ADDRESS, Bytes::from(malformed), false)?
+                .finalize(ZONE_INBOX_ADDRESS, vec![Bytes::from(malformed)], false)?
                 .is_revert()
         );
         harness.assert_checkpoint(genesis_hash, genesis.number())
@@ -421,7 +443,7 @@ mod tests {
 
         assert!(
             harness
-                .finalize(ZONE_INBOX_ADDRESS, &child, false)?
+                .finalize(ZONE_INBOX_ADDRESS, vec![encode_header(&child)], false)?
                 .is_revert()
         );
         harness.assert_checkpoint(genesis_hash, genesis.number())
@@ -436,7 +458,7 @@ mod tests {
 
         assert!(
             harness
-                .finalize(ZONE_INBOX_ADDRESS, &child, false)?
+                .finalize(ZONE_INBOX_ADDRESS, vec![encode_header(&child)], false)?
                 .is_revert()
         );
         harness.assert_checkpoint(genesis_hash, genesis.number())

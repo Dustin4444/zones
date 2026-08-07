@@ -84,7 +84,7 @@ mod subscriber;
 #[cfg(test)]
 mod tests;
 
-pub use block::{L1BlockDeposits, PreparedL1Block};
+pub use block::{L1BlockDeposits, PreparedL1BlockRange, validate_l1_headers};
 pub use deposit::{Deposit, L1Deposit, WithdrawalBounceBackDeposit};
 pub use encryption_keys::EncryptionKeyRing;
 pub use event::{EnabledToken, EncryptionKeyRotation, L1PortalEvents, LeaderTransition};

@@ -5,10 +5,10 @@ derives its state from Tempo L1.
 
 ## Overview
 
-A **zone** is a Tempo L2 that processes one L1 block per zone block. The
-sequencer watches the L1 chain for deposit, withdrawal, and token-enablement
-events, builds zone blocks that execute those events via a system transaction,
-and periodically submits batch proofs back to the L1 portal contract.
+A **zone** is a Tempo L2 that imports a contiguous range of one or more finalized L1 blocks in
+each zone block. The sequencer watches the L1 chain for deposit, withdrawal, and token-enablement
+events, builds zone blocks that execute those events via a system transaction, and periodically
+submits batch proofs back to the L1 portal contract.
 
 ## Architecture
 
@@ -43,21 +43,20 @@ graph TD
 
 ## Block Production
 
-Each zone block processes exactly one L1 block. The flow is driven by the
+Each zone block processes a non-empty contiguous L1 range. The flow is driven by the
 `ZoneEngine`:
 
 1. **L1Subscriber** connects to L1 via WebSocket, backfills missed blocks, and
    enqueues `L1BlockDeposits` into the `DepositQueue`.
-2. **ZoneEngine** peeks the next L1 block from the queue and builds
-   `ZonePayloadAttributes` containing the L1 header, deposits, and enabled
-   tokens.
+2. **ZoneEngine** peeks the next bounded L1 range from the queue and builds
+   `ZonePayloadAttributes` containing its headers, deposits, and enabled tokens.
 3. The **payload builder** constructs an `advanceTempo` system transaction that
-   calls `ZoneInbox.advanceTempo(header, deposits, decryptions, enabledTokens)`.
+   calls `ZoneInbox.advanceTempo(headers, deposits, decryptions, enabledTokens)`.
    This is always the first transaction in a zone block.
 4. Pool transactions are appended after the system transaction, followed by a
    withdrawal batch finalization if applicable.
-5. After `newPayload` succeeds, the engine **confirms** the L1 block in the
-   deposit queue (removing it). On failure the block stays for retry.
+5. After `newPayload` succeeds, the engine **confirms** the complete L1 range in the
+   deposit queue. On failure the range stays queued for retry.
 
 The zone uses **instant finality** — head, safe, and finalized all point to the
 same block.
@@ -73,9 +72,9 @@ transaction atomically:
 - Processes deposits from the L1 queue — minting zone-side tokens to recipients.
 - Validates the deposit hash chain against the L1 portal's queue hash.
 
-Chain continuity is enforced: the L1 block number must equal
-`tempoBlockNumber + 1` and its parent hash must match the stored
-`tempoBlockHash`.
+Chain continuity is enforced: the first L1 block number must equal `tempoBlockNumber + 1`, its
+parent hash must match the stored `tempoBlockHash`, and every later header must directly extend its
+predecessor.
 
 ### Deposits
 

@@ -8,6 +8,7 @@ use alloy_transport::mock::Asserter;
 use serde::Deserialize;
 use std::{
     collections::{HashSet, VecDeque},
+    num::NonZeroUsize,
     time::Duration,
 };
 use tempo_alloy::rpc::{TempoHeaderResponse, TempoTransactionReceipt};
@@ -255,7 +256,7 @@ fn observed_portal_events_require_complete_advance_tempo_inputs() {
     let missing_token = events
         .validate_advance_tempo_inputs(&deposits, &[])
         .unwrap_err();
-    assert!(missing_token.to_string().contains("token enables"));
+    assert!(missing_token.to_string().contains("token enable"));
 }
 
 #[tokio::test]
@@ -683,10 +684,17 @@ fn update_l1_state_anchor_applies_raw_mutations_before_publishing_coverage() {
     assert_eq!(cache.get(TIP403_REGISTRY_ADDRESS, slot, 11), None);
 }
 
+fn first_pending(queue: &DepositQueue) -> Arc<L1BlockDeposits> {
+    queue
+        .peek(NonZeroUsize::MIN)
+        .and_then(|range| range.into_iter().next())
+        .expect("queue is empty")
+}
+
 /// Confirm the front of a shared `DepositQueue`, panicking if it fails.
-fn confirm_shared(queue: &DepositQueue) -> L1BlockDeposits {
-    let num_hash = queue.peek().expect("queue is empty").header.num_hash();
-    queue.confirm(num_hash).expect("confirm mismatch")
+fn confirm_shared(queue: &DepositQueue) {
+    let front = queue.peek(NonZeroUsize::MIN).expect("queue is not empty");
+    queue.confirm(&front).expect("confirm mismatch");
 }
 
 fn deposit_hash_chain(previous_hash: B256, deposits: &[L1Deposit]) -> B256 {
@@ -1021,8 +1029,8 @@ fn test_withdrawal_bounce_back_and_deposit_hash_chain() {
     assert_eq!(next_hash, hash_2);
 }
 
-#[tokio::test]
-async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
+#[test]
+fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
     use k256::{AffinePoint, ProjectivePoint, Scalar};
 
     let token = address!("0x0000000000000000000000000000000000001000");
@@ -1045,7 +1053,7 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         U256::ZERO,
     )
     .expect("encrypted deposit should be valid");
-    let encryption_keys = EncryptionKeyRing::new([sequencer_key.clone()]);
+    let encryption_keys = EncryptionKeyRing::new([sequencer_key]);
     encryption_keys
         .apply_rotation(&EncryptionKeyRotation {
             x: seq_pub_x,
@@ -1072,9 +1080,7 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
         })]),
     };
 
-    let prepared = block
-        .prepare(&encryption_keys, portal)
-        .await
+    let prepared = PreparedL1BlockRange::new(&[Arc::new(block)], &encryption_keys, portal)
         .expect("decrypted deposit should prepare without an engine-side policy read");
 
     assert_eq!(prepared.queued_deposits.len(), 1);
@@ -1089,8 +1095,8 @@ async fn test_prepare_decrypted_deposit_defers_policy_to_upstream_mint() {
     );
 }
 
-#[tokio::test]
-async fn deposits_select_the_private_key_by_portal_index() {
+#[test]
+fn deposits_select_the_private_key_by_portal_index() {
     let token = address!("0x0000000000000000000000000000000000001000");
     let sender = address!("0x0000000000000000000000000000000000001234");
     let portal = address!("0x0000000000000000000000000000000000000ABC");
@@ -1158,13 +1164,11 @@ async fn deposits_select_the_private_key_by_portal_index() {
         }));
     }
 
-    let prepared = L1BlockDeposits {
+    let block = Arc::new(L1BlockDeposits {
         header: seal(make_test_header(20)),
         events: L1PortalEvents::from_deposits(deposits),
-    }
-    .prepare(&encryption_keys, portal)
-    .await
-    .unwrap();
+    });
+    let prepared = PreparedL1BlockRange::new(&[block], &encryption_keys, portal).unwrap();
 
     assert_eq!(
         prepared
@@ -1191,7 +1195,7 @@ fn finalized_queue_tracks_tip_after_consumption() {
 
     confirm_shared(&queue);
     confirm_shared(&queue);
-    assert!(queue.peek().is_none());
+    assert!(queue.peek(NonZeroUsize::MIN).is_none());
     assert_eq!(
         queue.last_enqueued(),
         Some(NumHash::new(101, h101_hash)),
@@ -1249,7 +1253,34 @@ fn external_enqueue_accepts_duplicate_producers() {
             .try_enqueue_sealed(duplicate, L1PortalEvents::default())
             .unwrap()
     );
-    assert_eq!(queue.peek().unwrap().header.number(), 10);
+    assert_eq!(first_pending(&queue).header.number(), 10);
+}
+
+#[test]
+fn queue_range_stops_before_a_portal_leader_transition() {
+    const LIMIT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
+    let queue = DepositQueue::default();
+    let mut parent_hash = B256::ZERO;
+    for number in 1..=4 {
+        let header = seal(make_chained_header(number, parent_hash));
+        let mut events = L1PortalEvents::default();
+        if number == 3 {
+            events.leader_transitions.push(LeaderTransition {
+                previous_leader: Address::ZERO,
+                new_leader: Address::repeat_byte(0x11),
+                epoch: 2,
+                activation_tempo_block: number,
+            });
+        }
+        parent_hash = header.hash();
+        queue.enqueue_sealed(header, events);
+    }
+
+    let range = queue.peek(LIMIT).unwrap();
+    assert_eq!(range.len(), 2);
+    queue.confirm(&range).unwrap();
+    assert_eq!(queue.peek(LIMIT).unwrap().len(), 2);
 }
 
 #[test]
@@ -1266,22 +1297,28 @@ fn confirm_through_is_idempotent_and_drains_stale_entries() {
     }
 
     queue.confirm_through(anchor).unwrap();
-    assert!(queue.peek().is_none());
+    assert!(queue.peek(NonZeroUsize::MIN).is_none());
     queue.confirm_through(anchor).unwrap();
 }
 
 #[test]
-fn confirm_through_rejects_a_conflicting_anchor() {
+fn confirm_through_rejects_a_conflicting_anchor_without_popping_prior_entries() {
     let queue = DepositQueue::new();
-    queue
-        .try_enqueue_sealed(seal(make_test_header(10)), L1PortalEvents::default())
-        .unwrap();
+    let h10 = make_test_header(10);
+    let h11 = make_chained_header(11, header_hash(&h10));
+    let h12 = make_chained_header(12, header_hash(&h11));
+    for header in [h10, h11, h12] {
+        queue
+            .try_enqueue_sealed(seal(header), L1PortalEvents::default())
+            .unwrap();
+    }
 
     let err = queue
-        .confirm_through(NumHash::new(10, B256::repeat_byte(0xab)))
+        .confirm_through(NumHash::new(12, B256::repeat_byte(0xab)))
         .expect_err("a different hash at the same height must fail");
-    assert!(err.to_string().contains("deposit queue holds L1 block 10"));
-    assert_eq!(queue.peek().unwrap().header.number(), 10);
+    assert!(err.to_string().contains("deposit queue holds L1 block 12"));
+    assert_eq!(first_pending(&queue).header.number(), 10);
+    assert_eq!(queue.pending_len(), 3);
 }
 
 #[test]
@@ -1410,24 +1447,27 @@ fn finalized_queue_rejects_stale_blocks() {
 fn finalized_queue_rejects_confirmation_mismatch_without_mutation() {
     let mut queue = PendingDeposits::default();
     let h10 = make_test_header(10);
-    let h10_hash = header_hash(&h10);
+    let h10_hash = seal(h10.clone()).num_hash();
     queue.enqueue(h10, L1PortalEvents::default());
 
+    let mut conflicting = make_test_header(10);
+    conflicting.inner.gas_limit += 1;
+    let selected = Arc::new(L1BlockDeposits {
+        header: seal(conflicting),
+        events: L1PortalEvents::default(),
+    });
     let err = queue
-        .confirm(NumHash::new(10, B256::with_last_byte(0xff)))
+        .confirm(std::slice::from_ref(&selected))
         .expect_err("confirming a different block must fail");
 
-    assert!(
-        err.to_string()
-            .contains("finalized L1 queue confirmation mismatch")
-    );
+    assert!(err.to_string().contains("range confirmation mismatch"));
     assert_eq!(queue.pending_len(), 1);
     assert_eq!(
         queue
-            .peek()
-            .expect("front should remain queued")
+            .peek_with_leadership(NonZeroUsize::MIN, |_| None::<()>)
+            .expect("front should remain queued")[0]
             .header
-            .hash(),
+            .num_hash(),
         h10_hash
     );
 }

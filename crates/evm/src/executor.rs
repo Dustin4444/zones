@@ -642,7 +642,7 @@ mod tests {
         // The header is the valid next checkpoint, but a decryption entry without an encrypted
         // deposit makes the Inbox precompile revert after attempting the checkpoint transition.
         let calldata = IZoneInbox::advanceTempoCall {
-            header: child_rlp.into(),
+            headers: vec![Bytes::from(child_rlp)],
             deposits: Vec::new(),
             decryptions: vec![DecryptionData {
                 sharedSecret: B256::ZERO,

@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::VecDeque;
+use std::{collections::VecDeque, num::NonZeroUsize};
 
 /// Finalized L1 blocks waiting to be processed by the Zone engine.
 ///
@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 #[derive(Debug, Default)]
 pub(crate) struct PendingDeposits {
     /// Pending L1 blocks with their portal events, not yet processed by the Zone.
-    pending: VecDeque<L1BlockDeposits>,
+    pending: VecDeque<Arc<L1BlockDeposits>>,
     /// Highest L1 block ever enqueued (number + hash). Survives `confirm` /
     /// `drain` so that reconnecting subscribers know where the queue left off,
     /// even if the engine has already consumed the blocks.
@@ -65,7 +65,8 @@ impl PendingDeposits {
         }
 
         self.last_enqueued = Some(header.num_hash());
-        self.pending.push_back(L1BlockDeposits { header, events });
+        self.pending
+            .push_back(Arc::new(L1BlockDeposits { header, events }));
         Ok(true)
     }
 
@@ -75,61 +76,110 @@ impl PendingDeposits {
             .expect("test finalized blocks must be contiguous");
     }
 
-    /// Peek at the next pending L1 block without removing it.
+    /// Peek a bounded contiguous range for one atomic Zone advance.
     ///
-    /// Returns `None` if no L1 blocks are queued. Use [`confirm`](Self::confirm)
-    /// after a successful build to advance the queue.
-    pub(crate) fn peek(&self) -> Option<&L1BlockDeposits> {
-        self.pending.front()
+    /// NOTE: A leader-transition block starts a new range unless it is already the first block.
+    ///
+    /// Returns `None` if no L1 blocks are queued. Use [`confirm`](Self::confirm) after a
+    /// successful build to advance the queue. Use
+    /// [`peek_with_leadership`](Self::peek_with_leadership) to also enforce effective leadership
+    /// boundaries.
+    pub(crate) fn peek(&self, max_headers: NonZeroUsize) -> Option<Vec<Arc<L1BlockDeposits>>> {
+        self.peek_with_leadership(max_headers, |_| None::<()>)
     }
 
-    /// Confirm the next pending L1 block was successfully processed and remove it.
+    /// Peek a bounded contiguous range governed by one effective leadership record.
     ///
-    /// The caller must pass the [`NumHash`] returned by [`Self::peek`]. A
-    /// mismatch is an internal consumer-ordering error and leaves the queue
-    /// unchanged.
-    pub(crate) fn confirm(&mut self, expected: NumHash) -> eyre::Result<L1BlockDeposits> {
-        let front = self
-            .pending
-            .front()
-            .ok_or_else(|| eyre::eyre!("cannot confirm an empty finalized L1 queue"))?;
+    /// NOTE: A change from the first block's effective leadership record starts a new range. This
+    /// catches boundaries, such as forced recovery, that may not emit a leader-transition event.
+    /// Otherwise, it has the same portal-transition and confirmation semantics as
+    /// [`peek`](Self::peek).
+    pub(crate) fn peek_with_leadership<R: PartialEq>(
+        &self,
+        max_headers: NonZeroUsize,
+        mut leadership_for: impl FnMut(u64) -> Option<R>,
+    ) -> Option<Vec<Arc<L1BlockDeposits>>> {
+        let first_record = leadership_for(self.pending.front()?.header.number());
+        let mut range = Vec::with_capacity(self.pending.len().min(max_headers.get()));
+        for block in self.pending.iter().take(max_headers.get()) {
+            // A portal transition block starts the next range. Keep it when it is the first
+            // header, but never let it become the final header of the outgoing range.
+            if !range.is_empty() && !block.events.leader_transitions.is_empty() {
+                break;
+            }
+            if !range.is_empty()
+                && leadership_for(block.header.number()).as_ref() != first_record.as_ref()
+            {
+                break;
+            }
+            range.push(block.clone());
+        }
+        Some(range)
+    }
+
+    /// Strictly confirm one producer-selected range and remove exactly that range.
+    ///
+    /// All selected headers are validated before the queue is mutated. Taking the selected range
+    /// itself avoids passing independently derived anchors and lengths that could disagree.
+    pub(crate) fn confirm(&mut self, selected: &[Arc<L1BlockDeposits>]) -> eyre::Result<()> {
         eyre::ensure!(
-            front.header.num_hash() == expected,
-            "finalized L1 queue confirmation mismatch: expected {expected:?}, front is {:?}",
-            front.header.num_hash()
+            !selected.is_empty(),
+            "cannot confirm an empty finalized L1 range"
         );
-        Ok(self
-            .pending
-            .pop_front()
-            .expect("front was checked immediately before pop"))
+        eyre::ensure!(
+            selected.len() <= self.pending.len(),
+            "finalized L1 range confirmation is too long: selected {} entries, only {} are pending",
+            selected.len(),
+            self.pending.len()
+        );
+        for (index, (queued, selected)) in self.pending.iter().zip(selected).enumerate() {
+            eyre::ensure!(
+                Arc::ptr_eq(queued, selected),
+                "finalized L1 range confirmation mismatch at index {index}: selected {:?}, queued {:?}",
+                selected.header.num_hash(),
+                queued.header.num_hash()
+            );
+        }
+        drop(self.pending.drain(..selected.len()));
+        Ok(())
     }
 
     /// Confirm every pending L1 block up to and including `expected`.
     ///
-    /// Follower import calls this only after the corresponding zone block is
-    /// canonical. It is therefore idempotent and tolerates stale entries before
-    /// `expected`, but rejects a different hash at the expected height.
+    /// Follower import calls this only after the corresponding zone block is canonical. It is
+    /// intentionally idempotent for an already-consumed anchor, but prevalidates the target before
+    /// removing any stale entries so a hash conflict or missing target leaves the queue unchanged.
     pub(crate) fn confirm_through(&mut self, expected: NumHash) -> eyre::Result<()> {
-        while let Some(front) = self.pending.front().map(|entry| entry.header.num_hash()) {
-            if front.number > expected.number {
-                break;
-            }
-            eyre::ensure!(
-                front.number < expected.number || front.hash == expected.hash,
-                "deposit queue holds L1 block {} with hash {}, but the consumed block is {}",
-                front.number,
-                front.hash,
-                expected.hash,
-            );
-            self.confirm(front)
-                .expect("front was just read and matches by construction");
+        let Some(front) = self.pending.front() else {
+            return Ok(());
+        };
+        if front.header.number() > expected.number {
+            return Ok(());
         }
+
+        let target_index = usize::try_from(expected.number - front.header.number())
+            .map_err(|_| eyre::eyre!("finalized L1 range exceeds addressable memory"))?;
+        let target = self.pending.get(target_index).ok_or_else(|| {
+            eyre::eyre!(
+                "cannot confirm through absent finalized L1 block {}",
+                expected.number
+            )
+        })?;
+        eyre::ensure!(
+            target.header.hash() == expected.hash,
+            "deposit queue holds L1 block {} with hash {}, but the consumed block is {}",
+            target.header.number(),
+            target.header.hash(),
+            expected.hash,
+        );
+
+        drop(self.pending.drain(..=target_index));
         Ok(())
     }
 
     /// Drain all pending L1 block deposits.
     #[cfg(test)]
-    pub(crate) fn drain(&mut self) -> Vec<L1BlockDeposits> {
+    pub(crate) fn drain(&mut self) -> Vec<Arc<L1BlockDeposits>> {
         self.pending.drain(..).collect()
     }
 
@@ -220,15 +270,28 @@ impl DepositQueue {
         appended
     }
 
-    /// Peek at the next L1 block without removing it.
-    pub fn peek(&self) -> Option<L1BlockDeposits> {
-        self.inner.lock().peek().cloned()
+    /// Peek at the next non-empty contiguous L1 block range, bounded by portal-recorded leader
+    /// transitions, without removing it.
+    ///
+    /// Use [`Self::peek_with_leadership`] to also enforce effective leadership boundaries.
+    pub fn peek(&self, max_headers: NonZeroUsize) -> Option<Vec<Arc<L1BlockDeposits>>> {
+        self.inner.lock().peek(max_headers)
     }
 
-    /// Confirm the next L1 block was successfully processed and remove it.
-    ///
-    pub fn confirm(&self, expected: NumHash) -> eyre::Result<L1BlockDeposits> {
-        self.inner.lock().confirm(expected)
+    /// Like [`Self::peek`], but also bounds the range at effective leadership changes.
+    pub fn peek_with_leadership<R: PartialEq>(
+        &self,
+        max_headers: NonZeroUsize,
+        leadership_for: impl FnMut(u64) -> Option<R>,
+    ) -> Option<Vec<Arc<L1BlockDeposits>>> {
+        self.inner
+            .lock()
+            .peek_with_leadership(max_headers, leadership_for)
+    }
+
+    /// Confirm a L1 block range was successfully processed and remove it.
+    pub fn confirm(&self, selected: &[Arc<L1BlockDeposits>]) -> eyre::Result<()> {
+        self.inner.lock().confirm(selected)
     }
 
     /// Advance the queue past a canonical follower anchor.
@@ -250,8 +313,13 @@ impl DepositQueue {
     }
 
     #[cfg(test)]
-    pub(crate) fn drain(&self) -> Vec<L1BlockDeposits> {
+    pub(crate) fn drain(&self) -> Vec<Arc<L1BlockDeposits>> {
         self.inner.lock().drain()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.inner.lock().pending_len()
     }
 }
 

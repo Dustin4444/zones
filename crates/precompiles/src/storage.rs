@@ -48,12 +48,11 @@ pub trait L1StorageReader: Clone + Send + Sync + 'static {
 ///
 /// - For an ordinary transaction, the first L1 read selects the `tempoBlockNumber` loaded from the
 ///   chosen Zone state.
-/// - During `advanceTempo`, the `TempoState` precompile governs advancement: it first
-///   validates that the submitted header is the direct child of the stored checkpoint, then
-///   advances the anchor to that child before any reads at the new checkpoint.
+/// - During `advanceTempo`, the `TempoState` precompile validates a contiguous header range, then
+///   advances the anchor directly to its final checkpoint before any L1-backed reads.
 ///
 /// Once selected, the anchor is immutable for the transaction attempt. Reads at another block,
-/// advancement after a parent-anchor read, and duplicate or non-contiguous advancement are
+/// advancement after a parent-anchor read, and duplicate or non-forward advancement are
 /// rejected. The Zone EVM resets the anchor after every transaction attempt, including failed and
 /// noncommitting simulations.
 ///
@@ -114,12 +113,12 @@ impl<P> L1State<P> {
         }
     }
 
-    /// Selects the child anchor after `TempoState.finalizeTempo` validates the header transition.
+    /// Selects the final anchor after a contiguous multi-header Tempo range has been validated.
     ///
-    /// Advancement is valid only before any L1 read has selected an anchor and only from a parent
-    /// to its direct child.
+    /// The caller must validate every intermediate header before calling this method. All reads in
+    /// the catch-up transaction then resolve against the final imported root.
     pub fn advance_anchor(&self, from: u64, to: u64) -> Result<(), L1StateError> {
-        if from.checked_add(1) != Some(to) {
+        if to <= from {
             return Err(L1StateError::AdvanceTempoConflict { from, to });
         } else if let Some(current) = self.get_anchor() {
             return Err(L1StateError::AnchorConflict { current, new: to });
@@ -390,10 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn l1_state_rejects_non_contiguous_advance() {
-        let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
-        assert!(l1.advance_anchor(10, 12).is_err());
-        assert_eq!(l1.get_anchor(), None);
+    fn l1_state_accepts_a_validated_range_and_rejects_non_forward_advancement() {
+        let range = L1State::new(MockL1Reader::default(), Address::ZERO);
+        range.advance_anchor(10, 12).unwrap();
+        assert_eq!(range.get_anchor(), Some(12));
+
+        let backwards = L1State::new(MockL1Reader::default(), Address::ZERO);
+        assert!(backwards.advance_anchor(12, 10).is_err());
+        assert_eq!(backwards.get_anchor(), None);
     }
 
     #[test]

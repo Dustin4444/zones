@@ -111,15 +111,20 @@ impl L1PortalEvents {
             );
         }
 
-        let expected_tokens: Vec<_> = self
-            .enabled_tokens
-            .iter()
-            .map(EnabledToken::to_abi)
-            .collect();
         eyre::ensure!(
-            enabled_tokens == expected_tokens,
-            "advanceTempo token enables do not match observed L1 events"
+            enabled_tokens.len() == self.enabled_tokens.len(),
+            "advanceTempo token enable count does not match observed L1 events: expected {}, got {}",
+            self.enabled_tokens.len(),
+            enabled_tokens.len()
         );
+        for (index, (expected, actual)) in
+            self.enabled_tokens.iter().zip(enabled_tokens).enumerate()
+        {
+            eyre::ensure!(
+                *actual == expected.to_abi(),
+                "advanceTempo token enable {index} does not match the observed L1 event"
+            );
+        }
         Ok(())
     }
 

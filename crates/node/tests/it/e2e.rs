@@ -5,7 +5,7 @@
 //! subscriber retries a dummy URL in the background, but L2 execution is fully
 //! exercised via queue injection (with the L1 state cache seeded for precompile reads).
 
-use std::{net::TcpListener, time::Duration};
+use std::{net::TcpListener, num::NonZeroUsize, time::Duration};
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_consensus::Transaction;
@@ -518,11 +518,10 @@ async fn test_multiple_deposits_across_blocks() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Self-contained test: verify the zone produces blocks even for empty L1
-/// blocks (no deposits). The zone must advance its TempoState for every L1
-/// block to maintain chain continuity.
+/// Verify empty L1 blocks are imported in multi-header zone blocks while preserving Tempo
+/// continuity.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
+async fn test_empty_l1_blocks_are_batched() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
@@ -530,8 +529,13 @@ async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
     // Inject several empty L1 blocks
     fixture.inject_empty_blocks(zone.deposit_queue(), 5);
 
-    // Each L1 block advances tempoBlockNumber — wait for all 5
+    // Every L1 block advances TempoState, but batching should require fewer zone blocks.
     zone.wait_for_tempo_block_number(5, DEFAULT_TIMEOUT).await?;
+    let zone_blocks = zone.provider().get_block_number().await?;
+    assert!(
+        zone_blocks < 5,
+        "expected at least one zone block to import multiple L1 headers"
+    );
 
     Ok(())
 }
@@ -540,9 +544,9 @@ async fn test_empty_l1_blocks_advance_zone() -> eyre::Result<()> {
 /// queue cursor and the local head in agreement.
 ///
 /// This is the graceful-stop invariant needed by the future leadership handoff: an advance
-/// consumes an L1 block from the queue and canonicalizes the resulting zone block across several
-/// awaits. Stopping partway would either replay an L1 anchor (`advanceTempo` rejects it) or skip
-/// one, and either way the node could never build another block.
+/// consumes a contiguous L1 range from the queue and canonicalizes the resulting zone block across
+/// several awaits. Stopping partway would either replay an L1 anchor (`advanceTempo` rejects it) or
+/// skip one, and either way the node could never build another block.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_zone_engine_stops_cleanly_between_blocks() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -558,16 +562,17 @@ async fn test_zone_engine_stops_cleanly_between_blocks() -> eyre::Result<()> {
     fixture.inject_empty_blocks(zone.deposit_queue(), 10);
     let head = zone.stop_engine().await?;
 
-    // Every L1 block the engine consumed produced exactly one zone block, and nothing was
-    // half-consumed: the queue front is the next unbuilt anchor.
+    // Each zone block imports at least one Tempo header, and nothing was half-consumed: the queue
+    // front is the next unbuilt anchor even when one zone block imported multiple headers.
     let tempo_block_number = zone.tempo_block_number().await?;
-    assert_eq!(
-        tempo_block_number, head,
-        "each zone block imports exactly one L1 block, so the head and the Tempo cursor must agree"
+    assert!(
+        tempo_block_number >= head,
+        "the Tempo cursor cannot trail the zone head"
     );
     let next_anchor = zone
         .deposit_queue()
-        .peek()
+        .peek(NonZeroUsize::MIN)
+        .and_then(|mut range| range.pop())
         .map(|block| block.header.num_hash().number);
     if let Some(next_anchor) = next_anchor {
         assert_eq!(
@@ -1442,7 +1447,7 @@ async fn test_chain_tempo_state_ext_from_canon_notification() -> eyre::Result<()
     let (zone, mut fixture) = start_local_zone_with_fixture(10).await?;
     let mut canon_rx = zone.subscribe_to_canonical_state();
 
-    // Inject 3 empty L1 blocks — each produces a zone block.
+    // Inject 3 empty L1 blocks; the engine may aggregate them into fewer zone blocks.
     fixture.inject_empty_blocks(zone.deposit_queue(), 3);
 
     // Wait for tempoBlockNumber to reach 3 via RPC (ensures blocks are mined).
@@ -1458,11 +1463,9 @@ async fn test_chain_tempo_state_ext_from_canon_notification() -> eyre::Result<()
         }
     }
 
-    // We should have received notifications for blocks 1, 2, 3.
     assert!(
-        num_hashes.len() >= 3,
-        "expected at least 3 canon notifications with non-zero tempoBlockNumber, got {}",
-        num_hashes.len()
+        !num_hashes.is_empty(),
+        "expected a canonical notification with a non-zero Tempo checkpoint"
     );
 
     // Verify the L1 block numbers are monotonically increasing.

@@ -25,7 +25,7 @@ const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000
 const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
 sol! {
-    function advanceTempo(bytes calldata header, QueuedDeposit[] calldata deposits, DecryptionData[] calldata decryptions, EnabledToken[] calldata enabledTokens);
+    function advanceTempo(bytes[] calldata headers, QueuedDeposit[] calldata deposits, DecryptionData[] calldata decryptions, EnabledToken[] calldata enabledTokens);
     function tempoBlockHash() external view returns (bytes32);
 
     struct QueuedDeposit {
@@ -459,7 +459,7 @@ fn advance_tempo_repro() {
     println!("\n=== Calling ZoneInbox.advanceTempo() ===");
 
     let advance_calldata = advanceTempoCall {
-        header: Bytes::from(next_header_rlp),
+        headers: vec![Bytes::from(next_header_rlp)],
         deposits: vec![],
         decryptions: vec![],
         enabledTokens: vec![],

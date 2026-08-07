@@ -9,9 +9,9 @@
 //! ```text
 //! L1Subscriber ──enqueue──► DepositQueue ──notify──► ZoneEngine
 //!                                │                       │
-//!                                │                   1. peek queue → L1 block
+//!                                │                   1. peek queue → L1 block range
 //!                                │                   2. build ZonePayloadAttributes
-//!                                │                      (inner attrs + l1_block)
+//!                                │                      (inner attrs + l1_block_range)
 //!                                │                   3. FCU w/ payload attributes
 //!                                │                       │
 //!                                │                       ▼
@@ -30,9 +30,9 @@
 //! ```
 //!
 //! The deposit queue uses a **peek / confirm** pattern: the engine peeks at
-//! the next L1 block, wraps it into [`ZonePayloadAttributes`], and only
-//! confirms (removes) the block after `newPayload` succeeds. A failed build
-//! leaves the block in the queue for retry.
+//! the next contiguous L1 block range, wraps it into [`ZonePayloadAttributes`], and only
+//! confirms (removes) the range after `newPayload` succeeds. A failed build
+//! leaves the range in the queue for retry.
 //!
 //! The zone assumes **instant finality** — head, safe, and finalized all point
 //! to the same block.
@@ -46,15 +46,22 @@ use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::SealedHeader;
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use tempo_primitives::TempoHeader;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use zone_chainspec::ZoneChainSpec;
-use zone_l1::{DepositQueue, EncryptionKeyRing, L1BlockDeposits, L1BlockTracker, PreparedL1Block};
+use zone_l1::{
+    DepositQueue, EncryptionKeyRing, L1BlockDeposits, L1BlockTracker, PreparedL1BlockRange,
+};
 use zone_p2p::{LeadershipSchedule, P2pPeerId};
 use zone_payload::{ZonePayloadAttributes, ZonePayloadTypes};
+
+/// Conservative operational ceiling for one catch-up transaction. The zone block gas and size
+/// limits remain the consensus bounds; this headroom avoids making a long outage impossible to
+/// recover from in a single oversized build.
+const MAX_HEADERS_PER_IMPORT: NonZeroUsize = NonZeroUsize::new(4_096).unwrap();
 
 /// Per-anchor production permit backed by the effective leadership schedule.
 ///
@@ -155,15 +162,15 @@ where
 
 /// Engine that drives L2 block production from L1 events.
 ///
-/// Waits for L1 blocks in the [`DepositQueue`], then for each block:
-/// 1. Peeks the L1 block from the queue
+/// Waits for L1 blocks in the [`DepositQueue`], then for each range:
+/// 1. Peeks the L1 block range from the queue
 /// 2. Builds [`ZonePayloadAttributes`] wrapping inner Tempo attrs + L1 data
 /// 3. Sends FCU with payload attributes to start a build
 /// 4. Resolves the built payload
 /// 5. Submits via `newPayload`
-/// 6. Confirms the L1 block in the queue (removes it)
+/// 6. Confirms the L1 block range in the queue (removes it)
 ///
-/// On failure the L1 block stays in the queue and is retried.
+/// On failure the L1 block range stays in the queue and is retried.
 #[derive(Debug)]
 pub struct ZoneEngine {
     /// Chain spec for hardfork checks when building attributes.
@@ -225,7 +232,7 @@ impl ZoneEngine {
     ///
     /// Without a permit this method only returns on cancellation. It:
     /// 1. Waits for L1 blocks to arrive in the deposit queue
-    /// 2. Advances the zone chain for each available L1 block (no delay between blocks)
+    /// 2. Advances the zone chain for each available L1 block range (no delay between ranges)
     /// 3. Sends periodic FCU heartbeats
     pub async fn run_until(mut self, stop: CancellationToken) -> EngineExit {
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
@@ -286,9 +293,9 @@ impl ZoneEngine {
         Ok(())
     }
 
-    /// Advance the chain for all available L1 blocks in the queue.
+    /// Advance the chain for all available L1 block ranges in the queue.
     ///
-    /// During catch-up this processes blocks as fast as the EVM can execute
+    /// During catch-up this processes block ranges as fast as the EVM can execute
     /// them, with no timer delays between blocks.
     ///
     /// Returns `Some` when the loop must stop: cancellation, demotion, or fenced leadership.
@@ -311,30 +318,25 @@ impl ZoneEngine {
         }
     }
 
-    /// Decrypt deposits and ABI-encode them into a [`PreparedL1Block`] ready for
-    /// the payload builder. Mint-recipient policy is enforced during upstream TIP-20 execution
-    /// against the finalized L1 anchor.
-    async fn prepare_l1_block(&self, l1_block: L1BlockDeposits) -> eyre::Result<PreparedL1Block> {
-        l1_block
-            .prepare(&self.encryption_keys, self.portal_address)
-            .await
-    }
-
     /// Advance the chain by one block.
     ///
-    /// Wraps the given L1 block into [`ZonePayloadAttributes`], sends FCU
+    /// Wraps the given L1 block range into [`ZonePayloadAttributes`], sends FCU
     /// with those attributes, waits for the payload to be built, then submits
-    /// via `newPayload`. Only confirms (removes) the L1 block from the
+    /// via `newPayload`. Only confirms (removes) the L1 block range from the
     /// deposit queue after `newPayload` succeeds.
-    async fn advance(&mut self, l1_block: L1BlockDeposits) -> eyre::Result<()> {
-        let l1_num_hash = l1_block.header.num_hash();
+    async fn advance(&mut self, l1_blocks: Vec<Arc<L1BlockDeposits>>) -> eyre::Result<()> {
+        let final_l1_header = &l1_blocks
+            .last()
+            .ok_or_else(|| eyre::eyre!("cannot advance an empty L1 range"))?
+            .header;
+        let final_l1_num_hash = final_l1_header.num_hash();
 
-        // Zone block timestamp is locked to the L1 block's timestamp so the
-        // two chains stay in lockstep.
-        let timestamp_secs = l1_block.header.timestamp();
-        let timestamp_millis_part = l1_block.header.timestamp_millis_part;
+        // Zone block time follows the final imported L1 block.
+        let timestamp_secs = final_l1_header.timestamp();
+        let timestamp_millis_part = final_l1_header.timestamp_millis_part;
 
-        let l1_block = self.prepare_l1_block(l1_block).await?;
+        let l1_block_range =
+            PreparedL1BlockRange::new(&l1_blocks, &self.encryption_keys, self.portal_address)?;
 
         let attributes = ZonePayloadAttributes {
             inner: EthPayloadAttributes {
@@ -353,12 +355,12 @@ impl ZoneEngine {
                 target_gas_limit: None,
             },
             timestamp_millis_part,
-            l1_block,
+            l1_block_range,
         };
 
         // Send FCU with payload attributes through the engine API to trigger
         // payload building. The forkchoice state points at the current head;
-        // the attributes carry the L1 block data for the new zone block.
+        // the attributes carry the L1 block range data for the new zone block.
         let res = self
             .to_engine
             .fork_choice_updated(self.forkchoice_state(), Some(attributes))
@@ -386,12 +388,13 @@ impl ZoneEngine {
             eyre::bail!("Invalid payload for block {block_number}");
         }
 
-        // newPayload succeeded — remove the exact finalized L1 block that
-        // produced it. A mismatch indicates an internal consumer-ordering bug.
-        self.deposit_queue.confirm(l1_num_hash)?;
-        self.l1_block_tracker.prune_through(l1_num_hash.number);
+        // newPayload succeeded — remove exactly the peeked finalized L1 range that produced it.
+        // A mismatch indicates an internal consumer-ordering bug.
+        self.deposit_queue.confirm(&l1_blocks)?;
+        self.l1_block_tracker
+            .prune_through(final_l1_num_hash.number);
         if let Some(permit) = &self.production_permit {
-            permit.record_applied_anchor(l1_num_hash.number);
+            permit.record_applied_anchor(final_l1_num_hash.number);
         }
 
         self.last_header = header;
@@ -408,17 +411,30 @@ impl ZoneEngine {
 }
 
 impl AvailableBlockDrain for ZoneEngine {
-    type Block = L1BlockDeposits;
+    type Block = Vec<Arc<L1BlockDeposits>>;
 
     fn next_available(&self) -> Option<Self::Block> {
-        self.deposit_queue.peek()
+        let Some(permit) = &self.production_permit else {
+            return self.deposit_queue.peek(MAX_HEADERS_PER_IMPORT);
+        };
+
+        // Leadership can change without a `LeaderUpdated` event when forced recovery begins.
+        // Select the range against the effective schedule, not just the portal events attached
+        // to its headers, so the final header is governed by the same authority as the first one.
+        self.deposit_queue
+            .peek_with_leadership(MAX_HEADERS_PER_IMPORT, |tempo_anchor| {
+                permit
+                    .schedule
+                    .leader_for(tempo_anchor)
+                    .map(|record| (record.epoch, record.leader))
+            })
     }
 
     fn permit(&self, block: &Self::Block) -> Option<EngineExit> {
         // No permit is legacy single-sequencer mode: production is always authorized.
         self.production_permit
             .as_ref()
-            .and_then(|permit| permit.check(block.header.number()))
+            .and_then(|permit| permit.check(block.first()?.header.number()))
     }
 
     async fn advance_one(&mut self, block: Self::Block) -> eyre::Result<()> {
@@ -429,8 +445,12 @@ impl AvailableBlockDrain for ZoneEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Header;
+    use alloy_primitives::B256;
+    use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::collections::VecDeque;
     use tokio::sync::oneshot;
+    use zone_p2p::LeadershipState;
 
     struct PausedDrain {
         pending: VecDeque<u64>,
@@ -556,11 +576,68 @@ mod tests {
     }
 
     #[test]
-    fn production_permit_is_a_single_schedule_lookup() {
-        use alloy_primitives::B256;
-        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-        use zone_p2p::LeadershipState;
+    fn production_range_uses_effective_leadership_schedule() {
+        const TEST_RANGE_LIMIT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
+        let me = PrivateKey::from_seed(1).public_key();
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(1, me.clone(), 0));
+        schedule
+            .publish(LeadershipState::new(
+                2,
+                PrivateKey::from_seed(2).public_key(),
+                3,
+            ))
+            .unwrap();
+        let permit = ProductionPermit::new(schedule, me);
+        let queue = DepositQueue::default();
+        let mut parent_hash = B256::ZERO;
+        for number in 1..=4 {
+            let header = SealedHeader::seal_slow(TempoHeader {
+                inner: Header {
+                    number,
+                    parent_hash,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            parent_hash = header.hash();
+            queue.enqueue_sealed(header, Default::default());
+        }
+
+        let leadership_for = |anchor| {
+            permit
+                .schedule
+                .leader_for(anchor)
+                .map(|record| (record.epoch, record.leader))
+        };
+        let range = queue
+            .peek_with_leadership(TEST_RANGE_LIMIT, leadership_for)
+            .unwrap();
+        assert_eq!(
+            range
+                .iter()
+                .map(|block| block.header.number())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(permit.check(range[0].header.number()), None);
+
+        queue.confirm(&range).unwrap();
+        let next = queue
+            .peek_with_leadership(TEST_RANGE_LIMIT, leadership_for)
+            .unwrap();
+        assert_eq!(next[0].header.number(), 3);
+        assert_eq!(
+            permit.check(next[0].header.number()),
+            Some(EngineExit::Demoted {
+                tempo_anchor: 3,
+                epoch: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn production_permit_is_a_single_schedule_lookup() {
         let me = PrivateKey::from_seed(1).public_key();
         let other = PrivateKey::from_seed(2).public_key();
         let schedule = LeadershipSchedule::seeded(LeadershipState::new(1, me.clone(), 0));

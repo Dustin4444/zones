@@ -16,7 +16,7 @@ use tempo_precompiles::{
     zone_factory::{ZonePortalStorage, zone_portal_slots},
 };
 use tempo_primitives::TempoHeader;
-use zone_primitives::constants::ZONE_OUTBOX_ADDRESS;
+use zone_primitives::constants::{MAX_UNPROCESSED_DEPOSITS, ZONE_OUTBOX_ADDRESS};
 
 use crate::test_utils::{
     EncryptedDepositFixture, MockL1Reader, TestContext, build_plaintext, call_precompile,
@@ -97,11 +97,25 @@ impl Harness {
     }
 
     fn set_queue_hash(&self, hash: B256) {
+        self.set_queue_hash_at(1, hash);
+    }
+
+    fn set_queue_hash_at(&self, block: u64, hash: B256) {
         self.l1
-            .with_storage(1, || {
+            .with_storage(block, || {
                 ZonePortalStorage::new(PORTAL)
                     .current_deposit_queue_hash
                     .write(hash)
+            })
+            .unwrap();
+    }
+
+    fn set_leader_activation_at(&self, block: u64, activation: u64) {
+        self.l1
+            .with_storage(block, || {
+                ZonePortalStorage::new(PORTAL)
+                    .leader_activation_tempo_block
+                    .write(activation)
             })
             .unwrap();
     }
@@ -121,11 +135,29 @@ impl Harness {
         enabled_tokens: Vec<EnabledToken>,
     ) -> IZoneInbox::advanceTempoCall {
         IZoneInbox::advanceTempoCall {
-            header: encode_header(&self.child_header()),
+            headers: vec![encode_header(&self.child_header())],
             deposits,
             decryptions,
             enabledTokens: enabled_tokens,
         }
+    }
+
+    fn two_header_call(
+        &self,
+        deposits: Vec<QueuedDeposit>,
+    ) -> (IZoneInbox::advanceTempoCall, TempoHeader) {
+        let first = self.child_header();
+        let second = TempoHeader {
+            inner: alloy_consensus::Header {
+                parent_hash: keccak256(encode_header(&first)),
+                number: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut call = self.advance_call(deposits, Vec::new());
+        call.headers = vec![encode_header(&first), encode_header(&second)];
+        (call, second)
     }
 
     fn call(&mut self, caller: Address, calldata: impl AsRef<[u8]>) -> PrecompileResult {
@@ -321,10 +353,8 @@ fn failed_deposit_gas(deposits: usize, token_enablements: usize) -> eyre::Result
 #[test]
 fn max_portal_deposit_block_fits_system_gas_budget() -> eyre::Result<()> {
     const BUFFERED_GAS_LIMIT: u64 = 200_000_000;
-    const MAX_DEPOSITS_PER_TEMPO_BLOCK: usize = 230;
-
-    for deposits in [640, MAX_DEPOSITS_PER_TEMPO_BLOCK] {
-        let should_fit = deposits <= MAX_DEPOSITS_PER_TEMPO_BLOCK;
+    for deposits in [640, MAX_UNPROCESSED_DEPOSITS] {
+        let should_fit = deposits <= MAX_UNPROCESSED_DEPOSITS;
         let gas_used = failed_deposit_gas(deposits, 0)?;
         eprintln!("{deposits} portal deposit block: {gas_used} gas");
         assert_eq!(
@@ -339,18 +369,27 @@ fn max_portal_deposit_block_fits_system_gas_budget() -> eyre::Result<()> {
 #[test]
 fn max_portal_deposit_and_token_block_fits_system_gas_budget() -> eyre::Result<()> {
     const COMBINED_BUFFERED_GAS_LIMIT: u64 = 225_000_000;
-    const MAX_DEPOSITS_PER_TEMPO_BLOCK: usize = 230;
     const MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK: usize = 8;
-
-    let gas_used = failed_deposit_gas(
-        MAX_DEPOSITS_PER_TEMPO_BLOCK,
-        MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
-    )?;
+    let gas_used =
+        failed_deposit_gas(MAX_UNPROCESSED_DEPOSITS, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK)?;
     eprintln!("max portal deposit and token block: {gas_used} gas");
     assert!(
         gas_used <= COMBINED_BUFFERED_GAS_LIMIT,
         "max portal deposit and token block used {gas_used} gas"
     );
+    Ok(())
+}
+
+#[test]
+fn multi_header_advance_accepts_accumulated_token_enablements() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    let enabled_tokens = (1..=9).map(maximum_metadata_token).collect::<Vec<_>>();
+    let (mut call, _) = harness.two_header_call(Vec::new());
+    call.enabledTokens = enabled_tokens;
+
+    let output = harness.call_with_gas(Address::ZERO, call.abi_encode(), u64::MAX)?;
+    assert!(output.is_success(), "token activation failed: {output:?}");
+    assert_eq!(harness.l1_state.get_anchor(), Some(2));
     Ok(())
 }
 
@@ -369,6 +408,81 @@ fn system_advance_selects_child_anchor_and_reads_queue() -> eyre::Result<()> {
         1,
         &ZonePortalStorage::new(PORTAL).current_deposit_queue_hash,
     ));
+    Ok(())
+}
+
+#[test]
+fn multi_header_advance_processes_catch_up_deposit_at_final_root() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    let nonce = 99u64;
+    harness.seed_fallback_recipient(nonce, BOB)?;
+    let mut encoded_nonce = [0u8; 20];
+    encoded_nonce[12..].copy_from_slice(&nonce.to_be_bytes());
+    let deposit = WithdrawalBounceBackDeposit {
+        token: PATH_USD_ADDRESS,
+        to: Address::from(encoded_nonce),
+        amount: 777,
+    };
+    let queue_hash = keccak256(
+        (
+            DepositType::WithdrawalBounceBack,
+            deposit.clone(),
+            B256::ZERO,
+        )
+            .abi_encode_params(),
+    );
+    harness.set_queue_hash_at(2, queue_hash);
+
+    let (call, second) = harness.two_header_call(vec![QueuedDeposit {
+        depositType: DepositType::WithdrawalBounceBack,
+        depositData: deposit.abi_encode().into(),
+    }]);
+
+    let output = harness.call(Address::ZERO, call.abi_encode())?;
+    assert!(output.is_success());
+    assert_eq!(harness.balance(PATH_USD_ADDRESS, BOB)?, U256::from(777));
+    assert_eq!(harness.l1_state.get_anchor(), Some(2));
+    let mut storage = test_storage_provider(&mut harness.ctx, u64::MAX, false);
+    StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+        assert_eq!(TempoState::new().tempo_block_number()?, 2);
+        assert_eq!(
+            TempoState::new().tempo_block_hash()?,
+            keccak256(encode_header(&second))
+        );
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn multi_header_advance_enforces_leadership_boundaries() -> eyre::Result<()> {
+    for (activation, accepted) in [(1, true), (2, false)] {
+        let mut harness = Harness::new()?;
+        harness.set_leader_activation_at(2, activation);
+        let (call, _) = harness.two_header_call(Vec::new());
+        let output = harness.call_atomic(Address::ZERO, call.abi_encode())?;
+
+        if accepted {
+            assert!(
+                output.is_success(),
+                "activation at the first header is valid"
+            );
+        } else {
+            assert!(output.is_revert(), "an interior activation must revert");
+            assert_eq!(
+                output.bytes,
+                IZoneInbox::LeaderTransitionCrossed {}.abi_encode()
+            );
+        }
+        let mut storage = test_storage_provider(&mut harness.ctx, u64::MAX, false);
+        StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+            assert_eq!(
+                TempoState::new().tempo_block_number()?,
+                if accepted { 2 } else { 0 }
+            );
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 

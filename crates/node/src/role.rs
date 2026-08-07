@@ -446,7 +446,8 @@ enum Readiness {
 ///
 /// Forced-recovery promotion requires the local canonical head to remain exactly at the
 /// operator-selected block. Normal transitions need no additional evidence: the next-anchor rule
-/// and one-to-one zone/L1 block mapping ensure all earlier leaders' blocks are already local.
+/// ensures every preceding Tempo anchor has already been imported, even when zone blocks contain
+/// multi-header ranges.
 fn promotion_readiness<P>(
     provider: &P,
     schedule: &LeadershipSchedule,

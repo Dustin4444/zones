@@ -15,6 +15,6 @@ crate::sol! {
         function tempoBlockHash() external view returns (bytes32);
         function tempoBlockNumber() external view returns (uint64);
 
-        function finalizeTempo(bytes calldata header) external;
+        function finalizeTempo(bytes[] calldata headers) external;
     }
 }

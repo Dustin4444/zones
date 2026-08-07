@@ -95,6 +95,7 @@ crate::sol! {
         error MissingDecryptionData();
         error ExtraDecryptionData();
         error InvalidSharedSecretProof();
+        error LeaderTransitionCrossed();
         error Unauthorized();
 
         function processedDepositQueueHash() external view returns (bytes32);
@@ -105,7 +106,7 @@ crate::sol! {
         function claimRefund(address token) external returns (uint128 amount);
 
         function advanceTempo(
-            bytes calldata header,
+            bytes[] calldata headers,
             QueuedDeposit[] calldata deposits,
             DecryptionData[] calldata decryptions,
             EnabledToken[] calldata enabledTokens

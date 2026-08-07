@@ -1418,8 +1418,8 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for ZoneNode {
     }
 }
 
-/// Builds [`ZonePayloadAttributes`] with `l1_block: None` — suitable for
-/// debug/test scenarios where no L1 data is available.
+/// Provides the payload-attributes builder used by debug/test scenarios where no L1 range is
+/// available.
 #[derive(Debug)]
 pub(crate) struct ZonePayloadAttributesBuilder;
 
