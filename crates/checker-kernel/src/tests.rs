@@ -1,12 +1,13 @@
-use alloy_primitives::{Address, B256, U256, address, b256, fixed_bytes};
+use alloy_primitives::{Address, B256, Bytes, U256, address, b256, fixed_bytes};
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
 use crate::{
-    BatchId, DepositId, DepositOutcome, ExpectedEffect, FallbackId, ImportedFacts,
-    ImportedOperation, InboxRefundId, ModelError, OrdinaryDeposit, PortalIdentity, PortalRefundId,
-    PortalState, State, StateKey, StateValue, TokenEnable, TokenPhase, WithdrawalId, ZoneFacts,
-    apply_imported, apply_zone,
+    BatchId, BatchState, BatchSubmission, Deposit, DepositId, DepositOutcome, ExpectedEffect,
+    FallbackId, Finalization, ImportedFacts, ImportedOperation, InboxRefundId, ModelError,
+    OrdinaryDeposit, PortalIdentity, PortalRefundId, PortalState, RefundClaim, State, StateKey,
+    StateValue, TokenEnable, TokenPhase, UserWithdrawal, WithdrawalId, WithdrawalOutcome,
+    WithdrawalProcessing, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
     commitments::{ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
@@ -73,6 +74,7 @@ fn created_with_deposit() -> (State, OrdinaryDeposit) {
                 },
                 ImportedOperation::AppendDeposit(deposit.clone()),
             ],
+            ..ImportedFacts::default()
         },
     )
     .unwrap();
@@ -87,6 +89,127 @@ fn created_with_deposit() -> (State, OrdinaryDeposit) {
     let mut state = parent;
     state.apply(&candidate.delta).unwrap();
     (state, deposit)
+}
+
+fn commit(state: &mut State, imported: ImportedFacts, zone: ZoneFacts) -> Vec<ExpectedEffect> {
+    let candidate = apply_zone(apply_imported(state, &imported).unwrap(), &zone).unwrap();
+    state.apply(&candidate.delta).unwrap();
+    candidate.expected_effects
+}
+
+fn funded_state() -> State {
+    let mut state = State::awaiting(identity());
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::Create {
+                identity: identity(),
+                initial_token: enable(identity().initial_token),
+            }],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts {
+            enabled_tokens: vec![enable(identity().initial_token)],
+            ..ZoneFacts::default()
+        },
+    );
+    let mut rows = state.rows().clone();
+    let StateValue::Token(mut token) = rows[&StateKey::Token(identity().initial_token)].clone()
+    else {
+        unreachable!()
+    };
+    token.accounting.supply = U256::from(100);
+    rows.insert(
+        StateKey::Token(identity().initial_token),
+        StateValue::Token(token),
+    );
+    State::from_rows(rows).unwrap()
+}
+
+fn user_withdrawal(seed: u8, amount: u128) -> UserWithdrawal {
+    UserWithdrawal {
+        sender: Address::repeat_byte(seed),
+        transaction_hash: B256::repeat_byte(seed.wrapping_add(1)),
+        token: identity().initial_token,
+        to: Address::repeat_byte(seed.wrapping_add(2)),
+        amount,
+        memo: B256::repeat_byte(seed.wrapping_add(3)),
+        gas_limit: 0,
+        callback_data: Default::default(),
+        reveal_to: Default::default(),
+    }
+}
+
+fn finalized_user_state() -> (State, crate::Withdrawal) {
+    let mut state = funded_state();
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            operations: vec![ZoneOperation::AcceptWithdrawal(user_withdrawal(0x40, 40))],
+            ..ZoneFacts::default()
+        },
+    );
+    commit(
+        &mut state,
+        ImportedFacts {
+            block_number: 2,
+            ..ImportedFacts::default()
+        },
+        ZoneFacts {
+            block_hash: B256::repeat_byte(2),
+            block_number: 2,
+            finalization: Some(Finalization {
+                block_number: 2,
+                declared_count: 1,
+                encrypted_senders: vec![Default::default()],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    let id = WithdrawalId {
+        zone_id: ZONE_ID,
+        index: 0,
+    };
+    let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) =
+        state.rows()[&StateKey::Withdrawal(id)].clone()
+    else {
+        unreachable!()
+    };
+    (state, data)
+}
+
+fn submit_first_batch(state: &mut State) {
+    let id = BatchId {
+        zone_id: ZONE_ID,
+        index: NonZeroU64::MIN,
+    };
+    let StateValue::Batch(BatchState::Finalized {
+        boundary,
+        queue_hash,
+        ..
+    }) = state.rows()[&StateKey::Batch(id)].clone()
+    else {
+        unreachable!()
+    };
+    commit(
+        state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::SubmitBatch(BatchSubmission {
+                tempo_block: boundary.tempo_block,
+                previous_block: boundary.first_parent,
+                next_block: boundary.final_block,
+                previous_deposit: boundary.first_deposit,
+                next_deposit: boundary.final_deposit,
+                withdrawal_queue_hash: queue_hash,
+                next_zone_height: U256::from(boundary.zone_height),
+            })],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
 }
 
 #[test]
@@ -104,6 +227,7 @@ fn overlay_reads_writes_deletes_and_finishes_in_key_order() {
             identity: identity(),
             bounceback_gas: 5,
             deposit: crate::state::Cursor::ZERO,
+            settlement: crate::state::Settlement::ZERO,
         })),
     );
     assert!(overlay.get(&StateKey::Token(token)).is_none());
@@ -124,7 +248,10 @@ fn state_key_family_order_is_stable() {
         portal: identity().portal,
         number: NonZeroU64::MIN,
     };
-    let withdrawal = WithdrawalId { zone_id: ZONE_ID, index: 0 };
+    let withdrawal = WithdrawalId {
+        zone_id: ZONE_ID,
+        index: 0,
+    };
     let keys = [
         StateKey::Portal,
         StateKey::Zone,
@@ -161,6 +288,7 @@ fn creation_checks_identity_address_initial_token_and_repetition() {
             identity,
             initial_token: enable(token),
         }],
+        ..ImportedFacts::default()
     };
     let mut wrong_identity = identity();
     wrong_identity.zone_id += 1;
@@ -200,6 +328,7 @@ fn creation_checks_identity_address_initial_token_and_repetition() {
                         initial_token: enable(identity().initial_token),
                     },
                 ],
+                ..ImportedFacts::default()
             }
         )
         .unwrap_err(),
@@ -217,6 +346,7 @@ fn token_enablement_requires_creation_and_rejects_duplicates() {
                 operations: vec![ImportedOperation::EnableToken(enable(
                     identity().initial_token
                 ))],
+                ..ImportedFacts::default()
             }
         )
         .unwrap_err(),
@@ -233,6 +363,7 @@ fn token_enablement_requires_creation_and_rejects_duplicates() {
                     },
                     ImportedOperation::EnableToken(enable(identity().initial_token)),
                 ],
+                ..ImportedFacts::default()
             }
         )
         .unwrap_err(),
@@ -250,6 +381,7 @@ fn zone_enablement_must_exactly_match_this_imported_block() {
                 identity: identity(),
                 initial_token: enable(identity().initial_token),
             }],
+            ..ImportedFacts::default()
         },
     )
     .unwrap();
@@ -273,7 +405,7 @@ fn ordinary_deposit_append_and_mint_close_accounting() {
     let candidate = apply_zone(
         apply_imported(&state, &ImportedFacts::default()).unwrap(),
         &ZoneFacts {
-            deposits: vec![deposit.clone()],
+            deposits: vec![Deposit::Ordinary(deposit.clone())],
             outcomes: vec![DepositOutcome::Minted],
             ..ZoneFacts::default()
         },
@@ -306,7 +438,7 @@ fn failed_deposit_creates_refund_owner_and_rejects_prefix_mutation() {
     let error = apply_zone(
         apply_imported(&state, &ImportedFacts::default()).unwrap(),
         &ZoneFacts {
-            deposits: vec![mutated],
+            deposits: vec![Deposit::Ordinary(mutated)],
             outcomes: vec![DepositOutcome::Failed],
             ..ZoneFacts::default()
         },
@@ -317,7 +449,7 @@ fn failed_deposit_creates_refund_owner_and_rejects_prefix_mutation() {
     let candidate = apply_zone(
         apply_imported(&state, &ImportedFacts::default()).unwrap(),
         &ZoneFacts {
-            deposits: vec![deposit],
+            deposits: vec![Deposit::Ordinary(deposit)],
             outcomes: vec![DepositOutcome::Failed],
             ..ZoneFacts::default()
         },
@@ -325,6 +457,10 @@ fn failed_deposit_creates_refund_owner_and_rejects_prefix_mutation() {
     .unwrap();
     assert!(matches!(
         candidate.expected_effects[0],
+        ExpectedEffect::WithdrawalRequested { .. }
+    ));
+    assert!(matches!(
+        candidate.expected_effects[1],
         ExpectedEffect::DepositFailed { .. }
     ));
     assert!(
@@ -344,7 +480,7 @@ fn outcome_cardinality_is_exact_and_failures_do_not_mutate_parent() {
         apply_zone(
             apply_imported(&state, &ImportedFacts::default()).unwrap(),
             &ZoneFacts {
-                deposits: vec![deposit],
+                deposits: vec![Deposit::Ordinary(deposit)],
                 outcomes: vec![],
                 ..ZoneFacts::default()
             }
@@ -385,9 +521,480 @@ fn zero_refund_recipient_is_rejected() {
                     },
                     ImportedOperation::AppendDeposit(input),
                 ],
+                ..ImportedFacts::default()
             }
         )
         .unwrap_err(),
         ModelError::ZeroRefundRecipient
     );
+}
+
+#[test]
+fn user_delivery_closes_batch_withdrawal_fallback_and_w() {
+    let (mut state, withdrawal) = finalized_user_state();
+    submit_first_batch(&mut state);
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    withdrawals: vec![withdrawal],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::UserDelivered {
+                        callback_deposits: Vec::new(),
+                    }],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    let token = match state.rows()[&StateKey::Token(identity().initial_token)] {
+        StateValue::Token(token) => token,
+        _ => unreachable!(),
+    };
+    assert_eq!(token.accounting.supply, U256::from(60));
+    assert_eq!(token.accounting.withdrawals, U256::ZERO);
+    assert!(!state.rows().keys().any(|key| matches!(
+        key,
+        StateKey::Withdrawal(_) | StateKey::Fallback(_) | StateKey::Batch(_)
+    )));
+    validate(&state).unwrap();
+}
+
+#[test]
+fn user_bounce_pending_and_inbox_claim_close_complete_lifecycle() {
+    let (mut state, withdrawal) = finalized_user_state();
+    submit_first_batch(&mut state);
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    withdrawals: vec![withdrawal],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::UserBounced],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    let bounce = crate::BounceBackDeposit {
+        token: identity().initial_token,
+        fallback_nonce: NonZeroU64::MIN,
+        amount: 40,
+    };
+    let recipient = Address::repeat_byte(0x88);
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            deposits: vec![Deposit::BounceBack(bounce)],
+            outcomes: vec![DepositOutcome::BounceBackPending { recipient }],
+            ..ZoneFacts::default()
+        },
+    );
+    assert!(
+        state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::InboxRefund(_)))
+    );
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            operations: vec![ZoneOperation::ClaimInboxRefund(RefundClaim {
+                token: identity().initial_token,
+                recipient,
+                amount: 40,
+            })],
+            ..ZoneFacts::default()
+        },
+    );
+    let StateValue::Token(token) = state.rows()[&StateKey::Token(identity().initial_token)] else {
+        unreachable!()
+    };
+    assert_eq!(token.accounting.supply, U256::from(100));
+    assert_eq!(token.accounting.withdrawals, U256::ZERO);
+    validate(&state).unwrap();
+}
+
+#[test]
+fn empty_batch_submits_without_ring_capacity() {
+    let mut state = funded_state();
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            finalization: Some(Finalization {
+                block_number: 1,
+                declared_count: 0,
+                encrypted_senders: vec![],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    let effects = {
+        let id = BatchId {
+            zone_id: ZONE_ID,
+            index: NonZeroU64::MIN,
+        };
+        let StateValue::Batch(BatchState::Finalized {
+            boundary,
+            queue_hash,
+            ..
+        }) = state.rows()[&StateKey::Batch(id)].clone()
+        else {
+            unreachable!()
+        };
+        commit(
+            &mut state,
+            ImportedFacts {
+                operations: vec![ImportedOperation::SubmitBatch(BatchSubmission {
+                    tempo_block: boundary.tempo_block,
+                    previous_block: boundary.first_parent,
+                    next_block: boundary.final_block,
+                    previous_deposit: boundary.first_deposit,
+                    next_deposit: boundary.final_deposit,
+                    withdrawal_queue_hash: queue_hash,
+                    next_zone_height: U256::from(boundary.zone_height),
+                })],
+                ..ImportedFacts::default()
+            },
+            ZoneFacts::default(),
+        )
+    };
+    assert!(
+        matches!(effects.last(), Some(ExpectedEffect::BatchSubmitted { queue_index, .. }) if *queue_index == U256::MAX)
+    );
+    let StateValue::Portal(PortalState::Created { settlement, .. }) =
+        &state.rows()[&StateKey::Portal]
+    else {
+        unreachable!()
+    };
+    assert_eq!(settlement.queue_head, settlement.queue_tail);
+    assert!(
+        !state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::Batch(_)))
+    );
+    validate(&state).unwrap();
+}
+
+#[test]
+fn partial_processing_keeps_exact_suffix_then_exhausts() {
+    let mut state = funded_state();
+    let mut rows = state.rows().clone();
+    let StateValue::Token(mut token) = rows[&StateKey::Token(identity().initial_token)] else {
+        unreachable!()
+    };
+    token.accounting.supply = U256::from(200);
+    rows.insert(
+        StateKey::Token(identity().initial_token),
+        StateValue::Token(token),
+    );
+    state = State::from_rows(rows).unwrap();
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            operations: vec![
+                ZoneOperation::AcceptWithdrawal(user_withdrawal(0x50, 40)),
+                ZoneOperation::AcceptWithdrawal(user_withdrawal(0x60, 30)),
+            ],
+            finalization: Some(Finalization {
+                block_number: 1,
+                declared_count: 2,
+                encrypted_senders: vec![Default::default(), Default::default()],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    submit_first_batch(&mut state);
+    let withdrawals = (0..2)
+        .map(|index| {
+            let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) = &state
+                .rows()[&StateKey::Withdrawal(WithdrawalId {
+                zone_id: ZONE_ID,
+                index,
+            })] else {
+                unreachable!()
+            };
+            data.clone()
+        })
+        .collect::<Vec<_>>();
+    let suffix = crate::withdrawal_hash(&withdrawals[1], crate::WITHDRAWAL_SENTINEL);
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    withdrawals: vec![withdrawals[0].clone()],
+                    remaining_queue: suffix,
+                    outcomes: vec![WithdrawalOutcome::UserDelivered {
+                        callback_deposits: vec![],
+                    }],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    assert!(
+        state
+            .rows()
+            .contains_key(&StateKey::Withdrawal(WithdrawalId {
+                zone_id: ZONE_ID,
+                index: 1
+            }))
+    );
+    assert!(
+        state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::Batch(_)))
+    );
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    withdrawals: vec![withdrawals[1].clone()],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::UserDelivered {
+                        callback_deposits: vec![],
+                    }],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    assert!(!state.rows().keys().any(|key| matches!(
+        key,
+        StateKey::Batch(_) | StateKey::Withdrawal(_) | StateKey::Fallback(_)
+    )));
+    validate(&state).unwrap();
+}
+
+#[test]
+fn failed_deposit_pending_refund_claim_closes_d() {
+    let (mut state, deposit) = created_with_deposit();
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            deposits: vec![Deposit::Ordinary(deposit.clone())],
+            outcomes: vec![DepositOutcome::Failed],
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            finalization: Some(Finalization {
+                block_number: 1,
+                declared_count: 1,
+                encrypted_senders: vec![Default::default()],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    submit_first_batch(&mut state);
+    let wid = WithdrawalId {
+        zone_id: ZONE_ID,
+        index: 0,
+    };
+    let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) =
+        state.rows()[&StateKey::Withdrawal(wid)].clone()
+    else {
+        unreachable!()
+    };
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    withdrawals: vec![data],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::FailedDepositPending],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    assert!(
+        state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::PortalRefund(_)))
+    );
+    commit(
+        &mut state,
+        ImportedFacts {
+            operations: vec![ImportedOperation::ClaimPortalRefund(RefundClaim {
+                token: deposit.token,
+                recipient: deposit.tempo_refund_recipient,
+                amount: deposit.amount,
+            })],
+            ..ImportedFacts::default()
+        },
+        ZoneFacts::default(),
+    );
+    let StateValue::Token(token) = state.rows()[&StateKey::Token(deposit.token)] else {
+        unreachable!()
+    };
+    assert_eq!(token.accounting.deposits, U256::ZERO);
+    validate(&state).unwrap();
+}
+
+#[test]
+fn every_ordinary_deposit_field_is_prefix_authenticated() {
+    let (state, value) = created_with_deposit();
+    let mut mutations = Vec::new();
+    macro_rules! mutated {
+        ($body:expr) => {{
+            let mut changed = value.clone();
+            $body(&mut changed);
+            mutations.push(changed);
+        }};
+    }
+    mutated!(|v: &mut OrdinaryDeposit| v.token = Address::repeat_byte(0xa1));
+    mutated!(|v: &mut OrdinaryDeposit| v.sender = Address::repeat_byte(0xa2));
+    mutated!(|v: &mut OrdinaryDeposit| v.amount += 1);
+    mutated!(|v: &mut OrdinaryDeposit| v.tempo_refund_recipient = Address::repeat_byte(0xa3));
+    mutated!(|v: &mut OrdinaryDeposit| v.key_index += U256::ONE);
+    mutated!(|v: &mut OrdinaryDeposit| v.encrypted.ephemeral_pubkey_x = B256::repeat_byte(0xa4));
+    mutated!(|v: &mut OrdinaryDeposit| v.encrypted.ephemeral_pubkey_y_parity ^= 1);
+    mutated!(|v: &mut OrdinaryDeposit| v.encrypted.ciphertext[0] ^= 1);
+    mutated!(|v: &mut OrdinaryDeposit| v.encrypted.nonce[0] ^= 1);
+    mutated!(|v: &mut OrdinaryDeposit| v.encrypted.tag[0] ^= 1);
+    for changed in mutations {
+        assert_eq!(
+            apply_zone(
+                apply_imported(&state, &ImportedFacts::default()).unwrap(),
+                &ZoneFacts {
+                    deposits: vec![Deposit::Ordinary(changed)],
+                    outcomes: vec![DepositOutcome::Minted],
+                    ..ZoneFacts::default()
+                },
+            )
+            .unwrap_err(),
+            ModelError::DepositPrefixMismatch
+        );
+    }
+}
+
+#[test]
+fn every_submission_commitment_field_is_compared() {
+    let (state, _) = finalized_user_state();
+    let id = BatchId {
+        zone_id: ZONE_ID,
+        index: NonZeroU64::MIN,
+    };
+    let StateValue::Batch(BatchState::Finalized {
+        boundary,
+        queue_hash,
+        ..
+    }) = state.rows()[&StateKey::Batch(id)].clone()
+    else {
+        unreachable!()
+    };
+    let exact = BatchSubmission {
+        tempo_block: boundary.tempo_block,
+        previous_block: boundary.first_parent,
+        next_block: boundary.final_block,
+        previous_deposit: boundary.first_deposit,
+        next_deposit: boundary.final_deposit,
+        withdrawal_queue_hash: queue_hash,
+        next_zone_height: U256::from(boundary.zone_height),
+    };
+    let mut mutations = Vec::new();
+    macro_rules! changed {
+        ($field:ident, $value:expr) => {{
+            let mut input = exact.clone();
+            input.$field = $value;
+            mutations.push(input);
+        }};
+    }
+    changed!(tempo_block, exact.tempo_block + 1);
+    changed!(previous_block, B256::repeat_byte(0x11));
+    changed!(next_block, B256::repeat_byte(0x12));
+    changed!(
+        previous_deposit,
+        crate::Cursor {
+            hash: B256::repeat_byte(0x13),
+            number: 0
+        }
+    );
+    changed!(
+        next_deposit,
+        crate::Cursor {
+            hash: B256::repeat_byte(0x14),
+            number: 0
+        }
+    );
+    changed!(withdrawal_queue_hash, B256::repeat_byte(0x15));
+    changed!(next_zone_height, exact.next_zone_height + U256::ONE);
+    for input in mutations {
+        assert_eq!(
+            apply_imported(
+                &state,
+                &ImportedFacts {
+                    operations: vec![ImportedOperation::SubmitBatch(input)],
+                    ..ImportedFacts::default()
+                },
+            )
+            .unwrap_err(),
+            ModelError::CommitmentMismatch
+        );
+    }
+}
+
+#[test]
+fn every_withdrawal_preimage_field_is_prefix_authenticated() {
+    let (mut state, withdrawal) = finalized_user_state();
+    submit_first_batch(&mut state);
+    let mut mutations = Vec::new();
+    macro_rules! changed {
+        ($body:expr) => {{
+            let mut value = withdrawal.clone();
+            $body(&mut value);
+            mutations.push(value);
+        }};
+    }
+    changed!(|v: &mut crate::Withdrawal| v.token = Address::repeat_byte(0xb1));
+    changed!(|v: &mut crate::Withdrawal| v.sender_tag = B256::repeat_byte(0xb2));
+    changed!(|v: &mut crate::Withdrawal| v.to = Address::repeat_byte(0xb3));
+    changed!(|v: &mut crate::Withdrawal| v.amount += 1);
+    changed!(|v: &mut crate::Withdrawal| v.memo = B256::repeat_byte(0xb4));
+    changed!(|v: &mut crate::Withdrawal| v.gas_limit += 1);
+    changed!(|v: &mut crate::Withdrawal| v.fallback_nonce += 1);
+    changed!(|v: &mut crate::Withdrawal| v.callback_data = Bytes::from_static(b"x"));
+    changed!(|v: &mut crate::Withdrawal| v.encrypted_sender = Bytes::from_static(b"x"));
+    for value in mutations {
+        assert_eq!(
+            apply_imported(
+                &state,
+                &ImportedFacts {
+                    operations: vec![ImportedOperation::ProcessWithdrawals(
+                        WithdrawalProcessing {
+                            withdrawals: vec![value],
+                            remaining_queue: B256::ZERO,
+                            outcomes: vec![WithdrawalOutcome::UserDelivered {
+                                callback_deposits: vec![]
+                            }],
+                        }
+                    )],
+                    ..ImportedFacts::default()
+                },
+            )
+            .unwrap_err(),
+            ModelError::CommitmentMismatch
+        );
+    }
 }

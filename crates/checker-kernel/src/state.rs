@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Bound};
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::facts::OrdinaryDeposit;
@@ -77,13 +77,38 @@ impl Cursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum PortalState {
     AwaitingCreation(PortalIdentity),
     Created {
         identity: PortalIdentity,
         bounceback_gas: u64,
         deposit: Cursor,
+        settlement: Settlement,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settlement {
+    pub batch_index: u64,
+    pub block_hash: B256,
+    pub tempo_block: u64,
+    pub submitted_deposit: Cursor,
+    pub zone_height: U256,
+    pub queue_head: U256,
+    pub queue_tail: U256,
+}
+
+impl Settlement {
+    pub const ZERO: Self = Self {
+        batch_index: 0,
+        block_hash: B256::ZERO,
+        tempo_block: 0,
+        submitted_deposit: Cursor::ZERO,
+        zone_height: U256::ZERO,
+        queue_head: U256::ZERO,
+        queue_tail: U256::ZERO,
+    };
 }
 
 impl PortalState {
@@ -100,6 +125,10 @@ pub struct ZoneState {
     pub next_withdrawal_index: u64,
     pub withdrawal_queue_hash: B256,
     pub withdrawal_batch_index: u64,
+    pub tempo_gas_rate: u128,
+    pub max_withdrawals_per_block: u32,
+    pub last_fallback_nonce: u64,
+    pub batch_start: BatchBoundaryStart,
 }
 
 impl Default for ZoneState {
@@ -109,8 +138,26 @@ impl Default for ZoneState {
             next_withdrawal_index: 0,
             withdrawal_queue_hash: B256::ZERO,
             withdrawal_batch_index: 0,
+            tempo_gas_rate: 0,
+            max_withdrawals_per_block: 0,
+            last_fallback_nonce: 0,
+            batch_start: BatchBoundaryStart::ZERO,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchBoundaryStart {
+    pub parent_hash: B256,
+    pub deposit: Cursor,
+    pub withdrawal_index: u64,
+}
+impl BatchBoundaryStart {
+    pub const ZERO: Self = Self {
+        parent_hash: B256::ZERO,
+        deposit: Cursor::ZERO,
+        withdrawal_index: 0,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,23 +190,93 @@ pub struct TokenState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DepositOwner {
     Ordinary(OrdinaryDeposit),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WithdrawalOwner {
-    FailedDeposit {
-        deposit: DepositId,
+    BounceBack {
+        withdrawal: WithdrawalId,
         token: Address,
-        recipient: Address,
+        fallback_nonce: NonZeroU64,
         amount: u128,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchState;
+pub enum WithdrawalOwner {
+    PendingFailedDeposit {
+        deposit: DepositId,
+        token: Address,
+        recipient: Address,
+        amount: u128,
+    },
+    PendingUser {
+        data: Withdrawal,
+        fallback: FallbackId,
+    },
+    Finalized {
+        data: Withdrawal,
+        origin: WithdrawalOrigin,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FallbackState;
+pub struct Withdrawal {
+    pub token: Address,
+    pub sender_tag: B256,
+    pub to: Address,
+    pub amount: u128,
+    pub memo: B256,
+    pub gas_limit: u64,
+    pub fallback_nonce: u64,
+    pub callback_data: Bytes,
+    pub encrypted_sender: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WithdrawalOrigin {
+    User { fallback: FallbackId },
+    FailedDeposit { deposit: DepositId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchBoundary {
+    pub first_parent: B256,
+    pub final_block: B256,
+    pub first_deposit: Cursor,
+    pub final_deposit: Cursor,
+    pub tempo_block: u64,
+    pub zone_height: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BatchState {
+    Finalized {
+        boundary: BatchBoundary,
+        first_withdrawal: u64,
+        count: u64,
+        queue_hash: B256,
+    },
+    Submitted {
+        boundary: BatchBoundary,
+        first_withdrawal: u64,
+        count: u64,
+        queue_hash: B256,
+        next_ordinal: u64,
+        logical_queue_index: U256,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FallbackState {
+    Held {
+        withdrawal: WithdrawalId,
+        token: Address,
+        amount: u128,
+    },
+    Queued {
+        withdrawal: WithdrawalId,
+        token: Address,
+        amount: u128,
+        deposit: DepositId,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefundCredit {

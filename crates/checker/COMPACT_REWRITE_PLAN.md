@@ -16,9 +16,9 @@ Merge base: `55b0fcbed520570c5e1089dc5db97d05b5546571`
 |---|---|---|---|---|
 | 0 — baseline and characterization | passed | `746e6ad4` | Branch `horsefacts/zone-checker`; starting HEAD `fa525d28cb38246cf53a635012fbcf90a4f9652c`; merge base confirmed; clean worktree; baseline LOC and guarantee inventories recorded below; `cargo +1.95.0 test -p zone-checker` (432 unit tests and 1 doc test passed) | The default Rust 1.94.1 toolchain is older than the workspace's required 1.95.0, so gates use the already-installed `+1.95.0` toolchain. |
 | 1 — full L1 transaction authentication | passed | `18535206` | Full envelopes fetched in one exact-block response; local envelope hashes and `transactions_root` checked before receipt binding and Portal decode; selective by-hash fetch deleted. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker` (433 unit tests and 1 doc test); `cargo +1.95.0 clippy -p zone-checker --all-targets --all-features -- -D warnings`. Checker production/test LOC: 34,179/28,193. | One metrics test was flaky under a concurrent gate run; its isolated rerun and the subsequent full serial gate passed. |
-| 2 — compact kernel skeleton | passed | this milestone commit; resolved in the next ledger update | Independent four-dependency kernel; one typed row space, read-through overlay, sorted delta, compact facts/effects/findings, creation/config/token/ordinary-deposit transitions, literal commitment vector, and legacy semantic snapshot parity. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (12 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (434 unit tests and 1 doc test); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Kernel production/test LOC: 1,018/393; migration-wide production/test LOC: 35,197/28,821. The skeleton's density supports the planned 6–7.5k complete-kernel range. | Legacy remains authoritative outside creation, configuration, token enablement, and ordinary-deposit append/processing. The pre-existing metrics recorder test requires serial execution because its derived metric handles are process-global. |
-| 3 — complete lifecycle kernel | active | pending | Porting remaining ownership, withdrawal, finalization, submission, processing, refund, callback, empty-batch, and ring lifecycle | — |
-| 4 — checkpoint/journal store | pending | pending | — | — |
+| 2 — compact kernel skeleton | passed | `f2d91909` | Independent four-dependency kernel; one typed row space, read-through overlay, sorted delta, compact facts/effects/findings, creation/config/token/ordinary-deposit transitions, literal commitment vector, and legacy semantic snapshot parity. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (12 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (434 unit tests and 1 doc test); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Kernel production/test LOC: 1,018/393; migration-wide production/test LOC: 35,197/28,821. The skeleton's density supports the planned 6–7.5k complete-kernel range. | Legacy remains authoritative outside creation, configuration, token enablement, and ordinary-deposit append/processing. The pre-existing metrics recorder test requires serial execution because its derived metric handles are process-global. |
+| 3 — complete lifecycle kernel | passed | this milestone commit; resolved in the next ledger update | Complete release-one ownership and lifecycle, exact native effect grammar, imported-context ownership, owner-graph/ring/S-D-W invariants, all six terminal differential traces, partial processing, empty batches, aggregate claims, and field mutations. Oracle blockers were applied. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (20 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (439 unit tests and 1 doc test); focused differential suite (6 tests); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Kernel production/test LOC: 2,610/1,000. | Legacy remains the differential oracle through Milestone 5. Persistence-load validation and production observation reconciliation are Milestones 4–5 responsibilities. |
+| 4 — checkpoint/journal store | active | pending | Four-table schema, bounded codecs, checkpoint/journal/reorg/findings implementation next | — |
 | 5 — builder and compact runtime | pending | pending | — | — |
 | 6 — cutover and deletion | pending | pending | — | — |
 
@@ -66,6 +66,28 @@ Existing guarantee coverage at baseline:
 | Reorg and alert | One/multi/interrupted reorg; descendant-preserving, exact-finding-removing, and replacement-divergence alert reorgs in `tests/runtime` | Alert restart followed by alert-removing reorg is not one combined scenario. |
 | Coverage and acknowledgement | Partial-notification durable-prefix retry, acquisition atomicity, prepared-candidate non-authority, commit-abort retry, commit-before-mirror restart, and no-ack acquisition failure in `tests/runtime/atomicity.rs` | Current architecture does not yet persist the compact runtime's explicit verified/acknowledged gap model. |
 | Real node | Bootstrap/restart/advance and active-alert progress in `crates/node/tests/it/checker_e2e.rs` | No real-node lifecycle/reorg/crash breadth beyond those smoke tests. |
+
+### Milestone 3 authenticated-field disposition
+
+- **Consumed by compact semantics:** the authenticated imported block hash, number, base fee, and
+  ordered Portal calls; complete creation/configuration/token/deposit/submission/processing/refund
+  call fields; ordered Zone token enables, deposit preimages and dispositions, configuration and
+  withdrawal operations, finalization block/count/sender vector, Zone block hash and number; exact
+  state/supply/collateral values. Imported context is carried once from the authenticated boundary,
+  never copied from Zone observations.
+- **Compared independently:** every native event field represented by `ExpectedEffect`; imported and
+  Zone fixed-state commitments; supply and collateral; complete queue preimages, suffixes, indices,
+  counters, batch boundaries, fees, sender tags, refund aggregates, owner IDs, and S/D/W values.
+  One-field mutation suites cover transaction/receipt/header identity and roots, deposit and
+  withdrawal preimages, submission commitments, finalization structure, event grammar, exact state,
+  supply, and collateral. Differential traces compare all six lifecycle terminals plus partial and
+  empty batches.
+- **Explicitly unchecked:** successful proof/quorum payloads; event coordinates except as finding
+  locations; ordinary `DepositProcessed.to` and `memo`; bounce-back `zone_fallback_recipient`;
+  opaque finalization encrypted-sender bytes after authenticated ordering/shape checks;
+  `advanceTempo.decryptions`; non-enabled token supplies; surplus collateral; and upper bytes of the
+  packed Outbox batch slot. These values must remain classified as unchecked in the production
+  adapter and may not be reported as verified.
 
 ## 1. Executive direction
 
