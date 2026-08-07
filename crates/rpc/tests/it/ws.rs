@@ -44,7 +44,11 @@ struct TestContext {
 }
 
 impl TestContext {
-    async fn start(api: MockZoneRpcApi) -> Self {
+    async fn start() -> Self {
+        Self::start_with(MockZoneRpcApi::websocket()).await
+    }
+
+    async fn start_with(api: MockZoneRpcApi) -> Self {
         Self::start_shared(Arc::new(api)).await
     }
 
@@ -145,7 +149,7 @@ fn parse_response(msg: tungstenite::Message) -> Value {
 
 #[tokio::test]
 async fn ws_roundtrip_with_header_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -161,7 +165,7 @@ async fn ws_roundtrip_with_header_auth() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_query_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let token = ctx.build_token();
     let url = format!("{}/?token={token}", ctx.ws_url());
 
@@ -180,7 +184,7 @@ async fn ws_roundtrip_with_query_auth() {
 
 #[tokio::test]
 async fn ws_reject_no_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let result = connect_async(ctx.ws_url()).await;
     // Server should reject the upgrade — tungstenite surfaces this as an error
     // with the HTTP 401 status.
@@ -193,7 +197,7 @@ async fn ws_reject_no_auth() {
 
 #[tokio::test]
 async fn ws_reject_invalid_token() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let req = tungstenite::http::Request::builder()
         .uri(ctx.ws_url())
         .header("x-authorization-token", "deadbeef")
@@ -219,7 +223,7 @@ async fn ws_reject_invalid_token() {
 
 #[tokio::test]
 async fn ws_multiple_requests() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     for i in 1..=5 {
@@ -236,7 +240,7 @@ async fn ws_multiple_requests() {
 
 #[tokio::test]
 async fn ws_batch_request() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     let batch = serde_json::json!([
@@ -258,7 +262,7 @@ async fn ws_batch_request() {
 
 #[tokio::test]
 async fn ws_invalid_json() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text("{broken".into()))
@@ -271,7 +275,7 @@ async fn ws_invalid_json() {
 
 #[tokio::test]
 async fn ws_unknown_method() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(jsonrpc("eth_foobar", 1).into()))
@@ -285,7 +289,7 @@ async fn ws_unknown_method() {
 
 #[tokio::test]
 async fn ws_disabled_subscription_method() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -301,7 +305,7 @@ async fn ws_disabled_subscription_method() {
 
 #[tokio::test]
 async fn ws_subscribe_new_heads_emits_redacted_headers() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -343,7 +347,7 @@ async fn ws_subscribe_new_heads_emits_redacted_headers() {
 
 #[tokio::test]
 async fn ws_subscribe_logs_emits_notifications() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -370,7 +374,7 @@ async fn ws_subscribe_logs_emits_notifications() {
 
 #[tokio::test]
 async fn ws_subscribe_pending_transactions_is_disabled() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     for (id, params) in [
@@ -392,7 +396,7 @@ async fn ws_subscribe_pending_transactions_is_disabled() {
 
 #[tokio::test]
 async fn ws_unsubscribe_removes_subscription() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text(
@@ -421,7 +425,7 @@ async fn ws_unsubscribe_removes_subscription() {
 
 #[tokio::test]
 async fn ws_subscribe_rejects_invalid_param_shapes() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     for (id, params) in [(1, json!(["newHeads", false])), (2, json!(["logs", false]))] {
@@ -438,7 +442,7 @@ async fn ws_subscribe_rejects_invalid_param_shapes() {
 
 #[tokio::test]
 async fn ws_subscribe_rejects_too_many_active_subscriptions() {
-    let ctx = TestContext::start(MockZoneRpcApi::with_ws_subscriptions()).await;
+    let ctx = TestContext::start_with(MockZoneRpcApi::subscriptions()).await;
     let mut ws = connect_with_header(&ctx).await;
 
     for id in 1..=32 {
@@ -482,7 +486,7 @@ async fn ws_subscribe_rejects_too_many_active_subscriptions() {
 
 #[tokio::test]
 async fn ws_empty_batch() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let mut ws = connect_with_header(&ctx).await;
 
     ws.send(tungstenite::Message::Text("[]".into()))
@@ -495,7 +499,7 @@ async fn ws_empty_batch() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_p256_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let signing_key = P256SigningKey::random(&mut thread_rng());
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
@@ -520,7 +524,7 @@ async fn ws_roundtrip_with_p256_auth() {
 
 #[tokio::test]
 async fn ws_roundtrip_with_webauthn_auth() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let signing_key = P256SigningKey::random(&mut thread_rng());
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
@@ -551,7 +555,7 @@ async fn ws_roundtrip_with_keychain_auth() {
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
     let (signature, key_id) = sign_keychain_signature(digest, &access_signer, root_account, 0x04)
         .expect("keychain signing should succeed");
-    let ctx = TestContext::start(MockZoneRpcApi::with_key(
+    let ctx = TestContext::start_with(MockZoneRpcApi::with_key(
         root_account,
         key_id,
         KeyInfoSignatureType::P256,
@@ -575,7 +579,7 @@ async fn ws_roundtrip_with_keychain_auth() {
 
 #[tokio::test]
 async fn ws_closes_when_auth_token_expires() {
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let now = now_secs();
     let token = ctx.build_token_expiring_at(now, now + 1);
     let mut ws = connect_with_token(&ctx.ws_url(), ctx.addr, &token)
@@ -653,7 +657,7 @@ async fn ws_closes_when_keychain_key_is_revoked_during_request() {
 async fn ws_reject_unauthorized_keychain_token() {
     let root_account = Address::repeat_byte(0x44);
     let access_signer = P256SigningKey::random(&mut thread_rng());
-    let ctx = TestContext::start(MockZoneRpcApi::for_websocket_tests()).await;
+    let ctx = TestContext::start().await;
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
     let (signature, _key_id) = sign_keychain_signature(digest, &access_signer, root_account, 0x04)
@@ -673,7 +677,8 @@ async fn ws_reject_unauthorized_keychain_token() {
 async fn ws_keychain_lookup_failure_returns_500() {
     let root_account = Address::repeat_byte(0x66);
     let access_signer = P256SigningKey::random(&mut thread_rng());
-    let ctx = TestContext::start(MockZoneRpcApi::with_key_lookup_error("key lookup failed")).await;
+    let ctx =
+        TestContext::start_with(MockZoneRpcApi::with_key_lookup_error("key lookup failed")).await;
     let now = now_secs();
     let (fields, digest) = build_token_fields(ZONE_ID, CHAIN_ID, now, now + 600);
     let (signature, _key_id) = sign_keychain_signature(digest, &access_signer, root_account, 0x04)

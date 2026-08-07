@@ -763,6 +763,10 @@ mod tests {
 
     use test_api::TestZoneRpcApi as MockZoneRpcApi;
 
+    fn handler_api() -> MockZoneRpcApi {
+        MockZoneRpcApi::handlers()
+    }
+
     fn auth() -> AuthContext {
         AuthContext {
             caller: Address::repeat_byte(0xaa),
@@ -790,7 +794,7 @@ mod tests {
         assert_eq!(classify_method("zone_getSequencerInfo"), None);
         assert_eq!(classify_method("zone_setLeader"), None);
 
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let excluded = dispatch(&request("zone_setLeader", json!([])), &auth(), &api).await;
         assert_eq!(excluded.error.unwrap().code, -32601);
 
@@ -800,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_zone_get_authorization_token_info() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let resp = dispatch(
             &request("zone_getAuthorizationTokenInfo", json!([])),
             &auth(),
@@ -820,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_allowed_compatibility_methods() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
 
         let syncing = dispatch(&request("eth_syncing", json!([])), &auth(), &api).await;
         assert_eq!(
@@ -848,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_zone_get_zone_info() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let resp = dispatch(&request("zone_getZoneInfo", json!([])), &auth(), &api).await;
 
         assert!(resp.error.is_none());
@@ -869,7 +873,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_pending_transaction_filter_endpoint() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
 
         let resp = dispatch(
             &request("eth_newPendingTransactionFilter", json!([])),
@@ -884,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_state_override_for_eth_call() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let resp = dispatch(
             &request(
                 "eth_call",
@@ -907,7 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_state_override_for_estimate_gas() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let resp = dispatch(
             &request(
                 "eth_estimateGas",
@@ -930,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_extra_block_override_param_for_eth_call() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
         let resp = dispatch(
             &request(
                 "eth_call",
@@ -953,7 +957,7 @@ mod tests {
     }
     #[tokio::test]
     async fn classifies_spec_disabled_and_restricted_methods() {
-        let api = MockZoneRpcApi::for_handler_tests();
+        let api = handler_api();
 
         for method in [
             "eth_getProof",

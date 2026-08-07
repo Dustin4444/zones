@@ -41,14 +41,14 @@ pub(super) struct TestZoneRpcApi {
 }
 
 impl TestZoneRpcApi {
-    pub(super) fn for_handler_tests() -> Self {
+    pub(super) fn handlers() -> Self {
         Self {
             profile: ResponseProfile::Handler,
             ..Self::default()
         }
     }
 
-    pub(super) fn for_websocket_tests() -> Self {
+    pub(super) fn websocket() -> Self {
         Self {
             profile: ResponseProfile::WebSocket,
             ..Self::default()
@@ -66,7 +66,7 @@ impl TestZoneRpcApi {
         key_id: Address,
         signature_type: KeyInfoSignatureType,
     ) -> Self {
-        let api = Self::for_websocket_tests();
+        let api = Self::websocket();
         api.key_infos.lock().insert(
             (account, key_id),
             KeyInfo {
@@ -99,7 +99,7 @@ impl TestZoneRpcApi {
         }
     }
 
-    pub(super) fn with_ws_subscriptions() -> Self {
+    pub(super) fn subscriptions() -> Self {
         Self {
             profile: ResponseProfile::WebSocket,
             ws_subscriptions_enabled: true,
@@ -124,6 +124,47 @@ macro_rules! stub {
             self.unimplemented()
         }
     };
+}
+
+fn new_head_payload() -> serde_json::Value {
+    serde_json::json!({
+        "hash": format!(
+            "{:#x}",
+            b256!("0x4444444444444444444444444444444444444444444444444444444444444444")
+        ),
+        "number": "0x42",
+        "parentHash": format!("{:#x}", B256::ZERO),
+        "logsBloom": format!("0x{}", "0".repeat(512)),
+        "gasUsed": "0x0",
+        "size": "0x0",
+        "transactionsRoot": format!("{:#x}", B256::ZERO),
+        "receiptsRoot": format!("{:#x}", B256::ZERO),
+        "stateRoot": format!("{:#x}", B256::ZERO),
+        "extraData": "0x",
+    })
+}
+
+fn log_payload() -> serde_json::Value {
+    serde_json::json!({
+        "address": format!("{:#x}", Address::ZERO),
+        "topics": [format!(
+            "{:#x}",
+            b256!("0x1111111111111111111111111111111111111111111111111111111111111111")
+        )],
+        "data": "0x",
+        "blockHash": format!(
+            "{:#x}",
+            b256!("0x2222222222222222222222222222222222222222222222222222222222222222")
+        ),
+        "blockNumber": "0x42",
+        "transactionHash": format!(
+            "{:#x}",
+            b256!("0x3333333333333333333333333333333333333333333333333333333333333333")
+        ),
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "removed": false,
+    })
 }
 
 impl ZoneRpcApi for TestZoneRpcApi {
@@ -223,21 +264,7 @@ impl ZoneRpcApi for TestZoneRpcApi {
                 return Err(JsonRpcError::method_disabled());
             }
 
-            let stream = stream::iter(vec![to_raw(&serde_json::json!({
-                "hash": format!(
-                    "{:#x}",
-                    b256!("0x4444444444444444444444444444444444444444444444444444444444444444")
-                ),
-                "number": "0x42",
-                "parentHash": format!("{:#x}", B256::ZERO),
-                "logsBloom": format!("0x{}", "0".repeat(512)),
-                "gasUsed": "0x0",
-                "size": "0x0",
-                "transactionsRoot": format!("{:#x}", B256::ZERO),
-                "receiptsRoot": format!("{:#x}", B256::ZERO),
-                "stateRoot": format!("{:#x}", B256::ZERO),
-                "extraData": "0x",
-            }))]);
+            let stream = stream::iter(vec![to_raw(&new_head_payload())]);
             let stream: WsSubscriptionStream = Box::pin(stream);
             Ok(stream)
         })
@@ -254,26 +281,7 @@ impl ZoneRpcApi for TestZoneRpcApi {
                 return Err(JsonRpcError::method_disabled());
             }
 
-            let stream = stream::iter(vec![to_raw(&serde_json::json!({
-                "address": format!("{:#x}", Address::ZERO),
-                "topics": [format!(
-                    "{:#x}",
-                    b256!("0x1111111111111111111111111111111111111111111111111111111111111111")
-                )],
-                "data": "0x",
-                "blockHash": format!(
-                    "{:#x}",
-                    b256!("0x2222222222222222222222222222222222222222222222222222222222222222")
-                ),
-                "blockNumber": "0x42",
-                "transactionHash": format!(
-                    "{:#x}",
-                    b256!("0x3333333333333333333333333333333333333333333333333333333333333333")
-                ),
-                "transactionIndex": "0x0",
-                "logIndex": "0x0",
-                "removed": false,
-            }))]);
+            let stream = stream::iter(vec![to_raw(&log_payload())]);
             let stream: WsSubscriptionStream = Box::pin(stream);
             Ok(stream)
         })
