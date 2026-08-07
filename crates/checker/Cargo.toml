@@ -53,6 +53,7 @@ tracing.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+zone-checker-kernel.workspace = true
 alloy-consensus = { workspace = true, features = ["std"] }
 alloy-rpc-types-eth.workspace = true
 alloy-transport.workspace = true

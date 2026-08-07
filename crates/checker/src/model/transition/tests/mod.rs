@@ -1,3 +1,4 @@
+mod compact_differential;
 mod deposits;
 mod finalization;
 mod lifecycle_matrix;
