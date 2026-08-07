@@ -272,22 +272,25 @@ interface IAesGcmDecrypt {
 // limit.
 uint64 constant MAX_WITHDRAWAL_CALLBACK_GAS = 10_000_000;
 
+// Domain separator for pre-transaction sender commitments.
+bytes32 constant SENDER_TAG_DOMAIN = keccak256("tempo.zone.sender-tag.v1");
+
 struct Withdrawal {
     address token; // TIP-20 token being withdrawn
-    bytes32 senderTag; // keccak256(abi.encodePacked(sender, txHash, fallbackNonce))
+    bytes32 senderTag; // commitment to (source portal, sender, sender witness)
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     bytes32 memo; // user-provided context
     uint64 gasLimit; // max gas for IWithdrawalReceiver callback (0 = no callback)
     uint64 fallbackNonce; // resolves to the zone bounce-back recipient in ZoneOutbox
     bytes callbackData; // calldata for IWithdrawalReceiver (if gasLimit > 0)
-    bytes encryptedSender; // optional encrypted (sender, txHash) reveal payload
+    bytes encryptedSender; // optional encrypted (sender, senderWitness) reveal payload
 }
 
 struct PendingWithdrawal {
     address token; // TIP-20 token being withdrawn
     address sender; // who initiated the withdrawal on the zone
-    bytes32 txHash; // hash of the zone transaction that requested the withdrawal
+    bytes32 senderWitness; // private per-withdrawal sender commitment witness
     address to; // Tempo recipient
     uint128 amount; // amount to send to recipient (excludes fee)
     bytes32 memo; // user-provided context
@@ -1177,6 +1180,7 @@ interface IZoneOutbox {
     event WithdrawalRequested(
         uint64 indexed withdrawalIndex,
         address indexed sender,
+        bytes32 indexed senderTag,
         address token,
         address to,
         uint128 amount,
@@ -1253,6 +1257,7 @@ interface IZoneOutbox {
         uint64 gasLimit,
         address zoneFallbackRecipient,
         bytes calldata data,
+        bytes32 senderWitness,
         bytes calldata revealTo
     )
         external;

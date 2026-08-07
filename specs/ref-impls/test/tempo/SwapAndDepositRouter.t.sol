@@ -77,6 +77,7 @@ contract MockZonePortalForRouter {
     uint128 public lastDepositAmount;
     uint256 public lastDepositKeyIndex;
     address public lastDepositBouncebackRecipient;
+    bytes12 public lastDepositNonce;
     bool public encryptedDepositCalled;
 
     function enableToken(address _token) external {
@@ -91,7 +92,7 @@ contract MockZonePortalForRouter {
         address _token,
         uint128 amount,
         uint256 keyIndex,
-        DepositPayload calldata,
+        DepositPayload calldata encrypted,
         address tempoRefundRecipient
     )
         external
@@ -101,6 +102,7 @@ contract MockZonePortalForRouter {
         lastDepositAmount = amount;
         lastDepositKeyIndex = keyIndex;
         lastDepositBouncebackRecipient = tempoRefundRecipient;
+        lastDepositNonce = encrypted.nonce;
         encryptedDepositCalled = true;
         return bytes32(0);
     }
@@ -245,6 +247,41 @@ contract SwapAndDepositRouterTest is BaseTest {
         assertEq(mockPortal.lastDepositBouncebackRecipient(), refundBurner);
     }
 
+    function test_revertAuthenticatedWithdrawalReplay() public {
+        DepositPayload memory payload = _defaultDepositPayload();
+        bytes memory data =
+            _buildCallbackData(address(pathUSD), address(mockPortal), 0, payload, refundBurner, 0);
+
+        vm.prank(ZONE_MESSENGER_ADDRESS);
+        router.onWithdrawalReceived(
+            SOURCE_ZONE_ID, sourcePortal, senderTag, address(pathUSD), AMOUNT, data
+        );
+
+        vm.prank(ZONE_MESSENGER_ADDRESS);
+        vm.expectPartialRevert(SwapAndDepositRouter.WithdrawalAlreadyConsumed.selector);
+        router.onWithdrawalReceived(
+            SOURCE_ZONE_ID, sourcePortal, senderTag, address(pathUSD), AMOUNT, data
+        );
+    }
+
+    function test_copiedPayloadIsReboundToActualWithdrawal() public {
+        DepositPayload memory payload = _defaultDepositPayload();
+        bytes memory data =
+            _buildCallbackData(address(pathUSD), address(mockPortal), 0, payload, refundBurner, 0);
+        bytes32 mallorySenderTag = keccak256("mallory");
+
+        vm.prank(ZONE_MESSENGER_ADDRESS);
+        router.onWithdrawalReceived(
+            SOURCE_ZONE_ID, sourcePortal, mallorySenderTag, address(pathUSD), AMOUNT, data
+        );
+
+        bytes32 withdrawalId =
+            keccak256(abi.encode(address(router), sourcePortal, mallorySenderTag));
+        assertTrue(router.withdrawals(withdrawalId));
+        assertEq(mockPortal.lastDepositNonce(), bytes12(withdrawalId));
+        assertNotEq(mockPortal.lastDepositNonce(), payload.nonce);
+    }
+
     function test_deposit_withSwap() public {
         uint128 swapOut = 950e6;
         mockDEX.setNextAmountOut(swapOut);
@@ -266,15 +303,21 @@ contract SwapAndDepositRouterTest is BaseTest {
         assertEq(mockPortal2.lastDepositBouncebackRecipient(), refundBurner);
     }
 
-    function test_swapSlippageReverts() public {
+    function test_failedCallbackDoesNotConsumePayload() public {
         mockDEX.setNextAmountOut(800e6);
 
+        DepositPayload memory payload = _defaultDepositPayload();
         bytes memory data = _buildCallbackData(
-            address(token1), address(mockPortal2), 0, _defaultDepositPayload(), refundBurner, 900e6
+            address(token1), address(mockPortal2), 0, payload, refundBurner, 900e6
         );
-
         vm.prank(ZONE_MESSENGER_ADDRESS);
         vm.expectRevert(IStablecoinDEX.InsufficientOutput.selector);
+        router.onWithdrawalReceived(
+            SOURCE_ZONE_ID, sourcePortal, senderTag, address(pathUSD), AMOUNT, data
+        );
+
+        mockDEX.setNextAmountOut(950e6);
+        vm.prank(ZONE_MESSENGER_ADDRESS);
         router.onWithdrawalReceived(
             SOURCE_ZONE_ID, sourcePortal, senderTag, address(pathUSD), AMOUNT, data
         );

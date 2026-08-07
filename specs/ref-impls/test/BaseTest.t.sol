@@ -19,6 +19,7 @@ import { EIP2935 } from "../src/libraries/BlockHashHistory.sol";
 import { Verifier } from "../src/tempo/Verifier.sol";
 import { ZoneMessenger } from "../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../src/tempo/ZonePortal.sol";
+import { ZoneOutbox } from "../src/zone/ZoneOutbox.sol";
 import { MockZoneGateway } from "./mocks/MockZoneGateway.sol";
 import { MockZoneTxContext } from "./mocks/MockZoneTxContext.sol";
 import { Test, console } from "forge-std/Test.sol";
@@ -40,6 +41,54 @@ import { IValidatorConfig } from "tempo-std/interfaces/IValidatorConfig.sol";
 contract BaseTest is Test {
 
     mapping(address portal => uint256 height) private _submittedZoneHeights;
+    uint256 private _senderWitnessNonce;
+
+    function _nextSenderWitness() internal returns (bytes32) {
+        return keccak256(abi.encode("test-withdrawal-secret", ++_senderWitnessNonce));
+    }
+
+    function _requestWithdrawal(
+        ZoneOutbox outbox,
+        address token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        uint64 gasLimit,
+        address fallbackRecipient,
+        bytes memory data
+    )
+        internal
+    {
+        outbox.requestWithdrawal(
+            token, to, amount, memo, gasLimit, fallbackRecipient, data, _nextSenderWitness()
+        );
+    }
+
+    function _requestWithdrawal(
+        ZoneOutbox outbox,
+        address token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        uint64 gasLimit,
+        address fallbackRecipient,
+        bytes memory data,
+        bytes memory revealTo
+    )
+        internal
+    {
+        outbox.requestWithdrawal(
+            token,
+            to,
+            amount,
+            memo,
+            gasLimit,
+            fallbackRecipient,
+            data,
+            _nextSenderWitness(),
+            revealTo
+        );
+    }
 
     // Registry precompiles
     address internal constant _ACCOUNT_KEYCHAIN = StdPrecompiles.ACCOUNT_KEYCHAIN_ADDRESS;

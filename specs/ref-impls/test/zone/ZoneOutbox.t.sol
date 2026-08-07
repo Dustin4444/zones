@@ -9,9 +9,9 @@ import {
     PORTAL_ACCESS_MODE_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     PendingWithdrawal,
+    SENDER_TAG_DOMAIN,
     Withdrawal,
-    ZONE_INBOX,
-    ZONE_TX_CONTEXT
+    ZONE_INBOX
 } from "../../src/interfaces/IZone.sol";
 import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
@@ -19,28 +19,64 @@ import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { GatewayCallbackData, GatewayFlow } from "../mocks/MockZoneGateway.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
-import { MockZoneTxContext } from "../mocks/MockZoneTxContext.sol";
 import { Test } from "forge-std/Test.sol";
-
-contract ZeroTxContext {
-
-    function currentTxHash() external pure returns (bytes32) {
-        return bytes32(0);
-    }
-
-}
 
 /// @title ZoneOutboxTest
 /// @notice Tests for ZoneOutbox finalizeWithdrawalBatch() functionality and withdrawal storage
 contract ZoneOutboxTest is Test {
 
     uint128 internal constant TEST_MAX_TEMPO_GAS_RATE = 1e18;
+    uint256 private _senderWitnessNonce;
+
+    function _nextSenderWitness() internal returns (bytes32) {
+        return keccak256(abi.encode("test-withdrawal-secret", ++_senderWitnessNonce));
+    }
+
+    function _requestWithdrawal(
+        address token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        uint64 gasLimit,
+        address fallbackRecipient,
+        bytes memory data
+    )
+        internal
+    {
+        outbox.requestWithdrawal(
+            token, to, amount, memo, gasLimit, fallbackRecipient, data, _nextSenderWitness()
+        );
+    }
+
+    function _requestWithdrawal(
+        address token,
+        address to,
+        uint128 amount,
+        bytes32 memo,
+        uint64 gasLimit,
+        address fallbackRecipient,
+        bytes memory data,
+        bytes memory revealTo
+    )
+        internal
+    {
+        outbox.requestWithdrawal(
+            token,
+            to,
+            amount,
+            memo,
+            gasLimit,
+            fallbackRecipient,
+            data,
+            _nextSenderWitness(),
+            revealTo
+        );
+    }
 
     ZoneOutbox public outbox;
     ZoneInbox public inbox;
     MockZoneToken public zoneToken;
     MockTempoState public tempoState;
-    MockZoneTxContext public txContext = MockZoneTxContext(ZONE_TX_CONTEXT);
 
     address public sequencer = address(0x1);
     address public alice = address(0x200);
@@ -53,9 +89,6 @@ contract ZoneOutboxTest is Test {
     uint64 constant GENESIS_TEMPO_BLOCK_NUMBER = 1;
 
     function setUp() public {
-        MockZoneTxContext mockTxContext = new MockZoneTxContext();
-        vm.etch(ZONE_TX_CONTEXT, address(mockTxContext).code);
-
         zoneToken = new MockZoneToken("Zone USD", "zUSD");
         tempoState =
             new MockTempoState(sequencer, GENESIS_TEMPO_BLOCK_HASH, GENESIS_TEMPO_BLOCK_NUMBER);
@@ -86,9 +119,13 @@ contract ZoneOutboxTest is Test {
         zoneToken.mint(charlie, 10_000e6);
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return
-            keccak256(abi.encodePacked(sender, txContext.txHashFor(txSequence), uint64(txSequence)));
+    function _senderTag(address sender, uint256 withdrawalSequence)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 secret = keccak256(abi.encode("test-withdrawal-secret", withdrawalSequence));
+        return keccak256(abi.encode(SENDER_TAG_DOMAIN, mockPortal, sender, secret));
     }
 
     function _setModes(bool accessMode, bool gatewayMode) internal {
@@ -191,7 +228,18 @@ contract ZoneOutboxTest is Test {
 
         vm.expectEmit(true, true, false, true);
         emit IZoneOutbox.WithdrawalRequested(
-            0, address(0), address(zoneToken), bob, amount, 0, bytes32(0), 0, 0, "", ""
+            0,
+            address(0),
+            keccak256(abi.encodePacked(address(0), bytes32(0))),
+            address(zoneToken),
+            bob,
+            amount,
+            0,
+            bytes32(0),
+            0,
+            0,
+            "",
+            ""
         );
 
         vm.prank(ZONE_INBOX);
@@ -237,14 +285,14 @@ contract ZoneOutboxTest is Test {
     function test_requestWithdrawal_storesInArray() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("memo"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("memo"), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 1);
 
         vm.startPrank(bob);
         zoneToken.approve(address(outbox), 300e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 300e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 300e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 2);
@@ -253,8 +301,8 @@ contract ZoneOutboxTest is Test {
     function test_requestWithdrawal_assignsMonotonicFallbackNonces() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, charlie, "");
+        _requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, charlie, "");
         vm.stopPrank();
 
         PendingWithdrawal[] memory pending = _getPendingWithdrawals();
@@ -266,7 +314,7 @@ contract ZoneOutboxTest is Test {
     function test_consumeFallbackRecipient_resolvesAndDeletesMapping() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, charlie, "");
+        _requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(0), 0, charlie, "");
         vm.stopPrank();
 
         vm.prank(ZONE_INBOX);
@@ -285,22 +333,39 @@ contract ZoneOutboxTest is Test {
     function test_getPendingWithdrawals_returnsPendingInFifoOrder() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 800e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("first"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), bob, 300e6, bytes32("second"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("first"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 300e6, bytes32("second"), 0, alice, "");
         vm.stopPrank();
 
         PendingWithdrawal[] memory pending = _getPendingWithdrawals();
         assertEq(pending.length, 2);
         assertEq(pending[0].sender, alice);
-        assertEq(pending[0].txHash, txContext.txHashFor(1));
         assertEq(pending[0].to, alice);
         assertEq(pending[0].amount, 500e6);
         assertEq(pending[0].memo, bytes32("first"));
         assertEq(pending[1].sender, alice);
-        assertEq(pending[1].txHash, txContext.txHashFor(2));
         assertEq(pending[1].to, bob);
         assertEq(pending[1].amount, 300e6);
         assertEq(pending[1].memo, bytes32("second"));
+    }
+
+    function test_requestWithdrawal_rejectsDuplicateSenderTagBeforeBurn() public {
+        bytes32 senderWitness = keccak256("reused-withdrawal-secret");
+        vm.startPrank(alice);
+        zoneToken.approve(address(outbox), 1000e6);
+        outbox.requestWithdrawal(
+            address(zoneToken), bob, 100e6, bytes32(0), 0, alice, "", senderWitness
+        );
+        uint256 balanceAfterFirst = zoneToken.balanceOf(alice);
+
+        vm.expectRevert(ZoneOutbox.DuplicateSenderTag.selector);
+        outbox.requestWithdrawal(
+            address(zoneToken), bob, 100e6, bytes32(0), 0, alice, "", senderWitness
+        );
+        vm.stopPrank();
+
+        assertEq(zoneToken.balanceOf(alice), balanceAfterFirst);
+        assertEq(_pendingWithdrawalsCount(), 1);
     }
 
     function test_pendingWithdrawalGetters_revertUnlessSequencerOrSystem() public {
@@ -328,7 +393,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         disabledToken.approve(address(outbox), 500e6);
         vm.expectRevert(IZonePortal.TokenNotEnabled.selector);
-        outbox.requestWithdrawal(address(disabledToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(disabledToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 0);
@@ -341,9 +406,9 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
-        outbox.requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
         vm.expectRevert(IZonePortal.InvalidCallbackTarget.selector);
-        outbox.requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 1, alice, "");
+        _requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 1, alice, "");
         vm.stopPrank();
     }
 
@@ -354,26 +419,20 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1500e6);
-        outbox.requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 1, alice, "");
-        outbox.requestWithdrawal(
-            address(zoneToken), callbackTarget, 500e6, bytes32(0), 0, alice, ""
-        );
+        _requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 1, alice, "");
+        _requestWithdrawal(address(zoneToken), callbackTarget, 500e6, bytes32(0), 0, alice, "");
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.AccountNotAllowed.selector, outsider));
-        outbox.requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
     }
 
-    function test_requestWithdrawal_revertsOnInvalidCurrentTxHash() public {
-        ZeroTxContext zeroTxContext = new ZeroTxContext();
-        vm.etch(ZONE_TX_CONTEXT, address(zeroTxContext).code);
-
+    function test_requestWithdrawal_doesNotRequireTxContext() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        vm.expectRevert(ZoneOutbox.InvalidCurrentTxHash.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
-        assertEq(_pendingWithdrawalsCount(), 0);
+        assertEq(_pendingWithdrawalsCount(), 1);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -391,7 +450,7 @@ contract ZoneOutboxTest is Test {
         // Add a withdrawal
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 1);
@@ -407,7 +466,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_singleWithdrawal_correctHash() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("memo"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("memo"), 0, alice, "");
         vm.stopPrank();
 
         // Expected hash
@@ -423,13 +482,13 @@ contract ZoneOutboxTest is Test {
         // Alice withdraws
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         // Bob withdraws
         vm.startPrank(bob);
         zoneToken.approve(address(outbox), 300e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 300e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 300e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         // Build expected hash (oldest = outermost)
@@ -451,8 +510,8 @@ contract ZoneOutboxTest is Test {
         // Add withdrawals
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 300e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 300e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 2);
@@ -467,9 +526,9 @@ contract ZoneOutboxTest is Test {
         // Add 3 withdrawals
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w2"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w3"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w3"), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 3);
@@ -485,10 +544,10 @@ contract ZoneOutboxTest is Test {
         // Add 4 withdrawals in order
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 4000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("w3"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 400e6, bytes32("w4"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("w3"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 400e6, bytes32("w4"), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 4);
@@ -511,7 +570,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_emitsEvent() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         Withdrawal memory w = _withdrawal(1, alice, alice, 500e6, bytes32(0), 0, alice, "");
@@ -530,7 +589,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_writesLastBatchToState() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         Withdrawal memory w = _withdrawal(1, alice, alice, 500e6, bytes32(0), 0, alice, "");
@@ -551,7 +610,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_writesLastFinalizedTimestamp() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         vm.warp(1234);
@@ -567,7 +626,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_onlySequencer() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         // Non-sequencer should revert
@@ -601,22 +660,20 @@ contract ZoneOutboxTest is Test {
     function test_requestWithdrawal_plainRejectsZoneGatewayRecipient() public {
         vm.prank(alice);
         vm.expectRevert(IZonePortal.InvalidCallbackTarget.selector);
-        outbox.requestWithdrawal(
-            address(zoneToken), callbackTarget, 500e6, bytes32(0), 0, alice, ""
-        );
+        _requestWithdrawal(address(zoneToken), callbackTarget, 500e6, bytes32(0), 0, alice, "");
     }
 
     function test_requestWithdrawal_callbackRejectsNonGatewayRecipient() public {
         vm.prank(alice);
         vm.expectRevert(IZonePortal.InvalidCallbackTarget.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 1, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 1, alice, "");
     }
 
     function test_requestWithdrawal_callbackDataIsOpaque() public {
         uint256 balanceBefore = zoneToken.balanceOf(alice);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), callbackTarget, 500e6, bytes32(0), 100_000, alice, hex"01"
         );
         vm.stopPrank();
@@ -629,14 +686,14 @@ contract ZoneOutboxTest is Test {
         address outsider = address(0x600);
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.AccountNotAllowed.selector, outsider));
-        outbox.requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), outsider, 500e6, bytes32(0), 0, alice, "");
     }
 
     function test_requestWithdrawal_allowsUnlistedZoneFallbackRecipient() public {
         address outsider = address(0x600);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, outsider, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, outsider, "");
         vm.stopPrank();
 
         vm.prank(ZONE_INBOX);
@@ -647,7 +704,7 @@ contract ZoneOutboxTest is Test {
         bytes memory callbackData = _callbackData(GatewayFlow.Deposit, alice);
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), // token
             callbackTarget, // to
             500e6, // amount
@@ -678,13 +735,13 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 3000e6);
 
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         assertEq(outbox.nextWithdrawalIndex(), 1);
 
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         assertEq(outbox.nextWithdrawalIndex(), 2);
 
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         assertEq(outbox.nextWithdrawalIndex(), 3);
 
         vm.stopPrank();
@@ -695,8 +752,8 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 5000e6);
 
         // First batch
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
 
         vm.stopPrank();
 
@@ -704,7 +761,7 @@ contract ZoneOutboxTest is Test {
 
         // Second batch
         vm.startPrank(alice);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
 
         assertEq(outbox.nextWithdrawalIndex(), 3);
         vm.stopPrank();
@@ -720,12 +777,12 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 3000e6);
 
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
         assertEq(_pendingWithdrawalsCount(), 1);
 
         vm.startPrank(alice);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
         assertEq(_pendingWithdrawalsCount(), 2);
 
@@ -759,7 +816,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), amount + expectedFee);
         bytes memory callbackData = _callbackData(GatewayFlow.Deposit, alice);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), callbackTarget, amount, bytes32(0), gasLimit, alice, callbackData
         );
         vm.stopPrank();
@@ -776,7 +833,7 @@ contract ZoneOutboxTest is Test {
         uint256 supplyBefore = zoneToken.totalSupply();
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, data);
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, data);
         vm.stopPrank();
 
         assertEq(zoneToken.totalSupply(), supplyBefore - 500e6);
@@ -789,7 +846,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
         vm.expectRevert(ZoneOutbox.CallbackDataTooLarge.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, data);
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, data);
         vm.stopPrank();
     }
 
@@ -798,7 +855,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 4 * 500e6);
         for (uint256 i = 0; i < 4; i++) {
-            outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+            _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         }
         vm.stopPrank();
 
@@ -814,7 +871,7 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(zoneToken.balanceOf(alice), aliceBalanceBefore - 500e6);
@@ -825,7 +882,7 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(zoneToken.totalSupply(), totalSupplyBefore - 500e6);
@@ -836,7 +893,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 200_000e6);
 
         vm.expectRevert(MockZoneToken.InsufficientBalance.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 200_000e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 200_000e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
     }
 
@@ -845,7 +902,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 100e6);
 
         vm.expectRevert(MockZoneToken.InsufficientAllowance.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
     }
 
@@ -858,7 +915,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         // gasLimit = 0, zoneFallbackRecipient = alice is fine
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 1);
@@ -870,7 +927,7 @@ contract ZoneOutboxTest is Test {
 
         // zoneFallbackRecipient = address(0) reverts
         vm.expectRevert(ZoneOutbox.InvalidFallbackRecipient.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, address(0), "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, address(0), "");
         vm.stopPrank();
     }
 
@@ -880,7 +937,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         // gasLimit > 0 with valid fallback
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), callbackTarget, 500e6, bytes32(0), 100_000, alice, callbackData
         );
         vm.stopPrank();
@@ -896,7 +953,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         vm.expectRevert(ZoneOutbox.GasLimitTooHigh.selector);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), bob, 500e6, bytes32(0), highGasLimit, alice, "callback"
         );
         vm.stopPrank();
@@ -913,7 +970,7 @@ contract ZoneOutboxTest is Test {
     function test_requestWithdrawal_validRevealTo_ok() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "", _validRevealTo()
         );
         vm.stopPrank();
@@ -931,7 +988,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         vm.expectRevert(ZoneOutbox.InvalidRevealTo.selector);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken),
             bob,
             500e6,
@@ -949,7 +1006,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         vm.expectRevert(ZoneOutbox.InvalidRevealTo.selector);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken),
             bob,
             500e6,
@@ -967,7 +1024,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         vm.expectRevert(ZoneOutbox.InvalidRevealTo.selector);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken),
             bob,
             500e6,
@@ -983,7 +1040,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_encryptedSenderCountMismatch_reverts() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         bytes[] memory encryptedSenders = new bytes[](0);
@@ -998,7 +1055,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_encryptedSenderLengthMismatch_reverts() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(
+        _requestWithdrawal(
             address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "", _validRevealTo()
         );
         vm.stopPrank();
@@ -1025,17 +1082,17 @@ contract ZoneOutboxTest is Test {
         // Add three withdrawals
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 3000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
         vm.stopPrank();
 
         vm.startPrank(bob);
         zoneToken.approve(address(outbox), 3000e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 200e6, bytes32("w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 200e6, bytes32("w2"), 0, alice, "");
         vm.stopPrank();
 
         vm.startPrank(charlie);
         zoneToken.approve(address(outbox), 3000e6);
-        outbox.requestWithdrawal(address(zoneToken), charlie, 300e6, bytes32("w3"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), charlie, 300e6, bytes32("w3"), 0, alice, "");
         vm.stopPrank();
 
         // Build expected hash (oldest = outermost)
@@ -1056,11 +1113,11 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_partialBatchDoesNotLeaveRemainder_reverts() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 5000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("w3"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 400e6, bytes32("w4"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w5"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("w3"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 400e6, bytes32("w4"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w5"), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 5);
@@ -1075,8 +1132,8 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_countLargerThanPending_reverts() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
         vm.stopPrank();
 
         bytes[] memory encryptedSenders = new bytes[](1000);
@@ -1091,8 +1148,8 @@ contract ZoneOutboxTest is Test {
         // First batch
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 10_000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("b1w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("b1w2"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("b1w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("b1w2"), 0, alice, "");
         vm.stopPrank();
 
         bytes32 hash1 = _finalizeWithdrawalBatch(type(uint256).max);
@@ -1100,7 +1157,7 @@ contract ZoneOutboxTest is Test {
 
         // Second batch
         vm.startPrank(alice);
-        outbox.requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("b2w1"), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("b2w1"), 0, alice, "");
         vm.stopPrank();
 
         bytes32 hash2 = _finalizeWithdrawalBatch(type(uint256).max);
@@ -1125,7 +1182,8 @@ contract ZoneOutboxTest is Test {
             bytes32("payment123"), // memo
             50_000, // gasLimit
             charlie, // zoneFallbackRecipient
-            callbackData // data
+            callbackData, // data
+            _nextSenderWitness()
         );
         vm.stopPrank();
 
@@ -1148,7 +1206,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 0);
         vm.expectRevert(ZoneOutbox.ZeroAmountWithdrawal.selector);
-        outbox.requestWithdrawal(address(zoneToken), bob, 0, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 0, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 0);
@@ -1165,10 +1223,14 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), 500e6);
 
         uint128 expectedFee = outbox.calculateWithdrawalFee(50_000);
-        vm.expectEmit(true, true, false, true);
+        bytes32 senderWitness = _nextSenderWitness();
+        bytes32 expectedSenderTag =
+            keccak256(abi.encode(SENDER_TAG_DOMAIN, mockPortal, alice, senderWitness));
+        vm.expectEmit(true, true, true, true);
         emit IZoneOutbox.WithdrawalRequested(
             0, // index
             alice, // sender
+            expectedSenderTag,
             address(zoneToken), // token
             callbackTarget, // to
             500e6, // amount
@@ -1187,7 +1249,8 @@ contract ZoneOutboxTest is Test {
             bytes32("memo"),
             50_000,
             charlie,
-            callbackData
+            callbackData,
+            senderWitness
         );
         vm.stopPrank();
     }
@@ -1212,7 +1275,7 @@ contract ZoneOutboxTest is Test {
         zoneToken.approve(address(outbox), numWithdrawals * 100e6);
 
         for (uint256 i = 0; i < numWithdrawals; i++) {
-            outbox.requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(i), 0, alice, "");
+            _requestWithdrawal(address(zoneToken), bob, 100e6, bytes32(i), 0, alice, "");
         }
         vm.stopPrank();
 
@@ -1248,7 +1311,7 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
         for (uint256 i = 0; i < 10; i++) {
-            outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+            _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
         }
         vm.stopPrank();
         assertEq(_pendingWithdrawalsCount(), 10);
@@ -1261,12 +1324,12 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
 
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
 
         vm.expectRevert(ZoneOutbox.TooManyWithdrawalsThisBlock.selector);
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
     }
 
@@ -1277,19 +1340,19 @@ contract ZoneOutboxTest is Test {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
 
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
 
         vm.expectRevert(ZoneOutbox.TooManyWithdrawalsThisBlock.selector);
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
 
         vm.roll(block.number + 1);
 
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
 
         vm.expectRevert(ZoneOutbox.TooManyWithdrawalsThisBlock.selector);
-        outbox.requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), alice, 10e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(_pendingWithdrawalsCount(), 4);
@@ -1376,7 +1439,7 @@ contract ZoneOutboxTest is Test {
     function test_finalizeWithdrawalBatch_zeroCountWithPending_doesNotAdvance() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         bytes[] memory encryptedSenders = new bytes[](0);
@@ -1393,7 +1456,7 @@ contract ZoneOutboxTest is Test {
 
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32("memo"), 0, alice, data);
+        _requestWithdrawal(address(zoneToken), bob, 500e6, bytes32("memo"), 0, alice, data);
         vm.stopPrank();
 
         Withdrawal memory w = _withdrawal(1, alice, bob, 500e6, bytes32("memo"), 0, alice, data);
@@ -1413,7 +1476,7 @@ contract ZoneOutboxTest is Test {
 
             vm.startPrank(sender);
             zoneToken.approve(address(outbox), amount);
-            outbox.requestWithdrawal(address(zoneToken), sender, amount, memo, 0, alice, "");
+            _requestWithdrawal(address(zoneToken), sender, amount, memo, 0, alice, "");
             vm.stopPrank();
 
             withdrawals[i] = _withdrawal(i + 1, sender, sender, amount, memo, 0, alice, "");

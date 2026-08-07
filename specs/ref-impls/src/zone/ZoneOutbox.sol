@@ -6,7 +6,6 @@ import {
     IZoneOutbox,
     IZonePortal,
     IZoneToken,
-    IZoneTxContext,
     LastBatch,
     MAX_WITHDRAWAL_CALLBACK_GAS,
     PORTAL_ACCESS_MODE_SLOT,
@@ -17,9 +16,9 @@ import {
     PORTAL_TOKEN_CONFIGS_SLOT,
     PendingWithdrawal,
     Role,
+    SENDER_TAG_DOMAIN,
     Withdrawal,
-    ZONE_INBOX,
-    ZONE_TX_CONTEXT
+    ZONE_INBOX
 } from "../interfaces/IZone.sol";
 
 import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
@@ -99,6 +98,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Private fallback recipient lookup used when an L1 withdrawal bounces back
     mapping(uint64 fallbackNonce => address zoneFallbackRecipient) internal _zoneFallbackRecipients;
 
+    /// @notice Permanently consumed user sender tags.
+    mapping(bytes32 senderTag => bool used) internal _usedSenderTags;
+
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -111,7 +113,7 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidBlockNumber();
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
-    error InvalidCurrentTxHash();
+    error DuplicateSenderTag();
     error ZeroAmountWithdrawal();
     error InvalidWithdrawalCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
@@ -181,6 +183,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param gasLimit L1 callback gas limit (0 = no callback, capped by MAX_WITHDRAWAL_GAS_LIMIT)
     /// @param zoneFallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
+    /// @param senderWitness Fresh private 32-byte sender commitment witness
     function requestWithdrawal(
         address token,
         address to,
@@ -188,11 +191,14 @@ contract ZoneOutbox is IZoneOutbox {
         bytes32 memo,
         uint64 gasLimit,
         address zoneFallbackRecipient,
-        bytes calldata data
+        bytes calldata data,
+        bytes32 senderWitness
     )
         external
     {
-        _requestWithdrawal(token, to, amount, memo, gasLimit, zoneFallbackRecipient, data, "");
+        _requestWithdrawal(
+            token, to, amount, memo, gasLimit, zoneFallbackRecipient, data, senderWitness, ""
+        );
     }
 
     /// @notice Request a withdrawal from the zone back to Tempo
@@ -208,6 +214,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param gasLimit L1 callback gas limit (0 = no callback, capped by MAX_WITHDRAWAL_GAS_LIMIT)
     /// @param zoneFallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
+    /// @param senderWitness Fresh private 32-byte sender commitment witness
     /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
     function requestWithdrawal(
         address token,
@@ -217,11 +224,14 @@ contract ZoneOutbox is IZoneOutbox {
         uint64 gasLimit,
         address zoneFallbackRecipient,
         bytes calldata data,
+        bytes32 senderWitness,
         bytes calldata revealTo
     )
         external
     {
-        _requestWithdrawal(token, to, amount, memo, gasLimit, zoneFallbackRecipient, data, revealTo);
+        _requestWithdrawal(
+            token, to, amount, memo, gasLimit, zoneFallbackRecipient, data, senderWitness, revealTo
+        );
     }
 
     /// @notice Shared implementation for withdrawal requests with optional sender reveal
@@ -235,6 +245,7 @@ contract ZoneOutbox is IZoneOutbox {
     /// @param gasLimit L1 callback gas limit (0 = no callback)
     /// @param zoneFallbackRecipient Zone address for bounce-back if callback fails
     /// @param data Calldata for IWithdrawalReceiver callback
+    /// @param senderWitness Fresh private 32-byte sender commitment witness
     /// @param revealTo Optional compressed secp256k1 pubkey for encrypted sender reveal
     function _requestWithdrawal(
         address token,
@@ -244,6 +255,7 @@ contract ZoneOutbox is IZoneOutbox {
         uint64 gasLimit,
         address zoneFallbackRecipient,
         bytes memory data,
+        bytes32 senderWitness,
         bytes memory revealTo
     )
         internal
@@ -294,8 +306,10 @@ contract ZoneOutbox is IZoneOutbox {
         // Fee is paid in the same token being withdrawn
         uint128 fee = _calculateWithdrawalFee(gasLimit);
         uint128 totalBurn = amount + fee;
-        bytes32 txHash = IZoneTxContext(ZONE_TX_CONTEXT).currentTxHash();
-        if (txHash == bytes32(0)) revert InvalidCurrentTxHash();
+        bytes32 senderTag =
+            keccak256(abi.encode(SENDER_TAG_DOMAIN, tempoPortal, msg.sender, senderWitness));
+        if (_usedSenderTags[senderTag]) revert DuplicateSenderTag();
+        _usedSenderTags[senderTag] = true;
 
         // Transfer tokens from sender to this contract, then burn
         // (Using transferFrom so user must approve first)
@@ -314,7 +328,7 @@ contract ZoneOutbox is IZoneOutbox {
             PendingWithdrawal({
                 token: token,
                 sender: msg.sender,
-                txHash: txHash,
+                senderWitness: senderWitness,
                 to: to,
                 amount: amount,
                 memo: memo,
@@ -329,7 +343,18 @@ contract ZoneOutbox is IZoneOutbox {
         uint64 index = nextWithdrawalIndex++;
 
         emit WithdrawalRequested(
-            index, msg.sender, token, to, amount, fee, memo, gasLimit, fallbackNonce, data, revealTo
+            index,
+            msg.sender,
+            senderTag,
+            token,
+            to,
+            amount,
+            fee,
+            memo,
+            gasLimit,
+            fallbackNonce,
+            data,
+            revealTo
         );
     }
 
@@ -348,7 +373,7 @@ contract ZoneOutbox is IZoneOutbox {
             PendingWithdrawal({
                 token: token,
                 sender: address(0),
-                txHash: bytes32(0),
+                senderWitness: bytes32(0),
                 to: tempoRefundRecipient,
                 amount: amount,
                 memo: bytes32(0),
@@ -361,7 +386,18 @@ contract ZoneOutbox is IZoneOutbox {
 
         uint64 index = nextWithdrawalIndex++;
         emit WithdrawalRequested(
-            index, address(0), token, tempoRefundRecipient, amount, 0, bytes32(0), 0, 0, "", ""
+            index,
+            address(0),
+            keccak256(abi.encodePacked(address(0), bytes32(0))),
+            token,
+            tempoRefundRecipient,
+            amount,
+            0,
+            bytes32(0),
+            0,
+            0,
+            "",
+            ""
         );
     }
 
@@ -466,20 +502,12 @@ contract ZoneOutbox is IZoneOutbox {
         emit BatchFinalized(withdrawalQueueHash, currentWithdrawalBatchIndex);
     }
 
-    /// @dev Include the public per-withdrawal nonce so requests from one private transaction do
-    ///      not share a tag. Preserve the existing canonical tag for deposit bounce-backs.
-    function _senderTag(PendingWithdrawal memory pendingWithdrawal)
-        internal
-        pure
-        returns (bytes32)
-    {
-        if (pendingWithdrawal.sender == address(0) && pendingWithdrawal.fallbackNonce == 0) {
-            return keccak256(abi.encodePacked(pendingWithdrawal.sender, pendingWithdrawal.txHash));
+    function _senderTag(PendingWithdrawal memory pending) internal view returns (bytes32) {
+        if (pending.sender == address(0) && pending.fallbackNonce == 0) {
+            return keccak256(abi.encodePacked(address(0), bytes32(0)));
         }
         return keccak256(
-            abi.encodePacked(
-                pendingWithdrawal.sender, pendingWithdrawal.txHash, pendingWithdrawal.fallbackNonce
-            )
+            abi.encode(SENDER_TAG_DOMAIN, tempoPortal, pending.sender, pending.senderWitness)
         );
     }
 

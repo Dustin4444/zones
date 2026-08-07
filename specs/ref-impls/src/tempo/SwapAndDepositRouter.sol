@@ -27,6 +27,9 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     IStablecoinDEX public immutable stablecoinDEX;
     IZoneFactory public immutable zoneFactory;
 
+    /// @notice Authenticated source withdrawals already consumed by this router.
+    mapping(bytes32 nullifier => bool consumed) public withdrawals;
+
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -35,6 +38,7 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     error InvalidSourcePortal();
     error InvalidTargetPortal();
     error InvalidToken();
+    error WithdrawalAlreadyConsumed(bytes32 nullifier);
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -64,7 +68,7 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     function onWithdrawalReceived(
         uint32 sourceZoneId,
         address sourcePortal,
-        bytes32, /* senderTag */
+        bytes32 senderTag,
         address tokenIn,
         uint128 amount,
         bytes calldata data
@@ -90,6 +94,16 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
             uint128 minAmountOut
         ) = abi.decode(data, (address, address, uint256, DepositPayload, address, uint128));
 
+        // Derive one router-scoped withdrawal identity exclusively from authenticated callback
+        // arguments. Its full 32 bytes are the replay nullifier; its first 12 bytes are the GCM
+        // nonce that binds the encrypted payload to this withdrawal.
+        bytes32 withdrawalId = _withdrawalId(sourcePortal, senderTag);
+        if (withdrawals[withdrawalId]) {
+            revert WithdrawalAlreadyConsumed(withdrawalId);
+        }
+        withdrawals[withdrawalId] = true;
+        encrypted.nonce = bytes12(withdrawalId);
+
         _validateTarget(targetPortal, tokenOut);
 
         uint128 amountOut = _swapIfNeeded(tokenIn, tokenOut, amount, minAmountOut);
@@ -104,6 +118,16 @@ contract SwapAndDepositRouter is IWithdrawalReceiver {
     /*//////////////////////////////////////////////////////////////
                            INTERNAL HELPERS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev `senderTag` is already domain-separated by the source protocol. `address(this)` scopes
+    ///      the derived identity to this callback application.
+    function _withdrawalId(address sourcePortal, bytes32 senderTag)
+        internal
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(address(this), sourcePortal, senderTag));
+    }
 
     /// @notice Validate the target portal is registered and the token is enabled on it
     function _validateTarget(address targetPortal, address tokenOut) internal view {

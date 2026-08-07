@@ -22,6 +22,7 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
+    SENDER_TAG_DOMAIN,
     Withdrawal,
     ZONE_MESSENGER_ADDRESS,
     ZONE_VERIFIER_ADDRESS,
@@ -300,10 +301,13 @@ contract ZoneIntegrationTest is BaseTest {
         l2Inbox.advanceTempo(new bytes[](1), queuedDeposits, decryptions, new EnabledToken[](0));
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return keccak256(
-            abi.encodePacked(sender, zoneTxContext.txHashFor(txSequence), uint64(txSequence))
-        );
+    function _senderTag(address sender, uint256 withdrawalSequence)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 secret = keccak256(abi.encode("test-withdrawal-secret", withdrawalSequence));
+        return keccak256(abi.encode(SENDER_TAG_DOMAIN, address(l1Portal), sender, secret));
     }
 
     function _withdrawal(
@@ -560,7 +564,8 @@ contract ZoneIntegrationTest is BaseTest {
         // Alice requests withdrawal to the configured gateway.
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 2000e6);
-        l2Outbox.requestWithdrawal(
+        _requestWithdrawal(
+            l2Outbox,
             address(l2ZoneToken),
             address(zoneGateway),
             2000e6,
@@ -643,8 +648,8 @@ contract ZoneIntegrationTest is BaseTest {
         // First batch: Alice withdraws to Bob
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 50_000e6);
-        l2Outbox.requestWithdrawal(
-            address(l2ZoneToken), bob, 1000e6, bytes32("to bob"), 0, alice, ""
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), bob, 1000e6, bytes32("to bob"), 0, alice, ""
         );
         vm.stopPrank();
 
@@ -674,8 +679,8 @@ contract ZoneIntegrationTest is BaseTest {
 
         // Second batch: Alice withdraws to Charlie
         vm.startPrank(alice);
-        l2Outbox.requestWithdrawal(
-            address(l2ZoneToken), charlie, 2000e6, bytes32("to charlie"), 0, alice, ""
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), charlie, 2000e6, bytes32("to charlie"), 0, alice, ""
         );
         vm.stopPrank();
 
@@ -703,8 +708,8 @@ contract ZoneIntegrationTest is BaseTest {
 
         // Third batch: Alice withdraws to herself
         vm.startPrank(alice);
-        l2Outbox.requestWithdrawal(
-            address(l2ZoneToken), alice, 3000e6, bytes32("to self"), 0, alice, ""
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), alice, 3000e6, bytes32("to self"), 0, alice, ""
         );
         vm.stopPrank();
 
@@ -800,12 +805,16 @@ contract ZoneIntegrationTest is BaseTest {
         // Phase 2: Withdrawals
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 5000e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), charlie, 2000e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), charlie, 2000e6, bytes32(0), 0, alice, ""
+        );
         vm.stopPrank();
 
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 3000e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), charlie, 1500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), charlie, 1500e6, bytes32(0), 0, alice, ""
+        );
         vm.stopPrank();
 
         bytes32 wHash = _finalizeWithdrawalBatch(type(uint256).max);
@@ -906,7 +915,7 @@ contract ZoneIntegrationTest is BaseTest {
         // Withdraw 3000
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 3000e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 3000e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(l2Outbox, address(l2ZoneToken), bob, 3000e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         assertEq(l2ZoneToken.totalSupply(), initialSupply + 10_000e6 - 3000e6); // Tokens burned on withdrawal request

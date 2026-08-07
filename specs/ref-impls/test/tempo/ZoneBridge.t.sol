@@ -23,6 +23,7 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
+    SENDER_TAG_DOMAIN,
     Withdrawal,
     ZONE_INBOX,
     ZONE_MESSENGER_ADDRESS,
@@ -261,10 +262,13 @@ contract ZoneBridgeTest is BaseTest {
         l2BlockHash = GENESIS_BLOCK_HASH;
     }
 
-    function _senderTag(address sender, uint256 txSequence) internal view returns (bytes32) {
-        return keccak256(
-            abi.encodePacked(sender, zoneTxContext.txHashFor(txSequence), uint64(txSequence))
-        );
+    function _senderTag(address sender, uint256 withdrawalSequence)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes32 secret = keccak256(abi.encode("test-withdrawal-secret", withdrawalSequence));
+        return keccak256(abi.encode(SENDER_TAG_DOMAIN, address(l1Portal), sender, secret));
     }
 
     function _withdrawal(
@@ -546,7 +550,8 @@ contract ZoneBridgeTest is BaseTest {
         uint128 withdrawAmount = 400e6;
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), withdrawAmount);
-        l2Outbox.requestWithdrawal(
+        _requestWithdrawal(
+            l2Outbox,
             address(l2ZoneToken),
             alice, // to (back to self on L1)
             withdrawAmount,
@@ -616,12 +621,12 @@ contract ZoneBridgeTest is BaseTest {
         // === Both request withdrawals ===
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 500e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), alice, 500e6, bytes32(0), 0, alice, "");
+        _requestWithdrawal(l2Outbox, address(l2ZoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 1000e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 1000e6, bytes32(0), 0, bob, "");
+        _requestWithdrawal(l2Outbox, address(l2ZoneToken), bob, 1000e6, bytes32(0), 0, bob, "");
         vm.stopPrank();
 
         // Sequencer observes withdrawals
@@ -667,7 +672,8 @@ contract ZoneBridgeTest is BaseTest {
         // Request withdrawal with callback
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 500e6);
-        l2Outbox.requestWithdrawal(
+        _requestWithdrawal(
+            l2Outbox,
             address(l2ZoneToken),
             address(zoneGateway),
             500e6,
@@ -713,7 +719,8 @@ contract ZoneBridgeTest is BaseTest {
         zoneGateway.setReturnToZone(false);
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 500e6);
-        l2Outbox.requestWithdrawal(
+        _requestWithdrawal(
+            l2Outbox,
             address(l2ZoneToken),
             address(zoneGateway),
             500e6,
@@ -764,7 +771,7 @@ contract ZoneBridgeTest is BaseTest {
         // Bob withdraws on zone
         vm.startPrank(bob);
         l2ZoneToken.approve(address(l2Outbox), 300e6);
-        l2Outbox.requestWithdrawal(address(l2ZoneToken), bob, 300e6, bytes32(0), 0, bob, "");
+        _requestWithdrawal(l2Outbox, address(l2ZoneToken), bob, 300e6, bytes32(0), 0, bob, "");
         vm.stopPrank();
 
         // Verify Bob's zone balance debited (100K + 300e6 received - 300e6 withdrawn)
@@ -786,8 +793,8 @@ contract ZoneBridgeTest is BaseTest {
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), type(uint256).max);
         vm.expectRevert(MockZoneToken.InsufficientBalance.selector);
-        l2Outbox.requestWithdrawal(
-            address(l2ZoneToken), alice, uint128(100_001e6), bytes32(0), 0, alice, ""
+        _requestWithdrawal(
+            l2Outbox, address(l2ZoneToken), alice, uint128(100_001e6), bytes32(0), 0, alice, ""
         );
         vm.stopPrank();
     }
@@ -865,7 +872,8 @@ contract ZoneBridgeTest is BaseTest {
         vm.startPrank(alice);
         l2ZoneToken.approve(address(l2Outbox), 500e6);
         vm.expectRevert(ZoneOutbox.InvalidFallbackRecipient.selector);
-        l2Outbox.requestWithdrawal(
+        _requestWithdrawal(
+            l2Outbox,
             address(l2ZoneToken),
             address(withdrawalReceiver),
             500e6,
