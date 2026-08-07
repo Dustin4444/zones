@@ -2888,6 +2888,7 @@ impl WithdrawalArgs {
     /// The withdrawal callback sends tokens to the router, which deposits them
     /// into `target_portal` for `recipient`. Both zones must use the same token
     /// (no swap needed — `tokenOut == tokenIn`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn cross_zone_via_router(
         l1: &L1TestNode,
         amount: u128,
