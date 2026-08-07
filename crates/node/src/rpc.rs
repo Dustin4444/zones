@@ -51,7 +51,7 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval},
 };
-use zone_l1::TempoStateExt as _;
+use zone_l1::{TempoStateExt as _, state::EnabledTokenRegistry};
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
 use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
@@ -566,6 +566,7 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
 pub struct ZoneRpc<Api: EthApiTypes> {
     eth: EthHandlers<Api>,
     config: zone_rpc::RedactedRpcConfig,
+    enabled_tokens: EnabledTokenRegistry,
     l1_provider: DynProvider<TempoNetwork>,
     tempo_state: tempo_zone_contracts::TempoState::TempoStateInstance<
         DynProvider<TempoNetwork>,
@@ -581,6 +582,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
     pub async fn new(
         eth: EthHandlers<Api>,
         config: zone_rpc::RedactedRpcConfig,
+        enabled_tokens: EnabledTokenRegistry,
     ) -> eyre::Result<Self> {
         let l1_rpc_url = config.l1_rpc_url.clone();
         let zone_rpc_url = config.zone_rpc_url.clone();
@@ -604,6 +606,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         let rpc = Self {
             eth,
             config,
+            enabled_tokens,
             l1_provider,
             tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
@@ -668,8 +671,13 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         }
     }
 
-    async fn zone_tokens(&self) -> Result<Vec<Address>, JsonRpcError> {
-        zone_tokens(self.config.zone_portal, &self.l1_provider).await
+    fn zone_tokens(&self) -> Vec<Address> {
+        // Preserve the default token when running without an L1 portal.
+        if self.config.zone_portal.is_zero() {
+            return vec![ZONE_TOKEN_ADDRESS];
+        }
+
+        self.enabled_tokens.read().iter().copied().collect()
     }
 
     fn enforce_authorized(
@@ -985,7 +993,7 @@ where
 
     fn get_logs(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
             let logs = EthFilterApiServer::logs(&self.eth.filter, filter)
@@ -998,7 +1006,7 @@ where
 
     fn new_filter(&self, mut filter: Filter, auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &auth.caller)?;
             let id = EthFilterApiServer::new_filter(&self.eth.filter, filter)
@@ -1131,7 +1139,7 @@ where
             let provider = self.eth.api.provider().clone();
             let caller = auth.caller;
 
-            let zone_tokens = self.zone_tokens().await?;
+            let zone_tokens = self.zone_tokens();
             zone_rpc::filter::scope_filter_addresses(&mut filter, &zone_tokens)?;
             zone_rpc::filter::scope_filter_for_caller(&mut filter, &caller)?;
 
