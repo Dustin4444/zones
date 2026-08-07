@@ -4,7 +4,7 @@ use alloy_network::ReceiptResponse as _;
 use alloy_primitives::{Address, B256};
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
-use crate::protocol::events::{L1ProtocolEvent, PortalModelEvent, classify_l1_protocol_event};
+use crate::protocol::events::{L1ProtocolEvent, PortalEvent, classify_l1_protocol_event};
 
 use super::OrderedL1Outcome;
 use crate::observe::error::{ObservationError, PortalCallError, PortalCallFamily, ProtocolChain};
@@ -51,7 +51,7 @@ pub(super) fn ordered_transactions(
             else {
                 continue;
             };
-            if matches!(event, L1ProtocolEvent::KnownNonModel) {
+            if matches!(event, L1ProtocolEvent::KnownIgnored) {
                 continue;
             }
 
@@ -77,23 +77,23 @@ pub(super) fn ordered_transactions(
 
 fn call_requirement(event: &L1ProtocolEvent) -> Option<PortalCallFamily> {
     match event {
-        L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(_)) => {
+        L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_)) => {
             Some(PortalCallFamily::SubmitBatch)
         }
         L1ProtocolEvent::Portal(
-            PortalModelEvent::WithdrawalProcessed(_)
-            | PortalModelEvent::WithdrawalBounceBack(_)
-            | PortalModelEvent::DepositBounceBack(_)
-            | PortalModelEvent::DepositBounceBackPending(_),
+            PortalEvent::WithdrawalProcessed(_)
+            | PortalEvent::WithdrawalBounceBack(_)
+            | PortalEvent::DepositBounceBack(_)
+            | PortalEvent::DepositBounceBackPending(_),
         ) => Some(PortalCallFamily::ProcessWithdrawals),
         L1ProtocolEvent::Portal(
-            PortalModelEvent::DepositMade(_)
-            | PortalModelEvent::TokenEnabled(_)
-            | PortalModelEvent::RefundClaimed(_)
-            | PortalModelEvent::BouncebackGasUpdated(_),
+            PortalEvent::DepositMade(_)
+            | PortalEvent::TokenEnabled(_)
+            | PortalEvent::RefundClaimed(_)
+            | PortalEvent::BouncebackGasUpdated(_),
         )
         | L1ProtocolEvent::FactoryZoneCreated(_)
-        | L1ProtocolEvent::KnownNonModel => None,
+        | L1ProtocolEvent::KnownIgnored => None,
     }
 }
 

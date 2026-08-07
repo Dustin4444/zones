@@ -1,5 +1,3 @@
-//! Deterministic local checkpoint-builder identity checks.
-
 pub(crate) mod ancestry;
 mod error;
 pub(crate) mod genesis;

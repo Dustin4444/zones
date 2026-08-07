@@ -1,19 +1,17 @@
-//! Fail-closed archive bootstrap errors.
-
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, U256};
 use reth_storage_api::errors::provider::ProviderError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BootstrapError {
-    #[error("observe mode requires a nonzero zone ID")]
+    #[error("Zone ID must not be zero")]
     MissingZoneId,
-    #[error("observe mode requires a nonzero portal creation block hash")]
+    #[error("Portal creation block hash must not be zero")]
     MissingCreationBlockHash,
-    #[error("unsupported bootstrap: zone genesis has a zero TempoState checkpoint")]
+    #[error("unsupported bootstrap: Zone genesis has a zero TempoState checkpoint")]
     UnsupportedBootstrapStyle,
     #[error(
-        "unsupported bootstrap: zone genesis has nonzero protocol progress \
+        "unsupported bootstrap: Zone genesis has nonzero protocol progress \
          (processed deposit cursor {processed_deposit_number}:{processed_deposit_queue_hash}, \
          last withdrawal batch {withdrawal_batch_index}:{withdrawal_queue_hash})"
     )]
@@ -23,28 +21,28 @@ pub(crate) enum BootstrapError {
         withdrawal_queue_hash: B256,
         withdrawal_batch_index: u64,
     },
-    #[error("unsupported bootstrap: token {token} has nonzero supply {actual} at zone genesis")]
+    #[error("unsupported bootstrap: token {token} has nonzero supply {actual} at Zone genesis")]
     NonzeroZoneGenesisSupply { token: Address, actual: U256 },
-    #[error("failed to read exact zone genesis state at {hash}")]
+    #[error("failed to read Zone genesis state at {hash}")]
     LocalGenesisStateRead {
         hash: B256,
         #[source]
         source: ProviderError,
     },
-    #[error("zone genesis fee token is not a canonically padded address: {word}")]
+    #[error("Zone genesis fee token is not a canonically padded address: {word}")]
     MalformedZoneGenesisInitialToken { word: U256 },
-    #[error("zone genesis fee token must be nonzero")]
+    #[error("Zone genesis fee token must not be zero")]
     MissingZoneGenesisInitialToken,
-    #[error("failed to read canonical zone block {number}")]
+    #[error("failed to read canonical Zone block {number}")]
     LocalCanonicalRead {
         number: u64,
         #[source]
         source: ProviderError,
     },
-    #[error("canonical zone block {number} is missing; archive history is required")]
+    #[error("canonical Zone block {number} is missing; archive history is required")]
     MissingLocalCanonical { number: u64 },
     #[error(
-        "zone genesis TempoState checkpoint {checkpoint_number} does not match L1 header {header_number} at {hash}"
+        "Zone genesis TempoState checkpoint {checkpoint_number} does not match Tempo header {header_number} at {hash}"
     )]
     GenesisAnchorNumberMismatch {
         hash: B256,
@@ -52,7 +50,7 @@ pub(crate) enum BootstrapError {
         header_number: u64,
     },
     #[error(
-        "cannot prove Tempo ancestry: proposed descendant {descendant:?} precedes proposed ancestor {ancestor:?}"
+        "invalid Tempo ancestry range: descendant {descendant:?} precedes ancestor {ancestor:?}"
     )]
     InvalidTempoAncestryRange {
         descendant: BlockNumHash,
@@ -74,7 +72,7 @@ pub(crate) enum BootstrapError {
         expected_parent: BlockNumHash,
         actual_parent: BlockNumHash,
     },
-    #[error("zone ID {zone_id} requires chain ID {expected}, local genesis uses {actual}")]
+    #[error("Zone ID {zone_id} requires chain ID {expected}, local genesis uses {actual}")]
     ZoneChainIdMismatch {
         zone_id: u32,
         expected: u64,

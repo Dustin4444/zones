@@ -13647,6 +13647,7 @@ dependencies = [
  "reth-provider",
  "reth-storage-api",
  "serde",
+ "syn 2.0.119",
  "tempfile",
  "tempo-alloy",
  "tempo-contracts",
@@ -13654,18 +13655,8 @@ dependencies = [
  "tempo-zone-contracts",
  "thiserror 2.0.18",
  "tokio",
- "zone-checker-kernel",
+ "toml",
  "zone-primitives",
-]
-
-[[package]]
-name = "zone-checker-kernel"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]

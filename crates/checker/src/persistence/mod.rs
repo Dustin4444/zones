@@ -1,5 +1,3 @@
-//! Checkpoint and canonical-journal persistence.
-
 mod codec;
 mod schema;
 #[cfg(test)]
@@ -8,6 +6,7 @@ mod types;
 
 pub(crate) use types::*;
 
+use crate::kernel::{Datum, Finding as FindingDetails, FindingLocation, State, validate};
 use reth_db::{
     Database, DatabaseEnv, DatabaseEnvKind,
     cursor::{DbCursorRO, DbCursorRW},
@@ -23,9 +22,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use zone_checker_kernel::{Datum, Finding as FindingDetails, FindingLocation, State, validate};
 
 pub(crate) const SCHEMA_VERSION: u32 = 3;
+const CHECKPOINT_INTERVAL: u64 = 64;
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,7 +36,7 @@ pub(crate) enum PersistenceError {
     #[error("database codec error: {0}")]
     Codec(#[from] codec::CodecError),
     #[error(
-        "incompatible checker schema: expected {expected}, actual {actual}; rebuild at {rebuild_path}"
+        "incompatible checker schema: expected {expected}, found {actual}; rebuild at {rebuild_path}"
     )]
     Schema {
         expected: u32,
@@ -91,7 +90,7 @@ impl Persistence {
         Self {
             db: Arc::new(db),
             identity,
-            checkpoint_interval: 64,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         }
@@ -113,7 +112,7 @@ impl Persistence {
         let this = Self {
             db: Arc::new(db),
             identity,
-            checkpoint_interval: 64,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -127,19 +126,14 @@ impl Persistence {
             active_finding: None,
             coverage: Coverage::Complete,
         };
-        codec::encode(&Checkpoint {
+        let checkpoint = Checkpoint {
             cut,
             state: state.clone(),
-        })?;
+        };
+        codec::encode(&checkpoint)?;
         codec::encode(&meta)?;
         let tx = this.db.tx_mut()?;
-        tx.put::<Checkpoints>(
-            id,
-            Checkpoint {
-                cut,
-                state: state.clone(),
-            },
-        )?;
+        tx.put::<Checkpoints>(id, checkpoint)?;
         tx.put::<Meta>(MetaKey::Version, MetaValue::Version(SCHEMA_VERSION))?;
         tx.put::<Meta>(
             MetaKey::Metadata,
@@ -156,7 +150,7 @@ impl Persistence {
         let this = Self {
             db: Arc::new(db),
             identity,
-            checkpoint_interval: 64,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -338,32 +332,24 @@ impl Persistence {
         finding: Finding,
     ) -> Result<Snapshot> {
         self.write(prior, prior.state.clone(), |tx, meta| {
-            if finding.zone.number
-                != meta
-                    .verified_zone_tip
-                    .number
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("height overflow"))?
-                || finding.parent != meta.verified_zone_tip
-                || !valid_imported_finding_coordinate(&finding, meta.imported_tempo_tip)
-            {
-                return Err(invalid("finding is not at the next verified coordinate"));
-            }
             validate_finding(key, &finding, Some(meta))?;
             codec::encode(&finding)?;
             if let Some(old) = tx.get::<Findings>(key)? {
-                let mut old_identity = old.clone();
-                old_identity.summary.clear();
-                let mut new_identity = finding.clone();
-                new_identity.summary.clear();
-                if old_identity != new_identity {
+                let same_evidence = old.zone == finding.zone
+                    && old.parent == finding.parent
+                    && old.imported_tempo == finding.imported_tempo
+                    && old.imported_tempo_parent == finding.imported_tempo_parent
+                    && old.details == finding.details
+                    && old.evidence_len == finding.evidence_len
+                    && old.evidence_digest == finding.evidence_digest;
+                if !same_evidence {
                     return Err(invalid("conflicting same-height finding evidence"));
                 }
                 if old.summary != finding.summary {
-                    tx.put::<Findings>(key, finding.clone())?;
+                    tx.put::<Findings>(key, finding)?;
                 }
             } else {
-                tx.put::<Findings>(key, finding.clone())?;
+                tx.put::<Findings>(key, finding)?;
             }
             meta.active_finding = Some(key);
             Ok(())
@@ -621,8 +607,8 @@ fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<
 fn validate_state(state: &State, identity: Identity) -> Result<()> {
     State::from_rows(state.rows().clone()).map_err(|e| invalid(e.to_string()))?;
     validate(state).map_err(|e| invalid(format!("invariant {e:?}")))?;
-    let Some(zone_checker_kernel::StateValue::Portal(portal)) =
-        state.rows().get(&zone_checker_kernel::StateKey::Portal)
+    let Some(crate::kernel::StateValue::Portal(portal)) =
+        state.rows().get(&crate::kernel::StateKey::Portal)
     else {
         return Err(invalid("missing Portal identity"));
     };
@@ -674,7 +660,9 @@ fn canonical_datum(value: Option<&Datum>) -> Vec<u8> {
     value.map(Datum::canonical_bytes).unwrap_or_default()
 }
 
-fn finding_evidence(details: &FindingDetails) -> Result<(u32, alloy_primitives::B256)> {
+fn finding_evidence(
+    details: &FindingDetails,
+) -> Result<(usize, usize, u32, alloy_primitives::B256)> {
     let expected = canonical_datum(details.expected.as_ref());
     let actual = canonical_datum(details.actual.as_ref());
     let mut canonical = Vec::with_capacity(8 + expected.len() + actual.len());
@@ -683,14 +671,16 @@ fn finding_evidence(details: &FindingDetails) -> Result<(u32, alloy_primitives::
             .map_err(|_| invalid("expected too large"))?
             .to_be_bytes(),
     );
-    canonical.extend(&expected);
+    canonical.extend_from_slice(&expected);
     canonical.extend(
         u32::try_from(actual.len())
             .map_err(|_| invalid("actual too large"))?
             .to_be_bytes(),
     );
-    canonical.extend(&actual);
+    canonical.extend_from_slice(&actual);
     Ok((
+        expected.len(),
+        actual.len(),
         u32::try_from(canonical.len()).map_err(|_| invalid("evidence too large"))?,
         alloy_primitives::keccak256(canonical),
     ))
@@ -717,7 +707,7 @@ pub(crate) fn make_finding(
         operation,
         code: details.code,
     };
-    let (evidence_len, evidence_digest) = finding_evidence(&details)?;
+    let (_, _, evidence_len, evidence_digest) = finding_evidence(&details)?;
     let (imported_tempo, imported_tempo_parent) = imported.unzip();
     let finding = Finding {
         zone,
@@ -733,25 +723,28 @@ pub(crate) fn make_finding(
     Ok((key, finding))
 }
 
-fn valid_imported_finding_coordinate(finding: &Finding, parent: BlockNumHash) -> bool {
+fn valid_imported_finding_coordinate(
+    finding: &Finding,
+    previous_imported_tempo_tip: BlockNumHash,
+) -> bool {
     match (finding.imported_tempo, finding.imported_tempo_parent) {
         (None, None) => true,
         (Some(imported), Some(imported_parent)) => {
-            imported.number > parent.number && imported_parent == parent
+            imported.number > previous_imported_tempo_tip.number
+                && imported_parent == previous_imported_tempo_tip
         }
         _ => false,
     }
 }
 
 fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>) -> Result<()> {
-    let expected = canonical_datum(finding.details.expected.as_ref());
-    let actual = canonical_datum(finding.details.actual.as_ref());
-    let (evidence_len, evidence_digest) = finding_evidence(&finding.details)?;
+    let (expected_len, actual_len, evidence_len, evidence_digest) =
+        finding_evidence(&finding.details)?;
     if finding.zone != key.zone
         || finding_operation(finding.details.location.as_ref()) != key.operation
         || finding.details.code != key.code
-        || expected.len() > 256
-        || actual.len() > 256
+        || expected_len > 256
+        || actual_len > 256
         || finding.summary.len() > 1_024
         || finding.evidence_len != evidence_len
         || finding.evidence_digest != evidence_digest

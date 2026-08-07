@@ -279,7 +279,6 @@ fn advance_tempo_round_trips_every_dynamic_input_family() {
     let decoded = decode_advance(&calldata).unwrap();
     assert!(decoded.deposits[0].as_ordinary().is_some());
     assert!(decoded.deposits[1].as_withdrawal_bounce_back().is_some());
-    assert_eq!(decoded.decryptions.len(), 1);
     assert_eq!(decoded.enabled_tokens.len(), 1);
 }
 

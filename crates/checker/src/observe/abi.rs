@@ -25,7 +25,7 @@ const SELECTOR: usize = 4;
 // a five-word encrypted-payload head, and a three-word ciphertext tail.
 const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
 
-// Both deployed ABI shapes are valid protocol inputs.
+// `advanceTempo` accepts either one header or an array of headers.
 sol! {
     interface MultiHeaderZoneInbox {
         enum DepositType { WithdrawalBounceBack, Deposit }
@@ -56,7 +56,6 @@ struct AbiError {
 struct AdvanceCall {
     headers: Vec<Bytes>,
     deposits: Vec<(u8, Bytes)>,
-    decryptions: Vec<IZoneInbox::DecryptionData>,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 }
 
@@ -158,7 +157,6 @@ impl ImportedDeposit {
 pub(crate) struct DecodedAdvanceTempo {
     imported_headers: Vec<ImportedTempoHeader>,
     deposits: Vec<ImportedDeposit>,
-    decryptions: Vec<IZoneInbox::DecryptionData>,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 }
 
@@ -204,7 +202,7 @@ impl DecodedFinalization {
     }
 }
 
-/// Selectively acquired top-level Portal calldata.
+/// Decoded top-level Portal calldata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedPortalCall {
     kind: DecodedPortalCallKind,
@@ -588,7 +586,6 @@ fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, Ab
                         .into_iter()
                         .map(|queued| (queued.depositType as u8, queued.depositData))
                         .collect(),
-                    decryptions: call.decryptions,
                     enabled_tokens: call.enabledTokens,
                 }
             }
@@ -605,18 +602,6 @@ fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, Ab
                         .deposits
                         .into_iter()
                         .map(|queued| (queued.depositType as u8, queued.depositData))
-                        .collect(),
-                    decryptions: call
-                        .decryptions
-                        .into_iter()
-                        .map(|d| IZoneInbox::DecryptionData {
-                            sharedSecret: d.sharedSecret,
-                            sharedSecretYParity: d.sharedSecretYParity,
-                            cpProof: IZoneInbox::ChaumPedersenProof {
-                                s: d.cpProof.s,
-                                c: d.cpProof.c,
-                            },
-                        })
                         .collect(),
                     enabled_tokens: call
                         .enabledTokens
@@ -695,7 +680,6 @@ fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, Ab
     Ok(DecodedAdvanceTempo {
         imported_headers,
         deposits,
-        decryptions: call.decryptions,
         enabled_tokens: call.enabled_tokens,
     })
 }

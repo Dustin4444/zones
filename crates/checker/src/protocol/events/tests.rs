@@ -39,7 +39,7 @@ fn assert_signature<E: SolEvent>(literal: B256, signature: &'static str) {
     assert_eq!(E::SIGNATURE_HASH, literal);
 }
 
-macro_rules! assert_portal_model_vector {
+macro_rules! assert_portal_transition_vector {
     ($event:expr, $event_ty:ty, $topic:expr, $signature:literal, $variant:pat) => {{
         assert_signature::<$event_ty>($topic, $signature);
         let log = event_log(PORTAL_ADDRESS, $event);
@@ -58,7 +58,7 @@ macro_rules! assert_portal_known_vector {
         assert_eq!(log.topics().first(), Some(&$topic));
         assert_eq!(
             classify_l1_protocol_event(PORTAL_ADDRESS, &log).unwrap(),
-            Some(L1ProtocolEvent::KnownNonModel)
+            Some(L1ProtocolEvent::KnownIgnored)
         );
     }};
 }
@@ -96,10 +96,10 @@ macro_rules! assert_outbox_vector {
 }
 
 #[test]
-fn model_event_portal_vectors_classify_exactly() {
+fn portal_vectors_classify_exactly() {
     assert_eq!(Portal::PortalEvents::COUNT, 21);
 
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::DepositMade {
             newCurrentDepositQueueHash: B256::repeat_byte(1),
             sender: ACCOUNT,
@@ -118,9 +118,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::DepositMade,
         portal_model::DEPOSIT_MADE_TOPIC,
         "DepositMade(bytes32,address,address,uint128,uint128,uint256,bytes32,uint8,bytes,bytes12,bytes16,address,uint64)",
-        PortalModelEvent::DepositMade(_)
+        PortalEvent::DepositMade(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::TokenEnabled {
             token: TOKEN,
             name: "Token".into(),
@@ -130,9 +130,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::TokenEnabled,
         portal_model::TOKEN_ENABLED_TOPIC,
         "TokenEnabled(address,string,string,string)",
-        PortalModelEvent::TokenEnabled(_)
+        PortalEvent::TokenEnabled(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::BatchSubmitted {
             withdrawalBatchIndex: 1,
             withdrawalQueueIndex: U256::from(2),
@@ -144,9 +144,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::BatchSubmitted,
         portal_model::BATCH_SUBMITTED_TOPIC,
         "BatchSubmitted(uint64,uint256,bytes32,bytes32,bytes32,uint64)",
-        PortalModelEvent::BatchSubmitted(_)
+        PortalEvent::BatchSubmitted(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::WithdrawalProcessed {
             to: RECIPIENT,
             senderTag: B256::repeat_byte(1),
@@ -157,9 +157,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::WithdrawalProcessed,
         portal_model::WITHDRAWAL_PROCESSED_TOPIC,
         "WithdrawalProcessed(address,bytes32,address,uint128,bool)",
-        PortalModelEvent::WithdrawalProcessed(_)
+        PortalEvent::WithdrawalProcessed(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::WithdrawalBounceBack {
             newCurrentDepositQueueHash: B256::repeat_byte(1),
             fallbackNonce: 2,
@@ -170,9 +170,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::WithdrawalBounceBack,
         portal_model::WITHDRAWAL_BOUNCE_BACK_TOPIC,
         "WithdrawalBounceBack(bytes32,uint64,address,uint128,uint64)",
-        PortalModelEvent::WithdrawalBounceBack(_)
+        PortalEvent::WithdrawalBounceBack(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::DepositBounceBack {
             tempoRefundRecipient: RECIPIENT,
             token: TOKEN,
@@ -182,9 +182,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::DepositBounceBack,
         portal_model::DEPOSIT_BOUNCE_BACK_TOPIC,
         "DepositBounceBack(address,address,uint128,uint128)",
-        PortalModelEvent::DepositBounceBack(_)
+        PortalEvent::DepositBounceBack(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::DepositBounceBackPending {
             tempoRefundRecipient: RECIPIENT,
             token: TOKEN,
@@ -194,9 +194,9 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::DepositBounceBackPending,
         portal_model::DEPOSIT_BOUNCE_BACK_PENDING_TOPIC,
         "DepositBounceBackPending(address,address,uint128,uint128)",
-        PortalModelEvent::DepositBounceBackPending(_)
+        PortalEvent::DepositBounceBackPending(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::RefundClaimed {
             recipient: RECIPIENT,
             token: TOKEN,
@@ -205,14 +205,14 @@ fn model_event_portal_vectors_classify_exactly() {
         Portal::RefundClaimed,
         portal_model::REFUND_CLAIMED_TOPIC,
         "RefundClaimed(address,address,uint128)",
-        PortalModelEvent::RefundClaimed(_)
+        PortalEvent::RefundClaimed(_)
     );
-    assert_portal_model_vector!(
+    assert_portal_transition_vector!(
         Portal::BouncebackGasUpdated { bouncebackGas: 7 },
         Portal::BouncebackGasUpdated,
         portal_model::BOUNCEBACK_GAS_UPDATED_TOPIC,
         "BouncebackGasUpdated(uint64)",
-        PortalModelEvent::BouncebackGasUpdated(_)
+        PortalEvent::BouncebackGasUpdated(_)
     );
 
     assert_portal_known_vector!(
@@ -319,7 +319,7 @@ fn model_event_portal_vectors_classify_exactly() {
 }
 
 #[test]
-fn model_event_factory_vectors_classify_exactly() {
+fn factory_vectors_classify_exactly() {
     assert_eq!(Factory::FactoryEvents::COUNT, 2);
     assert_factory_vector!(
         Factory::ZoneCreated {
@@ -346,7 +346,7 @@ fn model_event_factory_vectors_classify_exactly() {
         Factory::OwnershipTransferred,
         factory_model::OWNERSHIP_TRANSFERRED_TOPIC,
         "OwnershipTransferred(address,address)",
-        L1ProtocolEvent::KnownNonModel
+        L1ProtocolEvent::KnownIgnored
     );
 
     let other_portal = Address::repeat_byte(0x55);
@@ -366,12 +366,12 @@ fn model_event_factory_vectors_classify_exactly() {
     );
     assert_eq!(
         classify_l1_protocol_event(PORTAL_ADDRESS, &unrelated_zone),
-        Ok(Some(L1ProtocolEvent::KnownNonModel))
+        Ok(Some(L1ProtocolEvent::KnownIgnored))
     );
 }
 
 #[test]
-fn model_event_inbox_vectors_classify_exactly() {
+fn inbox_vectors_classify_exactly() {
     assert_eq!(Inbox::InboxEvents::COUNT, 7);
     assert_inbox_vector!(
         Inbox::TempoAdvanced {
@@ -473,7 +473,7 @@ fn model_event_inbox_vectors_classify_exactly() {
 }
 
 #[test]
-fn model_event_outbox_and_tempo_vectors_classify_exactly() {
+fn outbox_and_tempo_vectors_classify_exactly() {
     assert_eq!(Outbox::OutboxEvents::COUNT, 4);
     assert_outbox_vector!(
         Outbox::WithdrawalRequested {
@@ -543,7 +543,7 @@ fn model_event_outbox_and_tempo_vectors_classify_exactly() {
 }
 
 #[test]
-fn model_event_unknown_topicless_and_external_logs_follow_emitter_boundary() {
+fn unknown_topicless_and_external_logs_follow_emitter_boundary() {
     let external = raw_log(
         EXTERNAL_ADDRESS,
         vec![portal_model::BOUNCEBACK_GAS_UPDATED_TOPIC],
@@ -577,7 +577,7 @@ fn model_event_unknown_topicless_and_external_logs_follow_emitter_boundary() {
 }
 
 #[test]
-fn model_event_deposit_rejected_is_explicitly_unsupported() {
+fn deposit_rejected_is_explicitly_unsupported() {
     let log = event_log(
         ZONE_INBOX_ADDRESS,
         inbox_model::DepositRejected {
@@ -599,7 +599,7 @@ fn model_event_deposit_rejected_is_explicitly_unsupported() {
 }
 
 #[test]
-fn model_event_known_events_require_canonical_topics_and_data() {
+fn known_events_require_canonical_topics_and_data() {
     let event = Portal::BouncebackGasUpdated { bouncebackGas: 7 };
     let mut log = event_log(PORTAL_ADDRESS, event);
     log.data.data = [log.data.data.as_ref(), &[0]].concat().into();
@@ -620,7 +620,7 @@ fn model_event_known_events_require_canonical_topics_and_data() {
 }
 
 #[test]
-fn model_event_dynamic_fields_enforce_typed_protocol_bounds() {
+fn dynamic_fields_enforce_protocol_bounds() {
     fn deposit(ciphertext_len: usize) -> Portal::DepositMade {
         Portal::DepositMade {
             newCurrentDepositQueueHash: B256::repeat_byte(1),
@@ -752,7 +752,7 @@ fn model_event_dynamic_fields_enforce_typed_protocol_bounds() {
 }
 
 #[test]
-fn model_event_array_count_is_guarded_before_generated_vec_allocation() {
+fn array_count_is_guarded_before_generated_vec_allocation() {
     // SequencerSetUpdated body: threshold, address[] offset, then count.
     let mut data = vec![0; 96];
     data[63] = 64;
@@ -769,7 +769,7 @@ fn model_event_array_count_is_guarded_before_generated_vec_allocation() {
 }
 
 #[test]
-fn model_event_rpc_url_is_structurally_bounded_without_an_invented_cap() {
+fn rpc_url_is_structurally_bounded_without_an_invented_cap() {
     let event = Portal::RpcUrlUpdated {
         rpcUrl: "x".repeat(4_096),
     };

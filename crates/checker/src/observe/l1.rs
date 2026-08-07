@@ -39,8 +39,8 @@ impl OrderedL1Outcome {
     }
 }
 
-/// Authenticated outcomes and any directly decoded Portal input for
-/// one transaction. `direct_call` is absent when no model rule needs calldata.
+/// Authenticated outcomes and any directly decoded Portal input for one
+/// transaction. `direct_call` is absent when no transition needs calldata.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct L1TransactionObservation {
     transaction_index: usize,

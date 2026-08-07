@@ -25,15 +25,15 @@ pub(crate) use inbox::Inbox;
 pub(crate) use outbox::Outbox;
 pub(crate) use tempo_state::TempoState;
 
-pub(crate) use portal::PortalModelEvent;
+pub(crate) use portal::PortalEvent;
 
-/// A strictly decoded, model-driving L1 protocol event.
+/// A strictly decoded L1 protocol event.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum L1ProtocolEvent {
-    Portal(PortalModelEvent),
+    Portal(PortalEvent),
     FactoryZoneCreated(Factory::ZoneCreated),
     /// A listed event that cannot change checker state.
-    KnownNonModel,
+    KnownIgnored,
 }
 
 /// A strictly decoded L2 protocol event.
@@ -77,14 +77,14 @@ pub(crate) fn classify_l1_protocol_event(
     if log.address == configured_portal {
         Ok(Some(match portal::decode(log)? {
             Some(event) => L1ProtocolEvent::Portal(event),
-            None => L1ProtocolEvent::KnownNonModel,
+            None => L1ProtocolEvent::KnownIgnored,
         }))
     } else if log.address == ZONE_FACTORY_ADDRESS {
         Ok(Some(match factory::decode(log)? {
             Some(event) if event.portal == configured_portal => {
                 L1ProtocolEvent::FactoryZoneCreated(event)
             }
-            Some(_) | None => L1ProtocolEvent::KnownNonModel,
+            Some(_) | None => L1ProtocolEvent::KnownIgnored,
         }))
     } else {
         Ok(None)

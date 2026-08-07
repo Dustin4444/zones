@@ -1,10 +1,9 @@
-//! Reth acquisition adapter and launched checker runtime.
-
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     time::{Duration, Instant},
 };
 
+use crate::kernel::{State, StateKey, StateValue, TokenPhase, apply_imported};
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -17,11 +16,10 @@ use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
-use zone_checker_kernel::{State, StateKey, StateValue, TokenPhase, apply_imported};
 
 use crate::{
     CheckerConfig,
-    adapter::{PreauthenticatedObservation, adapt},
+    adapter::{AuthenticatedObservation, adapt},
     observe::{
         AcquisitionError, ExactStateLookup, ObservationError, acquire_portal_collateral,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
@@ -54,36 +52,36 @@ fn observation_failure(error: ObservationError) -> Failure {
             transaction,
             evidence,
             ..
-        } => Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::FindingCategory::Observation,
+        } => Some(Box::new(crate::kernel::Finding {
+            category: crate::kernel::FindingCategory::Observation,
             code: 110,
-            location: Some(zone_checker_kernel::FindingLocation::Operation(
+            location: Some(crate::kernel::FindingLocation::Operation(
                 transaction.transaction_index() as u32,
             )),
             expected: None,
-            actual: Some(zone_checker_kernel::Datum::Bytes {
+            actual: Some(crate::kernel::Datum::Bytes {
                 length: evidence.length(),
                 digest: evidence.digest(),
             }),
         })),
         ObservationError::InvalidEnvelope { .. } => Some(Box::new(kernel_failure(
             120,
-            zone_checker_kernel::FindingCategory::Observation,
+            crate::kernel::FindingCategory::Observation,
         ))),
         ObservationError::ProtocolEvent {
             transaction_index, ..
-        } => Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::FindingCategory::Observation,
+        } => Some(Box::new(crate::kernel::Finding {
+            category: crate::kernel::FindingCategory::Observation,
             code: 130,
-            location: Some(zone_checker_kernel::FindingLocation::Operation(
+            location: Some(crate::kernel::FindingLocation::Operation(
                 *transaction_index as u32,
             )),
             expected: None,
-            actual: Some(zone_checker_kernel::Datum::Code(130)),
+            actual: Some(crate::kernel::Datum::Code(130)),
         })),
         ObservationError::PortalCall(_) => Some(Box::new(kernel_failure(
             140,
-            zone_checker_kernel::FindingCategory::Observation,
+            crate::kernel::FindingCategory::Observation,
         ))),
         ObservationError::Acquisition(_) => None,
     };
@@ -266,8 +264,7 @@ where
     .await
     .map_err(observation_failure)?;
 
-    // The exact supply set is durable enabled tokens plus tokens enabled by
-    // this authenticated advance.
+    // Include tokens enabled by this import in the post-block supply reads.
     let mut supply_tokens = enabled_tokens(&parent);
     supply_tokens.extend(
         l2.inputs()
@@ -280,15 +277,14 @@ where
     let state = acquire_zone_post_state(zone_state, block.hash(), &supplies)
         .map_err(|error| observation_failure(error.into()))?;
 
-    let observation = PreauthenticatedObservation {
+    let observation = AuthenticatedObservation {
         l2,
         l1,
         state,
-        collateral: BTreeMap::new(),
         portal_creation_block_hash,
         zone_id,
     };
-    let mut result = adapt(&observation)?;
+    let result = adapt(&observation)?;
     let imported_candidate =
         apply_imported(&parent, &result.imported).map_err(|error| Failure {
             class: FailureClass::AuthenticatedDivergence,
@@ -296,7 +292,7 @@ where
             message: error.to_string(),
             finding: Some(Box::new(kernel_failure(
                 2,
-                zone_checker_kernel::FindingCategory::Invariant,
+                crate::kernel::FindingCategory::Invariant,
             ))),
         })?;
     // Collateral belongs to the exact post-import/pre-Zone cut. Zone
@@ -310,11 +306,10 @@ where
                 message: error.to_string(),
                 finding: Some(Box::new(kernel_failure(
                     3,
-                    zone_checker_kernel::FindingCategory::CollateralMismatch,
+                    crate::kernel::FindingCategory::CollateralMismatch,
                 ))),
             })?;
     let imported_tip = observation.l1.last().expect("nonempty imported range");
-    let mut collateral = BTreeMap::new();
     for (token, accounting) in imported_accounting {
         let balance = acquire_portal_collateral(
             l1_provider,
@@ -333,33 +328,28 @@ where
                 class: FailureClass::AuthenticatedDivergence,
                 gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
                 message: "imported collateral is insufficient".into(),
-                finding: Some(Box::new(zone_checker_kernel::Finding {
-                    category: zone_checker_kernel::FindingCategory::CollateralMismatch,
+                finding: Some(Box::new(crate::kernel::Finding {
+                    category: crate::kernel::FindingCategory::CollateralMismatch,
                     code: 4,
-                    location: Some(zone_checker_kernel::FindingLocation::State(
-                        zone_checker_kernel::StateKey::Token(token),
+                    location: Some(crate::kernel::FindingLocation::State(
+                        crate::kernel::StateKey::Token(token),
                     )),
-                    expected: Some(zone_checker_kernel::Datum::U256(required)),
-                    actual: Some(zone_checker_kernel::Datum::U256(balance)),
+                    expected: Some(crate::kernel::Datum::U256(required)),
+                    actual: Some(crate::kernel::Datum::U256(balance)),
                 })),
             });
         }
-        collateral.insert(token, balance);
     }
-    result.outputs.collateral = collateral;
     Ok(result)
 }
 
-fn kernel_failure(
-    code: u16,
-    category: zone_checker_kernel::FindingCategory,
-) -> zone_checker_kernel::Finding {
-    zone_checker_kernel::Finding {
+fn kernel_failure(code: u16, category: crate::kernel::FindingCategory) -> crate::kernel::Finding {
+    crate::kernel::Finding {
         category,
         code,
-        location: Some(zone_checker_kernel::FindingLocation::Block),
+        location: Some(crate::kernel::FindingLocation::Block),
         expected: None,
-        actual: Some(zone_checker_kernel::Datum::Code(code)),
+        actual: Some(crate::kernel::Datum::Code(code)),
     }
 }
 
@@ -397,7 +387,7 @@ where
 {
     eyre::ensure!(
         !config.acquisition_timeout.is_zero(),
-        "checker acquisition timeout must be nonzero"
+        "checker acquisition timeout must not be zero"
     );
     let path = config.database_path.as_path();
     let identity = Persistence::inspect_identity(path)?;
@@ -409,14 +399,11 @@ where
         .erased();
     let actual_l1 = l1.get_chain_id().await?;
     if actual_l1 != identity.l1_chain_id {
-        eyre::bail!("checker checkpoint L1 chain ID is incompatible");
+        eyre::bail!("Tempo chain ID does not match the checker checkpoint");
     }
 
-    // A failed send leaves this watermark durable; a restart reaches this
-    // exact send before consuming another notification.
+    // Resend the persisted acknowledgement, then catch up from the verified tip.
     ctx.send_finished_height(num_hash(snapshot.meta.acknowledged_zone_tip))?;
-    // The acknowledgement watermark is resent exactly, while catch-up starts
-    // at the verified cut so a durable gap can be reconstructed and closed.
     ctx.catch_up_notifications_with_head(ExExHead::new(num_hash(snapshot.meta.verified_zone_tip)))?;
 
     let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
@@ -455,7 +442,7 @@ where
                         break Err(Failure {
                             class: FailureClass::TransientRetry,
                             gap_reason: CoverageGapReason::ProviderUnavailable,
-                            message: "authenticated acquisition attempt timed out".into(),
+                            message: "checker acquisition timed out".into(),
                             finding: None,
                         });
                     }
@@ -467,7 +454,7 @@ where
                             RuntimeAction::None => {}
                             RuntimeAction::AcknowledgeAndTerminate(height) => {
                                 ctx.send_finished_height(num_hash(height))?;
-                                eyre::bail!("checker disabled after bounded FIFO overflow");
+                                eyre::bail!("checker stopped after recording a queue overflow gap");
                             }
                             RuntimeAction::Terminal => {
                                 eyre::bail!("checker rejected notification during acquisition");
@@ -499,10 +486,10 @@ where
             }
             RuntimeAction::AcknowledgeAndTerminate(height) => {
                 ctx.send_finished_height(num_hash(height))?;
-                eyre::bail!("checker disabled after durable terminal acknowledgement");
+                eyre::bail!("checker stopped after recording an unchecked range");
             }
             RuntimeAction::RetryAt(deadline) => retry_at = Some(deadline),
-            RuntimeAction::Terminal => eyre::bail!("checker disabled"),
+            RuntimeAction::Terminal => eyre::bail!("checker stopped"),
             RuntimeAction::AwaitNotification => {}
             RuntimeAction::None if runtime.current().is_some() => continue,
             RuntimeAction::None => {}
@@ -525,9 +512,9 @@ where
                 match runtime.push_or_record_overflow(&store, notification)? {
                     RuntimeAction::AcknowledgeAndTerminate(height) => {
                         ctx.send_finished_height(num_hash(height))?;
-                        eyre::bail!("checker disabled after bounded FIFO overflow");
+                        eyre::bail!("checker stopped after recording a queue overflow gap");
                     }
-                    RuntimeAction::Terminal => eyre::bail!("checker disabled"),
+                    RuntimeAction::Terminal => eyre::bail!("checker stopped"),
                     RuntimeAction::None => {}
                     RuntimeAction::Acknowledge(_)
                     | RuntimeAction::AwaitNotification
@@ -552,7 +539,7 @@ fn validate_runtime_identity(
         || identity.portal != config.portal_address
         || identity.creation_block != config.portal_creation_block_hash
     {
-        eyre::bail!("checker checkpoint identity is incompatible");
+        eyre::bail!("checker checkpoint identity does not match the node configuration");
     }
     Ok(())
 }
@@ -575,7 +562,7 @@ fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
     for number in tip.number + 1..=head {
         let hash = provider
             .block_hash(number)?
-            .ok_or_else(|| eyre::eyre!("canonical block {number} unavailable"))?;
+            .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
         suffix.push(BlockNumHash { number, hash });
     }
     if let RuntimeAction::AcknowledgeAndTerminate(_) =
@@ -585,5 +572,5 @@ fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
         // durable watermark.
         return Ok(());
     }
-    eyre::bail!("failed to persist canonical stream gap")
+    eyre::bail!("failed to record canonical stream gap")
 }

@@ -76,7 +76,7 @@ impl<P: StateProviderFactory + ?Sized> ExactStateLookup for P {
 
 /// Acquire protocol outputs from the state selected by `block_hash` exactly.
 ///
-/// The caller owns the token set because the checker model, rather than node
+/// The caller owns the token set because the checker kernel, rather than node
 /// implementation state, defines which token supplies must be reconciled.
 pub(crate) fn acquire_zone_post_state<P: ExactStateLookup + ?Sized>(
     provider: &P,

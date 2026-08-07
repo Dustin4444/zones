@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use crate::kernel::{
     commitments::{RING_CAPACITY, bounceback_deposit_hash, ordinary_deposit_hash},
     finding::Datum,
     state::{
@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InvariantCode {
+pub(crate) enum InvariantCode {
     MissingPortal,
     MissingZone,
     FamilyMismatch,
@@ -35,14 +35,14 @@ pub enum InvariantCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InvariantViolation {
-    pub code: InvariantCode,
-    pub location: Option<Box<StateKey>>,
-    pub expected: Option<Datum>,
-    pub actual: Option<Datum>,
+pub(crate) struct InvariantViolation {
+    pub(crate) code: InvariantCode,
+    pub(crate) location: Option<Box<StateKey>>,
+    pub(crate) expected: Option<Datum>,
+    pub(crate) actual: Option<Datum>,
 }
 
-pub fn validate(state: &State) -> Result<(), InvariantViolation> {
+pub(crate) fn validate(state: &State) -> Result<(), InvariantViolation> {
     let Some(StateValue::Portal(portal)) = state.rows().get(&StateKey::Portal) else {
         return Err(violation(
             InvariantCode::MissingPortal,
@@ -63,7 +63,7 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
     for (key, value) in state.rows() {
         match (key, value) {
             (StateKey::Deposit(id), StateValue::Deposit(owner)) => {
-                let crate::state::DepositOwner::Ordinary(deposit) = owner else {
+                let crate::kernel::state::DepositOwner::Ordinary(deposit) = owner else {
                     continue;
                 };
                 if !matches!(
@@ -111,7 +111,8 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
             Some(StateKey::Token(identity.initial_token)),
         ));
     }
-    let good_cursor = |cursor: crate::state::Cursor| cursor.number != 0 || cursor.hash.is_zero();
+    let good_cursor =
+        |cursor: crate::kernel::state::Cursor| cursor.number != 0 || cursor.hash.is_zero();
     if !good_cursor(*portal_cursor)
         || !good_cursor(zone.processed_deposit)
         || !good_cursor(settlement.submitted_deposit)
@@ -131,13 +132,13 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
             Some(StateKey::Portal),
         ));
     }
-    if (settlement.batch_index == 0 && *settlement != crate::state::Settlement::ZERO)
+    if (settlement.batch_index == 0 && *settlement != crate::kernel::state::Settlement::ZERO)
         || settlement.batch_index > zone.withdrawal_batch_index
         || settlement.zone_height > U256::from(u64::MAX)
         || zone.last_fallback_nonce > zone.next_withdrawal_index
         || (zone.withdrawal_batch_index == 0
             && (!zone.withdrawal_queue_hash.is_zero()
-                || zone.batch_start != crate::state::BatchBoundaryStart::ZERO))
+                || zone.batch_start != crate::kernel::state::BatchBoundaryStart::ZERO))
         || zone.batch_start.withdrawal_index > zone.next_withdrawal_index
     {
         return Err(violation(
@@ -159,7 +160,7 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
                     Some(StateKey::Portal),
                 ));
             };
-            let id = crate::state::DepositId {
+            let id = crate::kernel::state::DepositId {
                 portal: portal.identity().portal,
                 number,
             };
@@ -170,16 +171,16 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
                 ));
             };
             cursor.hash = match owner {
-                crate::state::DepositOwner::Ordinary(value) => {
+                crate::kernel::state::DepositOwner::Ordinary(value) => {
                     ordinary_deposit_hash(value, cursor.hash)
                 }
-                crate::state::DepositOwner::BounceBack {
+                crate::kernel::state::DepositOwner::BounceBack {
                     token,
                     fallback_nonce,
                     amount,
                     ..
                 } => bounceback_deposit_hash(
-                    crate::facts::BounceBackDeposit {
+                    crate::kernel::facts::BounceBackDeposit {
                         token: *token,
                         fallback_nonce: *fallback_nonce,
                         amount: *amount,
@@ -223,7 +224,7 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
                     amount,
                 }),
             ) => {
-                let fallback = crate::state::FallbackId {
+                let fallback = crate::kernel::state::FallbackId {
                     zone_id: withdrawal.zone_id,
                     nonce: *fallback_nonce,
                 };
@@ -292,16 +293,9 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
                     || id.number.get() > portal_cursor.number
                     || match owner {
                         DepositOwner::Ordinary(d) => d.tempo_refund_recipient.is_zero(),
-                        DepositOwner::BounceBack { withdrawal, .. } => {
-                            withdrawal.zone_id != identity.zone_id
-                                || !zone_token(
-                                    state,
-                                    match owner {
-                                        DepositOwner::BounceBack { token, .. } => *token,
-                                        _ => unreachable!(),
-                                    },
-                                )
-                        }
+                        DepositOwner::BounceBack {
+                            withdrawal, token, ..
+                        } => withdrawal.zone_id != identity.zone_id || !zone_token(state, *token),
                     }
                 {
                     return Err(violation(InvariantCode::Bounds, Some(*key)));
@@ -420,7 +414,7 @@ pub fn validate(state: &State) -> Result<(), InvariantViolation> {
         let valid = match (key, value) {
             (
                 StateKey::Deposit(_),
-                StateValue::Deposit(crate::state::DepositOwner::Ordinary(d)),
+                StateValue::Deposit(crate::kernel::state::DepositOwner::Ordinary(d)),
             ) => add(&mut deposits, d.token, d.amount),
             (
                 StateKey::Withdrawal(_),
@@ -502,15 +496,15 @@ fn add_refund(
 
 fn validate_batches(
     state: &State,
-    identity: crate::state::PortalIdentity,
-    zone: &crate::state::ZoneState,
-    settlement: &crate::state::Settlement,
+    identity: crate::kernel::state::PortalIdentity,
+    zone: &crate::kernel::state::ZoneState,
+    settlement: &crate::kernel::state::Settlement,
 ) -> Result<(), InvariantViolation> {
     let bad = |key| violation(InvariantCode::Batch, Some(key));
     let mut queues = BTreeMap::new();
     let mut owned = std::collections::BTreeSet::new();
     let mut prior_end = None;
-    let mut prior_submitted: Option<(u64, crate::state::BatchBoundary)> = None;
+    let mut prior_submitted: Option<(u64, crate::kernel::state::BatchBoundary)> = None;
     let mut prior_unsubmitted = (
         settlement.batch_index,
         settlement.block_hash,
@@ -562,9 +556,10 @@ fn validate_batches(
                 )
             }
         };
-        let cursor_ok = |c: crate::state::Cursor| c.number != 0 || c.hash.is_zero();
-        let prefix =
-            |a: crate::state::Cursor, b: crate::state::Cursor| a.number < b.number || a == b;
+        let cursor_ok = |c: crate::kernel::state::Cursor| c.number != 0 || c.hash.is_zero();
+        let prefix = |a: crate::kernel::state::Cursor, b: crate::kernel::state::Cursor| {
+            a.number < b.number || a == b
+        };
         let end = first.checked_add(count).ok_or_else(|| bad(*key))?;
         if id.zone_id != identity.zone_id
             || index > zone.withdrawal_batch_index
@@ -630,7 +625,7 @@ fn validate_batches(
         let start = first.checked_add(ordinal).ok_or_else(|| bad(*key))?;
         let mut values = Vec::new();
         for wi in start..end {
-            let wk = StateKey::Withdrawal(crate::state::WithdrawalId {
+            let wk = StateKey::Withdrawal(crate::kernel::state::WithdrawalId {
                 zone_id: identity.zone_id,
                 index: wi,
             });
@@ -644,7 +639,7 @@ fn validate_batches(
             }
             values.push(data.clone());
         }
-        if crate::commitments::withdrawal_queue_hash(&values) != hash {
+        if crate::kernel::commitments::withdrawal_queue_hash(&values) != hash {
             return Err(bad(*key));
         }
 
@@ -720,9 +715,9 @@ fn validate_batches(
 
 fn require_held_fallback(
     state: &State,
-    withdrawal: crate::state::WithdrawalId,
-    data: &crate::state::Withdrawal,
-    fallback: crate::state::FallbackId,
+    withdrawal: crate::kernel::state::WithdrawalId,
+    data: &crate::kernel::state::Withdrawal,
+    fallback: crate::kernel::state::FallbackId,
     location: StateKey,
 ) -> Result<(), InvariantViolation> {
     if matches!(

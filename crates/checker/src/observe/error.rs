@@ -9,19 +9,19 @@ use crate::protocol::events::ProtocolEventError;
 /// External or notification-local source required for a complete view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AcquisitionSource {
-    #[error("exact L1 block")]
+    #[error("Tempo block")]
     L1Block,
-    #[error("complete L1 receipts")]
+    #[error("Tempo receipts")]
     L1Receipts,
-    #[error("complete L1 transactions")]
+    #[error("Tempo transactions")]
     L1Transaction,
-    #[error("zone notification receipts")]
+    #[error("Zone notification receipts")]
     ZoneNotificationReceipts,
-    #[error("zone notification block data")]
+    #[error("Zone notification block data")]
     ZoneNotificationBlock,
-    #[error("exact zone state")]
+    #[error("Zone state")]
     ExactZoneState,
-    #[error("exact portal collateral")]
+    #[error("Portal collateral")]
     PortalCollateral,
 }
 
@@ -99,12 +99,9 @@ impl AuthenticatedDataEvidence {
     }
 }
 
-/// A failure to acquire a complete, internally consistent authenticated view.
+/// Failure to acquire a complete, internally consistent view.
 ///
-/// Remote absence/unavailability can be retried. A structurally inconsistent
-/// in-process notification may not become valid on retry, but it remains an
-/// acquisition failure rather than a protocol finding. No variant is converted
-/// into a zero/default observation.
+/// No variant is converted into a default observation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AcquisitionError {
     #[error("{kind} is unavailable: {detail}")]
@@ -243,8 +240,7 @@ pub(crate) enum PortalCallFamily {
     ProcessWithdrawals,
 }
 
-/// Reconciliation failures between authenticated Portal events and the one
-/// selectively fetched top-level transaction body.
+/// Reconciliation failures between Portal events and top-level calldata.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PortalCallError {
     #[error(

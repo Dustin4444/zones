@@ -1,3 +1,7 @@
+use crate::kernel::{
+    Datum, Finding as FindingDetails, FindingCategory, FindingLocation, ImportedFacts,
+    PortalIdentity, State, StateDelta, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
+};
 use alloy_primitives::{Address, B256};
 use reth_db::{
     Database, TableSet,
@@ -5,10 +9,6 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use tempfile::TempDir;
-use zone_checker_kernel::{
-    Datum, Finding as FindingDetails, FindingCategory, FindingLocation, ImportedFacts,
-    PortalIdentity, State, StateDelta, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
-};
 
 use super::{
     BlockNumHash, ChainCut, Coverage, CoverageGapReason, Finding, FindingKey, Identity,
@@ -397,9 +397,9 @@ fn finding_retains_typed_state_location_and_multi_block_tempo_coordinate() {
         FindingDetails {
             category: FindingCategory::StateMismatch,
             code: 12,
-            location: Some(FindingLocation::State(
-                zone_checker_kernel::StateKey::Token(token),
-            )),
+            location: Some(FindingLocation::State(crate::kernel::StateKey::Token(
+                token,
+            ))),
             expected: Some(Datum::Address(token)),
             actual: None,
         },
@@ -413,9 +413,9 @@ fn finding_retains_typed_state_location_and_multi_block_tempo_coordinate() {
     let persisted = tx.get::<Findings>(key).unwrap().unwrap();
     assert_eq!(
         persisted.details.location,
-        Some(FindingLocation::State(
-            zone_checker_kernel::StateKey::Token(token)
-        ))
+        Some(FindingLocation::State(crate::kernel::StateKey::Token(
+            token
+        )))
     );
 }
 
@@ -700,15 +700,14 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
 fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
     let (_directory, store) = create();
     let mut rows = state().rows().clone();
-    let zone_checker_kernel::StateValue::Zone(mut zone) =
-        rows[&zone_checker_kernel::StateKey::Zone].clone()
+    let crate::kernel::StateValue::Zone(mut zone) = rows[&crate::kernel::StateKey::Zone].clone()
     else {
         unreachable!()
     };
     zone.tempo_gas_rate = 1;
     rows.insert(
-        zone_checker_kernel::StateKey::Zone,
-        zone_checker_kernel::StateValue::Zone(zone),
+        crate::kernel::StateKey::Zone,
+        crate::kernel::StateValue::Zone(zone),
     );
     let conflicting = State::from_rows(rows).unwrap();
     assert!(matches!(

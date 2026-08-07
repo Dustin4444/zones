@@ -15,7 +15,6 @@ members = [
   "crates/l1",
   "crates/node",
   "crates/checker",
-  "crates/checker-kernel",
   "crates/p2p",
   "crates/payload",
   "crates/precompiles",
@@ -131,7 +130,6 @@ zone-primitives = { path = "crates/primitives", default-features = false }
 zone-rpc = { path = "crates/rpc" }
 zone-sequencer = { path = "crates/sequencer" }
 zone-checker = { path = "crates/checker" }
-zone-checker-kernel = { path = "crates/checker-kernel" }
 zone-spf = { path = "crates/spf" }
 
 # reth

@@ -1,5 +1,3 @@
-//! Real local L1 and Zone integration coverage for checkpoint building and restart.
-
 use std::time::Duration;
 
 use crate::utils::{L1TestNode, ZoneTestLaunchConfig, ZoneTestNode};
@@ -27,7 +25,7 @@ async fn canonical_tip(zone: &ZoneTestNode) -> eyre::Result<BlockNumHash> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> eyre::Result<()> {
+async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     let l1 = L1TestNode::start_with(|config| config.dev.block_time = None).await?;
     let provisioned = provision_zone(ProvisionConfig {
@@ -54,7 +52,6 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
         acquisition_timeout: Duration::from_secs(30),
     };
 
-    // Build the identity-bound bootstrap checkpoint from a local Zone provider.
     let builder = ZoneTestNode::launch(
         ZoneTestLaunchConfig::new(
             l1.ws_url().to_string(),
@@ -70,7 +67,6 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
     drop(builder);
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    // The production ExEx consumes the checkpoint and durably catches up.
     let l1_target = l1.provider().get_block_number().await?;
     let zone = ZoneTestNode::launch(
         ZoneTestLaunchConfig::new(
@@ -92,11 +88,9 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
     let first = inspect_database(&path)?;
     assert_eq!(first.acknowledged_zone_tip, first_tip);
     assert_eq!(first.verified_zone_tip, first_tip);
-    assert!(!first.active_alert);
+    assert!(!first.active_finding);
     assert!(!first.has_coverage_gap);
 
-    // Reopen the same checker database, reconstruct the same Zone history,
-    // then advance both chains and prove the durable journal moves forward.
     let restarted = ZoneTestNode::launch(
         ZoneTestLaunchConfig::new(
             l1.ws_url().to_string(),
@@ -121,7 +115,7 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
     let snapshot = inspect_database(&path)?;
     assert_eq!(snapshot.acknowledged_zone_tip, restarted_tip);
     assert_eq!(snapshot.verified_zone_tip, restarted_tip);
-    assert!(!snapshot.active_alert);
+    assert!(!snapshot.active_finding);
     assert!(!snapshot.has_coverage_gap);
     Ok(())
 }

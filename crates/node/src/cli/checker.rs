@@ -1,5 +1,3 @@
-//! Checker CLI arguments and mode-dependent configuration.
-
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use alloy_primitives::{Address, B256};
@@ -10,9 +8,9 @@ use zone_checker::{CheckerConfig, CheckerMode};
 
 use super::{NodeAction, ZoneArgs, run_node};
 
-/// Checker database commands.
+/// Manage checker checkpoints.
 #[derive(Debug, Parser)]
-#[command(name = "checker", about = "Prepare a durable checker database")]
+#[command(name = "checker", about = "Manage checker checkpoints")]
 pub struct CheckerCommand {
     #[command(subcommand)]
     command: CheckerSubcommand,
@@ -24,14 +22,14 @@ enum CheckerSubcommand {
     BuildCheckpoint(CheckerBuildCheckpointArgs),
 }
 
-/// Checker checkpoint destination and ordinary node arguments.
+/// Checkpoint output and node arguments.
 #[derive(Debug, Args)]
 struct CheckerBuildCheckpointArgs {
-    /// L1 block hash containing the authenticated `ZoneCreated` event.
+    /// Tempo block hash containing the `ZoneCreated` event.
     #[arg(long = "checker.portal-creation-block-hash", value_name = "HASH")]
     portal_creation_block_hash: B256,
 
-    /// Destination path for the atomically published checker checkpoint.
+    /// Destination for the checker database.
     #[arg(long = "checker.database-path", value_name = "PATH")]
     database_path: PathBuf,
 
@@ -45,6 +43,7 @@ impl CheckerCommand {
     pub(super) fn run(self) -> eyre::Result<()> {
         match self.command {
             CheckerSubcommand::BuildCheckpoint(args) => {
+                validate_node_args(&args.node_args)?;
                 let cli = Cli::<ZoneChainSpecParser, ZoneArgs>::try_parse_from(
                     std::iter::once(OsString::from("zone-node")).chain(args.node_args),
                 )?;
@@ -60,19 +59,24 @@ impl CheckerCommand {
     }
 }
 
-/// Durable observe-only checker arguments.
+fn validate_node_args(arguments: &[OsString]) -> eyre::Result<()> {
+    eyre::ensure!(
+        !arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("--checker.")),
+        "checker options must appear before `--`"
+    );
+    Ok(())
+}
+
+/// Checker options.
 #[derive(Debug, Clone, Args)]
 pub struct CheckerArgs {
-    /// Checker ExEx mode: `off` (default) or `observe`.
-    #[arg(
-        long = "checker.mode",
-        env = "CHECKER_MODE",
-        default_value = "off",
-        value_parser = CheckerMode::parse,
-    )]
+    /// Checker mode: `off` (default) or `observe`.
+    #[arg(long = "checker.mode", env = "CHECKER_MODE", default_value = "off")]
     pub mode: CheckerMode,
 
-    /// L1 block hash containing the authenticated `ZoneCreated` event for this portal.
+    /// Tempo block hash containing this Portal's `ZoneCreated` event.
     #[arg(
         long = "checker.portal-creation-block-hash",
         env = "CHECKER_PORTAL_CREATION_BLOCK_HASH",
@@ -88,7 +92,7 @@ pub struct CheckerArgs {
     )]
     pub database_path: Option<PathBuf>,
 
-    /// Maximum seconds for one authenticated checker acquisition attempt.
+    /// Maximum seconds for one checker acquisition attempt.
     #[arg(
         long = "checker.acquisition-timeout-secs",
         env = "CHECKER_ACQUISITION_TIMEOUT_SECS",
@@ -99,7 +103,6 @@ pub struct CheckerArgs {
 }
 
 impl CheckerArgs {
-    /// Validate the selected mode and build its runtime configuration.
     pub(super) fn config(
         &self,
         l1_rpc_url: &str,
@@ -121,7 +124,7 @@ impl CheckerArgs {
             CheckerMode::Observe => {
                 eyre::ensure!(
                     zone_id != 0,
-                    "--zone.id must be nonzero with --checker.mode observe"
+                    "--zone.id must not be zero with --checker.mode observe"
                 );
                 let portal_creation_block_hash =
                     self.portal_creation_block_hash.ok_or_else(|| {
@@ -131,11 +134,11 @@ impl CheckerArgs {
                     })?;
                 eyre::ensure!(
                     !portal_creation_block_hash.is_zero(),
-                    "--checker.portal-creation-block-hash must be nonzero"
+                    "--checker.portal-creation-block-hash must not be zero"
                 );
                 eyre::ensure!(
                     self.acquisition_timeout_secs != 0,
-                    "--checker.acquisition-timeout-secs must be nonzero"
+                    "--checker.acquisition-timeout-secs must not be zero"
                 );
                 let database_path = self.database_path.clone().ok_or_else(|| {
                     eyre::eyre!("--checker.database-path is required with --checker.mode observe")
@@ -155,13 +158,13 @@ impl CheckerArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{ffi::OsString, path::PathBuf, time::Duration};
 
     use alloy_primitives::{Address, B256};
     use clap::Parser as _;
     use zone_checker::CheckerMode;
 
-    use super::{CheckerArgs, CheckerCommand, CheckerSubcommand};
+    use super::{CheckerArgs, CheckerCommand, CheckerSubcommand, validate_node_args};
 
     const CREATION_HASH: &str =
         "0x1111111111111111111111111111111111111111111111111111111111111111";
@@ -257,7 +260,7 @@ mod tests {
         ]);
 
         let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
-        assert!(error.to_string().contains("must be nonzero"));
+        assert!(error.to_string().contains("must not be zero"));
     }
 
     #[test]
@@ -271,7 +274,7 @@ mod tests {
         ]);
 
         let error = args.config("ws://localhost:8546", PORTAL, 0).unwrap_err();
-        assert!(error.to_string().contains("--zone.id must be nonzero"));
+        assert!(error.to_string().contains("--zone.id must not be zero"));
     }
 
     #[test]
@@ -356,5 +359,14 @@ mod tests {
                 clap::error::ErrorKind::MissingRequiredArgument
             );
         }
+    }
+
+    #[test]
+    fn build_checkpoint_rejects_checker_options_after_separator() {
+        let arguments = [OsString::from("--checker.mode=observe")];
+        assert_eq!(
+            validate_node_args(&arguments).unwrap_err().to_string(),
+            "checker options must appear before `--`"
+        );
     }
 }

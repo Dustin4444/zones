@@ -1,88 +1,75 @@
 # Zone checker design
 
-## Purpose and boundary
+The checker observes Zone and Tempo data, evaluates checker-owned bridge
+transitions, compares the result with observed output, and stores its progress.
+It does not call production bridge transitions or affect consensus.
 
-The checker is a second, independently implemented specification of Zone
-bridge semantics. It observes canonical data and reports divergence; it does
-not execute production precompiles, replay arbitrary EVM behavior, or enforce
-consensus.
+## Data flow
 
 ```text
-canonical Zone block and receipts
-             │ advanceTempo authenticates imported header
+Zone block, receipts, and state
+             │ advanceTempo names imported Tempo headers
              ▼
-authenticated Zone and Tempo observation
+authenticated observation
   full envelopes ─ transactions_root
   full receipts  ─ receipts_root and bloom
-             │ facts and implementation outcomes
+             │ protocol facts and observed output
              ▼
-zone-checker-kernel pure transition
-             │ expected effects and sorted StateDelta
+kernel transition
+             │ expected effects, state, and accounting
              ▼
 state/supply/collateral comparisons
              │
              ▼
-checkpoint + journal + finding transaction
+metadata + journal + checkpoint + finding transaction
              │ commit before acknowledgement
              ▼
 Reth FinishedHeight
 ```
 
-Observation and expectation have separate construction paths.
-ABI bindings decode authenticated wire data; they are not semantic model
-helpers. The kernel depends on generic primitives and checker-owned protocol
-types, not production Inbox, Outbox, Portal, sequencer, or payload transition
-code.
+Observation and expectation use separate construction paths. ABI bindings
+decode wire data. The kernel uses checker-owned types rather than production
+Inbox, Outbox, Portal, sequencer, or payload transition code.
 
 ## Authenticated observation
 
-The first Zone system transaction supplies canonical `advanceTempo` calldata
-and the imported Tempo header. The optional final Zone system transaction
-supplies finalization inputs. Their caller, destination, location, success,
-canonical ABI, bounded dynamic values, and canonical header RLP are checked.
-Protocol-emitter logs are classified by address and topic. A malformed known
-event or unknown protocol topic fails closed.
+The first Zone system transaction supplies `advanceTempo` calldata and the
+imported Tempo headers. An optional final system transaction supplies
+finalization inputs. The checker validates transaction position, caller,
+destination, success, ABI encoding, value bounds, and header RLP. It classifies
+protocol logs by emitter and topic and rejects malformed or unknown protocol
+events.
 
-For the exact imported Tempo hash, the adapter fetches every full transaction
-envelope and receipt. It locally hashes the envelopes, reconstructs the
-transaction trie root, and compares it with the imported header. Receipt count,
-ordering, block/index/hash metadata, trie root, and aggregate bloom must match;
-receipt transaction hashes come from the local envelope order. Direct
-`submitBatch` and non-empty `processWithdrawals` inputs are decoded from those
-root-authenticated envelopes. There is no selective unauthenticated by-hash
-body path.
+For each imported Tempo block, the checker fetches the complete ordered
+transaction envelopes and receipt set. It reconstructs both roots and checks
+them against the imported header. It also checks receipt count, order, block
+and transaction coordinates, and the aggregate bloom. It decodes `submitBatch`
+and non-empty `processWithdrawals` calls from those transactions.
 
-An unavailable provider response is not evidence. Acquisition errors retry or
-produce durable coverage gaps according to runtime policy; they never become a
-default observation. Authenticated, well-formed semantic contradictions become
-findings.
+Unavailable data is retried and may become a coverage gap. It is never replaced
+with a default value. A contradiction in authenticated data becomes a finding.
 
-## Pure semantic kernel
+## Kernel transitions
 
-`zone-checker-kernel` represents all authoritative semantic state with one
-validated `StateKey` / `StateValue` vocabulary. A generic overlay reads a
-parent `State`, stages typed changes, validates key/value families, and emits a
-sorted `StateDelta`. This representation is shared by transitions,
-persistence, checkpoints, journal replay, and reorg reconstruction; there are
-no persistence-specific model mirrors.
+The checker's internal `kernel` module stores semantic state as validated
+`StateKey` and `StateValue` rows. An overlay reads a parent state, stages
+changes, validates key/value families, and emits a sorted `StateDelta`.
+Transitions, checkpoints, journal replay, and reorg reconstruction use the same
+representation.
 
 Transitions cover:
 
-- Portal creation, identity, configuration, and token enablement;
-- ordered ordinary and callback/bounce-back deposits;
-- empty, partial, and complete contiguous Zone deposit processing;
-- failed-deposit withdrawal and refund ownership;
-- user withdrawals, active fees, IDs, nonces, sender tags, and burns;
-- finalization, withdrawal queue folds, and empty batches;
-- batch submission, ring ownership, and queue slots;
-- empty, partial, and complete Portal processing;
-- successful delivery, pending Portal refunds, and aggregate claims;
-- withdrawal bounce-back, Zone mint or Inbox refund, and aggregate claims;
-- complete one-owner lifecycle closure and per-token `S/D/W` accounting.
+- Portal creation, configuration, and token enablement;
+- ordinary, callback, and bounce-back deposits;
+- partial and complete deposit processing;
+- failed deposits and refunds;
+- withdrawals, fees, sender tags, and burns;
+- finalization, batches, queue commitments, and ring ownership;
+- delivery, Portal refunds, Inbox refunds, and claims;
+- ownership and per-token `S/D/W` accounting.
 
 Each operation derives expected identities, fees, commitments, effects, and
-accounting independently, then compares them with observed outcomes. A valid
-transition cannot silently drop an owner or value. Arithmetic is checked.
+accounting independently from observed outcomes. Arithmetic is checked.
 
 The imported Tempo transition is applied first. Portal collateral is compared
 against `S + D + W` at that post-Tempo/pre-Zone cut. The Zone transition then
@@ -90,117 +77,97 @@ applies, after which fixed commitments and exact token supply are compared.
 
 ## Persistent representation
 
-The checker owns a dedicated MDBX environment with exactly four tables:
+The checker uses a dedicated MDBX environment with four tables:
 
 | Table | Content |
 |---|---|
 | `Meta` | Version, identity, tips, coverage, and active finding latch |
-| `Checkpoints` | Bounded complete state snapshots |
-| `Journal` | Canonical block identity, parent continuity, sorted delta, coverage |
-| `Findings` | Bounded findings and canonical/orphan lineage |
+| `Checkpoints` | State snapshots |
+| `Journal` | Block identity, parent continuity, and sorted state delta |
+| `Findings` | Findings and chain coordinates |
 
-Keys and values use exact, bounded, versioned codecs. Unknown versions and tags,
-trailing data, missing rows, duplicate positions, conflicting entries, and
-invalid key/value families are corruption. An incompatible schema is opened
-read-only to identify the mismatch, then routed to a fresh checkpoint build.
+Keys and values use bounded, versioned codecs. Unknown versions or tags,
+trailing data, missing rows, conflicting entries, and invalid key/value
+families invalidate the database. Schema changes require a new checkpoint.
 
 The identity-bound bootstrap checkpoint is immutable. Checkpoint publication
-is staged and reopened for validation before becoming authoritative. The
-canonical journal is unpruned because no finality or reorg-horizon contract
-exists.
+uses a sibling staging directory and reopens the database before moving it to
+the target path. The canonical journal is not pruned.
 
-Every block apply transaction records continuity, semantic delta, tips,
-coverage, and any finding atomically. A checkpoint transaction writes a
-complete validated cut without exposing a partial snapshot. Restart loads a
-checkpoint and replays its exact journal suffix. Fault tests require an
-interrupted write to expose either the old state or the complete new state,
-never a mixture.
+Each update commits its metadata, journal, checkpoint, finding, and reorg
+changes in one MDBX transaction. Restart loads a checkpoint, replays its journal
+suffix, and validates the complete reconstructed state.
 
 ## Canonical reorgs and findings
 
-A journal entry names the exact canonical hash, parent, prior imported cut, and
-state delta needed to reconstruct state. Reorg handling finds the common
-ancestor, reconstructs that exact cut from a checkpoint plus journal, truncates
-the old canonical suffix atomically, and applies replacement blocks in order.
-Reorgs before, after, and across checkpoints use the same representation.
+A journal entry stores the block, parent, imported Tempo cut, and state delta.
+On a reorg, the checker reconstructs the common ancestor from a checkpoint and
+journal, removes the old suffix in the same transaction, and applies the
+replacement branch in order.
 
-A deterministic semantic divergence commits a finding and the active
-alert latch without committing its candidate semantic delta. The latch names
-the exact finding lineage and verified parent. Descendants are persisted as
-`NotCheckedAncestorDivergence`; they are never passing blocks. If a reorg
-retains the alerting block, the latch remains. If it removes the block, the
-finding is orphaned and the latch is cleared in the same canonical update.
+A semantic mismatch atomically records a finding without applying the expected
+state delta. Descendants are recorded as `NotCheckedAncestorDivergence`, not as
+verified blocks. A reorg that retains the finding's block keeps it active. A
+reorg that removes the block clears the active finding in the same transaction;
+the finding row remains as an audit record.
 
 ## Runtime state machine
 
-The runtime has one current notification and one bounded FIFO. It does not
-spawn overlapping semantic writers. Its externally meaningful states are:
+The runtime has one current notification and one bounded queue:
 
-- `Starting`: validating identity/checkpoint and acquiring catch-up work;
-- `Healthy`: following the canonical stream with no uncovered suffix;
-- `Retrying`: retaining work while bounded acquisition attempts run;
-- `Alerting`: sticky authenticated finding; descendants are not checked;
-- `Disabled`: terminal checker failure with truthful durable gaps.
+- `Starting`: validate state and acquire catch-up work;
+- `Healthy`: follow the canonical stream;
+- `Retrying`: retain work while retrying acquisition;
+- `Alerting`: retain a finding and skip descendants;
+- `Disabled`: stop checking after a terminal failure.
 
 Notifications containing several blocks are applied one block at a time, each
-with its own commit. The runtime acknowledges a height only after all durable
-effects or gaps through that height commit. A crash between commit and
-acknowledgement replays idempotently. A crash before commit leaves the parent
-authoritative.
+with its own commit. The runtime acknowledges a height only after state or a
+coverage gap through that height commits. A crash after commit may resend the
+acknowledgement. A crash before commit leaves the parent state unchanged.
 
 Retry policy distinguishes immediate terminal, bounded retry, transient retry,
-and authenticated divergence. Once bounded fail-open behavior is exhausted,
-the exact unverified suffix is committed as a gap before acknowledging beyond
-it. Verified, acknowledged, and gap ranges therefore remain distinguishable
-after restart.
+and authenticated divergence. When retries are exhausted, the unchecked suffix
+is committed as a gap before acknowledgement. Verified and acknowledged tips
+remain separate.
 
 Stream loss triggers canonical catch-up reconstruction rather than trusting
-the next fragment. A malformed or discontinuous `FinishedHeight` signal is
-handled conservatively: absent proof of Reth jump semantics, the checker does
-not silently jump and call the intervening range verified.
+the next fragment. A malformed or discontinuous `FinishedHeight` update records
+an unchecked range rather than advancing the verified tip.
 
-## Deterministic checkpoint builder
+## Checkpoint builder
 
-The builder uses the same authenticated adapters and pure kernel transitions as
-the runtime. It validates local Zone genesis, configured chain IDs, Portal and
-factory creation evidence, ancestry, initial token, zero genesis supply, and
-the explicit genesis token handoff. Reorgs observed while building cause
-canonical reconstruction, not publication of a mixed-fork checkpoint.
+The builder uses the same observation adapters and kernel transitions as the
+runtime. It validates the local Zone genesis, chain IDs, Portal creation,
+Tempo ancestry, initial token, zero genesis supply, and the genesis token
+handoff.
 
-Checkpoint construction is local because its identity and trust sources are
-local. Importing a third-party state snapshot without independently replaying
-its evidence would weaken the checker boundary and is unsupported by default.
+Checkpoint construction uses the local Zone database and configured Tempo
+endpoint. The checker does not import third-party state snapshots.
 
 ## Trust and coverage contract
 
-The checker proves transaction and receipt commitment membership for imported
-Tempo evidence. It does not prove independent Tempo finality or availability.
-The configured archive endpoint is trusted for availability and hash-pinned
-Portal balance reads; those reads do not include checker-verified state proofs.
+The checker verifies imported transaction and receipt roots. It does not verify
+Tempo finality or availability. The Tempo archive endpoint supplies hash-pinned
+Portal balance reads, which are not checked against a storage trie.
 
-The in-process node is trusted for the canonical Zone chain and exact-hash
-state reads. Fixed commitment and supply reads are pinned to a block hash but
-are not independently proven against a state trie by the checker. Missing
-historical data is a visible acquisition failure.
+The in-process node supplies the canonical Zone chain and hash-pinned state
+reads. The checker does not verify those reads against a state trie. Missing
+history is an acquisition failure.
 
-Cryptographic validity of encrypted payloads/proofs, arbitrary EVM and callback
-behavior, private recipients, and unavailable withdrawal-time fallback
-recipients are outside the semantic claim. The checker does verify the exposed
-identity, ordering, ownership, queue, accounting, supply, and collateral
-consequences of every authenticated branch.
+The checker does not validate encrypted payload cryptography, arbitrary EVM or
+callback behavior, private recipients, or a fallback recipient absent from the
+observed data.
 
-Coverage is truthful by construction:
+Coverage has three relevant states:
 
-- **verified** means authenticated observation, kernel transition, all required
-  comparisons, and durable commit succeeded;
-- **acknowledged with gap** means runtime progress continued after durably
-  recording the exact unchecked range;
-- **ancestor divergence** means checking stopped at a durable canonical
-  finding and descendants were not evaluated.
+- **verified:** observation, transition, comparisons, and commit succeeded;
+- **acknowledged with gap:** the unchecked range was recorded before
+  acknowledgement;
+- **ancestor divergence:** a finding stopped checks of descendant blocks.
 
 ## Operational limitations
 
 There is no journal pruning policy; disk use grows with canonical history.
 Rebuild requires local Zone history and the Tempo archive evidence used by the
-builder. Schema changes require a fresh database path. Findings include the
-coordinates needed for archive investigation.
+builder. Schema changes require a new database path.

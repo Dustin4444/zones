@@ -1,6 +1,6 @@
+use crate::kernel::{Finding as FindingDetails, State, StateDelta};
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
-use zone_checker_kernel::{Finding as FindingDetails, State, StateDelta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct BlockNumHash {

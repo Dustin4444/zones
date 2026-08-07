@@ -6,6 +6,7 @@ mod adapter;
 mod bootstrap;
 mod builder;
 mod exex;
+mod kernel;
 mod observe;
 pub(crate) mod persistence;
 mod protocol;
@@ -53,37 +54,30 @@ impl FromStr for CheckerMode {
             "off" => Ok(Self::Off),
             "observe" => Ok(Self::Observe),
             other => Err(eyre::eyre!(
-                "unsupported checker mode `{other}`, expected `off` or `observe`"
+                "invalid checker mode `{other}`, expected `off` or `observe`"
             )),
         }
     }
 }
 
-impl CheckerMode {
-    /// Parse a mode without coupling this crate to clap.
-    pub fn parse(value: &str) -> Result<Self, eyre::Report> {
-        value.parse()
-    }
-}
-
-/// Complete configuration for one checker database and Portal identity.
+/// Configuration for one checker database and Portal.
 #[derive(Debug, Clone)]
 pub struct CheckerConfig {
-    /// Archive-capable Tempo RPC used for exact L1 bootstrap and live checks.
+    /// Archive-capable Tempo RPC used for bootstrap and live checks.
     pub l1_rpc_url: String,
-    /// ZonePortal whose authenticated lifecycle this checker models.
+    /// ZonePortal checked by this instance.
     pub portal_address: Address,
-    /// Exact Tempo block containing the ZoneFactory creation event.
+    /// Tempo block containing the ZoneFactory creation event.
     pub portal_creation_block_hash: B256,
     /// ZoneFactory Zone ID bound to the local Zone chain ID.
     pub zone_id: u32,
     /// Checker database path.
     pub database_path: PathBuf,
-    /// Maximum wall-clock time for one authenticated block acquisition attempt.
+    /// Maximum time for one block acquisition attempt.
     pub acquisition_timeout: Duration,
 }
 
-/// Durable checker ExEx configuration.
+/// Checker ExEx configuration.
 pub struct CheckerExEx {
     config: CheckerConfig,
 }
@@ -93,8 +87,7 @@ impl CheckerExEx {
         Self { config }
     }
 
-    /// Run deterministic local preflight in Reth's outer initializer, then
-    /// return the non-resolving durable checker worker.
+    /// Run preflight and return the checker worker.
     pub fn launch<Node>(
         self,
         ctx: ExExContext<Node>,
@@ -108,5 +101,7 @@ impl CheckerExEx {
     }
 }
 
+#[cfg(test)]
+mod kernel_boundary_tests;
 #[cfg(test)]
 mod tests;

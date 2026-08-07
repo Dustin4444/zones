@@ -182,7 +182,7 @@ impl From<ObservationError> for L2ObservationFailure {
 /// notification or backfill result. This layer authenticates the complete
 /// receipt set against the block header, authenticates transaction envelopes,
 /// and strictly decodes protocol logs; the evaluator compares those independent
-/// inputs and outputs against model expectations.
+/// inputs and outputs against expected transitions.
 #[cfg(test)]
 pub(crate) fn observe_l2_block(
     block: &RecoveredBlock<Block>,
