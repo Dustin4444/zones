@@ -9,7 +9,7 @@ use crate::{
     runtime::{RuntimeResult, bootstrap::error::BootstrapError},
 };
 
-pub(super) fn validate_zero_genesis_supply<P>(
+pub(crate) fn validate_zero_genesis_supply<P>(
     zone_provider: &P,
     zone_genesis_hash: B256,
     tokens: impl IntoIterator<Item = Address>,
@@ -29,7 +29,7 @@ where
     Ok(())
 }
 
-pub(super) fn genesis_anchor<P>(
+pub(crate) fn genesis_anchor<P>(
     zone_provider: &P,
     zone_genesis: BlockNumHash,
 ) -> RuntimeResult<BlockNumHash>

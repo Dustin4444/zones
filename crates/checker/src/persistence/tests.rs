@@ -30,6 +30,7 @@ fn identity() -> Identity {
         zone_id: 7,
         portal: Address::repeat_byte(0x70),
         creation_block: B256::repeat_byte(0xc0),
+        creation_height: 0,
     }
 }
 
@@ -53,6 +54,10 @@ fn entry(number: u64, parent: BlockNumHash) -> JournalEntry {
         zone: block(number, 0x10u8.wrapping_add(number as u8)),
         parent,
         imported_tempo: block(number, 0x20u8.wrapping_add(number as u8)),
+        imported_tempo_parent: block(
+            number.saturating_sub(1),
+            0x20u8.wrapping_add(number.saturating_sub(1) as u8),
+        ),
         delta: StateDelta::default(),
     }
 }
@@ -92,6 +97,13 @@ fn finding(zone: BlockNumHash) -> (FindingKey, Finding) {
         operation: 3,
         code: 9,
     };
+    let expected = vec![1, 2];
+    let actual = vec![3, 4];
+    let mut canonical = vec![];
+    canonical.extend((expected.len() as u32).to_be_bytes());
+    canonical.extend(&expected);
+    canonical.extend((actual.len() as u32).to_be_bytes());
+    canonical.extend(&actual);
     let value = Finding {
         zone,
         parent: block(zone.number - 1, 0x10 + zone.number as u8 - 1),
@@ -100,10 +112,10 @@ fn finding(zone: BlockNumHash) -> (FindingKey, Finding) {
         code: key.code,
         location: 4,
         operation: key.operation,
-        expected: vec![1, 2],
-        actual: vec![3, 4],
-        evidence_len: 8,
-        evidence_digest: B256::repeat_byte(0xee),
+        expected,
+        actual,
+        evidence_len: u32::try_from(canonical.len()).unwrap(),
+        evidence_digest: alloy_primitives::keccak256(canonical),
         summary: "authenticated divergence".into(),
     };
     (key, value)
@@ -299,36 +311,6 @@ fn reorg_before_after_and_across_checkpoints_reconstructs_exact_metadata() {
 }
 
 #[test]
-fn active_finding_survives_descendant_reorg_and_is_orphaned_with_its_block() {
-    let (_directory, store) = create();
-    let one = apply(&store, 1, bootstrap().zone);
-    let two = apply(&store, 2, one);
-    let (key, value) = finding(two);
-    store.record_finding(identity(), key, value).unwrap();
-    let three = apply(&store, 3, two);
-    assert_eq!(
-        store.reorg(identity(), two).unwrap().meta.active_finding,
-        Some(key)
-    );
-    assert!(matches!(
-        store.reorg(
-            identity(),
-            BlockNumHash {
-                number: 2,
-                hash: B256::repeat_byte(0xff)
-            }
-        ),
-        Err(PersistenceError::Invalid(_))
-    ));
-    apply(&store, 3, two);
-    assert_eq!(
-        store.reorg(identity(), one).unwrap().meta.active_finding,
-        None
-    );
-    let _ = three;
-}
-
-#[test]
 fn same_height_finding_is_idempotent_but_conflicting_evidence_is_rejected() {
     let (_directory, store) = create();
     let (key, value) = finding(block(1, 0x11));
@@ -349,6 +331,43 @@ fn same_height_finding_is_idempotent_but_conflicting_evidence_is_rejected() {
         store.load(identity()).unwrap().meta.active_finding,
         Some(key)
     );
+}
+
+#[test]
+fn finding_identity_ignores_summary_but_separates_codes() {
+    let (_directory, store) = create();
+    let (key, value) = finding(block(1, 0x11));
+    let mut reworded = value.clone();
+    reworded.summary = "new display wording".into();
+    store.record_finding(identity(), key, value).unwrap();
+    store.record_finding(identity(), key, reworded).unwrap();
+
+    let mut other_key = key;
+    other_key.code += 1;
+    let mut other = finding(block(1, 0x11)).1;
+    other.code = other_key.code;
+    store.record_finding(identity(), other_key, other).unwrap();
+    assert_eq!(
+        store.load(identity()).unwrap().meta.active_finding,
+        Some(other_key)
+    );
+}
+
+#[test]
+fn finding_rejects_forged_evidence_and_wrong_coordinates() {
+    let (_directory, store) = create();
+    let (key, value) = finding(block(1, 0x11));
+    let mut forged = value.clone();
+    forged.evidence_len += 1;
+    assert!(store.record_finding(identity(), key, forged).is_err());
+    let mut forged = value.clone();
+    forged.evidence_digest = B256::ZERO;
+    assert!(store.record_finding(identity(), key, forged).is_err());
+    let (wrong_key, wrong) = finding(block(2, 0x12));
+    assert!(store.record_finding(identity(), wrong_key, wrong).is_err());
+    let mut wrong_parent = value;
+    wrong_parent.parent.hash = B256::ZERO;
+    assert!(store.record_finding(identity(), key, wrong_parent).is_err());
 }
 
 #[test]
@@ -385,6 +404,66 @@ fn alert_descendant_reorg_preserves_or_removes_the_latch_by_exact_height() {
             .active_finding,
         None
     );
+}
+
+#[test]
+fn deep_reorg_retains_orphan_finding_as_structural_audit_record() {
+    let (directory, store) = create();
+    let one = apply(&store, 1, bootstrap().zone);
+    let _two = apply(&store, 2, one);
+    let finding_block = block(3, 0x43);
+    let (key, value) = finding(finding_block);
+    store.record_finding(identity(), key, value).unwrap();
+    store
+        .record_gap(
+            identity(),
+            finding_block,
+            block(4, 0x44),
+            CoverageGapReason::NotCheckedAncestorDivergence,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .reorg(identity(), bootstrap().zone)
+            .unwrap()
+            .meta
+            .active_finding,
+        None
+    );
+    drop(store);
+    let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened.meta.verified_zone_tip, bootstrap().zone);
+    assert_eq!(reopened.meta.active_finding, None);
+}
+
+#[test]
+fn stale_orphan_cannot_be_installed_as_active_finding() {
+    let (_directory, store) = create();
+    let old = block(1, 0x41);
+    let (key, value) = finding(old);
+    store.record_finding(identity(), key, value).unwrap();
+    store
+        .record_gap(
+            identity(),
+            old,
+            old,
+            CoverageGapReason::NotCheckedAncestorDivergence,
+        )
+        .unwrap();
+    store.reorg(identity(), bootstrap().zone).unwrap();
+    let replacement = apply(&store, 1, bootstrap().zone);
+    assert_ne!(replacement, old);
+
+    let mut meta = store.load(identity()).unwrap().meta;
+    meta.active_finding = Some(key);
+    let tx = store.db.tx_mut().unwrap();
+    tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta)))
+        .unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(
+        store.load(identity()),
+        Err(PersistenceError::Invalid(_))
+    ));
 }
 
 #[test]

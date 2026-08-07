@@ -1,8 +1,8 @@
 //! Version-gated open, authenticated L1 bootstrap, and Zone-replay handoff.
 
-mod ancestry;
+pub(crate) mod ancestry;
 pub(super) mod error;
-mod genesis;
+pub(crate) mod genesis;
 mod replay;
 
 use std::path::{Path, PathBuf};
@@ -41,17 +41,17 @@ pub(super) enum DatabaseState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct LocalZoneIdentity {
+pub(crate) struct LocalZoneIdentity {
     genesis: BlockNumHash,
     initial_token: Address,
 }
 
 impl LocalZoneIdentity {
-    pub(super) const fn genesis(self) -> BlockNumHash {
+    pub(crate) const fn genesis(self) -> BlockNumHash {
         self.genesis
     }
 
-    pub(super) const fn initial_token(self) -> Address {
+    pub(crate) const fn initial_token(self) -> Address {
         self.initial_token
     }
 }
@@ -75,7 +75,7 @@ pub(super) fn inspect_database(path: &Path) -> RuntimeResult<DatabaseState> {
 
 /// Validate checker configuration against the local Zone identity without
 /// touching the remote Tempo endpoint.
-pub(super) fn validate_local_configuration<P>(
+pub(crate) fn validate_local_configuration<P>(
     config: &CheckerConfig,
     zone_chain_id: u64,
     zone_provider: &P,

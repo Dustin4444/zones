@@ -129,7 +129,6 @@ impl L1BlockAcquisition {
         self.receipt_fetch_duration
     }
 
-    #[cfg(test)]
     pub(crate) fn into_observation(self) -> L1BlockObservation {
         self.observation
     }

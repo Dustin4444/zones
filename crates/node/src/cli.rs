@@ -88,14 +88,23 @@ impl ZoneCli {
     /// background tasks, and blocks until exit.
     pub fn run(self) -> eyre::Result<()> {
         match self {
-            Self::Node(cli) => run_node(*cli),
+            Self::Node(cli) => run_node(*cli, NodeAction::Run),
             Self::Dev(command) => (*command).run(),
         }
     }
 }
 
 /// Main entry point for the `node` command.
-fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
+#[derive(Debug)]
+enum NodeAction {
+    Run,
+    BuildCheckpoint {
+        portal_creation_block_hash: alloy_primitives::B256,
+        database_path: PathBuf,
+    },
+}
+
+fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> eyre::Result<()> {
     prepend_log_filter(&mut cli.logs.log_stdout_filter, ZONE_LOG_FILTER_DIRECTIVES);
     prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
 
@@ -111,11 +120,31 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
         validate_portal_address(args.portal_address)?;
-        let checker_config = args.checker.config(
-            &args.l1_rpc_url,
-            args.portal_address,
-            args.zone_id,
-        )?;
+        let zone_chain_id = builder.config().chain.genesis().config.chain_id;
+        args.validate_zone_id(zone_chain_id)?;
+        if matches!(action, NodeAction::BuildCheckpoint { .. }) {
+            eyre::ensure!(
+                !args.enable_sequencer
+                    && args.sequencer_key.is_none()
+                    && args.sequencer_key_file.is_none()
+                    && args.sequencer_manifest.is_none()
+                    && args.p2p_key.is_none()
+                    && args.secp256k1_key.is_none()
+                    && args.sequencer_role.is_none()
+                    && !args.p2p_bypass_ip_check
+                    && args.deposit_decryption_keys_file.is_none(),
+                "checker build-checkpoint rejects sequencer, P2P, and decryption key options"
+            );
+        }
+        let checker_config = if matches!(action, NodeAction::BuildCheckpoint { .. }) {
+            None
+        } else {
+            args.checker.config(
+                &args.l1_rpc_url,
+                args.portal_address,
+                args.zone_id,
+            )?
+        };
 
         let p2p_config = args
             .sequencer_manifest
@@ -189,7 +218,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
 
         let mut node = ZoneNode::new(
-            args.l1_rpc_url,
+            args.l1_rpc_url.clone(),
             args.portal_address,
             args.l1_fetch_concurrency,
             Duration::from_millis(args.l1_retry_connection_interval_ms),
@@ -233,6 +262,33 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         }
 
         // Install the checker ExEx only when observe mode produced a runtime config.
+        if let NodeAction::BuildCheckpoint {
+            portal_creation_block_hash,
+            database_path,
+        } = action
+        {
+            let config = zone_checker::CheckerConfig {
+                l1_rpc_url: args.l1_rpc_url.clone(),
+                portal_address: args.portal_address,
+                portal_creation_block_hash,
+                zone_id: args.zone_id,
+                database_path: Some(database_path.clone()),
+            };
+            let node_handle = builder
+                .node(node)
+                .launch_with_debug_capabilities()
+                .await?;
+            zone_checker::build_compact_checkpoint(
+                config,
+                zone_chain_id,
+                node_handle.node.provider(),
+                &database_path,
+            )
+            .await?;
+            drop(node_handle);
+            return Ok(());
+        }
+
         match checker_config {
             None => {
                 let handle = builder

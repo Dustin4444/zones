@@ -7,7 +7,8 @@ use crate::{
     FallbackId, Finalization, ImportedFacts, ImportedOperation, InboxRefundId, ModelError,
     OrdinaryDeposit, PortalIdentity, PortalRefundId, PortalState, RefundClaim, State, StateKey,
     StateValue, TokenEnable, TokenPhase, UserWithdrawal, WithdrawalId, WithdrawalOutcome,
-    WithdrawalProcessing, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
+    WithdrawalProcessing, ZoneFacts, ZoneOperation, apply_genesis_handoff, apply_imported,
+    apply_zone,
     commitments::{ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
@@ -89,6 +90,52 @@ fn created_with_deposit() -> (State, OrdinaryDeposit) {
     let mut state = parent;
     state.apply(&candidate.delta).unwrap();
     (state, deposit)
+}
+
+#[test]
+fn genesis_handoff_promotes_authenticated_pending_tokens_for_first_live_use() {
+    let mut state = State::awaiting(identity());
+    let imported = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::Create {
+                identity: identity(),
+                initial_token: enable(identity().initial_token),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    state = imported.into_state();
+    assert!(matches!(
+        state.rows().get(&StateKey::Token(identity().initial_token)),
+        Some(StateValue::Token(TokenState {
+            phase: TokenPhase::PendingZoneEnable,
+            ..
+        }))
+    ));
+    state
+        .apply(&apply_genesis_handoff(&state).unwrap())
+        .unwrap();
+    assert!(matches!(
+        state.rows().get(&StateKey::Token(identity().initial_token)),
+        Some(StateValue::Token(TokenState {
+            phase: TokenPhase::ZoneEnabled,
+            ..
+        }))
+    ));
+    apply_zone(
+        apply_imported(&state, &ImportedFacts::default()).unwrap(),
+        &ZoneFacts {
+            operations: vec![ZoneOperation::ClaimInboxRefund(RefundClaim {
+                token: identity().initial_token,
+                recipient: Address::repeat_byte(9),
+                amount: 0,
+            })],
+            ..Default::default()
+        },
+    )
+    .unwrap();
 }
 
 fn commit(state: &mut State, imported: ImportedFacts, zone: ZoneFacts) -> Vec<ExpectedEffect> {

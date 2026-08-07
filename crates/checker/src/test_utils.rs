@@ -16,6 +16,23 @@ use alloy_primitives::Address;
 
 #[cfg(feature = "test-utils")]
 use crate::{CheckerConfig, CheckerExEx};
+
+/// Internal M5 entrypoint for integration tests. Production launch remains
+/// [`CheckerExEx::launch`].
+#[cfg(feature = "test-utils")]
+pub fn launch_compact_shadow<Node>(
+    config: CheckerConfig,
+    ctx: reth_exex::ExExContext<Node>,
+) -> impl std::future::Future<Output = eyre::Result<()>> + Send
+where
+    Node: reth_node_api::FullNodeComponents,
+    Node::Provider: reth_storage_api::BlockReader<Block = tempo_primitives::Block>
+        + reth_storage_api::BlockNumReader
+        + reth_storage_api::StateProviderFactory,
+    Node::Types: reth_node_api::NodeTypes<Primitives = tempo_primitives::TempoPrimitives>,
+{
+    crate::compact_exex::launch_shadow(config, ctx)
+}
 use crate::{
     model::state::TokenPhase,
     store::{db::CheckerStore, value::BootstrapState},

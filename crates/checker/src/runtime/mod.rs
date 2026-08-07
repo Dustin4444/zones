@@ -2,7 +2,7 @@
 
 mod alert;
 mod apply;
-mod bootstrap;
+pub(crate) mod bootstrap;
 mod chain;
 mod error;
 mod exex;
