@@ -304,12 +304,22 @@ pub struct SequencerReadiness {
     pub reasons: Vec<String>,
 }
 
+/// Sequencer topology mode for `zone_getSequencerInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SequencerMode {
+    /// Single-sequencer node (or multi-sequencer machinery not yet initialized).
+    Single,
+    /// Multi-sequencer manifest mode.
+    Multi,
+}
+
 /// Response payload for `zone_getSequencerInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SequencerInfoResponse {
-    /// `multi` in manifest mode, `single` otherwise.
-    pub mode: String,
+    /// Whether this node runs in manifest (`multi`) or `single` sequencer mode.
+    pub mode: SequencerMode,
     /// ZonePortal address on Tempo L1.
     pub portal: Address,
     /// Local node identity and role (multi-sequencer mode only).
@@ -331,12 +341,22 @@ pub struct SequencerInfoResponse {
     pub readiness: Option<SequencerReadiness>,
 }
 
+/// Outcome of a `zone_setLeader` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SetLeaderStatus {
+    /// A leadership transaction was relayed and confirmed.
+    Submitted,
+    /// Finalized no-op: the target already is the active leader.
+    AlreadyActive,
+}
+
 /// Response payload for `zone_setLeader`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLeaderResponse {
-    /// `submitted` when a transaction was relayed, `alreadyActive` for a finalized no-op.
-    pub status: String,
+    /// Whether a transaction was relayed or the target was already active.
+    pub status: SetLeaderStatus,
     /// Hash of the relayed L1 transaction, when one was submitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_hash: Option<B256>,

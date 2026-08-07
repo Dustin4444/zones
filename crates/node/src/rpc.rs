@@ -60,8 +60,8 @@ use zone_rpc::{
     auth::AuthContext,
     types::{
         ActiveLeaderInfo, AuthorizationTokenInfoResponse, BoxEyreFut, BoxFut, JsonRpcError,
-        LocalSequencerInfo, PeerTipInfo, SequencerInfoResponse, SequencerPeerInfo,
-        SequencerProgress, SequencerReadiness, SetLeaderResponse,
+        LocalSequencerInfo, PeerTipInfo, SequencerInfoResponse, SequencerMode, SequencerPeerInfo,
+        SequencerProgress, SequencerReadiness, SetLeaderResponse, SetLeaderStatus,
         TempoStorageRead as RpcTempoStorageRead, ZoneExecutionWitness, ZoneInfoResponse, internal,
         raw_null, raw_zero, to_raw,
     },
@@ -91,29 +91,6 @@ pub struct SequencerRpcContext {
     pub local_ed25519_public_key: zone_p2p::P2pPeerId,
     /// Wallet-backed L1 provider signing with the individual key, when this node holds one.
     pub relayer: Option<DynProvider<TempoNetwork>>,
-}
-
-impl SequencerRpcContext {
-    /// Create the RPC context for a multi-sequencer node.
-    pub(crate) fn new(
-        schedule: LeadershipSchedule,
-        status: SharedRoleStatus,
-        peer_tips: PeerTipRegistry,
-        manifest: Arc<ZoneManifest>,
-        local_secp256k1_address: Option<Address>,
-        local_ed25519_public_key: zone_p2p::P2pPeerId,
-        relayer: Option<DynProvider<TempoNetwork>>,
-    ) -> Self {
-        Self {
-            schedule,
-            status,
-            peer_tips,
-            manifest,
-            local_secp256k1_address,
-            local_ed25519_public_key,
-            relayer,
-        }
-    }
 }
 
 /// Public, authentication-independent Zone metadata methods.
@@ -360,7 +337,7 @@ where
     let Some(context) = sequencer.get() else {
         // Single-sequencer (or not yet initialized) node: report the minimal view.
         return Ok(SequencerInfoResponse {
-            mode: "single".to_owned(),
+            mode: SequencerMode::Single,
             portal: portal_address,
             local: None,
             active_leader: None,
@@ -399,12 +376,7 @@ where
             sequencer_address: node.secp256k1_address(),
             rpc_only: node.is_rpc_only(),
             is_local: node.ed25519_public_key() == &context.local_ed25519_public_key,
-            tip: tips.get(node.ed25519_public_key()).map(|tip| PeerTipInfo {
-                zone_height: U64::from(tip.zone_height),
-                zone_hash: tip.zone_hash,
-                tempo_block_number: U64::from(tip.tempo_block_number),
-                tempo_block_hash: tip.tempo_block_hash,
-            }),
+            tip: tips.get(node.ed25519_public_key()).map(peer_tip_info),
         })
         .collect();
 
@@ -414,7 +386,7 @@ where
         .manifest
         .node_by_ed25519_public_key(&context.local_ed25519_public_key);
     Ok(SequencerInfoResponse {
-        mode: "multi".to_owned(),
+        mode: SequencerMode::Multi,
         portal: portal_address,
         local: Some(LocalSequencerInfo {
             name: local_node
@@ -425,12 +397,7 @@ where
             role: status.role.to_owned(),
         }),
         active_leader,
-        local_tip: Some(PeerTipInfo {
-            zone_height: U64::from(local_tip.zone_height),
-            zone_hash: local_tip.zone_hash,
-            tempo_block_number: U64::from(local_tip.tempo_block_number),
-            tempo_block_hash: local_tip.tempo_block_hash,
-        }),
+        local_tip: Some(peer_tip_info(&local_tip)),
         peers,
         progress: Some(SequencerProgress {
             zone_height: U64::from(local_tip.zone_height),
@@ -452,7 +419,18 @@ where
     })
 }
 
+/// Converts hash-carrying peer tip evidence into its RPC representation.
+fn peer_tip_info(tip: &PeerTip) -> PeerTipInfo {
+    PeerTipInfo {
+        zone_height: U64::from(tip.zone_height),
+        zone_hash: tip.zone_hash,
+        tempo_block_number: U64::from(tip.tempo_block_number),
+        tempo_block_hash: tip.tempo_block_hash,
+    }
+}
+
 type RpcBlock = Block<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>, TempoHeaderResponse>;
+type RpcFilterChanges = FilterChanges<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>;
 const FILTER_OWNER_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_WS_FRAME_AND_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
@@ -514,20 +492,10 @@ async fn prune_filter_owners<Api: EthApiTypes + 'static>(
 /// whitelist, so this struct effectively acts as an **enforced allowlist**
 /// of Ethereum JSON-RPC endpoints.
 ///
-/// For every allowed endpoint it applies typed privacy checks *before*
-/// serializing to JSON:
-///
-/// - **Block redaction** — zeroing `logsBloom` and clearing transaction
-///   lists for non-sequencer callers.
-/// - **Sender-scoped access** — returning `null` for transactions and
-///   receipts not owned by the authenticated caller.
-/// - **`from`-enforcement** — `eth_call` / `eth_estimateGas` may only
-///   simulate from the authenticated account (`-32004` on mismatch,
-///   auto-set when omitted); state overrides are rejected for
-///   non-sequencer callers (`-32602`).
-/// - **Sender verification** — `eth_sendRawTransaction` checks that the
-///   recovered transaction sender matches the authenticated account
-///   (`-32003` on mismatch).
+/// The per-method access rules (sender scoping, `from`-enforcement, block
+/// and receipt redaction) are documented on the [`ZoneRpcApi`] trait; this
+/// implementation applies them to typed responses *before* serializing to
+/// JSON.
 ///
 /// [`classify_method`]: zone_rpc::types::classify_method
 pub struct ZoneRpc<Api: EthApiTypes> {
@@ -615,7 +583,6 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
 
     /// Verify that the filter belongs to the authenticated caller.
     ///
-    /// Returns `Ok(())` if the caller owns the filter or is the sequencer.
     /// Returns an error indistinguishable from "filter not found" to avoid
     /// leaking filter existence to non-owners.
     async fn ensure_filter_owner(
@@ -645,14 +612,6 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
         }
 
         self.enabled_tokens.read().iter().copied().collect()
-    }
-
-    fn enforce_authorized(
-        &self,
-        request: &mut TempoTransactionRequest,
-        auth: &AuthContext,
-    ) -> Result<(), JsonRpcError> {
-        zone_rpc::policy::enforce_authorized(request, auth)
     }
 }
 
@@ -716,7 +675,7 @@ where
     fn chain_id(&self) -> BoxFut<'_> {
         Box::pin(async move {
             let chain_id = EthApiSpec::chain_id(&self.eth.api);
-            to_raw(&Some(chain_id))
+            to_raw(&chain_id)
         })
     }
 
@@ -864,7 +823,7 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            self.enforce_authorized(&mut request, &auth)?;
+            zone_rpc::policy::enforce_authorized(&mut request, &auth)?;
 
             let result = EthCall::call(&self.eth.api, request, block, EvmOverrides::default())
                 .await
@@ -880,7 +839,7 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            self.enforce_authorized(&mut request, &auth)?;
+            zone_rpc::policy::enforce_authorized(&mut request, &auth)?;
 
             let result = EthCall::estimate_gas_at(
                 &self.eth.api,
@@ -925,10 +884,10 @@ where
         auth: AuthContext,
     ) -> BoxFut<'_> {
         Box::pin(async move {
-            self.enforce_authorized(&mut request, &auth)?;
+            zone_rpc::policy::enforce_authorized(&mut request, &auth)?;
 
-            // Prefill the users request so the `fill_transaction` doesnt leak dynamic fee estimates via
-            // missing fee fields.
+            // Prefill the user's request so `fill_transaction` doesn't leak dynamic fee
+            // estimates via missing fee fields.
             apply_public_fee_policy(&mut request);
 
             let result = EthTransactions::fill_transaction(&self.eth.api, request)
@@ -995,20 +954,13 @@ where
             match changes {
                 FilterChanges::Logs(logs) => {
                     let filtered = zone_rpc::filter::filter_logs(logs, &auth.caller);
-                    to_raw(&FilterChanges::<
-                        alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                    >::Logs(filtered))
+                    to_raw(&RpcFilterChanges::Logs(filtered))
                 }
-                FilterChanges::Hashes(hashes) => to_raw(&FilterChanges::<
-                    alloy_rpc_types_eth::Transaction<TempoTxEnvelope>,
-                >::Hashes(hashes)),
+                FilterChanges::Hashes(hashes) => to_raw(&RpcFilterChanges::Hashes(hashes)),
                 // Pending transaction filters are disabled — return empty if one somehow exists
-                FilterChanges::Transactions(_) => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
-                FilterChanges::Empty => to_raw(
-                    &FilterChanges::<alloy_rpc_types_eth::Transaction<TempoTxEnvelope>>::Empty,
-                ),
+                FilterChanges::Transactions(_) | FilterChanges::Empty => {
+                    to_raw(&RpcFilterChanges::Empty)
+                }
             }
         })
     }
@@ -1239,7 +1191,7 @@ async fn set_leader(
 
     if leader == target {
         return Ok(SetLeaderResponse {
-            status: "alreadyActive".to_owned(),
+            status: SetLeaderStatus::AlreadyActive,
             tx_hash: None,
             relayer: relayer_address,
             requested_leader: target,
@@ -1286,7 +1238,7 @@ async fn set_leader(
         "Confirmed setLeader on the ZonePortal"
     );
     Ok(SetLeaderResponse {
-        status: "submitted".to_owned(),
+        status: SetLeaderStatus::Submitted,
         tx_hash: Some(tx_hash),
         relayer: relayer_address,
         requested_leader: target,
@@ -1408,7 +1360,7 @@ mod tests {
             )
             .await
             .expect("single-sequencer info should be available without authentication");
-        assert_eq!(info.mode, "single");
+        assert_eq!(info.mode, SequencerMode::Single);
         assert_eq!(info.portal, Address::repeat_byte(0x11));
 
         let error = module

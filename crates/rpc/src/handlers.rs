@@ -63,8 +63,8 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
 
     /// `eth_getBalance(address, block)` — returns the balance of an account.
     ///
-    /// Returns `0x0` for non-sequencer callers querying an address that does
-    /// not match `auth.caller`.
+    /// Returns `0x0` whenever the queried address does not match
+    /// `auth.caller`, so account existence is not leaked.
     fn get_balance(
         &self,
         address: Address,
@@ -74,8 +74,8 @@ pub trait ZoneRpcApi: Send + Sync + 'static {
 
     /// `eth_getTransactionCount(address, block)` — returns the nonce.
     ///
-    /// Returns `0x0` for non-sequencer callers querying an address that does
-    /// not match `auth.caller`.
+    /// Returns `0x0` whenever the queried address does not match
+    /// `auth.caller`, so account existence is not leaked.
     fn get_transaction_count(
         &self,
         address: Address,
@@ -362,7 +362,7 @@ async fn handle_web3_sha3(id: Value, raw: &str) -> JsonRpcResponse {
     api_result(id, "web3_sha3", crate::types::to_raw(&keccak256(data)))
 }
 
-/// Handle `eth_getBlockByNumber`. Rejects `full=true` for non-sequencer callers.
+/// Handle `eth_getBlockByNumber`. Rejects `full=true`.
 async fn handle_get_block_by_number(
     id: Value,
     raw: &str,
@@ -452,7 +452,7 @@ async fn handle_get_transaction_receipt(
 }
 
 /// Handle `eth_call`. Enforces `from` matches the authenticated account and
-/// rejects state overrides for non-sequencer callers.
+/// rejects state overrides.
 async fn handle_call(
     id: Value,
     raw: &str,
@@ -582,8 +582,8 @@ async fn handle_fee_history(id: Value, raw: &str, api: &dyn ZoneRpcApi) -> JsonR
     )
 }
 
-/// Handle `eth_getBalance`. Returns `0x0` for non-sequencer callers querying
-/// a different address (checked in API impl, no timing leak since check is pre-fetch).
+/// Handle `eth_getBalance`. Returns `0x0` for queries about a different
+/// address (checked in API impl, no timing leak since check is pre-fetch).
 async fn handle_get_balance(
     id: Value,
     raw: &str,
@@ -603,8 +603,8 @@ async fn handle_get_balance(
     )
 }
 
-/// Handle `eth_getTransactionCount`. Returns `0x0` for non-sequencer callers
-/// querying a different address (checked in API impl, no timing leak).
+/// Handle `eth_getTransactionCount`. Returns `0x0` for queries about a
+/// different address (checked in API impl, no timing leak).
 async fn handle_get_transaction_count(
     id: Value,
     raw: &str,

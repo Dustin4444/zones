@@ -660,15 +660,15 @@ where
                 None => None,
             };
             sequencer_rpc_slot
-                .set(SequencerRpcContext::new(
-                    schedule.clone(),
-                    role_status.clone(),
-                    peer_tips.clone(),
+                .set(SequencerRpcContext {
+                    schedule: schedule.clone(),
+                    status: role_status.clone(),
+                    peer_tips: peer_tips.clone(),
                     manifest,
                     local_secp256k1_address,
-                    local_ed25519_public_key.clone(),
+                    local_ed25519_public_key: local_ed25519_public_key.clone(),
                     relayer,
-                ))
+                })
                 .expect("the sequencer RPC context is installed exactly once");
             p2p_runtime = Some((
                 sinks,
