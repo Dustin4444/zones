@@ -10,6 +10,63 @@ Reviewed HEAD: `d9002b4bee897698b2252b45bdedc90d41d4ba3c`
 
 Merge base: `55b0fcbed520570c5e1089dc5db97d05b5546571`
 
+## Implementation progress
+
+| Milestone | Status | Local commit | Validation and measurements | Remaining caveats |
+|---|---|---|---|---|
+| 0 — baseline and characterization | passed | this milestone commit; resolved in the next ledger update | Branch `horsefacts/zone-checker`; starting HEAD `fa525d28cb38246cf53a635012fbcf90a4f9652c`; merge base confirmed; clean worktree; baseline LOC and guarantee inventories recorded below; `cargo +1.95.0 test -p zone-checker` (432 unit tests and 1 doc test passed) | The default Rust 1.94.1 toolchain is older than the workspace's required 1.95.0, so gates use the already-installed `+1.95.0` toolchain. |
+| 1 — full L1 transaction authentication | active | pending | Full-envelope and transaction-root implementation in progress | — |
+| 2 — compact kernel skeleton | pending | pending | — | — |
+| 3 — complete lifecycle kernel | pending | pending | — | — |
+| 4 — checkpoint/journal store | pending | pending | — | — |
+| 5 — builder and compact runtime | pending | pending | — | — |
+| 6 — cutover and deletion | pending | pending | — | — |
+
+### Milestone 0 baseline record
+
+LOC uses physical Rust lines under `crates/checker/src`; files below a `tests/` directory or named
+`tests.rs` are counted as tests. The same script and classification will be used at cutover.
+
+| Subsystem | Production LOC | Test LOC | Total LOC |
+|---|---:|---:|---:|
+| `check` | 1,936 | 2,490 | 4,426 |
+| `model` | 13,418 | 9,392 | 22,810 |
+| `observe` | 2,736 | 2,224 | 4,960 |
+| `runtime` | 3,514 | 2,383 | 5,897 |
+| `store` | 11,522 | 8,616 | 20,138 |
+| roots and cross-cutting | 1,031 | 3,031 | 4,062 |
+| **Total** | **34,157** | **28,136** | **62,293** |
+
+Authenticated-field classification at baseline:
+
+- **Consumed:** exact imported and Zone headers and chain coordinates; complete receipt identity,
+  order, roots, and blooms; system-envelope identity and calldata; Portal and Zone lifecycle
+  inputs; operation order and branch outcomes; exact-hash state and collateral reads.
+- **Compared:** deposit numbers and queue commitments; batch, withdrawal, refund, processing,
+  finalization, token-enable, and Tempo-advance outputs; exact fixed Zone state; enabled-token
+  supplies; Portal collateral lower bound.
+- **Explicitly unchecked:** successful batch proof/quorum payloads after authenticated execution;
+  event coordinates as semantic values; ordinary `DepositProcessed.to` and `memo`; bounce-back
+  `zone_fallback_recipient`; finalization encrypted-sender contents after grammar/count checks;
+  non-enabled token supplies; surplus collateral; upper bytes of the packed Outbox batch slot.
+- **Baseline classification gap to close:** `advanceTempo.decryptions` is authenticated and bounded
+  but neither semantically consumed nor explicitly documented as unchecked. Compared-field
+  mutation coverage is complete only for fixed state, supply, collateral, one imported queue hash,
+  and one finalized hash; Milestone 3 must add the remaining one-field mutations.
+- **Milestone 1 evidence hole:** the RPC transaction-hash vector binds receipts, but full envelopes
+  are not authenticated against `transactions_root`; selected Portal bodies are fetched by hash.
+
+Existing guarantee coverage at baseline:
+
+| Guarantee family | Existing focused coverage | Known weak point carried forward |
+|---|---|---|
+| Complete lifecycle | Creation/config/token, ordinary and failed deposits, refunds, user withdrawals and fees, finalization, submission, delivery, pending refund, bounce-back, callback, partial/empty processing, ring reuse, aggregate accounting and all terminal owners in `model/transition/tests`, `check/tests/lifecycle`, and `tests/lifecycle_recovery.rs` | Ring reuse and empty-batch persistence/reorg are not isolated. |
+| Authentication | Exact L1 header; receipt cardinality/coordinates/root/bloom; Portal topic and ABI policy; Zone system envelopes and receipt commitments in `observe/l1/tests.rs` and `observe/l2/tests.rs` | No complete L1 transaction-root/body proof; no authentication-failure/restart/retry cross-test. |
+| Persistence/restart | Store opening, schema/codec corruption, history, lifecycle recovery, durable L1 cursor resume, and bootstrap restart tests | Accounting persistence is mostly whole-state rather than focused boundary tests. |
+| Reorg and alert | One/multi/interrupted reorg; descendant-preserving, exact-finding-removing, and replacement-divergence alert reorgs in `tests/runtime` | Alert restart followed by alert-removing reorg is not one combined scenario. |
+| Coverage and acknowledgement | Partial-notification durable-prefix retry, acquisition atomicity, prepared-candidate non-authority, commit-abort retry, commit-before-mirror restart, and no-ack acquisition failure in `tests/runtime/atomicity.rs` | Current architecture does not yet persist the compact runtime's explicit verified/acknowledged gap model. |
+| Real node | Bootstrap/restart/advance and active-alert progress in `crates/node/tests/it/checker_e2e.rs` | No real-node lifecycle/reorg/crash breadth beyond those smoke tests. |
+
 ## 1. Executive direction
 
 The checker is overengineered, but not primarily because its bridge lifecycle model is too
