@@ -28,7 +28,7 @@ use tower::service_fn;
 use tracing::{info, warn};
 
 use crate::{
-    auth::{self, AuthContext},
+    auth::{self, AuthContext, now_unix_seconds},
     config::RedactedRpcConfig,
     error::{AuthError, AuthenticateError},
     metrics::RedactedRpcAuthMetrics,
@@ -374,11 +374,4 @@ fn validate_keychain_key_info(key_info: &KeyInfo) -> Result<(), AuthenticateErro
         return Err(AuthError::ExpiredKeychainKey.into());
     }
     Ok(())
-}
-
-fn now_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_secs()
 }
