@@ -13,6 +13,8 @@ members = [
   "bin/tempo-zone",
   "crates/chainspec",
   "crates/contracts",
+  "crates/checker",
+  "crates/checker-kernel",
   "crates/evm",
   "crates/l1",
   "crates/node",
@@ -133,6 +135,7 @@ zone-primitives = { path = "crates/primitives", default-features = false }
 zone-rpc = { path = "crates/rpc" }
 zone-sequencer = { path = "crates/sequencer" }
 zone-checker = { path = "crates/checker" }
+zone-checker-kernel = { path = "crates/checker-kernel" }
 zone-spf = { path = "crates/spf" }
 
 # reth

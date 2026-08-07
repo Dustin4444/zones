@@ -1,0 +1,17 @@
+[package]
+name = "zone-checker-kernel"
+description = "Independent compact semantic kernel for the Tempo Zone checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["serde", "std"] }
+alloy-sol-types = { workspace = true, features = ["std"] }
+serde.workspace = true
+thiserror.workspace = true

@@ -13742,7 +13742,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zone-checker-kernel",
  "zone-primitives",
+]
+
+[[package]]
+name = "zone-checker-kernel"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
