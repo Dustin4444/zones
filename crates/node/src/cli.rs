@@ -261,7 +261,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
             node = node.with_p2p(config);
         }
 
-        // Install the checker ExEx only when observe mode produced a runtime config.
         if let NodeAction::BuildCheckpoint {
             portal_creation_block_hash,
             database_path,
@@ -283,7 +282,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
                 config,
                 zone_chain_id,
                 node_handle.node.provider(),
-                &database_path,
             )
             .await?;
             drop(node_handle);

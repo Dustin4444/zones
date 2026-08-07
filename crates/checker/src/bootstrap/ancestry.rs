@@ -1,5 +1,3 @@
-//! Exact-hash Tempo ancestry acquisition for archive bootstrap.
-
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockNumHash;
 use alloy_provider::DynProvider;
@@ -39,11 +37,9 @@ pub(crate) async fn acquire_anchor_header(
     Ok(header)
 }
 
-/// Return the exact ancestor-to-descendant header sequence, inclusive.
+/// Return the hash-linked ancestor-to-descendant header sequence, inclusive.
 ///
-/// Both endpoints have already been authenticated by exact hash. Retaining
-/// every acquired header lets replay consume this proof directly instead of
-/// fetching the same ancestry a second time.
+/// Reuse the acquired headers during replay instead of fetching them again.
 pub(crate) async fn prove_ancestry(
     provider: &DynProvider<TempoNetwork>,
     descendant: ImportedTempoHeader,
@@ -57,11 +53,9 @@ pub(crate) async fn prove_ancestry(
     Ok(path)
 }
 
-/// Return the authenticated descendants strictly after a durable ancestor.
+/// Return hash-linked descendants strictly after an ancestor.
 ///
-/// The boundary itself is not fetched again. Its hash is instead proven by
-/// the first returned child's parent link. An equal descendant and ancestor
-/// therefore needs no archive RPC at all.
+/// The first child's parent link checks the boundary without fetching it again.
 pub(super) async fn prove_descendants_after(
     provider: &DynProvider<TempoNetwork>,
     descendant: ImportedTempoHeader,

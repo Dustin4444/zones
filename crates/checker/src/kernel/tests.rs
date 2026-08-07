@@ -2,16 +2,20 @@ use alloy_primitives::{Address, B256, Bytes, U256, address, b256, fixed_bytes};
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
-use crate::{
-    BatchId, BatchState, BatchSubmission, Deposit, DepositId, DepositOutcome, Effect, FallbackId,
-    Finalization, ImportedFacts, ImportedOperation, InboxRefundId, ModelError, OrdinaryDeposit,
-    PortalIdentity, PortalRefundId, PortalState, RefundClaim, State, StateKey, StateValue,
-    TokenEnable, TokenPhase, UserWithdrawal, WithdrawalId, WithdrawalOutcome, WithdrawalProcessing,
-    ZoneFacts, ZoneOperation, apply_genesis_handoff, apply_imported, apply_zone,
-    commitments::{ordinary_deposit_hash, portal_address},
+use crate::kernel::{
+    BatchId, BatchSubmission, Deposit, DepositId, DepositOutcome, Effect, Finalization,
+    ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalIdentity, PortalState, RefundClaim,
+    State, StateKey, StateValue, TokenEnable, TokenPhase, UserWithdrawal, WithdrawalId,
+    WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
+    apply::TransitionError,
+    apply_genesis_handoff, apply_imported, apply_zone,
+    commitments::{WITHDRAWAL_SENTINEL, ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
-    state::{Overlay, TokenAccounting, TokenState},
+    state::{
+        BatchState, FallbackId, InboxRefundId, Overlay, PortalRefundId, TokenAccounting,
+        TokenState, WithdrawalOwner,
+    },
 };
 
 const ZONE_ID: u32 = 7;
@@ -112,7 +116,7 @@ fn zone_rejects_a_deposit_prefix_without_mutating_parent() {
                 ..Default::default()
             }
         ),
-        Err(ModelError::CommitmentMismatch)
+        Err(TransitionError::CommitmentMismatch)
     );
     assert_eq!(parent, before);
 }
@@ -212,7 +216,7 @@ fn user_withdrawal(seed: u8, amount: u128) -> UserWithdrawal {
     }
 }
 
-fn finalized_user_state() -> (State, crate::Withdrawal) {
+fn finalized_user_state() -> (State, crate::kernel::Withdrawal) {
     let mut state = funded_state();
     commit(
         &mut state,
@@ -245,7 +249,7 @@ fn finalized_user_state() -> (State, crate::Withdrawal) {
         zone_id: ZONE_ID,
         index: 0,
     };
-    let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) =
+    let StateValue::Withdrawal(WithdrawalOwner::Finalized { data, .. }) =
         state.rows()[&StateKey::Withdrawal(id)].clone()
     else {
         unreachable!()
@@ -373,8 +377,8 @@ fn overlay_reads_writes_deletes_and_finishes_in_key_order() {
         Some(StateValue::Portal(PortalState::Created {
             identity: identity(),
             bounceback_gas: 5,
-            deposit: crate::state::Cursor::ZERO,
-            settlement: crate::state::Settlement::ZERO,
+            deposit: crate::kernel::state::Cursor::ZERO,
+            settlement: crate::kernel::state::Settlement::ZERO,
         })),
     );
     assert!(overlay.get(&StateKey::Token(token)).is_none());
@@ -441,7 +445,7 @@ fn creation_checks_identity_address_initial_token_and_repetition() {
     wrong_identity.zone_id += 1;
     assert_eq!(
         apply_imported(&parent, &create(wrong_identity, identity().initial_token)).unwrap_err(),
-        ModelError::PortalIdentityMismatch
+        TransitionError::PortalIdentityMismatch
     );
     let wrong_address_identity = PortalIdentity {
         portal: Address::repeat_byte(0xaa),
@@ -454,11 +458,11 @@ fn creation_checks_identity_address_initial_token_and_repetition() {
             &create(wrong_address_identity, wrong_address_identity.initial_token)
         )
         .unwrap_err(),
-        ModelError::PortalAddressMismatch
+        TransitionError::PortalAddressMismatch
     );
     assert_eq!(
         apply_imported(&parent, &create(identity(), Address::repeat_byte(0xbb))).unwrap_err(),
-        ModelError::InitialTokenMismatch
+        TransitionError::InitialTokenMismatch
     );
     assert!(apply_imported(&parent, &create(identity(), identity().initial_token)).is_ok());
     assert_eq!(
@@ -479,7 +483,7 @@ fn creation_checks_identity_address_initial_token_and_repetition() {
             }
         )
         .unwrap_err(),
-        ModelError::PortalAlreadyCreated
+        TransitionError::PortalAlreadyCreated
     );
 }
 
@@ -497,7 +501,7 @@ fn token_enablement_requires_creation_and_rejects_duplicates() {
             }
         )
         .unwrap_err(),
-        ModelError::PortalNotCreated
+        TransitionError::PortalNotCreated
     );
     assert_eq!(
         apply_imported(
@@ -514,7 +518,7 @@ fn token_enablement_requires_creation_and_rejects_duplicates() {
             }
         )
         .unwrap_err(),
-        ModelError::TokenAlreadyEnabled(identity().initial_token)
+        TransitionError::TokenAlreadyEnabled(identity().initial_token)
     );
 }
 
@@ -534,12 +538,12 @@ fn zone_enablement_must_exactly_match_this_imported_block() {
     .unwrap();
     assert_eq!(
         apply_zone(imported, &ZoneFacts::default()).unwrap_err(),
-        ModelError::TokenEnableMismatch
+        TransitionError::TokenEnableMismatch
     );
 }
 
 #[test]
-fn ordinary_deposit_commitment_matches_independent_literal_vector() {
+fn ordinary_deposit_commitment_matches_literal_vector() {
     assert_eq!(
         ordinary_deposit_hash(&deposit(), B256::ZERO),
         b256!("89982eeee3ca64954daa0322b331f17efd85a433564bfdb4938c0ab087663a5d")
@@ -551,15 +555,15 @@ fn sender_tag_matches_literal_vector_and_includes_fallback_nonce() {
     let sender = Address::repeat_byte(0x11);
     let transaction = B256::repeat_byte(0x22);
     assert_eq!(
-        crate::commitments::sender_tag(sender, transaction, 0x0102_0304_0506_0708),
+        crate::kernel::commitments::sender_tag(sender, transaction, 0x0102_0304_0506_0708),
         b256!("09e5aae3d74dbb09f2046a3a15c5504ce844113049b83c2884ca41a43124acbf")
     );
     assert_ne!(
-        crate::commitments::sender_tag(sender, transaction, 1),
-        crate::commitments::sender_tag(sender, transaction, 2)
+        crate::kernel::commitments::sender_tag(sender, transaction, 1),
+        crate::kernel::commitments::sender_tag(sender, transaction, 2)
     );
     assert_eq!(
-        crate::commitments::failed_deposit_sender_tag(),
+        crate::kernel::commitments::failed_deposit_sender_tag(),
         alloy_primitives::keccak256([0u8; 52])
     );
 }
@@ -605,7 +609,7 @@ fn failed_deposit_creates_refund_owner_and_rejects_prefix_mutation() {
         },
     )
     .unwrap_err();
-    assert_eq!(error, ModelError::DepositPrefixMismatch);
+    assert_eq!(error, TransitionError::DepositPrefixMismatch);
 
     let candidate = apply_zone(
         apply_imported(&state, &ImportedFacts::default()).unwrap(),
@@ -647,8 +651,32 @@ fn outcome_cardinality_is_exact_and_failures_do_not_mutate_parent() {
             }
         )
         .unwrap_err(),
-        ModelError::DepositOutcomeCountMismatch
+        TransitionError::DepositOutcomeCountMismatch
     );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn withdrawal_outcome_cardinality_is_distinct_and_exact() {
+    let (mut state, withdrawal) = finalized_user_state();
+    submit_first_batch(&mut state);
+    let before = state.clone();
+    let error = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    base_fee: U256::ZERO,
+                    withdrawals: vec![withdrawal],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, TransitionError::WithdrawalOutcomeCountMismatch);
     assert_eq!(state, before);
 }
 
@@ -686,12 +714,12 @@ fn zero_refund_recipient_is_rejected() {
             }
         )
         .unwrap_err(),
-        ModelError::ZeroRefundRecipient
+        TransitionError::ZeroRefundRecipient
     );
 }
 
 #[test]
-fn user_delivery_closes_batch_withdrawal_fallback_and_w() {
+fn user_delivery_closes_batch_withdrawal_fallback_accounting() {
     let (mut state, withdrawal) = finalized_user_state();
     submit_first_batch(&mut state);
     commit(
@@ -728,7 +756,7 @@ fn user_delivery_closes_batch_withdrawal_fallback_and_w() {
 fn user_bounce_pending_and_inbox_claim_close_complete_lifecycle() {
     let (mut state, withdrawal) = finalized_user_state();
     submit_first_batch(&mut state);
-    let bounce = crate::BounceBackDeposit {
+    let bounce = crate::kernel::BounceBackDeposit {
         token: identity().initial_token,
         fallback_nonce: NonZeroU64::MIN,
         amount: 40,
@@ -878,17 +906,18 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
     submit_first_batch(&mut state);
     let withdrawals = (0..2)
         .map(|index| {
-            let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) = &state
-                .rows()[&StateKey::Withdrawal(WithdrawalId {
-                zone_id: ZONE_ID,
-                index,
-            })] else {
+            let StateValue::Withdrawal(WithdrawalOwner::Finalized { data, .. }) = &state.rows()
+                [&StateKey::Withdrawal(WithdrawalId {
+                    zone_id: ZONE_ID,
+                    index,
+                })]
+            else {
                 unreachable!()
             };
             data.clone()
         })
         .collect::<Vec<_>>();
-    let suffix = crate::commitments::withdrawal_hash(&withdrawals[1], crate::WITHDRAWAL_SENTINEL);
+    let suffix = crate::kernel::commitments::withdrawal_hash(&withdrawals[1], WITHDRAWAL_SENTINEL);
     commit(
         &mut state,
         ImportedFacts {
@@ -945,7 +974,7 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
 }
 
 #[test]
-fn failed_deposit_pending_refund_claim_closes_d() {
+fn failed_deposit_pending_refund_claim_accounting() {
     let (mut state, deposit) = created_with_deposit();
     commit(
         &mut state,
@@ -968,7 +997,7 @@ fn failed_deposit_pending_refund_claim_closes_d() {
         zone_id: ZONE_ID,
         index: 0,
     };
-    let StateValue::Withdrawal(crate::WithdrawalOwner::Finalized { data, .. }) =
+    let StateValue::Withdrawal(WithdrawalOwner::Finalized { data, .. }) =
         state.rows()[&StateKey::Withdrawal(wid)].clone()
     else {
         unreachable!()
@@ -1045,7 +1074,7 @@ fn every_ordinary_deposit_field_is_prefix_authenticated() {
                 },
             )
             .unwrap_err(),
-            ModelError::DepositPrefixMismatch
+            TransitionError::DepositPrefixMismatch
         );
     }
 }
@@ -1087,20 +1116,20 @@ fn every_submission_commitment_field_is_compared() {
     changed!(next_block, B256::repeat_byte(0x12));
     changed!(
         previous_deposit,
-        crate::Cursor {
+        crate::kernel::Cursor {
             hash: B256::repeat_byte(0x13),
             number: 0
         }
     );
     changed!(
         next_deposit,
-        crate::Cursor {
+        crate::kernel::Cursor {
             hash: B256::repeat_byte(0x14),
             number: 0
         }
     );
     changed!(withdrawal_queue_hash, B256::repeat_byte(0x15));
-    changed!(withdrawal_queue_hash, crate::WITHDRAWAL_SENTINEL);
+    changed!(withdrawal_queue_hash, WITHDRAWAL_SENTINEL);
     changed!(next_zone_height, exact.next_zone_height + U256::ONE);
     for input in mutations {
         assert_eq!(
@@ -1112,7 +1141,7 @@ fn every_submission_commitment_field_is_compared() {
                 },
             )
             .unwrap_err(),
-            ModelError::CommitmentMismatch
+            TransitionError::CommitmentMismatch
         );
     }
 }
@@ -1129,15 +1158,15 @@ fn every_withdrawal_preimage_field_is_prefix_authenticated() {
             mutations.push(value);
         }};
     }
-    changed!(|v: &mut crate::Withdrawal| v.token = Address::repeat_byte(0xb1));
-    changed!(|v: &mut crate::Withdrawal| v.sender_tag = B256::repeat_byte(0xb2));
-    changed!(|v: &mut crate::Withdrawal| v.to = Address::repeat_byte(0xb3));
-    changed!(|v: &mut crate::Withdrawal| v.amount += 1);
-    changed!(|v: &mut crate::Withdrawal| v.memo = B256::repeat_byte(0xb4));
-    changed!(|v: &mut crate::Withdrawal| v.gas_limit += 1);
-    changed!(|v: &mut crate::Withdrawal| v.fallback_nonce += 1);
-    changed!(|v: &mut crate::Withdrawal| v.callback_data = Bytes::from_static(b"x"));
-    changed!(|v: &mut crate::Withdrawal| v.encrypted_sender = Bytes::from_static(b"x"));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.token = Address::repeat_byte(0xb1));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.sender_tag = B256::repeat_byte(0xb2));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.to = Address::repeat_byte(0xb3));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.amount += 1);
+    changed!(|v: &mut crate::kernel::Withdrawal| v.memo = B256::repeat_byte(0xb4));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.gas_limit += 1);
+    changed!(|v: &mut crate::kernel::Withdrawal| v.fallback_nonce += 1);
+    changed!(|v: &mut crate::kernel::Withdrawal| v.callback_data = Bytes::from_static(b"x"));
+    changed!(|v: &mut crate::kernel::Withdrawal| v.encrypted_sender = Bytes::from_static(b"x"));
     for value in mutations {
         assert_eq!(
             apply_imported(
@@ -1157,7 +1186,7 @@ fn every_withdrawal_preimage_field_is_prefix_authenticated() {
                 },
             )
             .unwrap_err(),
-            ModelError::CommitmentMismatch
+            TransitionError::CommitmentMismatch
         );
     }
 }

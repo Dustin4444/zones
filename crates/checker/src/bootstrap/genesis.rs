@@ -1,5 +1,3 @@
-//! Exact local Zone-genesis observations used to choose the archive replay boundary.
-
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use reth_storage_api::StateProviderFactory;

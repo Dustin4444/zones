@@ -32,7 +32,7 @@ use crate::{
     },
     protocol::{
         constants::AUTHENTICATED_WITHDRAWAL_SIZE,
-        events::{L1ProtocolEvent, PortalModelEvent},
+        events::{L1ProtocolEvent, PortalEvent},
     },
 };
 
@@ -417,7 +417,7 @@ fn authenticated_event_order_uses_receipt_vectors_not_rpc_log_metadata() {
         92,
         800,
     );
-    let known_non_model = event_log(
+    let ignored = event_log(
         PORTAL,
         ZonePortal::LeaderUpdated {
             previousLeader: Address::repeat_byte(1),
@@ -430,7 +430,7 @@ fn authenticated_event_order_uses_receipt_vectors_not_rpc_log_metadata() {
     );
     let operation = batch_submitted_log(94, 600);
     let (imported, receipts) = anchor(vec![
-        receipt(hashes[0], 0, true, vec![external, config, known_non_model]),
+        receipt(hashes[0], 0, true, vec![external, config, ignored]),
         receipt(hashes[1], 1, true, vec![operation]),
     ]);
     authentication::authenticate_receipts(&imported, &hashes, &receipts).unwrap();
@@ -439,7 +439,7 @@ fn authenticated_event_order_uses_receipt_vectors_not_rpc_log_metadata() {
     assert_eq!(observed.len(), 2);
     assert!(matches!(
         observed[0].outcomes[0].event,
-        L1ProtocolEvent::Portal(PortalModelEvent::BouncebackGasUpdated(_))
+        L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(_))
     ));
     assert_eq!(
         observed[1].required_call,
@@ -465,7 +465,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
         92,
         800,
     );
-    let known_non_model = event_log(
+    let ignored = event_log(
         PORTAL,
         ZonePortal::LeaderUpdated {
             previousLeader: Address::repeat_byte(1),
@@ -478,7 +478,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
     );
     let (imported, receipts) = anchor(vec![
         receipt(hashes[0], 0, true, vec![operation]),
-        receipt(hashes[1], 1, true, vec![external, config, known_non_model]),
+        receipt(hashes[1], 1, true, vec![external, config, ignored]),
     ]);
     authentication::authenticate_receipts(&imported, &hashes, &receipts).unwrap();
 
@@ -488,7 +488,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
     let operation = &observed[0].outcomes[0];
     assert!(matches!(
         operation.event,
-        L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(_))
+        L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_))
     ));
     assert_eq!(
         observed[0].required_call,
@@ -498,7 +498,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
     let config = &observed[1].outcomes[0];
     assert!(matches!(
         config.event,
-        L1ProtocolEvent::Portal(PortalModelEvent::BouncebackGasUpdated(_))
+        L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(_))
     ));
     assert_eq!(observed[1].required_call, None);
 }
@@ -553,7 +553,7 @@ fn malformed_and_unknown_configured_portal_logs_fail_closed_but_external_logs_do
 }
 
 #[test]
-fn one_receipt_cannot_imply_both_selective_portal_call_families() {
+fn one_receipt_cannot_imply_two_portal_call_families() {
     let tx_hash = B256::repeat_byte(0x10);
     let batch = batch_submitted_log(0, 0);
     let processed = withdrawal_processed_log(0, 1);
@@ -774,7 +774,7 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     };
     assert!(matches!(
         outcome.event(),
-        L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(_))
+        L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(_))
     ));
     assert!(asserter.read_q().is_empty());
 }

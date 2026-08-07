@@ -1,13 +1,14 @@
-//! Archive bootstrap for the checker store.
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use std::path::Path;
-
+use crate::kernel::{
+    ImportedOperation, PortalIdentity, State, apply_genesis_handoff, apply_imported,
+};
 use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use tempo_alloy::TempoNetwork;
-use zone_checker_kernel::{
-    ImportedOperation, PortalIdentity, State, apply_genesis_handoff, apply_imported,
-};
 
 use crate::{
     CheckerConfig,
@@ -20,19 +21,14 @@ use crate::{
         validate_local_configuration,
     },
     observe::{acquire_l1_header, acquire_portal_collateral, observe_l1},
-    persistence::{BlockNumHash, ChainCut},
-    runtime::{BuildConfig, publish_genesis_checkpoint},
+    persistence::{BlockNumHash, ChainCut, Identity, Persistence, PersistenceError, Snapshot},
 };
 
 /// Build and atomically publish a checkpoint at local Zone genesis.
-///
-/// Every Tempo block is authenticated by exact hash and replayed only through
-/// the independent checker kernel.
 pub async fn build_checkpoint<P>(
     config: CheckerConfig,
     zone_chain_id: u64,
     zone_provider: &P,
-    target: impl AsRef<Path>,
 ) -> eyre::Result<()>
 where
     P: BlockNumReader + StateProviderFactory + ?Sized,
@@ -50,7 +46,7 @@ where
     let creation_tip = header_tip(&creation_header);
     let creation_observation =
         observe_l1(&l1_provider, &creation_header, config.portal_address).await?;
-    let creation_projection = adapt_imported(
+    let (creation_facts, _) = adapt_imported(
         &creation_observation,
         &creation_header,
         config.portal_creation_block_hash,
@@ -62,7 +58,7 @@ where
             identity,
             initial_token,
         },
-    ] = creation_projection.facts.operations.as_slice()
+    ] = creation_facts.operations.as_slice()
     else {
         eyre::bail!("creation block must contain one portal creation operation");
     };
@@ -72,9 +68,7 @@ where
         initial_token: local.initial_token(),
     };
     if *identity != expected_identity || initial_token.token != local.initial_token() {
-        eyre::bail!(
-            "authenticated creation identity does not match configuration and zone genesis"
-        );
+        eyre::bail!("creation identity does not match configuration and Zone genesis");
     }
 
     let mut state = State::awaiting(expected_identity);
@@ -98,7 +92,7 @@ where
                 }
             }
             let tokens = state.rows().keys().filter_map(|key| match key {
-                zone_checker_kernel::StateKey::Token(token) => Some(*token),
+                crate::kernel::StateKey::Token(token) => Some(*token),
                 _ => None,
             });
             validate_zero_genesis_supply(zone_provider, local.genesis().hash, tokens)?;
@@ -106,7 +100,6 @@ where
             state.apply(&handoff)?;
         }
         FreshHistory::PortalCreatedAfterGenesisAnchor => {
-            // Prove that the genesis anchor precedes portal creation.
             prove_ancestry(&l1_provider, creation_header, &anchor_header).await?;
             validate_zero_genesis_supply(
                 zone_provider,
@@ -116,28 +109,100 @@ where
         }
     }
 
-    publish_genesis_checkpoint(
-        BuildConfig {
-            path: target.as_ref(),
-            l1_chain_id,
-            zone_chain_id,
-            creation_block: creation_tip.hash,
-            creation_height: creation_tip.number,
-            portal_identity: expected_identity,
-            anchor: ChainCut {
-                zone: BlockNumHash {
-                    number: local.genesis().number,
-                    hash: local.genesis().hash,
-                },
-                tempo: BlockNumHash {
-                    number: anchor.number,
-                    hash: anchor.hash,
-                },
-            },
+    let identity = Identity {
+        l1_chain_id,
+        zone_chain_id,
+        zone_id: expected_identity.zone_id,
+        portal: expected_identity.portal,
+        creation_block: creation_tip.hash,
+        creation_height: creation_tip.number,
+    };
+    let anchor = ChainCut {
+        zone: BlockNumHash {
+            number: local.genesis().number,
+            hash: local.genesis().hash,
         },
-        state,
-    )?;
+        tempo: BlockNumHash {
+            number: anchor.number,
+            hash: anchor.hash,
+        },
+    };
+    publish_genesis_checkpoint(&config.database_path, identity, anchor, state)?;
     Ok(())
+}
+
+pub(crate) fn publish_genesis_checkpoint(
+    target: &Path,
+    identity: Identity,
+    anchor: ChainCut,
+    state: State,
+) -> Result<Snapshot, PersistenceError> {
+    let staging = prepare_staging(target)?;
+    let result = (|| {
+        let (store, snapshot) = Persistence::create(&staging, identity, anchor, state)?;
+        drop(store);
+        let (reopened, verified) = Persistence::open(&staging, identity)?;
+        drop(reopened);
+        if snapshot != verified {
+            return Err(PersistenceError::Invalid(
+                "genesis checkpoint changed across final reopen".into(),
+            ));
+        }
+        Ok(verified)
+    })();
+    publish_staging(target, &staging, result)
+}
+
+fn prepare_staging(target: &Path) -> Result<PathBuf, PersistenceError> {
+    if target.exists() {
+        return Err(PersistenceError::Invalid(
+            "checkpoint target already exists".into(),
+        ));
+    }
+    let staging = staging_path(target)?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|error| {
+            PersistenceError::Invalid(format!("cannot remove checkpoint staging: {error}"))
+        })?;
+    }
+    fs::create_dir_all(&staging).map_err(|error| {
+        PersistenceError::Invalid(format!("cannot create checkpoint staging: {error}"))
+    })?;
+    Ok(staging)
+}
+
+fn publish_staging(
+    target: &Path,
+    staging: &Path,
+    result: Result<Snapshot, PersistenceError>,
+) -> Result<Snapshot, PersistenceError> {
+    match result {
+        Ok(snapshot) => {
+            fs::rename(staging, target).map_err(|error| {
+                let _ = fs::remove_dir_all(staging);
+                PersistenceError::Invalid(format!("cannot atomically publish checkpoint: {error}"))
+            })?;
+            Ok(snapshot)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(staging);
+            Err(error)
+        }
+    }
+}
+
+fn staging_path(target: &Path) -> Result<PathBuf, PersistenceError> {
+    let parent = target.parent().ok_or_else(|| {
+        PersistenceError::Invalid("checkpoint target has no sibling directory".into())
+    })?;
+    let name = target.file_name().ok_or_else(|| {
+        PersistenceError::Invalid("checkpoint target has no directory name".into())
+    })?;
+    Ok(parent.join(format!(
+        ".{}.staging-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
 }
 
 async fn replay_one(
@@ -147,17 +212,17 @@ async fn replay_one(
     config: &CheckerConfig,
     provider: &DynProvider<TempoNetwork>,
 ) -> eyre::Result<()> {
-    let projection = adapt_imported(
+    let (facts, effects) = adapt_imported(
         observation,
         header,
         config.portal_creation_block_hash,
         config.zone_id,
     )
     .map_err(|failure| eyre::eyre!(failure.message))?;
-    let candidate = apply_imported(state, &projection.facts)?;
+    let candidate = apply_imported(state, &facts)?;
     let expected_effects = candidate.expected_effects();
-    if projection.effects != expected_effects {
-        eyre::bail!("authenticated imported effects differ from expected effects");
+    if effects != expected_effects {
+        eyre::bail!("imported effects differ from expected effects");
     }
     for (token, accounting) in candidate.expected_accounting()? {
         let actual = acquire_portal_collateral(

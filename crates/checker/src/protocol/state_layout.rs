@@ -121,7 +121,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_exact_state_accesses_match_literal_fixed_vectors() {
+    fn state_accesses_match_literal_vectors() {
         let cases = [
             (
                 TEMPO_BLOCK_HASH_ACCESS,
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn model_full_word_hash_decode_is_byte_exact() {
+    fn full_word_hash_decode_is_byte_exact() {
         let word = uint!(0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f_U256);
         assert_eq!(
             decode_full_word_hash(word),
@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn model_low_u64_decode_ignores_other_outbox_slot_two_fields() {
+    fn low_u64_decode_ignores_other_outbox_slot_two_fields() {
         // High-to-low bytes: timestamp | current block | counted withdrawals |
         // max withdrawals | withdrawal batch index.
         let packed = uint!(0x4142434445464748313233343536373821222324111213140102030405060708_U256);
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn model_address_word_decode_requires_canonical_padding() {
+    fn address_word_decode_requires_canonical_padding() {
         let address = address!("20c0000000000000000000000000000000001234");
         let canonical = U256::from_be_slice(B256::left_padding_from(address.as_slice()).as_slice());
         assert_eq!(decode_address_word(canonical), Some(address));

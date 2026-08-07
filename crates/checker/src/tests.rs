@@ -3,12 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256};
-use tempfile::TempDir;
-use zone_checker_kernel::{
+use crate::kernel::{
     Candidate, ExpectedState, ImportedFacts, PortalIdentity, State, ZoneFacts, ZoneOperation,
     apply_imported, apply_zone,
 };
+use alloy_primitives::{Address, B256};
+use tempfile::TempDir;
 
 use crate::{
     persistence::{
@@ -16,9 +16,9 @@ use crate::{
         PersistenceError,
     },
     runtime::{
-        AuthenticatedBlock, AuthenticatedOutputs, BuildConfig, Failure, FailureClass,
-        NotificationPlan, ObservationPipeline, PlannedNotification, RetryBudget, Runtime,
-        RuntimeAction, RuntimeState, build_checkpoint,
+        AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass, NotificationPlan,
+        ObservationPipeline, PlannedNotification, RetryBudget, Runtime, RuntimeAction,
+        RuntimeState,
     },
 };
 
@@ -147,11 +147,6 @@ fn outputs(candidate: &Candidate) -> AuthenticatedOutputs {
             .iter()
             .map(|(token, value)| (*token, value.supply))
             .collect(),
-        collateral: candidate
-            .expected_accounting
-            .iter()
-            .filter_map(|(token, value)| value.collateral().map(|amount| (*token, amount)))
-            .collect(),
     }
 }
 
@@ -255,7 +250,7 @@ fn committed_prefix_then_divergence_records_exact_second_gap_before_ack() {
 }
 
 #[test]
-fn retry_spans_polls_accepts_fifo_and_exhaustion_names_full_suffix() {
+fn retry_spans_polls_accepts_queued_work_and_names_full_suffix() {
     let (_directory, store) = create();
     let coordinates = vec![coordinate(1, 0x10), coordinate(2, 0x10)];
     let failing = FakeNotification {
@@ -547,39 +542,26 @@ fn malformed_coordinates_are_terminal_without_ack() {
 }
 
 #[test]
-fn builder_rejects_existing_target_and_reopens_completed_checkpoint() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::write(directory.path().join("unrelated"), b"occupied").unwrap();
-    let config = || BuildConfig {
-        path: directory.path(),
-        l1_chain_id: 1,
-        zone_chain_id: 2,
-        creation_block: identity().creation_block,
-        creation_height: identity().creation_height,
-        portal_identity: portal(),
-        anchor: anchor(),
-    };
-    assert!(matches!(
-        build_checkpoint(config(), &[] as &[FakeNotification], &mut FakePipeline),
-        Err(PersistenceError::Invalid(_))
-    ));
+fn production_publication_rejects_existing_target_and_reopens() {
+    let parent = tempfile::tempdir().unwrap();
+    let occupied = parent.path().join("occupied");
+    fs::create_dir(&occupied).unwrap();
+    assert!(
+        crate::builder::publish_genesis_checkpoint(
+            &occupied,
+            identity(),
+            anchor(),
+            State::awaiting(portal()),
+        )
+        .is_err()
+    );
 
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("checkpoint");
-    let initial = State::awaiting(portal());
-    let history = [notification(blocks(&initial, 1, 2, 0x10))];
-    let snapshot = build_checkpoint(
-        BuildConfig {
-            path: &target,
-            l1_chain_id: 1,
-            zone_chain_id: 2,
-            creation_block: identity().creation_block,
-            creation_height: identity().creation_height,
-            portal_identity: portal(),
-            anchor: anchor(),
-        },
-        &history,
-        &mut FakePipeline,
+    let target = parent.path().join("checkpoint");
+    let snapshot = crate::builder::publish_genesis_checkpoint(
+        &target,
+        identity(),
+        anchor(),
+        State::awaiting(portal()),
     )
     .unwrap();
     let (_, reopened) = Persistence::open(&target, identity()).unwrap();
@@ -587,65 +569,18 @@ fn builder_rejects_existing_target_and_reopens_completed_checkpoint() {
 }
 
 #[test]
-fn builder_unwinds_reorg_before_authenticating_replacement() {
-    let directory = tempfile::tempdir().unwrap();
-    let target = directory.path().join("checkpoint");
-    let initial = State::awaiting(portal());
-    let old = blocks(&initial, 1, 1, 0x10);
-    let mut replacement = blocks(&initial, 1, 1, 0x30);
-    replacement[0].parent = anchor().zone;
-    let history = [
-        notification(old.clone()),
-        FakeNotification {
-            plan: Some(NotificationPlan {
-                reverted: vec![old[0].zone],
-                ancestor: anchor().zone,
-                applied: vec![replacement[0].zone],
-                acknowledge: replacement[0].zone,
-            }),
-            coordinates: Ok(vec![replacement[0].zone]),
-            blocks: Ok(replacement.clone()),
-        },
-    ];
-    let snapshot = build_checkpoint(
-        BuildConfig {
-            path: &target,
-            l1_chain_id: 1,
-            zone_chain_id: 2,
-            creation_block: identity().creation_block,
-            creation_height: identity().creation_height,
-            portal_identity: portal(),
-            anchor: anchor(),
-        },
-        &history,
-        &mut FakePipeline,
-    )
-    .unwrap();
-    assert_eq!(snapshot.meta.verified_zone_tip, replacement[0].zone);
-    assert_ne!(snapshot.meta.verified_zone_tip, old[0].zone);
-}
-
-#[test]
-fn failed_builder_removes_target_and_sibling_staging() {
+fn failed_production_publication_removes_staging_directory() {
     let parent = tempfile::tempdir().unwrap();
-    let target = parent.path().join("checker");
-    let initial = State::awaiting(portal());
-    let mut bad = blocks(&initial, 1, 1, 0x10);
-    bad[0].parent = coordinate(99, 0xee);
+    let target = parent.path().join("checkpoint");
+    let mut wrong_identity = identity();
+    wrong_identity.zone_id += 1;
 
     assert!(
-        build_checkpoint(
-            BuildConfig {
-                path: &target,
-                l1_chain_id: 1,
-                zone_chain_id: 2,
-                creation_block: identity().creation_block,
-                creation_height: identity().creation_height,
-                portal_identity: portal(),
-                anchor: anchor(),
-            },
-            &[notification(bad)],
-            &mut FakePipeline,
+        crate::builder::publish_genesis_checkpoint(
+            &target,
+            wrong_identity,
+            anchor(),
+            State::awaiting(portal()),
         )
         .is_err()
     );

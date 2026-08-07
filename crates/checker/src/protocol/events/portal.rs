@@ -159,12 +159,9 @@ pub(super) const DEPOSITS_RESUMED_TOPIC: B256 =
 pub(super) const RPC_URL_UPDATED_TOPIC: B256 =
     b256!("f4e00967b25e707df96d88676243b33be84847ef27615af8ef91290b52294fc6");
 
-/// Decoded Portal payloads that may drive or check the model.
-///
-/// Known non-model variants never enter this enum, so downstream transition
-/// code does not need unreachable match arms for them.
+/// Portal events used by checker transitions.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PortalModelEvent {
+pub(crate) enum PortalEvent {
     DepositMade(Portal::DepositMade),
     TokenEnabled(Portal::TokenEnabled),
     BatchSubmitted(Portal::BatchSubmitted),
@@ -176,7 +173,7 @@ pub(crate) enum PortalModelEvent {
     BouncebackGasUpdated(Portal::BouncebackGasUpdated),
 }
 
-pub(super) fn decode(log: &Log) -> Result<Option<PortalModelEvent>, ProtocolEventError> {
+pub(super) fn decode(log: &Log) -> Result<Option<PortalEvent>, ProtocolEventError> {
     let topic = required_topic(log)?;
     match topic {
         DEPOSIT_MADE_TOPIC
@@ -213,26 +210,24 @@ pub(super) fn decode(log: &Log) -> Result<Option<PortalModelEvent>, ProtocolEven
     validate_dynamic_bounds(log, &decoded)?;
 
     Ok(match decoded {
-        Portal::PortalEvents::DepositMade(event) => Some(PortalModelEvent::DepositMade(event)),
-        Portal::PortalEvents::TokenEnabled(event) => Some(PortalModelEvent::TokenEnabled(event)),
-        Portal::PortalEvents::BatchSubmitted(event) => {
-            Some(PortalModelEvent::BatchSubmitted(event))
-        }
+        Portal::PortalEvents::DepositMade(event) => Some(PortalEvent::DepositMade(event)),
+        Portal::PortalEvents::TokenEnabled(event) => Some(PortalEvent::TokenEnabled(event)),
+        Portal::PortalEvents::BatchSubmitted(event) => Some(PortalEvent::BatchSubmitted(event)),
         Portal::PortalEvents::WithdrawalProcessed(event) => {
-            Some(PortalModelEvent::WithdrawalProcessed(event))
+            Some(PortalEvent::WithdrawalProcessed(event))
         }
         Portal::PortalEvents::WithdrawalBounceBack(event) => {
-            Some(PortalModelEvent::WithdrawalBounceBack(event))
+            Some(PortalEvent::WithdrawalBounceBack(event))
         }
         Portal::PortalEvents::DepositBounceBack(event) => {
-            Some(PortalModelEvent::DepositBounceBack(event))
+            Some(PortalEvent::DepositBounceBack(event))
         }
         Portal::PortalEvents::DepositBounceBackPending(event) => {
-            Some(PortalModelEvent::DepositBounceBackPending(event))
+            Some(PortalEvent::DepositBounceBackPending(event))
         }
-        Portal::PortalEvents::RefundClaimed(event) => Some(PortalModelEvent::RefundClaimed(event)),
+        Portal::PortalEvents::RefundClaimed(event) => Some(PortalEvent::RefundClaimed(event)),
         Portal::PortalEvents::BouncebackGasUpdated(event) => {
-            Some(PortalModelEvent::BouncebackGasUpdated(event))
+            Some(PortalEvent::BouncebackGasUpdated(event))
         }
         Portal::PortalEvents::SequencerEncryptionKeyUpdated(_)
         | Portal::PortalEvents::ZoneGasRateUpdated(_)

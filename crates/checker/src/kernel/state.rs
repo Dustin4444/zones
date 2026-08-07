@@ -3,55 +3,55 @@ use std::{collections::BTreeMap, num::NonZeroU64, ops::Bound};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::facts::OrdinaryDeposit;
+use crate::kernel::facts::OrdinaryDeposit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PortalIdentity {
-    pub portal: Address,
-    pub zone_id: u32,
-    pub initial_token: Address,
+pub(crate) struct PortalIdentity {
+    pub(crate) portal: Address,
+    pub(crate) zone_id: u32,
+    pub(crate) initial_token: Address,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct DepositId {
-    pub portal: Address,
-    pub number: NonZeroU64,
+pub(crate) struct DepositId {
+    pub(crate) portal: Address,
+    pub(crate) number: NonZeroU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WithdrawalId {
-    pub zone_id: u32,
-    pub index: u64,
+pub(crate) struct WithdrawalId {
+    pub(crate) zone_id: u32,
+    pub(crate) index: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BatchId {
-    pub zone_id: u32,
-    pub index: NonZeroU64,
+pub(crate) struct BatchId {
+    pub(crate) zone_id: u32,
+    pub(crate) index: NonZeroU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct FallbackId {
-    pub zone_id: u32,
-    pub nonce: NonZeroU64,
+pub(crate) struct FallbackId {
+    pub(crate) zone_id: u32,
+    pub(crate) nonce: NonZeroU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PortalRefundId {
-    pub token: Address,
-    pub recipient: Address,
-    pub deposit: DepositId,
+pub(crate) struct PortalRefundId {
+    pub(crate) token: Address,
+    pub(crate) recipient: Address,
+    pub(crate) deposit: DepositId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct InboxRefundId {
-    pub token: Address,
-    pub recipient: Address,
-    pub withdrawal: WithdrawalId,
+pub(crate) struct InboxRefundId {
+    pub(crate) token: Address,
+    pub(crate) recipient: Address,
+    pub(crate) withdrawal: WithdrawalId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum StateKey {
+pub(crate) enum StateKey {
     Portal,
     Zone,
     Token(Address),
@@ -64,13 +64,13 @@ pub enum StateKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cursor {
-    pub hash: B256,
-    pub number: u64,
+pub(crate) struct Cursor {
+    pub(crate) hash: B256,
+    pub(crate) number: u64,
 }
 
 impl Cursor {
-    pub const ZERO: Self = Self {
+    pub(crate) const ZERO: Self = Self {
         hash: B256::ZERO,
         number: 0,
     };
@@ -78,7 +78,7 @@ impl Cursor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum PortalState {
+pub(crate) enum PortalState {
     AwaitingCreation(PortalIdentity),
     Created {
         identity: PortalIdentity,
@@ -89,18 +89,18 @@ pub enum PortalState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Settlement {
-    pub batch_index: u64,
-    pub block_hash: B256,
-    pub tempo_block: u64,
-    pub submitted_deposit: Cursor,
-    pub zone_height: U256,
-    pub queue_head: U256,
-    pub queue_tail: U256,
+pub(crate) struct Settlement {
+    pub(crate) batch_index: u64,
+    pub(crate) block_hash: B256,
+    pub(crate) tempo_block: u64,
+    pub(crate) submitted_deposit: Cursor,
+    pub(crate) zone_height: U256,
+    pub(crate) queue_head: U256,
+    pub(crate) queue_tail: U256,
 }
 
 impl Settlement {
-    pub const ZERO: Self = Self {
+    pub(crate) const ZERO: Self = Self {
         batch_index: 0,
         block_hash: B256::ZERO,
         tempo_block: 0,
@@ -112,7 +112,7 @@ impl Settlement {
 }
 
 impl PortalState {
-    pub const fn identity(&self) -> PortalIdentity {
+    pub(crate) const fn identity(&self) -> PortalIdentity {
         match self {
             Self::AwaitingCreation(identity) | Self::Created { identity, .. } => *identity,
         }
@@ -120,15 +120,15 @@ impl PortalState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ZoneState {
-    pub processed_deposit: Cursor,
-    pub next_withdrawal_index: u64,
-    pub withdrawal_queue_hash: B256,
-    pub withdrawal_batch_index: u64,
-    pub tempo_gas_rate: u128,
-    pub max_withdrawals_per_block: u32,
-    pub last_fallback_nonce: u64,
-    pub batch_start: BatchBoundaryStart,
+pub(crate) struct ZoneState {
+    pub(crate) processed_deposit: Cursor,
+    pub(crate) next_withdrawal_index: u64,
+    pub(crate) withdrawal_queue_hash: B256,
+    pub(crate) withdrawal_batch_index: u64,
+    pub(crate) tempo_gas_rate: u128,
+    pub(crate) max_withdrawals_per_block: u32,
+    pub(crate) last_fallback_nonce: u64,
+    pub(crate) batch_start: BatchBoundaryStart,
 }
 
 impl Default for ZoneState {
@@ -147,13 +147,13 @@ impl Default for ZoneState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchBoundaryStart {
-    pub parent_hash: B256,
-    pub deposit: Cursor,
-    pub withdrawal_index: u64,
+pub(crate) struct BatchBoundaryStart {
+    pub(crate) parent_hash: B256,
+    pub(crate) deposit: Cursor,
+    pub(crate) withdrawal_index: u64,
 }
 impl BatchBoundaryStart {
-    pub const ZERO: Self = Self {
+    pub(crate) const ZERO: Self = Self {
         parent_hash: B256::ZERO,
         deposit: Cursor::ZERO,
         withdrawal_index: 0,
@@ -161,20 +161,20 @@ impl BatchBoundaryStart {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TokenPhase {
+pub(crate) enum TokenPhase {
     PendingZoneEnable,
     ZoneEnabled,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenAccounting {
-    pub supply: U256,
-    pub deposits: U256,
-    pub withdrawals: U256,
+pub(crate) struct TokenAccounting {
+    pub(crate) supply: U256,
+    pub(crate) deposits: U256,
+    pub(crate) withdrawals: U256,
 }
 
 impl TokenAccounting {
-    pub fn collateral(self) -> Option<U256> {
+    pub(crate) fn collateral(self) -> Option<U256> {
         self.supply
             .checked_add(self.deposits)?
             .checked_add(self.withdrawals)
@@ -182,13 +182,13 @@ impl TokenAccounting {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenState {
-    pub phase: TokenPhase,
-    pub accounting: TokenAccounting,
+pub(crate) struct TokenState {
+    pub(crate) phase: TokenPhase,
+    pub(crate) accounting: TokenAccounting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DepositOwner {
+pub(crate) enum DepositOwner {
     Ordinary(OrdinaryDeposit),
     BounceBack {
         withdrawal: WithdrawalId,
@@ -199,7 +199,7 @@ pub enum DepositOwner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WithdrawalOwner {
+pub(crate) enum WithdrawalOwner {
     PendingFailedDeposit {
         deposit: DepositId,
         token: Address,
@@ -217,36 +217,36 @@ pub enum WithdrawalOwner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Withdrawal {
-    pub token: Address,
-    pub sender_tag: B256,
-    pub to: Address,
-    pub amount: u128,
-    pub memo: B256,
-    pub gas_limit: u64,
-    pub fallback_nonce: u64,
-    pub callback_data: Bytes,
-    pub encrypted_sender: Bytes,
+pub(crate) struct Withdrawal {
+    pub(crate) token: Address,
+    pub(crate) sender_tag: B256,
+    pub(crate) to: Address,
+    pub(crate) amount: u128,
+    pub(crate) memo: B256,
+    pub(crate) gas_limit: u64,
+    pub(crate) fallback_nonce: u64,
+    pub(crate) callback_data: Bytes,
+    pub(crate) encrypted_sender: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WithdrawalOrigin {
+pub(crate) enum WithdrawalOrigin {
     User { fallback: FallbackId },
     FailedDeposit { deposit: DepositId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BatchBoundary {
-    pub first_parent: B256,
-    pub final_block: B256,
-    pub first_deposit: Cursor,
-    pub final_deposit: Cursor,
-    pub tempo_block: u64,
-    pub zone_height: u64,
+pub(crate) struct BatchBoundary {
+    pub(crate) first_parent: B256,
+    pub(crate) final_block: B256,
+    pub(crate) first_deposit: Cursor,
+    pub(crate) final_deposit: Cursor,
+    pub(crate) tempo_block: u64,
+    pub(crate) zone_height: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BatchState {
+pub(crate) enum BatchState {
     Finalized {
         boundary: BatchBoundary,
         first_withdrawal: u64,
@@ -264,7 +264,7 @@ pub enum BatchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FallbackState {
+pub(crate) enum FallbackState {
     Held {
         withdrawal: WithdrawalId,
         token: Address,
@@ -279,12 +279,12 @@ pub enum FallbackState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefundCredit {
-    pub amount: u128,
+pub(crate) struct RefundCredit {
+    pub(crate) amount: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StateValue {
+pub(crate) enum StateValue {
     Portal(PortalState),
     Zone(ZoneState),
     Token(TokenState),
@@ -297,7 +297,7 @@ pub enum StateValue {
 }
 
 impl StateValue {
-    pub fn matches_key(&self, key: &StateKey) -> bool {
+    pub(crate) fn matches_key(&self, key: &StateKey) -> bool {
         matches!(
             (key, self),
             (StateKey::Portal, Self::Portal(_))
@@ -314,12 +314,12 @@ impl StateValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct State {
+pub(crate) struct State {
     rows: BTreeMap<StateKey, StateValue>,
 }
 
 impl State {
-    pub fn awaiting(identity: PortalIdentity) -> Self {
+    pub(crate) fn awaiting(identity: PortalIdentity) -> Self {
         Self {
             rows: BTreeMap::from([
                 (
@@ -331,7 +331,9 @@ impl State {
         }
     }
 
-    pub fn from_rows(rows: BTreeMap<StateKey, StateValue>) -> Result<Self, StateFamilyError> {
+    pub(crate) fn from_rows(
+        rows: BTreeMap<StateKey, StateValue>,
+    ) -> Result<Self, StateFamilyError> {
         for (key, value) in &rows {
             if !value.matches_key(key) {
                 return Err(StateFamilyError { key: *key });
@@ -340,11 +342,11 @@ impl State {
         Ok(Self { rows })
     }
 
-    pub fn rows(&self) -> &BTreeMap<StateKey, StateValue> {
+    pub(crate) fn rows(&self) -> &BTreeMap<StateKey, StateValue> {
         &self.rows
     }
 
-    pub fn apply(&mut self, delta: &StateDelta) -> Result<(), StateFamilyError> {
+    pub(crate) fn apply(&mut self, delta: &StateDelta) -> Result<(), StateFamilyError> {
         delta.validate()?;
         for (key, value) in &delta.writes {
             match value {
@@ -362,8 +364,8 @@ impl State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("state value does not match key family {key:?}")]
-pub struct StateFamilyError {
-    pub key: StateKey,
+pub(crate) struct StateFamilyError {
+    pub(crate) key: StateKey,
 }
 
 pub(crate) struct Overlay<'a> {
@@ -422,7 +424,7 @@ impl<'a> Overlay<'a> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateDelta {
+pub(crate) struct StateDelta {
     writes: Vec<(StateKey, Option<StateValue>)>,
 }
 
@@ -431,11 +433,11 @@ impl StateDelta {
         Self { writes }
     }
 
-    pub fn writes(&self) -> &[(StateKey, Option<StateValue>)] {
+    pub(crate) fn writes(&self) -> &[(StateKey, Option<StateValue>)] {
         &self.writes
     }
 
-    pub fn validate(&self) -> Result<(), StateFamilyError> {
+    pub(crate) fn validate(&self) -> Result<(), StateFamilyError> {
         let mut previous = None;
         for (key, value) in &self.writes {
             if previous.is_some_and(|previous| previous >= *key)

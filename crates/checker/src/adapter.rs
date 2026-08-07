@@ -1,38 +1,29 @@
-//! Kernel adapter for already authenticated observations.
-//!
-//! Inputs feed the kernel; outputs come only from receipt events and exact
-//! reads.
+use std::num::NonZeroU64;
 
-use std::{collections::BTreeMap, num::NonZeroU64};
-
-use alloy_consensus::BlockHeader as _;
-use alloy_primitives::{Address, B256, FixedBytes, U256};
-use zone_checker_kernel::{
+use crate::kernel::{
     BatchSubmission, BounceBackDeposit, Cursor, Deposit, DepositOutcome, ExpectedState,
     Finalization, ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalIdentity, RefundClaim,
     TokenEnable, UserWithdrawal, Withdrawal, WithdrawalOutcome, WithdrawalProcessing, ZoneFacts,
     ZoneOperation,
 };
+use alloy_consensus::BlockHeader as _;
+use alloy_primitives::{Address, B256, FixedBytes, U256};
 
 use crate::{
     observe::{L1BlockObservation, L2BlockObservation, ZonePostStateOutputs},
     persistence::{BlockNumHash, CoverageGapReason},
     protocol::events::{
-        Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalModelEvent, TempoState,
+        Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalEvent, TempoState,
     },
     runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass},
 };
 
-use zone_checker_kernel::Effect;
+use crate::kernel::Effect;
 
-/// Synchronous input after all roots, envelopes, and exact state calls have
-/// already been authenticated by `observe`.
-pub(crate) struct PreauthenticatedObservation {
+pub(crate) struct AuthenticatedObservation {
     pub l2: L2BlockObservation,
     pub l1: Vec<L1BlockObservation>,
     pub state: ZonePostStateOutputs,
-    /// Exact Portal balances at the imported Tempo hash, by enabled token.
-    pub collateral: BTreeMap<Address, U256>,
     pub portal_creation_block_hash: B256,
     pub zone_id: u32,
 }
@@ -50,33 +41,27 @@ fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
         class: FailureClass::AuthenticatedDivergence,
         gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
         message: message.into(),
-        finding: Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::FindingCategory::Observation,
+        finding: Some(Box::new(crate::kernel::Finding {
+            category: crate::kernel::FindingCategory::Observation,
             code,
-            location: Some(zone_checker_kernel::FindingLocation::Block),
+            location: Some(crate::kernel::FindingLocation::Block),
             expected: None,
-            actual: Some(zone_checker_kernel::Datum::Code(code)),
+            actual: Some(crate::kernel::Datum::Code(code)),
         })),
     }
 }
 
-pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
+pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
     let headers = o.l2.inputs().advance_tempo().imported_headers();
     if o.l1.len() != headers.len() {
         return Err(failure(
             AdapterFindingCode::HeaderSequence,
-            "L1 observation count does not match authenticated advance headers",
+            "Tempo observation count does not match advanceTempo headers",
         ));
     }
     let mut imported_facts = ImportedFacts {
-        block_hash: headers
-            .last()
-            .expect("authenticated headers are nonempty")
-            .hash(),
-        block_number: headers
-            .last()
-            .expect("authenticated headers are nonempty")
-            .number(),
+        block_hash: headers.last().expect("headers are nonempty").hash(),
+        block_number: headers.last().expect("headers are nonempty").number(),
         operations: Vec::new(),
     };
     let mut imported_effects = Vec::new();
@@ -86,15 +71,13 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
         {
             return Err(failure(
                 AdapterFindingCode::HeaderSequence,
-                "L1 observation does not match authenticated advance header",
+                "Tempo observation does not match advanceTempo header",
             ));
         }
-        let projection =
+        let (facts, effects) =
             adapt_imported(observation, header, o.portal_creation_block_hash, o.zone_id)?;
-        imported_facts
-            .operations
-            .extend(projection.facts.operations);
-        imported_effects.extend(projection.effects);
+        imported_facts.operations.extend(facts.operations);
+        imported_effects.extend(effects);
     }
     let (zone_facts, mut zone_effects) = zone_facts(o)?;
     imported_effects.append(&mut zone_effects);
@@ -106,7 +89,7 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
         withdrawal_queue_hash: o.state.withdrawal_queue_hash(),
         withdrawal_batch_index: o.state.withdrawal_batch_index(),
     };
-    let first = headers.first().expect("authenticated headers are nonempty");
+    let first = headers.first().expect("headers are nonempty");
     let final_observation = o.l1.last().expect("matched nonempty headers");
     Ok(AuthenticatedBlock {
         zone: BlockNumHash {
@@ -136,15 +119,8 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
             effects: imported_effects,
             state,
             supplies: o.state.token_supplies().clone(),
-            collateral: o.collateral.clone(),
         },
     })
-}
-
-/// Projects one authenticated Tempo block for bootstrap without a Zone transition.
-pub(crate) struct ImportedProjection {
-    pub facts: ImportedFacts,
-    pub effects: Vec<Effect>,
 }
 
 pub(crate) fn adapt_imported(
@@ -152,16 +128,14 @@ pub(crate) fn adapt_imported(
     header: &crate::observe::ImportedTempoHeader,
     portal_creation_block_hash: B256,
     zone_id: u32,
-) -> Result<ImportedProjection, Failure> {
+) -> Result<(ImportedFacts, Vec<Effect>), Failure> {
     if (observation.block_hash(), observation.block_number()) != (header.hash(), header.number()) {
         return Err(failure(
             AdapterFindingCode::Grammar,
-            "L1 observation does not match authenticated header",
+            "Tempo observation does not match imported header",
         ));
     }
-    let (facts, effects) =
-        imported_facts(observation, header, portal_creation_block_hash, zone_id)?;
-    Ok(ImportedProjection { facts, effects })
+    imported_facts(observation, header, portal_creation_block_hash, zone_id)
 }
 
 fn token(token: Address, name: &str, symbol: &str, currency: &str) -> TokenEnable {
@@ -177,7 +151,7 @@ fn ordinary(d: &tempo_zone_contracts::ZonePortal::Deposit) -> Result<OrdinaryDep
     let ciphertext: [u8; 64] = d.encrypted.ciphertext.as_ref().try_into().map_err(|_| {
         failure(
             AdapterFindingCode::Grammar,
-            "authenticated deposit ciphertext is not 64 bytes",
+            "deposit ciphertext is not 64 bytes",
         )
     })?;
     Ok(OrdinaryDeposit {
@@ -186,7 +160,7 @@ fn ordinary(d: &tempo_zone_contracts::ZonePortal::Deposit) -> Result<OrdinaryDep
         amount: d.amount,
         tempo_refund_recipient: d.tempoRefundRecipient,
         key_index: d.keyIndex,
-        encrypted: zone_checker_kernel::DepositPayload {
+        encrypted: crate::kernel::DepositPayload {
             ephemeral_pubkey_x: d.encrypted.ephemeralPubkeyX,
             ephemeral_pubkey_y_parity: d.encrypted.ephemeralPubkeyYParity,
             ciphertext: FixedBytes::from(ciphertext),
@@ -210,7 +184,7 @@ fn imported_facts(
             if let Some(call) = call.as_submit_batch() {
                 if !matches!(
                     events.as_slice(),
-                    [L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(_))]
+                    [L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_))]
                 ) {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -274,11 +248,11 @@ fn imported_facts(
             matches!(
                 event,
                 L1ProtocolEvent::Portal(
-                    PortalModelEvent::BatchSubmitted(_)
-                        | PortalModelEvent::WithdrawalProcessed(_)
-                        | PortalModelEvent::WithdrawalBounceBack(_)
-                        | PortalModelEvent::DepositBounceBack(_)
-                        | PortalModelEvent::DepositBounceBackPending(_)
+                    PortalEvent::BatchSubmitted(_)
+                        | PortalEvent::WithdrawalProcessed(_)
+                        | PortalEvent::WithdrawalBounceBack(_)
+                        | PortalEvent::DepositBounceBack(_)
+                        | PortalEvent::DepositBounceBackPending(_)
                 )
             )
         }) {
@@ -293,23 +267,20 @@ fn imported_facts(
             && !matches!(
                 events.as_slice(),
                 [
-                    L1ProtocolEvent::Portal(PortalModelEvent::TokenEnabled(_)),
+                    L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_)),
                     L1ProtocolEvent::FactoryZoneCreated(_)
                 ]
             )
         {
             return Err(failure(
                 AdapterFindingCode::Grammar,
-                "creation requires exact TokenEnabled then ZoneCreated pair",
+                "creation requires TokenEnabled followed by ZoneCreated",
             ));
         }
         if observation.block_hash() == portal_creation_block_hash
-            && events.iter().any(|event| {
-                matches!(
-                    event,
-                    L1ProtocolEvent::Portal(PortalModelEvent::TokenEnabled(_))
-                )
-            })
+            && events
+                .iter()
+                .any(|event| matches!(event, L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_))))
             && !events
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
@@ -341,7 +312,7 @@ fn imported_facts(
                         .outcomes()
                         .iter()
                         .find_map(|x| match x.event() {
-                            L1ProtocolEvent::Portal(PortalModelEvent::TokenEnabled(e)) => {
+                            L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(e)) => {
                                 Some(token(e.token, &e.name, &e.symbol, &e.currency))
                             }
                             _ => None,
@@ -358,7 +329,7 @@ fn imported_facts(
                         initial_token: enabled,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalModelEvent::TokenEnabled(e))
+                L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(e))
                     if observation.block_hash() != portal_creation_block_hash =>
                 {
                     operations.push(ImportedOperation::EnableToken(token(
@@ -368,10 +339,10 @@ fn imported_facts(
                         &e.currency,
                     )))
                 }
-                L1ProtocolEvent::Portal(PortalModelEvent::BouncebackGasUpdated(e)) => {
+                L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(e)) => {
                     operations.push(ImportedOperation::UpdateBouncebackGas(e.bouncebackGas))
                 }
-                L1ProtocolEvent::Portal(PortalModelEvent::DepositMade(e))
+                L1ProtocolEvent::Portal(PortalEvent::DepositMade(e))
                     if tx
                         .direct_call()
                         .is_none_or(|call| call.as_process_withdrawals().is_none()) =>
@@ -379,7 +350,7 @@ fn imported_facts(
                     let ciphertext: [u8; 64] = e.ciphertext.as_ref().try_into().map_err(|_| {
                         failure(
                             AdapterFindingCode::Grammar,
-                            "authenticated deposit ciphertext is not 64 bytes",
+                            "deposit ciphertext is not 64 bytes",
                         )
                     })?;
                     let d = OrdinaryDeposit {
@@ -388,7 +359,7 @@ fn imported_facts(
                         amount: e.netAmount,
                         tempo_refund_recipient: e.tempoRefundRecipient,
                         key_index: e.keyIndex,
-                        encrypted: zone_checker_kernel::DepositPayload {
+                        encrypted: crate::kernel::DepositPayload {
                             ephemeral_pubkey_x: e.ephemeralPubkeyX,
                             ephemeral_pubkey_y_parity: e.ephemeralPubkeyYParity,
                             ciphertext: FixedBytes::from(ciphertext),
@@ -398,7 +369,7 @@ fn imported_facts(
                     };
                     operations.push(ImportedOperation::AppendDeposit(d));
                     effects.push(Effect::DepositAppended {
-                        id: zone_checker_kernel::DepositId {
+                        id: crate::kernel::DepositId {
                             portal: observation.portal_address(),
                             number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
                                 failure(AdapterFindingCode::Grammar, "zero deposit number")
@@ -407,7 +378,7 @@ fn imported_facts(
                         queue_hash: e.newCurrentDepositQueueHash,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalModelEvent::RefundClaimed(e)) => {
+                L1ProtocolEvent::Portal(PortalEvent::RefundClaimed(e)) => {
                     operations.push(ImportedOperation::ClaimPortalRefund(RefundClaim {
                         token: e.token,
                         recipient: e.recipient,
@@ -419,9 +390,9 @@ fn imported_facts(
                         amount: e.amount,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalModelEvent::BatchSubmitted(e)) => {
+                L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(e)) => {
                     effects.push(Effect::BatchSubmitted {
-                        id: zone_checker_kernel::BatchId {
+                        id: crate::kernel::BatchId {
                             zone_id,
                             index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
                                 failure(AdapterFindingCode::Grammar, "zero batch index")
@@ -435,24 +406,24 @@ fn imported_facts(
                     })
                 }
                 L1ProtocolEvent::Portal(
-                    PortalModelEvent::WithdrawalProcessed(_)
-                    | PortalModelEvent::WithdrawalBounceBack(_)
-                    | PortalModelEvent::DepositBounceBack(_)
-                    | PortalModelEvent::DepositBounceBackPending(_),
+                    PortalEvent::WithdrawalProcessed(_)
+                    | PortalEvent::WithdrawalBounceBack(_)
+                    | PortalEvent::DepositBounceBack(_)
+                    | PortalEvent::DepositBounceBackPending(_),
                 ) if tx
                     .direct_call()
                     .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
-                L1ProtocolEvent::Portal(PortalModelEvent::DepositMade(_))
+                L1ProtocolEvent::Portal(PortalEvent::DepositMade(_))
                     if tx
                         .direct_call()
                         .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
-                L1ProtocolEvent::Portal(PortalModelEvent::TokenEnabled(_))
+                L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_))
                     if observation.block_hash() == portal_creation_block_hash => {}
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}
-                L1ProtocolEvent::KnownNonModel | L1ProtocolEvent::Portal(_) => {
+                L1ProtocolEvent::KnownIgnored | L1ProtocolEvent::Portal(_) => {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
-                        "protocol event was not consumed by exactly one grammar",
+                        "protocol event does not match the expected grammar",
                     ));
                 }
             }
@@ -485,7 +456,7 @@ fn parse_withdrawal_events(
         })?;
         cursor += 1;
         match event {
-            L1ProtocolEvent::Portal(PortalModelEvent::DepositBounceBack(e)) => {
+            L1ProtocolEvent::Portal(PortalEvent::DepositBounceBack(e)) => {
                 outcomes.push(WithdrawalOutcome::FailedDepositPaid {
                     collected_fee: e.bouncebackFee,
                 });
@@ -497,7 +468,7 @@ fn parse_withdrawal_events(
                     pending: false,
                 });
             }
-            L1ProtocolEvent::Portal(PortalModelEvent::DepositBounceBackPending(e)) => {
+            L1ProtocolEvent::Portal(PortalEvent::DepositBounceBackPending(e)) => {
                 outcomes.push(WithdrawalOutcome::FailedDepositPending {
                     collected_fee: e.bouncebackFee,
                 });
@@ -509,12 +480,12 @@ fn parse_withdrawal_events(
                     pending: true,
                 });
             }
-            L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalBounceBack(e)) => {
+            L1ProtocolEvent::Portal(PortalEvent::WithdrawalBounceBack(e)) => {
                 effects.push(Effect::BounceBackAppended {
                     fallback_nonce: e.fallbackNonce,
                     token: e.token,
                     amount: e.amount,
-                    id: zone_checker_kernel::DepositId {
+                    id: crate::kernel::DepositId {
                         portal,
                         number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
                             failure(
@@ -525,7 +496,7 @@ fn parse_withdrawal_events(
                     },
                     queue_hash: e.newCurrentDepositQueueHash,
                 });
-                let Some(L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(processed))) =
+                let Some(L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed))) =
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
@@ -549,7 +520,7 @@ fn parse_withdrawal_events(
                 });
                 outcomes.push(WithdrawalOutcome::UserBounced);
             }
-            L1ProtocolEvent::Portal(PortalModelEvent::DepositMade(first)) => {
+            L1ProtocolEvent::Portal(PortalEvent::DepositMade(first)) => {
                 let mut callback_deposits = Vec::new();
                 let mut next = Some(first.clone());
                 while let Some(deposit) = next.take() {
@@ -557,7 +528,7 @@ fn parse_withdrawal_events(
                         deposit.ciphertext.as_ref().try_into().map_err(|_| {
                             failure(
                                 AdapterFindingCode::Grammar,
-                                "authenticated callback ciphertext is not 64 bytes",
+                                "callback ciphertext is not 64 bytes",
                             )
                         })?;
                     callback_deposits.push(OrdinaryDeposit {
@@ -566,7 +537,7 @@ fn parse_withdrawal_events(
                         amount: deposit.netAmount,
                         tempo_refund_recipient: deposit.tempoRefundRecipient,
                         key_index: deposit.keyIndex,
-                        encrypted: zone_checker_kernel::DepositPayload {
+                        encrypted: crate::kernel::DepositPayload {
                             ephemeral_pubkey_x: deposit.ephemeralPubkeyX,
                             ephemeral_pubkey_y_parity: deposit.ephemeralPubkeyYParity,
                             ciphertext: FixedBytes::from(ciphertext),
@@ -575,7 +546,7 @@ fn parse_withdrawal_events(
                         },
                     });
                     effects.push(Effect::DepositAppended {
-                        id: zone_checker_kernel::DepositId {
+                        id: crate::kernel::DepositId {
                             portal,
                             number: NonZeroU64::new(deposit.depositNumber).ok_or_else(|| {
                                 failure(AdapterFindingCode::Grammar, "zero callback deposit number")
@@ -583,14 +554,14 @@ fn parse_withdrawal_events(
                         },
                         queue_hash: deposit.newCurrentDepositQueueHash,
                     });
-                    if let Some(L1ProtocolEvent::Portal(PortalModelEvent::DepositMade(d))) =
+                    if let Some(L1ProtocolEvent::Portal(PortalEvent::DepositMade(d))) =
                         events.get(cursor).copied()
                     {
                         cursor += 1;
                         next = Some(d.clone());
                     }
                 }
-                let Some(L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(processed))) =
+                let Some(L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed))) =
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
@@ -614,7 +585,7 @@ fn parse_withdrawal_events(
                 });
                 outcomes.push(WithdrawalOutcome::UserDelivered { callback_deposits });
             }
-            L1ProtocolEvent::Portal(PortalModelEvent::WithdrawalProcessed(processed)) => {
+            L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed)) => {
                 if !processed.callbackSuccess {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -649,7 +620,7 @@ fn parse_withdrawal_events(
     Ok((outcomes, effects))
 }
 
-fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), Failure> {
+fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), Failure> {
     let advance = o.l2.inputs().advance_tempo();
     let advance_hash = o.l2.inputs().advance_transaction_hash();
     validate_zone_event_grammar(o)?;
@@ -758,7 +729,7 @@ fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>
                     }));
                 }
                 effects.push(Effect::WithdrawalRequested {
-                    id: zone_checker_kernel::WithdrawalId {
+                    id: crate::kernel::WithdrawalId {
                         zone_id: o.zone_id,
                         index: e.withdrawalIndex,
                     },
@@ -788,7 +759,7 @@ fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>
             }
             L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(e)) => {
                 effects.push(Effect::BatchFinalized {
-                    id: zone_checker_kernel::BatchId {
+                    id: crate::kernel::BatchId {
                         zone_id: o.zone_id,
                         index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
                             failure(AdapterFindingCode::Grammar, "zero finalized batch index")
@@ -821,7 +792,7 @@ fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>
 }
 
 /// Validate event ownership and order with one transaction-scoped cursor.
-fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Failure> {
+fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failure> {
     let events = o.l2.outcomes().events();
     let advance = o.l2.inputs().advance_tempo();
     let advance_hash = o.l2.inputs().advance_transaction_hash();
@@ -836,7 +807,7 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
         _ => {
             return Err(failure(
                 AdapterFindingCode::Grammar,
-                "TempoBlockFinalized fields do not match authenticated header",
+                "TempoBlockFinalized fields do not match the imported header",
             ));
         }
     }
@@ -948,7 +919,7 @@ fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Fa
         _ => {
             return Err(failure(
                 AdapterFindingCode::Grammar,
-                "TempoAdvanced fields do not match authenticated input/state",
+                "TempoAdvanced fields do not match advanceTempo input or Zone state",
             ));
         }
     }

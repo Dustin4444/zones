@@ -1,12 +1,12 @@
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue as _;
 
-use crate::facts::{BounceBackDeposit, OrdinaryDeposit};
-use crate::state::Withdrawal;
+use crate::kernel::facts::{BounceBackDeposit, OrdinaryDeposit};
+use crate::kernel::state::Withdrawal;
 
-pub const WITHDRAWAL_SENTINEL: B256 = B256::repeat_byte(0xff);
-pub const RING_CAPACITY: u64 = 100;
-pub const NO_QUEUE_INDEX: U256 = U256::MAX;
+pub(crate) const WITHDRAWAL_SENTINEL: B256 = B256::repeat_byte(0xff);
+pub(crate) const RING_CAPACITY: u64 = 100;
+pub(crate) const NO_QUEUE_INDEX: U256 = U256::MAX;
 
 mod abi {
     alloy_sol_types::sol! {

@@ -1,26 +1,19 @@
-//! Deterministic checkpoint builder and bounded runtime primitives.
-//!
-//! Observation adapters are the only intended producers of
-//! [`AuthenticatedBlock`].
-
 use std::{
     collections::VecDeque,
-    fs,
-    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+use crate::kernel::{
+    Datum, Effect, ExpectedState, Finding, FindingCategory, FindingLocation, ImportedFacts, State,
+    ZoneFacts, apply_imported, apply_zone,
+};
 #[cfg(test)]
 use alloy_primitives::B256;
-use alloy_primitives::{Address, U256, keccak256};
-use zone_checker_kernel::{
-    Datum, Effect, ExpectedState, Finding, FindingCategory, FindingLocation, ImportedFacts,
-    PortalIdentity, State, ZoneFacts, apply_imported, apply_zone, validate,
-};
+use alloy_primitives::keccak256;
 
 use crate::persistence::{
-    BlockNumHash, ChainCut, CoverageGapReason, Identity, JournalEntry, Persistence,
-    PersistenceError, Snapshot, make_finding,
+    BlockNumHash, CoverageGapReason, Identity, JournalEntry, Persistence, PersistenceError,
+    Snapshot, make_finding,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,19 +63,13 @@ fn typed_failure(
     }
 }
 
-/// Facts may be constructed only inside the checker crate after the observe
-/// module has authenticated envelopes, receipts, roots and exact state.
+/// Receipt- and state-derived output, constructed separately from the kernel result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthenticatedOutputs {
-    /// Constructed from authenticated receipts/state reads, never from the
-    /// kernel candidate.
     pub effects: Vec<Effect>,
     pub state: ExpectedState,
     /// Exact token supplies read at this block, keyed by token address.
     pub supplies: std::collections::BTreeMap<alloy_primitives::Address, alloy_primitives::U256>,
-    /// Exact Portal balance reads, keyed by token. These are collateral
-    /// carriers, not model requirements; surplus is valid.
-    pub collateral: std::collections::BTreeMap<Address, U256>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +115,7 @@ impl NotificationPlan {
             return Err(Failure {
                 class: FailureClass::ImmediateTerminal,
                 gap_reason: CoverageGapReason::Other(2),
-                message: "invalid notification geometry".into(),
+                message: "invalid notification shape".into(),
                 finding: None,
             });
         }
@@ -141,7 +128,6 @@ pub(crate) trait PlannedNotification {
     fn plan(&self) -> Result<NotificationPlan, Failure>;
 }
 
-/// The single observation+projection boundary shared by builder and runtime.
 pub(crate) trait ObservationPipeline<N> {
     /// Authenticate exactly one block. `parent_state` is the durable state at
     /// the block's parent; implementations must not speculate across blocks.
@@ -155,9 +141,9 @@ pub(crate) trait ObservationPipeline<N> {
 
 pub(crate) fn compare_authenticated(
     block: &AuthenticatedBlock,
-    candidate: &zone_checker_kernel::Candidate,
+    candidate: &crate::kernel::Candidate,
 ) -> Result<(), Failure> {
-    let effects = candidate.expected_effects.clone();
+    let effects = &candidate.expected_effects;
     let supplies = candidate
         .expected_accounting
         .iter()
@@ -165,12 +151,12 @@ pub(crate) fn compare_authenticated(
         .collect();
     let observed = &block.outputs.state;
     let expected = &candidate.expected_state;
-    if block.outputs.effects != effects {
+    if block.outputs.effects.as_slice() != effects.as_slice() {
         let index = block
             .outputs
             .effects
             .iter()
-            .zip(&effects)
+            .zip(effects)
             .position(|(a, b)| a != b)
             .unwrap_or_else(|| block.outputs.effects.len().min(effects.len()));
         let evidence = |effect: Option<&Effect>| {
@@ -188,7 +174,7 @@ pub(crate) fn compare_authenticated(
             Some(FindingLocation::Operation(index as u32)),
             evidence(effects.get(index)),
             evidence(block.outputs.effects.get(index)),
-            "authenticated output differs from checker candidate",
+            "output mismatch",
         ));
     }
     macro_rules! commitment {
@@ -200,7 +186,7 @@ pub(crate) fn compare_authenticated(
                     Some(FindingLocation::Block),
                     Some(Datum::$datum(expected.$field.into())),
                     Some(Datum::$datum(observed.$field.into())),
-                    "authenticated state commitment differs",
+                    "state commitment mismatch",
                 ));
             }
         };
@@ -223,12 +209,12 @@ pub(crate) fn compare_authenticated(
         return Err(typed_failure(
             FindingCategory::SupplyMismatch,
             30,
-            Some(FindingLocation::State(
-                zone_checker_kernel::StateKey::Token(token),
-            )),
+            Some(FindingLocation::State(crate::kernel::StateKey::Token(
+                token,
+            ))),
             supplies.get(&token).copied().map(Datum::U256),
             block.outputs.supplies.get(&token).copied().map(Datum::U256),
-            "authenticated token supply differs",
+            "token supply mismatch",
         ));
     }
     Ok(())
@@ -239,7 +225,7 @@ fn validate_creation_coordinate(
     state: &State,
     block: &AuthenticatedBlock,
 ) -> Result<(), Failure> {
-    use zone_checker_kernel::{ImportedOperation, PortalState, StateValue};
+    use crate::kernel::{ImportedOperation, PortalState, StateValue};
 
     // Height zero is retained as the pre-creation-checkpoint sentinel.
     if identity.creation_height == 0 {
@@ -275,7 +261,7 @@ fn validate_creation_coordinate(
             Some(FindingLocation::Block),
             Some(Datum::Hash(identity.creation_block)),
             Some(Datum::Hash(block.tempo.hash)),
-            "portal creation does not match the configured anchor",
+            "portal creation anchor mismatch",
         ))
     }
 }
@@ -297,12 +283,12 @@ impl RetryBudget {
     }
 }
 
-/// Exactly one current notification and one bounded FIFO.
+/// Exactly one current notification and one bounded queue.
 pub(crate) struct Runtime<N> {
     snapshot: Snapshot,
     state: RuntimeState,
     current: Option<QueuedNotification<N>>,
-    fifo: VecDeque<QueuedNotification<N>>,
+    queue: VecDeque<QueuedNotification<N>>,
     capacity: usize,
     budget: RetryBudget,
     retry: Option<RetryState>,
@@ -336,7 +322,7 @@ impl<N> Runtime<N> {
             snapshot,
             state: RuntimeState::Starting,
             current: None,
-            fifo: VecDeque::with_capacity(capacity),
+            queue: VecDeque::with_capacity(capacity),
             capacity,
             budget,
             retry: None,
@@ -367,12 +353,9 @@ impl<N> Runtime<N> {
             return Ok(None);
         };
         let plan = current.plan.clone();
-        let before = self.snapshot.clone();
-        if let Some(active) = before.meta.active_finding
+        if let Some(active) = self.snapshot.meta.active_finding
             && !plan.reverted.contains(&active.zone)
         {
-            // Poll classifies retained-finding catch-up and descendants before
-            // any observation provider is touched.
             return Ok(None);
         }
         if !plan.reverted.is_empty() && !self.current_unwound {
@@ -382,14 +365,18 @@ impl<N> Runtime<N> {
         if plan.applied.is_empty() {
             return Ok(None);
         }
-        let snapshot = self.snapshot.clone();
-        if snapshot.meta.active_finding.is_some()
-            && snapshot.meta.acknowledged_zone_tip.number.checked_add(1)
+        if self.snapshot.meta.active_finding.is_some()
+            && self
+                .snapshot
+                .meta
+                .acknowledged_zone_tip
+                .number
+                .checked_add(1)
                 == Some(plan.applied[0].number)
         {
             return Ok(None);
         }
-        let tip = snapshot.meta.verified_zone_tip;
+        let tip = self.snapshot.meta.verified_zone_tip;
         if tip == plan.ancestor {
             Ok(Some(0))
         } else {
@@ -420,15 +407,15 @@ impl<N> Runtime<N> {
         if self.current.is_none() {
             self.current = Some(queued);
             Ok(())
-        } else if self.fifo.len() < self.capacity {
-            self.fifo.push_back(queued);
+        } else if self.queue.len() < self.capacity {
+            self.queue.push_back(queued);
             Ok(())
         } else {
             Err(queued.notification)
         }
     }
 
-    /// Fail open on FIFO overflow, but only after durably naming every item
+    /// Fail open on queue overflow, but only after durably naming every item
     /// that will no longer be checked.
     pub(crate) fn push_or_record_overflow(
         &mut self,
@@ -448,22 +435,21 @@ impl<N> Runtime<N> {
                 return Ok(RuntimeAction::Terminal);
             }
         };
-        if self.current.is_none() || self.fifo.len() < self.capacity {
+        if self.current.is_none() || self.queue.len() < self.capacity {
             let accepted = self.enqueue(notification, plan);
             debug_assert!(accepted.is_ok());
             return Ok(RuntimeAction::None);
         }
-        let mut plans = self
+        let plans = self
             .current
             .iter()
-            .chain(self.fifo.iter())
-            .map(|queued| queued.plan.clone())
+            .chain(self.queue.iter())
+            .map(|queued| &queued.plan)
+            .chain(std::iter::once(&plan))
             .collect::<Vec<_>>();
-        plans.push(plan);
-        let snapshot = self.snapshot.clone();
         let first_reaches_tip = plans.first().is_some_and(|plan| {
-            plan.ancestor == snapshot.meta.verified_zone_tip
-                || plan.applied.contains(&snapshot.meta.verified_zone_tip)
+            plan.ancestor == self.snapshot.meta.verified_zone_tip
+                || plan.applied.contains(&self.snapshot.meta.verified_zone_tip)
         });
         let valid = plans
             .iter()
@@ -477,12 +463,12 @@ impl<N> Runtime<N> {
             return Ok(RuntimeAction::Terminal);
         }
         let first_plan = &plans[0];
-        let first = if snapshot.meta.verified_zone_tip == first_plan.ancestor {
+        let first = if self.snapshot.meta.verified_zone_tip == first_plan.ancestor {
             first_plan.applied[0]
         } else if let Some(index) = first_plan
             .applied
             .iter()
-            .position(|coordinate| *coordinate == snapshot.meta.verified_zone_tip)
+            .position(|coordinate| *coordinate == self.snapshot.meta.verified_zone_tip)
         {
             *first_plan.applied.get(index + 1).ok_or_else(|| {
                 PersistenceError::Invalid("overflow has no unchecked suffix".into())
@@ -492,14 +478,14 @@ impl<N> Runtime<N> {
             return Ok(RuntimeAction::Terminal);
         };
         let last = plans.last().expect("nonempty plan set").acknowledge;
-        let reason = match &snapshot.meta.coverage {
+        let reason = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
             crate::persistence::Coverage::Complete => CoverageGapReason::ProviderUnavailable,
         };
         self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
         self.current = None;
-        self.fifo.clear();
+        self.queue.clear();
         Ok(RuntimeAction::AcknowledgeAndTerminate(last))
     }
 
@@ -517,8 +503,7 @@ impl<N> Runtime<N> {
             self.state = RuntimeState::Disabled;
             return Ok(RuntimeAction::Terminal);
         }
-        let snapshot = self.snapshot.clone();
-        let (first, reason) = match &snapshot.meta.coverage {
+        let (first, reason) = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Complete => {
                 (canonical_suffix[0], CoverageGapReason::ProviderUnavailable)
             }
@@ -529,7 +514,8 @@ impl<N> Runtime<N> {
             } => (*first_unchecked, reason.clone()),
         };
         let last = *canonical_suffix.last().expect("nonempty");
-        if snapshot.meta.verified_zone_tip.number.checked_add(1) != Some(canonical_suffix[0].number)
+        if self.snapshot.meta.verified_zone_tip.number.checked_add(1)
+            != Some(canonical_suffix[0].number)
             || canonical_suffix[0] != first
         {
             self.state = RuntimeState::Disabled;
@@ -556,7 +542,7 @@ impl<N> Runtime<N> {
         Ok(())
     }
     fn advance(&mut self) {
-        self.current = self.fifo.pop_front();
+        self.current = self.queue.pop_front();
         self.retry = None;
         self.current_unwound = false;
     }
@@ -577,8 +563,7 @@ impl<N> Runtime<N> {
             return Ok(RuntimeAction::None);
         };
         let plan = current.plan.clone();
-        let before = self.snapshot.clone();
-        if let Some(active) = before.meta.active_finding
+        if let Some(active) = self.snapshot.meta.active_finding
             && !plan.reverted.contains(&active.zone)
         {
             let same_height_conflict = std::iter::once(plan.ancestor)
@@ -588,11 +573,12 @@ impl<N> Runtime<N> {
                     coordinate.number == active.zone.number && coordinate.hash != active.zone.hash
                 });
             let exact_commit_descendant = plan.reverted.is_empty()
-                && (plan.ancestor == before.meta.acknowledged_zone_tip
+                && (plan.ancestor == self.snapshot.meta.acknowledged_zone_tip
                     || plan.ancestor == active.zone);
             let exact_reorg_descendant = !plan.reverted.is_empty()
                 && (plan.ancestor == active.zone
-                    || plan.reverted.last().copied() == Some(before.meta.acknowledged_zone_tip));
+                    || plan.reverted.last().copied()
+                        == Some(self.snapshot.meta.acknowledged_zone_tip));
             let preserves = !same_height_conflict
                 && (plan.applied.contains(&active.zone)
                     || exact_commit_descendant
@@ -605,8 +591,7 @@ impl<N> Runtime<N> {
                 self.reorg(store, plan.ancestor)?;
                 self.current_unwound = true;
             }
-            let snapshot = self.snapshot.clone();
-            let first = match snapshot.meta.coverage {
+            let first = match self.snapshot.meta.coverage {
                 crate::persistence::Coverage::Gap {
                     first_unchecked, ..
                 } => first_unchecked,
@@ -622,8 +607,7 @@ impl<N> Runtime<N> {
             self.advance();
             return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
         }
-        // Canonical unwind is always durable before inspecting replacement
-        // data. Repeating this after a crash is harmless.
+        // Persist the unwind before inspecting the replacement branch.
         if !plan.reverted.is_empty() && !self.current_unwound {
             self.reorg(store, plan.ancestor)?;
             self.current_unwound = true;
@@ -633,15 +617,16 @@ impl<N> Runtime<N> {
             return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
         }
         let coordinates = plan.applied;
-        let snapshot = self.snapshot.clone();
-        // A finding may itself be in the unverified gap, so the durable tip
-        // need not equal this notification's immediate ancestor. Descendant
-        // notifications extend that same gap without touching providers.
-        if snapshot.meta.active_finding.is_some()
-            && snapshot.meta.acknowledged_zone_tip.number.checked_add(1)
+        if self.snapshot.meta.active_finding.is_some()
+            && self
+                .snapshot
+                .meta
+                .acknowledged_zone_tip
+                .number
+                .checked_add(1)
                 == Some(coordinates[0].number)
         {
-            let gap_first = match &snapshot.meta.coverage {
+            let gap_first = match &self.snapshot.meta.coverage {
                 crate::persistence::Coverage::Gap {
                     first_unchecked, ..
                 } => *first_unchecked,
@@ -657,11 +642,11 @@ impl<N> Runtime<N> {
             self.advance();
             return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
         }
-        let first = if snapshot.meta.verified_zone_tip == plan.ancestor {
+        let first = if self.snapshot.meta.verified_zone_tip == plan.ancestor {
             0
         } else if let Some(index) = coordinates
             .iter()
-            .position(|coordinate| *coordinate == snapshot.meta.verified_zone_tip)
+            .position(|coordinate| *coordinate == self.snapshot.meta.verified_zone_tip)
         {
             index + 1
         } else {
@@ -672,13 +657,13 @@ impl<N> Runtime<N> {
             self.advance();
             return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
         }
-        let gap_next = match &snapshot.meta.coverage {
+        let gap_next = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Gap {
                 acknowledged_through,
                 ..
             } if coordinates[first] != *acknowledged_through => {
                 let next = coordinates.get(first + 1).copied().or_else(|| {
-                    self.fifo.front().and_then(|next| {
+                    self.queue.front().and_then(|next| {
                         (next.plan.ancestor == plan.acknowledge)
                             .then_some(&next.plan)
                             .and_then(|next_plan| next_plan.applied.first().copied())
@@ -707,7 +692,7 @@ impl<N> Runtime<N> {
                 .expect("current notification retained")
                 .notification,
             first,
-            &snapshot.state,
+            &self.snapshot.state,
         ) {
             Ok(block) => block,
             Err(f)
@@ -727,7 +712,7 @@ impl<N> Runtime<N> {
                     let first = coordinates[first];
                     let mut last = *coordinates.last().unwrap();
                     let mut previous = plan.acknowledge;
-                    for queued in &self.fifo {
+                    for queued in &self.queue {
                         let queued = &queued.plan;
                         if !queued.reverted.is_empty()
                             || queued.applied.is_empty()
@@ -739,14 +724,14 @@ impl<N> Runtime<N> {
                         last = queued.acknowledge;
                         previous = queued.acknowledge;
                     }
-                    let reason = match &snapshot.meta.coverage {
+                    let reason = match &self.snapshot.meta.coverage {
                         crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
                         crate::persistence::Coverage::Complete => f.gap_reason,
                     };
                     self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
                     self.state = RuntimeState::Disabled;
                     self.current = None;
-                    self.fifo.clear();
+                    self.queue.clear();
                     return Ok(RuntimeAction::AcknowledgeAndTerminate(last));
                 }
                 retry.next_attempt = now + Duration::from_millis(25);
@@ -755,13 +740,12 @@ impl<N> Runtime<N> {
             Err(failure) if failure.class == FailureClass::AuthenticatedDivergence => {
                 let zone = coordinates[first];
                 let last = *coordinates.last().unwrap();
-                let snapshot = self.snapshot.clone();
-                let typed = failure.finding.ok_or_else(|| {
-                    PersistenceError::Invalid("authenticated divergence has no finding".into())
-                })?;
+                let typed = failure
+                    .finding
+                    .ok_or_else(|| PersistenceError::Invalid("divergence has no finding".into()))?;
                 let (key, finding) = make_finding(
                     zone,
-                    snapshot.meta.verified_zone_tip,
+                    self.snapshot.meta.verified_zone_tip,
                     None,
                     *typed,
                     failure.message,
@@ -834,9 +818,8 @@ impl<N> Runtime<N> {
         gap_next: Option<BlockNumHash>,
         is_last: bool,
     ) -> Result<(), PersistenceError> {
-        let snapshot = self.snapshot.clone();
-        if snapshot.meta.active_finding.is_some() {
-            let first = match snapshot.meta.coverage {
+        if self.snapshot.meta.active_finding.is_some() {
+            let first = match self.snapshot.meta.coverage {
                 crate::persistence::Coverage::Gap {
                     first_unchecked, ..
                 } => first_unchecked,
@@ -852,10 +835,10 @@ impl<N> Runtime<N> {
             return Ok(());
         }
 
-        if let Err(failure) = validate_creation_coordinate(identity, &snapshot.state, block) {
+        if let Err(failure) = validate_creation_coordinate(identity, &self.snapshot.state, block) {
             return self.record_divergence(store, block, suffix_end, failure);
         }
-        let candidate = match apply_imported(&snapshot.state, &block.imported)
+        let candidate = match apply_imported(&self.snapshot.state, &block.imported)
             .and_then(|imported| apply_zone(imported, &block.zone_facts))
         {
             Ok(candidate) => candidate,
@@ -885,7 +868,7 @@ impl<N> Runtime<N> {
             return Ok(());
         }
 
-        let coverage = match &snapshot.meta.coverage {
+        let coverage = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Gap {
                 first_unchecked,
                 acknowledged_through,
@@ -942,9 +925,9 @@ impl<N> Runtime<N> {
         suffix_end: BlockNumHash,
         failure: Failure,
     ) -> Result<(), PersistenceError> {
-        let typed = failure.finding.ok_or_else(|| {
-            PersistenceError::Invalid("authenticated divergence has no finding".into())
-        })?;
+        let typed = failure
+            .finding
+            .ok_or_else(|| PersistenceError::Invalid("divergence has no finding".into()))?;
         let (key, finding) = make_finding(
             block.zone,
             block.parent,
@@ -964,248 +947,12 @@ impl<N> Runtime<N> {
     }
 }
 
-pub(crate) struct BuildConfig<'a> {
-    pub path: &'a Path,
-    pub l1_chain_id: u64,
-    pub zone_chain_id: u64,
-    pub creation_block: alloy_primitives::B256,
-    pub creation_height: u64,
-    pub portal_identity: PortalIdentity,
-    pub anchor: ChainCut,
-}
-
-#[cfg(test)]
-pub(crate) fn build_checkpoint<N: PlannedNotification, P: ObservationPipeline<N>>(
-    config: BuildConfig<'_>,
-    history: &[N],
-    pipeline: &mut P,
-) -> Result<Snapshot, PersistenceError> {
-    let target = config.path.to_path_buf();
-    let staging = prepare_staging(&target)?;
-    let staged = BuildConfig {
-        path: &staging,
-        l1_chain_id: config.l1_chain_id,
-        zone_chain_id: config.zone_chain_id,
-        creation_block: config.creation_block,
-        creation_height: config.creation_height,
-        portal_identity: config.portal_identity,
-        anchor: config.anchor,
-    };
-    let result = build_checkpoint_in_place(staged, history, pipeline);
-    publish_staging(&target, &staging, result)
-}
-
-/// Atomically publish an identity-bound genesis checkpoint assembled by
-/// an authenticated bootstrap replay.
-pub(crate) fn publish_genesis_checkpoint(
-    config: BuildConfig<'_>,
-    state: State,
-) -> Result<Snapshot, PersistenceError> {
-    let target = config.path.to_path_buf();
-    let staging = prepare_staging(&target)?;
-    let identity = Identity {
-        l1_chain_id: config.l1_chain_id,
-        zone_chain_id: config.zone_chain_id,
-        zone_id: config.portal_identity.zone_id,
-        portal: config.portal_identity.portal,
-        creation_block: config.creation_block,
-        creation_height: config.creation_height,
-    };
-    let result = (|| {
-        validate(&state)
-            .map_err(|error| PersistenceError::Invalid(format!("bootstrap invariant {error:?}")))?;
-        let (store, snapshot) = Persistence::create(&staging, identity, config.anchor, state)?;
-        drop(store);
-        let (reopened, verified) = Persistence::open(&staging, identity)?;
-        drop(reopened);
-        if snapshot != verified {
-            return Err(PersistenceError::Invalid(
-                "genesis checkpoint changed across final reopen".into(),
-            ));
-        }
-        Ok(verified)
-    })();
-    publish_staging(&target, &staging, result)
-}
-
-fn prepare_staging(target: &Path) -> Result<PathBuf, PersistenceError> {
-    if target.exists() {
-        return Err(PersistenceError::Invalid(
-            "checkpoint target already exists".into(),
-        ));
-    }
-    let staging = staging_path(target)?;
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|error| {
-            PersistenceError::Invalid(format!("cannot remove checkpoint staging: {error}"))
-        })?;
-    }
-    fs::create_dir_all(&staging).map_err(|error| {
-        PersistenceError::Invalid(format!("cannot create checkpoint staging: {error}"))
-    })?;
-    Ok(staging)
-}
-
-fn publish_staging(
-    target: &Path,
-    staging: &Path,
-    result: Result<Snapshot, PersistenceError>,
-) -> Result<Snapshot, PersistenceError> {
-    match result {
-        Ok(snapshot) => {
-            fs::rename(staging, target).map_err(|error| {
-                let _ = fs::remove_dir_all(staging);
-                PersistenceError::Invalid(format!("cannot atomically publish checkpoint: {error}"))
-            })?;
-            Ok(snapshot)
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(staging);
-            Err(error)
-        }
-    }
-}
-
-fn staging_path(target: &Path) -> Result<PathBuf, PersistenceError> {
-    let parent = target.parent().ok_or_else(|| {
-        PersistenceError::Invalid("checkpoint target has no sibling directory".into())
-    })?;
-    let name = target.file_name().ok_or_else(|| {
-        PersistenceError::Invalid("checkpoint target has no directory name".into())
-    })?;
-    Ok(parent.join(format!(
-        ".{}.staging-{}",
-        name.to_string_lossy(),
-        std::process::id()
-    )))
-}
-
-#[cfg(test)]
-fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
-    config: BuildConfig<'_>,
-    history: &[N],
-    pipeline: &mut P,
-) -> Result<Snapshot, PersistenceError> {
-    let BuildConfig {
-        path,
-        l1_chain_id,
-        zone_chain_id,
-        creation_block,
-        creation_height,
-        portal_identity,
-        anchor,
-    } = config;
-    let identity = Identity {
-        l1_chain_id,
-        zone_chain_id,
-        zone_id: portal_identity.zone_id,
-        portal: portal_identity.portal,
-        creation_block,
-        creation_height,
-    };
-    let initial = State::awaiting(portal_identity);
-    validate(&initial)
-        .map_err(|e| PersistenceError::Invalid(format!("initial invariant {e:?}")))?;
-    let (store, mut snapshot) = Persistence::create(path, identity, anchor, initial)?;
-    for notification in history {
-        let plan = notification
-            .plan()
-            .map_err(|f| PersistenceError::Invalid(format!("local replay plan: {}", f.message)))?;
-        if !plan.reverted.is_empty() {
-            snapshot = store.reorg(&snapshot, plan.ancestor)?;
-        }
-        for index in 0..plan.applied.len() {
-            let block = pipeline
-                .authenticate_at(notification, index, &snapshot.state)
-                .map_err(|f| PersistenceError::Invalid(format!("local replay: {}", f.message)))?;
-            validate_creation_coordinate(identity, &snapshot.state, &block)
-                .map_err(|f| PersistenceError::Invalid(format!("local replay: {}", f.message)))?;
-            let candidate = apply_zone(
-                apply_imported(&snapshot.state, &block.imported)
-                    .map_err(|e| PersistenceError::Invalid(e.to_string()))?,
-                &block.zone_facts,
-            )
-            .map_err(|e| PersistenceError::Invalid(e.to_string()))?;
-            compare_authenticated(&block, &candidate).map_err(|f| {
-                PersistenceError::Invalid(format!("local replay comparison: {}", f.message))
-            })?;
-            snapshot = store.apply(
-                &snapshot,
-                JournalEntry {
-                    zone: block.zone,
-                    parent: block.parent,
-                    imported_tempo: block.tempo,
-                    imported_tempo_parent: block.tempo_parent,
-                    delta: candidate.delta,
-                },
-                block.zone,
-                crate::persistence::Coverage::Complete,
-            )?;
-        }
-    }
-    validate(&snapshot.state)
-        .map_err(|e| PersistenceError::Invalid(format!("replay invariant {e:?}")))?;
-    let completed = store.checkpoint_current(&snapshot)?;
-    drop(store);
-    // A successful build is not publishable until an independent open has
-    // replayed the journal and rerun all persistence/kernel invariants.
-    let (reopened, verified) = Persistence::open(path, identity)?;
-    drop(reopened);
-    if completed != verified {
-        return Err(PersistenceError::Invalid(
-            "checkpoint changed across final reopen".into(),
-        ));
-    }
-    Ok(verified)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn observation_projection_omits_only_unavailable_carrier_ids() {
-        let processed = Effect::UserWithdrawalProcessed {
-            to: Address::repeat_byte(1),
-            sender_tag: B256::repeat_byte(2),
-            token: Address::repeat_byte(3),
-            amount: 4,
-            callback_success: true,
-        };
-        assert_eq!(
-            processed,
-            Effect::UserWithdrawalProcessed {
-                to: Address::repeat_byte(1),
-                sender_tag: B256::repeat_byte(2),
-                token: Address::repeat_byte(3),
-                amount: 4,
-                callback_success: true,
-            }
-        );
-
-        let refund = |_number| Effect::FailedDepositRefunded {
-            recipient: Address::repeat_byte(6),
-            token: Address::repeat_byte(7),
-            amount: 8,
-            fee: 9,
-            pending: false,
-        };
-        assert_eq!(
-            refund(1),
-            refund(42),
-            "DepositBounceBack has no DepositId carrier"
-        );
-
-        let mut mutated = processed.clone();
-        let Effect::UserWithdrawalProcessed { amount, .. } = &mut mutated else {
-            unreachable!()
-        };
-        *amount += 1;
-        assert_ne!(mutated, processed);
-    }
-
-    #[test]
-    fn bounded_fifo_keeps_one_current_and_order() {
+    fn bounded_queue_keeps_one_current_and_preserves_order() {
         let (_directory, store) = crate::tests::create();
         let mut runtime = Runtime::new(
             store.load().unwrap(),

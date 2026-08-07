@@ -1,10 +1,10 @@
 use alloy_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::state::StateKey;
+use crate::kernel::state::StateKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Datum {
+pub(crate) enum Datum {
     U64(u64),
     U128(u128),
     U256(U256),
@@ -20,7 +20,7 @@ pub enum Datum {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FindingCategory {
+pub(crate) enum FindingCategory {
     Authentication,
     EffectMismatch,
     StateMismatch,
@@ -34,7 +34,7 @@ pub enum FindingCategory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FindingLocation {
+pub(crate) enum FindingLocation {
     Operation(u32),
     State(StateKey),
     Block,
@@ -42,17 +42,17 @@ pub enum FindingLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Finding {
-    pub category: FindingCategory,
-    pub code: u16,
-    pub location: Option<FindingLocation>,
-    pub expected: Option<Datum>,
-    pub actual: Option<Datum>,
+pub(crate) struct Finding {
+    pub(crate) category: FindingCategory,
+    pub(crate) code: u16,
+    pub(crate) location: Option<FindingLocation>,
+    pub(crate) expected: Option<Datum>,
+    pub(crate) actual: Option<Datum>,
 }
 
 impl Datum {
     /// Canonical, version-independent bytes used for finding evidence identity.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(41);
         match self {
             Self::U64(v) => {

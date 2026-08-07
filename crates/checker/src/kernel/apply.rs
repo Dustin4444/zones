@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, num::NonZeroU64};
+use std::{collections::BTreeMap, num::NonZeroU64, ops::Bound};
 
 use alloy_primitives::{Address, U256};
 
-use crate::{
+use crate::kernel::{
     commitments::{
         NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL, bounceback_deposit_hash,
         bounceback_fee, failed_deposit_sender_tag, ordinary_deposit_hash, portal_address,
@@ -23,14 +23,14 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ModelError {
+pub(crate) enum TransitionError {
     #[error("portal has not been created")]
     PortalNotCreated,
     #[error("portal is already created")]
     PortalAlreadyCreated,
     #[error("portal identity mismatch")]
     PortalIdentityMismatch,
-    #[error("portal address does not match zone ID")]
+    #[error("portal address does not match Zone ID")]
     PortalAddressMismatch,
     #[error("initial token mismatch")]
     InitialTokenMismatch,
@@ -38,7 +38,7 @@ pub enum ModelError {
     TokenAlreadyEnabled(Address),
     #[error("token {0} is not enabled on the portal")]
     TokenNotEnabled(Address),
-    #[error("token {0} is not enabled in the Zone")]
+    #[error("token {0} is not enabled in the zone")]
     TokenNotZoneEnabled(Address),
     #[error("zone token enablement does not match imported portal operations")]
     TokenEnableMismatch,
@@ -54,6 +54,8 @@ pub enum ModelError {
     DepositPrefixMismatch,
     #[error("deposit outcome count mismatch")]
     DepositOutcomeCountMismatch,
+    #[error("withdrawal outcome count mismatch")]
+    WithdrawalOutcomeCountMismatch,
     #[error("withdrawal owner collision")]
     WithdrawalCollision,
     #[error("corrupt state row family")]
@@ -69,7 +71,7 @@ pub enum ModelError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportedCandidate {
+pub(crate) struct ImportedCandidate {
     state: State,
     effects: Vec<Effect>,
     delta: StateDelta,
@@ -81,30 +83,32 @@ pub struct ImportedCandidate {
 impl ImportedCandidate {
     /// Exact accounting after the imported Tempo block and before any Zone
     /// inputs are applied. This is the collateral cut authenticated on Tempo.
-    pub fn expected_accounting(&self) -> Result<BTreeMap<Address, TokenAccounting>, ModelError> {
+    pub(crate) fn expected_accounting(
+        &self,
+    ) -> Result<BTreeMap<Address, TokenAccounting>, TransitionError> {
         token_accounting(&Overlay::new(&self.state))
     }
 
     /// Effects independently predicted from the imported block alone.
-    pub fn expected_effects(&self) -> &[Effect] {
+    pub(crate) fn expected_effects(&self) -> &[Effect] {
         &self.effects
     }
 
     /// Materialize the authenticated post-import state without applying a
     /// synthetic Zone transition.
-    pub fn into_state(self) -> State {
+    pub(crate) fn into_state(self) -> State {
         self.state
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
-    pub delta: StateDelta,
-    pub expected_effects: Vec<Effect>,
-    pub expected_state: ExpectedState,
+pub(crate) struct Candidate {
+    pub(crate) delta: StateDelta,
+    pub(crate) expected_effects: Vec<Effect>,
+    pub(crate) expected_state: ExpectedState,
     /// Exact accounting for every token in the resulting overlay, including
     /// unchanged token rows which therefore do not occur in `delta`.
-    pub expected_accounting: BTreeMap<Address, TokenAccounting>,
+    pub(crate) expected_accounting: BTreeMap<Address, TokenAccounting>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,29 +117,27 @@ enum RefundSide {
     Inbox,
 }
 
-/// Promote the Portal-enabled token set proven at the Zone genesis anchor.
+/// Promote tokens enabled before Zone genesis.
 ///
-/// Genesis has no ordinary `advanceTempo` transition, so this is the only
-/// transition allowed to change token phase without matching imported
-/// `TokenEnabled` effects. The caller must independently authenticate zero
-/// genesis supply for this exact token set before applying the delta.
-pub fn apply_genesis_handoff(parent: &State) -> Result<StateDelta, ModelError> {
+/// Genesis has no ordinary Zone transition, so this is the only phase promotion
+/// without matching Zone token-enable effects. The caller must authenticate
+/// zero genesis supply for every promoted token.
+pub(crate) fn apply_genesis_handoff(parent: &State) -> Result<StateDelta, TransitionError> {
     if !matches!(portal(&Overlay::new(parent))?, PortalState::Created { .. }) {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     }
-    let mut overlay = Overlay::new(parent);
-    let tokens = overlay
-        .range(
-            std::ops::Bound::Included(StateKey::Token(Address::ZERO)),
-            std::ops::Bound::Included(StateKey::Token(Address::repeat_byte(0xff))),
-        )
+    let tokens = parent
+        .rows()
+        .range((
+            Bound::Included(StateKey::Token(Address::ZERO)),
+            Bound::Included(StateKey::Token(Address::repeat_byte(0xff))),
+        ))
         .map(|(key, value)| match (key, value) {
-            (StateKey::Token(address), StateValue::Token(token)) => {
-                Ok((address.to_owned(), *token))
-            }
-            _ => Err(ModelError::CorruptState),
+            (StateKey::Token(address), StateValue::Token(token)) => Ok((*address, *token)),
+            _ => Err(TransitionError::CorruptState),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut overlay = Overlay::new(parent);
     for (address, mut token) in tokens {
         if token.phase == TokenPhase::PendingZoneEnable {
             token.phase = TokenPhase::ZoneEnabled;
@@ -145,10 +147,10 @@ pub fn apply_genesis_handoff(parent: &State) -> Result<StateDelta, ModelError> {
     Ok(overlay.finish())
 }
 
-pub fn apply_imported(
+pub(crate) fn apply_imported(
     parent: &State,
     facts: &ImportedFacts,
-) -> Result<ImportedCandidate, ModelError> {
+) -> Result<ImportedCandidate, TransitionError> {
     let mut overlay = Overlay::new(parent);
     let mut effects = Vec::new();
     let mut token_enables = Vec::new();
@@ -160,16 +162,16 @@ pub fn apply_imported(
             } => {
                 let portal = portal(&overlay)?;
                 let PortalState::AwaitingCreation(expected) = portal else {
-                    return Err(ModelError::PortalAlreadyCreated);
+                    return Err(TransitionError::PortalAlreadyCreated);
                 };
                 if expected != *identity {
-                    return Err(ModelError::PortalIdentityMismatch);
+                    return Err(TransitionError::PortalIdentityMismatch);
                 }
                 if portal_address(identity.zone_id) != identity.portal {
-                    return Err(ModelError::PortalAddressMismatch);
+                    return Err(TransitionError::PortalAddressMismatch);
                 }
                 if initial_token.token != identity.initial_token {
-                    return Err(ModelError::InitialTokenMismatch);
+                    return Err(TransitionError::InitialTokenMismatch);
                 }
                 overlay.set(
                     StateKey::Portal,
@@ -191,7 +193,7 @@ pub fn apply_imported(
                     ..
                 } = portal(&overlay)?
                 else {
-                    return Err(ModelError::PortalNotCreated);
+                    return Err(TransitionError::PortalNotCreated);
                 };
                 overlay.set(
                     StateKey::Portal,
@@ -214,7 +216,7 @@ pub fn apply_imported(
                 submit_batch(&mut overlay, input, &mut effects)?
             }
             ImportedOperation::ProcessWithdrawals(input) => {
-                process_withdrawals(&mut overlay, input, input.base_fee, &mut effects)?
+                process_withdrawals(&mut overlay, input, &mut effects)?
             }
             ImportedOperation::ClaimPortalRefund(input) => {
                 claim_refund(&mut overlay, *input, RefundSide::Portal, &mut effects)?
@@ -236,12 +238,15 @@ pub fn apply_imported(
     })
 }
 
-pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Candidate, ModelError> {
+pub(crate) fn apply_zone(
+    imported: ImportedCandidate,
+    facts: &ZoneFacts,
+) -> Result<Candidate, TransitionError> {
     if imported.token_enables != facts.enabled_tokens {
-        return Err(ModelError::TokenEnableMismatch);
+        return Err(TransitionError::TokenEnableMismatch);
     }
     if facts.deposits.len() != facts.outcomes.len() {
-        return Err(ModelError::DepositOutcomeCountMismatch);
+        return Err(TransitionError::DepositOutcomeCountMismatch);
     }
     let mut overlay = Overlay::new(&imported.state);
     let mut effects = imported.effects;
@@ -265,7 +270,7 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
     if let PortalState::Created { deposit, .. } = portal(&overlay)?
         && zone(&overlay)?.processed_deposit != deposit
     {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     apply_zone_operations(&mut overlay, &facts.operations, &mut effects)?;
     if let Some(finalization) = &facts.finalization {
@@ -297,7 +302,7 @@ pub fn apply_zone(imported: ImportedCandidate, facts: &ZoneFacts) -> Result<Cand
 
 fn token_accounting(
     overlay: &Overlay<'_>,
-) -> Result<BTreeMap<Address, TokenAccounting>, ModelError> {
+) -> Result<BTreeMap<Address, TokenAccounting>, TransitionError> {
     overlay
         .range(
             std::ops::Bound::Included(StateKey::Token(Address::ZERO)),
@@ -307,38 +312,38 @@ fn token_accounting(
             (StateKey::Token(token), StateValue::Token(state)) => {
                 Ok((token.to_owned(), state.accounting))
             }
-            _ => Err(ModelError::CorruptState),
+            _ => Err(TransitionError::CorruptState),
         })
         .collect()
 }
 
-fn portal(overlay: &Overlay<'_>) -> Result<PortalState, ModelError> {
+fn portal(overlay: &Overlay<'_>) -> Result<PortalState, TransitionError> {
     match overlay.get(&StateKey::Portal) {
         Some(StateValue::Portal(portal)) => Ok(portal.clone()),
-        _ => Err(ModelError::CorruptState),
+        _ => Err(TransitionError::CorruptState),
     }
 }
 
-fn zone(overlay: &Overlay<'_>) -> Result<ZoneState, ModelError> {
+fn zone(overlay: &Overlay<'_>) -> Result<ZoneState, TransitionError> {
     match overlay.get(&StateKey::Zone) {
         Some(StateValue::Zone(zone)) => Ok(zone.clone()),
-        _ => Err(ModelError::CorruptState),
+        _ => Err(TransitionError::CorruptState),
     }
 }
 
-fn token(overlay: &Overlay<'_>, address: Address) -> Result<TokenState, ModelError> {
+fn token(overlay: &Overlay<'_>, address: Address) -> Result<TokenState, TransitionError> {
     match overlay.get(&StateKey::Token(address)) {
         Some(StateValue::Token(token)) => Ok(*token),
-        _ => Err(ModelError::TokenNotEnabled(address)),
+        _ => Err(TransitionError::TokenNotEnabled(address)),
     }
 }
 
-fn enable_token(overlay: &mut Overlay<'_>, enable: &TokenEnable) -> Result<(), ModelError> {
+fn enable_token(overlay: &mut Overlay<'_>, enable: &TokenEnable) -> Result<(), TransitionError> {
     if !matches!(portal(overlay)?, PortalState::Created { .. }) {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     }
     if overlay.get(&StateKey::Token(enable.token)).is_some() {
-        return Err(ModelError::TokenAlreadyEnabled(enable.token));
+        return Err(TransitionError::TokenAlreadyEnabled(enable.token));
     }
     overlay.set(
         StateKey::Token(enable.token),
@@ -354,9 +359,9 @@ fn append_deposit(
     overlay: &mut Overlay<'_>,
     input: &OrdinaryDeposit,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     if input.tempo_refund_recipient.is_zero() {
-        return Err(ModelError::ZeroRefundRecipient);
+        return Err(TransitionError::ZeroRefundRecipient);
     }
     let PortalState::Created {
         identity,
@@ -365,23 +370,26 @@ fn append_deposit(
         settlement,
     } = portal(overlay)?
     else {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     };
     let mut token = token(overlay, input.token)?;
-    let number = deposit.number.checked_add(1).ok_or(ModelError::Overflow)?;
+    let number = deposit
+        .number
+        .checked_add(1)
+        .ok_or(TransitionError::Overflow)?;
     let hash = ordinary_deposit_hash(input, deposit.hash);
     let id = DepositId {
         portal: identity.portal,
         number: NonZeroU64::new(number).expect("increment from a cursor is nonzero"),
     };
     if overlay.get(&StateKey::Deposit(id)).is_some() {
-        return Err(ModelError::DepositCollision);
+        return Err(TransitionError::DepositCollision);
     }
     token.accounting.deposits = token
         .accounting
         .deposits
         .checked_add(U256::from(input.amount))
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     overlay.set(StateKey::Token(input.token), Some(StateValue::Token(token)));
     overlay.set(
         StateKey::Deposit(id),
@@ -408,25 +416,25 @@ fn consume_deposit(
     supplied: &Deposit,
     outcome: DepositOutcome,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     let mut zone = zone(overlay)?;
     let number = zone
         .processed_deposit
         .number
         .checked_add(1)
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     let identity = portal(overlay)?.identity();
     let id = DepositId {
         portal: identity.portal,
         number: NonZeroU64::new(number).expect("increment from a cursor is nonzero"),
     };
     let Some(StateValue::Deposit(owner)) = overlay.get(&StateKey::Deposit(id)) else {
-        return Err(ModelError::DepositPrefixMismatch);
+        return Err(TransitionError::DepositPrefixMismatch);
     };
     let (token_address, amount, hash) = match owner {
         DepositOwner::Ordinary(expected) => {
             if supplied != &Deposit::Ordinary(expected.clone()) {
-                return Err(ModelError::DepositPrefixMismatch);
+                return Err(TransitionError::DepositPrefixMismatch);
             }
             (
                 expected.token,
@@ -446,7 +454,7 @@ fn consume_deposit(
                 amount: *amount,
             };
             if supplied != &Deposit::BounceBack(expected) {
-                return Err(ModelError::DepositPrefixMismatch);
+                return Err(TransitionError::DepositPrefixMismatch);
             }
             (
                 *token,
@@ -458,7 +466,7 @@ fn consume_deposit(
     let owner = owner.clone();
     let mut token = token(overlay, token_address)?;
     if token.phase != TokenPhase::ZoneEnabled {
-        return Err(ModelError::TokenNotZoneEnabled(token_address));
+        return Err(TransitionError::TokenNotZoneEnabled(token_address));
     }
     match (owner, outcome) {
         (DepositOwner::Ordinary(expected), DepositOutcome::Minted) => {
@@ -466,12 +474,12 @@ fn consume_deposit(
                 .accounting
                 .supply
                 .checked_add(U256::from(amount))
-                .ok_or(ModelError::Overflow)?;
+                .ok_or(TransitionError::Overflow)?;
             token.accounting.deposits = token
                 .accounting
                 .deposits
                 .checked_sub(U256::from(amount))
-                .ok_or(ModelError::Underflow)?;
+                .ok_or(TransitionError::Underflow)?;
             effects.push(Effect::DepositProcessed {
                 deposit_hash: hash,
                 sender: expected.sender,
@@ -485,12 +493,12 @@ fn consume_deposit(
                 index: zone.next_withdrawal_index,
             };
             if overlay.get(&StateKey::Withdrawal(withdrawal)).is_some() {
-                return Err(ModelError::WithdrawalCollision);
+                return Err(TransitionError::WithdrawalCollision);
             }
             zone.next_withdrawal_index = zone
                 .next_withdrawal_index
                 .checked_add(1)
-                .ok_or(ModelError::Overflow)?;
+                .ok_or(TransitionError::Overflow)?;
             overlay.set(
                 StateKey::Withdrawal(withdrawal),
                 Some(StateValue::Withdrawal(
@@ -540,18 +548,18 @@ fn consume_deposit(
                 id,
             )?;
             if recipient.is_zero() {
-                return Err(ModelError::OwnerMismatch);
+                return Err(TransitionError::OwnerMismatch);
             }
             token.accounting.supply = token
                 .accounting
                 .supply
                 .checked_add(U256::from(amount))
-                .ok_or(ModelError::Overflow)?;
+                .ok_or(TransitionError::Overflow)?;
             token.accounting.withdrawals = token
                 .accounting
                 .withdrawals
                 .checked_sub(U256::from(amount))
-                .ok_or(ModelError::Underflow)?;
+                .ok_or(TransitionError::Underflow)?;
             overlay.set(StateKey::Fallback(fallback), None);
             effects.push(Effect::BounceBackMinted {
                 token: owner_token,
@@ -576,7 +584,7 @@ fn consume_deposit(
                 id,
             )?;
             if recipient.is_zero() || amount == 0 {
-                return Err(ModelError::OwnerMismatch);
+                return Err(TransitionError::OwnerMismatch);
             }
             let refund = InboxRefundId {
                 token: owner_token,
@@ -584,7 +592,7 @@ fn consume_deposit(
                 withdrawal,
             };
             if overlay.get(&StateKey::InboxRefund(refund)).is_some() {
-                return Err(ModelError::OwnerMismatch);
+                return Err(TransitionError::OwnerMismatch);
             }
             overlay.set(
                 StateKey::InboxRefund(refund),
@@ -596,7 +604,7 @@ fn consume_deposit(
                 amount,
             });
         }
-        _ => return Err(ModelError::DepositPrefixMismatch),
+        _ => return Err(TransitionError::DepositPrefixMismatch),
     }
     zone.processed_deposit = Cursor { hash, number };
     overlay.set(
@@ -615,7 +623,7 @@ fn require_bounceback_owner(
     fallback_nonce: NonZeroU64,
     amount: u128,
     deposit: DepositId,
-) -> Result<FallbackId, ModelError> {
+) -> Result<FallbackId, TransitionError> {
     let key = FallbackId {
         zone_id: withdrawal.zone_id,
         nonce: fallback_nonce,
@@ -633,7 +641,7 @@ fn require_bounceback_owner(
         {
             Ok(key)
         }
-        _ => Err(ModelError::OwnerMismatch),
+        _ => Err(TransitionError::OwnerMismatch),
     }
 }
 
@@ -641,7 +649,7 @@ fn apply_zone_operations(
     overlay: &mut Overlay<'_>,
     operations: &[ZoneOperation],
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     let mut accepted = 0u32;
     for operation in operations {
         match operation {
@@ -659,11 +667,11 @@ fn apply_zone_operations(
                 let mut z = zone(overlay)?;
                 let limited = z.max_withdrawals_per_block != 0;
                 if limited && accepted >= z.max_withdrawals_per_block {
-                    return Err(ModelError::WithdrawalCap);
+                    return Err(TransitionError::WithdrawalCap);
                 }
                 let mut t = token(overlay, input.token)?;
                 if t.phase != TokenPhase::ZoneEnabled {
-                    return Err(ModelError::TokenNotZoneEnabled(input.token));
+                    return Err(TransitionError::TokenNotZoneEnabled(input.token));
                 }
                 if input.amount == 0
                     || input.transaction_hash.is_zero()
@@ -673,27 +681,27 @@ fn apply_zone_operations(
                         && (input.reveal_to.len() != 33
                             || !matches!(input.reveal_to[0], 0x02 | 0x03)))
                 {
-                    return Err(ModelError::CommitmentMismatch);
+                    return Err(TransitionError::CommitmentMismatch);
                 }
                 let fee = withdrawal_fee(input.gas_limit, z.tempo_gas_rate)
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 let burn = U256::from(input.amount)
                     .checked_add(U256::from(fee))
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 t.accounting.supply = t
                     .accounting
                     .supply
                     .checked_sub(burn)
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
                 t.accounting.withdrawals = t
                     .accounting
                     .withdrawals
                     .checked_add(U256::from(input.amount))
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 let fallback_nonce = z
                     .last_fallback_nonce
                     .checked_add(1)
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 let fallback = FallbackId {
                     zone_id: portal(overlay)?.identity().zone_id,
                     nonce: NonZeroU64::new(fallback_nonce).expect("increment is nonzero"),
@@ -705,7 +713,7 @@ fn apply_zone_operations(
                 if overlay.get(&StateKey::Withdrawal(id)).is_some()
                     || overlay.get(&StateKey::Fallback(fallback)).is_some()
                 {
-                    return Err(ModelError::WithdrawalCollision);
+                    return Err(TransitionError::WithdrawalCollision);
                 }
                 let tag = sender_tag(input.sender, input.transaction_hash, fallback_nonce);
                 let data = Withdrawal {
@@ -738,11 +746,11 @@ fn apply_zone_operations(
                 z.next_withdrawal_index = z
                     .next_withdrawal_index
                     .checked_add(1)
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 z.last_fallback_nonce = fallback_nonce;
                 overlay.set(StateKey::Zone, Some(StateValue::Zone(z)));
                 if limited {
-                    accepted = accepted.checked_add(1).ok_or(ModelError::Overflow)?;
+                    accepted = accepted.checked_add(1).ok_or(TransitionError::Overflow)?;
                 }
                 effects.push(Effect::WithdrawalRequested {
                     id,
@@ -772,17 +780,17 @@ fn finalize(
     imported_block_number: u64,
     input: &Finalization,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     let mut z = zone(overlay)?;
     let count = z
         .next_withdrawal_index
         .checked_sub(z.batch_start.withdrawal_index)
-        .ok_or(ModelError::Underflow)?;
+        .ok_or(TransitionError::Underflow)?;
     if input.block_number != facts.block_number
         || input.declared_count != input.encrypted_senders.len()
         || usize::try_from(count).ok() != Some(input.declared_count)
     {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     let zone_id = portal(overlay)?.identity().zone_id;
     let mut values = Vec::with_capacity(input.declared_count);
@@ -790,13 +798,13 @@ fn finalize(
         let index = z
             .batch_start
             .withdrawal_index
-            .checked_add(u64::try_from(offset).map_err(|_| ModelError::Overflow)?)
-            .ok_or(ModelError::Overflow)?;
+            .checked_add(u64::try_from(offset).map_err(|_| TransitionError::Overflow)?)
+            .ok_or(TransitionError::Overflow)?;
         let id = WithdrawalId { zone_id, index };
         let owner = overlay
             .get(&StateKey::Withdrawal(id))
             .cloned()
-            .ok_or(ModelError::OwnerMismatch)?;
+            .ok_or(TransitionError::OwnerMismatch)?;
         let (mut data, origin) = match owner {
             StateValue::Withdrawal(WithdrawalOwner::PendingUser { data, fallback }) => {
                 let expected_len = if data.encrypted_sender.is_empty() {
@@ -805,7 +813,7 @@ fn finalize(
                     113
                 };
                 if encrypted.len() != expected_len {
-                    return Err(ModelError::CommitmentMismatch);
+                    return Err(TransitionError::CommitmentMismatch);
                 }
                 (data, WithdrawalOrigin::User { fallback })
             }
@@ -828,10 +836,10 @@ fn finalize(
                 },
                 WithdrawalOrigin::FailedDeposit { deposit },
             ),
-            _ => return Err(ModelError::OwnerMismatch),
+            _ => return Err(TransitionError::OwnerMismatch),
         };
         if matches!(origin, WithdrawalOrigin::FailedDeposit { .. }) && !encrypted.is_empty() {
-            return Err(ModelError::CommitmentMismatch);
+            return Err(TransitionError::CommitmentMismatch);
         }
         data.encrypted_sender = encrypted.clone();
         values.push(data.clone());
@@ -846,13 +854,13 @@ fn finalize(
     let index = z
         .withdrawal_batch_index
         .checked_add(1)
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     let id = BatchId {
         zone_id,
         index: NonZeroU64::new(index).expect("increment is nonzero"),
     };
     if overlay.get(&StateKey::Batch(id)).is_some() {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     }
     let queue_hash = withdrawal_queue_hash(&values);
     let boundary = BatchBoundary {
@@ -874,7 +882,7 @@ fn finalize(
     );
     z.withdrawal_batch_index = index;
     z.withdrawal_queue_hash = queue_hash;
-    z.batch_start = crate::state::BatchBoundaryStart {
+    z.batch_start = crate::kernel::state::BatchBoundaryStart {
         parent_hash: facts.block_hash,
         deposit: z.processed_deposit,
         withdrawal_index: z.next_withdrawal_index,
@@ -888,7 +896,7 @@ fn submit_batch(
     overlay: &mut Overlay<'_>,
     input: &BatchSubmission,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     let PortalState::Created {
         identity,
         bounceback_gas,
@@ -896,12 +904,12 @@ fn submit_batch(
         mut settlement,
     } = portal(overlay)?
     else {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     };
     let next = settlement
         .batch_index
         .checked_add(1)
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     let id = BatchId {
         zone_id: identity.zone_id,
         index: NonZeroU64::new(next).expect("increment is nonzero"),
@@ -914,9 +922,9 @@ fn submit_batch(
     }) = overlay
         .get(&StateKey::Batch(id))
         .cloned()
-        .ok_or(ModelError::OwnerMismatch)?
+        .ok_or(TransitionError::OwnerMismatch)?
     else {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     };
     if input.tempo_block != boundary.tempo_block
         || input.previous_block != boundary.first_parent
@@ -931,7 +939,7 @@ fn submit_batch(
         || boundary.final_deposit.number > deposit.number
         || (count != 0 && queue_hash == WITHDRAWAL_SENTINEL)
     {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     let queue_len = checked_ring_len(settlement.queue_head, settlement.queue_tail)?;
     let queue_index = if count == 0 {
@@ -939,10 +947,12 @@ fn submit_batch(
         NO_QUEUE_INDEX
     } else {
         if queue_len == U256::from(RING_CAPACITY) {
-            return Err(ModelError::WithdrawalCap);
+            return Err(TransitionError::WithdrawalCap);
         }
         let index = settlement.queue_tail;
-        settlement.queue_tail = index.checked_add(U256::ONE).ok_or(ModelError::Overflow)?;
+        settlement.queue_tail = index
+            .checked_add(U256::ONE)
+            .ok_or(TransitionError::Overflow)?;
         overlay.set(
             StateKey::Batch(id),
             Some(StateValue::Batch(BatchState::Submitted {
@@ -984,11 +994,10 @@ fn submit_batch(
 fn process_withdrawals(
     overlay: &mut Overlay<'_>,
     input: &WithdrawalProcessing,
-    base_fee: U256,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     if input.withdrawals.len() != input.outcomes.len() {
-        return Err(ModelError::DepositOutcomeCountMismatch);
+        return Err(TransitionError::WithdrawalOutcomeCountMismatch);
     }
     if input.withdrawals.is_empty() {
         return Ok(());
@@ -1000,11 +1009,11 @@ fn process_withdrawals(
         mut settlement,
     } = portal(overlay)?
     else {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     };
     let queue_len = checked_ring_len(settlement.queue_head, settlement.queue_tail)?;
     if queue_len.is_zero() {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     }
     let (id, batch) = overlay
         .range(
@@ -1021,7 +1030,7 @@ fn process_withdrawals(
             (StateKey::Batch(id), StateValue::Batch(batch)) => Some((id, batch.clone())),
             _ => None,
         })
-        .ok_or(ModelError::OwnerMismatch)?;
+        .ok_or(TransitionError::OwnerMismatch)?;
     let BatchState::Submitted {
         boundary,
         first_withdrawal,
@@ -1031,20 +1040,20 @@ fn process_withdrawals(
         logical_queue_index,
     } = batch
     else {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     };
     if logical_queue_index != settlement.queue_head {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     }
-    let supplied = u64::try_from(input.withdrawals.len()).map_err(|_| ModelError::Overflow)?;
+    let supplied = u64::try_from(input.withdrawals.len()).map_err(|_| TransitionError::Overflow)?;
     let next = next_ordinal
         .checked_add(supplied)
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     if next > count {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     if queue_hash == WITHDRAWAL_SENTINEL || input.remaining_queue == WITHDRAWAL_SENTINEL {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     let tail = if input.remaining_queue.is_zero() {
         WITHDRAWAL_SENTINEL
@@ -1057,7 +1066,7 @@ fn process_withdrawals(
         .rev()
         .fold(tail, |hash, value| withdrawal_hash(value, hash));
     if folded != queue_hash || (next == count) != input.remaining_queue.is_zero() {
-        return Err(ModelError::CommitmentMismatch);
+        return Err(TransitionError::CommitmentMismatch);
     }
     for (offset, (supplied_value, outcome)) in
         input.withdrawals.iter().zip(&input.outcomes).enumerate()
@@ -1065,7 +1074,7 @@ fn process_withdrawals(
         let index = first_withdrawal
             .checked_add(next_ordinal)
             .and_then(|v| v.checked_add(u64::try_from(offset).ok()?))
-            .ok_or(ModelError::Overflow)?;
+            .ok_or(TransitionError::Overflow)?;
         let wid = WithdrawalId {
             zone_id: identity.zone_id,
             index,
@@ -1073,12 +1082,12 @@ fn process_withdrawals(
         let StateValue::Withdrawal(WithdrawalOwner::Finalized { data, origin }) = overlay
             .get(&StateKey::Withdrawal(wid))
             .cloned()
-            .ok_or(ModelError::OwnerMismatch)?
+            .ok_or(TransitionError::OwnerMismatch)?
         else {
-            return Err(ModelError::OwnerMismatch);
+            return Err(TransitionError::OwnerMismatch);
         };
         if &data != supplied_value {
-            return Err(ModelError::CommitmentMismatch);
+            return Err(TransitionError::CommitmentMismatch);
         }
         let mut t = token(overlay, data.token)?;
         let terminal_effect = match (origin, outcome) {
@@ -1088,13 +1097,13 @@ fn process_withdrawals(
             ) => {
                 require_held_fallback(overlay, fallback, wid, data.token, data.amount)?;
                 if data.gas_limit == 0 && !callback_deposits.is_empty() {
-                    return Err(ModelError::OwnerMismatch);
+                    return Err(TransitionError::OwnerMismatch);
                 }
                 t.accounting.withdrawals = t
                     .accounting
                     .withdrawals
                     .checked_sub(U256::from(data.amount))
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
                 for callback in callback_deposits {
                     append_deposit(overlay, callback, effects)?;
                 }
@@ -1125,7 +1134,7 @@ fn process_withdrawals(
                 else {
                     unreachable!()
                 };
-                let number = pc.number.checked_add(1).ok_or(ModelError::Overflow)?;
+                let number = pc.number.checked_add(1).ok_or(TransitionError::Overflow)?;
                 let bounce = BounceBackDeposit {
                     token: data.token,
                     fallback_nonce: nonce,
@@ -1137,7 +1146,7 @@ fn process_withdrawals(
                     number: NonZeroU64::new(number).expect("increment"),
                 };
                 if overlay.get(&StateKey::Deposit(did)).is_some() {
-                    return Err(ModelError::DepositCollision);
+                    return Err(TransitionError::DepositCollision);
                 }
                 overlay.set(StateKey::Deposit(did), Some(StateValue::Deposit(member)));
                 overlay.set(
@@ -1177,16 +1186,16 @@ fn process_withdrawals(
                 WithdrawalOrigin::FailedDeposit { deposit: _ },
                 WithdrawalOutcome::FailedDepositPaid { collected_fee },
             ) => {
-                let max_fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
-                    .ok_or(ModelError::Overflow)?;
+                let max_fee = bounceback_fee(bounceback_gas, input.base_fee, data.amount)
+                    .ok_or(TransitionError::Overflow)?;
                 if *collected_fee != 0 && *collected_fee != max_fee {
-                    return Err(ModelError::CommitmentMismatch);
+                    return Err(TransitionError::CommitmentMismatch);
                 }
                 t.accounting.deposits = t
                     .accounting
                     .deposits
                     .checked_sub(U256::from(data.amount))
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
                 Effect::FailedDepositRefunded {
                     recipient: data.to,
                     token: data.token,
@@ -1199,23 +1208,23 @@ fn process_withdrawals(
                 WithdrawalOrigin::FailedDeposit { deposit: failed },
                 WithdrawalOutcome::FailedDepositPending { collected_fee },
             ) => {
-                let max_fee = bounceback_fee(bounceback_gas, base_fee, data.amount)
-                    .ok_or(ModelError::Overflow)?;
+                let max_fee = bounceback_fee(bounceback_gas, input.base_fee, data.amount)
+                    .ok_or(TransitionError::Overflow)?;
                 if *collected_fee != 0 && *collected_fee != max_fee {
-                    return Err(ModelError::CommitmentMismatch);
+                    return Err(TransitionError::CommitmentMismatch);
                 }
                 t.accounting.deposits = t
                     .accounting
                     .deposits
                     .checked_sub(U256::from(*collected_fee))
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
                 let refund = PortalRefundId {
                     token: data.token,
                     recipient: data.to,
                     deposit: failed,
                 };
                 if overlay.get(&StateKey::PortalRefund(refund)).is_some() {
-                    return Err(ModelError::OwnerMismatch);
+                    return Err(TransitionError::OwnerMismatch);
                 }
                 overlay.set(
                     StateKey::PortalRefund(refund),
@@ -1231,7 +1240,7 @@ fn process_withdrawals(
                     pending: true,
                 }
             }
-            _ => return Err(ModelError::OwnerMismatch),
+            _ => return Err(TransitionError::OwnerMismatch),
         };
         overlay.set(StateKey::Token(data.token), Some(StateValue::Token(t)));
         overlay.set(StateKey::Withdrawal(wid), None);
@@ -1242,7 +1251,7 @@ fn process_withdrawals(
         settlement.queue_head = settlement
             .queue_head
             .checked_add(U256::ONE)
-            .ok_or(ModelError::Overflow)?;
+            .ok_or(TransitionError::Overflow)?;
     } else {
         overlay.set(
             StateKey::Batch(id),
@@ -1275,10 +1284,10 @@ fn process_withdrawals(
     Ok(())
 }
 
-fn checked_ring_len(head: U256, tail: U256) -> Result<U256, ModelError> {
-    let len = tail.checked_sub(head).ok_or(ModelError::Underflow)?;
+fn checked_ring_len(head: U256, tail: U256) -> Result<U256, TransitionError> {
+    let len = tail.checked_sub(head).ok_or(TransitionError::Underflow)?;
     if len > U256::from(RING_CAPACITY) {
-        return Err(ModelError::OwnerMismatch);
+        return Err(TransitionError::OwnerMismatch);
     }
     Ok(len)
 }
@@ -1289,7 +1298,7 @@ fn require_held_fallback(
     withdrawal: WithdrawalId,
     token: Address,
     amount: u128,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     match overlay.get(&StateKey::Fallback(fallback)) {
         Some(StateValue::Fallback(FallbackState::Held {
             withdrawal: actual_withdrawal,
@@ -1301,7 +1310,7 @@ fn require_held_fallback(
         {
             Ok(())
         }
-        _ => Err(ModelError::OwnerMismatch),
+        _ => Err(TransitionError::OwnerMismatch),
     }
 }
 
@@ -1310,9 +1319,9 @@ fn claim_refund(
     claim: RefundClaim,
     side: RefundSide,
     effects: &mut Vec<Effect>,
-) -> Result<(), ModelError> {
+) -> Result<(), TransitionError> {
     let PortalState::Created { identity, .. } = portal(overlay)? else {
-        return Err(ModelError::PortalNotCreated);
+        return Err(TransitionError::PortalNotCreated);
     };
     let (start, end) = match side {
         RefundSide::Portal => (
@@ -1380,9 +1389,9 @@ fn claim_refund(
     let total = credits
         .iter()
         .try_fold(0u128, |sum, (_, amount)| sum.checked_add(*amount))
-        .ok_or(ModelError::Overflow)?;
+        .ok_or(TransitionError::Overflow)?;
     if total != claim.amount {
-        return Err(ModelError::RefundMismatch);
+        return Err(TransitionError::RefundMismatch);
     }
     if total != 0 {
         let mut t = token(overlay, claim.token)?;
@@ -1392,22 +1401,22 @@ fn claim_refund(
                     .accounting
                     .deposits
                     .checked_sub(U256::from(total))
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
             }
             RefundSide::Inbox => {
                 if t.phase != TokenPhase::ZoneEnabled {
-                    return Err(ModelError::TokenNotZoneEnabled(claim.token));
+                    return Err(TransitionError::TokenNotZoneEnabled(claim.token));
                 }
                 t.accounting.supply = t
                     .accounting
                     .supply
                     .checked_add(U256::from(total))
-                    .ok_or(ModelError::Overflow)?;
+                    .ok_or(TransitionError::Overflow)?;
                 t.accounting.withdrawals = t
                     .accounting
                     .withdrawals
                     .checked_sub(U256::from(total))
-                    .ok_or(ModelError::Underflow)?;
+                    .ok_or(TransitionError::Underflow)?;
             }
         }
         overlay.set(StateKey::Token(claim.token), Some(StateValue::Token(t)));
@@ -1427,7 +1436,7 @@ fn expected_state(
     overlay: &Overlay<'_>,
     tempo_block_hash: alloy_primitives::B256,
     tempo_block_number: u64,
-) -> Result<ExpectedState, ModelError> {
+) -> Result<ExpectedState, TransitionError> {
     let zone = zone(overlay)?;
     Ok(ExpectedState {
         tempo_block_hash,

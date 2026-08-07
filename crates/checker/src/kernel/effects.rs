@@ -1,10 +1,10 @@
 use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::state::{BatchId, DepositId, WithdrawalId};
+use crate::kernel::state::{BatchId, DepositId, WithdrawalId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Effect {
+pub(crate) enum Effect {
     TokenEnabled {
         token: Address,
         name: String,
@@ -89,11 +89,11 @@ pub enum Effect {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExpectedState {
-    pub tempo_block_hash: B256,
-    pub tempo_block_number: u64,
-    pub processed_deposit_hash: B256,
-    pub processed_deposit_number: u64,
-    pub withdrawal_queue_hash: B256,
-    pub withdrawal_batch_index: u64,
+pub(crate) struct ExpectedState {
+    pub(crate) tempo_block_hash: B256,
+    pub(crate) tempo_block_number: u64,
+    pub(crate) processed_deposit_hash: B256,
+    pub(crate) processed_deposit_number: u64,
+    pub(crate) withdrawal_queue_hash: B256,
+    pub(crate) withdrawal_batch_index: u64,
 }

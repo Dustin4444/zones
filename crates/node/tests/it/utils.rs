@@ -1448,9 +1448,7 @@ impl ZoneTestNode {
             }
         };
         if let Some(config) = checker_checkpoint {
-            let path = config.database_path.clone();
-            zone_checker::build_checkpoint(config, chain_id, node_handle.node.provider(), path)
-                .await?;
+            zone_checker::build_checkpoint(config, chain_id, node_handle.node.provider()).await?;
         }
 
         let mut engine_stop = None;
@@ -1798,7 +1796,7 @@ impl L1TestNode {
         .await
     }
 
-    /// Assert that matching withdrawal results were emitted in FIFO order.
+    /// Assert that matching withdrawal results were emitted in queue order.
     pub(crate) async fn assert_withdrawals_processed_in_order(
         &self,
         portal_address: Address,
@@ -4819,8 +4817,8 @@ impl L1Fixture {
             );
         }
 
-        // System transactions resolve their zero-address fee token before execution. Keep that
-        // synthetic token permissive in RPC-free fixtures, matching the old policy-provider stub.
+        // System transactions resolve their zero-address fee token before execution.
+        // Keep the synthetic token permissive in RPC-free fixtures.
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         drop(cache);
