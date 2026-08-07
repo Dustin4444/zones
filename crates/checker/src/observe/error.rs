@@ -159,6 +159,26 @@ impl AcquisitionError {
     }
 }
 
+pub(crate) fn ensure_acquisition_equal<T>(
+    source: AcquisitionSource,
+    field: impl fmt::Display,
+    expected: T,
+    actual: T,
+) -> Result<(), ObservationError>
+where
+    T: PartialEq + fmt::Debug,
+{
+    if expected != actual {
+        return Err(AcquisitionError::inconsistent(
+            source,
+            format!("{field} {expected:?}"),
+            format!("{field} {actual:?}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Protocol envelope rule enforced directly from canonical L2 data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EnvelopeRule {

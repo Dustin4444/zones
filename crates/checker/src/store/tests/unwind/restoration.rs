@@ -38,6 +38,49 @@ fn one_block_unwind_restores_the_exact_parent_cut_and_deletes_child_history() {
 }
 
 #[test]
+fn zone_replay_unwind_rewinds_its_tempo_cursor_and_accepts_a_replacement() {
+    let (directory, initialization, store) = open_test_store(BootstrapPhase::ZoneReplay);
+    let parent = store.load_current().unwrap();
+    let token = initialization.identity.portal_identity().initial_token();
+    let (child_zone, child_tempo) = apply_token_child(
+        &store,
+        parent.verified_zone_tip,
+        parent.imported_tempo_tip,
+        0x88,
+        0x98,
+        token,
+        7,
+    );
+    let child = store.load_current().unwrap();
+    assert_eq!(child.bootstrap, BootstrapState::zone_replay(child_tempo));
+    drop(store);
+
+    let store = CheckerStore::open_existing(directory.path(), initialization.identity).unwrap();
+    assert_eq!(
+        store.unwind_tip(child_zone).unwrap(),
+        ParentTips::new(parent.verified_zone_tip, parent.imported_tempo_tip)
+    );
+    assert_eq!(store.load_current().unwrap(), parent);
+
+    let replacement = block(
+        parent.verified_zone_tip,
+        parent.imported_tempo_tip,
+        0x89,
+        0x99,
+        Vec::new(),
+    );
+    assert_eq!(
+        store.apply_block(replacement).unwrap(),
+        WriteOutcome::Applied
+    );
+    let replacement = store.load_current().unwrap();
+    assert_eq!(
+        replacement.bootstrap,
+        BootstrapState::zone_replay(replacement.imported_tempo_tip)
+    );
+}
+
+#[test]
 fn metadata_only_block_unwinds_without_model_mutations() {
     let (_directory, _initialization, store) = open_test_store(BootstrapPhase::Live);
     let parent = store.load_current().unwrap();

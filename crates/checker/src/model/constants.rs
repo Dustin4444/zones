@@ -20,6 +20,12 @@ pub(crate) const ZONE_INBOX_ADDRESS: Address =
 pub(crate) const ZONE_OUTBOX_ADDRESS: Address =
     address!("0x1c00000000000000000000000000000000000002");
 
+/// Zone-native fee manager predeploy.
+///
+/// Pinned source: `crates/primitives/src/constants.rs:47-52`.
+pub(crate) const ZONE_FEE_MANAGER_ADDRESS: Address =
+    address!("0xfeec000000000000000000000000000000000001");
+
 /// Native TIP-1091 factory address.
 ///
 /// Pinned source: `crates/contracts/src/precompiles/zone_factory.rs:8`.
@@ -171,6 +177,10 @@ mod tests {
         assert_eq!(
             ZONE_OUTBOX_ADDRESS,
             address!("1c00000000000000000000000000000000000002")
+        );
+        assert_eq!(
+            ZONE_FEE_MANAGER_ADDRESS,
+            address!("feec000000000000000000000000000000000001")
         );
         assert_eq!(
             ZONE_FACTORY_ADDRESS,

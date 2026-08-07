@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use alloy_consensus::{Header, Sealable as _, Signed, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256};
-use alloy_provider::ProviderBuilder;
+use alloy_consensus::{BlockHeader as _, Header, Sealable as _, Signed, TxLegacy, TxReceipt as _};
+use alloy_primitives::{Address, B256, Bloom, Bytes, Log, Signature, U256};
+use alloy_provider::{DynProvider, Provider as _, ProviderBuilder};
 use alloy_rlp::Encodable as _;
 use alloy_rpc_types_eth::{BlockTransactions, Header as RpcHeader};
 use alloy_sol_types::{SolCall as _, SolEvent as _};
@@ -17,7 +17,7 @@ use tempo_alloy::{
 };
 use tempo_contracts::precompiles::ITIP20;
 use tempo_primitives::{
-    BlockBody, TempoHeader, TempoTxEnvelope, TempoTxType,
+    Block, BlockBody, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
     transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE,
 };
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
@@ -31,7 +31,7 @@ use crate::{
             TEMPO_BLOCK_HASH_ACCESS, TEMPO_BLOCK_NUMBER_ACCESS, tip20_total_supply_access,
         },
     },
-    observe::AcquisitionError,
+    observe::ExactStateLookup,
 };
 
 mod pipeline;
@@ -66,32 +66,6 @@ fn checker_mode_parse_display_default() {
     assert_eq!(CheckerMode::Observe.to_string(), "observe");
 }
 
-#[test]
-fn acknowledgement_state_never_crosses_the_first_observation_gap() {
-    let first_tip = BlockNumHash::new(1, B256::repeat_byte(0x01));
-    let later_tip = BlockNumHash::new(2, B256::repeat_byte(0x02));
-    let mut state = AcknowledgementState::default();
-
-    assert_eq!(state.record(Ok(first_tip)).unwrap(), Some(first_tip));
-    assert!(matches!(
-        state.record(Err(AcquisitionError::missing(
-            AcquisitionSource::L1Block,
-            B256::repeat_byte(0xee),
-        )
-        .into())),
-        Err(ObservationError::Acquisition(AcquisitionError::Missing {
-            kind: AcquisitionSource::L1Block,
-            ..
-        }))
-    ));
-    assert_eq!(state, AcknowledgementState::Blocked);
-    assert_eq!(state.record(Ok(later_tip)).unwrap(), None);
-}
-
-fn imported_header(number: u64) -> TempoHeader {
-    imported_child_header(number, B256::ZERO)
-}
-
 fn imported_child_header(number: u64, parent_hash: B256) -> TempoHeader {
     let receipts_root = alloy_consensus::proofs::calculate_receipt_root::<
         alloy_consensus::ReceiptWithBloom<tempo_primitives::TempoReceipt<Log>>,
@@ -123,8 +97,9 @@ fn zone_block_with_user_withdrawal(
     parent_hash: B256,
     imported: &TempoHeader,
     sender: Address,
+    token: Address,
 ) -> RecoveredBlock<Block> {
-    zone_block_with_user_withdrawal_marker(number, parent_hash, imported, sender, 0)
+    zone_block_with_user_withdrawal_marker(number, parent_hash, imported, sender, token, 0)
 }
 
 fn zone_block_with_user_withdrawal_marker(
@@ -132,6 +107,7 @@ fn zone_block_with_user_withdrawal_marker(
     parent_hash: B256,
     imported: &TempoHeader,
     sender: Address,
+    token: Address,
     fork_marker: u8,
 ) -> RecoveredBlock<Block> {
     let user = TempoTxEnvelope::Legacy(Signed::new_unhashed(
@@ -141,6 +117,10 @@ fn zone_block_with_user_withdrawal_marker(
         },
         Signature::new(U256::ONE, U256::from(2), false),
     ));
+    let receipts = [
+        zone_receipt(imported),
+        user_withdrawal_receipt(sender, token),
+    ];
     let block = Block {
         header: TempoHeader {
             inner: Header {
@@ -156,7 +136,7 @@ fn zone_block_with_user_withdrawal_marker(
             ..Default::default()
         },
     };
-    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::ZERO, sender])
+    seal_zone_block(block, vec![Address::ZERO, sender], &receipts)
 }
 
 fn zone_block_with_marker(
@@ -166,6 +146,7 @@ fn zone_block_with_marker(
     fork_marker: u8,
 ) -> RecoveredBlock<Block> {
     let advance = advance_transaction(imported);
+    let receipts = [zone_receipt(imported)];
     let block = Block {
         header: TempoHeader {
             inner: Header {
@@ -181,7 +162,27 @@ fn zone_block_with_marker(
             ..Default::default()
         },
     };
-    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![Address::ZERO])
+    seal_zone_block(block, vec![Address::ZERO], &receipts)
+}
+
+fn seal_zone_block(
+    mut block: Block,
+    senders: Vec<Address>,
+    receipts: &[TempoReceipt],
+) -> RecoveredBlock<Block> {
+    block.header.inner.receipts_root = TempoReceipt::calculate_receipt_root_no_memo(receipts);
+    block.header.inner.logs_bloom = receipts
+        .iter()
+        .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom());
+    RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), senders)
+}
+
+fn with_zone_receipts(
+    block: RecoveredBlock<Block>,
+    receipts: &[TempoReceipt],
+) -> RecoveredBlock<Block> {
+    let senders = block.senders().to_vec();
+    seal_zone_block(block.into_block(), senders, receipts)
 }
 
 fn advance_transaction(imported: &TempoHeader) -> TempoTxEnvelope {
@@ -375,107 +376,4 @@ fn l1_provider_with_collateral_sequence(
     ProviderBuilder::new_with_network::<TempoNetwork>()
         .connect_mocked_client(asserter)
         .erased()
-}
-
-#[tokio::test]
-async fn committed_notification_wires_zone_and_imported_tempo_observers() {
-    let imported = imported_header(L1_NUMBER);
-    let block = zone_block(1, B256::repeat_byte(0x11), &imported);
-    let expected_tip = BlockNumHash::new(1, block.hash());
-    let notification = ExExNotification::ChainCommitted {
-        new: chain(vec![block], vec![vec![zone_receipt(&imported)]]),
-    };
-    let provider = zone_state(&imported);
-    let mut l1 = Some(l1_provider(&imported));
-
-    let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-        .await
-        .unwrap();
-
-    assert_eq!(tip, expected_tip);
-}
-
-#[tokio::test]
-async fn exact_zone_state_gap_blocks_live_observation_acknowledgement() {
-    let imported = imported_header(L1_NUMBER);
-    let block = zone_block(1, B256::repeat_byte(0x19), &imported);
-    let notification = ExExNotification::ChainCommitted {
-        new: chain(vec![block], vec![vec![zone_receipt(&imported)]]),
-    };
-    let mut l1 = Some(l1_provider(&imported));
-
-    assert!(matches!(
-        process_notification(&notification, &UnavailableZoneState, &mut l1, "", PORTAL).await,
-        Err(ObservationError::Acquisition(
-            AcquisitionError::Unavailable {
-                kind: AcquisitionSource::ExactZoneState,
-                ..
-            }
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn notification_receipt_set_gap_preserves_acquisition_class() {
-    let imported = imported_header(L1_NUMBER);
-    let block = zone_block(1, B256::repeat_byte(0x22), &imported);
-    let notification = ExExNotification::ChainCommitted {
-        new: Arc::new(Chain::new(
-            vec![block],
-            ExecutionOutcome::<TempoReceipt>::default(),
-            BTreeMap::new(),
-        )),
-    };
-    let mut l1 = None;
-
-    assert!(matches!(
-        process_notification(&notification, &TestProvider::new(), &mut l1, "", PORTAL,).await,
-        Err(ObservationError::Acquisition(
-            AcquisitionError::Inconsistent {
-                kind: AcquisitionSource::ZoneNotificationReceipts,
-                ..
-            }
-        ))
-    ));
-}
-
-#[tokio::test]
-async fn reverted_notification_returns_the_parent_tip_without_observation() {
-    let parent_hash = B256::repeat_byte(0x33);
-    let imported = imported_header(L1_NUMBER);
-    let block = zone_block(7, parent_hash, &imported);
-    let notification = ExExNotification::ChainReverted {
-        old: chain(vec![block], vec![vec![zone_receipt(&imported)]]),
-    };
-    let mut l1 = None;
-
-    let tip = process_notification(&notification, &TestProvider::new(), &mut l1, "", PORTAL)
-        .await
-        .unwrap();
-
-    assert_eq!(tip, BlockNumHash::new(6, parent_hash));
-}
-
-#[tokio::test]
-async fn reorg_logs_the_old_chain_then_observes_only_the_replacement() {
-    let parent_hash = B256::repeat_byte(0x44);
-    let imported = imported_header(L1_NUMBER);
-    let old = zone_block_with_marker(7, parent_hash, &imported, 1);
-    let replacement = zone_block_with_marker(7, parent_hash, &imported, 2);
-    assert_ne!(old.hash(), replacement.hash());
-    let replacement_tip = BlockNumHash::new(7, replacement.hash());
-    let notification = ExExNotification::ChainReorged {
-        // An intentionally incomplete old receipt set proves the reverted side
-        // is never sent through the authenticated observation adapters.
-        old: chain(vec![old], vec![]),
-        new: chain(vec![replacement], vec![vec![zone_receipt(&imported)]]),
-    };
-    let provider = zone_state(&imported);
-    let mut l1 = Some(l1_provider(&imported));
-
-    let tip = process_notification(&notification, &provider, &mut l1, "", PORTAL)
-        .await
-        .unwrap();
-
-    assert_eq!(tip, replacement_tip);
 }

@@ -1,7 +1,7 @@
 //! Authenticated Tempo observation projection.
 
 use alloy_consensus::BlockHeader as _;
-use alloy_primitives::{Address, FixedBytes, U256};
+use alloy_primitives::{Address, B256, FixedBytes, U256};
 
 use crate::{
     model::{
@@ -33,6 +33,7 @@ pub(crate) use actual::{
     ObservedImportedOutput, ObservedProcessedWithdrawal, ObservedRefundClaim,
     ObservedSubmittedBatch, ObservedUserWithdrawalBounce, ObservedUserWithdrawalDelivery,
     ObservedWithdrawalBounceBackAppend, ObservedWithdrawalProcessed, ObservedWithdrawalProcessing,
+    PortalCreationIdentityError,
 };
 pub(crate) use error::{ImportedEventKind, ImportedProjectionError};
 
@@ -45,9 +46,14 @@ struct PositionedEvent<'a> {
 }
 
 /// Project the exact authenticated L1 block selected by `imported`.
+///
+/// The factory creation outcome drives the model only at the configured
+/// bootstrap hash. Strictly decoded later `ZoneCreated` outcomes are known
+/// non-model events, matching the release-one event surface.
 pub(crate) fn project_imported(
     observation: &L1BlockObservation,
     imported: &ImportedTempoHeader,
+    portal_creation_block_hash: B256,
 ) -> Result<ImportedProjection, ImportedProjectionError> {
     if observation.block_hash() != imported.hash() {
         return Err(ImportedProjectionError::BlockHashMismatch {
@@ -69,6 +75,7 @@ pub(crate) fn project_imported(
     let mut operations = Vec::new();
     let mut outputs = Vec::new();
     let mut previous_transaction_index = None;
+    let is_portal_creation_block = imported.hash() == portal_creation_block_hash;
     for transaction in observation.protocol_transactions() {
         if let Some(previous) = previous_transaction_index
             && transaction.transaction_index() <= previous
@@ -80,7 +87,7 @@ pub(crate) fn project_imported(
         }
         previous_transaction_index = Some(transaction.transaction_index());
 
-        let events = transaction
+        let mut events = transaction
             .outcomes()
             .iter()
             .map(|outcome| {
@@ -107,6 +114,15 @@ pub(crate) fn project_imported(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        if !is_portal_creation_block {
+            events
+                .retain(|outcome| !matches!(outcome.event, L1ProtocolEvent::FactoryZoneCreated(_)));
+        }
+
+        if events.is_empty() {
+            continue;
+        }
 
         if let Some(call) = transaction.direct_call() {
             if let Some(call) = call.as_submit_batch() {

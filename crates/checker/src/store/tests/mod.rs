@@ -19,7 +19,7 @@ use crate::model::{
     ownership::{DepositId, DepositOwner},
     state::{ModelState, PortalDepositCursor, PortalIdentity, TokenPhase, TokenState},
     transition::{
-        ModelTransition,
+        ModelTransition, ZoneGenesisStateUpdate,
         test_inputs::{
             AuthenticatedDepositOutcome, ImportedTempoOperation, deposit_prefix, imported_block,
             zone_block,
@@ -28,7 +28,7 @@ use crate::model::{
 };
 
 use super::{
-    db::{CheckerStore, Initialization, LiveBlock, RefundCredit},
+    db::{CanonicalBlock, CheckerStore, FreshBootstrap, Initialization, RefundCredit},
     error::StoreError,
     history::BlockCommit,
     model_state::{flatten_model, model_bytes},
@@ -73,13 +73,17 @@ fn identity() -> StoreIdentity {
 }
 
 fn identity_with_portal(portal: Address) -> StoreIdentity {
+    identity_with_portal_and_creation(portal, tip(5, 0x50))
+}
+
+fn identity_with_portal_and_creation(portal: Address, creation: BlockNumHash) -> StoreIdentity {
     StoreIdentity::new(
         4242,
         hash(0x10),
         PortalIdentity::new(portal, 7, Address::repeat_byte(0x20)),
         31337,
         Address::repeat_byte(0x30),
-        hash(0x50),
+        creation,
     )
 }
 
@@ -91,15 +95,22 @@ fn initialization(phase: BootstrapPhase) -> Initialization {
         BootstrapPhase::ZoneReplay => BootstrapState::zone_replay(tempo),
         BootstrapPhase::Live => BootstrapState::live(),
     };
+    let mut model = ModelState::created_with_zone_token_for_test(
+        identity.portal_identity(),
+        TokenAccounting::ZERO,
+    );
+    if matches!(phase, BootstrapPhase::L1Replay) {
+        model.set_token_phase_for_test(
+            identity.portal_identity().initial_token(),
+            TokenPhase::PendingZoneEnable,
+        );
+    }
     Initialization::new(
         identity,
         bootstrap,
         BlockNumHash::new(0, identity.zone_genesis_hash()),
         tempo,
-        ModelState::created_with_zone_token_for_test(
-            identity.portal_identity(),
-            TokenAccounting::ZERO,
-        ),
+        model,
     )
 }
 
@@ -157,6 +168,15 @@ fn open_test_store(phase: BootstrapPhase) -> (TempDir, Initialization, CheckerSt
 
 fn token_value(amount: u64) -> ModelValue {
     token_value_with_liabilities(amount, 0, 0)
+}
+
+fn pending_token_value() -> ModelValue {
+    ModelValue::Token(TokenValue {
+        phase: StoredTokenPhase::PendingZoneEnable,
+        supply: U256::ZERO,
+        deposit_liability: U256::ZERO,
+        withdrawal_liability: U256::ZERO,
+    })
 }
 
 fn token_value_with_liabilities(supply: u64, deposit: u128, withdrawal: u128) -> ModelValue {

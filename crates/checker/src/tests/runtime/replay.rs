@@ -180,6 +180,7 @@ async fn one_block_reorg_unwinds_old_then_applies_replacement() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         sender,
+        fixture.token,
         0xa1,
     );
     assert_ne!(replacement.hash(), fixture.block.hash());
@@ -252,7 +253,7 @@ async fn multi_block_reorg_resumes_after_one_durable_unwind_and_restart() {
     );
     assert_eq!(store.load_current().unwrap(), old.after_first);
     drop(store);
-    fixture.checker = LiveChecker::from_store(
+    fixture.checker = PersistentChecker::from_store(
         CheckerStore::open_existing(fixture.directory.path(), identity).unwrap(),
     )
     .unwrap();
@@ -292,6 +293,7 @@ impl TwoBlockFork {
             fixture.initialization.verified_zone_tip.hash,
             &fixture.imported,
             Address::repeat_byte(0x53),
+            fixture.token,
             0xa2,
         );
         let replacement_second = zone_block(2, replacement_first.hash(), &imported);

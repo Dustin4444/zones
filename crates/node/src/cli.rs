@@ -1,5 +1,9 @@
 //! Tempo Zone CLI.
 
+mod checker;
+
+pub use checker::CheckerArgs;
+
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
@@ -18,6 +22,7 @@ use crate::{
     ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
     rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
+use zone_checker::CheckerExEx;
 use zone_sequencer::{
     BatchAnchorConfig, DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
     MAX_WITHDRAWAL_BATCH_GAS, WithdrawalBatchLimits,
@@ -106,6 +111,11 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
         validate_portal_address(args.portal_address)?;
+        let checker_config = args.checker.config(
+            &args.l1_rpc_url,
+            args.portal_address,
+            args.zone_id,
+        )?;
 
         let p2p_config = args
             .sequencer_manifest
@@ -178,10 +188,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         builder.config_mut().rpc.rpc_max_logs_per_response = MAX_LOGS_PER_RESPONSE.into();
         builder.config_mut().rpc.rpc_max_blocks_per_filter = MAX_BLOCKS_PER_FILTER.into();
 
-        // Clone L1 connection details for the checker before they are moved into ZoneNode.
-        let checker_l1_rpc_url = args.l1_rpc_url.clone();
-        let checker_portal_address = args.portal_address;
-
         let mut node = ZoneNode::new(
             args.l1_rpc_url,
             args.portal_address,
@@ -226,21 +232,21 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             node = node.with_p2p(config);
         }
 
-        // Install or skip the checker ExEx based on the configured mode.
-        match args.checker_mode {
-            CheckerMode::Off => {
+        // Install the checker ExEx only when observe mode produced a runtime config.
+        match checker_config {
+            None => {
                 let handle = builder
                     .node(node)
                     .launch_with_debug_capabilities()
                     .await?;
                 handle.wait_for_node_exit().await
             }
-            CheckerMode::Observe => {
+            Some(config) => {
                 info!(target: "reth::cli", "Checker ExEx enabled (observe mode)");
-                let checker = CheckerExEx::new(checker_l1_rpc_url, checker_portal_address);
+                let checker = CheckerExEx::new(config);
                 builder
                     .node(node)
-                    .install_exex("zone-checker", async move |ctx| Ok(checker.run(ctx)))
+                    .install_exex("zone-checker", async move |ctx| checker.launch(ctx))
                     .launch_with_debug_capabilities()
                     .await?
                     .wait_for_node_exit()
@@ -499,14 +505,9 @@ pub struct ZoneArgs {
     #[arg(long = "sequencer.enable-prover", env = "SEQUENCER_ENABLE_PROVER")]
     pub enable_prover: bool,
 
-    /// Checker ExEx mode: `off` (default) or `observe`.
-    #[arg(
-        long = "checker.mode",
-        env = "CHECKER_MODE",
-        default_value = "off",
-        value_parser = zone_checker::CheckerMode::parse,
-    )]
-    pub checker_mode: zone_checker::CheckerMode,
+    /// Durable observe-only checker configuration.
+    #[command(flatten)]
+    pub checker: CheckerArgs,
 }
 
 fn prepend_log_filter(filter: &mut String, directives: &str) {

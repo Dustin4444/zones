@@ -11,10 +11,10 @@ use super::{
     RuntimeError, RuntimeResult,
     apply::L1Client,
     chain::{ValidatedChain, validate_reorg},
-    state::{LiveChecker, ReadyToAcknowledge},
+    state::{PersistentChecker, ReadyToAcknowledge},
 };
 
-impl LiveChecker {
+impl PersistentChecker {
     pub(crate) async fn process_notification_once<S>(
         &mut self,
         notification: &ExExNotification<TempoPrimitives>,
@@ -52,7 +52,7 @@ impl LiveChecker {
         }
         self.remove_reverted_alert(old)?;
         self.unwind_old_progress(old, None)?;
-        let tip = self.store.load_current()?.verified_zone_tip;
+        let tip = self.store.load_progress()?.verified_zone_tip;
         if tip != old.base() {
             return Err(RuntimeError::ReorgProgressConflict { tip });
         }
@@ -168,7 +168,7 @@ impl LiveChecker {
         old: &ValidatedChain<'_>,
         replacement: Option<&ValidatedChain<'_>>,
     ) -> RuntimeResult<()> {
-        let mut current = self.store.load_current()?.verified_zone_tip;
+        let mut current = self.store.load_progress()?.verified_zone_tip;
         if current == old.base()
             || replacement.is_some_and(|replacement| replacement.contains(current))
         {

@@ -13722,6 +13722,7 @@ dependencies = [
  "eyre",
  "futures",
  "metrics",
+ "reth-chainspec",
  "reth-codecs",
  "reth-db",
  "reth-db-api",
@@ -13741,6 +13742,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zone-primitives",
 ]
 
 [[package]]
@@ -13876,6 +13878,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tempo-alloy",
  "tempo-chainspec",
  "tempo-contracts",

@@ -40,6 +40,8 @@ const BLOCK_NUMBER: u64 = 42;
 const PORTAL: Address = Address::repeat_byte(0x42);
 const EXTERNAL: Address = Address::repeat_byte(0xee);
 
+mod exact_header;
+
 fn rpc_log(log: Log, transaction_index: u64, misleading_log_index: u64) -> RpcLog {
     RpcLog {
         inner: log,
@@ -297,56 +299,27 @@ fn assert_unavailable(error: ObservationError, source: AcquisitionSource) {
 }
 
 #[test]
-fn header_authentication_requires_reported_computed_number_and_exact_identity() {
+fn imported_header_authentication_requires_number_and_exact_identity() {
     let (imported, _) = anchor(vec![]);
-    authentication::authenticate_header(
-        &imported,
-        imported.hash(),
-        imported.hash(),
-        imported.header(),
-    )
-    .unwrap();
+    authentication::authenticate_imported_header(&imported, &imported).unwrap();
 
-    for (reported, computed, header) in [
-        (
-            B256::repeat_byte(1),
-            imported.hash(),
-            imported.header().clone(),
-        ),
-        (
-            imported.hash(),
-            B256::repeat_byte(2),
-            imported.header().clone(),
-        ),
-        (
-            imported.hash(),
-            imported.hash(),
-            TempoHeader {
-                inner: Header {
-                    number: imported.number() + 1,
-                    ..imported.header().inner.clone()
-                },
-                ..imported.header().clone()
-            },
-        ),
-    ] {
-        assert_inconsistent(
-            authentication::authenticate_header(&imported, reported, computed, &header)
-                .unwrap_err(),
-            AcquisitionSource::L1Block,
-        );
-    }
+    let wrong_number = ImportedTempoHeader::for_test(TempoHeader {
+        inner: Header {
+            number: imported.number() + 1,
+            ..imported.header().inner.clone()
+        },
+        ..imported.header().clone()
+    });
+    assert_inconsistent(
+        authentication::authenticate_imported_header(&imported, &wrong_number).unwrap_err(),
+        AcquisitionSource::L1Block,
+    );
 
     let mut different = imported.header().clone();
     different.inner.gas_limit += 1;
+    let different = ImportedTempoHeader::for_test(different);
     assert_inconsistent(
-        authentication::authenticate_header(
-            &imported,
-            imported.hash(),
-            imported.hash(),
-            &different,
-        )
-        .unwrap_err(),
+        authentication::authenticate_imported_header(&imported, &different).unwrap_err(),
         AcquisitionSource::L1Block,
     );
 }

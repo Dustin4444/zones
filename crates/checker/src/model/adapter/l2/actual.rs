@@ -468,6 +468,7 @@ pub(crate) struct ZoneProjection {
 }
 
 impl ZoneProjection {
+    #[cfg(test)]
     pub(crate) const fn input(&self) -> &ZoneBlockInput {
         &self.input
     }

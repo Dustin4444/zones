@@ -274,6 +274,7 @@ impl DepositQueueMember {
 }
 
 /// Fold an ordered oldest-to-newest deposit prefix from `previous_hash`.
+#[cfg(test)]
 pub(crate) fn fold_deposit_prefix<'a>(
     previous_hash: B256,
     members: impl IntoIterator<Item = &'a DepositQueueMember>,
@@ -355,6 +356,7 @@ impl SenderReveal {
         Ok(Self::Encrypted)
     }
 
+    #[cfg(test)]
     pub(crate) fn none() -> Self {
         Self::None
     }
@@ -642,6 +644,7 @@ impl Withdrawal {
         self.gas_limit
     }
 
+    #[cfg(test)]
     pub(crate) const fn fallback_nonce(&self) -> u64 {
         self.fallback_nonce
     }

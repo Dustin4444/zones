@@ -30,7 +30,7 @@ use super::{
         InboxRefundOwner, PortalRefundId, PortalRefundOwner, RefundAccount, WithdrawalId,
         WithdrawalOwner,
     },
-    state::{CreatedPortalState, ModelState, PortalLifecycle, TokenState, ZoneState},
+    state::{CreatedPortalState, ModelState, PortalLifecycle, TokenPhase, TokenState, ZoneState},
 };
 
 pub(crate) use error::{
@@ -280,6 +280,17 @@ pub(crate) struct ImportedTempoStateUpdate {
     delta: LogicalDelta,
 }
 
+/// One-time model handoff from authenticated pre-genesis Portal history to
+/// the Zone genesis cut.
+///
+/// The capability can only promote existing Portal token rows. It cannot
+/// change their accounting or mutate any owner ledger, and it is persisted in
+/// the same transaction that enters Zone replay.
+#[must_use = "the Zone genesis handoff must be persisted before mirror adoption"]
+pub(crate) struct ZoneGenesisStateUpdate {
+    tokens: BTreeMap<Address, TokenState>,
+}
+
 impl ModelStateUpdate {
     /// Apply to the exact parent from which this update was projected.
     ///
@@ -308,9 +319,46 @@ impl ImportedTempoStateUpdate {
         visit_delta(&self.delta, visitor)
     }
 
-    #[cfg(test)]
+    /// Apply only after the matching L1 replay cursor and model rows commit.
     pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
         apply_delta(state, self.delta);
+    }
+}
+
+impl ZoneGenesisStateUpdate {
+    /// Derive the implicit Zone-genesis enablement of every token already
+    /// authenticated through the L1 archive anchor.
+    pub(crate) fn from_portal_cut(parent: &ModelState) -> Self {
+        let mut tokens = BTreeMap::new();
+        for (token, state) in &parent.tokens {
+            if state.phase == TokenPhase::PendingZoneEnable {
+                let mut enabled = state.clone();
+                enabled.phase = TokenPhase::ZoneEnabled;
+                tokens.insert(*token, enabled);
+            }
+        }
+        Self { tokens }
+    }
+
+    pub(crate) fn try_visit_mutations<'a, E>(
+        &'a self,
+        mut visitor: impl FnMut(LogicalMutationRef<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for (token, state) in &self.tokens {
+            visitor(LogicalMutationRef::Token(*token, state))?;
+        }
+        Ok(())
+    }
+
+    /// Tokens whose literal Zone-genesis supply must be authenticated before
+    /// this handoff can be persisted.
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = Address> + '_ {
+        self.tokens.keys().copied()
+    }
+
+    /// Adopt only after the matching bootstrap phase and model rows commit.
+    pub(crate) fn apply_to_current_parent(self, state: &mut ModelState) {
+        state.tokens.extend(self.tokens);
     }
 }
 
@@ -536,6 +584,7 @@ impl<'a> ImportedTempoTransition<'a> {
     }
 
     /// Read-only token view at the post-L1/pre-Zone collateral cut.
+    #[cfg(test)]
     pub(crate) fn token(&self, token: Address) -> Option<&TokenState> {
         self.candidate.token(token)
     }
@@ -636,6 +685,7 @@ impl CompletedTransition<'_> {
     }
 
     /// Token state at the post-Zone candidate cut used by Goal 5 supply checks.
+    #[cfg(test)]
     pub(crate) fn token(&self, token: Address) -> Option<&TokenState> {
         self.delta
             .tokens

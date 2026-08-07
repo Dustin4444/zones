@@ -7,10 +7,12 @@ use crate::{
     check::pipeline::InMemoryChecker,
     store::{
         db::{CheckerStore, StoreSnapshot},
-        error::StoreError,
-        value::{ActiveAlert, BootstrapState},
+        value::ActiveAlert,
     },
 };
+
+#[cfg(test)]
+use crate::store::{error::StoreError, value::BootstrapState};
 
 use super::{RuntimeError, RuntimeResult};
 
@@ -55,13 +57,14 @@ pub(super) enum LivePhase {
 }
 
 /// Sole owner of one checker store and its post-commit in-memory mirror.
-pub(crate) struct LiveChecker {
+pub(crate) struct PersistentChecker {
     pub(super) store: CheckerStore,
     pub(super) mirror: InMemoryChecker,
     pub(super) phase: LivePhase,
 }
 
-impl LiveChecker {
+impl PersistentChecker {
+    #[cfg(test)]
     pub(crate) fn from_store(store: CheckerStore) -> RuntimeResult<Self> {
         let snapshot = store.load_current()?;
         if snapshot.bootstrap != BootstrapState::Live {
@@ -71,15 +74,27 @@ impl LiveChecker {
             .into());
         }
 
+        Ok(Self::from_snapshot(store, snapshot))
+    }
+
+    /// Load a durable bootstrap cut without weakening the live constructor's
+    /// completed-bootstrap invariant.
+    #[cfg(test)]
+    pub(super) fn from_bootstrap_store(store: CheckerStore) -> RuntimeResult<Self> {
+        let snapshot = store.load_current()?;
+        Ok(Self::from_snapshot(store, snapshot))
+    }
+
+    pub(super) fn from_snapshot(store: CheckerStore, snapshot: StoreSnapshot) -> Self {
         let phase = snapshot
             .active_alert
             .map_or(LivePhase::Verifying, LivePhase::Alerting);
         let mirror = mirror_from_snapshot(&store, snapshot);
-        Ok(Self {
+        Self {
             store,
             mirror,
             phase,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -121,7 +136,7 @@ impl LiveChecker {
         }
 
         loop {
-            let tip = self.store.load_current()?.verified_zone_tip;
+            let tip = self.store.load_progress()?.verified_zone_tip;
             if local_hash(provider, tip)? == Some(tip.hash) {
                 self.reload_mirror()?;
                 return Ok(ReadyToAcknowledge::verified(tip));
@@ -190,7 +205,7 @@ where
 fn mirror_from_snapshot(store: &CheckerStore, snapshot: StoreSnapshot) -> InMemoryChecker {
     InMemoryChecker::new(
         snapshot.model,
-        store.portal_creation_block_hash(),
+        store.portal_creation_block(),
         snapshot.verified_zone_tip,
         snapshot.imported_tempo_tip,
     )

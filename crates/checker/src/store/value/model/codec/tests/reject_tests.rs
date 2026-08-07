@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn unknown_top_level_and_nested_tags_fail_closed() {
-    assert!(ModelValue::decompress(&[0x02, 0xff]).is_err());
+    assert!(ModelValue::decompress(&[0x03, 0xff]).is_err());
 
     let mut cases = vec![];
     let token = ModelValue::Token(TokenValue {

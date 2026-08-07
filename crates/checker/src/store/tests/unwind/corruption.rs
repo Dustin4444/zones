@@ -50,7 +50,7 @@ fn incoherent_restored_parent_is_validated_before_any_write() {
         key: ModelKey::Token(token),
         value: Some(Box::new(ModelValue::Token(TokenValue {
             phase: StoredTokenPhase::PendingZoneEnable,
-            supply: U256::ZERO,
+            supply: U256::ONE,
             deposit_liability: U256::ZERO,
             withdrawal_liability: U256::ZERO,
         }))),

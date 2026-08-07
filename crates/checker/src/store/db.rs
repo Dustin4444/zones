@@ -7,17 +7,14 @@ use std::{
 };
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use reth_db::{
-    Database, DatabaseEnv, DatabaseEnvKind,
+    Database, DatabaseEnv,
     cursor::{DbCursorRO, DbCursorRW},
-    is_database_empty,
-    mdbx::{DatabaseArguments, init_db_for},
-    open_db_read_only,
     transaction::{DbTx, DbTxMut},
 };
 
-use crate::model::state::{ModelState, TokenPhase};
+use crate::model::state::{ModelState, PortalIdentity, TokenPhase};
 
 use super::{
     codec::validate_canonical,
@@ -25,7 +22,7 @@ use super::{
     model_state::{ModelRows, assemble_model, flatten_model},
     schema::{
         CanonicalHash, CheckerCanonical, CheckerChangesets, CheckerFindings, CheckerMeta,
-        CheckerModelState, CheckerTables, MetaKey, ModelKey,
+        CheckerModelState, MetaKey, ModelKey,
     },
     value::{
         ActiveAlert, BootstrapState, MetaValue, ModelValue, PortalSettlementValue, StoreIdentity,
@@ -33,9 +30,12 @@ use super::{
 };
 
 #[cfg(test)]
-use super::{schema::FindingKey, value::FindingRecord};
+use {
+    super::{schema::FindingKey, value::FindingRecord},
+    alloy_primitives::Address,
+};
 
-const CHECKER_DIRECTORY: &str = "checker";
+mod open;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Initialization {
@@ -46,7 +46,37 @@ pub(crate) struct Initialization {
     pub(crate) model: ModelState,
 }
 
+/// Authenticated starting cut for one fresh checker database.
+///
+/// The type deliberately excludes `Live`: a fresh database must either replay
+/// Portal history from the parent of the configured creation block or start at
+/// Zone genesis while the development flow is still awaiting Portal creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshBootstrap {
+    L1Replay { creation_parent: BlockNumHash },
+    ZoneReplay { genesis_anchor: BlockNumHash },
+}
+
 impl Initialization {
+    pub(crate) fn fresh(identity: StoreIdentity, start: FreshBootstrap) -> Self {
+        let (bootstrap, imported_tempo_tip) = match start {
+            FreshBootstrap::L1Replay { creation_parent } => {
+                (BootstrapState::l1_replay(None), creation_parent)
+            }
+            FreshBootstrap::ZoneReplay { genesis_anchor } => {
+                (BootstrapState::zone_replay(genesis_anchor), genesis_anchor)
+            }
+        };
+        Self {
+            identity,
+            bootstrap,
+            verified_zone_tip: BlockNumHash::new(0, identity.zone_genesis_hash()),
+            imported_tempo_tip,
+            model: ModelState::awaiting_creation(identity.portal_identity()),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) const fn new(
         identity: StoreIdentity,
         bootstrap: BootstrapState,
@@ -74,9 +104,9 @@ pub(crate) struct StoreSnapshot {
     pub(crate) model_rows: ModelRows,
 }
 
-/// Durable preflight classification of a Zone block offered to the live checker.
+/// Durable preflight classification of a canonical Zone block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LiveBlock {
+pub(crate) enum CanonicalBlock {
     /// The exact next child, paired with the authoritative parent tips.
     Next {
         verified_zone_tip: BlockNumHash,
@@ -96,20 +126,22 @@ pub(crate) enum LiveBlock {
 /// unbounded open-owner tables for every block would make commit cost depend on
 /// historical backlog rather than the block's logical delta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct StoreHead {
-    pub(super) verified_zone_tip: BlockNumHash,
-    pub(super) imported_tempo_tip: BlockNumHash,
-    pub(super) bootstrap: BootstrapState,
-    pub(super) active_alert: Option<ActiveAlert>,
+pub(crate) struct StoreProgress {
+    pub(crate) verified_zone_tip: BlockNumHash,
+    pub(crate) imported_tempo_tip: BlockNumHash,
+    pub(crate) bootstrap: BootstrapState,
+    pub(crate) active_alert: Option<ActiveAlert>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct RefundCredit {
     pub(crate) origin: u64,
     pub(crate) amount: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum RefundLedger {
     Portal,
     Inbox,
@@ -123,104 +155,16 @@ pub(crate) struct CheckerStore {
 }
 
 impl CheckerStore {
-    /// Open the dedicated checker environment, initializing only a wholly empty schema.
-    pub(crate) fn open(
-        data_dir: impl AsRef<Path>,
-        initialization: Initialization,
-    ) -> StoreResult<Self> {
-        let path = data_dir.as_ref().join(CHECKER_DIRECTORY);
-        let db = init_db_for::<_, CheckerTables>(&path, DatabaseArguments::default()).map_err(
-            |source| StoreError::Open {
-                path: path.clone(),
-                source,
-            },
-        )?;
-        let store = Self {
-            db: Arc::new(db),
-            identity: initialization.identity,
-            path,
-        };
-
-        let tx = store.db.tx_mut()?;
-        let is_empty = match all_tables_empty(&tx) {
-            Ok(is_empty) => is_empty,
-            Err(error) => {
-                tx.abort();
-                return Err(error);
-            }
-        };
-        if is_empty {
-            let result = prepare_initial_model(&initialization)
-                .and_then(|rows| initialize_empty(&tx, &initialization, rows));
-            match result {
-                Ok(()) => tx.commit()?,
-                Err(error) => {
-                    tx.abort();
-                    return Err(error);
-                }
-            }
-        } else {
-            tx.abort();
-        }
-        // Restart validates the authoritative cut without replaying history.
-        // The exhaustive changeset walk remains an explicit diagnostic.
-        store.validate_restart()?;
-        Ok(store)
-    }
-
-    /// Open an initialized checker database without creating tables or state.
-    pub(crate) fn open_existing(
-        data_dir: impl AsRef<Path>,
-        identity: StoreIdentity,
-    ) -> StoreResult<Self> {
-        let path = data_dir.as_ref().join(CHECKER_DIRECTORY);
-        if is_database_empty(&path) {
-            return Err(StoreError::EmptyExistingDatabase { path });
-        }
-        let probe = open_db_read_only(&path, DatabaseArguments::default()).map_err(|source| {
-            StoreError::Open {
-                path: path.clone(),
-                source,
-            }
-        })?;
-        let probe = Self {
-            db: Arc::new(probe),
-            identity,
-            path: path.clone(),
-        };
-        let tx = probe.db.tx()?;
-        let empty = all_tables_empty(&tx);
-        let empty = finish_read(tx, empty)?;
-        if empty {
-            return Err(StoreError::EmptyExistingDatabase { path });
-        }
-        // Fail on identity, version, or codec corruption before an RW open can
-        // acquire/create storage locks or perform environment recovery.
-        probe.validate_restart()?;
-        drop(probe);
-
-        let db = DatabaseEnv::open(&path, DatabaseEnvKind::RW, DatabaseArguments::default())
-            .map_err(|source| StoreError::Open {
-                path: path.clone(),
-                source: source.into(),
-            })?;
-        let store = Self {
-            db: Arc::new(db),
-            identity,
-            path,
-        };
-        // Validate after reopening read/write so a replaced environment can
-        // never bypass the read-only probe.
-        store.validate_restart()?;
-        Ok(store)
-    }
-
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) const fn portal_creation_block_hash(&self) -> B256 {
-        self.identity.portal_creation_block_hash()
+    pub(crate) const fn portal_creation_block(&self) -> BlockNumHash {
+        self.identity.portal_creation_block()
+    }
+
+    pub(crate) const fn l1_chain_id(&self) -> u64 {
+        self.identity.l1_chain_id()
     }
 
     pub(crate) fn load_current(&self) -> StoreResult<StoreSnapshot> {
@@ -229,20 +173,30 @@ impl CheckerStore {
         finish_read(tx, result)
     }
 
-    /// Classify a live Zone candidate against one authoritative read transaction.
-    ///
-    /// Retained canonical blocks remain acknowledgeable while bootstrap or an
-    /// alert prevents new work. Only an exact next child reaches acquisition.
-    pub(crate) fn preflight_live_block(
-        &self,
-        child: BlockNumHash,
-        parent_hash: B256,
-    ) -> StoreResult<LiveBlock> {
+    /// Read and validate the fixed-size durable progress cut without walking
+    /// the unbounded model table.
+    pub(crate) fn load_progress(&self) -> StoreResult<StoreProgress> {
         let tx = self.db.tx()?;
-        let result = preflight_live_block(&tx, self.identity, &self.path, child, parent_hash);
+        let result = read_head(&tx, self.identity, &self.path);
         finish_read(tx, result)
     }
 
+    /// Classify a canonical Zone candidate against one authoritative read transaction.
+    ///
+    /// Retained canonical blocks remain acknowledgeable while L1 replay or an
+    /// alert prevents new work. Zone replay and live mode share the exact-next
+    /// ordinary commit path.
+    pub(crate) fn preflight_block(
+        &self,
+        child: BlockNumHash,
+        parent_hash: B256,
+    ) -> StoreResult<CanonicalBlock> {
+        let tx = self.db.tx()?;
+        let result = preflight_block(&tx, self.identity, &self.path, child, parent_hash);
+        finish_read(tx, result)
+    }
+
+    #[cfg(test)]
     pub(crate) fn active_alert(&self) -> StoreResult<Option<ActiveAlert>> {
         let tx = self.db.tx()?;
         let result = read_active_alert(&tx);
@@ -256,6 +210,7 @@ impl CheckerStore {
         finish_read(tx, result)
     }
 
+    #[cfg(test)]
     pub(crate) fn portal_refund_credits(
         &self,
         token: Address,
@@ -264,6 +219,7 @@ impl CheckerStore {
         self.refund_credits(token, recipient, RefundLedger::Portal)
     }
 
+    #[cfg(test)]
     pub(crate) fn inbox_refund_credits(
         &self,
         token: Address,
@@ -272,6 +228,7 @@ impl CheckerStore {
         self.refund_credits(token, recipient, RefundLedger::Inbox)
     }
 
+    #[cfg(test)]
     fn refund_credits(
         &self,
         token: Address,
@@ -289,13 +246,13 @@ impl CheckerStore {
     }
 }
 
-fn preflight_live_block<TX: DbTx>(
+fn preflight_block<TX: DbTx>(
     tx: &TX,
     identity: StoreIdentity,
     path: &Path,
     child: BlockNumHash,
     parent_hash: B256,
-) -> StoreResult<LiveBlock> {
+) -> StoreResult<CanonicalBlock> {
     let head = read_head(tx, identity, path)?;
     if child.number <= head.verified_zone_tip.number {
         let canonical = tx
@@ -311,13 +268,13 @@ fn preflight_live_block<TX: DbTx>(
                 actual: canonical,
             });
         }
-        return Ok(LiveBlock::AlreadyCanonical {
+        return Ok(CanonicalBlock::AlreadyCanonical {
             verified_zone_tip: head.verified_zone_tip,
         });
     }
-    if head.bootstrap != BootstrapState::Live {
+    if matches!(head.bootstrap, BootstrapState::L1Replay { .. }) {
         return Err(StoreError::InvalidBootstrapProgress(
-            "live block preflight requires live bootstrap state",
+            "ordinary block preflight is disabled during L1 replay",
         ));
     }
     if let Some(alert) = head.active_alert {
@@ -338,7 +295,7 @@ fn preflight_live_block<TX: DbTx>(
         });
     }
 
-    Ok(LiveBlock::Next {
+    Ok(CanonicalBlock::Next {
         verified_zone_tip: head.verified_zone_tip,
         imported_tempo_tip: head.imported_tempo_tip,
     })
@@ -420,6 +377,7 @@ pub(super) fn read_snapshot<TX: DbTx>(
     let model = assemble_model(identity.portal_identity(), model_rows.clone())?;
     validate_model_cut_coherence(
         tx,
+        identity,
         Some(head.bootstrap),
         head.verified_zone_tip,
         head.imported_tempo_tip,
@@ -443,11 +401,13 @@ pub(super) fn read_snapshot<TX: DbTx>(
 /// commits retain their sparse, touched-row validation path.
 pub(super) fn validate_bootstrap_candidate<TX: DbTx>(
     tx: &TX,
+    identity: StoreIdentity,
     bootstrap: BootstrapState,
     snapshot: &StoreSnapshot,
 ) -> StoreResult<()> {
     validate_model_cut_coherence(
         tx,
+        identity,
         Some(bootstrap),
         snapshot.verified_zone_tip,
         snapshot.imported_tempo_tip,
@@ -463,13 +423,15 @@ pub(super) fn validate_bootstrap_candidate<TX: DbTx>(
 /// apply; only the phase-specific Live bounds are skipped.
 pub(super) fn validate_model_cut_coherence<TX: DbTx>(
     tx: &TX,
+    identity: StoreIdentity,
     bootstrap: Option<BootstrapState>,
     verified_zone_tip: BlockNumHash,
     imported_tempo_tip: BlockNumHash,
     model: &ModelState,
 ) -> StoreResult<()> {
+    validate_portal_creation_progress(identity, imported_tempo_tip, model)?;
     if let Some(bootstrap) = bootstrap {
-        validate_bootstrap_model(bootstrap, model)?;
+        validate_bootstrap_token_phases(bootstrap, model)?;
     }
     validate_settlement_position(
         tx,
@@ -513,12 +475,13 @@ pub(super) fn read_head<TX: DbTx>(
     tx: &TX,
     identity: StoreIdentity,
     path: &Path,
-) -> StoreResult<StoreHead> {
+) -> StoreResult<StoreProgress> {
     validate_identity(tx, identity, path)?;
     let bootstrap = read_bootstrap(tx)?;
     let verified_zone_tip = read_tip(tx, MetaKey::VerifiedZoneTip)?;
     let imported_tempo_tip = read_tip(tx, MetaKey::ImportedTempoTip)?;
     validate_bootstrap_coherence(bootstrap, imported_tempo_tip)?;
+    validate_l1_replay_progress(identity, bootstrap, verified_zone_tip, imported_tempo_tip)?;
     let active_alert = read_active_alert(tx)?;
 
     let canonical = tx
@@ -540,7 +503,7 @@ pub(super) fn read_head<TX: DbTx>(
         return Err(StoreError::MissingActiveFinding(alert.finding));
     }
 
-    Ok(StoreHead {
+    Ok(StoreProgress {
         verified_zone_tip,
         imported_tempo_tip,
         bootstrap,
@@ -574,12 +537,23 @@ fn prepare_initial_model(initialization: &Initialization) -> StoreResult<ModelRo
         .map_err(|_| {
             StoreError::InvalidInitialization("bootstrap state and imported tip disagree")
         })?;
+    validate_l1_replay_progress(
+        initialization.identity,
+        initialization.bootstrap,
+        initialization.verified_zone_tip,
+        initialization.imported_tempo_tip,
+    )?;
     if initialization.model.portal().identity() != initialization.identity.portal_identity() {
         return Err(StoreError::InvalidInitialization(
             "model Portal identity differs from database identity",
         ));
     }
-    validate_bootstrap_model(initialization.bootstrap, &initialization.model)?;
+    validate_portal_creation_progress(
+        initialization.identity,
+        initialization.imported_tempo_tip,
+        &initialization.model,
+    )?;
+    validate_bootstrap_token_phases(initialization.bootstrap, &initialization.model)?;
     validate_settlement_bounds(
         Some(initialization.bootstrap),
         initialization.verified_zone_tip,
@@ -645,6 +619,21 @@ fn initialize_empty<TX: DbTxMut + DbTx>(
 }
 
 fn validate_identity<TX: DbTx>(tx: &TX, identity: StoreIdentity, path: &Path) -> StoreResult<()> {
+    validate_schema_version(tx, path)?;
+    for (key, expected) in identity.metadata().into_iter().skip(1) {
+        let actual = required_meta(tx, key)?;
+        if actual != expected {
+            return Err(StoreError::IdentityMismatch {
+                key,
+                expected: Box::new(expected),
+                actual: Box::new(actual),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_schema_version<TX: DbTx>(tx: &TX, path: &Path) -> StoreResult<()> {
     let expected_version = u32::from(super::SCHEMA_VERSION);
     let actual_version = match required_meta(tx, MetaKey::Version)? {
         MetaValue::Version(version) => version,
@@ -660,23 +649,57 @@ fn validate_identity<TX: DbTx>(tx: &TX, identity: StoreIdentity, path: &Path) ->
             path: path.to_path_buf(),
             expected: expected_version,
             actual: actual_version,
-            rebuild_path: path.with_file_name(format!("checker-v{expected_version}")),
+            rebuild_path: versioned_rebuild_path(path, expected_version),
         });
-    }
-
-    for (key, expected) in identity.metadata().into_iter().skip(1) {
-        let actual = required_meta(tx, key)?;
-        if actual != expected {
-            return Err(StoreError::IdentityMismatch {
-                key,
-                expected: Box::new(expected),
-                actual: Box::new(actual),
-            });
-        }
     }
     Ok(())
 }
 
+fn versioned_rebuild_path(path: &Path, version: u32) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| std::ffi::OsString::from("checker"));
+    name.push(format!("-v{version}"));
+    path.with_file_name(name)
+}
+
+fn read_stored_identity<TX: DbTx>(tx: &TX) -> StoreResult<StoreIdentity> {
+    let MetaValue::ZoneIdentity {
+        chain_id: zone_chain_id,
+        genesis_hash: zone_genesis_hash,
+        zone_id,
+        initial_token,
+    } = required_meta(tx, MetaKey::ZoneIdentity)?
+    else {
+        unreachable!("required metadata enforces its value family")
+    };
+    let MetaValue::L1ChainId(l1_chain_id) = required_meta(tx, MetaKey::L1ChainId)? else {
+        unreachable!("required metadata enforces its value family")
+    };
+    let MetaValue::Contracts {
+        zone_factory,
+        portal,
+    } = required_meta(tx, MetaKey::Contracts)?
+    else {
+        unreachable!("required metadata enforces its value family")
+    };
+    let MetaValue::PortalCreationBlock(portal_creation_block) =
+        required_meta(tx, MetaKey::PortalCreationBlock)?
+    else {
+        unreachable!("required metadata enforces its value family")
+    };
+    Ok(StoreIdentity::new(
+        zone_chain_id,
+        zone_genesis_hash,
+        PortalIdentity::new(portal, zone_id, initial_token),
+        l1_chain_id,
+        zone_factory,
+        portal_creation_block,
+    ))
+}
+
+#[cfg(test)]
 fn read_refund_credits<TX: DbTx>(
     tx: &TX,
     token: Address,
@@ -753,13 +776,82 @@ pub(super) fn validate_bootstrap_coherence(
     }
 }
 
-fn validate_bootstrap_model(bootstrap: BootstrapState, model: &ModelState) -> StoreResult<()> {
-    if bootstrap == BootstrapState::Live
-        && let Some(token) = model.tokens().iter().find_map(|(token, state)| {
-            (state.phase() == TokenPhase::PendingZoneEnable).then_some(*token)
-        })
+fn validate_l1_replay_progress(
+    identity: StoreIdentity,
+    bootstrap: BootstrapState,
+    verified_zone_tip: BlockNumHash,
+    imported_tempo_tip: BlockNumHash,
+) -> StoreResult<()> {
+    let BootstrapState::L1Replay { cursor } = bootstrap else {
+        return Ok(());
+    };
+
+    let expected = BlockNumHash::new(0, identity.zone_genesis_hash());
+    if verified_zone_tip != expected {
+        return Err(StoreError::L1ReplayZoneTipMismatch {
+            expected,
+            actual: verified_zone_tip,
+        });
+    }
+
+    let creation = identity.portal_creation_block();
+    if cursor.is_none() && creation.number.checked_sub(1) != Some(imported_tempo_tip.number) {
+        return Err(StoreError::L1ReplayStartHeightMismatch {
+            creation,
+            actual: imported_tempo_tip,
+        });
+    }
+    if let Some(cursor) = cursor
+        && (cursor.number < creation.number
+            || (cursor.number == creation.number && cursor.hash != creation.hash))
     {
-        return Err(StoreError::LiveModelHasPendingToken { token });
+        return Err(StoreError::L1ReplayCursorOutsideCreationHistory { creation, cursor });
+    }
+    Ok(())
+}
+
+fn validate_portal_creation_progress(
+    identity: StoreIdentity,
+    imported_tip: BlockNumHash,
+    model: &ModelState,
+) -> StoreResult<()> {
+    let creation = identity.portal_creation_block();
+    let portal_created = model.portal().created().is_some();
+    if imported_tip.number == creation.number && imported_tip != creation {
+        return Err(StoreError::PortalCreationProgressMismatch {
+            creation,
+            imported_tip,
+            portal_created,
+        });
+    }
+    let expected_created = imported_tip.number >= creation.number;
+    if portal_created != expected_created {
+        return Err(StoreError::PortalCreationProgressMismatch {
+            creation,
+            imported_tip,
+            portal_created,
+        });
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_token_phases(
+    bootstrap: BootstrapState,
+    model: &ModelState,
+) -> StoreResult<()> {
+    for (token, state) in model.tokens() {
+        let valid = match bootstrap {
+            BootstrapState::L1Replay { .. } => state.phase() == TokenPhase::PendingZoneEnable,
+            BootstrapState::ZoneReplay { .. } | BootstrapState::Live => {
+                state.phase() == TokenPhase::ZoneEnabled
+            }
+        };
+        if !valid {
+            return Err(StoreError::BootstrapTokenPhaseMismatch {
+                bootstrap,
+                token: *token,
+            });
+        }
     }
     Ok(())
 }

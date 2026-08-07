@@ -50,7 +50,7 @@ pub struct StoreIdentity {
     portal_identity: PortalIdentity,
     l1_chain_id: u64,
     zone_factory: Address,
-    portal_creation_block_hash: B256,
+    portal_creation_block: BlockNumHash,
 }
 
 impl StoreIdentity {
@@ -60,7 +60,7 @@ impl StoreIdentity {
         portal_identity: PortalIdentity,
         l1_chain_id: u64,
         zone_factory: Address,
-        portal_creation_block_hash: B256,
+        portal_creation_block: BlockNumHash,
     ) -> Self {
         Self {
             zone_chain_id,
@@ -68,7 +68,7 @@ impl StoreIdentity {
             portal_identity,
             l1_chain_id,
             zone_factory,
-            portal_creation_block_hash,
+            portal_creation_block,
         }
     }
 
@@ -80,8 +80,12 @@ impl StoreIdentity {
         self.zone_genesis_hash
     }
 
-    pub(crate) const fn portal_creation_block_hash(self) -> B256 {
-        self.portal_creation_block_hash
+    pub(crate) const fn l1_chain_id(self) -> u64 {
+        self.l1_chain_id
+    }
+
+    pub(crate) const fn portal_creation_block(self) -> BlockNumHash {
+        self.portal_creation_block
     }
 
     pub(crate) fn metadata(self) -> [(MetaKey, MetaValue); 5] {
@@ -108,8 +112,8 @@ impl StoreIdentity {
                 },
             ),
             (
-                MetaKey::PortalCreationBlockHash,
-                MetaValue::PortalCreationBlockHash(self.portal_creation_block_hash),
+                MetaKey::PortalCreationBlock,
+                MetaValue::PortalCreationBlock(self.portal_creation_block),
             ),
         ]
     }
@@ -129,7 +133,7 @@ pub enum MetaValue {
         zone_factory: Address,
         portal: Address,
     },
-    PortalCreationBlockHash(B256),
+    PortalCreationBlock(BlockNumHash),
     Bootstrap(BootstrapState),
     VerifiedZoneTip(BlockNumHash),
     ImportedTempoTip(BlockNumHash),
@@ -144,10 +148,7 @@ impl MetaValue {
                 | (MetaKey::ZoneIdentity, Self::ZoneIdentity { .. })
                 | (MetaKey::L1ChainId, Self::L1ChainId(_))
                 | (MetaKey::Contracts, Self::Contracts { .. })
-                | (
-                    MetaKey::PortalCreationBlockHash,
-                    Self::PortalCreationBlockHash(_)
-                )
+                | (MetaKey::PortalCreationBlock, Self::PortalCreationBlock(_))
                 | (MetaKey::Bootstrap, Self::Bootstrap(_))
                 | (MetaKey::VerifiedZoneTip, Self::VerifiedZoneTip(_))
                 | (MetaKey::ImportedTempoTip, Self::ImportedTempoTip(_))
@@ -190,10 +191,10 @@ impl CheckedCompact for MetaValue {
                 out.address(*zone_factory);
                 out.address(*portal);
             }
-            Self::PortalCreationBlockHash(hash) => {
+            Self::PortalCreationBlock(block) => {
                 out.version();
                 out.u8(0x04);
-                out.hash(*hash);
+                encode_tip(out, *block);
             }
             Self::Bootstrap(state) => {
                 out.version();
@@ -244,9 +245,10 @@ impl CheckedCompact for MetaValue {
                 zone_factory: input.address("ZoneFactory address")?,
                 portal: input.address("Portal address")?,
             }),
-            0x04 => Ok(Self::PortalCreationBlockHash(
-                input.hash("Portal creation block hash")?,
-            )),
+            0x04 => Ok(Self::PortalCreationBlock(decode_tip(
+                input,
+                "Portal creation block",
+            )?)),
             0x05 => Ok(Self::Bootstrap(decode_bootstrap(input)?)),
             0x06 => Ok(Self::VerifiedZoneTip(decode_tip(
                 input,
@@ -368,7 +370,7 @@ mod tests {
                 zone_factory: Address::repeat_byte(0x33),
                 portal: Address::repeat_byte(0x44),
             },
-            MetaValue::PortalCreationBlockHash(hash(0x55)),
+            MetaValue::PortalCreationBlock(BlockNumHash::new(3, hash(0x55))),
             MetaValue::Bootstrap(BootstrapState::l1_replay(Some(BlockNumHash::new(
                 4,
                 hash(0x66),
@@ -394,7 +396,7 @@ mod tests {
     #[test]
     fn version_bytes_are_golden_and_strict() {
         let bytes = MetaValue::Version(u32::from(SCHEMA_VERSION)).compress();
-        assert_eq!(bytes, vec![0, 0, 0, 0, 2]);
+        assert_eq!(bytes, vec![0, 0, 0, 0, 3]);
         assert_eq!(
             MetaValue::decompress(&[0, 0, 0, 0, 1]).unwrap(),
             MetaValue::Version(1)
@@ -403,6 +405,42 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(MetaValue::decompress(&trailing).is_err());
+    }
+
+    #[test]
+    fn every_bootstrap_phase_has_stable_bytes() {
+        let cursor = BlockNumHash::new(4, hash(0x66));
+        let values = [
+            (
+                BootstrapState::l1_replay(None),
+                vec![SCHEMA_VERSION, 0x05, 0x00, 0x00],
+            ),
+            (
+                BootstrapState::l1_replay(Some(cursor)),
+                bootstrap_bytes(0x00, cursor),
+            ),
+            (
+                BootstrapState::zone_replay(cursor),
+                bootstrap_bytes(0x01, cursor),
+            ),
+            (
+                BootstrapState::live(),
+                vec![SCHEMA_VERSION, 0x05, 0x02, 0x00],
+            ),
+        ];
+
+        for (state, expected) in values {
+            let value = MetaValue::Bootstrap(state);
+            assert_eq!(value.clone().compress(), expected);
+            assert_eq!(MetaValue::decompress(&expected).unwrap(), value);
+        }
+    }
+
+    fn bootstrap_bytes(phase: u8, cursor: BlockNumHash) -> Vec<u8> {
+        let mut bytes = vec![SCHEMA_VERSION, 0x05, phase, 0x01];
+        bytes.extend_from_slice(&cursor.number.to_be_bytes());
+        bytes.extend_from_slice(cursor.hash.as_slice());
+        bytes
     }
 
     fn golden(value: &MetaValue) -> Vec<u8> {
@@ -436,9 +474,10 @@ mod tests {
                 bytes.extend_from_slice(zone_factory.as_slice());
                 bytes.extend_from_slice(portal.as_slice());
             }
-            MetaValue::PortalCreationBlockHash(hash) => {
+            MetaValue::PortalCreationBlock(block) => {
                 bytes.extend_from_slice(&[SCHEMA_VERSION, 0x04]);
-                bytes.extend_from_slice(hash.as_slice());
+                bytes.extend_from_slice(&block.number.to_be_bytes());
+                bytes.extend_from_slice(block.hash.as_slice());
             }
             MetaValue::Bootstrap(state) => {
                 bytes.extend_from_slice(&[SCHEMA_VERSION, 0x05, 0x00, 0x01]);

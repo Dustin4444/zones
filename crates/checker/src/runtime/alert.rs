@@ -12,10 +12,10 @@ use crate::{
 
 use super::{
     RuntimeResult,
-    state::{LiveChecker, LivePhase},
+    state::{LivePhase, PersistentChecker},
 };
 
-impl LiveChecker {
+impl PersistentChecker {
     /// Persist the first deterministic finding before granting alert-mode
     /// acknowledgement capability.
     pub(super) fn activate_alert(

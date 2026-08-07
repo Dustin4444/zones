@@ -52,6 +52,8 @@ pub struct ProvisionedZone {
     pub factory: Address,
     /// `ZonePortal` address on L1.
     pub portal: Address,
+    /// Exact L1 block hash containing the authenticated `ZoneCreated` event.
+    pub portal_creation_block_hash: B256,
     /// L1 anchor block number immediately before `createZone`.
     pub anchor_block_number: u64,
     /// Zone genesis anchored to the L1.
@@ -131,6 +133,9 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         .get_receipt()
         .await?;
     eyre::ensure!(receipt.status(), "createZone reverted");
+    let portal_creation_block_hash = receipt
+        .block_hash()
+        .ok_or_else(|| eyre::eyre!("createZone receipt is missing its block hash"))?;
 
     let zone_created = receipt
         .inner
@@ -154,6 +159,7 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         chain_id,
         factory: factory_address,
         portal,
+        portal_creation_block_hash,
         anchor_block_number,
         genesis,
     })
@@ -388,6 +394,7 @@ mod command {
                 "sequencer": format!("{}", dev_key.address()),
                 "sequencerKey": self.dev_key,
                 "tempoAnchorBlock": provisioned.anchor_block_number,
+                "portalCreationBlockHash": format!("{}", provisioned.portal_creation_block_hash),
                 "zoneFactory": format!("{}", provisioned.factory),
                 "rpcUrl": format!("http://{}:{}", self.http_addr, self.http_port),
             });
@@ -404,6 +411,10 @@ mod command {
             println!("  ZoneFactory:  {}", provisioned.factory);
             println!("  Portal:       {}", provisioned.portal);
             println!("  Anchor block: {}", provisioned.anchor_block_number);
+            println!(
+                "  Portal creation block hash: {}",
+                provisioned.portal_creation_block_hash
+            );
             println!("  Dev account:  {}", dev_key.address());
             println!(
                 "  HTTP RPC:     http://{}:{}",

@@ -63,6 +63,8 @@ impl CheckerStore {
 
 struct PreparedUnwind {
     child: BlockNumHash,
+    child_bootstrap: BootstrapState,
+    parent_bootstrap: BootstrapState,
     parent_rows: ModelRows,
     block: BlockBeforeImage,
     group: Vec<(ChangesetKey, BeforeImage)>,
@@ -89,9 +91,9 @@ fn prepare_tip_unwind<TX: DbTx>(
     if let Some(alert) = child.active_alert {
         return Err(StoreError::ActiveAlert(alert.finding));
     }
-    if child.bootstrap != BootstrapState::Live {
+    if matches!(child.bootstrap, BootstrapState::L1Replay { .. }) {
         return Err(StoreError::InvalidBootstrapProgress(
-            "tip unwind requires live bootstrap state",
+            "tip unwind is disabled during L1 replay",
         ));
     }
     if child.verified_zone_tip != expected_child {
@@ -119,10 +121,18 @@ fn prepare_tip_unwind<TX: DbTx>(
         &group,
         &mut parent_rows,
     )?;
+    let parent_bootstrap = match child.bootstrap {
+        BootstrapState::ZoneReplay { .. } => {
+            BootstrapState::zone_replay(block.prior_imported_tempo_tip)
+        }
+        BootstrapState::Live => BootstrapState::live(),
+        BootstrapState::L1Replay { .. } => unreachable!("rejected before reading the changeset"),
+    };
     let parent_model = assemble_model(identity.portal_identity(), parent_rows.clone())?;
     validate_model_cut_coherence(
         tx,
-        Some(child.bootstrap),
+        identity,
+        Some(parent_bootstrap),
         block.prior_verified_zone_tip,
         block.prior_imported_tempo_tip,
         &parent_model,
@@ -130,6 +140,8 @@ fn prepare_tip_unwind<TX: DbTx>(
 
     Ok(PreparedUnwind {
         child: expected_child,
+        child_bootstrap: child.bootstrap,
+        parent_bootstrap,
         parent_rows,
         block,
         group,
@@ -145,6 +157,8 @@ fn apply_tip_unwind<TX: DbTxMut + DbTx>(
 ) -> StoreResult<ParentTips> {
     let PreparedUnwind {
         child,
+        child_bootstrap,
+        parent_bootstrap,
         parent_rows,
         block,
         group,
@@ -174,6 +188,14 @@ fn apply_tip_unwind<TX: DbTxMut + DbTx>(
         MetaValue::ImportedTempoTip(block.prior_imported_tempo_tip),
     )?;
     gate.wrote()?;
+    if parent_bootstrap != child_bootstrap {
+        write_meta(
+            tx,
+            MetaKey::Bootstrap,
+            MetaValue::Bootstrap(parent_bootstrap),
+        )?;
+        gate.wrote()?;
+    }
     if !tx.delete::<CheckerCanonical>(child.number, None)? {
         return Err(StoreError::MissingCanonical {
             height: child.number,
@@ -194,6 +216,7 @@ fn apply_tip_unwind<TX: DbTxMut + DbTx>(
     let parent = read_snapshot(tx, identity, path)?;
     if parent.verified_zone_tip != block.prior_verified_zone_tip
         || parent.imported_tempo_tip != block.prior_imported_tempo_tip
+        || parent.bootstrap != parent_bootstrap
         || parent.model_rows != parent_rows
     {
         return invalid_changeset(

@@ -18,7 +18,7 @@ pub(crate) mod meta_tag {
     pub(crate) const ZONE_IDENTITY: u8 = 0x01;
     pub(crate) const L1_CHAIN_ID: u8 = 0x02;
     pub(crate) const CONTRACTS: u8 = 0x03;
-    pub(crate) const PORTAL_CREATION_BLOCK_HASH: u8 = 0x04;
+    pub(crate) const PORTAL_CREATION_BLOCK: u8 = 0x04;
     pub(crate) const BOOTSTRAP: u8 = 0x05;
     pub(crate) const VERIFIED_ZONE_TIP: u8 = 0x06;
     pub(crate) const IMPORTED_TEMPO_TIP: u8 = 0x07;
@@ -60,7 +60,7 @@ pub enum MetaKey {
     ZoneIdentity,
     L1ChainId,
     Contracts,
-    PortalCreationBlockHash,
+    PortalCreationBlock,
     Bootstrap,
     VerifiedZoneTip,
     ImportedTempoTip,
@@ -74,7 +74,7 @@ impl MetaKey {
             Self::ZoneIdentity => meta_tag::ZONE_IDENTITY,
             Self::L1ChainId => meta_tag::L1_CHAIN_ID,
             Self::Contracts => meta_tag::CONTRACTS,
-            Self::PortalCreationBlockHash => meta_tag::PORTAL_CREATION_BLOCK_HASH,
+            Self::PortalCreationBlock => meta_tag::PORTAL_CREATION_BLOCK,
             Self::Bootstrap => meta_tag::BOOTSTRAP,
             Self::VerifiedZoneTip => meta_tag::VERIFIED_ZONE_TIP,
             Self::ImportedTempoTip => meta_tag::IMPORTED_TEMPO_TIP,
@@ -101,7 +101,7 @@ impl Decode for MetaKey {
             meta_tag::ZONE_IDENTITY => Ok(Self::ZoneIdentity),
             meta_tag::L1_CHAIN_ID => Ok(Self::L1ChainId),
             meta_tag::CONTRACTS => Ok(Self::Contracts),
-            meta_tag::PORTAL_CREATION_BLOCK_HASH => Ok(Self::PortalCreationBlockHash),
+            meta_tag::PORTAL_CREATION_BLOCK => Ok(Self::PortalCreationBlock),
             meta_tag::BOOTSTRAP => Ok(Self::Bootstrap),
             meta_tag::VERIFIED_ZONE_TIP => Ok(Self::VerifiedZoneTip),
             meta_tag::IMPORTED_TEMPO_TIP => Ok(Self::ImportedTempoTip),

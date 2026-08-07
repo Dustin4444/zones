@@ -10,17 +10,17 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 
-use crate::model::{state::ModelState, transition::ModelStateUpdate};
+use crate::model::transition::ModelStateUpdate;
 
 use super::{
     codec::validate_canonical,
     db::{
         CheckerStore, finish_read, read_bootstrap, read_head, read_snapshot, read_tip,
-        validate_model_cut_coherence, validate_portal_settlement_change,
+        validate_portal_settlement_change,
     },
     error::{ParentTips, StoreError, StoreResult},
     model_state::{
-        ModelRows, assemble_model,
+        ModelRows,
         update::{ModelRowChanges, lower_update},
     },
     operations::{
@@ -36,7 +36,12 @@ use super::{
 };
 
 #[cfg(test)]
-use super::operations::ModelMutation;
+use {
+    super::{
+        db::validate_model_cut_coherence, model_state::assemble_model, operations::ModelMutation,
+    },
+    crate::model::state::ModelState,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockCommit {
@@ -84,6 +89,7 @@ impl BlockCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct HistoricalSnapshot {
     pub(crate) verified_zone_tip: BlockNumHash,
     pub(crate) imported_tempo_tip: BlockNumHash,
@@ -114,6 +120,7 @@ impl CheckerStore {
         self.apply_block_inner(commit, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn reconstruct(&self, target: u64) -> StoreResult<HistoricalSnapshot> {
         let tx = self.db.tx()?;
         let result = (|| {
@@ -123,6 +130,7 @@ impl CheckerStore {
         finish_read(tx, result)
     }
 
+    #[cfg(test)]
     pub(crate) fn check_consistency(&self) -> StoreResult<()> {
         let tx = self.db.tx()?;
         let result = (|| {
@@ -139,9 +147,9 @@ impl CheckerStore {
         finish_read(tx, result)
     }
 
-    /// Decode every durable table and validate the authoritative cut without
-    /// replaying historical model states from genesis.
-    pub(super) fn validate_restart(&self) -> StoreResult<()> {
+    /// Decode every durable table and return the validated authoritative cut
+    /// without replaying historical model states from genesis.
+    pub(super) fn load_validated_snapshot(&self) -> StoreResult<super::db::StoreSnapshot> {
         let tx = self.db.tx()?;
         let result = (|| {
             let current = read_snapshot(&tx, self.identity, self.path())?;
@@ -151,7 +159,8 @@ impl CheckerStore {
                 current.verified_zone_tip,
                 self.identity.zone_genesis_hash(),
             )?;
-            validate_all_changeset_keys(&tx, current.verified_zone_tip.number)
+            validate_all_changeset_keys(&tx, current.verified_zone_tip.number)?;
+            Ok(current)
         })();
         finish_read(tx, result)
     }
@@ -343,6 +352,7 @@ fn apply_block_transaction<TX: DbTxMut + DbTx>(
     Ok(WriteOutcome::Applied)
 }
 
+#[cfg(test)]
 fn reconstruct_from<TX: DbTx>(
     tx: &TX,
     identity: super::value::StoreIdentity,
@@ -372,7 +382,7 @@ fn reconstruct_from<TX: DbTx>(
         zone_tip = block.prior_verified_zone_tip;
         tempo_tip = block.prior_imported_tempo_tip;
         model = assemble_model(identity.portal_identity(), rows.clone())?;
-        validate_model_cut_coherence(tx, None, zone_tip, tempo_tip, &model)?;
+        validate_model_cut_coherence(tx, identity, None, zone_tip, tempo_tip, &model)?;
     }
     let canonical = required_canonical(tx, target)?;
     if canonical != zone_tip.hash {
@@ -403,6 +413,7 @@ fn next_block_bootstrap(
     }
 }
 
+#[cfg(test)]
 fn unwind_changeset<TX: DbTx>(
     tx: &TX,
     child_zone: BlockNumHash,

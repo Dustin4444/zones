@@ -28,10 +28,6 @@ impl Golden {
         self.0.extend_from_slice(&value.to_be_bytes());
     }
 
-    fn u128(&mut self, value: u128) {
-        self.0.extend_from_slice(&value.to_be_bytes());
-    }
-
     fn address(&mut self, value: Address) {
         self.0.extend_from_slice(value.as_slice());
     }
@@ -51,7 +47,7 @@ impl Golden {
 
 fn golden_record(value: &FindingRecord) -> Vec<u8> {
     let mut out = Golden::default();
-    out.byte(0x02);
+    out.byte(0x03);
     out.hash(value.zone_parent_hash);
     match value.imported_tempo {
         None => out.byte(0x00),

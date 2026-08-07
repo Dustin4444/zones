@@ -7,7 +7,8 @@
 use alloy_primitives::{Address, B256, U256};
 
 use super::constants::{
-    TEMPO_STATE_ADDRESS, TIP20_TOTAL_SUPPLY_SLOT, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    TEMPO_STATE_ADDRESS, TIP20_TOTAL_SUPPLY_SLOT, ZONE_FEE_MANAGER_ADDRESS, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS,
 };
 
 /// One literal account/slot pair read from exact Zone state.
@@ -31,6 +32,13 @@ impl ExactStateAccess {
 const SLOT_ZERO: U256 = U256::ZERO;
 const SLOT_ONE: U256 = U256::from_limbs([1, 0, 0, 0]);
 const SLOT_TWO: U256 = U256::from_limbs([2, 0, 0, 0]);
+
+/// `ZoneFeeManager.default_fee_token`: canonical Zone initial token at slot 0.
+///
+/// Pinned source: `crates/precompiles/src/zone_fee_manager/mod.rs:17-31` and
+/// `crates/node/src/genesis.rs:101-112`.
+pub(crate) const DEFAULT_FEE_TOKEN_ACCESS: ExactStateAccess =
+    ExactStateAccess::new(ZONE_FEE_MANAGER_ADDRESS, SLOT_ZERO);
 
 /// `TempoState.tempoBlockHash`: full word at slot 0.
 ///
@@ -98,6 +106,15 @@ pub(crate) fn decode_low_u64(word: U256) -> u64 {
     (word & U256::from(u64::MAX)).to::<u64>()
 }
 
+/// Decode one canonically left-padded address word.
+pub(crate) fn decode_address_word(word: U256) -> Option<Address> {
+    let bytes = word.to_be_bytes::<32>();
+    bytes[..12]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| Address::from_slice(&bytes[12..]))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, b256, uint};
@@ -137,6 +154,11 @@ mod tests {
                 address!("1c00000000000000000000000000000000000002"),
                 b256!("0000000000000000000000000000000000000000000000000000000000000002"),
             ),
+            (
+                DEFAULT_FEE_TOKEN_ACCESS,
+                address!("feec000000000000000000000000000000000001"),
+                B256::ZERO,
+            ),
         ];
 
         for (access, expected_address, expected_key) in cases {
@@ -168,5 +190,15 @@ mod tests {
         // max withdrawals | withdrawal batch index.
         let packed = uint!(0x4142434445464748313233343536373821222324111213140102030405060708_U256);
         assert_eq!(decode_low_u64(packed), 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn model_address_word_decode_requires_canonical_padding() {
+        let address = address!("20c0000000000000000000000000000000001234");
+        let canonical = U256::from_be_slice(B256::left_padding_from(address.as_slice()).as_slice());
+        assert_eq!(decode_address_word(canonical), Some(address));
+
+        let malformed = canonical | (U256::from(1) << 248);
+        assert_eq!(decode_address_word(malformed), None);
     }
 }

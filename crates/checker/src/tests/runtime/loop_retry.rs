@@ -39,6 +39,7 @@ async fn retained_notification_retries_the_same_block_until_acquisition_recovers
         &notification,
         &state,
         &mut l1_client,
+        true,
         &mut status,
     )
     .await
@@ -84,6 +85,7 @@ async fn retained_reorg_retries_after_alert_removal_and_applies_replacement() {
         fixture.initialization.verified_zone_tip.hash,
         &fixture.imported,
         Address::repeat_byte(0x53),
+        fixture.token,
         0xe1,
     );
     let replacement_tip = BlockNumHash::new(1, replacement.hash());
@@ -114,6 +116,7 @@ async fn retained_reorg_retries_after_alert_removal_and_applies_replacement() {
         &notification,
         &state,
         &mut replacement_l1,
+        true,
         &mut status,
     )
     .await
