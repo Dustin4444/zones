@@ -201,20 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_tag_matches_plaintext_hash() {
+    fn test_sender_tag_matches_domain_separated_commitment() {
+        let source_portal = address!("0x0000000000000000000000000000000000001001");
         let sender = address!("0x0000000000000000000000000000000000000001");
-        let tx_hash = B256::repeat_byte(0x22);
-        let fallback_nonce = 7u64;
-        let plaintext = Withdrawal::authenticated_sender_plaintext(sender, tx_hash);
-        let mut tag_preimage = [0u8; 60];
-        tag_preimage[..52].copy_from_slice(&plaintext);
-        tag_preimage[52..].copy_from_slice(&fallback_nonce.to_be_bytes());
+        let sender_witness = B256::repeat_byte(0x22);
+        let expected =
+            keccak256((SENDER_TAG_DOMAIN, source_portal, sender, sender_witness).abi_encode());
 
-        assert_eq!(&plaintext[..20], sender.as_slice());
-        assert_eq!(&plaintext[20..], tx_hash.as_slice());
         assert_eq!(
-            Withdrawal::sender_tag(sender, tx_hash, fallback_nonce),
-            keccak256(tag_preimage)
+            SENDER_TAG_DOMAIN,
+            keccak256("tempo.zone.sender-tag.v1"),
+            "compile-time domain constant must match the specified label"
+        );
+        assert_eq!(
+            Withdrawal::sender_tag(source_portal, sender, sender_witness),
+            expected
         );
     }
 

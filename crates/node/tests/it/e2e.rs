@@ -984,6 +984,7 @@ async fn submit_withdrawals(
                     0,
                     dev_address,
                     Bytes::new(),
+                    B256::random(),
                     Bytes::new(),
                 )
                 .nonce(nonce + offset as u64)
@@ -1060,11 +1061,8 @@ async fn test_withdrawal_request_finalizes_same_block() -> eyre::Result<()> {
         .query()
         .await?;
     assert_eq!(requested_logs.len(), 1);
-    let (requested, requested_log) = &requested_logs[0];
-    let withdrawal_tx_hash = requested_log
-        .transaction_hash
-        .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-    let withdrawal = Withdrawal::from_requested_event(requested, withdrawal_tx_hash, Bytes::new());
+    let (requested, _) = &requested_logs[0];
+    let withdrawal = Withdrawal::from_requested_event(requested, Bytes::new());
     let expected_hash = Withdrawal::queue_hash(&[withdrawal]);
 
     let finalized_logs = outbox
@@ -1174,15 +1172,8 @@ async fn test_multiple_withdrawals_finalize_in_one_batch() -> eyre::Result<()> {
     assert_eq!(requested_logs.len(), 2);
 
     let mut withdrawals = Vec::new();
-    for (requested, log) in &requested_logs {
-        let tx_hash = log
-            .transaction_hash
-            .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-        withdrawals.push(Withdrawal::from_requested_event(
-            requested,
-            tx_hash,
-            Bytes::new(),
-        ));
+    for (requested, _) in &requested_logs {
+        withdrawals.push(Withdrawal::from_requested_event(requested, Bytes::new()));
     }
     let expected_hash = Withdrawal::queue_hash(&withdrawals);
     let (finalized, log) = &finalized_logs[0];
@@ -1336,11 +1327,8 @@ async fn test_current_only_block_finalizes_at_batch_boundary() -> eyre::Result<(
         .to_block(withdrawal_block)
         .query()
         .await?;
-    let (requested, requested_log) = &requested_logs[0];
-    let withdrawal_tx_hash = requested_log
-        .transaction_hash
-        .ok_or_else(|| eyre::eyre!("WithdrawalRequested log missing transaction hash"))?;
-    let withdrawal = Withdrawal::from_requested_event(requested, withdrawal_tx_hash, Bytes::new());
+    let (requested, _) = &requested_logs[0];
+    let withdrawal = Withdrawal::from_requested_event(requested, Bytes::new());
     assert_eq!(
         finalized_logs[0].0.withdrawalQueueHash,
         Withdrawal::queue_hash(&[withdrawal])
@@ -1405,6 +1393,7 @@ async fn test_withdrawal_request_rejects_over_max_callback_gas() -> eyre::Result
             max_callback_gas + 1,
             dev_address,
             Bytes::from_static(b"callback"),
+            B256::random(),
             Bytes::new(),
         )
         .gas_price(TEMPO_T0_BASE_FEE as u128)

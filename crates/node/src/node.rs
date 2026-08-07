@@ -118,8 +118,8 @@ type ZoneNetworkPrimitives = BasicNetworkPrimitives<TempoPrimitives, TempoTxEnve
 /// The encrypted sender payload is hashed into withdrawal data, so ECIES must
 /// not use fresh randomness here. This implementation derives reproducible
 /// encryption material from the sequencer encryption key, zone id, reveal key,
-/// sender, withdrawal transaction hash, and fallback nonce, which keeps identical
-/// withdrawal batches byte-for-byte stable across sequencers.
+/// sender, sender witness, and fallback nonce, which keeps identical withdrawal batches
+/// byte-for-byte stable across sequencers.
 struct SequencerWithdrawalRevealEncryptor {
     encryption_key: Arc<SecretKey>,
     zone_id: u32,
@@ -147,7 +147,7 @@ impl WithdrawalRevealEncryptor for SequencerWithdrawalRevealEncryptor {
         &self,
         reveal_to: &[u8],
         sender: Address,
-        tx_hash: alloy_primitives::B256,
+        sender_witness: alloy_primitives::B256,
         fallback_nonce: u64,
     ) -> Option<Vec<u8>> {
         zone_precompiles::ecies::encrypt_authenticated_withdrawal_deterministic(
@@ -155,7 +155,7 @@ impl WithdrawalRevealEncryptor for SequencerWithdrawalRevealEncryptor {
             self.zone_id,
             reveal_to,
             sender,
-            tx_hash,
+            sender_witness,
             fallback_nonce,
         )
     }

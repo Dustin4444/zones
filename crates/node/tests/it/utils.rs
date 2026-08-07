@@ -2340,11 +2340,30 @@ impl L1TestNode {
         Ok(())
     }
 
-    /// Build a valid encrypted deposit payload for the current portal key.
+    /// Build a valid direct encrypted deposit payload for the current portal key.
     pub(crate) async fn encrypt_deposit_for_portal(
         &self,
         portal_address: Address,
         sender: Address,
+        recipient: Address,
+        memo: B256,
+    ) -> eyre::Result<(U256, tempo_zone_contracts::DepositPayload)> {
+        self.encrypt_deposit_for_portal_with_nonce(
+            portal_address,
+            sender,
+            rand::random(),
+            recipient,
+            memo,
+        )
+        .await
+    }
+
+    /// Build an encrypted deposit with a caller-selected GCM nonce.
+    pub(crate) async fn encrypt_deposit_for_portal_with_nonce(
+        &self,
+        portal_address: Address,
+        sender: Address,
+        nonce: [u8; 12],
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<(U256, tempo_zone_contracts::DepositPayload)> {
@@ -2360,7 +2379,7 @@ impl L1TestNode {
         );
         let key_index = key_count - U256::from(1);
 
-        let enc = ecies::encrypt_deposit(
+        let enc = ecies::encrypt_deposit_with_nonce(
             &key_result.x,
             key_result.yParity,
             recipient,
@@ -2368,19 +2387,11 @@ impl L1TestNode {
             sender,
             portal_address,
             key_index,
+            nonce,
         )
         .ok_or_else(|| eyre::eyre!("ECIES encryption failed"))?;
 
-        Ok((
-            key_index,
-            tempo_zone_contracts::DepositPayload {
-                ephemeralPubkeyX: enc.eph_pub_x,
-                ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-                ciphertext: enc.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(enc.nonce),
-                tag: alloy_primitives::FixedBytes(enc.tag),
-            },
-        ))
+        Ok((key_index, enc.into()))
     }
 
     /// Transfer a specific TIP-20 token from the dev account to a recipient on L1.
@@ -2766,12 +2777,15 @@ pub(crate) struct WithdrawalArgs {
     pub gas_limit: u64,
     pub zone_fallback_recipient: Option<Address>,
     pub data: alloy_primitives::Bytes,
+    pub sender_witness: B256,
     pub reveal_to: alloy_primitives::Bytes,
 }
 
 pub(crate) struct RouterDepositArgs {
     pub amount: u128,
     pub router: Address,
+    pub source_portal: Address,
+    pub source_sender: Address,
     pub token_out: Address,
     pub target_portal: Address,
     pub recipient: Address,
@@ -2787,6 +2801,7 @@ pub(crate) struct RouterCallbackArgs {
     pub target_portal: Address,
     pub key_index: U256,
     pub encrypted: tempo_zone_contracts::DepositPayload,
+    pub sender_witness: B256,
     pub tempo_refund_recipient: Address,
     pub min_amount_out: u128,
 }
@@ -2801,6 +2816,7 @@ impl WithdrawalArgs {
             gas_limit: 0,
             zone_fallback_recipient: None,
             data: alloy_primitives::Bytes::new(),
+            sender_witness: B256::random(),
             reveal_to: alloy_primitives::Bytes::new(),
         }
     }
@@ -2810,8 +2826,22 @@ impl WithdrawalArgs {
         l1: &L1TestNode,
         args: RouterDepositArgs,
     ) -> eyre::Result<Self> {
+        let sender_witness = B256::random();
+        let sender_tag = tempo_zone_contracts::Withdrawal::sender_tag(
+            args.source_portal,
+            args.source_sender,
+            sender_witness,
+        );
+        let nonce =
+            tempo_zone_contracts::routed_deposit_nonce(args.router, args.source_portal, sender_tag);
         let (key_index, encrypted) = l1
-            .encrypt_deposit_for_portal(args.target_portal, args.router, args.recipient, args.memo)
+            .encrypt_deposit_for_portal_with_nonce(
+                args.target_portal,
+                args.router,
+                nonce.0,
+                args.recipient,
+                args.memo,
+            )
             .await?;
         Ok(Self::swap_and_deposit_via_router_callback(
             RouterCallbackArgs {
@@ -2821,6 +2851,7 @@ impl WithdrawalArgs {
                 target_portal: args.target_portal,
                 key_index,
                 encrypted,
+                sender_witness,
                 tempo_refund_recipient: args.tempo_refund_recipient,
                 min_amount_out: args.min_amount_out,
             },
@@ -2847,6 +2878,7 @@ impl WithdrawalArgs {
             gas_limit: 2_500_000,
             zone_fallback_recipient: None, // defaults to self
             data: alloy_primitives::Bytes::from(callback_data),
+            sender_witness: args.sender_witness,
             reveal_to: alloy_primitives::Bytes::new(),
         }
     }
@@ -2860,6 +2892,8 @@ impl WithdrawalArgs {
         l1: &L1TestNode,
         amount: u128,
         router: Address,
+        source_portal: Address,
+        source_sender: Address,
         target_portal: Address,
         token: Address,
         recipient: Address,
@@ -2870,6 +2904,8 @@ impl WithdrawalArgs {
             RouterDepositArgs {
                 amount,
                 router,
+                source_portal,
+                source_sender,
                 token_out: token,
                 target_portal,
                 recipient,
@@ -3184,7 +3220,7 @@ impl ZoneAccount {
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<(U256, tempo_zone_contracts::DepositPayload)> {
-        use tempo_zone_contracts::{DepositPayload, ZonePortal};
+        use tempo_zone_contracts::ZonePortal;
         use zone_precompiles::ecies;
 
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
@@ -3206,16 +3242,7 @@ impl ZoneAccount {
         )
         .ok_or_else(|| eyre::eyre!("ECIES encryption failed"))?;
 
-        Ok((
-            key_index,
-            DepositPayload {
-                ephemeralPubkeyX: enc.eph_pub_x,
-                ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-                ciphertext: enc.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(enc.nonce),
-                tag: alloy_primitives::FixedBytes(enc.tag),
-            },
-        ))
+        Ok((key_index, enc.into()))
     }
 
     /// Approve the ZoneOutbox, then request a withdrawal on L2.
@@ -3250,6 +3277,7 @@ impl ZoneAccount {
                 args.gas_limit,
                 zone_fallback_recipient,
                 args.data,
+                args.sender_witness,
                 args.reveal_to,
             )
             .from(self.address)
@@ -3291,6 +3319,7 @@ impl ZoneAccount {
                 args.gas_limit,
                 zone_fallback_recipient,
                 args.data,
+                args.sender_witness,
                 args.reveal_to,
             )
             .send()

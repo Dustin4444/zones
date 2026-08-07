@@ -594,6 +594,7 @@ impl DemoBlacklist {
                     0,
                     target,
                     Bytes::new(),
+                    B256::random(),
                     Bytes::new(),
                 )
                 .gas(500_000)
@@ -714,13 +715,7 @@ async fn send_deposit<P: Provider<TempoNetwork>>(
     )
     .ok_or_else(|| eyre!("ECIES encryption failed"))?;
 
-    let payload = DepositPayload {
-        ephemeralPubkeyX: enc.eph_pub_x,
-        ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-        ciphertext: Bytes::from(enc.ciphertext),
-        nonce: enc.nonce.into(),
-        tag: enc.tag.into(),
-    };
+    let payload: DepositPayload = enc.into();
 
     let receipt = portal
         .deposit(token, amount, key_index, payload, tempo_refund_recipient)

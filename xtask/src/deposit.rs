@@ -5,7 +5,7 @@
 
 use alloy::{
     network::{EthereumWallet, primitives::ReceiptResponse},
-    primitives::{Address, B256, Bytes, address},
+    primitives::{Address, B256, address},
     providers::{Provider, ProviderBuilder},
     rpc::types::Filter,
     signers::local::PrivateKeySigner,
@@ -106,13 +106,7 @@ impl Deposit {
         )
         .ok_or_else(|| eyre!("ECIES encryption failed — invalid sequencer public key?"))?;
 
-        let payload = DepositPayload {
-            ephemeralPubkeyX: enc.eph_pub_x,
-            ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-            ciphertext: Bytes::from(enc.ciphertext),
-            nonce: enc.nonce.into(),
-            tag: enc.tag.into(),
-        };
+        let payload: DepositPayload = enc.into();
 
         println!("Sending deposit of {} to {to}...", self.amount);
         let receipt = portal

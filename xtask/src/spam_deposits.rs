@@ -304,13 +304,7 @@ impl SpamDeposits {
         )
         .ok_or_else(|| eyre!("ECIES encryption failed"))?;
 
-        let payload = DepositPayload {
-            ephemeralPubkeyX: encrypted.eph_pub_x,
-            ephemeralPubkeyYParity: encrypted.eph_pub_y_parity,
-            ciphertext: Bytes::from(encrypted.ciphertext),
-            nonce: encrypted.nonce.into(),
-            tag: encrypted.tag.into(),
-        };
+        let payload: DepositPayload = encrypted.into();
 
         Ok(ZonePortal::depositCall {
             token: self.token,

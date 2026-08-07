@@ -107,9 +107,10 @@ where
         env,
         execution::NoCallRules,
         move |data, caller| {
-            let (tx_hash, fee_payer) =
-                tx_context::current_transaction().unwrap_or((Default::default(), caller));
-            ZoneOutbox::new().call_with_transaction(&l1, data, caller, tx_hash, fee_payer)
+            let fee_payer = tx_context::current_transaction()
+                .map(|(_, fee_payer)| fee_payer)
+                .unwrap_or(caller);
+            ZoneOutbox::new().call_with_transaction(&l1, data, caller, fee_payer)
         },
     )
 }

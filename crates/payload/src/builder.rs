@@ -560,14 +560,14 @@ where
                     .encrypt_sender(
                         request.revealTo.as_ref(),
                         request.sender,
-                        request.txHash,
+                        request.senderWitness,
                         request.fallbackNonce,
                     )
                     .map(Bytes::from)
                     .ok_or_else(|| {
                         PayloadBuilderError::Internal(reth_errors::RethError::msg(format!(
-                            "failed to encrypt authenticated sender reveal for tx {}",
-                            request.txHash
+                            "failed to encrypt authenticated sender reveal for fallback nonce {}",
+                            request.fallbackNonce
                         )))
                     })
             }

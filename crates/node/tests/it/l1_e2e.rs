@@ -585,6 +585,8 @@ async fn test_open_mode_unlisted_account_roundtrip() -> eyre::Result<()> {
         100_000,
         router,
         portal_address,
+        account.address(),
+        portal_address,
         PATH_USD_ADDRESS,
         account.address(),
         account.address(),
@@ -610,6 +612,8 @@ async fn test_open_mode_unlisted_account_roundtrip() -> eyre::Result<()> {
         &l1,
         callback_amount,
         router,
+        portal_address,
+        account.address(),
         portal_address,
         PATH_USD_ADDRESS,
         account.address(),
@@ -792,6 +796,8 @@ async fn test_access_and_gateway_modes_are_mutable_and_independent() -> eyre::Re
         100_000,
         router,
         portal_address,
+        outsider,
+        portal_address,
         PATH_USD_ADDRESS,
         outsider,
         outsider,
@@ -925,6 +931,8 @@ async fn test_queued_callback_bounces_after_gateway_revocation() -> eyre::Result
         &fixture.l1,
         callback_amount,
         fixture.router,
+        fixture.portal_address,
+        fixture.account.address(),
         fixture.portal_address,
         PATH_USD_ADDRESS,
         fixture.account.address(),
@@ -1075,6 +1083,8 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
         &l1,
         cross_amount,
         router,
+        portal_a,
+        account_a.address(),
         portal_b,
         PATH_USD_ADDRESS,
         account_a.address(),
@@ -1119,6 +1129,8 @@ async fn test_cross_zone_withdrawal() -> eyre::Result<()> {
         &l1,
         reverse_amount,
         router,
+        portal_b,
+        account_b.address(),
         portal_a,
         PATH_USD_ADDRESS,
         account_b.address(),
@@ -1218,8 +1230,18 @@ async fn test_cross_zone_router_tempo_refund_recipient() -> eyre::Result<()> {
     let _seq_a = spawn_sequencer(&l1, &zone_a, portal_a, seq_a_signer.clone()).await;
     let _seq_b = spawn_sequencer(&l1, &zone_b, portal_b, seq_b_signer.clone()).await;
 
+    let sender_witness = B256::random();
+    let sender_tag =
+        tempo_zone_contracts::Withdrawal::sender_tag(portal_a, alice.address(), sender_witness);
+    let nonce = tempo_zone_contracts::routed_deposit_nonce(router, portal_a, sender_tag);
     let (key_index, encrypted) = l1
-        .encrypt_deposit_for_portal(portal_b, router, blacklisted_recipient, B256::ZERO)
+        .encrypt_deposit_for_portal_with_nonce(
+            portal_b,
+            router,
+            nonce.0,
+            blacklisted_recipient,
+            B256::ZERO,
+        )
         .await?;
 
     let refund_before = l1.balance_of(PATH_USD_ADDRESS, refund_burner).await?;
@@ -1232,6 +1254,7 @@ async fn test_cross_zone_router_tempo_refund_recipient() -> eyre::Result<()> {
         target_portal: portal_b,
         key_index,
         encrypted,
+        sender_witness,
         tempo_refund_recipient: refund_burner,
         min_amount_out: 0,
     });
@@ -1317,6 +1340,8 @@ async fn test_swap_and_deposit_into_same_zone() -> eyre::Result<()> {
         RouterDepositArgs {
             amount: fixture.swap_amount,
             router: fixture.router,
+            source_portal: fixture.portal_address,
+            source_sender: fixture.account.address(),
             token_out: fixture.beta,
             target_portal: fixture.portal_address,
             recipient: fixture.account.address(),
@@ -1419,6 +1444,8 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_when_target_deposits_
         RouterDepositArgs {
             amount: fixture.swap_amount,
             router: fixture.router,
+            source_portal: fixture.portal_address,
+            source_sender: fixture.account.address(),
             token_out: fixture.beta,
             target_portal: fixture.portal_address,
             recipient: fixture.account.address(),
@@ -1509,11 +1536,23 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_with_explicit_payload
         .pause_deposits_on_portal(fixture.portal_address, fixture.beta)
         .await?;
 
+    let sender_witness = B256::random();
+    let sender_tag = tempo_zone_contracts::Withdrawal::sender_tag(
+        fixture.portal_address,
+        fixture.account.address(),
+        sender_witness,
+    );
+    let nonce = tempo_zone_contracts::routed_deposit_nonce(
+        fixture.router,
+        fixture.portal_address,
+        sender_tag,
+    );
     let (key_index, encrypted) = fixture
         .l1
-        .encrypt_deposit_for_portal(
+        .encrypt_deposit_for_portal_with_nonce(
             fixture.portal_address,
             fixture.router,
+            nonce.0,
             fixture.account.address(),
             B256::ZERO,
         )
@@ -1534,6 +1573,7 @@ async fn test_swap_and_deposit_into_same_zone_bounces_back_with_explicit_payload
         target_portal: fixture.portal_address,
         key_index,
         encrypted,
+        sender_witness,
         tempo_refund_recipient: fixture.account.address(),
         min_amount_out: expected_beta,
     });
@@ -2027,7 +2067,6 @@ async fn test_deposit_old_key_during_grace_mints_after_rotation() -> eyre::Resul
 
     use k256::{AffinePoint, ProjectivePoint, Scalar};
     use tempo_contracts::precompiles::ITIP20;
-    use tempo_zone_contracts::DepositPayload;
     use zone_precompiles::ecies;
 
     let l1 = L1TestNode::start().await?;
@@ -2100,13 +2139,7 @@ async fn test_deposit_old_key_during_grace_mints_after_rotation() -> eyre::Resul
             PATH_USD_ADDRESS,
             current_amount,
             U256::ONE,
-            DepositPayload {
-                ephemeralPubkeyX: current.eph_pub_x,
-                ephemeralPubkeyYParity: current.eph_pub_y_parity,
-                ciphertext: current.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(current.nonce),
-                tag: alloy_primitives::FixedBytes(current.tag),
-            },
+            current.into(),
             depositor.address(),
         )
         .send()
@@ -2134,13 +2167,7 @@ async fn test_deposit_old_key_during_grace_mints_after_rotation() -> eyre::Resul
             PATH_USD_ADDRESS,
             historical_amount,
             U256::ZERO,
-            DepositPayload {
-                ephemeralPubkeyX: historical.eph_pub_x,
-                ephemeralPubkeyYParity: historical.eph_pub_y_parity,
-                ciphertext: historical.ciphertext.into(),
-                nonce: alloy_primitives::FixedBytes(historical.nonce),
-                tag: alloy_primitives::FixedBytes(historical.tag),
-            },
+            historical.into(),
             depositor.address(),
         )
         .send()
@@ -2251,13 +2278,7 @@ async fn test_deposit_blacklisted_recipient() -> eyre::Result<()> {
                 PATH_USD_ADDRESS,
                 deposit_amount,
                 key_index,
-                tempo_zone_contracts::DepositPayload {
-                    ephemeralPubkeyX: enc.eph_pub_x,
-                    ephemeralPubkeyYParity: enc.eph_pub_y_parity,
-                    ciphertext: enc.ciphertext.into(),
-                    nonce: alloy_primitives::FixedBytes(enc.nonce),
-                    tag: alloy_primitives::FixedBytes(enc.tag),
-                },
+                enc.into(),
                 depositor.address(),
             )
             .send()

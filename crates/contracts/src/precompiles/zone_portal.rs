@@ -6,9 +6,14 @@ pub use ZonePortal::{
 };
 
 use crate::{IZoneOutbox, ZoneInboxEvent};
-use alloy_primitives::{Address, B256, Bytes, keccak256};
+use alloy_primitives::{Address, B256, Bytes, b256, keccak256};
 use alloy_sol_types::SolValue;
 use zone_primitives::constants::EMPTY_SENTINEL;
+
+/// Domain separator for pre-transaction sender commitments:
+/// `keccak256("tempo.zone.sender-tag.v1")`.
+pub const SENDER_TAG_DOMAIN: B256 =
+    b256!("78b7e834dd61babde94ae4ed57982b78a12b3a6200860fd199faf30ab20aa98b");
 
 crate::sol! {
     #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -512,42 +517,35 @@ impl Deposit {
 }
 
 impl Withdrawal {
-    /// Build the authenticated-withdrawal sender plaintext `[sender(20) | tx_hash(32)]`.
-    pub fn authenticated_sender_plaintext(sender: Address, tx_hash: B256) -> [u8; 52] {
+    /// Build authenticated-withdrawal reveal plaintext `[sender(20) | sender_witness(32)]`.
+    pub fn authenticated_sender_plaintext(sender: Address, sender_witness: B256) -> [u8; 52] {
         let mut plaintext = [0u8; 52];
         plaintext[..20].copy_from_slice(sender.as_slice());
-        plaintext[20..].copy_from_slice(tx_hash.as_slice());
+        plaintext[20..].copy_from_slice(sender_witness.as_slice());
         plaintext
     }
 
-    /// Compute the authenticated sender tag for one user withdrawal.
-    ///
-    /// The fallback nonce is public on L1 and unique per user withdrawal, so including it keeps
-    /// multiple withdrawals from the same private transaction unlinkable. Deposit bounce-backs
-    /// retain their canonical zero-sender tag.
-    pub fn sender_tag(sender: Address, tx_hash: B256, fallback_nonce: u64) -> B256 {
-        if sender.is_zero() && fallback_nonce == 0 {
-            return keccak256(Self::authenticated_sender_plaintext(
-                Address::ZERO,
-                B256::ZERO,
-            ));
-        }
+    /// Compute a pre-transaction sender commitment for one user withdrawal.
+    pub fn sender_tag(source_portal: Address, sender: Address, sender_witness: B256) -> B256 {
+        keccak256((SENDER_TAG_DOMAIN, source_portal, sender, sender_witness).abi_encode())
+    }
 
-        let mut preimage = [0u8; 60];
-        preimage[..52].copy_from_slice(&Self::authenticated_sender_plaintext(sender, tx_hash));
-        preimage[52..].copy_from_slice(&fallback_nonce.to_be_bytes());
-        keccak256(preimage)
+    /// Canonical sender tag retained for internal deposit bounce-backs.
+    pub fn bounce_back_sender_tag() -> B256 {
+        keccak256(Self::authenticated_sender_plaintext(
+            Address::ZERO,
+            B256::ZERO,
+        ))
     }
 
     /// Reconstruct the public L1-facing withdrawal from a zone-side withdrawal request event.
     pub fn from_requested_event(
         event: &IZoneOutbox::WithdrawalRequested,
-        tx_hash: B256,
         encrypted_sender: Bytes,
     ) -> Self {
         Self {
             token: event.token,
-            senderTag: Self::sender_tag(event.sender, tx_hash, event.fallbackNonce),
+            senderTag: event.senderTag,
             to: event.to,
             amount: event.amount,
             memo: event.memo,

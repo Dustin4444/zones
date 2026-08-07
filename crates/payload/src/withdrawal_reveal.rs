@@ -7,7 +7,7 @@ pub trait WithdrawalRevealEncryptor: fmt::Debug + Send + Sync + 'static {
         &self,
         reveal_to: &[u8],
         sender: Address,
-        tx_hash: B256,
+        sender_witness: B256,
         fallback_nonce: u64,
     ) -> Option<Vec<u8>>;
 }

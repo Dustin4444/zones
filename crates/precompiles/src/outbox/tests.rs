@@ -40,6 +40,7 @@ struct Harness {
     precompile: DynPrecompile,
     l1: MockL1Reader,
     token: Address,
+    next_secret: u8,
 }
 
 impl Harness {
@@ -97,6 +98,7 @@ impl Harness {
             precompile,
             l1,
             token,
+            next_secret: 1,
         })
     }
 
@@ -166,11 +168,22 @@ impl Harness {
             gasLimit: gas_limit,
             zoneFallbackRecipient: ALICE,
             data: Bytes::new(),
+            senderWitness: B256::ZERO,
             revealTo: Bytes::new(),
         })
     }
 
-    fn request_custom(&mut self, call: ZoneOutboxAbi::requestWithdrawalCall) -> PrecompileResult {
+    fn request_custom(
+        &mut self,
+        mut call: ZoneOutboxAbi::requestWithdrawalCall,
+    ) -> PrecompileResult {
+        if call.senderWitness.is_zero() {
+            call.senderWitness = B256::repeat_byte(self.next_secret);
+            self.next_secret = self
+                .next_secret
+                .checked_add(1)
+                .expect("test secret overflow");
+        }
         self.call(ALICE, call.abi_encode())
     }
 
@@ -261,11 +274,37 @@ fn request_withdrawal_stores_fields_and_fifo_order() -> eyre::Result<()> {
     let pending = harness.pending()?;
     assert_eq!(pending.len(), 2);
     assert_eq!(pending[0].sender, ALICE);
-    assert_eq!(pending[0].txHash, TX_HASH);
+    assert_eq!(pending[0].senderWitness, B256::repeat_byte(1));
     assert_eq!(pending[0].to, ALICE);
     assert_eq!(pending[0].amount, 500);
     assert_eq!(pending[1].to, BOB);
     assert_eq!(pending[1].amount, 300);
+    Ok(())
+}
+
+#[test]
+fn duplicate_sender_tag_is_rejected_before_second_burn() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    let token = harness.token;
+    let secret = B256::repeat_byte(0x99);
+    let call = || ZoneOutboxAbi::requestWithdrawalCall {
+        token,
+        to: BOB,
+        amount: 100,
+        memo: B256::ZERO,
+        gasLimit: 0,
+        zoneFallbackRecipient: ALICE,
+        data: Bytes::new(),
+        senderWitness: secret,
+        revealTo: Bytes::new(),
+    };
+
+    harness.request_custom(call())?;
+    assert_revert(
+        harness.request_custom(call()),
+        ZoneOutboxError::duplicate_sender_tag(),
+    );
+    assert_eq!(harness.pending()?.len(), 1);
     Ok(())
 }
 
@@ -321,7 +360,7 @@ fn outbox_reads_injected_l1_state_at_tempo_checkpoint() -> eyre::Result<()> {
 }
 
 #[test]
-fn request_withdrawal_rejects_missing_transaction_hash() -> eyre::Result<()> {
+fn request_withdrawal_does_not_require_transaction_context() -> eyre::Result<()> {
     let mut harness = Harness::new()?;
     let token = harness.token;
     let result = harness.call_without_hash(
@@ -334,15 +373,12 @@ fn request_withdrawal_rejects_missing_transaction_hash() -> eyre::Result<()> {
             gasLimit: 0,
             zoneFallbackRecipient: ALICE,
             data: Bytes::new(),
+            senderWitness: B256::repeat_byte(0x44),
             revealTo: Bytes::new(),
         }
         .abi_encode(),
     );
-    assert_revert(result, ZoneOutboxError::invalid_current_tx_hash());
-    assert!(
-        harness.l1.storage_requests().is_empty(),
-        "missing transaction context must be rejected before portal reads"
-    );
+    assert!(result?.is_success());
     Ok(())
 }
 
@@ -357,6 +393,7 @@ fn request_withdrawal_rejects_unknown_token_before_portal_read() -> eyre::Result
         gasLimit: 0,
         zoneFallbackRecipient: ALICE,
         data: Bytes::new(),
+        senderWitness: B256::ZERO,
         revealTo: Bytes::new(),
     });
     assert_revert(result, TIP20Error::uninitialized());
@@ -496,11 +533,7 @@ fn finalize_withdrawals_match_queue_hash_and_have_unique_sender_tags() -> eyre::
         .iter()
         .map(|pending| Withdrawal {
             token: pending.token,
-            senderTag: Withdrawal::sender_tag(
-                pending.sender,
-                pending.txHash,
-                pending.fallbackNonce,
-            ),
+            senderTag: Withdrawal::sender_tag(PORTAL, pending.sender, pending.senderWitness),
             to: pending.to,
             amount: pending.amount,
             memo: pending.memo,
@@ -609,6 +642,7 @@ fn callback_and_reveal_boundaries_are_enforced() -> eyre::Result<()> {
         gasLimit: 0,
         zoneFallbackRecipient: ALICE,
         data,
+        senderWitness: B256::ZERO,
         revealTo: reveal_to,
     };
 
@@ -652,6 +686,7 @@ fn request_rejects_zero_fallback_recipient() -> eyre::Result<()> {
             gasLimit: 0,
             zoneFallbackRecipient: Address::ZERO,
             data: Bytes::new(),
+            senderWitness: B256::ZERO,
             revealTo: Bytes::new(),
         }),
         ZoneOutboxError::invalid_fallback_recipient(),
@@ -705,6 +740,7 @@ fn request_charges_withdrawal_fee_to_effective_fee_payer() -> eyre::Result<()> {
             gasLimit: 0,
             zoneFallbackRecipient: ALICE,
             data: Bytes::new(),
+            senderWitness: B256::repeat_byte(0x70),
             revealTo: Bytes::new(),
         }
         .abi_encode(),
@@ -834,6 +870,7 @@ fn static_mutation_reverts_with_static_call_not_allowed() -> eyre::Result<()> {
                 gasLimit: 0,
                 zoneFallbackRecipient: ALICE,
                 data: Bytes::new(),
+                senderWitness: B256::repeat_byte(0x71),
                 revealTo: Bytes::new(),
             }
             .abi_encode(),

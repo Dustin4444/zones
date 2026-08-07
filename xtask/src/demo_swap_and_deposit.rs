@@ -15,9 +15,10 @@ use tempo_contracts::precompiles::{
 };
 use tempo_precompiles::{PATH_USD_ADDRESS, TIP20_FACTORY_ADDRESS, tip20::ISSUER_ROLE};
 use tempo_zone_contracts::{
-    DepositPayload, IZoneOutbox, SwapAndDepositRouterCallback, ZONE_OUTBOX_ADDRESS, ZonePortal,
+    IZoneOutbox, SwapAndDepositRouterCallback, Withdrawal, ZONE_OUTBOX_ADDRESS, ZonePortal,
+    routed_deposit_nonce,
 };
-use zone_precompiles::ecies::encrypt_deposit;
+use zone_precompiles::ecies::{encrypt_deposit, encrypt_deposit_with_nonce};
 
 use crate::zone_utils::{
     ROUTER_CALLBACK_GAS_LIMIT, STABLECOIN_DEX_ADDRESS, ZoneMetadata, check, fund_l1_wallet,
@@ -346,10 +347,13 @@ impl DemoSwapAndDeposit {
         );
 
         let portal_contract_seq = ZonePortal::new(portal, &l1_seq);
+        let sender_witness = B256::random();
+        let sender_tag = Withdrawal::sender_tag(portal, operator, sender_witness);
         let callback_data = build_router_callback(
             &portal_contract_seq,
             RouterCallbackRequest {
                 sender: router,
+                nonce: routed_deposit_nonce(router, portal, sender_tag).0,
                 target_portal: portal,
                 token_out: beta,
                 recipient: operator,
@@ -370,6 +374,7 @@ impl DemoSwapAndDeposit {
                 ROUTER_CALLBACK_GAS_LIMIT,
                 operator,
                 callback_data,
+                sender_witness,
                 Bytes::new(),
             )
             .gas(WITHDRAWAL_TX_GAS)
@@ -593,6 +598,7 @@ fn parse_private_key(private_key: &str) -> eyre::Result<PrivateKeySigner> {
 
 struct RouterCallbackRequest<'a> {
     sender: Address,
+    nonce: [u8; 12],
     target_portal: Address,
     token_out: Address,
     recipient: Address,
@@ -636,13 +642,7 @@ async fn send_deposit<P: Provider<TempoNetwork>>(
             token,
             amount,
             key_index,
-            DepositPayload {
-                ephemeralPubkeyX: encrypted.eph_pub_x,
-                ephemeralPubkeyYParity: encrypted.eph_pub_y_parity,
-                ciphertext: Bytes::from(encrypted.ciphertext),
-                nonce: encrypted.nonce.into(),
-                tag: encrypted.tag.into(),
-            },
+            encrypted.into(),
             tempo_refund_recipient,
         )
         .send_sync()
@@ -667,7 +667,7 @@ async fn build_router_callback<P: Provider<TempoNetwork>>(
         )
     })?;
 
-    let encrypted = encrypt_deposit(
+    let encrypted = encrypt_deposit_with_nonce(
         &key.x,
         y_parity,
         request.recipient,
@@ -675,6 +675,7 @@ async fn build_router_callback<P: Provider<TempoNetwork>>(
         request.sender,
         request.target_portal,
         key_index,
+        request.nonce,
     )
     .ok_or_else(|| eyre!("ECIES encryption failed — invalid sequencer public key?"))?;
 
@@ -682,13 +683,7 @@ async fn build_router_callback<P: Provider<TempoNetwork>>(
         token_out: request.token_out,
         target_portal: request.target_portal,
         key_index,
-        encrypted: DepositPayload {
-            ephemeralPubkeyX: encrypted.eph_pub_x,
-            ephemeralPubkeyYParity: encrypted.eph_pub_y_parity,
-            ciphertext: Bytes::from(encrypted.ciphertext),
-            nonce: encrypted.nonce.into(),
-            tag: encrypted.tag.into(),
-        },
+        encrypted: encrypted.into(),
         tempo_refund_recipient: request.tempo_refund_recipient,
         min_amount_out: request.min_amount_out,
     };

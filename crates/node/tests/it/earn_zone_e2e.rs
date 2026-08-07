@@ -917,6 +917,7 @@ impl EarnZoneFixture {
                     gas_limit: CALLBACK_GAS_LIMIT,
                     zone_fallback_recipient: Some(self.user.address()),
                     data,
+                    sender_witness: B256::random(),
                     reveal_to: Bytes::new(),
                 },
             )
@@ -1012,6 +1013,7 @@ impl EarnZoneFixture {
                     gas_limit: callback_gas_limit,
                     zone_fallback_recipient: Some(self.user.address()),
                     data,
+                    sender_witness: B256::random(),
                     reveal_to: Bytes::new(),
                 },
             )
@@ -1111,6 +1113,7 @@ impl EarnZoneFixture {
                     gas_limit: CALLBACK_GAS_LIMIT,
                     zone_fallback_recipient: Some(self.user.address()),
                     data,
+                    sender_witness: B256::random(),
                     reveal_to: Bytes::new(),
                 },
             )
@@ -1214,6 +1217,7 @@ impl EarnZoneFixture {
                     gas_limit: CALLBACK_GAS_LIMIT,
                     zone_fallback_recipient: Some(account.address()),
                     data,
+                    sender_witness: B256::random(),
                     reveal_to: Bytes::new(),
                 },
             )
@@ -1976,6 +1980,7 @@ async fn matrix_redeem_private_public_rejects_legacy_destination() -> eyre::Resu
                 gas_limit: CALLBACK_GAS_LIMIT,
                 zone_fallback_recipient: Some(user),
                 data,
+                sender_witness: B256::random(),
                 reveal_to: Bytes::new(),
             },
         )

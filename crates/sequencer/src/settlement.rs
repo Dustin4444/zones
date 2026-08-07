@@ -1217,7 +1217,6 @@ struct RequestedWithdrawalLog {
     block_number: u64,
     tx_index: u64,
     log_index: u64,
-    tx_hash: B256,
     event: abi::IZoneOutbox::WithdrawalRequested,
 }
 
@@ -1567,7 +1566,7 @@ pub(crate) async fn fetch_finalized_batch<P: ZoneSequencerProvider>(
         .into_iter()
         .zip(encrypted_senders)
         .map(|(request, encrypted_sender)| {
-            abi::Withdrawal::from_requested_event(&request.event, request.tx_hash, encrypted_sender)
+            abi::Withdrawal::from_requested_event(&request.event, encrypted_sender)
         })
         .collect::<Vec<_>>();
 
@@ -1617,7 +1616,7 @@ fn fetch_requested_withdrawal_logs<P: ZoneSequencerProvider>(
     let mut requests = Vec::new();
     for block_number in from..=to {
         let (block, receipts) = block_with_receipts(provider, block_number)?;
-        for (tx_index, (tx, receipt)) in block
+        for (tx_index, (_, receipt)) in block
             .body
             .transactions
             .iter()
@@ -1635,7 +1634,6 @@ fn fetch_requested_withdrawal_logs<P: ZoneSequencerProvider>(
                     block_number,
                     tx_index: tx_index as u64,
                     log_index: log_index as u64,
-                    tx_hash: *tx.tx_hash(),
                     event: IZoneOutbox::WithdrawalRequested::decode_log(log)
                         .map_err(|err| {
                             eyre::eyre!(

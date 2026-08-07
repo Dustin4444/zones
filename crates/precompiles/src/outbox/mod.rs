@@ -53,6 +53,7 @@ pub struct ZoneOutbox {
     pending_withdrawals: Vec<PendingWithdrawal>,
     last_fallback_nonce: u64,
     fallback_recipients: Mapping<u64, Address>,
+    used_sender_tags: Mapping<B256, bool>,
 }
 
 impl ZoneOutbox {
@@ -143,9 +144,9 @@ impl ZoneOutbox {
         Ok(())
     }
 
-    fn enqueue(&mut self, pending: PendingWithdrawal) -> ZoneResult<()> {
+    fn enqueue(&mut self, pending: PendingWithdrawal, sender_tag: B256) -> ZoneResult<()> {
         let index = self.next_withdrawal_index.read()?;
-        self.emit_event(pending.requested_event(index))?;
+        self.emit_event(pending.requested_event(index, sender_tag))?;
 
         self.pending_withdrawals.push(pending)?;
         self.next_withdrawal_index.write(
@@ -161,7 +162,6 @@ impl ZoneOutbox {
         l1: &L1State<P>,
         caller: Address,
         fee_payer: Address,
-        current_tx_hash: B256,
         call: IZoneOutbox::requestWithdrawalCall,
     ) -> ZoneResult<()> {
         if call.zoneFallbackRecipient.is_zero() {
@@ -176,9 +176,6 @@ impl ZoneOutbox {
 
         validate_gas_limit(call.gasLimit)?;
 
-        if current_tx_hash.is_zero() {
-            return Err(ZoneOutboxError::invalid_current_tx_hash().into());
-        }
         let mut zone_token = TIP20Token::from_address(call.token)?;
         if !zone_token.is_initialized()? {
             return Err(TempoPrecompileError::from(TIP20Error::uninitialized()).into());
@@ -192,6 +189,12 @@ impl ZoneOutbox {
         }
 
         let fee = self.calculate_fee_unchecked(call.gasLimit)?;
+        let sender_tag = Withdrawal::sender_tag(l1.portal(), caller, call.senderWitness);
+        if self.used_sender_tags[sender_tag].read()? {
+            return Err(ZoneOutboxError::duplicate_sender_tag().into());
+        }
+        self.used_sender_tags[sender_tag].write(true)?;
+
         if caller == fee_payer {
             let total = call
                 .amount
@@ -212,13 +215,10 @@ impl ZoneOutbox {
             .ok_or_else(TempoPrecompileError::under_overflow)?;
         self.last_fallback_nonce.write(fallback_nonce)?;
         self.fallback_recipients[fallback_nonce].write(call.zoneFallbackRecipient)?;
-        self.enqueue(PendingWithdrawal::from_request(
-            caller,
-            current_tx_hash,
-            fee,
-            fallback_nonce,
-            call,
-        ))
+        self.enqueue(
+            PendingWithdrawal::from_request(caller, fee, fallback_nonce, call),
+            sender_tag,
+        )
     }
 
     fn transfer_and_burn(
@@ -251,7 +251,10 @@ impl ZoneOutbox {
             return Err(ZoneOutboxError::only_zone_inbox().into());
         }
 
-        self.enqueue(PendingWithdrawal::from_bounce_back(call))
+        self.enqueue(
+            PendingWithdrawal::from_bounce_back(call),
+            Withdrawal::bounce_back_sender_tag(),
+        )
     }
 
     pub(crate) fn consume_fallback_recipient(
@@ -286,7 +289,7 @@ impl ZoneOutbox {
 
     fn finalize_withdrawal_batch<P: L1StorageReader>(
         &mut self,
-        _l1: &L1State<P>,
+        l1: &L1State<P>,
         caller: Address,
         call: IZoneOutbox::finalizeWithdrawalBatchCall,
     ) -> ZoneResult<B256> {
@@ -316,7 +319,7 @@ impl ZoneOutbox {
             withdrawal_queue_hash = zone_primitives::constants::EMPTY_SENTINEL;
             for (index, encrypted_sender) in call.encryptedSenders.into_iter().enumerate().rev() {
                 let pending = self.pending_withdrawals[index].read()?;
-                let withdrawal = pending.into_withdrawal(encrypted_sender)?;
+                let withdrawal = pending.into_withdrawal(l1.portal(), encrypted_sender)?;
                 withdrawal_queue_hash = withdrawal.hash_with_tail(withdrawal_queue_hash);
             }
             self.pending_withdrawals.delete()?;
@@ -407,7 +410,7 @@ impl ZoneOutbox {
 struct PendingWithdrawal {
     token: Address,
     sender: Address,
-    tx_hash: B256,
+    sender_witness: B256,
     to: Address,
     amount: u128,
     fee: u128,
@@ -421,7 +424,6 @@ struct PendingWithdrawal {
 impl PendingWithdrawal {
     fn from_request(
         sender: Address,
-        tx_hash: B256,
         fee: u128,
         fallback_nonce: u64,
         call: IZoneOutbox::requestWithdrawalCall,
@@ -429,7 +431,7 @@ impl PendingWithdrawal {
         Self {
             token: call.token,
             sender,
-            tx_hash,
+            sender_witness: call.senderWitness,
             to: call.to,
             amount: call.amount,
             fee,
@@ -450,10 +452,11 @@ impl PendingWithdrawal {
         }
     }
 
-    fn requested_event(&self, index: u64) -> ZoneOutboxEvent {
+    fn requested_event(&self, index: u64, sender_tag: B256) -> ZoneOutboxEvent {
         ZoneOutboxEvent::withdrawal_requested(
             index,
             self.sender,
+            sender_tag,
             self.token,
             self.to,
             self.amount,
@@ -466,7 +469,7 @@ impl PendingWithdrawal {
         )
     }
 
-    fn into_withdrawal(self, encrypted_sender: Bytes) -> ZoneResult<Withdrawal> {
+    fn into_withdrawal(self, portal: Address, encrypted_sender: Bytes) -> ZoneResult<Withdrawal> {
         let expected = if self.reveal_to.is_empty() {
             0
         } else {
@@ -480,7 +483,11 @@ impl PendingWithdrawal {
             .into());
         }
 
-        let sender_tag = Withdrawal::sender_tag(self.sender, self.tx_hash, self.fallback_nonce);
+        let sender_tag = if self.sender.is_zero() && self.fallback_nonce == 0 {
+            Withdrawal::bounce_back_sender_tag()
+        } else {
+            Withdrawal::sender_tag(portal, self.sender, self.sender_witness)
+        };
         Ok(Withdrawal {
             token: self.token,
             senderTag: sender_tag,
@@ -500,7 +507,7 @@ impl From<PendingWithdrawal> for IZoneOutbox::PendingWithdrawal {
         Self {
             token: pending.token,
             sender: pending.sender,
-            txHash: pending.tx_hash,
+            senderWitness: pending.sender_witness,
             to: pending.to,
             amount: pending.amount,
             memo: pending.memo,

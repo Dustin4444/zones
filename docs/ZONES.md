@@ -297,7 +297,7 @@ The sequencer includes the withdrawal in the next batch submission to L1 and pro
 
 #### Router Swap + Deposit Demo (Same Zone)
 
-This demo exercises the `SwapAndDepositRouter` flow against a running zone. It creates temporary `AlphaUSD` and `BetaUSD` tokens on L1, seeds matching StablecoinDEX liquidity, withdraws `AlphaUSD` from the zone to the router, swaps on L1, and deposits `BetaUSD` back into the same zone. The router consumes each canonical encrypted-payload nullifier at most once, so another withdrawal cannot replay a published callback through the router. The routed callback payload includes a public `tempoRefundRecipient` for the downstream portal deposit; set `ROUTER_BOUNCEBACK_RECIPIENT` to a refund-specific burner or stealth address you control if you do not want a later refund to point at the encrypted zone recipient. If the portal does not already have the current sequencer encryption key registered, the demo registers it automatically before building the routed callback payload.
+This demo exercises the `SwapAndDepositRouter` flow against a running zone. It creates temporary `AlphaUSD` and `BetaUSD` tokens on L1, seeds matching StablecoinDEX liquidity, withdraws `AlphaUSD` from the zone to the router, swaps on L1, and deposits `BetaUSD` back into the same zone. The router consumes each authenticated `(sourcePortal, senderTag)` nullifier at most once and enforces a GCM nonce derived from that callback identity, so a copied encrypted payload cannot authenticate for another withdrawal. The routed callback payload includes a public `tempoRefundRecipient` for the downstream portal deposit; set `ROUTER_BOUNCEBACK_RECIPIENT` to a refund-specific burner or stealth address you control if you do not want a later refund to point at the encrypted zone recipient. If the portal does not already have the current sequencer encryption key registered, the demo registers it automatically before building the routed callback payload.
 
 Prerequisites:
 - A running zone with an active sequencer
@@ -581,7 +581,7 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 | Precompile | Address | Description |
 |------------|---------|-------------|
 | TempoStateReader | `0x1c00…0004` | Reads L1 contract storage from zone contracts via the L1 state cache. |
-| ZoneTxContext | `0x1c00…0005` | Exposes the hash of the currently executing zone transaction (`currentTxHash`), used by ZoneOutbox for authenticated withdrawals. |
+| ZoneTxContext | `0x1c00…0005` | Exposes the hash of the currently executing zone transaction (`currentTxHash`); sender commitments no longer depend on it. |
 | ChaumPedersenVerify | `0x1c00…0100` | Verifies DLOG equality proofs for ECDH key exchange (encrypted deposits). |
 | AesGcmDecrypt | `0x1c00…0101` | AES-256-GCM authenticated decryption (encrypted deposit payloads). |
 

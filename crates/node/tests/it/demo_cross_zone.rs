@@ -121,6 +121,8 @@ async fn test_cross_zone_send() -> eyre::Result<()> {
         &l1,
         cross_amount,
         router,
+        portal_a,
+        alice.address(),
         portal_b,
         PATH_USD_ADDRESS,
         bob_address,   // recipient on zone_b is Bob

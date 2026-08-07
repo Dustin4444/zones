@@ -16,7 +16,7 @@ crate::sol! {
         struct PendingWithdrawal {
             address token;
             address sender;
-            bytes32 txHash;
+            bytes32 senderWitness;
             address to;
             uint128 amount;
             bytes32 memo;
@@ -31,6 +31,7 @@ crate::sol! {
         event WithdrawalRequested(
             uint64 indexed withdrawalIndex,
             address indexed sender,
+            bytes32 indexed senderTag,
             address token,
             address to,
             uint128 amount,
@@ -61,7 +62,7 @@ crate::sol! {
         error InvalidBlockNumber();
         error TooManyWithdrawalsThisBlock();
         error InvalidRevealTo();
-        error InvalidCurrentTxHash();
+        error DuplicateSenderTag();
         error ZeroAmountWithdrawal();
         error StaticCallNotAllowed();
 
@@ -95,6 +96,7 @@ crate::sol! {
             uint64 gasLimit,
             address zoneFallbackRecipient,
             bytes calldata data,
+            bytes32 senderWitness,
             bytes calldata revealTo
         ) external;
         function enqueueDepositBounceBack(
