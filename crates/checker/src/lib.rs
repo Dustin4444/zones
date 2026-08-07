@@ -7,6 +7,7 @@ pub mod diagnostic;
 mod metrics;
 mod model;
 mod observe;
+pub(crate) mod persistence;
 mod runtime;
 mod store;
 
