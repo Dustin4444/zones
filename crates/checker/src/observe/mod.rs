@@ -1,9 +1,8 @@
 //! Ephemeral authenticated observations for one Zone block and its imported
 //! Tempo block.
 //!
-//! Concrete input and outcome fields are intentionally separate. Only the L1
-//! and L2 adapters in this module construct them; there is no generic wrapper
-//! that can relabel arbitrary data as authenticated.
+//! Input and outcome fields remain separate. Only this module's L1 and L2
+//! adapters can construct them.
 
 mod abi;
 mod error;

@@ -279,7 +279,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
                 portal_address: args.portal_address,
                 portal_creation_block_hash,
                 zone_id: args.zone_id,
-                database_path: Some(database_path.clone()),
+                database_path: database_path.clone(),
                 acquisition_timeout: Duration::from_secs(30),
             };
             let node_handle = builder
@@ -306,7 +306,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
                 handle.wait_for_node_exit().await
             }
             Some(config) => {
-                info!(target: "reth::cli", "Checker ExEx enabled (observe mode)");
+                info!(target: "reth::cli", mode = "observe", "checker enabled");
                 let checker = CheckerExEx::new(config);
                 builder
                     .node(node)

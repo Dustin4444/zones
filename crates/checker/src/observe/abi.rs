@@ -25,10 +25,9 @@ const SELECTOR: usize = 4;
 // a five-word encrypted-payload head, and a three-word ciphertext tail.
 const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
 
-// Keep observation compatible while the generated production binding still
-// describes the former `bytes header` signature.
+// Both deployed ABI shapes are valid protocol inputs.
 sol! {
-    interface ObservationZoneInbox {
+    interface MultiHeaderZoneInbox {
         enum DepositType { WithdrawalBounceBack, Deposit }
         struct QueuedDeposit { DepositType depositType; bytes depositData; }
         struct ChaumPedersenProof { bytes32 s; bytes32 c; }
@@ -59,6 +58,12 @@ struct AdvanceCall {
     deposits: Vec<(u8, Bytes)>,
     decryptions: Vec<IZoneInbox::DecryptionData>,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
+}
+
+#[derive(Clone, Copy)]
+enum AdvanceTempoAbi {
+    SingleHeader,
+    MultiHeader,
 }
 
 impl AbiError {
@@ -478,29 +483,35 @@ fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), AbiError> {
     Ok(())
 }
 
-fn preflight_advance_tempo(calldata: &[u8]) -> Result<bool, AbiError> {
+fn preflight_advance_tempo(calldata: &[u8]) -> Result<AdvanceTempoAbi, AbiError> {
     let surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let legacy =
-        calldata.get(..SELECTOR) == Some(IZoneInbox::advanceTempoCall::SELECTOR.as_slice());
-    let selector = if legacy {
-        &IZoneInbox::advanceTempoCall::SELECTOR
+    let abi = if calldata.get(..SELECTOR) == Some(IZoneInbox::advanceTempoCall::SELECTOR.as_slice())
+    {
+        AdvanceTempoAbi::SingleHeader
     } else {
-        &ObservationZoneInbox::advanceTempoCall::SELECTOR
+        AdvanceTempoAbi::MultiHeader
+    };
+    let selector = match abi {
+        AdvanceTempoAbi::SingleHeader => &IZoneInbox::advanceTempoCall::SELECTOR,
+        AdvanceTempoAbi::MultiHeader => &MultiHeaderZoneInbox::advanceTempoCall::SELECTOR,
     };
     let bounds = Bounds::from_call(DataSource::AdvanceTempoCalldata, calldata, selector)?;
     bounds.ensure_head(4)?;
-    if legacy {
-        bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
-    } else {
-        let maximum_headers = bounds.data.len() / WORD;
-        let (header_head, header_count) =
-            bounds.dynamic_array(0, 0, 4, maximum_headers, "headers")?;
-        if header_count == 0 {
-            return Err(surface.malformed("headers must be nonempty"));
+    match abi {
+        AdvanceTempoAbi::SingleHeader => {
+            bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
         }
-        for index in 0..header_count {
-            let header = bounds.dynamic_element(header_head, header_count, index)?;
-            bounds.direct_bytes(header, bounds.data.len(), "header")?;
+        AdvanceTempoAbi::MultiHeader => {
+            let maximum_headers = bounds.data.len() / WORD;
+            let (header_head, header_count) =
+                bounds.dynamic_array(0, 0, 4, maximum_headers, "headers")?;
+            if header_count == 0 {
+                return Err(surface.malformed("headers must be nonempty"));
+            }
+            for index in 0..header_count {
+                let header = bounds.dynamic_element(header_head, header_count, index)?;
+                bounds.direct_bytes(header, bounds.data.len(), "header")?;
+            }
         }
     }
 
@@ -548,7 +559,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<bool, AbiError> {
         bounds.bytes_field(token, 2, 4, MAX_TOKEN_SYMBOL_BYTES, "token symbol")?;
         bounds.bytes_field(token, 3, 4, MAX_TOKEN_CURRENCY_BYTES, "token currency")?;
     }
-    Ok(legacy)
+    Ok(abi)
 }
 
 pub(crate) fn decode_advance_tempo(
@@ -560,64 +571,66 @@ pub(crate) fn decode_advance_tempo(
 
 fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError> {
     let advance_surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let legacy = preflight_advance_tempo(calldata)?;
-    let call = if legacy {
-        let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-            .map_err(|error| advance_surface.malformed(error))?;
-        if call.abi_encode() != calldata {
-            return Err(
-                advance_surface.malformed("encoding is non-canonical or has trailing bytes")
-            );
-        }
-        AdvanceCall {
-            headers: vec![call.header],
-            deposits: call
-                .deposits
-                .into_iter()
-                .map(|queued| (queued.depositType as u8, queued.depositData))
-                .collect(),
-            decryptions: call.decryptions,
-            enabled_tokens: call.enabledTokens,
-        }
-    } else {
-        let call = ObservationZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-            .map_err(|error| advance_surface.malformed(error))?;
-        if call.abi_encode() != calldata {
-            return Err(
-                advance_surface.malformed("encoding is non-canonical or has trailing bytes")
-            );
-        }
-        AdvanceCall {
-            headers: call.headers,
-            deposits: call
-                .deposits
-                .into_iter()
-                .map(|queued| (queued.depositType as u8, queued.depositData))
-                .collect(),
-            decryptions: call
-                .decryptions
-                .into_iter()
-                .map(|d| IZoneInbox::DecryptionData {
-                    sharedSecret: d.sharedSecret,
-                    sharedSecretYParity: d.sharedSecretYParity,
-                    cpProof: IZoneInbox::ChaumPedersenProof {
-                        s: d.cpProof.s,
-                        c: d.cpProof.c,
-                    },
-                })
-                .collect(),
-            enabled_tokens: call
-                .enabledTokens
-                .into_iter()
-                .map(|t| IZoneInbox::EnabledToken {
-                    token: t.token,
-                    name: t.name,
-                    symbol: t.symbol,
-                    currency: t.currency,
-                })
-                .collect(),
-        }
-    };
+    let abi = preflight_advance_tempo(calldata)?;
+    let call =
+        match abi {
+            AdvanceTempoAbi::SingleHeader => {
+                let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
+                    .map_err(|error| advance_surface.malformed(error))?;
+                if call.abi_encode() != calldata {
+                    return Err(advance_surface
+                        .malformed("encoding is non-canonical or has trailing bytes"));
+                }
+                AdvanceCall {
+                    headers: vec![call.header],
+                    deposits: call
+                        .deposits
+                        .into_iter()
+                        .map(|queued| (queued.depositType as u8, queued.depositData))
+                        .collect(),
+                    decryptions: call.decryptions,
+                    enabled_tokens: call.enabledTokens,
+                }
+            }
+            AdvanceTempoAbi::MultiHeader => {
+                let call = MultiHeaderZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
+                    .map_err(|error| advance_surface.malformed(error))?;
+                if call.abi_encode() != calldata {
+                    return Err(advance_surface
+                        .malformed("encoding is non-canonical or has trailing bytes"));
+                }
+                AdvanceCall {
+                    headers: call.headers,
+                    deposits: call
+                        .deposits
+                        .into_iter()
+                        .map(|queued| (queued.depositType as u8, queued.depositData))
+                        .collect(),
+                    decryptions: call
+                        .decryptions
+                        .into_iter()
+                        .map(|d| IZoneInbox::DecryptionData {
+                            sharedSecret: d.sharedSecret,
+                            sharedSecretYParity: d.sharedSecretYParity,
+                            cpProof: IZoneInbox::ChaumPedersenProof {
+                                s: d.cpProof.s,
+                                c: d.cpProof.c,
+                            },
+                        })
+                        .collect(),
+                    enabled_tokens: call
+                        .enabledTokens
+                        .into_iter()
+                        .map(|t| IZoneInbox::EnabledToken {
+                            token: t.token,
+                            name: t.name,
+                            symbol: t.symbol,
+                            currency: t.currency,
+                        })
+                        .collect(),
+                }
+            }
+        };
 
     let mut imported_headers: Vec<ImportedTempoHeader> = Vec::with_capacity(call.headers.len());
     for encoded in call.headers {

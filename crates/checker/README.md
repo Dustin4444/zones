@@ -11,8 +11,7 @@ consensus. A deterministic divergence becomes a durable, sticky alert;
 descendants are acknowledged as not checked because of that ancestor rather
 than reported as passing.
 
-See [DESIGN.md](DESIGN.md) for the data flow and persistence contract and
-[MODEL_VECTORS.md](MODEL_VECTORS.md) for the independent vector inventory.
+See [DESIGN.md](DESIGN.md) for the data flow and persistence contract.
 
 ## Operator setup
 
@@ -41,51 +40,28 @@ tempo-zone \
   --zone.id 123
 ```
 
-Use `tempo-zone checker build-checkpoint --help` for the exact CLI accepted by
-the current binary. The default checker database is the node's resolved
-checker directory; `--checker.database-path` selects an explicit dedicated
-path. `--checker.acquisition-timeout-secs` bounds each authenticated block
-acquisition attempt and defaults to 30 seconds. `off` remains the default
-checker mode.
+Use `tempo-zone checker build-checkpoint --help` for CLI details. Observe mode
+requires `--checker.database-path`.
+`--checker.acquisition-timeout-secs` bounds each authenticated block acquisition
+attempt and defaults to 30 seconds. The checker is off by default.
 
 Checkpoint publication uses a sibling staging directory and validates the
 completed database before making it available. An existing incompatible
 database is preserved: schema changes and corruption require a newly built
-path, not an in-place migration.
+path.
 
-## Evidence boundary
+## What it checks
 
-For every imported Tempo block the checker:
+For each imported Tempo block, the checker reconstructs the transaction root
+from full envelopes and authenticates the complete receipt set, receipt root,
+and bloom. It strictly decodes protocol calldata and events, then compares the
+kernel's expected bridge effects with receipts and exact state reads.
 
-1. obtains the exact full transaction envelopes;
-2. hashes each envelope locally and reconstructs `transactions_root`;
-3. compares the root with the header authenticated by Zone `advanceTempo`;
-4. authenticates the complete ordered receipt vector, receipt root, and bloom;
-5. binds each receipt to the locally derived transaction hash and index; and
-6. decodes required direct Portal calldata from those authenticated envelopes.
-
-Zone system envelopes, canonical ABI and RLP, dynamic allocation bounds,
-receipt cardinality, protocol event topics, fixed state commitments, token
-supply, and Portal collateral are checked under the same fail-closed policies.
-Unknown activity from a protocol emitter is never silently classified as
-verified.
-
-Expected values are constructed only by `zone-checker-kernel`. Generated ABI
-types are observation/wire carriers and production protocol transition helpers
-are outside the kernel's dependency fence.
-
-## Lifecycle coverage
-
-The kernel covers creation and configuration, token enablement, ordinary and
-failed deposits, withdrawal requests and fees, finalization, queue folds,
-submission, full and partial processing, successful delivery, pending refunds,
-bounce-backs, callback deposits, aggregate claims, empty batches, and complete
-owner closure. It preserves checker-owned IDs, sender tags, sentinels, queue
-commitments, fees, ownership, refund origins, counters, storage layouts, and
-per-token `S/D/W` accounting.
-
-Collateral is checked at the imported Tempo cut before the Zone transition;
-fixed Zone state and supply are checked after the Zone transition.
+The kernel covers portal creation, token enablement, deposits, withdrawals,
+batches, bounce-backs, refunds, callbacks, ownership, commitments, and
+per-token accounting. Collateral is checked after the Tempo import and before
+the Zone transition. Zone commitments and token supply are checked after the
+Zone transition.
 
 ## Durability and runtime behavior
 
@@ -96,10 +72,10 @@ The dedicated database has four tables:
 | `Meta` | Identity, schema, durable tips, coverage, and active alert |
 | `Checkpoints` | Immutable bootstrap state and later complete state cuts |
 | `Journal` | Ordered canonical per-block deltas and continuity data |
-| `Findings` | Compact deterministic findings and canonical lineage |
+| `Findings` | Deterministic findings and canonical lineage |
 
-The bootstrap checkpoint is immutable. The canonical journal is currently
-retained without pruning; no unsupported reorg horizon is implied.
+The bootstrap checkpoint is immutable. The canonical journal is retained
+without pruning; no unsupported reorg horizon is implied.
 
 The runtime uses one current notification, one bounded FIFO, bounded retry
 attempts/timers, and the states `Starting`, `Healthy`, `Retrying`, `Alerting`,
@@ -151,21 +127,3 @@ proof systems, arbitrary callback/EVM behavior, private mint recipients, or
 the withdrawal-time fallback recipient when that value is not authenticated
 at the observation boundary. It checks all lifecycle, ownership, commitment,
 and accounting consequences exposed within this boundary.
-
-The removed checker architecture's diagnostic command, retained before-image
-history, live bootstrap state machine, and metrics suite are not part of this
-runtime. Operational diagnosis uses compact findings plus the named L1/L2
-archive coordinates. No performance or production-SLO claim is made by this
-document; the current real-node gate establishes functional checkpoint,
-processing, persistence, and restart behavior.
-
-## Validation
-
-```sh
-cargo +1.95.0 fmt --check
-cargo +1.95.0 test -p zone-checker-kernel
-RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker
-cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker \
-  --all-targets --all-features -- -D warnings
-cargo +1.95.0 test -p zone-node --features cli,test-utils --test it checker
-```

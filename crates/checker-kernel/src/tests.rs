@@ -547,7 +547,7 @@ fn ordinary_deposit_commitment_matches_independent_literal_vector() {
 }
 
 #[test]
-fn sender_tag_includes_big_endian_fallback_nonce() {
+fn sender_tag_matches_literal_vector_and_includes_fallback_nonce() {
     let sender = Address::repeat_byte(0x11);
     let transaction = B256::repeat_byte(0x22);
     assert_eq!(
@@ -1163,7 +1163,7 @@ fn every_withdrawal_preimage_field_is_prefix_authenticated() {
 }
 
 #[test]
-fn batch_invariants_reject_compact_state_relation_mutations() {
+fn batch_invariants_reject_state_relation_mutations() {
     type StateMutation = Box<dyn Fn(&mut BTreeMap<StateKey, StateValue>)>;
 
     let (finalized, _) = finalized_user_state();

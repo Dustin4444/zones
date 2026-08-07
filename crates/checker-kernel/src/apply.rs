@@ -24,25 +24,25 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
-    #[error("Portal has not been created")]
+    #[error("portal has not been created")]
     PortalNotCreated,
-    #[error("Portal is already created")]
+    #[error("portal is already created")]
     PortalAlreadyCreated,
-    #[error("Portal identity mismatch")]
+    #[error("portal identity mismatch")]
     PortalIdentityMismatch,
-    #[error("Portal address does not match Zone ID")]
+    #[error("portal address does not match zone ID")]
     PortalAddressMismatch,
     #[error("initial token mismatch")]
     InitialTokenMismatch,
     #[error("token {0} is already enabled")]
     TokenAlreadyEnabled(Address),
-    #[error("token {0} is not Portal-enabled")]
+    #[error("token {0} is not enabled on the portal")]
     TokenNotEnabled(Address),
-    #[error("token {0} is not Zone-enabled")]
+    #[error("token {0} is not enabled in the Zone")]
     TokenNotZoneEnabled(Address),
-    #[error("Zone token-enablement prefix does not match imported Portal operations")]
+    #[error("zone token enablement does not match imported portal operations")]
     TokenEnableMismatch,
-    #[error("Tempo refund recipient is zero")]
+    #[error("refund recipient is zero")]
     ZeroRefundRecipient,
     #[error("counter or accounting overflow")]
     Overflow,
@@ -105,6 +105,12 @@ pub struct Candidate {
     /// Exact accounting for every token in the resulting overlay, including
     /// unchanged token rows which therefore do not occur in `delta`.
     pub expected_accounting: BTreeMap<Address, TokenAccounting>,
+}
+
+#[derive(Clone, Copy)]
+enum RefundSide {
+    Portal,
+    Inbox,
 }
 
 /// Promote the Portal-enabled token set proven at the Zone genesis anchor.
@@ -211,7 +217,7 @@ pub fn apply_imported(
                 process_withdrawals(&mut overlay, input, input.base_fee, &mut effects)?
             }
             ImportedOperation::ClaimPortalRefund(input) => {
-                claim_refund(&mut overlay, *input, true, &mut effects)?
+                claim_refund(&mut overlay, *input, RefundSide::Portal, &mut effects)?
             }
         }
     }
@@ -753,7 +759,7 @@ fn apply_zone_operations(
                 });
             }
             ZoneOperation::ClaimInboxRefund(claim) => {
-                claim_refund(overlay, *claim, false, effects)?
+                claim_refund(overlay, *claim, RefundSide::Inbox, effects)?
             }
         }
     }
@@ -1302,49 +1308,49 @@ fn require_held_fallback(
 fn claim_refund(
     overlay: &mut Overlay<'_>,
     claim: RefundClaim,
-    portal_side: bool,
+    side: RefundSide,
     effects: &mut Vec<Effect>,
 ) -> Result<(), ModelError> {
     let PortalState::Created { identity, .. } = portal(overlay)? else {
         return Err(ModelError::PortalNotCreated);
     };
-    let start = if portal_side {
-        StateKey::PortalRefund(PortalRefundId {
-            token: Address::ZERO,
-            recipient: Address::ZERO,
-            deposit: DepositId {
-                portal: Address::ZERO,
-                number: NonZeroU64::MIN,
-            },
-        })
-    } else {
-        StateKey::InboxRefund(InboxRefundId {
-            token: Address::ZERO,
-            recipient: Address::ZERO,
-            withdrawal: WithdrawalId {
-                zone_id: 0,
-                index: 0,
-            },
-        })
-    };
-    let end = if portal_side {
-        StateKey::PortalRefund(PortalRefundId {
-            token: Address::repeat_byte(0xff),
-            recipient: Address::repeat_byte(0xff),
-            deposit: DepositId {
-                portal: Address::repeat_byte(0xff),
-                number: NonZeroU64::new(u64::MAX).expect("nonzero"),
-            },
-        })
-    } else {
-        StateKey::InboxRefund(InboxRefundId {
-            token: Address::repeat_byte(0xff),
-            recipient: Address::repeat_byte(0xff),
-            withdrawal: WithdrawalId {
-                zone_id: u32::MAX,
-                index: u64::MAX,
-            },
-        })
+    let (start, end) = match side {
+        RefundSide::Portal => (
+            StateKey::PortalRefund(PortalRefundId {
+                token: Address::ZERO,
+                recipient: Address::ZERO,
+                deposit: DepositId {
+                    portal: Address::ZERO,
+                    number: NonZeroU64::MIN,
+                },
+            }),
+            StateKey::PortalRefund(PortalRefundId {
+                token: Address::repeat_byte(0xff),
+                recipient: Address::repeat_byte(0xff),
+                deposit: DepositId {
+                    portal: Address::repeat_byte(0xff),
+                    number: NonZeroU64::new(u64::MAX).expect("nonzero"),
+                },
+            }),
+        ),
+        RefundSide::Inbox => (
+            StateKey::InboxRefund(InboxRefundId {
+                token: Address::ZERO,
+                recipient: Address::ZERO,
+                withdrawal: WithdrawalId {
+                    zone_id: 0,
+                    index: 0,
+                },
+            }),
+            StateKey::InboxRefund(InboxRefundId {
+                token: Address::repeat_byte(0xff),
+                recipient: Address::repeat_byte(0xff),
+                withdrawal: WithdrawalId {
+                    zone_id: u32::MAX,
+                    index: u64::MAX,
+                },
+            }),
+        ),
     };
     let credits: Vec<_> = overlay
         .range(
@@ -1353,7 +1359,7 @@ fn claim_refund(
         )
         .filter_map(|(key, value)| match (key, value) {
             (StateKey::PortalRefund(id), StateValue::PortalRefund(c))
-                if portal_side
+                if matches!(side, RefundSide::Portal)
                     && id.deposit.portal == identity.portal
                     && id.token == claim.token
                     && id.recipient == claim.recipient =>
@@ -1361,7 +1367,7 @@ fn claim_refund(
                 Some((key, c.amount))
             }
             (StateKey::InboxRefund(id), StateValue::InboxRefund(c))
-                if !portal_side
+                if matches!(side, RefundSide::Inbox)
                     && id.withdrawal.zone_id == identity.zone_id
                     && id.token == claim.token
                     && id.recipient == claim.recipient =>
@@ -1380,26 +1386,29 @@ fn claim_refund(
     }
     if total != 0 {
         let mut t = token(overlay, claim.token)?;
-        if portal_side {
-            t.accounting.deposits = t
-                .accounting
-                .deposits
-                .checked_sub(U256::from(total))
-                .ok_or(ModelError::Underflow)?;
-        } else {
-            if t.phase != TokenPhase::ZoneEnabled {
-                return Err(ModelError::TokenNotZoneEnabled(claim.token));
+        match side {
+            RefundSide::Portal => {
+                t.accounting.deposits = t
+                    .accounting
+                    .deposits
+                    .checked_sub(U256::from(total))
+                    .ok_or(ModelError::Underflow)?;
             }
-            t.accounting.supply = t
-                .accounting
-                .supply
-                .checked_add(U256::from(total))
-                .ok_or(ModelError::Overflow)?;
-            t.accounting.withdrawals = t
-                .accounting
-                .withdrawals
-                .checked_sub(U256::from(total))
-                .ok_or(ModelError::Underflow)?;
+            RefundSide::Inbox => {
+                if t.phase != TokenPhase::ZoneEnabled {
+                    return Err(ModelError::TokenNotZoneEnabled(claim.token));
+                }
+                t.accounting.supply = t
+                    .accounting
+                    .supply
+                    .checked_add(U256::from(total))
+                    .ok_or(ModelError::Overflow)?;
+                t.accounting.withdrawals = t
+                    .accounting
+                    .withdrawals
+                    .checked_sub(U256::from(total))
+                    .ok_or(ModelError::Underflow)?;
+            }
         }
         overlay.set(StateKey::Token(claim.token), Some(StateValue::Token(t)));
     }

@@ -15,7 +15,7 @@ pub enum Datum {
         length: u64,
         digest: B256,
     },
-    /// A stable protocol discriminator. This is deliberately not display text.
+    /// A stable protocol discriminator, not display text.
     Code(u16),
 }
 
@@ -49,10 +49,6 @@ pub struct Finding {
     pub expected: Option<Datum>,
     pub actual: Option<Datum>,
 }
-
-/// Names used by the checker persistence contract.
-pub type ViolationCategory = FindingCategory;
-pub type FindingData = Datum;
 
 impl Datum {
     /// Canonical, version-independent bytes used for finding evidence identity.

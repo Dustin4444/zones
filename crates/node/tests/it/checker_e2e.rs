@@ -50,7 +50,7 @@ async fn test_checker_builds_checkpoint_and_restarts_from_durable_journal() -> e
         portal_address: provisioned.portal,
         portal_creation_block_hash: provisioned.portal_creation_block_hash,
         zone_id: provisioned.zone_id,
-        database_path: Some(path.clone()),
+        database_path: path.clone(),
         acquisition_timeout: Duration::from_secs(30),
     };
 

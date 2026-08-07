@@ -72,7 +72,7 @@ pub(crate) struct Metadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MetaValue {
     Version(u32),
-    State(Box<Metadata>),
+    Metadata(Box<Metadata>),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {

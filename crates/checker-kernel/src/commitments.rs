@@ -40,7 +40,7 @@ pub(crate) fn sender_tag(sender: Address, transaction_hash: B256, fallback_nonce
     keccak256(value)
 }
 
-/// Failed-deposit withdrawals retain the Portal's legacy 52-byte zero preimage.
+/// Failed-deposit withdrawals use the Portal's 52-byte zero preimage.
 pub(crate) fn failed_deposit_sender_tag() -> B256 {
     keccak256([0u8; 52])
 }

@@ -14,8 +14,8 @@ use std::{
 use alloy_primitives::B256;
 use alloy_primitives::{Address, U256, keccak256};
 use zone_checker_kernel::{
-    Effect, ExpectedState, Finding as CompactFinding, FindingData, FindingLocation, ImportedFacts,
-    PortalIdentity, State, ViolationCategory, ZoneFacts, apply_imported, apply_zone, validate,
+    Datum, Effect, ExpectedState, Finding, FindingCategory, FindingLocation, ImportedFacts,
+    PortalIdentity, State, ZoneFacts, apply_imported, apply_zone, validate,
 };
 
 use crate::persistence::{
@@ -45,22 +45,22 @@ pub(crate) struct Failure {
     pub class: FailureClass,
     pub gap_reason: CoverageGapReason,
     pub message: String,
-    pub finding: Option<Box<CompactFinding>>,
+    pub finding: Option<Box<Finding>>,
 }
 
 fn typed_failure(
-    category: ViolationCategory,
+    category: FindingCategory,
     code: u16,
     location: Option<FindingLocation>,
-    expected: Option<FindingData>,
-    actual: Option<FindingData>,
+    expected: Option<Datum>,
+    actual: Option<Datum>,
     message: impl Into<String>,
 ) -> Failure {
     Failure {
         class: FailureClass::AuthenticatedDivergence,
         gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
         message: message.into(),
-        finding: Some(Box::new(CompactFinding {
+        finding: Some(Box::new(Finding {
             category,
             code,
             location,
@@ -96,9 +96,6 @@ pub(crate) struct AuthenticatedBlock {
     pub outputs: AuthenticatedOutputs,
 }
 
-/// Shallow, validated notification geometry.  This is deliberately richer
-/// than a vector of coordinates: confusing the old and new fragments (or the
-/// reorg ancestor and replacement tip) can acknowledge unchecked history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NotificationPlan {
     pub reverted: Vec<BlockNumHash>,
@@ -139,9 +136,7 @@ impl NotificationPlan {
     }
 }
 
-/// Must inspect only notification-owned headers; no provider access is
-/// permitted before this plan has been validated and descendants of an active
-/// finding have been handled.
+/// Builds and validates a plan using only notification-owned headers.
 pub(crate) trait PlannedNotification {
     fn plan(&self) -> Result<NotificationPlan, Failure>;
 }
@@ -181,14 +176,14 @@ pub(crate) fn compare_authenticated(
         let evidence = |effect: Option<&Effect>| {
             effect.map(|value| {
                 let bytes = format!("{value:?}").into_bytes();
-                FindingData::Bytes {
+                Datum::Bytes {
                     length: bytes.len() as u64,
                     digest: keccak256(bytes),
                 }
             })
         };
         return Err(typed_failure(
-            ViolationCategory::EffectMismatch,
+            FindingCategory::EffectMismatch,
             1,
             Some(FindingLocation::Operation(index as u32)),
             evidence(effects.get(index)),
@@ -200,11 +195,11 @@ pub(crate) fn compare_authenticated(
         ($field:ident, $datum:ident, $code:expr) => {
             if observed.$field != expected.$field {
                 return Err(typed_failure(
-                    ViolationCategory::StateMismatch,
+                    FindingCategory::StateMismatch,
                     $code,
                     Some(FindingLocation::Block),
-                    Some(FindingData::$datum(expected.$field.into())),
-                    Some(FindingData::$datum(observed.$field.into())),
+                    Some(Datum::$datum(expected.$field.into())),
+                    Some(Datum::$datum(observed.$field.into())),
                     "authenticated state commitment differs",
                 ));
             }
@@ -226,18 +221,13 @@ pub(crate) fn compare_authenticated(
             .copied()
             .expect("unequal maps have a differing key");
         return Err(typed_failure(
-            ViolationCategory::SupplyMismatch,
+            FindingCategory::SupplyMismatch,
             30,
             Some(FindingLocation::State(
                 zone_checker_kernel::StateKey::Token(token),
             )),
-            supplies.get(&token).copied().map(FindingData::U256),
-            block
-                .outputs
-                .supplies
-                .get(&token)
-                .copied()
-                .map(FindingData::U256),
+            supplies.get(&token).copied().map(Datum::U256),
+            block.outputs.supplies.get(&token).copied().map(Datum::U256),
             "authenticated token supply differs",
         ));
     }
@@ -280,12 +270,12 @@ fn validate_creation_coordinate(
         Ok(())
     } else {
         Err(typed_failure(
-            ViolationCategory::CreationAnchor,
+            FindingCategory::CreationAnchor,
             1,
             Some(FindingLocation::Block),
-            Some(FindingData::Hash(identity.creation_block)),
-            Some(FindingData::Hash(block.tempo.hash)),
-            "Portal creation height/hash/grammar diverges from configured anchor",
+            Some(Datum::Hash(identity.creation_block)),
+            Some(Datum::Hash(block.tempo.hash)),
+            "portal creation does not match the configured anchor",
         ))
     }
 }
@@ -357,8 +347,10 @@ impl<N> Runtime<N> {
     pub(crate) fn state(&self) -> RuntimeState {
         self.state
     }
-    pub(crate) fn current(&self) -> Option<&N> {
-        self.current.as_ref().map(|queued| &queued.notification)
+    pub(crate) fn current(&self) -> Option<(&N, &NotificationPlan)> {
+        self.current
+            .as_ref()
+            .map(|queued| (&queued.notification, &queued.plan))
     }
     pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.snapshot
@@ -413,7 +405,7 @@ impl<N> Runtime<N> {
     where
         N: PlannedNotification,
     {
-        let plan = match notification.plan().and_then(NotificationPlan::validate) {
+        let plan = match notification.plan() {
             Ok(plan) => plan,
             Err(_) => return Err(notification),
         };
@@ -449,7 +441,7 @@ impl<N> Runtime<N> {
         if self.state == RuntimeState::Disabled {
             return Ok(RuntimeAction::Terminal);
         }
-        let plan = match notification.plan().and_then(NotificationPlan::validate) {
+        let plan = match notification.plan() {
             Ok(plan) => plan,
             Err(_) => {
                 self.state = RuntimeState::Disabled;
@@ -765,9 +757,7 @@ impl<N> Runtime<N> {
                 let last = *coordinates.last().unwrap();
                 let snapshot = self.snapshot.clone();
                 let typed = failure.finding.ok_or_else(|| {
-                    PersistenceError::Invalid(
-                        "authenticated divergence missing typed finding".into(),
-                    )
+                    PersistenceError::Invalid("authenticated divergence has no finding".into())
                 })?;
                 let (key, finding) = make_finding(
                     zone,
@@ -808,133 +798,14 @@ impl<N> Runtime<N> {
         let suffix_end = *coordinates
             .last()
             .expect("validated nonempty applied fragment");
-        for block in std::slice::from_ref(&block) {
-            let snapshot = self.snapshot.clone();
-            if snapshot.meta.active_finding.is_some() {
-                let first = match snapshot.meta.coverage {
-                    crate::persistence::Coverage::Gap {
-                        first_unchecked, ..
-                    } => first_unchecked,
-                    crate::persistence::Coverage::Complete => block.zone,
-                };
-                self.snapshot = store.record_gap(
-                    &self.snapshot,
-                    first,
-                    suffix_end,
-                    CoverageGapReason::NotCheckedAncestorDivergence,
-                )?;
-                self.state = RuntimeState::Alerting;
-                break;
-            }
-            if let Err(failure) = validate_creation_coordinate(identity, &snapshot.state, block) {
-                self.persist_divergence(store, block, failure)?;
-                self.snapshot = store.record_gap(
-                    &self.snapshot,
-                    block.zone,
-                    suffix_end,
-                    CoverageGapReason::NotCheckedAncestorDivergence,
-                )?;
-                self.state = RuntimeState::Alerting;
-                break;
-            }
-            let candidate = match apply_imported(&snapshot.state, &block.imported)
-                .and_then(|imported| apply_zone(imported, &block.zone_facts))
-            {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    self.persist_divergence(
-                        store,
-                        block,
-                        typed_failure(
-                            ViolationCategory::Invariant,
-                            1,
-                            Some(FindingLocation::Block),
-                            None,
-                            Some(FindingData::Code(1)),
-                            error.to_string(),
-                        ),
-                    )?;
-                    self.snapshot = store.record_gap(
-                        &self.snapshot,
-                        block.zone,
-                        suffix_end,
-                        CoverageGapReason::NotCheckedAncestorDivergence,
-                    )?;
-                    self.state = RuntimeState::Alerting;
-                    break;
-                }
-            };
-            if let Err(failure) = compare_authenticated(block, &candidate) {
-                if failure.class == FailureClass::AuthenticatedDivergence {
-                    self.persist_divergence(store, block, failure)?;
-                    self.snapshot = store.record_gap(
-                        &self.snapshot,
-                        block.zone,
-                        suffix_end,
-                        CoverageGapReason::NotCheckedAncestorDivergence,
-                    )?;
-                    self.state = RuntimeState::Alerting;
-                } else {
-                    let first = block.zone;
-                    self.snapshot =
-                        store.record_gap(&self.snapshot, first, suffix_end, failure.gap_reason)?;
-                    self.state = RuntimeState::Disabled;
-                }
-                break;
-            }
-            // A durable gap is recovered one block at a time.  Keep its
-            // original acknowledgement and reason until the final missing
-            // block closes it; never jump directly from a multi-block gap to
-            // Complete.
-            let coverage = match &snapshot.meta.coverage {
-                crate::persistence::Coverage::Gap {
-                    first_unchecked,
-                    acknowledged_through,
-                    reason,
-                } if *first_unchecked == block.zone => {
-                    if block.zone == *acknowledged_through {
-                        crate::persistence::Coverage::Complete
-                    } else {
-                        let next = gap_next.ok_or_else(|| {
-                            PersistenceError::Invalid("durable gap has no next coordinate".into())
-                        })?;
-                        crate::persistence::Coverage::Gap {
-                            first_unchecked: next,
-                            acknowledged_through: *acknowledged_through,
-                            reason: reason.clone(),
-                        }
-                    }
-                }
-                crate::persistence::Coverage::Complete => crate::persistence::Coverage::Complete,
-                _ => {
-                    return Err(PersistenceError::Invalid(
-                        "applied block does not begin at durable gap".into(),
-                    ));
-                }
-            };
-            let acknowledged = match &coverage {
-                crate::persistence::Coverage::Complete => block.zone,
-                crate::persistence::Coverage::Gap {
-                    acknowledged_through,
-                    ..
-                } => *acknowledged_through,
-            };
-            self.snapshot = store.apply(
-                &self.snapshot,
-                JournalEntry {
-                    zone: block.zone,
-                    parent: block.parent,
-                    imported_tempo: block.tempo,
-                    imported_tempo_parent: block.tempo_parent,
-                    delta: candidate.delta,
-                },
-                acknowledged,
-                coverage,
-            )?;
-            if first + 1 == coordinates.len() {
-                self.state = RuntimeState::Healthy;
-            }
-        }
+        self.process_block(
+            store,
+            identity,
+            &block,
+            suffix_end,
+            gap_next,
+            first + 1 == coordinates.len(),
+        )?;
         // Persistence above is the commit point; only now may the caller ack.
         let ready = self.snapshot.meta.acknowledged_zone_tip;
         if first + 1 == coordinates.len()
@@ -954,14 +825,125 @@ impl<N> Runtime<N> {
         }
     }
 
-    fn persist_divergence(
+    fn process_block(
+        &mut self,
+        store: &Persistence,
+        identity: Identity,
+        block: &AuthenticatedBlock,
+        suffix_end: BlockNumHash,
+        gap_next: Option<BlockNumHash>,
+        is_last: bool,
+    ) -> Result<(), PersistenceError> {
+        let snapshot = self.snapshot.clone();
+        if snapshot.meta.active_finding.is_some() {
+            let first = match snapshot.meta.coverage {
+                crate::persistence::Coverage::Gap {
+                    first_unchecked, ..
+                } => first_unchecked,
+                crate::persistence::Coverage::Complete => block.zone,
+            };
+            self.snapshot = store.record_gap(
+                &self.snapshot,
+                first,
+                suffix_end,
+                CoverageGapReason::NotCheckedAncestorDivergence,
+            )?;
+            self.state = RuntimeState::Alerting;
+            return Ok(());
+        }
+
+        if let Err(failure) = validate_creation_coordinate(identity, &snapshot.state, block) {
+            return self.record_divergence(store, block, suffix_end, failure);
+        }
+        let candidate = match apply_imported(&snapshot.state, &block.imported)
+            .and_then(|imported| apply_zone(imported, &block.zone_facts))
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return self.record_divergence(
+                    store,
+                    block,
+                    suffix_end,
+                    typed_failure(
+                        FindingCategory::Invariant,
+                        1,
+                        Some(FindingLocation::Block),
+                        None,
+                        Some(Datum::Code(1)),
+                        error.to_string(),
+                    ),
+                );
+            }
+        };
+        if let Err(failure) = compare_authenticated(block, &candidate) {
+            if failure.class == FailureClass::AuthenticatedDivergence {
+                return self.record_divergence(store, block, suffix_end, failure);
+            }
+            self.snapshot =
+                store.record_gap(&self.snapshot, block.zone, suffix_end, failure.gap_reason)?;
+            self.state = RuntimeState::Disabled;
+            return Ok(());
+        }
+
+        let coverage = match &snapshot.meta.coverage {
+            crate::persistence::Coverage::Gap {
+                first_unchecked,
+                acknowledged_through,
+                reason,
+            } if *first_unchecked == block.zone => {
+                if block.zone == *acknowledged_through {
+                    crate::persistence::Coverage::Complete
+                } else {
+                    crate::persistence::Coverage::Gap {
+                        first_unchecked: gap_next.ok_or_else(|| {
+                            PersistenceError::Invalid("durable gap has no next coordinate".into())
+                        })?,
+                        acknowledged_through: *acknowledged_through,
+                        reason: reason.clone(),
+                    }
+                }
+            }
+            crate::persistence::Coverage::Complete => crate::persistence::Coverage::Complete,
+            _ => {
+                return Err(PersistenceError::Invalid(
+                    "applied block does not begin at durable gap".into(),
+                ));
+            }
+        };
+        let acknowledged = match &coverage {
+            crate::persistence::Coverage::Complete => block.zone,
+            crate::persistence::Coverage::Gap {
+                acknowledged_through,
+                ..
+            } => *acknowledged_through,
+        };
+        self.snapshot = store.apply(
+            &self.snapshot,
+            JournalEntry {
+                zone: block.zone,
+                parent: block.parent,
+                imported_tempo: block.tempo,
+                imported_tempo_parent: block.tempo_parent,
+                delta: candidate.delta,
+            },
+            acknowledged,
+            coverage,
+        )?;
+        if is_last {
+            self.state = RuntimeState::Healthy;
+        }
+        Ok(())
+    }
+
+    fn record_divergence(
         &mut self,
         store: &Persistence,
         block: &AuthenticatedBlock,
+        suffix_end: BlockNumHash,
         failure: Failure,
     ) -> Result<(), PersistenceError> {
         let typed = failure.finding.ok_or_else(|| {
-            PersistenceError::Invalid("authenticated divergence missing typed finding".into())
+            PersistenceError::Invalid("authenticated divergence has no finding".into())
         })?;
         let (key, finding) = make_finding(
             block.zone,
@@ -971,13 +953,17 @@ impl<N> Runtime<N> {
             failure.message,
         )?;
         self.snapshot = store.record_finding(&self.snapshot, key, finding)?;
+        self.snapshot = store.record_gap(
+            &self.snapshot,
+            block.zone,
+            suffix_end,
+            CoverageGapReason::NotCheckedAncestorDivergence,
+        )?;
+        self.state = RuntimeState::Alerting;
         Ok(())
     }
 }
 
-/// Locally derives identity and replays every block through the exact same
-/// authenticated pipeline and kernel used by the live path. There is
-/// intentionally no API accepting an imported checkpoint.
 pub(crate) struct BuildConfig<'a> {
     pub path: &'a Path,
     pub l1_chain_id: u64,
@@ -995,20 +981,7 @@ pub(crate) fn build_checkpoint<N: PlannedNotification, P: ObservationPipeline<N>
     pipeline: &mut P,
 ) -> Result<Snapshot, PersistenceError> {
     let target = config.path.to_path_buf();
-    if target.exists() {
-        return Err(PersistenceError::Invalid(
-            "checkpoint target is unrelated nonempty state".into(),
-        ));
-    }
-    let staging = staging_path(&target)?;
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|error| {
-            PersistenceError::Invalid(format!("cannot clean stale checkpoint staging: {error}"))
-        })?;
-    }
-    fs::create_dir_all(&staging).map_err(|error| {
-        PersistenceError::Invalid(format!("cannot create checkpoint staging: {error}"))
-    })?;
+    let staging = prepare_staging(&target)?;
     let staged = BuildConfig {
         path: &staging,
         l1_chain_id: config.l1_chain_id,
@@ -1019,23 +992,7 @@ pub(crate) fn build_checkpoint<N: PlannedNotification, P: ObservationPipeline<N>
         anchor: config.anchor,
     };
     let result = build_checkpoint_in_place(staged, history, pipeline);
-    match result {
-        Ok(snapshot) => {
-            // MDBX handles were dropped by `build_checkpoint_in_place`; only a
-            // fully reopened and validated image reaches this publication point.
-            if let Err(error) = fs::rename(&staging, &target) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(PersistenceError::Invalid(format!(
-                    "cannot atomically publish checkpoint: {error}"
-                )));
-            }
-            Ok(snapshot)
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(error)
-        }
-    }
+    publish_staging(&target, &staging, result)
 }
 
 /// Atomically publish an identity-bound genesis checkpoint assembled by
@@ -1045,20 +1002,7 @@ pub(crate) fn publish_genesis_checkpoint(
     state: State,
 ) -> Result<Snapshot, PersistenceError> {
     let target = config.path.to_path_buf();
-    if target.exists() {
-        return Err(PersistenceError::Invalid(
-            "checkpoint target is unrelated nonempty state".into(),
-        ));
-    }
-    let staging = staging_path(&target)?;
-    if staging.exists() {
-        fs::remove_dir_all(&staging).map_err(|error| {
-            PersistenceError::Invalid(format!("cannot clean stale checkpoint staging: {error}"))
-        })?;
-    }
-    fs::create_dir_all(&staging).map_err(|error| {
-        PersistenceError::Invalid(format!("cannot create checkpoint staging: {error}"))
-    })?;
+    let staging = prepare_staging(&target)?;
     let identity = Identity {
         l1_chain_id: config.l1_chain_id,
         zone_chain_id: config.zone_chain_id,
@@ -1081,16 +1025,42 @@ pub(crate) fn publish_genesis_checkpoint(
         }
         Ok(verified)
     })();
+    publish_staging(&target, &staging, result)
+}
+
+fn prepare_staging(target: &Path) -> Result<PathBuf, PersistenceError> {
+    if target.exists() {
+        return Err(PersistenceError::Invalid(
+            "checkpoint target already exists".into(),
+        ));
+    }
+    let staging = staging_path(target)?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|error| {
+            PersistenceError::Invalid(format!("cannot remove checkpoint staging: {error}"))
+        })?;
+    }
+    fs::create_dir_all(&staging).map_err(|error| {
+        PersistenceError::Invalid(format!("cannot create checkpoint staging: {error}"))
+    })?;
+    Ok(staging)
+}
+
+fn publish_staging(
+    target: &Path,
+    staging: &Path,
+    result: Result<Snapshot, PersistenceError>,
+) -> Result<Snapshot, PersistenceError> {
     match result {
         Ok(snapshot) => {
-            fs::rename(&staging, &target).map_err(|error| {
-                let _ = fs::remove_dir_all(&staging);
+            fs::rename(staging, target).map_err(|error| {
+                let _ = fs::remove_dir_all(staging);
                 PersistenceError::Invalid(format!("cannot atomically publish checkpoint: {error}"))
             })?;
             Ok(snapshot)
         }
         Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
+            let _ = fs::remove_dir_all(staging);
             Err(error)
         }
     }
@@ -1140,7 +1110,6 @@ fn build_checkpoint_in_place<N: PlannedNotification, P: ObservationPipeline<N>>(
     for notification in history {
         let plan = notification
             .plan()
-            .and_then(NotificationPlan::validate)
             .map_err(|f| PersistenceError::Invalid(format!("local replay plan: {}", f.message)))?;
         if !plan.reverted.is_empty() {
             snapshot = store.reorg(&snapshot, plan.ancestor)?;
@@ -1264,9 +1233,15 @@ mod tests {
         assert!(runtime.enqueue(3, plan.clone()).is_ok());
         assert_eq!(runtime.enqueue(4, plan), Err(4));
         runtime.advance();
-        assert_eq!(runtime.current(), Some(&2));
+        assert_eq!(
+            runtime.current().map(|(notification, _)| notification),
+            Some(&2)
+        );
         runtime.advance();
-        assert_eq!(runtime.current(), Some(&3));
+        assert_eq!(
+            runtime.current().map(|(notification, _)| notification),
+            Some(&3)
+        );
     }
     #[test]
     fn attempt_and_elapsed_budgets_are_both_terminal() {

@@ -70,6 +70,10 @@ fn create() -> (TempDir, Persistence) {
     (directory, store)
 }
 
+fn current(store: &Persistence) -> super::Snapshot {
+    store.load().unwrap()
+}
+
 fn apply(store: &Persistence, number: u64, parent: BlockNumHash) -> BlockNumHash {
     let snapshot = store.load().unwrap();
     let candidate = apply_zone(
@@ -86,7 +90,7 @@ fn apply(store: &Persistence, number: u64, parent: BlockNumHash) -> BlockNumHash
     };
     let tip = value.zone;
     store
-        .apply(identity(), value, tip, Coverage::Complete)
+        .apply(&current(store), value, tip, Coverage::Complete)
         .unwrap();
     tip
 }
@@ -291,14 +295,18 @@ fn reorg_before_after_and_across_checkpoints_reconstructs_exact_metadata() {
     let three = apply(&store, 3, two);
 
     assert_eq!(
-        store.reorg(identity(), two).unwrap().meta.verified_zone_tip,
+        store
+            .reorg(&current(&store), two)
+            .unwrap()
+            .meta
+            .verified_zone_tip,
         two
     );
     let replacement_three = apply(&store, 3, two);
     assert_eq!(replacement_three, three);
     assert_eq!(
         store
-            .reorg(identity(), bootstrap().zone)
+            .reorg(&current(&store), bootstrap().zone)
             .unwrap()
             .meta
             .active_checkpoint
@@ -316,16 +324,16 @@ fn same_height_finding_is_idempotent_but_conflicting_evidence_is_rejected() {
     let (_directory, store) = create();
     let (key, value) = finding(block(1, 0x11));
     store
-        .record_finding(identity(), key, value.clone())
+        .record_finding(&current(&store), key, value.clone())
         .unwrap();
     store
-        .record_finding(identity(), key, value.clone())
+        .record_finding(&current(&store), key, value.clone())
         .unwrap();
 
     let mut conflicting = value;
     conflicting.details.actual = Some(Datum::Code(5));
     assert!(matches!(
-        store.record_finding(identity(), key, conflicting),
+        store.record_finding(&current(&store), key, conflicting),
         Err(PersistenceError::Invalid(_))
     ));
     assert_eq!(store.load().unwrap().meta.active_finding, Some(key));
@@ -337,14 +345,18 @@ fn finding_identity_ignores_summary_but_separates_codes() {
     let (key, value) = finding(block(1, 0x11));
     let mut reworded = value.clone();
     reworded.summary = "new display wording".into();
-    store.record_finding(identity(), key, value).unwrap();
-    store.record_finding(identity(), key, reworded).unwrap();
+    store.record_finding(&current(&store), key, value).unwrap();
+    store
+        .record_finding(&current(&store), key, reworded)
+        .unwrap();
 
     let mut other_key = key;
     other_key.code += 1;
     let mut other = finding(block(1, 0x11)).1;
     other.details.code = other_key.code;
-    store.record_finding(identity(), other_key, other).unwrap();
+    store
+        .record_finding(&current(&store), other_key, other)
+        .unwrap();
     assert_eq!(store.load().unwrap().meta.active_finding, Some(other_key));
 }
 
@@ -354,15 +366,23 @@ fn finding_rejects_forged_evidence_and_wrong_coordinates() {
     let (key, value) = finding(block(1, 0x11));
     let mut forged = value.clone();
     forged.evidence_len += 1;
-    assert!(store.record_finding(identity(), key, forged).is_err());
+    assert!(store.record_finding(&current(&store), key, forged).is_err());
     let mut forged = value.clone();
     forged.evidence_digest = B256::ZERO;
-    assert!(store.record_finding(identity(), key, forged).is_err());
+    assert!(store.record_finding(&current(&store), key, forged).is_err());
     let (wrong_key, wrong) = finding(block(2, 0x12));
-    assert!(store.record_finding(identity(), wrong_key, wrong).is_err());
+    assert!(
+        store
+            .record_finding(&current(&store), wrong_key, wrong)
+            .is_err()
+    );
     let mut wrong_parent = value;
     wrong_parent.parent.hash = B256::ZERO;
-    assert!(store.record_finding(identity(), key, wrong_parent).is_err());
+    assert!(
+        store
+            .record_finding(&current(&store), key, wrong_parent)
+            .is_err()
+    );
 }
 
 #[test]
@@ -404,10 +424,10 @@ fn alert_descendant_reorg_preserves_or_removes_the_latch_by_exact_height() {
     let (_directory, store) = create();
     let finding_block = block(1, 0x41);
     let (key, value) = finding(finding_block);
-    store.record_finding(identity(), key, value).unwrap();
+    store.record_finding(&current(&store), key, value).unwrap();
     store
         .record_gap(
-            identity(),
+            &current(&store),
             finding_block,
             block(3, 0x43),
             CoverageGapReason::Other(9),
@@ -415,19 +435,19 @@ fn alert_descendant_reorg_preserves_or_removes_the_latch_by_exact_height() {
         .unwrap();
     assert_eq!(
         store
-            .reorg(identity(), block(2, 0x42))
+            .reorg(&current(&store), block(2, 0x42))
             .unwrap()
             .meta
             .active_finding,
         Some(key)
     );
     assert!(matches!(
-        store.reorg(identity(), block(1, 0xff)),
+        store.reorg(&current(&store), block(1, 0xff)),
         Err(PersistenceError::Invalid(_))
     ));
     assert_eq!(
         store
-            .reorg(identity(), bootstrap().zone)
+            .reorg(&current(&store), bootstrap().zone)
             .unwrap()
             .meta
             .active_finding,
@@ -442,10 +462,10 @@ fn deep_reorg_retains_orphan_finding_as_structural_audit_record() {
     let _two = apply(&store, 2, one);
     let finding_block = block(3, 0x43);
     let (key, value) = finding(finding_block);
-    store.record_finding(identity(), key, value).unwrap();
+    store.record_finding(&current(&store), key, value).unwrap();
     store
         .record_gap(
-            identity(),
+            &current(&store),
             finding_block,
             block(4, 0x44),
             CoverageGapReason::NotCheckedAncestorDivergence,
@@ -453,7 +473,7 @@ fn deep_reorg_retains_orphan_finding_as_structural_audit_record() {
         .unwrap();
     assert_eq!(
         store
-            .reorg(identity(), bootstrap().zone)
+            .reorg(&current(&store), bootstrap().zone)
             .unwrap()
             .meta
             .active_finding,
@@ -470,23 +490,23 @@ fn stale_orphan_cannot_be_installed_as_active_finding() {
     let (_directory, store) = create();
     let old = block(1, 0x41);
     let (key, value) = finding(old);
-    store.record_finding(identity(), key, value).unwrap();
+    store.record_finding(&current(&store), key, value).unwrap();
     store
         .record_gap(
-            identity(),
+            &current(&store),
             old,
             old,
             CoverageGapReason::NotCheckedAncestorDivergence,
         )
         .unwrap();
-    store.reorg(identity(), bootstrap().zone).unwrap();
+    store.reorg(&current(&store), bootstrap().zone).unwrap();
     let replacement = apply(&store, 1, bootstrap().zone);
     assert_ne!(replacement, old);
 
     let mut meta = store.load().unwrap().meta;
     meta.active_finding = Some(key);
     let tx = store.db.tx_mut().unwrap();
-    tx.put::<Meta>(MetaKey::State, MetaValue::State(Box::new(meta)))
+    tx.put::<Meta>(MetaKey::Metadata, MetaValue::Metadata(Box::new(meta)))
         .unwrap();
     tx.commit().unwrap();
     assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
@@ -499,7 +519,7 @@ fn gap_is_durable_before_acknowledgement_advances() {
     let through = block(4, 0x34);
     store
         .record_gap(
-            identity(),
+            &current(&store),
             first,
             through,
             CoverageGapReason::MissingReceipts,
@@ -526,11 +546,11 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
     let three = block(3, 0x13);
     let reason = CoverageGapReason::ProviderUnavailable;
     store
-        .record_gap(identity(), one, three, reason.clone())
+        .record_gap(&current(&store), one, three, reason.clone())
         .unwrap();
     assert!(matches!(
         store.apply(
-            identity(),
+            &current(&store),
             entry(1, bootstrap().zone),
             one,
             Coverage::Complete
@@ -539,7 +559,7 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
     ));
     store
         .apply(
-            identity(),
+            &current(&store),
             entry(1, bootstrap().zone),
             three,
             Coverage::Gap {
@@ -551,7 +571,7 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
         .unwrap();
     store
         .apply(
-            identity(),
+            &current(&store),
             entry(2, one),
             three,
             Coverage::Gap {
@@ -562,7 +582,7 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
         )
         .unwrap();
     let snapshot = store
-        .apply(identity(), entry(3, two), three, Coverage::Complete)
+        .apply(&current(&store), entry(3, two), three, Coverage::Complete)
         .unwrap();
     assert_eq!(snapshot.meta.verified_zone_tip, three);
     assert_eq!(snapshot.meta.acknowledged_zone_tip, three);
@@ -585,14 +605,19 @@ fn stale_checkpoint_from_an_orphaned_branch_is_skipped() {
         )
         .unwrap();
     apply(&store, 2, one_a);
-    store.reorg(identity(), bootstrap().zone).unwrap();
+    store.reorg(&current(&store), bootstrap().zone).unwrap();
 
     let mut replacement = entry(1, bootstrap().zone);
     replacement.zone = block(1, 0xb1);
     store
-        .apply(identity(), replacement, block(1, 0xb1), Coverage::Complete)
+        .apply(
+            &current(&store),
+            replacement,
+            block(1, 0xb1),
+            Coverage::Complete,
+        )
         .unwrap();
-    let snapshot = store.reorg(identity(), block(1, 0xb1)).unwrap();
+    let snapshot = store.reorg(&current(&store), block(1, 0xb1)).unwrap();
     assert_eq!(snapshot.meta.active_checkpoint.height, 0);
     assert_eq!(snapshot.meta.verified_zone_tip, block(1, 0xb1));
 }
@@ -603,7 +628,7 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
     store.inject_abort();
     assert!(matches!(
         store.apply(
-            identity(),
+            &current(&store),
             entry(1, bootstrap().zone),
             block(1, 0x11),
             Coverage::Complete
@@ -634,7 +659,7 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
     let two = apply(&store, 2, one);
     store.inject_abort();
     assert!(matches!(
-        store.reorg(identity(), one),
+        store.reorg(&current(&store), one),
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(store.load().unwrap().meta.verified_zone_tip, two);
@@ -649,7 +674,7 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
     let (key, value) = finding(block(1, 0x41));
     store.inject_abort();
     assert!(matches!(
-        store.record_finding(identity(), key, value),
+        store.record_finding(&current(&store), key, value),
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(store.load().unwrap().meta.active_finding, None);
@@ -657,7 +682,7 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
     store.inject_abort();
     assert!(matches!(
         store.record_gap(
-            identity(),
+            &current(&store),
             block(1, 0x41),
             block(3, 0x43),
             CoverageGapReason::MissingTempoData,

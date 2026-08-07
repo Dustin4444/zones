@@ -28,7 +28,7 @@ checkpoint + journal + finding transaction
 Reth FinishedHeight
 ```
 
-Observation and expectation have deliberately separate construction paths.
+Observation and expectation have separate construction paths.
 ABI bindings decode authenticated wire data; they are not semantic model
 helpers. The kernel depends on generic primitives and checker-owned protocol
 types, not production Inbox, Outbox, Portal, sequencer, or payload transition
@@ -99,16 +99,15 @@ The checker owns a dedicated MDBX environment with exactly four tables:
 | `Journal` | Canonical block identity, parent continuity, sorted delta, coverage |
 | `Findings` | Bounded findings and canonical/orphan lineage |
 
-Keys and values use exact, bounded, versioned codecs. Unknown versions/tags,
+Keys and values use exact, bounded, versioned codecs. Unknown versions and tags,
 trailing data, missing rows, duplicate positions, conflicting entries, and
 invalid key/value families are corruption. An incompatible schema is opened
-read-only only as needed to identify the mismatch, then routed to a fresh
-checkpoint build; it is never modified as if compatible.
+read-only to identify the mismatch, then routed to a fresh checkpoint build.
 
 The identity-bound bootstrap checkpoint is immutable. Checkpoint publication
 is staged and reopened for validation before becoming authoritative. The
-canonical journal is intentionally unpruned because no accepted finality or
-reorg-horizon contract exists.
+canonical journal is unpruned because no finality or reorg-horizon contract
+exists.
 
 Every block apply transaction records continuity, semantic delta, tips,
 coverage, and any finding atomically. A checkpoint transaction writes a
@@ -125,7 +124,7 @@ ancestor, reconstructs that exact cut from a checkpoint plus journal, truncates
 the old canonical suffix atomically, and applies replacement blocks in order.
 Reorgs before, after, and across checkpoints use the same representation.
 
-A deterministic semantic divergence commits a compact finding and the active
+A deterministic semantic divergence commits a finding and the active
 alert latch without committing its candidate semantic delta. The latch names
 the exact finding lineage and verified parent. Descendants are persisted as
 `NotCheckedAncestorDivergence`; they are never passing blocks. If a reorg
@@ -201,10 +200,7 @@ Coverage is truthful by construction:
 
 ## Operational limitations
 
-There is no journal pruning policy yet; disk use grows with canonical history.
-Rebuild requires the local Zone history and configured Tempo archive evidence
-needed by the builder. Schema changes require a fresh database path. There is
-no offline semantic-key diagnostic command or metrics/performance contract in
-the cut-over implementation; findings contain compact coordinates for archive
-investigation. Current real-node evidence is a functional checkpoint,
-processing, persistence, and restart test, not a production performance claim.
+There is no journal pruning policy; disk use grows with canonical history.
+Rebuild requires local Zone history and the Tempo archive evidence used by the
+builder. Schema changes require a fresh database path. Findings include the
+coordinates needed for archive investigation.

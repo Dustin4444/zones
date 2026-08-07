@@ -1,7 +1,7 @@
 //! Kernel adapter for already authenticated observations.
 //!
-//! This module deliberately translates wire facts twice: inputs feed the
-//! kernel, while outputs are built only from receipt events and exact reads.
+//! Inputs feed the kernel; outputs come only from receipt events and exact
+//! reads.
 
 use std::{collections::BTreeMap, num::NonZeroU64};
 
@@ -51,11 +51,11 @@ fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
         gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
         message: message.into(),
         finding: Some(Box::new(zone_checker_kernel::Finding {
-            category: zone_checker_kernel::ViolationCategory::Observation,
+            category: zone_checker_kernel::FindingCategory::Observation,
             code,
             location: Some(zone_checker_kernel::FindingLocation::Block),
             expected: None,
-            actual: Some(zone_checker_kernel::FindingData::Code(code)),
+            actual: Some(zone_checker_kernel::Datum::Code(code)),
         })),
     }
 }
@@ -141,9 +141,7 @@ pub(crate) fn adapt(o: &PreauthenticatedObservation) -> Result<AuthenticatedBloc
     })
 }
 
-/// Standalone projection for one authenticated Tempo block. This is
-/// intentionally independent of an L2 observation, so archive bootstrap cannot
-/// manufacture a Zone step.
+/// Projects one authenticated Tempo block for bootstrap without a Zone transition.
 pub(crate) struct ImportedProjection {
     pub facts: ImportedFacts,
     pub effects: Vec<Effect>,
@@ -822,10 +820,7 @@ fn zone_facts(o: &PreauthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>
     ))
 }
 
-/// Validate the event language with one transaction-scoped cursor. Projection
-/// below is deliberately field-oriented; this gate establishes ownership and
-/// ensures no protocol event can be ignored, borrowed by another envelope, or
-/// accepted in a different order.
+/// Validate event ownership and order with one transaction-scoped cursor.
 fn validate_zone_event_grammar(o: &PreauthenticatedObservation) -> Result<(), Failure> {
     let events = o.l2.outcomes().events();
     let advance = o.l2.inputs().advance_tempo();
