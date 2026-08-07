@@ -20,13 +20,14 @@ fn checker_is_parsed_by_the_top_level_cli() {
     let parsed = ZoneCli::try_parse_from([
         "tempo-zone",
         "checker",
-        "diagnose",
-        "--database-path",
+        "build-checkpoint",
+        "--checker.portal-creation-block-hash",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "--checker.database-path",
         "checker-db",
-        "--zone-height",
-        "1",
-        "--key",
-        "portal-config",
+        "--",
+        "--chain",
+        "dev",
     ])
     .unwrap();
     assert!(matches!(parsed, ZoneCli::Checker(_)));

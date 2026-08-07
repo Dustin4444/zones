@@ -1,7 +1,5 @@
 //! Exact-header and complete-receipt authentication.
 
-use std::time::{Duration, Instant};
-
 use alloy_consensus::{BlockHeader as _, Sealable as _};
 use alloy_eips::BlockId;
 use alloy_network::{
@@ -97,24 +95,22 @@ pub(super) async fn acquire_receipts<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
     block: &AuthenticatedBlock,
-) -> Result<(Vec<TempoTransactionReceipt>, Duration), ObservationError>
+) -> Result<Vec<TempoTransactionReceipt>, ObservationError>
 where
     P: Provider<TempoNetwork>,
 {
-    let fetch_started = Instant::now();
     let receipts = provider
         .get_block_receipts(BlockId::hash(imported.hash()))
         .await
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Receipts, error))?
         .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Receipts, imported.hash()))?;
-    let fetch_duration = fetch_started.elapsed();
     let transaction_hashes = block
         .transactions
         .iter()
         .map(|transaction| transaction.tx_hash())
         .collect::<Vec<_>>();
     authenticate_receipts(imported, &transaction_hashes, &receipts)?;
-    Ok((receipts, fetch_duration))
+    Ok(receipts)
 }
 
 pub(super) fn authenticate_transactions(

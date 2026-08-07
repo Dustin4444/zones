@@ -8,7 +8,7 @@ use reth_primitives_traits::SealedHeader;
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZonePortal};
 
-use crate::model::constants::{
+use crate::protocol::constants::{
     AUTHENTICATED_WITHDRAWAL_SIZE, ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE, MAX_CALLBACK_DATA_SIZE,
     MAX_DEPOSITS_PER_TEMPO_BLOCK, MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES,
     MAX_TOKEN_SYMBOL_BYTES, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
@@ -139,16 +139,6 @@ impl DecodedAdvanceTempo {
 
     pub(crate) fn enabled_tokens(&self) -> &[IZoneInbox::EnabledToken] {
         &self.enabled_tokens
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty_for_test(imported_header: ImportedTempoHeader) -> Self {
-        Self {
-            imported_header,
-            deposits: Vec::new(),
-            decryptions: Vec::new(),
-            enabled_tokens: Vec::new(),
-        }
     }
 }
 

@@ -22,10 +22,6 @@ use tempo_zone_contracts::ZonePortal;
 
 use super::{authentication, calls, events, observe_l1};
 use crate::{
-    model::{
-        constants::AUTHENTICATED_WITHDRAWAL_SIZE,
-        events::{L1ProtocolEvent, PortalModelEvent},
-    },
     observe::{
         abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
         error::{
@@ -33,6 +29,10 @@ use crate::{
             AuthenticatedTransaction, DataSource, ObservationError, PortalCallError,
             PortalCallFamily, ProtocolChain,
         },
+    },
+    protocol::{
+        constants::AUTHENTICATED_WITHDRAWAL_SIZE,
+        events::{L1ProtocolEvent, PortalModelEvent},
     },
 };
 

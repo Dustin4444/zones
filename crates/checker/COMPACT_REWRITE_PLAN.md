@@ -1,6 +1,6 @@
 # Compact Zone checker rewrite plan
 
-Status: implementation handoff
+Status: implemented
 
 Target agent: Amp `medium`
 
@@ -19,8 +19,8 @@ Merge base: `55b0fcbed520570c5e1089dc5db97d05b5546571`
 | 2 — compact kernel skeleton | passed | `f2d91909` | Independent four-dependency kernel; one typed row space, read-through overlay, sorted delta, compact facts/effects/findings, creation/config/token/ordinary-deposit transitions, literal commitment vector, and legacy semantic snapshot parity. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (12 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (434 unit tests and 1 doc test); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Kernel production/test LOC: 1,018/393; migration-wide production/test LOC: 35,197/28,821. The skeleton's density supports the planned 6–7.5k complete-kernel range. | Legacy remains authoritative outside creation, configuration, token enablement, and ordinary-deposit append/processing. The pre-existing metrics recorder test requires serial execution because its derived metric handles are process-global. |
 | 3 — complete lifecycle kernel | passed | `721eb1c2` | Complete release-one ownership and lifecycle, exact native effect grammar, imported-context ownership, owner-graph/ring/S-D-W invariants, all six terminal differential traces, partial processing, empty batches, aggregate claims, and field mutations. Oracle blockers were applied. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (20 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (439 unit tests and 1 doc test); focused differential suite (6 tests); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Kernel production/test LOC: 2,610/1,000. | Legacy remains the differential oracle through Milestone 5. Persistence-load validation and production observation reconciliation are Milestones 4–5 responsibilities. |
 | 4 — checkpoint/journal store | passed | `e181548e` | Exactly four tables; fixed-int bounded versioned codecs; immutable bootstrap and exact authoritative checkpoints; complete canonical journal; validated replay/restart/reorg; compact durable findings and active latch; truthful gap recovery; atomic apply/checkpoint/reorg/finding/gap writes. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (20 tests); `cargo +1.95.0 test -p zone-checker persistence --no-fail-fast` (16 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (454 unit tests and 1 doc test); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`. Persistence production/test LOC: 964/627; kernel production/test LOC: 2,619/1,000; migration-wide production/test LOC: 37,763/30,922. | The canonical journal is intentionally unpruned. Checkpoint size and replay latency are measured on a small-state, 256-block fixture; operational-scale measurement remains a runtime rollout concern, not a correctness gap. |
-| 5 — builder and compact runtime | passed | this milestone commit; resolved in the next ledger update | Identity-bound archive builder, authenticated genesis handoff, concrete block-granular ExEx acquisition, bounded FIFO/retries, exact commit/revert/reorg plans, typed findings, durable verified/acknowledged/gap state, active-finding lineage, commit-before-ack, terminal fail-open, and restart catch-up. Three Oracle review rounds were applied; final review found no M5 blocker. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (21 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (473 unit tests and 1 doc test); focused compact/persistence suites (21/19 tests); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`; `cargo +1.95.0 test -p zone-node --features cli,test-utils --test it checker` (2 passed, 1 manual benchmark ignored); checker CLI suite (11 tests). Compact runtime/adapter/builder production/test LOC: 3,361/666; persistence: 1,075/727; kernel: 2,754/1,047; migration-wide production/test LOC: 41,394/31,714 while the legacy oracle remains. | The canonical journal remains unpruned. `FinishedHeight` is emitted only from validated notification or durable coordinates; malformed/empty notification fragments terminate without acknowledgement. Public launch remains legacy until M6 cutover. |
-| 6 — cutover and deletion | active | pending | Public cutover, legacy deletion, consolidation, documentation, and final gates next | — |
+| 5 — builder and compact runtime | passed | `b450d67a` | Identity-bound archive builder, authenticated genesis handoff, concrete block-granular ExEx acquisition, bounded FIFO/retries, exact commit/revert/reorg plans, typed findings, durable verified/acknowledged/gap state, active-finding lineage, commit-before-ack, terminal fail-open, and restart catch-up. Three Oracle review rounds were applied; final review found no M5 blocker. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (21 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (473 unit tests and 1 doc test); focused compact/persistence suites (21/19 tests); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`; `cargo +1.95.0 test -p zone-node --features cli,test-utils --test it checker` (2 passed, 1 manual benchmark ignored); checker CLI suite (11 tests). Compact runtime/adapter/builder production/test LOC: 3,361/666; persistence: 1,075/727; kernel: 2,754/1,047; migration-wide production/test LOC: 41,394/31,714 while the legacy oracle remains. | The canonical journal remains unpruned. `FinishedHeight` is emitted only from validated notification or durable coordinates; malformed/empty notification fragments terminate without acknowledgement. Public launch remained legacy until M6 cutover. |
+| 6 — cutover and deletion | passed | this milestone commit; exact SHA recorded by the final ledger commit | Public launch/CLI/ExEx use the new runtime; old semantic, adapter, store, history, finding-codec, diagnostic, metrics, bootstrap-FSM, runtime, and duplicated test forests deleted; migration names removed; operator/design/vector/performance documentation rewritten. `cargo +1.95.0 fmt --check`; `cargo +1.95.0 test -p zone-checker-kernel` (21 tests); `RUST_TEST_THREADS=1 cargo +1.95.0 test -p zone-checker` (106 tests); `cargo +1.95.0 clippy -p zone-checker-kernel -p zone-checker --all-targets --all-features -- -D warnings`; `cargo +1.95.0 test -p zone-node --features cli,test-utils --test it checker` (1 real-node checkpoint/process/restart test). Final production/test LOC: 11,405/5,496. All applicable differential and field-mutation gates passed before deletion. | The canonical journal remains unpruned. Exact-hash Zone state and Tempo collateral reads have no independently verified state proof. Unprovable `FinishedHeight` jumps remain explicit gaps rather than trusted jumps. No performance/SLO claim is made. |
 
 ### Milestone 0 baseline record
 
@@ -36,6 +36,24 @@ LOC uses physical Rust lines under `crates/checker/src`; files below a `tests/` 
 | `store` | 11,522 | 8,616 | 20,138 |
 | roots and cross-cutting | 1,031 | 3,031 | 4,062 |
 | **Total** | **34,157** | **28,136** | **62,293** |
+
+### Milestone 6 final measurements
+
+The baseline physical-line classification gives:
+
+| Subsystem | Production LOC | Test LOC | Total LOC |
+|---|---:|---:|---:|
+| authenticated observation | 2,559 | 2,263 | 4,822 |
+| neutral protocol/events/layout | 1,187 | 793 | 1,980 |
+| checkpoint/journal persistence | 1,088 | 727 | 1,815 |
+| builder/runtime/adapter/ExEx and roots | 3,442 | 666 | 4,108 |
+| bootstrap identity/ancestry | 375 | 0 | 375 |
+| semantic kernel | 2,754 | 1,047 | 3,801 |
+| **Total** | **11,405** | **5,496** | **16,901** |
+
+The lower-than-planned production total reflects deletion of wrapper/model-mirror forests rather
+than reduced semantic coverage. The kernel lifecycle, independent vectors, mutation tests, and
+crash/reorg tests remain in the final tree.
 
 Authenticated-field classification at baseline:
 

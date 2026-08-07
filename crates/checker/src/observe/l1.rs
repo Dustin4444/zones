@@ -5,13 +5,11 @@
 //! that header, authenticates every transaction envelope against the header's
 //! transaction root, and decodes needed Portal calldata from those envelopes.
 
-use std::time::Duration;
-
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use tempo_alloy::TempoNetwork;
 
-use crate::model::events::L1ProtocolEvent;
+use crate::protocol::events::L1ProtocolEvent;
 
 use super::{
     abi::{DecodedPortalCall, ImportedTempoHeader},
@@ -39,18 +37,22 @@ pub(crate) struct L1EventPosition {
 }
 
 impl L1EventPosition {
+    #[cfg(test)]
     pub(crate) fn transaction_index(&self) -> usize {
         self.transaction_index
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_log_index(&self) -> usize {
         self.receipt_log_index
     }
 
+    #[cfg(test)]
     pub(crate) fn block_log_index(&self) -> usize {
         self.block_log_index
     }
 
+    #[cfg(test)]
     pub(crate) fn transaction_hash(&self) -> B256 {
         self.transaction_hash
     }
@@ -64,6 +66,7 @@ pub(crate) struct OrderedL1Outcome {
 }
 
 impl OrderedL1Outcome {
+    #[cfg(test)]
     pub(crate) fn position(&self) -> L1EventPosition {
         self.position
     }
@@ -84,10 +87,12 @@ pub(crate) struct L1TransactionObservation {
 }
 
 impl L1TransactionObservation {
+    #[cfg(test)]
     pub(crate) fn transaction_index(&self) -> usize {
         self.transaction_index
     }
 
+    #[cfg(test)]
     pub(crate) fn transaction_hash(&self) -> B256 {
         self.transaction_hash
     }
@@ -110,23 +115,16 @@ pub(crate) struct L1BlockObservation {
     protocol_transactions: Vec<L1TransactionObservation>,
 }
 
-/// Authenticated L1 block data paired with acquisition-only measurements.
-///
-/// Timings are deliberately kept outside [`L1BlockObservation`]: wall-clock
-/// metadata is neither authenticated nor part of observation equality.
+/// Authenticated L1 block data.
 #[derive(Debug)]
 pub(crate) struct L1BlockAcquisition {
     observation: L1BlockObservation,
-    receipt_fetch_duration: Duration,
 }
 
 impl L1BlockAcquisition {
+    #[cfg(test)]
     pub(crate) const fn observation(&self) -> &L1BlockObservation {
         &self.observation
-    }
-
-    pub(crate) const fn receipt_fetch_duration(&self) -> Duration {
-        self.receipt_fetch_duration
     }
 
     pub(crate) fn into_observation(self) -> L1BlockObservation {
@@ -150,68 +148,6 @@ impl L1BlockObservation {
     pub(crate) fn protocol_transactions(&self) -> &[L1TransactionObservation] {
         &self.protocol_transactions
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        block_number: u64,
-        block_hash: B256,
-        portal_address: Address,
-        transactions: Vec<(B256, Vec<L1ProtocolEvent>)>,
-    ) -> Self {
-        Self::with_calls_for_test(
-            block_number,
-            block_hash,
-            portal_address,
-            transactions
-                .into_iter()
-                .map(|(hash, events)| (hash, None, events))
-                .collect(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_calls_for_test(
-        block_number: u64,
-        block_hash: B256,
-        portal_address: Address,
-        transactions: Vec<(B256, Option<DecodedPortalCall>, Vec<L1ProtocolEvent>)>,
-    ) -> Self {
-        let mut block_log_index = 0;
-        let protocol_transactions = transactions
-            .into_iter()
-            .enumerate()
-            .map(
-                |(transaction_index, (transaction_hash, direct_call, events))| {
-                    let outcomes = events
-                        .into_iter()
-                        .enumerate()
-                        .map(|(receipt_log_index, event)| {
-                            let position = L1EventPosition {
-                                transaction_index,
-                                receipt_log_index,
-                                block_log_index,
-                                transaction_hash,
-                            };
-                            block_log_index += 1;
-                            OrderedL1Outcome { position, event }
-                        })
-                        .collect();
-                    L1TransactionObservation {
-                        transaction_index,
-                        transaction_hash,
-                        direct_call,
-                        outcomes,
-                    }
-                },
-            )
-            .collect();
-        Self {
-            block_number,
-            block_hash,
-            portal_address,
-            protocol_transactions,
-        }
-    }
 }
 
 /// Observe the exact L1 block selected by the authenticated `advanceTempo`
@@ -228,8 +164,7 @@ where
     P: Provider<TempoNetwork>,
 {
     let block = authentication::acquire_block(provider, imported).await?;
-    let (receipts, receipt_fetch_duration) =
-        authentication::acquire_receipts(provider, imported, &block).await?;
+    let receipts = authentication::acquire_receipts(provider, imported, &block).await?;
     let transaction_hashes = block
         .transactions
         .iter()
@@ -268,6 +203,5 @@ where
             portal_address: portal,
             protocol_transactions,
         },
-        receipt_fetch_duration,
     })
 }

@@ -278,7 +278,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
                 .node(node)
                 .launch_with_debug_capabilities()
                 .await?;
-            zone_checker::build_compact_checkpoint(
+            zone_checker::build_checkpoint(
                 config,
                 zone_chain_id,
                 node_handle.node.provider(),
