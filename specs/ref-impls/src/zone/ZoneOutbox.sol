@@ -306,8 +306,7 @@ contract ZoneOutbox is IZoneOutbox {
         // Fee is paid in the same token being withdrawn
         uint128 fee = _calculateWithdrawalFee(gasLimit);
         uint128 totalBurn = amount + fee;
-        bytes32 senderTag =
-            keccak256(abi.encode(SENDER_TAG_DOMAIN, tempoPortal, msg.sender, senderWitness));
+        bytes32 senderTag = _senderTag(tempoPortal, msg.sender, senderWitness);
         if (_usedSenderTags[senderTag]) revert DuplicateSenderTag();
         _usedSenderTags[senderTag] = true;
 
@@ -506,9 +505,19 @@ contract ZoneOutbox is IZoneOutbox {
         if (pending.sender == address(0) && pending.fallbackNonce == 0) {
             return keccak256(abi.encodePacked(address(0), bytes32(0)));
         }
-        return keccak256(
-            abi.encode(SENDER_TAG_DOMAIN, tempoPortal, pending.sender, pending.senderWitness)
-        );
+        return _senderTag(tempoPortal, pending.sender, pending.senderWitness);
+    }
+
+    function _senderTag(
+        address portal,
+        address sender,
+        bytes32 senderWitness
+    )
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(SENDER_TAG_DOMAIN, portal, sender, senderWitness));
     }
 
     /// @notice Number of pending withdrawals
