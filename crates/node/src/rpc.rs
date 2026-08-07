@@ -111,6 +111,7 @@ pub(crate) struct OperatorZoneApi<P> {
     zone_id: u32,
     chain_id: u64,
     portal_address: Address,
+    enabled_tokens: EnabledTokenRegistry,
     l1_provider: DynProvider<TempoNetwork>,
     zone_provider: P,
 }
@@ -120,6 +121,7 @@ impl<P> OperatorZoneApi<P> {
         zone_id: u32,
         chain_id: u64,
         portal_address: Address,
+        enabled_tokens: EnabledTokenRegistry,
         l1_provider: DynProvider<TempoNetwork>,
         zone_provider: P,
     ) -> Self {
@@ -127,6 +129,7 @@ impl<P> OperatorZoneApi<P> {
             zone_id,
             chain_id,
             portal_address,
+            enabled_tokens,
             l1_provider,
             zone_provider,
         }
@@ -150,6 +153,7 @@ where
             self.zone_id,
             self.chain_id,
             self.portal_address,
+            enabled_zone_tokens(self.portal_address, &self.enabled_tokens),
             tempo_block_number,
             &self.l1_provider,
         )
@@ -288,16 +292,27 @@ async fn zone_sequencers(
     Ok(sequencers)
 }
 
+/// Returns the zone's enabled token addresses from the node's synced registry,
+/// preserving the default token when running without an L1 portal.
+fn enabled_zone_tokens(portal_address: Address, registry: &EnabledTokenRegistry) -> Vec<Address> {
+    if portal_address.is_zero() {
+        return vec![ZONE_TOKEN_ADDRESS];
+    }
+
+    registry.read().iter().copied().collect()
+}
+
 /// Builds the Zone metadata shared by the operator and redacted RPC surfaces.
 ///
-/// The caller supplies the local Zone's processed Tempo block number; the
-/// remaining dynamic fields are read directly from the ZonePortal on Tempo L1.
-/// A zero portal address (running without an L1 portal) reports static
-/// defaults without touching L1.
+/// The caller supplies the enabled token list and the local Zone's processed
+/// Tempo block number; the remaining dynamic fields are read directly from the
+/// ZonePortal on Tempo L1. A zero portal address (running without an L1
+/// portal) reports static defaults without touching L1.
 async fn zone_info(
     zone_id: u32,
     chain_id: u64,
     portal_address: Address,
+    zone_tokens: Vec<Address>,
     tempo_block_number: u64,
     l1_provider: &DynProvider<TempoNetwork>,
 ) -> Result<ZoneInfoResponse, JsonRpcError> {
@@ -306,7 +321,7 @@ async fn zone_info(
             zone_id: U64::from(zone_id),
             is_access_enforced: false,
             is_gateway_open: true,
-            zone_tokens: vec![ZONE_TOKEN_ADDRESS],
+            zone_tokens,
             sequencers: Vec::new(),
             chain_id: U64::from(chain_id),
             tempo_block_number: U64::from(tempo_block_number),
@@ -314,8 +329,7 @@ async fn zone_info(
     }
 
     let portal = ZonePortal::new(portal_address, l1_provider);
-    let (zone_tokens, sequencers, is_access_enforced, is_gateway_open) = tokio::try_join!(
-        async { portal.enabled_tokens().await.map_err(internal) },
+    let (sequencers, is_access_enforced, is_gateway_open) = tokio::try_join!(
         zone_sequencers(portal_address, l1_provider),
         async { portal.isAccessEnforced().call().await.map_err(internal) },
         async { portal.isGatewayOpen().call().await.map_err(internal) },
@@ -396,7 +410,7 @@ where
             sequencer_address: node.secp256k1_address(),
             rpc_only: node.is_rpc_only(),
             is_local: node.ed25519_public_key() == &context.local_ed25519_public_key,
-            tip: tips.get(node.ed25519_public_key()).map(peer_tip_info),
+            tip: tips.get(node.ed25519_public_key()).map(PeerTip::rpc_info),
         })
         .collect();
 
@@ -417,7 +431,7 @@ where
             role: status.role.to_owned(),
         }),
         active_leader,
-        local_tip: Some(peer_tip_info(&local_tip)),
+        local_tip: Some(local_tip.rpc_info()),
         peers,
         progress: Some(SequencerProgress {
             zone_height: U64::from(local_tip.zone_height),
@@ -439,13 +453,22 @@ where
     })
 }
 
-/// Converts hash-carrying peer tip evidence into its RPC representation.
-fn peer_tip_info(tip: &PeerTip) -> PeerTipInfo {
-    PeerTipInfo {
-        zone_height: U64::from(tip.zone_height),
-        zone_hash: tip.zone_hash,
-        tempo_block_number: U64::from(tip.tempo_block_number),
-        tempo_block_hash: tip.tempo_block_hash,
+/// Conversion into the RPC representation of hash-carrying peer tip evidence.
+///
+/// An extension trait because both [`PeerTip`] and [`PeerTipInfo`] are foreign
+/// types here, so a `From` impl is not possible.
+trait PeerTipExt {
+    fn rpc_info(&self) -> PeerTipInfo;
+}
+
+impl PeerTipExt for PeerTip {
+    fn rpc_info(&self) -> PeerTipInfo {
+        PeerTipInfo {
+            zone_height: U64::from(self.zone_height),
+            zone_hash: self.zone_hash,
+            tempo_block_number: U64::from(self.tempo_block_number),
+            tempo_block_hash: self.tempo_block_hash,
+        }
     }
 }
 
@@ -626,12 +649,7 @@ impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
     }
 
     fn zone_tokens(&self) -> Vec<Address> {
-        // Preserve the default token when running without an L1 portal.
-        if self.config.zone_portal.is_zero() {
-            return vec![ZONE_TOKEN_ADDRESS];
-        }
-
-        self.enabled_tokens.read().iter().copied().collect()
+        enabled_zone_tokens(self.config.zone_portal, &self.enabled_tokens)
     }
 }
 
@@ -1116,6 +1134,7 @@ where
                 self.config.zone_id,
                 self.config.chain_id,
                 self.config.zone_portal,
+                self.zone_tokens(),
                 tempo_block_number,
                 &self.l1_provider,
             )
@@ -1419,6 +1438,7 @@ mod tests {
             1,
             42431,
             Address::repeat_byte(0x11),
+            EnabledTokenRegistry::default(),
             l1_provider,
             Arc::new(reth_provider::test_utils::MockEthProvider::default()),
         )
@@ -1438,7 +1458,8 @@ mod tests {
             .connect_http("http://127.0.0.1:1".parse().expect("valid URL"))
             .erased();
 
-        let info = zone_info(1, 42431, Address::ZERO, 7, &l1_provider)
+        let zone_tokens = enabled_zone_tokens(Address::ZERO, &EnabledTokenRegistry::default());
+        let info = zone_info(1, 42431, Address::ZERO, zone_tokens, 7, &l1_provider)
             .await
             .expect("portal-less zone info should not require L1");
 

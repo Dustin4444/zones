@@ -699,6 +699,7 @@ where
             self.redacted_rpc_config.zone_id,
             chain_id,
             self.portal_address,
+            self.l1_config.enabled_tokens.clone(),
             l1_provider.clone(),
             provider.clone(),
         );
