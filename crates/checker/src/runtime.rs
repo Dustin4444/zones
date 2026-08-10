@@ -948,12 +948,15 @@ impl<N> Runtime<N> {
 }
 
 #[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn bounded_queue_keeps_one_current_and_preserves_order() {
-        let (_directory, store) = crate::tests::create();
+        let (_directory, store) = super::integration_tests::create();
         let mut runtime = Runtime::new(
             store.load().unwrap(),
             2,

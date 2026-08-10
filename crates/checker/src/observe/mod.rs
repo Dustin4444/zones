@@ -6,6 +6,7 @@
 
 mod abi;
 mod error;
+pub(crate) mod events;
 mod l1;
 mod l2;
 mod state;

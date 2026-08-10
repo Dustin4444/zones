@@ -19,21 +19,16 @@ use tempo_primitives::{
     transaction::{Call, TempoSignature, TempoTransaction},
 };
 use tempo_zone_contracts::ZonePortal;
+use zone_precompiles::ecies::AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE;
 
 use super::{authentication, calls, events, observe_l1};
-use crate::{
-    observe::{
-        abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
-        error::{
-            AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence,
-            AuthenticatedTransaction, DataSource, ObservationError, PortalCallError,
-            PortalCallFamily, ProtocolChain,
-        },
+use crate::observe::{
+    abi::{DecodedPortalCall, ImportedTempoHeader, decode_portal_call},
+    error::{
+        AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
+        DataSource, ObservationError, PortalCallError, PortalCallFamily, ProtocolChain,
     },
-    protocol::{
-        constants::AUTHENTICATED_WITHDRAWAL_SIZE,
-        events::{L1ProtocolEvent, PortalEvent},
-    },
+    events::{L1ProtocolEvent, PortalEvent},
 };
 
 const BLOCK_NUMBER: u64 = 42;
@@ -286,7 +281,7 @@ fn process_withdrawals_calldata(nonempty: bool) -> Bytes {
             gasLimit: 6,
             fallbackNonce: 7,
             callbackData: Bytes::new(),
-            encryptedSender: Bytes::from(vec![8; AUTHENTICATED_WITHDRAWAL_SIZE]),
+            encryptedSender: Bytes::from(vec![8; AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE]),
         })
         .into_iter()
         .collect();

@@ -1,4 +1,4 @@
-use alloy_consensus::{Header, Sealable as _};
+use alloy_consensus::Header;
 use alloy_primitives::Address;
 
 use super::*;
@@ -37,30 +37,6 @@ fn header_bytes(number: u64) -> Bytes {
     encoded.into()
 }
 
-fn chained_header_bytes(number: u64, parent_hash: B256) -> Bytes {
-    let header = TempoHeader {
-        inner: Header {
-            number,
-            parent_hash,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut encoded = Vec::new();
-    header.encode(&mut encoded);
-    encoded.into()
-}
-
-fn multi_header_advance_call() -> Vec<u8> {
-    MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header_bytes(7)],
-        deposits: Vec::new(),
-        decryptions: Vec::new(),
-        enabledTokens: Vec::new(),
-    }
-    .abi_encode()
-}
-
 fn single_header_advance_call() -> Vec<u8> {
     IZoneInbox::advanceTempoCall {
         header: header_bytes(7),
@@ -81,7 +57,7 @@ fn ordinary_deposit() -> ZonePortal::Deposit {
         encrypted: ZonePortal::DepositPayload {
             ephemeralPubkeyX: B256::repeat_byte(6),
             ephemeralPubkeyYParity: 2,
-            ciphertext: Bytes::from(vec![7; ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE]),
+            ciphertext: Bytes::from(vec![7; ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE]),
             nonce: [8; 12].into(),
             tag: [9; 16].into(),
         },
@@ -89,16 +65,16 @@ fn ordinary_deposit() -> ZonePortal::Deposit {
 }
 
 fn advance_with_ordinary_deposit_data(deposit_data: Vec<u8>) -> Vec<u8> {
-    MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header_bytes(7)],
-        deposits: vec![MultiHeaderZoneInbox::QueuedDeposit {
-            depositType: MultiHeaderZoneInbox::DepositType::Deposit,
+    IZoneInbox::advanceTempoCall {
+        header: header_bytes(7),
+        deposits: vec![IZoneInbox::QueuedDeposit {
+            depositType: IZoneInbox::DepositType::Deposit,
             depositData: deposit_data.into(),
         }],
-        decryptions: vec![MultiHeaderZoneInbox::DecryptionData {
+        decryptions: vec![IZoneInbox::DecryptionData {
             sharedSecret: B256::ZERO,
             sharedSecretYParity: 0,
-            cpProof: MultiHeaderZoneInbox::ChaumPedersenProof {
+            cpProof: IZoneInbox::ChaumPedersenProof {
                 s: B256::ZERO,
                 c: B256::ZERO,
             },
@@ -171,24 +147,9 @@ fn advance_tempo_selectors_match_literal_vectors() {
         &[0x97, 0xca, 0xc0, 0xfb]
     );
     assert_eq!(
-        MultiHeaderZoneInbox::advanceTempoCall::SELECTOR.as_slice(),
-        &[0xb3, 0x20, 0x5c, 0xc5]
-    );
-    assert_eq!(
         &single_header_advance_call()[..SELECTOR],
         IZoneInbox::advanceTempoCall::SELECTOR.as_slice()
     );
-    assert_eq!(
-        &multi_header_advance_call()[..SELECTOR],
-        MultiHeaderZoneInbox::advanceTempoCall::SELECTOR.as_slice()
-    );
-}
-
-#[test]
-fn advance_tempo_round_trips_canonical_header_and_calldata() {
-    let decoded = decode_advance(&multi_header_advance_call()).unwrap();
-    assert_eq!(decoded.final_imported_header().number(), 7);
-    assert!(decoded.deposits.is_empty());
 }
 
 #[test]
@@ -199,47 +160,6 @@ fn single_header_call_normalizes_to_one_imported_header() {
 }
 
 #[test]
-fn advance_tempo_retains_ordered_consecutive_headers() {
-    let first = header_bytes(7);
-    let mut cursor = first.as_ref();
-    let first_decoded = TempoHeader::decode(&mut cursor).unwrap();
-    let second = chained_header_bytes(8, first_decoded.hash_slow());
-    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![first, second],
-        deposits: Vec::new(),
-        decryptions: Vec::new(),
-        enabledTokens: Vec::new(),
-    }
-    .abi_encode();
-
-    let decoded = decode_advance(&calldata).unwrap();
-    assert_eq!(decoded.imported_headers().len(), 2);
-    assert_eq!(decoded.imported_headers()[0].number(), 7);
-    assert_eq!(decoded.final_imported_header().number(), 8);
-}
-
-#[test]
-fn advance_tempo_rejects_empty_and_discontinuous_headers() {
-    let empty = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: Vec::new(),
-        deposits: Vec::new(),
-        decryptions: Vec::new(),
-        enabledTokens: Vec::new(),
-    }
-    .abi_encode();
-    assert_malformed(decode_advance(&empty), DataSource::AdvanceTempoCalldata);
-
-    let discontinuous = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header_bytes(7), chained_header_bytes(9, B256::ZERO)],
-        deposits: Vec::new(),
-        decryptions: Vec::new(),
-        enabledTokens: Vec::new(),
-    }
-    .abi_encode();
-    assert_malformed(decode_advance(&discontinuous), DataSource::AdvanceHeaderRlp);
-}
-
-#[test]
 fn advance_tempo_round_trips_every_dynamic_input_family() {
     let ordinary = ordinary_deposit();
     let bounce_back = IZoneInbox::WithdrawalBounceBackDeposit {
@@ -247,27 +167,27 @@ fn advance_tempo_round_trips_every_dynamic_input_family() {
         to: Address::repeat_byte(11),
         amount: 12,
     };
-    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header_bytes(7)],
+    let calldata = IZoneInbox::advanceTempoCall {
+        header: header_bytes(7),
         deposits: vec![
-            MultiHeaderZoneInbox::QueuedDeposit {
-                depositType: MultiHeaderZoneInbox::DepositType::Deposit,
+            IZoneInbox::QueuedDeposit {
+                depositType: IZoneInbox::DepositType::Deposit,
                 depositData: ordinary.abi_encode().into(),
             },
-            MultiHeaderZoneInbox::QueuedDeposit {
-                depositType: MultiHeaderZoneInbox::DepositType::WithdrawalBounceBack,
+            IZoneInbox::QueuedDeposit {
+                depositType: IZoneInbox::DepositType::WithdrawalBounceBack,
                 depositData: bounce_back.abi_encode().into(),
             },
         ],
-        decryptions: vec![MultiHeaderZoneInbox::DecryptionData {
+        decryptions: vec![IZoneInbox::DecryptionData {
             sharedSecret: B256::repeat_byte(13),
             sharedSecretYParity: 2,
-            cpProof: MultiHeaderZoneInbox::ChaumPedersenProof {
+            cpProof: IZoneInbox::ChaumPedersenProof {
                 s: B256::repeat_byte(14),
                 c: B256::repeat_byte(15),
             },
         }],
-        enabledTokens: vec![MultiHeaderZoneInbox::EnabledToken {
+        enabledTokens: vec![IZoneInbox::EnabledToken {
             token: Address::repeat_byte(16),
             name: "Token".into(),
             symbol: "TKN".into(),
@@ -325,7 +245,7 @@ fn ordinary_deposit_nested_offsets_and_lengths_fail_in_borrowed_preflight() {
         (0, WORD + 1),
         (deposit + 5 * WORD, 5 * WORD),
         (encrypted + 2 * WORD, 4 * WORD),
-        (ciphertext, ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE + 1),
+        (ciphertext, ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE + 1),
     ] {
         let mut malformed = canonical.clone();
         set_usize_word(&mut malformed, offset, value);
@@ -339,10 +259,9 @@ fn ordinary_deposit_nested_offsets_and_lengths_fail_in_borrowed_preflight() {
 
 #[test]
 fn advance_tempo_rejects_trailing_abi_bytes() {
-    for mut calldata in [multi_header_advance_call(), single_header_advance_call()] {
-        calldata.extend([0_u8; WORD]);
-        assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
-    }
+    let mut calldata = single_header_advance_call();
+    calldata.extend([0_u8; WORD]);
+    assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
 }
 
 #[test]
@@ -354,8 +273,8 @@ fn advance_tempo_rejects_noncanonical_header_rlp() {
     let first_item = header.len() - cursor.len();
     assert_eq!(header[first_item], 0x80, "first Tempo header field is zero");
     header[first_item] = 0x00;
-    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header.into()],
+    let calldata = IZoneInbox::advanceTempoCall {
+        header: header.into(),
         deposits: Vec::new(),
         decryptions: Vec::new(),
         enabledTokens: Vec::new(),
@@ -368,8 +287,8 @@ fn advance_tempo_rejects_noncanonical_header_rlp() {
 fn advance_tempo_rejects_trailing_header_rlp() {
     let mut header = header_bytes(7).to_vec();
     header.push(0x80);
-    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![header.into()],
+    let calldata = IZoneInbox::advanceTempoCall {
+        header: header.into(),
         deposits: Vec::new(),
         decryptions: Vec::new(),
         enabledTokens: Vec::new(),
@@ -384,7 +303,7 @@ fn dynamic_array_protocol_caps_are_checked_before_generated_decode() {
         (1, MAX_UNPROCESSED_DEPOSITS),
         (3, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK),
     ] {
-        let mut calldata = multi_header_advance_call();
+        let mut calldata = single_header_advance_call();
         let payload = &mut calldata[SELECTOR..];
         let array = usize_word(payload, head_word * WORD);
         set_usize_word(payload, array, maximum + 1);
@@ -400,13 +319,13 @@ fn dynamic_array_protocol_caps_are_checked_before_generated_decode() {
 
 #[test]
 fn abi_offsets_lengths_and_element_tables_fail_closed_before_decode() {
-    for bad_offset in [4 * WORD + 1, multi_header_advance_call().len() - SELECTOR] {
-        let mut calldata = multi_header_advance_call();
+    for bad_offset in [4 * WORD + 1, single_header_advance_call().len() - SELECTOR] {
+        let mut calldata = single_header_advance_call();
         set_usize_word(&mut calldata[SELECTOR..], 0, bad_offset);
         assert_malformed(decode_advance(&calldata), DataSource::AdvanceTempoCalldata);
     }
 
-    let mut calldata = multi_header_advance_call();
+    let mut calldata = single_header_advance_call();
     let payload = &mut calldata[SELECTOR..];
     let header = usize_word(payload, 0);
     set_usize_word(payload, header, payload.len());
@@ -427,7 +346,7 @@ fn finalization_decodes_count_block_and_structural_sender_lengths() {
         blockNumber: 9,
         encryptedSenders: vec![
             Bytes::new(),
-            Bytes::from(vec![7; AUTHENTICATED_WITHDRAWAL_SIZE]),
+            Bytes::from(vec![7; AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE]),
         ],
     }
     .abi_encode();
@@ -437,7 +356,7 @@ fn finalization_decodes_count_block_and_structural_sender_lengths() {
     assert_eq!(decoded.encrypted_senders[0].len(), 0);
     assert_eq!(
         decoded.encrypted_senders[1].len(),
-        AUTHENTICATED_WITHDRAWAL_SIZE
+        AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE
     );
 }
 
@@ -498,7 +417,7 @@ fn nonempty_process_withdrawals_round_trips_canonically() {
             gasLimit: 6,
             fallbackNonce: 7,
             callbackData: Bytes::from_static(b"callback"),
-            encryptedSender: Bytes::from(vec![8; AUTHENTICATED_WITHDRAWAL_SIZE]),
+            encryptedSender: Bytes::from(vec![8; AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE]),
         }],
         remainingQueue: B256::repeat_byte(9),
     }

@@ -6,10 +6,7 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
 
-use crate::{
-    CheckerConfig,
-    protocol::state_layout::{DEFAULT_FEE_TOKEN_ACCESS, decode_address_word},
-};
+use crate::{CheckerConfig, observe::acquire_zone_post_state};
 
 use self::error::BootstrapError;
 
@@ -75,18 +72,7 @@ fn local_genesis_initial_token<P>(provider: &P, hash: B256) -> eyre::Result<Addr
 where
     P: StateProviderFactory + ?Sized,
 {
-    let state = provider
-        .state_by_block_hash(hash)
-        .map_err(|source| BootstrapError::LocalGenesisStateRead { hash, source })?;
-    let word = state
-        .storage(
-            DEFAULT_FEE_TOKEN_ACCESS.address,
-            DEFAULT_FEE_TOKEN_ACCESS.storage_key(),
-        )
-        .map_err(|source| BootstrapError::LocalGenesisStateRead { hash, source })?
-        .unwrap_or_default();
-    let token = decode_address_word(word)
-        .ok_or(BootstrapError::MalformedZoneGenesisInitialToken { word })?;
+    let token = acquire_zone_post_state(provider, hash, &[])?.default_fee_token();
     if token.is_zero() {
         return Err(BootstrapError::MissingZoneGenesisInitialToken.into());
     }

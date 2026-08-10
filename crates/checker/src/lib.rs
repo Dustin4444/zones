@@ -9,12 +9,11 @@ mod exex;
 mod kernel;
 mod observe;
 pub(crate) mod persistence;
-mod protocol;
 mod runtime;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
-pub mod test_utils;
+pub mod inspection;
 
 use std::{fmt, future::Future, path::PathBuf, str::FromStr, time::Duration};
 
@@ -100,8 +99,3 @@ impl CheckerExEx {
         Ok(exex::run(self.config, ctx))
     }
 }
-
-#[cfg(test)]
-mod kernel_boundary_tests;
-#[cfg(test)]
-mod tests;

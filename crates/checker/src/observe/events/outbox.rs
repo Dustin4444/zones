@@ -1,42 +1,11 @@
-// Generated constructors inherit the immutable protocol event arity.
-#![allow(clippy::too_many_arguments)]
-
 use alloy_primitives::{B256, Log, b256};
-
-use crate::protocol::constants::{COMPRESSED_PUBLIC_KEY_SIZE, MAX_CALLBACK_DATA_SIZE};
+use tempo_zone_contracts::IZoneOutbox as Outbox;
+use zone_precompiles::{ecies::COMPRESSED_PUBLIC_KEY_SIZE, outbox::MAX_CALLBACK_DATA_SIZE};
 
 use super::{
     ProtocolEventError,
     common::{malformed, required_topic, strict_decode_interface, unsupported, validate_max_bytes},
 };
-
-// Checker-owned native ZoneOutbox event ABI.
-//
-// Pinned source: `crates/contracts/src/precompiles/outbox.rs:29-47`.
-alloy_sol_types::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    contract Outbox {
-        event WithdrawalRequested(
-            uint64 indexed withdrawalIndex,
-            address indexed sender,
-            address token,
-            address to,
-            uint128 amount,
-            uint128 fee,
-            bytes32 memo,
-            uint64 gasLimit,
-            uint64 fallbackNonce,
-            bytes data,
-            bytes revealTo
-        );
-        event BatchFinalized(
-            bytes32 indexed withdrawalQueueHash,
-            uint64 withdrawalBatchIndex
-        );
-        event TempoGasRateUpdated(uint128 tempoGasRate);
-        event MaxWithdrawalsPerBlockUpdated(uint32 maxWithdrawalsPerBlock);
-    }
-}
 
 pub(super) const WITHDRAWAL_REQUESTED_TOPIC: B256 =
     b256!("34ca953f3eed14157d2f660c7e92a5bd9c05be0d61a188830f3bf1cb7d094f96");
@@ -47,7 +16,7 @@ pub(super) const TEMPO_GAS_RATE_UPDATED_TOPIC: B256 =
 pub(super) const MAX_WITHDRAWALS_PER_BLOCK_UPDATED_TOPIC: B256 =
     b256!("5340f6cf6e1274bffd0c7188c75f885ed6c90cd6b0879a646290a92f84a6dce3");
 
-pub(super) fn decode(log: &Log) -> Result<Outbox::OutboxEvents, ProtocolEventError> {
+pub(super) fn decode(log: &Log) -> Result<Outbox::IZoneOutboxEvents, ProtocolEventError> {
     match required_topic(log)? {
         WITHDRAWAL_REQUESTED_TOPIC
         | BATCH_FINALIZED_TOPIC
@@ -55,9 +24,8 @@ pub(super) fn decode(log: &Log) -> Result<Outbox::OutboxEvents, ProtocolEventErr
         | MAX_WITHDRAWALS_PER_BLOCK_UPDATED_TOPIC => {}
         _ => return Err(unsupported(log)),
     }
-
-    let decoded = strict_decode_interface::<Outbox::OutboxEvents>(log, "ZoneOutbox event")?;
-    if let Outbox::OutboxEvents::WithdrawalRequested(event) = &decoded {
+    let decoded = strict_decode_interface::<Outbox::IZoneOutboxEvents>(log, "ZoneOutbox event")?;
+    if let Outbox::IZoneOutboxEvents::WithdrawalRequested(event) = &decoded {
         validate_max_bytes(
             log,
             "WithdrawalRequested",

@@ -2,8 +2,20 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use syn::visit::{self, Visit};
 
-const ALLOWED_DEPENDENCIES: &[&str] =
-    &["alloy_primitives", "alloy_sol_types", "serde", "thiserror"];
+const ALLOWED_DEPENDENCIES: &[&str] = &[
+    "alloy_primitives",
+    "alloy_sol_types",
+    "serde",
+    "tempo_zone_contracts",
+    "thiserror",
+];
+
+const FORBIDDEN_PRODUCTION_HELPERS: &[&str] = &[
+    "from_requested_event",
+    "hash_with_tail",
+    "queue_hash",
+    "sender_tag",
+];
 
 struct BoundaryVisitor<'a> {
     file: &'a Path,
@@ -105,6 +117,17 @@ impl<'ast> Visit<'ast> for BoundaryVisitor<'_> {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         self.check_use_tree(&item.tree, Vec::new());
         visit::visit_item_use(self, item);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if FORBIDDEN_PRODUCTION_HELPERS.contains(&call.method.to_string().as_str()) {
+            self.failures.push(format!(
+                "{}: production helper `{}` defeats independent kernel verification",
+                self.file.display(),
+                call.method
+            ));
+        }
+        visit::visit_expr_method_call(self, call);
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {

@@ -13650,12 +13650,16 @@ dependencies = [
  "syn 2.0.119",
  "tempfile",
  "tempo-alloy",
+ "tempo-chainspec",
  "tempo-contracts",
+ "tempo-precompiles",
  "tempo-primitives",
+ "tempo-revm",
  "tempo-zone-contracts",
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "zone-precompiles",
  "zone-primitives",
 ]
 

@@ -23,14 +23,6 @@ pub(crate) enum BootstrapError {
     },
     #[error("unsupported bootstrap: token {token} has nonzero supply {actual} at Zone genesis")]
     NonzeroZoneGenesisSupply { token: Address, actual: U256 },
-    #[error("failed to read Zone genesis state at {hash}")]
-    LocalGenesisStateRead {
-        hash: B256,
-        #[source]
-        source: ProviderError,
-    },
-    #[error("Zone genesis fee token is not a canonically padded address: {word}")]
-    MalformedZoneGenesisInitialToken { word: U256 },
     #[error("Zone genesis fee token must not be zero")]
     MissingZoneGenesisInitialToken,
     #[error("failed to read canonical Zone block {number}")]

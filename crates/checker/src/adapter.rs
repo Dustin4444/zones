@@ -10,11 +10,13 @@ use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, B256, FixedBytes, U256};
 
 use crate::{
-    observe::{L1BlockObservation, L2BlockObservation, ZonePostStateOutputs},
-    persistence::{BlockNumHash, CoverageGapReason},
-    protocol::events::{
-        Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalEvent, TempoState,
+    observe::{
+        L1BlockObservation, L2BlockObservation, ZonePostStateOutputs,
+        events::{
+            Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalEvent, TempoState,
+        },
     },
+    persistence::{BlockNumHash, CoverageGapReason},
     runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass},
 };
 
@@ -661,7 +663,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
     let mut effects = Vec::new();
     for outcome in o.l2.outcomes().events() {
         match outcome.event() {
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::TokenEnabled(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TokenEnabled(e)) => {
                 effects.push(Effect::TokenEnabled {
                     token: e.token,
                     name: e.name.clone(),
@@ -669,7 +671,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     currency: e.currency.clone(),
                 })
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositProcessed(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositProcessed(e)) => {
                 outcomes.push(DepositOutcome::Minted);
                 effects.push(Effect::DepositProcessed {
                     deposit_hash: e.depositHash,
@@ -678,7 +680,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     amount: e.amount,
                 });
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositFailed(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositFailed(e)) => {
                 outcomes.push(DepositOutcome::Failed);
                 effects.push(Effect::DepositFailed {
                     deposit_hash: e.depositHash,
@@ -687,7 +689,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     amount: e.amount,
                 });
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::WithdrawalBounceBackProcessed(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::WithdrawalBounceBackProcessed(e)) => {
                 outcomes.push(DepositOutcome::BounceBackMinted {
                     recipient: e.zoneFallbackRecipient,
                 });
@@ -696,7 +698,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     amount: e.amount,
                 });
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::WithdrawalBounceBackPending(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::WithdrawalBounceBackPending(e)) => {
                 outcomes.push(DepositOutcome::BounceBackPending {
                     recipient: e.zoneFallbackRecipient,
                 });
@@ -705,15 +707,15 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     amount: e.amount,
                 });
             }
-            L2ProtocolEvent::Outbox(Outbox::OutboxEvents::TempoGasRateUpdated(e)) => {
+            L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::TempoGasRateUpdated(e)) => {
                 operations.push(ZoneOperation::UpdateTempoGasRate(e.tempoGasRate))
             }
-            L2ProtocolEvent::Outbox(Outbox::OutboxEvents::MaxWithdrawalsPerBlockUpdated(e)) => {
-                operations.push(ZoneOperation::UpdateMaxWithdrawals(
-                    e.maxWithdrawalsPerBlock,
-                ))
-            }
-            L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(e)) => {
+            L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::MaxWithdrawalsPerBlockUpdated(
+                e,
+            )) => operations.push(ZoneOperation::UpdateMaxWithdrawals(
+                e.maxWithdrawalsPerBlock,
+            )),
+            L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(e)) => {
                 let sender = outcome.position().transaction_sender();
                 if outcome.position().transaction_hash() != advance_hash {
                     operations.push(ZoneOperation::AcceptWithdrawal(UserWithdrawal {
@@ -745,7 +747,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     reveal_to: e.revealTo.clone(),
                 });
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::RefundClaimed(e)) => {
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::RefundClaimed(e)) => {
                 operations.push(ZoneOperation::ClaimInboxRefund(RefundClaim {
                     token: e.token,
                     recipient: e.recipient,
@@ -757,7 +759,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     amount: e.amount,
                 });
             }
-            L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(e)) => {
+            L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(e)) => {
                 effects.push(Effect::BatchFinalized {
                     id: crate::kernel::BatchId {
                         zone_id: o.zone_id,
@@ -768,8 +770,14 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     queue_hash: e.withdrawalQueueHash,
                 })
             }
-            L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(_))
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(_))
             | L2ProtocolEvent::TempoState(_) => {}
+            L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositRejected(_)) => {
+                return Err(failure(
+                    AdapterFindingCode::Grammar,
+                    "unsupported DepositRejected event passed classification",
+                ));
+            }
         }
     }
     let finalization = o.l2.inputs().finalization().map(|f| Finalization {
@@ -845,7 +853,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
             |e: &L2ProtocolEvent| {
                 matches!(
                     e,
-                    L2ProtocolEvent::Inbox(Inbox::InboxEvents::TokenEnabled(_))
+                    L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TokenEnabled(_))
                 )
             },
             "TokenEnabled",
@@ -869,13 +877,13 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
             }
             cursor += 1;
             match outcome.event() {
-                L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositProcessed(_)) => {}
-                L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(_)) => {
+                L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositProcessed(_)) => {}
+                L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(_)) => {
                     next_advance!(
                         |e: &L2ProtocolEvent| {
                             matches!(
                                 e,
-                                L2ProtocolEvent::Inbox(Inbox::InboxEvents::DepositFailed(_))
+                                L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositFailed(_))
                             )
                         },
                         "DepositFailed",
@@ -894,8 +902,8 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                     matches!(
                         e,
                         L2ProtocolEvent::Inbox(
-                            Inbox::InboxEvents::WithdrawalBounceBackProcessed(_)
-                                | Inbox::InboxEvents::WithdrawalBounceBackPending(_)
+                            Inbox::IZoneInboxEvents::WithdrawalBounceBackProcessed(_)
+                                | Inbox::IZoneInboxEvents::WithdrawalBounceBackPending(_)
                         )
                     )
                 },
@@ -909,7 +917,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
         }
     }
     match events.get(cursor).map(|outcome| outcome.event()) {
-        Some(L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(event)))
+        Some(L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(event)))
             if event.tempoBlockHash == o.state.tempo_block_hash()
                 && event.tempoBlockNumber == o.state.tempo_block_number()
                 && event.newProcessedDepositQueueHash == o.state.processed_deposit_queue_hash()
@@ -927,7 +935,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
         |e: &L2ProtocolEvent| {
             matches!(
                 e,
-                L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(_))
+                L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(_))
             )
         },
         "TempoAdvanced",
@@ -950,10 +958,10 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
         if !matches!(
             outcome.event(),
             L2ProtocolEvent::Outbox(
-                Outbox::OutboxEvents::TempoGasRateUpdated(_)
-                    | Outbox::OutboxEvents::MaxWithdrawalsPerBlockUpdated(_)
-                    | Outbox::OutboxEvents::WithdrawalRequested(_)
-            ) | L2ProtocolEvent::Inbox(Inbox::InboxEvents::RefundClaimed(_))
+                Outbox::IZoneOutboxEvents::TempoGasRateUpdated(_)
+                    | Outbox::IZoneOutboxEvents::MaxWithdrawalsPerBlockUpdated(_)
+                    | Outbox::IZoneOutboxEvents::WithdrawalRequested(_)
+            ) | L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::RefundClaimed(_))
         ) {
             return Err(failure(
                 AdapterFindingCode::Grammar,
@@ -973,7 +981,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
             if outcome.position().transaction_hash() != hash
                 || !matches!(
                     outcome.event(),
-                    L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(_))
+                    L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(_))
                 )
             {
                 return Err(failure(
@@ -986,7 +994,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
         None if events.get(cursor).is_some_and(|o| {
             matches!(
                 o.event(),
-                L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(_))
+                L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(_))
             )
         }) =>
         {

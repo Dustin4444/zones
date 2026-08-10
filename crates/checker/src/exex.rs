@@ -10,8 +10,7 @@ use alloy_provider::{Provider, ProviderBuilder};
 use futures::TryStreamExt;
 use reth_chainspec::EthChainSpec as _;
 use reth_execution_types::Chain;
-use reth_exex::ExExHead;
-use reth_exex::{ExExContext, ExExNotification};
+use reth_exex::{ExExContext, ExExHead, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
 use tempo_alloy::TempoNetwork;
@@ -489,7 +488,9 @@ where
                 eyre::bail!("checker stopped after recording an unchecked range");
             }
             RuntimeAction::RetryAt(deadline) => retry_at = Some(deadline),
-            RuntimeAction::Terminal => eyre::bail!("checker stopped"),
+            RuntimeAction::Terminal => {
+                eyre::bail!("checker stopped");
+            }
             RuntimeAction::AwaitNotification => {}
             RuntimeAction::None if runtime.current().is_some() => continue,
             RuntimeAction::None => {}
@@ -514,7 +515,9 @@ where
                         ctx.send_finished_height(num_hash(height))?;
                         eyre::bail!("checker stopped after recording a queue overflow gap");
                     }
-                    RuntimeAction::Terminal => eyre::bail!("checker stopped"),
+                    RuntimeAction::Terminal => {
+                        eyre::bail!("checker stopped");
+                    }
                     RuntimeAction::None => {}
                     RuntimeAction::Acknowledge(_)
                     | RuntimeAction::AwaitNotification
@@ -572,5 +575,5 @@ fn record_local_canonical_suffix<P: BlockNumReader + ?Sized>(
         // durable watermark.
         return Ok(());
     }
-    eyre::bail!("failed to record canonical stream gap")
+    Err(eyre::eyre!("failed to record canonical stream gap"))
 }

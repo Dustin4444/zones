@@ -4,7 +4,7 @@ use alloy_primitives::{B256, IntoLogData, Log};
 use alloy_sol_types::SolEventInterface;
 
 use super::ProtocolEventError;
-use crate::protocol::constants::{
+use tempo_zone_contracts::{
     MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES,
 };
 
@@ -35,7 +35,7 @@ pub(super) fn malformed(
     }
 }
 
-/// Decode through a checker-owned generated event interface and reject any
+/// Decode through the shared generated event interface and reject any
 /// encoding that does not round-trip byte-for-byte.
 pub(super) fn strict_decode_interface<E>(
     log: &Log,

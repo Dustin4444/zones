@@ -4,7 +4,7 @@ use alloy_network::ReceiptResponse as _;
 use alloy_primitives::{Address, B256};
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
-use crate::protocol::events::{L1ProtocolEvent, PortalEvent, classify_l1_protocol_event};
+use crate::observe::events::{L1ProtocolEvent, PortalEvent, classify_l1_protocol_event};
 
 use super::OrderedL1Outcome;
 use crate::observe::error::{ObservationError, PortalCallError, PortalCallFamily, ProtocolChain};

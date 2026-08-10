@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::utils::{L1TestNode, ZoneTestLaunchConfig, ZoneTestNode};
 use alloy::{eips::BlockNumHash, providers::Provider, rpc::types::BlockNumberOrTag};
 use tempo_precompiles::PATH_USD_ADDRESS;
-use zone_checker::{CheckerConfig, CheckerExEx, test_utils::inspect_database};
+use zone_checker::{CheckerConfig, CheckerExEx, inspection::inspect_database};
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
