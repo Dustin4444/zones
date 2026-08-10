@@ -1282,24 +1282,26 @@ where
         chain_id: u64,
     ) -> eyre::Result<()> {
         let eth_handlers = handle.eth_handlers().clone();
-        let zone_rpc_url = handle
-            .rpc_server_handles
-            .rpc
-            .http_url()
-            .expect("HTTP RPC server must be enabled for redacted RPC");
+        let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_with_config(
+                &l1_rpc_url,
+                rpc_connection_config(retry_connection_interval),
+            )
+            .await?
+            .erased();
         let redacted_rpc_config = zone_rpc::RedactedRpcConfig {
             listen_addr: ([0, 0, 0, 0], config.redacted_rpc_port).into(),
-            l1_rpc_url,
-            zone_rpc_url,
-            retry_connection_interval,
             zone_id: config.zone_id,
             chain_id,
             max_auth_token_validity: config.max_auth_token_validity,
             zone_portal: portal_address,
         };
-        let api: Arc<dyn ZoneRpcApi> = Arc::new(
-            ZoneRpc::new(eth_handlers, redacted_rpc_config.clone(), enabled_tokens).await?,
-        );
+        let api: Arc<dyn ZoneRpcApi> = Arc::new(ZoneRpc::new(
+            eth_handlers,
+            redacted_rpc_config.clone(),
+            enabled_tokens,
+            l1_provider,
+        ));
         let local_addr = start_redacted_rpc(redacted_rpc_config, api).await?;
         info!(target: "reth::cli", %local_addr, "Redacted zone RPC server started");
 

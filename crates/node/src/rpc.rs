@@ -15,7 +15,7 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256, keccak256};
-use alloy_provider::{DynProvider, Provider, ProviderBuilder};
+use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::{
     Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
     FilterId, TransactionRequest,
@@ -55,7 +55,7 @@ use tokio::{
 use zone_l1::{TempoStateExt as _, state::EnabledTokenRegistry};
 
 use alloy_rpc_client::{ConnectionConfig, WebSocketConfig};
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
+use tempo_zone_contracts::{ZONE_TOKEN_ADDRESS, ZonePortal};
 use zone_evm::ZoneEvmConfig;
 use zone_p2p::{LeadershipSchedule, PeerTip, ZoneManifest};
 use zone_rpc::{
@@ -582,51 +582,28 @@ pub struct ZoneRpc<Api: EthApiTypes> {
     config: zone_rpc::RedactedRpcConfig,
     enabled_tokens: EnabledTokenRegistry,
     l1_provider: DynProvider<TempoNetwork>,
-    tempo_state: tempo_zone_contracts::TempoState::TempoStateInstance<
-        DynProvider<TempoNetwork>,
-        TempoNetwork,
-    >,
     /// Maps filter IDs to the authenticated account that created them.
     /// The reth filter registry remains the source of truth for filter liveness.
     filter_owners: Arc<Mutex<HashMap<FilterId, Address>>>,
 }
 
 impl<Api: EthApiTypes + 'static> ZoneRpc<Api> {
-    /// Wrap reth's [`EthHandlers`] (api + filter + pubsub).
-    pub async fn new(
+    /// Wrap reth's [`EthHandlers`] (api + filter + pubsub) and an L1 provider.
+    pub fn new(
         eth: EthHandlers<Api>,
         config: zone_rpc::RedactedRpcConfig,
         enabled_tokens: EnabledTokenRegistry,
-    ) -> eyre::Result<Self> {
-        let l1_rpc_url = config.l1_rpc_url.clone();
-        let zone_rpc_url = config.zone_rpc_url.clone();
-        let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_with_config(
-                &l1_rpc_url,
-                rpc_connection_config(config.retry_connection_interval),
-            )
-            .await
-            .wrap_err("failed to connect redacted RPC L1 provider")?
-            .erased();
-        let zone_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_with_config(
-                &zone_rpc_url,
-                rpc_connection_config(config.retry_connection_interval),
-            )
-            .await
-            .wrap_err("failed to connect redacted RPC zone provider")?
-            .erased();
-        let tempo_state = tempo_zone_contracts::TempoState::new(TEMPO_STATE_ADDRESS, zone_provider);
+        l1_provider: DynProvider<TempoNetwork>,
+    ) -> Self {
         let rpc = Self {
             eth,
             config,
             enabled_tokens,
             l1_provider,
-            tempo_state,
             filter_owners: Arc::new(Mutex::new(HashMap::new())),
         };
         rpc.spawn_filter_owner_pruner();
-        Ok(rpc)
+        rpc
     }
 
     /// Returns a reference to the inner [`EthFilter`] handler.
@@ -1206,10 +1183,12 @@ where
     fn zone_get_zone_info(&self, _auth: AuthContext) -> BoxFut<'_> {
         Box::pin(async move {
             let tempo_block_number = self
-                .tempo_state
-                .tempoBlockNumber()
-                .call()
-                .await
+                .eth
+                .api
+                .provider()
+                .latest()
+                .map_err(internal)?
+                .tempo_block_number()
                 .map_err(internal)?;
             let info = zone_info(
                 self.config.zone_id,
@@ -1440,6 +1419,7 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_provider::ProviderBuilder;
 
     #[test]
     fn records_block_hashes_as_eip2935_storage_targets() {
