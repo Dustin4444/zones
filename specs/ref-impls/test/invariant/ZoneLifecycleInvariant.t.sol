@@ -291,7 +291,7 @@ contract ZoneLifecycleHandler is Test {
             portal.currentDepositQueueHash()
         );
 
-        vm.prank(sequencer);
+        vm.prank(address(0));
         inbox.advanceTempo(new bytes[](1), queued, _decryptions(count), new EnabledToken[](0));
         require(inbox.processedDepositQueueHash() == expectedHash, "processed hash mismatch");
 

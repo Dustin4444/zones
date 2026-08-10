@@ -158,7 +158,7 @@ contract ZoneNonCustodialHandler is Test {
             PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
             portal.currentDepositQueueHash()
         );
-        vm.prank(admin);
+        vm.prank(address(0));
         inbox.advanceTempo(new bytes[](1), queued, _decryptions(count), new EnabledToken[](0));
 
         mirrorProcessedHash = expectedHash;
