@@ -23,6 +23,9 @@ use zone_p2p::P2pCommand;
 use crate::replication::AttestationContext;
 use zone_sequencer::attestation::{SettlementAttestation, SignedSettlementAttestation};
 
+/// Fallback cadence for transient L1 validation failures or dropped P2P settlement proposals.
+const SETTLEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Check the manifest's settlement quorum against `ZonePortal` before any role task starts.
 ///
 /// A quorum node the portal has not registered can never settle, and an unreachable threshold
@@ -286,21 +289,13 @@ async fn validate_settlement_anchor(
     anchor_block_number: u64,
     anchor_block_hash: B256,
 ) -> eyre::Result<()> {
-    eyre::ensure!(
-        anchor_block_number >= tempo_block_number,
-        "proposed L1 anchor predates the zone batch's Tempo block"
-    );
-
     let current_l1_block = context.l1_provider.get_block_number().await?;
-    eyre::ensure!(
-        anchor_block_number < current_l1_block,
-        "proposed L1 anchor is not yet available through EIP-2935"
-    );
-    eyre::ensure!(
-        current_l1_block.saturating_sub(anchor_block_number)
-            < context.anchor_config.history_window(),
-        "proposed L1 anchor fell outside the EIP-2935 history window"
-    );
+    validate_settlement_anchor_height(
+        tempo_block_number,
+        anchor_block_number,
+        current_l1_block,
+        context.anchor_config.history_window(),
+    )?;
 
     let anchor_header = context
         .l1_provider
@@ -326,6 +321,27 @@ async fn validate_settlement_anchor(
     eyre::ensure!(
         tempo_header.hash_slow() == tempo_block_hash,
         "zone batch's Tempo block hash does not match finalized L1"
+    );
+    Ok(())
+}
+
+fn validate_settlement_anchor_height(
+    tempo_block_number: u64,
+    anchor_block_number: u64,
+    current_l1_block: u64,
+    history_window: u64,
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        anchor_block_number >= tempo_block_number,
+        "proposed L1 anchor predates the zone batch's Tempo block"
+    );
+    eyre::ensure!(
+        anchor_block_number <= current_l1_block,
+        "proposed L1 anchor is ahead of the current L1 tip"
+    );
+    eyre::ensure!(
+        current_l1_block.saturating_sub(anchor_block_number) < history_window,
+        "proposed L1 anchor fell outside the EIP-2935 history window"
     );
     Ok(())
 }
@@ -370,7 +386,7 @@ pub(crate) async fn collect_leader_settlements<P>(
             .await;
 
     let mut last_scanned = head;
-    let mut retry = tokio::time::interval(Duration::from_secs(5));
+    let mut retry = tokio::time::interval(SETTLEMENT_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
@@ -578,6 +594,17 @@ mod tests {
     use zone_p2p::ZoneManifest;
     use zone_sequencer::attestation::AttestationStore;
 
+    #[test]
+    fn settlement_anchor_accepts_current_tip_and_rejects_future() {
+        validate_settlement_anchor_height(100, 100, 100, 10).unwrap();
+
+        let err = validate_settlement_anchor_height(100, 101, 100, 10).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("proposed L1 anchor is ahead of the current L1 tip")
+        );
+    }
+
     fn test_manifest() -> ZoneManifest {
         let public_keys = [1_u64, 2, 3].map(|seed| PrivateKey::from_seed(seed).public_key());
         let mut input = format!(
@@ -733,7 +760,7 @@ mod tests {
         store.remove_submitted(2_070);
         let submitted = tokio::time::timeout(Duration::from_millis(100), waiting)
             .await
-            .expect("confirmation should wake the collector without its five-second retry")
+            .expect("confirmation should wake the collector without its fallback retry")
             .expect("submission wait task should not panic")
             .expect("submission notification channel should remain open");
         assert_eq!(submitted, 2_070);
