@@ -260,7 +260,8 @@ impl CreateZone {
 
         let zone_id = event.zoneId;
         let portal = event.portal;
-        let chain_id = zone_chain_id(zone_id);
+        let parent_chain_id = provider.get_chain_id().await?;
+        let chain_id = zone_chain_id(parent_chain_id, zone_id)?;
 
         let portal_contract = ZonePortal::new(portal, &provider);
         let creation_block_id = BlockId::number(creation_block);

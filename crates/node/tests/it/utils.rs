@@ -70,11 +70,12 @@ use zone_l1::{
     Deposit, DepositQueue, EnabledToken, EncryptionKeyRotation, L1BlockTracker, L1Deposit,
     L1PortalEvents, L1StateCache, state::EnabledTokenRegistry,
 };
-use zone_node::{ZoneNode, ZoneSequencerAddOnsConfig};
+use zone_node::{ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig};
 use zone_p2p::{LeadershipSchedule, LeadershipState, P2pConfig, P2pPeerId, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
 use zone_primitives::constants::{
     PORTAL_ACCESS_MODE_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT, PORTAL_TOKEN_CONFIGS_SLOT,
+    zone_chain_id as derive_zone_chain_id,
 };
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
@@ -1283,6 +1284,17 @@ impl ZoneTestNode {
             .connect_http(l1_http_url)
             .erased();
 
+        let (chain_id, zone_id) = if portal_address.is_zero() {
+            (chain_id, 0)
+        } else {
+            let parent_chain_id = l1_provider.get_chain_id().await?;
+            let zone_id = ZonePortal::new(portal_address, &l1_provider)
+                .zoneId()
+                .call()
+                .await?;
+            (derive_zone_chain_id(parent_chain_id, zone_id)?, zone_id)
+        };
+
         let mut genesis = custom_genesis.unwrap_or_else(|| {
             serde_json::from_str(zone_node::genesis::GENESIS_TEMPLATE_JSON)
                 .expect("valid zone genesis template")
@@ -1297,6 +1309,10 @@ impl ZoneTestNode {
             std::time::Duration::from_millis(100),
         )
         .with_withdrawal_batch_interval_blocks(withdrawal_batch_interval_blocks)
+        .with_redacted_rpc(ZoneRedactedRpcConfig {
+            zone_id,
+            ..Default::default()
+        })
         .with_deposit_decryption_keys(
             std::iter::once(SecretKey::from(sequencer_signer.credential()))
                 .chain(additional_decryption_keys),
@@ -3486,7 +3502,7 @@ pub(crate) async fn start_local_zone_with_fixture_and_withdrawal_batch_interval(
     let zone = ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
         DUMMY_L1_URL.to_string(),
         Address::ZERO,
-        zone_primitives::constants::zone_chain_id(zone_id),
+        zone_primitives::constants::zone_chain_id(1_337, zone_id)?,
         Some(genesis),
         signer,
         withdrawal_batch_interval_blocks,

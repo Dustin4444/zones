@@ -46,7 +46,7 @@ pub struct ProvisionConfig {
 pub struct ProvisionedZone {
     /// Zone ID assigned by the factory.
     pub zone_id: u32,
-    /// Zone chain ID derived from the zone ID.
+    /// Zone chain ID derived from the parent and zone IDs.
     pub chain_id: u64,
     /// `ZoneFactory` address on L1.
     pub factory: Address,
@@ -140,7 +140,8 @@ pub async fn provision_zone(config: ProvisionConfig) -> eyre::Result<Provisioned
         .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
     let zone_id = zone_created.zoneId;
     let portal = zone_created.portal;
-    let chain_id = zone_chain_id(zone_id);
+    let parent_chain_id = provider.get_chain_id().await?;
+    let chain_id = zone_chain_id(parent_chain_id, zone_id)?;
 
     register_encryption_key(&provider, portal, &dev_key).await?;
 
