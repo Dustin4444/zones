@@ -87,6 +87,15 @@ pub(crate) struct EncodedPersistedBlock {
     encoded: Vec<u8>,
 }
 
+/// How the persisted block broadcaster should finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistedBlockBroadcastShutdown {
+    /// The engine stopped cleanly, so wait for its final canonical blocks to persist.
+    Drain,
+    /// The engine did not stop cleanly, so publish only blocks that are already durable.
+    Stop,
+}
+
 /// Interface used by the replication task to keep track of blocks that are persisted vs broadcast
 pub(crate) trait PersistedBlockSource: Clone + Send + Sync + 'static {
     fn last_block_number(&self) -> eyre::Result<u64>;
@@ -137,19 +146,19 @@ where
 
 /// Broadcast every newly persisted leader block in canonical order until cancelled.
 ///
-/// Two shutdown inputs, because a leader's last block matters and its durability matters more:
+/// Two shutdown modes, because a leader's last block matters and its durability matters more:
 ///
-/// * `drain_after_engine_stop` is the graceful path. The role controller fires it only after the
-///   engine task has returned, which freezes the canonical head and lets this task wait for the
-///   final block to persist before publishing it.
-/// * `stop` is the abrupt path. It flushes what is already durable and abandons the rest.
+/// * [`PersistedBlockBroadcastShutdown::Drain`] is the graceful path. The role controller sends
+///   it only after the engine task has returned, which freezes the canonical head and lets this
+///   task wait for the final block to persist before publishing it.
+/// * [`PersistedBlockBroadcastShutdown::Stop`] is the abrupt path. It flushes what is already
+///   durable and abandons the rest.
 ///
 /// Neither path ever broadcasts a canonical-only block.
 pub(crate) async fn broadcast_persisted_blocks<P>(
     provider: P,
     commands: mpsc::Sender<P2pCommand>,
-    stop: CancellationToken,
-    mut drain_after_engine_stop: oneshot::Receiver<()>,
+    mut shutdown: oneshot::Receiver<PersistedBlockBroadcastShutdown>,
 ) where
     P: PersistedBlockSource,
 {
@@ -183,9 +192,9 @@ pub(crate) async fn broadcast_persisted_blocks<P>(
     loop {
         let persisted_tip = tokio::select! {
             biased;
-            result = &mut drain_after_engine_stop => {
+            result = &mut shutdown => {
                 match result {
-                    Ok(()) => {
+                    Ok(PersistedBlockBroadcastShutdown::Drain) => {
                         if let Err(err) = drain_persisted_blocks_after_engine_stop(
                             &provider,
                             &commands,
@@ -197,36 +206,35 @@ pub(crate) async fn broadcast_persisted_blocks<P>(
                             tracing::error!(target: "zone::p2p", %err, "Failed draining persisted zone blocks after the leader engine stopped");
                         }
                     }
-                    Err(_) => {
-                        debug!(target: "zone::p2p", "Persisted block broadcaster drain control dropped");
-                    }
-                }
-                return;
-            }
-            () = stop.cancelled() => {
-                // Stopped without an engine-complete drain, so the canonical head is still
-                // moving and cannot be a flush target. Publish what is already durable and
-                // abandon the rest: a canonical-only block would disappear from this node on
-                // restart, leaving followers on a height no replica can serve.
-                match provider.last_block_number() {
-                    Ok(persisted_head) => {
-                        if let Err(err) = broadcast_persisted_range(
-                            &provider,
-                            &commands,
-                            &mut last_broadcast,
-                            persisted_head,
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::error!(target: "zone::p2p", %err, "Failed flushing persisted zone blocks on stop");
+                    Ok(PersistedBlockBroadcastShutdown::Stop) => {
+                        // Stopped without an engine-complete drain, so the canonical head is still
+                        // moving and cannot be a flush target. Publish what is already durable and
+                        // abandon the rest: a canonical-only block would disappear from this node on
+                        // restart, leaving followers on a height no replica can serve.
+                        match provider.last_block_number() {
+                            Ok(persisted_head) => {
+                                if let Err(err) = broadcast_persisted_range(
+                                    &provider,
+                                    &commands,
+                                    &mut last_broadcast,
+                                    persisted_head,
+                                    None,
+                                )
+                                .await
+                                {
+                                    tracing::error!(target: "zone::p2p", %err, "Failed flushing persisted zone blocks on stop");
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(target: "zone::p2p", %err, "Failed reading the persisted zone head for the stop flush");
+                            }
                         }
+                        debug!(target: "zone::p2p", "Persisted block broadcaster stopped");
                     }
-                    Err(err) => {
-                        tracing::error!(target: "zone::p2p", %err, "Failed reading the persisted zone head for the stop flush");
+                    Err(_) => {
+                        debug!(target: "zone::p2p", "Persisted block broadcaster shutdown control dropped");
                     }
                 }
-                debug!(target: "zone::p2p", "Persisted block broadcaster stopped");
                 return;
             }
             tip = persisted.next() => match tip {
@@ -1325,8 +1333,9 @@ mod tests {
 
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, EncodedPersistedBlock, MAX_PENDING_BLOCKS,
-        PersistedBlockSource, PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
-        validate_live_block_sender, wait_for_validated_peer_anchor,
+        PersistedBlockBroadcastShutdown, PersistedBlockSource, PersistedTip,
+        broadcast_persisted_blocks, buffer_pending_block, validate_live_block_sender,
+        wait_for_validated_peer_anchor,
     };
     use alloy_primitives::B256;
     use zone_l1::{L1BlockTracker, L1PortalEvents};
@@ -1744,15 +1753,9 @@ mod tests {
             },
         };
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(4);
-        let (_drain, drain_rx) = oneshot::channel();
+        let (_shutdown, shutdown_rx) = oneshot::channel();
 
-        broadcast_persisted_blocks(
-            source,
-            commands,
-            tokio_util::sync::CancellationToken::new(),
-            drain_rx,
-        )
-        .await;
+        broadcast_persisted_blocks(source, commands, shutdown_rx).await;
 
         assert_eq!(
             command_rx.recv().await,
@@ -1776,11 +1779,12 @@ mod tests {
             .1,
         };
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(4);
-        let stop = tokio_util::sync::CancellationToken::new();
-        let (_drain, drain_rx) = oneshot::channel();
-        stop.cancel();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        shutdown
+            .send(PersistedBlockBroadcastShutdown::Stop)
+            .expect("the broadcaster must retain the shutdown receiver");
 
-        broadcast_persisted_blocks(source, commands, stop, drain_rx).await;
+        broadcast_persisted_blocks(source, commands, shutdown_rx).await;
 
         // Block 1 is durable and must be flushed; block 2 exists only in memory and would be
         // lost on restart, stranding any follower that imported it.
@@ -1810,16 +1814,11 @@ mod tests {
             updates: update_rx,
         };
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(4);
-        let (drain, drain_rx) = oneshot::channel();
-        let task = tokio::spawn(broadcast_persisted_blocks(
-            source,
-            commands,
-            tokio_util::sync::CancellationToken::new(),
-            drain_rx,
-        ));
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(broadcast_persisted_blocks(source, commands, shutdown_rx));
 
-        drain
-            .send(())
+        shutdown
+            .send(PersistedBlockBroadcastShutdown::Drain)
             .expect("the broadcaster must retain the drain receiver");
 
         // The durable prefix goes out immediately.
