@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 #
 # Deploy a standalone zone — Verifier, ZoneMessenger, and an initialized ZonePortal — without the
-# native TIP-1091 ZoneFactory. Needs a deployer key, an active sequencer transaction signer, an
-# encryption key, and an RPC URL.
+# native TIP-1091 ZoneFactory. The sequencer set and threshold are installed atomically during
+# initialization, then an active sequencer registers the shared encryption key.
 #
-#   PRIVATE_KEY=0x... \
-#   SEQUENCER_ENCRYPTION_PRIVATE_KEY=0x... \
-#   ETH_RPC_URL=http://localhost:8545 \
+# Example: three settlement signers with a 2-of-3 threshold. Load private keys from your normal
+# secret manager rather than writing them into shell history.
+#
+#   export PRIVATE_KEY='<funded deployer key>'
+#   export SEQUENCERS='[0x1111111111111111111111111111111111111111,0x2222222222222222222222222222222222222222,0x3333333333333333333333333333333333333333]'
+#   export THRESHOLD=2
+#   export SEQUENCER_TRANSACTION_PRIVATE_KEY='<private key for one address in SEQUENCERS>'
+#   export SEQUENCER_ENCRYPTION_PRIVATE_KEY='<shared deposit-decryption key>'
+#   export ETH_RPC_URL='https://rpc.example.invalid'
 #   ./scripts/deploy-standalone-zone.sh
+#
+# Key roles:
+#   PRIVATE_KEY                         deploys and initializes the standalone contracts
+#   SEQUENCER_TRANSACTION_PRIVATE_KEY   belongs to one registered settlement signer and pays for
+#                                       the encryption-key registration transaction
+#   SEQUENCER_ENCRYPTION_PRIVATE_KEY    shared by the nodes and signs the encryption-key proof;
+#                                       it does not need to be a registered settlement signer
 #
 # Why this needs to patch the reference contracts
 # ------------------------------------------------
@@ -40,6 +53,16 @@ if [ -z "${SEQUENCER_ENCRYPTION_PRIVATE_KEY:-}" ]; then
   exit 1
 fi
 
+if [ -z "${SEQUENCERS:-}" ]; then
+  echo "SEQUENCERS must be set to the complete settlement signer set" >&2
+  exit 1
+fi
+
+if [ -z "${THRESHOLD:-}" ]; then
+  echo "THRESHOLD must be set to the settlement signature threshold" >&2
+  exit 1
+fi
+
 ETH_RPC_URL="${ETH_RPC_URL:-http://localhost:8545}"
 
 for tool in forge cast jq; do
@@ -47,17 +70,16 @@ for tool in forge cast jq; do
 done
 
 DEPLOYER="$(cast wallet address "$PRIVATE_KEY")"
-# This key pays for setSequencerEncryptionKey and must be included in SEQUENCERS. In the default
-# single-sequencer configuration, the deployer is also the active sequencer.
+# This key pays for setSequencerEncryptionKey and must be included in SEQUENCERS. It defaults to
+# the deployer for an explicitly configured single-sequencer deployment.
 SEQUENCER_TRANSACTION_PRIVATE_KEY="${SEQUENCER_TRANSACTION_PRIVATE_KEY:-$PRIVATE_KEY}"
 SEQUENCER_TRANSACTION_SIGNER="$(cast wallet address "$SEQUENCER_TRANSACTION_PRIVATE_KEY")"
 
-# Zone parameters. Defaults produce a single-sequencer, fully open zone owned by the deployer.
+# Zone parameters. The quorum has no defaults: production deployments must not accidentally create
+# a temporary deployer-only signer set that later needs to be replaced.
 ZONE_ID="${ZONE_ID:-1}"
 INITIAL_TOKEN="$(cast to-check-sum-address "${INITIAL_TOKEN:-0x20C0000000000000000000000000000000000000}")"
 ADMIN="$(cast to-check-sum-address "${ADMIN:-$DEPLOYER}")"
-SEQUENCERS="${SEQUENCERS:-[$DEPLOYER]}"
-THRESHOLD="${THRESHOLD:-1}"
 ACCESS_ENFORCED="${ACCESS_ENFORCED:-false}"
 GATEWAY_ENFORCED="${GATEWAY_ENFORCED:-false}"
 ALLOWED_ACCOUNTS="${ALLOWED_ACCOUNTS:-[]}"
@@ -67,8 +89,63 @@ ZONE_RPC_URL="${ZONE_RPC_URL:-}"
 # Whoever is allowed to call initialize. Must be the caller below, so it defaults to the deployer.
 FACTORY_AUTHORITY="$(cast to-check-sum-address "${FACTORY_AUTHORITY:-$DEPLOYER}")"
 
-if ! tr -d '[:space:]' <<<"$SEQUENCERS" | tr ',[]' '\n' | tr '[:upper:]' '[:lower:]' \
-  | grep -Fxq "${SEQUENCER_TRANSACTION_SIGNER,,}"; then
+if [ "$FACTORY_AUTHORITY" != "$DEPLOYER" ]; then
+  echo "FACTORY_AUTHORITY must resolve to the PRIVATE_KEY deployer ($DEPLOYER)" >&2
+  exit 1
+fi
+
+if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then
+  echo "THRESHOLD must be an integer" >&2
+  exit 1
+fi
+
+# Normalize and validate the cast-compatible address-array input before deploying anything.
+SEQUENCER_LIST="$(tr -d '[:space:]' <<<"$SEQUENCERS")"
+if [[ "$SEQUENCER_LIST" != \[*\] ]]; then
+  echo "SEQUENCERS must use address-array syntax: [0x...,0x...]" >&2
+  exit 1
+fi
+SEQUENCER_LIST="${SEQUENCER_LIST#[}"
+SEQUENCER_LIST="${SEQUENCER_LIST%]}"
+IFS=',' read -r -a SEQUENCER_ADDRESSES <<<"$SEQUENCER_LIST"
+if [ "${#SEQUENCER_ADDRESSES[@]}" -eq 0 ] || [ -z "${SEQUENCER_ADDRESSES[0]}" ]; then
+  echo "SEQUENCERS must contain at least one address" >&2
+  exit 1
+fi
+if [ "${#SEQUENCER_ADDRESSES[@]}" -gt 8 ]; then
+  echo "SEQUENCERS cannot contain more than 8 addresses" >&2
+  exit 1
+fi
+if [ "$THRESHOLD" -lt 1 ] || [ "$THRESHOLD" -gt "${#SEQUENCER_ADDRESSES[@]}" ]; then
+  echo "THRESHOLD must be between 1 and the number of SEQUENCERS" >&2
+  exit 1
+fi
+
+NORMALIZED_SEQUENCERS=""
+SEEN_SEQUENCERS=""
+for i in "${!SEQUENCER_ADDRESSES[@]}"; do
+  sequencer="$(cast to-check-sum-address "${SEQUENCER_ADDRESSES[$i]}")"
+  if [ "$sequencer" = "0x0000000000000000000000000000000000000000" ]; then
+    echo "SEQUENCERS cannot contain the zero address" >&2
+    exit 1
+  fi
+  sequencer_lower="$(tr '[:upper:]' '[:lower:]' <<<"$sequencer")"
+  if grep -Fxq "$sequencer_lower" <<<"$SEEN_SEQUENCERS"; then
+    echo "SEQUENCERS contains duplicate address $sequencer" >&2
+    exit 1
+  fi
+  SEEN_SEQUENCERS="${SEEN_SEQUENCERS}${sequencer_lower}"$'\n'
+  SEQUENCER_ADDRESSES[$i]="$sequencer"
+  NORMALIZED_SEQUENCERS="${NORMALIZED_SEQUENCERS}${NORMALIZED_SEQUENCERS:+,}${sequencer}"
+done
+SEQUENCERS="[${NORMALIZED_SEQUENCERS}]"
+
+if [ "${#SEQUENCER_ADDRESSES[@]}" -gt 1 ] && [ "$THRESHOLD" -lt 2 ]; then
+  echo "WARNING: a multi-sequencer deployment with threshold 1 does not require follower approval" >&2
+fi
+
+transaction_signer_lower="$(tr '[:upper:]' '[:lower:]' <<<"$SEQUENCER_TRANSACTION_SIGNER")"
+if ! grep -Fxq "$transaction_signer_lower" <<<"$SEEN_SEQUENCERS"; then
   echo "SEQUENCER_TRANSACTION_PRIVATE_KEY must belong to one of SEQUENCERS" >&2
   exit 1
 fi
@@ -87,6 +164,8 @@ echo "  chain             $(cast chain-id --rpc-url "$ETH_RPC_URL")"
 echo "  deployer          ${DEPLOYER}"
 echo "  factory authority ${FACTORY_AUTHORITY}"
 echo "  initial token     ${INITIAL_TOKEN}"
+echo "  sequencers        ${SEQUENCERS}"
+echo "  threshold         ${THRESHOLD}"
 echo "  encryption tx signer ${SEQUENCER_TRANSACTION_SIGNER}"
 echo
 
@@ -159,6 +238,29 @@ cast send "$PORTAL" \
   "$SEQUENCERS" "$THRESHOLD" "$VERIFIER" "$ZONE_RPC_URL" \
   --rpc-url "$ETH_RPC_URL" --private-key "$PRIVATE_KEY" >/dev/null
 
+assert_equal() {
+  local label="$1" actual="$2" expected="$3"
+  if [ "$actual" != "$expected" ]; then
+    echo "$label mismatch: expected $expected, got $actual" >&2
+    exit 1
+  fi
+}
+
+# Check the complete quorum before submitting any sequencer-authorized follow-up transaction.
+# Installing it in initialize keeps sequencerSetVersion at 0 and avoids a temporary 1-of-1 portal.
+REGISTERED_SEQUENCER_COUNT="$(cast call "$PORTAL" 'sequencerCount()(uint256)' --rpc-url "$ETH_RPC_URL")"
+REGISTERED_THRESHOLD="$(cast call "$PORTAL" 'sequencerThreshold()(uint8)' --rpc-url "$ETH_RPC_URL")"
+REGISTERED_SET_VERSION="$(cast call "$PORTAL" 'sequencerSetVersion()(uint64)' --rpc-url "$ETH_RPC_URL")"
+REGISTERED_LEADER="$(cast call "$PORTAL" 'leader()(address)' --rpc-url "$ETH_RPC_URL")"
+assert_equal "sequencer count" "$REGISTERED_SEQUENCER_COUNT" "${#SEQUENCER_ADDRESSES[@]}"
+assert_equal "sequencer threshold" "$REGISTERED_THRESHOLD" "$THRESHOLD"
+assert_equal "sequencer set version" "$REGISTERED_SET_VERSION" "0"
+assert_equal "initial leader" "$REGISTERED_LEADER" "${SEQUENCER_ADDRESSES[0]}"
+for sequencer in "${SEQUENCER_ADDRESSES[@]}"; do
+  registered="$(cast call "$PORTAL" 'isSequencer(address)(bool)' "$sequencer" --rpc-url "$ETH_RPC_URL")"
+  assert_equal "sequencer membership for $sequencer" "$registered" "true"
+done
+
 # The Portal only accepts encrypted deposits after an active sequencer publishes the shared
 # deposit-decryption key. The transaction signer is intentionally separate from that key: in a
 # multi-sequencer deployment the shared encryption key is normally not itself a Portal sequencer.
@@ -197,14 +299,17 @@ cast send "$PORTAL" 'setSequencerEncryptionKey(bytes32,uint8,uint8,bytes32,bytes
   "$ENCRYPTION_POP_R" "$ENCRYPTION_POP_S" \
   --rpc-url "$ETH_RPC_URL" --private-key "$SEQUENCER_TRANSACTION_PRIVATE_KEY" >/dev/null
 
-mapfile -t REGISTERED_ENCRYPTION_KEY < <(
+REGISTERED_ENCRYPTION_KEY="$(
   cast call "$PORTAL" 'sequencerEncryptionKey()(bytes32,uint8)' --rpc-url "$ETH_RPC_URL"
-)
-if [ "${REGISTERED_ENCRYPTION_KEY[0]:-}" != "$ENCRYPTION_KEY_X" ] \
-  || [ "${REGISTERED_ENCRYPTION_KEY[1]:-}" != "$ENCRYPTION_KEY_Y_PARITY" ]; then
-  echo "registered encryption key does not match SEQUENCER_ENCRYPTION_PRIVATE_KEY" >&2
-  exit 1
-fi
+)"
+REGISTERED_ENCRYPTION_KEY_X="$(sed -n '1p' <<<"$REGISTERED_ENCRYPTION_KEY")"
+REGISTERED_ENCRYPTION_KEY_Y_PARITY="$(sed -n '2p' <<<"$REGISTERED_ENCRYPTION_KEY")"
+REGISTERED_ENCRYPTION_KEY_COUNT="$(
+  cast call "$PORTAL" 'encryptionKeyCount()(uint256)' --rpc-url "$ETH_RPC_URL"
+)"
+assert_equal "encryption key x" "$REGISTERED_ENCRYPTION_KEY_X" "$ENCRYPTION_KEY_X"
+assert_equal "encryption key y parity" "$REGISTERED_ENCRYPTION_KEY_Y_PARITY" "$ENCRYPTION_KEY_Y_PARITY"
+assert_equal "encryption key count" "$REGISTERED_ENCRYPTION_KEY_COUNT" "1"
 
 echo
 echo "Zone ${ZONE_ID} deployed:"
@@ -218,4 +323,8 @@ echo "  admin         $(cast call "$PORTAL" 'admin()(address)' --rpc-url "$ETH_R
 echo "  messenger     $(cast call "$PORTAL" 'messenger()(address)' --rpc-url "$ETH_RPC_URL")"
 echo "  verifier      $(cast call "$PORTAL" 'verifier()(address)' --rpc-url "$ETH_RPC_URL")"
 echo "  token enabled $(cast call "$PORTAL" 'isTokenEnabled(address)(bool)' "$INITIAL_TOKEN" --rpc-url "$ETH_RPC_URL")"
+echo "  sequencers    ${REGISTERED_SEQUENCER_COUNT} (${SEQUENCERS})"
+echo "  threshold     ${REGISTERED_THRESHOLD}"
+echo "  set version   ${REGISTERED_SET_VERSION}"
+echo "  leader        ${REGISTERED_LEADER}"
 echo "  encryption key $(cast call "$PORTAL" 'sequencerEncryptionKey()(bytes32,uint8)' --rpc-url "$ETH_RPC_URL" | tr '\n' ' ')"
