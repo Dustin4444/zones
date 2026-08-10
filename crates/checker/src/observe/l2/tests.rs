@@ -1,7 +1,4 @@
-use alloy_consensus::{
-    Header, Sealable as _, SignableTransaction as _, Signed, TxLegacy, TxReceipt as _,
-    transaction::TxHashRef as _,
-};
+use alloy_consensus::{Header, Sealable as _, SignableTransaction as _, Signed, TxLegacy};
 use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData, Signature, U256, b256};
 use alloy_rlp::Encodable as _;
 use alloy_sol_types::{SolCall as _, SolEvent as _};
@@ -10,19 +7,18 @@ use tempo_primitives::{
     Block, BlockBody, TempoHeader, TempoReceipt, TempoTxEnvelope, TempoTxType,
     transaction::envelope::TEMPO_SYSTEM_TX_SIGNATURE,
 };
-use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState};
+use tempo_zone_contracts::{
+    IZoneInbox, IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_INBOX_ADDRESS,
+    ZONE_OUTBOX_ADDRESS,
+};
 
 use super::*;
-use crate::{
-    observe::abi::MultiHeaderZoneInbox,
-    observe::error::{
+use crate::observe::{
+    error::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, EnvelopeRule, ObservationError, ProtocolChain,
     },
-    protocol::{
-        constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
-        events::{Inbox, L2ProtocolEvent, Outbox},
-    },
+    events::{Inbox, L2ProtocolEvent, Outbox},
 };
 
 const ZONE_NUMBER: u64 = 9;
@@ -53,19 +49,11 @@ fn advance_transaction_with_tokens(
     to: Address,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
 ) -> TempoTxEnvelope {
-    let calldata = MultiHeaderZoneInbox::advanceTempoCall {
-        headers: vec![encode_header(&imported_header())],
+    let calldata = IZoneInbox::advanceTempoCall {
+        header: encode_header(&imported_header()),
         deposits: Vec::new(),
         decryptions: Vec::new(),
-        enabledTokens: enabled_tokens
-            .into_iter()
-            .map(|t| MultiHeaderZoneInbox::EnabledToken {
-                token: t.token,
-                name: t.name,
-                symbol: t.symbol,
-                currency: t.currency,
-            })
-            .collect(),
+        enabledTokens: enabled_tokens,
     }
     .abi_encode();
     system_transaction(to, calldata.into())
@@ -315,7 +303,7 @@ fn tempo_advanced_cursor_is_retained_for_later_evaluation() {
     let observation = observe_l2_block(&block, &receipts).unwrap();
     assert!(matches!(
         &observation.outcomes.events[1].event,
-        L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(event))
+        L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(event))
             if event.newProcessedDepositQueueHash == B256::repeat_byte(0xa1)
                 && event.lastProcessedDepositNumber == 91
     ));
@@ -339,7 +327,7 @@ fn mismatched_tempo_advanced_is_retained_independently_from_calldata() {
     );
     assert!(matches!(
         &observation.outcomes.events[1].event,
-        L2ProtocolEvent::Inbox(Inbox::InboxEvents::TempoAdvanced(event))
+        L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(event))
             if event.tempoBlockHash == forged_hash
     ));
 }
@@ -372,7 +360,7 @@ fn mismatched_enabled_token_output_is_retained_for_later_evaluation() {
     );
     assert!(matches!(
         &observation.outcomes.events[2].event,
-        L2ProtocolEvent::Inbox(Inbox::InboxEvents::TokenEnabled(event))
+        L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TokenEnabled(event))
             if event.symbol == "BAD"
     ));
 }
@@ -500,7 +488,7 @@ fn outcomes_preserve_config_before_operation_order() {
     );
     assert!(matches!(
         user_events[0].event(),
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::TempoGasRateUpdated(_))
+        L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::TempoGasRateUpdated(_))
     ));
     assert_eq!(
         user_events[1].position().transaction_sender(),
@@ -508,7 +496,7 @@ fn outcomes_preserve_config_before_operation_order() {
     );
     assert!(matches!(
         user_events[1].event(),
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(event))
+        L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(event))
             if event.sender == Address::repeat_byte(0x45)
     ));
 }
@@ -542,11 +530,11 @@ fn outcomes_preserve_operation_before_config_order() {
     );
     assert!(matches!(
         user_events[0].event(),
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::WithdrawalRequested(_))
+        L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(_))
     ));
     assert!(matches!(
         user_events[1].event(),
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::TempoGasRateUpdated(_))
+        L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::TempoGasRateUpdated(_))
     ));
 }
 
@@ -591,7 +579,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
             transaction_hash: actual_hash,
             error,
         } if actual_hash == transaction_hash
-            && matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
+            && matches!(error.as_ref(), crate::observe::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 
     let (block, mut receipts) = basic_fixture();
@@ -609,7 +597,7 @@ fn protocol_event_surface_fails_closed_and_external_logs_are_ignored() {
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
-            if matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::MalformedProtocolEvent { .. })
+            if matches!(error.as_ref(), crate::observe::events::ProtocolEventError::MalformedProtocolEvent { .. })
     ));
 }
 
@@ -632,7 +620,7 @@ fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
     assert!(matches!(
         observe_l2_block(&block, &receipts),
         Err(ObservationError::ProtocolEvent { error, .. })
-            if matches!(error.as_ref(), crate::protocol::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
+            if matches!(error.as_ref(), crate::observe::events::ProtocolEventError::UnsupportedProtocolEvent { .. })
     ));
 }
 
@@ -667,7 +655,7 @@ fn finalization_is_unique_final_and_retains_its_event_output() {
     );
     assert!(matches!(
         &observation.outcomes.events.last().unwrap().event,
-        L2ProtocolEvent::Outbox(Outbox::OutboxEvents::BatchFinalized(event))
+        L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(event))
             if event.withdrawalQueueHash == B256::repeat_byte(0xa1)
                 && event.withdrawalBatchIndex == 91
     ));

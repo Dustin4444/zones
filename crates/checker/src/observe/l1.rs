@@ -9,7 +9,7 @@ use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use tempo_alloy::TempoNetwork;
 
-use crate::protocol::events::L1ProtocolEvent;
+use crate::observe::events::L1ProtocolEvent;
 
 use super::{
     abi::{DecodedPortalCall, ImportedTempoHeader},

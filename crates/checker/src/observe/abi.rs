@@ -3,15 +3,18 @@
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{B256, Bytes, U256};
 use alloy_rlp::{Decodable as _, Encodable as _};
-use alloy_sol_types::{SolCall as _, SolValue as _, sol};
+use alloy_sol_types::{SolCall as _, SolValue as _};
 use reth_primitives_traits::SealedHeader;
 use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZonePortal};
 
-use crate::protocol::constants::{
-    AUTHENTICATED_WITHDRAWAL_SIZE, ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE, MAX_CALLBACK_DATA_SIZE,
+use tempo_zone_contracts::{
     MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES,
     MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, MAX_UNPROCESSED_DEPOSITS,
+};
+use zone_precompiles::{
+    ecies::{AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE},
+    outbox::MAX_CALLBACK_DATA_SIZE,
 };
 
 use super::error::{
@@ -25,27 +28,6 @@ const SELECTOR: usize = 4;
 // a five-word encrypted-payload head, and a three-word ciphertext tail.
 const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
 
-// `advanceTempo` accepts either one header or an array of headers.
-sol! {
-    interface MultiHeaderZoneInbox {
-        enum DepositType { WithdrawalBounceBack, Deposit }
-        struct QueuedDeposit { DepositType depositType; bytes depositData; }
-        struct ChaumPedersenProof { bytes32 s; bytes32 c; }
-        struct DecryptionData {
-            bytes32 sharedSecret;
-            uint8 sharedSecretYParity;
-            ChaumPedersenProof cpProof;
-        }
-        struct EnabledToken { address token; string name; string symbol; string currency; }
-        function advanceTempo(
-            bytes[] headers,
-            QueuedDeposit[] deposits,
-            DecryptionData[] decryptions,
-            EnabledToken[] enabledTokens
-        );
-    }
-}
-
 #[derive(Debug)]
 struct AbiError {
     source: DataSource,
@@ -57,12 +39,6 @@ struct AdvanceCall {
     headers: Vec<Bytes>,
     deposits: Vec<(u8, Bytes)>,
     enabled_tokens: Vec<IZoneInbox::EnabledToken>,
-}
-
-#[derive(Clone, Copy)]
-enum AdvanceTempoAbi {
-    SingleHeader,
-    MultiHeader,
 }
 
 impl AbiError {
@@ -469,49 +445,27 @@ fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), AbiError> {
         encrypted,
         2,
         5,
-        ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE,
+        ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
         "ciphertext",
     )?;
-    if ciphertext.len() != ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE {
+    if ciphertext.len() != ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE {
         return Err(surface.malformed(format!(
-            "ciphertext length {}, expected {ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE}",
+            "ciphertext length {}, expected {ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE}",
             ciphertext.len()
         )));
     }
     Ok(())
 }
 
-fn preflight_advance_tempo(calldata: &[u8]) -> Result<AdvanceTempoAbi, AbiError> {
+fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
     let surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let abi = if calldata.get(..SELECTOR) == Some(IZoneInbox::advanceTempoCall::SELECTOR.as_slice())
-    {
-        AdvanceTempoAbi::SingleHeader
-    } else {
-        AdvanceTempoAbi::MultiHeader
-    };
-    let selector = match abi {
-        AdvanceTempoAbi::SingleHeader => &IZoneInbox::advanceTempoCall::SELECTOR,
-        AdvanceTempoAbi::MultiHeader => &MultiHeaderZoneInbox::advanceTempoCall::SELECTOR,
-    };
-    let bounds = Bounds::from_call(DataSource::AdvanceTempoCalldata, calldata, selector)?;
+    let bounds = Bounds::from_call(
+        DataSource::AdvanceTempoCalldata,
+        calldata,
+        &IZoneInbox::advanceTempoCall::SELECTOR,
+    )?;
     bounds.ensure_head(4)?;
-    match abi {
-        AdvanceTempoAbi::SingleHeader => {
-            bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
-        }
-        AdvanceTempoAbi::MultiHeader => {
-            let maximum_headers = bounds.data.len() / WORD;
-            let (header_head, header_count) =
-                bounds.dynamic_array(0, 0, 4, maximum_headers, "headers")?;
-            if header_count == 0 {
-                return Err(surface.malformed("headers must be nonempty"));
-            }
-            for index in 0..header_count {
-                let header = bounds.dynamic_element(header_head, header_count, index)?;
-                bounds.direct_bytes(header, bounds.data.len(), "header")?;
-            }
-        }
-    }
+    bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
 
     let (deposit_head, deposit_count) =
         bounds.dynamic_array(0, 1, 4, MAX_UNPROCESSED_DEPOSITS, "deposits")?;
@@ -557,7 +511,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<AdvanceTempoAbi, AbiError>
         bounds.bytes_field(token, 2, 4, MAX_TOKEN_SYMBOL_BYTES, "token symbol")?;
         bounds.bytes_field(token, 3, 4, MAX_TOKEN_CURRENCY_BYTES, "token currency")?;
     }
-    Ok(abi)
+    Ok(())
 }
 
 pub(crate) fn decode_advance_tempo(
@@ -569,53 +523,21 @@ pub(crate) fn decode_advance_tempo(
 
 fn decode_advance_tempo_inner(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError> {
     let advance_surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let abi = preflight_advance_tempo(calldata)?;
-    let call =
-        match abi {
-            AdvanceTempoAbi::SingleHeader => {
-                let call = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-                    .map_err(|error| advance_surface.malformed(error))?;
-                if call.abi_encode() != calldata {
-                    return Err(advance_surface
-                        .malformed("encoding is non-canonical or has trailing bytes"));
-                }
-                AdvanceCall {
-                    headers: vec![call.header],
-                    deposits: call
-                        .deposits
-                        .into_iter()
-                        .map(|queued| (queued.depositType as u8, queued.depositData))
-                        .collect(),
-                    enabled_tokens: call.enabledTokens,
-                }
-            }
-            AdvanceTempoAbi::MultiHeader => {
-                let call = MultiHeaderZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
-                    .map_err(|error| advance_surface.malformed(error))?;
-                if call.abi_encode() != calldata {
-                    return Err(advance_surface
-                        .malformed("encoding is non-canonical or has trailing bytes"));
-                }
-                AdvanceCall {
-                    headers: call.headers,
-                    deposits: call
-                        .deposits
-                        .into_iter()
-                        .map(|queued| (queued.depositType as u8, queued.depositData))
-                        .collect(),
-                    enabled_tokens: call
-                        .enabledTokens
-                        .into_iter()
-                        .map(|t| IZoneInbox::EnabledToken {
-                            token: t.token,
-                            name: t.name,
-                            symbol: t.symbol,
-                            currency: t.currency,
-                        })
-                        .collect(),
-                }
-            }
-        };
+    preflight_advance_tempo(calldata)?;
+    let decoded = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
+        .map_err(|error| advance_surface.malformed(error))?;
+    if decoded.abi_encode() != calldata {
+        return Err(advance_surface.malformed("encoding is non-canonical or has trailing bytes"));
+    }
+    let call = AdvanceCall {
+        headers: vec![decoded.header],
+        deposits: decoded
+            .deposits
+            .into_iter()
+            .map(|queued| (queued.depositType as u8, queued.depositData))
+            .collect(),
+        enabled_tokens: decoded.enabledTokens,
+    };
 
     let mut imported_headers: Vec<ImportedTempoHeader> = Vec::with_capacity(call.headers.len());
     for encoded in call.headers {
@@ -702,11 +624,14 @@ fn preflight_finalization(calldata: &[u8]) -> Result<(), AbiError> {
     }
     for index in 0..sender_count {
         let sender = bounds.dynamic_element(sender_head, sender_count, index)?;
-        let bytes =
-            bounds.direct_bytes(sender, AUTHENTICATED_WITHDRAWAL_SIZE, "encrypted sender")?;
-        if !matches!(bytes.len(), 0 | AUTHENTICATED_WITHDRAWAL_SIZE) {
+        let bytes = bounds.direct_bytes(
+            sender,
+            AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
+            "encrypted sender",
+        )?;
+        if !matches!(bytes.len(), 0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE) {
             return Err(surface.malformed(format!(
-                    "encrypted sender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_SIZE}",
+                    "encrypted sender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
                     bytes.len()
                 )));
         }
@@ -756,12 +681,12 @@ fn preflight_process_withdrawals(calldata: &[u8]) -> Result<(), AbiError> {
             withdrawal,
             8,
             9,
-            AUTHENTICATED_WITHDRAWAL_SIZE,
+            AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
             "encryptedSender",
         )?;
-        if !matches!(encrypted.len(), 0 | AUTHENTICATED_WITHDRAWAL_SIZE) {
+        if !matches!(encrypted.len(), 0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE) {
             return Err(surface.malformed(format!(
-                    "encryptedSender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_SIZE}",
+                    "encryptedSender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
                     encrypted.len()
                 )));
         }

@@ -33,11 +33,15 @@ alloy-sol-types.workspace = true
 
 # tempo
 tempo-alloy.workspace = true
+tempo-chainspec.workspace = true
 tempo-contracts.workspace = true
+tempo-precompiles.workspace = true
 tempo-primitives.workspace = true
+tempo-revm = { workspace = true, features = ["reth"] }
 
 # zones
 tempo-zone-contracts = { workspace = true, features = ["std"] }
+zone-precompiles = { workspace = true, features = ["std"] }
 zone-primitives = { workspace = true, features = ["std"] }
 
 # misc

@@ -8,10 +8,9 @@ use alloy_primitives::{Address, B256, Bloom};
 use reth_primitives_traits::RecoveredBlock;
 use tempo_primitives::{Block, TempoReceipt, TempoTxEnvelope};
 
-use crate::protocol::{
-    constants::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS},
-    events::{L2ProtocolEvent, classify_l2_protocol_event},
-};
+use tempo_zone_contracts::{ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
+
+use crate::observe::events::{L2ProtocolEvent, classify_l2_protocol_event};
 
 use super::{
     abi::{DecodedAdvanceTempo, DecodedFinalization, decode_advance_tempo, decode_finalization},

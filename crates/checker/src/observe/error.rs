@@ -4,7 +4,7 @@ use std::fmt;
 
 use alloy_primitives::{Address, B256, keccak256};
 
-use crate::protocol::events::ProtocolEventError;
+use crate::observe::events::ProtocolEventError;
 
 /// External or notification-local source required for a complete view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

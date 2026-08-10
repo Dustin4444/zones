@@ -2,8 +2,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use alloy_primitives::{B256, Log, b256};
-
-use crate::protocol::constants::{ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE, MAX_SEQUENCERS};
+use tempo_zone_contracts::{MAX_SEQUENCERS, ZonePortal as Portal};
+use zone_precompiles::ecies::ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE;
 
 use super::{
     ProtocolEventError,
@@ -12,108 +12,6 @@ use super::{
         validate_exact_bytes, validate_token_metadata,
     },
 };
-
-// Checker-owned Portal event ABI.
-//
-// Pinned source: `specs/ref-impls/src/interfaces/IZone.sol:504-605,652`.
-// The production Rust ABI mirror omits `DepositsPaused`, `DepositsResumed`,
-// and `RpcUrlUpdated`, so the checker defines them here.
-alloy_sol_types::sol! {
-    #[derive(Debug, PartialEq, Eq)]
-    contract Portal {
-        enum Role {
-            None,
-            Account,
-            CallbackGateway
-        }
-
-        event DepositMade(
-            bytes32 indexed newCurrentDepositQueueHash,
-            address indexed sender,
-            address token,
-            uint128 netAmount,
-            uint128 fee,
-            uint256 keyIndex,
-            bytes32 ephemeralPubkeyX,
-            uint8 ephemeralPubkeyYParity,
-            bytes ciphertext,
-            bytes12 nonce,
-            bytes16 tag,
-            address tempoRefundRecipient,
-            uint64 depositNumber
-        );
-        event TokenEnabled(address indexed token, string name, string symbol, string currency);
-        event BatchSubmitted(
-            uint64 indexed withdrawalBatchIndex,
-            uint256 indexed withdrawalQueueIndex,
-            bytes32 nextProcessedDepositQueueHash,
-            bytes32 nextBlockHash,
-            bytes32 withdrawalQueueHash,
-            uint64 lastProcessedDepositNumber
-        );
-        event WithdrawalProcessed(
-            address indexed to,
-            bytes32 indexed senderTag,
-            address token,
-            uint128 amount,
-            bool callbackSuccess
-        );
-        event WithdrawalBounceBack(
-            bytes32 indexed newCurrentDepositQueueHash,
-            uint64 indexed fallbackNonce,
-            address token,
-            uint128 amount,
-            uint64 depositNumber
-        );
-        event DepositBounceBack(
-            address indexed tempoRefundRecipient,
-            address token,
-            uint128 amount,
-            uint128 bouncebackFee
-        );
-        event DepositBounceBackPending(
-            address indexed tempoRefundRecipient,
-            address token,
-            uint128 amount,
-            uint128 bouncebackFee
-        );
-        event RefundClaimed(address indexed recipient, address indexed token, uint128 amount);
-        event BouncebackGasUpdated(uint64 bouncebackGas);
-
-        event SequencerEncryptionKeyUpdated(
-            bytes32 x,
-            uint8 yParity,
-            uint256 keyIndex,
-            uint64 activationBlock
-        );
-        event ZoneGasRateUpdated(uint128 zoneGasRate);
-        event MaxTempoGasRateUpdated(uint128 maxTempoGasRate);
-        event AdminTransferStarted(
-            address indexed currentAdmin,
-            address indexed pendingAdmin
-        );
-        event AdminTransferred(
-            address indexed previousAdmin,
-            address indexed newAdmin
-        );
-        event RoleUpdated(address indexed account, Role prev, Role next);
-        event EnforcementModesUpdated(bool accessMode, bool gatewayMode);
-        event SequencerSetUpdated(
-            uint64 indexed nonce,
-            uint8 threshold,
-            address[] sequencers
-        );
-        event LeaderUpdated(
-            address indexed previousLeader,
-            address indexed newLeader,
-            uint64 indexed epoch,
-            uint64 activationTempoBlock
-        );
-        event DepositsPaused(address indexed token);
-        event DepositsResumed(address indexed token);
-        event RpcUrlUpdated(string rpcUrl);
-    }
-}
 
 // Independent topic0 literals. Tests compare them with `SolEvent::SIGNATURE_HASH`.
 pub(super) const DEPOSIT_MADE_TOPIC: B256 =
@@ -206,64 +104,64 @@ pub(super) fn decode(log: &Log) -> Result<Option<PortalEvent>, ProtocolEventErro
         preflight_address_array_count(log, "SequencerSetUpdated", 1, MAX_SEQUENCERS)?;
     }
 
-    let decoded = strict_decode_interface::<Portal::PortalEvents>(log, "Portal event")?;
+    let decoded = strict_decode_interface::<Portal::ZonePortalEvents>(log, "Portal event")?;
     validate_dynamic_bounds(log, &decoded)?;
 
     Ok(match decoded {
-        Portal::PortalEvents::DepositMade(event) => Some(PortalEvent::DepositMade(event)),
-        Portal::PortalEvents::TokenEnabled(event) => Some(PortalEvent::TokenEnabled(event)),
-        Portal::PortalEvents::BatchSubmitted(event) => Some(PortalEvent::BatchSubmitted(event)),
-        Portal::PortalEvents::WithdrawalProcessed(event) => {
+        Portal::ZonePortalEvents::DepositMade(event) => Some(PortalEvent::DepositMade(event)),
+        Portal::ZonePortalEvents::TokenEnabled(event) => Some(PortalEvent::TokenEnabled(event)),
+        Portal::ZonePortalEvents::BatchSubmitted(event) => Some(PortalEvent::BatchSubmitted(event)),
+        Portal::ZonePortalEvents::WithdrawalProcessed(event) => {
             Some(PortalEvent::WithdrawalProcessed(event))
         }
-        Portal::PortalEvents::WithdrawalBounceBack(event) => {
+        Portal::ZonePortalEvents::WithdrawalBounceBack(event) => {
             Some(PortalEvent::WithdrawalBounceBack(event))
         }
-        Portal::PortalEvents::DepositBounceBack(event) => {
+        Portal::ZonePortalEvents::DepositBounceBack(event) => {
             Some(PortalEvent::DepositBounceBack(event))
         }
-        Portal::PortalEvents::DepositBounceBackPending(event) => {
+        Portal::ZonePortalEvents::DepositBounceBackPending(event) => {
             Some(PortalEvent::DepositBounceBackPending(event))
         }
-        Portal::PortalEvents::RefundClaimed(event) => Some(PortalEvent::RefundClaimed(event)),
-        Portal::PortalEvents::BouncebackGasUpdated(event) => {
+        Portal::ZonePortalEvents::RefundClaimed(event) => Some(PortalEvent::RefundClaimed(event)),
+        Portal::ZonePortalEvents::BouncebackGasUpdated(event) => {
             Some(PortalEvent::BouncebackGasUpdated(event))
         }
-        Portal::PortalEvents::SequencerEncryptionKeyUpdated(_)
-        | Portal::PortalEvents::ZoneGasRateUpdated(_)
-        | Portal::PortalEvents::MaxTempoGasRateUpdated(_)
-        | Portal::PortalEvents::AdminTransferStarted(_)
-        | Portal::PortalEvents::AdminTransferred(_)
-        | Portal::PortalEvents::RoleUpdated(_)
-        | Portal::PortalEvents::EnforcementModesUpdated(_)
-        | Portal::PortalEvents::SequencerSetUpdated(_)
-        | Portal::PortalEvents::LeaderUpdated(_)
-        | Portal::PortalEvents::DepositsPaused(_)
-        | Portal::PortalEvents::DepositsResumed(_)
-        | Portal::PortalEvents::RpcUrlUpdated(_) => None,
+        Portal::ZonePortalEvents::SequencerEncryptionKeyUpdated(_)
+        | Portal::ZonePortalEvents::ZoneGasRateUpdated(_)
+        | Portal::ZonePortalEvents::MaxTempoGasRateUpdated(_)
+        | Portal::ZonePortalEvents::AdminTransferStarted(_)
+        | Portal::ZonePortalEvents::AdminTransferred(_)
+        | Portal::ZonePortalEvents::RoleUpdated(_)
+        | Portal::ZonePortalEvents::EnforcementModesUpdated(_)
+        | Portal::ZonePortalEvents::SequencerSetUpdated(_)
+        | Portal::ZonePortalEvents::LeaderUpdated(_)
+        | Portal::ZonePortalEvents::DepositsPaused(_)
+        | Portal::ZonePortalEvents::DepositsResumed(_)
+        | Portal::ZonePortalEvents::RpcUrlUpdated(_) => None,
     })
 }
 
 fn validate_dynamic_bounds(
     log: &Log,
-    event: &Portal::PortalEvents,
+    event: &Portal::ZonePortalEvents,
 ) -> Result<(), ProtocolEventError> {
     match event {
-        Portal::PortalEvents::DepositMade(event) => validate_exact_bytes(
+        Portal::ZonePortalEvents::DepositMade(event) => validate_exact_bytes(
             log,
             "DepositMade",
             "ciphertext",
             event.ciphertext.len(),
-            ENCRYPTED_DEPOSIT_CIPHERTEXT_SIZE,
+            ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
         ),
-        Portal::PortalEvents::TokenEnabled(event) => validate_token_metadata(
+        Portal::ZonePortalEvents::TokenEnabled(event) => validate_token_metadata(
             log,
             "TokenEnabled",
             &event.name,
             &event.symbol,
             &event.currency,
         ),
-        Portal::PortalEvents::SequencerSetUpdated(event)
+        Portal::ZonePortalEvents::SequencerSetUpdated(event)
             if event.sequencers.len() > MAX_SEQUENCERS =>
         {
             Err(super::common::malformed(
