@@ -206,6 +206,10 @@ ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" SEQUENCER_KEY="$SEQUENCER_KEY" \
 available for admin-only portal calls such as changing either mode or account roles,
 enabling tokens, and pausing or resuming deposits. When `SEQUENCER_KEY` is set (or
 `--sequencer-key` is passed), `create-zone` also registers that sequencer's encryption key.
+For a multi-sequencer zone, also pass `--transaction-private-key` (or set
+`TRANSACTION_PRIVATE_KEY`) to the portal admin or an individual key whose address is in the
+configured sequencer set. The shared `SEQUENCER_KEY` remains the encryption key and does not need
+to be a portal sequencer address.
 
 ### 5. Start the Zone Node
 
@@ -273,6 +277,16 @@ PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
 # Send a deposit
 just send-deposit 1000000                       # to your own address
 just send-deposit 1000000 <recipient-address>   # to a specific address
+```
+
+For a multi-sequencer zone, sign the portal transaction with the admin or one node's individual
+key while using the shared key only for the encryption-key proof of possession:
+
+```bash
+PRIVATE_KEY="$SEQUENCER_KEY" TRANSACTION_PRIVATE_KEY="$TRANSACTION_PRIVATE_KEY" \
+  cargo run -p tempo-xtask -- set-encryption-key \
+  --portal "$L1_PORTAL_ADDRESS" \
+  --l1-rpc-url "$L1_RPC_URL"
 ```
 
 For shared-key rotations, pass the currently deployed
@@ -669,8 +683,9 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `L1_RPC_URL` | Yes | Certified Tempo follower WebSocket RPC URL (`wss://...`) |
-| `SEQUENCER_KEY` | For short-lived tooling | Sequencer private key for `just create-zone` and xtasks; not accepted by the node |
+| `SEQUENCER_KEY` | For short-lived tooling | Shared block-production and ECIES encryption key for `just create-zone` and xtasks; not accepted by the node |
 | `SEQUENCER_KEY_FILE` | For sequencing | Owner-readable file or FIFO containing the sequencer private key |
+| `TRANSACTION_PRIVATE_KEY` | Short-lived multi-sequencer tooling | Portal admin or individual registered sequencer key used to submit encryption-key registration transactions |
 | `DEPOSIT_DECRYPTION_KEYS_FILE` | During encryption-key rotation | Additional historical or pre-provisioned deposit decryption keys, one hex key per line |
 | `ADMIN_KEY` | For portal governance | Portal admin private key for `enableToken` / deposit pause controls. `SEQUENCER_KEY` only works for legacy zones where admin == sequencer. |
 | `PRIVATE_KEY` | For transactions | Key for L1 transactions (deposits, approvals) |
