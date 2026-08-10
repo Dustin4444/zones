@@ -2370,6 +2370,7 @@ impl L1TestNode {
     pub(crate) async fn encrypt_deposit_for_portal(
         &self,
         portal_address: Address,
+        sender: Address,
         recipient: Address,
         memo: B256,
     ) -> eyre::Result<(U256, tempo_zone_contracts::DepositPayload)> {
@@ -2390,6 +2391,7 @@ impl L1TestNode {
             key_result.yParity,
             recipient,
             memo,
+            sender,
             portal_address,
             key_index,
         )
@@ -2835,7 +2837,7 @@ impl WithdrawalArgs {
         args: RouterDepositArgs,
     ) -> eyre::Result<Self> {
         let (key_index, encrypted) = l1
-            .encrypt_deposit_for_portal(args.target_portal, args.recipient, args.memo)
+            .encrypt_deposit_for_portal(args.target_portal, args.router, args.recipient, args.memo)
             .await?;
         Ok(Self::swap_and_deposit_via_router_callback(
             RouterCallbackArgs {
@@ -3223,6 +3225,7 @@ impl ZoneAccount {
             key_result.yParity,
             recipient,
             memo,
+            self.address,
             self.portal_address,
             key_index,
         )
@@ -4694,6 +4697,7 @@ impl L1Fixture {
                         &deposit.tag,
                         Address::ZERO,
                         deposit.key_index,
+                        deposit.sender,
                     ) {
                         self.seed_no_receive_policy_at(block_number, decrypted.to)
                             .expect("encrypted receive-policy fixture seed must be admitted");
@@ -4852,10 +4856,11 @@ impl L1Fixture {
         let shared_secret_x: [u8; 32] = ss_enc.x().unwrap().as_slice().try_into().unwrap();
 
         // HKDF-SHA256 key derivation (matching ecies.rs)
-        let mut info = Vec::with_capacity(84);
+        let mut info = Vec::with_capacity(104);
         info.extend_from_slice(portal_address.as_slice());
         info.extend_from_slice(&key_index.to_be_bytes::<32>());
         info.extend_from_slice(&eph_pub_x.0);
+        info.extend_from_slice(sender.as_slice());
         let aes_key = hkdf_sha256(&shared_secret_x, b"ecies-aes-key", &info);
 
         // Build and encrypt plaintext (deterministic zero nonce)
