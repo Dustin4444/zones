@@ -756,8 +756,6 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     let [transaction] = observed.protocol_transactions() else {
         panic!("expected one protocol transaction");
     };
-    assert_eq!(transaction.transaction_index(), 0);
-    assert_eq!(transaction.transaction_hash(), tx_hash);
     let call = transaction
         .direct_call()
         .and_then(DecodedPortalCall::as_process_withdrawals)

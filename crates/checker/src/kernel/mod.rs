@@ -20,9 +20,12 @@ pub(crate) use facts::{
 pub(crate) use finding::{Datum, Finding, FindingCategory, FindingLocation};
 pub(crate) use invariants::validate;
 pub(crate) use state::{
-    BatchId, Cursor, DepositId, PortalIdentity, PortalState, State, StateDelta, StateKey, TokenPhase,
-    Withdrawal, WithdrawalId,
+    BatchId, Cursor, DepositId, PortalIdentity, PortalState, State, StateDelta, StateKey,
+    TokenPhase, Withdrawal, WithdrawalId,
 };
+
+#[cfg(test)]
+pub(crate) use state::StateValue;
 
 #[cfg(test)]
 mod tests;

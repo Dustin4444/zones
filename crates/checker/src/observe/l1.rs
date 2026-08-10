@@ -43,23 +43,11 @@ impl OrderedL1Outcome {
 /// transaction. `direct_call` is absent when no transition needs calldata.
 #[derive(Debug)]
 pub(crate) struct L1TransactionObservation {
-    transaction_index: usize,
-    transaction_hash: B256,
     direct_call: Option<DecodedPortalCall>,
     outcomes: Vec<OrderedL1Outcome>,
 }
 
 impl L1TransactionObservation {
-    #[cfg(test)]
-    pub(crate) fn transaction_index(&self) -> usize {
-        self.transaction_index
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transaction_hash(&self) -> B256 {
-        self.transaction_hash
-    }
-
     pub(crate) fn direct_call(&self) -> Option<&DecodedPortalCall> {
         self.direct_call.as_ref()
     }
@@ -135,8 +123,6 @@ where
             None => None,
         };
         protocol_transactions.push(L1TransactionObservation {
-            transaction_index: transaction.transaction_index,
-            transaction_hash: transaction.transaction_hash,
             direct_call,
             outcomes: transaction.outcomes,
         });

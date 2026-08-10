@@ -347,10 +347,7 @@ fn enable_token(overlay: &mut Overlay<'_>, enable: &TokenEnable) -> Result<(), T
     }
     overlay.set(
         StateKey::Token(enable.token),
-        Some(StateValue::Token(TokenState {
-            phase: TokenPhase::PendingZoneEnable,
-            accounting: TokenAccounting::default(),
-        })),
+        Some(StateValue::Token(TokenState::pending())),
     );
     Ok(())
 }
@@ -378,10 +375,7 @@ fn append_deposit(
         .checked_add(1)
         .ok_or(TransitionError::Overflow)?;
     let hash = ordinary_deposit_hash(input, deposit.hash);
-    let id = DepositId {
-        portal: identity.portal,
-        number: NonZeroU64::new(number).expect("increment from a cursor is nonzero"),
-    };
+    let id = DepositId::new(identity.portal, number).ok_or(TransitionError::Overflow)?;
     if overlay.get(&StateKey::Deposit(id)).is_some() {
         return Err(TransitionError::DepositCollision);
     }
@@ -424,10 +418,7 @@ fn consume_deposit(
         .checked_add(1)
         .ok_or(TransitionError::Overflow)?;
     let identity = portal(overlay)?.identity();
-    let id = DepositId {
-        portal: identity.portal,
-        number: NonZeroU64::new(number).expect("increment from a cursor is nonzero"),
-    };
+    let id = DepositId::new(identity.portal, number).ok_or(TransitionError::Overflow)?;
     let Some(StateValue::Deposit(owner)) = overlay.get(&StateKey::Deposit(id)) else {
         return Err(TransitionError::DepositPrefixMismatch);
     };
@@ -624,10 +615,8 @@ fn require_bounceback_owner(
     amount: u128,
     deposit: DepositId,
 ) -> Result<FallbackId, TransitionError> {
-    let key = FallbackId {
-        zone_id: withdrawal.zone_id,
-        nonce: fallback_nonce,
-    };
+    let key = FallbackId::new(withdrawal.zone_id, fallback_nonce.get())
+        .ok_or(TransitionError::Overflow)?;
     match overlay.get(&StateKey::Fallback(key)) {
         Some(StateValue::Fallback(FallbackState::Queued {
             withdrawal: actual_withdrawal,
@@ -702,10 +691,8 @@ fn apply_zone_operations(
                     .last_fallback_nonce
                     .checked_add(1)
                     .ok_or(TransitionError::Overflow)?;
-                let fallback = FallbackId {
-                    zone_id: portal(overlay)?.identity().zone_id,
-                    nonce: NonZeroU64::new(fallback_nonce).expect("increment is nonzero"),
-                };
+                let fallback = FallbackId::new(portal(overlay)?.identity().zone_id, fallback_nonce)
+                    .ok_or(TransitionError::Overflow)?;
                 let id = WithdrawalId {
                     zone_id: fallback.zone_id,
                     index: z.next_withdrawal_index,
@@ -855,10 +842,7 @@ fn finalize(
         .withdrawal_batch_index
         .checked_add(1)
         .ok_or(TransitionError::Overflow)?;
-    let id = BatchId {
-        zone_id,
-        index: NonZeroU64::new(index).expect("increment is nonzero"),
-    };
+    let id = BatchId::new(zone_id, index).ok_or(TransitionError::Overflow)?;
     if overlay.get(&StateKey::Batch(id)).is_some() {
         return Err(TransitionError::OwnerMismatch);
     }
@@ -910,10 +894,7 @@ fn submit_batch(
         .batch_index
         .checked_add(1)
         .ok_or(TransitionError::Overflow)?;
-    let id = BatchId {
-        zone_id: identity.zone_id,
-        index: NonZeroU64::new(next).expect("increment is nonzero"),
-    };
+    let id = BatchId::new(identity.zone_id, next).ok_or(TransitionError::Overflow)?;
     let StateValue::Batch(BatchState::Finalized {
         boundary,
         first_withdrawal,
@@ -1017,14 +998,12 @@ fn process_withdrawals(
     }
     let (id, batch) = overlay
         .range(
-            std::ops::Bound::Included(StateKey::Batch(BatchId {
-                zone_id: identity.zone_id,
-                index: NonZeroU64::MIN,
-            })),
-            std::ops::Bound::Included(StateKey::Batch(BatchId {
-                zone_id: identity.zone_id,
-                index: NonZeroU64::new(u64::MAX).unwrap(),
-            })),
+            std::ops::Bound::Included(StateKey::Batch(
+                BatchId::new(identity.zone_id, 1).expect("nonzero lower bound"),
+            )),
+            std::ops::Bound::Included(StateKey::Batch(
+                BatchId::new(identity.zone_id, u64::MAX).expect("nonzero upper bound"),
+            )),
         )
         .find_map(|(key, value)| match (key, value) {
             (StateKey::Batch(id), StateValue::Batch(batch)) => Some((id, batch.clone())),
@@ -1141,10 +1120,7 @@ fn process_withdrawals(
                     amount: data.amount,
                 };
                 let hash = bounceback_deposit_hash(bounce, pc.hash);
-                let did = DepositId {
-                    portal: pi.portal,
-                    number: NonZeroU64::new(number).expect("increment"),
-                };
+                let did = DepositId::new(pi.portal, number).ok_or(TransitionError::Overflow)?;
                 if overlay.get(&StateKey::Deposit(did)).is_some() {
                     return Err(TransitionError::DepositCollision);
                 }
@@ -1328,18 +1304,13 @@ fn claim_refund(
             StateKey::PortalRefund(PortalRefundId {
                 token: Address::ZERO,
                 recipient: Address::ZERO,
-                deposit: DepositId {
-                    portal: Address::ZERO,
-                    number: NonZeroU64::MIN,
-                },
+                deposit: DepositId::new(Address::ZERO, 1).expect("nonzero lower bound"),
             }),
             StateKey::PortalRefund(PortalRefundId {
                 token: Address::repeat_byte(0xff),
                 recipient: Address::repeat_byte(0xff),
-                deposit: DepositId {
-                    portal: Address::repeat_byte(0xff),
-                    number: NonZeroU64::new(u64::MAX).expect("nonzero"),
-                },
+                deposit: DepositId::new(Address::repeat_byte(0xff), u64::MAX)
+                    .expect("nonzero upper bound"),
             }),
         ),
         RefundSide::Inbox => (

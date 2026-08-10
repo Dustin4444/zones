@@ -149,15 +149,12 @@ pub(crate) fn validate(state: &State) -> Result<(), InvariantViolation> {
     let mut cursor = zone.processed_deposit;
     if let Some(first_pending) = cursor.number.checked_add(1) {
         for number in first_pending..=portal_cursor.number {
-            let Some(number) = std::num::NonZeroU64::new(number) else {
+            let Some(id) = crate::kernel::state::DepositId::new(portal.identity().portal, number)
+            else {
                 return Err(violation(
                     InvariantCode::DepositCursor,
                     Some(StateKey::Portal),
                 ));
-            };
-            let id = crate::kernel::state::DepositId {
-                portal: portal.identity().portal,
-                number,
             };
             let Some(StateValue::Deposit(owner)) = state.rows().get(&StateKey::Deposit(id)) else {
                 return Err(violation(
@@ -183,7 +180,7 @@ pub(crate) fn validate(state: &State) -> Result<(), InvariantViolation> {
                     cursor.hash,
                 ),
             };
-            cursor.number = number.get();
+            cursor.number = number;
         }
     }
     if cursor != *portal_cursor {
@@ -219,10 +216,9 @@ pub(crate) fn validate(state: &State) -> Result<(), InvariantViolation> {
                     amount,
                 }),
             ) => {
-                let fallback = crate::kernel::state::FallbackId {
-                    zone_id: withdrawal.zone_id,
-                    nonce: *fallback_nonce,
-                };
+                let fallback =
+                    crate::kernel::state::FallbackId::new(withdrawal.zone_id, fallback_nonce.get())
+                        .expect("stored fallback nonce is nonzero");
                 if !matches!(
                     state.rows().get(&StateKey::Fallback(fallback)),
                     Some(StateValue::Fallback(FallbackState::Queued {

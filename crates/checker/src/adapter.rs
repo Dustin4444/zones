@@ -12,9 +12,7 @@ use alloy_primitives::{Address, B256, FixedBytes, U256};
 use crate::{
     observe::{
         L1BlockObservation, L2BlockObservation, ZonePostStateOutputs,
-        events::{
-            Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, Portal, TempoState,
-        },
+        events::{Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, Portal, TempoState},
     },
     persistence::{BlockNumHash, CoverageGapReason},
     runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass},
@@ -186,7 +184,9 @@ fn imported_facts(
             if let Some(call) = call.as_submit_batch() {
                 if !matches!(
                     events.as_slice(),
-                    [L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(_))]
+                    [L1ProtocolEvent::Portal(
+                        Portal::ZonePortalEvents::BatchSubmitted(_)
+                    )]
                 ) {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -280,9 +280,12 @@ fn imported_facts(
             ));
         }
         if observation.block_hash() == portal_creation_block_hash
-            && events
-                .iter()
-                .any(|event| matches!(event, L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))))
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))
+                )
+            })
             && !events
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
@@ -371,12 +374,13 @@ fn imported_facts(
                     };
                     operations.push(ImportedOperation::AppendDeposit(d));
                     effects.push(Effect::DepositAppended {
-                        id: crate::kernel::DepositId {
-                            portal: observation.portal_address(),
-                            number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
-                                failure(AdapterFindingCode::Grammar, "zero deposit number")
-                            })?,
-                        },
+                        id: crate::kernel::DepositId::new(
+                            observation.portal_address(),
+                            e.depositNumber,
+                        )
+                        .ok_or_else(|| {
+                            failure(AdapterFindingCode::Grammar, "zero deposit number")
+                        })?,
                         queue_hash: e.newCurrentDepositQueueHash,
                     });
                 }
@@ -392,21 +396,18 @@ fn imported_facts(
                         amount: e.amount,
                     });
                 }
-                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(e)) => {
-                    effects.push(Effect::BatchSubmitted {
-                        id: crate::kernel::BatchId {
-                            zone_id,
-                            index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(e)) => effects
+                    .push(Effect::BatchSubmitted {
+                        id: crate::kernel::BatchId::new(zone_id, e.withdrawalBatchIndex)
+                            .ok_or_else(|| {
                                 failure(AdapterFindingCode::Grammar, "zero batch index")
                             })?,
-                        },
                         queue_index: e.withdrawalQueueIndex,
                         processed_deposit_hash: e.nextProcessedDepositQueueHash,
                         final_block_hash: e.nextBlockHash,
                         queue_hash: e.withdrawalQueueHash,
                         processed_deposit_number: e.lastProcessedDepositNumber,
-                    })
-                }
+                    }),
                 L1ProtocolEvent::Portal(
                     Portal::ZonePortalEvents::WithdrawalProcessed(_)
                     | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
@@ -487,19 +488,19 @@ fn parse_withdrawal_events(
                     fallback_nonce: e.fallbackNonce,
                     token: e.token,
                     amount: e.amount,
-                    id: crate::kernel::DepositId {
-                        portal,
-                        number: NonZeroU64::new(e.depositNumber).ok_or_else(|| {
+                    id: crate::kernel::DepositId::new(portal, e.depositNumber).ok_or_else(
+                        || {
                             failure(
                                 AdapterFindingCode::Grammar,
                                 "zero bounceback deposit number",
                             )
-                        })?,
-                    },
+                        },
+                    )?,
                     queue_hash: e.newCurrentDepositQueueHash,
                 });
-                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed))) =
-                    events.get(cursor).copied()
+                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(
+                    processed,
+                ))) = events.get(cursor).copied()
                 else {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -548,12 +549,10 @@ fn parse_withdrawal_events(
                         },
                     });
                     effects.push(Effect::DepositAppended {
-                        id: crate::kernel::DepositId {
-                            portal,
-                            number: NonZeroU64::new(deposit.depositNumber).ok_or_else(|| {
+                        id: crate::kernel::DepositId::new(portal, deposit.depositNumber)
+                            .ok_or_else(|| {
                                 failure(AdapterFindingCode::Grammar, "zero callback deposit number")
                             })?,
-                        },
                         queue_hash: deposit.newCurrentDepositQueueHash,
                     });
                     if let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(d))) =
@@ -563,8 +562,9 @@ fn parse_withdrawal_events(
                         next = Some(d.clone());
                     }
                 }
-                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed))) =
-                    events.get(cursor).copied()
+                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(
+                    processed,
+                ))) = events.get(cursor).copied()
                 else {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -761,12 +761,9 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
             }
             L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(e)) => {
                 effects.push(Effect::BatchFinalized {
-                    id: crate::kernel::BatchId {
-                        zone_id: o.zone_id,
-                        index: NonZeroU64::new(e.withdrawalBatchIndex).ok_or_else(|| {
-                            failure(AdapterFindingCode::Grammar, "zero finalized batch index")
-                        })?,
-                    },
+                    id: crate::kernel::BatchId::new(o.zone_id, e.withdrawalBatchIndex).ok_or_else(
+                        || failure(AdapterFindingCode::Grammar, "zero finalized batch index"),
+                    )?,
                     queue_hash: e.withdrawalQueueHash,
                 })
             }

@@ -13,19 +13,11 @@ use crate::kernel::{
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
     state::{
-        BatchState, FallbackId, InboxRefundId, Overlay, PortalRefundId, TokenAccounting,
-        TokenState, WithdrawalOwner,
+        BatchState, FallbackId, InboxRefundId, Overlay, PortalRefundId, TokenState, WithdrawalOwner,
     },
 };
 
 const ZONE_ID: u32 = 7;
-
-fn token_state() -> TokenState {
-    TokenState {
-        phase: TokenPhase::PendingZoneEnable,
-        accounting: TokenAccounting::default(),
-    }
-}
 
 fn identity() -> PortalIdentity {
     PortalIdentity {
@@ -367,7 +359,10 @@ fn batch_invariants_allow_tempo_to_advance_faster_than_zone_height() {
 fn overlay_reads_writes_deletes_and_finishes_in_key_order() {
     let mut rows = State::awaiting(identity()).rows().clone();
     let token = identity().initial_token;
-    rows.insert(StateKey::Token(token), StateValue::Token(token_state()));
+    rows.insert(
+        StateKey::Token(token),
+        StateValue::Token(TokenState::pending()),
+    );
     let parent = State::from_rows(rows).unwrap();
 
     let mut overlay = Overlay::new(&parent);
@@ -679,7 +674,7 @@ fn invariant_validation_detects_pre_creation_rows() {
     let mut rows = State::awaiting(identity()).rows().clone();
     rows.insert(
         StateKey::Token(identity().initial_token),
-        StateValue::Token(token_state()),
+        StateValue::Token(TokenState::pending()),
     );
     let state = State::from_rows(rows).unwrap();
     assert_eq!(

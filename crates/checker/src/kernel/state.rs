@@ -18,6 +18,15 @@ pub(crate) struct DepositId {
     pub(crate) number: NonZeroU64,
 }
 
+impl DepositId {
+    pub(crate) fn new(portal: Address, number: u64) -> Option<Self> {
+        Some(Self {
+            portal,
+            number: NonZeroU64::new(number)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct WithdrawalId {
     pub(crate) zone_id: u32,
@@ -30,10 +39,28 @@ pub(crate) struct BatchId {
     pub(crate) index: NonZeroU64,
 }
 
+impl BatchId {
+    pub(crate) fn new(zone_id: u32, index: u64) -> Option<Self> {
+        Some(Self {
+            zone_id,
+            index: NonZeroU64::new(index)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct FallbackId {
     pub(crate) zone_id: u32,
     pub(crate) nonce: NonZeroU64,
+}
+
+impl FallbackId {
+    pub(crate) fn new(zone_id: u32, nonce: u64) -> Option<Self> {
+        Some(Self {
+            zone_id,
+            nonce: NonZeroU64::new(nonce)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -185,6 +212,15 @@ impl TokenAccounting {
 pub(crate) struct TokenState {
     pub(crate) phase: TokenPhase,
     pub(crate) accounting: TokenAccounting,
+}
+
+impl TokenState {
+    pub(crate) fn pending() -> Self {
+        Self {
+            phase: TokenPhase::PendingZoneEnable,
+            accounting: TokenAccounting::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,10 +405,12 @@ impl State {
     }
 
     pub(crate) fn tokens(&self) -> impl Iterator<Item = (Address, &TokenState)> {
-        self.rows.iter().filter_map(|(key, value)| match (key, value) {
-            (StateKey::Token(address), StateValue::Token(token)) => Some((*address, token)),
-            _ => None,
-        })
+        self.rows
+            .iter()
+            .filter_map(|(key, value)| match (key, value) {
+                (StateKey::Token(address), StateValue::Token(token)) => Some((*address, token)),
+                _ => None,
+            })
     }
 
     pub(crate) fn validate_families(&self) -> Result<(), StateFamilyError> {
