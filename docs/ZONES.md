@@ -194,7 +194,8 @@ You can also run the xtask directly for more control. Set `ZONE_FACTORY_OWNER_KE
 invocation instead of passing a key argument:
 
 ```bash
-ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- create-zone \
+ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" SEQUENCER_KEY="$SEQUENCER_KEY" \
+  cargo run -p tempo-xtask -- create-zone \
   --output generated/my-zone \
   --initial-token 0x20c0000000000000000000000000000000000001 \
   --admin "$ADMIN_ADDR" \
@@ -203,7 +204,8 @@ ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- create-zone 
 
 `create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY`
 available for admin-only portal calls such as changing either mode or account roles,
-enabling tokens, and pausing or resuming deposits.
+enabling tokens, and pausing or resuming deposits. When `SEQUENCER_KEY` is set (or
+`--sequencer-key` is passed), `create-zone` also registers that sequencer's encryption key.
 
 ### 5. Start the Zone Node
 
@@ -262,8 +264,8 @@ just send-deposit 1000000 <recipient-address>   # deposit to a specific address
 Encrypted deposits hide the recipient address and memo on-chain using ECIES encryption to the sequencer's public key. Only the sequencer can decrypt them during block building.
 
 ```bash
-# The sequencer must first register their encryption key (done automatically by deploy-zone)
-# For manual setup:
+# Zone creation registers the initial key automatically when SEQUENCER_KEY is set.
+# Use the standalone command for manual setup or key rotation:
 PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
   --portal "$L1_PORTAL_ADDRESS" \
   --l1-rpc-url "$L1_RPC_URL"

@@ -21,6 +21,7 @@ use tempo_zone_contracts::{
     ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
 };
 use zone_primitives::constants::zone_chain_id;
+use zone_sequencer::register_encryption_key;
 
 use crate::zone_utils::{MODERATO_ZONE_FACTORY, write_owner_only};
 
@@ -88,6 +89,11 @@ pub(crate) struct CreateZone {
     #[arg(long, env = "ZONE_FACTORY_OWNER_KEY", hide_env_values = true)]
     private_key: String,
 
+    /// Optional sequencer private key (hex). When provided, registers its public key for
+    /// encrypted deposits after creating the zone. The key must belong to the sequencer set.
+    #[arg(long, env = "SEQUENCER_KEY", hide_env_values = true)]
+    sequencer_key: Option<String>,
+
     /// Base fee per gas for the zone L2.
     #[arg(long, default_value_t = TEMPO_T0_BASE_FEE.into())]
     base_fee_per_gas: u128,
@@ -141,6 +147,9 @@ impl CreateZone {
                 self.threshold
             ));
         }
+
+        let sequencer_signer =
+            parse_sequencer_key(self.sequencer_key.as_deref(), &self.sequencers)?;
         if self.sequencers.len() > 1 && self.threshold < 2 {
             // With threshold 1 a leader can settle blocks no follower holds, so an
             // empty-disk leader recovery cannot reconstruct the settled chain from
@@ -343,6 +352,19 @@ impl CreateZone {
         )
         .wrap_err("failed writing zone.json")?;
 
+        if let Some(signer) = sequencer_signer {
+            let sequencer_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+                .wallet(EthereumWallet::from(signer.clone()))
+                .connect(&self.l1_rpc_url)
+                .await
+                .wrap_err("failed connecting to Tempo L1 RPC for encryption-key registration")?;
+            println!("Registering sequencer encryption key on ZonePortal...");
+            let tx_hash = register_encryption_key(&sequencer_provider, portal, &signer)
+                .await
+                .wrap_err("failed to register sequencer encryption key")?;
+            println!("Encryption key registered  [tx: {tx_hash}]");
+        }
+
         println!("Zone created successfully!");
         println!("  Zone ID: {zone_id}");
         println!("  Chain ID: {chain_id}");
@@ -370,6 +392,27 @@ impl CreateZone {
     }
 }
 
+fn parse_private_key(key: &str) -> eyre::Result<PrivateKeySigner> {
+    key.strip_prefix("0x")
+        .unwrap_or(key)
+        .parse()
+        .map_err(Into::into)
+}
+
+fn parse_sequencer_key(
+    key: Option<&str>,
+    sequencers: &[Address],
+) -> eyre::Result<Option<PrivateKeySigner>> {
+    let Some(key) = key else { return Ok(None) };
+    let signer = parse_private_key(key).wrap_err("SEQUENCER_KEY is not a valid private key")?;
+    ensure!(
+        sequencers.contains(&signer.address()),
+        "SEQUENCER_KEY resolves to {}, but that address is not in the configured sequencer set",
+        signer.address()
+    );
+    Ok(Some(signer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +438,7 @@ mod tests {
             admin: address!("0x5000000000000000000000000000000000000005"),
             rpc_url: String::new(),
             private_key: String::new(),
+            sequencer_key: None,
             base_fee_per_gas: 1,
             gas_limit: 30_000_000,
         };
@@ -402,5 +446,29 @@ mod tests {
         let params = command.factory_params();
         assert_eq!(params.sequencers, sequencers);
         assert_eq!(params.threshold, 2);
+    }
+
+    #[test]
+    fn accepts_encryption_key_in_the_sequencer_set() {
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let signer = parse_private_key(key).unwrap();
+        let parsed = parse_sequencer_key(Some(key), &[signer.address()]).unwrap();
+
+        assert_eq!(parsed.unwrap().address(), signer.address());
+    }
+
+    #[test]
+    fn rejects_encryption_key_outside_the_sequencer_set() {
+        let error = parse_sequencer_key(
+            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            &[address!("0x2000000000000000000000000000000000000002")],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not in the configured sequencer set")
+        );
     }
 }
