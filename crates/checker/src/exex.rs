@@ -20,8 +20,8 @@ use crate::{
     CheckerConfig,
     adapter::{AuthenticatedObservation, adapt},
     observe::{
-        AcquisitionError, ExactStateLookup, ObservationError, acquire_portal_collateral,
-        acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
+        AcquisitionError, ObservationError, acquire_portal_collateral, acquire_zone_post_state,
+        observe_l1_range, observe_l2_block_with_context,
     },
     persistence::{BlockNumHash, CoverageGapReason, Identity, Persistence},
     runtime::{
@@ -223,7 +223,7 @@ pub(crate) async fn acquire_applied_at<P, S>(
 ) -> Result<AuthenticatedBlock, Failure>
 where
     P: Provider<TempoNetwork>,
-    S: ExactStateLookup + ?Sized,
+    S: StateProviderFactory + ?Sized,
 {
     validate(chain, "applied")?;
     let block = chain

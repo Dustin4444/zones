@@ -19,4 +19,4 @@ pub(crate) use l1::{
     L1BlockObservation, acquire_l1_header, acquire_portal_collateral, observe_l1, observe_l1_range,
 };
 pub(crate) use l2::{L2BlockObservation, observe_l2_block_with_context};
-pub(crate) use state::{ExactStateLookup, ZonePostStateOutputs, acquire_zone_post_state};
+pub(crate) use state::{ZonePostStateOutputs, acquire_zone_post_state};

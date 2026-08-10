@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
-use reth_storage_api::{StateProviderBox, StateProviderFactory, errors::provider::ProviderResult};
+use reth_storage_api::StateProviderFactory;
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_precompiles::{storage::StorageActions, tip20::TIP20Token};
 use tempo_revm::TempoStateAccess;
@@ -51,25 +51,14 @@ impl ZonePostStateOutputs {
     }
 }
 
-/// Narrow exact-hash lookup used by the observation adapter.
-pub(crate) trait ExactStateLookup {
-    fn state_by_exact_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox>;
-}
-
-impl<P: StateProviderFactory + ?Sized> ExactStateLookup for P {
-    fn state_by_exact_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
-        self.state_by_block_hash(block_hash)
-    }
-}
-
 /// Acquire protocol outputs from the state selected by `block_hash` exactly.
-pub(crate) fn acquire_zone_post_state<P: ExactStateLookup + ?Sized>(
+pub(crate) fn acquire_zone_post_state<P: StateProviderFactory + ?Sized>(
     provider: &P,
     block_hash: B256,
     tokens: &[Address],
 ) -> Result<ZonePostStateOutputs, AcquisitionError> {
     let mut state = provider
-        .state_by_exact_block_hash(block_hash)
+        .state_by_block_hash(block_hash)
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::ExactZoneState, error))?;
 
     state
