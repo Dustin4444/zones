@@ -11,14 +11,15 @@ use alloy::{
     network::{EthereumWallet, ReceiptResponse as _},
     primitives::Address,
     providers::{Provider, ProviderBuilder},
-    rpc::types::Filter,
     signers::local::PrivateKeySigner,
-    sol_types::SolEvent,
 };
 use eyre::{WrapErr as _, ensure};
 use futures::{StreamExt as _, TryStreamExt as _};
 use tempo_alloy::TempoNetwork;
 use tempo_zone_contracts::{ZonePortal, ZonePortal::Role as PortalRole};
+
+/// Bounded `eth_getLogs` range to accommodate providers that reject long historical queries.
+const LOG_QUERY_BLOCK_CHUNK: u64 = 5_000;
 
 /// Close account access and clear the portal account allowlist during an incident.
 #[derive(Debug, clap::Parser)]
@@ -112,20 +113,18 @@ impl LockDownAccess {
             "Replaying RoleUpdated events from block {} through {}...",
             self.from_block, snapshot_block
         );
-        let filter = Filter::new()
-            .address(self.portal)
-            .event_signature(ZonePortal::RoleUpdated::SIGNATURE_HASH)
+        let logs = portal
+            .RoleUpdated_filter()
             .from_block(self.from_block)
-            .to_block(snapshot_block);
-        let logs = provider
-            .get_logs(&filter)
+            .to_block(snapshot_block)
+            .chunked()
+            .chunk_size(LOG_QUERY_BLOCK_CHUNK)
+            .query()
             .await
             .wrap_err("failed fetching ZonePortal RoleUpdated logs")?;
 
         let mut candidates = BTreeSet::new();
-        for log in logs {
-            let event = ZonePortal::RoleUpdated::decode_log(&log.inner)
-                .wrap_err("failed decoding ZonePortal RoleUpdated log")?;
+        for (event, _) in logs {
             candidates.insert(event.account);
         }
 
