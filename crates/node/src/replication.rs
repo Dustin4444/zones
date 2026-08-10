@@ -90,8 +90,6 @@ pub(crate) struct EncodedPersistedBlock {
 /// Interface used by the replication task to keep track of blocks that are persisted vs broadcast
 pub(crate) trait PersistedBlockSource: Clone + Send + Sync + 'static {
     fn last_block_number(&self) -> eyre::Result<u64>;
-    /// The canonical head, which may be ahead of the persisted head (reth persists lazily).
-    fn canonical_block_number(&self) -> eyre::Result<u64>;
     fn persisted_block_stream(&self) -> BoxStream<'static, PersistedTip>;
     fn encoded_block_by_number(&self, number: u64) -> eyre::Result<EncodedPersistedBlock>;
 }
@@ -102,10 +100,6 @@ where
 {
     fn last_block_number(&self) -> eyre::Result<u64> {
         Ok(BlockNumReader::last_block_number(self)?)
-    }
-
-    fn canonical_block_number(&self) -> eyre::Result<u64> {
-        Ok(BlockNumReader::best_block_number(self)?)
     }
 
     fn persisted_block_stream(&self) -> BoxStream<'static, PersistedTip> {
@@ -171,22 +165,22 @@ pub(crate) async fn broadcast_persisted_blocks<P>(
             () = stop.cancelled() => {
                 // The block generation is stopping (leader demotion). Flush all persisted
                 // blocks to ensure the new leader can take over properly.
-                match provider.canonical_block_number() {
-                    Ok(canonical) => {
+                match provider.last_block_number() {
+                    Ok(persisted) => {
                         if let Err(err) = broadcast_persisted_range(
                             &provider,
                             &commands,
                             &mut last_broadcast,
-                            canonical,
+                            persisted,
                             None,
                         )
                         .await
                         {
-                            tracing::error!(target: "zone::p2p", %err, "Failed flushing canonical zone blocks on stop");
+                            tracing::error!(target: "zone::p2p", %err, "Failed flushing persisted zone blocks on stop");
                         }
                     }
                     Err(err) => {
-                        tracing::error!(target: "zone::p2p", %err, "Failed reading the canonical zone head for the stop flush");
+                        tracing::error!(target: "zone::p2p", %err, "Failed reading the persisted zone head for the stop flush");
                     }
                 }
                 debug!(target: "zone::p2p", "Persisted block broadcaster stopped");
@@ -402,11 +396,11 @@ where
         + HeaderProvider<Header = TempoHeader>
         + StateProviderFactory,
 {
-    let tip = provider.best_block_number()?;
+    let tip = provider.last_block_number()?;
     let end = tip.min(start.saturating_add(BACKFILL_PAGE_SIZE.saturating_sub(1)));
     for number in start..=end {
         let block = provider.block_by_number(number)?.ok_or_else(|| {
-            eyre::eyre!("canonical block {number} is missing while serving backfill")
+            eyre::eyre!("persisted canonical block {number} is missing while serving backfill")
         })?;
         commands
             .blocking_send(BackfillCommand::SendBlock {
@@ -416,10 +410,10 @@ where
             })
             .map_err(|_| eyre::eyre!("P2P command channel closed"))?;
     }
-    // Advertise the tip
-    let tip_header = provider
-        .sealed_header(tip)?
-        .ok_or_else(|| eyre::eyre!("canonical head {tip} is missing while serving backfill"))?;
+    // Advertise the persisted tip.
+    let tip_header = provider.sealed_header(tip)?.ok_or_else(|| {
+        eyre::eyre!("persisted canonical head {tip} is missing while serving backfill")
+    })?;
     let tempo = provider
         .state_by_block_hash(tip_header.hash())?
         .tempo_num_hash()?;
@@ -1261,10 +1255,6 @@ mod tests {
             } else {
                 self.tip.number
             })
-        }
-
-        fn canonical_block_number(&self) -> eyre::Result<u64> {
-            Ok(self.tip.number)
         }
 
         fn persisted_block_stream(&self) -> futures::stream::BoxStream<'static, PersistedTip> {
