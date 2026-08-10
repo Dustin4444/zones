@@ -620,6 +620,7 @@ where
                 config,
                 signer,
                 provider,
+                None,
                 tokio_util::sync::CancellationToken::new(),
             )
             .await
@@ -1311,6 +1312,7 @@ impl ZoneTestNode {
                     batch_anchor_config: Default::default(),
                     withdrawal_poll_interval: Duration::from_secs(5),
                     withdrawal_batch_limits: Default::default(),
+                    enable_prover: false,
                 });
         }
         // Multi-sequencer nodes run the real role controller, which owns the engine; the
