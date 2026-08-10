@@ -28,7 +28,7 @@ pub(crate) use collateral::acquire_portal_collateral;
 mod tests;
 
 /// One strictly decoded implementation outcome in canonical block order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct OrderedL1Outcome {
     event: L1ProtocolEvent,
 }
@@ -41,7 +41,7 @@ impl OrderedL1Outcome {
 
 /// Authenticated outcomes and any directly decoded Portal input for one
 /// transaction. `direct_call` is absent when no transition needs calldata.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct L1TransactionObservation {
     transaction_index: usize,
     transaction_hash: B256,
@@ -70,7 +70,7 @@ impl L1TransactionObservation {
 }
 
 /// Complete ephemeral observation of the exact Tempo block imported by L2.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct L1BlockObservation {
     block_number: u64,
     block_hash: B256,

@@ -32,29 +32,6 @@ pub(crate) enum L1ProtocolEvent {
     KnownIgnored,
 }
 
-impl PartialEq for L1ProtocolEvent {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Portal(left), Self::Portal(right)) => left == right,
-            (Self::FactoryZoneCreated(left), Self::FactoryZoneCreated(right)) => {
-                left.zoneId == right.zoneId
-                    && left.portal == right.portal
-                    && left.initialToken == right.initialToken
-                    && left.accessMode == right.accessMode
-                    && left.gatewayMode == right.gatewayMode
-                    && left.admin == right.admin
-                    && left.sequencers == right.sequencers
-                    && left.threshold == right.threshold
-                    && left.verifier == right.verifier
-            }
-            (Self::KnownIgnored, Self::KnownIgnored) => true,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for L1ProtocolEvent {}
-
 /// A strictly decoded L2 protocol event.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum L2ProtocolEvent {
