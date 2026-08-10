@@ -6,7 +6,8 @@ use crate::{
     deploy_router::DeployRouter, deposit::Deposit, generate_p2p_key::GenerateP2pKey,
     generate_zone_genesis::GenerateZoneGenesis,
     install_reference_zone_factory::InstallReferenceZoneFactory,
-    set_encryption_key::SetEncryptionKey, spam_deposits::SpamDeposits, zone_info::ZoneInfoCmd,
+    rotate_sequencer_set::RotateSequencerSet, set_encryption_key::SetEncryptionKey,
+    spam_deposits::SpamDeposits, zone_info::ZoneInfoCmd,
 };
 use clap::Parser as _;
 use eyre::Context;
@@ -22,6 +23,7 @@ mod deposit;
 mod generate_p2p_key;
 mod generate_zone_genesis;
 mod install_reference_zone_factory;
+mod rotate_sequencer_set;
 mod set_encryption_key;
 mod spam_deposits;
 mod zone_info;
@@ -59,6 +61,9 @@ async fn main() -> eyre::Result<()> {
         Action::InstallReferenceZoneFactory(args) => args
             .run()
             .wrap_err("failed to install reference ZoneFactory"),
+        Action::RotateSequencerSet(args) => {
+            args.run().await.wrap_err("failed to rotate sequencer set")
+        }
         Action::SetEncryptionKey(args) => args.run().await.wrap_err("failed to set encryption key"),
         Action::SpamDeposits(args) => args.run().await.wrap_err("failed to spam deposits"),
         Action::ZoneInfo(args) => args.run().await.wrap_err("failed to fetch zone info"),
@@ -88,6 +93,7 @@ enum Action {
     GenerateP2pKey(GenerateP2pKey),
     GenerateZoneGenesis(GenerateZoneGenesis),
     InstallReferenceZoneFactory(InstallReferenceZoneFactory),
+    RotateSequencerSet(RotateSequencerSet),
     SetEncryptionKey(SetEncryptionKey),
     SpamDeposits(SpamDeposits),
     ZoneInfo(ZoneInfoCmd),
