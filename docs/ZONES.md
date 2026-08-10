@@ -627,6 +627,24 @@ Zones inherit the Tempo L1 EVM but replace, disable, or pass through each precom
 
 The xtasks use this Moderato `ZoneFactory` as their built-in default: `create-zone` and `zone-info` point at it automatically, and `deploy-router` uses `zoneFactory` from `zone.json` before falling back to this address. Pass `--zone-factory` or set `ZONE_FACTORY` to override it.
 
+### Emergency portal access lockdown
+
+To immediately close an open portal and remove every currently allowed account, replay the portal's
+role history and revoke all current `Account` roles:
+
+```bash
+PRIVATE_KEY="<portal-admin-key>" cargo run -p tempo-xtask -- lock-down-access \
+  --l1-rpc-url "$L1_RPC_URL" \
+  --portal "$L1_PORTAL_ADDRESS" \
+  --from-block <portal-creation-block>
+```
+
+`RoleUpdated` is the source of truth for this backfill because portal roles are stored in a mapping.
+Set `--from-block` at or before the portal initialization block; choosing a later block can miss an
+already-allowed account. The command first enables access enforcement when the portal is open, then
+replays events through that transaction's block, revokes current account roles, and verifies the
+result. Callback gateway roles are not changed.
+
 ### Verifying the ZoneFactory
 
 TIP-1091 makes the factory and its shared dependencies protocol-managed accounts. Verify them at their fixed addresses:
