@@ -18,6 +18,7 @@ use crate::{
         ZoneRpcApi, operator_zone_rpc_module, rpc_connection_config, start_redacted_rpc,
     },
 };
+use alloy_chains::Chain;
 use alloy_primitives::{Address, U256};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
@@ -544,7 +545,6 @@ where
             )
             .await?
             .erased();
-
         self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
             .await?;
         if let Some(keys) = self.l1_config.encryption_keys.clone() {
@@ -647,7 +647,7 @@ where
             let relayer = match individual_signer {
                 Some(signer) => {
                     use tempo_alloy::provider::ext::TempoProviderBuilderExt as _;
-                    Some(
+                    let provider =
                         alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
                             .with_nonce_key_filler()
                             .wallet(alloy_network::EthereumWallet::from(signer))
@@ -656,8 +656,16 @@ where
                                 rpc_connection_config(self.l1_config.retry_connection_interval),
                             )
                             .await?
-                            .erased(),
-                    )
+                            .erased();
+                    if !provider.client().is_local()
+                        && let Some(avg_block_time) =
+                            Chain::from_id(l1_chain_id).average_blocktime_hint()
+                    {
+                        provider
+                            .client()
+                            .set_poll_interval(avg_block_time.mul_f32(0.6));
+                    }
+                    Some(provider)
                 }
                 None => None,
             };
