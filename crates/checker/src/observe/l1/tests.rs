@@ -28,7 +28,7 @@ use crate::observe::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, ObservationError, PortalCallError, PortalCallFamily, ProtocolChain,
     },
-    events::{L1ProtocolEvent, PortalEvent},
+    events::L1ProtocolEvent,
 };
 
 const BLOCK_NUMBER: u64 = 42;
@@ -434,7 +434,7 @@ fn authenticated_event_order_uses_receipt_vectors_not_rpc_log_metadata() {
     assert_eq!(observed.len(), 2);
     assert!(matches!(
         observed[0].outcomes[0].event,
-        L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(_))
+        L1ProtocolEvent::Portal(ZonePortal::ZonePortalEvents::BouncebackGasUpdated(_))
     ));
     assert_eq!(
         observed[1].required_call,
@@ -483,7 +483,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
     let operation = &observed[0].outcomes[0];
     assert!(matches!(
         operation.event,
-        L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_))
+        L1ProtocolEvent::Portal(ZonePortal::ZonePortalEvents::BatchSubmitted(_))
     ));
     assert_eq!(
         observed[0].required_call,
@@ -493,7 +493,7 @@ fn authenticated_event_order_preserves_operation_before_config() {
     let config = &observed[1].outcomes[0];
     assert!(matches!(
         config.event,
-        L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(_))
+        L1ProtocolEvent::Portal(ZonePortal::ZonePortalEvents::BouncebackGasUpdated(_))
     ));
     assert_eq!(observed[1].required_call, None);
 }
@@ -769,7 +769,7 @@ async fn eventful_process_withdrawals_fetches_once_and_retains_input_and_outcome
     };
     assert!(matches!(
         outcome.event(),
-        L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(_))
+        L1ProtocolEvent::Portal(ZonePortal::ZonePortalEvents::WithdrawalProcessed(_))
     ));
     assert!(asserter.read_q().is_empty());
 }

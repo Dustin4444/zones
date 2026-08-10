@@ -19,14 +19,13 @@ mod tempo_state;
 
 pub(crate) use tempo_zone_contracts::{
     IZoneInbox as Inbox, IZoneOutbox as Outbox, TempoState, ZoneFactory as Factory,
+    ZonePortal as Portal,
 };
-
-pub(crate) use portal::PortalEvent;
 
 /// A strictly decoded L1 protocol event.
 #[derive(Debug)]
 pub(crate) enum L1ProtocolEvent {
-    Portal(PortalEvent),
+    Portal(Portal::ZonePortalEvents),
     FactoryZoneCreated(Factory::ZoneCreated),
     /// A listed event that cannot change checker state.
     KnownIgnored,

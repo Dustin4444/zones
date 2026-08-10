@@ -57,21 +57,7 @@ pub(super) const DEPOSITS_RESUMED_TOPIC: B256 =
 pub(super) const RPC_URL_UPDATED_TOPIC: B256 =
     b256!("f4e00967b25e707df96d88676243b33be84847ef27615af8ef91290b52294fc6");
 
-/// Portal events used by checker transitions.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PortalEvent {
-    DepositMade(Portal::DepositMade),
-    TokenEnabled(Portal::TokenEnabled),
-    BatchSubmitted(Portal::BatchSubmitted),
-    WithdrawalProcessed(Portal::WithdrawalProcessed),
-    WithdrawalBounceBack(Portal::WithdrawalBounceBack),
-    DepositBounceBack(Portal::DepositBounceBack),
-    DepositBounceBackPending(Portal::DepositBounceBackPending),
-    RefundClaimed(Portal::RefundClaimed),
-    BouncebackGasUpdated(Portal::BouncebackGasUpdated),
-}
-
-pub(super) fn decode(log: &Log) -> Result<Option<PortalEvent>, ProtocolEventError> {
+pub(super) fn decode(log: &Log) -> Result<Option<Portal::ZonePortalEvents>, ProtocolEventError> {
     let topic = required_topic(log)?;
     match topic {
         DEPOSIT_MADE_TOPIC
@@ -107,39 +93,19 @@ pub(super) fn decode(log: &Log) -> Result<Option<PortalEvent>, ProtocolEventErro
     let decoded = strict_decode_interface::<Portal::ZonePortalEvents>(log, "Portal event")?;
     validate_dynamic_bounds(log, &decoded)?;
 
-    Ok(match decoded {
-        Portal::ZonePortalEvents::DepositMade(event) => Some(PortalEvent::DepositMade(event)),
-        Portal::ZonePortalEvents::TokenEnabled(event) => Some(PortalEvent::TokenEnabled(event)),
-        Portal::ZonePortalEvents::BatchSubmitted(event) => Some(PortalEvent::BatchSubmitted(event)),
-        Portal::ZonePortalEvents::WithdrawalProcessed(event) => {
-            Some(PortalEvent::WithdrawalProcessed(event))
-        }
-        Portal::ZonePortalEvents::WithdrawalBounceBack(event) => {
-            Some(PortalEvent::WithdrawalBounceBack(event))
-        }
-        Portal::ZonePortalEvents::DepositBounceBack(event) => {
-            Some(PortalEvent::DepositBounceBack(event))
-        }
-        Portal::ZonePortalEvents::DepositBounceBackPending(event) => {
-            Some(PortalEvent::DepositBounceBackPending(event))
-        }
-        Portal::ZonePortalEvents::RefundClaimed(event) => Some(PortalEvent::RefundClaimed(event)),
-        Portal::ZonePortalEvents::BouncebackGasUpdated(event) => {
-            Some(PortalEvent::BouncebackGasUpdated(event))
-        }
-        Portal::ZonePortalEvents::SequencerEncryptionKeyUpdated(_)
-        | Portal::ZonePortalEvents::ZoneGasRateUpdated(_)
-        | Portal::ZonePortalEvents::MaxTempoGasRateUpdated(_)
-        | Portal::ZonePortalEvents::AdminTransferStarted(_)
-        | Portal::ZonePortalEvents::AdminTransferred(_)
-        | Portal::ZonePortalEvents::RoleUpdated(_)
-        | Portal::ZonePortalEvents::EnforcementModesUpdated(_)
-        | Portal::ZonePortalEvents::SequencerSetUpdated(_)
-        | Portal::ZonePortalEvents::LeaderUpdated(_)
-        | Portal::ZonePortalEvents::DepositsPaused(_)
-        | Portal::ZonePortalEvents::DepositsResumed(_)
-        | Portal::ZonePortalEvents::RpcUrlUpdated(_) => None,
-    })
+    let changes_checker_state = matches!(
+        decoded,
+        Portal::ZonePortalEvents::DepositMade(_)
+            | Portal::ZonePortalEvents::TokenEnabled(_)
+            | Portal::ZonePortalEvents::BatchSubmitted(_)
+            | Portal::ZonePortalEvents::WithdrawalProcessed(_)
+            | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
+            | Portal::ZonePortalEvents::DepositBounceBack(_)
+            | Portal::ZonePortalEvents::DepositBounceBackPending(_)
+            | Portal::ZonePortalEvents::RefundClaimed(_)
+            | Portal::ZonePortalEvents::BouncebackGasUpdated(_)
+    );
+    Ok(changes_checker_state.then_some(decoded))
 }
 
 fn validate_dynamic_bounds(

@@ -13,7 +13,7 @@ use crate::{
     observe::{
         L1BlockObservation, L2BlockObservation, ZonePostStateOutputs,
         events::{
-            Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, PortalEvent, TempoState,
+            Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, Portal, TempoState,
         },
     },
     persistence::{BlockNumHash, CoverageGapReason},
@@ -186,7 +186,7 @@ fn imported_facts(
             if let Some(call) = call.as_submit_batch() {
                 if !matches!(
                     events.as_slice(),
-                    [L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_))]
+                    [L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(_))]
                 ) {
                     return Err(failure(
                         AdapterFindingCode::Grammar,
@@ -250,11 +250,11 @@ fn imported_facts(
             matches!(
                 event,
                 L1ProtocolEvent::Portal(
-                    PortalEvent::BatchSubmitted(_)
-                        | PortalEvent::WithdrawalProcessed(_)
-                        | PortalEvent::WithdrawalBounceBack(_)
-                        | PortalEvent::DepositBounceBack(_)
-                        | PortalEvent::DepositBounceBackPending(_)
+                    Portal::ZonePortalEvents::BatchSubmitted(_)
+                        | Portal::ZonePortalEvents::WithdrawalProcessed(_)
+                        | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
+                        | Portal::ZonePortalEvents::DepositBounceBack(_)
+                        | Portal::ZonePortalEvents::DepositBounceBackPending(_)
                 )
             )
         }) {
@@ -269,7 +269,7 @@ fn imported_facts(
             && !matches!(
                 events.as_slice(),
                 [
-                    L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_)),
+                    L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_)),
                     L1ProtocolEvent::FactoryZoneCreated(_)
                 ]
             )
@@ -282,7 +282,7 @@ fn imported_facts(
         if observation.block_hash() == portal_creation_block_hash
             && events
                 .iter()
-                .any(|event| matches!(event, L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_))))
+                .any(|event| matches!(event, L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))))
             && !events
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
@@ -314,7 +314,7 @@ fn imported_facts(
                         .outcomes()
                         .iter()
                         .find_map(|x| match x.event() {
-                            L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(e)) => {
+                            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(e)) => {
                                 Some(token(e.token, &e.name, &e.symbol, &e.currency))
                             }
                             _ => None,
@@ -331,7 +331,7 @@ fn imported_facts(
                         initial_token: enabled,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(e))
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(e))
                     if observation.block_hash() != portal_creation_block_hash =>
                 {
                     operations.push(ImportedOperation::EnableToken(token(
@@ -341,10 +341,10 @@ fn imported_facts(
                         &e.currency,
                     )))
                 }
-                L1ProtocolEvent::Portal(PortalEvent::BouncebackGasUpdated(e)) => {
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BouncebackGasUpdated(e)) => {
                     operations.push(ImportedOperation::UpdateBouncebackGas(e.bouncebackGas))
                 }
-                L1ProtocolEvent::Portal(PortalEvent::DepositMade(e))
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(e))
                     if tx
                         .direct_call()
                         .is_none_or(|call| call.as_process_withdrawals().is_none()) =>
@@ -380,7 +380,7 @@ fn imported_facts(
                         queue_hash: e.newCurrentDepositQueueHash,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalEvent::RefundClaimed(e)) => {
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::RefundClaimed(e)) => {
                     operations.push(ImportedOperation::ClaimPortalRefund(RefundClaim {
                         token: e.token,
                         recipient: e.recipient,
@@ -392,7 +392,7 @@ fn imported_facts(
                         amount: e.amount,
                     });
                 }
-                L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(e)) => {
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(e)) => {
                     effects.push(Effect::BatchSubmitted {
                         id: crate::kernel::BatchId {
                             zone_id,
@@ -408,18 +408,18 @@ fn imported_facts(
                     })
                 }
                 L1ProtocolEvent::Portal(
-                    PortalEvent::WithdrawalProcessed(_)
-                    | PortalEvent::WithdrawalBounceBack(_)
-                    | PortalEvent::DepositBounceBack(_)
-                    | PortalEvent::DepositBounceBackPending(_),
+                    Portal::ZonePortalEvents::WithdrawalProcessed(_)
+                    | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
+                    | Portal::ZonePortalEvents::DepositBounceBack(_)
+                    | Portal::ZonePortalEvents::DepositBounceBackPending(_),
                 ) if tx
                     .direct_call()
                     .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
-                L1ProtocolEvent::Portal(PortalEvent::DepositMade(_))
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(_))
                     if tx
                         .direct_call()
                         .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
-                L1ProtocolEvent::Portal(PortalEvent::TokenEnabled(_))
+                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))
                     if observation.block_hash() == portal_creation_block_hash => {}
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}
                 L1ProtocolEvent::KnownIgnored | L1ProtocolEvent::Portal(_) => {
@@ -458,7 +458,7 @@ fn parse_withdrawal_events(
         })?;
         cursor += 1;
         match event {
-            L1ProtocolEvent::Portal(PortalEvent::DepositBounceBack(e)) => {
+            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositBounceBack(e)) => {
                 outcomes.push(WithdrawalOutcome::FailedDepositPaid {
                     collected_fee: e.bouncebackFee,
                 });
@@ -470,7 +470,7 @@ fn parse_withdrawal_events(
                     pending: false,
                 });
             }
-            L1ProtocolEvent::Portal(PortalEvent::DepositBounceBackPending(e)) => {
+            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositBounceBackPending(e)) => {
                 outcomes.push(WithdrawalOutcome::FailedDepositPending {
                     collected_fee: e.bouncebackFee,
                 });
@@ -482,7 +482,7 @@ fn parse_withdrawal_events(
                     pending: true,
                 });
             }
-            L1ProtocolEvent::Portal(PortalEvent::WithdrawalBounceBack(e)) => {
+            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalBounceBack(e)) => {
                 effects.push(Effect::BounceBackAppended {
                     fallback_nonce: e.fallbackNonce,
                     token: e.token,
@@ -498,7 +498,7 @@ fn parse_withdrawal_events(
                     },
                     queue_hash: e.newCurrentDepositQueueHash,
                 });
-                let Some(L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed))) =
+                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed))) =
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
@@ -522,7 +522,7 @@ fn parse_withdrawal_events(
                 });
                 outcomes.push(WithdrawalOutcome::UserBounced);
             }
-            L1ProtocolEvent::Portal(PortalEvent::DepositMade(first)) => {
+            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(first)) => {
                 let mut callback_deposits = Vec::new();
                 let mut next = Some(first.clone());
                 while let Some(deposit) = next.take() {
@@ -556,14 +556,14 @@ fn parse_withdrawal_events(
                         },
                         queue_hash: deposit.newCurrentDepositQueueHash,
                     });
-                    if let Some(L1ProtocolEvent::Portal(PortalEvent::DepositMade(d))) =
+                    if let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(d))) =
                         events.get(cursor).copied()
                     {
                         cursor += 1;
                         next = Some(d.clone());
                     }
                 }
-                let Some(L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed))) =
+                let Some(L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed))) =
                     events.get(cursor).copied()
                 else {
                     return Err(failure(
@@ -587,7 +587,7 @@ fn parse_withdrawal_events(
                 });
                 outcomes.push(WithdrawalOutcome::UserDelivered { callback_deposits });
             }
-            L1ProtocolEvent::Portal(PortalEvent::WithdrawalProcessed(processed)) => {
+            L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed)) => {
                 if !processed.callbackSuccess {
                     return Err(failure(
                         AdapterFindingCode::Grammar,

@@ -4,7 +4,7 @@ use alloy_network::ReceiptResponse as _;
 use alloy_primitives::{Address, B256};
 use tempo_alloy::rpc::TempoTransactionReceipt;
 
-use crate::observe::events::{L1ProtocolEvent, PortalEvent, classify_l1_protocol_event};
+use crate::observe::events::{L1ProtocolEvent, Portal, classify_l1_protocol_event};
 
 use super::OrderedL1Outcome;
 use crate::observe::error::{ObservationError, PortalCallError, PortalCallFamily, ProtocolChain};
@@ -77,21 +77,22 @@ pub(super) fn ordered_transactions(
 
 fn call_requirement(event: &L1ProtocolEvent) -> Option<PortalCallFamily> {
     match event {
-        L1ProtocolEvent::Portal(PortalEvent::BatchSubmitted(_)) => {
+        L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(_)) => {
             Some(PortalCallFamily::SubmitBatch)
         }
         L1ProtocolEvent::Portal(
-            PortalEvent::WithdrawalProcessed(_)
-            | PortalEvent::WithdrawalBounceBack(_)
-            | PortalEvent::DepositBounceBack(_)
-            | PortalEvent::DepositBounceBackPending(_),
+            Portal::ZonePortalEvents::WithdrawalProcessed(_)
+            | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
+            | Portal::ZonePortalEvents::DepositBounceBack(_)
+            | Portal::ZonePortalEvents::DepositBounceBackPending(_),
         ) => Some(PortalCallFamily::ProcessWithdrawals),
         L1ProtocolEvent::Portal(
-            PortalEvent::DepositMade(_)
-            | PortalEvent::TokenEnabled(_)
-            | PortalEvent::RefundClaimed(_)
-            | PortalEvent::BouncebackGasUpdated(_),
+            Portal::ZonePortalEvents::DepositMade(_)
+            | Portal::ZonePortalEvents::TokenEnabled(_)
+            | Portal::ZonePortalEvents::RefundClaimed(_)
+            | Portal::ZonePortalEvents::BouncebackGasUpdated(_),
         )
+        | L1ProtocolEvent::Portal(_)
         | L1ProtocolEvent::FactoryZoneCreated(_)
         | L1ProtocolEvent::KnownIgnored => None,
     }
