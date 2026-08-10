@@ -59,10 +59,8 @@ alloy-rpc-types-eth.workspace = true
 alloy-transport.workspace = true
 reth-primitives-traits = { workspace = true, features = ["std", "test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
-syn = { version = "2", features = ["full", "visit"] }
 tempfile.workspace = true
 tokio.workspace = true
-toml.workspace = true
 
 [features]
 default = []
