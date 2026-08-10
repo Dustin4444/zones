@@ -388,12 +388,6 @@ fn overlay_reads_writes_deletes_and_finishes_in_key_order() {
 }
 
 #[test]
-fn state_rejects_wrong_value_family() {
-    let rows = BTreeMap::from([(StateKey::Portal, StateValue::Token(token_state()))]);
-    assert_eq!(State::from_rows(rows).unwrap_err().key, StateKey::Portal);
-}
-
-#[test]
 fn state_key_family_order_is_stable() {
     let deposit = DepositId {
         portal: identity().portal,

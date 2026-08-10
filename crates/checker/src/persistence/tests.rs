@@ -699,17 +699,15 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
 #[test]
 fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
     let (_directory, store) = create();
-    let mut rows = state().rows().clone();
-    let crate::kernel::StateValue::Zone(mut zone) = rows[&crate::kernel::StateKey::Zone].clone()
-    else {
-        unreachable!()
-    };
+    let mut conflicting = state();
+    let mut zone = conflicting.zone().expect("fixture has Zone state").clone();
     zone.tempo_gas_rate = 1;
-    rows.insert(
-        crate::kernel::StateKey::Zone,
-        crate::kernel::StateValue::Zone(zone),
-    );
-    let conflicting = State::from_rows(rows).unwrap();
+    conflicting
+        .apply(&crate::kernel::StateDelta::from_sorted_writes(vec![(
+            crate::kernel::StateKey::Zone,
+            Some(crate::kernel::StateValue::Zone(zone)),
+        )]))
+        .unwrap();
     assert!(matches!(
         store.checkpoint(identity(), bootstrap(), conflicting),
         Err(PersistenceError::Invalid(_))

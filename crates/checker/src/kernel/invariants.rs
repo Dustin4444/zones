@@ -98,14 +98,9 @@ pub(crate) fn validate(state: &State) -> Result<(), InvariantViolation> {
     else {
         return Ok(());
     };
-    let StateValue::Zone(zone) = state.rows().get(&StateKey::Zone).expect("checked above") else {
-        unreachable!()
-    };
+    let zone = state.zone().expect("checked above");
     let identity = portal.identity();
-    if !matches!(
-        state.rows().get(&StateKey::Token(identity.initial_token)),
-        Some(StateValue::Token(_))
-    ) {
+    if state.token(identity.initial_token).is_none() {
         return Err(violation(
             InvariantCode::DepositToken,
             Some(StateKey::Token(identity.initial_token)),

@@ -225,16 +225,13 @@ fn validate_creation_coordinate(
     state: &State,
     block: &AuthenticatedBlock,
 ) -> Result<(), Failure> {
-    use crate::kernel::{ImportedOperation, PortalState, StateValue};
+    use crate::kernel::{ImportedOperation, PortalState};
 
     // Height zero is retained as the pre-creation-checkpoint sentinel.
     if identity.creation_height == 0 {
         return Ok(());
     }
-    let awaiting = state
-        .rows()
-        .values()
-        .any(|value| matches!(value, StateValue::Portal(PortalState::AwaitingCreation(_))));
+    let awaiting = matches!(state.portal(), Some(PortalState::AwaitingCreation(_)));
     let creates = block
         .imported
         .operations

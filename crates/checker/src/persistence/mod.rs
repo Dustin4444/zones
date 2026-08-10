@@ -605,11 +605,11 @@ fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<
 }
 
 fn validate_state(state: &State, identity: Identity) -> Result<()> {
-    State::from_rows(state.rows().clone()).map_err(|e| invalid(e.to_string()))?;
+    state
+        .validate_families()
+        .map_err(|e| invalid(e.to_string()))?;
     validate(state).map_err(|e| invalid(format!("invariant {e:?}")))?;
-    let Some(crate::kernel::StateValue::Portal(portal)) =
-        state.rows().get(&crate::kernel::StateKey::Portal)
-    else {
+    let Some(portal) = state.portal() else {
         return Err(invalid("missing Portal identity"));
     };
     let portal_identity = portal.identity();

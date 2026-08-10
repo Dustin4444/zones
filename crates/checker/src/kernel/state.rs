@@ -331,7 +331,8 @@ impl State {
         }
     }
 
-    pub(crate) fn from_rows(
+    #[cfg(test)]
+    pub(super) fn from_rows(
         rows: BTreeMap<StateKey, StateValue>,
     ) -> Result<Self, StateFamilyError> {
         for (key, value) in &rows {
@@ -342,8 +343,45 @@ impl State {
         Ok(Self { rows })
     }
 
-    pub(crate) fn rows(&self) -> &BTreeMap<StateKey, StateValue> {
+    pub(super) fn rows(&self) -> &BTreeMap<StateKey, StateValue> {
         &self.rows
+    }
+
+    pub(crate) fn portal(&self) -> Option<&PortalState> {
+        match self.rows.get(&StateKey::Portal) {
+            Some(StateValue::Portal(portal)) => Some(portal),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn zone(&self) -> Option<&ZoneState> {
+        match self.rows.get(&StateKey::Zone) {
+            Some(StateValue::Zone(zone)) => Some(zone),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn token(&self, address: Address) -> Option<&TokenState> {
+        match self.rows.get(&StateKey::Token(address)) {
+            Some(StateValue::Token(token)) => Some(token),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tokens(&self) -> impl Iterator<Item = (Address, &TokenState)> {
+        self.rows.iter().filter_map(|(key, value)| match (key, value) {
+            (StateKey::Token(address), StateValue::Token(token)) => Some((*address, token)),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn validate_families(&self) -> Result<(), StateFamilyError> {
+        for (key, value) in &self.rows {
+            if !value.matches_key(key) {
+                return Err(StateFamilyError { key: *key });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn apply(&mut self, delta: &StateDelta) -> Result<(), StateFamilyError> {

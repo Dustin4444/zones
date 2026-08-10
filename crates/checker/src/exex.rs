@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::kernel::{State, StateKey, StateValue, TokenPhase, apply_imported};
+use crate::kernel::{State, TokenPhase, apply_imported};
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -197,16 +197,8 @@ fn applied_chain(
 
 fn enabled_tokens(state: &State) -> BTreeSet<Address> {
     state
-        .rows()
-        .iter()
-        .filter_map(|(key, value)| match (key, value) {
-            (StateKey::Token(token), StateValue::Token(token_state))
-                if token_state.phase == TokenPhase::ZoneEnabled =>
-            {
-                Some(*token)
-            }
-            _ => None,
-        })
+        .tokens()
+        .filter_map(|(token, state)| (state.phase == TokenPhase::ZoneEnabled).then_some(token))
         .collect()
 }
 
@@ -249,15 +241,8 @@ where
         l1_provider,
         imported_headers,
         parent
-            .rows()
-            .values()
-            .find_map(|v| {
-                if let StateValue::Portal(p) = v {
-                    Some(p.identity().portal)
-                } else {
-                    None
-                }
-            })
+            .portal()
+            .map(|portal| portal.identity().portal)
             .ok_or_else(|| malformed("checker state has no portal identity"))?,
     )
     .await

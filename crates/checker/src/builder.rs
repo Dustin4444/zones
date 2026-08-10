@@ -91,10 +91,7 @@ where
                     replay_one(&mut state, &observation, &header, &config, &l1_provider).await?;
                 }
             }
-            let tokens = state.rows().keys().filter_map(|key| match key {
-                crate::kernel::StateKey::Token(token) => Some(*token),
-                _ => None,
-            });
+            let tokens = state.tokens().map(|(token, _)| token);
             validate_zero_genesis_supply(zone_provider, local.genesis().hash, tokens)?;
             let handoff = apply_genesis_handoff(&state)?;
             state.apply(&handoff)?;

@@ -20,8 +20,8 @@ pub(crate) use facts::{
 pub(crate) use finding::{Datum, Finding, FindingCategory, FindingLocation};
 pub(crate) use invariants::validate;
 pub(crate) use state::{
-    BatchId, Cursor, DepositId, PortalIdentity, PortalState, State, StateDelta, StateKey,
-    StateValue, TokenPhase, Withdrawal, WithdrawalId,
+    BatchId, Cursor, DepositId, PortalIdentity, PortalState, State, StateDelta, StateKey, TokenPhase,
+    Withdrawal, WithdrawalId,
 };
 
 #[cfg(test)]
