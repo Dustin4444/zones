@@ -72,7 +72,7 @@ fn local_genesis_initial_token<P>(provider: &P, hash: B256) -> eyre::Result<Addr
 where
     P: StateProviderFactory + ?Sized,
 {
-    let token = acquire_zone_post_state(provider, hash, &[])?.default_fee_token();
+    let token = acquire_zone_post_state(provider, hash, &[])?.default_fee_token;
     if token.is_zero() {
         return Err(BootstrapError::MissingZoneGenesisInitialToken.into());
     }

@@ -17,7 +17,7 @@ where
     let tokens = tokens.into_iter().collect::<Vec<_>>();
     let outputs = acquire_zone_post_state(zone_provider, zone_genesis_hash, &tokens)?;
     if let Some((&token, &actual)) = outputs
-        .token_supplies()
+        .token_supplies
         .iter()
         .find(|(_, supply)| !supply.is_zero())
     {
@@ -34,24 +34,24 @@ where
     P: StateProviderFactory + ?Sized,
 {
     let outputs = acquire_zone_post_state(zone_provider, zone_genesis.hash, &[])?;
-    if outputs.tempo_block_hash().is_zero() {
+    if outputs.tempo_block_hash.is_zero() {
         return Err(BootstrapError::UnsupportedBootstrapStyle.into());
     }
-    if !outputs.processed_deposit_queue_hash().is_zero()
-        || outputs.processed_deposit_number() != 0
-        || !outputs.withdrawal_queue_hash().is_zero()
-        || outputs.withdrawal_batch_index() != 0
+    if !outputs.processed_deposit_queue_hash.is_zero()
+        || outputs.processed_deposit_number != 0
+        || !outputs.withdrawal_queue_hash.is_zero()
+        || outputs.withdrawal_batch_index != 0
     {
         return Err(BootstrapError::NonzeroZoneGenesisProgress {
-            processed_deposit_queue_hash: outputs.processed_deposit_queue_hash(),
-            processed_deposit_number: outputs.processed_deposit_number(),
-            withdrawal_queue_hash: outputs.withdrawal_queue_hash(),
-            withdrawal_batch_index: outputs.withdrawal_batch_index(),
+            processed_deposit_queue_hash: outputs.processed_deposit_queue_hash,
+            processed_deposit_number: outputs.processed_deposit_number,
+            withdrawal_queue_hash: outputs.withdrawal_queue_hash,
+            withdrawal_batch_index: outputs.withdrawal_batch_index,
         }
         .into());
     }
     Ok(BlockNumHash::new(
-        outputs.tempo_block_number(),
-        outputs.tempo_block_hash(),
+        outputs.tempo_block_number,
+        outputs.tempo_block_hash,
     ))
 }

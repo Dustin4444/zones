@@ -14,41 +14,14 @@ use crate::observe::error::{AcquisitionError, AcquisitionSource};
 /// Protocol commitments read from state after one exact Zone block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ZonePostStateOutputs {
-    tempo_block_hash: B256,
-    tempo_block_number: u64,
-    processed_deposit_queue_hash: B256,
-    processed_deposit_number: u64,
-    withdrawal_queue_hash: B256,
-    withdrawal_batch_index: u64,
-    default_fee_token: Address,
-    token_supplies: BTreeMap<Address, U256>,
-}
-
-impl ZonePostStateOutputs {
-    pub(crate) fn tempo_block_hash(&self) -> B256 {
-        self.tempo_block_hash
-    }
-    pub(crate) fn tempo_block_number(&self) -> u64 {
-        self.tempo_block_number
-    }
-    pub(crate) fn processed_deposit_queue_hash(&self) -> B256 {
-        self.processed_deposit_queue_hash
-    }
-    pub(crate) fn processed_deposit_number(&self) -> u64 {
-        self.processed_deposit_number
-    }
-    pub(crate) fn withdrawal_queue_hash(&self) -> B256 {
-        self.withdrawal_queue_hash
-    }
-    pub(crate) fn withdrawal_batch_index(&self) -> u64 {
-        self.withdrawal_batch_index
-    }
-    pub(crate) fn default_fee_token(&self) -> Address {
-        self.default_fee_token
-    }
-    pub(crate) fn token_supplies(&self) -> &BTreeMap<Address, U256> {
-        &self.token_supplies
-    }
+    pub(crate) tempo_block_hash: B256,
+    pub(crate) tempo_block_number: u64,
+    pub(crate) processed_deposit_queue_hash: B256,
+    pub(crate) processed_deposit_number: u64,
+    pub(crate) withdrawal_queue_hash: B256,
+    pub(crate) withdrawal_batch_index: u64,
+    pub(crate) default_fee_token: Address,
+    pub(crate) token_supplies: BTreeMap<Address, U256>,
 }
 
 /// Acquire protocol outputs from the state selected by `block_hash` exactly.

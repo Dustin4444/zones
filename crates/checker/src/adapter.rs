@@ -84,12 +84,12 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
     let (zone_facts, mut zone_effects) = zone_facts(o)?;
     imported_effects.append(&mut zone_effects);
     let state = ExpectedState {
-        tempo_block_hash: o.state.tempo_block_hash(),
-        tempo_block_number: o.state.tempo_block_number(),
-        processed_deposit_hash: o.state.processed_deposit_queue_hash(),
-        processed_deposit_number: o.state.processed_deposit_number(),
-        withdrawal_queue_hash: o.state.withdrawal_queue_hash(),
-        withdrawal_batch_index: o.state.withdrawal_batch_index(),
+        tempo_block_hash: o.state.tempo_block_hash,
+        tempo_block_number: o.state.tempo_block_number,
+        processed_deposit_hash: o.state.processed_deposit_queue_hash,
+        processed_deposit_number: o.state.processed_deposit_number,
+        withdrawal_queue_hash: o.state.withdrawal_queue_hash,
+        withdrawal_batch_index: o.state.withdrawal_batch_index,
     };
     let first = headers.first().expect("headers are nonempty");
     let final_observation = o.l1.last().expect("matched nonempty headers");
@@ -120,7 +120,7 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
         outputs: AuthenticatedOutputs {
             effects: imported_effects,
             state,
-            supplies: o.state.token_supplies().clone(),
+            supplies: o.state.token_supplies.clone(),
         },
     })
 }
@@ -918,10 +918,10 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
     }
     match events.get(cursor).map(|outcome| outcome.event()) {
         Some(L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(event)))
-            if event.tempoBlockHash == o.state.tempo_block_hash()
-                && event.tempoBlockNumber == o.state.tempo_block_number()
-                && event.newProcessedDepositQueueHash == o.state.processed_deposit_queue_hash()
-                && event.lastProcessedDepositNumber == o.state.processed_deposit_number()
+            if event.tempoBlockHash == o.state.tempo_block_hash
+                && event.tempoBlockNumber == o.state.tempo_block_number
+                && event.newProcessedDepositQueueHash == o.state.processed_deposit_queue_hash
+                && event.lastProcessedDepositNumber == o.state.processed_deposit_number
                 && event.depositsProcessed
                     == u64::try_from(advance.deposits().len()).unwrap_or(u64::MAX) => {}
         _ => {
