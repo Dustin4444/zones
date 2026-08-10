@@ -3,8 +3,6 @@
 //! Replaces the Solidity TempoState predeploy at `0x1c00...0000` while
 //! preserving the zone-facing checkpoint ABI.
 
-use alloc::format;
-
 use crate::{
     ZoneResult,
     storage::{L1State, L1StorageReader},
@@ -16,8 +14,7 @@ use alloy_rlp::Decodable as _;
 use alloy_sol_types::SolError;
 use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
-    EncodePrecompileResult, charge_input_cost, dispatch, error::TempoPrecompileError,
-    storage::Handler, view,
+    EncodePrecompileResult, charge_input_cost, dispatch, storage::Handler, view,
 };
 use tempo_precompiles_macros::contract;
 use tempo_primitives::TempoHeader;
@@ -37,6 +34,12 @@ pub struct TempoState {
 /// Storage slot containing the finalized Tempo block number in Zone state.
 pub const TEMPO_BLOCK_NUMBER_SLOT: alloy_primitives::U256 = slots::TEMPO_BLOCK_NUMBER;
 
+/// Storage slot containing the finalized Tempo block hash in Zone state.
+///
+/// Zero means no checkpoint has been imported yet, which is distinct from a checkpoint at Tempo
+/// block zero. Readers must consult this before treating [`TEMPO_BLOCK_NUMBER_SLOT`] as a height.
+pub const TEMPO_BLOCK_HASH_SLOT: alloy_primitives::U256 = slots::TEMPO_BLOCK_HASH;
+
 impl TempoState {
     /// Creates the direct-call-only `TempoState` precompile with checkpoint storage.
     ///
@@ -53,20 +56,9 @@ impl TempoState {
         )
     }
 
-    /// Initializes the predeploy account code and checkpoint from the genesis Tempo header.
-    pub fn initialize(&mut self, header_rlp: &[u8]) -> tempo_precompiles::Result<()> {
-        self.__initialize()?;
-        let mut cursor = header_rlp;
-        let header = TempoHeader::decode(&mut cursor).map_err(|err| {
-            TempoPrecompileError::Fatal(format!("invalid Tempo genesis header RLP: {err}"))
-        })?;
-        if !cursor.is_empty() {
-            return Err(TempoPrecompileError::Fatal(
-                "invalid Tempo genesis header RLP: trailing bytes after header".into(),
-            ));
-        }
-        self.write_checkpoint(header_rlp, header.number())?;
-        Ok(())
+    /// Initializes the predeploy account code with an empty Tempo checkpoint.
+    pub fn initialize(&mut self) -> tempo_precompiles::Result<()> {
+        self.__initialize()
     }
 
     fn write_checkpoint(
@@ -95,13 +87,12 @@ impl TempoState {
     /// read against that exact root.
     ///
     /// This typed operation is shared by the public `finalizeTempo` ABI and the native Inbox.
-    pub(crate) fn finalize_checkpoint<P>(
+    pub(crate) fn finalize_checkpoint<P: L1StorageReader>(
         &mut self,
         l1: &L1State<P>,
         header_rlp: Bytes,
     ) -> ZoneResult<()> {
         let prev_block_hash = self.tempo_block_hash.read()?;
-        let prev_block_number = self.tempo_block_number.read()?;
 
         let mut header_cursor = header_rlp.as_ref();
         let header = TempoHeader::decode(&mut header_cursor)
@@ -117,14 +108,22 @@ impl TempoState {
             }
             Ok(())
         })?;
-        if header.parent_hash() != prev_block_hash {
-            return Err(TempoStateError::invalid_parent_hash().into());
-        }
-        if prev_block_number.checked_add(1) != Some(header.number()) {
-            return Err(TempoStateError::invalid_block_number().into());
+        if prev_block_hash.is_zero() {
+            let admin = l1.read_portal_at(header.number(), |portal| &portal.admin)?;
+            if admin.is_zero() {
+                return Err(TempoStateError::portal_not_found().into());
+            }
+        } else {
+            let prev_block_number = self.tempo_block_number.read()?;
+            if header.parent_hash() != prev_block_hash {
+                return Err(TempoStateError::invalid_parent_hash().into());
+            }
+            if prev_block_number.checked_add(1) != Some(header.number()) {
+                return Err(TempoStateError::invalid_block_number().into());
+            }
+            l1.advance_anchor(prev_block_number, header.number())?;
         }
 
-        l1.advance_anchor(prev_block_number, header.number())?;
         let tempo_block_hash = self.write_checkpoint(&header_rlp, header.number())?;
         self.emit_event(TempoStateAbi::TempoBlockFinalized {
             blockHash: tempo_block_hash,
@@ -134,7 +133,7 @@ impl TempoState {
         Ok(())
     }
 
-    fn apply_checkpoint<P>(
+    fn apply_checkpoint<P: L1StorageReader>(
         &mut self,
         l1: &L1State<P>,
         sender: Address,
@@ -194,10 +193,11 @@ mod tests {
     };
     use alloc::{vec, vec::Vec};
     use alloy_evm::precompiles::DynPrecompile;
-    use alloy_primitives::{address, b256};
+    use alloy_primitives::{U256, address, b256};
     use alloy_rlp::Encodable as _;
     use alloy_sol_types::SolCall;
     use tempo_precompiles::storage::StorageCtx;
+    use zone_primitives::constants::PORTAL_ADMIN_SLOT;
 
     struct TempoStateHarness {
         ctx: TestContext,
@@ -207,13 +207,39 @@ mod tests {
 
     impl TempoStateHarness {
         fn new(header: &TempoHeader) -> eyre::Result<Self> {
-            let mut ctx = test_context();
+            Self::with_reader(header, MockL1Reader::default())
+        }
+
+        fn with_reader(header: &TempoHeader, reader: MockL1Reader) -> eyre::Result<Self> {
             let encoded = encode_header(header);
-            {
-                let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
-                StorageCtx::enter(&mut storage, || TempoState::new().initialize(&encoded))?;
-            }
-            let l1 = L1State::new(MockL1Reader::default(), Address::ZERO);
+            Self::build(reader, Address::ZERO, |tempo_state| {
+                tempo_state
+                    .write_checkpoint(&encoded, header.number())
+                    .map(|_| ())
+            })
+        }
+
+        /// Harness whose `TempoState` still holds the empty genesis checkpoint.
+        fn empty(reader: MockL1Reader, portal: Address) -> eyre::Result<Self> {
+            Self::build(reader, portal, |_| Ok(()))
+        }
+
+        /// Initialize `TempoState`, apply `seed_checkpoint`, then wire up the precompile.
+        fn build(
+            reader: MockL1Reader,
+            portal: Address,
+            seed_checkpoint: impl FnOnce(&mut TempoState) -> tempo_precompiles::Result<()>,
+        ) -> eyre::Result<Self> {
+            let mut ctx = test_context();
+            let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
+            StorageCtx::enter(&mut storage, || {
+                let mut tempo_state = TempoState::new();
+                tempo_state.initialize()?;
+                seed_checkpoint(&mut tempo_state)
+            })?;
+            drop(storage);
+
+            let l1 = L1State::new(reader, portal);
             let precompile = TempoState::create(l1.clone(), &test_env(&ctx));
             Ok(Self {
                 ctx,
@@ -341,10 +367,52 @@ mod tests {
     }
 
     #[test]
-    fn initialize_sets_checkpoint() -> eyre::Result<()> {
+    fn initialize_starts_with_empty_checkpoint() -> eyre::Result<()> {
+        let mut harness = TempoStateHarness::empty(MockL1Reader::default(), Address::ZERO)?;
+        harness.assert_checkpoint(B256::ZERO, 0)
+    }
+
+    #[test]
+    fn first_import_requires_initialized_portal() -> eyre::Result<()> {
+        let reader = MockL1Reader::default();
+        let portal = Address::repeat_byte(0x42);
         let header = child_header(B256::repeat_byte(0xaa), 42);
-        let mut harness = TempoStateHarness::new(&header)?;
-        harness.assert_checkpoint(keccak256(encode_header(&header)), 42)
+        let mut harness = TempoStateHarness::empty(reader.clone(), portal)?;
+        harness.set_block_timestamp(&header);
+
+        let output = harness.finalize(ZONE_INBOX_ADDRESS, &header, false)?;
+        assert!(output.is_revert());
+        harness.assert_checkpoint(B256::ZERO, 0)?;
+        assert_eq!(
+            reader.storage_requests(),
+            vec![(portal, PORTAL_ADMIN_SLOT, 42)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_import_accepts_any_block_after_portal_creation() -> eyre::Result<()> {
+        let reader = MockL1Reader::default();
+        let portal = Address::repeat_byte(0x42);
+        reader.insert(
+            portal,
+            U256::from_be_bytes(PORTAL_ADMIN_SLOT.0),
+            42,
+            U256::from(1),
+        );
+        let header = child_header(B256::repeat_byte(0xaa), 42);
+        let mut harness = TempoStateHarness::empty(reader.clone(), portal)?;
+        harness.set_block_timestamp(&header);
+
+        let output = harness.finalize(ZONE_INBOX_ADDRESS, &header, false)?;
+        assert!(output.is_success());
+        harness.assert_checkpoint(keccak256(encode_header(&header)), 42)?;
+        assert_eq!(harness.l1.get_anchor(), Some(42));
+        assert_eq!(
+            reader.storage_requests(),
+            vec![(portal, PORTAL_ADMIN_SLOT, 42)]
+        );
+        Ok(())
     }
 
     #[test]

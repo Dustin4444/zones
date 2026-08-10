@@ -209,6 +209,12 @@ where
         }
 
         let next_phase = self.phase.validate_transaction(recovered.tx())?;
+        if self.phase == ZoneBlockPhase::AwaitingAdvanceTempo {
+            // Only a transaction that carries the Tempo system signature reaches this point, so
+            // this is what separates the real block-opening call from an `eth_call` that merely
+            // sets `from` to the zero address.
+            self.evm_mut().authorize_system_advance();
+        }
 
         let result = self
             .inner

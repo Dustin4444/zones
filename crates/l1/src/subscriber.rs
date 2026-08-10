@@ -73,6 +73,14 @@ impl L1BlockTracker {
         self.state.read().latest
     }
 
+    /// Subscribe to observation updates, which fire whenever a new L1 block is recorded.
+    ///
+    /// Lets a caller hold one subscription across a wait loop so an observation recorded between
+    /// checks still wakes it, rather than being missed by a fresh subscribe.
+    pub fn subscribe_observations(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+
     /// Return whether `number` fits inside the bounded subscriber lookahead window.
     pub fn has_capacity_for(&self, number: u64) -> bool {
         self.state
@@ -93,7 +101,20 @@ impl L1BlockTracker {
         Ok(())
     }
 
-    /// Return the next L1 height the subscriber needs to retain.
+    /// Return the next L1 height that canonical zone state has not yet consumed.
+    ///
+    /// This is the import cursor, distinct from
+    /// [`next_observation_number`](Self::next_observation_number), which is the *fetch* cursor and
+    /// runs ahead of it. A block being imported names a height the observer has already seen, so
+    /// callers validating an import must compare against this.
+    pub fn next_unconsumed_number(&self) -> Option<u64> {
+        self.state
+            .read()
+            .pruned_through
+            .map(|consumed| consumed.saturating_add(1))
+    }
+
+    /// Return the next L1 height the observer needs to retain.
     pub fn next_observation_number(&self) -> Option<u64> {
         let state = self.state.read();
         state
@@ -270,6 +291,8 @@ pub struct L1SubscriberConfig {
     pub l1_rpc_url: String,
     /// ZonePortal contract address on L1.
     pub portal_address: Address,
+    /// Optional Tempo block immediately before portal creation, used to bootstrap a fresh zone.
+    pub genesis_tempo_block_number: Option<u64>,
     /// Shared registry of tokens enabled for this zone.
     pub enabled_tokens: crate::state::EnabledTokenRegistry,
     /// Shared L1 state cache. The subscriber updates the cache anchor on each
@@ -479,18 +502,29 @@ impl L1Subscriber {
 
     /// Determine the starting block number for backfill.
     ///
-    /// The zone's persisted Tempo checkpoint is the authoritative source for
-    /// where ingestion resumes. A non-zero hash distinguishes an L1-anchored
-    /// block-zero genesis from the unanchored template.
+    /// Persisted zone state is authoritative after the first import. Before that, a configured
+    /// creation anchor identifies the last block already consumed by genesis, so replay starts
+    /// at the portal-creation block.
     pub(crate) fn resolve_start_block(&self) -> eyre::Result<u64> {
         let local_checkpoint = self.local_state.latest_tempo_checkpoint()?;
-        eyre::ensure!(
-            local_checkpoint.hash != B256::ZERO,
-            "zone genesis is not anchored to an L1 block"
+        if local_checkpoint.hash != B256::ZERO {
+            info!(
+                local_tempo_block_number = local_checkpoint.number,
+                "Resuming from local zone state"
+            );
+            return Ok(local_checkpoint.number.saturating_add(1));
+        }
+
+        let genesis = self.config.genesis_tempo_block_number.ok_or_else(|| {
+            eyre::eyre!(
+                "zone has no Tempo checkpoint; set --l1.genesis-block-number to the block immediately before portal creation"
+            )
+        })?;
+        info!(
+            genesis,
+            "Bootstrapping from configured portal creation anchor"
         );
-        let local_tempo_block_number = local_checkpoint.number;
-        info!(local_tempo_block_number, "Resuming from local zone state");
-        Ok(local_tempo_block_number + 1)
+        Ok(genesis.saturating_add(1))
     }
 
     /// Resolve the first L1 block that has not already been ingested.

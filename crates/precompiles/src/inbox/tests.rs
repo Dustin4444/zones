@@ -16,7 +16,7 @@ use tempo_precompiles::{
     zone_factory::{ZonePortalStorage, zone_portal_slots},
 };
 use tempo_primitives::TempoHeader;
-use zone_primitives::constants::ZONE_OUTBOX_ADDRESS;
+use zone_primitives::constants::{PORTAL_ADMIN_SLOT, ZONE_OUTBOX_ADDRESS};
 
 use crate::test_utils::{
     EncryptedDepositFixture, MockL1Reader, TestContext, build_plaintext, call_precompile,
@@ -41,7 +41,6 @@ struct Harness {
     l1_state: L1State<MockL1Reader>,
     precompile: DynPrecompile,
     outbox_precompile: DynPrecompile,
-    genesis_hash: B256,
 }
 
 impl Harness {
@@ -52,22 +51,10 @@ impl Harness {
     fn with_l1(l1: MockL1Reader) -> eyre::Result<Self> {
         let mut ctx = test_context();
         ctx.cfg.spec = TempoHardfork::T9;
-        let genesis_rlp = encode_header(&TempoHeader::default());
-        let genesis_hash = keccak256(&genesis_rlp);
-        let child_header = TempoHeader {
-            inner: alloy_consensus::Header {
-                parent_hash: genesis_hash,
-                number: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        ctx.block.inner.timestamp = U256::from(child_header.inner.timestamp);
-        ctx.block.timestamp_millis_part = child_header.timestamp_millis_part;
         {
             let mut storage = test_storage_provider(&mut ctx, u64::MAX, false);
             StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
-                TempoState::new().initialize(&genesis_rlp)?;
+                TempoState::new().initialize()?;
                 ZoneInbox::new().initialize()?;
                 ZoneOutbox::new().initialize()?;
                 ReceivePolicyGuard::new().initialize()?;
@@ -80,8 +67,12 @@ impl Harness {
             })?;
         }
 
+        l1.insert(PORTAL, PORTAL_ADMIN_SLOT.into(), 1, U256::ONE);
         l1.seed_active_sequencer(PORTAL, 1, SEQUENCER);
         let l1_state = L1State::new(l1.clone(), PORTAL);
+        // Stand in for the block executor, which authorizes the block's `advanceTempo` before
+        // executing it. Tests exercising the unauthorized path clear this first.
+        l1_state.authorize_system_advance();
         let env = test_env(&ctx);
         let precompile = ZoneInbox::create(l1_state.clone(), &env);
         let outbox_precompile = crate::create_outbox_precompile(l1_state.clone(), &env);
@@ -91,14 +82,13 @@ impl Harness {
             l1_state,
             precompile,
             outbox_precompile,
-            genesis_hash,
         })
     }
 
-    fn child_header(&self) -> TempoHeader {
+    fn child_header() -> TempoHeader {
         TempoHeader {
             inner: alloy_consensus::Header {
-                parent_hash: self.genesis_hash,
+                parent_hash: B256::ZERO,
                 number: 1,
                 ..Default::default()
             },
@@ -141,7 +131,7 @@ impl Harness {
         enabled_tokens: Vec<EnabledToken>,
     ) -> IZoneInbox::advanceTempoCall {
         IZoneInbox::advanceTempoCall {
-            header: encode_header(&self.child_header()),
+            header: encode_header(&Self::child_header()),
             deposits,
             decryptions,
             enabledTokens: enabled_tokens,
@@ -406,6 +396,26 @@ fn non_system_advance_reverts_before_selecting_or_reading_l1() -> eyre::Result<(
 
     assert!(output.is_revert());
     assert_eq!(output.bytes, IZoneInbox::OnlySequencer {}.abi_encode());
+    assert_eq!(harness.l1_state.get_anchor(), None);
+    assert!(harness.l1.storage_requests().is_empty());
+    Ok(())
+}
+
+#[test]
+fn unauthorized_advance_reverts_even_from_the_zero_address() -> eyre::Result<()> {
+    let mut harness = Harness::new()?;
+    // An `eth_call` can set `from` to the zero address, but it never reaches the block executor,
+    // so it never gets authorized. Model that by clearing the authorization the harness seeded.
+    harness.l1_state.reset_transaction_state();
+
+    let output = harness.call(
+        Address::ZERO,
+        harness.advance_call(Vec::new(), Vec::new()).abi_encode(),
+    )?;
+
+    assert!(output.is_revert());
+    assert_eq!(output.bytes, IZoneInbox::OnlySequencer {}.abi_encode());
+    // Nothing was read at the caller-supplied header height, and no anchor was selected.
     assert_eq!(harness.l1_state.get_anchor(), None);
     assert!(harness.l1.storage_requests().is_empty());
     Ok(())

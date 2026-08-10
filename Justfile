@@ -275,6 +275,7 @@ zone-up name reset="false" profile="dev" args="":
                       --chain "$GENESIS_JSON" \
                       --l1.rpc-url "${L1_RPC_URL:?Set L1_RPC_URL env var (wss://...)}" \
                       --l1.portal-address "$PORTAL" \
+                      --l1.genesis-block-number "$ANCHOR_BLOCK" \
                       --zone.id "$ZONE_ID" \
                       --http \
                       --http.addr 0.0.0.0 \
@@ -905,6 +906,7 @@ deploy-zone name token="" access_enforced="false" gateway_enforced="false":
                       --chain "$OUTPUT/genesis.json" \
                       --l1.rpc-url "$L1_RPC" \
                       --l1.portal-address "$PORTAL" \
+                      --l1.genesis-block-number "$ANCHOR_BLOCK" \
                       --zone.id "$ZONE_ID" \
                       --http \
                       --http.addr 0.0.0.0 \

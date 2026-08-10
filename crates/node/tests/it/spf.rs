@@ -26,6 +26,8 @@ use tempo_precompiles::{
 };
 use tempo_primitives::TempoHeader;
 use zone_chainspec::ZoneChainSpec;
+use zone_precompiles::tempo_state;
+use zone_primitives::constants::TEMPO_STATE_ADDRESS;
 use zone_rpc::types::ZoneExecutionWitness;
 use zone_spf::{
     BatchWitness, PublicInputs, SpfConfig, TempoStateWitness, ZoneBlock, ZoneStateWitness,
@@ -386,6 +388,20 @@ fn state_changing_transaction(recipient: Address) -> TransactionRequest {
 
 fn funded_zone_genesis() -> Genesis {
     let mut genesis = zone_node::genesis::genesis_template().expect("valid Zone genesis template");
+    // These SPF cases prove ordinary post-bootstrap batches. Seed their custom genesis with the
+    // same checkpoint represented by `TempoStateWitness::initial_tempo_header_rlp`; empty-genesis
+    // bootstrap behavior is covered by the dedicated TempoState and L1 integration tests.
+    let initial_tempo_header = TempoHeader::default();
+    genesis
+        .alloc
+        .get_mut(&TEMPO_STATE_ADDRESS)
+        .expect("TempoState genesis account")
+        .storage
+        .get_or_insert_default()
+        .insert(
+            B256::from(tempo_state::slots::TEMPO_BLOCK_HASH.to_be_bytes()),
+            initial_tempo_header.hash_slow(),
+        );
     let sender = address!("f39fd6e51aad88f6f4ce6ab8827279cfffb92266");
     let fee_balance_slot = sender.mapping_slot(tip20_slots::BALANCES);
     genesis

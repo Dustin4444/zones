@@ -1151,7 +1151,13 @@ where
     let local = provider
         .state_by_block_hash(parent.hash())?
         .tempo_num_hash()?;
-    validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, block_number)?;
+    validate_l1_checkpoint_transition(
+        &l1_header,
+        local.number,
+        local.hash,
+        block_number,
+        l1_block_tracker.next_unconsumed_number(),
+    )?;
     let anchor = l1_header.num_hash();
 
     // Anchor-aware fence for live blocks: the sender must
@@ -1323,7 +1329,28 @@ fn validate_l1_checkpoint_transition(
     local_number: u64,
     local_hash: B256,
     zone_block_number: u64,
+    next_replay_block: Option<u64>,
 ) -> eyre::Result<()> {
+    // A zero hash denotes an uninitialized checkpoint, so there is no parent to chain from. The
+    // first import is instead pinned to the replay cursor: accepting any observed height would let
+    // a leader skip the portal-creation block, and because the tracker prunes everything through
+    // the imported height, the events in the skipped blocks — notably the portal's initial
+    // `TokenEnabled` — would be discarded before any node processed them.
+    if local_hash.is_zero() {
+        let Some(expected) = next_replay_block else {
+            // No cursor yet: the subscriber has not resolved a start block, so there is nothing
+            // to pin against and the authoritative check still runs during execution.
+            return Ok(());
+        };
+        if l1_header.number() != expected {
+            eyre::bail!(
+                "peer block {zone_block_number} bootstraps Tempo at L1 block {}, but the replay cursor expects {expected}",
+                l1_header.number()
+            );
+        }
+        return Ok(());
+    }
+
     if l1_header.number() != local_number.saturating_add(1) {
         eyre::bail!(
             "peer block {zone_block_number} advances Tempo to L1 block {}, but local checkpoint is {}; expected {}",
@@ -1731,16 +1758,46 @@ mod tests {
             },
             ..Default::default()
         });
-        super::validate_l1_checkpoint_transition(&header, 10, local_hash, 7).unwrap();
+        super::validate_l1_checkpoint_transition(&header, 10, local_hash, 7, None).unwrap();
 
         let skipped =
-            super::validate_l1_checkpoint_transition(&header, 9, local_hash, 7).unwrap_err();
+            super::validate_l1_checkpoint_transition(&header, 9, local_hash, 7, None).unwrap_err();
         assert!(skipped.to_string().contains("expected 10"));
 
         let wrong_parent =
-            super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7)
+            super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7, None)
                 .unwrap_err();
         assert!(wrong_parent.to_string().contains("does not extend"));
+    }
+
+    #[test]
+    fn pins_the_zero_genesis_first_import_to_the_replay_cursor() {
+        use reth_primitives_traits::SealedHeader;
+        use tempo_primitives::TempoHeader;
+
+        let header = SealedHeader::seal_slow(TempoHeader {
+            inner: alloy_consensus::Header {
+                number: 11,
+                parent_hash: B256::repeat_byte(0x42),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        // The creation block is the cursor, so importing it is the only accepted first transition.
+        super::validate_l1_checkpoint_transition(&header, 0, B256::ZERO, 7, Some(11)).unwrap();
+
+        // Skipping ahead would prune the skipped blocks' portal events, including the portal's
+        // initial TokenEnabled, before any node had a chance to process them.
+        let skipped = super::validate_l1_checkpoint_transition(&header, 0, B256::ZERO, 7, Some(9))
+            .unwrap_err();
+        assert!(
+            skipped.to_string().contains("replay cursor expects 9"),
+            "{skipped}"
+        );
+
+        // Without a resolved cursor there is nothing to pin against; execution still checks.
+        super::validate_l1_checkpoint_transition(&header, 0, B256::ZERO, 7, None).unwrap();
     }
 
     #[tokio::test]

@@ -70,6 +70,8 @@ pub struct L1State<P> {
     /// when a subcall reverts, preserving charges for potentially incurred L1 fetch work and
     /// simplifying the accounting model.
     access_set: Rc<RefCell<HashSet<(Address, B256)>>>,
+    /// Whether the current transaction is the block's sanctioned `advanceTempo` system call.
+    system_advance_authorized: Rc<Cell<bool>>,
     /// Underlying cache/RPC-backed reader for storage at an explicit Tempo block number.
     provider: P,
     /// ZonePortal read through the L1 provider by explicit storage operations.
@@ -82,6 +84,7 @@ impl<P> L1State<P> {
         Self {
             anchor: Rc::new(Cell::new(None)),
             access_set: Rc::new(RefCell::new(HashSet::default())),
+            system_advance_authorized: Rc::new(Cell::new(false)),
             provider,
             portal_address,
         }
@@ -91,6 +94,22 @@ impl<P> L1State<P> {
     pub fn reset_transaction_state(&self) {
         self.anchor.set(None);
         self.access_set.borrow_mut().clear();
+        self.system_advance_authorized.set(false);
+    }
+
+    /// Marks the current transaction as the block's sanctioned `advanceTempo` system call.
+    ///
+    /// Only the block executor calls this, after classifying the transaction as a Tempo system
+    /// transaction. `msg.sender == address(0)` alone is not sufficient authorization: an
+    /// `eth_call` may set `from` freely, and without this gate a simulation could execute a
+    /// consensus operation — writing a checkpoint and driving L1 reads at a caller-chosen height.
+    pub fn authorize_system_advance(&self) {
+        self.system_advance_authorized.set(true);
+    }
+
+    /// Whether the current transaction may execute `advanceTempo`.
+    pub fn is_system_advance_authorized(&self) -> bool {
+        self.system_advance_authorized.get()
     }
 
     /// Returns the anchor selected for the current transaction, if any.
@@ -148,7 +167,7 @@ impl<P: L1StorageReader> L1State<P> {
 
     /// Reads L1 storage, with gas metering, after selecting or validating `block_number` as this
     /// transaction's anchor.
-    fn read_l1_storage(
+    pub(crate) fn read_l1_storage(
         &self,
         account: Address,
         slot: B256,
@@ -196,6 +215,17 @@ impl<P: L1StorageReader> L1State<P> {
         expected: tempo_zone_contracts::ZonePortal::Role,
     ) -> tempo_precompiles::Result<bool> {
         Ok(self.read_portal(|portal| &portal.role[account])? == u8::from(expected))
+    }
+
+    /// Selects an explicit anchor and reads a typed slot from the configured `ZonePortal`.
+    pub fn read_portal_at<T: Storable>(
+        &self,
+        block_number: u64,
+        select_slot: impl for<'a> FnOnce(&'a ZonePortal) -> &'a Slot<T>,
+    ) -> tempo_precompiles::Result<T> {
+        self.set_anchor(block_number)
+            .map_err(|err| TempoPrecompileError::Fatal(err.to_string()))?;
+        self.read_portal(select_slot)
     }
 }
 

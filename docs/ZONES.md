@@ -647,7 +647,8 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 |------|---------|-------------|
 | `--l1.rpc-url` | (required) | Certified Tempo follower WebSocket RPC URL |
 | `--l1.portal-address` | (from zone.json) | ZonePortal contract on L1 |
-| `--zone.id` | 0 | Zone ID from ZoneFactory. At startup it must match `ZonePortal.zoneId()`; `0` does not bypass validation. |
+| `--l1.genesis-block-number` | `tempoAnchorBlock` from zone.json | Tempo block immediately before Portal creation; required until the Zone has imported its first checkpoint |
+| `--zone.id` | 0 | Zone ID from ZoneFactory. At startup it must match `ZonePortal.zoneId()`; `0` does not bypass validation. The zone's chain ID is derived from the parent L1 chain ID and zone ID. |
 | `--sequencer` | false | Enable sequencer mode for block production and withdrawal batch submission |
 | `--sequencer-key-file` | (required for sequencing) | Owner-readable file or FIFO containing the sequencer private key |
 | `--deposit-decryption-keys-file` | (optional) | File containing additional historical or pre-provisioned deposit decryption keys, one hex key per line |

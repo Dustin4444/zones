@@ -240,6 +240,7 @@ impl ZoneNode {
     pub fn new(
         l1_rpc_url: String,
         portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
         l1_fetch_concurrency: usize,
         retry_connection_interval: Duration,
     ) -> Self {
@@ -251,6 +252,7 @@ impl ZoneNode {
         let l1_config = L1SubscriberConfig {
             l1_rpc_url: l1_rpc_url.clone(),
             portal_address,
+            genesis_tempo_block_number,
             enabled_tokens: enabled_tokens.clone(),
             l1_state_cache: l1_state_cache.clone(),
             block_tracker: l1_block_tracker.clone(),
@@ -506,6 +508,16 @@ where
         );
 
         let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
+        // A fresh zero-genesis node has not imported an L1 header yet, so its on-chain
+        // checkpoint is zero even when the configured replay cursor is later. Bootstrap every
+        // L1-derived subsystem from the newest snapshot represented by either source. On restart,
+        // the imported checkpoint naturally takes precedence over the original genesis cursor.
+        let startup_snapshot_block = self
+            .l1_config
+            .genesis_tempo_block_number
+            .map_or(tempo_block_number, |genesis| {
+                genesis.max(tempo_block_number)
+            });
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
                 &self.l1_config.l1_rpc_url,
@@ -552,10 +564,10 @@ where
             validate_zone_chain_id(l1_chain_id, portal_zone_id, chain_id)?;
         }
 
-        self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
+        self.resolve_and_seed_tokens(&l1_provider, startup_snapshot_block)
             .await?;
         if let Some(keys) = self.l1_config.encryption_keys.clone() {
-            self.resolve_and_seed_encryption_keys(&l1_provider, tempo_block_number, &keys)
+            self.resolve_and_seed_encryption_keys(&l1_provider, startup_snapshot_block, &keys)
                 .await?;
         }
 
@@ -565,7 +577,7 @@ where
         // leadership transition.
         if let Some(p2p) = self.p2p_config.as_ref() {
             let schedule = p2p.leadership();
-            let snapshot_anchor = tempo_block_number;
+            let snapshot_anchor = startup_snapshot_block;
             // Freeze the replay/live boundary before the subscriber starts. Historical identities
             // may authenticate transitions that were already finalized when this process began,
             // but must never authorize a leader selected later.
@@ -1520,6 +1532,7 @@ where
             self.l1_state_provider_config.clone(),
             self.l1_state_cache.clone(),
             self.enabled_tokens.clone(),
+            self.l1_block_tracker.clone(),
         );
         let mut payload_factory = ZonePayloadFactory::new(self.withdrawal_batch_interval_blocks);
         if let Some(encryptor) = self.withdrawal_reveal_encryptor.clone() {
@@ -1591,19 +1604,24 @@ pub struct ZoneExecutorBuilder {
     l1_state_provider_config: L1StateProviderConfig,
     l1_state_cache: L1StateCache,
     enabled_tokens: EnabledTokenRegistry,
+    l1_block_tracker: L1BlockTracker,
 }
 
 impl ZoneExecutorBuilder {
     /// Create a zone executor builder with the shared L1 state cache.
+    ///
+    /// `l1_block_tracker` bounds precompile L1 reads to independently observed blocks.
     pub fn new(
         l1_state_provider_config: L1StateProviderConfig,
         l1_state_cache: L1StateCache,
         enabled_tokens: EnabledTokenRegistry,
+        l1_block_tracker: L1BlockTracker,
     ) -> Self {
         Self {
             l1_state_provider_config,
             l1_state_cache,
             enabled_tokens,
+            l1_block_tracker,
         }
     }
 }
@@ -1644,7 +1662,8 @@ where
             self.l1_state_cache,
             runtime_handle.clone(),
         )
-        .await?;
+        .await?
+        .with_head_bound(self.l1_block_tracker);
 
         let l1_chain_id = l1_provider.chain_id().await?;
         let genesis_l1_chain_id = decode_l1_chain_id(ctx.chain_spec().genesis().config.chain_id)?;

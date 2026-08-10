@@ -164,6 +164,7 @@ fn test_subscriber(local_state: Arc<dyn LocalTempoCheckpointReader>) -> L1Subscr
         config: L1SubscriberConfig {
             l1_rpc_url: "http://127.0.0.1:8545".to_owned(),
             portal_address,
+            genesis_tempo_block_number: None,
             enabled_tokens: crate::state::EnabledTokenRegistry::default(),
             l1_state_cache: crate::L1StateCache::new(),
             block_tracker: L1BlockTracker::default(),
@@ -718,8 +719,16 @@ fn test_resolve_start_block_rejects_unanchored_genesis() {
             .resolve_start_block()
             .unwrap_err()
             .to_string()
-            .contains("zone genesis is not anchored to an L1 block")
+            .contains("set --l1.genesis-block-number")
     );
+}
+
+#[test]
+fn test_resolve_start_block_uses_creation_anchor_for_empty_checkpoint() {
+    let mut subscriber =
+        test_subscriber(Arc::new(SequenceLocalTempoCheckpointReader::unanchored()));
+    subscriber.config.genesis_tempo_block_number = Some(41);
+    assert_eq!(subscriber.resolve_start_block().unwrap(), 42);
 }
 
 #[tokio::test]

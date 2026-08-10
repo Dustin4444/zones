@@ -25,7 +25,7 @@ use tempo_zone_contracts::{
     ZonePortal, ZonePortal::Role as PortalRole,
 };
 use zone_node::dev::{ProvisionConfig, provision_zone};
-use zone_primitives::constants::PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT;
+use zone_primitives::{constants::PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, portal_creation_anchor};
 
 /// Longer timeout for real L1 tests — the L1 dev node produces blocks every
 /// 500ms and the L1Subscriber needs to connect, backfill, and subscribe.
@@ -125,19 +125,23 @@ async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
     let l1 = L1TestNode::start().await?;
 
     // Verify L1 is producing blocks
-    let l1_block_0 = l1.provider().get_block_number().await?;
+    let pre_submit_head = l1.provider().get_block_number().await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let l1_block_1 = l1.provider().get_block_number().await?;
+    let l1_head_after_delay = l1.provider().get_block_number().await?;
     assert!(
-        l1_block_1 > l1_block_0,
+        l1_head_after_delay > pre_submit_head,
         "L1 should be producing blocks in dev mode"
     );
 
-    // Match the normal provision flow by anchoring immediately before the portal deployment.
-    // Startup must leave the registry empty at this anchor and let subscriber backfill process
-    // the constructor's initial TokenEnabled event.
-    let anchor_block_number = l1.provider().get_block_number().await?;
-    let portal_address = l1.deploy_zone().await?;
+    // Simulate delayed inclusion after a caller has observed the L1 head. The confirmed receipt,
+    // rather than this stale sample, determines the anchor and therefore the first replayed block.
+    let (portal_address, creation_block_number) = l1.deploy_zone_with_creation_block().await?;
+    assert!(
+        creation_block_number > pre_submit_head + 1,
+        "test must include createZone after a multi-block delay"
+    );
+    let anchor_block_number =
+        portal_creation_anchor(creation_block_number).expect("portal is not created at genesis");
     let zone = ZoneTestNode::start_from_l1_at_block(
         l1.http_url(),
         l1.ws_url(),
@@ -155,6 +159,20 @@ async fn test_zone_advances_with_real_l1() -> eyre::Result<()> {
     assert!(
         zone.enabled_tokens().read().contains(&PATH_USD_ADDRESS),
         "subscriber backfill should populate the initial enabled token"
+    );
+    let finalized_events = TempoState::new(TEMPO_STATE_ADDRESS, zone.provider())
+        .TempoBlockFinalized_filter()
+        .from_block(0)
+        .query()
+        .await?;
+    let first_replayed_block = finalized_events
+        .iter()
+        .map(|(event, _)| event.blockNumber)
+        .min()
+        .ok_or_else(|| eyre::eyre!("missing TempoBlockFinalized event"))?;
+    assert_eq!(
+        first_replayed_block, creation_block_number,
+        "the first queued L1 block must be the portal-creation block"
     );
 
     // Zone should also have produced L2 blocks

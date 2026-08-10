@@ -4,23 +4,21 @@
 
 use alloy::{
     network::{EthereumWallet, primitives::ReceiptResponse},
-    primitives::{Address, address, keccak256},
+    primitives::{Address, address},
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
     sol_types::SolEvent,
 };
-use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::BlockId;
 use eyre::{WrapErr as _, ensure, eyre};
 use std::path::PathBuf;
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::TEMPO_T0_BASE_FEE;
 use tempo_contracts::precompiles::ITIP403Registry;
 use tempo_precompiles::TIP403_REGISTRY_ADDRESS;
 use tempo_zone_contracts::{
     ZONE_MESSENGER_ADDRESS, ZONE_VERIFIER_ADDRESS, ZoneFactory, ZonePortal,
 };
-use zone_primitives::constants::zone_chain_id;
+use zone_primitives::{constants::zone_chain_id, portal_creation_anchor};
 
 use crate::zone_utils::{MODERATO_ZONE_FACTORY, write_owner_only};
 
@@ -87,18 +85,6 @@ pub(crate) struct CreateZone {
     /// process argument list.
     #[arg(long, env = "ZONE_FACTORY_OWNER_KEY", hide_env_values = true)]
     private_key: String,
-
-    /// Base fee per gas for the zone L2.
-    #[arg(long, default_value_t = TEMPO_T0_BASE_FEE.into())]
-    base_fee_per_gas: u128,
-
-    /// Genesis block gas limit for the zone L2.
-    #[arg(long, default_value_t = 30_000_000)]
-    gas_limit: u64,
-
-    /// Path to the Foundry compiled output directory containing zone contract artifacts.
-    #[arg(long, default_value = "specs/ref-impls/out")]
-    specs_out: PathBuf,
 }
 
 /// Mirrors `ZonePortal.MAX_SEQUENCERS` for a fast client-side error.
@@ -206,19 +192,6 @@ impl CreateZone {
             ));
         }
 
-        // Anchor before createZone so the zone replays the creation block and its
-        // initial TokenEnabled event during L1 backfill.
-        let anchor_block_number = provider.get_block_number().await?;
-        let anchor_header = provider
-            .get_header_by_number(anchor_block_number.into())
-            .await?
-            .ok_or_else(|| eyre!("anchor header {anchor_block_number} not found"))?
-            .inner
-            .inner;
-        let mut genesis_header_rlp = Vec::new();
-        anchor_header.encode(&mut genesis_header_rlp);
-        let anchor_hash = keccak256(&genesis_header_rlp);
-
         println!("Admin: {}", self.admin);
         println!("Sequencers: {:?}", self.sequencers);
         println!("Threshold: {}", self.threshold);
@@ -250,6 +223,10 @@ impl CreateZone {
         let creation_block = receipt
             .block_number
             .ok_or_else(|| eyre!("createZone receipt is missing its block number"))?;
+        // Replay the confirmed portal-creation block, including the constructor's initial
+        // TokenEnabled event. A pre-submit head is not sufficient because inclusion may be delayed.
+        let anchor_block_number = portal_creation_anchor(creation_block)
+            .ok_or_else(|| eyre!("createZone cannot be included in L1 genesis block"))?;
 
         let event = receipt
             .inner
@@ -298,28 +275,14 @@ impl CreateZone {
         );
         println!("Sequencer set version: {sequencer_set_version}");
 
-        println!(
-            "Using pre-creation block {} (hash: {anchor_hash}) as genesis anchor",
-            anchor_header.inner.number
-        );
-
-        let header_rlp_hex = const_hex::encode(&genesis_header_rlp);
-
-        let genesis_cmd = crate::generate_zone_genesis::GenerateZoneGenesis {
-            output: self.output.clone(),
+        let genesis_cmd = crate::generate_zone_genesis::GenerateZoneGenesis::canonical(
+            self.output.clone(),
             chain_id,
-            base_fee_per_gas: self.base_fee_per_gas,
-            gas_limit: self.gas_limit,
-            tempo_portal: portal,
-            default_fee_token: self.initial_token,
-            tempo_genesis_header_rlp: Some(header_rlp_hex),
-            admin: self.admin,
-            sequencer: Some(leader),
-            specs_out: self.specs_out.clone(),
-            with_createx: true,
-            with_safe_deployer: true,
-            with_create2_factory: true,
-        };
+            portal,
+            self.initial_token,
+            self.admin,
+            leader,
+        );
         genesis_cmd.run().await?;
 
         // Write zone.json with deployment metadata for downstream tooling (e.g. `just zone-up`).
@@ -338,7 +301,7 @@ impl CreateZone {
             "sequencers": self.sequencers.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "sequencerThreshold": self.threshold,
             "sequencerSetVersion": sequencer_set_version,
-            "tempoAnchorBlock": anchor_header.inner.number,
+            "tempoAnchorBlock": anchor_block_number,
             "zoneFactory": format!("{}", self.zone_factory),
             "rpcUrl": self.rpc_url,
         });
@@ -365,7 +328,7 @@ impl CreateZone {
         if !self.rpc_url.is_empty() {
             println!("  RPC URL: {}", self.rpc_url);
         }
-        println!("  Tempo anchor block: {}", anchor_header.inner.number);
+        println!("  Tempo anchor block: {anchor_block_number}");
         println!(
             "  Genesis written to: {}",
             self.output.join("genesis.json").display()
@@ -401,9 +364,6 @@ mod tests {
             admin: address!("0x5000000000000000000000000000000000000005"),
             rpc_url: String::new(),
             private_key: String::new(),
-            base_fee_per_gas: 1,
-            gas_limit: 30_000_000,
-            specs_out: PathBuf::new(),
         };
 
         let params = command.factory_params();

@@ -12,6 +12,7 @@ crate::sol! {
         error InvalidTimestamp();
         error InvalidRlpData();
         error OnlyZoneInbox();
+        error PortalNotFound();
 
         function tempoBlockHash() external view returns (bytes32);
         function tempoBlockNumber() external view returns (uint64);

@@ -181,6 +181,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         let mut node = ZoneNode::new(
             args.l1_rpc_url,
             args.portal_address,
+            args.l1_genesis_block_number,
             args.l1_fetch_concurrency,
             Duration::from_millis(args.l1_retry_connection_interval_ms),
         )
@@ -426,6 +427,10 @@ pub struct ZoneArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     pub withdrawal_max_in_flight_batches: usize,
+
+    /// Tempo block immediately before portal creation, required to bootstrap an empty checkpoint.
+    #[arg(long = "l1.genesis-block-number", env = "L1_GENESIS_BLOCK_NUMBER")]
+    pub l1_genesis_block_number: Option<u64>,
 
     /// Maximum number of concurrent L1 receipt fetches.
     #[arg(

@@ -5,7 +5,7 @@ use alloy_network::{EthereumWallet, ReceiptResponse};
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder, bindings::IMulticall3};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_eth::{BlockId, BlockNumberOrTag, Filter, TransactionRequest};
+use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, TransactionRequest};
 use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 use commonware_codec::Encode as _;
@@ -73,9 +73,8 @@ use zone_node::{ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig};
 use zone_p2p::{LeadershipSchedule, LeadershipState, P2pConfig, P2pPeerId, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
 use zone_primitives::constants::{
-    PORTAL_ACCESS_MODE_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT, PORTAL_PAUSE_SLOT,
-    PORTAL_TOKEN_CONFIGS_SLOT, ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_TOKEN_ENABLEMENT_HASH_SLOT,
-    zone_chain_id as derive_zone_chain_id,
+    PORTAL_ACCESS_MODE_SLOT, PORTAL_ADMIN_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT, PORTAL_PAUSE_SLOT,
+    PORTAL_TOKEN_CONFIGS_SLOT, zone_chain_id as derive_zone_chain_id,
 };
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
@@ -1029,7 +1028,7 @@ impl ZoneTestNode {
 
     /// Start a zone node pointing at a real L1 WebSocket URL.
     pub(crate) async fn start(l1_ws_url: String, portal_address: Address) -> eyre::Result<Self> {
-        Self::launch(l1_ws_url, portal_address, next_unique_chain_id()).await
+        Self::launch(l1_ws_url, portal_address, None, next_unique_chain_id()).await
     }
 
     /// Start a zone node connected to a real L1, generating genesis from the L1's
@@ -1041,12 +1040,14 @@ impl ZoneTestNode {
         l1_ws_url: &url::Url,
         portal_address: Address,
     ) -> eyre::Result<Self> {
-        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
+            Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
             signer,
@@ -1061,12 +1062,14 @@ impl ZoneTestNode {
         portal_address: Address,
         additional_decryption_keys: Vec<SecretKey>,
     ) -> eyre::Result<Self> {
-        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
             l1_ws_url.to_string(),
             portal_address,
+            Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
             signer,
@@ -1085,13 +1088,13 @@ impl ZoneTestNode {
         portal_address: Address,
         block_number: u64,
     ) -> eyre::Result<Self> {
-        let (genesis, _) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, block_number).await?;
+        let genesis = build_zone_genesis(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url.to_string(),
             portal_address,
+            Some(block_number),
             next_unique_chain_id(),
             Some(genesis),
             signer,
@@ -1108,12 +1111,14 @@ impl ZoneTestNode {
         portal_address: Address,
         withdrawal_batch_interval_blocks: u64,
     ) -> eyre::Result<Self> {
-        let (genesis, _) = build_l1_anchored_genesis(l1_http_url, portal_address).await?;
+        let (genesis, genesis_block_number) =
+            build_l1_anchored_genesis(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url.to_string(),
             portal_address,
+            Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
             signer,
@@ -1135,14 +1140,13 @@ impl ZoneTestNode {
         portal_address: Address,
         genesis_block_number: u64,
     ) -> eyre::Result<Self> {
-        let (genesis, _) =
-            build_l1_anchored_genesis_at_block(l1_http_url, portal_address, genesis_block_number)
-                .await?;
+        let genesis = build_zone_genesis(l1_http_url, portal_address).await?;
 
         let signer = l1_dev_signer();
         Self::launch_with_genesis(
             l1_ws_url.to_string(),
             portal_address,
+            Some(genesis_block_number),
             next_unique_chain_id(),
             Some(genesis),
             signer,
@@ -1160,6 +1164,7 @@ impl ZoneTestNode {
         Self::launch(
             DUMMY_L1_URL.to_string(),
             Address::ZERO,
+            None,
             next_unique_chain_id(),
         )
         .await
@@ -1170,7 +1175,7 @@ impl ZoneTestNode {
     /// Useful for running multiple zone nodes in a single test — each needs
     /// a unique chain ID to avoid datadir collisions.
     pub(crate) async fn start_local_with_chain_id(chain_id: u64) -> eyre::Result<Self> {
-        Self::launch(DUMMY_L1_URL.to_string(), Address::ZERO, chain_id).await
+        Self::launch(DUMMY_L1_URL.to_string(), Address::ZERO, None, chain_id).await
     }
 
     pub(crate) async fn start_local_with_p2p(
@@ -1182,6 +1187,7 @@ impl ZoneTestNode {
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_rpc_url,
             Address::ZERO,
+            None,
             next_unique_chain_id(),
             None,
             signer,
@@ -1195,6 +1201,7 @@ impl ZoneTestNode {
     async fn launch(
         l1_ws_url: String,
         portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
         chain_id: u64,
     ) -> eyre::Result<Self> {
         // Generate a throwaway signer for tests that don't use encrypted deposits.
@@ -1203,6 +1210,7 @@ impl ZoneTestNode {
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url,
             portal_address,
+            genesis_tempo_block_number,
             chain_id,
             None,
             signer,
@@ -1216,6 +1224,7 @@ impl ZoneTestNode {
     async fn launch_with_genesis(
         l1_ws_url: String,
         portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
         chain_id: u64,
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
@@ -1223,6 +1232,7 @@ impl ZoneTestNode {
         Self::launch_with_genesis_and_withdrawal_batch_interval(
             l1_ws_url,
             portal_address,
+            genesis_tempo_block_number,
             chain_id,
             custom_genesis,
             sequencer_signer,
@@ -1237,6 +1247,7 @@ impl ZoneTestNode {
     async fn launch_with_genesis_and_withdrawal_batch_interval(
         l1_ws_url: String,
         portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
         chain_id: u64,
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
@@ -1247,6 +1258,7 @@ impl ZoneTestNode {
         Self::launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
             l1_ws_url,
             portal_address,
+            genesis_tempo_block_number,
             chain_id,
             custom_genesis,
             sequencer_signer,
@@ -1262,6 +1274,7 @@ impl ZoneTestNode {
     async fn launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
         l1_ws_url: String,
         portal_address: Address,
+        genesis_tempo_block_number: Option<u64>,
         chain_id: u64,
         custom_genesis: Option<Genesis>,
         sequencer_signer: alloy_signer_local::PrivateKeySigner,
@@ -1311,6 +1324,7 @@ impl ZoneTestNode {
         let mut zone_node = ZoneNode::new(
             l1_ws_url,
             portal_address,
+            genesis_tempo_block_number,
             4,
             std::time::Duration::from_millis(100),
         )
@@ -1842,8 +1856,13 @@ impl L1TestNode {
     /// Combines [`native_zone_factory`](Self::native_zone_factory) and
     /// [`create_zone`](Self::create_zone). Returns the portal address.
     pub(crate) async fn deploy_zone(&self) -> eyre::Result<Address> {
+        Ok(self.deploy_zone_with_creation_block().await?.0)
+    }
+
+    /// Create a zone through the native ZoneFactory and return its portal and inclusion block.
+    pub(crate) async fn deploy_zone_with_creation_block(&self) -> eyre::Result<(Address, u64)> {
         let factory = self.native_zone_factory().await?;
-        self.create_zone(factory).await
+        self.create_zone_with_creation_block(factory).await
     }
 
     /// Wait for a withdrawal to be fully processed on L1 (pathUSD).
@@ -2003,23 +2022,36 @@ impl L1TestNode {
     ///
     /// [`admin_address`]: Self::admin_address
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
+        Ok(self
+            .create_zone_with_creation_block(factory_address)
+            .await?
+            .0)
+    }
+
+    /// Create a zone and return both its portal address and confirmed inclusion block.
+    pub(crate) async fn create_zone_with_creation_block(
+        &self,
+        factory_address: Address,
+    ) -> eyre::Result<(Address, u64)> {
         let config =
             ZoneCreationConfig::closed(vec![self.admin_address(), self.user_signer().address()]);
-        let portal = self
-            .create_zone_with_admin_sequencer_and_config(
+        let created = self
+            .create_zone_with_admin_sequencers_config_and_block(
                 factory_address,
                 self.admin_address(),
-                self.dev_address(),
+                vec![self.dev_address()],
+                1,
                 config,
             )
             .await?;
         // The admin is not pre-funded; give it pathUSD to pay for gas on
         // admin-only portal calls.
         self.fund_user(self.admin_address(), 10_000_000).await?;
+        let portal = created.0;
         let encryption_key = k256::SecretKey::from(self.dev_signer().credential());
         self.set_sequencer_encryption_key(portal, &encryption_key)
             .await?;
-        Ok(portal)
+        Ok(created)
     }
 
     /// Create a zone with an exact access-mode, membership, and gateway configuration.
@@ -2030,25 +2062,26 @@ impl L1TestNode {
         sequencer: Address,
         config: ZoneCreationConfig,
     ) -> eyre::Result<Address> {
-        self.create_zone_with_admin_sequencers_and_config(
-            factory_address,
-            admin,
-            vec![sequencer],
-            1,
-            config,
-        )
-        .await
+        Ok(self
+            .create_zone_with_admin_sequencers_config_and_block(
+                factory_address,
+                admin,
+                vec![sequencer],
+                1,
+                config,
+            )
+            .await?
+            .0)
     }
 
-    /// Create a zone with an explicit on-chain settlement signer set and threshold.
-    pub(crate) async fn create_zone_with_admin_sequencers_and_config(
+    async fn create_zone_with_admin_sequencers_config_and_block(
         &self,
         factory_address: Address,
         admin: Address,
         sequencers: Vec<Address>,
         threshold: u8,
         config: ZoneCreationConfig,
-    ) -> eyre::Result<Address> {
+    ) -> eyre::Result<(Address, u64)> {
         use tempo_precompiles::PATH_USD_ADDRESS;
         use tempo_zone_contracts::ZoneFactory;
 
@@ -2076,6 +2109,9 @@ impl L1TestNode {
             .get_receipt()
             .await?;
         eyre::ensure!(receipt.status(), "createZone failed");
+        let creation_block_number = receipt
+            .block_number
+            .ok_or_else(|| eyre::eyre!("createZone receipt missing block number"))?;
 
         let zone_created = receipt
             .inner
@@ -2084,7 +2120,7 @@ impl L1TestNode {
             .find_map(|log| ZoneFactory::ZoneCreated::decode_log(&log.inner).ok())
             .ok_or_else(|| eyre::eyre!("ZoneCreated event not found"))?;
 
-        Ok(zone_created.portal)
+        Ok((zone_created.portal, creation_block_number))
     }
 
     /// Deploy the SwapAndDepositRouter contract on L1 from the Foundry artifact.
@@ -2783,49 +2819,8 @@ impl L1TestNode {
     }
 }
 
-/// Patch a controlled post-creation test snapshot with the portal's token commitment.
-///
-/// This is intentionally test-only. It is sound for the shared integration fixture because the
-/// fixture has exactly its genesis token and no queued deposits. Tests that exercise portal
-/// creation replay pass a pre-portal block explicitly and leave the commitment empty.
-async fn patch_clean_portal_snapshot<P: Provider<TempoNetwork>>(
-    provider: &P,
-    genesis: &mut Genesis,
-    portal_address: Address,
-    block_number: u64,
-) -> eyre::Result<()> {
-    let block_id = BlockId::number(block_number);
-    let portal = ZonePortal::new(portal_address, provider);
-    eyre::ensure!(
-        portal.enabledTokenCount().block(block_id).call().await? == U256::from(1)
-            && portal
-                .currentDepositQueueHash()
-                .block(block_id)
-                .call()
-                .await?
-                .is_zero(),
-        "test snapshot at L1 block {block_number} is not a clean initial-token snapshot"
-    );
-    let token_enablement_hash = portal.tokenEnablementHash().block(block_id).call().await?;
-    eyre::ensure!(
-        !token_enablement_hash.is_zero(),
-        "test snapshot at L1 block {block_number} has no initial-token commitment"
-    );
-
-    genesis
-        .alloc
-        .get_mut(&ZONE_INBOX_ADDRESS)
-        .ok_or_else(|| eyre::eyre!("ZoneInbox not found in test genesis alloc"))?
-        .storage
-        .get_or_insert_with(Default::default)
-        .insert(
-            ZONE_INBOX_PROCESSED_TOKEN_ENABLEMENT_HASH_SLOT,
-            token_enablement_hash,
-        );
-    Ok(())
-}
-
-/// Build a zone test genesis anchored to a real L1 block.
+/// Build a zone test genesis bound to `portal_address`, and report the current L1 height to
+/// backfill from.
 ///
 /// Returns `(genesis, genesis_block_number)`.
 async fn build_l1_anchored_genesis(
@@ -2834,69 +2829,30 @@ async fn build_l1_anchored_genesis(
 ) -> eyre::Result<(Genesis, u64)> {
     let l1_provider =
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
-
-    let block = l1_provider
-        .get_block_by_number(BlockNumberOrTag::Latest)
-        .await?
-        .ok_or_else(|| eyre::eyre!("L1 latest block not found"))?;
-    let l1_header: &TempoHeader = block.header.as_ref();
-    let default_fee_token = if portal_address.is_zero() {
-        PATH_USD_ADDRESS
-    } else {
-        ZonePortal::new(portal_address, &l1_provider)
-            .enabledTokenAt(U256::ZERO)
-            .call()
-            .await?
-    };
-    let (mut genesis, genesis_block_number) =
-        zone_node::genesis::l1_anchored_genesis(l1_header, portal_address, default_fee_token)?;
-    if !portal_address.is_zero() {
-        patch_clean_portal_snapshot(
-            &l1_provider,
-            &mut genesis,
-            portal_address,
-            l1_header.inner.number,
-        )
-        .await?;
-    }
+    let genesis_block_number = l1_provider.get_block_number().await?;
+    let genesis = build_zone_genesis(l1_http_url, portal_address).await?;
     Ok((genesis, genesis_block_number))
 }
 
-/// Build a zone test genesis anchored to a specific L1 block number.
-async fn build_l1_anchored_genesis_at_block(
+/// Build a zone test genesis bound to `portal_address`.
+///
+/// The genesis itself does not depend on any L1 block — `TempoState` starts empty and the first
+/// import establishes the anchor — so callers pick the backfill height independently.
+async fn build_zone_genesis(
     l1_http_url: &url::Url,
     portal_address: Address,
-    block_number: u64,
-) -> eyre::Result<(Genesis, u64)> {
-    let l1_provider =
-        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
-
-    let block = l1_provider
-        .get_block_by_number(block_number.into())
-        .await?
-        .ok_or_else(|| eyre::eyre!("L1 block {block_number} not found"))?;
-    let l1_header: &TempoHeader = block.header.as_ref();
+) -> eyre::Result<Genesis> {
     let default_fee_token = if portal_address.is_zero() {
         PATH_USD_ADDRESS
     } else {
+        let l1_provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(l1_http_url.clone());
         ZonePortal::new(portal_address, &l1_provider)
             .enabledTokenAt(U256::ZERO)
             .call()
             .await?
     };
-    let (mut genesis, genesis_block_number) =
-        zone_node::genesis::l1_anchored_genesis(l1_header, portal_address, default_fee_token)?;
-    if !portal_address.is_zero()
-        && !l1_provider
-            .get_code_at(portal_address)
-            .block_id(BlockId::number(block_number))
-            .await?
-            .is_empty()
-    {
-        patch_clean_portal_snapshot(&l1_provider, &mut genesis, portal_address, block_number)
-            .await?;
-    }
-    Ok((genesis, genesis_block_number))
+    zone_node::genesis::l1_anchored_genesis(portal_address, default_fee_token)
 }
 
 /// Poll an async condition until it returns `Some(T)` or the timeout expires.
@@ -3602,6 +3558,7 @@ pub(crate) async fn start_local_zone_with_fixture_and_withdrawal_batch_interval(
     let zone = ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
         DUMMY_L1_URL.to_string(),
         Address::ZERO,
+        None,
         zone_primitives::constants::zone_chain_id(1_337, zone_id)?,
         Some(genesis),
         signer,
@@ -3825,8 +3782,8 @@ pub(crate) async fn start_real_p2p_cluster_with_active_nodes(
         .map(|key| key.parse::<PrivateKeySigner>().expect("valid test signer"));
 
     let factory = l1.native_zone_factory().await?;
-    let portal_address = l1
-        .create_zone_with_admin_sequencers_and_config(
+    let (portal_address, portal_creation_block) = l1
+        .create_zone_with_admin_sequencers_config_and_block(
             factory,
             l1.admin_address(),
             attestation_signers
@@ -3852,7 +3809,7 @@ pub(crate) async fn start_real_p2p_cluster_with_active_nodes(
 
     let portal = ZonePortal::new(portal_address, l1.provider());
     let zone_id = portal.zoneId().call().await?;
-    let (genesis, _) = build_l1_anchored_genesis(l1.http_url(), portal_address).await?;
+    let genesis = build_zone_genesis(l1.http_url(), portal_address).await?;
     let chain_id = next_unique_chain_id();
 
     let config_dir = std::env::temp_dir().join(format!(
@@ -3912,6 +3869,10 @@ pub(crate) async fn start_real_p2p_cluster_with_active_nodes(
             ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
                 l1.ws_url().to_string(),
                 portal_address,
+                Some(
+                    zone_primitives::portal_creation_anchor(portal_creation_block)
+                        .expect("portal is not created at genesis"),
+                ),
                 chain_id,
                 Some(genesis.clone()),
                 attestation_signers[index].clone(),
@@ -4018,6 +3979,7 @@ pub(crate) async fn start_local_p2p_cluster(seed_blocks: u64) -> eyre::Result<P2
             ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
                 l1_rpc_url.clone(),
                 Address::ZERO,
+                None,
                 chain_id,
                 Some(genesis.clone()),
                 sequencer_signers[index].clone(),
@@ -4625,6 +4587,7 @@ pub(crate) async fn start_zone_with_redacted_rpc() -> eyre::Result<RedactedRpcTe
     let zone = ZoneTestNode::launch(
         DUMMY_L1_URL.to_string(),
         Address::ZERO,
+        None,
         next_unique_chain_id(),
     )
     .await?;
@@ -4834,6 +4797,12 @@ impl L1Fixture {
         for block in 0..=num_blocks {
             cache.set(
                 portal_address,
+                PORTAL_ADMIN_SLOT,
+                block,
+                B256::with_last_byte(1),
+            );
+            cache.set(
+                portal_address,
                 sequencer_membership_slot,
                 block,
                 B256::from(U256::from(u8::from(PortalRole::Sequencer))),
@@ -4891,6 +4860,7 @@ impl L1Fixture {
         seed_raw_tip403_token_policy(&mut cache, 0, Address::ZERO, ALLOW_ALL_POLICY_ID);
         seed_raw_tip403_token_policy(&mut cache, 0, PATH_USD_ADDRESS, ALLOW_ALL_POLICY_ID);
         drop(cache);
+        enabled_tokens.write().insert(PATH_USD_ADDRESS);
         self.caches.lock().unwrap().push(cache_handle.clone());
         self.enabled_token_registries
             .lock()
