@@ -24,7 +24,10 @@ use reth_provider::HeaderProvider;
 use reth_storage_api::{BlockNumReader, BlockReader, ReceiptProvider, StateProviderFactory};
 use reth_transaction_pool::TransactionPool;
 use tempo_primitives::{Block, TempoHeader};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{debug, error, info, warn};
 use zone_chainspec::ZoneChainSpec;
@@ -308,6 +311,16 @@ enum TaskEnd {
     Ended(&'static str),
 }
 
+/// Whether a generation stopped with its canonical-state boundary proven.
+///
+/// A failed stop must fence the role controller: an aborted engine task may have an already
+/// enqueued Engine API message that Reth can still apply after the task has gone away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationStopOutcome {
+    Stopped,
+    Failed,
+}
+
 /// Supervise the two long-running sequencer children as one role-generation task.
 ///
 /// An unexpected child exit must restart the whole generation immediately. During an intentional
@@ -360,14 +373,80 @@ struct RunningGeneration {
     id: u64,
     role: DesiredRole,
     token: CancellationToken,
+    /// Fires when the leader engine task returns.
+    engine_done: Option<oneshot::Receiver<()>>,
+    /// The block broadcaster's own token, deliberately not `token`: the broadcaster has to
+    /// outlive the engine so it can publish the final blocks once they persist.
+    broadcast_stop: Option<CancellationToken>,
+    /// Releases the broadcaster to drain the now-frozen canonical tail.
+    broadcast_drain: Option<oneshot::Sender<()>>,
     tasks: JoinSet<TaskEnd>,
 }
 
 impl RunningGeneration {
-    async fn stop(mut self, sinks: &EventSinks) {
+    async fn stop(mut self, sinks: &EventSinks) -> GenerationStopOutcome {
         sinks.clear();
         self.token.cancel();
         let deadline = tokio::time::Instant::now() + GENERATION_STOP_TIMEOUT;
+
+        let mut outcome = GenerationStopOutcome::Stopped;
+
+        // Cancellation is not a block boundary: an in-flight advance still completes before the
+        // engine returns, so the canonical head keeps moving after `token.cancel()`. The
+        // broadcaster can only be given a drain target once the engine has actually stopped.
+        let draining = match self.engine_done.take() {
+            Some(engine_done) => match tokio::time::timeout_at(deadline, engine_done).await {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => {
+                    outcome = GenerationStopOutcome::Failed;
+                    error!(
+                        target: "zone::role",
+                        generation = self.id,
+                        "Engine task ended without acknowledging a clean stop; fencing role controller"
+                    );
+                    false
+                }
+                Err(_) => {
+                    outcome = GenerationStopOutcome::Failed;
+                    error!(
+                        target: "zone::role",
+                        generation = self.id,
+                        "Engine did not stop within the timeout; fencing role controller"
+                    );
+                    false
+                }
+            },
+            // Not a leader generation, so there is no canonical tail to drain.
+            None => false,
+        };
+        if draining {
+            if let Some(drain) = self.broadcast_drain.take() {
+                // The broadcaster now owns its own shutdown and returns once the tail is
+                // durable, so `broadcast_stop` must stay uncancelled here.
+                if drain.send(()).is_err() {
+                    outcome = GenerationStopOutcome::Failed;
+                    error!(
+                        target: "zone::role",
+                        generation = self.id,
+                        "Persisted block broadcaster exited before its drain could be acknowledged; fencing role controller"
+                    );
+                    if let Some(stop) = self.broadcast_stop.take() {
+                        stop.cancel();
+                    }
+                }
+            }
+        } else {
+            if self.broadcast_drain.is_some() {
+                warn!(
+                    target: "zone::role",
+                    generation = self.id,
+                    "Stopping block broadcaster without a canonical drain"
+                );
+            }
+            if let Some(stop) = self.broadcast_stop.take() {
+                stop.cancel();
+            }
+        }
         loop {
             match tokio::time::timeout_at(deadline, self.tasks.join_next()).await {
                 Ok(Some(result)) => {
@@ -384,13 +463,22 @@ impl RunningGeneration {
                         generation = self.id,
                         "Generation did not stop within the timeout; aborting remaining tasks"
                     );
+                    outcome = GenerationStopOutcome::Failed;
                     self.tasks.abort_all();
                     while self.tasks.join_next().await.is_some() {}
                     break;
                 }
             }
         }
-        info!(target: "zone::role", generation = self.id, role = self.role.name(), "Role generation stopped");
+        match outcome {
+            GenerationStopOutcome::Stopped => {
+                info!(target: "zone::role", generation = self.id, role = self.role.name(), "Role generation stopped");
+            }
+            GenerationStopOutcome::Failed => {
+                error!(target: "zone::role", generation = self.id, role = self.role.name(), "Role generation teardown was not proven safe");
+            }
+        }
+        outcome
     }
 }
 
@@ -586,8 +674,11 @@ pub(crate) async fn run_role_controller<P, Pool>(
             .as_ref()
             .is_some_and(|generation| generation.role.same_variant(desired))
         {
-            if let Some(generation) = current.take() {
-                generation.stop(&sinks).await;
+            if let Some(generation) = current.take()
+                && generation.stop(&sinks).await == GenerationStopOutcome::Failed
+            {
+                error!(target: "zone::role", "Role controller exiting after an unproven generation teardown");
+                return;
             }
             generation_id += 1;
             match start_generation(&context, &sinks, desired, generation_id).await {
@@ -683,6 +774,15 @@ pub(crate) async fn run_role_controller<P, Pool>(
                             epoch,
                             "Engine halted at the activation boundary; demoting"
                         );
+                        // Stop here rather than letting the next iteration notice the role
+                        // change, so the broadcaster drains this leader's final blocks before
+                        // the successor starts producing.
+                        if let Some(generation) = current.take()
+                            && generation.stop(&sinks).await == GenerationStopOutcome::Failed
+                        {
+                            error!(target: "zone::role", "Role controller exiting after an unproven generation teardown");
+                            return;
+                        }
                         // The next loop iteration derives Follower from the same schedule.
                     }
                     Some(Ok(TaskEnd::Engine(EngineExit::Fenced { tempo_anchor }))) => {
@@ -691,8 +791,11 @@ pub(crate) async fn run_role_controller<P, Pool>(
                             tempo_anchor,
                             "Engine fenced on an ungoverned anchor"
                         );
-                        if let Some(generation) = current.take() {
-                            generation.stop(&sinks).await;
+                        if let Some(generation) = current.take()
+                            && generation.stop(&sinks).await == GenerationStopOutcome::Failed
+                        {
+                            error!(target: "zone::role", "Role controller exiting after an unproven generation teardown");
+                            return;
                         }
                         tokio::time::sleep(GENERATION_RESTART_BACKOFF).await;
                     }
@@ -702,15 +805,21 @@ pub(crate) async fn run_role_controller<P, Pool>(
                         // A generation task ended while its generation is still desired:
                         // restart the whole generation to keep the task graph coherent.
                         error!(target: "zone::role", task = name, "Generation task ended unexpectedly; restarting generation");
-                        if let Some(generation) = current.take() {
-                            generation.stop(&sinks).await;
+                        if let Some(generation) = current.take()
+                            && generation.stop(&sinks).await == GenerationStopOutcome::Failed
+                        {
+                            error!(target: "zone::role", "Role controller exiting after an unproven generation teardown");
+                            return;
                         }
                         tokio::time::sleep(GENERATION_RESTART_BACKOFF).await;
                     }
                     Some(Err(err)) => {
                         error!(target: "zone::role", %err, "Generation task panicked; restarting generation");
-                        if let Some(generation) = current.take() {
-                            generation.stop(&sinks).await;
+                        if let Some(generation) = current.take()
+                            && generation.stop(&sinks).await == GenerationStopOutcome::Failed
+                        {
+                            error!(target: "zone::role", "Role controller exiting after an unproven generation teardown");
+                            return;
                         }
                         tokio::time::sleep(GENERATION_RESTART_BACKOFF).await;
                     }
@@ -750,6 +859,9 @@ where
     Pool: TransactionPool<Transaction = TempoPooledTransaction> + Clone + 'static,
 {
     let token = CancellationToken::new();
+    let mut engine_done = None;
+    let mut broadcast_stop = None;
+    let mut broadcast_drain = None;
     let mut tasks = JoinSet::new();
 
     match desired {
@@ -874,13 +986,26 @@ where
             // Canonical head writer: the engine with the per-anchor production permit.
             let engine = build_engine(context, sequencer, last_header);
             let engine_token = token.clone();
-            tasks.spawn(async move { TaskEnd::Engine(engine.run_until(engine_token).await) });
+            let (engine_done_tx, engine_done_rx) = oneshot::channel();
+            engine_done = Some(engine_done_rx);
+            tasks.spawn(async move {
+                let exit = engine.run_until(engine_token).await;
+                // Signalled before the task resolves so `stop` learns the canonical head is
+                // pinned without having to drain the JoinSet first.
+                let _ = engine_done_tx.send(());
+                TaskEnd::Engine(exit)
+            });
 
-            let broadcast_token = token.clone();
+            // The broadcaster outlives the generation token on purpose: it must still be able to
+            // publish the engine's final blocks after every other task has been cancelled.
+            let broadcast_token = CancellationToken::new();
+            let (drain_tx, drain_rx) = oneshot::channel();
+            broadcast_stop = Some(broadcast_token.clone());
+            broadcast_drain = Some(drain_tx);
             let provider = context.provider.clone();
             let commands = context.commands.clone();
             tasks.spawn(async move {
-                broadcast_persisted_blocks(provider, commands, broadcast_token).await;
+                broadcast_persisted_blocks(provider, commands, broadcast_token, drain_rx).await;
                 TaskEnd::Ended("block-broadcast")
             });
 
@@ -959,6 +1084,9 @@ where
         id,
         role: desired,
         token,
+        engine_done,
+        broadcast_stop,
+        broadcast_drain,
         tasks,
     })
 }
