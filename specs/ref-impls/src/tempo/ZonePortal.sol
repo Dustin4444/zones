@@ -636,10 +636,15 @@ contract ZonePortal is IZonePortal {
     /// @notice Get the sequencer's current encryption public key
     /// @return x The X coordinate
     /// @return yParity The Y coordinate parity (0x02 or 0x03)
-    function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity) {
+    /// @return pubkey The Ethereum address derived from the public key
+    function sequencerEncryptionKey()
+        external
+        view
+        returns (bytes32 x, uint8 yParity, address pubkey)
+    {
         if (_encryptionKeys.length == 0) revert NoEncryptionKeySet();
         EncryptionKeyEntry storage current = _encryptionKeys[_encryptionKeys.length - 1];
-        return (current.x, current.yParity);
+        return (current.x, current.yParity, Secp256k1Lib.deriveAddress(current.x, current.yParity));
     }
 
     /// @notice Set the sequencer's encryption public key with proof of possession from its private key

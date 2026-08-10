@@ -1819,7 +1819,8 @@ interface IZonePortal {
 
     // Encryption keys
     function setSequencerEncryptionKey(bytes32 x, uint8 yParity, uint8 popV, bytes32 popR, bytes32 popS) external;
-    function sequencerEncryptionKey() external view returns (bytes32 x, uint8 yParity);
+    function sequencerEncryptionKey()
+        external view returns (bytes32 x, uint8 yParity, address pubkey);
     
     function encryptionKeyCount() external view returns (uint256);
     function encryptionKeyAt(uint256 index) external view returns (EncryptionKeyEntry memory entry);
