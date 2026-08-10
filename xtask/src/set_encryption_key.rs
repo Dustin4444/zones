@@ -1,15 +1,18 @@
-//! Registers the sequencer's encryption key on the ZonePortal.
+//! Registers an encryption public key on the ZonePortal from its corresponding private key.
 //!
 //! Calls the shared sequencer registration helper, which derives the secp256k1
 //! public key, constructs the proof-of-possession signature, and submits it to
 //! the portal contract.
 
 use alloy::{
-    network::EthereumWallet, primitives::Address, providers::ProviderBuilder,
+    network::EthereumWallet,
+    primitives::Address,
+    providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
 use eyre::WrapErr as _;
 use tempo_alloy::TempoNetwork;
+use tempo_chainspec::constants::{mainnet::MAINNET_CHAIN_ID, moderato::MODERATO_CHAIN_ID};
 use zone_sequencer::register_encryption_key;
 
 #[derive(Debug, clap::Parser)]
@@ -22,38 +25,48 @@ pub(crate) struct SetEncryptionKey {
     #[arg(long, env = "L1_PORTAL_ADDRESS")]
     portal: Address,
 
-    /// Sequencer private key (hex). Used both as the signing key for the
-    /// transaction and as the encryption key to register.
+    /// Admin or active sequencer private key (hex) used to sign the transaction.
     #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     private_key: String,
+
+    /// Encryption private key (hex) whose public key is registered. Defaults to --private-key.
+    #[arg(long, env = "ENCRYPTION_PRIVATE_KEY", hide_env_values = true)]
+    encryption_private_key: Option<String>,
 }
 
 impl SetEncryptionKey {
     pub(crate) async fn run(self) -> eyre::Result<()> {
-        let key_str = self
-            .private_key
-            .strip_prefix("0x")
+        let encryption_private_key = self
+            .encryption_private_key
+            .as_ref()
             .unwrap_or(&self.private_key);
 
-        // The sequencer key is used both to sign the tx and as the encryption key
-        let signer: PrivateKeySigner = key_str.parse()?;
+        let transaction_signer: PrivateKeySigner = self.private_key.parse()?;
+        let encryption_signer: PrivateKeySigner = encryption_private_key.parse()?;
 
-        let wallet = EthereumWallet::from(signer.clone());
+        let wallet = EthereumWallet::from(transaction_signer);
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .wallet(wallet)
             .connect(&self.l1_rpc_url)
             .await?;
+        let chain_id = provider.get_chain_id().await?;
 
         println!(
             "Sending setSequencerEncryptionKey to portal {}...",
             self.portal
         );
-        let tx_hash = register_encryption_key(&provider, self.portal, &signer)
+        let tx_hash = register_encryption_key(&provider, self.portal, &encryption_signer)
             .await
             .wrap_err("failed to send setSequencerEncryptionKey")?;
 
-        println!("Encryption key registered!");
-        println!("Explorer: https://explore.moderato.tempo.xyz/tx/{tx_hash}");
+        println!("Encryption public key registered!");
+        match chain_id {
+            MAINNET_CHAIN_ID => println!("Explorer: https://explore.tempo.xyz/tx/{tx_hash}"),
+            MODERATO_CHAIN_ID => {
+                println!("Explorer: https://explore.moderato.tempo.xyz/tx/{tx_hash}")
+            }
+            _ => println!("Transaction: {tx_hash}"),
+        }
 
         Ok(())
     }

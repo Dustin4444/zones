@@ -4382,10 +4382,27 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.encryptionKeyCount(), 1);
     }
 
-    function test_setSequencerEncryptionKey_onlySequencer() public {
+    function test_setSequencerEncryptionKey_revertsForCallerThatIsNeitherAdminNorSequencer()
+        public
+    {
         vm.prank(alice);
         vm.expectRevert(IZonePortal.NotSequencer.selector);
         portal.setSequencerEncryptionKey(bytes32(uint256(1)), 0x02, 27, bytes32(0), bytes32(0));
+    }
+
+    function test_setSequencerEncryptionKey_adminCanSet() public {
+        Vm.Wallet memory w = vm.createWallet(ENC_KEY_1);
+        bytes32 x = bytes32(w.publicKeyX);
+        uint8 yParity = w.publicKeyY % 2 == 0 ? 0x02 : 0x03;
+        bytes32 message = keccak256(abi.encode(address(portal), x, yParity));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(w.privateKey, message);
+
+        vm.prank(admin);
+        portal.setSequencerEncryptionKey(x, yParity, v, r, s);
+
+        (bytes32 storedX, uint8 storedYParity) = portal.sequencerEncryptionKey();
+        assertEq(storedX, x);
+        assertEq(storedYParity, yParity);
     }
 
     function test_setSequencerEncryptionKey_multipleKeys() public {

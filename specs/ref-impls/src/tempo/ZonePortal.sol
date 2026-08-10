@@ -133,7 +133,7 @@ contract ZonePortal is IZonePortal {
     /// @dev Packed into the unused bytes in slot 4. Defaults to zero.
     uint64 public bouncebackGas;
 
-    /// @notice Historical encryption keys with activation blocks
+    /// @notice Historical encryption public keys with activation blocks
     /// @dev Users specify which key they encrypted to (by index). Maintained for key rotation.
     ///      Stored at slot 5 in the ZonePortal storage layout.
     EncryptionKeyEntry[] internal _encryptionKeys;
@@ -273,6 +273,11 @@ contract ZonePortal is IZonePortal {
 
     modifier onlySequencer() {
         if (!isSequencer[msg.sender]) revert NotSequencer();
+        _;
+    }
+
+    modifier onlySequencerOrAdmin() {
+        if (!isSequencer[msg.sender] && msg.sender != admin) revert NotSequencer();
         _;
     }
 
@@ -637,8 +642,8 @@ contract ZonePortal is IZonePortal {
         return (current.x, current.yParity);
     }
 
-    /// @notice Set the sequencer's encryption public key with proof of possession
-    /// @dev Only callable by the sequencer. Appends to key history.
+    /// @notice Set the sequencer's encryption public key with proof of possession from its private key
+    /// @dev Only callable by an active sequencer or the admin. Appends to key history.
     ///      No reentrancy guard is needed because this function makes no unrestricted external
     ///      calls; its only external calls are to fixed cryptographic precompiles.
     ///      Requires a valid ECDSA signature over keccak256(abi.encode(address(this), x, yParity))
@@ -657,7 +662,7 @@ contract ZonePortal is IZonePortal {
         bytes32 popS
     )
         external
-        onlySequencer
+        onlySequencerOrAdmin
     {
         // Validate yParity
         if (!Secp256k1Lib.isCompressedYParity(yParity)) revert InvalidEphemeralPubkey();
@@ -665,7 +670,7 @@ contract ZonePortal is IZonePortal {
         // Validate x is on the secp256k1 curve
         if (!Secp256k1Lib.isValidX(x)) revert InvalidEphemeralPubkey();
 
-        // Verify proof of possession: the sequencer must sign with the encryption key's private key
+        // Verify proof of possession: the caller must prove control of the encryption private key.
         bytes32 message = keccak256(abi.encode(address(this), x, yParity));
         address recovered = ecrecover(message, popV, popR, popS);
         address expected = Secp256k1Lib.deriveAddress(x, yParity);
