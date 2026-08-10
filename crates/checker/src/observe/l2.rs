@@ -240,7 +240,7 @@ pub(crate) fn observe_l2_block_with_context(
     let advance_coordinate =
         AuthenticatedTransaction::new(ProtocolChain::ZoneL2, 0, *first.tx_hash());
     let advance_tempo = decode_advance_tempo(first.input(), advance_coordinate)?;
-    let imported_header = advance_tempo.final_imported_header();
+    let imported_header = advance_tempo.imported_header();
     let imported_tempo = BlockNumHash::new(imported_header.number(), imported_header.hash());
 
     let finish = || -> Result<L2BlockObservation, ObservationError> {
@@ -633,11 +633,7 @@ mod tests {
         assert_eq!(observation.block_hash, block.hash());
         assert_eq!(observation.parent_hash(), ZONE_PARENT_HASH);
         assert_eq!(
-            observation
-                .inputs
-                .advance_tempo
-                .final_imported_header()
-                .hash(),
+            observation.inputs.advance_tempo.imported_header().hash(),
             imported_header().hash_slow()
         );
         assert_eq!(observation.outcomes.events.len(), 2);
@@ -651,11 +647,7 @@ mod tests {
         let observation = observe_l2_block(&block, &receipts).unwrap();
 
         assert_eq!(
-            observation
-                .inputs
-                .advance_tempo
-                .final_imported_header()
-                .hash(),
+            observation.inputs.advance_tempo.imported_header().hash(),
             imported_header().hash_slow()
         );
         assert!(observation.outcomes.events.is_empty());
@@ -695,11 +687,7 @@ mod tests {
         let block = reseal_with_receipts(block, &receipts);
         let observation = observe_l2_block(&block, &receipts).unwrap();
         assert_eq!(
-            observation
-                .inputs
-                .advance_tempo
-                .final_imported_header()
-                .hash(),
+            observation.inputs.advance_tempo.imported_header().hash(),
             imported_header().hash_slow()
         );
         assert!(matches!(

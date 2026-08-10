@@ -236,10 +236,10 @@ where
         .collect();
     let l2 = observe_l2_block_with_context(block.as_ref(), &receipts)
         .map_err(|failure| observation_failure(failure.into_parts().0))?;
-    let imported_headers = l2.inputs().advance_tempo().imported_headers();
+    let imported_header = l2.inputs().advance_tempo().imported_header();
     let l1 = observe_l1_range(
         l1_provider,
-        imported_headers,
+        core::slice::from_ref(imported_header),
         parent
             .portal()
             .map(|portal| portal.identity().portal)

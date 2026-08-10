@@ -52,33 +52,16 @@ fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
 }
 
 pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
-    let headers = o.l2.inputs().advance_tempo().imported_headers();
-    if o.l1.len() != headers.len() {
+    let header = o.l2.inputs().advance_tempo().imported_header();
+    if o.l1.len() != 1 {
         return Err(failure(
             AdapterFindingCode::HeaderSequence,
-            "Tempo observation count does not match advanceTempo headers",
+            "advanceTempo requires exactly one Tempo observation",
         ));
     }
-    let mut imported_facts = ImportedFacts {
-        block_hash: headers.last().expect("headers are nonempty").hash(),
-        block_number: headers.last().expect("headers are nonempty").number(),
-        operations: Vec::new(),
-    };
-    let mut imported_effects = Vec::new();
-    for (observation, header) in o.l1.iter().zip(headers) {
-        if (observation.block_hash(), observation.block_number())
-            != (header.hash(), header.number())
-        {
-            return Err(failure(
-                AdapterFindingCode::HeaderSequence,
-                "Tempo observation does not match advanceTempo header",
-            ));
-        }
-        let (facts, effects) =
-            adapt_imported(observation, header, o.portal_creation_block_hash, o.zone_id)?;
-        imported_facts.operations.extend(facts.operations);
-        imported_effects.extend(effects);
-    }
+    let observation = &o.l1[0];
+    let (imported_facts, mut imported_effects) =
+        adapt_imported(observation, header, o.portal_creation_block_hash, o.zone_id)?;
     let (zone_facts, mut zone_effects) = zone_facts(o)?;
     imported_effects.append(&mut zone_effects);
     let state = ExpectedState {
@@ -89,8 +72,6 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
         withdrawal_queue_hash: o.state.withdrawal_queue_hash,
         withdrawal_batch_index: o.state.withdrawal_batch_index,
     };
-    let first = headers.first().expect("headers are nonempty");
-    let final_observation = o.l1.last().expect("matched nonempty headers");
     Ok(AuthenticatedBlock {
         zone: BlockNumHash {
             number: o.l2.block_number(),
@@ -101,17 +82,17 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
             hash: o.l2.parent_hash(),
         },
         tempo: BlockNumHash {
-            number: final_observation.block_number(),
-            hash: final_observation.block_hash(),
+            number: observation.block_number(),
+            hash: observation.block_hash(),
         },
         tempo_parent: BlockNumHash {
-            number: first.number().checked_sub(1).ok_or_else(|| {
+            number: header.number().checked_sub(1).ok_or_else(|| {
                 failure(
                     AdapterFindingCode::HeaderSequence,
                     "imported genesis has no parent",
                 )
             })?,
-            hash: first.header().parent_hash(),
+            hash: header.header().parent_hash(),
         },
         imported: imported_facts,
         zone_facts,
@@ -802,7 +783,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
     let advance = o.l2.inputs().advance_tempo();
     let advance_hash = o.l2.inputs().advance_transaction_hash();
     let mut cursor = 0usize;
-    let imported = advance.final_imported_header();
+    let imported = advance.imported_header();
     match events.first().map(|outcome| outcome.event()) {
         Some(L2ProtocolEvent::TempoState(TempoState::TempoStateEvents::TempoBlockFinalized(
             event,

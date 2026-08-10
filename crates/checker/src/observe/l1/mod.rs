@@ -283,7 +283,7 @@ mod tests {
             receipt.inner.block_hash = Some(hash);
             receipt.inner.block_number = Some(BLOCK_NUMBER);
         }
-        let imported = ImportedTempoHeader::for_test(header);
+        let imported = ImportedTempoHeader::new(header);
         (imported, receipts)
     }
 
@@ -414,7 +414,7 @@ mod tests {
         let (imported, _) = anchor(vec![]);
         authentication::authenticate_imported_header(&imported, &imported).unwrap();
 
-        let wrong_number = ImportedTempoHeader::for_test(TempoHeader {
+        let wrong_number = ImportedTempoHeader::new(TempoHeader {
             inner: Header {
                 number: imported.number() + 1,
                 ..imported.header().inner.clone()
@@ -428,7 +428,7 @@ mod tests {
 
         let mut different = imported.header().clone();
         different.inner.gas_limit += 1;
-        let different = ImportedTempoHeader::for_test(different);
+        let different = ImportedTempoHeader::new(different);
         assert_inconsistent(
             authentication::authenticate_imported_header(&imported, &different).unwrap_err(),
             AcquisitionSource::L1Block,
@@ -477,7 +477,7 @@ mod tests {
 
         let mut wrong_root_header = imported.header().clone();
         wrong_root_header.inner.receipts_root = B256::repeat_byte(0xaa);
-        let wrong_root = ImportedTempoHeader::for_test(wrong_root_header);
+        let wrong_root = ImportedTempoHeader::new(wrong_root_header);
         let mut root_bound_receipts = receipts.clone();
         root_bound_receipts[0].inner.block_hash = Some(wrong_root.hash());
         assert_inconsistent(
@@ -488,7 +488,7 @@ mod tests {
 
         let mut wrong_bloom_header = imported.header().clone();
         wrong_bloom_header.inner.logs_bloom = Bloom::repeat_byte(0xbb);
-        let wrong_bloom = ImportedTempoHeader::for_test(wrong_bloom_header);
+        let wrong_bloom = ImportedTempoHeader::new(wrong_bloom_header);
         let mut bloom_bound_receipts = receipts;
         bloom_bound_receipts[0].inner.block_hash = Some(wrong_bloom.hash());
         assert_inconsistent(
