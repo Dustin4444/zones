@@ -257,23 +257,30 @@ just send-deposit 1000000                       # deposit to your own address
 just send-deposit 1000000 <recipient-address>   # deposit to a specific address
 ```
 
-#### Encryption Key Setup
+#### Encryption Public-Key Setup
 
 Encrypted deposits hide the recipient address and memo on-chain using ECIES encryption to the sequencer's public key. Only the sequencer can decrypt them during block building.
 
 ```bash
-# The sequencer must first register their encryption key (done automatically by deploy-zone)
+# The sequencer must first register their encryption public key (done automatically by deploy-zone).
+# The private key is retained by the sequencer for decryption and proof of possession.
 # For manual setup:
 PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
   --portal "$L1_PORTAL_ADDRESS" \
   --l1-rpc-url "$L1_RPC_URL"
+
+# To sign from the admin or an active sequencer but register a separate encryption public key:
+PRIVATE_KEY="$PORTAL_CALLER_KEY" ENCRYPTION_PRIVATE_KEY="$ENCRYPTION_KEY" \
+  cargo run -p tempo-xtask -- set-encryption-key \
+    --portal "$L1_PORTAL_ADDRESS" \
+    --l1-rpc-url "$L1_RPC_URL"
 
 # Send a deposit
 just send-deposit 1000000                       # to your own address
 just send-deposit 1000000 <recipient-address>   # to a specific address
 ```
 
-Before registering a replacement encryption key, add its private key to
+Before registering a replacement encryption public key, add its encryption private key to
 `--deposit-decryption-keys-file`, restart every node that may sequence, and confirm the nodes are
 healthy. Keep each previous key in the file while the Portal still accepts deposits for it during
 the rotation grace period. File order does not matter: finalized Portal registrations bind each

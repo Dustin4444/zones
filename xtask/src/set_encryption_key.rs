@@ -1,15 +1,18 @@
-//! Registers the sequencer's encryption key on the ZonePortal.
+//! Registers an encryption public key on the ZonePortal from its corresponding private key.
 //!
 //! Calls the shared sequencer registration helper, which derives the secp256k1
 //! public key, constructs the proof-of-possession signature, and submits it to
 //! the portal contract.
 
 use alloy::{
-    network::EthereumWallet, primitives::Address, providers::ProviderBuilder,
+    network::EthereumWallet,
+    primitives::Address,
+    providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
 use eyre::WrapErr as _;
 use tempo_alloy::TempoNetwork;
+use tempo_chainspec::constants::{mainnet::MAINNET_CHAIN_ID, moderato::MODERATO_CHAIN_ID};
 use zone_sequencer::register_encryption_key;
 
 #[derive(Debug, clap::Parser)]
@@ -22,31 +25,27 @@ pub(crate) struct SetEncryptionKey {
     #[arg(long, env = "L1_PORTAL_ADDRESS")]
     portal: Address,
 
-    /// Encryption private key (hex). Also signs the transaction unless
-    /// `transaction_private_key` is provided.
+    /// Admin or active sequencer private key (hex) used to sign the transaction.
     #[arg(long, env = "PRIVATE_KEY", hide_env_values = true)]
     private_key: String,
 
-    /// Private key of the active sequencer that submits the L1 transaction.
-    /// Defaults to `private_key` for single-sequencer zones.
-    #[arg(long, env = "TRANSACTION_PRIVATE_KEY", hide_env_values = true)]
-    transaction_private_key: Option<String>,
+    /// Encryption private key (hex) whose public key is registered.
+    #[arg(long, hide_env_values = true)]
+    encryption_private_key: String,
 }
 
 impl SetEncryptionKey {
     pub(crate) async fn run(self) -> eyre::Result<()> {
-        let encryption_signer = parse_private_key(&self.private_key)?;
-        let transaction_signer = parse_private_key(
-            self.transaction_private_key
-                .as_deref()
-                .unwrap_or(&self.private_key),
-        )?;
-
+        let transaction_signer =
+            parse_private_key(&self.private_key, "--private-key / PRIVATE_KEY")?;
+        let encryption_signer =
+            parse_private_key(&self.encryption_private_key, "--encryption-private-key")?;
         let wallet = EthereumWallet::from(transaction_signer);
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .wallet(wallet)
             .connect(&self.l1_rpc_url)
             .await?;
+        let chain_id = provider.get_chain_id().await?;
 
         println!(
             "Sending setSequencerEncryptionKey to portal {}...",
@@ -56,18 +55,26 @@ impl SetEncryptionKey {
             .await
             .wrap_err("failed to send setSequencerEncryptionKey")?;
 
-        println!("Encryption key registered!");
-        println!("Explorer: https://explore.moderato.tempo.xyz/tx/{tx_hash}");
+        println!("Encryption public key registered!");
+        match chain_id {
+            MAINNET_CHAIN_ID => println!("Explorer: https://explore.tempo.xyz/tx/{tx_hash}"),
+            MODERATO_CHAIN_ID => {
+                println!("Explorer: https://explore.moderato.tempo.xyz/tx/{tx_hash}")
+            }
+            _ => println!("Transaction: {tx_hash}"),
+        }
 
         Ok(())
     }
 }
 
-fn parse_private_key(private_key: &str) -> eyre::Result<PrivateKeySigner> {
-    Ok(private_key
+fn parse_private_key(private_key: &str, source: &str) -> eyre::Result<PrivateKeySigner> {
+    private_key
+        .trim()
         .strip_prefix("0x")
-        .unwrap_or(private_key)
-        .parse()?)
+        .unwrap_or(private_key.trim())
+        .parse()
+        .wrap_err_with(|| format!("invalid {source}"))
 }
 
 #[cfg(test)]
@@ -79,8 +86,10 @@ mod tests {
         let key = "1111111111111111111111111111111111111111111111111111111111111111";
 
         assert_eq!(
-            parse_private_key(key).unwrap().to_bytes(),
-            parse_private_key(&format!("0x{key}")).unwrap().to_bytes()
+            parse_private_key(key, "test key").unwrap().to_bytes(),
+            parse_private_key(&format!("0x{key}"), "test key")
+                .unwrap()
+                .to_bytes()
         );
     }
 }

@@ -9,18 +9,20 @@ use alloy_sol_types::SolValue;
 use tempo_alloy::TempoNetwork;
 use tempo_zone_contracts::ZonePortal;
 
-/// Registers `signer` as the sequencer encryption key on `portal`.
+/// Registers the encryption public key corresponding to `encryption_signer` on `portal`.
 ///
 /// Derives the secp256k1 public key, signs a proof-of-possession over
-/// `(portal, x, yParity)`, and returns the registration transaction hash.
+/// `(portal, x, yParity)`, and returns the registration transaction hash. The
+/// provider's wallet signs and sends the transaction, so it may be distinct
+/// from `encryption_signer`.
 pub async fn register_encryption_key<P: Provider<TempoNetwork>>(
     provider: &P,
     portal: Address,
-    signer: &PrivateKeySigner,
+    encryption_signer: &PrivateKeySigner,
 ) -> eyre::Result<B256> {
     use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::sec1::ToEncodedPoint};
 
-    let secret = k256::SecretKey::from_slice(signer.to_bytes().as_slice())?;
+    let secret = k256::SecretKey::from_slice(encryption_signer.to_bytes().as_slice())?;
     let scalar: Scalar = *secret.to_nonzero_scalar();
     let public = AffinePoint::from(ProjectivePoint::GENERATOR * scalar);
     let encoded = public.to_encoded_point(true);
@@ -28,7 +30,7 @@ pub async fn register_encryption_key<P: Provider<TempoNetwork>>(
     let y_parity: u8 = encoded.as_bytes()[0]; // 0x02 or 0x03
 
     let message = keccak256((portal, x, U256::from(y_parity)).abi_encode());
-    let signature = signer.sign_hash_sync(&message)?;
+    let signature = encryption_signer.sign_hash_sync(&message)?;
     let pop_v = signature.v() as u8 + 27;
     let pop_r = B256::from(signature.r().to_be_bytes::<32>());
     let pop_s = B256::from(signature.s().to_be_bytes::<32>());
