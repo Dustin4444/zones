@@ -2,17 +2,25 @@
 pragma solidity ^0.8.13;
 
 import {
+    AES_GCM_DECRYPT,
+    CHAUM_PEDERSEN_VERIFY,
+    ChaumPedersenProof,
     DecryptionData,
     Deposit,
+    DepositPayload,
     DepositType,
     EnabledToken,
+    IAesGcmDecrypt,
+    IChaumPedersenVerify,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+    PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_TOKEN_CONFIGS_SLOT,
     QueuedDeposit,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
+import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
-import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { BaseTest } from "../BaseTest.t.sol";
@@ -66,6 +74,27 @@ contract ZoneNonCustodialHandler is Test {
         actors = [_alice, _bob, _charlie];
     }
 
+    function _payload() internal pure returns (DepositPayload memory) {
+        return DepositPayload({
+            ephemeralPubkeyX: bytes32(uint256(0x1234)),
+            ephemeralPubkeyYParity: 0x02,
+            ciphertext: new bytes(64),
+            nonce: bytes12(0),
+            tag: bytes16(0)
+        });
+    }
+
+    function _decryptions(uint256 count) internal pure returns (DecryptionData[] memory decs) {
+        decs = new DecryptionData[](count);
+        for (uint256 i; i < count; ++i) {
+            decs[i] = DecryptionData({
+                sharedSecret: bytes32(uint256(0xdeadbeef)),
+                sharedSecretYParity: 0x02,
+                cpProof: ChaumPedersenProof({ s: bytes32(uint256(1)), c: bytes32(uint256(2)) })
+            });
+        }
+    }
+
     function _actor(uint256 seed) internal view returns (address) {
         return actors[seed % 3];
     }
@@ -85,25 +114,26 @@ contract ZoneNonCustodialHandler is Test {
     /// @notice Deposit on L1 (only valid while deposits are active) and mirror it for minting.
     function deposit(uint256 actorSeed, uint256 amountSeed) external {
         if (!portal.areDepositsActive(address(token))) return;
-        address user = _actor(actorSeed);
+        actorSeed;
+        address user = actors[0];
         uint256 bal = token.balanceOf(user);
         if (bal == 0) return;
         uint128 amount = uint128(bound(amountSeed, 1, bal));
 
         vm.startPrank(user);
         token.approve(address(portal), amount);
-        portal.deposit(address(token), user, amount, bytes32(0), user);
+        portal.deposit(address(token), amount, 0, _payload(), user);
         vm.stopPrank();
 
         Deposit memory d = Deposit({
             token: address(token),
             sender: user,
-            to: user,
             amount: amount, // fee is zero in this suite
             tempoRefundRecipient: user,
-            memo: bytes32(0)
+            keyIndex: 0,
+            encrypted: _payload()
         });
-        mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
+        mirrorDepositHash = keccak256(abi.encode(DepositType.Deposit, d, mirrorDepositHash));
         depositMirror.push(d);
     }
 
@@ -118,9 +148,9 @@ contract ZoneNonCustodialHandler is Test {
         for (uint256 i = 0; i < count; i++) {
             Deposit memory d = depositMirror[depositHead + i];
             queued[i] = QueuedDeposit({
-                depositType: DepositType.Regular, depositData: abi.encode(d), rejected: false
+                depositType: DepositType.Deposit, depositData: abi.encode(d), rejected: false
             });
-            expectedHash = keccak256(abi.encode(DepositType.Regular, d, expectedHash));
+            expectedHash = keccak256(abi.encode(DepositType.Deposit, d, expectedHash));
         }
 
         tempoState.setMockStorageValue(
@@ -129,7 +159,7 @@ contract ZoneNonCustodialHandler is Test {
             portal.currentDepositQueueHash()
         );
         vm.prank(admin);
-        inbox.advanceTempo("", queued, new DecryptionData[](0), new EnabledToken[](0));
+        inbox.advanceTempo(new bytes[](1), queued, _decryptions(count), new EnabledToken[](0));
 
         mirrorProcessedHash = expectedHash;
         depositHead += count;
@@ -185,7 +215,6 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
     ZonePortal internal portal;
     MockZoneToken internal token;
     MockTempoState internal tempoState;
-    ZoneConfig internal config;
     ZoneInbox internal inbox;
     ZoneOutbox internal outbox;
     ZoneNonCustodialHandler internal handler;
@@ -212,20 +241,43 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
         sequencers[0] = address(this);
         portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
+        bytes32 entriesBase = keccak256(abi.encode(uint256(PORTAL_ENCRYPTION_KEYS_SLOT)));
+        bytes32 keyX = bytes32(uint256(0x1234));
+        bytes32 keyMeta = bytes32((uint256(uint64(block.number)) << 8) | uint256(0x02));
+        vm.store(address(portal), PORTAL_ENCRYPTION_KEYS_SLOT, bytes32(uint256(1)));
+        vm.store(address(portal), entriesBase, keyX);
+        vm.store(address(portal), bytes32(uint256(entriesBase) + 1), keyMeta);
+
         tempoState =
             new MockTempoState(address(this), GENESIS_TEMPO_BLOCK_HASH, genesisTempoBlockNumber);
-        config = new ZoneConfig(address(portal), address(tempoState));
         tempoState.setMockStorageValue(
             address(portal),
             keccak256(abi.encode(address(this), PORTAL_IS_SEQUENCER_SLOT)),
             bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(address(portal), address(token), true);
-        inbox = new ZoneInbox(address(config), address(portal), address(tempoState));
-        outbox = new ZoneOutbox(address(config));
+        tempoState.setMockStorageValue(
+            address(portal), PORTAL_ENCRYPTION_KEYS_SLOT, bytes32(uint256(1))
+        );
+        tempoState.setMockStorageValue(address(portal), entriesBase, keyX);
+        tempoState.setMockStorageValue(address(portal), bytes32(uint256(entriesBase) + 1), keyMeta);
+        inbox = new ZoneInbox(address(portal), address(tempoState));
+        outbox = new ZoneOutbox(address(portal), address(tempoState));
 
         token.setMinter(address(inbox), true);
         token.setBurner(address(outbox), true);
+        vm.etch(CHAUM_PEDERSEN_VERIFY, hex"00");
+        vm.etch(AES_GCM_DECRYPT, hex"00");
+        vm.mockCall(
+            CHAUM_PEDERSEN_VERIFY,
+            abi.encodeWithSelector(IChaumPedersenVerify.verifyProof.selector),
+            abi.encode(true)
+        );
+        vm.mockCall(
+            AES_GCM_DECRYPT,
+            abi.encodeWithSelector(IAesGcmDecrypt.decrypt.selector),
+            abi.encode(EncryptedDepositLib.encodePlaintext(alice, bytes32(0)), true)
+        );
 
         handler = new ZoneNonCustodialHandler(
             portal, inbox, outbox, token, tempoState, address(this), alice, bob, charlie
@@ -242,7 +294,12 @@ contract ZoneNonCustodialInvariantTest is BaseTest {
             "TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: token became disabled on L1"
         );
         assertTrue(
-            config.isEnabledToken(address(token)),
+            uint256(
+                    tempoState.readTempoStorageSlot(
+                        address(portal),
+                        keccak256(abi.encode(address(token), PORTAL_TOKEN_CONFIGS_SLOT))
+                    )
+                ) & 0xff == 1,
             "TEMPO-ZONE-TOKEN-ENABLEMENT-APPEND-ONLY: token became disabled on zone"
         );
     }

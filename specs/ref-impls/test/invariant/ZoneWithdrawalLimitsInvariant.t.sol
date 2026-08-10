@@ -6,7 +6,6 @@ import {
     ZONE_INBOX,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
-import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
 import { MockZoneToken } from "../mocks/MockZoneToken.sol";
@@ -18,7 +17,7 @@ import { Test } from "forge-std/Test.sol";
 ///         per-item bounds (TEMPO-ZONE-WITHDRAWAL-CALLBACK-BOUNDS: gas limit and callback data size) that are otherwise internal.
 contract ZoneOutboxHarness is ZoneOutbox {
 
-    constructor(address _config) ZoneOutbox(_config) { }
+    constructor(address _tempoPortal, address _tempoState) ZoneOutbox(_tempoPortal, _tempoState) { }
 
     function rawLength() external view returns (uint256) {
         return _pendingWithdrawals.length;
@@ -170,7 +169,6 @@ contract ZoneWithdrawalLimitsHandler is Test {
 ///         gas limit and callback data size) and the per-block withdrawal cap.
 contract ZoneWithdrawalLimitsInvariantTest is Test {
 
-    ZoneConfig internal config;
     ZoneOutboxHarness internal outbox;
     MockTempoState internal tempoState;
     MockZoneToken internal token;
@@ -192,12 +190,11 @@ contract ZoneWithdrawalLimitsInvariantTest is Test {
 
         token = new MockZoneToken("Zone USD", "zUSD");
         tempoState = new MockTempoState(SEQ, GENESIS_TEMPO_BLOCK_HASH, GENESIS_TEMPO_BLOCK_NUMBER);
-        config = new ZoneConfig(MOCK_PORTAL, address(tempoState));
         tempoState.setMockStorageValue(
             MOCK_PORTAL, keccak256(abi.encode(SEQ, PORTAL_IS_SEQUENCER_SLOT)), bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(MOCK_PORTAL, address(token), true);
-        outbox = new ZoneOutboxHarness(address(config));
+        outbox = new ZoneOutboxHarness(MOCK_PORTAL, address(tempoState));
 
         token.setBurner(address(outbox), true);
         token.setMinter(address(this), true);

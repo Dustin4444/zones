@@ -15,16 +15,17 @@ mod zone_evm;
 
 pub use database::{L1OverlayDB, ZoneDbError};
 pub use executor::{ZoneBlockExecutor, ZoneTxResult};
-pub use zone_evm::{ZoneEvm, contract_creation::validate_transaction};
+pub use zone_evm::{ZoneEvm, validate_transaction};
 
 use crate::{
     fee_manager::ZoneProtocolFeeManager,
     precompiles::{
         AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt, CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify,
         L1State, L1StorageReader, TIP403_REGISTRY_ADDRESS, TempoState, ZONE_FEE_MANAGER_ADDRESS,
-        ZoneInbox, ZonePrecompileEnv, create_receive_policy_guard_precompile,
-        create_tip20_precompile, create_tip403_precompile, create_zone_fee_manager_precompile,
-        tx_context::ZoneTxContext,
+        ZoneInbox, ZonePrecompileEnv, create_account_keychain_precompile,
+        create_nonce_manager_precompile, create_receive_policy_guard_precompile,
+        create_storage_credits_precompile, create_tip20_precompile, create_tip403_precompile,
+        create_zone_fee_manager_precompile, tx_context::ZoneTxContext,
     },
 };
 use alloy_evm::{
@@ -33,7 +34,7 @@ use alloy_evm::{
     precompiles::PrecompilesMap,
     revm::{Inspector, context::DBErrorMarker, inspector::NoOpInspector},
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use reth_chainspec::EthChainSpec;
 use reth_evm::{
@@ -42,7 +43,12 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
 };
 use reth_primitives_traits::{SealedBlock, SealedHeader};
-use std::{fmt, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt,
+    num::NonZeroU32,
+    sync::{Arc, Mutex},
+};
 use tempo_alloy::TempoNetwork;
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardfork};
 use tempo_evm::{
@@ -52,11 +58,10 @@ use tempo_evm::{
 };
 use tempo_payload_types::TempoExecutionData;
 use tempo_precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, PrecompileEnv,
-    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS,
-    TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS,
-    account_keychain::AccountKeychain, error::Result as TempoResult, nonce::NonceManager,
-    storage::actions::StorageActions, storage_credits::StorageCredits, tip20::is_tip20_prefix,
+    ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, RECEIVE_POLICY_GUARD_ADDRESS,
+    STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS, TIP_FEE_MANAGER_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS, error::Result as TempoResult,
+    storage::actions::StorageActions, tip20::is_tip20_prefix,
 };
 use tempo_primitives::{
     Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
@@ -100,7 +105,7 @@ where
         let actions = StorageActions::disabled();
         let non_creditable_slots = evm.non_creditable_slots();
         let (_, _, precompiles) = evm.components_mut();
-        let env = ZonePrecompileEnv::new(&cfg, actions.clone(), non_creditable_slots.clone());
+        let env = ZonePrecompileEnv::new(&cfg, actions, non_creditable_slots);
         precompiles.apply_precompile(&TEMPO_STATE_ADDRESS, |_| {
             Some(TempoState::create(l1.clone(), &env))
         });
@@ -134,20 +139,28 @@ where
             Some(create_tip403_precompile(&tip403_env))
         });
         let tip20_l1 = l1.clone();
-        let tempo_env = PrecompileEnv::new(&cfg, actions, non_creditable_slots);
+        let nonce_l1 = l1.clone();
+        let account_keychain_l1 = l1.clone();
+        let storage_credits_l1 = l1.clone();
         precompiles.set_precompile_lookup(move |address: &alloy_primitives::Address| {
             if is_tip20_prefix(*address) {
                 Some(create_tip20_precompile(*address, &env, tip20_l1.clone()))
             } else if *address == STABLECOIN_DEX_ADDRESS {
                 None
             } else if *address == NONCE_PRECOMPILE_ADDRESS {
-                Some(NonceManager::create_precompile(&tempo_env))
+                Some(create_nonce_manager_precompile(&env, nonce_l1.clone()))
             } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
-                Some(AccountKeychain::create_precompile(&tempo_env))
+                Some(create_account_keychain_precompile(
+                    &env,
+                    account_keychain_l1.clone(),
+                ))
             } else if *address == RECEIVE_POLICY_GUARD_ADDRESS {
                 Some(create_receive_policy_guard_precompile(&env))
             } else if *address == STORAGE_CREDITS_ADDRESS {
-                Some(StorageCredits::create_precompile(&tempo_env))
+                Some(create_storage_credits_precompile(
+                    &env,
+                    storage_credits_l1.clone(),
+                ))
             } else {
                 None
             }
@@ -316,6 +329,22 @@ where
     pub fn tempo_chain_spec(&self) -> &Arc<TempoChainSpec> {
         self.inner.chain_spec()
     }
+
+    /// Clones this configuration with a Tempo L1 storage-read recorder.
+    pub fn with_l1_storage_recorder(
+        &self,
+    ) -> (
+        ZoneEvmConfig<RecordingL1StorageReader<L1>>,
+        RecordingL1StorageReader<L1>,
+    ) {
+        let reader = RecordingL1StorageReader::new(self.zone_factory.l1_reader.clone());
+        let config = ZoneEvmConfig::from_chain_spec(
+            self.chain_spec.clone(),
+            reader.clone(),
+            self.zone_factory.portal_address,
+        );
+        (config, reader)
+    }
 }
 
 impl ZoneEvmConfig {
@@ -482,6 +511,52 @@ where
     }
 }
 
+/// An [`L1StorageReader`] wrapper that records successful Tempo storage reads.
+#[derive(Clone, Debug)]
+pub struct RecordingL1StorageReader<L1> {
+    inner: L1,
+    reads: Arc<Mutex<HashSet<TempoStorageRead>>>,
+}
+
+impl<L1> RecordingL1StorageReader<L1> {
+    fn new(inner: L1) -> Self {
+        Self {
+            inner,
+            reads: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Takes and returns the deduplicated storage reads recorded so far.
+    pub fn take_reads(&self) -> HashSet<TempoStorageRead> {
+        std::mem::take(&mut self.reads.lock().expect("L1 read recorder lock poisoned"))
+    }
+}
+
+impl<L1: L1StorageReader> L1StorageReader for RecordingL1StorageReader<L1> {
+    fn read_l1_storage(
+        &self,
+        account: Address,
+        slot: B256,
+        block_number: u64,
+    ) -> Result<B256, zone_precompiles::L1StateError> {
+        let value = self.inner.read_l1_storage(account, slot, block_number)?;
+        self.reads
+            .lock()
+            .expect("L1 read recorder lock poisoned")
+            .insert(TempoStorageRead { account, slot });
+        Ok(value)
+    }
+}
+
+/// A Tempo L1 storage slot accessed while replaying a Zone block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TempoStorageRead {
+    /// Tempo account whose storage was accessed.
+    pub account: Address,
+    /// Storage slot that was accessed.
+    pub slot: B256,
+}
+
 /// Copies the Zone chain spec and applies the Tempo hardfork conditions from its parent chain.
 fn compose_chain_spec(zone: &ZoneChainSpec, tempo: &TempoChainSpec) -> Arc<ZoneChainSpec> {
     Arc::new(zone.clone().with_tempo_hardforks_from(tempo))
@@ -524,6 +599,25 @@ mod tests {
                 MODERATO.tempo_fork_activation(hardfork)
             );
         }
+    }
+
+    #[test]
+    fn l1_storage_recorder_deduplicates_successful_reads_without_block_numbers() {
+        let account = Address::repeat_byte(0xaa);
+        let slot = B256::repeat_byte(0xbb);
+        let value = B256::repeat_byte(0xcc);
+        let reader = RecordingL1StorageReader::new(MockL1Reader::returning(value));
+
+        assert_eq!(reader.read_l1_storage(account, slot, 10).unwrap(), value);
+        assert_eq!(reader.read_l1_storage(account, slot, 11).unwrap(), value);
+        assert_eq!(
+            reader.take_reads(),
+            HashSet::from_iter([TempoStorageRead { account, slot }])
+        );
+
+        let failing = RecordingL1StorageReader::new(MockL1Reader::failing_storage());
+        assert!(failing.read_l1_storage(account, slot, 10).is_err());
+        assert!(failing.take_reads().is_empty());
     }
 
     #[test]

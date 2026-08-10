@@ -2,27 +2,35 @@
 pragma solidity ^0.8.13;
 
 import {
+    AES_GCM_DECRYPT,
     BlockTransition,
+    CHAUM_PEDERSEN_VERIFY,
+    ChaumPedersenProof,
     DecryptionData,
     Deposit,
+    DepositPayload,
     DepositQueueTransition,
     DepositType,
     EnabledToken,
+    IAesGcmDecrypt,
+    IChaumPedersenVerify,
     PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+    PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
     QueuedDeposit,
     Withdrawal,
+    WithdrawalBounceBackDeposit,
     ZONE_INBOX,
     ZONE_OUTBOX,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
+import { EncryptedDepositLib } from "../../src/libraries/EncryptedDeposit.sol";
 import {
     EMPTY_SENTINEL,
     WITHDRAWAL_QUEUE_CAPACITY
 } from "../../src/libraries/WithdrawalQueueLib.sol";
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
 import { ZonePortal } from "../../src/tempo/ZonePortal.sol";
-import { ZoneConfig } from "../../src/zone/ZoneConfig.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { BaseTest } from "../BaseTest.t.sol";
@@ -134,6 +142,27 @@ contract ZoneLifecycleHandler is Test {
         initialSupply = _token.totalSupply();
     }
 
+    function _payload() internal pure returns (DepositPayload memory) {
+        return DepositPayload({
+            ephemeralPubkeyX: bytes32(uint256(0x1234)),
+            ephemeralPubkeyYParity: 0x02,
+            ciphertext: new bytes(64),
+            nonce: bytes12(0),
+            tag: bytes16(0)
+        });
+    }
+
+    function _decryptions(uint256 count) internal pure returns (DecryptionData[] memory decs) {
+        decs = new DecryptionData[](count);
+        for (uint256 i; i < count; ++i) {
+            decs[i] = DecryptionData({
+                sharedSecret: bytes32(uint256(0xdeadbeef)),
+                sharedSecretYParity: 0x02,
+                cpProof: ChaumPedersenProof({ s: bytes32(uint256(1)), c: bytes32(uint256(2)) })
+            });
+        }
+    }
+
     function outstandingSupply() public view returns (uint256) {
         return minted - burned;
     }
@@ -188,26 +217,27 @@ contract ZoneLifecycleHandler is Test {
 
     /// @notice A user deposits on L1; escrow grows and the deposit is mirrored for later minting.
     function deposit(uint256 actorSeed, uint256 amountSeed) external {
-        address user = _actor(actorSeed);
+        actorSeed;
+        address user = actors[0];
         uint256 bal = token.balanceOf(user);
         if (bal == 0) return;
         uint128 amount = uint128(bound(amountSeed, 1, bal));
 
         vm.startPrank(user);
         token.approve(address(portal), amount);
-        bytes32 newHash = portal.deposit(address(token), user, amount, bytes32(0), user);
+        bytes32 newHash = portal.deposit(address(token), amount, 0, _payload(), user);
         vm.stopPrank();
 
         uint128 net = amount - portal.calculateDepositFee(); // fee is zero in this suite
         Deposit memory d = Deposit({
             token: address(token),
             sender: user,
-            to: user,
             amount: net,
             tempoRefundRecipient: user,
-            memo: bytes32(0)
+            keyIndex: 0,
+            encrypted: _payload()
         });
-        mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
+        mirrorDepositHash = keccak256(abi.encode(DepositType.Deposit, d, mirrorDepositHash));
         require(newHash == mirrorDepositHash, "deposit hash mismatch");
         require(portal.currentDepositQueueHash() == mirrorDepositHash, "portal hash mismatch");
 
@@ -229,9 +259,29 @@ contract ZoneLifecycleHandler is Test {
         for (uint256 i = 0; i < count; i++) {
             Deposit memory d = depositMirror[depositHead + i];
             queued[i] = QueuedDeposit({
-                depositType: DepositType.Regular, depositData: abi.encode(d), rejected: false
+                depositType: d.sender == address(portal)
+                    ? DepositType.WithdrawalBounceBack
+                    : DepositType.Deposit,
+                depositData: d.sender == address(portal)
+                    ? abi.encode(
+                        WithdrawalBounceBackDeposit({
+                            token: d.token, to: address(uint160(d.keyIndex)), amount: d.amount
+                        })
+                    )
+                    : abi.encode(d),
+                rejected: false
             });
-            expectedHash = keccak256(abi.encode(DepositType.Regular, d, expectedHash));
+            expectedHash = d.sender == address(portal)
+                ? keccak256(
+                    abi.encode(
+                        DepositType.WithdrawalBounceBack,
+                        WithdrawalBounceBackDeposit({
+                            token: d.token, to: address(uint160(d.keyIndex)), amount: d.amount
+                        }),
+                        expectedHash
+                    )
+                )
+                : keccak256(abi.encode(DepositType.Deposit, d, expectedHash));
         }
 
         // The honest sequencer mirrors the L1 deposit hash into the zone's Tempo view.
@@ -242,14 +292,15 @@ contract ZoneLifecycleHandler is Test {
         );
 
         vm.prank(sequencer);
-        inbox.advanceTempo("", queued, new DecryptionData[](0), new EnabledToken[](0));
+        inbox.advanceTempo(new bytes[](1), queued, _decryptions(count), new EnabledToken[](0));
         require(inbox.processedDepositQueueHash() == expectedHash, "processed hash mismatch");
 
         for (uint256 i = 0; i < count; i++) {
             Deposit memory d = depositMirror[depositHead + i];
             minted += d.amount;
-            address recipient =
-                d.sender == address(portal) ? fallbackRecipients[uint64(uint160(d.to))] : d.to;
+            address recipient = d.sender == address(portal)
+                ? fallbackRecipients[uint64(uint160(d.keyIndex))]
+                : actors[0];
             require(recipient != address(0), "unknown bounce recipient");
             zoneCredit[recipient] += d.amount;
         }
@@ -450,12 +501,17 @@ contract ZoneLifecycleHandler is Test {
             Deposit memory d = Deposit({
                 token: w.token,
                 sender: address(portal),
-                to: address(uint160(w.fallbackNonce)),
                 amount: w.amount,
                 tempoRefundRecipient: address(0),
-                memo: bytes32(0)
+                keyIndex: uint256(uint160(w.fallbackNonce)),
+                encrypted: _payload()
             });
-            mirrorDepositHash = keccak256(abi.encode(DepositType.Regular, d, mirrorDepositHash));
+            WithdrawalBounceBackDeposit memory bounce = WithdrawalBounceBackDeposit({
+                token: w.token, to: address(uint160(w.fallbackNonce)), amount: w.amount
+            });
+            mirrorDepositHash = keccak256(
+                abi.encode(DepositType.WithdrawalBounceBack, bounce, mirrorDepositHash)
+            );
             require(portal.currentDepositQueueHash() == mirrorDepositHash, "bounce hash mismatch");
             depositMirror.push(d);
             numFailedCallbacksProcessed++;
@@ -496,7 +552,6 @@ contract ZoneLifecycleInvariantTest is BaseTest {
     ZonePortal internal portal;
     MockZoneToken internal token;
     MockTempoState internal tempoState;
-    ZoneConfig internal config;
     ZoneInbox internal inbox;
     ZoneOutbox internal outbox;
     RevertingLifecycleReceiver internal revertingReceiver;
@@ -525,20 +580,31 @@ contract ZoneLifecycleInvariantTest is BaseTest {
         sequencers[0] = address(this);
         portal = _createZonePortal(1, address(token), address(this), sequencers, 1, "");
 
+        bytes32 entriesBase = keccak256(abi.encode(uint256(PORTAL_ENCRYPTION_KEYS_SLOT)));
+        bytes32 keyX = bytes32(uint256(0x1234));
+        bytes32 keyMeta = bytes32((uint256(uint64(block.number)) << 8) | uint256(0x02));
+        vm.store(address(portal), PORTAL_ENCRYPTION_KEYS_SLOT, bytes32(uint256(1)));
+        vm.store(address(portal), entriesBase, keyX);
+        vm.store(address(portal), bytes32(uint256(entriesBase) + 1), keyMeta);
+
         // Zone side.
         tempoState =
             new MockTempoState(address(this), GENESIS_TEMPO_BLOCK_HASH, genesisTempoBlockNumber);
-        config = new ZoneConfig(address(portal), address(tempoState));
         tempoState.setMockStorageValue(
             address(portal),
             keccak256(abi.encode(address(this), PORTAL_IS_SEQUENCER_SLOT)),
             bytes32(uint256(1))
         );
         tempoState.setMockTokenEnabled(address(portal), address(token), true);
-        ZoneInbox inboxImpl = new ZoneInbox(address(config), address(portal), address(tempoState));
+        tempoState.setMockStorageValue(
+            address(portal), PORTAL_ENCRYPTION_KEYS_SLOT, bytes32(uint256(1))
+        );
+        tempoState.setMockStorageValue(address(portal), entriesBase, keyX);
+        tempoState.setMockStorageValue(address(portal), bytes32(uint256(entriesBase) + 1), keyMeta);
+        ZoneInbox inboxImpl = new ZoneInbox(address(portal), address(tempoState));
         vm.etch(ZONE_INBOX, address(inboxImpl).code);
         inbox = ZoneInbox(ZONE_INBOX);
-        ZoneOutbox outboxImpl = new ZoneOutbox(address(config));
+        ZoneOutbox outboxImpl = new ZoneOutbox(address(portal), address(tempoState));
         vm.etch(ZONE_OUTBOX, address(outboxImpl).code);
         outbox = ZoneOutbox(ZONE_OUTBOX);
 
@@ -551,6 +617,18 @@ contract ZoneLifecycleInvariantTest is BaseTest {
             address(StdPrecompiles.SIGNATURE_VERIFIER),
             abi.encodeWithSelector(ISignatureVerifier.recover.selector),
             abi.encode(address(this))
+        );
+        vm.etch(CHAUM_PEDERSEN_VERIFY, hex"00");
+        vm.etch(AES_GCM_DECRYPT, hex"00");
+        vm.mockCall(
+            CHAUM_PEDERSEN_VERIFY,
+            abi.encodeWithSelector(IChaumPedersenVerify.verifyProof.selector),
+            abi.encode(true)
+        );
+        vm.mockCall(
+            AES_GCM_DECRYPT,
+            abi.encodeWithSelector(IAesGcmDecrypt.decrypt.selector),
+            abi.encode(EncryptedDepositLib.encodePlaintext(alice, bytes32(0)), true)
         );
 
         handler = new ZoneLifecycleHandler(

@@ -2,8 +2,8 @@
 pragma solidity ^0.8.13;
 
 import {
+    DepositPayload,
     ENCRYPTION_KEY_GRACE_PERIOD,
-    EncryptedDepositPayload,
     IZonePortal
 } from "../../src/interfaces/IZone.sol";
 import { ZoneMessenger } from "../../src/tempo/ZoneMessenger.sol";
@@ -68,8 +68,8 @@ contract ZoneEncryptionKeyHandler is Test {
         activationBlocks.push(uint64(block.number));
     }
 
-    function _payload() internal pure returns (EncryptedDepositPayload memory) {
-        return EncryptedDepositPayload({
+    function _payload() internal pure returns (DepositPayload memory) {
+        return DepositPayload({
             ephemeralPubkeyX: VALID_SECP256K1_X,
             ephemeralPubkeyYParity: 0x02,
             ciphertext: new bytes(64),
@@ -81,7 +81,7 @@ contract ZoneEncryptionKeyHandler is Test {
     /// @notice The latest key admits deposits regardless of prior block advances.
     function depositWithLatestKey(uint256 walletSeed) external {
         if (activationBlocks.length == 0) _registerKey(walletSeed);
-        portal.depositEncrypted(
+        portal.deposit(
             address(token), DEPOSIT_AMOUNT, activationBlocks.length - 1, _payload(), address(this)
         );
         latestDepositCount++;
@@ -95,9 +95,7 @@ contract ZoneEncryptionKeyHandler is Test {
 
         uint64 expiry = activationBlocks[oldKeyIndex + 1] + ENCRYPTION_KEY_GRACE_PERIOD;
         assertLt(block.number, expiry, "ghost ledger did not produce a grace-window key");
-        portal.depositEncrypted(
-            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
-        );
+        portal.deposit(address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this));
         graceDepositCount++;
     }
 
@@ -110,9 +108,7 @@ contract ZoneEncryptionKeyHandler is Test {
 
         uint64 expiry = activationBlocks[oldKeyIndex + 1] + ENCRYPTION_KEY_GRACE_PERIOD;
         assertLt(block.number, expiry, "ghost ledger did not preserve the older grace window");
-        portal.depositEncrypted(
-            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
-        );
+        portal.deposit(address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this));
         nonAdjacentGraceDepositCount++;
     }
 
@@ -136,9 +132,7 @@ contract ZoneEncryptionKeyHandler is Test {
                 activationBlocks[oldKeyIndex + 1]
             )
         );
-        portal.depositEncrypted(
-            address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this)
-        );
+        portal.deposit(address(token), DEPOSIT_AMOUNT, oldKeyIndex, _payload(), address(this));
 
         assertEq(
             token.balanceOf(address(this)), depositorBalance, "revert changed depositor balance"
