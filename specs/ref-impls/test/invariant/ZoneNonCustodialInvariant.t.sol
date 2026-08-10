@@ -138,10 +138,10 @@ contract ZoneNonCustodialHandler is Test {
     }
 
     /// @notice Mint a contiguous prefix of mirrored deposits on the zone (credit to withdraw).
-    function advanceDeposits(uint256 countSeed) external {
+    function advanceDeposits(uint256) external {
         uint256 pending = depositMirror.length - depositHead;
         if (pending == 0) return;
-        uint256 count = bound(countSeed, 1, pending);
+        uint256 count = pending;
 
         QueuedDeposit[] memory queued = new QueuedDeposit[](count);
         bytes32 expectedHash = mirrorProcessedHash;

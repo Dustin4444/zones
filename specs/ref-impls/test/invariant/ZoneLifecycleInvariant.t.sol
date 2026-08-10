@@ -249,10 +249,10 @@ contract ZoneLifecycleHandler is Test {
 
     /// @notice The sequencer processes a contiguous prefix of mirrored deposits on the zone,
     ///         minting the corresponding zone-token supply.
-    function advanceDeposits(uint256 countSeed) external {
+    function advanceDeposits(uint256) external {
         uint256 pending = depositMirror.length - depositHead;
         if (pending == 0) return;
-        uint256 count = bound(countSeed, 1, pending);
+        uint256 count = pending;
 
         QueuedDeposit[] memory queued = new QueuedDeposit[](count);
         bytes32 expectedHash = mirrorProcessedHash;
@@ -327,14 +327,15 @@ contract ZoneLifecycleHandler is Test {
         vm.stopPrank();
 
         bytes32 txHash = txCtx.txHashFor(seqBefore + 1);
+        uint64 fallbackNonce = outbox.lastFallbackNonce();
         Withdrawal memory w = Withdrawal({
             token: address(token),
-            senderTag: keccak256(abi.encodePacked(holder, txHash)),
+            senderTag: keccak256(abi.encodePacked(holder, txHash, fallbackNonce)),
             to: holder,
             amount: amount,
             memo: bytes32(0),
             gasLimit: 0,
-            fallbackNonce: uint64(seqBefore + 1),
+            fallbackNonce: fallbackNonce,
             callbackData: "",
             encryptedSender: ""
         });
@@ -367,7 +368,9 @@ contract ZoneLifecycleHandler is Test {
         pendingWithdrawals.push(
             Withdrawal({
                 token: address(token),
-                senderTag: keccak256(abi.encodePacked(holder, txCtx.txHashFor(seqBefore + 1))),
+                senderTag: keccak256(
+                    abi.encodePacked(holder, txCtx.txHashFor(seqBefore + 1), fallbackNonce)
+                ),
                 to: address(revertingReceiver),
                 amount: amount,
                 memo: bytes32(0),
