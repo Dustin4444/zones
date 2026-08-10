@@ -256,8 +256,10 @@ contract ZoneLifecycleHandler is Test {
 
         QueuedDeposit[] memory queued = new QueuedDeposit[](count);
         bytes32 expectedHash = mirrorProcessedHash;
+        uint256 decryptionCount;
         for (uint256 i = 0; i < count; i++) {
             Deposit memory d = depositMirror[depositHead + i];
+            if (d.sender != address(portal)) decryptionCount++;
             queued[i] = QueuedDeposit({
                 depositType: d.sender == address(portal)
                     ? DepositType.WithdrawalBounceBack
@@ -292,7 +294,9 @@ contract ZoneLifecycleHandler is Test {
         );
 
         vm.prank(address(0));
-        inbox.advanceTempo(new bytes[](1), queued, _decryptions(count), new EnabledToken[](0));
+        inbox.advanceTempo(
+            new bytes[](1), queued, _decryptions(decryptionCount), new EnabledToken[](0)
+        );
         require(inbox.processedDepositQueueHash() == expectedHash, "processed hash mismatch");
 
         for (uint256 i = 0; i < count; i++) {
