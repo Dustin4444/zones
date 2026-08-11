@@ -773,13 +773,9 @@ where
         let payload_builder = ctx.node.payload_builder_handle().clone();
         let operator_rpc_slot = sequencer_rpc_slot.clone();
         let operator_rpc_provider = provider.clone();
-        let operator_zone_api = OperatorZoneApi::new(
-            self.redacted_rpc_config.zone_id,
-            chain_id,
-            self.portal_address,
-            l1_provider.clone(),
-            provider.clone(),
-        );
+        let operator_zone_provider = provider.clone();
+        let operator_zone_id = self.redacted_rpc_config.zone_id;
+        let operator_l1_provider = l1_provider.clone();
         let portal_address = self.portal_address;
         let evm_chain_spec = ctx.node.evm_config().chain_spec().clone();
         let handle = self
@@ -789,6 +785,14 @@ where
                     reth_rpc_builder::RethRpcModule::Web3,
                     OperatorWeb3Api.into_rpc(),
                 )?;
+                let operator_zone_api = OperatorZoneApi::new(
+                    operator_zone_id,
+                    chain_id,
+                    portal_address,
+                    operator_l1_provider,
+                    operator_zone_provider,
+                    container.registry.eth_api().clone(),
+                );
                 container
                     .modules
                     .merge_configured(operator_zone_api.into_rpc())?;

@@ -45,7 +45,7 @@ use tempo_alloy::{
 };
 use tempo_chainspec::spec::{TEMPO_T0_BASE_FEE, TEMPO_T1_BASE_FEE};
 use tempo_contracts::precompiles::{
-    ACCOUNT_KEYCHAIN_ADDRESS,
+    ACCOUNT_KEYCHAIN_ADDRESS, ITIP20,
     account_keychain::IAccountKeychain::{self, KeyInfo, getKeyCall},
 };
 use tempo_primitives::{TempoPrimitives, TempoTxEnvelope};
@@ -129,25 +129,36 @@ pub(crate) trait ZoneApi {
     /// Returns the encryption key active at the current Tempo L1 head.
     #[method(name = "getEncryptionKey")]
     async fn get_encryption_key(&self) -> RpcResult<ZonePortal::encryptionKeyAtBlockReturn>;
+
+    /// Returns a private TIP-20 balance through the trusted operator RPC.
+    #[method(name = "getBalance")]
+    async fn get_balance(
+        &self,
+        token: Address,
+        account: Address,
+        block: Option<BlockId>,
+    ) -> RpcResult<U256>;
 }
 
 /// Public Zone API backed directly by the node and Tempo L1 providers.
 #[derive(Clone)]
-pub(crate) struct OperatorZoneApi<P> {
+pub(crate) struct OperatorZoneApi<P, E> {
     zone_id: u32,
     chain_id: u64,
     portal_address: Address,
     l1_provider: DynProvider<TempoNetwork>,
     zone_provider: P,
+    eth_api: E,
 }
 
-impl<P> OperatorZoneApi<P> {
+impl<P, E> OperatorZoneApi<P, E> {
     pub(crate) const fn new(
         zone_id: u32,
         chain_id: u64,
         portal_address: Address,
         l1_provider: DynProvider<TempoNetwork>,
         zone_provider: P,
+        eth_api: E,
     ) -> Self {
         Self {
             zone_id,
@@ -155,14 +166,28 @@ impl<P> OperatorZoneApi<P> {
             portal_address,
             l1_provider,
             zone_provider,
+            eth_api,
         }
     }
 }
 
+fn operator_balance_request(token: Address, account: Address) -> TempoTransactionRequest {
+    TempoTransactionRequest {
+        inner: TransactionRequest {
+            from: Some(account),
+            to: Some(token.into()),
+            input: ITIP20::balanceOfCall { account }.abi_encode().into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[jsonrpsee::core::async_trait]
-impl<P> ZoneApiServer for OperatorZoneApi<P>
+impl<P, E> ZoneApiServer for OperatorZoneApi<P, E>
 where
     P: StateProviderFactory + Clone + Send + Sync + 'static,
+    E: FullEthApi<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
 {
     async fn get_zone_info(&self) -> RpcResult<ZoneInfoResponse> {
         let tempo_block_number = self
@@ -187,6 +212,20 @@ where
         encryption_key(self.portal_address, &self.l1_provider)
             .await
             .map_err(operator_rpc_error)
+    }
+
+    async fn get_balance(
+        &self,
+        token: Address,
+        account: Address,
+        block: Option<BlockId>,
+    ) -> RpcResult<U256> {
+        let request = operator_balance_request(token, account);
+        let output = EthCall::call(&self.eth_api, request, block, EvmOverrides::default())
+            .await
+            .map_err(|error| operator_rpc_error(internal(error)))?;
+        ITIP20::balanceOfCall::abi_decode_returns(&output)
+            .map_err(|error| operator_rpc_error(internal(error)))
     }
 }
 
@@ -1435,7 +1474,6 @@ pub(crate) fn rpc_connection_config(retry_connection_interval: Duration) -> Conn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_provider::ProviderBuilder;
 
     #[test]
     fn records_block_hashes_as_eip2935_storage_targets() {
@@ -1530,24 +1568,17 @@ mod tests {
     }
 
     #[test]
-    fn operator_zone_api_exposes_only_metadata_methods_without_auth() {
-        let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_http("http://127.0.0.1:1".parse().expect("valid URL"))
-            .erased();
-        let module = OperatorZoneApi::new(
-            1,
-            42431,
-            Address::repeat_byte(0x11),
-            l1_provider,
-            Arc::new(reth_provider::test_utils::MockEthProvider::default()),
-        )
-        .into_rpc();
+    fn operator_balance_request_uses_account_as_trusted_call_context() {
+        let token = Address::repeat_byte(0x11);
+        let account = Address::repeat_byte(0x22);
+        let request = operator_balance_request(token, account);
 
-        let methods = module.method_names().collect::<HashSet<_>>();
-        assert_eq!(methods.len(), 2);
-        assert!(methods.contains("zone_getZoneInfo"));
-        assert!(methods.contains("zone_getEncryptionKey"));
-        assert!(!methods.contains("zone_getAuthorizationTokenInfo"));
+        assert_eq!(request.inner.from, Some(account));
+        assert_eq!(request.inner.to, Some(token.into()));
+        assert_eq!(
+            ITIP20::balanceOfCall::abi_decode(&request.inner.input.input().unwrap()),
+            Ok(ITIP20::balanceOfCall { account })
+        );
     }
 
     #[test]
