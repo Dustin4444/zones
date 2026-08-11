@@ -14,9 +14,10 @@ use crate::{
         run_role_controller,
     },
     rpc::{
-        NodeZoneDebugApi, OperatorWeb3Api, OperatorZoneApi, SequencerRpcContext,
-        ZoneApiServer as _, ZoneRpc, ZoneRpcApi, operator_zone_rpc_module, rpc_connection_config,
-        start_redacted_rpc,
+        NodeZoneDebugApi, OperatorWeb3Api, OperatorZoneApi, OperatorZoneBalanceApi,
+        SequencerRpcContext,
+        ZoneApiServer as _, ZoneBalanceApiServer as _, ZoneRpc, ZoneRpcApi,
+        operator_zone_rpc_module, rpc_connection_config, start_redacted_rpc,
     },
 };
 use alloy_chains::Chain;
@@ -791,11 +792,13 @@ where
                     portal_address,
                     operator_l1_provider,
                     operator_zone_provider,
-                    container.registry.eth_api().clone(),
                 );
                 container
                     .modules
                     .merge_configured(operator_zone_api.into_rpc())?;
+                container.modules.merge_http(
+                    OperatorZoneBalanceApi::new(container.registry.eth_api().clone()).into_rpc(),
+                )?;
                 container.modules.merge_configured(
                     NodeZoneDebugApi::new(container.registry.eth_api().clone()).into_rpc(),
                 )?;
