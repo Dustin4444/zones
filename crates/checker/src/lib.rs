@@ -11,8 +11,6 @@ mod observe;
 pub(crate) mod persistence;
 mod runtime;
 
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
 pub mod inspection;
 
 use std::{fmt, future::Future, path::PathBuf, str::FromStr, time::Duration};

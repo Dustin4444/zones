@@ -22,6 +22,41 @@ build-release binary extra_args="": (build binary "-r " + extra_args)
 build binary extra_args="":
     {{cargo_build_binary}} build {{extra_args}} --bin {{binary}}
 
+[group('checker')]
+[doc('Build and start the local Tempo L1 and Zone checker development lab')]
+checker-lab-up:
+    bash contrib/checker-lab/checker-lab.sh up
+
+[group('checker')]
+[doc('Rebuild and restart the checker lab Zone while preserving its chains and checkpoint')]
+checker-lab-restart-zone:
+    bash contrib/checker-lab/checker-lab.sh restart-zone
+
+[group('checker')]
+[doc('Submit token, deposit, or withdrawal activity to the running checker lab')]
+checker-lab-trigger scenario:
+    bash contrib/checker-lab/checker-lab.sh trigger {{scenario}}
+
+[group('checker')]
+[doc('Show checker lab processes and durable checker state')]
+checker-lab-status:
+    bash contrib/checker-lab/checker-lab.sh status
+
+[group('checker')]
+[doc('Follow checker lab logs for zone (default) or l1')]
+checker-lab-logs name="zone":
+    bash contrib/checker-lab/checker-lab.sh logs {{name}}
+
+[group('checker')]
+[doc('Stop the checker lab while preserving its state')]
+checker-lab-down:
+    bash contrib/checker-lab/checker-lab.sh down
+
+[group('checker')]
+[doc('Stop the checker lab and delete its state')]
+checker-lab-reset:
+    bash contrib/checker-lab/checker-lab.sh reset
+
 [group('zone')]
 [doc('Regenerates the bundled zone dev genesis from the current Solidity artifacts')]
 regen-zone-dev-genesis:
@@ -285,7 +320,7 @@ max-approve-outbox token="0x20C0000000000000000000000000000000000000" rpc=zone_r
     OUTBOX="0x1c00000000000000000000000000000000000002"
     echo "Approving ZoneOutbox for max zone tokens..."
     TX_OUTPUT=$(cast send "{{token}}" "approve(address,uint256)" "$OUTBOX" "$(cast max-uint)" \
-        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 150000 --json)
+        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 500000 --json)
     STATUS=$(echo "$TX_OUTPUT" | jq -r '.status')
     if [[ "$STATUS" == "0x1" ]]; then
         echo "Approved!"
@@ -314,7 +349,12 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
     L2_OUTPUT=$(cast send "$OUTBOX" \
         "requestWithdrawal(address,address,uint128,bytes32,uint64,address,bytes,bytes)" \
         "{{token}}" "$TO" "{{amount}}" "{{memo}}" "{{gas-limit}}" "$FALLBACK" "{{data}}" "{{reveal-to}}" \
-        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 500000 --json)
+        --rpc-url "{{rpc}}" --private-key "$PK" --json)
+    if [[ $(echo "$L2_OUTPUT" | jq -r '.status') != "0x1" ]]; then
+        echo "Withdrawal request failed!"
+        echo "$L2_OUTPUT" | jq .
+        exit 1
+    fi
     L2_TX=$(echo "$L2_OUTPUT" | jq -r '.transactionHash')
     L2_BLOCK=$(echo "$L2_OUTPUT" | jq -r '.blockNumber')
     echo "Withdrawal requested on L2! tx: $L2_TX (block $(printf '%d' "$L2_BLOCK"))"

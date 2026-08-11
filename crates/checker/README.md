@@ -22,6 +22,7 @@ tempo-zone checker build-checkpoint \
   --checker.database-path /var/lib/tempo-zone/checker \
   --checker.portal-creation-block-hash 0x... \
   -- \
+  node \
   --chain /etc/tempo-zone/genesis.json \
   --datadir /var/lib/tempo-zone \
   --l1.rpc-url wss://tempo-archive.example \
@@ -47,18 +48,128 @@ database before moving it to the requested path. An existing database is not
 replaced. Build a new checkpoint at another path after a schema change or when
 the existing database is invalid.
 
+Inspect durable progress and alert state with:
+
+```sh
+tempo-zone checker inspect \
+  --checker.database-path /var/lib/tempo-zone/checker \
+  --json
+```
+
+## Development lab
+
+The repository includes a persistent local Tempo L1 and Zone checker lab for
+testing bridge changes. It requires `cargo`, `cast`, `jq`, and `just`.
+
+The lab uses a sibling `../tempo` checkout by default. That checkout must be at
+the revision pinned by the Zones workspace so its native contracts match the
+Zone bindings. To keep an existing Tempo checkout on another branch, create a
+compatible worktree once and point the lab at it:
+
+```sh
+TEMPO_REV=$(sed -nE 's/.*tempo-alloy.*rev = "([0-9a-f]+)".*/\1/p' Cargo.toml | head -n 1)
+git -C ../tempo worktree add --detach ../tempo-zone-checker "$TEMPO_REV"
+export TEMPO_ROOT="$PWD/../tempo-zone-checker"
+```
+
+Start the persistent L1, provision a Zone, build its checker checkpoint, and
+start the Zone in checker observe mode:
+
+```sh
+just checker-lab-up
+just checker-lab-status
+```
+
+Submit representative bridge operations and wait for the checker to verify
+them:
+
+```sh
+just checker-lab-trigger token
+just checker-lab-trigger deposit
+just checker-lab-trigger withdrawal
+```
+
+Follow the Zone/checker or Tempo L1 logs in another terminal:
+
+```sh
+just checker-lab-logs zone
+just checker-lab-logs l1
+```
+
+The Zone log reports protocol operations at `INFO` only after the checker has
+verified and durably recorded the transition. It also includes generic
+per-block verification at `DEBUG` under the lab's default log filter.
+
+`checker-lab-status` compares the imported Tempo tip with finalized L1, rather
+than the live L1 head. The head-to-finalized distance is expected consensus
+finality; `finalized lag` is checker/Zone ingestion lag. Zone `lag` is the
+distance from the live Zone head to the verified Zone tip. The included JSON is
+the authoritative durable checker state.
+
+After changing checker, Zone ingestion, precompile, or payload code, rebuild and
+restart only the Zone while preserving L1, Zone, checkpoint, and checker state:
+
+```sh
+just checker-lab-restart-zone
+```
+
+Stop the processes while preserving state, or stop them and delete all lab
+state:
+
+```sh
+just checker-lab-down
+just checker-lab-reset
+```
+
+State and logs live under `target/checker-lab` by default. Set
+`CHECKER_LAB_STATE_DIR` to use another location; set `TEMPO_ROOT` to use another
+compatible Tempo checkout.
+
 ## What it checks
 
-For each imported Tempo block, the checker fetches the complete ordered
-transaction envelopes and receipt set. It reconstructs both roots, checks
-receipt metadata and the aggregate bloom, and decodes protocol calldata and
-events. It compares the kernel result with receipt events, Zone state, token
-supply, and Portal collateral.
+Each Zone `advanceTempo` must import exactly one Tempo block. The checker fetches
+that block's complete ordered transaction envelopes and receipt set. It
+reconstructs both roots, checks receipt metadata and the aggregate bloom, and
+decodes protocol calldata and events. It compares the kernel result with
+receipt events, Zone state, token supply, and Portal collateral.
 
 The kernel covers Portal creation, token enablement, deposits, withdrawals,
 batches, bounce-backs, refunds, callbacks, commitments, ownership, and token
 accounting. It checks collateral after the Tempo transition and before the Zone
 transition. It checks Zone commitments and token supply afterward.
+
+### Example: token enablement
+
+Token enablement illustrates the separation between authenticated observations
+and independently derived expectations:
+
+```text
+L1 Portal       L2 block        Observation     Adapter         Kernel/runtime
+    │               │               │               │               │
+    │ TokenEnabled ────────────────▶│               │               │
+    │               │ inputs ─────▶│               │               │
+    │               │ event ──────▶│               │               │
+    │               │               │ strict decode │               │
+    │               │               │ and validation│               │
+    │               │               ├──────────────▶│               │
+    │               │               │               │ compare L1    │
+    │               │               │               │ with L2 input │
+    │               │               │               ├─────────────▶│
+    │               │               │               │ observed event│
+    │               │               │               ├─────────────▶│
+    │               │               │               │               │ compare expected
+    │               │               │               │               │ with observed
+    │               │               │               │               ├─▶ accept/finding
+```
+
+Event decoding first pins the shared Portal and Inbox event types and validates
+metadata bounds. The adapter then requires the ordered L2 event envelope to
+belong to the `advanceTempo` transaction. Finally, the kernel requires the full
+ordered L1 enablement values—token address, name, symbol, and currency—to equal
+the L2 inputs, and the runtime requires the emitted L2 effect to equal the
+independently derived expected effect. See
+[`observe/events.rs`](src/observe/events.rs),
+[`adapter.rs`](src/adapter.rs), and [`kernel/apply.rs`](src/kernel/apply.rs).
 
 ## Durability and runtime behavior
 
@@ -85,21 +196,25 @@ state from a checkpoint and journal. A reorg restores the common ancestor and
 then applies the replacement branch. Removing the finding's block clears the
 active finding atomically; retaining it keeps the finding active.
 
-Malformed or discontinuous `FinishedHeight` updates are not treated as
-verified. The checker records the unchecked range instead.
+Malformed or discontinuous notification plans are not treated as verified. The
+checker records an unchecked range when it can establish the affected canonical
+suffix; otherwise it terminates without advancing progress.
 
 ## Failure policy
 
 - **Immediate terminal:** invalid local identity, schema, or notification data.
 - **Bounded retry:** unavailable notification/provider data with a finite
   retry budget.
-- **Transient retry:** interrupted stream or data acquisition.
+- **Transient retry:** temporarily unavailable provider data or an acquisition
+  timeout.
 - **Authenticated divergence:** record a finding before acknowledging the
   block; do not check descendants.
 
 If retries are exhausted, the checker commits the unchecked suffix before
 acknowledging it and stopping. Acknowledged blocks in that suffix are not
-verified.
+verified. Notification-stream loss and queue overflow also fail closed: the
+checker records the canonical unchecked suffix before acknowledging and
+terminating.
 
 ## Trust assumptions and non-claims
 

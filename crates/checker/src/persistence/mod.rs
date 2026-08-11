@@ -82,7 +82,6 @@ impl Persistence {
         Ok(meta.identity)
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn inspect_snapshot(path: impl AsRef<Path>) -> Result<Snapshot> {
         let path = path.as_ref();
         let identity = Self::inspect_identity(path)?;

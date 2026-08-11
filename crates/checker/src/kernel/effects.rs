@@ -88,6 +88,26 @@ pub(crate) enum Effect {
     },
 }
 
+impl Effect {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::TokenEnabled { .. } => "TokenEnabled",
+            Self::DepositAppended { .. } => "DepositAppended",
+            Self::DepositProcessed { .. } => "DepositProcessed",
+            Self::DepositFailed { .. } => "DepositFailed",
+            Self::WithdrawalRequested { .. } => "WithdrawalRequested",
+            Self::BatchFinalized { .. } => "BatchFinalized",
+            Self::BatchSubmitted { .. } => "BatchSubmitted",
+            Self::UserWithdrawalProcessed { .. } => "UserWithdrawalProcessed",
+            Self::FailedDepositRefunded { .. } => "FailedDepositRefunded",
+            Self::BounceBackAppended { .. } => "BounceBackAppended",
+            Self::BounceBackMinted { .. } => "BounceBackMinted",
+            Self::BounceBackPending { .. } => "BounceBackPending",
+            Self::RefundClaimed { .. } => "RefundClaimed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExpectedState {
     pub(crate) tempo_block_hash: B256,

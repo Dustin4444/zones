@@ -20,6 +20,8 @@ pub struct CheckerCommand {
 enum CheckerSubcommand {
     /// Build and atomically publish a checkpoint using a local Zone node.
     BuildCheckpoint(CheckerBuildCheckpointArgs),
+    /// Inspect durable checker progress and alert state.
+    Inspect(CheckerInspectArgs),
 }
 
 /// Checkpoint output and node arguments.
@@ -33,10 +35,22 @@ struct CheckerBuildCheckpointArgs {
     #[arg(long = "checker.database-path", value_name = "PATH")]
     database_path: PathBuf,
 
-    /// Standard node arguments after `--`, including `--chain`, `--datadir`,
-    /// `--l1.rpc-url`, `--l1.portal-address`, and `--zone.id`.
+    /// The `node` subcommand and its arguments after `--`, including `--chain`,
+    /// `--datadir`, `--l1.rpc-url`, `--l1.portal-address`, and `--zone.id`.
     #[arg(last = true, required = true, value_name = "NODE_ARGS")]
     node_args: Vec<OsString>,
+}
+
+/// Read-only checker database inspection.
+#[derive(Debug, Args)]
+struct CheckerInspectArgs {
+    /// Path to the checker's dedicated database.
+    #[arg(long = "checker.database-path", value_name = "PATH")]
+    database_path: PathBuf,
+
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 impl CheckerCommand {
@@ -54,6 +68,46 @@ impl CheckerCommand {
                         database_path: args.database_path,
                     },
                 )
+            }
+            CheckerSubcommand::Inspect(args) => {
+                let snapshot = zone_checker::inspection::inspect_database(args.database_path)?;
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "verifiedZoneTip": {
+                                "number": snapshot.verified_zone_tip.number,
+                                "hash": snapshot.verified_zone_tip.hash,
+                            },
+                            "importedTempoTip": {
+                                "number": snapshot.imported_tempo_tip.number,
+                                "hash": snapshot.imported_tempo_tip.hash,
+                            },
+                            "acknowledgedZoneTip": {
+                                "number": snapshot.acknowledged_zone_tip.number,
+                                "hash": snapshot.acknowledged_zone_tip.hash,
+                            },
+                            "activeFinding": snapshot.active_finding,
+                            "hasCoverageGap": snapshot.has_coverage_gap,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Verified Zone tip:     {}/{}",
+                        snapshot.verified_zone_tip.number, snapshot.verified_zone_tip.hash
+                    );
+                    println!(
+                        "Imported Tempo tip:    {}/{}",
+                        snapshot.imported_tempo_tip.number, snapshot.imported_tempo_tip.hash
+                    );
+                    println!(
+                        "Acknowledged Zone tip: {}/{}",
+                        snapshot.acknowledged_zone_tip.number, snapshot.acknowledged_zone_tip.hash
+                    );
+                    println!("Active finding:       {}", snapshot.active_finding);
+                    println!("Coverage gap:         {}", snapshot.has_coverage_gap);
+                }
+                Ok(())
             }
         }
     }
@@ -368,5 +422,23 @@ mod tests {
             validate_node_args(&arguments).unwrap_err().to_string(),
             "checker options must appear before `--`"
         );
+    }
+
+    #[test]
+    fn inspect_accepts_database_path_and_json_output() {
+        let command = CheckerCommand::try_parse_from([
+            "checker",
+            "inspect",
+            "--checker.database-path",
+            "checker-test-db",
+            "--json",
+        ])
+        .unwrap();
+
+        let CheckerSubcommand::Inspect(args) = command.command else {
+            panic!("expected inspect command");
+        };
+        assert_eq!(args.database_path, PathBuf::from("checker-test-db"));
+        assert!(args.json);
     }
 }

@@ -1,4 +1,4 @@
-//! Read-only checker inspection for integration tests.
+//! Read-only inspection of durable checker progress and alert state.
 
 use std::path::Path;
 
