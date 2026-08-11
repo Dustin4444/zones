@@ -1,3 +1,5 @@
+//! Converts authenticated observations into independent checker facts and effects.
+
 use std::num::NonZeroU64;
 
 use crate::kernel::{
@@ -14,12 +16,13 @@ use crate::{
         L1BlockObservation, L2BlockObservation, ZonePostStateOutputs,
         events::{Factory, Inbox, L1ProtocolEvent, L2ProtocolEvent, Outbox, Portal, TempoState},
     },
-    persistence::{BlockNumHash, CoverageGapReason},
-    runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure, FailureClass},
+    persistence::BlockNumHash,
+    runtime::{AuthenticatedBlock, AuthenticatedOutputs, Failure},
 };
 
 use crate::kernel::Effect;
 
+/// Authenticated L1, L2, and post-state inputs for one Zone block.
 pub(crate) struct AuthenticatedObservation {
     pub l2: L2BlockObservation,
     pub l1: Vec<L1BlockObservation>,
@@ -28,6 +31,7 @@ pub(crate) struct AuthenticatedObservation {
     pub zone_id: u32,
 }
 
+/// Stable finding codes emitted while adapting authenticated observations.
 #[derive(Debug, Clone, Copy)]
 #[repr(u16)]
 pub(crate) enum AdapterFindingCode {
@@ -35,22 +39,20 @@ pub(crate) enum AdapterFindingCode {
     Grammar = 200,
 }
 
+/// Build an authenticated-divergence failure for an adapter invariant.
 fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
     let code = code as u16;
-    Failure {
-        class: FailureClass::AuthenticatedDivergence,
-        gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
-        message: message.into(),
-        finding: Some(Box::new(crate::kernel::Finding {
-            category: crate::kernel::FindingCategory::Observation,
+    Failure::authenticated_divergence(
+        message,
+        crate::kernel::Finding::coded(
+            crate::kernel::FindingCategory::Observation,
             code,
-            location: Some(crate::kernel::FindingLocation::Block),
-            expected: None,
-            actual: Some(crate::kernel::Datum::Code(code)),
-        })),
-    }
+            crate::kernel::FindingLocation::Block,
+        ),
+    )
 }
 
+/// Adapt one authenticated Zone block into kernel inputs and independent outputs.
 pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
     let header = o.l2.inputs().advance_tempo().imported_header();
     if o.l1.len() != 1 {
@@ -78,7 +80,12 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
             hash: o.l2.block_hash(),
         },
         parent: BlockNumHash {
-            number: o.l2.block_number() - 1,
+            number: o.l2.block_number().checked_sub(1).ok_or_else(|| {
+                failure(
+                    AdapterFindingCode::HeaderSequence,
+                    "Zone genesis has no parent",
+                )
+            })?,
             hash: o.l2.parent_hash(),
         },
         tempo: BlockNumHash {
@@ -104,6 +111,7 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
     })
 }
 
+/// Adapt one authenticated imported Tempo block for bootstrap or live checking.
 pub(crate) fn adapt_imported(
     observation: &L1BlockObservation,
     header: &crate::observe::ImportedTempoHeader,
@@ -119,22 +127,21 @@ pub(crate) fn adapt_imported(
     imported_facts(observation, header, portal_creation_block_hash, zone_id)
 }
 
-fn token(token: Address, name: &str, symbol: &str, currency: &str) -> TokenEnable {
-    TokenEnable {
-        token,
-        name: name.into(),
-        symbol: symbol.into(),
-        currency: currency.into(),
-    }
-}
-
-fn ordinary(d: &tempo_zone_contracts::ZonePortal::Deposit) -> Result<OrdinaryDeposit, Failure> {
-    let ciphertext: [u8; 64] = d.encrypted.ciphertext.as_ref().try_into().map_err(|_| {
+/// Decode the fixed-size ciphertext authenticated by deposit calldata or events.
+fn decode_ciphertext(bytes: &[u8], context: &'static str) -> Result<FixedBytes<64>, Failure> {
+    let ciphertext: [u8; 64] = bytes.try_into().map_err(|_| {
         failure(
             AdapterFindingCode::Grammar,
-            "deposit ciphertext is not 64 bytes",
+            format!("{context} ciphertext is not 64 bytes"),
         )
     })?;
+    Ok(FixedBytes::from(ciphertext))
+}
+
+/// Decode an ordinary deposit while enforcing its fixed-size encrypted payload.
+fn decode_ordinary_deposit(
+    d: &tempo_zone_contracts::ZonePortal::Deposit,
+) -> Result<OrdinaryDeposit, Failure> {
     Ok(OrdinaryDeposit {
         token: d.token,
         sender: d.sender,
@@ -144,13 +151,14 @@ fn ordinary(d: &tempo_zone_contracts::ZonePortal::Deposit) -> Result<OrdinaryDep
         encrypted: crate::kernel::DepositPayload {
             ephemeral_pubkey_x: d.encrypted.ephemeralPubkeyX,
             ephemeral_pubkey_y_parity: d.encrypted.ephemeralPubkeyYParity,
-            ciphertext: FixedBytes::from(ciphertext),
+            ciphertext: decode_ciphertext(d.encrypted.ciphertext.as_ref(), "deposit")?,
             nonce: d.encrypted.nonce,
             tag: d.encrypted.tag,
         },
     })
 }
 
+/// Parse imported transaction envelopes into ordered kernel facts and effects.
 fn imported_facts(
     observation: &L1BlockObservation,
     header: &crate::observe::ImportedTempoHeader,
@@ -161,7 +169,9 @@ fn imported_facts(
     let mut effects = Vec::new();
     for tx in observation.protocol_transactions() {
         let events: Vec<_> = tx.outcomes().iter().map(|x| x.event()).collect();
-        if let Some(call) = tx.direct_call() {
+        let direct_call = tx.direct_call();
+        let is_creation_block = observation.block_hash() == portal_creation_block_hash;
+        if let Some(call) = direct_call {
             if let Some(call) = call.as_submit_batch() {
                 if !matches!(
                     events.as_slice(),
@@ -260,7 +270,7 @@ fn imported_facts(
                 "creation requires TokenEnabled followed by ZoneCreated",
             ));
         }
-        if observation.block_hash() == portal_creation_block_hash
+        if is_creation_block
             && events.iter().any(|event| {
                 matches!(
                     event,
@@ -276,7 +286,7 @@ fn imported_facts(
                 "creation-block TokenEnabled must belong to the creation pair",
             ));
         }
-        if observation.block_hash() != portal_creation_block_hash
+        if !is_creation_block
             && events
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
@@ -293,13 +303,18 @@ fn imported_facts(
                     zoneId,
                     initialToken,
                     ..
-                }) if observation.block_hash() == portal_creation_block_hash => {
+                }) if is_creation_block => {
                     let enabled = tx
                         .outcomes()
                         .iter()
                         .find_map(|x| match x.event() {
                             L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(e)) => {
-                                Some(token(e.token, &e.name, &e.symbol, &e.currency))
+                                Some(TokenEnable {
+                                    token: e.token,
+                                    name: e.name.clone(),
+                                    symbol: e.symbol.clone(),
+                                    currency: e.currency.clone(),
+                                })
                             }
                             _ => None,
                         })
@@ -316,29 +331,21 @@ fn imported_facts(
                     });
                 }
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(e))
-                    if observation.block_hash() != portal_creation_block_hash =>
+                    if !is_creation_block =>
                 {
-                    operations.push(ImportedOperation::EnableToken(token(
-                        e.token,
-                        &e.name,
-                        &e.symbol,
-                        &e.currency,
-                    )))
+                    operations.push(ImportedOperation::EnableToken(TokenEnable {
+                        token: e.token,
+                        name: e.name.clone(),
+                        symbol: e.symbol.clone(),
+                        currency: e.currency.clone(),
+                    }))
                 }
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BouncebackGasUpdated(e)) => {
                     operations.push(ImportedOperation::UpdateBouncebackGas(e.bouncebackGas))
                 }
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(e))
-                    if tx
-                        .direct_call()
-                        .is_none_or(|call| call.as_process_withdrawals().is_none()) =>
+                    if direct_call.is_none_or(|call| call.as_process_withdrawals().is_none()) =>
                 {
-                    let ciphertext: [u8; 64] = e.ciphertext.as_ref().try_into().map_err(|_| {
-                        failure(
-                            AdapterFindingCode::Grammar,
-                            "deposit ciphertext is not 64 bytes",
-                        )
-                    })?;
                     let d = OrdinaryDeposit {
                         token: e.token,
                         sender: e.sender,
@@ -348,7 +355,7 @@ fn imported_facts(
                         encrypted: crate::kernel::DepositPayload {
                             ephemeral_pubkey_x: e.ephemeralPubkeyX,
                             ephemeral_pubkey_y_parity: e.ephemeralPubkeyYParity,
-                            ciphertext: FixedBytes::from(ciphertext),
+                            ciphertext: decode_ciphertext(e.ciphertext.as_ref(), "deposit")?,
                             nonce: e.nonce,
                             tag: e.tag,
                         },
@@ -394,15 +401,11 @@ fn imported_facts(
                     | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
                     | Portal::ZonePortalEvents::DepositBounceBack(_)
                     | Portal::ZonePortalEvents::DepositBounceBackPending(_),
-                ) if tx
-                    .direct_call()
-                    .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
+                ) if direct_call.is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(_))
-                    if tx
-                        .direct_call()
-                        .is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
+                    if direct_call.is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))
-                    if observation.block_hash() == portal_creation_block_hash => {}
+                    if is_creation_block => {}
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}
                 L1ProtocolEvent::KnownIgnored | L1ProtocolEvent::Portal(_) => {
                     return Err(failure(
@@ -423,6 +426,7 @@ fn imported_facts(
     ))
 }
 
+/// Parse the exact event sequence produced by `processWithdrawals`.
 fn parse_withdrawal_events(
     events: &[&L1ProtocolEvent],
     member_count: usize,
@@ -508,13 +512,6 @@ fn parse_withdrawal_events(
                 let mut callback_deposits = Vec::new();
                 let mut next = Some(first.clone());
                 while let Some(deposit) = next.take() {
-                    let ciphertext: [u8; 64] =
-                        deposit.ciphertext.as_ref().try_into().map_err(|_| {
-                            failure(
-                                AdapterFindingCode::Grammar,
-                                "callback ciphertext is not 64 bytes",
-                            )
-                        })?;
                     callback_deposits.push(OrdinaryDeposit {
                         token: deposit.token,
                         sender: deposit.sender,
@@ -524,7 +521,7 @@ fn parse_withdrawal_events(
                         encrypted: crate::kernel::DepositPayload {
                             ephemeral_pubkey_x: deposit.ephemeralPubkeyX,
                             ephemeral_pubkey_y_parity: deposit.ephemeralPubkeyYParity,
-                            ciphertext: FixedBytes::from(ciphertext),
+                            ciphertext: decode_ciphertext(deposit.ciphertext.as_ref(), "callback")?,
                             nonce: deposit.nonce,
                             tag: deposit.tag,
                         },
@@ -603,6 +600,7 @@ fn parse_withdrawal_events(
     Ok((outcomes, effects))
 }
 
+/// Parse Zone calldata and its validated event grammar into kernel facts and effects.
 fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), Failure> {
     let advance = o.l2.inputs().advance_tempo();
     let advance_hash = o.l2.inputs().advance_transaction_hash();
@@ -610,12 +608,17 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
     let enabled_tokens = advance
         .enabled_tokens()
         .iter()
-        .map(|e| token(e.token, &e.name, &e.symbol, &e.currency))
+        .map(|e| TokenEnable {
+            token: e.token,
+            name: e.name.clone(),
+            symbol: e.symbol.clone(),
+            currency: e.currency.clone(),
+        })
         .collect();
     let mut deposits = Vec::new();
     for d in advance.deposits() {
         if let Some(d) = d.as_ordinary() {
-            deposits.push(Deposit::Ordinary(ordinary(d)?));
+            deposits.push(Deposit::Ordinary(decode_ordinary_deposit(d)?));
         } else if let Some(d) = d.as_withdrawal_bounce_back() {
             let bytes = d.to.as_slice();
             if bytes[..12].iter().any(|byte| *byte != 0) {
@@ -630,13 +633,20 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
                     "zero bounceback amount",
                 ));
             }
-            let nonce = NonZeroU64::new(u64::from_be_bytes(bytes[12..].try_into().unwrap()))
+            let mut nonce_bytes = [0; 8];
+            nonce_bytes.copy_from_slice(&bytes[12..]);
+            let nonce = NonZeroU64::new(u64::from_be_bytes(nonce_bytes))
                 .ok_or_else(|| failure(AdapterFindingCode::Grammar, "zero bounceback nonce"))?;
             deposits.push(Deposit::BounceBack(BounceBackDeposit {
                 token: d.token,
                 fallback_nonce: nonce,
                 amount: d.amount,
             }));
+        } else {
+            return Err(failure(
+                AdapterFindingCode::Grammar,
+                "unsupported deposit kind",
+            ));
         }
     }
     let mut outcomes = Vec::new();
@@ -777,7 +787,7 @@ fn zone_facts(o: &AuthenticatedObservation) -> Result<(ZoneFacts, Vec<Effect>), 
     ))
 }
 
-/// Validate event ownership and order with one transaction-scoped cursor.
+/// Validate Zone event ownership and order with one transaction-scoped cursor.
 fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failure> {
     let events = o.l2.outcomes().events();
     let advance = o.l2.inputs().advance_tempo();

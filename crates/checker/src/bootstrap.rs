@@ -1,3 +1,5 @@
+//! Builds the initial authenticated checker checkpoint from Zone genesis.
+
 use crate::kernel::{
     ImportedOperation, PortalIdentity, State, apply_genesis_handoff, apply_imported,
 };
