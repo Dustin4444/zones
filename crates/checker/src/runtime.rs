@@ -9,9 +9,12 @@ use crate::kernel::{
 };
 use alloy_primitives::keccak256;
 
-use crate::persistence::{
-    BlockNumHash, CoverageGapReason, Identity, JournalEntry, Persistence, PersistenceError,
-    Snapshot, make_finding,
+use crate::{
+    observe::{AcquisitionError, ObservationError},
+    persistence::{
+        BlockNumHash, CoverageGapReason, Identity, JournalEntry, Persistence, PersistenceError,
+        Snapshot, make_finding,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,102 @@ pub(crate) struct Failure {
     pub finding: Option<Box<Finding>>,
 }
 
+impl Failure {
+    pub(crate) fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::ImmediateTerminal,
+            gap_reason: CoverageGapReason::Other(2),
+            message: message.into(),
+            finding: None,
+        }
+    }
+
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::TransientRetry,
+            gap_reason: CoverageGapReason::ProviderUnavailable,
+            message: message.into(),
+            finding: None,
+        }
+    }
+
+    fn incomplete(message: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::BoundedRetry,
+            gap_reason: CoverageGapReason::MissingTempoData,
+            message: message.into(),
+            finding: None,
+        }
+    }
+
+    pub(crate) fn authenticated_divergence(message: impl Into<String>, finding: Finding) -> Self {
+        Self {
+            class: FailureClass::AuthenticatedDivergence,
+            gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
+            message: message.into(),
+            finding: Some(Box::new(finding)),
+        }
+    }
+}
+
+impl From<AcquisitionError> for Failure {
+    fn from(error: AcquisitionError) -> Self {
+        let message = error.to_string();
+        match error {
+            AcquisitionError::Unavailable { .. } => Self::transient(message),
+            AcquisitionError::Missing { .. } | AcquisitionError::Inconsistent { .. } => {
+                Self::incomplete(message)
+            }
+        }
+    }
+}
+
+impl From<ObservationError> for Failure {
+    fn from(error: ObservationError) -> Self {
+        let message = error.to_string();
+        match error {
+            ObservationError::Acquisition(error) => error.into(),
+            ObservationError::MalformedAuthenticatedData {
+                transaction,
+                evidence,
+                ..
+            } => Self::authenticated_divergence(
+                message,
+                Finding::new(
+                    FindingCategory::Observation,
+                    110,
+                    Some(FindingLocation::Operation(
+                        transaction.transaction_index() as u32
+                    )),
+                    None,
+                    Some(Datum::Bytes {
+                        length: evidence.length(),
+                        digest: evidence.digest(),
+                    }),
+                ),
+            ),
+            ObservationError::InvalidEnvelope { .. } => Self::authenticated_divergence(
+                message,
+                Finding::coded(FindingCategory::Observation, 120, FindingLocation::Block),
+            ),
+            ObservationError::ProtocolEvent {
+                transaction_index, ..
+            } => Self::authenticated_divergence(
+                message,
+                Finding::coded(
+                    FindingCategory::Observation,
+                    130,
+                    FindingLocation::Operation(transaction_index as u32),
+                ),
+            ),
+            ObservationError::PortalCall(_) => Self::authenticated_divergence(
+                message,
+                Finding::coded(FindingCategory::Observation, 140, FindingLocation::Block),
+            ),
+        }
+    }
+}
+
 fn typed_failure(
     category: FindingCategory,
     code: u16,
@@ -51,13 +150,9 @@ fn typed_failure(
         class: FailureClass::AuthenticatedDivergence,
         gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
         message: message.into(),
-        finding: Some(Box::new(Finding {
-            category,
-            code,
-            location,
-            expected,
-            actual,
-        })),
+        finding: Some(Box::new(Finding::new(
+            category, code, location, expected, actual,
+        ))),
     }
 }
 
@@ -90,6 +185,21 @@ pub(crate) struct NotificationPlan {
 }
 
 impl NotificationPlan {
+    pub(crate) fn new(
+        reverted: Vec<BlockNumHash>,
+        applied: Vec<BlockNumHash>,
+        ancestor: BlockNumHash,
+    ) -> Result<Self, Failure> {
+        let acknowledge = applied.last().copied().unwrap_or(ancestor);
+        Self {
+            reverted,
+            ancestor,
+            applied,
+            acknowledge,
+        }
+        .validate()
+    }
+
     pub(crate) fn validate(self) -> Result<Self, Failure> {
         let contiguous = |values: &[BlockNumHash]| {
             values
@@ -110,12 +220,7 @@ impl NotificationPlan {
             || self.applied.last().is_some_and(|b| *b != self.acknowledge)
             || (self.reverted.is_empty() && self.applied.is_empty())
         {
-            return Err(Failure {
-                class: FailureClass::ImmediateTerminal,
-                gap_reason: CoverageGapReason::Other(2),
-                message: "invalid notification shape".into(),
-                finding: None,
-            });
+            return Err(Failure::terminal("invalid notification shape"));
         }
         Ok(self)
     }
@@ -311,6 +416,21 @@ pub(crate) enum RuntimeAction {
     Terminal,
 }
 
+/// Outcome of enqueueing a notification into the bounded runtime queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnqueueAction {
+    Queued,
+    AcknowledgeAndTerminate(BlockNumHash),
+    Terminal,
+}
+
+/// Outcome of durably recording a notification-stream failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamFailureAction {
+    GapRecorded(BlockNumHash),
+    Terminal,
+}
+
 impl<N> Runtime<N> {
     pub(crate) fn new(snapshot: Snapshot, capacity: usize, budget: RetryBudget) -> Self {
         Self {
@@ -416,24 +536,24 @@ impl<N> Runtime<N> {
         &mut self,
         store: &Persistence,
         notification: N,
-    ) -> Result<RuntimeAction, PersistenceError>
+    ) -> Result<EnqueueAction, PersistenceError>
     where
         N: PlannedNotification,
     {
         if self.state == RuntimeState::Disabled {
-            return Ok(RuntimeAction::Terminal);
+            return Ok(EnqueueAction::Terminal);
         }
         let plan = match notification.plan() {
             Ok(plan) => plan,
             Err(_) => {
                 self.state = RuntimeState::Disabled;
-                return Ok(RuntimeAction::Terminal);
+                return Ok(EnqueueAction::Terminal);
             }
         };
         if self.current.is_none() || self.queue.len() < self.capacity {
             let accepted = self.enqueue(notification, plan);
             debug_assert!(accepted.is_ok());
-            return Ok(RuntimeAction::None);
+            return Ok(EnqueueAction::Queued);
         }
         let plans = self
             .current
@@ -455,7 +575,7 @@ impl<N> Runtime<N> {
                 .all(|pair| pair[1].ancestor == pair[0].acknowledge);
         if !valid {
             self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
+            return Ok(EnqueueAction::Terminal);
         }
         let first_plan = &plans[0];
         let first = if self.snapshot.meta.verified_zone_tip == first_plan.ancestor {
@@ -470,7 +590,7 @@ impl<N> Runtime<N> {
             })?
         } else {
             self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
+            return Ok(EnqueueAction::Terminal);
         };
         let last = plans.last().expect("nonempty plan set").acknowledge;
         let reason = match &self.snapshot.meta.coverage {
@@ -481,7 +601,7 @@ impl<N> Runtime<N> {
         self.state = RuntimeState::Disabled;
         self.current = None;
         self.queue.clear();
-        Ok(RuntimeAction::AcknowledgeAndTerminate(last))
+        Ok(EnqueueAction::AcknowledgeAndTerminate(last))
     }
 
     /// Persist a canonical suffix reconstructed locally after stream failure.
@@ -489,14 +609,14 @@ impl<N> Runtime<N> {
         &mut self,
         store: &Persistence,
         canonical_suffix: &[BlockNumHash],
-    ) -> Result<RuntimeAction, PersistenceError> {
+    ) -> Result<StreamFailureAction, PersistenceError> {
         if canonical_suffix.is_empty()
             || canonical_suffix
                 .windows(2)
                 .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
         {
             self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
+            return Ok(StreamFailureAction::Terminal);
         }
         let (first, reason) = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Complete => {
@@ -514,11 +634,11 @@ impl<N> Runtime<N> {
             || canonical_suffix[0] != first
         {
             self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::Terminal);
+            return Ok(StreamFailureAction::Terminal);
         }
         self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
-        Ok(RuntimeAction::AcknowledgeAndTerminate(last))
+        Ok(StreamFailureAction::GapRecorded(last))
     }
 
     pub(crate) fn reorg(

@@ -50,6 +50,34 @@ pub(crate) struct Finding {
     pub(crate) actual: Option<Datum>,
 }
 
+impl Finding {
+    pub(crate) fn new(
+        category: FindingCategory,
+        code: u16,
+        location: Option<FindingLocation>,
+        expected: Option<Datum>,
+        actual: Option<Datum>,
+    ) -> Self {
+        Self {
+            category,
+            code,
+            location,
+            expected,
+            actual,
+        }
+    }
+
+    pub(crate) fn coded(category: FindingCategory, code: u16, location: FindingLocation) -> Self {
+        Self::new(
+            category,
+            code,
+            Some(location),
+            None,
+            Some(Datum::Code(code)),
+        )
+    }
+}
+
 impl Datum {
     /// Canonical, version-independent bytes used for finding evidence identity.
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
