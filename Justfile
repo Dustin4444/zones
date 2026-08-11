@@ -57,6 +57,12 @@ checker-lab-down:
 checker-lab-reset:
     bash contrib/checker-lab/checker-lab.sh reset
 
+[group('checker')]
+[doc('Validate checker lab scripts and command dispatch')]
+checker-lab-check:
+    bash -n contrib/checker-lab/*.sh
+    bash contrib/checker-lab/checker-lab.sh help >/dev/null
+
 [group('zone')]
 [doc('Regenerates the bundled zone dev genesis from the current Solidity artifacts')]
 regen-zone-dev-genesis:
