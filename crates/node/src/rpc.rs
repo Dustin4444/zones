@@ -17,8 +17,8 @@ use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bloom, Bytes, U64, U256, keccak256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::{
-    Block, BlockId, BlockNumberOrTag, BlockTransactions, FeeHistory, Filter, FilterChanges,
-    FilterId, TransactionRequest,
+    Block, BlockId, BlockNumberOrTag, BlockOverrides, BlockTransactions, FeeHistory, Filter,
+    FilterChanges, FilterId, TransactionRequest,
     state::{EvmOverrides, StateOverride},
 };
 use alloy_sol_types::SolCall;
@@ -131,17 +131,18 @@ pub(crate) trait ZoneApi {
     async fn get_encryption_key(&self) -> RpcResult<ZonePortal::encryptionKeyAtBlockReturn>;
 }
 
-/// Trusted operator-only Zone balance API.
-#[rpc(server, namespace = "zone")]
-pub(crate) trait ZoneBalanceApi {
-    /// Returns a private TIP-20 balance through the trusted operator RPC.
-    #[method(name = "getBalance")]
-    async fn get_balance(
+/// Operator `eth_call` override that supplies the private-balance call context.
+#[rpc(server, namespace = "eth")]
+pub(crate) trait OperatorEthCallApi {
+    /// Executes a call, deriving `from` for TIP-20 `balanceOf` when omitted.
+    #[method(name = "call")]
+    async fn call(
         &self,
-        token: Address,
-        account: Address,
-        block: Option<BlockId>,
-    ) -> RpcResult<U256>;
+        request: TempoTransactionRequest,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Bytes>;
 }
 
 /// Public Zone API backed directly by the node and Tempo L1 providers.
@@ -172,27 +173,26 @@ impl<P> OperatorZoneApi<P> {
     }
 }
 
-/// Trusted operator balance API backed by reth's Eth API.
+/// Trusted operator `eth_call` API backed by reth's Eth API.
 #[derive(Clone)]
-pub(crate) struct OperatorZoneBalanceApi<E> {
+pub(crate) struct OperatorEthCall<E> {
     eth_api: E,
 }
 
-impl<E> OperatorZoneBalanceApi<E> {
+impl<E> OperatorEthCall<E> {
     pub(crate) const fn new(eth_api: E) -> Self {
         Self { eth_api }
     }
 }
 
-fn operator_balance_request(token: Address, account: Address) -> TempoTransactionRequest {
-    TempoTransactionRequest {
-        inner: TransactionRequest {
-            from: Some(account),
-            to: Some(token.into()),
-            input: ITIP20::balanceOfCall { account }.abi_encode().into(),
-            ..Default::default()
-        },
-        ..Default::default()
+fn apply_operator_call_context(request: &mut TempoTransactionRequest) {
+    if request.inner.from.is_some() {
+        return;
+    }
+    if let Some(input) = request.inner.input.input()
+        && let Ok(call) = ITIP20::balanceOfCall::abi_decode(input)
+    {
+        request.inner.from = Some(call.account);
     }
 }
 
@@ -228,22 +228,26 @@ where
 }
 
 #[jsonrpsee::core::async_trait]
-impl<E> ZoneBalanceApiServer for OperatorZoneBalanceApi<E>
+impl<E> OperatorEthCallApiServer for OperatorEthCall<E>
 where
     E: FullEthApi<NetworkTypes = TempoNetwork> + Send + Sync + 'static,
 {
-    async fn get_balance(
+    async fn call(
         &self,
-        token: Address,
-        account: Address,
-        block: Option<BlockId>,
-    ) -> RpcResult<U256> {
-        let request = operator_balance_request(token, account);
-        let output = EthCall::call(&self.eth_api, request, block, EvmOverrides::default())
-            .await
-            .map_err(|error| operator_rpc_error(internal(error)))?;
-        ITIP20::balanceOfCall::abi_decode_returns(&output)
-            .map_err(|error| operator_rpc_error(internal(error)))
+        mut request: TempoTransactionRequest,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Bytes> {
+        apply_operator_call_context(&mut request);
+        EthCall::call(
+            &self.eth_api,
+            request,
+            block_number,
+            EvmOverrides::new(state_overrides, block_overrides),
+        )
+        .await
+        .map_err(|error| operator_rpc_error(internal(error)))
     }
 }
 
@@ -1609,17 +1613,55 @@ mod tests {
     }
 
     #[test]
-    fn operator_balance_request_uses_account_as_trusted_call_context() {
+    fn operator_call_context_defaults_balance_of_from_to_account() {
         let token = Address::repeat_byte(0x11);
         let account = Address::repeat_byte(0x22);
-        let request = operator_balance_request(token, account);
+        let mut request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(token.into()),
+                input: ITIP20::balanceOfCall { account }.abi_encode().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        apply_operator_call_context(&mut request);
 
         assert_eq!(request.inner.from, Some(account));
         assert_eq!(request.inner.to, Some(token.into()));
-        assert_eq!(
-            ITIP20::balanceOfCall::abi_decode(request.inner.input.input().unwrap()),
-            Ok(ITIP20::balanceOfCall { account })
-        );
+    }
+
+    #[test]
+    fn operator_call_context_preserves_explicit_from() {
+        let account = Address::repeat_byte(0x22);
+        let caller = Address::repeat_byte(0x33);
+        let mut request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                from: Some(caller),
+                input: ITIP20::balanceOfCall { account }.abi_encode().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        apply_operator_call_context(&mut request);
+
+        assert_eq!(request.inner.from, Some(caller));
+    }
+
+    #[test]
+    fn operator_call_context_ignores_non_balance_calls() {
+        let mut request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                input: ITIP20::nameCall {}.abi_encode().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        apply_operator_call_context(&mut request);
+
+        assert_eq!(request.inner.from, None);
     }
 
     #[test]
