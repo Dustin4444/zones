@@ -181,8 +181,9 @@ contract ZoneOutboxTest is Test {
     }
 
     function _getPendingWithdrawals() internal returns (PendingWithdrawal[] memory pending) {
+        uint256 count = _pendingWithdrawalsCount();
         vm.prank(sequencer);
-        pending = outbox.getPendingWithdrawals();
+        pending = outbox.getPendingWithdrawals(0, count);
     }
 
     function _finalizeWithdrawalBatch(uint256 count) internal returns (bytes32) {
@@ -238,7 +239,7 @@ contract ZoneOutboxTest is Test {
                           STORAGE TESTS
     //////////////////////////////////////////////////////////////*/
 
-    function test_requestWithdrawal_storesInArray() public {
+    function test_requestWithdrawal_storesInQueue() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("memo"), 0, alice, "");
@@ -307,6 +308,33 @@ contract ZoneOutboxTest is Test {
         assertEq(pending[1].memo, bytes32("second"));
     }
 
+    function test_getPendingWithdrawals_returnsBoundedPages() public {
+        vm.startPrank(alice);
+        zoneToken.approve(address(outbox), 1500e6);
+        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("first"), 0, alice, "");
+        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32("second"), 0, alice, "");
+        outbox.requestWithdrawal(address(zoneToken), charlie, 500e6, bytes32("third"), 0, alice, "");
+        vm.stopPrank();
+
+        vm.prank(sequencer);
+        PendingWithdrawal[] memory page = outbox.getPendingWithdrawals(1, 1);
+        assertEq(page.length, 1);
+        assertEq(page[0].memo, bytes32("second"));
+
+        vm.prank(sequencer);
+        page = outbox.getPendingWithdrawals(2, 2);
+        assertEq(page.length, 1);
+        assertEq(page[0].memo, bytes32("third"));
+
+        vm.prank(sequencer);
+        assertEq(outbox.getPendingWithdrawals(3, 1).length, 0);
+
+        uint256 maximumPageSize = outbox.MAX_PENDING_WITHDRAWALS_PER_PAGE();
+        vm.expectRevert(ZoneOutbox.PendingWithdrawalPageTooLarge.selector);
+        vm.prank(sequencer);
+        outbox.getPendingWithdrawals(0, maximumPageSize + 1);
+    }
+
     function test_pendingWithdrawalGetters_revertUnlessSequencerOrSystem() public {
         vm.expectRevert(ZoneOutbox.OnlySequencer.selector);
         vm.prank(alice);
@@ -314,13 +342,13 @@ contract ZoneOutboxTest is Test {
 
         vm.expectRevert(ZoneOutbox.OnlySequencer.selector);
         vm.prank(alice);
-        outbox.getPendingWithdrawals();
+        outbox.getPendingWithdrawals(0, 1);
 
         vm.prank(address(0));
         assertEq(outbox.pendingWithdrawalsCount(), 0);
 
         vm.prank(address(0));
-        assertEq(outbox.getPendingWithdrawals().length, 0);
+        assertEq(outbox.getPendingWithdrawals(0, 1).length, 0);
     }
 
     function test_requestWithdrawal_revertsWhenTokenNotEnabled() public {
@@ -450,7 +478,7 @@ contract ZoneOutboxTest is Test {
         assertEq(hash, expectedHash);
     }
 
-    function test_finalizeWithdrawalBatch_clearsStorage() public {
+    function test_finalizeWithdrawalBatch_clearsConsumedWithdrawals() public {
         // Add withdrawals
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
@@ -464,6 +492,7 @@ contract ZoneOutboxTest is Test {
         _finalizeWithdrawalBatch(type(uint256).max);
 
         assertEq(_pendingWithdrawalsCount(), 0);
+        assertEq(outbox.pendingWithdrawalHead(), 2);
     }
 
     function test_finalizeWithdrawalBatch_partialBatch_consumesOldestWithdrawals() public {
@@ -496,7 +525,7 @@ contract ZoneOutboxTest is Test {
         );
         assertEq(_finalizeWithdrawalBatch(3), remainingHash);
         assertEq(_pendingWithdrawalsCount(), 0);
-        assertEq(outbox.pendingWithdrawalHead(), 0);
+        assertEq(outbox.pendingWithdrawalHead(), 5);
     }
 
     function test_finalizeWithdrawalBatch_enforcesOutstandingRootCapAndAllowsRecovery() public {

@@ -649,7 +649,7 @@ Withdrawal requests are bounded before they enter the pending queue. `gasLimit` 
 
 The sequencer can additionally configure `maxWithdrawalsPerBlock` on the outbox. A value of `0` means unlimited. When nonzero, only that many `requestWithdrawal` calls can be accepted in a single zone block; further requests in the same block revert with `TooManyWithdrawalsThisBlock` before any token transfer or burn. The outbox tracks the last block number counted and resets the per-block counter when `block.number` changes.
 
-The outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and appends the withdrawal to a pending FIFO. A `pendingWithdrawalHead` index identifies the oldest unfinalized entry; finalized entries may be deleted or compacted without changing the consensus-visible FIFO order. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
+The outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and appends the withdrawal to a pending FIFO. Pending withdrawals are stored in a mapping keyed by their monotonic withdrawal index: `pendingWithdrawalHead` identifies the oldest unfinalized entry and `nextWithdrawalIndex` is the queue tail. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
 
 Keeping the recipient in zone state prevents the L1-visible withdrawal and any later bounce-back from revealing the user's private zone address. A monotonic nonce is deterministic under the zone's canonical transaction ordering, including multi-sequencer execution, while remaining collision-free; it reveals only relative withdrawal order and count, not the mapped recipient.
 
@@ -675,12 +675,14 @@ Let `pendingWithdrawalCount` be the number of entries at or after `pendingWithdr
 ```
 withdrawalQueueHash = EMPTY_SENTINEL
 for i from count down to 1:
-    pending = pendingWithdrawals[pendingWithdrawalHead + i - 1]
-    withdrawalQueueHash = keccak256(abi.encode(pending.toWithdrawal(), withdrawalQueueHash))
+    index = pendingWithdrawalHead + i - 1
+    withdrawalQueueHash = keccak256(abi.encode(pendingWithdrawals[index].toWithdrawal(), withdrawalQueueHash))
+for index in [pendingWithdrawalHead, pendingWithdrawalHead + count):
+    delete pendingWithdrawals[index]
 pendingWithdrawalHead += count
 ```
 
-Any storage representation is valid if it preserves these FIFO semantics with bounded execution and without shifting the unselected remainder, allowing an accumulated queue to drain in gas- and payload-bounded batches.
+The mapping and monotonic head/tail counters define the canonical EVM storage transition: consumed entries MUST be deleted individually and `pendingWithdrawalHead` MUST advance by `count`, with no whole-queue cleanup or compaction. Every consensus implementation MUST reproduce these storage writes and resulting state root. `pendingWithdrawalsCount()` returns `nextWithdrawalIndex - pendingWithdrawalHead`; `getPendingWithdrawals(offset, limit)` returns at most 256 entries starting at `pendingWithdrawalHead + offset`, and MUST revert when `limit > 256`.
 
 For `count == 0`, the call MUST produce `withdrawalQueueHash = bytes32(0)`, accept an empty `encryptedSenders` array, and leave pending withdrawals unchanged even when they exist. It still updates `lastBatch`, advances `withdrawalBatchIndex`, and remains a normal settlement capable of acknowledging deposit progress. Zero denotes no Portal queue entry; `EMPTY_SENTINEL` only terminates a non-empty hash chain.
 
@@ -698,7 +700,7 @@ outstandingRoots = finalizedNonEmptyRootCount - portalWithdrawalQueueHead
 
 This includes both occupied Portal slots and finalized-but-unsubmitted non-empty roots, and MUST remain at most `WITHDRAWAL_QUEUE_CAPACITY = 100`. A non-empty batch may be finalized only when `outstandingRoots < 100`; at `outstandingRoots >= 100` it MUST revert with `WithdrawalRootCapReached()` rather than silently selecting an empty root. Empty finalization, withdrawal requests, and failed-deposit bounce-backs MUST remain valid at the cap.
 
-Because the Portal head is monotonic and comes from consensus-finalized Tempo state, a lagging checkpoint can only overestimate pressure: it may delay non-empty finalization but MUST NOT admit an extra root. Genesis initializes both new state values to zero.
+Because the Portal head is monotonic and comes from consensus-finalized Tempo state, a lagging checkpoint can only overestimate pressure: it may delay non-empty finalization but MUST NOT admit an extra root. Genesis initializes `finalizedNonEmptyRootCount`, `pendingWithdrawalHead`, and `nextWithdrawalIndex` to zero.
 
 ### Withdrawal Queue
 
@@ -1615,6 +1617,19 @@ struct Withdrawal {
     bytes encryptedSender;      // ECDH-encrypted (sender, txHash), or empty
 }
 
+struct PendingWithdrawal {
+    address token;
+    address sender;
+    bytes32 txHash;
+    address to;
+    uint128 amount;
+    bytes32 memo;
+    uint64 gasLimit;
+    uint64 fallbackNonce;
+    bytes callbackData;
+    bytes revealTo;
+}
+
 struct Deposit {
     address token;
     address sender;
@@ -2065,6 +2080,7 @@ interface IZoneOutbox {
     function MAX_CALLBACK_DATA_SIZE() external view returns (uint256);
     function MAX_WITHDRAWAL_GAS_LIMIT() external view returns (uint64);
     function WITHDRAWAL_BASE_GAS() external view returns (uint64);
+    function MAX_PENDING_WITHDRAWALS_PER_PAGE() external view returns (uint256);
 
     event WithdrawalRequested(
         uint64 indexed withdrawalIndex, address indexed sender, address token, address to,
@@ -2085,6 +2101,7 @@ interface IZoneOutbox {
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
     error InvalidCurrentTxHash();
+    error PendingWithdrawalPageTooLarge();
     error WithdrawalRootCapReached();
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
@@ -2098,6 +2115,8 @@ interface IZoneOutbox {
     function pendingWithdrawalHead() external view returns (uint256);
     function lastBatch() external view returns (LastBatch memory);
     function pendingWithdrawalsCount() external view returns (uint256);
+    function getPendingWithdrawals(uint256 offset, uint256 limit)
+        external view returns (PendingWithdrawal[] memory);
     function maxWithdrawalsPerBlock() external view returns (uint32);
 
     function setTempoGasRate(uint128 _tempoGasRate) external;

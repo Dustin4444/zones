@@ -1175,6 +1175,9 @@ interface IZoneOutbox {
     /// @notice Base gas cost for processing a withdrawal on Tempo (excluding callback)
     function WITHDRAWAL_BASE_GAS() external view returns (uint64);
 
+    /// @notice Maximum number of pending withdrawals returned by one paginated read
+    function MAX_PENDING_WITHDRAWALS_PER_PAGE() external view returns (uint256);
+
     event WithdrawalRequested(
         uint64 indexed withdrawalIndex,
         address indexed sender,
@@ -1210,7 +1213,7 @@ interface IZoneOutbox {
     /// @notice Number of non-empty withdrawal roots finalized since genesis
     function finalizedNonEmptyRootCount() external view returns (uint256);
 
-    /// @notice Storage index of the oldest pending withdrawal
+    /// @notice Monotonic index of the oldest pending withdrawal
     function pendingWithdrawalHead() external view returns (uint256);
 
     /// @notice Resolve and delete a fallback recipient. Only callable by ZoneInbox.
@@ -1224,8 +1227,14 @@ interface IZoneOutbox {
     /// @notice Number of pending withdrawals
     function pendingWithdrawalsCount() external view returns (uint256);
 
-    /// @notice Pending withdrawals waiting to be finalized
-    function getPendingWithdrawals() external view returns (PendingWithdrawal[] memory);
+    /// @notice Return a bounded page of pending withdrawals in FIFO order
+    function getPendingWithdrawals(
+        uint256 offset,
+        uint256 limit
+    )
+        external
+        view
+        returns (PendingWithdrawal[] memory);
 
     /// @notice Timestamp of the latest withdrawal batch finalization
     function lastFinalizedTimestamp() external view returns (uint64);

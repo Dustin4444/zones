@@ -55,6 +55,9 @@ contract ZoneOutbox is IZoneOutbox {
     /// @dev compressed ephemeral pubkey (33) || nonce (12) || ciphertext (52) || tag (16)
     uint256 public constant AUTHENTICATED_WITHDRAWAL_CIPHERTEXT_LENGTH = 113;
 
+    /// @notice Maximum number of pending withdrawals returned by one paginated read
+    uint256 public constant MAX_PENDING_WITHDRAWALS_PER_PAGE = 256;
+
     /*//////////////////////////////////////////////////////////////
                                 STORAGE
     //////////////////////////////////////////////////////////////*/
@@ -91,8 +94,8 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Timestamp of the latest withdrawal batch finalization.
     uint64 public lastFinalizedTimestamp;
 
-    /// @notice Pending withdrawals waiting to be batched
-    PendingWithdrawal[] internal _pendingWithdrawals;
+    /// @notice Pending withdrawals keyed by their monotonic withdrawal index
+    mapping(uint256 withdrawalIndex => PendingWithdrawal) internal _pendingWithdrawals;
 
     /// @notice Last nonce assigned to a user withdrawal fallback recipient
     uint64 public lastFallbackNonce;
@@ -104,8 +107,8 @@ contract ZoneOutbox is IZoneOutbox {
     /// @dev Empty roots advance the batch index but do not increment this counter.
     uint256 public finalizedNonEmptyRootCount;
 
-    /// @notice Storage index of the oldest pending withdrawal
-    /// @dev Entries before this index have already been finalized and are ignored by getters.
+    /// @notice Monotonic index of the oldest pending withdrawal
+    /// @dev Entries before this index have already been finalized and deleted.
     uint256 public pendingWithdrawalHead;
 
     /*//////////////////////////////////////////////////////////////
@@ -123,6 +126,7 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidCurrentTxHash();
     error ZeroAmountWithdrawal();
     error InvalidWithdrawalCount(uint256 actual, uint256 maximum);
+    error PendingWithdrawalPageTooLarge();
     error WithdrawalRootCapReached();
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
@@ -317,27 +321,24 @@ contract ZoneOutbox is IZoneOutbox {
         // Burn the tokens (they'll be released on Tempo when withdrawal is processed).
         zoneToken.burn(totalBurn);
 
-        // Store withdrawal in pending array
+        // Store the withdrawal at the monotonic queue tail.
         uint64 fallbackNonce = ++lastFallbackNonce;
         _zoneFallbackRecipients[fallbackNonce] = zoneFallbackRecipient;
-        _pendingWithdrawals.push(
-            PendingWithdrawal({
-                token: token,
-                sender: msg.sender,
-                txHash: txHash,
-                to: to,
-                amount: amount,
-                memo: memo,
-                gasLimit: gasLimit,
-                fallbackNonce: fallbackNonce,
-                callbackData: data,
-                revealTo: revealTo
-            })
-        );
+        uint64 index = nextWithdrawalIndex++;
+        _pendingWithdrawals[index] = PendingWithdrawal({
+            token: token,
+            sender: msg.sender,
+            txHash: txHash,
+            to: to,
+            amount: amount,
+            memo: memo,
+            gasLimit: gasLimit,
+            fallbackNonce: fallbackNonce,
+            callbackData: data,
+            revealTo: revealTo
+        });
 
         // Emit event for observability
-        uint64 index = nextWithdrawalIndex++;
-
         emit WithdrawalRequested(
             index, msg.sender, token, to, amount, fee, memo, gasLimit, fallbackNonce, data, revealTo
         );
@@ -354,22 +355,20 @@ contract ZoneOutbox is IZoneOutbox {
     {
         if (msg.sender != ZONE_INBOX) revert OnlyZoneInbox();
 
-        _pendingWithdrawals.push(
-            PendingWithdrawal({
-                token: token,
-                sender: address(0),
-                txHash: bytes32(0),
-                to: tempoRefundRecipient,
-                amount: amount,
-                memo: bytes32(0),
-                gasLimit: 0,
-                fallbackNonce: 0,
-                callbackData: "",
-                revealTo: ""
-            })
-        );
-
         uint64 index = nextWithdrawalIndex++;
+        _pendingWithdrawals[index] = PendingWithdrawal({
+            token: token,
+            sender: address(0),
+            txHash: bytes32(0),
+            to: tempoRefundRecipient,
+            amount: amount,
+            memo: bytes32(0),
+            gasLimit: 0,
+            fallbackNonce: 0,
+            callbackData: "",
+            revealTo: ""
+        });
+
         emit WithdrawalRequested(
             index, address(0), token, tempoRefundRecipient, amount, 0, bytes32(0), 0, 0, "", ""
         );
@@ -425,7 +424,7 @@ contract ZoneOutbox is IZoneOutbox {
         if (blockNumber != uint64(block.number)) revert InvalidBlockNumber();
 
         uint256 head = pendingWithdrawalHead;
-        uint256 pending = _pendingWithdrawals.length - head;
+        uint256 pending = uint256(nextWithdrawalIndex) - head;
 
         if (count > pending) revert InvalidWithdrawalCount(count, pending);
         if (encryptedSenders.length != count) {
@@ -468,13 +467,7 @@ contract ZoneOutbox is IZoneOutbox {
             }
 
             finalizedNonEmptyRootCount += 1;
-            head += count;
-            if (head == _pendingWithdrawals.length) {
-                delete _pendingWithdrawals;
-                pendingWithdrawalHead = 0;
-            } else {
-                pendingWithdrawalHead = head;
-            }
+            pendingWithdrawalHead = head + count;
         }
 
         // Increment withdrawal batch index (matches Tempo portal's next expected withdrawal batch index)
@@ -509,17 +502,34 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Number of pending withdrawals
     function pendingWithdrawalsCount() external view returns (uint256) {
         if (msg.sender != address(0) && !_isSequencer(msg.sender)) revert OnlySequencer();
-        return _pendingWithdrawals.length - pendingWithdrawalHead;
+        return uint256(nextWithdrawalIndex) - pendingWithdrawalHead;
     }
 
-    /// @notice Pending withdrawals in FIFO order.
-    function getPendingWithdrawals() external view returns (PendingWithdrawal[] memory pending) {
+    /// @notice Return a bounded page of pending withdrawals in FIFO order.
+    /// @param offset Zero-based offset from the oldest pending withdrawal
+    /// @param limit Maximum number of withdrawals to return
+    function getPendingWithdrawals(
+        uint256 offset,
+        uint256 limit
+    )
+        external
+        view
+        returns (PendingWithdrawal[] memory pending)
+    {
         if (msg.sender != address(0) && !_isSequencer(msg.sender)) revert OnlySequencer();
-        uint256 head = pendingWithdrawalHead;
-        uint256 count = _pendingWithdrawals.length - head;
+        if (limit > MAX_PENDING_WITHDRAWALS_PER_PAGE) revert PendingWithdrawalPageTooLarge();
+
+        uint256 pendingCount = uint256(nextWithdrawalIndex) - pendingWithdrawalHead;
+        if (offset >= pendingCount || limit == 0) return new PendingWithdrawal[](0);
+
+        uint256 count = limit;
+        uint256 remaining = pendingCount - offset;
+        if (count > remaining) count = remaining;
+
         pending = new PendingWithdrawal[](count);
-        for (uint256 i = 0; i < count;) {
-            pending[i] = _pendingWithdrawals[head + i];
+        uint256 start = pendingWithdrawalHead + offset;
+        for (uint256 i; i < count;) {
+            pending[i] = _pendingWithdrawals[start + i];
             unchecked {
                 i++;
             }
