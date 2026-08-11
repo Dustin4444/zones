@@ -3846,16 +3846,13 @@ pub(crate) async fn start_real_p2p_cluster_with_active_nodes(
             vec![SecretKey::from(attestation_signers[0].credential())]
         };
         nodes.push(
-            ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval_and_decryption_keys(
-                l1.ws_url().to_string(),
-                portal_address,
-                chain_id,
-                Some(genesis.clone()),
-                attestation_signers[index].clone(),
-                withdrawal_batch_interval_blocks,
-                Some(config),
-                false,
-                additional_decryption_keys,
+            ZoneTestNode::launch(
+                ZoneTestLaunchConfig::new(l1.ws_url().to_string(), portal_address, chain_id)
+                    .with_genesis(genesis.clone())
+                    .with_sequencer_signer(attestation_signers[index].clone())
+                    .with_withdrawal_batch_interval(withdrawal_batch_interval_blocks)
+                    .with_p2p(config)
+                    .with_additional_decryption_keys(additional_decryption_keys),
             )
             .await?,
         );

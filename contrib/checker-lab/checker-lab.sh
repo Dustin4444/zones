@@ -304,16 +304,17 @@ start_zone() {
     if cast block-number --rpc-url "$ZONE_HTTP_URL" >/dev/null 2>&1; then
         die "$ZONE_HTTP_URL is already serving RPC but is not owned by the checker lab"
     fi
-    local portal zone_id creation_hash
+    local portal zone_id creation_hash sequencer_key_file
     portal="$(zone_metadata portal)"
     zone_id="$(zone_metadata zoneId)"
     creation_hash="$(zone_metadata portalCreationBlockHash)"
+    sequencer_key_file="$ZONE_DIR/sequencer.key"
+    [[ -f "$sequencer_key_file" ]] || die "Zone sequencer key file is missing; run 'up'"
     say "Starting Zone with checker observe mode; log: $ZONE_LOG"
     (
         cd "$ZONES_ROOT"
         export RUST_LOG="${RUST_LOG:-info,zone::checker=debug}"
         export RUST_LOG_STYLE=never
-        export SEQUENCER_KEY="$DEV_KEY"
         exec "$ZONE_BIN" node \
             --chain "$ZONE_DIR/genesis.json" \
             --datadir "$ZONE_DATADIR" \
@@ -324,6 +325,7 @@ start_zone() {
             --redacted-rpc.port "$ZONE_REDACTED_PORT" \
             --log.file.directory "$ZONE_DIR/logs" \
             --sequencer \
+            --sequencer-key-file "$sequencer_key_file" \
             --checker.mode observe \
             --checker.database-path "$CHECKER_DB" \
             --checker.portal-creation-block-hash "$creation_hash"

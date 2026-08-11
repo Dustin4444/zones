@@ -37,8 +37,8 @@ where
         .connect(&config.l1_rpc_url)
         .await?
         .erased();
-    let local = validate_local_configuration(&config, zone_chain_id, zone_provider)?;
     let l1_chain_id = l1_provider.get_chain_id().await?;
+    let local = validate_local_configuration(&config, l1_chain_id, zone_chain_id, zone_provider)?;
     let anchor = genesis_anchor(zone_provider, local.genesis())?;
     let anchor_header = acquire_anchor_header(&l1_provider, anchor).await?;
     let creation_header =

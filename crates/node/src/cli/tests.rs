@@ -4,7 +4,7 @@ use clap::Parser as _;
 
 use super::{
     Role, ZoneArgs, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
-    validate_l1_rpc_url, validate_portal_address,
+    validate_l1_rpc_url, validate_p2p_transaction_size_limit, validate_portal_address,
 };
 use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
@@ -23,26 +23,22 @@ fn portal_address_must_be_nonzero() {
 }
 
 #[test]
-fn zone_id_must_match_genesis_chain_id() {
-    let args = ZoneArgsParser::try_parse_from([
-        "tempo-zone",
-        "--l1.rpc-url",
-        "ws://localhost:8546",
-        "--l1.portal-address",
-        "0x0000000000000000000000000000000000000001",
-        "--zone.id",
-        "7",
-    ])
-    .unwrap()
-    .zone;
-    let expected = zone_primitives::constants::zone_chain_id(args.zone_id);
-
-    assert!(args.validate_zone_id(expected).is_ok());
-    assert!(args.validate_zone_id(expected + 1).is_err());
+fn manifest_mode_rejects_a_txpool_limit_above_the_p2p_wire_limit() {
+    assert!(
+        validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE).is_ok()
+    );
+    assert!(
+        validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
+            .is_err()
+    );
+    assert!(
+        validate_p2p_transaction_size_limit(false, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
+            .is_ok()
+    );
 }
 
 #[test]
-fn sequencer_key_file_is_accepted_and_conflicts_with_inline_key() {
+fn sequencer_key_file_is_accepted_and_inline_key_is_rejected() {
     let common = [
         "tempo-zone",
         "--l1.rpc-url",
@@ -61,16 +57,11 @@ fn sequencer_key_file_is_accepted_and_conflicts_with_inline_key() {
         parsed.zone.sequencer_key_file.as_deref(),
         Some(std::path::Path::new("/run/secrets/sequencer-key"))
     );
-    assert!(parsed.zone.sequencer_key.is_none());
 
-    let error = ZoneArgsParser::try_parse_from(common.into_iter().chain([
-        "--sequencer-key",
-        "0x01",
-        "--sequencer-key-file",
-        "/run/secrets/sequencer-key",
-    ]))
-    .unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let error =
+        ZoneArgsParser::try_parse_from(common.into_iter().chain(["--sequencer-key", "0x01"]))
+            .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -83,7 +74,7 @@ async fn loads_sequencer_key_from_file_with_trailing_newline() {
     )
     .unwrap();
 
-    let signer = load_sequencer_signer(None, Some(&path)).await.unwrap();
+    let signer = load_sequencer_signer(Some(&path)).await.unwrap();
     std::fs::remove_file(path).unwrap();
 
     assert_eq!(
@@ -149,13 +140,10 @@ async fn loads_sequencer_key_from_fifo() {
         .unwrap();
     });
 
-    let signer = tokio::time::timeout(
-        Duration::from_secs(2),
-        load_sequencer_signer(None, Some(&path)),
-    )
-    .await
-    .expect("FIFO read timed out")
-    .unwrap();
+    let signer = tokio::time::timeout(Duration::from_secs(2), load_sequencer_signer(Some(&path)))
+        .await
+        .expect("FIFO read timed out")
+        .unwrap();
     writer.join().unwrap();
     std::fs::remove_file(path).unwrap();
 
@@ -175,8 +163,6 @@ fn manifest_mode_requires_the_p2p_key_and_conflicts_with_legacy_sequencer() {
         "ws://localhost:8546",
         "--l1.portal-address",
         "0x0000000000000000000000000000000000000001",
-        "--sequencer-key",
-        "0x01",
     ];
 
     let missing_key = ZoneArgsParser::try_parse_from(
@@ -223,8 +209,8 @@ fn legacy_mode_still_accepts_the_sequencer_flag_without_a_manifest() {
         "ws://localhost:8546",
         "--l1.portal-address",
         "0x0000000000000000000000000000000000000001",
-        "--sequencer-key",
-        "0x01",
+        "--sequencer-key-file",
+        "/run/secrets/sequencer-key",
         "--sequencer",
     ])
     .unwrap();
@@ -240,8 +226,6 @@ fn zone_poll_interval_keeps_one_second_default_and_accepts_override() {
         "ws://localhost:8546",
         "--l1.portal-address",
         "0x0000000000000000000000000000000000000001",
-        "--sequencer-key",
-        "0x01",
     ];
 
     let default = ZoneArgsParser::try_parse_from(common).unwrap();
@@ -284,8 +268,6 @@ fn withdrawal_batch_gas_rejects_values_above_the_safe_limit() {
         "ws://localhost:8546",
         "--l1.portal-address",
         "0x0000000000000000000000000000000000000001",
-        "--sequencer-key",
-        "0x01",
         "--withdrawal-max-batch-gas",
         &above_limit,
     ])
@@ -301,8 +283,6 @@ fn p2p_ip_check_bypass_is_explicit_and_requires_manifest_mode() {
         "ws://localhost:8546",
         "--l1.portal-address",
         "0x0000000000000000000000000000000000000001",
-        "--sequencer-key",
-        "0x01",
     ];
 
     let without_manifest =
@@ -358,7 +338,6 @@ fn sequencer_role_argument_accepts_the_rpc_follower_spelling() {
     // A standby holds neither key. Requiredness is checked against the manifest after it is
     // read, so neither flag is a parse-time requirement.
     assert_eq!(parsed.zone.secp256k1_key, None);
-    assert_eq!(parsed.zone.sequencer_key, None);
     assert_eq!(parsed.zone.sequencer_key_file, None);
 }
 

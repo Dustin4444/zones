@@ -9,6 +9,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, CommandFactory, FromArgMatches};
+use reth_chainspec::EthChainSpec;
 use reth_consensus::noop::NoopConsensus;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
@@ -121,11 +122,9 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
         validate_l1_rpc_url(&args.l1_rpc_url)?;
         validate_portal_address(args.portal_address)?;
         let zone_chain_id = builder.config().chain.genesis().config.chain_id;
-        args.validate_zone_id(zone_chain_id)?;
         if matches!(action, NodeAction::BuildCheckpoint { .. }) {
             eyre::ensure!(
                 !args.enable_sequencer
-                    && args.sequencer_key.is_none()
                     && args.sequencer_key_file.is_none()
                     && args.sequencer_manifest.is_none()
                     && args.p2p_key.is_none()
