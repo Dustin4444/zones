@@ -323,10 +323,14 @@ mod tests {
             serve_block_number(second_stream, "0x2", false).await;
         });
 
-        let provider =
-            connect_l1_provider(&url, Duration::from_millis(10), PrivateKeySigner::random())
-                .await
-                .unwrap();
+        let provider = connect_l1_provider(
+            &url,
+            Duration::from_millis(10),
+            Address::ZERO,
+            PrivateKeySigner::random(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(provider.get_block_number().await.unwrap(), 1);
         assert_eq!(
