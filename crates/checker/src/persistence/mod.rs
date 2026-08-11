@@ -19,6 +19,7 @@ use schema::{Checkpoints, Findings, Journal, Meta, MetaKey, PersistenceTables};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -63,6 +64,59 @@ pub(crate) struct Persistence {
 }
 
 impl Persistence {
+    /// Create, verify, and atomically publish an initial checker database.
+    pub(crate) fn create_atomic(
+        target: &Path,
+        identity: Identity,
+        cut: ChainCut,
+        state: State,
+    ) -> Result<Snapshot> {
+        if target.exists() {
+            return Err(invalid("checkpoint target already exists"));
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| invalid("checkpoint target has no sibling directory"))?;
+        let name = target
+            .file_name()
+            .ok_or_else(|| invalid("checkpoint target has no directory name"))?;
+        let staging = parent.join(format!(
+            ".{}.staging-{}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)
+                .map_err(|error| invalid(format!("cannot remove checkpoint staging: {error}")))?;
+        }
+        fs::create_dir_all(&staging)
+            .map_err(|error| invalid(format!("cannot create checkpoint staging: {error}")))?;
+
+        let result = (|| {
+            let (store, snapshot) = Self::create(&staging, identity, cut, state)?;
+            drop(store);
+            let (reopened, verified) = Self::open(&staging, identity)?;
+            drop(reopened);
+            if snapshot != verified {
+                return Err(invalid("genesis checkpoint changed across final reopen"));
+            }
+            Ok(verified)
+        })();
+        match result {
+            Ok(snapshot) => {
+                fs::rename(&staging, target).map_err(|error| {
+                    let _ = fs::remove_dir_all(&staging);
+                    invalid(format!("cannot atomically publish checkpoint: {error}"))
+                })?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                Err(error)
+            }
+        }
+    }
+
     /// Read the authenticated identity from an existing checker database.
     /// This never creates or repairs a database and is intended for runtime
     /// preflight before opening the sole-writer handle.

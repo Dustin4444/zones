@@ -4,7 +4,6 @@
 
 mod adapter;
 mod bootstrap;
-mod builder;
 mod exex;
 mod kernel;
 mod observe;
@@ -21,7 +20,7 @@ use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
 use tempo_primitives::{Block, TempoPrimitives};
 
-pub use builder::build_checkpoint;
+pub use bootstrap::build_checkpoint;
 
 /// Runtime mode for the checker ExEx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
