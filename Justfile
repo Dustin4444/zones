@@ -864,7 +864,8 @@ deploy-zone name token="" access_enforced="false" gateway_enforced="false":
     echo "Step 5: Registering sequencer encryption key on ZonePortal..."
     PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
         --l1-rpc-url "$HTTP_RPC" \
-        --portal "$PORTAL"
+        --portal "$PORTAL" \
+        --encryption-private-key "$SEQUENCER_KEY"
     echo ""
 
     # Step 6: Display summary

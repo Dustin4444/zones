@@ -267,13 +267,14 @@ Encrypted deposits hide the recipient address and memo on-chain using ECIES encr
 # For manual setup:
 PRIVATE_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
   --portal "$L1_PORTAL_ADDRESS" \
-  --l1-rpc-url "$L1_RPC_URL"
+  --l1-rpc-url "$L1_RPC_URL" \
+  --encryption-private-key "$SEQUENCER_KEY"
 
 # To sign from the admin or an active sequencer but register a separate encryption public key:
-PRIVATE_KEY="$PORTAL_CALLER_KEY" ENCRYPTION_PRIVATE_KEY="$ENCRYPTION_KEY" \
-  cargo run -p tempo-xtask -- set-encryption-key \
+PRIVATE_KEY="$PORTAL_CALLER_KEY" cargo run -p tempo-xtask -- set-encryption-key \
     --portal "$L1_PORTAL_ADDRESS" \
-    --l1-rpc-url "$L1_RPC_URL"
+    --l1-rpc-url "$L1_RPC_URL" \
+    --encryption-private-key "$ENCRYPTION_KEY"
 
 # Send a deposit
 just send-deposit 1000000                       # to your own address
