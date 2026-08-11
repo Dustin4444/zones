@@ -27,6 +27,7 @@ import {
     PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
     PORTAL_PENDING_ADMIN_SLOT,
     PORTAL_ROLE_SLOT,
+    PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT,
     Role,
     Withdrawal,
     WithdrawalBounceBackDeposit,
@@ -986,6 +987,29 @@ contract ZonePortalTest is BaseTest {
             callbackData: callbackData,
             encryptedSender: ""
         });
+    }
+
+    function _failingCallbackWithdrawals(uint256 count)
+        internal
+        view
+        returns (Withdrawal[] memory withdrawals, bytes32 withdrawalHash)
+    {
+        withdrawals = new Withdrawal[](count);
+        withdrawalHash = EMPTY_SENTINEL;
+        for (uint256 i = count; i > 0; --i) {
+            Withdrawal memory withdrawal = _withdrawal(
+                address(pathUSD),
+                alice,
+                address(zoneGateway),
+                1,
+                bytes32("failing"),
+                1,
+                address(uint160(i)),
+                ""
+            );
+            withdrawals[i - 1] = withdrawal;
+            withdrawalHash = keccak256(abi.encode(withdrawal, withdrawalHash));
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2119,7 +2143,7 @@ contract ZonePortalTest is BaseTest {
         _deposit(portal, address(pathUSD), bob, 1, bytes32("reserved"), bob);
     }
 
-    function test_processWithdrawals_rejectsBatchAboveRemainingDepositCapacity() public {
+    function test_processWithdrawals_headRootAboveReserveRecoversThroughEmptyBatch() public {
         uint64 maximum = portal.MAX_UNPROCESSED_DEPOSITS();
         uint64 publicDepositLimit = maximum - 20;
         _setEncKeyWithPoP(ENC_KEY_1);
@@ -2131,15 +2155,10 @@ contract ZonePortalTest is BaseTest {
         }
         vm.stopPrank();
 
-        Withdrawal memory withdrawal =
-            _withdrawal(address(pathUSD), alice, bob, 1, bytes32("capacity"), 0, alice, "");
+        // All 21 callbacks fail reliably and each failure needs one bounce-back deposit slot.
         uint256 attempted = 21;
-        Withdrawal[] memory withdrawals = new Withdrawal[](attempted);
-        bytes32 withdrawalHash = EMPTY_SENTINEL;
-        for (uint256 i = attempted; i > 0; --i) {
-            withdrawals[i - 1] = withdrawal;
-            withdrawalHash = keccak256(abi.encode(withdrawal, withdrawalHash));
-        }
+        (Withdrawal[] memory withdrawals, bytes32 withdrawalHash) =
+            _failingCallbackWithdrawals(attempted);
 
         vm.roll(block.number + 1);
         _submitBatch(
@@ -2169,6 +2188,53 @@ contract ZonePortalTest is BaseTest {
 
         assertEq(portal.withdrawalQueueHead(), 0);
         assertEq(portal.withdrawalQueueSlot(0), withdrawalHash);
+
+        // Process the first 20, filling the reserve while leaving the 21st item in the head root.
+        uint256 reserve = 20;
+        Withdrawal[] memory firstTwenty = new Withdrawal[](reserve);
+        for (uint256 i; i < reserve; ++i) {
+            firstTwenty[i] = withdrawals[i];
+        }
+        Withdrawal memory finalWithdrawal = withdrawals[reserve];
+        bytes32 finalWithdrawalHash = keccak256(abi.encode(finalWithdrawal, EMPTY_SENTINEL));
+        portal.processWithdrawals(firstTwenty, finalWithdrawalHash);
+
+        assertEq(portal.depositCount(), maximum);
+        assertEq(portal.withdrawalQueueHead(), 0);
+        assertEq(portal.withdrawalQueueSlot(0), finalWithdrawalHash);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.WithdrawalBatchCapacityExceeded.selector, uint256(1), uint64(0)
+            )
+        );
+        portal.processWithdrawals(_singleWithdrawal(finalWithdrawal), bytes32(0));
+
+        // A normal empty-root settlement acknowledges all deposits without requiring the head
+        // root to be exhausted first, after which the final failing withdrawal can retire it.
+        bytes32 fullDepositQueueHash = portal.currentDepositQueueHash();
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("head-root-recovery")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: fullDepositQueueHash,
+                prevDepositNumber: 0,
+                nextDepositNumber: maximum
+            }),
+            bytes32(0),
+            "",
+            ""
+        );
+
+        assertEq(portal.lastProcessedDepositNumber(), maximum);
+        portal.processWithdrawals(_singleWithdrawal(finalWithdrawal), bytes32(0));
+        assertEq(portal.withdrawalQueueHead(), 1);
+        assertEq(portal.withdrawalQueueSlot(0), EMPTY_SENTINEL);
     }
 
     function test_deposit_hashChainStructure() public {
@@ -4947,6 +5013,7 @@ contract ZonePortalTest is BaseTest {
     ///        slot 3: currentDepositQueueHash (bytes32)
     ///        slot 4: deposit counters + bouncebackGas (uint64) [packed]
     ///        slot 5: _encryptionKeys.length (EncryptionKeyEntry[])
+    ///        slot 9: _withdrawalQueue.head
     ///        slot 15: zoneId (uint32) + messenger (address) [packed]
     ///        slot 16: verifier + _initialized + sequencerSetVersion + threshold [packed]
     ///        slot 17: zoneHeight
@@ -4995,6 +5062,17 @@ contract ZonePortalTest is BaseTest {
         // Before adding keys, length should be 0
         bytes32 slot5keys = vm.load(address(portal), PORTAL_ENCRYPTION_KEYS_SLOT);
         assertEq(uint256(slot5keys), 0, "slot 5: _encryptionKeys length should be 0 initially");
+
+        // --- Slot 9: _withdrawalQueue.head ---
+        uint256 testWithdrawalQueueHead = 7;
+        vm.store(
+            address(portal), PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT, bytes32(testWithdrawalQueueHead)
+        );
+        assertEq(
+            portal.withdrawalQueueHead(),
+            testWithdrawalQueueHead,
+            "slot 9: withdrawal queue head mismatch"
+        );
 
         // --- Slot 13: pendingAdmin ---
         // Nominate a new admin to get a non-zero pendingAdmin (rpcUrl at slot 12 is short,
@@ -5410,13 +5488,17 @@ contract ZonePortalTest is BaseTest {
         assertEq(pathUSD.balanceOf(bob), bobBalanceBefore + amount);
     }
 
-    /// @notice Submitting a batch reverts once the withdrawal queue is full.
-    function test_withdrawalQueue_revertsWhenFull() public {
+    /// @notice A full withdrawal ring and full deposit queue recover through an empty root.
+    function test_withdrawalQueue_fullRingAndDepositQueueRecoverThroughEmptyBatch() public {
         vm.roll(genesisTempoBlockNumber + 1);
-        uint256 i;
-        while (
-            portal.withdrawalQueueTail() - portal.withdrawalQueueHead() < WITHDRAWAL_QUEUE_CAPACITY
-        ) {
+
+        uint256 reserve = 20;
+        (Withdrawal[] memory failingWithdrawals, bytes32 failingRoot) =
+            _failingCallbackWithdrawals(reserve);
+
+        // The first slot can fill the entire bounce-back reserve; fill the other 99 slots too.
+        for (uint256 i; i < WITHDRAWAL_QUEUE_CAPACITY; ++i) {
+            bytes32 root = i == 0 ? failingRoot : keccak256(abi.encode("w", i));
             _submitBatch(
                 portal,
                 genesisTempoBlockNumber,
@@ -5426,38 +5508,100 @@ contract ZonePortalTest is BaseTest {
                 }),
                 DepositQueueTransition({
                     prevProcessedHash: bytes32(0),
-                    nextProcessedHash: portal.currentDepositQueueHash(),
+                    nextProcessedHash: bytes32(0),
                     prevDepositNumber: 0,
                     nextDepositNumber: 0
                 }),
-                keccak256(abi.encode("w", i)),
+                root,
                 "",
                 ""
             );
-            i++;
-            assertLe(i, WITHDRAWAL_QUEUE_CAPACITY);
         }
         assertEq(
             portal.withdrawalQueueTail() - portal.withdrawalQueueHead(), WITHDRAWAL_QUEUE_CAPACITY
         );
 
-        bytes32 prevBlockHash = portal.blockHash();
-        bytes32 depositQueueHash = portal.currentDepositQueueHash();
+        bytes32 fullRingBlockHash = portal.blockHash();
         vm.expectRevert(WithdrawalQueueLib.WithdrawalQueueFull.selector);
         _submitBatch(
             portal,
             genesisTempoBlockNumber,
             0,
-            BlockTransition({ prevBlockHash: prevBlockHash, nextBlockHash: keccak256("full") }),
-            DepositQueueTransition({
-                prevProcessedHash: bytes32(0),
-                nextProcessedHash: depositQueueHash,
-                prevDepositNumber: 0,
-                nextDepositNumber: 0
+            BlockTransition({
+                prevBlockHash: fullRingBlockHash, nextBlockHash: keccak256("overflow")
             }),
+            DepositQueueTransition({
+                    prevProcessedHash: bytes32(0),
+                    nextProcessedHash: bytes32(0),
+                    prevDepositNumber: 0,
+                    nextDepositNumber: 0
+                }),
             keccak256("overflow"),
             "",
             ""
+        );
+
+        uint64 maximum = portal.MAX_UNPROCESSED_DEPOSITS();
+        uint64 publicDepositLimit = maximum - uint64(reserve);
+        vm.startPrank(alice);
+        pathUSD.approve(address(portal), publicDepositLimit);
+        for (uint256 i; i < publicDepositLimit; ++i) {
+            _deposit(portal, address(pathUSD), alice, 1, bytes32(i), alice);
+        }
+        vm.stopPrank();
+
+        // Twenty failures fill the deposit queue and free one ring slot.
+        portal.processWithdrawals(failingWithdrawals, bytes32(0));
+        assertEq(portal.depositCount(), maximum);
+        assertEq(portal.withdrawalQueueHead(), 1);
+
+        // A root finalized when the head advanced can refill that slot without acknowledging
+        // deposits, reproducing the full-ring/full-deposit state at the protocol root cap.
+        _submitBatch(
+            portal,
+            genesisTempoBlockNumber,
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("replacement")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            keccak256("replacement"),
+            "",
+            ""
+        );
+        assertEq(
+            portal.withdrawalQueueTail() - portal.withdrawalQueueHead(), WITHDRAWAL_QUEUE_CAPACITY
+        );
+
+        // An empty root acknowledges all 230 deposits without consuming another ring slot.
+        uint256 tailBefore = portal.withdrawalQueueTail();
+        _submitBatch(
+            portal,
+            genesisTempoBlockNumber,
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("empty-recovery")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: portal.currentDepositQueueHash(),
+                prevDepositNumber: 0,
+                nextDepositNumber: maximum
+            }),
+            bytes32(0),
+            "",
+            ""
+        );
+
+        assertEq(portal.lastProcessedDepositNumber(), maximum);
+        assertEq(portal.withdrawalQueueTail(), tailBefore);
+        assertEq(
+            portal.withdrawalQueueTail() - portal.withdrawalQueueHead(), WITHDRAWAL_QUEUE_CAPACITY
         );
     }
 

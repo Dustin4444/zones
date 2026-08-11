@@ -133,7 +133,7 @@ Users transact on the zone privately. Balances, transfers, and transaction histo
 
 Zones rely on the following trust assumptions: the verifier must be sound for state transition integrity, the sequencer is trusted for liveness and data availability, and there is no forced inclusion or permissionless exit mechanism.
 
-When a user wants to exit, they request a withdrawal on the zone. Their tokens are burned on the zone side, and the withdrawal is added to a pending list. At the end of a batch, the sequencer finalizes all pending withdrawals into a hash chain and generates a proof covering the full batch of zone blocks. The sequencer submits this batch and proof to the portal on Tempo, which verifies the proof and queues the withdrawals. The sequencer then processes each withdrawal, releasing tokens from the portal to the recipient.
+When a user wants to exit, they request a withdrawal on the zone. Their tokens are burned on the zone side, and the withdrawal is appended to a pending FIFO. At the end of a batch, the sequencer may finalize a bounded number of oldest pending withdrawals into a hash chain, or explicitly finalize an empty root while leaving the FIFO untouched. The sequencer submits the batch and proof to the portal on Tempo, which verifies the proof and queues a non-empty root. The sequencer then processes each withdrawal, releasing tokens from the portal to the recipient. Protocol execution caps finalized-but-unprocessed non-empty roots at the portal's 100-slot capacity so an empty-root settlement always remains available to acknowledge deposits during congestion.
 
 ```mermaid
 sequenceDiagram
@@ -409,7 +409,7 @@ currentDepositQueueHash = keccak256(abi.encode(DepositType.Deposit, deposit, cur
 
 The newest deposit is always outermost, making onchain addition O(1). The zone tracks its own `processedDepositQueueHash` and `processedDepositNumber` in state. During `advanceTempo()`, the zone processes deposits oldest-first, rebuilding the hash chain and validating that the result matches `currentDepositQueueHash` read from Tempo L1 at the zone's finalized checkpoint.
 
-Each portal accepts at most `MAX_UNPROCESSED_DEPOSITS` deposits outstanding in its queue. Before appending a deposit or withdrawal bounce-back, the portal computes `depositCount - lastProcessedDepositNumber`; the append is rejected when that count has reached the applicable limit. Twenty slots are reserved for withdrawal bounce-backs, enough for one maximum-size sequencer withdrawal batch, so user deposits stop at `MAX_UNPROCESSED_DEPOSITS - 20`. This bounds the complete deposit vector below the Zone's `advanceTempo()` system gas budget.
+Each portal accepts at most `MAX_UNPROCESSED_DEPOSITS` deposits outstanding in its queue. Before appending a deposit or withdrawal bounce-back, the portal computes `depositCount - lastProcessedDepositNumber`; the append is rejected when that count has reached the applicable limit. Twenty slots are reserved for withdrawal bounce-backs, so user deposits stop at `MAX_UNPROCESSED_DEPOSITS - 20` and up to 20 failing withdrawals can append bounce-backs before another deposit acknowledgement is required. This bounds the complete deposit vector below the Zone's `advanceTempo()` system gas budget.
 
 `advanceTempo()` reads the portal's `currentDepositQueueHash` from Tempo L1 at the zone's finalized checkpoint. The call must process deposits through the current queue head: after rebuilding the hash chain, the resulting `processedDepositQueueHash` must equal the portal's `currentDepositQueueHash`. This check is binding and atomic: a mismatch reverts the entire system transaction, including the Tempo checkpoint advancement, token enablement, deposit mints, and any bounce-back side effects. The opening `advanceTempo` system transaction is also consensus-critical: if it reverts or halts for any reason, the containing zone block is invalid and must not be committed; it is not a valid block with a failed system-transaction receipt.
 
@@ -614,7 +614,7 @@ Withdrawal requests are bounded before they enter the pending queue. `gasLimit` 
 
 The sequencer can additionally configure `maxWithdrawalsPerBlock` on the outbox. A value of `0` means unlimited. When nonzero, only that many `requestWithdrawal` calls can be accepted in a single zone block; further requests in the same block revert with `TooManyWithdrawalsThisBlock` before any token transfer or burn. The outbox tracks the last block number counted and resets the per-block counter when `block.number` changes.
 
-The outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and stores the withdrawal in a pending array. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
+The outbox transfers `amount + fee` from the user via `transferFrom`, burns the tokens, assigns a monotonically increasing nonzero `uint64 fallbackNonce`, stores `fallbackNonce -> zoneFallbackRecipient`, and appends the withdrawal to a pending FIFO. A `pendingWithdrawalHead` index identifies the oldest unfinalized entry; finalized entries may be deleted or compacted without changing the consensus-visible FIFO order. The `WithdrawalRequested` event is emitted with the plaintext sender and fallback nonce (zone events are private).
 
 Keeping the recipient in zone state prevents the L1-visible withdrawal and any later bounce-back from revealing the user's private zone address. A monotonic nonce is deterministic under the zone's canonical transaction ordering, including multi-sequencer execution, while remaining collision-free; it reveals only relative withdrawal order and count, not the mapped recipient.
 
@@ -633,17 +633,37 @@ fee = (WITHDRAWAL_BASE_GAS + gasLimit) * tempoGasRate
 
 ### Withdrawal Batching
 
-A withdrawal batch ends with exactly one call to `finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)` on the `ZoneOutbox` in the final block of that batch. The block builder includes this as the last transaction using the zone system caller (`msg.sender == address(0)`), and the `blockNumber` argument must match the current zone block number. The encrypted-senders array carries one sequencer-supplied ciphertext per finalized withdrawal for [authenticated withdrawals](#authenticated-withdrawals) (empty bytes for withdrawals without `revealTo`); `senderTag` is recomputed by the outbox from the queued withdrawal sender, transaction hash, and fallback nonce. This constructs a hash chain from pending withdrawals in LIFO order (newest to oldest), so the oldest withdrawal ends up outermost, enabling FIFO processing on Tempo:
+A withdrawal batch ends with exactly one call to `finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)` on the `ZoneOutbox` in the final block of that batch. The block builder includes this as the last transaction using the zone system caller (`msg.sender == address(0)`), and `blockNumber` must match the current zone block. The encrypted-senders array MUST contain one sequencer-supplied ciphertext per selected withdrawal (empty bytes without `revealTo`); the outbox recomputes each `senderTag`.
+
+Let `pendingWithdrawalCount` be the number of entries at or after `pendingWithdrawalHead`. The call MUST accept `0 <= count <= pendingWithdrawalCount`. For `count > 0`, it MUST consume exactly the oldest `count` entries, preserve the remainder's order, and hash the selected withdrawals in reverse storage order so the oldest is processed first on Tempo:
 
 ```
 withdrawalQueueHash = EMPTY_SENTINEL
-for i from (count - 1) down to 0:
-    withdrawalQueueHash = keccak256(abi.encode(withdrawals[i], withdrawalQueueHash))
+for i from count down to 1:
+    pending = pendingWithdrawals[pendingWithdrawalHead + i - 1]
+    withdrawalQueueHash = keccak256(abi.encode(pending.toWithdrawal(), withdrawalQueueHash))
+pendingWithdrawalHead += count
 ```
 
-The function writes `withdrawalQueueHash` and `withdrawalBatchIndex` to `lastBatch` storage, where the proof reads them. The call is required at each batch boundary even if there are zero withdrawals (use `count = 0`) so the batch index advances. The `withdrawalBatchIndex` ensures batches are submitted in order, preventing the sequencer from omitting batches that contain withdrawals.
+Any storage representation is valid if it preserves these FIFO semantics with bounded execution and without shifting the unselected remainder, allowing an accumulated queue to drain in gas- and payload-bounded batches.
 
-Batch cadence is deterministic. It closes a batch when there are pending withdrawals or otherwise closes an empty batch at a block-number boundary. The default cadence is every 120th zone block (~1 minute at Tempo's expected 500 ms block interval), configurable as a block count. Intermediate zone blocks in the same batch do not call `finalizeWithdrawalBatch`.
+For `count == 0`, the call MUST produce `withdrawalQueueHash = bytes32(0)`, accept an empty `encryptedSenders` array, and leave pending withdrawals unchanged even when they exist. It still updates `lastBatch`, advances `withdrawalBatchIndex`, and remains a normal settlement capable of acknowledging deposit progress. Zero denotes no Portal queue entry; `EMPTY_SENTINEL` only terminates a non-empty hash chain.
+
+Every batch boundary requires this call. It writes `withdrawalQueueHash` and `withdrawalBatchIndex` to `lastBatch`, and the index advances for both empty and non-empty roots so a finalized batch cannot be omitted.
+
+### Finalized Root Capacity
+
+`ZoneOutbox` maintains a monotonic `uint256 finalizedNonEmptyRootCount`, initialized to zero. It MUST increment exactly once for a successful `count > 0` finalization and MUST NOT increment for an empty root; `withdrawalBatchIndex` cannot replace it because that index also counts empty roots.
+
+Before non-empty finalization, the outbox reads the Portal's `withdrawalQueueHead` from slot 9 through `TempoState` at the finalized Tempo checkpoint and computes:
+
+```
+outstandingRoots = finalizedNonEmptyRootCount - portalWithdrawalQueueHead
+```
+
+This includes both occupied Portal slots and finalized-but-unsubmitted non-empty roots, and MUST remain at most `WITHDRAWAL_QUEUE_CAPACITY = 100`. A non-empty batch may be finalized only when `outstandingRoots < 100`; at `outstandingRoots >= 100` it MUST revert with `WithdrawalRootCapReached()` rather than silently selecting an empty root. Empty finalization, withdrawal requests, and failed-deposit bounce-backs MUST remain valid at the cap.
+
+Because the Portal head is monotonic and comes from consensus-finalized Tempo state, a lagging checkpoint can only overestimate pressure: it may delay non-empty finalization but MUST NOT admit an extra root. Genesis initializes both new state values to zero.
 
 ### Withdrawal Queue
 
@@ -651,15 +671,38 @@ The portal stores withdrawals in a fixed-size ring buffer with `WITHDRAWAL_QUEUE
 
 The portal tracks `head` (oldest unprocessed batch) and `tail` (the logical index assigned to the next non-empty batch). Both are monotonically increasing counters that never wrap. The physical ring-buffer slot for a logical queue index is `index % 100`. `withdrawalQueueSlot(physicalSlot)` reads a physical slot, so clients resolving a pending logical index from an event must call `withdrawalQueueSlot(withdrawalQueueIndex % 100)`. Empty physical slots contain `EMPTY_SENTINEL` (`0xff...ff`) instead of `0x00` to avoid storage clearing and gas refund incentive issues.
 
-When `submitBatch` includes a non-zero `withdrawalQueueHash`, the current `tail` is assigned as its logical `withdrawalQueueIndex`, the hash is written to `slots[withdrawalQueueIndex % 100]`, and `tail` advances. `BatchSubmitted.withdrawalQueueIndex` emits that assigned logical index. For an empty batch, the event emits `NO_QUEUE_INDEX = type(uint256).max` and `tail` does not advance. The queue reverts with `WithdrawalQueueFull` if `tail - head >= 100`.
+When `submitBatch` includes a non-zero `withdrawalQueueHash`, the current `tail` is assigned as its logical `withdrawalQueueIndex`, the hash is written to `slots[withdrawalQueueIndex % 100]`, and `tail` advances. `BatchSubmitted.withdrawalQueueIndex` emits that assigned logical index. For an empty batch, the event emits `NO_QUEUE_INDEX = type(uint256).max` and `tail` does not advance. The queue reverts with `WithdrawalQueueFull` if `tail - head >= 100`; the finalized-root invariant guarantees every valid non-empty root eventually fits.
 
 ### Withdrawal Processing
 
 The sequencer processes ordered withdrawals atomically on Tempo by calling `processWithdrawals(withdrawals, remainingQueue)` on the portal. `remainingQueue` is the queue suffix after the last supplied withdrawal, or `0x00` when the call exhausts the current slot. The portal derives each intermediate queue hash by folding the withdrawals backward from that suffix, then verifies and processes them in order.
 
-Before each call, the portal bounds the attempted withdrawal count by the deposit-queue capacity that remains before the next Tempo batch can process deposits. Specifically, with `unprocessed = depositCount - lastProcessedDepositNumber` and `remainingCapacity = MAX_UNPROCESSED_DEPOSITS - unprocessed`, the call must satisfy `withdrawals.length <= remainingCapacity`. This conservative check assumes every attempted withdrawal fails and creates a bounce-back, so all possible side effects fit within the outstanding-deposit limit. A finalized withdrawal batch may therefore be split across multiple ordered `processWithdrawals` calls, each carrying the appropriate `remainingQueue`; if `remainingCapacity` is zero, the operator must first run `advanceTempo()` to process queued deposits and reopen capacity.
+Before each call, the portal bounds the attempted withdrawal count by the deposit-queue capacity that remains before the next Tempo batch can acknowledge deposits. Specifically, with `unprocessed = depositCount - lastProcessedDepositNumber` and `remainingCapacity = MAX_UNPROCESSED_DEPOSITS - unprocessed`, the call must satisfy `withdrawals.length <= remainingCapacity`. This conservative check assumes every attempted withdrawal fails and creates a bounce-back, so all possible side effects fit within the outstanding-deposit limit. A finalized withdrawal batch may therefore be split across multiple ordered `processWithdrawals` calls, each carrying the appropriate `remainingQueue`.
 
 The portal dequeues before executing the withdrawal, then independently requires `withdrawal.token` to be enabled. Failed callbacks roll back in an external self-call and become bounce-backs, so the dequeue remains committed and cannot block the FIFO. If `remainingQueue` is zero (last item in the slot), processing sets the slot to `EMPTY_SENTINEL` and advances `head`; otherwise it updates the slot to `remainingQueue`.
+
+### Congestion Recovery and Sequencer Guidance
+
+A full 100-slot withdrawal ring and a full 230-entry deposit queue would otherwise form a circular dependency: no withdrawal can be attempted because it might need a bounce-back deposit, while a deposit-acknowledging batch with a non-empty root cannot enter the full ring. The finalized-root cap prevents additional non-empty roots from accumulating behind the Portal, and explicit empty finalization supplies the required recovery transition:
+
+```
+full withdrawal ring + full deposit queue
+→ Zone processes the pending deposits
+→ sequencer finalizes an empty withdrawal root
+→ submitBatch acknowledges deposit progress without consuming a ring slot
+→ bounce-back deposit capacity reopens
+→ processWithdrawals resumes and eventually advances the Portal head
+→ sequencer finalizes the oldest pending withdrawals
+```
+
+An empty-root settlement is fully verified and may prove all ordinary state changes, including Tempo checkpoint and deposit progress. Recovery MUST also work when a head root exceeds the 20-withdrawal bounce-back reserve: after 20 failures fill the reserve without exhausting the root, an empty settlement can acknowledge those deposits before the head slot is freed.
+
+The following are operational policy rather than block-validity conditions:
+
+- At the root cap, the sequencer SHOULD produce an empty-root settlement when deposit progress can reopen bounce-back capacity; pending withdrawals alone SHOULD NOT force one every Zone block, and otherwise normal periodic cadence applies (120 blocks by default).
+- After the finalized Portal head advances, the sequencer SHOULD promptly finalize a substantial number of oldest pending withdrawals that fit gas and payload limits, rather than consistently selecting unnecessarily small batches.
+- Operators SHOULD prioritize `processWithdrawals` and useful deposit acknowledgements at the cap, and monitor root/deposit occupancy, failure rate, and time since head advancement.
+- Sequencers MAY adapt settlement frequency, withdrawal concurrency, fees, and deposits admitted through controlled RPCs or relayers. Direct Portal deposits bypass these controls, so admission policy is only an optimization.
 
 The sequencer first packs withdrawals into transactions using a configurable per-transaction gas budget, then submits them through a queue bounded by transaction count. Transactions use consecutive nonces on the dedicated withdrawal nonce key, preserving FIFO queue transitions even when later transactions are broadcast before earlier receipts arrive. If a submission reverts or cannot be confirmed, the sequencer stops admitting new transactions, drains those already submitted, then reconciles the on-chain queue and retries its unfinished suffix.
 
@@ -758,7 +801,7 @@ Each zone block contains system transactions and user transactions in a fixed or
 
 1. `ZoneInbox.advanceTempo(headers, deposits, decryptions, enabledTokens)` (required as the first transaction in every non-genesis block). Imports one or more consecutive finalized Tempo blocks, enables newly-bridged tokens, processes any pending deposits, and verifies encrypted deposit decryptions. The headers are ordered from oldest to newest; only the final header supplies the Tempo state root used by the rest of the call. All deposits in the call, including deposits enqueued in an intermediate imported Tempo block, use that final root for every Tempo state read and TIP-403 policy decision.
 2. User transactions, executed in order.
-3. `ZoneOutbox.finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)` (required in the final block of a batch, absent in intermediate blocks). Constructs the withdrawal hash chain from pending withdrawals, populates `encryptedSender` for authenticated withdrawals, and writes the `withdrawalQueueHash` and `withdrawalBatchIndex` to state. Must be called at each batch boundary even if there are zero withdrawals so the batch index advances. It is the unique final transaction and uses the zone system caller (`msg.sender == address(0)`).
+3. `ZoneOutbox.finalizeWithdrawalBatch(count, blockNumber, encryptedSenders)` (required in the final block of a batch, absent in intermediate blocks). Finalizes an explicit empty root or the oldest `count` pending withdrawals, populates `encryptedSender`, enforces the root cap against the finalized Portal head, and updates `lastBatch`. It remains required when `count == 0` and withdrawals are pending, advances the batch index, and is the unique final transaction from the zone system caller (`msg.sender == address(0)`).
 
 A batch covers one or more zone blocks and ends with exactly one `finalizeWithdrawalBatch` call. The bootstrap batch MUST contain at least two blocks. Its first block is the canonical genesis block, which contains no transactions, and every subsequent block follows the non-genesis rules above. This guarantees that the first submitted batch imports at least one finalized Tempo block, performs the corresponding Tempo state reads, and finalizes the withdrawal batch in a non-genesis block.
 
@@ -792,7 +835,7 @@ Zone execution differs from standard Tempo execution in three areas. These chang
 
 ## Tempo State Reads
 
-The zone reads all of its configuration from Tempo: the sequencer address, the token registry, the deposit queue hash, and TIP-403 policy state. These reads use the finalized Tempo checkpoint.
+The zone reads all of its configuration from Tempo: the sequencer address, the token registry, the deposit queue hash, the Portal withdrawal queue head, and TIP-403 policy state. These reads use the finalized Tempo checkpoint.
 
 ### TempoState Predeploy
 
@@ -818,7 +861,7 @@ Every non-genesis zone block must call `advanceTempo` exactly once as its first 
 
 ### L1 Storage Reads
 
-`ZoneInbox`, `ZoneOutbox`, and TIP-403 execution read Tempo account storage from the final block selected by the finalized checkpoint. Each read identifies a Tempo account and storage slot, and the zone node resolves the value through its finalized Tempo L1 provider. No state reads are performed against intermediate headers imported in the same zone block. In particular, every deposit in a multi-header `advanceTempo` call is evaluated against the final imported block, even when that deposit was enqueued by an earlier block in the imported range.
+`ZoneInbox`, `ZoneOutbox`, and TIP-403 execution read Tempo account storage from the final block selected by the finalized checkpoint. Each read identifies a Tempo account and storage slot, and the zone node resolves the value through its finalized Tempo L1 provider. No state reads are performed against intermediate headers imported in the same zone block. In particular, every deposit in a multi-header `advanceTempo` call is evaluated against the final imported block, even when that deposit was enqueued by an earlier block in the imported range. Non-empty withdrawal finalization reads `ZonePortal._withdrawalQueue.head` from slot 9 at this same final root; empty finalization performs no root-cap read.
 
 The prover validates each read against the Tempo state root from the final header in the corresponding zone block's header array and includes Merkle proofs for every account and storage slot accessed by system precompiles during the batch.
 
@@ -1181,8 +1224,10 @@ pub struct ZoneBlock {
     /// Must be empty only for the canonical genesis block.
     pub enabled_tokens: Vec<EnabledToken>,
 
-    /// Sequencer-only: finalize a batch (only in final block, must be last)
+    /// Sequencer-only: finalize a batch (only in final block, must be last).
     /// Required for the final block in a batch; must be absent in intermediate blocks.
+    /// Zero explicitly selects an empty root even if pending withdrawals exist;
+    /// a nonzero value selects that many oldest pending withdrawals.
     /// Uses U256 to match Solidity `finalizeWithdrawalBatch(uint256 count)`.
     pub finalize_withdrawal_batch_count: Option<U256>,
 
@@ -1320,7 +1365,7 @@ The stateless execution function must reject the witness on any failed check, mi
    Run each user transaction against the materialized zone state using the current block environment. Whenever execution performs a Tempo L1 storage read, satisfy it by locating the corresponding `L1StateRead`, proving it against the Tempo root currently bound for this block, and requiring the decoded value to match the witness entry. Any zone-state or Tempo-state access not covered by the witness is an error. `ZoneOutbox.requestWithdrawal` execution must include the `maxWithdrawalsPerBlock` state machine exactly, including the `block.number`-based counter reset, because rejected withdrawal requests must not enter the pending queue or contribute to `withdrawal_queue_hash`.
 
 8. **Execute `finalizeWithdrawalBatch` at the end of the final block.**
-   If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_batch_encrypted_senders)` as the final zone system transaction after all user transactions in that block. This call uses the zone system caller (`msg.sender == address(0)`) and must update the outbox's last-batch state and compute the `withdrawal_queue_hash` committed by the batch. The encrypted-sender array is derived deterministically as specified in [Authenticated Withdrawals](#authenticated-withdrawals), and it is part of each public `Withdrawal` encoded into the withdrawal hash chain. Intermediate blocks must not execute this call.
+   If `finalize_withdrawal_batch_count` is present, execute `ZoneOutbox.finalizeWithdrawalBatch(count, block.number, finalize_withdrawal_batch_encrypted_senders)` as the final zone system transaction after all user transactions in that block. This call uses the zone system caller (`msg.sender == address(0)`). Require `count <= pendingWithdrawalCount` and require the encrypted-sender array length to equal `count`. For zero, preserve the pending FIFO, leave `finalizedNonEmptyRootCount` unchanged, and commit a zero root while advancing the batch index. For nonzero, verify the Portal head read at the active finalized Tempo root, require `finalizedNonEmptyRootCount - portalHead < 100`, consume exactly the oldest `count` entries, and increment `finalizedNonEmptyRootCount` once. The encrypted-sender array is derived deterministically as specified in [Authenticated Withdrawals](#authenticated-withdrawals), and each entry is part of its selected public `Withdrawal` in the hash chain. Intermediate blocks must not execute this call.
 
 9. **Compute the resulting block header and carry it forward.**
     After block execution, use the canonical Tempo block assembler and the active Tempo fork rules to derive the complete `TempoHeader`, including the transaction root, receipt root, logs bloom, state root, gas fields, millisecond timestamp, and applicable optional fields. Compute `next_block_hash` with Tempo's canonical header hash function, then set `prev_block_hash = next_block_hash` and `prev_header = header` before moving to the next block.
@@ -1336,7 +1381,7 @@ The stateless execution function must reject the witness on any failed check, mi
 
 ### Tempo State Witness
 
-System contracts read Tempo state during execution (deposit queue hash, sequencer address, token registry, TIP-403 policies). `BatchStateProof` applies the [shared trie proof format](#shared-trie-proof-format) to the final Tempo root imported by the current zone block's required `advanceTempo` call. The witness includes a `BatchStateProof` containing:
+System contracts read Tempo state during execution (deposit queue hash, Portal withdrawal queue head, sequencer address, token registry, TIP-403 policies). `BatchStateProof` applies the [shared trie proof format](#shared-trie-proof-format) to the final Tempo root imported by the current zone block's required `advanceTempo` call. The witness includes a `BatchStateProof` containing:
 
 - The RLP-encoded header for the initially bound Tempo checkpoint. Its hash and block number must match the `TempoState` values in the initial zone state.
 - A deduplicated `node_pool` of raw RLP-encoded MPT nodes. The prover computes `keccak256(rlp(node))` for each entry and builds a hash-to-node index.
@@ -1987,6 +2032,7 @@ interface IZoneOutbox {
     error TooManyWithdrawalsThisBlock();
     error InvalidRevealTo();
     error InvalidCurrentTxHash();
+    error WithdrawalRootCapReached();
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
     error GasLimitTooHigh();
@@ -1995,6 +2041,8 @@ interface IZoneOutbox {
     function tempoGasRate() external view returns (uint128);
     function nextWithdrawalIndex() external view returns (uint64);
     function lastFallbackNonce() external view returns (uint64);
+    function finalizedNonEmptyRootCount() external view returns (uint256);
+    function pendingWithdrawalHead() external view returns (uint256);
     function lastBatch() external view returns (LastBatch memory);
     function pendingWithdrawalsCount() external view returns (uint256);
     function maxWithdrawalsPerBlock() external view returns (uint32);

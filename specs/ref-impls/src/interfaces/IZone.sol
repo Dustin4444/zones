@@ -366,6 +366,7 @@ bytes32 constant PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT = bytes32(uint256(3));
 bytes32 constant PORTAL_ENCRYPTION_KEYS_SLOT = bytes32(uint256(5));
 bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(6));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(7));
+bytes32 constant PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT = bytes32(uint256(9));
 bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(13));
 bytes32 constant PORTAL_IS_SEQUENCER_SLOT = bytes32(uint256(19));
 bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(PORTAL_IS_SEQUENCER_SLOT) + 1);
@@ -1206,6 +1207,12 @@ interface IZoneOutbox {
     /// @notice Last nonce assigned to a user withdrawal fallback recipient
     function lastFallbackNonce() external view returns (uint64);
 
+    /// @notice Number of non-empty withdrawal roots finalized since genesis
+    function finalizedNonEmptyRootCount() external view returns (uint256);
+
+    /// @notice Storage index of the oldest pending withdrawal
+    function pendingWithdrawalHead() external view returns (uint256);
+
     /// @notice Resolve and delete a fallback recipient. Only callable by ZoneInbox.
     function consumeFallbackRecipient(uint64 fallbackNonce)
         external
@@ -1264,11 +1271,12 @@ interface IZoneOutbox {
     )
         external;
 
-    /// @notice Finalize batch at end of block - build withdrawal hash and write to state
-    /// @dev Only callable by sequencer. Required per batch. `count` must equal
-    ///      the current pending withdrawal count (including 0 for an empty batch).
+    /// @notice Finalize the batch at end of block and write its withdrawal hash to state
+    /// @dev Only callable by sequencer. Required per batch. `count` may be zero even while
+    ///      withdrawals are pending, and otherwise must not exceed the pending count.
+    ///      Non-empty finalization is rejected while 100 non-empty roots remain unprocessed.
     ///      Writes withdrawal batch parameters to lastBatch storage for proof access.
-    /// @param count The number of pending withdrawals to process
+    /// @param count The number of oldest pending withdrawals to process
     /// @return withdrawalQueueHash The hash chain (0 if no withdrawals)
     function finalizeWithdrawalBatch(
         uint256 count,

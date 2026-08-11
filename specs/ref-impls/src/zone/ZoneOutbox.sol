@@ -15,6 +15,7 @@ import {
     PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
     PORTAL_ROLE_SLOT,
     PORTAL_TOKEN_CONFIGS_SLOT,
+    PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT,
     PendingWithdrawal,
     Role,
     Withdrawal,
@@ -23,7 +24,7 @@ import {
 } from "../interfaces/IZone.sol";
 
 import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
-import { EMPTY_SENTINEL } from "../libraries/WithdrawalQueueLib.sol";
+import { EMPTY_SENTINEL, WITHDRAWAL_QUEUE_CAPACITY } from "../libraries/WithdrawalQueueLib.sol";
 
 /// @title ZoneOutbox
 /// @notice Zone-side predeploy for requesting withdrawals back to Tempo
@@ -99,6 +100,14 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Private fallback recipient lookup used when an L1 withdrawal bounces back
     mapping(uint64 fallbackNonce => address zoneFallbackRecipient) internal _zoneFallbackRecipients;
 
+    /// @notice Number of non-empty withdrawal roots finalized since genesis
+    /// @dev Empty roots advance the batch index but do not increment this counter.
+    uint256 public finalizedNonEmptyRootCount;
+
+    /// @notice Storage index of the oldest pending withdrawal
+    /// @dev Entries before this index have already been finalized and are ignored by getters.
+    uint256 public pendingWithdrawalHead;
+
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -113,7 +122,8 @@ contract ZoneOutbox is IZoneOutbox {
     error InvalidRevealTo();
     error InvalidCurrentTxHash();
     error ZeroAmountWithdrawal();
-    error InvalidWithdrawalCount(uint256 actual, uint256 expected);
+    error InvalidWithdrawalCount(uint256 actual, uint256 maximum);
+    error WithdrawalRootCapReached();
     error InvalidEncryptedSenderCount(uint256 actual, uint256 expected);
     error InvalidEncryptedSenderLength(uint256 actual, uint256 expected);
     error GasLimitTooHigh();
@@ -385,11 +395,11 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Finalize the batch at end of block - build withdrawal hash and emit proof inputs
     /// @dev Only callable by sequencer at the end of a block.
     ///      The proof enforces that this is the last call in the block and that a batch
-    ///      ends with exactly one finalizeWithdrawalBatch call. `count` must equal the
-    ///      current pending withdrawal count (including 0 if no withdrawals).
+    ///      ends with exactly one finalizeWithdrawalBatch call. `count` may be zero and must not
+    ///      exceed the pending withdrawal count; nonzero selects the oldest `count` withdrawals.
     ///      Protocol and proof enforce this runs at the end of the final block in the batch.
     ///      Emits BatchFinalized for observability (proof reads from state).
-    /// @param count Number of pending withdrawals to process
+    /// @param count Number of oldest pending withdrawals to process
     /// @param encryptedSenders One ciphertext per finalized withdrawal (empty for plaintext withdrawals)
     /// @return withdrawalQueueHash The hash chain (0 if no withdrawals)
     function finalizeWithdrawalBatch(
@@ -414,22 +424,28 @@ contract ZoneOutbox is IZoneOutbox {
         if (msg.sender != address(0) && !_isSequencer(msg.sender)) revert OnlySequencer();
         if (blockNumber != uint64(block.number)) revert InvalidBlockNumber();
 
-        uint256 pending = _pendingWithdrawals.length;
+        uint256 head = pendingWithdrawalHead;
+        uint256 pending = _pendingWithdrawals.length - head;
 
-        if (count != pending) revert InvalidWithdrawalCount(count, pending);
+        if (count > pending) revert InvalidWithdrawalCount(count, pending);
         if (encryptedSenders.length != count) {
             revert InvalidEncryptedSenderCount(encryptedSenders.length, count);
         }
-
-        // Build hash chain in reverse order (newest to oldest)
-        // So oldest ends up outermost, matching Tempo expectations.
-        // Process the oldest withdrawals first (FIFO).
+        // Build the hash chain in reverse order (newest selected to oldest selected).
+        // The oldest selected withdrawal ends up outermost, matching Tempo expectations.
+        // Empty finalization leaves the pending FIFO untouched.
         if (count > 0) {
+            uint256 portalHead = uint256(_readPortal(PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT));
+            if (finalizedNonEmptyRootCount - portalHead >= WITHDRAWAL_QUEUE_CAPACITY) {
+                revert WithdrawalRootCapReached();
+            }
+
             withdrawalQueueHash = EMPTY_SENTINEL;
 
             for (uint256 i = count; i > 0;) {
                 uint256 index = i - 1;
-                PendingWithdrawal memory pendingWithdrawal = _pendingWithdrawals[index];
+                uint256 storageIndex = head + index;
+                PendingWithdrawal memory pendingWithdrawal = _pendingWithdrawals[storageIndex];
                 bytes memory encryptedSender = encryptedSenders[index];
                 _validateEncryptedSender(pendingWithdrawal.revealTo, encryptedSender);
 
@@ -445,13 +461,20 @@ contract ZoneOutbox is IZoneOutbox {
                     encryptedSender: encryptedSender
                 });
                 withdrawalQueueHash = keccak256(abi.encode(w, withdrawalQueueHash));
-                delete _pendingWithdrawals[index];
+                delete _pendingWithdrawals[storageIndex];
                 unchecked {
                     i--;
                 }
             }
 
-            delete _pendingWithdrawals;
+            finalizedNonEmptyRootCount += 1;
+            head += count;
+            if (head == _pendingWithdrawals.length) {
+                delete _pendingWithdrawals;
+                pendingWithdrawalHead = 0;
+            } else {
+                pendingWithdrawalHead = head;
+            }
         }
 
         // Increment withdrawal batch index (matches Tempo portal's next expected withdrawal batch index)
@@ -486,16 +509,17 @@ contract ZoneOutbox is IZoneOutbox {
     /// @notice Number of pending withdrawals
     function pendingWithdrawalsCount() external view returns (uint256) {
         if (msg.sender != address(0) && !_isSequencer(msg.sender)) revert OnlySequencer();
-        return _pendingWithdrawals.length;
+        return _pendingWithdrawals.length - pendingWithdrawalHead;
     }
 
     /// @notice Pending withdrawals in FIFO order.
     function getPendingWithdrawals() external view returns (PendingWithdrawal[] memory pending) {
         if (msg.sender != address(0) && !_isSequencer(msg.sender)) revert OnlySequencer();
-        uint256 count = _pendingWithdrawals.length;
+        uint256 head = pendingWithdrawalHead;
+        uint256 count = _pendingWithdrawals.length - head;
         pending = new PendingWithdrawal[](count);
         for (uint256 i = 0; i < count;) {
-            pending[i] = _pendingWithdrawals[i];
+            pending[i] = _pendingWithdrawals[head + i];
             unchecked {
                 i++;
             }

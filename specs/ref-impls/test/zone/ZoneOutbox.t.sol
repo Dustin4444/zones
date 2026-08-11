@@ -8,12 +8,16 @@ import {
     LastBatch,
     PORTAL_ACCESS_MODE_SLOT,
     PORTAL_IS_SEQUENCER_SLOT,
+    PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT,
     PendingWithdrawal,
     Withdrawal,
     ZONE_INBOX,
     ZONE_TX_CONTEXT
 } from "../../src/interfaces/IZone.sol";
-import { EMPTY_SENTINEL } from "../../src/libraries/WithdrawalQueueLib.sol";
+import {
+    EMPTY_SENTINEL,
+    WITHDRAWAL_QUEUE_CAPACITY
+} from "../../src/libraries/WithdrawalQueueLib.sol";
 import { ZoneInbox } from "../../src/zone/ZoneInbox.sol";
 import { ZoneOutbox } from "../../src/zone/ZoneOutbox.sol";
 import { MockTempoState } from "../mocks/MockTempoState.sol";
@@ -387,21 +391,20 @@ contract ZoneOutboxTest is Test {
         assertEq(hash, bytes32(0));
     }
 
-    function test_finalizeWithdrawalBatch_zeroCountWithPending_reverts() public {
-        // Add a withdrawal
+    function test_finalizeWithdrawalBatch_zeroCountWithPending_preservesFifo() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 500e6);
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32(0), 0, alice, "");
         vm.stopPrank();
 
-        assertEq(_pendingWithdrawalsCount(), 1);
+        PendingWithdrawal[] memory beforePending = _getPendingWithdrawals();
+        assertEq(_finalizeWithdrawalBatch(0), bytes32(0));
+        assertEq(_finalizeWithdrawalBatch(0), bytes32(0));
 
-        bytes[] memory encryptedSenders = new bytes[](0);
-
-        vm.prank(sequencer);
-        vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 0, 1));
-        outbox.finalizeWithdrawalBatch(0, uint64(block.number), encryptedSenders);
         assertEq(_pendingWithdrawalsCount(), 1);
+        assertEq(_getPendingWithdrawals()[0].txHash, beforePending[0].txHash);
+        assertEq(outbox.lastBatch().withdrawalBatchIndex, 2);
+        assertEq(outbox.finalizedNonEmptyRootCount(), 0);
     }
 
     function test_finalizeWithdrawalBatch_singleWithdrawal_correctHash() public {
@@ -463,22 +466,72 @@ contract ZoneOutboxTest is Test {
         assertEq(_pendingWithdrawalsCount(), 0);
     }
 
-    function test_finalizeWithdrawalBatch_partialBatch_reverts() public {
-        // Add 3 withdrawals
+    function test_finalizeWithdrawalBatch_partialBatch_consumesOldestWithdrawals() public {
         vm.startPrank(alice);
-        zoneToken.approve(address(outbox), 1500e6);
+        zoneToken.approve(address(outbox), 2500e6);
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w1"), 0, alice, "");
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w2"), 0, alice, "");
         outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w3"), 0, alice, "");
+        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w4"), 0, alice, "");
+        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w5"), 0, alice, "");
         vm.stopPrank();
 
-        assertEq(_pendingWithdrawalsCount(), 3);
+        Withdrawal memory w1 = _withdrawal(1, alice, alice, 500e6, bytes32("w1"), 0, alice, "");
+        Withdrawal memory w2 = _withdrawal(2, alice, alice, 500e6, bytes32("w2"), 0, alice, "");
+        bytes32 expectedHash = keccak256(abi.encode(w1, keccak256(abi.encode(w2, EMPTY_SENTINEL))));
 
-        bytes[] memory encryptedSenders = new bytes[](2);
-        vm.prank(sequencer);
-        vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 2, 3));
-        outbox.finalizeWithdrawalBatch(2, uint64(block.number), encryptedSenders);
+        assertEq(_finalizeWithdrawalBatch(2), expectedHash);
         assertEq(_pendingWithdrawalsCount(), 3);
+        assertEq(outbox.pendingWithdrawalHead(), 2);
+        PendingWithdrawal[] memory pending = _getPendingWithdrawals();
+        assertEq(pending[0].memo, bytes32("w3"));
+        assertEq(pending[1].memo, bytes32("w4"));
+        assertEq(pending[2].memo, bytes32("w5"));
+
+        Withdrawal memory w3 = _withdrawal(3, alice, alice, 500e6, bytes32("w3"), 0, alice, "");
+        Withdrawal memory w4 = _withdrawal(4, alice, alice, 500e6, bytes32("w4"), 0, alice, "");
+        Withdrawal memory w5 = _withdrawal(5, alice, alice, 500e6, bytes32("w5"), 0, alice, "");
+        bytes32 remainingHash = keccak256(
+            abi.encode(w3, keccak256(abi.encode(w4, keccak256(abi.encode(w5, EMPTY_SENTINEL)))))
+        );
+        assertEq(_finalizeWithdrawalBatch(3), remainingHash);
+        assertEq(_pendingWithdrawalsCount(), 0);
+        assertEq(outbox.pendingWithdrawalHead(), 0);
+    }
+
+    function test_finalizeWithdrawalBatch_enforcesOutstandingRootCapAndAllowsRecovery() public {
+        uint256 cap = WITHDRAWAL_QUEUE_CAPACITY;
+        assertEq(cap, 100);
+
+        vm.prank(alice);
+        zoneToken.approve(address(outbox), uint256(cap + 2));
+
+        for (uint256 i = 0; i < cap; i++) {
+            vm.prank(alice);
+            outbox.requestWithdrawal(address(zoneToken), bob, 1, bytes32(i), 0, alice, "");
+            _finalizeWithdrawalBatch(1);
+        }
+
+        assertEq(outbox.finalizedNonEmptyRootCount(), cap);
+
+        vm.prank(alice);
+        outbox.requestWithdrawal(address(zoneToken), bob, 1, bytes32("at-cap"), 0, alice, "");
+
+        // A stale finalized view still at head zero safely blocks another non-empty root.
+        vm.expectRevert(ZoneOutbox.WithdrawalRootCapReached.selector);
+        _finalizeWithdrawalBatch(1);
+
+        // Empty settlement remains available and preserves the pending withdrawal.
+        assertEq(_finalizeWithdrawalBatch(0), bytes32(0));
+        assertEq(_pendingWithdrawalsCount(), 1);
+        assertEq(outbox.finalizedNonEmptyRootCount(), cap);
+
+        // Once the finalized Portal head advances, exactly one new non-empty root fits.
+        tempoState.setMockStorageValue(
+            mockPortal, PORTAL_WITHDRAWAL_QUEUE_HEAD_SLOT, bytes32(uint256(1))
+        );
+        assertTrue(_finalizeWithdrawalBatch(1) != bytes32(0));
+        assertEq(outbox.finalizedNonEmptyRootCount(), cap + 1);
     }
 
     function test_finalizeWithdrawalBatch_exactCountProcessesAllInFifoOrder() public {
@@ -1053,25 +1106,6 @@ contract ZoneOutboxTest is Test {
         assertEq(hash, expectedHash);
     }
 
-    function test_finalizeWithdrawalBatch_partialBatchDoesNotLeaveRemainder_reverts() public {
-        vm.startPrank(alice);
-        zoneToken.approve(address(outbox), 5000e6);
-        outbox.requestWithdrawal(address(zoneToken), alice, 100e6, bytes32("w1"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 200e6, bytes32("w2"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 300e6, bytes32("w3"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 400e6, bytes32("w4"), 0, alice, "");
-        outbox.requestWithdrawal(address(zoneToken), alice, 500e6, bytes32("w5"), 0, alice, "");
-        vm.stopPrank();
-
-        assertEq(_pendingWithdrawalsCount(), 5);
-
-        bytes[] memory encryptedSenders = new bytes[](2);
-        vm.prank(sequencer);
-        vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 2, 5));
-        outbox.finalizeWithdrawalBatch(2, uint64(block.number), encryptedSenders);
-        assertEq(_pendingWithdrawalsCount(), 5);
-    }
-
     function test_finalizeWithdrawalBatch_countLargerThanPending_reverts() public {
         vm.startPrank(alice);
         zoneToken.approve(address(outbox), 1000e6);
@@ -1370,21 +1404,6 @@ contract ZoneOutboxTest is Test {
             uint128 expected = uint128(outbox.WITHDRAWAL_BASE_GAS() + gasLimit) * tempoGasRate;
             assertEq(outbox.calculateWithdrawalFee(gasLimit), expected);
         }
-    }
-
-    /// @notice Zero-count finalization with pending withdrawals reverts.
-    function test_finalizeWithdrawalBatch_zeroCountWithPending_doesNotAdvance() public {
-        vm.startPrank(alice);
-        zoneToken.approve(address(outbox), 500e6);
-        outbox.requestWithdrawal(address(zoneToken), bob, 500e6, bytes32(0), 0, alice, "");
-        vm.stopPrank();
-
-        bytes[] memory encryptedSenders = new bytes[](0);
-        vm.prank(sequencer);
-        vm.expectRevert(abi.encodeWithSelector(ZoneOutbox.InvalidWithdrawalCount.selector, 0, 1));
-        outbox.finalizeWithdrawalBatch(0, uint64(block.number), encryptedSenders);
-        assertEq(_pendingWithdrawalsCount(), 1);
-        assertEq(outbox.lastBatch().withdrawalBatchIndex, 0);
     }
 
     /// @notice Zero gas limit withdrawals still store callback data in the hash.
