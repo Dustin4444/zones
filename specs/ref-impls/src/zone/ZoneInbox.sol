@@ -195,18 +195,15 @@ contract ZoneInbox is IZoneInbox {
 
     /// @notice Advance Tempo state and process deposits in a single system transaction
     /// @dev This is the main entry point for the sequencer's system transaction.
-    ///      1. Advances the zone's view of Tempo by processing the header array
-    ///      2. Processes deposits from the unified queue (regular + encrypted)
-    ///      3. Validates the resulting hash chain equals Tempo's currentDepositQueueHash
-    ///      The proof and system call require exact equality with the final queue head.
+    ///      1. Advances the zone's view of Tempo by processing the header
+    ///      2. Processes user deposits and internal withdrawal bounce-backs
+    ///      3. Requires the resulting hash chain to equal Tempo's currentDepositQueueHash
     ///      Protocol and proof enforce at most one call at the start of a block (or zero if skipping).
-    /// @param headers Ordered RLP-encoded Tempo block headers; only the final
-    ///        header's state root is used for every Tempo read in this call, including
-    ///        TIP-403 policy resolution for every deposit; no per-header policy snapshots exist
-    /// @param deposits Array of queued deposits to process (oldest first, must be contiguous)
+    /// @param header RLP-encoded Tempo block header
+    /// @param deposits All queued deposits through the current head, oldest first
     /// @param decryptions Decryption data for valid user deposits, in order
     function advanceTempo(
-        bytes[] calldata headers,
+        bytes calldata header,
         QueuedDeposit[] calldata deposits,
         DecryptionData[] calldata decryptions,
         EnabledToken[] calldata enabledTokens
@@ -216,7 +213,7 @@ contract ZoneInbox is IZoneInbox {
         if (msg.sender != address(0)) revert OnlySequencer();
 
         // Step 1: Advance Tempo state (validates chain continuity internally)
-        _tempoState.finalizeTempo(headers);
+        _tempoState.finalizeTempo(header);
 
         // Activate new tokens directly in the Inbox.
         for (uint256 i = 0; i < enabledTokens.length; i++) {
@@ -338,8 +335,8 @@ contract ZoneInbox is IZoneInbox {
         if (decryptionIndex != decryptions.length) revert ExtraDecryptionData();
 
         // Step 3: Validate against Tempo state
-        // Read currentDepositQueueHash from the portal's storage using the final imported root.
-        // The system transaction is all-or-nothing: every queued deposit through the final
+        // Read currentDepositQueueHash from the portal's storage using the new Tempo state.
+        // The system transaction is all-or-nothing: every queued deposit through the current
         // queue head must be processed in this call, or the entire call reverts. That rollback
         // also undoes the Tempo checkpoint, token activation, and any deposit-side effects above.
         bytes32 tempoCurrentHash =
