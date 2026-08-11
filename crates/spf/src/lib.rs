@@ -514,10 +514,25 @@ pub enum Error {
         transaction_index: usize,
     },
     /// The Tempo EVM rejected or failed to execute a user transaction.
-    #[error("failed to execute transaction {transaction_index} in zone block {block_index}")]
+    #[error(
+        "failed to execute transaction {transaction_index} ({transaction_hash}) in Zone block {block_number} (batch index {block_index})"
+    )]
     TransactionExecution {
         block_index: usize,
+        block_number: u64,
         transaction_index: usize,
+        transaction_hash: B256,
+    },
+    /// The Tempo EVM rejected or failed to execute a user transaction with a detailed cause.
+    #[error(
+        "failed to execute transaction {transaction_index} ({transaction_hash}) in Zone block {block_number} (batch index {block_index}): {reason}"
+    )]
+    TransactionExecutionError {
+        block_index: usize,
+        block_number: u64,
+        transaction_index: usize,
+        transaction_hash: B256,
+        reason: String,
     },
     /// Production block post-execution changes could not be finalized.
     #[error("failed to finalize execution of zone block {block_index}")]

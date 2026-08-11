@@ -4,7 +4,7 @@ use std::{borrow::Cow, collections::HashMap};
 
 use alloy_consensus::{
     Signed, TxLegacy,
-    transaction::{Recovered, SignerRecoverable as _},
+    transaction::{Recovered, SignerRecoverable as _, TxHashRef as _},
 };
 use alloy_eips::{eip2718::Decodable2718 as _, eip4895::Withdrawals};
 use alloy_evm::{
@@ -132,6 +132,7 @@ pub(crate) fn execute_zone_block(
     )?);
     transactions.extend(execute_user_transactions(
         &mut executor,
+        block.number,
         zone_block_index,
         user_transactions,
     )?);
@@ -336,6 +337,7 @@ fn decode_user_transactions(
 
 fn execute_user_transactions<'a, 'db, I>(
     executor: &mut WitnessExecutor<'a, 'db, I>,
+    block_number: u64,
     block_index: usize,
     transactions: Vec<Recovered<TempoTxEnvelope>>,
 ) -> Result<Vec<TempoTxEnvelope>, Error>
@@ -345,12 +347,15 @@ where
     let mut executed = Vec::with_capacity(transactions.len());
     for (transaction_index, transaction) in transactions.into_iter().enumerate() {
         let envelope = transaction.clone_inner();
+        let transaction_hash = *transaction.tx_hash();
         execute_recovered_transaction(
             executor,
             transaction,
             Error::TransactionExecution {
                 block_index,
+                block_number,
                 transaction_index,
+                transaction_hash,
             },
             false,
         )?;
@@ -420,7 +425,21 @@ fn map_block_execution_error(
         return (*error).into();
     }
 
-    execution_error
+    match execution_error {
+        Error::TransactionExecution {
+            block_index,
+            block_number,
+            transaction_index,
+            transaction_hash,
+        } => Error::TransactionExecutionError {
+            block_index,
+            block_number,
+            transaction_index,
+            transaction_hash,
+            reason: error.to_string(),
+        },
+        error => error,
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +474,24 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "advanceTempo reverted in zone block 7: unknown revert; data: 0xdeadbeef"
+        );
+    }
+
+    #[test]
+    fn retains_user_transaction_execution_error() {
+        let error = map_block_execution_error(
+            alloy_evm::block::BlockValidationError::msg("invalid chain ID").into(),
+            Error::TransactionExecution {
+                block_index: 3,
+                block_number: 20_044,
+                transaction_index: 0,
+                transaction_hash: B256::repeat_byte(0x11),
+            },
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "failed to execute transaction 0 (0x1111111111111111111111111111111111111111111111111111111111111111) in Zone block 20044 (batch index 3): invalid chain ID"
         );
     }
 }

@@ -77,11 +77,38 @@ struct ProverJob {
     batch: BatchData,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct ValidationStats {
     witness_bytes: usize,
     zone_state_nodes: usize,
+    zone_bytecodes: usize,
     tempo_state_nodes: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("SPF rejected generated witness")]
+struct SpfValidationError {
+    #[source]
+    source: zone_spf::Error,
+    stats: ValidationStats,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+struct OutputValidationError {
+    reason: String,
+    stats: ValidationStats,
+}
+
+fn validation_error_stats(error: &eyre::Report) -> Option<ValidationStats> {
+    error
+        .downcast_ref::<SpfValidationError>()
+        .map(|error| error.stats)
+        .or_else(|| {
+            error
+                .downcast_ref::<OutputValidationError>()
+                .map(|error| error.stats)
+        })
 }
 
 struct ProverContext<P> {
@@ -155,12 +182,14 @@ pub(crate) fn spawn_shadow_prover<P: ZoneSequencerProvider>(
                         elapsed_ms = started.elapsed().as_millis(),
                         witness_bytes = stats.witness_bytes,
                         zone_state_nodes = stats.zone_state_nodes,
+                        zone_bytecodes = stats.zone_bytecodes,
                         tempo_state_nodes = stats.tempo_state_nodes,
                         "Shadow prover validated finalized batch candidate"
                     );
                 }
                 Err(err) => {
                     metrics.validation_failure_total.increment(1);
+                    let stats = validation_error_stats(&err);
                     error!(
                         target: "zone::sequencer::prover",
                         zone_from = job.from,
@@ -168,6 +197,11 @@ pub(crate) fn spawn_shadow_prover<P: ZoneSequencerProvider>(
                         prev_block_hash = %job.batch.prev_block_hash,
                         next_block_hash = %job.batch.next_block_hash,
                         elapsed_ms = started.elapsed().as_millis(),
+                        witness_stats_available = stats.is_some(),
+                        witness_bytes = stats.map_or(0, |stats| stats.witness_bytes),
+                        zone_state_nodes = stats.map_or(0, |stats| stats.zone_state_nodes),
+                        zone_bytecodes = stats.map_or(0, |stats| stats.zone_bytecodes),
+                        tempo_state_nodes = stats.map_or(0, |stats| stats.tempo_state_nodes),
                         error = ?err,
                         "Shadow prover failed to validate finalized batch candidate"
                     );
@@ -291,20 +325,27 @@ async fn validate_candidate<P: ZoneSequencerProvider>(
         tempo_ancestry_headers: anchor.ancestry_headers,
     };
 
-    let spf_config = SpfConfig::new(context.config.chain_spec.clone(), context.portal);
-    let attempt = witness.clone();
-    let output = tokio::task::spawn_blocking(move || prove_zone_batch(&spf_config, attempt))
-        .await
-        .context("SPF worker panicked")?
-        .context("SPF rejected generated witness")?;
-
-    compare_output(&output, &job.batch, witness.parent_header.hash_slow())?;
-
-    Ok(ValidationStats {
+    let stats = ValidationStats {
         witness_bytes: witness_size(&witness),
         zone_state_nodes: witness.zone_state_witness.node_pool.len(),
+        zone_bytecodes: witness.zone_state_witness.bytecodes.len(),
         tempo_state_nodes: witness.tempo_state_witness.node_pool.len(),
-    })
+    };
+    let spf_config = SpfConfig::new(context.config.chain_spec.clone(), context.portal);
+    let attempt = witness.clone();
+    let result = tokio::task::spawn_blocking(move || prove_zone_batch(&spf_config, attempt))
+        .await
+        .context("SPF worker panicked")?;
+    let output = result.map_err(|source| SpfValidationError { source, stats })?;
+
+    compare_output(&output, &job.batch, witness.parent_header.hash_slow()).map_err(|error| {
+        OutputValidationError {
+            reason: format!("{error:?}"),
+            stats,
+        }
+    })?;
+
+    Ok(stats)
 }
 
 fn build_zone_inputs<P: ZoneSequencerProvider>(
