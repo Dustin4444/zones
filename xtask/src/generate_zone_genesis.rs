@@ -1,8 +1,10 @@
 use alloy::{
     genesis::{ChainConfig, Genesis, GenesisAccount},
-    primitives::{Address, Bytes, TxKind, U256, address},
+    primitives::{Address, Bytes, TxKind, U256, address, keccak256},
+    providers::{Provider, ProviderBuilder},
     sol_types::SolValue,
 };
+use alloy_rlp::Encodable;
 use eyre::{WrapErr as _, eyre};
 use reth_evm::{
     Evm as _, EvmEnv, EvmFactory,
@@ -20,6 +22,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+use tempo_alloy::TempoNetwork;
 use tempo_chainspec::{hardfork::TempoHardfork, spec::TEMPO_T0_BASE_FEE};
 use tempo_contracts::{
     ARACHNID_CREATE2_FACTORY_ADDRESS, CREATEX_ADDRESS, MULTICALL3_ADDRESS, PERMIT2_ADDRESS,
@@ -68,11 +71,16 @@ pub(crate) struct GenerateZoneGenesis {
     #[arg(long)]
     pub(crate) tempo_portal: Address,
 
+    /// Tempo L1 HTTP RPC URL used to derive the pre-creation genesis anchor.
+    #[arg(long, default_value = "https://rpc.moderato.tempo.xyz")]
+    pub(crate) l1_rpc_url: String,
+
     /// Canonical fee token used when a zone transaction omits `fee_token`.
     #[arg(long, default_value_t = PATH_USD_ADDRESS)]
     pub(crate) default_fee_token: Address,
 
-    /// RLP-encoded Tempo genesis header. Defaults to `TempoHeader::default()`.
+    /// RLP-encoded Tempo genesis header. When omitted, a nonzero portal derives its pre-creation
+    /// anchor from L1; the zero-address development genesis uses `TempoHeader::default()`.
     #[arg(long)]
     pub(crate) tempo_genesis_header_rlp: Option<String>,
 
@@ -120,7 +128,8 @@ impl GenerateZoneGenesis {
             Some(header_rlp) => {
                 const_hex::decode(header_rlp).wrap_err("failed to decode hex string")?
             }
-            None => alloy_rlp::encode(TempoHeader::default()),
+            None if self.tempo_portal.is_zero() => alloy_rlp::encode(TempoHeader::default()),
+            None => derive_pre_creation_anchor(&self.l1_rpc_url, self.tempo_portal).await?,
         };
 
         let mut evm = setup_zone_evm(self.chain_id, self.gas_limit);
@@ -309,6 +318,63 @@ impl GenerateZoneGenesis {
 
         Ok(())
     }
+}
+
+async fn derive_pre_creation_anchor(l1_rpc_url: &str, portal: Address) -> eyre::Result<Vec<u8>> {
+    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect(l1_rpc_url)
+        .await
+        .wrap_err_with(|| format!("failed to connect to Tempo L1 RPC {l1_rpc_url}"))?;
+    let latest = provider
+        .get_block_number()
+        .await
+        .wrap_err("failed to fetch latest Tempo L1 block")?;
+
+    if provider
+        .get_code_at(portal)
+        .await
+        .wrap_err_with(|| format!("failed to fetch code for portal {portal}"))?
+        .is_empty()
+    {
+        return Err(eyre!(
+            "portal {portal} has no code at the Tempo L1 tip; check --tempo-portal and --l1-rpc-url"
+        ));
+    }
+
+    let mut low = 0;
+    let mut high = latest;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let code = provider
+            .get_code_at(portal)
+            .block_id(mid.into())
+            .await
+            .wrap_err_with(|| format!("failed to fetch portal code at Tempo block {mid}"))?;
+        if code.is_empty() {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    let creation_block = low;
+    let anchor_block = creation_block.checked_sub(1).ok_or_else(|| {
+        eyre!("portal {portal} exists at genesis, so no pre-creation anchor is available")
+    })?;
+    let anchor_header = provider
+        .get_header_by_number(anchor_block.into())
+        .await
+        .wrap_err_with(|| format!("failed to fetch Tempo anchor header {anchor_block}"))?
+        .ok_or_else(|| eyre!("Tempo anchor header {anchor_block} was not found"))?
+        .inner
+        .inner;
+    let mut header_rlp = Vec::new();
+    anchor_header.encode(&mut header_rlp);
+    println!(
+        "Derived pre-creation Tempo anchor block {anchor_block} (hash: {}) for portal {portal}",
+        keccak256(&header_rlp)
+    );
+    Ok(header_rlp)
 }
 
 fn setup_zone_evm(chain_id: u64, gas_limit: u64) -> TempoEvm<CacheDB<EmptyDB>> {
