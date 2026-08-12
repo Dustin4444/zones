@@ -25,11 +25,7 @@ import { getBlockHash } from "../libraries/BlockHashHistory.sol";
 import { DepositQueueLib } from "../libraries/DepositQueueLib.sol";
 import { ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE } from "../libraries/EncryptedDeposit.sol";
 import { Secp256k1Lib } from "../libraries/Secp256k1Lib.sol";
-import {
-    EMPTY_SENTINEL,
-    WithdrawalQueue,
-    WithdrawalQueueLib
-} from "../libraries/WithdrawalQueueLib.sol";
+import { WithdrawalQueue, WithdrawalQueueLib } from "../libraries/WithdrawalQueueLib.sol";
 import { StdPrecompiles } from "tempo-std/StdPrecompiles.sol";
 import { ITIP20 } from "tempo-std/interfaces/ITIP20.sol";
 import { ITIP20Factory } from "tempo-std/interfaces/ITIP20Factory.sol";
@@ -146,7 +142,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Refunds parked after a deposit bounce-back transfer reverts on Tempo.
     mapping(address token => mapping(address owner => uint128 amount)) public refunds;
 
-    /// @notice Withdrawal queue (zone→Tempo): fixed-size ring buffer
+    /// @notice Withdrawal queue (zone→Tempo): unbounded FIFO
     WithdrawalQueue internal _withdrawalQueue;
 
     /// @notice Operator RPC endpoint for the zone
@@ -510,8 +506,8 @@ contract ZonePortal is IZonePortal {
         return _withdrawalQueue.tail;
     }
 
-    function withdrawalQueueSlot(uint256 physicalSlot) external view returns (bytes32) {
-        return _withdrawalQueue.slots[physicalSlot];
+    function withdrawalQueueSlot(uint256 queueIndex) external view returns (bytes32) {
+        return _withdrawalQueue.slots[queueIndex];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -988,8 +984,7 @@ contract ZonePortal is IZonePortal {
 
         for (uint256 i = withdrawals.length; i > 0; --i) {
             remainingQueues[i - 1] = nextQueue;
-            bytes32 encodedQueue = nextQueue == bytes32(0) ? EMPTY_SENTINEL : nextQueue;
-            nextQueue = keccak256(abi.encode(withdrawals[i - 1], encodedQueue));
+            nextQueue = keccak256(abi.encode(withdrawals[i - 1], nextQueue));
         }
 
         for (uint256 i; i < withdrawals.length; ++i) {
