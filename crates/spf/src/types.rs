@@ -98,6 +98,8 @@ pub struct ZoneBlock {
     pub number: u64,
     pub parent_hash: B256,
     pub timestamp: u64,
+    /// Millisecond component of the Zone block timestamp.
+    pub timestamp_millis_part: u64,
     pub beneficiary: Address,
     /// RLP-encoded Tempo header passed to `ZoneInbox.advanceTempo`.
     pub tempo_header_rlp: Bytes,

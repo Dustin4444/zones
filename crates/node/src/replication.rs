@@ -1112,6 +1112,13 @@ where
     // 3. Require the block to advance the local Tempo checkpoint by exactly
     // one independently observed L1 block.
     let (l1_header, portal_inputs) = decode_advance_tempo(&block)?;
+    let zone_timestamp = (block.timestamp(), block.header().timestamp_millis_part);
+    let tempo_timestamp = (l1_header.timestamp(), l1_header.timestamp_millis_part);
+    eyre::ensure!(
+        zone_timestamp == tempo_timestamp,
+        "zone block {block_number} timestamp {zone_timestamp:?} does not match Tempo anchor {} timestamp {tempo_timestamp:?}",
+        l1_header.number(),
+    );
     let local = provider
         .state_by_block_hash(parent.hash())?
         .tempo_num_hash()?;

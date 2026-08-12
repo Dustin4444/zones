@@ -3,7 +3,7 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use alloy_consensus::{
-    Signed, TxLegacy,
+    BlockHeader as _, Signed, TxLegacy,
     transaction::{Recovered, SignerRecoverable as _},
 };
 use alloy_eips::{eip2718::Decodable2718 as _, eip4895::Withdrawals};
@@ -100,7 +100,8 @@ pub(crate) fn execute_zone_block(
         .block_hashes
         .insert(parent_number, block.parent_hash);
 
-    let attributes = next_block_env_attributes(evm_config.chain_spec(), parent, block)?;
+    let attributes =
+        next_block_env_attributes(evm_config.chain_spec(), parent, zone_block_index, block)?;
     let mut env = evm_config
         .next_evm_env(parent, &attributes)
         .map_err(|_| Error::EvmEnvironment)?;
@@ -167,6 +168,7 @@ pub(crate) fn execute_zone_block(
 pub(crate) fn next_block_env_attributes(
     chain_spec: &zone_chainspec::ZoneChainSpec,
     parent: &TempoHeader,
+    block_index: usize,
     block: &ZoneBlock,
 ) -> Result<TempoNextBlockEnvAttributes, Error> {
     let block_gas_limit = parent.inner.gas_limit;
@@ -176,6 +178,15 @@ pub(crate) fn next_block_env_attributes(
         .map_err(|_| crate::WitnessDatabaseError::InvalidTempoHeader)?;
     if !encoded.is_empty() {
         return Err(crate::WitnessDatabaseError::InvalidTempoHeader.into());
+    }
+    if (block.timestamp, block.timestamp_millis_part)
+        != (header.timestamp(), header.timestamp_millis_part)
+    {
+        return Err(Error::BlockTempoTimestampMismatch {
+            block_index,
+            zone_timestamp: (block.timestamp, block.timestamp_millis_part),
+            tempo_timestamp: (header.timestamp(), header.timestamp_millis_part),
+        });
     }
 
     Ok(TempoNextBlockEnvAttributes {
@@ -195,7 +206,7 @@ pub(crate) fn next_block_env_attributes(
         },
         general_gas_limit: 0,
         shared_gas_limit: block_gas_limit,
-        timestamp_millis_part: header.timestamp_millis_part,
+        timestamp_millis_part: block.timestamp_millis_part,
         consensus_context: None,
         subblock_fee_recipients: HashMap::new(),
     })

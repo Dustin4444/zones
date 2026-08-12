@@ -130,7 +130,15 @@ impl PayloadValidator<ZonePayloadTypes> for TempoEngineValidator {
         attr: &ZonePayloadAttributes,
         header: &TempoHeader,
     ) -> Result<(), InvalidPayloadAttributesError> {
-        if PayloadAttributes::timestamp(attr) < AlloyBlockHeader::timestamp(header) {
+        let l1_header = attr.l1_block().header.header();
+        if (
+            PayloadAttributes::timestamp(attr),
+            attr.timestamp_millis_part(),
+        ) != (l1_header.timestamp(), l1_header.timestamp_millis_part)
+        {
+            return Err(InvalidPayloadAttributesError::InvalidTimestamp);
+        }
+        if PayloadAttributes::timestamp(attr) < header.timestamp() {
             return Err(InvalidPayloadAttributesError::InvalidTimestamp);
         }
         Ok(())

@@ -132,6 +132,21 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
                 actual: block.number,
             });
         }
+        let mut encoded = block.tempo_header_rlp.as_ref();
+        let tempo_header = TempoHeader::decode(&mut encoded)
+            .map_err(|_| WitnessDatabaseError::InvalidTempoHeader)?;
+        if !encoded.is_empty() {
+            return Err(WitnessDatabaseError::InvalidTempoHeader.into());
+        }
+        if (block.timestamp, block.timestamp_millis_part)
+            != (tempo_header.timestamp(), tempo_header.timestamp_millis_part)
+        {
+            return Err(Error::BlockTempoTimestampMismatch {
+                block_index,
+                zone_timestamp: (block.timestamp, block.timestamp_millis_part),
+                tempo_timestamp: (tempo_header.timestamp(), tempo_header.timestamp_millis_part),
+            });
+        }
         if block.timestamp < previous_header.timestamp() {
             return Err(Error::BlockTimestampRegression {
                 previous: previous_header.timestamp(),
@@ -463,6 +478,15 @@ pub enum Error {
     /// A Zone block timestamp regressed from its predecessor.
     #[error("zone block timestamp regressed: previous {previous}, got {actual}")]
     BlockTimestampRegression { previous: u64, actual: u64 },
+    /// A Zone block timestamp does not match its embedded Tempo anchor.
+    #[error(
+        "zone block at batch index {block_index} timestamp mismatch: Zone {zone_timestamp:?}, Tempo {tempo_timestamp:?}"
+    )]
+    BlockTempoTimestampMismatch {
+        block_index: usize,
+        zone_timestamp: (u64, u64),
+        tempo_timestamp: (u64, u64),
+    },
     /// Tempo-dependent inputs appeared without a Tempo header import.
     #[error("zone block {block_index} has Tempo inputs without a Tempo header")]
     TempoInputsWithoutHeader { block_index: usize },
@@ -727,6 +751,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
+            timestamp_millis_part: 0,
             beneficiary: Address::ZERO,
             tempo_header_rlp: Bytes::new(),
             deposits: Vec::new(),
@@ -821,7 +846,7 @@ mod tests {
         parent_chain_id: u64,
         zone_id: u32,
     ) -> Result<alloy_evm::EvmEnv<TempoHardfork, TempoBlockEnv>, Error> {
-        let attributes = next_block_env_attributes(config.chain_spec().as_ref(), parent, block)?;
+        let attributes = next_block_env_attributes(config.chain_spec().as_ref(), parent, 0, block)?;
         let mut env = ZoneEvmConfig::from_composed_chain_spec(
             config.chain_spec().clone(),
             tempo_database,
@@ -1003,6 +1028,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
+            timestamp_millis_part: 0,
             beneficiary: Address::ZERO,
             tempo_header_rlp: witness.tempo_state_witness.initial_tempo_header_rlp.clone(),
             deposits: Vec::new(),
@@ -1017,6 +1043,7 @@ mod tests {
         let attributes = execution::evm::next_block_env_attributes(
             config.chain_spec().as_ref(),
             &witness.parent_header,
+            0,
             &block,
         )
         .unwrap();
@@ -1055,12 +1082,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zone_timestamp_millis_mismatch_with_tempo_anchor() {
+        let witness = minimal_batch_witness();
+        let block = ZoneBlock {
+            number: 1,
+            parent_hash: witness.parent_header.hash_slow(),
+            timestamp: 0,
+            timestamp_millis_part: 1,
+            beneficiary: Address::ZERO,
+            tempo_header_rlp: witness.tempo_state_witness.initial_tempo_header_rlp.clone(),
+            deposits: Vec::new(),
+            decryptions: Vec::new(),
+            enabled_tokens: Vec::new(),
+            finalize_withdrawal_batch_count: None,
+            finalize_withdrawal_batch_encrypted_senders: Vec::new(),
+            transactions: Vec::new(),
+        };
+
+        assert!(matches!(
+            execution::evm::next_block_env_attributes(
+                test_config().chain_spec().as_ref(),
+                &witness.parent_header,
+                0,
+                &block,
+            ),
+            Err(Error::BlockTempoTimestampMismatch {
+                block_index: 0,
+                zone_timestamp: (0, 1),
+                tempo_timestamp: (0, 0),
+            })
+        ));
+    }
+
+    #[test]
     fn accepts_an_open_snapshot_without_finalization() {
         let witness = minimal_batch_witness();
         let block = ZoneBlock {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
+            timestamp_millis_part: 0,
             beneficiary: Address::ZERO,
             tempo_header_rlp: Bytes::from([0x01]),
             deposits: Vec::new(),
@@ -1081,6 +1142,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
+            timestamp_millis_part: 0,
             beneficiary: Address::ZERO,
             tempo_header_rlp: Bytes::from([0x01]),
             deposits: Vec::new(),
@@ -1109,6 +1171,7 @@ mod tests {
             number: 1,
             parent_hash: witness.parent_header.hash_slow(),
             timestamp: 0,
+            timestamp_millis_part: 0,
             beneficiary: Address::ZERO,
             tempo_header_rlp: Bytes::from([0x01]),
             deposits: Vec::new(),
