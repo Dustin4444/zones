@@ -1689,8 +1689,23 @@ async fn zone_removed_private_holder_can_exit() -> eyre::Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn zone_rewards_private_holder() -> eyre::Result<()> {
+#[test]
+fn zone_rewards_private_holder() -> eyre::Result<()> {
+    std::thread::Builder::new()
+        .name("zone_rewards_private_holder".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(zone_rewards_private_holder_inner())
+        })
+        .wrap_err("spawning private-holder reward test thread")?
+        .join()
+        .map_err(|_| eyre::eyre!("private-holder reward test thread panicked"))?
+}
+
+async fn zone_rewards_private_holder_inner() -> eyre::Result<()> {
     let mut fixture = EarnZoneFixture::start().await?;
     let user = fixture.user.address();
     let shares = fixture.zone_deposit(fixture.alternate_asset, user).await?;
