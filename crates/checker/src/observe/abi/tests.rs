@@ -302,7 +302,7 @@ fn advance_rejects_noncanonical_encoding() {
 #[test]
 fn dynamic_arrays_enforce_bounds() {
     for (name, head_word, maximum) in [
-        ("deposit cap", 1, MAX_UNPROCESSED_DEPOSITS),
+        ("deposit cap", 1, MAX_DEPOSITS_PER_TEMPO_BLOCK),
         ("enabled-token cap", 3, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK),
     ] {
         let mut calldata = single_header_advance_call();
