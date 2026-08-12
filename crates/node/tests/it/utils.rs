@@ -3530,15 +3530,15 @@ pub(crate) async fn start_local_zone_with_fixture_and_withdrawal_batch_interval(
 ) -> eyre::Result<(ZoneTestNode, L1Fixture)> {
     let throwaway_key = k256::SecretKey::from_slice(&[0x01; 32])?;
     let signer = alloy_signer_local::PrivateKeySigner::from_signing_key(throwaway_key.into());
-    let zone = ZoneTestNode::launch_with_genesis_and_withdrawal_batch_interval(
-        DUMMY_L1_URL.to_string(),
-        Address::ZERO,
-        zone_primitives::constants::zone_chain_id(1_337, zone_id)?,
-        Some(genesis),
-        signer,
-        withdrawal_batch_interval_blocks,
-        None,
-        true,
+    let zone = ZoneTestNode::launch(
+        ZoneTestLaunchConfig::new(
+            DUMMY_L1_URL.to_string(),
+            Address::ZERO,
+            zone_primitives::constants::zone_chain_id(1_337, zone_id)?,
+        )
+        .with_genesis(genesis)
+        .with_sequencer_signer(signer)
+        .with_withdrawal_batch_interval(withdrawal_batch_interval_blocks),
     )
     .await?;
     let fixture = L1Fixture::new();
