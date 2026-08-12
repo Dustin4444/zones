@@ -2,7 +2,7 @@
 
 mod checker;
 
-pub use checker::CheckerArgs;
+pub use checker::{CheckerArgs, CheckerCommand};
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -43,6 +43,7 @@ const ZONE_LOG_FILTER_DIRECTIVES: &str = concat!(
 pub enum ZoneCli {
     Node(Box<Cli<ZoneChainSpecParser, ZoneArgs>>),
     Dev(Box<DevCommand>),
+    Checker(Box<CheckerCommand>),
 }
 
 impl ZoneCli {
@@ -50,6 +51,7 @@ impl ZoneCli {
         Cli::<ZoneChainSpecParser, ZoneArgs>::command()
             .about("Tempo Zone")
             .subcommand(DevCommand::command())
+            .subcommand(CheckerCommand::command())
     }
 
     /// Parse CLI arguments from the environment.
@@ -78,6 +80,11 @@ impl ZoneCli {
                 .map(Box::new)
                 .map(Self::Dev);
         }
+        if let Some(("checker", checker_matches)) = matches.subcommand() {
+            return CheckerCommand::from_arg_matches(checker_matches)
+                .map(Box::new)
+                .map(Self::Checker);
+        }
         Cli::from_arg_matches(&matches)
             .map(Box::new)
             .map(Self::Node)
@@ -91,6 +98,7 @@ impl ZoneCli {
         match self {
             Self::Node(cli) => run_node(*cli, NodeAction::Run),
             Self::Dev(command) => (*command).run(),
+            Self::Checker(command) => (*command).run(),
         }
     }
 }
@@ -637,10 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_lists_dev_subcommand() {
+    fn top_level_help_lists_checker_and_dev_subcommands() {
         let result = ZoneCli::try_parse_from(["tempo-zone", "--help"]);
         let error = result.err().expect("--help exits through clap");
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("  checker"));
         assert!(error.to_string().contains("  dev"));
     }
 
@@ -648,6 +657,19 @@ mod tests {
     fn dev_is_parsed_by_the_top_level_cli() {
         let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
         assert!(matches!(parsed, ZoneCli::Dev(_)));
+    }
+
+    #[test]
+    fn checker_is_parsed_by_the_top_level_cli() {
+        let parsed = ZoneCli::try_parse_from([
+            "tempo-zone",
+            "checker",
+            "inspect",
+            "--checker.database-path",
+            "checker-test-db",
+        ])
+        .unwrap();
+        assert!(matches!(parsed, ZoneCli::Checker(_)));
     }
 
     #[test]
