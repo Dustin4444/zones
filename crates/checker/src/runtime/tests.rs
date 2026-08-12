@@ -4,13 +4,15 @@ use std::{
 };
 
 use crate::kernel::{
-    Candidate, Datum, ExpectedState, FindingCategory, FindingLocation, ImportedFacts,
-    PortalIdentity, State, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
+    Datum, ExpectedState, FindingCategory, FindingLocation, ImportedFacts, PortalIdentity, State,
+    TransitionCandidate, ZoneFacts, ZoneOperation, apply_imported, apply_zone,
 };
 use alloy_primitives::{Address, B256};
 use tempfile::TempDir;
 
 use crate::{
+    failure::{Failure, FailureClass},
+    notification::NotificationPlan,
     observe::{
         AcquisitionError, AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction,
         DataSource, EnvelopeRule, ObservationError, PortalCallError, ProtocolChain,
@@ -21,63 +23,53 @@ use crate::{
         PersistenceError,
     },
     runtime::{
-        AuthenticatedBlock, AuthenticatedOutputs, EnqueueAction, Failure, FailureClass,
-        NotificationPlan, ObservationPipeline, PlannedNotification, RetryBudget, Runtime,
+        AuthenticatedBlock, AuthenticatedOutputs, EnqueueAction, RetryBudget, Runtime,
         RuntimeAction, RuntimeState, StreamFailureAction,
     },
 };
 
 #[derive(Debug, Clone)]
 struct FakeNotification {
-    plan: Option<NotificationPlan>,
-    coordinates: Result<Vec<BlockNumHash>, ()>,
+    plan: NotificationPlan,
     blocks: Result<Vec<AuthenticatedBlock>, FailureClass>,
 }
 
-impl PlannedNotification for FakeNotification {
-    fn plan(&self) -> Result<NotificationPlan, Failure> {
-        if let Some(plan) = &self.plan {
-            return plan.clone().validate();
-        }
-        let applied = self
-            .coordinates
-            .clone()
-            .map_err(|()| failure(FailureClass::ImmediateTerminal))?;
-        let first = applied
-            .first()
-            .copied()
-            .ok_or_else(|| failure(FailureClass::ImmediateTerminal))?;
-        let ancestor = BlockNumHash {
-            number: first.number - 1,
-            hash: coordinate(first.number - 1, 0x10).hash,
-        };
-        let acknowledge = *applied.last().unwrap();
-        NotificationPlan {
-            reverted: vec![],
-            ancestor,
-            applied,
-            acknowledge,
-        }
-        .validate()
+trait RuntimeTestExt {
+    fn push(&mut self, notification: FakeNotification) -> Result<(), ()>;
+
+    fn push_or_record_overflow(
+        &mut self,
+        store: &Persistence,
+        notification: FakeNotification,
+    ) -> Result<EnqueueAction, PersistenceError>;
+}
+
+impl RuntimeTestExt for Runtime<FakeNotification> {
+    fn push(&mut self, notification: FakeNotification) -> Result<(), ()> {
+        let plan = notification.plan.clone();
+        self.push_planned(notification, plan).map_err(|_| ())
+    }
+
+    fn push_or_record_overflow(
+        &mut self,
+        store: &Persistence,
+        notification: FakeNotification,
+    ) -> Result<EnqueueAction, PersistenceError> {
+        let plan = notification.plan.clone();
+        self.push_planned_or_record_overflow(store, notification, plan)
     }
 }
 
-#[derive(Default)]
-struct FakePipeline;
-
-impl ObservationPipeline<FakeNotification> for FakePipeline {
-    fn authenticate_at(
-        &mut self,
-        notification: &FakeNotification,
-        index: usize,
-        _parent_state: &State,
-    ) -> Result<AuthenticatedBlock, Failure> {
-        notification
-            .blocks
-            .clone()
-            .map(|blocks| blocks[index].clone())
-            .map_err(failure)
-    }
+fn authenticate(
+    notification: &FakeNotification,
+    index: usize,
+    _parent_state: &State,
+) -> Result<AuthenticatedBlock, Failure> {
+    notification
+        .blocks
+        .clone()
+        .map(|blocks| blocks[index].clone())
+        .map_err(failure)
 }
 
 fn failure(class: FailureClass) -> Failure {
@@ -238,7 +230,7 @@ pub(crate) fn create() -> (TempDir, Persistence) {
 
 /// Build observed outputs without the observation adapter to test the
 /// runtime/kernel boundary.
-fn outputs(candidate: &Candidate) -> AuthenticatedOutputs {
+fn outputs(candidate: &TransitionCandidate) -> AuthenticatedOutputs {
     AuthenticatedOutputs {
         effects: candidate.expected_effects.to_vec(),
         state: ExpectedState {
@@ -290,9 +282,18 @@ fn blocks(state: &State, first: u64, count: usize, fork: u8) -> Vec<Authenticate
 }
 
 fn notification(blocks: Vec<AuthenticatedBlock>) -> FakeNotification {
+    let applied: Vec<_> = blocks.iter().map(|block| block.zone).collect();
+    let first = *applied.first().expect("fixture must contain a block");
     FakeNotification {
-        plan: None,
-        coordinates: Ok(blocks.iter().map(|block| block.zone).collect()),
+        plan: NotificationPlan::new(
+            Vec::new(),
+            applied,
+            BlockNumHash {
+                number: first.number - 1,
+                hash: coordinate(first.number - 1, 0x10).hash,
+            },
+        )
+        .expect("fixture plan is contiguous"),
         blocks: Ok(blocks),
     }
 }
@@ -319,7 +320,7 @@ fn apply_abort_never_acknowledges_and_keeps_parent_tip() {
         .unwrap();
     store.inject_abort();
     assert!(matches!(
-        runtime.poll(&store, identity(), &mut FakePipeline, Instant::now()),
+        runtime.poll(&store, identity(), authenticate, Instant::now()),
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(store.load().unwrap().meta.verified_zone_tip, anchor().zone);
@@ -335,14 +336,14 @@ fn committed_prefix_then_divergence_records_exact_second_gap_before_ack() {
     runtime.push(notification(values)).unwrap();
     assert_eq!(
         runtime
-            .poll(&store, identity(), &mut FakePipeline, Instant::now())
+            .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
         RuntimeAction::None
     );
     assert_eq!(store.load().unwrap().meta.verified_zone_tip.number, 1);
     assert_eq!(
         runtime
-            .poll(&store, identity(), &mut FakePipeline, Instant::now())
+            .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
         RuntimeAction::Acknowledge(second)
     );
@@ -361,17 +362,14 @@ fn retry_spans_polls_accepts_queued_work_and_names_full_suffix() {
     let (_directory, store) = create();
     let coordinates = vec![coordinate(1, 0x10), coordinate(2, 0x10)];
     let failing = FakeNotification {
-        plan: None,
-        coordinates: Ok(coordinates.clone()),
+        plan: NotificationPlan::new(Vec::new(), coordinates.clone(), anchor().zone).unwrap(),
         blocks: Err(FailureClass::TransientRetry),
     };
     let mut runtime = runtime(&store, 2);
     runtime.push(failing).unwrap();
     let now = Instant::now();
     assert!(matches!(
-        runtime
-            .poll(&store, identity(), &mut FakePipeline, now)
-            .unwrap(),
+        runtime.poll(&store, identity(), authenticate, now).unwrap(),
         RuntimeAction::RetryAt(_)
     ));
     runtime
@@ -387,7 +385,7 @@ fn retry_spans_polls_accepts_queued_work_and_names_full_suffix() {
             .poll(
                 &store,
                 identity(),
-                &mut FakePipeline,
+                authenticate,
                 now + Duration::from_millis(25)
             )
             .unwrap(),
@@ -422,7 +420,7 @@ fn durable_gap_recovers_across_separate_notifications() {
     for _ in 0..3 {
         assert!(matches!(
             runtime
-                .poll(&store, identity(), &mut FakePipeline, Instant::now())
+                .poll(&store, identity(), authenticate, Instant::now())
                 .unwrap(),
             RuntimeAction::Acknowledge(_)
         ));
@@ -509,14 +507,14 @@ fn finding_descendants_stay_alerting_and_reorg_recovers_before_replacement() {
     let mut runtime = runtime(&store, 2);
     runtime.push(notification(bad)).unwrap();
     runtime
-        .poll(&store, identity(), &mut FakePipeline, Instant::now())
+        .poll(&store, identity(), authenticate, Instant::now())
         .unwrap();
     runtime
         .push(notification(blocks(&state, 2, 2, 0x10)))
         .unwrap();
     assert_eq!(
         runtime
-            .poll(&store, identity(), &mut FakePipeline, Instant::now())
+            .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
         RuntimeAction::Acknowledge(coordinate(3, 0x10))
     );
@@ -530,7 +528,7 @@ fn finding_descendants_stay_alerting_and_reorg_recovers_before_replacement() {
     replacement[0].parent = anchor().zone;
     runtime.push(notification(replacement)).unwrap();
     runtime
-        .poll(&store, identity(), &mut FakePipeline, Instant::now())
+        .poll(&store, identity(), authenticate, Instant::now())
         .unwrap();
     assert_eq!(runtime.state(), RuntimeState::Healthy);
 }
@@ -544,7 +542,7 @@ fn restart_catchup_containing_active_finding_never_authenticates() {
     let mut first_runtime = runtime(&store, 2);
     first_runtime.push(notification(bad)).unwrap();
     first_runtime
-        .poll(&store, identity(), &mut FakePipeline, Instant::now())
+        .poll(&store, identity(), authenticate, Instant::now())
         .unwrap();
     store
         .record_gap(
@@ -558,18 +556,22 @@ fn restart_catchup_containing_active_finding_never_authenticates() {
     let mut restarted = runtime(&store, 2);
     restarted
         .push(FakeNotification {
-            plan: None,
-            coordinates: Ok(vec![
-                coordinate(1, 0x10),
-                coordinate(2, 0x10),
-                coordinate(3, 0x10),
-            ]),
+            plan: NotificationPlan::new(
+                Vec::new(),
+                vec![
+                    coordinate(1, 0x10),
+                    coordinate(2, 0x10),
+                    coordinate(3, 0x10),
+                ],
+                anchor().zone,
+            )
+            .unwrap(),
             blocks: Err(FailureClass::ImmediateTerminal),
         })
         .unwrap();
     assert_eq!(
         restarted
-            .poll(&store, identity(), &mut FakePipeline, Instant::now())
+            .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
         RuntimeAction::Acknowledge(coordinate(3, 0x10))
     );
@@ -585,7 +587,7 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
     let mut runtime = runtime(&store, 2);
     runtime.push(notification(bad)).unwrap();
     runtime
-        .poll(&store, identity(), &mut FakePipeline, Instant::now())
+        .poll(&store, identity(), authenticate, Instant::now())
         .unwrap();
     store
         .record_gap(
@@ -597,19 +599,18 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
         .unwrap();
     runtime
         .push(FakeNotification {
-            plan: Some(NotificationPlan {
+            plan: NotificationPlan {
                 reverted: vec![],
                 ancestor: coordinate(3, 0x50),
                 applied: vec![coordinate(4, 0x50)],
                 acknowledge: coordinate(4, 0x50),
-            }),
-            coordinates: Ok(vec![coordinate(4, 0x50)]),
+            },
             blocks: Ok(blocks(&state, 4, 1, 0x50)),
         })
         .unwrap();
     assert_eq!(
         runtime
-            .poll(&store, identity(), &mut FakePipeline, Instant::now())
+            .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
         RuntimeAction::Terminal
     );
@@ -620,32 +621,16 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
 }
 
 #[test]
-fn malformed_coordinates_are_terminal_without_ack() {
-    let (_directory, store) = create();
-    for coordinates in [
-        Err(()),
-        Ok(vec![]),
-        Ok(vec![coordinate(1, 0x10), coordinate(3, 0x10)]),
-    ] {
-        let mut runtime = runtime(&store, 2);
-        assert_eq!(
-            runtime
-                .push_or_record_overflow(
-                    &store,
-                    FakeNotification {
-                        plan: None,
-                        coordinates,
-                        blocks: Ok(vec![]),
-                    }
-                )
-                .unwrap(),
-            EnqueueAction::Terminal
-        );
-        assert_eq!(
-            store.load().unwrap().meta.acknowledged_zone_tip,
-            anchor().zone
-        );
-    }
+fn notification_plan_rejects_malformed_coordinates() {
+    assert!(NotificationPlan::new(Vec::new(), Vec::new(), anchor().zone).is_err());
+    assert!(
+        NotificationPlan::new(
+            Vec::new(),
+            vec![coordinate(1, 0x10), coordinate(3, 0x10)],
+            anchor().zone,
+        )
+        .is_err()
+    );
 }
 
 #[test]

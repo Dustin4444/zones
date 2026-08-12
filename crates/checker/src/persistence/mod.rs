@@ -1,12 +1,24 @@
+//! Durable snapshots, journals, and findings for the Zone checker.
+
 mod codec;
+mod model;
 mod schema;
 #[cfg(test)]
 mod tests;
-mod types;
+mod validation;
 
-pub(crate) use types::*;
+pub(crate) use validation::make_finding;
+use validation::{
+    validate_checkpoint, validate_coverage_advance, validate_finding, validate_metadata,
+    validate_state,
+};
 
-use crate::kernel::{Datum, Finding as FindingDetails, FindingLocation, State, validate};
+pub(crate) use model::{
+    BlockNumHash, ChainCut, Checkpoint, CheckpointId, Coverage, CoverageGapReason, Finding,
+    FindingKey, Identity, JournalEntry, MetaValue, Metadata, Snapshot,
+};
+
+use crate::kernel::State;
 use reth_db::{
     Database, DatabaseEnv, DatabaseEnvKind,
     cursor::{DbCursorRO, DbCursorRW},
@@ -26,8 +38,10 @@ use std::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 3;
 const CHECKPOINT_INTERVAL: u64 = 64;
+/// Result returned by durable persistence operations.
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
+/// Failure while opening, validating, or updating durable checker state.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PersistenceError {
     #[error("database open failed: {0}")]
@@ -55,6 +69,7 @@ pub(crate) enum PersistenceError {
     InjectedAbort,
 }
 
+/// Sole-writer handle for one durable checker database.
 pub(crate) struct Persistence {
     db: Arc<DatabaseEnv>,
     identity: Identity,
@@ -77,25 +92,15 @@ impl Persistence {
         let parent = target
             .parent()
             .ok_or_else(|| invalid("checkpoint target has no sibling directory"))?;
-        let name = target
-            .file_name()
-            .ok_or_else(|| invalid("checkpoint target has no directory name"))?;
-        let staging = parent.join(format!(
-            ".{}.staging-{}",
-            name.to_string_lossy(),
-            std::process::id()
-        ));
-        if staging.exists() {
-            fs::remove_dir_all(&staging)
-                .map_err(|error| invalid(format!("cannot remove checkpoint staging: {error}")))?;
-        }
-        fs::create_dir_all(&staging)
+        let staging = tempfile::Builder::new()
+            .prefix(".checker-staging-")
+            .tempdir_in(parent)
             .map_err(|error| invalid(format!("cannot create checkpoint staging: {error}")))?;
 
         let result = (|| {
-            let (store, snapshot) = Self::create(&staging, identity, cut, state)?;
+            let (store, snapshot) = Self::create(staging.path(), identity, cut, state)?;
             drop(store);
-            let (reopened, verified) = Self::open(&staging, identity)?;
+            let (reopened, verified) = Self::open(staging.path(), identity)?;
             drop(reopened);
             if snapshot != verified {
                 return Err(invalid("genesis checkpoint changed across final reopen"));
@@ -104,16 +109,12 @@ impl Persistence {
         })();
         match result {
             Ok(snapshot) => {
-                fs::rename(&staging, target).map_err(|error| {
-                    let _ = fs::remove_dir_all(&staging);
+                fs::rename(staging.path(), target).map_err(|error| {
                     invalid(format!("cannot atomically publish checkpoint: {error}"))
                 })?;
                 Ok(snapshot)
             }
-            Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -125,24 +126,24 @@ impl Persistence {
         probe(path)?;
         let db = open_db_read_only(path, DatabaseArguments::default())?;
         let tx = db.tx()?;
-        let value = tx
-            .get::<Meta>(MetaKey::Metadata)?
-            .ok_or_else(|| invalid("metadata row is missing"))?;
-        let MetaValue::Metadata(meta) = value else {
-            return Err(invalid("metadata type mismatch"));
-        };
+        let meta = read_metadata(&tx)?;
         validate_metadata(&meta)?;
         tx.commit()?;
         Ok(meta.identity)
     }
 
+    /// Read and reconstruct an existing database without opening a writer.
     pub(crate) fn inspect_snapshot(path: impl AsRef<Path>) -> Result<Snapshot> {
         let path = path.as_ref();
-        let identity = Self::inspect_identity(path)?;
+        probe(path)?;
         let db = open_db_read_only(path, DatabaseArguments::default())?;
+        let tx = db.tx()?;
+        let meta = read_metadata(&tx)?;
+        validate_metadata(&meta)?;
+        tx.commit()?;
         Self {
             db: Arc::new(db),
-            identity,
+            identity: meta.identity,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
@@ -150,6 +151,7 @@ impl Persistence {
         .load()
     }
 
+    /// Create a fresh database initialized at the supplied chain cut.
     pub(crate) fn create(
         path: impl AsRef<Path>,
         identity: Identity,
@@ -196,6 +198,7 @@ impl Persistence {
         Ok((this, Snapshot { meta, state }))
     }
 
+    /// Open the sole-writer database handle and reconstruct its active snapshot.
     pub(crate) fn open(path: impl AsRef<Path>, identity: Identity) -> Result<(Self, Snapshot)> {
         let path = path.as_ref().to_path_buf();
         probe(&path)?;
@@ -210,16 +213,11 @@ impl Persistence {
         this.load().map(|snapshot| (this, snapshot))
     }
 
+    /// Reconstruct and validate the active durable snapshot.
     pub(crate) fn load(&self) -> Result<Snapshot> {
         let identity = self.identity;
         let tx = self.db.tx()?;
-        let meta = tx
-            .get::<Meta>(MetaKey::Metadata)?
-            .ok_or_else(|| invalid("metadata row is missing"))?;
-        let MetaValue::Metadata(meta) = meta else {
-            return Err(invalid("metadata type mismatch"));
-        };
-        let meta = *meta;
+        let meta = read_metadata(&tx)?;
         if meta.identity != identity {
             return Err(PersistenceError::Identity);
         }
@@ -276,7 +274,7 @@ impl Persistence {
             }
             state
                 .apply(&entry.delta)
-                .map_err(|e| invalid(e.to_string()))?;
+                .map_err(|error| invalid(error.to_string()))?;
             tip = entry.zone;
             imported = entry.imported_tempo;
         }
@@ -301,6 +299,7 @@ impl Persistence {
         Ok(Snapshot { meta, state })
     }
 
+    /// Persist one contiguous verified transition and its resulting state.
     pub(crate) fn apply(
         &self,
         prior: &Snapshot,
@@ -343,21 +342,23 @@ impl Persistence {
                 .saturating_sub(meta.active_checkpoint.height)
                 >= self.checkpoint_interval
             {
-                checkpoint_in_tx(tx, meta, &candidate)?;
+                Self::checkpoint_in_tx(tx, meta, &candidate)?;
             }
             Ok(())
         })
     }
 
+    /// Persist a checkpoint for the already active snapshot.
     #[cfg(test)]
     pub(crate) fn checkpoint_current(&self, prior: &Snapshot) -> Result<Snapshot> {
         validate_state(&prior.state, self.identity)?;
         self.write(prior, prior.state.clone(), |tx, meta| {
-            checkpoint_in_tx(tx, meta, &prior.state)?;
+            Self::checkpoint_in_tx(tx, meta, &prior.state)?;
             Ok(())
         })
     }
 
+    /// Assert a supplied snapshot is active, then checkpoint it.
     #[cfg(test)]
     pub(crate) fn checkpoint(
         &self,
@@ -378,6 +379,7 @@ impl Persistence {
         self.checkpoint_current(&prior)
     }
 
+    /// Persist a finding at the next verified Zone coordinate.
     pub(crate) fn record_finding(
         &self,
         prior: &Snapshot,
@@ -388,14 +390,7 @@ impl Persistence {
             validate_finding(key, &finding, Some(meta))?;
             codec::encode(&finding)?;
             if let Some(old) = tx.get::<Findings>(key)? {
-                let same_evidence = old.zone == finding.zone
-                    && old.parent == finding.parent
-                    && old.imported_tempo == finding.imported_tempo
-                    && old.imported_tempo_parent == finding.imported_tempo_parent
-                    && old.details == finding.details
-                    && old.evidence_len == finding.evidence_len
-                    && old.evidence_digest == finding.evidence_digest;
-                if !same_evidence {
+                if !same_finding_evidence(&old, &finding) {
                     return Err(invalid("conflicting same-height finding evidence"));
                 }
                 if old.summary != finding.summary {
@@ -409,6 +404,7 @@ impl Persistence {
         })
     }
 
+    /// Record a durable gap in otherwise contiguous checker coverage.
     pub(crate) fn record_gap(
         &self,
         prior: &Snapshot,
@@ -444,37 +440,48 @@ impl Persistence {
         })
     }
 
+    /// Rewind durable journal and coverage state to a retained ancestor.
     pub(crate) fn reorg(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         if ancestor.number > prior.meta.verified_zone_tip.number {
-            if ancestor.number > prior.meta.acknowledged_zone_tip.number {
-                return Err(invalid("reorg ancestor exceeds acknowledged history"));
-            }
-            return self.write(prior, prior.state.clone(), |_tx, meta| {
-                update_active_finding(meta, ancestor)?;
-                let Coverage::Gap {
-                    first_unchecked,
-                    reason,
-                    ..
-                } = &meta.coverage
-                else {
-                    return Err(invalid(
-                        "unverified reorg ancestor has no durable coverage gap",
-                    ));
-                };
-                if first_unchecked.number > ancestor.number {
-                    return Err(invalid(
-                        "unverified reorg ancestor precedes the coverage gap",
-                    ));
-                }
-                meta.acknowledged_zone_tip = ancestor;
-                meta.coverage = Coverage::Gap {
-                    first_unchecked: *first_unchecked,
-                    acknowledged_through: ancestor,
-                    reason: reason.clone(),
-                };
-                Ok(())
-            });
+            return self.reorg_unverified(prior, ancestor);
         }
+        self.reorg_verified(prior, ancestor)
+    }
+
+    /// Rewind acknowledged coverage that has not yet been verified.
+    fn reorg_unverified(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
+        if ancestor.number > prior.meta.acknowledged_zone_tip.number {
+            return Err(invalid("reorg ancestor exceeds acknowledged history"));
+        }
+        self.write(prior, prior.state.clone(), |_tx, meta| {
+            update_active_finding(meta, ancestor)?;
+            let Coverage::Gap {
+                first_unchecked,
+                reason,
+                ..
+            } = &meta.coverage
+            else {
+                return Err(invalid(
+                    "unverified reorg ancestor has no durable coverage gap",
+                ));
+            };
+            if first_unchecked.number > ancestor.number {
+                return Err(invalid(
+                    "unverified reorg ancestor precedes the coverage gap",
+                ));
+            }
+            meta.acknowledged_zone_tip = ancestor;
+            meta.coverage = Coverage::Gap {
+                first_unchecked: *first_unchecked,
+                acknowledged_through: ancestor,
+                reason: reason.clone(),
+            };
+            Ok(())
+        })
+    }
+
+    /// Reconstruct verified state and remove journal entries after the ancestor.
+    fn reorg_verified(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         let snapshot = self.reconstruct_at(ancestor)?;
         self.write(prior, snapshot.state.clone(), |tx, meta| {
             let mut cursor = tx.cursor_write::<Journal>()?;
@@ -507,16 +514,11 @@ impl Persistence {
         })
     }
 
+    /// Reconstruct a canonical snapshot at a verified reorg ancestor.
     fn reconstruct_at(&self, ancestor: BlockNumHash) -> Result<Snapshot> {
         let identity = self.identity;
         let tx = self.db.tx()?;
-        let meta = tx
-            .get::<Meta>(MetaKey::Metadata)?
-            .ok_or_else(|| invalid("metadata row is missing"))?;
-        let MetaValue::Metadata(meta) = meta else {
-            return Err(invalid("metadata type mismatch"));
-        };
-        let meta = *meta;
+        let meta = read_metadata(&tx)?;
         if meta.identity != identity || ancestor.number > meta.verified_zone_tip.number {
             return Err(invalid("invalid reorg ancestor"));
         }
@@ -527,43 +529,46 @@ impl Persistence {
             .map(|(id, _)| id)
             .ok_or_else(|| invalid("bootstrap checkpoint is missing"))?;
         for row in cur.walk(None)? {
-            let (id, cp) = row?;
-            validate_checkpoint(id, &cp, identity)?;
+            let (id, checkpoint) = row?;
+            validate_checkpoint(id, &checkpoint, identity)?;
             let canonical = if id == bootstrap_id {
                 true
             } else {
                 tx.get::<Journal>(id.height)?
-                    .is_some_and(|entry| entry.zone == cp.cut.zone)
+                    .is_some_and(|entry| entry.zone == checkpoint.cut.zone)
             };
             if canonical
-                && cp.cut.zone.number <= ancestor.number
+                && checkpoint.cut.zone.number <= ancestor.number
                 && best
                     .as_ref()
-                    .is_none_or(|(_, b): &(CheckpointId, Checkpoint)| {
-                        b.cut.zone.number < cp.cut.zone.number
+                    .is_none_or(|(_, best): &(CheckpointId, Checkpoint)| {
+                        best.cut.zone.number < checkpoint.cut.zone.number
                     })
             {
-                best = Some((id, cp));
+                best = Some((id, checkpoint));
             }
         }
-        let (checkpoint_id, cp) = best.ok_or_else(|| invalid("no checkpoint before ancestor"))?;
-        let mut state = cp.state;
-        let mut tip = cp.cut.zone;
-        let mut imported = cp.cut.tempo;
-        for h in tip.number.saturating_add(1)..=ancestor.number {
-            let e = tx
-                .get::<Journal>(h)?
+        let (checkpoint_id, checkpoint) =
+            best.ok_or_else(|| invalid("no checkpoint before ancestor"))?;
+        let mut state = checkpoint.state;
+        let mut tip = checkpoint.cut.zone;
+        let mut imported = checkpoint.cut.tempo;
+        for height in tip.number.saturating_add(1)..=ancestor.number {
+            let entry = tx
+                .get::<Journal>(height)?
                 .ok_or_else(|| invalid("missing reorg journal"))?;
-            if e.zone.number != h
-                || e.parent != tip
-                || e.imported_tempo_parent != imported
-                || e.imported_tempo.number <= imported.number
+            if entry.zone.number != height
+                || entry.parent != tip
+                || entry.imported_tempo_parent != imported
+                || entry.imported_tempo.number <= imported.number
             {
                 return Err(invalid("non-contiguous reorg journal"));
             }
-            state.apply(&e.delta).map_err(|e| invalid(e.to_string()))?;
-            tip = e.zone;
-            imported = e.imported_tempo;
+            state
+                .apply(&entry.delta)
+                .map_err(|error| invalid(error.to_string()))?;
+            tip = entry.zone;
+            imported = entry.imported_tempo;
         }
         if tip != ancestor {
             return Err(invalid("ancestor hash conflict"));
@@ -576,18 +581,40 @@ impl Persistence {
         Ok(Snapshot { meta: out, state })
     }
 
+    /// Write or verify the immutable checkpoint at the current metadata tips.
+    fn checkpoint_in_tx(
+        tx: &<DatabaseEnv as Database>::TXMut,
+        meta: &mut Metadata,
+        state: &State,
+    ) -> Result<()> {
+        let cut = ChainCut {
+            zone: meta.verified_zone_tip,
+            tempo: meta.imported_tempo_tip,
+        };
+        let id = CheckpointId::from(cut.zone);
+        let checkpoint = Checkpoint {
+            cut,
+            state: state.clone(),
+        };
+        codec::encode(&checkpoint)?;
+        if let Some(existing) = tx.get::<Checkpoints>(id)? {
+            if existing != checkpoint {
+                return Err(invalid("checkpoint identity is immutable"));
+            }
+        } else {
+            tx.put::<Checkpoints>(id, checkpoint)?;
+        }
+        meta.active_checkpoint = id;
+        Ok(())
+    }
+
+    /// Apply one metadata mutation against the expected prior snapshot atomically.
     fn write<F>(&self, prior: &Snapshot, state: State, f: F) -> Result<Snapshot>
     where
         F: FnOnce(&<DatabaseEnv as Database>::TXMut, &mut Metadata) -> Result<()>,
     {
         let tx = self.db.tx_mut()?;
-        let meta = tx
-            .get::<Meta>(MetaKey::Metadata)?
-            .ok_or_else(|| invalid("metadata row is missing"))?;
-        let MetaValue::Metadata(meta) = meta else {
-            return Err(invalid("metadata type mismatch"));
-        };
-        let mut meta = *meta;
+        let mut meta = read_metadata(&tx)?;
         if meta.identity != self.identity {
             tx.abort();
             return Err(PersistenceError::Identity);
@@ -596,9 +623,9 @@ impl Persistence {
             tx.abort();
             return Err(PersistenceError::StaleSnapshot);
         }
-        if let Err(e) = f(&tx, &mut meta) {
+        if let Err(error) = f(&tx, &mut meta) {
             tx.abort();
-            return Err(e);
+            return Err(error);
         }
         tx.put::<Meta>(
             MetaKey::Metadata,
@@ -613,12 +640,14 @@ impl Persistence {
         Ok(Snapshot { meta, state })
     }
 
+    /// Make the next write transaction abort before commit.
     #[cfg(test)]
     pub(crate) fn inject_abort(&self) {
         self.abort_next_write.store(true, Ordering::SeqCst);
     }
 }
 
+/// Verify the on-disk schema version without opening a writer.
 fn probe(path: &Path) -> Result<()> {
     let db = open_db_read_only(path, DatabaseArguments::default())?;
     let tx = db.tx()?;
@@ -634,6 +663,19 @@ fn probe(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Read and type-check the singleton metadata value in an open transaction.
+fn read_metadata<T: DbTx>(tx: &T) -> Result<Metadata> {
+    let value = tx
+        .get::<Meta>(MetaKey::Metadata)?
+        .ok_or_else(|| invalid("metadata row is missing"))?;
+    let MetaValue::Metadata(meta) = value else {
+        return Err(invalid("metadata type mismatch"));
+    };
+    Ok(*meta)
+}
+
+/// Construct the rebuild instruction for an incompatible schema version.
 fn schema_error(actual: u32, path: &Path) -> PersistenceError {
     PersistenceError::Schema {
         expected: SCHEMA_VERSION,
@@ -641,10 +683,12 @@ fn schema_error(actual: u32, path: &Path) -> PersistenceError {
         rebuild_path: path.with_extension("rebuild"),
     }
 }
-fn invalid(message: impl Into<String>) -> PersistenceError {
+/// Construct a durable-data validation error.
+pub(super) fn invalid(message: impl Into<String>) -> PersistenceError {
     PersistenceError::Invalid(message.into())
 }
 
+/// Remove an active finding discarded by a reorg, or reject a height conflict.
 fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<()> {
     if let Some(key) = meta.active_finding {
         if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
@@ -657,248 +701,13 @@ fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<
     Ok(())
 }
 
-fn validate_state(state: &State, identity: Identity) -> Result<()> {
-    state
-        .validate_families()
-        .map_err(|e| invalid(e.to_string()))?;
-    validate(state).map_err(|e| invalid(format!("invariant {e:?}")))?;
-    let Some(portal) = state.portal() else {
-        return Err(invalid("missing Portal identity"));
-    };
-    let portal_identity = portal.identity();
-    if portal_identity.portal != identity.portal || portal_identity.zone_id != identity.zone_id {
-        return Err(PersistenceError::Identity);
-    }
-    Ok(())
-}
-
-fn validate_checkpoint(
-    id: CheckpointId,
-    checkpoint: &Checkpoint,
-    identity: Identity,
-) -> Result<()> {
-    if id != CheckpointId::from(checkpoint.cut.zone) {
-        return Err(invalid("checkpoint key does not match its embedded cut"));
-    }
-    validate_state(&checkpoint.state, identity)
-}
-
-fn checkpoint_in_tx(
-    tx: &<DatabaseEnv as Database>::TXMut,
-    meta: &mut Metadata,
-    state: &State,
-) -> Result<()> {
-    let cut = ChainCut {
-        zone: meta.verified_zone_tip,
-        tempo: meta.imported_tempo_tip,
-    };
-    let id = CheckpointId::from(cut.zone);
-    let checkpoint = Checkpoint {
-        cut,
-        state: state.clone(),
-    };
-    codec::encode(&checkpoint)?;
-    if let Some(existing) = tx.get::<Checkpoints>(id)? {
-        if existing != checkpoint {
-            return Err(invalid("checkpoint identity is immutable"));
-        }
-    } else {
-        tx.put::<Checkpoints>(id, checkpoint)?;
-    }
-    meta.active_checkpoint = id;
-    Ok(())
-}
-
-fn canonical_datum(value: Option<&Datum>) -> Vec<u8> {
-    value.map(Datum::canonical_bytes).unwrap_or_default()
-}
-
-fn finding_evidence(
-    details: &FindingDetails,
-) -> Result<(usize, usize, u32, alloy_primitives::B256)> {
-    let expected = canonical_datum(details.expected.as_ref());
-    let actual = canonical_datum(details.actual.as_ref());
-    let mut canonical = Vec::with_capacity(8 + expected.len() + actual.len());
-    canonical.extend(
-        u32::try_from(expected.len())
-            .map_err(|_| invalid("expected too large"))?
-            .to_be_bytes(),
-    );
-    canonical.extend_from_slice(&expected);
-    canonical.extend(
-        u32::try_from(actual.len())
-            .map_err(|_| invalid("actual too large"))?
-            .to_be_bytes(),
-    );
-    canonical.extend_from_slice(&actual);
-    Ok((
-        expected.len(),
-        actual.len(),
-        u32::try_from(canonical.len()).map_err(|_| invalid("evidence too large"))?,
-        alloy_primitives::keccak256(canonical),
-    ))
-}
-
-fn finding_operation(location: Option<&FindingLocation>) -> u32 {
-    match location {
-        Some(FindingLocation::Operation(operation))
-        | Some(FindingLocation::ImportedOperation(operation)) => *operation,
-        Some(FindingLocation::State(_) | FindingLocation::Block) | None => 0,
-    }
-}
-
-pub(crate) fn make_finding(
-    zone: BlockNumHash,
-    parent: BlockNumHash,
-    imported: Option<(BlockNumHash, BlockNumHash)>,
-    details: FindingDetails,
-    summary: String,
-) -> Result<(FindingKey, Finding)> {
-    let operation = finding_operation(details.location.as_ref());
-    let key = FindingKey {
-        zone,
-        operation,
-        code: details.code,
-    };
-    let (_, _, evidence_len, evidence_digest) = finding_evidence(&details)?;
-    let (imported_tempo, imported_tempo_parent) = imported.unzip();
-    let finding = Finding {
-        zone,
-        parent,
-        imported_tempo,
-        imported_tempo_parent,
-        details,
-        evidence_len,
-        evidence_digest,
-        summary,
-    };
-    validate_finding(key, &finding, None)?;
-    Ok((key, finding))
-}
-
-fn valid_imported_finding_coordinate(
-    finding: &Finding,
-    previous_imported_tempo_tip: BlockNumHash,
-) -> bool {
-    match (finding.imported_tempo, finding.imported_tempo_parent) {
-        (None, None) => true,
-        (Some(imported), Some(imported_parent)) => {
-            imported.number > previous_imported_tempo_tip.number
-                && imported_parent == previous_imported_tempo_tip
-        }
-        _ => false,
-    }
-}
-
-fn validate_finding(key: FindingKey, finding: &Finding, meta: Option<&Metadata>) -> Result<()> {
-    let (expected_len, actual_len, evidence_len, evidence_digest) =
-        finding_evidence(&finding.details)?;
-    if finding.zone != key.zone
-        || finding_operation(finding.details.location.as_ref()) != key.operation
-        || finding.details.code != key.code
-        || expected_len > 256
-        || actual_len > 256
-        || finding.summary.len() > 1_024
-        || finding.evidence_len != evidence_len
-        || finding.evidence_digest != evidence_digest
-    {
-        return Err(invalid("finding is inconsistent or exceeds codec bounds"));
-    }
-    if let Some(meta) = meta {
-        let next = meta
-            .verified_zone_tip
-            .number
-            .checked_add(1)
-            .ok_or_else(|| invalid("height overflow"))?;
-        if finding.zone.number != next
-            || finding.parent != meta.verified_zone_tip
-            || !valid_imported_finding_coordinate(finding, meta.imported_tempo_tip)
-        {
-            return Err(invalid("finding is not at the next verified coordinate"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_metadata(meta: &Metadata) -> Result<()> {
-    if meta.active_checkpoint.height > meta.verified_zone_tip.number
-        || meta.acknowledged_zone_tip.number < meta.verified_zone_tip.number
-    {
-        return Err(invalid("metadata tips or active checkpoint are incoherent"));
-    }
-    match &meta.coverage {
-        Coverage::Complete if meta.acknowledged_zone_tip != meta.verified_zone_tip => {
-            Err(invalid("complete coverage tips differ"))
-        }
-        Coverage::Gap {
-            first_unchecked,
-            acknowledged_through,
-            ..
-        } if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
-            || *acknowledged_through != meta.acknowledged_zone_tip =>
-        {
-            Err(invalid("coverage gap coordinates are incoherent"))
-        }
-        _ => Ok(()),
-    }
-}
-
-fn validate_coverage_advance(
-    meta: &Metadata,
-    child: BlockNumHash,
-    acknowledged: BlockNumHash,
-    next: &Coverage,
-) -> Result<()> {
-    if acknowledged.number < meta.acknowledged_zone_tip.number {
-        return Err(invalid("acknowledged tip cannot regress"));
-    }
-    match (&meta.coverage, next) {
-        (Coverage::Complete, Coverage::Complete) if acknowledged == child => Ok(()),
-        (
-            Coverage::Complete,
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                ..
-            },
-        ) if child.number.checked_add(1) == Some(first_unchecked.number)
-            && *acknowledged_through == acknowledged
-            && acknowledged.number >= first_unchecked.number =>
-        {
-            Ok(())
-        }
-        (
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                reason: _,
-            },
-            Coverage::Complete,
-        ) if child == *first_unchecked
-            && child == *acknowledged_through
-            && acknowledged == *acknowledged_through =>
-        {
-            Ok(())
-        }
-        (
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                reason,
-            },
-            Coverage::Gap {
-                first_unchecked: next_first,
-                acknowledged_through: next_through,
-                reason: next_reason,
-            },
-        ) if child == *first_unchecked
-            && child.number.checked_add(1) == Some(next_first.number)
-            && *next_through == *acknowledged_through
-            && acknowledged == *acknowledged_through
-            && next_reason == reason =>
-        {
-            Ok(())
-        }
-        _ => Err(invalid("coverage transition is inconsistent")),
-    }
+/// Return whether two findings retain identical immutable evidence.
+fn same_finding_evidence(existing: &Finding, candidate: &Finding) -> bool {
+    existing.zone == candidate.zone
+        && existing.parent == candidate.parent
+        && existing.imported_tempo == candidate.imported_tempo
+        && existing.imported_tempo_parent == candidate.imported_tempo_parent
+        && existing.details == candidate.details
+        && existing.evidence_len == candidate.evidence_len
+        && existing.evidence_digest == candidate.evidence_digest
 }

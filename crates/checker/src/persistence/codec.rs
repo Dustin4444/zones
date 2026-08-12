@@ -1,8 +1,13 @@
+//! Versioned value encoding for persistence tables.
+
 use bincode::Options;
 use reth_codecs::{Compress, Decompress, DecompressError};
 use serde::{Serialize, de::DeserializeOwned};
+/// Largest encoded persistence value accepted by the durable codec.
 pub(crate) const MAX_VALUE_SIZE: u64 = 8 * 1024 * 1024;
 const ENVELOPE_VERSION: u8 = 1;
+
+/// Failure while encoding or decoding a persisted value envelope.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CodecError {
     #[error("value exceeds 8 MiB limit")]
@@ -12,12 +17,14 @@ pub(crate) enum CodecError {
     #[error("malformed value: {0}")]
     Malformed(String),
 }
+/// Return the deterministic bincode configuration used inside value envelopes.
 fn options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
         .with_limit(MAX_VALUE_SIZE - 1)
 }
+/// Encode one persistence value with its versioned envelope.
 pub(crate) fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, CodecError> {
     let mut out = vec![ENVELOPE_VERSION];
     options().serialize_into(&mut out, v).map_err(map)?;
@@ -26,6 +33,7 @@ pub(crate) fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, CodecError> {
     }
     Ok(out)
 }
+/// Decode one bounded, versioned persistence value envelope.
 pub(crate) fn decode<T: DeserializeOwned>(v: &[u8]) -> Result<T, CodecError> {
     if v.len() as u64 > MAX_VALUE_SIZE {
         return Err(CodecError::Oversize);
@@ -38,6 +46,7 @@ pub(crate) fn decode<T: DeserializeOwned>(v: &[u8]) -> Result<T, CodecError> {
     }
     options().deserialize(body).map_err(map)
 }
+/// Map bincode failures into durable codec errors.
 fn map(e: Box<bincode::ErrorKind>) -> CodecError {
     if matches!(*e, bincode::ErrorKind::SizeLimit) {
         CodecError::Oversize
@@ -46,6 +55,7 @@ fn map(e: Box<bincode::ErrorKind>) -> CodecError {
     }
 }
 
+/// Implement the common value codec for one serde persistence record.
 macro_rules! value_codec {
     ($($value:ty),+ $(,)?) => {
         $(

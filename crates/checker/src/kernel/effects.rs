@@ -1,8 +1,11 @@
+//! Effects predicted by deterministic kernel transitions.
+
 use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::state::{BatchId, DepositId, WithdrawalId};
 
+/// One externally observable consequence predicted by a transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Effect {
     TokenEnabled {
@@ -89,6 +92,7 @@ pub(crate) enum Effect {
 }
 
 impl Effect {
+    /// Stable event-family name used by checker diagnostics and tracing.
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::TokenEnabled { .. } => "TokenEnabled",
@@ -108,6 +112,7 @@ impl Effect {
     }
 }
 
+/// Protocol commitments expected after a complete Tempo-and-Zone transition.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExpectedState {
     pub(crate) tempo_block_hash: B256,

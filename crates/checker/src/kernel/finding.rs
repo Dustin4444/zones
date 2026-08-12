@@ -1,8 +1,11 @@
+//! Stable evidence carried by checker findings.
+
 use alloy_primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::state::StateKey;
 
+/// A typed expected or observed value recorded in a finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Datum {
     U64(u64),
@@ -19,6 +22,7 @@ pub(crate) enum Datum {
     Code(u16),
 }
 
+/// Stable family of checker finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum FindingCategory {
     Authentication,
@@ -33,6 +37,7 @@ pub(crate) enum FindingCategory {
     CollateralMismatch,
 }
 
+/// Optional protocol location of a finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum FindingLocation {
     Operation(u32),
@@ -41,6 +46,7 @@ pub(crate) enum FindingLocation {
     ImportedOperation(u32),
 }
 
+/// Stable, structured evidence for one checker divergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Finding {
     pub(crate) category: FindingCategory,
@@ -51,6 +57,7 @@ pub(crate) struct Finding {
 }
 
 impl Finding {
+    /// Construct a finding from typed expected and observed evidence.
     pub(crate) fn new(
         category: FindingCategory,
         code: u16,
@@ -67,6 +74,7 @@ impl Finding {
         }
     }
 
+    /// Construct a finding whose code is also its observed protocol value.
     pub(crate) fn coded(category: FindingCategory, code: u16, location: FindingLocation) -> Self {
         Self::new(
             category,

@@ -11,6 +11,7 @@ use super::super::{
     },
 };
 
+/// Decode and reconcile the sole direct Portal call required by receipt outcomes.
 pub(super) fn decode_direct_portal_call(
     envelope: &TempoTxEnvelope,
     portal: Address,
@@ -39,6 +40,7 @@ pub(super) fn decode_direct_portal_call(
     Ok(decoded)
 }
 
+/// Return calldata only when the envelope contains exactly one direct Portal call.
 pub(super) fn sole_portal_calldata(
     envelope: &TempoTxEnvelope,
     portal: Address,

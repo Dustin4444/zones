@@ -1,3 +1,5 @@
+//! MDBX tables and fixed-width key encodings for persisted checker records.
+
 use super::{Checkpoint, CheckpointId, Finding, FindingKey, JournalEntry, MetaValue};
 use reth_db::{
     DatabaseError, TableSet,
@@ -5,6 +7,7 @@ use reth_db::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Key for one singleton metadata value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum MetaKey {
     Version,
@@ -29,6 +32,7 @@ impl Decode for MetaKey {
     }
 }
 
+/// Implement fixed-width database key encoding for one durable identifier.
 macro_rules! fixed_key {
     ($t:ty,$n:expr,$enc:expr,$dec:expr) => {
         impl Encode for $t {
@@ -82,6 +86,7 @@ fixed_key!(
     })
 );
 
+/// Declare one checker persistence table and its static metadata.
 macro_rules! table {
     ($name:ident,$key:ty,$value:ty,$db:literal) => {
         #[derive(Debug)]
@@ -107,6 +112,7 @@ table!(Checkpoints, CheckpointId, Checkpoint, "Checkpoints");
 table!(Journal, u64, JournalEntry, "Journal");
 table!(Findings, FindingKey, Finding, "Findings");
 
+/// Complete table set for one checker persistence database.
 pub(crate) struct PersistenceTables;
 impl TableSet for PersistenceTables {
     fn tables() -> Box<dyn Iterator<Item = Box<dyn TableInfo>>> {

@@ -5,7 +5,9 @@
 mod adapter;
 mod bootstrap;
 mod exex;
+mod failure;
 mod kernel;
+mod notification;
 mod observe;
 pub(crate) mod persistence;
 mod runtime;

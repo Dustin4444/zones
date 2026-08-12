@@ -1,4 +1,4 @@
-//! Exact imported-block Portal collateral acquisition.
+//! Exact imported-block Portal token-balance acquisition.
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, U256};
@@ -12,7 +12,7 @@ use crate::observe::error::{AcquisitionError, AcquisitionSource};
 ///
 /// A timeout, missing archive state, or call failure is an acquisition failure,
 /// not a zero balance or protocol finding.
-pub(crate) async fn acquire_portal_collateral<P>(
+pub(crate) async fn acquire_portal_token_balance<P>(
     provider: &P,
     token: Address,
     portal: Address,
@@ -53,7 +53,7 @@ mod tests {
             .connect_mocked_client(asserter.clone());
 
         assert_eq!(
-            acquire_portal_collateral(&provider, token, portal, block_hash)
+            acquire_portal_token_balance(&provider, token, portal, block_hash)
                 .await
                 .unwrap(),
             expected
@@ -65,7 +65,7 @@ mod tests {
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
         assert!(matches!(
-            acquire_portal_collateral(&provider, token, portal, block_hash).await,
+            acquire_portal_token_balance(&provider, token, portal, block_hash).await,
             Err(AcquisitionError::Unavailable {
                 kind: AcquisitionSource::PortalCollateral,
                 ..

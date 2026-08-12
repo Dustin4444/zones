@@ -1,3 +1,5 @@
+//! Deterministic protocol hashes, fees, tags, and addresses.
+
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue as _;
 use tempo_zone_contracts::{
@@ -11,8 +13,10 @@ use crate::kernel::{
     state::Withdrawal,
 };
 
+/// Maximum number of submitted withdrawal batches awaiting Portal processing.
 pub(crate) const RING_CAPACITY: u64 = 100;
 
+/// Derive the Portal sender tag for a user withdrawal and fallback nonce.
 pub(crate) fn sender_tag(sender: Address, transaction_hash: B256, fallback_nonce: u64) -> B256 {
     let mut value = [0u8; 60];
     value[..20].copy_from_slice(sender.as_slice());
@@ -26,6 +30,7 @@ pub(crate) fn failed_deposit_sender_tag() -> B256 {
     keccak256([0u8; 52])
 }
 
+/// Hash one withdrawal into a reverse-linked Portal queue.
 pub(crate) fn withdrawal_hash(value: &Withdrawal, tail: B256) -> B256 {
     let value = ZonePortal::Withdrawal {
         token: value.token,
@@ -41,6 +46,7 @@ pub(crate) fn withdrawal_hash(value: &Withdrawal, tail: B256) -> B256 {
     keccak256((value, tail).abi_encode_params())
 }
 
+/// Derive the Portal queue hash for withdrawals in processing order.
 pub(crate) fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
     if values.is_empty() {
         return B256::ZERO;
@@ -53,12 +59,14 @@ pub(crate) fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
         })
 }
 
+/// Compute the Zone withdrawal fee from its gas limit and Tempo gas rate.
 pub(crate) fn withdrawal_fee(gas_limit: u64, rate: u128) -> Option<u128> {
-    u128::from(50_000u64)
+    50_000u128
         .checked_add(u128::from(gas_limit))?
         .checked_mul(rate)
 }
 
+/// Compute the capped Tempo fee for a failed-deposit bounceback.
 pub(crate) fn bounceback_fee(gas: u64, base_fee: U256, amount: u128) -> Option<u128> {
     let scale = U256::from(1_000_000_000_000u64);
     let fee = U256::from(gas)
@@ -68,6 +76,7 @@ pub(crate) fn bounceback_fee(gas: u64, base_fee: U256, amount: u128) -> Option<u
     Some(fee.min(U256::from(amount)).to::<u128>())
 }
 
+/// Hash an ordinary deposit into the reverse-linked Portal deposit queue.
 pub(crate) fn ordinary_deposit_hash(deposit: &OrdinaryDeposit, previous: B256) -> B256 {
     let wire = ZonePortal::Deposit {
         token: deposit.token,
@@ -86,6 +95,7 @@ pub(crate) fn ordinary_deposit_hash(deposit: &OrdinaryDeposit, previous: B256) -
     keccak256((DepositType::Deposit, wire, previous).abi_encode_params())
 }
 
+/// Hash a bounceback deposit into the reverse-linked Portal deposit queue.
 pub(crate) fn bounceback_deposit_hash(deposit: BounceBackDeposit, previous: B256) -> B256 {
     let mut recipient = [0_u8; 20];
     recipient[12..].copy_from_slice(&deposit.fallback_nonce.get().to_be_bytes());
@@ -97,6 +107,7 @@ pub(crate) fn bounceback_deposit_hash(deposit: BounceBackDeposit, previous: B256
     keccak256((DepositType::WithdrawalBounceBack, wire, previous).abi_encode_params())
 }
 
+/// Derive the deterministic Portal address for one Zone ID.
 pub(crate) fn portal_address(zone_id: u32) -> alloy_primitives::Address {
     let mut bytes = [0_u8; 20];
     bytes[..12].copy_from_slice(ZONE_PORTAL_PREFIX.as_slice());

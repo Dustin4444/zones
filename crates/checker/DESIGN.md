@@ -31,6 +31,32 @@ Observation and expectation use separate construction paths. ABI bindings
 decode wire data. The kernel uses checker-owned types rather than production
 Inbox, Outbox, Portal, sequencer, or payload transition code.
 
+## Module boundaries
+
+The checker is organized around the authenticated-data flow rather than the
+source chain alone:
+
+- `observe` reads and strictly decodes Zone and Tempo data. Its `l1` and `l2`
+  modules own chain-specific acquisition and observation; `abi` and `events`
+  own shared wire decoding and event classification.
+- `adapter` compares the authenticated observations across the two chains and
+  constructs `AuthenticatedBlock` inputs. `adapter/tempo` covers imported
+  Tempo operations; `adapter/zone` covers Zone outputs.
+- `kernel` contains the checker-owned state model, deterministic transitions,
+  derived effects, and internal consistency invariants. It has no provider or
+  ExEx dependency.
+- `runtime` turns notification plans and authenticated blocks into durable
+  progress, retry, acknowledgement, and coverage-gap decisions.
+- `persistence` owns the MDBX schema, codecs, durable model, and atomic
+  checkpoint, journal, finding, and reorg updates.
+- `bootstrap` authenticates local Zone genesis and historical Tempo imports to
+  construct the initial checkpoint.
+- `exex` is the integration boundary: it receives Reth notifications, keeps
+  buffering them during acquisition, and forwards runtime actions to Reth.
+
+`failure`, `notification`, and `inspection` provide the shared failure policy,
+notification-plan representation, and public read-only inspection API.
+
 ## Authenticated observation
 
 The first Zone system transaction supplies `advanceTempo` calldata and the

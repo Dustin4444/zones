@@ -168,8 +168,9 @@ belong to the `advanceTempo` transaction. Finally, the kernel requires the full
 ordered L1 enablement values—token address, name, symbol, and currency—to equal
 the L2 inputs, and the runtime requires the emitted L2 effect to equal the
 independently derived expected effect. See
-[`observe/events.rs`](src/observe/events.rs),
-[`adapter.rs`](src/adapter.rs), and [`kernel/apply.rs`](src/kernel/apply.rs).
+[`observe/events/mod.rs`](src/observe/events/mod.rs),
+[`adapter/mod.rs`](src/adapter/mod.rs), and
+[`kernel/transition/mod.rs`](src/kernel/transition/mod.rs).
 
 ## Durability and runtime behavior
 

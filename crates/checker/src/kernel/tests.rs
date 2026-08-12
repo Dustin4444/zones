@@ -5,11 +5,10 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 use crate::kernel::{
     BatchId, BatchSubmission, Deposit, DepositId, DepositOutcome, Effect, Finalization,
     ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalIdentity, PortalState, RefundClaim,
-    State, StateKey, StateValue, TokenEnable, TokenPhase, UserWithdrawal, WithdrawalId,
-    WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
-    apply::TransitionError,
+    State, StateKey, StateValue, TokenEnable, TokenPhase, TransitionError, UserWithdrawal,
+    WithdrawalId, WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
     apply_genesis_handoff, apply_imported, apply_zone,
-    commitments::{WITHDRAWAL_SENTINEL, ordinary_deposit_hash, portal_address},
+    derivation::{WITHDRAWAL_SENTINEL, ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
     state::{
@@ -544,15 +543,15 @@ fn sender_tag_matches_literal_vector_and_includes_fallback_nonce() {
     let sender = Address::repeat_byte(0x11);
     let transaction = B256::repeat_byte(0x22);
     assert_eq!(
-        crate::kernel::commitments::sender_tag(sender, transaction, 0x0102_0304_0506_0708),
+        crate::kernel::derivation::sender_tag(sender, transaction, 0x0102_0304_0506_0708),
         b256!("09e5aae3d74dbb09f2046a3a15c5504ce844113049b83c2884ca41a43124acbf")
     );
     assert_ne!(
-        crate::kernel::commitments::sender_tag(sender, transaction, 1),
-        crate::kernel::commitments::sender_tag(sender, transaction, 2)
+        crate::kernel::derivation::sender_tag(sender, transaction, 1),
+        crate::kernel::derivation::sender_tag(sender, transaction, 2)
     );
     assert_eq!(
-        crate::kernel::commitments::failed_deposit_sender_tag(),
+        crate::kernel::derivation::failed_deposit_sender_tag(),
         alloy_primitives::keccak256([0u8; 52])
     );
 }
@@ -906,7 +905,7 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
             data.clone()
         })
         .collect::<Vec<_>>();
-    let suffix = crate::kernel::commitments::withdrawal_hash(&withdrawals[1], WITHDRAWAL_SENTINEL);
+    let suffix = crate::kernel::derivation::withdrawal_hash(&withdrawals[1], WITHDRAWAL_SENTINEL);
     commit(
         &mut state,
         ImportedFacts {

@@ -9,6 +9,7 @@ use crate::observe::events::{L1ProtocolEvent, Portal, classify_l1_protocol_event
 use super::OrderedL1Outcome;
 use crate::observe::error::{ObservationError, PortalCallError, PortalCallFamily, ProtocolChain};
 
+/// Protocol outcomes from one successful transaction before its calldata is reconciled.
 pub(super) struct PendingTransaction {
     pub(super) transaction_index: usize,
     pub(super) transaction_hash: B256,
@@ -16,6 +17,7 @@ pub(super) struct PendingTransaction {
     pub(super) outcomes: Vec<OrderedL1Outcome>,
 }
 
+/// Classify successful receipt logs in block order and derive their calldata requirement.
 pub(super) fn ordered_transactions(
     portal: Address,
     transaction_hashes: &[B256],
@@ -75,6 +77,7 @@ pub(super) fn ordered_transactions(
     Ok(transactions)
 }
 
+/// Return the single top-level Portal family an event requires, if any.
 fn call_requirement(event: &L1ProtocolEvent) -> Option<PortalCallFamily> {
     match event {
         L1ProtocolEvent::Portal(Portal::ZonePortalEvents::BatchSubmitted(_)) => {
@@ -98,6 +101,7 @@ fn call_requirement(event: &L1ProtocolEvent) -> Option<PortalCallFamily> {
     }
 }
 
+/// Reject a transaction whose outcomes imply incompatible top-level Portal calls.
 fn merge_requirement(
     current: &mut Option<PortalCallFamily>,
     next: Option<PortalCallFamily>,

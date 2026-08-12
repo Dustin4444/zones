@@ -1,3 +1,5 @@
+//! Authenticated protocol facts consumed by kernel transitions.
+
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +59,7 @@ pub(crate) enum ImportedOperation {
     ClaimPortalRefund(RefundClaim),
 }
 
+/// Ordered Portal operations authenticated in one Tempo block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ImportedFacts {
     pub(crate) block_hash: B256,
@@ -133,6 +136,7 @@ pub(crate) enum ZoneOperation {
     ClaimInboxRefund(RefundClaim),
 }
 
+/// Final Zone system-call input for the current withdrawal batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Finalization {
     pub(crate) block_number: u64,
@@ -140,6 +144,7 @@ pub(crate) struct Finalization {
     pub(crate) encrypted_senders: Vec<Bytes>,
 }
 
+/// Ordered Zone inputs and outcomes authenticated in one Zone block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ZoneFacts {
     pub(crate) block_hash: B256,

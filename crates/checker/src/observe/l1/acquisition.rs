@@ -16,6 +16,7 @@ use super::super::{
     error::{AcquisitionError, AcquisitionSource, ObservationError, ensure_acquisition_equal},
 };
 
+/// A full L1 block whose reported hash and transaction root have been checked.
 pub(super) struct AuthenticatedBlock {
     header: ImportedTempoHeader,
     pub(super) transactions: Vec<TempoTransactionResponse>,
@@ -35,6 +36,7 @@ where
     Ok(acquire_exact_block(provider, block_hash).await?.header)
 }
 
+/// Fetch the exact imported block and require its full header to match L2's input.
 pub(super) async fn acquire_block<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
@@ -47,6 +49,7 @@ where
     Ok(block)
 }
 
+/// Fetch one hash-addressed block and authenticate its header and transaction set.
 async fn acquire_exact_block<P>(
     provider: &P,
     block_hash: B256,
@@ -91,6 +94,7 @@ where
     })
 }
 
+/// Fetch the complete receipt stream and authenticate it against the imported header.
 pub(super) async fn acquire_receipts<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
@@ -113,6 +117,7 @@ where
     Ok(receipts)
 }
 
+/// Require transaction identities and their trie root to match the imported header.
 pub(super) fn authenticate_transactions(
     imported: &ImportedTempoHeader,
     transactions: &[TempoTransactionResponse],
@@ -157,6 +162,7 @@ pub(super) fn authenticate_transactions(
     )
 }
 
+/// Require both the RPC-reported and locally computed hashes to match the request.
 fn authenticate_header_hash(
     expected: B256,
     reported: B256,
@@ -176,6 +182,7 @@ fn authenticate_header_hash(
     )
 }
 
+/// Require a fetched header to be the exact header carried by `advanceTempo`.
 pub(super) fn authenticate_imported_header(
     imported: &ImportedTempoHeader,
     fetched: &ImportedTempoHeader,
@@ -197,6 +204,7 @@ pub(super) fn authenticate_imported_header(
     Ok(())
 }
 
+/// Require receipt identities, root, and bloom to match the imported header.
 pub(super) fn authenticate_receipts(
     imported: &ImportedTempoHeader,
     transaction_hashes: &[B256],

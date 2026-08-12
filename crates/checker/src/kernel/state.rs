@@ -1,3 +1,5 @@
+//! Persisted checker state and its typed keys, values, and mutations.
+
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Bound};
 
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -390,6 +392,7 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn zone(&self) -> Option<&ZoneState> {
         match self.rows.get(&StateKey::Zone) {
             Some(StateValue::Zone(zone)) => Some(zone),

@@ -22,76 +22,23 @@ use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
 use crate::{
     CheckerConfig,
     adapter::{AuthenticatedObservation, adapt},
+    failure::{Failure, FailureClass},
+    notification::NotificationPlan,
     observe::{
-        L2BlockObservation, ZonePostStateOutputs, acquire_portal_collateral,
+        L2BlockObservation, ZonePostStateOutputs, acquire_portal_token_balance,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
     persistence::{BlockNumHash, CoverageGapReason, Identity, Persistence},
     runtime::{
-        AuthenticatedBlock, EnqueueAction, Failure, FailureClass, NotificationPlan,
-        ObservationPipeline, PlannedNotification, RetryBudget, Runtime, RuntimeAction,
-        StreamFailureAction,
+        AuthenticatedBlock, AuthenticationRequest, EnqueueAction, RetryBudget, Runtime,
+        RuntimeAction, StreamFailureAction,
     },
 };
 
-/// Holds one asynchronously acquired block for the synchronous runtime poll.
-struct PreparedPipeline {
-    /// Applied-block index and authentication result waiting to be consumed.
-    block: Option<(usize, Result<AuthenticatedBlock, Failure>)>,
-}
-
-/// Coordinates and parent derived from a validated non-empty fragment.
-struct ValidatedFragment {
-    /// Ordered block coordinates in the fragment.
+/// A contiguous ExEx chain fragment and its common parent.
+struct ChainFragment {
     coordinates: Vec<BlockNumHash>,
-    /// Parent of the fragment's first block.
     parent: BlockNumHash,
-}
-
-/// Supplies the runtime with the asynchronously prepared authentication result.
-impl ObservationPipeline<ExExNotification<TempoPrimitives>> for PreparedPipeline {
-    /// Consume the prepared result when it matches the requested block index.
-    fn authenticate_at(
-        &mut self,
-        _notification: &ExExNotification<TempoPrimitives>,
-        index: usize,
-        _parent_state: &State,
-    ) -> Result<AuthenticatedBlock, Failure> {
-        match self.block.take() {
-            Some((prepared_index, block)) if prepared_index == index => block,
-            Some((prepared_index, _)) => Err(Failure::terminal(format!(
-                "prepared block index {prepared_index} does not match requested index {index}"
-            ))),
-            None => Err(Failure::transient("block has not yet been acquired")),
-        }
-    }
-}
-
-/// Converts Reth chain notifications into validated runtime plans.
-impl PlannedNotification for ExExNotification<TempoPrimitives> {
-    /// Validate the notification fragments and derive their runtime coordinates.
-    fn plan(&self) -> Result<NotificationPlan, Failure> {
-        match self {
-            Self::ChainCommitted { new } => {
-                let applied = validate_fragment(new, "committed")?;
-                NotificationPlan::new(Vec::new(), applied.coordinates, applied.parent)
-            }
-            Self::ChainReverted { old } => {
-                let reverted = validate_fragment(old, "reverted")?;
-                NotificationPlan::new(reverted.coordinates, Vec::new(), reverted.parent)
-            }
-            Self::ChainReorged { old, new } => {
-                let reverted = validate_fragment(old, "reverted")?;
-                let applied = validate_fragment(new, "replacement")?;
-                if reverted.parent != applied.parent {
-                    return Err(Failure::terminal(
-                        "reorg fragments have different common ancestors",
-                    ));
-                }
-                NotificationPlan::new(reverted.coordinates, applied.coordinates, reverted.parent)
-            }
-        }
-    }
 }
 
 /// Run the checker ExEx until the notification stream or runtime terminates.
@@ -123,24 +70,36 @@ where
     ctx.catch_up_notifications_with_head(ExExHead::new(snapshot.meta.verified_zone_tip.into()))?;
 
     let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
-    let mut prepared = PreparedPipeline { block: None };
+    let mut authentication = None;
     let mut retry_at: Option<Instant> = None;
 
     loop {
-        prepare_next_applied_block(
-            &config,
-            &mut ctx,
-            &store,
-            &mut runtime,
-            &mut prepared,
-            &l1_provider,
-        )
-        .await?;
-
-        match runtime.poll(&store, identity, &mut prepared, Instant::now())? {
+        let action = match authentication.take() {
+            Some((request, result)) => runtime.complete_authentication(
+                &store,
+                identity,
+                request,
+                result,
+                Instant::now(),
+            )?,
+            None => runtime.next_action(&store, Instant::now())?,
+        };
+        match action {
+            RuntimeAction::Authenticate(request) => {
+                let result = authenticate_requested_block(
+                    &config,
+                    &mut ctx,
+                    &store,
+                    &mut runtime,
+                    request,
+                    &l1_provider,
+                )
+                .await?;
+                authentication = Some((request, result));
+                continue;
+            }
             RuntimeAction::Acknowledge(height) => {
                 ctx.send_finished_height(height.into())?;
-                prepared.block = None;
                 retry_at = None;
                 continue;
             }
@@ -165,37 +124,43 @@ where
         } else {
             Some(ctx.notifications.try_next().await)
         };
-        let Some(next) = next else {
-            prepared.block = None;
-            continue;
-        };
+        let Some(next) = next else { continue };
         let l2_state_provider = ctx.provider().clone();
         handle_notification(&mut ctx, &mut runtime, &store, &l2_state_provider, next)?;
     }
 }
 
-/// Prepare the next applied block while continuing to buffer notifications.
-async fn prepare_next_applied_block<Node, P>(
+/// Ensure the persisted checker identity matches the active node configuration.
+fn validate_checkpoint_identity(
+    config: &CheckerConfig,
+    zone_chain_id: u64,
+    identity: Identity,
+) -> eyre::Result<()> {
+    if identity.zone_chain_id != zone_chain_id
+        || identity.zone_id != config.zone_id
+        || identity.portal != config.portal_address
+        || identity.creation_block != config.portal_creation_block_hash
+    {
+        eyre::bail!("checker checkpoint identity does not match the node configuration");
+    }
+    Ok(())
+}
+
+/// Authenticate a requested block while continuing to buffer notifications.
+async fn authenticate_requested_block<Node, P>(
     config: &CheckerConfig,
     ctx: &mut ExExContext<Node>,
     store: &Persistence,
     runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
-    prepared: &mut PreparedPipeline,
+    request: AuthenticationRequest,
     l1_provider: &P,
-) -> eyre::Result<()>
+) -> eyre::Result<Result<AuthenticatedBlock, Failure>>
 where
     Node: FullNodeComponents,
     Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     P: Provider<TempoNetwork>,
 {
-    let Some(applied_index) = runtime.next_applied_index(store)? else {
-        return Ok(());
-    };
-    if prepared.block.is_some() {
-        return Ok(());
-    }
-
     let (notification, plan) = runtime
         .current()
         .ok_or_else(|| eyre::eyre!("applied index has no current notification"))?;
@@ -212,7 +177,7 @@ where
     let parent_state = runtime.snapshot().state.clone();
     let acquisition = authenticate_applied_l2_block(
         &l2_chain,
-        applied_index,
+        request.index(),
         l1_provider,
         &l2_state_provider,
         parent_state,
@@ -233,8 +198,7 @@ where
             }
         }
     };
-    prepared.block = Some((applied_index, acquired));
-    Ok(())
+    Ok(acquired)
 }
 
 /// Handle one notification-stream result and apply its ExEx lifecycle outcome.
@@ -260,7 +224,9 @@ where
                 .wrap_err_with(|| format!("notification stream error: {error}"));
         }
     };
-    match runtime.push_or_record_overflow(store, notification)? {
+    let plan = notification_plan(&notification)
+        .map_err(|_| eyre::eyre!("checker rejected notification"))?;
+    match runtime.push_planned_or_record_overflow(store, notification, plan)? {
         EnqueueAction::Queued => Ok(()),
         EnqueueAction::AcknowledgeAndTerminate(height) => {
             ctx.send_finished_height(height.into())?;
@@ -268,6 +234,94 @@ where
         }
         EnqueueAction::Terminal => eyre::bail!("checker rejected notification"),
     }
+}
+
+/// Persist the unchecked suffix and terminate after the notification stream fails.
+fn handle_notification_stream_failure<P: BlockNumReader + ?Sized>(
+    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
+    store: &Persistence,
+    provider: &P,
+) -> eyre::Result<()> {
+    let tip = runtime.snapshot().meta.verified_zone_tip;
+    let head = provider.best_block_number()?;
+    if head <= tip.number {
+        eyre::bail!("notification stream failed without a reconstructable unchecked suffix");
+    }
+    let mut suffix = Vec::with_capacity((head - tip.number) as usize);
+    for number in tip.number + 1..=head {
+        let hash = provider
+            .block_hash(number)?
+            .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
+        suffix.push(BlockNumHash { number, hash });
+    }
+    match runtime.record_stream_failure(store, &suffix)? {
+        StreamFailureAction::GapRecorded(_) => {
+            // The durable watermark remains available for startup recovery.
+            Err(eyre::eyre!("checker notification stream unavailable"))
+        }
+        StreamFailureAction::Terminal => Err(eyre::eyre!("failed to record canonical stream gap")),
+    }
+}
+/// Convert a contiguous ExEx notification into a checked runtime plan.
+fn notification_plan(
+    notification: &ExExNotification<TempoPrimitives>,
+) -> Result<NotificationPlan, Failure> {
+    match notification {
+        ExExNotification::ChainCommitted { new } => {
+            let applied = validate_fragment(new, "committed")?;
+            NotificationPlan::new(Vec::new(), applied.coordinates, applied.parent)
+        }
+        ExExNotification::ChainReverted { old } => {
+            let reverted = validate_fragment(old, "reverted")?;
+            NotificationPlan::new(reverted.coordinates, Vec::new(), reverted.parent)
+        }
+        ExExNotification::ChainReorged { old, new } => {
+            let reverted = validate_fragment(old, "reverted")?;
+            let applied = validate_fragment(new, "replacement")?;
+            if reverted.parent != applied.parent {
+                return Err(Failure::terminal(
+                    "reorg fragments have different common ancestors",
+                ));
+            }
+            NotificationPlan::new(reverted.coordinates, applied.coordinates, reverted.parent)
+        }
+    }
+}
+
+/// Validate a contiguous chain fragment and derive its coordinates and parent.
+fn validate_fragment(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<ChainFragment, Failure> {
+    let first = chain
+        .blocks()
+        .values()
+        .next()
+        .ok_or_else(|| Failure::terminal(format!("empty {kind} fragment")))?;
+    let parent = BlockNumHash {
+        number: first
+            .number()
+            .checked_sub(1)
+            .ok_or_else(|| Failure::terminal("fragment starts at genesis"))?,
+        hash: first.parent_hash(),
+    };
+    let mut coordinates: Vec<BlockNumHash> = Vec::with_capacity(chain.len());
+    for block in chain.blocks().values() {
+        // Each block must directly extend the preceding block in the fragment.
+        if let Some(previous) = coordinates.last()
+            && (previous.number.checked_add(1) != Some(block.number())
+                || block.parent_hash() != previous.hash)
+        {
+            return Err(Failure::terminal(format!(
+                "{kind} fragment is not contiguous"
+            )));
+        }
+        coordinates.push(BlockNumHash {
+            number: block.number(),
+            hash: block.hash(),
+        });
+    }
+    Ok(ChainFragment {
+        coordinates,
+        parent,
+    })
 }
 
 /// Authenticate one applied L2 block against its L1 import and parent state.
@@ -373,7 +427,6 @@ where
     )
     .map_err(Failure::from)
 }
-
 /// Verify portal collateral at the authenticated imported Tempo block.
 async fn verify_l1_collateral<P>(
     l1_provider: &P,
@@ -410,7 +463,7 @@ where
             )
         })?;
     for (token, accounting) in expected_l1_accounting {
-        let collateral_balance = acquire_portal_collateral(
+        let collateral_balance = acquire_portal_token_balance(
             l1_provider,
             token,
             portal_address,
@@ -438,86 +491,4 @@ where
         }
     }
     Ok(())
-}
-
-/// Validate a non-empty contiguous fragment and derive its coordinates and parent.
-fn validate_fragment(
-    chain: &Chain<TempoPrimitives>,
-    kind: &str,
-) -> Result<ValidatedFragment, Failure> {
-    let first = chain
-        .blocks()
-        .values()
-        .next()
-        .ok_or_else(|| Failure::terminal(format!("empty {kind} fragment")))?;
-    let parent = BlockNumHash {
-        number: first
-            .number()
-            .checked_sub(1)
-            .ok_or_else(|| Failure::terminal("fragment starts at genesis"))?,
-        hash: first.parent_hash(),
-    };
-    let mut coordinates: Vec<BlockNumHash> = Vec::with_capacity(chain.len());
-    for block in chain.blocks().values() {
-        // Each block must directly extend the preceding block in the fragment.
-        if let Some(previous) = coordinates.last()
-            && (previous.number.checked_add(1) != Some(block.number())
-                || block.parent_hash() != previous.hash)
-        {
-            return Err(Failure::terminal(format!(
-                "{kind} fragment is not contiguous"
-            )));
-        }
-        coordinates.push(BlockNumHash {
-            number: block.number(),
-            hash: block.hash(),
-        });
-    }
-    Ok(ValidatedFragment {
-        coordinates,
-        parent,
-    })
-}
-
-/// Ensure the persisted checker identity matches the active node configuration.
-fn validate_checkpoint_identity(
-    config: &CheckerConfig,
-    zone_chain_id: u64,
-    identity: Identity,
-) -> eyre::Result<()> {
-    if identity.zone_chain_id != zone_chain_id
-        || identity.zone_id != config.zone_id
-        || identity.portal != config.portal_address
-        || identity.creation_block != config.portal_creation_block_hash
-    {
-        eyre::bail!("checker checkpoint identity does not match the node configuration");
-    }
-    Ok(())
-}
-
-/// Persist the unchecked suffix and terminate after the notification stream fails.
-fn handle_notification_stream_failure<P: BlockNumReader + ?Sized>(
-    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
-    store: &Persistence,
-    provider: &P,
-) -> eyre::Result<()> {
-    let tip = runtime.snapshot().meta.verified_zone_tip;
-    let head = provider.best_block_number()?;
-    if head <= tip.number {
-        eyre::bail!("notification stream failed without a reconstructable unchecked suffix");
-    }
-    let mut suffix = Vec::with_capacity((head - tip.number) as usize);
-    for number in tip.number + 1..=head {
-        let hash = provider
-            .block_hash(number)?
-            .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
-        suffix.push(BlockNumHash { number, hash });
-    }
-    match runtime.record_stream_failure(store, &suffix)? {
-        StreamFailureAction::GapRecorded(_) => {
-            // The durable watermark remains available for startup recovery.
-            Err(eyre::eyre!("checker notification stream unavailable"))
-        }
-        StreamFailureAction::Terminal => Err(eyre::eyre!("failed to record canonical stream gap")),
-    }
 }
