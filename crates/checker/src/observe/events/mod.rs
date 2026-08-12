@@ -7,8 +7,8 @@
 use alloy_primitives::{Address, B256, Log, b256};
 
 use tempo_zone_contracts::{
-    MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES,
-    TEMPO_STATE_ADDRESS, ZONE_FACTORY_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
+    MAX_SEQUENCERS, MAX_TOKEN_METADATA_BYTES, TEMPO_STATE_ADDRESS, ZONE_FACTORY_ADDRESS,
+    ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS,
 };
 use zone_precompiles::{ecies::COMPRESSED_PUBLIC_KEY_SIZE, outbox::MAX_CALLBACK_DATA_SIZE};
 
@@ -96,14 +96,14 @@ pub(super) fn validate_token_metadata(
     symbol: &str,
     currency: &str,
 ) -> Result<(), ProtocolEventError> {
-    validate_max_bytes(log, event, "name", name.len(), MAX_TOKEN_NAME_BYTES)?;
-    validate_max_bytes(log, event, "symbol", symbol.len(), MAX_TOKEN_SYMBOL_BYTES)?;
+    validate_max_bytes(log, event, "name", name.len(), MAX_TOKEN_METADATA_BYTES)?;
+    validate_max_bytes(log, event, "symbol", symbol.len(), MAX_TOKEN_METADATA_BYTES)?;
     validate_max_bytes(
         log,
         event,
         "currency",
         currency.len(),
-        MAX_TOKEN_CURRENCY_BYTES,
+        MAX_TOKEN_METADATA_BYTES,
     )
 }
 

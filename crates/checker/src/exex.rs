@@ -232,7 +232,7 @@ where
             ctx.send_finished_height(height.into())?;
             eyre::bail!("checker stopped after recording a queue overflow gap");
         }
-        EnqueueAction::Terminal => eyre::bail!("checker rejected notification"),
+        EnqueueAction::Terminal => Err(eyre::eyre!("checker rejected notification")),
     }
 }
 

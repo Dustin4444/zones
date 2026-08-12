@@ -11,8 +11,8 @@ use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZonePortal};
 
 use tempo_zone_contracts::{
-    MAX_DEPOSITS_PER_TEMPO_BLOCK, MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES,
-    MAX_TOKEN_SYMBOL_BYTES, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
+    MAX_DEPOSITS_PER_TEMPO_BLOCK, MAX_SEQUENCERS, MAX_TOKEN_METADATA_BYTES,
+    MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
 };
 use zone_precompiles::{
     ecies::{AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE},
@@ -289,9 +289,9 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
         bounds.dynamic_array(0, 3, 4, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, "enabledTokens")?;
     for index in 0..token_count {
         let token = bounds.dynamic_element(token_head, token_count, index)?;
-        bounds.bytes_field(token, 1, 4, MAX_TOKEN_NAME_BYTES, "token name")?;
-        bounds.bytes_field(token, 2, 4, MAX_TOKEN_SYMBOL_BYTES, "token symbol")?;
-        bounds.bytes_field(token, 3, 4, MAX_TOKEN_CURRENCY_BYTES, "token currency")?;
+        bounds.bytes_field(token, 1, 4, MAX_TOKEN_METADATA_BYTES, "token name")?;
+        bounds.bytes_field(token, 2, 4, MAX_TOKEN_METADATA_BYTES, "token symbol")?;
+        bounds.bytes_field(token, 3, 4, MAX_TOKEN_METADATA_BYTES, "token currency")?;
     }
     Ok(())
 }
