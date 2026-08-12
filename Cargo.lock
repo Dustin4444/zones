@@ -13722,14 +13722,11 @@ dependencies = [
  "bytes",
  "eyre",
  "futures",
- "metrics",
  "reth-chainspec",
  "reth-codecs",
  "reth-db",
- "reth-db-api",
  "reth-execution-types",
  "reth-exex",
- "reth-metrics",
  "reth-node-api",
  "reth-primitives-traits",
  "reth-provider",
@@ -13737,24 +13734,17 @@ dependencies = [
  "serde",
  "tempfile",
  "tempo-alloy",
+ "tempo-chainspec",
  "tempo-contracts",
+ "tempo-precompiles",
  "tempo-primitives",
+ "tempo-revm",
  "tempo-zone-contracts",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zone-checker-kernel",
+ "zone-precompiles",
  "zone-primitives",
-]
-
-[[package]]
-name = "zone-checker-kernel"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -13859,6 +13849,7 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "metrics",
+ "metrics-exporter-prometheus",
  "p256 0.13.2",
  "rand 0.8.7",
  "reqwest",
@@ -13871,6 +13862,7 @@ dependencies = [
  "reth-node-api",
  "reth-node-builder",
  "reth-node-core",
+ "reth-node-metrics",
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-primitives-traits",

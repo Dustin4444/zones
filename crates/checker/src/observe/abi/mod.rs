@@ -11,8 +11,8 @@ use tempo_primitives::TempoHeader;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, ZonePortal};
 
 use tempo_zone_contracts::{
-    MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES, MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES,
-    MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, MAX_UNPROCESSED_DEPOSITS,
+    MAX_DEPOSITS_PER_TEMPO_BLOCK, MAX_SEQUENCERS, MAX_TOKEN_CURRENCY_BYTES,
+    MAX_TOKEN_NAME_BYTES, MAX_TOKEN_SYMBOL_BYTES, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK,
 };
 use zone_precompiles::{
     ecies::{AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE, ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE},
@@ -250,7 +250,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
     bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
 
     let (deposit_head, deposit_count) =
-        bounds.dynamic_array(0, 1, 4, MAX_UNPROCESSED_DEPOSITS, "deposits")?;
+        bounds.dynamic_array(0, 1, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "deposits")?;
     let mut ordinary_count = 0usize;
     for index in 0..deposit_count {
         let deposit = bounds.dynamic_element(deposit_head, deposit_count, index)?;
@@ -278,7 +278,7 @@ fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
     }
 
     let decryption_count =
-        bounds.static_array(0, 2, 4, 4, MAX_UNPROCESSED_DEPOSITS, "decryptions")?;
+        bounds.static_array(0, 2, 4, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "decryptions")?;
     if decryption_count != ordinary_count {
         return Err(surface.malformed(format!(
                 "decryption count {decryption_count} does not match ordinary deposit count {ordinary_count}"
