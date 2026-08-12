@@ -6,15 +6,15 @@ use tempo_zone_contracts::{
     DepositType, IZoneInbox::WithdrawalBounceBackDeposit, ZONE_PORTAL_PREFIX, ZonePortal,
 };
 
-pub(crate) use tempo_zone_contracts::{EMPTY_SENTINEL as WITHDRAWAL_SENTINEL, NO_QUEUE_INDEX};
+pub(crate) use tempo_zone_contracts::NO_QUEUE_INDEX;
+
+/// Terminator for the reverse-linked Portal withdrawal queue.
+pub(crate) const WITHDRAWAL_TERMINATOR: B256 = B256::ZERO;
 
 use crate::kernel::{
     facts::{BounceBackDeposit, OrdinaryDeposit},
     state::Withdrawal,
 };
-
-/// Maximum number of submitted withdrawal batches awaiting Portal processing.
-pub(crate) const RING_CAPACITY: u64 = 100;
 
 /// Derive the Portal sender tag for a user withdrawal and fallback nonce.
 pub(crate) fn sender_tag(sender: Address, transaction_hash: B256, fallback_nonce: u64) -> B256 {
@@ -54,7 +54,7 @@ pub(crate) fn withdrawal_queue_hash(values: &[Withdrawal]) -> B256 {
     values
         .iter()
         .rev()
-        .fold(WITHDRAWAL_SENTINEL, |tail, value| {
+        .fold(WITHDRAWAL_TERMINATOR, |tail, value| {
             withdrawal_hash(value, tail)
         })
 }

@@ -205,18 +205,14 @@ fn submit_batch(
         || settlement.submitted_deposit != boundary.first_deposit
         || input.next_zone_height <= settlement.zone_height
         || boundary.final_deposit.number > deposit.number
-        || (count != 0 && queue_hash == WITHDRAWAL_SENTINEL)
+        || (count != 0 && queue_hash == WITHDRAWAL_TERMINATOR)
     {
         return Err(TransitionError::CommitmentMismatch);
     }
-    let queue_len = checked_ring_len(settlement.queue_head, settlement.queue_tail)?;
     let queue_index = if count == 0 {
         overlay.set(StateKey::Batch(id), None);
         NO_QUEUE_INDEX
     } else {
-        if queue_len == U256::from(RING_CAPACITY) {
-            return Err(TransitionError::WithdrawalCap);
-        }
         let index = settlement.queue_tail;
         settlement.queue_tail = index
             .checked_add(U256::ONE)
@@ -280,7 +276,7 @@ fn process_withdrawals(
     else {
         return Err(TransitionError::PortalNotCreated);
     };
-    let queue_len = checked_ring_len(settlement.queue_head, settlement.queue_tail)?;
+    let queue_len = checked_queue_len(settlement.queue_head, settlement.queue_tail)?;
     if queue_len.is_zero() {
         return Err(TransitionError::OwnerMismatch);
     }
@@ -319,19 +315,13 @@ fn process_withdrawals(
     if next > count {
         return Err(TransitionError::CommitmentMismatch);
     }
-    if queue_hash == WITHDRAWAL_SENTINEL || input.remaining_queue == WITHDRAWAL_SENTINEL {
-        return Err(TransitionError::CommitmentMismatch);
-    }
-    let tail = if input.remaining_queue.is_zero() {
-        WITHDRAWAL_SENTINEL
-    } else {
-        input.remaining_queue
-    };
     let folded = input
         .withdrawals
         .iter()
         .rev()
-        .fold(tail, |hash, value| withdrawal_hash(value, hash));
+        .fold(input.remaining_queue, |hash, value| {
+            withdrawal_hash(value, hash)
+        });
     if folded != queue_hash || (next == count) != input.remaining_queue.is_zero() {
         return Err(TransitionError::CommitmentMismatch);
     }
@@ -548,13 +538,9 @@ fn process_withdrawals(
     Ok(())
 }
 
-/// Return a bounded submitted-batch ring length.
-fn checked_ring_len(head: U256, tail: U256) -> Result<U256, TransitionError> {
-    let len = tail.checked_sub(head).ok_or(TransitionError::Underflow)?;
-    if len > U256::from(RING_CAPACITY) {
-        return Err(TransitionError::OwnerMismatch);
-    }
-    Ok(len)
+/// Return the number of submitted batches awaiting withdrawal processing.
+fn checked_queue_len(head: U256, tail: U256) -> Result<U256, TransitionError> {
+    tail.checked_sub(head).ok_or(TransitionError::Underflow)
 }
 
 /// Require a user withdrawal's fallback collateral to remain held.

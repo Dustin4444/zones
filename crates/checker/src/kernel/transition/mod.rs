@@ -6,9 +6,9 @@ use alloy_primitives::{Address, U256};
 
 use crate::kernel::{
     derivation::{
-        NO_QUEUE_INDEX, RING_CAPACITY, WITHDRAWAL_SENTINEL, bounceback_deposit_hash,
-        bounceback_fee, failed_deposit_sender_tag, ordinary_deposit_hash, portal_address,
-        sender_tag, withdrawal_fee, withdrawal_hash, withdrawal_queue_hash,
+        NO_QUEUE_INDEX, WITHDRAWAL_TERMINATOR, bounceback_deposit_hash, bounceback_fee,
+        failed_deposit_sender_tag, ordinary_deposit_hash, portal_address, sender_tag,
+        withdrawal_fee, withdrawal_hash, withdrawal_queue_hash,
     },
     effects::{Effect, ExpectedState},
     facts::{

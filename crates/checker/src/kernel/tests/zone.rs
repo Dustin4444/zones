@@ -366,7 +366,7 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
             data.clone()
         })
         .collect::<Vec<_>>();
-    let suffix = crate::kernel::derivation::withdrawal_hash(&withdrawals[1], WITHDRAWAL_SENTINEL);
+    let suffix = crate::kernel::derivation::withdrawal_hash(&withdrawals[1], WITHDRAWAL_TERMINATOR);
     commit(
         &mut state,
         ImportedFacts {

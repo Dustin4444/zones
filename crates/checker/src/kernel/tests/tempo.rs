@@ -249,7 +249,7 @@ fn every_submission_commitment_field_is_compared() {
         }
     );
     changed!(withdrawal_queue_hash, B256::repeat_byte(0x15));
-    changed!(withdrawal_queue_hash, WITHDRAWAL_SENTINEL);
+    changed!(withdrawal_queue_hash, WITHDRAWAL_TERMINATOR);
     changed!(next_zone_height, exact.next_zone_height + U256::ONE);
     for input in mutations {
         assert_eq!(

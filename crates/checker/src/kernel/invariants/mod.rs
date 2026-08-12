@@ -11,7 +11,7 @@ mod batches;
 mod ownership;
 
 use crate::kernel::{
-    derivation::{RING_CAPACITY, bounceback_deposit_hash, ordinary_deposit_hash},
+    derivation::{bounceback_deposit_hash, ordinary_deposit_hash},
     finding::Datum,
     state::{
         Cursor, DepositOwner, FallbackState, PortalIdentity, PortalState, Settlement, State,
@@ -168,9 +168,7 @@ fn validate_created_baseline(
             Some(StateKey::Zone),
         ));
     }
-    if settlement.queue_tail < settlement.queue_head
-        || settlement.queue_tail - settlement.queue_head > U256::from(RING_CAPACITY)
-    {
+    if settlement.queue_tail < settlement.queue_head {
         return Err(violation(InvariantCode::Ring, Some(StateKey::Portal)));
     }
     Ok(())

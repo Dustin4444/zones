@@ -8,7 +8,7 @@ use crate::kernel::{
     State, StateKey, StateValue, TokenEnable, TokenPhase, TransitionError, UserWithdrawal,
     WithdrawalId, WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
     apply_genesis_handoff, apply_imported, apply_zone,
-    derivation::{WITHDRAWAL_SENTINEL, ordinary_deposit_hash, portal_address},
+    derivation::{WITHDRAWAL_TERMINATOR, ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
     state::{
