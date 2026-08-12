@@ -1439,12 +1439,19 @@ impl ZoneTestNode {
             "checker runtime and checkpoint builder are mutually exclusive"
         );
         let node_handle = match checker {
-            None => builder.launch_with_debug_capabilities().await?,
+            None => {
+                Box::pin(std::future::IntoFuture::into_future(
+                    builder.launch_with_debug_capabilities(),
+                ))
+                .await?
+            }
             Some(checker) => {
-                builder
-                    .install_exex("zone-checker", async move |ctx| checker.launch(ctx))
-                    .launch_with_debug_capabilities()
-                    .await?
+                Box::pin(std::future::IntoFuture::into_future(
+                    builder
+                        .install_exex("zone-checker", async move |ctx| checker.launch(ctx))
+                        .launch_with_debug_capabilities(),
+                ))
+                .await?
             }
         };
         if let Some(config) = checker_checkpoint {
