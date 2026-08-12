@@ -47,14 +47,26 @@ pub(crate) enum AdapterFindingCode {
     Grammar = 200,
 }
 
+impl AdapterFindingCode {
+    /// Build an authenticated-divergence failure for this adapter invariant.
+    fn failure(self, message: impl Into<String>) -> Failure {
+        Failure::authenticated_divergence(
+            message,
+            crate::kernel::Finding::coded(
+                crate::kernel::FindingCategory::Observation,
+                self as u16,
+                crate::kernel::FindingLocation::Block,
+            ),
+        )
+    }
+}
+
 /// Adapt one authenticated Zone block into kernel inputs and independent outputs.
 pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, Failure> {
     let header = o.l2.inputs().advance_tempo().imported_header();
     if o.l1.len() != 1 {
-        return Err(failure(
-            AdapterFindingCode::HeaderSequence,
-            "advanceTempo requires exactly one Tempo observation",
-        ));
+        return Err(AdapterFindingCode::HeaderSequence
+            .failure("advanceTempo requires exactly one Tempo observation"));
     }
     let observation = &o.l1[0];
     let ImportedAdaptation {
@@ -81,10 +93,7 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
         },
         parent: BlockNumHash {
             number: o.l2.block_number().checked_sub(1).ok_or_else(|| {
-                failure(
-                    AdapterFindingCode::HeaderSequence,
-                    "Zone genesis has no parent",
-                )
+                AdapterFindingCode::HeaderSequence.failure("Zone genesis has no parent")
             })?,
             hash: o.l2.parent_hash(),
         },
@@ -94,10 +103,7 @@ pub(crate) fn adapt(o: &AuthenticatedObservation) -> Result<AuthenticatedBlock, 
         },
         tempo_parent: BlockNumHash {
             number: header.number().checked_sub(1).ok_or_else(|| {
-                failure(
-                    AdapterFindingCode::HeaderSequence,
-                    "imported genesis has no parent",
-                )
+                AdapterFindingCode::HeaderSequence.failure("imported genesis has no parent")
             })?,
             hash: header.header().parent_hash(),
         },
@@ -119,22 +125,9 @@ pub(crate) fn adapt_imported(
     zone_id: u32,
 ) -> Result<ImportedAdaptation, Failure> {
     if (observation.block_hash(), observation.block_number()) != (header.hash(), header.number()) {
-        return Err(failure(
-            AdapterFindingCode::Grammar,
-            "Tempo observation does not match imported header",
-        ));
+        return Err(
+            AdapterFindingCode::Grammar.failure("Tempo observation does not match imported header")
+        );
     }
     imported_facts(observation, header, portal_creation_block_hash, zone_id)
-}
-/// Build an authenticated-divergence failure for an adapter invariant.
-fn failure(code: AdapterFindingCode, message: impl Into<String>) -> Failure {
-    let code = code as u16;
-    Failure::authenticated_divergence(
-        message,
-        crate::kernel::Finding::coded(
-            crate::kernel::FindingCategory::Observation,
-            code,
-            crate::kernel::FindingLocation::Block,
-        ),
-    )
 }

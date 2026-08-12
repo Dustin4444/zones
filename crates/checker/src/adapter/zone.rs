@@ -19,7 +19,6 @@ use crate::{
 
 use super::{
     AdapterFindingCode, AuthenticatedObservation, ZoneAdaptation, deposits::ordinary_deposit,
-    failure,
 };
 
 /// Kernel outputs derived from authenticated Zone events.
@@ -69,10 +68,8 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
             && event.blockNumber == imported.number()
             && event.stateRoot == imported.header().state_root() => {}
         _ => {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "TempoBlockFinalized fields do not match the imported header",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("TempoBlockFinalized fields do not match the imported header"));
         }
     }
     expect_advance(
@@ -104,18 +101,14 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
     for (index, deposit) in advance.deposits().iter().enumerate() {
         if deposit.as_ordinary().is_some() {
             let outcome = events.get(cursor).ok_or_else(|| {
-                failure(
-                    AdapterFindingCode::Grammar,
-                    format!("deposit {index} missing outcome"),
-                )
+                AdapterFindingCode::Grammar.failure(format!("deposit {index} missing outcome"))
             })?;
             if outcome.position().transaction_index() != 0
                 || outcome.position().transaction_hash() != advance_hash
             {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    format!("deposit {index} outcome belongs to wrong transaction"),
-                ));
+                return Err(AdapterFindingCode::Grammar.failure(format!(
+                    "deposit {index} outcome belongs to wrong transaction"
+                )));
             }
             cursor += 1;
             match outcome.event() {
@@ -135,10 +128,8 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                     )?;
                 }
                 _ => {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        format!("deposit {index} has invalid outcome grammar"),
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure(format!("deposit {index} has invalid outcome grammar")));
                 }
             }
         } else if deposit.as_withdrawal_bounce_back().is_some() {
@@ -158,10 +149,8 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                 "bounceback outcome",
             )?;
         } else {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                format!("deposit {index} has unsupported kind"),
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure(format!("deposit {index} has unsupported kind")));
         }
     }
     match events.get(cursor).map(|outcome| outcome.event()) {
@@ -173,10 +162,8 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                 && event.depositsProcessed
                     == u64::try_from(advance.deposits().len()).unwrap_or(u64::MAX) => {}
         _ => {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "TempoAdvanced fields do not match advanceTempo input or Zone state",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("TempoAdvanced fields do not match advanceTempo input or Zone state"));
         }
     }
     expect_advance(
@@ -195,10 +182,7 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
         .get(cursor)
         .is_some_and(|e| e.position().transaction_index() == 0)
     {
-        return Err(failure(
-            AdapterFindingCode::Grammar,
-            "extra event in advance transaction",
-        ));
+        return Err(AdapterFindingCode::Grammar.failure("extra event in advance transaction"));
     }
 
     let final_hash = o.l2.inputs().finalization().map(|f| f.transaction_hash());
@@ -214,20 +198,16 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                     | Outbox::IZoneOutboxEvents::WithdrawalRequested(_)
             ) | L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::RefundClaimed(_))
         ) {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "unexpected post-advance protocol event",
-            ));
+            return Err(
+                AdapterFindingCode::Grammar.failure("unexpected post-advance protocol event")
+            );
         }
         cursor += 1;
     }
     match final_hash {
         Some(hash) => {
             let outcome = events.get(cursor).ok_or_else(|| {
-                failure(
-                    AdapterFindingCode::Grammar,
-                    "finalization missing BatchFinalized",
-                )
+                AdapterFindingCode::Grammar.failure("finalization missing BatchFinalized")
             })?;
             if outcome.position().transaction_hash() != hash
                 || !matches!(
@@ -235,10 +215,9 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
                     L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(_))
                 )
             {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    "finalization does not own BatchFinalized",
-                ));
+                return Err(
+                    AdapterFindingCode::Grammar.failure("finalization does not own BatchFinalized")
+                );
             }
             cursor += 1;
         }
@@ -249,18 +228,14 @@ fn validate_zone_event_grammar(o: &AuthenticatedObservation) -> Result<(), Failu
             )
         }) =>
         {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "BatchFinalized has no finalization envelope",
-            ));
+            return Err(
+                AdapterFindingCode::Grammar.failure("BatchFinalized has no finalization envelope")
+            );
         }
         None => {}
     }
     if cursor != events.len() {
-        return Err(failure(
-            AdapterFindingCode::Grammar,
-            "extra finalization or protocol events",
-        ));
+        return Err(AdapterFindingCode::Grammar.failure("extra finalization or protocol events"));
     }
     Ok(())
 }
@@ -273,20 +248,15 @@ fn expect_advance(
     expected: impl FnOnce(&L2ProtocolEvent) -> bool,
     label: &str,
 ) -> Result<(), Failure> {
-    let outcome = events.get(*cursor).ok_or_else(|| {
-        failure(
-            AdapterFindingCode::Grammar,
-            format!("advance missing {label}"),
-        )
-    })?;
+    let outcome = events
+        .get(*cursor)
+        .ok_or_else(|| AdapterFindingCode::Grammar.failure(format!("advance missing {label}")))?;
     if outcome.position().transaction_index() != 0
         || outcome.position().transaction_hash() != advance_hash
         || !expected(outcome.event())
     {
-        return Err(failure(
-            AdapterFindingCode::Grammar,
-            format!("advance expected {label} at cursor {cursor}"),
-        ));
+        return Err(AdapterFindingCode::Grammar
+            .failure(format!("advance expected {label} at cursor {cursor}")));
     }
     *cursor += 1;
     Ok(())
@@ -313,31 +283,23 @@ fn adapt_deposits(
         } else if let Some(d) = d.as_withdrawal_bounce_back() {
             let bytes = d.to.as_slice();
             if bytes[..12].iter().any(|byte| *byte != 0) {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    "bounceback recipient has non-canonical high bytes",
-                ));
+                return Err(AdapterFindingCode::Grammar
+                    .failure("bounceback recipient has non-canonical high bytes"));
             }
             if d.amount == 0 {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    "zero bounceback amount",
-                ));
+                return Err(AdapterFindingCode::Grammar.failure("zero bounceback amount"));
             }
             let mut nonce_bytes = [0; 8];
             nonce_bytes.copy_from_slice(&bytes[12..]);
             let nonce = NonZeroU64::new(u64::from_be_bytes(nonce_bytes))
-                .ok_or_else(|| failure(AdapterFindingCode::Grammar, "zero bounceback nonce"))?;
+                .ok_or_else(|| AdapterFindingCode::Grammar.failure("zero bounceback nonce"))?;
             deposits.push(Deposit::BounceBack(BounceBackDeposit {
                 token: d.token,
                 fallback_nonce: nonce,
                 amount: d.amount,
             }));
         } else {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "unsupported deposit kind",
-            ));
+            return Err(AdapterFindingCode::Grammar.failure("unsupported deposit kind"));
         }
     }
     Ok((enabled_tokens, deposits))
@@ -452,7 +414,7 @@ fn adapt_outcomes(
             L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::BatchFinalized(e)) => {
                 effects.push(Effect::BatchFinalized {
                     id: crate::kernel::BatchId::new(o.zone_id, e.withdrawalBatchIndex).ok_or_else(
-                        || failure(AdapterFindingCode::Grammar, "zero finalized batch index"),
+                        || AdapterFindingCode::Grammar.failure("zero finalized batch index"),
                     )?,
                     queue_hash: e.withdrawalQueueHash,
                 })
@@ -460,10 +422,8 @@ fn adapt_outcomes(
             L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::TempoAdvanced(_))
             | L2ProtocolEvent::TempoState(_) => {}
             L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::DepositRejected(_)) => {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    "unsupported DepositRejected event passed classification",
-                ));
+                return Err(AdapterFindingCode::Grammar
+                    .failure("unsupported DepositRejected event passed classification"));
             }
         }
     }

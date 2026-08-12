@@ -8,7 +8,7 @@ use crate::{
     observe::events::{L1ProtocolEvent, Portal},
 };
 
-use super::super::{AdapterFindingCode, deposits::ordinary_deposit_event, failure};
+use super::super::{AdapterFindingCode, deposits::ordinary_deposit_event};
 
 /// Parsed effects and outcomes for one `processWithdrawals` call.
 pub(crate) struct WithdrawalAdaptation {
@@ -27,10 +27,7 @@ pub(super) fn parse_withdrawal_events(
     let mut effects = Vec::new();
     for _ in 0..member_count {
         let event = events.get(cursor).ok_or_else(|| {
-            failure(
-                AdapterFindingCode::Grammar,
-                "processWithdrawals missing member outcome",
-            )
+            AdapterFindingCode::Grammar.failure("processWithdrawals missing member outcome")
         })?;
         cursor += 1;
         match event {
@@ -64,12 +61,7 @@ pub(super) fn parse_withdrawal_events(
                     token: e.token,
                     amount: e.amount,
                     id: crate::kernel::DepositId::new(portal, e.depositNumber).ok_or_else(
-                        || {
-                            failure(
-                                AdapterFindingCode::Grammar,
-                                "zero bounceback deposit number",
-                            )
-                        },
+                        || AdapterFindingCode::Grammar.failure("zero bounceback deposit number"),
                     )?,
                     queue_hash: e.newCurrentDepositQueueHash,
                 });
@@ -77,17 +69,13 @@ pub(super) fn parse_withdrawal_events(
                     processed,
                 ))) = events.get(cursor).copied()
                 else {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "WithdrawalBounceBack must be followed by WithdrawalProcessed",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("WithdrawalBounceBack must be followed by WithdrawalProcessed"));
                 };
                 cursor += 1;
                 if processed.callbackSuccess {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "bounce WithdrawalProcessed callbackSuccess must be false",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("bounce WithdrawalProcessed callbackSuccess must be false"));
                 }
                 effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
@@ -106,7 +94,7 @@ pub(super) fn parse_withdrawal_events(
                     effects.push(Effect::DepositAppended {
                         id: crate::kernel::DepositId::new(portal, deposit.depositNumber)
                             .ok_or_else(|| {
-                                failure(AdapterFindingCode::Grammar, "zero callback deposit number")
+                                AdapterFindingCode::Grammar.failure("zero callback deposit number")
                             })?,
                         queue_hash: deposit.newCurrentDepositQueueHash,
                     });
@@ -121,17 +109,13 @@ pub(super) fn parse_withdrawal_events(
                     processed,
                 ))) = events.get(cursor).copied()
                 else {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "callback deposits must be followed by WithdrawalProcessed",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("callback deposits must be followed by WithdrawalProcessed"));
                 };
                 cursor += 1;
                 if !processed.callbackSuccess {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "callback WithdrawalProcessed callbackSuccess must be true",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("callback WithdrawalProcessed callbackSuccess must be true"));
                 }
                 effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
@@ -144,10 +128,8 @@ pub(super) fn parse_withdrawal_events(
             }
             L1ProtocolEvent::Portal(Portal::ZonePortalEvents::WithdrawalProcessed(processed)) => {
                 if !processed.callbackSuccess {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "delivered WithdrawalProcessed callbackSuccess must be true",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("delivered WithdrawalProcessed callbackSuccess must be true"));
                 }
                 effects.push(Effect::UserWithdrawalProcessed {
                     to: processed.to,
@@ -161,18 +143,14 @@ pub(super) fn parse_withdrawal_events(
                 });
             }
             _ => {
-                return Err(failure(
-                    AdapterFindingCode::Grammar,
-                    "unexpected processWithdrawals member event",
-                ));
+                return Err(AdapterFindingCode::Grammar
+                    .failure("unexpected processWithdrawals member event"));
             }
         }
     }
     if cursor != events.len() {
-        return Err(failure(
-            AdapterFindingCode::Grammar,
-            "processWithdrawals has extra or out-of-order events",
-        ));
+        return Err(AdapterFindingCode::Grammar
+            .failure("processWithdrawals has extra or out-of-order events"));
     }
     Ok(WithdrawalAdaptation { outcomes, effects })
 }

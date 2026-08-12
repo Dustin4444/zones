@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use super::{AdapterFindingCode, ImportedAdaptation, deposits::ordinary_deposit_event, failure};
+use super::{AdapterFindingCode, ImportedAdaptation, deposits::ordinary_deposit_event};
 use withdrawals::{WithdrawalAdaptation, parse_withdrawal_events};
 
 /// Parse imported transaction envelopes into ordered kernel facts and effects.
@@ -41,10 +41,8 @@ pub(super) fn facts(
                         Portal::ZonePortalEvents::BatchSubmitted(_)
                     )]
                 ) {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "submitBatch requires exactly one BatchSubmitted event",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("submitBatch requires exactly one BatchSubmitted event"));
                 }
                 operations.push(ImportedOperation::SubmitBatch(BatchSubmission {
                     tempo_block: call.tempoBlockNumber,
@@ -90,10 +88,8 @@ pub(super) fn facts(
                     WithdrawalProcessing {
                         base_fee: U256::from(header.header().base_fee_per_gas().ok_or_else(
                             || {
-                                failure(
-                                    AdapterFindingCode::Grammar,
-                                    "imported header missing base fee",
-                                )
+                                AdapterFindingCode::Grammar
+                                    .failure("imported header missing base fee")
                             },
                         )?),
                         withdrawals,
@@ -114,10 +110,8 @@ pub(super) fn facts(
                 )
             )
         }) {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "direct-call event occurred outside its transaction envelope",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("direct-call event occurred outside its transaction envelope"));
         }
         if events
             .iter()
@@ -130,10 +124,8 @@ pub(super) fn facts(
                 ]
             )
         {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "creation requires TokenEnabled followed by ZoneCreated",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("creation requires TokenEnabled followed by ZoneCreated"));
         }
         if is_creation_block
             && events.iter().any(|event| {
@@ -146,20 +138,16 @@ pub(super) fn facts(
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
         {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "creation-block TokenEnabled must belong to the creation pair",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("creation-block TokenEnabled must belong to the creation pair"));
         }
         if !is_creation_block
             && events
                 .iter()
                 .any(|event| matches!(event, L1ProtocolEvent::FactoryZoneCreated(_)))
         {
-            return Err(failure(
-                AdapterFindingCode::Grammar,
-                "ZoneCreated occurred outside the configured creation block",
-            ));
+            return Err(AdapterFindingCode::Grammar
+                .failure("ZoneCreated occurred outside the configured creation block"));
         }
         for event in events {
             match event {
@@ -184,7 +172,7 @@ pub(super) fn facts(
                             _ => None,
                         })
                         .ok_or_else(|| {
-                            failure(AdapterFindingCode::Grammar, "creation missing TokenEnabled")
+                            AdapterFindingCode::Grammar.failure("creation missing TokenEnabled")
                         })?;
                     operations.push(ImportedOperation::Create {
                         identity: PortalIdentity {
@@ -219,7 +207,7 @@ pub(super) fn facts(
                             e.depositNumber,
                         )
                         .ok_or_else(|| {
-                            failure(AdapterFindingCode::Grammar, "zero deposit number")
+                            AdapterFindingCode::Grammar.failure("zero deposit number")
                         })?,
                         queue_hash: e.newCurrentDepositQueueHash,
                     });
@@ -240,7 +228,7 @@ pub(super) fn facts(
                     .push(Effect::BatchSubmitted {
                         id: crate::kernel::BatchId::new(zone_id, e.withdrawalBatchIndex)
                             .ok_or_else(|| {
-                                failure(AdapterFindingCode::Grammar, "zero batch index")
+                                AdapterFindingCode::Grammar.failure("zero batch index")
                             })?,
                         queue_index: e.withdrawalQueueIndex,
                         processed_deposit_hash: e.nextProcessedDepositQueueHash,
@@ -260,10 +248,8 @@ pub(super) fn facts(
                     if is_creation_block => {}
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}
                 L1ProtocolEvent::KnownIgnored | L1ProtocolEvent::Portal(_) => {
-                    return Err(failure(
-                        AdapterFindingCode::Grammar,
-                        "protocol event does not match the expected grammar",
-                    ));
+                    return Err(AdapterFindingCode::Grammar
+                        .failure("protocol event does not match the expected grammar"));
                 }
             }
         }

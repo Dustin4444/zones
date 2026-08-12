@@ -2,7 +2,6 @@
 
 mod ancestry;
 mod error;
-mod replay;
 mod zone_genesis;
 
 use crate::kernel::{ImportedOperation, PortalIdentity, State, apply_genesis_handoff};
@@ -19,7 +18,6 @@ use crate::{
 };
 use ancestry::{anchor_header, authenticated_path};
 use error::BootstrapError;
-use replay::imported_block;
 use zone_genesis::{LocalZoneIdentity, genesis_anchor, validate_zero_supply};
 
 /// Build and atomically publish a checkpoint at local Zone genesis.
@@ -128,5 +126,43 @@ fn validate_creation(
     if *identity != expected_identity || initial_token.token != expected_identity.initial_token {
         eyre::bail!("creation identity does not match configuration and Zone genesis");
     }
+    Ok(())
+}
+
+/// Apply one authenticated import and verify its effects and Portal collateral.
+async fn imported_block(
+    state: &mut State,
+    observation: &crate::observe::L1BlockObservation,
+    header: &crate::observe::ImportedTempoHeader,
+    config: &CheckerConfig,
+    provider: &alloy_provider::DynProvider<TempoNetwork>,
+) -> eyre::Result<()> {
+    let adaptation = adapt_imported(
+        observation,
+        header,
+        config.portal_creation_block_hash,
+        config.zone_id,
+    )
+    .map_err(|failure| eyre::eyre!(failure.message))?;
+    let candidate = crate::kernel::apply_imported(state, &adaptation.facts)?;
+    if adaptation.effects != candidate.expected_effects() {
+        eyre::bail!("imported effects differ from expected effects");
+    }
+    for (token, accounting) in candidate.expected_accounting()? {
+        let actual = crate::observe::acquire_portal_token_balance(
+            provider,
+            token,
+            observation.portal_address(),
+            observation.block_hash(),
+        )
+        .await?;
+        if accounting
+            .collateral()
+            .is_none_or(|required| actual < required)
+        {
+            eyre::bail!("imported collateral is insufficient for token {token}");
+        }
+    }
+    *state = candidate.into_state();
     Ok(())
 }

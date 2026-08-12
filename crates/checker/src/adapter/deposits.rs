@@ -4,7 +4,7 @@ use alloy_primitives::FixedBytes;
 
 use crate::{failure::Failure, kernel::OrdinaryDeposit};
 
-use super::{AdapterFindingCode, failure};
+use super::AdapterFindingCode;
 
 /// Convert an `advanceTempo` ordinary deposit into checker-owned facts.
 pub(super) fn ordinary_deposit(
@@ -49,10 +49,7 @@ pub(super) fn ordinary_deposit_event(
 /// Decode the fixed-size ciphertext authenticated by deposit calldata or events.
 fn ciphertext(bytes: &[u8], context: &'static str) -> Result<FixedBytes<64>, Failure> {
     let ciphertext: [u8; 64] = bytes.try_into().map_err(|_| {
-        failure(
-            AdapterFindingCode::Grammar,
-            format!("{context} ciphertext is not 64 bytes"),
-        )
+        AdapterFindingCode::Grammar.failure(format!("{context} ciphertext is not 64 bytes"))
     })?;
     Ok(FixedBytes::from(ciphertext))
 }

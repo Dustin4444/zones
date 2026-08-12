@@ -1,7 +1,7 @@
 use alloy_sol_types::SolEvent as _;
 use tempo_zone_contracts::{IZoneInbox, IZoneOutbox, TempoState, ZoneFactory, ZonePortal};
 
-use super::{factory, inbox, outbox, portal, tempo_state};
+use super::portal;
 
 #[test]
 fn independent_topics_match_shared_wire_types() {
@@ -91,63 +91,63 @@ fn independent_topics_match_shared_wire_types() {
             ZonePortal::RpcUrlUpdated::SIGNATURE_HASH,
         ),
         (
-            factory::ZONE_CREATED_TOPIC,
+            super::ZONE_CREATED_TOPIC,
             ZoneFactory::ZoneCreated::SIGNATURE_HASH,
         ),
         (
-            factory::OWNERSHIP_TRANSFERRED_TOPIC,
+            super::OWNERSHIP_TRANSFERRED_TOPIC,
             ZoneFactory::OwnershipTransferred::SIGNATURE_HASH,
         ),
         (
-            inbox::TEMPO_ADVANCED_TOPIC,
+            super::TEMPO_ADVANCED_TOPIC,
             IZoneInbox::TempoAdvanced::SIGNATURE_HASH,
         ),
         (
-            inbox::DEPOSIT_PROCESSED_TOPIC,
+            super::DEPOSIT_PROCESSED_TOPIC,
             IZoneInbox::DepositProcessed::SIGNATURE_HASH,
         ),
         (
-            inbox::DEPOSIT_FAILED_TOPIC,
+            super::DEPOSIT_FAILED_TOPIC,
             IZoneInbox::DepositFailed::SIGNATURE_HASH,
         ),
         (
-            inbox::WITHDRAWAL_BOUNCE_BACK_PROCESSED_TOPIC,
+            super::WITHDRAWAL_BOUNCE_BACK_PROCESSED_TOPIC,
             IZoneInbox::WithdrawalBounceBackProcessed::SIGNATURE_HASH,
         ),
         (
-            inbox::WITHDRAWAL_BOUNCE_BACK_PENDING_TOPIC,
+            super::WITHDRAWAL_BOUNCE_BACK_PENDING_TOPIC,
             IZoneInbox::WithdrawalBounceBackPending::SIGNATURE_HASH,
         ),
         (
-            inbox::REFUND_CLAIMED_TOPIC,
+            super::REFUND_CLAIMED_TOPIC,
             IZoneInbox::RefundClaimed::SIGNATURE_HASH,
         ),
         (
-            inbox::TOKEN_ENABLED_TOPIC,
+            super::INBOX_TOKEN_ENABLED_TOPIC,
             IZoneInbox::TokenEnabled::SIGNATURE_HASH,
         ),
         (
-            inbox::DEPOSIT_REJECTED_TOPIC,
+            super::DEPOSIT_REJECTED_TOPIC,
             IZoneInbox::DepositRejected::SIGNATURE_HASH,
         ),
         (
-            outbox::WITHDRAWAL_REQUESTED_TOPIC,
+            super::WITHDRAWAL_REQUESTED_TOPIC,
             IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH,
         ),
         (
-            outbox::BATCH_FINALIZED_TOPIC,
+            super::BATCH_FINALIZED_TOPIC,
             IZoneOutbox::BatchFinalized::SIGNATURE_HASH,
         ),
         (
-            outbox::TEMPO_GAS_RATE_UPDATED_TOPIC,
+            super::TEMPO_GAS_RATE_UPDATED_TOPIC,
             IZoneOutbox::TempoGasRateUpdated::SIGNATURE_HASH,
         ),
         (
-            outbox::MAX_WITHDRAWALS_PER_BLOCK_UPDATED_TOPIC,
+            super::MAX_WITHDRAWALS_PER_BLOCK_UPDATED_TOPIC,
             IZoneOutbox::MaxWithdrawalsPerBlockUpdated::SIGNATURE_HASH,
         ),
         (
-            tempo_state::BLOCK_FINALIZED_TOPIC,
+            super::BLOCK_FINALIZED_TOPIC,
             TempoState::TempoBlockFinalized::SIGNATURE_HASH,
         ),
     ];
