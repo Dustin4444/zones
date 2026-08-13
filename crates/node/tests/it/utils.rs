@@ -3631,8 +3631,11 @@ impl P2pCluster {
     ) -> eyre::Result<NumHash> {
         let block = self.fixture.next_block();
         let anchor = SealedHeader::seal_slow(block.header.clone()).num_hash();
+        let events = self.fixture.portal_events_from_deposits(&deposits);
         for index in observers {
-            self.nodes[*index].l1_block_tracker().record(anchor)?;
+            self.nodes[*index]
+                .l1_block_tracker()
+                .record_with_portal_events(anchor, events.clone())?;
         }
         for node in &self.nodes {
             self.fixture
@@ -3642,8 +3645,16 @@ impl P2pCluster {
     }
 
     /// Deliver a previously withheld anchor observation to one node.
-    pub(crate) fn record_anchor(&self, index: usize, anchor: NumHash) -> eyre::Result<()> {
-        self.nodes[index].l1_block_tracker().record(anchor)?;
+    pub(crate) fn record_anchor(
+        &self,
+        index: usize,
+        anchor: NumHash,
+        deposits: Vec<DepositFixture>,
+    ) -> eyre::Result<()> {
+        let events = self.fixture.portal_events_from_deposits(&deposits);
+        self.nodes[index]
+            .l1_block_tracker()
+            .record_with_portal_events(anchor, events)?;
         Ok(())
     }
 

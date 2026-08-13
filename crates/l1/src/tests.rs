@@ -114,6 +114,15 @@ impl DepositFixture {
     }
 }
 
+fn make_withdrawal_bounce_back(amount: u128) -> L1Deposit {
+    L1Deposit::WithdrawalBounceBack(WithdrawalBounceBackDeposit {
+        token: address!("0x0000000000000000000000000000000000001000"),
+        to: address!("0x0000000000000000000000000000000000000002"),
+        amount,
+        fee: 0,
+    })
+}
+
 struct SequenceLocalTempoCheckpointReader {
     values: Mutex<VecDeque<NumHash>>,
     last_value: NumHash,
@@ -180,6 +189,73 @@ async fn l1_block_tracker_waits_for_exact_observation() {
     assert!(!waiter.is_finished());
     tracker.record(anchor).unwrap();
     waiter.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn l1_block_tracker_returns_receipt_authenticated_portal_events() {
+    let tracker = L1BlockTracker::default();
+    let anchor = NumHash::new(10, B256::with_last_byte(0x10));
+    let events = L1PortalEvents::from_deposits(vec![make_withdrawal_bounce_back(100)]);
+    tracker
+        .record_with_portal_events(anchor, events.clone())
+        .unwrap();
+
+    let observed = tracker.wait_for_portal_events(anchor).await.unwrap();
+    assert_eq!(observed.deposits.len(), 1);
+    assert_eq!(
+        observed.deposits[0].to_abi_queued_deposit(),
+        events.deposits[0].to_abi_queued_deposit()
+    );
+}
+
+#[test]
+fn observed_portal_events_require_complete_advance_tempo_inputs() {
+    let events = L1PortalEvents {
+        deposits: vec![
+            make_withdrawal_bounce_back(100),
+            make_withdrawal_bounce_back(200),
+        ],
+        enabled_tokens: vec![EnabledToken {
+            token: address!("0x20C0000000000000000000000000000000000001"),
+            name: "Alpha USD".to_owned(),
+            symbol: "aUSD".to_owned(),
+            currency: "USD".to_owned(),
+        }],
+        encryption_key_rotations: vec![],
+        leader_transitions: vec![],
+    };
+    let deposits: Vec<_> = events
+        .deposits
+        .iter()
+        .map(L1Deposit::to_abi_queued_deposit)
+        .collect();
+    let enabled_tokens: Vec<_> = events
+        .enabled_tokens
+        .iter()
+        .map(EnabledToken::to_abi)
+        .collect();
+
+    // Rejection is a sequencer decision and does not change the authenticated deposit identity.
+    events
+        .validate_advance_tempo_inputs(&deposits, &enabled_tokens)
+        .unwrap();
+
+    let partial = events
+        .validate_advance_tempo_inputs(&deposits[..1], &enabled_tokens)
+        .unwrap_err();
+    assert!(partial.to_string().contains("deposit count"));
+
+    let mut fabricated = deposits.clone();
+    fabricated[1].depositData = Bytes::from_static(b"fabricated");
+    let fabricated = events
+        .validate_advance_tempo_inputs(&fabricated, &enabled_tokens)
+        .unwrap_err();
+    assert!(fabricated.to_string().contains("deposit 1"));
+
+    let missing_token = events
+        .validate_advance_tempo_inputs(&deposits, &[])
+        .unwrap_err();
+    assert!(missing_token.to_string().contains("token enables"));
 }
 
 #[tokio::test]

@@ -21,7 +21,7 @@ use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use zone_l1::{DepositQueue, L1BlockTracker, TempoStateExt};
+use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
     P2pPeerId, PeerTip,
@@ -1108,14 +1108,16 @@ where
         );
     }
 
-    // 3. Require the embedded L1 header to match an independently observed L1 anchor.
-    let l1_header = decode_advance_tempo(&block)?;
+    // 3. Require the embedded L1 header and portal inputs to match an
+    // independently observed L1 anchor. Execution validates the checkpoint
+    // transition against Zone state.
+    let (l1_header, portal_inputs) = decode_advance_tempo(&block)?;
     let anchor = l1_header.num_hash();
 
     // Observe and validate the anchor before authenticating a live sender. The anchor itself can
     // finalize a leadership transition that assigns the sender for this block.
-    l1_block_tracker
-        .wait_for_anchor_with_timeout(anchor, Duration::from_secs(30))
+    let observed = l1_block_tracker
+        .wait_for_portal_events_with_timeout(anchor, Duration::from_secs(30))
         .await
         .wrap_err_with(|| {
             format!(
@@ -1123,6 +1125,8 @@ where
                 anchor.number, anchor.hash
             )
         })?;
+    portal_inputs.validate(&observed)?;
+
     // The L1 subscriber applies any transition finalized by this anchor before recording the
     // anchor. Authenticate only against that post-anchor schedule so a new leader cannot race the
     // local observation.
@@ -1176,15 +1180,28 @@ where
     Ok(())
 }
 
+struct AdvanceTempoPortalInputs {
+    deposits: Vec<zone_payload::abi::QueuedDeposit>,
+    enabled_tokens: Vec<zone_payload::abi::EnabledToken>,
+}
+
+impl AdvanceTempoPortalInputs {
+    fn validate(&self, observed: &L1PortalEvents) -> eyre::Result<()> {
+        observed.validate_advance_tempo_inputs(&self.deposits, &self.enabled_tokens)
+    }
+}
+
 /// Decode the L1 header embedded in the first `IZoneInbox.advanceTempo` system transaction.
 #[cfg(test)]
 fn decode_advance_tempo_header(
     block: &SealedBlock<Block>,
 ) -> eyre::Result<SealedHeader<TempoHeader>> {
-    decode_advance_tempo(block)
+    decode_advance_tempo(block).map(|(header, _)| header)
 }
 
-fn decode_advance_tempo(block: &SealedBlock<Block>) -> eyre::Result<SealedHeader<TempoHeader>> {
+fn decode_advance_tempo(
+    block: &SealedBlock<Block>,
+) -> eyre::Result<(SealedHeader<TempoHeader>, AdvanceTempoPortalInputs)> {
     // Do some basic checks
 
     // 1. `advanceTempo` is the first tx
@@ -1215,7 +1232,13 @@ fn decode_advance_tempo(block: &SealedBlock<Block>) -> eyre::Result<SealedHeader
             header_rlp.len()
         )
     }
-    Ok(SealedHeader::seal_slow(header))
+    Ok((
+        SealedHeader::seal_slow(header),
+        AdvanceTempoPortalInputs {
+            deposits: call.deposits,
+            enabled_tokens: call.enabledTokens,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1230,11 +1253,12 @@ mod tests {
     use tokio::sync::{oneshot, watch};
 
     use super::{
-        BackfillProgress, BroadcasterShutdown, EncodedPersistedBlock, MAX_PENDING_BLOCKS,
-        PersistedBlockSource, PersistedTip, broadcast_persisted_blocks, buffer_pending_block,
+        AdvanceTempoPortalInputs, BackfillProgress, BroadcasterShutdown, EncodedPersistedBlock,
+        MAX_PENDING_BLOCKS, PersistedBlockSource, PersistedTip, broadcast_persisted_blocks,
+        buffer_pending_block,
     };
     use alloy_primitives::B256;
-    use zone_l1::L1BlockTracker;
+    use zone_l1::{L1BlockTracker, L1PortalEvents};
     use zone_p2p::{BackfillCommand, LeadershipSchedule, LeadershipState, P2pCommand};
 
     #[derive(Clone)]
@@ -1555,9 +1579,14 @@ mod tests {
             let schedule = schedule.clone();
             let tracker = tracker.clone();
             tokio::spawn(async move {
-                tracker
-                    .wait_for_anchor_with_timeout(anchor, std::time::Duration::from_secs(1))
+                let portal_inputs = AdvanceTempoPortalInputs {
+                    deposits: vec![],
+                    enabled_tokens: vec![],
+                };
+                let observed = tracker
+                    .wait_for_portal_events_with_timeout(anchor, std::time::Duration::from_secs(1))
                     .await?;
+                portal_inputs.validate(&observed)?;
                 Ok::<_, eyre::Report>(
                     schedule
                         .leader_for(ANCHOR_NUMBER)
@@ -1572,7 +1601,9 @@ mod tests {
         schedule
             .publish(LeadershipState::new(2, incoming.clone(), ANCHOR_NUMBER))
             .unwrap();
-        tracker.record(anchor).unwrap();
+        tracker
+            .record_with_portal_events(anchor, L1PortalEvents::default())
+            .unwrap();
 
         let leader = waiter
             .await

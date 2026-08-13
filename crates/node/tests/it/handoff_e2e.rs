@@ -384,9 +384,9 @@ async fn test_lagged_follower_promotes_only_after_catching_up() -> eyre::Result<
     // Deliver the withheld observations: B imports 3..=5, satisfies the promotion barrier
     // against the outgoing leader's tip evidence, and produces the boundary block itself.
     for anchor in withheld {
-        cluster.record_anchor(1, anchor)?;
+        cluster.record_anchor(1, anchor, vec![])?;
     }
-    cluster.record_anchor(1, boundary)?;
+    cluster.record_anchor(1, boundary, vec![])?;
     cluster.wait_all_at(6, HANDOFF_TIMEOUT).await?;
 
     let a_producer = cluster.sequencer_signers[0].address();

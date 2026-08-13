@@ -12,9 +12,15 @@ pub const MAX_L1_LOOKAHEAD_BLOCKS: u64 = 7_200;
 
 #[derive(Debug, Default)]
 struct L1BlockTrackerState {
-    observed: BTreeMap<u64, B256>,
+    observed: BTreeMap<u64, L1BlockObservation>,
     latest: Option<NumHash>,
     pruned_through: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct L1BlockObservation {
+    hash: B256,
+    portal_events: L1PortalEvents,
 }
 
 /// L1 blocks whose headers and receipts have been independently validated and
@@ -55,7 +61,11 @@ impl L1BlockTracker {
 
     /// Return the independently observed hash at `number`, if it is retained.
     pub fn observed_hash(&self, number: u64) -> Option<B256> {
-        self.state.read().observed.get(&number).copied()
+        self.state
+            .read()
+            .observed
+            .get(&number)
+            .map(|observation| observation.hash)
     }
 
     /// Return the highest independently observed L1 anchor.
@@ -98,18 +108,25 @@ impl L1BlockTracker {
 
     /// Wait until the exact L1 block has been validated and applied locally.
     pub async fn wait_for(&self, block: NumHash) -> eyre::Result<()> {
+        self.wait_for_portal_events(block).await.map(|_| ())
+    }
+
+    /// Wait for an exact L1 block and return its receipt-authenticated portal events.
+    pub async fn wait_for_portal_events(&self, block: NumHash) -> eyre::Result<L1PortalEvents> {
         let mut changed = self.changed.subscribe();
         loop {
             {
                 let state = self.state.read();
                 match state.observed.get(&block.number) {
-                    Some(hash) if *hash == block.hash => return Ok(()),
-                    Some(hash) => {
+                    Some(observation) if observation.hash == block.hash => {
+                        return Ok(observation.portal_events.clone());
+                    }
+                    Some(observation) => {
                         eyre::bail!(
                             "observed different L1 hash at block {}: expected {}, got {}",
                             block.number,
                             block.hash,
-                            hash
+                            observation.hash
                         )
                     }
                     None if state
@@ -141,32 +158,42 @@ impl L1BlockTracker {
         }
     }
 
-    /// Wait up to `timeout` for an exact L1 anchor to be validated and applied locally.
-    pub async fn wait_for_anchor_with_timeout(
+    /// Wait up to `timeout` for an exact L1 block and return its receipt-authenticated portal
+    /// events.
+    pub async fn wait_for_portal_events_with_timeout(
         &self,
-        anchor: NumHash,
+        block: NumHash,
         timeout: Duration,
-    ) -> eyre::Result<()> {
-        tokio::time::timeout(timeout, self.wait_for(anchor))
+    ) -> eyre::Result<L1PortalEvents> {
+        tokio::time::timeout(timeout, self.wait_for_portal_events(block))
             .await
             .map_err(|_| {
                 eyre::eyre!(
-                    "timed out after {timeout:?} waiting for L1 anchor {} ({})",
-                    anchor.number,
-                    anchor.hash
+                    "timed out after {timeout:?} waiting for L1 block {} ({})",
+                    block.number,
+                    block.hash
                 )
             })?
     }
 
     /// Record an independently validated and applied L1 anchor.
     pub fn record(&self, block: NumHash) -> eyre::Result<()> {
+        self.record_with_portal_events(block, L1PortalEvents::default())
+    }
+
+    /// Record an L1 anchor together with portal events decoded from its verified receipts.
+    pub fn record_with_portal_events(
+        &self,
+        block: NumHash,
+        portal_events: L1PortalEvents,
+    ) -> eyre::Result<()> {
         let mut state = self.state.write();
-        if let Some(hash) = state.observed.get(&block.number) {
+        if let Some(observation) = state.observed.get(&block.number) {
             eyre::ensure!(
-                *hash == block.hash,
+                observation.hash == block.hash,
                 "conflicting L1 hash at observed height {}: existing {}, new {}",
                 block.number,
-                hash,
+                observation.hash,
                 block.hash
             );
             return Ok(());
@@ -200,7 +227,13 @@ impl L1BlockTracker {
                 block.number
             );
         }
-        state.observed.insert(block.number, block.hash);
+        state.observed.insert(
+            block.number,
+            L1BlockObservation {
+                hash: block.hash,
+                portal_events,
+            },
+        );
         state.latest = Some(block);
         drop(state);
         self.changed.send_replace(());
@@ -703,7 +736,9 @@ impl L1Subscriber {
                 .wrap_err_with(|| {
                     format!("unexpected discontinuity while enqueueing L1 block {block_number}")
                 })?;
-            self.config.block_tracker.record(anchor)?;
+            self.config
+                .block_tracker
+                .record_with_portal_events(anchor, events.clone())?;
             // Publish derived L1 state only after the header has been admitted to every
             // configured retention sink and the contiguous observation tracker.
             self.apply_enabled_token_events(&events);
