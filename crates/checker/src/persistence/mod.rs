@@ -18,8 +18,7 @@ pub(crate) use model::{
     FindingKey, Identity, JournalEntry, MetaValue, Metadata, Snapshot,
 };
 
-use crate::CheckerBlockedReason;
-use crate::kernel::State;
+use crate::{CheckerBlockedReason, kernel::State};
 use reth_db::{
     Database, DatabaseEnv, DatabaseEnvKind,
     cursor::{DbCursorRO, DbCursorRW},
