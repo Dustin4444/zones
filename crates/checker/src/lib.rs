@@ -24,6 +24,38 @@ use tempo_primitives::{Block, TempoPrimitives};
 
 pub use bootstrap::build_checkpoint;
 
+/// Why the checker stopped acknowledging Zone notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckerBlockedReason {
+    /// The node delivered a malformed or discontinuous notification sequence.
+    InvalidNotificationSequence,
+    /// The configured Tempo provider belongs to another chain.
+    TempoChainMismatch,
+    /// The ExEx notification stream could not be recovered safely.
+    NotificationStreamUnavailable,
+    /// Communication with the ExEx manager failed.
+    ExExCommunication,
+    /// Authenticated work violated an internal checker assumption.
+    InvalidAuthenticatedData,
+    /// An unexpected checker runtime failure prevented safe progress.
+    RuntimeFailure,
+}
+
+impl fmt::Display for CheckerBlockedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::InvalidNotificationSequence => "invalid notification sequence",
+            Self::TempoChainMismatch => "Tempo chain mismatch",
+            Self::NotificationStreamUnavailable => "notification stream unavailable",
+            Self::ExExCommunication => "ExEx communication failure",
+            Self::InvalidAuthenticatedData => "invalid authenticated data",
+            Self::RuntimeFailure => "runtime failure",
+        };
+        f.write_str(reason)
+    }
+}
+
 /// Runtime mode for the checker ExEx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CheckerMode {

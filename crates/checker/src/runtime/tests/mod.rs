@@ -76,11 +76,12 @@ fn authenticate(
 }
 
 fn failure(class: FailureClass) -> Failure {
-    Failure {
-        class,
-        gap_reason: CoverageGapReason::ProviderUnavailable,
-        message: "injected failure".into(),
-        finding: None,
+    match class {
+        FailureClass::ImmediateTerminal => Failure::terminal("injected failure"),
+        FailureClass::TransientRetry => Failure::transient("injected failure"),
+        FailureClass::BoundedRetry | FailureClass::AuthenticatedDivergence => {
+            unreachable!("unsupported injected failure class")
+        }
     }
 }
 

@@ -1,6 +1,9 @@
 //! Durable checker records persisted in the local database.
 
-use crate::kernel::{Finding as FindingDetails, State, StateDelta};
+use crate::{
+    CheckerBlockedReason,
+    kernel::{Finding as FindingDetails, State, StateDelta},
+};
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +58,6 @@ pub(crate) enum CoverageGapReason {
     /// The notification is a descendant of a retained finding and therefore
     /// cannot be checked until that finding is removed by a reorg.
     NotCheckedAncestorDivergence,
-    Other(u16),
 }
 
 /// Whether checker coverage reaches the acknowledged Zone tip.
@@ -78,8 +80,8 @@ pub(crate) struct Metadata {
     pub acknowledged_zone_tip: BlockNumHash,
     pub active_finding: Option<FindingKey>,
     pub coverage: Coverage,
-    /// Reason the checker stopped without being able to safely acknowledge more work.
-    pub blocked: Option<CoverageGapReason>,
+    /// Why the checker stopped acknowledging new work.
+    pub blocked: Option<CheckerBlockedReason>,
 }
 /// One value stored in the metadata table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

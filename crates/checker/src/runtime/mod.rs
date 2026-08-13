@@ -8,6 +8,7 @@ use crate::kernel::State;
 use crate::kernel::{Effect, ExpectedState, ImportedFacts, ZoneFacts};
 
 use crate::{
+    CheckerBlockedReason,
     failure::{Failure, FailureClass},
     notification::NotificationPlan,
     persistence::{
@@ -195,16 +196,9 @@ impl<N> Runtime<N> {
     pub(crate) fn block(
         &mut self,
         store: &Persistence,
-        reason: CoverageGapReason,
+        reason: CheckerBlockedReason,
     ) -> Result<(), PersistenceError> {
-        match store.record_blocked(&self.snapshot, reason.clone()) {
-            Ok(snapshot) => self.snapshot = snapshot,
-            Err(PersistenceError::StaleSnapshot) => {
-                self.snapshot = store.load()?;
-                self.snapshot = store.record_blocked(&self.snapshot, reason)?;
-            }
-            Err(error) => return Err(error),
-        }
+        self.snapshot = store.record_blocked_current(reason)?;
         self.state = RuntimeState::Blocked;
         self.current = None;
         self.queue.clear();
@@ -274,7 +268,7 @@ impl<N> Runtime<N> {
                 .windows(2)
                 .all(|pair| pair[1].ancestor == pair[0].acknowledge);
         if !valid {
-            self.block(store, CoverageGapReason::Other(2))?;
+            self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
             return Ok(EnqueueAction::Blocked);
         }
         let first_plan = &plans[0];
@@ -289,7 +283,7 @@ impl<N> Runtime<N> {
                 PersistenceError::Invalid("overflow has no unchecked suffix".into())
             })?
         } else {
-            self.block(store, CoverageGapReason::Other(2))?;
+            self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
             return Ok(EnqueueAction::Blocked);
         };
         let last = plans.last().expect("nonempty plan set").acknowledge;
@@ -315,7 +309,7 @@ impl<N> Runtime<N> {
                 .windows(2)
                 .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
         {
-            self.block(store, CoverageGapReason::Other(2))?;
+            self.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
             return Ok(StreamFailureAction::Blocked);
         }
         let (first, reason) = match &self.snapshot.meta.coverage {
@@ -331,7 +325,7 @@ impl<N> Runtime<N> {
             != Some(canonical_suffix[0].number)
             || canonical_suffix[0] != first
         {
-            self.block(store, CoverageGapReason::Other(2))?;
+            self.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
             return Ok(StreamFailureAction::Blocked);
         }
         self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
@@ -347,17 +341,17 @@ impl<N> Runtime<N> {
         plan: NotificationPlan,
     ) -> Result<EnqueueAction, PersistenceError> {
         let Coverage::Gap { reason, .. } = &self.snapshot.meta.coverage else {
-            self.block(store, CoverageGapReason::Other(2))?;
+            self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
             return Ok(EnqueueAction::Blocked);
         };
         let reason = reason.clone();
         if plan.ancestor != self.snapshot.meta.acknowledged_zone_tip {
             if plan.reverted.is_empty() {
-                self.block(store, CoverageGapReason::Other(2))?;
+                self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(EnqueueAction::Blocked);
             }
             if plan.reverted.last().copied() != Some(self.snapshot.meta.acknowledged_zone_tip) {
-                self.block(store, CoverageGapReason::Other(2))?;
+                self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(EnqueueAction::Blocked);
             }
             self.reorg(store, plan.ancestor)?;
@@ -527,7 +521,7 @@ impl<N> Runtime<N> {
                     || exact_commit_descendant
                     || exact_reorg_descendant);
             if !preserves {
-                self.block(store, CoverageGapReason::Other(2))?;
+                self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(Some(RuntimeAction::Blocked));
             }
             self.unwind_current(store, plan)?;
@@ -590,7 +584,7 @@ impl<N> Runtime<N> {
                         || plan.applied.is_empty()
                         || plan.ancestor != previous
                     {
-                        self.block(store, CoverageGapReason::Other(2))?;
+                        self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                         return Ok(RuntimeAction::Blocked);
                     }
                     last = plan.acknowledge;
@@ -598,7 +592,7 @@ impl<N> Runtime<N> {
                 }
                 let reason = match &self.snapshot.meta.coverage {
                     Coverage::Gap { reason, .. } => reason.clone(),
-                    Coverage::Complete => failure.gap_reason,
+                    Coverage::Complete => failure.gap_reason(),
                 };
                 self.snapshot = store.record_gap(&self.snapshot, work.coordinate, last, reason)?;
                 self.state = RuntimeState::Disabled;
@@ -626,7 +620,7 @@ impl<N> Runtime<N> {
                 ))
             }
             FailureClass::ImmediateTerminal => {
-                self.block(store, failure.gap_reason)?;
+                self.block(store, CheckerBlockedReason::InvalidAuthenticatedData)?;
                 Ok(RuntimeAction::Blocked)
             }
         }
@@ -661,6 +655,9 @@ impl<N> Runtime<N> {
             work.gap_next,
             work.is_last,
         )?;
+        if self.state == RuntimeState::Blocked {
+            return Ok(RuntimeAction::Blocked);
+        }
         let ready = self.snapshot.meta.acknowledged_zone_tip;
         if self.state == RuntimeState::Disabled {
             self.current = None;
@@ -701,7 +698,7 @@ impl<N> Runtime<N> {
                 return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
             }
             WorkSelection::Terminal => {
-                self.block(store, CoverageGapReason::Other(2))?;
+                self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(RuntimeAction::Blocked);
             }
             WorkSelection::AwaitNotification => return Ok(RuntimeAction::AwaitNotification),
@@ -784,9 +781,17 @@ impl<N> Runtime<N> {
             Err(failure) if failure.class == FailureClass::AuthenticatedDivergence => {
                 return self.record_divergence(store, block, suffix_end, failure);
             }
+            Err(failure) if failure.class == FailureClass::ImmediateTerminal => {
+                self.block(store, CheckerBlockedReason::InvalidAuthenticatedData)?;
+                return Ok(());
+            }
             Err(failure) => {
-                self.snapshot =
-                    store.record_gap(&self.snapshot, block.zone, suffix_end, failure.gap_reason)?;
+                self.snapshot = store.record_gap(
+                    &self.snapshot,
+                    block.zone,
+                    suffix_end,
+                    failure.gap_reason(),
+                )?;
                 self.state = RuntimeState::Disabled;
                 return Ok(());
             }

@@ -28,12 +28,14 @@ pub(super) fn parse_withdrawal_events(
     for _ in 0..member_count {
         let mut operations = Vec::new();
         while let Some(event) = events.get(cursor).copied() {
-            let Some((operation, effect)) = callback_operation(event, portal)? else {
+            let Some((operation, effect)) = parse_callback_operation(event, portal)? else {
                 break;
             };
             cursor += 1;
             operations.push(operation);
-            effects.extend(effect);
+            if let Some(effect) = effect {
+                effects.push(effect);
+            }
         }
         let event = events.get(cursor).ok_or_else(|| {
             AdapterFindingCode::Grammar.failure("processWithdrawals missing member outcome")
@@ -132,7 +134,7 @@ pub(super) fn parse_withdrawal_events(
 }
 
 /// Parse one checker-relevant Portal event emitted by a withdrawal callback.
-fn callback_operation(
+fn parse_callback_operation(
     event: &L1ProtocolEvent,
     portal: Address,
 ) -> Result<Option<(PortalCallbackOperation, Option<Effect>)>, Failure> {

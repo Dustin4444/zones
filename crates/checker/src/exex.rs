@@ -19,15 +19,15 @@ use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
 
 use crate::{
-    CheckerConfig,
+    CheckerBlockedReason, CheckerConfig,
     adapter::{AuthenticatedObservation, adapt},
-    failure::{Failure, FailureClass},
+    failure::Failure,
     notification::NotificationPlan,
     observe::{
         L2BlockObservation, ZonePostStateOutputs, acquire_portal_token_balance,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
-    persistence::{BlockNumHash, CoverageGapReason, Identity, Persistence},
+    persistence::{BlockNumHash, Identity, Persistence},
     runtime::{
         AuthenticatedBlock, AuthenticationRequest, EnqueueAction, RetryBudget, Runtime,
         RuntimeAction, StreamFailureAction,
@@ -53,6 +53,7 @@ enum AuthenticationOutcome {
     Interrupted,
 }
 
+/// Recovery action after the ExEx notification stream fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamFailureDisposition {
     Reconstruct,
@@ -112,7 +113,7 @@ where
         }
     };
     if actual_l1_chain_id != identity.l1_chain_id {
-        runtime.block(&store, CoverageGapReason::Other(2))?;
+        runtime.block(&store, CheckerBlockedReason::TempoChainMismatch)?;
         tracing::error!(target: "zone::checker", expected = identity.l1_chain_id, actual = actual_l1_chain_id, "Tempo chain ID does not match the checker checkpoint");
         return Ok(());
     }
@@ -123,7 +124,7 @@ where
     }
 
     if let Err(error) = run_loop(config, ctx, &store, identity, &mut runtime, &l1_provider).await {
-        runtime.block(&store, CoverageGapReason::Other(2))?;
+        runtime.block(&store, CheckerBlockedReason::RuntimeFailure)?;
         return Err(error);
     }
     Ok(())
@@ -135,7 +136,7 @@ fn block_startup<N>(
     runtime: &mut Runtime<N>,
     error: impl Into<eyre::Report>,
 ) -> eyre::Result<()> {
-    runtime.block(store, CoverageGapReason::Other(2))?;
+    runtime.block(store, CheckerBlockedReason::ExExCommunication)?;
     Err(error.into())
 }
 
@@ -355,8 +356,8 @@ where
     };
     let plan = match notification_plan(&notification) {
         Ok(plan) => plan,
-        Err(failure) => {
-            runtime.block(store, failure.gap_reason)?;
+        Err(_) => {
+            runtime.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
             return Ok(NotificationOutcome::Blocked);
         }
     };
@@ -396,7 +397,7 @@ where
             return Ok(NotificationOutcome::Continue);
         }
         StreamFailureDisposition::Block => {
-            runtime.block(store, CoverageGapReason::Other(2))?;
+            runtime.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
             return Ok(NotificationOutcome::Blocked);
         }
     }
@@ -415,7 +416,7 @@ where
                 ctx.set_notifications_without_head();
                 Ok(NotificationOutcome::Disabled)
             } else {
-                runtime.block(store, CoverageGapReason::ProviderUnavailable)?;
+                runtime.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
                 ctx.send_finished_height(height.into())?;
                 Ok(NotificationOutcome::Blocked)
             }
@@ -545,12 +546,7 @@ fn observe_applied_l2_block(
         .ok_or_else(|| Failure::terminal("applied block index is out of bounds"))?;
     let l2_receipts: Vec<TempoReceipt> = l2_chain
         .receipts_by_block_hash(l2_block.hash())
-        .ok_or_else(|| Failure {
-            class: FailureClass::BoundedRetry,
-            gap_reason: CoverageGapReason::MissingReceipts,
-            message: "notification is missing receipt set".into(),
-            finding: None,
-        })?
+        .ok_or_else(|| Failure::missing_receipts("notification is missing receipt set"))?
         .into_iter()
         .cloned()
         .collect();

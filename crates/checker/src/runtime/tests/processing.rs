@@ -1,6 +1,7 @@
 //! Processing tests.
 
 use super::*;
+use crate::CheckerBlockedReason;
 
 #[test]
 fn apply_abort_never_acknowledges_and_keeps_parent_tip() {
@@ -20,6 +21,32 @@ fn apply_abort_never_acknowledges_and_keeps_parent_tip() {
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(store.load().unwrap().meta.verified_zone_tip, anchor().zone);
+}
+
+#[test]
+fn terminal_failure_records_why_acknowledgement_stopped() {
+    let (_directory, store) = create();
+    let mut runtime = runtime(&store, 2);
+    runtime
+        .push(FakeNotification {
+            plan: NotificationPlan::new(Vec::new(), vec![coordinate(1, 0x10)], anchor().zone)
+                .unwrap(),
+            blocks: Err(FailureClass::ImmediateTerminal),
+        })
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .poll(&store, identity(), authenticate, Instant::now())
+            .unwrap(),
+        RuntimeAction::Blocked
+    );
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.meta.acknowledged_zone_tip, anchor().zone);
+    assert_eq!(
+        snapshot.meta.blocked,
+        Some(CheckerBlockedReason::InvalidAuthenticatedData)
+    );
 }
 
 #[test]
@@ -475,7 +502,10 @@ fn disabled_runtime_extends_and_replaces_its_durable_gap_before_acknowledging() 
         EnqueueAction::Blocked
     );
     let snapshot = store.load().unwrap();
-    assert!(snapshot.meta.blocked.is_some());
+    assert_eq!(
+        snapshot.meta.blocked,
+        Some(CheckerBlockedReason::InvalidNotificationSequence)
+    );
     assert_eq!(snapshot.meta.acknowledged_zone_tip, coordinate(5, 0x20));
 }
 

@@ -19,7 +19,7 @@ pub(crate) enum FailureClass {
 /// A failure together with the durable action it requires.
 pub(crate) struct Failure {
     pub(crate) class: FailureClass,
-    pub(crate) gap_reason: CoverageGapReason,
+    gap_reason: Option<CoverageGapReason>,
     pub(crate) message: String,
     pub(crate) finding: Option<Box<Finding>>,
 }
@@ -29,7 +29,7 @@ impl Failure {
     pub(crate) fn terminal(message: impl Into<String>) -> Self {
         Self {
             class: FailureClass::ImmediateTerminal,
-            gap_reason: CoverageGapReason::Other(2),
+            gap_reason: None,
             message: message.into(),
             finding: None,
         }
@@ -39,7 +39,17 @@ impl Failure {
     pub(crate) fn transient(message: impl Into<String>) -> Self {
         Self {
             class: FailureClass::TransientRetry,
-            gap_reason: CoverageGapReason::ProviderUnavailable,
+            gap_reason: Some(CoverageGapReason::ProviderUnavailable),
+            message: message.into(),
+            finding: None,
+        }
+    }
+
+    /// Construct a retryable failure for an absent Zone receipt set.
+    pub(crate) fn missing_receipts(message: impl Into<String>) -> Self {
+        Self {
+            class: FailureClass::BoundedRetry,
+            gap_reason: Some(CoverageGapReason::MissingReceipts),
             message: message.into(),
             finding: None,
         }
@@ -48,7 +58,7 @@ impl Failure {
     fn incomplete(message: impl Into<String>) -> Self {
         Self {
             class: FailureClass::BoundedRetry,
-            gap_reason: CoverageGapReason::MissingTempoData,
+            gap_reason: Some(CoverageGapReason::MissingTempoData),
             message: message.into(),
             finding: None,
         }
@@ -58,10 +68,17 @@ impl Failure {
     pub(crate) fn authenticated_divergence(message: impl Into<String>, finding: Finding) -> Self {
         Self {
             class: FailureClass::AuthenticatedDivergence,
-            gap_reason: CoverageGapReason::NotCheckedAncestorDivergence,
+            gap_reason: Some(CoverageGapReason::NotCheckedAncestorDivergence),
             message: message.into(),
             finding: Some(Box::new(finding)),
         }
+    }
+
+    /// Return the durable coverage reason for a retryable failure.
+    pub(crate) fn gap_reason(&self) -> CoverageGapReason {
+        self.gap_reason
+            .clone()
+            .expect("terminal failures do not create coverage gaps")
     }
 }
 

@@ -363,23 +363,7 @@ fn process_withdrawals(
                 if data.gas_limit == 0 && !operations.is_empty() {
                     return Err(TransitionError::OwnerMismatch);
                 }
-                for operation in operations {
-                    match operation {
-                        PortalCallbackOperation::AppendDeposit(deposit) => {
-                            append_deposit(overlay, deposit, effects)?
-                        }
-                        PortalCallbackOperation::ClaimRefund(claim) => {
-                            claim_refund(overlay, *claim, RefundSide::Portal, effects)?
-                        }
-                        PortalCallbackOperation::EnableToken(enable) => {
-                            enable_token(overlay, enable)?;
-                            token_enables.push(enable.clone());
-                        }
-                        PortalCallbackOperation::UpdateBouncebackGas(gas) => {
-                            update_bounceback_gas(overlay, *gas)?
-                        }
-                    }
-                }
+                apply_callback_operations(overlay, operations, effects, token_enables)?;
                 withdrawal_token = token(overlay, data.token)?;
                 withdrawal_token.accounting.withdrawals = withdrawal_token
                     .accounting
@@ -560,6 +544,33 @@ fn process_withdrawals(
             settlement,
         })),
     );
+    Ok(())
+}
+
+/// Apply Portal operations emitted by a successful withdrawal callback.
+fn apply_callback_operations(
+    overlay: &mut Overlay<'_>,
+    operations: &[PortalCallbackOperation],
+    effects: &mut Vec<Effect>,
+    token_enables: &mut Vec<TokenEnable>,
+) -> Result<(), TransitionError> {
+    for operation in operations {
+        match operation {
+            PortalCallbackOperation::AppendDeposit(deposit) => {
+                append_deposit(overlay, deposit, effects)?
+            }
+            PortalCallbackOperation::ClaimRefund(claim) => {
+                claim_refund(overlay, *claim, RefundSide::Portal, effects)?
+            }
+            PortalCallbackOperation::EnableToken(enable) => {
+                enable_token(overlay, enable)?;
+                token_enables.push(enable.clone());
+            }
+            PortalCallbackOperation::UpdateBouncebackGas(gas) => {
+                update_bounceback_gas(overlay, *gas)?
+            }
+        }
+    }
     Ok(())
 }
 

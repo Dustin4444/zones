@@ -89,7 +89,7 @@ impl CheckerCommand {
                             },
                             "activeFinding": snapshot.active_finding,
                             "hasCoverageGap": snapshot.has_coverage_gap,
-                            "isBlocked": snapshot.is_blocked,
+                            "blockedReason": snapshot.blocked_reason,
                         }))?
                     );
                 } else {
@@ -107,7 +107,12 @@ impl CheckerCommand {
                     );
                     println!("Active finding:       {}", snapshot.active_finding);
                     println!("Coverage gap:         {}", snapshot.has_coverage_gap);
-                    println!("Blocked:              {}", snapshot.is_blocked);
+                    println!(
+                        "Blocked reason:       {}",
+                        snapshot
+                            .blocked_reason
+                            .map_or_else(|| "none".into(), |reason| reason.to_string())
+                    );
                 }
                 Ok(())
             }

@@ -88,7 +88,7 @@ fn observation_errors_map_to_runtime_policy_and_findings() {
     for (name, error, class, gap_reason, expected_finding) in cases {
         let failure = Failure::from(error);
         assert_eq!(failure.class, class, "{name}");
-        assert_eq!(failure.gap_reason, gap_reason, "{name}");
+        assert_eq!(failure.gap_reason(), gap_reason, "{name}");
         assert!(!failure.message.is_empty(), "{name}");
         match (failure.finding.as_deref(), expected_finding) {
             (None, None) => {}

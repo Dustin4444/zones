@@ -18,6 +18,7 @@ pub(crate) use model::{
     FindingKey, Identity, JournalEntry, MetaValue, Metadata, Snapshot,
 };
 
+use crate::CheckerBlockedReason;
 use crate::kernel::State;
 use reth_db::{
     Database, DatabaseEnv, DatabaseEnvKind,
@@ -36,7 +37,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 const CHECKPOINT_INTERVAL: u64 = 64;
 /// Result returned by durable persistence operations.
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
@@ -473,12 +474,9 @@ impl Persistence {
     }
 
     /// Persist that the checker cannot safely advance its acknowledgement watermark.
-    pub(crate) fn record_blocked(
-        &self,
-        prior: &Snapshot,
-        reason: CoverageGapReason,
-    ) -> Result<Snapshot> {
-        self.write(prior, prior.state.clone(), |_tx, meta| {
+    pub(crate) fn record_blocked_current(&self, reason: CheckerBlockedReason) -> Result<Snapshot> {
+        let current = self.load()?;
+        self.write(&current, current.state.clone(), |_tx, meta| {
             meta.blocked = Some(reason);
             Ok(())
         })

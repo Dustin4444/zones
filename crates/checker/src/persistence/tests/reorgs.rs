@@ -89,7 +89,7 @@ fn alert_descendant_reorg_preserves_or_removes_the_latch_by_exact_height() {
             &current(&store),
             finding_block,
             block(3, 0x43),
-            CoverageGapReason::Other(9),
+            CoverageGapReason::NotCheckedAncestorDivergence,
         )
         .unwrap();
     assert_eq!(
