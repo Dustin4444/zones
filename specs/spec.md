@@ -169,7 +169,7 @@ sequenceDiagram
 
 ## Access Control
 
-Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal): an **admin** and a set of **sequencers**. The roles are intentionally separated so that mission-critical governance powers can be held in a cold key (or multisig) while day-to-day block production runs from operational keys. An admin MAY also be a sequencer; the protocol does not enforce separation.
+Each zone has an **admin** authority and a set of **sequencers** registered on the [`ZonePortal`](#izoneportal). They can be operationally separated so mission-critical governance powers remain in a cold key or multisig, but the protocol does not require distinct addresses: admin authority is independent from the mutually exclusive portal role assigned to an address.
 
 ### Roles
 
@@ -190,7 +190,8 @@ Each zone has two privileged roles registered on the [`ZonePortal`](#izoneportal
 - Any active sequencer may perform a sequencer-authorized portal operation. Batch settlement additionally requires a threshold certificate.
 - Hold the encryption private keys corresponding to the portal's encryption public keys and used to decrypt [deposits](#deposits).
 
-A zone MAY include its admin in the sequencer set. The protocol still treats each privileged call as belonging to its role.
+The admin may also be a member of the sequencer set. Admin authorization remains independent of
+the account's mutually exclusive portal role.
 
 ### Permission Matrix
 
@@ -201,7 +202,8 @@ The following table lists every privileged action and the role authorized to inv
 | `enableToken(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `pauseDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `resumeDeposits(token)` | [`ZonePortal`](#izoneportal) | **admin** |
-| `setRole(account, role)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `setAllowedAccount(account, allowed)` | [`ZonePortal`](#izoneportal) | **admin** |
+| `setGateway(account, allowed)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setAccessMode(mode)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `setGatewayMode(mode)` | [`ZonePortal`](#izoneportal) | **admin** |
 | `transferAdmin(newAdmin)` | [`ZonePortal`](#izoneportal) | **admin** |
@@ -302,7 +304,7 @@ A single [`ZoneFactory`](#izonefactory) on Tempo creates zones and maintains the
 |----------|---------|
 | [`ZonePortal`](#izoneportal) | Locks deposited tokens, accepts batch submissions, verifies proofs, and processes withdrawals. Manages the token registry and deposit/withdrawal queues. |
 
-The factory's shared `ZoneMessenger` is fixed when each portal is initialized. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. Portal roles are managed atomically with `setRole(account, role)`. An account has exactly one of `None`, `Account`, or `CallbackGateway`; the messenger cannot have the `Account` role. `setAccessMode` and `setGatewayMode` activate or deactivate enforcement of the corresponding roles without clearing them.
+The factory's shared `ZoneMessenger` is fixed when each portal is initialized. It is separated from the portal so callback code does not execute with the fund-owning portal as `msg.sender`. An account has exactly one of `None`, `Sequencer`, `Account`, or `CallbackGateway`. The admin manages account and gateway membership through `setAllowedAccount` and `setGateway`, while sequencer membership changes only through `setSequencerSet`. Each account or gateway setter manages only its corresponding role, so changing between those roles requires first clearing the current role and then assigning the new one. `setAccessMode` and `setGatewayMode` activate or deactivate enforcement of the corresponding roles without clearing them.
 
 Account and gateway membership is evaluated when each portal or zone-side action executes. Revoked in-flight destinations and gateways bounce back, while revoked refund recipients have funds parked until membership is restored.
 
@@ -1788,8 +1790,9 @@ interface IZonePortal {
     function setAccessMode(bool enforced) external; // admin-only
     function isGatewayOpen() external view returns (bool);
     function setGatewayMode(bool enforced) external; // admin-only
-    function role(address account) external view returns (Role);
-    function setRole(address account, Role role) external; // admin-only
+    function hasRole(address account, Role role) external view returns (bool);
+    function setAllowedAccount(address account, bool allowed) external; // admin-only
+    function setGateway(address account, bool allowed) external; // admin-only
 
     // Zone RPC endpoint. Published on-chain so clients can discover how to reach the zone.
     event RpcUrlUpdated(string rpcUrl);

@@ -27,7 +27,7 @@ This single command will:
 5. Generate the zone's `genesis.json` and `zone.json`
 6. Build and start the zone node
 
-> `deploy-zone` uses the generated sequencer key as the portal admin too. It saves `sequencerKey`, `sequencerAddress`, `adminKey`, and `adminAddress` in `generated/<name>/zone.json`; `zone-up` reads the sequencer key automatically.
+> `deploy-zone` creates distinct admin and sequencer keys unless `ADMIN_KEY` or `ADMIN_ADDR` supplies the admin. It saves the available keys and both addresses in `generated/<name>/zone.json`; `zone-up` reads the sequencer key automatically.
 > `zone.json` also stores `zoneFactory`, and `just deploy-router` appends `swapAndDepositRouter`.
 
 Once running, generate a user wallet and deposit some tokens:

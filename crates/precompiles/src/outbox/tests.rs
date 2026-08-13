@@ -11,8 +11,8 @@ use tempo_precompiles::{
 };
 use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
 use zone_primitives::constants::{
-    PORTAL_ENFORCEMENT_MODES_SLOT, PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
-    PORTAL_ROLE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT, TEMPO_STATE_ADDRESS,
+    PORTAL_ENFORCEMENT_MODES_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT, PORTAL_ROLE_SLOT,
+    PORTAL_TOKEN_CONFIGS_SLOT, TEMPO_STATE_ADDRESS,
 };
 
 use crate::{
@@ -47,13 +47,12 @@ impl Harness {
         let mut ctx = test_context();
         let token = tempo_precompiles::PATH_USD_ADDRESS;
         let l1 = MockL1Reader::default();
-        let sequencer_membership_slot =
-            keccak256((SEQUENCER, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
+        let sequencer_membership_slot = keccak256((SEQUENCER, PORTAL_ROLE_SLOT).abi_encode());
         l1.insert(
             PORTAL,
             sequencer_membership_slot.into(),
             ANCHOR,
-            U256::from(1),
+            U256::from(u8::from(Role::Sequencer)),
         );
         l1.insert(
             PORTAL,
@@ -210,10 +209,10 @@ impl Harness {
             .insert(PORTAL, PORTAL_ENFORCEMENT_MODES_SLOT.into(), ANCHOR, modes);
     }
 
-    fn set_role(&self, account: Address, role: IZonePortal::Role) {
+    fn set_role(&self, account: Address, role: Role) {
         let slot = keccak256((account, PORTAL_ROLE_SLOT).abi_encode());
         self.l1
-            .insert(PORTAL, slot.into(), ANCHOR, U256::from(role as u8));
+            .insert(PORTAL, slot.into(), ANCHOR, U256::from(u8::from(role)));
     }
 
     fn set_token_enabled(&self, enabled: bool) {
@@ -250,6 +249,19 @@ fn assert_revert(result: PrecompileResult, error: impl SolInterface) {
     let output = result.expect("precompile error");
     assert!(output.is_revert());
     assert_eq!(output.bytes, error.abi_encode());
+}
+
+#[test]
+fn role_binding_order_matches_solidity_role_enum() {
+    assert_eq!(
+        [
+            u8::from(Role::None),
+            u8::from(Role::Sequencer),
+            u8::from(Role::Account),
+            u8::from(Role::CallbackGateway),
+        ],
+        [0, 1, 2, 3]
+    );
 }
 
 #[test]
@@ -297,12 +309,7 @@ fn outbox_reads_injected_l1_state_at_tempo_checkpoint() -> eyre::Result<()> {
 
     let portal = ZonePortalStorage::new(PORTAL);
     assert_eq!(harness.l1.storage_requests().len(), 5);
-    assert_eq!(
-        harness
-            .l1
-            .request_count(ANCHOR, &portal.is_sequencer[SEQUENCER]),
-        1
-    );
+    assert_eq!(harness.l1.request_count(ANCHOR, &portal.role[SEQUENCER]), 1);
     assert_eq!(
         harness.l1.request_count(ANCHOR, &portal.max_tempo_gas_rate),
         1
@@ -402,7 +409,7 @@ fn request_withdrawal_enforces_all_access_and_gateway_mode_combinations() -> eyr
     );
     assert_eq!(closed_open.balance_of(ALICE)?, balance_before);
     assert!(closed_open.pending()?.is_empty());
-    closed_open.set_role(BOB, IZonePortal::Role::Account);
+    closed_open.set_role(BOB, Role::Account);
     closed_open.request(1, BOB, B256::ZERO)?;
     closed_open.request_with_gas(1, FEE_PAYER, B256::ZERO, 1)?;
 
@@ -410,7 +417,7 @@ fn request_withdrawal_enforces_all_access_and_gateway_mode_combinations() -> eyr
     // gateways require callback gas and callback targets must have the CallbackGateway role.
     let mut open_enforced = Harness::new()?;
     open_enforced.set_modes(false, true);
-    open_enforced.set_role(GATEWAY, IZonePortal::Role::CallbackGateway);
+    open_enforced.set_role(GATEWAY, Role::CallbackGateway);
     open_enforced.request(1, BOB, B256::ZERO)?;
     let pending_before = open_enforced.pending()?.len();
     let balance_before = open_enforced.balance_of(ALICE)?;
@@ -429,8 +436,8 @@ fn request_withdrawal_enforces_all_access_and_gateway_mode_combinations() -> eyr
     // Closed access, enforced gateway: plain and callback paths enforce their distinct roles.
     let mut closed_enforced = Harness::new()?;
     closed_enforced.set_modes(true, true);
-    closed_enforced.set_role(BOB, IZonePortal::Role::Account);
-    closed_enforced.set_role(GATEWAY, IZonePortal::Role::CallbackGateway);
+    closed_enforced.set_role(BOB, Role::Account);
+    closed_enforced.set_role(GATEWAY, Role::CallbackGateway);
     closed_enforced.request(1, BOB, B256::ZERO)?;
     closed_enforced.request_with_gas(1, GATEWAY, B256::ZERO, 1)?;
     let pending_before = closed_enforced.pending()?.len();

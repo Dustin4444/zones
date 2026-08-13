@@ -168,8 +168,10 @@ contract ZonePortal is IZonePortal {
     uint8 public sequencerThreshold;
     uint256 public zoneHeight;
     address[] internal _sequencers;
-    mapping(address => bool) public isSequencer;
-    mapping(address => Role) public role;
+    /// @dev Reserved slot 19, available for future use.
+    uint256 private _reservedSlot19;
+    /// @dev Mutually exclusive Portal roles. Sequencer membership is derived from this mapping.
+    mapping(address => Role) internal role;
 
     /// @dev Solidity packs both enforcement booleans into slot 21.
     bool internal _isAccessEnforced;
@@ -234,7 +236,7 @@ contract ZonePortal is IZonePortal {
         _initialized = true;
         zoneId = _zoneId;
         messenger = _messenger;
-        admin = _admin;
+        _setAdmin(_admin);
         verifier = _verifier;
         _isAccessEnforced = accessEnforced;
         _isGatewayEnforced = gatewayEnforced;
@@ -248,10 +250,17 @@ contract ZonePortal is IZonePortal {
         _setLeader(initialSequencers[0]);
 
         for (uint256 i; i < _zoneGateways.length; ++i) {
-            _setRole(_zoneGateways[i], Role.CallbackGateway);
+            address account = _zoneGateways[i];
+            require(role[account] == Role.None);
+            role[account] = Role.CallbackGateway;
+            emit RoleUpdated(account, Role.None, Role.CallbackGateway);
         }
         for (uint256 i; i < _allowedAccounts.length; ++i) {
-            _setRole(_allowedAccounts[i], Role.Account);
+            address account = _allowedAccounts[i];
+            require(account != _messenger);
+            require(role[account] == Role.None);
+            role[account] = Role.Account;
+            emit RoleUpdated(account, Role.None, Role.Account);
         }
 
         // Enable the initial token
@@ -269,12 +278,12 @@ contract ZonePortal is IZonePortal {
     }
 
     modifier onlySequencer() {
-        if (!isSequencer[msg.sender]) revert NotSequencer();
+        if (!isSequencer(msg.sender)) revert NotSequencer();
         _;
     }
 
     modifier onlySequencerOrAdmin() {
-        if (msg.sender != admin && !isSequencer[msg.sender]) revert NotSequencer();
+        if (msg.sender != admin && !isSequencer(msg.sender)) revert NotSequencer();
         _;
     }
 
@@ -321,6 +330,8 @@ contract ZonePortal is IZonePortal {
         for (uint256 i = 0; i < length; ++i) {
             address signer = newSequencers[i];
             if (signer == address(0)) revert InvalidSequencerSet();
+            Role existing = role[signer];
+            require(existing == Role.None || existing == Role.Sequencer);
 
             for (uint256 j = 0; j < i; ++j) {
                 if (newSequencers[j] == signer) revert InvalidSequencerSet();
@@ -330,7 +341,7 @@ contract ZonePortal is IZonePortal {
         bool membersUnchanged = length == _sequencers.length;
         if (membersUnchanged) {
             for (uint256 i = 0; i < length; ++i) {
-                if (!isSequencer[newSequencers[i]]) {
+                if (!isSequencer(newSequencers[i])) {
                     membersUnchanged = false;
                     break;
                 }
@@ -341,17 +352,19 @@ contract ZonePortal is IZonePortal {
         }
 
         for (uint256 i = 0; i < _sequencers.length; ++i) {
-            isSequencer[_sequencers[i]] = false;
+            _setSequencer(_sequencers[i], false);
         }
         delete _sequencers;
         for (uint256 i = 0; i < length; ++i) {
             address signer = newSequencers[i];
             _sequencers.push(signer);
-            isSequencer[signer] = true;
+            _setSequencer(signer, true);
         }
         // Rotating out the active leader would strand block production: transfer leadership
         // first (add the replacement, setLeader, then remove the old member).
-        if (leader != address(0) && !isSequencer[leader]) revert ActiveLeaderRemoved();
+        if (leader != address(0) && !isSequencer(leader)) {
+            revert ActiveLeaderRemoved();
+        }
 
         sequencerThreshold = newThreshold;
         uint64 nonce = sequencerSetVersion;
@@ -370,8 +383,13 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @inheritdoc IZonePortal
+    function isSequencer(address account) public view returns (bool) {
+        return role[account] == Role.Sequencer;
+    }
+
+    /// @inheritdoc IZonePortal
     function setLeader(address newLeader, uint64 expectedEpoch) external onlySequencerOrAdmin {
-        if (!isSequencer[newLeader]) revert InvalidLeader();
+        if (!isSequencer(newLeader)) revert InvalidLeader();
         // Idempotent fanout: every node relays the same target, only the first call transitions.
         if (newLeader == leader) return;
         // Compare-and-set: a delayed duplicate carrying a pre-handoff epoch cannot roll
@@ -445,7 +463,7 @@ contract ZonePortal is IZonePortal {
     function acceptAdmin() external {
         if (pendingAdmin == address(0) || msg.sender != pendingAdmin) revert NotPendingAdmin();
         address previousAdmin = admin;
-        admin = pendingAdmin;
+        _setAdmin(pendingAdmin);
         pendingAdmin = address(0);
         emit AdminTransferred(previousAdmin, admin);
     }
@@ -473,25 +491,41 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Add or remove an account from closed-loop portal flows.
+    /// @dev Returns without emitting when the requested membership is already configured.
     function setAllowedAccount(address account, bool allowed) external onlyAdmin {
-        _setRole(account, allowed ? Role.Account : Role.None);
+        if (allowed) require(account != messenger);
+        Role previous = role[account];
+        Role next = allowed ? Role.Account : Role.None;
+        if (previous == next) return;
+        require(previous == (allowed ? Role.None : Role.Account));
+        role[account] = next;
+        emit RoleUpdated(account, previous, next);
     }
 
     /// @notice Add or remove a callback gateway.
+    /// @dev Returns without emitting when the requested membership is already configured.
     function setGateway(address account, bool allowed) external onlyAdmin {
-        _setRole(account, allowed ? Role.CallbackGateway : Role.None);
-    }
-
-    /// @notice Assign an account's role across portal flows without changing enforcement modes.
-    function setRole(address account, Role next) external onlyAdmin {
-        _setRole(account, next);
-    }
-
-    function _setRole(address account, Role next) internal {
-        if (next == Role.Account && account == messenger) revert InvalidAllowedAccount();
-        Role prev = role[account];
+        Role previous = role[account];
+        Role next = allowed ? Role.CallbackGateway : Role.None;
+        if (previous == next) return;
+        require(previous == (allowed ? Role.None : Role.CallbackGateway));
         role[account] = next;
-        emit RoleUpdated(account, prev, next);
+        emit RoleUpdated(account, previous, next);
+    }
+
+    function _setAdmin(address next) internal {
+        admin = next;
+    }
+
+    function _setSequencer(address account, bool enabled) internal {
+        Role previous = role[account];
+        Role next = enabled ? Role.Sequencer : Role.None;
+        role[account] = next;
+        emit RoleUpdated(account, previous, next);
+    }
+
+    function hasRole(address account, Role expected) public view returns (bool) {
+        return role[account] == expected;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -794,14 +828,14 @@ contract ZonePortal is IZonePortal {
 
     function _requireAllowedDepositor(address account) internal view {
         if (!_isAccessEnforced) return;
-        if (_isGatewayEnforced && role[account] == Role.CallbackGateway) {
+        if (_isGatewayEnforced && hasRole(account, Role.CallbackGateway)) {
             return;
         }
-        if (role[account] != Role.Account) revert AccountNotAllowed(account);
+        if (!hasRole(account, Role.Account)) revert AccountNotAllowed(account);
     }
 
     function _isAllowed(address account) internal view returns (bool) {
-        return !_isAccessEnforced || role[account] == Role.Account;
+        return !_isAccessEnforced || hasRole(account, Role.Account);
     }
 
     function _collectDepositFunds(
@@ -1022,7 +1056,7 @@ contract ZonePortal is IZonePortal {
         if (withdrawal.gasLimit == 0) {
             // Re-check current roles without reverting so an in-flight withdrawal to a revoked
             // account or newly registered gateway bounces without blocking the FIFO.
-            success = (!_isGatewayEnforced || role[withdrawal.to] != Role.CallbackGateway)
+            success = (!_isGatewayEnforced || !hasRole(withdrawal.to, Role.CallbackGateway))
                 && _isAllowed(withdrawal.to)
                 && _tryTransfer(_token, withdrawal.to, withdrawal.amount);
         } else {
@@ -1062,7 +1096,7 @@ contract ZonePortal is IZonePortal {
         external
         onlySelf
     {
-        if (_isGatewayEnforced && role[target] != Role.CallbackGateway) {
+        if (_isGatewayEnforced && !hasRole(target, Role.CallbackGateway)) {
             revert InvalidCallbackTarget();
         }
         if (!ITIP20(token).transfer(messenger, amount)) {
@@ -1349,7 +1383,7 @@ contract ZonePortal is IZonePortal {
             } catch {
                 return false;
             }
-            if (signer == address(0) || !isSequencer[signer]) return false;
+            if (signer == address(0) || !isSequencer(signer)) return false;
             for (uint256 j = 0; j < i; ++j) {
                 if (recovered[j] == signer) return false;
             }

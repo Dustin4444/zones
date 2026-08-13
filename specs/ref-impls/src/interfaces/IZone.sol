@@ -11,6 +11,7 @@ address constant ZONE_MESSENGER_ADDRESS = 0x5A4d00000000000000000000000000000000
 /// @notice Mutually exclusive authorization role assigned to a Tempo account.
 enum Role {
     None,
+    Sequencer,
     Account,
     CallbackGateway
 }
@@ -348,7 +349,7 @@ interface IZoneTxContext {
 //            + sequencerThreshold (uint8) [packed]
 //   slot 17: zoneHeight (uint256)
 //   slot 18: _sequencers (address[])
-//   slot 19: isSequencer (mapping(address => bool))
+//   slot 19: _reservedSlot19 (available for future use)
 //   slot 20: role (mapping(address => Role))
 //   slot 21: _isAccessEnforced (bool) + _isGatewayEnforced (bool) [packed]
 //   slot 22: maxTempoGasRate (uint128)
@@ -369,8 +370,7 @@ bytes32 constant PORTAL_TOKEN_CONFIGS_SLOT = bytes32(uint256(6));
 bytes32 constant PORTAL_ENABLED_TOKENS_SLOT = bytes32(uint256(7));
 bytes32 constant PORTAL_TOKEN_ENABLEMENT_HASH_SLOT = bytes32(uint256(26));
 bytes32 constant PORTAL_PENDING_ADMIN_SLOT = bytes32(uint256(13));
-bytes32 constant PORTAL_IS_SEQUENCER_SLOT = bytes32(uint256(19));
-bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(PORTAL_IS_SEQUENCER_SLOT) + 1);
+bytes32 constant PORTAL_ROLE_SLOT = bytes32(uint256(20));
 bytes32 constant PORTAL_ENFORCEMENT_MODES_SLOT = bytes32(uint256(PORTAL_ROLE_SLOT) + 1);
 bytes32 constant PORTAL_MAX_TEMPO_GAS_RATE_SLOT =
     bytes32(uint256(PORTAL_ENFORCEMENT_MODES_SLOT) + 1);
@@ -645,9 +645,7 @@ interface IZonePortal {
     error InvalidQuorumCertificate();
     error InvalidCallbackTarget();
     error CallbackDidNotReturnToZone();
-    error InvalidAllowedAccount();
     error AccountNotAllowed(address account);
-
     /// @notice Emitted when an account's portal role is initialized or updated.
     event RoleUpdated(address indexed account, Role prev, Role next);
 
@@ -702,11 +700,11 @@ interface IZonePortal {
     /// @notice Change callback gateway enforcement. Only callable by the admin.
     function setGatewayMode(bool enforced) external;
 
-    function role(address account) external view returns (Role);
+    /// @notice Whether an account has a Portal role.
+    function hasRole(address account, Role role) external view returns (bool);
 
-    /// @notice Assign an account's portal role. Only callable by the admin.
-    function setRole(address account, Role role) external;
-
+    /// @notice Assign an account's mutually exclusive Portal role.
+    /// @dev Sequencer membership is managed atomically through setSequencerSet.
     /// @notice Add or remove an account from closed-loop portal flows.
     function setAllowedAccount(address account, bool allowed) external;
 

@@ -59,8 +59,7 @@ use tempo_precompiles::{
 };
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::{
-    PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT, ZONE_FACTORY_ADDRESS,
-    ZONE_OUTBOX_ADDRESS,
+    PORTAL_MAX_TEMPO_GAS_RATE_SLOT, PORTAL_ROLE_SLOT, ZONE_FACTORY_ADDRESS, ZONE_OUTBOX_ADDRESS,
     ZonePortal::{self, Role as PortalRole},
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -755,7 +754,11 @@ impl ZoneTestNode {
         use tempo_zone_contracts::{ZonePortal, ZonePortal::Role};
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
         eyre::ensure!(
-            (portal.role(gateway).call().await? == Role::CallbackGateway) == expected,
+            portal
+                .hasRole(gateway, Role::CallbackGateway)
+                .call()
+                .await?
+                == expected,
             "portal gateway state for {gateway} did not equal {expected}"
         );
         Ok(())
@@ -798,7 +801,7 @@ impl ZoneTestNode {
         use tempo_zone_contracts::{ZonePortal, ZonePortal::Role};
         let portal = ZonePortal::new(self.portal_address, &self.l1_provider);
         let actual = !portal.isAccessEnforced().call().await?
-            || portal.role(account).call().await? == Role::Account;
+            || portal.hasRole(account, Role::Account).call().await?;
         eyre::ensure!(
             actual == expected,
             "portal account state for {account} did not equal {expected}"
@@ -1999,11 +2002,8 @@ impl L1TestNode {
     ///
     /// [`admin_address`]: Self::admin_address
     pub(crate) async fn create_zone(&self, factory_address: Address) -> eyre::Result<Address> {
-        let config = ZoneCreationConfig::closed(vec![
-            self.admin_address(),
-            self.dev_address(),
-            self.user_signer().address(),
-        ]);
+        let config =
+            ZoneCreationConfig::closed(vec![self.admin_address(), self.user_signer().address()]);
         let portal = self
             .create_zone_with_admin_sequencer_and_config(
                 factory_address,
@@ -2294,21 +2294,21 @@ impl L1TestNode {
         use tempo_zone_contracts::ZonePortal;
         let provider = self.provider_with_signer(admin_signer);
         let portal = ZonePortal::new(portal_address, &provider);
-        let role = if enabled {
-            PortalRole::CallbackGateway
-        } else {
-            PortalRole::None
-        };
         let receipt = portal
-            .setRole(gateway, role)
+            .setGateway(gateway, enabled)
             .send()
             .await?
             .get_receipt()
             .await?;
-        eyre::ensure!(receipt.status(), "setRole for gateway failed");
+        eyre::ensure!(receipt.status(), "setGateway failed");
+        let expected_role = if enabled {
+            PortalRole::CallbackGateway
+        } else {
+            PortalRole::None
+        };
         eyre::ensure!(
-            portal.role(gateway).call().await? as u8 == role as u8,
-            "L1 ZonePortal gateway role for {gateway} did not equal {role:?}"
+            portal.hasRole(gateway, expected_role).call().await?,
+            "L1 ZonePortal gateway role for {gateway} did not equal {expected_role:?}"
         );
         Ok(provider.get_block_number().await?)
     }
@@ -2340,21 +2340,21 @@ impl L1TestNode {
         use tempo_zone_contracts::ZonePortal;
         let provider = self.provider_with_signer(admin_signer);
         let portal = ZonePortal::new(portal_address, &provider);
-        let role = if enabled {
-            PortalRole::Account
-        } else {
-            PortalRole::None
-        };
         let receipt = portal
-            .setRole(account, role)
+            .setAllowedAccount(account, enabled)
             .send()
             .await?
             .get_receipt()
             .await?;
-        eyre::ensure!(receipt.status(), "setRole for account failed");
+        eyre::ensure!(receipt.status(), "setAllowedAccount failed");
+        let expected_role = if enabled {
+            PortalRole::Account
+        } else {
+            PortalRole::None
+        };
         eyre::ensure!(
-            portal.role(account).call().await? as u8 == role as u8,
-            "L1 ZonePortal account role for {account} did not equal {role:?}"
+            portal.hasRole(account, expected_role).call().await?,
+            "L1 ZonePortal account role for {account} did not equal {expected_role:?}"
         );
         Ok(provider.get_block_number().await?)
     }
@@ -4776,8 +4776,7 @@ impl L1Fixture {
         let mut cache = cache_handle.lock();
         let deposit_queue_hash_slot = B256::with_last_byte(3);
         let refunds_slot = B256::with_last_byte(8);
-        let sequencer_membership_slot =
-            keccak256((sequencer, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
+        let sequencer_membership_slot = keccak256((sequencer, PORTAL_ROLE_SLOT).abi_encode());
         let path_usd_config_slot: B256 = PATH_USD_ADDRESS
             .mapping_slot(PORTAL_TOKEN_CONFIGS_SLOT.into())
             .into();
@@ -4807,7 +4806,7 @@ impl L1Fixture {
                 portal_address,
                 sequencer_membership_slot,
                 block,
-                B256::with_last_byte(1),
+                B256::from(U256::from(u8::from(PortalRole::Sequencer))),
             );
             // Deposit queue hash slot (3) — read by ZoneInbox after finalizeTempo.
             // The initial value is B256::ZERO (empty queue).
