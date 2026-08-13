@@ -11,7 +11,7 @@ use alloy_genesis::Genesis;
 use alloy_network::primitives::BlockTransactions;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
-use alloy_rpc_types_eth::{Block, BlockNumberOrTag, Transaction};
+use alloy_rpc_types_eth::{Block, BlockNumberOrTag, EIP1186AccountProofResponse, Transaction};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall as _;
 use clap::{Parser, Subcommand};
@@ -1063,33 +1063,44 @@ async fn tempo_state_witness(
 ) -> Result<TempoStateWitness> {
     let requests = reads
         .into_iter()
-        .flat_map(|(block, accounts)| {
-            accounts.into_iter().map(move |(account, slots)| {
-                (block, account, slots.into_iter().collect::<Vec<_>>())
-            })
+        .map(|(block, accounts)| {
+            let targets = accounts
+                .into_iter()
+                .map(|(account, slots)| (account, slots.into_iter().collect::<Vec<_>>()))
+                .collect::<Vec<_>>();
+            (block, targets)
         })
         .collect::<Vec<_>>();
     let proofs = stream::iter(requests)
-        .map(|(block, account, slots)| async move {
+        .map(|(block, targets)| async move {
             let started = Instant::now();
             debug!(
                 tempo_block = block,
-                account = %account,
-                storage_slots = slots.len(),
-                "requesting Tempo state proof"
+                accounts = targets.len(),
+                storage_slots = targets.iter().map(|(_, slots)| slots.len()).sum::<usize>(),
+                "requesting Tempo state multiproof"
             );
             let proof = tempo
-                .get_proof(account, slots)
-                .block_id(BlockId::number(block))
+                .client()
+                .request::<_, Vec<EIP1186AccountProofResponse>>(
+                    "eth_getMultiProof",
+                    (targets, BlockId::number(block)),
+                )
                 .await
-                .wrap_err_with(|| format!("eth_getProof for {account} at Tempo block {block}"))?;
+                .wrap_err_with(|| format!("eth_getMultiProof at Tempo block {block}"))?;
             debug!(
                 tempo_block = block,
-                account = %account,
-                account_proof_nodes = proof.account_proof.len(),
-                storage_proofs = proof.storage_proof.len(),
+                accounts = proof.len(),
+                account_proof_nodes = proof
+                    .iter()
+                    .map(|proof| proof.account_proof.len())
+                    .sum::<usize>(),
+                storage_proofs = proof
+                    .iter()
+                    .map(|proof| proof.storage_proof.len())
+                    .sum::<usize>(),
                 elapsed_ms = started.elapsed().as_millis(),
-                "received Tempo state proof"
+                "received Tempo state multiproof"
             );
             Ok::<_, eyre::Report>(proof)
         })
@@ -1098,13 +1109,15 @@ async fn tempo_state_witness(
         .await?;
 
     let mut nodes = BTreeMap::new();
-    for proof in proofs {
-        for node in proof.account_proof {
-            nodes.entry(keccak256(&node)).or_insert(node);
-        }
-        for storage in proof.storage_proof {
-            for node in storage.proof {
+    for block_proofs in proofs {
+        for proof in block_proofs {
+            for node in proof.account_proof {
                 nodes.entry(keccak256(&node)).or_insert(node);
+            }
+            for storage in proof.storage_proof {
+                for node in storage.proof {
+                    nodes.entry(keccak256(&node)).or_insert(node);
+                }
             }
         }
     }
