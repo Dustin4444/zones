@@ -26,7 +26,21 @@ async fn wait_for_checker_to_catch_up(
         move || {
             let path = path.clone();
             async move {
-                let snapshot = inspect_database(&path)?;
+                let snapshot = match inspect_database(&path) {
+                    Ok(snapshot) => snapshot,
+                    // The checker owns the MDBX writer. A concurrent inspection can race its
+                    // short write transaction, so retry the read on the next poll.
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .to_string()
+                                .contains("Resource temporarily unavailable")
+                        }) =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(
                     (snapshot.verified_zone_tip.number > previous_verified_height
                         && snapshot.acknowledged_zone_tip == snapshot.verified_zone_tip
