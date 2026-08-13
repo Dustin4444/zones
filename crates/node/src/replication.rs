@@ -1,7 +1,6 @@
 //! Node-side leader block replication and follower import.
 
 use alloy_consensus::BlockHeader as _;
-use alloy_eips::NumHash;
 use alloy_primitives::B256;
 use alloy_provider::DynProvider;
 use alloy_rlp::Decodable as _;
@@ -21,7 +20,7 @@ use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
@@ -1117,20 +1116,28 @@ where
 
     // Observe and validate the anchor before authenticating a live sender. The anchor itself can
     // finalize a leadership transition that assigns the sender for this block.
-    //
-    // The post-observation sender check stops an honest stale leader's broadcast from splitting
-    // followers.
+    let observed = l1_block_tracker
+        .wait_for_portal_events_with_timeout(anchor, Duration::from_secs(30))
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "peer block {block_number} is not anchored to a locally observed L1 block {} ({})",
+                anchor.number, anchor.hash
+            )
+        })?;
+    portal_inputs.validate(&observed)?;
+
+    // The L1 subscriber applies any transition finalized by this anchor before recording the
+    // anchor. Authenticate only against that post-anchor schedule so a new leader cannot race the
+    // local observation.
     // Backfilled blocks carry no producer claim and are judged by parent/anchor/execution/conflict
     // validation only.
-    wait_for_validated_peer_anchor(
-        l1_block_tracker,
+    validate_live_block_sender(
         schedule,
-        &portal_inputs,
         peer_block.live_sender.as_ref(),
-        anchor,
+        anchor.number,
         block_number,
-    )
-    .await?;
+    )?;
 
     // 4. All txns in the block execute properly
     let payload = ZonePayloadTypes::block_to_payload(block, None);
@@ -1184,43 +1191,6 @@ fn validate_live_block_sender(
              record governs",
         ),
     }
-}
-
-async fn wait_for_validated_peer_anchor(
-    l1_block_tracker: &L1BlockTracker,
-    schedule: &LeadershipSchedule,
-    portal_inputs: &AdvanceTempoPortalInputs,
-    live_sender: Option<&P2pPeerId>,
-    anchor: NumHash,
-    block_number: u64,
-) -> eyre::Result<()> {
-    loop {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            l1_block_tracker.wait_for_portal_events(anchor),
-        )
-        .await
-        {
-            Ok(observed) => {
-                let observed = observed?;
-                portal_inputs.validate(&observed)?;
-                break;
-            }
-            Err(_) => warn!(
-                target: "zone::p2p",
-                block_number,
-                l1_block = anchor.number,
-                l1_hash = ?anchor.hash,
-                "Peer block import is waiting for local L1 observation of its anchor"
-            ),
-        }
-    }
-
-    // The L1 subscriber publishes any transition finalized by this anchor before recording the
-    // anchor in the tracker. Re-read the schedule now so the pre-wait decision cannot authorize a
-    // sender that this anchor demoted.
-    validate_live_block_sender(schedule, live_sender, anchor.number, block_number)?;
-    Ok(())
 }
 
 struct AdvanceTempoPortalInputs {
@@ -1298,7 +1268,7 @@ mod tests {
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, BroadcasterShutdown, EncodedPersistedBlock,
         MAX_PENDING_BLOCKS, PersistedBlockSource, PersistedTip, broadcast_persisted_blocks,
-        buffer_pending_block, validate_live_block_sender, wait_for_validated_peer_anchor,
+        buffer_pending_block, validate_live_block_sender,
     };
     use alloy_primitives::B256;
     use zone_l1::{L1BlockTracker, L1PortalEvents};
@@ -1629,15 +1599,16 @@ mod tests {
                     deposits: vec![],
                     enabled_tokens: vec![],
                 };
-                wait_for_validated_peer_anchor(
-                    &tracker,
+                let observed = tracker
+                    .wait_for_portal_events_with_timeout(anchor, std::time::Duration::from_secs(1))
+                    .await?;
+                portal_inputs.validate(&observed)?;
+                validate_live_block_sender(
                     &schedule,
-                    &portal_inputs,
                     Some(&outgoing),
-                    anchor,
+                    ANCHOR_NUMBER,
                     ZONE_BLOCK_NUMBER,
                 )
-                .await
             })
         };
 
