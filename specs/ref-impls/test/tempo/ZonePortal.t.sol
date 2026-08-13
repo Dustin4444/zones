@@ -7,6 +7,7 @@ import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
 import {
     BlockTransition,
+    Capability,
     Deposit,
     DepositPayload,
     DepositQueueTransition,
@@ -1492,6 +1493,268 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.areDepositsActive(address(pathUSD)));
     }
 
+    function test_pause_blocksDepositsAndWithdrawalProcessingButAllowsBatchSubmission() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        assertTrue(portal.paused());
+        assertEq(portal.pauseExpiry(), block.timestamp + 30 days);
+        assertFalse(portal.areDepositsActive(address(pathUSD)));
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.deposit(address(pathUSD), 1000e6, 0, _makeDepositPayload(), alice);
+
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.processWithdrawals(new Withdrawal[](0), bytes32(0));
+
+        vm.roll(block.number + 1);
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("paused-settlement")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            bytes32(0),
+            "",
+            ""
+        );
+        assertEq(portal.withdrawalBatchIndex(), 1);
+
+        vm.warp(block.timestamp + 30 days);
+        assertFalse(portal.paused());
+        assertTrue(portal.areDepositsActive(address(pathUSD)));
+    }
+
+    function test_pauseRoleCanPause() public {
+        address guardian = makeAddr("pause guardian");
+        vm.prank(admin);
+        portal.setPauseGuardian(guardian, true);
+
+        vm.prank(guardian);
+        portal.pause();
+        assertTrue(portal.paused());
+    }
+
+    function test_setPauseGuardian_isIdempotent() public {
+        address guardian = makeAddr("pause guardian");
+        vm.startPrank(admin);
+
+        portal.setPauseGuardian(guardian, true);
+        portal.setPauseGuardian(guardian, true);
+        assertTrue(portal.hasRole(guardian, Role.PauseGuardian));
+
+        portal.setPauseGuardian(guardian, false);
+        portal.setPauseGuardian(guardian, false);
+        assertTrue(portal.hasRole(guardian, Role.None));
+
+        vm.stopPrank();
+    }
+
+    function test_setPauseGuardian_cannotBeRemovedAfterCapabilityAbdication() public {
+        address guardian = makeAddr("pause guardian");
+        vm.startPrank(admin);
+        portal.setPauseGuardian(guardian, true);
+        portal.abdicate(Capability.PausePortal);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 30 days);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.setPauseGuardian(guardian, false);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.setPauseGuardian(bob, true);
+
+        assertTrue(portal.hasRole(guardian, Role.PauseGuardian));
+    }
+
+    function test_accessRoles_cannotBeRemovedAfterCapabilityAbdication() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.AccessPolicy);
+        vm.warp(block.timestamp + 30 days);
+
+        vm.startPrank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.CapabilityAbdicated.selector, Capability.AccessPolicy
+            )
+        );
+        portal.setAllowedAccount(alice, false);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.CapabilityAbdicated.selector, Capability.AccessPolicy
+            )
+        );
+        portal.setGateway(address(zoneGateway), false);
+
+        vm.stopPrank();
+
+        assertTrue(portal.hasRole(alice, Role.Account));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
+    }
+
+    function test_setPauseGuardian_cannotModifyAccessRoles() public {
+        vm.startPrank(admin);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(alice, false);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(alice, true);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(address(zoneGateway), false);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(address(zoneGateway), true);
+
+        vm.stopPrank();
+
+        assertTrue(portal.hasRole(alice, Role.Account));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
+    }
+
+    function test_pause_expiresAfterThirtyDays() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 30 days);
+        assertFalse(portal.paused());
+    }
+
+    function test_pause_adminCanResumeEarly() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 1 days);
+        vm.expectEmit(true, false, false, false);
+        emit IZonePortal.PortalResumed(admin);
+        vm.prank(admin);
+        portal.resume();
+
+        assertFalse(portal.paused());
+        assertEq(portal.pauseExpiry(), 0);
+    }
+
+    function test_pause_onlyAdminCanResumeEarly() public {
+        address guardian = makeAddr("pause guardian");
+        vm.prank(admin);
+        portal.setPauseGuardian(guardian, true);
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.resume();
+
+        vm.prank(guardian);
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.resume();
+
+        assertTrue(portal.paused());
+    }
+
+    function test_pause_resumeRemainsAvailableAfterAbdication() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.warp(block.timestamp + 29 days);
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(admin);
+        portal.resume();
+
+        assertFalse(portal.paused());
+        assertEq(portal.pauseExpiry(), 0);
+    }
+
+    function test_pause_cannotExtendActivePause() public {
+        vm.prank(sequencer);
+        portal.pause();
+        uint64 originalExpiry = portal.pauseExpiry();
+
+        vm.warp(block.timestamp + 15 days);
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.pause();
+
+        assertEq(portal.pauseExpiry(), originalExpiry);
+    }
+
+    function test_abdicatePause_delaysPermanentDisable() public {
+        uint64 effectiveAt = uint64(block.timestamp) + 30 days;
+        vm.expectEmit(true, false, false, true);
+        emit IZonePortal.AbdicationScheduled(Capability.PausePortal, effectiveAt);
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+        assertEq(portal.abdicationEffectiveAt(Capability.PausePortal), effectiveAt);
+        assertFalse(portal.paused());
+
+        vm.warp(effectiveAt);
+        vm.prank(sequencer);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.pause();
+    }
+
+    function test_abdicatePause_allowsStartingAPauseBeforeItTakesEffect() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.warp(block.timestamp + 29 days);
+        vm.prank(sequencer);
+        portal.pause();
+        uint64 pauseExpiry = portal.pauseExpiry();
+
+        vm.warp(block.timestamp + 1 days);
+        assertTrue(portal.paused());
+
+        vm.warp(pauseExpiry);
+        vm.prank(sequencer);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.pause();
+    }
+
+    function test_abdicatePause_cannotBeRescheduled() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.AbdicationAlreadyScheduled.selector, Capability.PausePortal
+            )
+        );
+        portal.abdicate(Capability.PausePortal);
+    }
+
+    function test_pause_revertsWithoutAuthority() public {
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.NotPauseAuthority.selector);
+        portal.pause();
+    }
+
     function test_tokenGovernance_revertsIfNotAdmin() public {
         vm.startPrank(sequencer);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
@@ -1655,9 +1918,8 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.isTokenEnabled(overflowToken));
     }
 
-    function test_sequencerGovernance_revertsIfAdmin() public {
-        // Admin may rotate the deposit-encryption key, but must not perform the other
-        // sequencer-only actions below.
+    function test_sequencerGovernance_revertsIfAdminLacksSequencerRole() public {
+        // Admin authority alone does not grant sequencer-only powers.
         Withdrawal memory w =
             _withdrawal(address(pathUSD), alice, bob, 500e6, bytes32(0), 0, alice, "");
         // Read state used as call args up front so the staticcall isn't mistaken
@@ -1729,13 +1991,12 @@ contract ZonePortalTest is BaseTest {
 
         // New admin can exercise governance powers.
         vm.prank(alice);
-        portal.pauseDeposits(address(pathUSD));
-        assertFalse(portal.areDepositsActive(address(pathUSD)));
+        portal.pause();
+        assertTrue(portal.paused());
 
-        // Old admin can no longer exercise them.
         vm.prank(admin);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
-        portal.resumeDeposits(address(pathUSD));
+        portal.abdicate(Capability.PausePortal);
     }
 
     function test_transferAdmin_revertsIfNotAdmin() public {
@@ -4961,7 +5222,7 @@ contract ZonePortalTest is BaseTest {
     ///        slot 16: verifier + _initialized + sequencerSetVersion + threshold [packed]
     ///        slot 17: zoneHeight
     ///        slot 18: _sequencers.length
-    ///        slot 19: isSequencer mapping
+    ///        slot 19: reserved for future use
     ///        slot 20: role mapping
     ///        slot 21: account/gateway enforcement booleans [packed]
     ///        slot 22: maxTempoGasRate (uint128)

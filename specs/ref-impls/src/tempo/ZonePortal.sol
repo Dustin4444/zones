@@ -3,6 +3,7 @@ pragma solidity ^0.8.13;
 
 import {
     BlockTransition,
+    Capability,
     Deposit,
     DepositPayload,
     DepositQueueTransition,
@@ -83,6 +84,12 @@ contract ZonePortal is IZonePortal {
     /// @notice Maximum number of independently countable settlement signers.
     /// @dev Matches the creation and replacement bound fixed by TIP-1091.
     uint256 public constant MAX_SEQUENCERS = 8;
+
+    /// @notice Duration of every emergency pause.
+    uint64 public constant PAUSE_DURATION = 30 days;
+
+    /// @notice Delay before a capability abdication becomes effective.
+    uint64 public constant ABDICATION_DELAY = PAUSE_DURATION;
 
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -205,9 +212,16 @@ contract ZonePortal is IZonePortal {
     uint64 internal _tokenEnableCountBlock;
     uint64 internal _tokensEnabledInCurrentBlock;
 
+    /// @notice Timestamp at which the current emergency pause expires.
+    /// @dev Packed after the token-enablement counter in slot 25.
+    uint64 public pauseExpiry;
+
     /// @notice Append-only commitment to every enabled token and its metadata.
-    /// @dev Stored at slot 26 so the existing portal layout remains unchanged.
+    /// @dev Stored at slot 26.
     bytes32 public tokenEnablementHash;
+
+    /// @notice Time after which the corresponding configuration surface is permanently closed.
+    mapping(Capability => uint64) public abdicationEffectiveAt;
 
     /*//////////////////////////////////////////////////////////////
                              INITIALIZATION
@@ -236,7 +250,7 @@ contract ZonePortal is IZonePortal {
         _initialized = true;
         zoneId = _zoneId;
         messenger = _messenger;
-        _setAdmin(_admin);
+        admin = _admin;
         verifier = _verifier;
         _isAccessEnforced = accessEnforced;
         _isGatewayEnforced = gatewayEnforced;
@@ -289,6 +303,11 @@ contract ZonePortal is IZonePortal {
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert NotAdmin();
+        _;
+    }
+
+    modifier whenNotPaused() {
+        if (paused()) revert PortalIsPaused();
         _;
     }
 
@@ -352,13 +371,16 @@ contract ZonePortal is IZonePortal {
         }
 
         for (uint256 i = 0; i < _sequencers.length; ++i) {
-            _setSequencer(_sequencers[i], false);
+            address signer = _sequencers[i];
+            role[signer] = Role.None;
+            emit RoleUpdated(signer, Role.Sequencer, Role.None);
         }
         delete _sequencers;
         for (uint256 i = 0; i < length; ++i) {
             address signer = newSequencers[i];
             _sequencers.push(signer);
-            _setSequencer(signer, true);
+            role[signer] = Role.Sequencer;
+            emit RoleUpdated(signer, Role.None, Role.Sequencer);
         }
         // Rotating out the active leader would strand block production: transfer leadership
         // first (add the replacement, setLeader, then remove the old member).
@@ -463,19 +485,21 @@ contract ZonePortal is IZonePortal {
     function acceptAdmin() external {
         if (pendingAdmin == address(0) || msg.sender != pendingAdmin) revert NotPendingAdmin();
         address previousAdmin = admin;
-        _setAdmin(pendingAdmin);
+        admin = pendingAdmin;
         pendingAdmin = address(0);
         emit AdminTransferred(previousAdmin, admin);
     }
 
     /// @notice Enable or disable account allowlist enforcement without discarding membership.
     function setAccessMode(bool enforced) external onlyAdmin {
+        _requireCapabilityActive(Capability.AccessPolicy);
         _isAccessEnforced = enforced;
         emit EnforcementModesUpdated(enforced, _isGatewayEnforced);
     }
 
     /// @notice Enable or disable callback gateway registration enforcement.
     function setGatewayMode(bool enforced) external onlyAdmin {
+        _requireCapabilityActive(Capability.AccessPolicy);
         _isGatewayEnforced = enforced;
         emit EnforcementModesUpdated(_isAccessEnforced, enforced);
     }
@@ -491,8 +515,9 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Add or remove an account from closed-loop portal flows.
-    /// @dev Returns without emitting when the requested membership is already configured.
+    /// @dev Returns without emitting when already configured. Abdication freezes all changes.
     function setAllowedAccount(address account, bool allowed) external onlyAdmin {
+        _requireCapabilityActive(Capability.AccessPolicy);
         if (allowed) require(account != messenger);
         Role previous = role[account];
         Role next = allowed ? Role.Account : Role.None;
@@ -503,8 +528,9 @@ contract ZonePortal is IZonePortal {
     }
 
     /// @notice Add or remove a callback gateway.
-    /// @dev Returns without emitting when the requested membership is already configured.
+    /// @dev Returns without emitting when already configured. Abdication freezes all changes.
     function setGateway(address account, bool allowed) external onlyAdmin {
+        _requireCapabilityActive(Capability.AccessPolicy);
         Role previous = role[account];
         Role next = allowed ? Role.CallbackGateway : Role.None;
         if (previous == next) return;
@@ -513,13 +539,14 @@ contract ZonePortal is IZonePortal {
         emit RoleUpdated(account, previous, next);
     }
 
-    function _setAdmin(address next) internal {
-        admin = next;
-    }
-
-    function _setSequencer(address account, bool enabled) internal {
+    /// @notice Add or remove a pause guardian.
+    /// @dev Pause-capability abdication freezes both additions and removals.
+    function setPauseGuardian(address account, bool allowed) external onlyAdmin {
+        _requireCapabilityActive(Capability.PausePortal);
         Role previous = role[account];
-        Role next = enabled ? Role.Sequencer : Role.None;
+        Role next = allowed ? Role.PauseGuardian : Role.None;
+        if (previous == next) return;
+        require(previous == (allowed ? Role.None : Role.PauseGuardian));
         role[account] = next;
         emit RoleUpdated(account, previous, next);
     }
@@ -556,7 +583,7 @@ contract ZonePortal is IZonePortal {
     /// @notice Check if deposits are currently active for a token
     function areDepositsActive(address _token) external view returns (bool) {
         TokenConfig storage cfg = _tokenConfigs[_token];
-        return cfg.enabled && cfg.depositsActive;
+        return !paused() && cfg.enabled && cfg.depositsActive;
     }
 
     /// @notice Get the token configuration for a specific token
@@ -572,6 +599,47 @@ contract ZonePortal is IZonePortal {
     /// @notice Get an enabled token by index
     function enabledTokenAt(uint256 index) external view returns (address) {
         return _enabledTokens[index];
+    }
+
+    /// @notice Whether deposits and withdrawal processing are currently paused.
+    /// @dev The pause expires automatically once block.timestamp reaches pauseExpiry.
+    function paused() public view returns (bool) {
+        return block.timestamp < pauseExpiry;
+    }
+
+    /// @notice Pause deposits and withdrawal processing for 30 days.
+    function pause() external whenNotPaused {
+        _requireCapabilityActive(Capability.PausePortal);
+        if (
+            msg.sender != admin && !isSequencer(msg.sender)
+                && !hasRole(msg.sender, Role.PauseGuardian)
+        ) {
+            revert NotPauseAuthority();
+        }
+        pauseExpiry = uint64(block.timestamp) + PAUSE_DURATION;
+        emit PortalPaused(msg.sender);
+    }
+
+    /// @notice Resume deposits and withdrawal processing before the pause expires.
+    /// @dev Admin recovery remains available after the pause capability is abdicated.
+    function resume() external onlyAdmin {
+        pauseExpiry = 0;
+        emit PortalResumed(msg.sender);
+    }
+
+    /// @notice Schedule permanent abdication of a Portal configuration surface.
+    function abdicate(Capability capability) external onlyAdmin whenNotPaused {
+        if (abdicationEffectiveAt[capability] != 0) revert AbdicationAlreadyScheduled(capability);
+        uint64 effectiveAt = uint64(block.timestamp) + ABDICATION_DELAY;
+        abdicationEffectiveAt[capability] = effectiveAt;
+        emit AbdicationScheduled(capability, effectiveAt);
+    }
+
+    function _requireCapabilityActive(Capability capability) internal view {
+        uint64 effectiveAt = abdicationEffectiveAt[capability];
+        if (effectiveAt != 0 && block.timestamp >= effectiveAt) {
+            revert CapabilityAbdicated(capability);
+        }
     }
 
     /// @notice Enable a new TIP-20 token for bridging. Only callable by admin.
@@ -889,9 +957,10 @@ contract ZonePortal is IZonePortal {
         address tempoRefundRecipient
     )
         external
+        whenNotPaused
         returns (bytes32 newCurrentDepositQueueHash)
     {
-        return depositEncrypted(_token, amount, keyIndex, encrypted, tempoRefundRecipient);
+        return _deposit(_token, amount, keyIndex, encrypted, tempoRefundRecipient);
     }
 
     /// @notice Deposit with encrypted recipient and memo
@@ -912,6 +981,7 @@ contract ZonePortal is IZonePortal {
         address tempoRefundRecipient
     )
         public
+        whenNotPaused
         returns (bytes32 newCurrentDepositQueueHash)
     {
         return _deposit(_token, amount, keyIndex, encrypted, tempoRefundRecipient);
@@ -1018,6 +1088,7 @@ contract ZonePortal is IZonePortal {
     )
         external
         onlySequencer
+        whenNotPaused
         nonReentrantWithdrawal
     {
         bytes32[] memory remainingQueues = new bytes32[](withdrawals.length);

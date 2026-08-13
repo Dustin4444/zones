@@ -2107,6 +2107,91 @@ async fn test_deposit_and_withdrawal() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A portal-wide pause rejects deposits and withdrawal processing while settlement continues.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_global_pause_blocks_deposits_and_l1_withdrawal_processing() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let l1 = L1TestNode::start().await?;
+    let portal_address = l1.deploy_zone().await?;
+    let zone = ZoneTestNode::start_from_l1(l1.http_url(), l1.ws_url(), portal_address).await?;
+    zone.wait_for_l2_tempo_finalized(0, L1_TIMEOUT).await?;
+
+    let recipient_signer = l1.signer_at(2);
+    let recipient = recipient_signer.address();
+    let mut depositor = ZoneAccount::from_l1_and_zone(&l1, &zone, portal_address);
+    let initial_deposit = 1_000_000u128;
+    l1.fund_user(depositor.address(), initial_deposit).await?;
+    depositor
+        .deposit_with_memo(initial_deposit, recipient, B256::ZERO, L1_TIMEOUT, &zone)
+        .await?;
+
+    let admin_provider = l1.admin_provider();
+    let portal = ZonePortal::new(portal_address, &admin_provider);
+    let initial_withdrawal_batch = portal.withdrawalBatchIndex().call().await?;
+    let zone_outbox = IZoneOutbox::new(ZONE_OUTBOX_ADDRESS, zone.provider());
+    let initial_zone_withdrawal_batch = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
+    let withdrawal_amount = 500_000u128;
+    let mut recipient_account =
+        ZoneAccount::with_signer(recipient_signer, &l1, &zone, portal_address);
+    recipient_account.withdraw(withdrawal_amount).await?;
+
+    let pause_receipt = portal.pause().send().await?.get_receipt().await?;
+    eyre::ensure!(pause_receipt.status(), "global pause transaction failed");
+    eyre::ensure!(portal.paused().call().await?, "portal should be paused");
+
+    let _ = depositor
+        .simulate_deposit(initial_deposit, depositor.address(), depositor.address())
+        .await
+        .expect_err("deposit simulation should revert while the portal is paused");
+
+    let withdrawal_start_block = l1.provider().get_block_number().await?;
+    let sequencer = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+
+    poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(250),
+        "withdrawal to be finalized into a zone batch",
+        || {
+            let zone_outbox = &zone_outbox;
+            async move {
+                let batch = zone_outbox.lastBatch().call().await?.withdrawalBatchIndex;
+                Ok((batch > initial_zone_withdrawal_batch).then_some(()))
+            }
+        },
+    )
+    .await?;
+    eyre::ensure!(
+        !sequencer.withdrawal_handle.is_finished(),
+        "withdrawal processor exited while the portal was paused"
+    );
+    poll_until(
+        L1_TIMEOUT,
+        Duration::from_millis(250),
+        "withdrawal batch to settle while the portal is paused",
+        || {
+            let portal = &portal;
+            async move {
+                let batch = portal.withdrawalBatchIndex().call().await?;
+                Ok((batch > initial_withdrawal_batch).then_some(()))
+            }
+        },
+    )
+    .await?;
+
+    let processed_while_paused = portal
+        .WithdrawalProcessed_filter()
+        .from_block(withdrawal_start_block)
+        .query()
+        .await?;
+    assert!(
+        processed_while_paused.is_empty(),
+        "withdrawal must remain queued while the portal is paused"
+    );
+
+    Ok(())
+}
+
 /// Test that TIP-403 policy operations on L1 work correctly and the zone
 /// continues to advance normally after policy changes.
 ///

@@ -83,6 +83,11 @@ impl ZoneOutbox {
             return Err(ZonePortalError::token_not_enabled().into());
         }
 
+        let pause_expiry = l1.read_portal(|portal| &portal.pause_expiry)?;
+        if self.storage.timestamp().to::<u64>() < pause_expiry {
+            return Err(ZonePortalError::portal_is_paused().into());
+        }
+
         let access_enforced = l1.read_portal(|portal| &portal.is_access_enforced)?;
         let gateway_enforced = l1.read_portal(|portal| &portal.is_gateway_enforced)?;
 
