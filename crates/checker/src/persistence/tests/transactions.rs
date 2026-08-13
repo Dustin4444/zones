@@ -113,3 +113,23 @@ fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
     ));
     assert_eq!(store.load().unwrap().state, state());
 }
+
+#[test]
+fn aborting_a_retention_checkpoint_leaves_history_unchanged() {
+    let (directory, mut store) = create();
+    store.set_retention_for_tests(2, 4);
+    let mut parent = bootstrap().zone;
+    for number in 1..=7 {
+        parent = apply(&store, number, parent);
+    }
+    let prior = current(&store);
+    store.inject_abort();
+    assert!(matches!(
+        store.apply(&prior, entry(8, parent), block(8, 0x18), Coverage::Complete,),
+        Err(PersistenceError::InjectedAbort)
+    ));
+    assert_eq!(current(&store), prior);
+    drop(store);
+    let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened, prior);
+}

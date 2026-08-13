@@ -40,6 +40,8 @@ pub enum CheckerBlockedReason {
     InvalidAuthenticatedData,
     /// An unexpected checker runtime failure prevented safe progress.
     RuntimeFailure,
+    /// A Zone reorg precedes the locally retained checker history.
+    DeepReorgBeyondRetention,
 }
 
 impl fmt::Display for CheckerBlockedReason {
@@ -51,6 +53,7 @@ impl fmt::Display for CheckerBlockedReason {
             Self::ExExCommunication => "ExEx communication failure",
             Self::InvalidAuthenticatedData => "invalid authenticated data",
             Self::RuntimeFailure => "runtime failure",
+            Self::DeepReorgBeyondRetention => "reorg exceeds retained checker history",
         };
         f.write_str(reason)
     }

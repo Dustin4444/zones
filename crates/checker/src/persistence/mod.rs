@@ -36,8 +36,12 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 const CHECKPOINT_INTERVAL: u64 = 64;
+/// Minimum Zone history retained for local reorg recovery.
+///
+/// This is an availability horizon, not a Zone finality claim.
+const MIN_RETAINED_JOURNAL_BLOCKS: u64 = 16_384;
 /// Result returned by durable persistence operations.
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
 
@@ -62,6 +66,11 @@ pub(crate) enum PersistenceError {
     Identity,
     #[error("stale database snapshot")]
     StaleSnapshot,
+    #[error("reorg ancestor {ancestor:?} is outside retained history at {recovery:?}")]
+    ReorgBeyondRetention {
+        ancestor: BlockNumHash,
+        recovery: BlockNumHash,
+    },
     #[error("invalid checker database: {0}")]
     Invalid(String),
     #[cfg(test)]
@@ -73,9 +82,23 @@ pub(crate) enum PersistenceError {
 pub(crate) struct Persistence {
     db: Arc<DatabaseEnv>,
     identity: Identity,
-    checkpoint_interval: u64,
+    retention: RetentionPolicy,
     #[cfg(test)]
     abort_next_write: AtomicBool,
+}
+
+/// Fixed persistence cadence and local reorg-recovery horizon.
+#[derive(Debug, Clone, Copy)]
+struct RetentionPolicy {
+    checkpoint_interval: u64,
+    minimum_journal_blocks: u64,
+}
+
+impl RetentionPolicy {
+    const PRODUCTION: Self = Self {
+        checkpoint_interval: CHECKPOINT_INTERVAL,
+        minimum_journal_blocks: MIN_RETAINED_JOURNAL_BLOCKS,
+    };
 }
 
 impl Persistence {
@@ -144,7 +167,7 @@ impl Persistence {
         Self {
             db: Arc::new(db),
             identity: meta.identity,
-            checkpoint_interval: CHECKPOINT_INTERVAL,
+            retention: RetentionPolicy::PRODUCTION,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         }
@@ -167,13 +190,14 @@ impl Persistence {
         let this = Self {
             db: Arc::new(db),
             identity,
-            checkpoint_interval: CHECKPOINT_INTERVAL,
+            retention: RetentionPolicy::PRODUCTION,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
         let id = CheckpointId::from(cut.zone);
         let meta = Metadata {
             identity,
+            recovery_checkpoint: id,
             active_checkpoint: id,
             verified_zone_tip: cut.zone,
             imported_tempo_tip: cut.tempo,
@@ -186,10 +210,9 @@ impl Persistence {
             cut,
             state: state.clone(),
         };
-        codec::encode(&checkpoint)?;
         codec::encode(&meta)?;
         let tx = this.db.tx_mut()?;
-        tx.put::<Checkpoints>(id, checkpoint)?;
+        Self::write_checkpoint(&tx, id, checkpoint)?;
         tx.put::<Meta>(MetaKey::Version, MetaValue::Version(SCHEMA_VERSION))?;
         tx.put::<Meta>(
             MetaKey::Metadata,
@@ -207,7 +230,7 @@ impl Persistence {
         let this = Self {
             db: Arc::new(db),
             identity,
-            checkpoint_interval: CHECKPOINT_INTERVAL,
+            retention: RetentionPolicy::PRODUCTION,
             #[cfg(test)]
             abort_next_write: AtomicBool::new(false),
         };
@@ -223,6 +246,10 @@ impl Persistence {
             return Err(PersistenceError::Identity);
         }
         validate_metadata(&meta)?;
+        let recovery = tx
+            .get::<Checkpoints>(meta.recovery_checkpoint)?
+            .ok_or_else(|| invalid("recovery checkpoint is missing"))?;
+        validate_checkpoint(meta.recovery_checkpoint, &recovery, identity)?;
         let active = tx
             .get::<Checkpoints>(meta.active_checkpoint)?
             .ok_or_else(|| invalid("active checkpoint is missing"))?;
@@ -232,57 +259,46 @@ impl Persistence {
             .first()?
             .map(|(id, _)| id)
             .ok_or_else(|| invalid("bootstrap checkpoint is missing"))?;
+        if recovery.cut.zone.number > meta.verified_zone_tip.number {
+            return Err(invalid("recovery checkpoint exceeds verified tip"));
+        }
+        let mut retained_tip = recovery.cut.zone;
+        let mut retained_imported = recovery.cut.tempo;
+        for height in retained_tip.number.saturating_add(1)..=active.cut.zone.number {
+            let entry = tx
+                .get::<Journal>(height)?
+                .ok_or_else(|| invalid(format!("missing journal height {height}")))?;
+            Self::validate_journal_entry(retained_tip, retained_imported, height, &entry)?;
+            retained_tip = entry.zone;
+            retained_imported = entry.imported_tempo;
+        }
+        if retained_tip != active.cut.zone || retained_imported != active.cut.tempo {
+            return Err(invalid(
+                "active checkpoint is not on retained journal history",
+            ));
+        }
         let mut state = active.state.clone();
         validate_state(&state, identity)?;
         let mut tip = active.cut.zone;
         let mut imported = active.cut.tempo;
-        if meta.active_checkpoint != bootstrap_id {
-            let predecessor = if meta.active_checkpoint.height == bootstrap_id.height + 1 {
-                tx.get::<Checkpoints>(bootstrap_id)?.map(|cp| cp.cut)
-            } else {
-                tx.get::<Journal>(meta.active_checkpoint.height - 1)?
-                    .map(|entry| ChainCut {
-                        zone: entry.zone,
-                        tempo: entry.imported_tempo,
-                    })
-            };
-            let canonical = predecessor.is_some_and(|parent| {
-                tx.get::<Journal>(meta.active_checkpoint.height)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|entry| {
-                        entry.zone == active.cut.zone
-                            && entry.imported_tempo == active.cut.tempo
-                            && entry.parent == parent.zone
-                            && entry.imported_tempo_parent == parent.tempo
-                    })
-            });
-            if !canonical {
-                return Err(invalid("active checkpoint is not on the canonical journal"));
-            }
-        }
         for height in tip.number.saturating_add(1)..=meta.verified_zone_tip.number {
             let entry = tx
                 .get::<Journal>(height)?
                 .ok_or_else(|| invalid(format!("missing journal height {height}")))?;
-            if entry.zone.number != height
-                || entry.parent != tip
-                || entry.delta.validate().is_err()
-                || entry.imported_tempo.number <= imported.number
-                || entry.imported_tempo_parent != imported
-            {
-                return Err(invalid(format!("conflicting journal height {height}")));
-            }
-            state
-                .apply(&entry.delta)
-                .map_err(|error| invalid(error.to_string()))?;
-            tip = entry.zone;
-            imported = entry.imported_tempo;
+            Self::apply_journal_entry(&mut state, &mut tip, &mut imported, height, entry)?;
         }
         if tip != meta.verified_zone_tip || imported != meta.imported_tempo_tip {
             return Err(invalid("journal does not reach verified tip"));
         }
         let mut journal = tx.cursor_read::<Journal>()?;
+        if meta.recovery_checkpoint != bootstrap_id
+            && meta.recovery_checkpoint.height < meta.verified_zone_tip.number
+            && journal
+                .first()?
+                .is_none_or(|(height, _)| height != meta.recovery_checkpoint.height + 1)
+        {
+            return Err(invalid("journal does not begin after recovery checkpoint"));
+        }
         if journal
             .last()?
             .is_some_and(|(height, _)| height > meta.verified_zone_tip.number)
@@ -341,9 +357,9 @@ impl Persistence {
                 .zone
                 .number
                 .saturating_sub(meta.active_checkpoint.height)
-                >= self.checkpoint_interval
+                >= self.retention.checkpoint_interval
             {
-                Self::checkpoint_in_tx(tx, meta, &candidate)?;
+                self.checkpoint_in_tx(tx, meta, &candidate)?;
             }
             Ok(())
         })
@@ -354,7 +370,7 @@ impl Persistence {
     pub(crate) fn checkpoint_current(&self, prior: &Snapshot) -> Result<Snapshot> {
         validate_state(&prior.state, self.identity)?;
         self.write(prior, prior.state.clone(), |tx, meta| {
-            Self::checkpoint_in_tx(tx, meta, &prior.state)?;
+            self.checkpoint_in_tx(tx, meta, &prior.state)?;
             Ok(())
         })
     }
@@ -530,6 +546,17 @@ impl Persistence {
     fn reorg_verified(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         let snapshot = self.reconstruct_at(ancestor)?;
         self.write(prior, snapshot.state.clone(), |tx, meta| {
+            let previous_active = meta.active_checkpoint;
+            let previous_recovery = meta.recovery_checkpoint;
+            let checkpoint = Checkpoint {
+                cut: ChainCut {
+                    zone: ancestor,
+                    tempo: snapshot.meta.imported_tempo_tip,
+                },
+                state: snapshot.state.clone(),
+            };
+            let active_checkpoint = CheckpointId::from(ancestor);
+            Self::write_checkpoint(tx, active_checkpoint, checkpoint)?;
             let mut cursor = tx.cursor_write::<Journal>()?;
             while let Some((height, _)) = cursor.last()? {
                 if height <= ancestor.number {
@@ -539,7 +566,7 @@ impl Persistence {
             }
             meta.verified_zone_tip = ancestor;
             meta.imported_tempo_tip = snapshot.meta.imported_tempo_tip;
-            meta.active_checkpoint = snapshot.meta.active_checkpoint;
+            meta.active_checkpoint = active_checkpoint;
             if meta.acknowledged_zone_tip.number > ancestor.number {
                 meta.acknowledged_zone_tip = ancestor;
             }
@@ -556,6 +583,7 @@ impl Persistence {
                 _ => Coverage::Complete,
             };
             update_active_finding(meta, ancestor)?;
+            Self::remove_obsolete_checkpoints(tx, meta, previous_active, previous_recovery)?;
             Ok(())
         })
     }
@@ -568,34 +596,28 @@ impl Persistence {
         if meta.identity != identity || ancestor.number > meta.verified_zone_tip.number {
             return Err(invalid("invalid reorg ancestor"));
         }
-        let mut best = None;
-        let mut cur = tx.cursor_read::<Checkpoints>()?;
-        let bootstrap_id = cur
-            .first()?
-            .map(|(id, _)| id)
-            .ok_or_else(|| invalid("bootstrap checkpoint is missing"))?;
-        for row in cur.walk(None)? {
-            let (id, checkpoint) = row?;
-            validate_checkpoint(id, &checkpoint, identity)?;
-            let canonical = if id == bootstrap_id {
-                true
-            } else {
-                tx.get::<Journal>(id.height)?
-                    .is_some_and(|entry| entry.zone == checkpoint.cut.zone)
-            };
-            if canonical
-                && checkpoint.cut.zone.number <= ancestor.number
-                && best
-                    .as_ref()
-                    .is_none_or(|(_, best): &(CheckpointId, Checkpoint)| {
-                        best.cut.zone.number < checkpoint.cut.zone.number
-                    })
-            {
-                best = Some((id, checkpoint));
-            }
+        let recovery = tx
+            .get::<Checkpoints>(meta.recovery_checkpoint)?
+            .ok_or_else(|| invalid("recovery checkpoint is missing"))?;
+        validate_checkpoint(meta.recovery_checkpoint, &recovery, identity)?;
+        if ancestor.number < recovery.cut.zone.number
+            || (ancestor.number == recovery.cut.zone.number && ancestor != recovery.cut.zone)
+        {
+            return Err(PersistenceError::ReorgBeyondRetention {
+                ancestor,
+                recovery: recovery.cut.zone,
+            });
         }
-        let (checkpoint_id, checkpoint) =
-            best.ok_or_else(|| invalid("no checkpoint before ancestor"))?;
+
+        let (checkpoint_id, checkpoint) = if meta.active_checkpoint.height <= ancestor.number {
+            let checkpoint = tx
+                .get::<Checkpoints>(meta.active_checkpoint)?
+                .ok_or_else(|| invalid("active checkpoint is missing"))?;
+            validate_checkpoint(meta.active_checkpoint, &checkpoint, identity)?;
+            (meta.active_checkpoint, checkpoint)
+        } else {
+            (meta.recovery_checkpoint, recovery)
+        };
         let mut state = checkpoint.state;
         let mut tip = checkpoint.cut.zone;
         let mut imported = checkpoint.cut.tempo;
@@ -603,18 +625,8 @@ impl Persistence {
             let entry = tx
                 .get::<Journal>(height)?
                 .ok_or_else(|| invalid("missing reorg journal"))?;
-            if entry.zone.number != height
-                || entry.parent != tip
-                || entry.imported_tempo_parent != imported
-                || entry.imported_tempo.number <= imported.number
-            {
-                return Err(invalid("non-contiguous reorg journal"));
-            }
-            state
-                .apply(&entry.delta)
-                .map_err(|error| invalid(error.to_string()))?;
-            tip = entry.zone;
-            imported = entry.imported_tempo;
+            Self::apply_journal_entry(&mut state, &mut tip, &mut imported, height, entry)
+                .map_err(|_| invalid("non-contiguous reorg journal"))?;
         }
         if tip != ancestor {
             return Err(invalid("ancestor hash conflict"));
@@ -629,10 +641,13 @@ impl Persistence {
 
     /// Write or verify the immutable checkpoint at the current metadata tips.
     fn checkpoint_in_tx(
+        &self,
         tx: &<DatabaseEnv as Database>::TXMut,
         meta: &mut Metadata,
         state: &State,
     ) -> Result<()> {
+        let previous_active = meta.active_checkpoint;
+        let previous_recovery = meta.recovery_checkpoint;
         let cut = ChainCut {
             zone: meta.verified_zone_tip,
             tempo: meta.imported_tempo_tip,
@@ -642,6 +657,62 @@ impl Persistence {
             cut,
             state: state.clone(),
         };
+        Self::write_checkpoint(tx, id, checkpoint)?;
+        meta.active_checkpoint = id;
+        self.advance_recovery_checkpoint(tx, meta)?;
+        Self::remove_obsolete_checkpoints(tx, meta, previous_active, previous_recovery)?;
+        Ok(())
+    }
+
+    /// Advance the durable local reorg floor and prune history before it.
+    fn advance_recovery_checkpoint(
+        &self,
+        tx: &<DatabaseEnv as Database>::TXMut,
+        meta: &mut Metadata,
+    ) -> Result<()> {
+        let Some(target_height) = meta
+            .verified_zone_tip
+            .number
+            .checked_sub(self.retention.minimum_journal_blocks)
+        else {
+            return Ok(());
+        };
+        if target_height <= meta.recovery_checkpoint.height {
+            return Ok(());
+        }
+
+        let checkpoint = Self::reconstruct_from_checkpoint(
+            tx,
+            meta,
+            meta.recovery_checkpoint,
+            target_height,
+            self.identity,
+        )?;
+        let id = CheckpointId::from(checkpoint.cut.zone);
+        Self::write_checkpoint(tx, id, checkpoint)?;
+        meta.recovery_checkpoint = id;
+        Self::prune_journal_through(tx, target_height)?;
+        Ok(())
+    }
+
+    /// Delete journal entries included in the recovery checkpoint.
+    fn prune_journal_through(tx: &<DatabaseEnv as Database>::TXMut, through: u64) -> Result<()> {
+        let mut cursor = tx.cursor_write::<Journal>()?;
+        while let Some((height, _)) = cursor.first()? {
+            if height > through {
+                break;
+            }
+            cursor.delete_current()?;
+        }
+        Ok(())
+    }
+
+    /// Write an immutable checkpoint, rejecting a conflicting existing cut.
+    fn write_checkpoint(
+        tx: &<DatabaseEnv as Database>::TXMut,
+        id: CheckpointId,
+        checkpoint: Checkpoint,
+    ) -> Result<()> {
         codec::encode(&checkpoint)?;
         if let Some(existing) = tx.get::<Checkpoints>(id)? {
             if existing != checkpoint {
@@ -650,7 +721,96 @@ impl Persistence {
         } else {
             tx.put::<Checkpoints>(id, checkpoint)?;
         }
-        meta.active_checkpoint = id;
+        Ok(())
+    }
+
+    /// Retain only bootstrap, recovery, and active checkpoints.
+    fn remove_obsolete_checkpoints(
+        tx: &<DatabaseEnv as Database>::TXMut,
+        meta: &Metadata,
+        previous_active: CheckpointId,
+        previous_recovery: CheckpointId,
+    ) -> Result<()> {
+        let bootstrap = Self::bootstrap_checkpoint_id(tx)?;
+        for id in [previous_active, previous_recovery] {
+            if id != bootstrap && id != meta.active_checkpoint && id != meta.recovery_checkpoint {
+                tx.delete::<Checkpoints>(id, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the immutable bootstrap checkpoint identity.
+    fn bootstrap_checkpoint_id(tx: &<DatabaseEnv as Database>::TXMut) -> Result<CheckpointId> {
+        tx.cursor_read::<Checkpoints>()?
+            .first()?
+            .map(|(id, _)| id)
+            .ok_or_else(|| invalid("bootstrap checkpoint is missing"))
+    }
+
+    /// Reconstruct a checkpoint state by applying journal entries through `height`.
+    fn reconstruct_from_checkpoint(
+        tx: &<DatabaseEnv as Database>::TXMut,
+        meta: &Metadata,
+        checkpoint_id: CheckpointId,
+        height: u64,
+        identity: Identity,
+    ) -> Result<Checkpoint> {
+        let checkpoint = tx
+            .get::<Checkpoints>(checkpoint_id)?
+            .ok_or_else(|| invalid("recovery checkpoint is missing"))?;
+        validate_checkpoint(checkpoint_id, &checkpoint, identity)?;
+        if height < checkpoint.cut.zone.number || height > meta.verified_zone_tip.number {
+            return Err(invalid("recovery checkpoint target is out of range"));
+        }
+        let mut state = checkpoint.state;
+        let mut zone = checkpoint.cut.zone;
+        let mut tempo = checkpoint.cut.tempo;
+        for number in zone.number.saturating_add(1)..=height {
+            let entry = tx
+                .get::<Journal>(number)?
+                .ok_or_else(|| invalid("missing recovery journal"))?;
+            Self::apply_journal_entry(&mut state, &mut zone, &mut tempo, number, entry)?;
+        }
+        validate_state(&state, identity)?;
+        Ok(Checkpoint {
+            cut: ChainCut { zone, tempo },
+            state,
+        })
+    }
+
+    /// Validate and apply one contiguous journal transition.
+    fn apply_journal_entry(
+        state: &mut State,
+        zone: &mut BlockNumHash,
+        tempo: &mut BlockNumHash,
+        height: u64,
+        entry: JournalEntry,
+    ) -> Result<()> {
+        Self::validate_journal_entry(*zone, *tempo, height, &entry)?;
+        state
+            .apply(&entry.delta)
+            .map_err(|error| invalid(error.to_string()))?;
+        *zone = entry.zone;
+        *tempo = entry.imported_tempo;
+        Ok(())
+    }
+
+    /// Validate one journal transition without replaying its state delta.
+    fn validate_journal_entry(
+        zone: BlockNumHash,
+        tempo: BlockNumHash,
+        height: u64,
+        entry: &JournalEntry,
+    ) -> Result<()> {
+        if entry.zone.number != height
+            || entry.parent != zone
+            || entry.delta.validate().is_err()
+            || entry.imported_tempo.number <= tempo.number
+            || entry.imported_tempo_parent != tempo
+        {
+            return Err(invalid(format!("conflicting journal height {height}")));
+        }
         Ok(())
     }
 
@@ -708,6 +868,19 @@ impl Persistence {
     #[cfg(test)]
     pub(crate) fn inject_abort(&self) {
         self.abort_next_write.store(true, Ordering::SeqCst);
+    }
+
+    /// Use a compact retention window in focused persistence and runtime tests.
+    #[cfg(test)]
+    pub(crate) fn set_retention_for_tests(
+        &mut self,
+        checkpoint_interval: u64,
+        minimum_journal_blocks: u64,
+    ) {
+        self.retention = RetentionPolicy {
+            checkpoint_interval,
+            minimum_journal_blocks,
+        };
     }
 }
 

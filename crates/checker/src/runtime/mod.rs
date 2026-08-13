@@ -157,6 +157,13 @@ pub(crate) enum StreamFailureAction {
     Blocked,
 }
 
+/// Outcome of attempting to restore the checker at a notification ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReorgOutcome {
+    Recovered,
+    Blocked,
+}
+
 impl<N> Runtime<N> {
     /// Start from a durable snapshot with one current notification and a bounded backlog.
     pub(crate) fn new(snapshot: Snapshot, capacity: usize, budget: RetryBudget) -> Self {
@@ -354,7 +361,9 @@ impl<N> Runtime<N> {
                 self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(EnqueueAction::Blocked);
             }
-            self.reorg(store, plan.ancestor)?;
+            if self.reorg(store, plan.ancestor)? == ReorgOutcome::Blocked {
+                return Ok(EnqueueAction::Blocked);
+            }
         }
         if matches!(self.snapshot.meta.coverage, Coverage::Complete) {
             if plan.applied.is_empty() {
@@ -375,12 +384,19 @@ impl<N> Runtime<N> {
     }
 
     /// Restore the durable state at `ancestor` and reset in-flight retry state.
-    pub(crate) fn reorg(
+    fn reorg(
         &mut self,
         store: &Persistence,
         ancestor: BlockNumHash,
-    ) -> Result<(), PersistenceError> {
-        let snapshot = store.reorg(&self.snapshot, ancestor)?;
+    ) -> Result<ReorgOutcome, PersistenceError> {
+        let snapshot = match store.reorg(&self.snapshot, ancestor) {
+            Ok(snapshot) => snapshot,
+            Err(PersistenceError::ReorgBeyondRetention { .. }) => {
+                self.block(store, CheckerBlockedReason::DeepReorgBeyondRetention)?;
+                return Ok(ReorgOutcome::Blocked);
+            }
+            Err(error) => return Err(error),
+        };
         self.retry = None;
         self.processed_notification_tip = Some(ancestor);
         self.state = if snapshot.meta.active_finding.is_some() {
@@ -389,7 +405,7 @@ impl<N> Runtime<N> {
             RuntimeState::Starting
         };
         self.snapshot = snapshot;
-        Ok(())
+        Ok(ReorgOutcome::Recovered)
     }
     /// Discard the completed current notification and promote the next queued item.
     fn advance(&mut self) {
@@ -440,12 +456,15 @@ impl<N> Runtime<N> {
         &mut self,
         store: &Persistence,
         plan: &NotificationPlan,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<ReorgOutcome, PersistenceError> {
         if !plan.reverted.is_empty() && !self.current_unwound {
-            self.reorg(store, plan.ancestor)?;
+            let outcome = self.reorg(store, plan.ancestor)?;
+            if outcome == ReorgOutcome::Blocked {
+                return Ok(outcome);
+            }
             self.current_unwound = true;
         }
-        Ok(())
+        Ok(ReorgOutcome::Recovered)
     }
 
     /// Select the next unchecked block without changing durable state.
@@ -524,14 +543,18 @@ impl<N> Runtime<N> {
                 self.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
                 return Ok(Some(RuntimeAction::Blocked));
             }
-            self.unwind_current(store, plan)?;
+            if self.unwind_current(store, plan)? == ReorgOutcome::Blocked {
+                return Ok(Some(RuntimeAction::Blocked));
+            }
             let first = self.first_unchecked_or(active.zone);
             let acknowledged = self.record_unchecked_descendants(store, first, plan.acknowledge)?;
             self.state = RuntimeState::Alerting;
             self.advance();
             return Ok(Some(RuntimeAction::Acknowledge(acknowledged)));
         }
-        self.unwind_current(store, plan)?;
+        if self.unwind_current(store, plan)? == ReorgOutcome::Blocked {
+            return Ok(Some(RuntimeAction::Blocked));
+        }
         if plan.applied.is_empty() {
             self.advance();
             return Ok(Some(RuntimeAction::Acknowledge(plan.acknowledge)));

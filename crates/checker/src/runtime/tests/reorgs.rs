@@ -136,3 +136,29 @@ fn notification_plan_rejects_malformed_coordinates() {
         .is_err()
     );
 }
+
+#[test]
+fn reorg_before_retained_history_blocks_the_checker() {
+    let (_directory, mut store) = create();
+    store.set_retention_for_tests(2, 4);
+    let mut runtime = runtime(&store, 2);
+    for number in 1..=8 {
+        let state = store.load().unwrap().state;
+        runtime
+            .push(notification(blocks(&state, number, 1, 0x10)))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .poll(&store, identity(), authenticate, Instant::now())
+                .unwrap(),
+            RuntimeAction::Acknowledge(coordinate(number, 0x10))
+        );
+    }
+
+    runtime.reorg(&store, coordinate(3, 0x10)).unwrap();
+    assert_eq!(runtime.state(), RuntimeState::Blocked);
+    assert_eq!(
+        store.load().unwrap().meta.blocked,
+        Some(crate::CheckerBlockedReason::DeepReorgBeyondRetention)
+    );
+}

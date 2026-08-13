@@ -159,7 +159,8 @@ pub(super) fn validate_finding(
 
 /// Validate metadata tips, checkpoints, and coverage coordinates.
 pub(super) fn validate_metadata(meta: &Metadata) -> Result<()> {
-    if meta.active_checkpoint.height > meta.verified_zone_tip.number
+    if meta.recovery_checkpoint.height > meta.active_checkpoint.height
+        || meta.active_checkpoint.height > meta.verified_zone_tip.number
         || meta.acknowledged_zone_tip.number < meta.verified_zone_tip.number
     {
         return Err(invalid("metadata tips or active checkpoint are incoherent"));

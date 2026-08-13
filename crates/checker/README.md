@@ -183,8 +183,10 @@ The dedicated database has four tables:
 | `Journal` | Ordered canonical per-block deltas and continuity data |
 | `Findings` | Findings and their chain coordinates |
 
-The bootstrap checkpoint is immutable. The canonical journal is retained
-without pruning.
+The bootstrap checkpoint is immutable. The checker retains bootstrap,
+recovery, and active checkpoints, plus at least 16,384 Zone blocks of journal
+history after the recovery checkpoint. It prunes older journal rows atomically;
+normal checkpoint cadence retains at most one additional interval.
 
 The runtime keeps one current notification and a bounded queue. It commits each
 block separately and sends Reth `FinishedHeight` only after all state, finding,
@@ -192,14 +194,17 @@ and coverage updates through that height have committed.
 
 Verified, acknowledged, and unchecked progress are stored separately. Before
 acknowledging an unchecked suffix, the checker records it as a coverage gap. A
-finding leaves semantic state at the verified parent. Restart reconstructs
-state from a checkpoint and journal. A reorg restores the common ancestor and
-then applies the replacement branch. Removing the finding's block clears the
+finding leaves semantic state at the verified parent. Restart validates retained
+journal continuity, then replays only the active checkpoint's journal suffix.
+A reorg within retained history restores
+the common ancestor and then applies the replacement branch. A deeper reorg
+durably blocks the checker without acknowledging further notifications and
+requires rebuilding its database. Removing the finding's block clears the
 active finding atomically; retaining it keeps the finding active.
 
 Malformed or discontinuous notification plans are not treated as verified. The
 checker records an unchecked range when it can establish the affected canonical
-suffix; otherwise it terminates without advancing progress.
+suffix; otherwise it blocks without advancing progress.
 
 ## Failure policy
 
@@ -212,10 +217,10 @@ suffix; otherwise it terminates without advancing progress.
   block; do not check descendants.
 
 If retries are exhausted, the checker commits the unchecked suffix before
-acknowledging it and stopping. Acknowledged blocks in that suffix are not
+acknowledging it and disabling checks. Acknowledged blocks in that suffix are not
 verified. Notification-stream loss and queue overflow also fail closed: the
 checker records the canonical unchecked suffix before acknowledging and
-terminating.
+blocking.
 
 ## Trust assumptions and non-claims
 

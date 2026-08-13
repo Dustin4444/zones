@@ -143,3 +143,96 @@ fn deep_reorg_retains_orphan_finding_as_structural_audit_record() {
     assert_eq!(reopened.meta.verified_zone_tip, bootstrap().zone);
     assert_eq!(reopened.meta.active_finding, None);
 }
+
+#[test]
+fn retention_advances_the_recovery_floor_and_rejects_older_reorgs() {
+    let (_directory, mut store) = create();
+    store.set_retention_for_tests(2, 4);
+
+    let mut parent = bootstrap().zone;
+    for number in 1..=8 {
+        parent = apply(&store, number, parent);
+    }
+
+    let snapshot = current(&store);
+    assert_eq!(
+        snapshot.meta.recovery_checkpoint,
+        super::super::CheckpointId::from(block(4, 0x14))
+    );
+    assert_eq!(
+        snapshot.meta.active_checkpoint,
+        super::super::CheckpointId::from(block(8, 0x18))
+    );
+
+    let tx = store.db.tx().unwrap();
+    let mut journal = tx.cursor_read::<Journal>().unwrap();
+    assert_eq!(journal.first().unwrap().map(|(height, _)| height), Some(5));
+    assert_eq!(journal.last().unwrap().map(|(height, _)| height), Some(8));
+    let checkpoints = tx
+        .cursor_read::<Checkpoints>()
+        .unwrap()
+        .walk(None)
+        .unwrap()
+        .count();
+    assert_eq!(checkpoints, 3);
+    tx.commit().unwrap();
+
+    assert!(matches!(
+        store.reorg(&snapshot, block(3, 0x13)),
+        Err(PersistenceError::ReorgBeyondRetention { .. })
+    ));
+    assert_eq!(
+        store
+            .reorg(&snapshot, block(4, 0x14))
+            .unwrap()
+            .meta
+            .verified_zone_tip,
+        block(4, 0x14)
+    );
+    assert!(matches!(
+        store.reorg(&snapshot, block(4, 0x44)),
+        Err(PersistenceError::ReorgBeyondRetention { .. })
+    ));
+}
+
+#[test]
+fn retained_history_survives_restart_and_rejects_a_missing_middle_entry() {
+    let (directory, mut store) = create();
+    store.set_retention_for_tests(2, 4);
+    let mut parent = bootstrap().zone;
+    for number in 1..=8 {
+        parent = apply(&store, number, parent);
+    }
+    let expected = current(&store);
+    drop(store);
+
+    let (store, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened, expected);
+    let tx = store.db.tx_mut().unwrap();
+    let mut journal = tx.cursor_write::<Journal>().unwrap();
+    journal.seek_exact(6).unwrap();
+    journal.delete_current().unwrap();
+    tx.commit().unwrap();
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
+}
+
+#[test]
+fn retained_reorg_installs_its_ancestor_as_the_active_checkpoint() {
+    let (directory, mut store) = create();
+    store.set_retention_for_tests(2, 4);
+    let mut parent = bootstrap().zone;
+    for number in 1..=8 {
+        parent = apply(&store, number, parent);
+    }
+
+    let ancestor = block(6, 0x16);
+    let snapshot = store.reorg(&current(&store), ancestor).unwrap();
+    assert_eq!(
+        snapshot.meta.active_checkpoint,
+        super::super::CheckpointId::from(ancestor)
+    );
+    drop(store);
+
+    let (_store, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened, snapshot);
+}

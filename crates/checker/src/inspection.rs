@@ -12,6 +12,8 @@ use crate::{
 /// Durable checker watermarks and alert state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckerSnapshot {
+    /// Oldest Zone coordinate from which local reorg recovery is supported.
+    pub recovery_zone_tip: BlockNumHash,
     pub verified_zone_tip: BlockNumHash,
     pub imported_tempo_tip: BlockNumHash,
     pub acknowledged_zone_tip: BlockNumHash,
@@ -24,6 +26,10 @@ pub struct CheckerSnapshot {
 pub fn inspect_database(path: impl AsRef<Path>) -> eyre::Result<CheckerSnapshot> {
     let snapshot = Persistence::inspect_snapshot(path)?;
     Ok(CheckerSnapshot {
+        recovery_zone_tip: BlockNumHash::new(
+            snapshot.meta.recovery_checkpoint.height,
+            snapshot.meta.recovery_checkpoint.hash,
+        ),
         verified_zone_tip: snapshot.meta.verified_zone_tip.into(),
         imported_tempo_tip: snapshot.meta.imported_tempo_tip.into(),
         acknowledged_zone_tip: snapshot.meta.acknowledged_zone_tip.into(),

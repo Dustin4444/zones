@@ -192,7 +192,10 @@ fn stale_checkpoint_from_an_orphaned_branch_is_skipped() {
         )
         .unwrap();
     let snapshot = store.reorg(&current(&store), block(1, 0xb1)).unwrap();
-    assert_eq!(snapshot.meta.active_checkpoint.height, 0);
+    assert_eq!(
+        snapshot.meta.active_checkpoint,
+        super::super::CheckpointId::from(block(1, 0xb1))
+    );
     assert_eq!(snapshot.meta.verified_zone_tip, block(1, 0xb1));
 }
 

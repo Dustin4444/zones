@@ -74,6 +74,8 @@ pub(crate) enum Coverage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Metadata {
     pub identity: Identity,
+    /// Oldest checkpoint from which local reorg recovery is supported.
+    pub recovery_checkpoint: CheckpointId,
     pub active_checkpoint: CheckpointId,
     pub verified_zone_tip: BlockNumHash,
     pub imported_tempo_tip: BlockNumHash,

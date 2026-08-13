@@ -75,6 +75,10 @@ impl CheckerCommand {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
+                            "recoveryZoneTip": {
+                                "number": snapshot.recovery_zone_tip.number,
+                                "hash": snapshot.recovery_zone_tip.hash,
+                            },
                             "verifiedZoneTip": {
                                 "number": snapshot.verified_zone_tip.number,
                                 "hash": snapshot.verified_zone_tip.hash,
@@ -93,6 +97,10 @@ impl CheckerCommand {
                         }))?
                     );
                 } else {
+                    println!(
+                        "Recovery Zone tip:     {}/{}",
+                        snapshot.recovery_zone_tip.number, snapshot.recovery_zone_tip.hash
+                    );
                     println!(
                         "Verified Zone tip:     {}/{}",
                         snapshot.verified_zone_tip.number, snapshot.verified_zone_tip.hash

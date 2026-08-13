@@ -118,18 +118,23 @@ families invalidate the database. Schema changes require a new checkpoint.
 
 The identity-bound bootstrap checkpoint is immutable. Checkpoint publication
 uses a sibling staging directory and reopens the database before moving it to
-the target path. The canonical journal is not pruned.
+the target path. The checker retains bootstrap, recovery, and active
+checkpoints, plus at least 16,384 Zone blocks of journal history after the
+recovery checkpoint. Older journal rows are pruned atomically when recovery
+advances; normal checkpoint cadence retains at most one additional interval.
 
 Each update commits its metadata, journal, checkpoint, finding, and reorg
-changes in one MDBX transaction. Restart loads a checkpoint, replays its journal
-suffix, and validates the complete reconstructed state.
+changes in one MDBX transaction. Restart validates retained journal continuity,
+then loads the active checkpoint and replays only its journal suffix.
 
 ## Canonical reorgs and findings
 
 A journal entry stores the block, parent, imported Tempo cut, and state delta.
-On a reorg, the checker reconstructs the common ancestor from a checkpoint and
-journal, removes the old suffix in the same transaction, and applies the
-replacement branch in order.
+On a reorg within the retained history, the checker reconstructs the common
+ancestor from the recovery or active checkpoint and journal, removes the old
+suffix in the same transaction, and applies the replacement branch in order.
+A reorg before the recovery checkpoint durably blocks checking without
+acknowledging further notifications; it requires a rebuilt checker database.
 
 A semantic mismatch atomically records a finding without applying the expected
 state delta. Descendants are recorded as `NotCheckedAncestorDivergence`, not as
@@ -194,6 +199,7 @@ Coverage has three relevant states:
 
 ## Operational limitations
 
-There is no journal pruning policy; disk use grows with canonical history.
-Rebuild requires local Zone history and the Tempo archive evidence used by the
-builder. Schema changes require a new database path.
+Journal retention bounds live checker state, but historical findings are kept
+as audit records and may grow indefinitely. Rebuild requires local Zone history
+and the Tempo archive evidence used by the builder. Schema changes require a
+new database path.
