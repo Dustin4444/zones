@@ -1463,14 +1463,12 @@ fn encryption_key_updated_log(
     portal: Address,
     x: B256,
     y_parity: u8,
-    pubkey: Address,
     key_index: U256,
     activation_block: u64,
 ) -> Log {
     let event = crate::abi::ZonePortal::SequencerEncryptionKeyUpdated {
         x,
         yParity: y_parity,
-        pubkey,
         keyIndex: key_index,
         activationBlock: activation_block,
     };
@@ -1495,7 +1493,7 @@ fn encryption_key_event_binds_private_key_to_portal_index() {
 
     events
         .push_log(
-            &encryption_key_updated_log(portal, x, y_parity, pubkey, key_index, 77),
+            &encryption_key_updated_log(portal, x, y_parity, key_index, 77),
             77,
         )
         .unwrap();
