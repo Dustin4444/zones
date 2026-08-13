@@ -1573,10 +1573,8 @@ contract ZonePortalTest is BaseTest {
     }
 
     function test_sequencerGovernance_revertsIfAdmin() public {
-        // Inverse of test_tokenGovernance_revertsIfNotAdmin: the admin role must
-        // not be able to perform any sequencer-only action. Locks in the
-        // admin/sequencer separation from both directions. (onlySequencer reverts
-        // at the modifier, so the call arguments below are otherwise irrelevant.)
+        // Admin may rotate the deposit-encryption key, but must not perform the other
+        // sequencer-only actions below.
         Withdrawal memory w =
             _withdrawal(address(pathUSD), alice, bob, 500e6, bytes32(0), 0, alice, "");
         // Read state used as call args up front so the staticcall isn't mistaken
@@ -1587,9 +1585,6 @@ contract ZonePortalTest is BaseTest {
 
         vm.expectRevert(IZonePortal.NotSequencer.selector);
         portal.setRpcUrl("https://rpc.example");
-
-        vm.expectRevert(IZonePortal.NotSequencer.selector);
-        portal.setSequencerEncryptionKey(bytes32(uint256(1)), 0x02, 27, bytes32(0), bytes32(0));
 
         vm.expectRevert(IZonePortal.NotSequencer.selector);
         portal.submitBatch(
@@ -4272,16 +4267,35 @@ contract ZonePortalTest is BaseTest {
     function test_setSequencerEncryptionKey_success() public {
         (bytes32 x, uint8 yParity) = _setEncKeyWithPoP(ENC_KEY_1);
 
-        (bytes32 storedX, uint8 storedYParity) = portal.sequencerEncryptionKey();
+        (bytes32 storedX, uint8 storedYParity, address pubkey) = portal.sequencerEncryptionKey();
         assertEq(storedX, x);
         assertEq(storedYParity, yParity);
+        assertEq(pubkey, vm.createWallet(ENC_KEY_1).addr);
         assertEq(portal.encryptionKeyCount(), 1);
     }
 
-    function test_setSequencerEncryptionKey_onlySequencer() public {
+    function test_setSequencerEncryptionKey_revertsForCallerThatIsNeitherAdminNorSequencer()
+        public
+    {
         vm.prank(alice);
         vm.expectRevert(IZonePortal.NotSequencer.selector);
         portal.setSequencerEncryptionKey(bytes32(uint256(1)), 0x02, 27, bytes32(0), bytes32(0));
+    }
+
+    function test_setSequencerEncryptionKey_adminCanSet() public {
+        Vm.Wallet memory w = vm.createWallet(ENC_KEY_1);
+        bytes32 x = bytes32(w.publicKeyX);
+        uint8 yParity = w.publicKeyY % 2 == 0 ? 0x02 : 0x03;
+        bytes32 message = keccak256(abi.encode(address(portal), x, yParity));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(w.privateKey, message);
+
+        vm.prank(admin);
+        portal.setSequencerEncryptionKey(x, yParity, v, r, s);
+
+        (bytes32 storedX, uint8 storedYParity, address pubkey) = portal.sequencerEncryptionKey();
+        assertEq(storedX, x);
+        assertEq(storedYParity, yParity);
+        assertEq(pubkey, w.addr);
     }
 
     function test_setSequencerEncryptionKey_multipleKeys() public {
@@ -4292,9 +4306,10 @@ contract ZonePortalTest is BaseTest {
         assertEq(portal.encryptionKeyCount(), 2);
 
         // sequencerEncryptionKey returns the latest key
-        (bytes32 storedX, uint8 storedYParity) = portal.sequencerEncryptionKey();
+        (bytes32 storedX, uint8 storedYParity, address pubkey) = portal.sequencerEncryptionKey();
         assertEq(storedX, x2);
         assertEq(storedYParity, yParity2);
+        assertEq(pubkey, vm.createWallet(ENC_KEY_2).addr);
     }
 
     function test_setSequencerEncryptionKey_emitsEvent() public {
@@ -4302,7 +4317,7 @@ contract ZonePortalTest is BaseTest {
         bytes32 x = bytes32(w.publicKeyX);
         uint8 yParity = w.publicKeyY % 2 == 0 ? 0x02 : 0x03;
         vm.expectEmit(true, true, true, true);
-        emit IZonePortal.SequencerEncryptionKeyUpdated(x, yParity, 0, uint64(block.number));
+        emit IZonePortal.SequencerEncryptionKeyUpdated(x, yParity, w.addr, 0, uint64(block.number));
         // can't use helper since expectEmit must come before the call
         bytes32 message = keccak256(abi.encode(address(portal), x, yParity));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(w.privateKey, message);
