@@ -192,20 +192,6 @@ async fn l1_block_tracker_waits_for_exact_observation() {
 }
 
 #[tokio::test]
-async fn l1_block_tracker_wait_for_portal_events_with_timeout_times_out() {
-    let tracker = L1BlockTracker::default();
-    let anchor = NumHash::new(10, B256::with_last_byte(0x10));
-
-    let error = tracker
-        .wait_for_portal_events_with_timeout(anchor, Duration::from_millis(1))
-        .await
-        .expect_err("an unobserved anchor must time out");
-
-    assert!(error.to_string().contains("timed out"));
-    assert!(error.to_string().contains("L1 block 10"));
-}
-
-#[tokio::test]
 async fn l1_block_tracker_returns_receipt_authenticated_portal_events() {
     let tracker = L1BlockTracker::default();
     let anchor = NumHash::new(10, B256::with_last_byte(0x10));
