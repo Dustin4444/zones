@@ -189,10 +189,9 @@ impl L1PortalEvents {
                 });
             }
             ZonePortalEvents::SequencerEncryptionKeyUpdated(event) => {
-                let pubkey = encryption_key_address(event.x, event.yParity)?;
                 info!(
                     l1_block = block_number,
-                    %pubkey,
+                    pubkey = %event.pubkey,
                     key_index = %event.keyIndex,
                     activation_block = event.activationBlock,
                     "Sequencer encryption key rotated on L1"
@@ -200,7 +199,7 @@ impl L1PortalEvents {
                 self.encryption_key_rotations.push(EncryptionKeyRotation {
                     x: event.x,
                     y_parity: event.yParity,
-                    pubkey,
+                    pubkey: event.pubkey,
                     key_index: event.keyIndex,
                     activation_block: event.activationBlock,
                 });
