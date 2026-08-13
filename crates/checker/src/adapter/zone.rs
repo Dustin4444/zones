@@ -368,36 +368,16 @@ fn adapt_outcomes(
                 e.maxWithdrawalsPerBlock,
             )),
             L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(e)) => {
-                let sender = outcome.position().transaction_sender();
-                if outcome.position().transaction_hash() != advance_hash {
-                    operations.push(ZoneOperation::AcceptWithdrawal(UserWithdrawal {
-                        sender,
-                        transaction_hash: outcome.position().transaction_hash(),
-                        token: e.token,
-                        to: e.to,
-                        amount: e.amount,
-                        memo: e.memo,
-                        gas_limit: e.gasLimit,
-                        callback_data: e.data.clone(),
-                        reveal_to: e.revealTo.clone(),
-                    }));
+                let (operation, effect) = adapt_withdrawal(
+                    e,
+                    outcome.position().transaction_hash(),
+                    advance_hash,
+                    o.zone_id,
+                );
+                if let Some(operation) = operation {
+                    operations.push(operation);
                 }
-                effects.push(Effect::WithdrawalRequested {
-                    id: crate::kernel::WithdrawalId {
-                        zone_id: o.zone_id,
-                        index: e.withdrawalIndex,
-                    },
-                    sender,
-                    token: e.token,
-                    to: e.to,
-                    amount: e.amount,
-                    fee: e.fee,
-                    memo: e.memo,
-                    gas_limit: e.gasLimit,
-                    fallback_nonce: e.fallbackNonce,
-                    callback_data: e.data.clone(),
-                    reveal_to: e.revealTo.clone(),
-                });
+                effects.push(effect);
             }
             L2ProtocolEvent::Inbox(Inbox::IZoneInboxEvents::RefundClaimed(e)) => {
                 operations.push(ZoneOperation::ClaimInboxRefund(RefundClaim {
@@ -438,4 +418,82 @@ fn adapt_outcomes(
         effects,
         finalization,
     })
+}
+
+/// Adapt a withdrawal using the immediate caller authenticated by its event.
+fn adapt_withdrawal(
+    event: &Outbox::WithdrawalRequested,
+    transaction_hash: B256,
+    advance_hash: B256,
+    zone_id: u32,
+) -> (Option<ZoneOperation>, Effect) {
+    let operation = (transaction_hash != advance_hash).then(|| {
+        ZoneOperation::AcceptWithdrawal(UserWithdrawal {
+            sender: event.sender,
+            transaction_hash,
+            token: event.token,
+            to: event.to,
+            amount: event.amount,
+            memo: event.memo,
+            gas_limit: event.gasLimit,
+            callback_data: event.data.clone(),
+            reveal_to: event.revealTo.clone(),
+        })
+    });
+    let effect = Effect::WithdrawalRequested {
+        id: crate::kernel::WithdrawalId {
+            zone_id,
+            index: event.withdrawalIndex,
+        },
+        sender: event.sender,
+        token: event.token,
+        to: event.to,
+        amount: event.amount,
+        fee: event.fee,
+        memo: event.memo,
+        gas_limit: event.gasLimit,
+        fallback_nonce: event.fallbackNonce,
+        callback_data: event.data.clone(),
+        reveal_to: event.revealTo.clone(),
+    };
+    (operation, effect)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, Bytes};
+
+    use super::*;
+
+    #[test]
+    fn contract_withdrawal_uses_the_authenticated_event_sender() {
+        let transaction_signer = Address::repeat_byte(0x44);
+        let contract_sender = Address::repeat_byte(0x45);
+        let transaction_hash = B256::repeat_byte(0x46);
+        let event = Outbox::WithdrawalRequested {
+            withdrawalIndex: 4,
+            sender: contract_sender,
+            token: Address::repeat_byte(0x55),
+            to: Address::repeat_byte(0x66),
+            amount: 100,
+            fee: 9,
+            memo: B256::repeat_byte(0x77),
+            gasLimit: 8,
+            fallbackNonce: 3,
+            data: Bytes::from_static(b"callback"),
+            revealTo: Bytes::new(),
+        };
+
+        assert_ne!(transaction_signer, event.sender);
+        let (operation, effect) = adapt_withdrawal(&event, transaction_hash, B256::ZERO, 7);
+        let Some(ZoneOperation::AcceptWithdrawal(withdrawal)) = operation else {
+            panic!("expected accepted withdrawal")
+        };
+        assert_eq!(withdrawal.sender, contract_sender);
+        assert_eq!(withdrawal.transaction_hash, transaction_hash);
+        assert!(matches!(
+            effect,
+            Effect::WithdrawalRequested { sender, .. } if sender == contract_sender
+        ));
+    }
 }

@@ -38,10 +38,6 @@ impl L2EventPosition {
     pub(crate) fn transaction_hash(&self) -> B256 {
         self.transaction_hash
     }
-
-    pub(crate) fn transaction_sender(&self) -> Address {
-        self.transaction_sender
-    }
 }
 
 /// One strictly decoded implementation outcome in canonical block order.

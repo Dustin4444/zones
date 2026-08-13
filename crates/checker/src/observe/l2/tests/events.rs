@@ -33,10 +33,6 @@ fn outcomes_preserve_config_before_operation_order() {
         user_events[0].event(),
         L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::TempoGasRateUpdated(_))
     ));
-    assert_eq!(
-        user_events[1].position().transaction_sender(),
-        Address::repeat_byte(0x44)
-    );
     assert!(matches!(
         user_events[1].event(),
         L2ProtocolEvent::Outbox(Outbox::IZoneOutboxEvents::WithdrawalRequested(event))
