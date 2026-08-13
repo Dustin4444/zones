@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
-use crate::utils::{L1TestNode, ZoneTestLaunchConfig, ZoneTestNode};
+use crate::utils::{L1TestNode, ZoneTestLaunchConfig, ZoneTestNode, poll_until};
 use alloy::providers::Provider;
 use tempo_precompiles::PATH_USD_ADDRESS;
 use zone_checker::{CheckerConfig, CheckerExEx, inspection::inspect_database};
@@ -12,6 +12,32 @@ async fn wait_for_zone_to_finalize_l1(zone: &ZoneTestNode, target: u64) -> eyre:
     zone.wait_for_l2_tempo_finalized(target.saturating_sub(1), TIMEOUT)
         .await?;
     Ok(())
+}
+
+async fn wait_for_checker_to_catch_up(
+    path: &Path,
+    previous_verified_height: u64,
+) -> eyre::Result<zone_checker::inspection::CheckerSnapshot> {
+    let path = path.to_path_buf();
+    poll_until(
+        TIMEOUT,
+        Duration::from_millis(100),
+        "checker to verify all acknowledged Zone blocks",
+        move || {
+            let path = path.clone();
+            async move {
+                let snapshot = inspect_database(&path)?;
+                Ok(
+                    (snapshot.verified_zone_tip.number > previous_verified_height
+                        && snapshot.acknowledged_zone_tip == snapshot.verified_zone_tip
+                        && !snapshot.active_finding
+                        && !snapshot.has_coverage_gap)
+                        .then_some(snapshot),
+                )
+            }
+        },
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -72,10 +98,9 @@ async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
     .await?;
     wait_for_zone_to_finalize_l1(&zone, l1_target).await?;
     zone.stop_engine().await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let first = wait_for_checker_to_catch_up(&path, initial.verified_zone_tip.number).await?;
     zone.crash();
     drop(zone);
-    let first = inspect_database(&path)?;
     assert_eq!(first.acknowledged_zone_tip, first.verified_zone_tip);
     assert!(first.verified_zone_tip.number > initial.verified_zone_tip.number);
     assert!(!first.active_finding);
@@ -97,10 +122,9 @@ async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
     let next_l1_target = l1.provider().get_block_number().await?;
     wait_for_zone_to_finalize_l1(&restarted, next_l1_target).await?;
     restarted.stop_engine().await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snapshot = wait_for_checker_to_catch_up(&path, first.verified_zone_tip.number).await?;
     restarted.crash();
     drop(restarted);
-    let snapshot = inspect_database(&path)?;
     assert_eq!(snapshot.acknowledged_zone_tip, snapshot.verified_zone_tip);
     assert!(snapshot.verified_zone_tip.number > first.verified_zone_tip.number);
     assert!(!snapshot.active_finding);
