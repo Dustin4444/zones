@@ -96,11 +96,8 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     let recipient = address!("0x0000000000000000000000000000000000005678");
     let amount = 1_000_000_u128;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, depositor, recipient, amount);
-    let observed = fixture.portal_events_from_deposits(std::slice::from_ref(&deposit));
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
-    follower
-        .l1_block_tracker()
-        .record_with_portal_events(anchor, observed)?;
+    follower.l1_block_tracker().record(anchor)?;
 
     leader
         .wait_for_balance(
@@ -127,11 +124,8 @@ async fn test_p2p_follower_tracks_leader_balance() -> eyre::Result<()> {
     let transfer_recipient = address!("0x0000000000000000000000000000000000009abc");
     fixture.seed_no_receive_policy(transfer_recipient)?;
     let sender_deposit = fixture.make_deposit(PATH_USD_ADDRESS, sender, sender, amount);
-    let observed = fixture.portal_events_from_deposits(std::slice::from_ref(&sender_deposit));
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![sender_deposit]);
-    follower
-        .l1_block_tracker()
-        .record_with_portal_events(anchor, observed)?;
+    follower.l1_block_tracker().record(anchor)?;
     leader
         .wait_for_balance(
             PATH_USD_ADDRESS,
@@ -279,7 +273,6 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
     // --- Block 1: fund Alice while pathUSD is still allow-all (anchor L1#1). ---
     let deposit_amount: u128 = 1_000_000;
     let deposit = fixture.make_deposit(PATH_USD_ADDRESS, alice, alice, deposit_amount);
-    let observed = fixture.portal_events_from_deposits(std::slice::from_ref(&deposit));
     let anchor = fixture.inject_deposits(leader.deposit_queue(), vec![deposit]);
     leader
         .wait_for_balance(
@@ -290,9 +283,7 @@ async fn test_p2p_follower_enforces_policy_change_at_anchor_block() -> eyre::Res
         )
         .await?;
 
-    follower
-        .l1_block_tracker()
-        .record_with_portal_events(anchor, observed)?;
+    follower.l1_block_tracker().record(anchor)?;
     follower
         .wait_for_balance(
             PATH_USD_ADDRESS,
