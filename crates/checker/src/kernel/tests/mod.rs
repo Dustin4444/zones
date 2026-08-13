@@ -4,15 +4,16 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use crate::kernel::{
     BatchId, BatchSubmission, Deposit, DepositId, DepositOutcome, Effect, Finalization,
-    ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalIdentity, PortalState, RefundClaim,
-    State, StateKey, StateValue, TokenEnable, TokenPhase, TransitionError, UserWithdrawal,
-    WithdrawalId, WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
-    apply_genesis_handoff, apply_imported, apply_zone,
+    ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalCallbackOperation, PortalIdentity,
+    PortalState, RefundClaim, State, StateKey, StateValue, TokenEnable, TokenPhase,
+    TransitionError, UserWithdrawal, WithdrawalId, WithdrawalOutcome, WithdrawalProcessing,
+    ZoneFacts, ZoneOperation, apply_genesis_handoff, apply_imported, apply_zone,
     derivation::{WITHDRAWAL_TERMINATOR, ordinary_deposit_hash, portal_address},
     facts::DepositPayload,
     invariants::{InvariantCode, validate},
     state::{
-        BatchState, FallbackId, InboxRefundId, Overlay, PortalRefundId, TokenState, WithdrawalOwner,
+        BatchState, FallbackId, InboxRefundId, Overlay, PortalRefundId, RefundCredit, TokenState,
+        WithdrawalOwner,
     },
 };
 

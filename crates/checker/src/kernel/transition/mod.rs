@@ -13,8 +13,8 @@ use crate::kernel::{
     effects::{Effect, ExpectedState},
     facts::{
         BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, Finalization, ImportedFacts,
-        ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, WithdrawalOutcome,
-        WithdrawalProcessing, ZoneFacts, ZoneOperation,
+        ImportedOperation, OrdinaryDeposit, PortalCallbackOperation, RefundClaim, TokenEnable,
+        WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
     },
     state::{
         BatchBoundary, BatchId, BatchState, Cursor, DepositId, DepositOwner, FallbackId,

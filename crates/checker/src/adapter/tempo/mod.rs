@@ -97,6 +97,7 @@ pub(super) fn facts(
                         outcomes,
                     },
                 ));
+                continue;
             }
         } else if events.iter().any(|event| {
             matches!(
@@ -236,14 +237,6 @@ pub(super) fn facts(
                         queue_hash: e.withdrawalQueueHash,
                         processed_deposit_number: e.lastProcessedDepositNumber,
                     }),
-                L1ProtocolEvent::Portal(
-                    Portal::ZonePortalEvents::WithdrawalProcessed(_)
-                    | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
-                    | Portal::ZonePortalEvents::DepositBounceBack(_)
-                    | Portal::ZonePortalEvents::DepositBounceBackPending(_),
-                ) if direct_call.is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
-                L1ProtocolEvent::Portal(Portal::ZonePortalEvents::DepositMade(_))
-                    if direct_call.is_some_and(|call| call.as_process_withdrawals().is_some()) => {}
                 L1ProtocolEvent::Portal(Portal::ZonePortalEvents::TokenEnabled(_))
                     if is_creation_block => {}
                 L1ProtocolEvent::FactoryZoneCreated(_) => {}

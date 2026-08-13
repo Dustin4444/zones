@@ -13,8 +13,8 @@ mod transition;
 pub(crate) use effects::{Effect, ExpectedState};
 pub(crate) use facts::{
     BatchSubmission, BounceBackDeposit, Deposit, DepositOutcome, DepositPayload, Finalization,
-    ImportedFacts, ImportedOperation, OrdinaryDeposit, RefundClaim, TokenEnable, UserWithdrawal,
-    WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
+    ImportedFacts, ImportedOperation, OrdinaryDeposit, PortalCallbackOperation, RefundClaim,
+    TokenEnable, UserWithdrawal, WithdrawalOutcome, WithdrawalProcessing, ZoneFacts, ZoneOperation,
 };
 pub(crate) use finding::{Datum, Finding, FindingCategory, FindingLocation};
 pub(crate) use invariants::validate;

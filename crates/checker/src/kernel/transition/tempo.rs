@@ -42,24 +42,7 @@ pub(crate) fn apply_imported(
                 token_enables.push(initial_token.clone());
             }
             ImportedOperation::UpdateBouncebackGas(gas) => {
-                let PortalState::Created {
-                    identity,
-                    deposit,
-                    settlement,
-                    ..
-                } = portal(&overlay)?
-                else {
-                    return Err(TransitionError::PortalNotCreated);
-                };
-                overlay.set(
-                    StateKey::Portal,
-                    Some(StateValue::Portal(PortalState::Created {
-                        identity,
-                        bounceback_gas: *gas,
-                        deposit,
-                        settlement,
-                    })),
-                );
+                update_bounceback_gas(&mut overlay, *gas)?;
             }
             ImportedOperation::EnableToken(enable) => {
                 enable_token(&mut overlay, enable)?;
@@ -72,7 +55,7 @@ pub(crate) fn apply_imported(
                 submit_batch(&mut overlay, input, &mut effects)?
             }
             ImportedOperation::ProcessWithdrawals(input) => {
-                process_withdrawals(&mut overlay, input, &mut effects)?
+                process_withdrawals(&mut overlay, input, &mut effects, &mut token_enables)?
             }
             ImportedOperation::ClaimPortalRefund(input) => {
                 claim_refund(&mut overlay, *input, RefundSide::Portal, &mut effects)?
@@ -104,6 +87,29 @@ fn enable_token(overlay: &mut Overlay<'_>, enable: &TokenEnable) -> Result<(), T
     overlay.set(
         StateKey::Token(enable.token),
         Some(StateValue::Token(TokenState::pending())),
+    );
+    Ok(())
+}
+
+/// Update the authenticated Portal bounceback gas configuration.
+fn update_bounceback_gas(overlay: &mut Overlay<'_>, gas: u64) -> Result<(), TransitionError> {
+    let PortalState::Created {
+        identity,
+        deposit,
+        settlement,
+        ..
+    } = portal(overlay)?
+    else {
+        return Err(TransitionError::PortalNotCreated);
+    };
+    overlay.set(
+        StateKey::Portal,
+        Some(StateValue::Portal(PortalState::Created {
+            identity,
+            bounceback_gas: gas,
+            deposit,
+            settlement,
+        })),
     );
     Ok(())
 }
@@ -260,6 +266,7 @@ fn process_withdrawals(
     overlay: &mut Overlay<'_>,
     input: &WithdrawalProcessing,
     effects: &mut Vec<Effect>,
+    token_enables: &mut Vec<TokenEnable>,
 ) -> Result<(), TransitionError> {
     if input.withdrawals.len() != input.outcomes.len() {
         return Err(TransitionError::WithdrawalOutcomeCountMismatch);
@@ -350,14 +357,28 @@ fn process_withdrawals(
         let terminal_effect = match (origin, outcome) {
             (
                 WithdrawalOrigin::User { fallback },
-                WithdrawalOutcome::UserDelivered { callback_deposits },
+                WithdrawalOutcome::UserDelivered { operations },
             ) => {
                 require_held_fallback(overlay, fallback, wid, data.token, data.amount)?;
-                if data.gas_limit == 0 && !callback_deposits.is_empty() {
+                if data.gas_limit == 0 && !operations.is_empty() {
                     return Err(TransitionError::OwnerMismatch);
                 }
-                for callback in callback_deposits {
-                    append_deposit(overlay, callback, effects)?;
+                for operation in operations {
+                    match operation {
+                        PortalCallbackOperation::AppendDeposit(deposit) => {
+                            append_deposit(overlay, deposit, effects)?
+                        }
+                        PortalCallbackOperation::ClaimRefund(claim) => {
+                            claim_refund(overlay, *claim, RefundSide::Portal, effects)?
+                        }
+                        PortalCallbackOperation::EnableToken(enable) => {
+                            enable_token(overlay, enable)?;
+                            token_enables.push(enable.clone());
+                        }
+                        PortalCallbackOperation::UpdateBouncebackGas(gas) => {
+                            update_bounceback_gas(overlay, *gas)?
+                        }
+                    }
                 }
                 withdrawal_token = token(overlay, data.token)?;
                 withdrawal_token.accounting.withdrawals = withdrawal_token

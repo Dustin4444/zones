@@ -180,7 +180,7 @@ fn user_delivery_closes_batch_withdrawal_fallback_accounting() {
                     withdrawals: vec![withdrawal],
                     remaining_queue: B256::ZERO,
                     outcomes: vec![WithdrawalOutcome::UserDelivered {
-                        callback_deposits: Vec::new(),
+                        operations: Vec::new(),
                     }],
                 },
             )],
@@ -215,7 +215,7 @@ fn user_delivery_preserves_same_token_callback_deposit_accounting() {
                     withdrawals: vec![withdrawal],
                     remaining_queue: B256::ZERO,
                     outcomes: vec![WithdrawalOutcome::UserDelivered {
-                        callback_deposits: vec![callback.clone()],
+                        operations: vec![PortalCallbackOperation::AppendDeposit(callback.clone())],
                     }],
                 },
             )],
@@ -231,6 +231,143 @@ fn user_delivery_preserves_same_token_callback_deposit_accounting() {
     assert_eq!(token.accounting.supply, U256::from(60));
     assert_eq!(token.accounting.withdrawals, U256::ZERO);
     assert_eq!(token.accounting.deposits, U256::from(callback.amount));
+    validate(&state).unwrap();
+}
+
+#[test]
+fn user_delivery_applies_callback_refund_claim_before_completing_withdrawal() {
+    let (mut state, withdrawal) = finalized_user_state_with_gas_limit(1);
+    submit_first_batch(&mut state);
+    let token = identity().initial_token;
+    let claim = RefundClaim {
+        token,
+        recipient: withdrawal.to,
+        amount: 7,
+    };
+    let mut rows = state.rows().clone();
+    let StateValue::Token(mut accounting) = rows[&StateKey::Token(token)].clone() else {
+        unreachable!()
+    };
+    accounting.accounting.deposits = U256::from(claim.amount);
+    rows.insert(StateKey::Token(token), StateValue::Token(accounting));
+    rows.insert(
+        StateKey::PortalRefund(PortalRefundId {
+            token,
+            recipient: claim.recipient,
+            deposit: DepositId::new(identity().portal, 1).unwrap(),
+        }),
+        StateValue::PortalRefund(RefundCredit {
+            amount: claim.amount,
+        }),
+    );
+    state = State::from_rows(rows).unwrap();
+
+    state = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    base_fee: U256::ZERO,
+                    withdrawals: vec![withdrawal],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::UserDelivered {
+                        operations: vec![PortalCallbackOperation::ClaimRefund(claim)],
+                    }],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+    )
+    .unwrap()
+    .into_state();
+
+    assert!(
+        !state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::PortalRefund(_)))
+    );
+    validate(&state).unwrap();
+}
+
+#[test]
+fn callback_claims_refund_created_by_an_earlier_withdrawal_member() {
+    let (mut state, deposit) = created_with_deposit();
+    let mut rows = state.rows().clone();
+    let StateValue::Token(mut token) = rows[&StateKey::Token(deposit.token)].clone() else {
+        unreachable!()
+    };
+    token.accounting.supply = U256::from(100);
+    rows.insert(StateKey::Token(deposit.token), StateValue::Token(token));
+    state = State::from_rows(rows).unwrap();
+    let user = UserWithdrawal {
+        gas_limit: 1,
+        ..user_withdrawal(0x50, 40)
+    };
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            deposits: vec![Deposit::Ordinary(deposit.clone())],
+            outcomes: vec![DepositOutcome::Failed],
+            operations: vec![ZoneOperation::AcceptWithdrawal(user)],
+            finalization: Some(Finalization {
+                block_number: 1,
+                declared_count: 2,
+                encrypted_senders: vec![Default::default(), Default::default()],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    submit_first_batch(&mut state);
+    let withdrawals = (0..2)
+        .map(|index| {
+            let StateValue::Withdrawal(WithdrawalOwner::Finalized { ref data, .. }) = state.rows()
+                [&StateKey::Withdrawal(WithdrawalId {
+                    zone_id: ZONE_ID,
+                    index,
+                })]
+            else {
+                unreachable!()
+            };
+            data.clone()
+        })
+        .collect::<Vec<_>>();
+    let claim = RefundClaim {
+        token: deposit.token,
+        recipient: deposit.tempo_refund_recipient,
+        amount: deposit.amount,
+    };
+    state = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    base_fee: U256::ZERO,
+                    withdrawals,
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![
+                        WithdrawalOutcome::FailedDepositPending { collected_fee: 0 },
+                        WithdrawalOutcome::UserDelivered {
+                            operations: vec![PortalCallbackOperation::ClaimRefund(claim)],
+                        },
+                    ],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+    )
+    .unwrap()
+    .into_state();
+
+    assert!(
+        !state
+            .rows()
+            .keys()
+            .any(|key| matches!(key, StateKey::PortalRefund(_)))
+    );
     validate(&state).unwrap();
 }
 
@@ -408,9 +545,7 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
                     base_fee: U256::ZERO,
                     withdrawals: vec![withdrawals[0].clone()],
                     remaining_queue: suffix,
-                    outcomes: vec![WithdrawalOutcome::UserDelivered {
-                        callback_deposits: vec![],
-                    }],
+                    outcomes: vec![WithdrawalOutcome::UserDelivered { operations: vec![] }],
                 },
             )],
             ..ImportedFacts::default()
@@ -439,9 +574,7 @@ fn partial_processing_keeps_exact_suffix_then_exhausts() {
                     base_fee: U256::ZERO,
                     withdrawals: vec![withdrawals[1].clone()],
                     remaining_queue: B256::ZERO,
-                    outcomes: vec![WithdrawalOutcome::UserDelivered {
-                        callback_deposits: vec![],
-                    }],
+                    outcomes: vec![WithdrawalOutcome::UserDelivered { operations: vec![] }],
                 },
             )],
             ..ImportedFacts::default()
@@ -555,9 +688,7 @@ fn every_withdrawal_preimage_field_is_prefix_authenticated() {
                             base_fee: U256::ZERO,
                             withdrawals: vec![value],
                             remaining_queue: B256::ZERO,
-                            outcomes: vec![WithdrawalOutcome::UserDelivered {
-                                callback_deposits: vec![]
-                            }],
+                            outcomes: vec![WithdrawalOutcome::UserDelivered { operations: vec![] }],
                         }
                     )],
                     ..ImportedFacts::default()

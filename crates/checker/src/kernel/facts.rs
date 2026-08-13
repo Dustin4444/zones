@@ -106,7 +106,7 @@ pub(crate) struct WithdrawalProcessing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WithdrawalOutcome {
     UserDelivered {
-        callback_deposits: Vec<OrdinaryDeposit>,
+        operations: Vec<PortalCallbackOperation>,
     },
     UserBounced,
     FailedDepositPaid {
@@ -115,6 +115,15 @@ pub(crate) enum WithdrawalOutcome {
     FailedDepositPending {
         collected_fee: u128,
     },
+}
+
+/// Checker-relevant Portal operation emitted while delivering a withdrawal callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PortalCallbackOperation {
+    AppendDeposit(OrdinaryDeposit),
+    ClaimRefund(RefundClaim),
+    EnableToken(TokenEnable),
+    UpdateBouncebackGas(u64),
 }
 
 /// Authenticated Zone outcome for one submitted deposit.
