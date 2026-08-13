@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use eyre::bail;
-use tempo_precompiles::test_util::{
+use tempo_precompiles_conformance::test_util::{
     abi_conformance::{AbiSurface, compare_abi},
     foundry_artifact_path,
 };
@@ -13,6 +13,7 @@ struct InterfaceSpec {
     artifact_name: &'static str,
     source: &'static str,
     rust: fn() -> AbiSurface,
+    ignored_rust_functions: &'static [&'static str],
     ignored_functions: &'static [&'static str],
 }
 
@@ -23,6 +24,7 @@ macro_rules! interface {
             artifact_name: $artifact,
             source: "IZone.sol",
             rust: || AbiSurface::from_abi(&tempo_zone_contracts::$name::abi::contract()),
+            ignored_rust_functions: &[],
             ignored_functions: &[],
         }
     };
@@ -34,12 +36,33 @@ const INTERFACES: &[InterfaceSpec] = &[
         artifact_name: "ITempoState",
         source: "IZone.sol",
         rust: || AbiSurface::from_abi(&tempo_zone_contracts::TempoState::abi::contract()),
+        ignored_rust_functions: &[],
         ignored_functions: &[
-            "readTempoStorageSlot(address,bytes32) returns (bytes32) [view]",
-            "readTempoStorageSlots(address,bytes32[]) returns (bytes32[]) [view]",
+            "function readTempoStorageSlot(address account, bytes32 slot) view returns (bytes32)",
+            "function readTempoStorageSlots(address account, bytes32[] slots) view returns (bytes32[])",
         ],
     },
-    interface!(IZoneInbox, "IZoneInbox"),
+    InterfaceSpec {
+        name: "IZoneInbox",
+        artifact_name: "IZoneInbox",
+        source: "IZone.sol",
+        rust: || AbiSurface::from_abi(&tempo_zone_contracts::IZoneInbox::abi::contract()),
+        // Alloy's generated JSON ABI currently omits names from a nested struct's components.
+        ignored_rust_functions: &[concat!(
+            "function advanceTempo(bytes header, ",
+            "tuple(uint8 depositType, bytes depositData, bool rejected)[] deposits, ",
+            "tuple(bytes32 sharedSecret, uint8 sharedSecretYParity, ",
+            "tuple(bytes32, bytes32) cpProof)[] decryptions, ",
+            "tuple(address token, string name, string symbol, string currency)[] enabledTokens)"
+        )],
+        ignored_functions: &[concat!(
+            "function advanceTempo(bytes header, ",
+            "tuple(uint8 depositType, bytes depositData, bool rejected)[] deposits, ",
+            "tuple(bytes32 sharedSecret, uint8 sharedSecretYParity, ",
+            "tuple(bytes32 s, bytes32 c) cpProof)[] decryptions, ",
+            "tuple(address token, string name, string symbol, string currency)[] enabledTokens)"
+        )],
+    },
     interface!(IZoneOutbox, "IZoneOutbox"),
     interface!(ZoneFactory, "IZoneFactory"),
     interface!(ZonePortal, "IZonePortal"),
@@ -57,7 +80,8 @@ impl CheckAbi {
         let mut failed = false;
         for spec in INTERFACES {
             let path = foundry_artifact_path(&self.artifacts, spec.source, spec.artifact_name);
-            let rust = (spec.rust)();
+            let mut rust = (spec.rust)();
+            rust.remove_functions(spec.ignored_rust_functions);
             let errors = compare_abi(&path, &rust, spec.ignored_functions)
                 .err()
                 .unwrap_or_default();
