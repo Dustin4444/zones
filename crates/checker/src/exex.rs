@@ -91,14 +91,10 @@ where
     let mut runtime = Runtime::new(snapshot);
 
     // The local node retains the replay journal; ExEx notifications only wake recovery.
-    ctx.send_finished_height(runtime.snapshot().meta.verified_zone_tip.into())?;
+    let l2_provider = ctx.provider().clone();
+    refresh_and_publish_canonical_head(ctx, &mut runtime, &store, &l2_provider)?;
     if runtime.snapshot().meta.blocked.is_some() {
         tracing::error!(target: "zone::checker", "checker remains blocked from a previous run");
-        return drain_notifications(ctx).await;
-    }
-    let l2_provider = ctx.provider().clone();
-    refresh_canonical_head(&mut runtime, &store, &l2_provider)?;
-    if runtime.snapshot().meta.blocked.is_some() {
         return drain_notifications(ctx).await;
     }
 
@@ -251,12 +247,12 @@ where
     }
 }
 
-/// Restore the newest retained checker checkpoint that remains canonical locally.
+/// Restore the newest retained canonical checkpoint and return its verified height.
 fn reconcile_canonical_head<P>(
     runtime: &mut Runtime,
     store: &Persistence,
     provider: &P,
-) -> eyre::Result<()>
+) -> eyre::Result<Option<BlockNumHash>>
 where
     P: BlockHashReader + BlockNumReader + ?Sized,
 {
@@ -267,7 +263,7 @@ where
         {
             runtime.reorg(store, verified)?;
         }
-        return Ok(());
+        return Ok(Some(runtime.snapshot().meta.verified_zone_tip));
     }
     let head = provider.best_block_number()?;
     for retained in store.retained_zone_coordinates()?.into_iter().rev() {
@@ -276,32 +272,52 @@ where
         }
         if provider.block_hash(retained.number)? == Some(retained.hash) {
             runtime.reorg(store, retained)?;
-            return Ok(());
+            return Ok(Some(runtime.snapshot().meta.verified_zone_tip));
         }
     }
     tracing::error!(target: "zone::checker", verified_block = verified.number, local_head = head, "Zone reorg exceeds retained checker history");
     runtime.block(store, CheckerBlockedReason::DeepReorgBeyondRetention)?;
-    Ok(())
+    Ok(None)
 }
 
 /// Reconcile verified history and record the current local canonical head.
+///
+/// Returns `None` when no retained checkpoint remains canonical.
 fn refresh_canonical_head<P>(
     runtime: &mut Runtime,
     store: &Persistence,
     provider: &P,
-) -> eyre::Result<()>
+) -> eyre::Result<Option<BlockNumHash>>
 where
     P: BlockHashReader + BlockNumReader + ?Sized,
 {
-    reconcile_canonical_head(runtime, store, provider)?;
+    let verified = reconcile_canonical_head(runtime, store, provider)?;
     if runtime.snapshot().meta.blocked.is_some() {
-        return Ok(());
+        return Ok(verified);
     }
     let number = provider.best_block_number()?;
     let hash = provider
         .block_hash(number)?
         .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
     runtime.observe_tip(store, BlockNumHash { number, hash })?;
+    Ok(verified)
+}
+
+/// Reconcile local history and publish the canonical verified height to Reth.
+fn refresh_and_publish_canonical_head<Node, P>(
+    ctx: &ExExContext<Node>,
+    runtime: &mut Runtime,
+    store: &Persistence,
+    provider: &P,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+    P: BlockHashReader + BlockNumReader + ?Sized,
+{
+    if let Some(verified) = refresh_canonical_head(runtime, store, provider)? {
+        ctx.send_finished_height(verified.into())?;
+    }
     Ok(())
 }
 
@@ -461,7 +477,7 @@ where
             "checker acquisition timed out",
         )))
     });
-    refresh_canonical_head(runtime, store, &provider)?;
+    refresh_and_publish_canonical_head(ctx, runtime, store, &provider)?;
     if runtime.snapshot().meta.blocked.is_some()
         || runtime.snapshot().meta.verified_zone_tip != parent
     {
@@ -474,7 +490,7 @@ where
     if let Some(coordinate) = coordinate
         && provider.block_hash(coordinate.number)? != Some(coordinate.hash)
     {
-        reconcile_canonical_head(runtime, store, &provider)?;
+        refresh_and_publish_canonical_head(ctx, runtime, store, &provider)?;
         return Ok(None);
     }
     Ok(Some(result))
@@ -505,6 +521,7 @@ fn handle_notification<Node, P, E>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     P: BlockNumReader + ?Sized,
     E: core::fmt::Display,
 {
@@ -514,7 +531,7 @@ where
         Err(error) => {
             tracing::error!(target: "zone::checker", %error, "checker notification stream failed; resuming direct notification delivery");
             ctx.set_notifications_without_head();
-            refresh_canonical_head(runtime, store, l2_state_provider)?;
+            refresh_and_publish_canonical_head(ctx, runtime, store, l2_state_provider)?;
             return Ok(());
         }
     };
@@ -523,7 +540,7 @@ where
         runtime.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
         return Ok(());
     }
-    refresh_canonical_head(runtime, store, l2_state_provider)?;
+    refresh_and_publish_canonical_head(ctx, runtime, store, l2_state_provider)?;
     Ok(())
 }
 
@@ -795,7 +812,29 @@ where
 mod tests {
     use std::time::Duration;
 
-    use super::{checkpoint_is_missing, retry_delay};
+    use alloy_primitives::{Address, B256};
+    use reth_provider::test_utils::MockEthProvider;
+    use tempo_primitives::{TempoHeader, TempoPrimitives};
+
+    use super::{checkpoint_is_missing, refresh_canonical_head, retry_delay};
+    use crate::{
+        kernel::{PortalIdentity, State, StateDelta},
+        persistence::{BlockNumHash, ChainCut, Coverage, Identity, JournalEntry, Persistence},
+        runtime::Runtime,
+    };
+
+    fn block(number: u64, byte: u8) -> BlockNumHash {
+        BlockNumHash {
+            number,
+            hash: B256::repeat_byte(byte),
+        }
+    }
+
+    fn add_header(provider: &MockEthProvider<TempoPrimitives>, coordinate: BlockNumHash) {
+        let mut header = TempoHeader::default();
+        header.inner.number = coordinate.number;
+        provider.add_header(coordinate.hash, header);
+    }
 
     #[test]
     fn only_an_absent_checkpoint_path_is_missing() {
@@ -813,5 +852,61 @@ mod tests {
         assert_eq!(retry_delay(4), Duration::from_secs(16));
         assert_eq!(retry_delay(5), Duration::from_secs(30));
         assert_eq!(retry_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reorg_refresh_returns_the_lower_verified_height() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            l1_chain_id: 1,
+            zone_chain_id: 2,
+            zone_id: 7,
+            portal: Address::repeat_byte(0x70),
+            creation_block: B256::repeat_byte(0xc0),
+            creation_height: 0,
+        };
+        let genesis = ChainCut {
+            zone: block(0, 0x10),
+            tempo: block(0, 0x20),
+        };
+        let state = State::awaiting(PortalIdentity {
+            portal: identity.portal,
+            zone_id: identity.zone_id,
+            initial_token: Address::repeat_byte(0x11),
+        });
+        let (store, mut snapshot) =
+            Persistence::create(directory.path(), identity, genesis, state).unwrap();
+
+        for number in 1..=2 {
+            let zone = block(number, 0x10 + number as u8);
+            let tempo = block(number, 0x20 + number as u8);
+            snapshot = store
+                .apply(
+                    &snapshot,
+                    JournalEntry {
+                        zone,
+                        parent: snapshot.meta.verified_zone_tip,
+                        imported_tempo: tempo,
+                        imported_tempo_parent: snapshot.meta.imported_tempo_tip,
+                        delta: StateDelta::default(),
+                    },
+                    zone,
+                    Coverage::Complete,
+                )
+                .unwrap();
+        }
+
+        let replacement = block(2, 0x92);
+        let provider = MockEthProvider::<TempoPrimitives>::new();
+        add_header(&provider, genesis.zone);
+        add_header(&provider, block(1, 0x11));
+        add_header(&provider, replacement);
+        let mut runtime = Runtime::new(snapshot);
+
+        let finished = refresh_canonical_head(&mut runtime, &store, &provider).unwrap();
+
+        assert_eq!(finished, Some(block(1, 0x11)));
+        assert_eq!(runtime.snapshot().meta.verified_zone_tip, block(1, 0x11));
+        assert_eq!(runtime.snapshot().meta.observed_zone_tip, replacement);
     }
 }
