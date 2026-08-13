@@ -22,7 +22,7 @@ use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt as _};
+use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
     P2pPeerId, PeerTip,
@@ -1109,13 +1109,10 @@ where
         );
     }
 
-    // 3. Require the block to advance the local Tempo checkpoint by exactly
-    // one independently observed L1 block.
+    // 3. Require the embedded L1 header and portal inputs to match an
+    // independently observed L1 anchor. Execution validates the checkpoint
+    // transition against Zone state.
     let (l1_header, portal_inputs) = decode_advance_tempo(&block)?;
-    let local = provider
-        .state_by_block_hash(parent.hash())?
-        .tempo_num_hash()?;
-    validate_l1_checkpoint_transition(&l1_header, local.number, local.hash, block_number)?;
     let anchor = l1_header.num_hash();
 
     // Anchor-aware fence for live blocks: the sender must
@@ -1133,7 +1130,7 @@ where
         anchor.number,
         block_number,
     )?;
-    let observed = wait_for_validated_peer_anchor(
+    wait_for_validated_peer_anchor(
         l1_block_tracker,
         schedule,
         &portal_inputs,
@@ -1142,14 +1139,6 @@ where
         block_number,
     )
     .await?;
-
-    // The subscriber normally enqueues immediately after recording this observation. Enqueueing
-    // here as well closes that small scheduling window and makes follower import self-contained;
-    // the queue treats the subscriber's later enqueue as a duplicate. This is peer-driven, so a
-    // gap must surface as a rejected block rather than aborting the node.
-    deposit_queue
-        .try_enqueue_sealed(l1_header, observed)
-        .wrap_err_with(|| format!("cannot queue the anchor of block {block_number}"))?;
 
     // 4. All txns in the block execute properly
     let payload = ZonePayloadTypes::block_to_payload(block, None);
@@ -1212,8 +1201,8 @@ async fn wait_for_validated_peer_anchor(
     live_sender: Option<&P2pPeerId>,
     anchor: NumHash,
     block_number: u64,
-) -> eyre::Result<L1PortalEvents> {
-    let observed = loop {
+) -> eyre::Result<()> {
+    loop {
         match tokio::time::timeout(
             Duration::from_secs(30),
             l1_block_tracker.wait_for_portal_events(anchor),
@@ -1223,7 +1212,7 @@ async fn wait_for_validated_peer_anchor(
             Ok(observed) => {
                 let observed = observed?;
                 portal_inputs.validate(&observed)?;
-                break observed;
+                break;
             }
             Err(_) => warn!(
                 target: "zone::p2p",
@@ -1233,13 +1222,13 @@ async fn wait_for_validated_peer_anchor(
                 "Peer block import is waiting for local L1 observation of its anchor"
             ),
         }
-    };
+    }
 
     // The L1 subscriber publishes any transition finalized by this anchor before recording the
     // anchor in the tracker. Re-read the schedule now so the pre-wait decision cannot authorize a
     // sender that this anchor demoted.
     validate_live_block_sender(schedule, live_sender, anchor.number, block_number)?;
-    Ok(observed)
+    Ok(())
 }
 
 struct AdvanceTempoPortalInputs {
@@ -1251,31 +1240,6 @@ impl AdvanceTempoPortalInputs {
     fn validate(&self, observed: &L1PortalEvents) -> eyre::Result<()> {
         observed.validate_advance_tempo_inputs(&self.deposits, &self.enabled_tokens)
     }
-}
-
-fn validate_l1_checkpoint_transition(
-    l1_header: &SealedHeader<TempoHeader>,
-    local_number: u64,
-    local_hash: B256,
-    zone_block_number: u64,
-) -> eyre::Result<()> {
-    if l1_header.number() != local_number.saturating_add(1) {
-        eyre::bail!(
-            "peer block {zone_block_number} advances Tempo to L1 block {}, but local checkpoint is {}; expected {}",
-            l1_header.number(),
-            local_number,
-            local_number.saturating_add(1)
-        );
-    }
-    if l1_header.parent_hash() != local_hash {
-        eyre::bail!(
-            "advanceTempo L1 header {} does not extend the local Tempo checkpoint: embedded parent {}, local hash {}",
-            l1_header.number(),
-            l1_header.parent_hash(),
-            local_hash
-        );
-    }
-    Ok(())
 }
 
 /// Decode the L1 header embedded in the first `IZoneInbox.advanceTempo` system transaction.
@@ -1645,32 +1609,6 @@ mod tests {
         let trailing = make_block(trailing);
         let error = super::decode_advance_tempo_header(&trailing).unwrap_err();
         assert!(error.to_string().contains("trailing bytes"));
-    }
-
-    #[test]
-    fn validates_embedded_l1_checkpoint_continuity() {
-        use reth_primitives_traits::SealedHeader;
-        use tempo_primitives::TempoHeader;
-
-        let local_hash = B256::repeat_byte(0x42);
-        let header = SealedHeader::seal_slow(TempoHeader {
-            inner: alloy_consensus::Header {
-                number: 11,
-                parent_hash: local_hash,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        super::validate_l1_checkpoint_transition(&header, 10, local_hash, 7).unwrap();
-
-        let skipped =
-            super::validate_l1_checkpoint_transition(&header, 9, local_hash, 7).unwrap_err();
-        assert!(skipped.to_string().contains("expected 10"));
-
-        let wrong_parent =
-            super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7)
-                .unwrap_err();
-        assert!(wrong_parent.to_string().contains("does not extend"));
     }
 
     #[tokio::test]
