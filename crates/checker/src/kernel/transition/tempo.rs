@@ -276,9 +276,9 @@ fn process_withdrawals(
     }
     let PortalState::Created {
         identity,
-        bounceback_gas,
         deposit: _,
         mut settlement,
+        ..
     } = portal(overlay)?
     else {
         return Err(TransitionError::PortalNotCreated);
@@ -446,8 +446,12 @@ fn process_withdrawals(
                 WithdrawalOrigin::FailedDeposit { deposit: _ },
                 WithdrawalOutcome::FailedDepositPaid { collected_fee },
             ) => {
-                let max_fee = bounceback_fee(bounceback_gas, input.base_fee, data.amount)
-                    .ok_or(TransitionError::Overflow)?;
+                let max_fee = bounceback_fee(
+                    current_bounceback_gas(overlay)?,
+                    input.base_fee,
+                    data.amount,
+                )
+                .ok_or(TransitionError::Overflow)?;
                 if *collected_fee != 0 && *collected_fee != max_fee {
                     return Err(TransitionError::CommitmentMismatch);
                 }
@@ -468,8 +472,12 @@ fn process_withdrawals(
                 WithdrawalOrigin::FailedDeposit { deposit: failed },
                 WithdrawalOutcome::FailedDepositPending { collected_fee },
             ) => {
-                let max_fee = bounceback_fee(bounceback_gas, input.base_fee, data.amount)
-                    .ok_or(TransitionError::Overflow)?;
+                let max_fee = bounceback_fee(
+                    current_bounceback_gas(overlay)?,
+                    input.base_fee,
+                    data.amount,
+                )
+                .ok_or(TransitionError::Overflow)?;
                 if *collected_fee != 0 && *collected_fee != max_fee {
                     return Err(TransitionError::CommitmentMismatch);
                 }
@@ -528,23 +536,33 @@ fn process_withdrawals(
             })),
         );
     }
-    let current = portal(overlay)?;
     let PortalState::Created {
-        deposit: latest, ..
-    } = current
+        identity,
+        bounceback_gas,
+        deposit,
+        ..
+    } = portal(overlay)?
     else {
-        unreachable!()
+        return Err(TransitionError::PortalNotCreated);
     };
     overlay.set(
         StateKey::Portal,
         Some(StateValue::Portal(PortalState::Created {
             identity,
             bounceback_gas,
-            deposit: latest,
+            deposit,
             settlement,
         })),
     );
     Ok(())
+}
+
+/// Read the current Portal bounce-back gas after any earlier callback operations.
+fn current_bounceback_gas(overlay: &Overlay<'_>) -> Result<u64, TransitionError> {
+    let PortalState::Created { bounceback_gas, .. } = portal(overlay)? else {
+        return Err(TransitionError::PortalNotCreated);
+    };
+    Ok(bounceback_gas)
 }
 
 /// Apply Portal operations emitted by a successful withdrawal callback.

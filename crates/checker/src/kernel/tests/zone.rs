@@ -372,6 +372,103 @@ fn callback_claims_refund_created_by_an_earlier_withdrawal_member() {
 }
 
 #[test]
+fn callback_bounceback_gas_applies_to_later_withdrawal_members() {
+    let mut state = funded_state();
+    let user = UserWithdrawal {
+        gas_limit: 1,
+        ..user_withdrawal(0x50, 40)
+    };
+    commit(
+        &mut state,
+        ImportedFacts::default(),
+        ZoneFacts {
+            block_hash: B256::repeat_byte(1),
+            block_number: 1,
+            operations: vec![ZoneOperation::AcceptWithdrawal(user)],
+            ..ZoneFacts::default()
+        },
+    );
+
+    let failed = deposit();
+    commit(
+        &mut state,
+        ImportedFacts {
+            block_hash: B256::repeat_byte(2),
+            block_number: 2,
+            operations: vec![
+                ImportedOperation::AppendDeposit(failed.clone()),
+                ImportedOperation::AppendDeposit(failed.clone()),
+            ],
+        },
+        ZoneFacts {
+            block_hash: B256::repeat_byte(2),
+            block_number: 2,
+            deposits: vec![Deposit::Ordinary(failed.clone()), Deposit::Ordinary(failed)],
+            outcomes: vec![DepositOutcome::Failed, DepositOutcome::Failed],
+            finalization: Some(Finalization {
+                block_number: 2,
+                declared_count: 3,
+                encrypted_senders: vec![Default::default(), Default::default(), Default::default()],
+            }),
+            ..ZoneFacts::default()
+        },
+    );
+    submit_first_batch(&mut state);
+
+    let withdrawals = (0..3)
+        .map(|index| {
+            let StateValue::Withdrawal(WithdrawalOwner::Finalized { ref data, .. }) = state.rows()
+                [&StateKey::Withdrawal(WithdrawalId {
+                    zone_id: ZONE_ID,
+                    index,
+                })]
+            else {
+                unreachable!()
+            };
+            data.clone()
+        })
+        .collect();
+    let bounceback_gas = 10;
+    state = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    base_fee: U256::from(1_000_000_000_000u64),
+                    withdrawals,
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![
+                        WithdrawalOutcome::UserDelivered {
+                            operations: vec![PortalCallbackOperation::UpdateBouncebackGas(
+                                bounceback_gas,
+                            )],
+                        },
+                        WithdrawalOutcome::FailedDepositPaid {
+                            collected_fee: u128::from(bounceback_gas),
+                        },
+                        WithdrawalOutcome::FailedDepositPending {
+                            collected_fee: u128::from(bounceback_gas),
+                        },
+                    ],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+    )
+    .unwrap()
+    .into_state();
+
+    assert!(matches!(
+        state.rows()[&StateKey::Portal],
+        StateValue::Portal(PortalState::Created {
+            bounceback_gas: 10,
+            ..
+        })
+    ));
+    validate(&state).unwrap();
+}
+
+#[test]
 fn user_bounce_pending_and_inbox_claim_close_complete_lifecycle() {
     let (mut state, withdrawal) = finalized_user_state();
     submit_first_batch(&mut state);
