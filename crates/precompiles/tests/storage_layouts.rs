@@ -1,8 +1,10 @@
 //! Programmatic conformance tests for Solidity and native Rust storage layouts.
 
 use super::{RustStorageField, artifact, assert_layout};
-use tempo_precompiles::zone_factory::zone_portal_slots;
-use tempo_precompiles::test_util::storage_conformance::{RustStorageSlot, assert_foundry_slots};
+use tempo_precompiles::{
+    test_util::storage_conformance::{RustStorageSlot, assert_foundry_slots},
+    zone_factory::zone_portal_slots,
+};
 use tempo_precompiles_macros::gen_test_fields_layout as layout_fields;
 
 #[test]
