@@ -276,15 +276,13 @@ mod tests {
 
     #[test]
     fn checker_only_options_require_observe_mode() {
-        for (option, value) in [("--checker.database-path", "checker-test-db")] {
-            let args = parse(["tempo-zone", option, value]);
-            let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("requires --checker.mode observe")
-            );
-        }
+        let args = parse(["tempo-zone", "--checker.database-path", "checker-test-db"]);
+        let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires --checker.mode observe")
+        );
     }
 
     #[test]
@@ -315,23 +313,12 @@ mod tests {
             CheckerSubcommand::BuildCheckpoint(_)
         ));
 
-        for omitted in ["--checker.database-path"] {
-            let mut args = vec![
-                "checker",
-                "build-checkpoint",
-                "--checker.database-path",
-                "checkpoint",
-                "--",
-                "--chain",
-                "dev",
-            ];
-            let index = args.iter().position(|arg| *arg == omitted).unwrap();
-            args.drain(index..=index + 1);
-            assert_eq!(
-                CheckerCommand::try_parse_from(args).unwrap_err().kind(),
-                clap::error::ErrorKind::MissingRequiredArgument
-            );
-        }
+        assert_eq!(
+            CheckerCommand::try_parse_from(["checker", "build-checkpoint", "--", "--chain", "dev"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
