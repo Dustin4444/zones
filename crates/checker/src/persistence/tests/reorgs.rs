@@ -46,6 +46,39 @@ fn reorg_before_after_and_across_checkpoints_reconstructs_exact_metadata() {
 }
 
 #[test]
+fn unverified_reorg_reanchors_gap_boundaries() {
+    for (ancestor, expected_first) in [
+        (block(2, 0x52), block(1, 0x41)),
+        (block(1, 0x51), block(1, 0x51)),
+    ] {
+        let (directory, store) = create();
+        store
+            .record_gap(
+                &current(&store),
+                block(1, 0x41),
+                block(3, 0x43),
+                CoverageGapReason::ProviderUnavailable,
+            )
+            .unwrap();
+
+        let snapshot = store.reorg(&current(&store), ancestor).unwrap();
+        assert_eq!(snapshot.meta.acknowledged_zone_tip, ancestor);
+        assert_eq!(
+            snapshot.meta.coverage,
+            Coverage::Gap {
+                first_unchecked: expected_first,
+                acknowledged_through: ancestor,
+                reason: CoverageGapReason::ProviderUnavailable,
+            }
+        );
+
+        drop(store);
+        let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+        assert_eq!(reopened.meta.coverage, snapshot.meta.coverage);
+    }
+}
+
+#[test]
 fn alert_descendant_reorg_preserves_or_removes_the_latch_by_exact_height() {
     let (_directory, store) = create();
     let finding_block = block(1, 0x41);

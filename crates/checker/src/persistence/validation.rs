@@ -173,6 +173,9 @@ pub(super) fn validate_metadata(meta: &Metadata) -> Result<()> {
             acknowledged_through,
             ..
         } if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
+            || first_unchecked.number > acknowledged_through.number
+            || (first_unchecked.number == acknowledged_through.number
+                && first_unchecked != acknowledged_through)
             || *acknowledged_through != meta.acknowledged_zone_tip =>
         {
             Err(invalid("coverage gap coordinates are incoherent"))
@@ -213,9 +216,9 @@ pub(super) fn validate_coverage_advance(
                 reason: _,
             },
             Coverage::Complete,
-        ) if child == *first_unchecked
-            && child == *acknowledged_through
-            && acknowledged == *acknowledged_through =>
+        ) if child.number == first_unchecked.number
+            && child.number == acknowledged_through.number
+            && acknowledged == child =>
         {
             Ok(())
         }
@@ -230,12 +233,27 @@ pub(super) fn validate_coverage_advance(
                 acknowledged_through: next_through,
                 reason: next_reason,
             },
-        ) if child == *first_unchecked
-            && child.number.checked_add(1) == Some(next_first.number)
-            && *next_through == *acknowledged_through
-            && acknowledged == *acknowledged_through
-            && next_reason == reason =>
-        {
+        ) => {
+            if child.number != first_unchecked.number
+                || child.number.checked_add(1) != Some(next_first.number)
+            {
+                return Err(invalid("gap recovery does not advance by one block"));
+            }
+            if next_first.number > next_through.number {
+                return Err(invalid("gap recovery begins after its endpoint"));
+            }
+            if next_first.number == next_through.number && next_first != next_through {
+                return Err(invalid("single-block gap has conflicting coordinates"));
+            }
+            if next_through.number != acknowledged_through.number {
+                return Err(invalid("gap recovery changes endpoint height"));
+            }
+            if *next_through != *acknowledged_through && next_first != next_through {
+                return Err(invalid("gap recovery changes an unverified endpoint hash"));
+            }
+            if acknowledged != *next_through || next_reason != reason {
+                return Err(invalid("gap recovery changes acknowledgement or reason"));
+            }
             Ok(())
         }
         _ => Err(invalid("coverage transition is inconsistent")),

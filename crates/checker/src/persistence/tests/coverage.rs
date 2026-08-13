@@ -78,3 +78,47 @@ fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
     assert_eq!(snapshot.meta.acknowledged_zone_tip, three);
     assert_eq!(snapshot.meta.coverage, Coverage::Complete);
 }
+
+#[test]
+fn gap_advance_rejects_a_start_beyond_or_conflicting_with_its_endpoint() {
+    let (_directory, store) = create();
+    let one = block(1, 0x11);
+    let two = block(2, 0x12);
+    let replacement_two = block(2, 0x22);
+    let reason = CoverageGapReason::ProviderUnavailable;
+
+    store
+        .record_gap(&current(&store), one, one, reason.clone())
+        .unwrap();
+    assert!(matches!(
+        store.apply(
+            &current(&store),
+            entry(1, bootstrap().zone),
+            one,
+            Coverage::Gap {
+                first_unchecked: two,
+                acknowledged_through: one,
+                reason: reason.clone(),
+            },
+        ),
+        Err(PersistenceError::Invalid(_))
+    ));
+
+    let (_directory, store) = create();
+    store
+        .record_gap(&current(&store), one, two, reason.clone())
+        .unwrap();
+    assert!(matches!(
+        store.apply(
+            &current(&store),
+            entry(1, bootstrap().zone),
+            two,
+            Coverage::Gap {
+                first_unchecked: replacement_two,
+                acknowledged_through: two,
+                reason,
+            },
+        ),
+        Err(PersistenceError::Invalid(_))
+    ));
+}

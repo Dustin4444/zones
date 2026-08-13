@@ -128,3 +128,36 @@ fn stale_orphan_cannot_be_installed_as_active_finding() {
     tx.commit().unwrap();
     assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 }
+
+#[test]
+fn divergence_reanchors_a_replaced_gap_start() {
+    let (directory, store) = create();
+    let old_first = block(1, 0x41);
+    store
+        .record_gap(
+            &current(&store),
+            old_first,
+            block(3, 0x43),
+            CoverageGapReason::ProviderUnavailable,
+        )
+        .unwrap();
+
+    let replacement = block(1, 0x11);
+    let (key, value) = finding(replacement);
+    let snapshot = store
+        .record_divergence(&current(&store), key, value, replacement)
+        .unwrap();
+    assert_eq!(snapshot.meta.acknowledged_zone_tip, replacement);
+    assert_eq!(
+        snapshot.meta.coverage,
+        Coverage::Gap {
+            first_unchecked: replacement,
+            acknowledged_through: replacement,
+            reason: CoverageGapReason::NotCheckedAncestorDivergence,
+        }
+    );
+
+    drop(store);
+    let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert_eq!(reopened.meta.coverage, snapshot.meta.coverage);
+}

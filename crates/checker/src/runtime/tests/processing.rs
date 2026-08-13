@@ -128,6 +128,201 @@ fn durable_gap_recovers_across_separate_notifications() {
 }
 
 #[test]
+fn gap_recovery_reanchors_replaced_first_and_endpoint_hashes() {
+    for (case, first_replaced) in [("inside the gap", 1), ("at the gap start", 0)] {
+        let (directory, store) = create();
+        let state = store.load().unwrap().state;
+        let original = blocks(&state, 1, 3, 0x10);
+        store
+            .record_gap(
+                &store.load().unwrap(),
+                original[0].zone,
+                original[2].zone,
+                CoverageGapReason::ProviderUnavailable,
+            )
+            .unwrap();
+
+        let mut canonical = original.clone();
+        for index in first_replaced..canonical.len() {
+            canonical[index].zone = coordinate(index as u64 + 1, 0x20);
+            if index > 0 {
+                canonical[index].parent = canonical[index - 1].zone;
+            }
+        }
+        let canonical_tip = canonical[2].zone;
+        let mut runtime = runtime(&store, 2);
+        runtime.push(notification(canonical)).unwrap();
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    runtime
+                        .poll(&store, identity(), authenticate, Instant::now())
+                        .unwrap(),
+                    RuntimeAction::Acknowledge(_) | RuntimeAction::None
+                ),
+                "{case}"
+            );
+        }
+        let snapshot = store.load().unwrap();
+        assert_eq!(snapshot.meta.coverage, Coverage::Complete, "{case}");
+        assert_eq!(snapshot.meta.verified_zone_tip, canonical_tip, "{case}");
+        assert_eq!(snapshot.meta.acknowledged_zone_tip, canonical_tip, "{case}");
+        drop(store);
+        let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+        assert_eq!(reopened.meta.coverage, Coverage::Complete, "{case}");
+        assert_eq!(reopened.meta.verified_zone_tip, canonical_tip, "{case}");
+    }
+}
+
+#[test]
+fn divergence_upgrades_an_existing_gap_atomically() {
+    let (directory, store) = create();
+    let mut values = blocks(&store.load().unwrap().state, 1, 3, 0x10);
+    let first = values[0].zone;
+    let through = values[2].zone;
+    store
+        .record_gap(
+            &store.load().unwrap(),
+            first,
+            through,
+            CoverageGapReason::ProviderUnavailable,
+        )
+        .unwrap();
+    values[0].outputs.state.tempo_block_number += 1;
+    let mut runtime = runtime(&store, 2);
+    runtime.push(notification(values)).unwrap();
+    assert_eq!(
+        runtime
+            .poll(&store, identity(), authenticate, Instant::now())
+            .unwrap(),
+        RuntimeAction::Acknowledge(through)
+    );
+    let snapshot = store.load().unwrap();
+    assert!(snapshot.meta.active_finding.is_some());
+    assert_eq!(
+        snapshot.meta.coverage,
+        Coverage::Gap {
+            first_unchecked: first,
+            acknowledged_through: through,
+            reason: CoverageGapReason::NotCheckedAncestorDivergence,
+        }
+    );
+    drop(store);
+    let (_, reopened) = Persistence::open(directory.path(), identity()).unwrap();
+    assert!(reopened.meta.active_finding.is_some());
+    assert_eq!(reopened.meta.coverage, snapshot.meta.coverage);
+}
+
+#[test]
+fn authentication_divergence_preserves_a_wider_gap_acknowledgement() {
+    let (_directory, store) = create();
+    let values = blocks(&store.load().unwrap().state, 1, 3, 0x10);
+    let first = values[0].zone;
+    let through = values[2].zone;
+    store
+        .record_gap(
+            &store.load().unwrap(),
+            first,
+            through,
+            CoverageGapReason::ProviderUnavailable,
+        )
+        .unwrap();
+    let failure = Failure::from(ObservationError::invalid_envelope(
+        0,
+        EnvelopeRule::AdvanceSystemCaller,
+    ));
+    let mut runtime = runtime(&store, 2);
+    runtime
+        .push(FakeNotification {
+            plan: NotificationPlan::new(Vec::new(), vec![first], anchor().zone).unwrap(),
+            blocks: Ok(vec![values[0].clone()]),
+        })
+        .unwrap();
+    runtime.push(notification(vec![values[1].clone()])).unwrap();
+    let replacement_through = coordinate(3, 0x20);
+    runtime
+        .push(FakeNotification {
+            plan: NotificationPlan::new(Vec::new(), vec![replacement_through], values[1].zone)
+                .unwrap(),
+            blocks: Ok(Vec::new()),
+        })
+        .unwrap();
+    assert_eq!(
+        runtime
+            .poll(
+                &store,
+                identity(),
+                |_notification, _index, _state| Err(failure.clone()),
+                Instant::now(),
+            )
+            .unwrap(),
+        RuntimeAction::Acknowledge(through)
+    );
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.meta.acknowledged_zone_tip, through);
+    assert_eq!(
+        snapshot.meta.coverage,
+        Coverage::Gap {
+            first_unchecked: first,
+            acknowledged_through: through,
+            reason: CoverageGapReason::NotCheckedAncestorDivergence,
+        }
+    );
+    assert_eq!(
+        runtime
+            .poll(&store, identity(), authenticate, Instant::now())
+            .unwrap(),
+        RuntimeAction::Acknowledge(through)
+    );
+    assert_eq!(
+        runtime
+            .poll(&store, identity(), authenticate, Instant::now())
+            .unwrap(),
+        RuntimeAction::Acknowledge(replacement_through)
+    );
+    assert_eq!(
+        store.load().unwrap().meta.coverage,
+        Coverage::Gap {
+            first_unchecked: first,
+            acknowledged_through: replacement_through,
+            reason: CoverageGapReason::NotCheckedAncestorDivergence,
+        }
+    );
+}
+
+#[test]
+fn divergence_and_gap_upgrade_abort_together() {
+    let (_directory, store) = create();
+    let mut values = blocks(&store.load().unwrap().state, 1, 2, 0x10);
+    let first = values[0].zone;
+    let through = values[1].zone;
+    let original = Coverage::Gap {
+        first_unchecked: first,
+        acknowledged_through: through,
+        reason: CoverageGapReason::ProviderUnavailable,
+    };
+    store
+        .record_gap(
+            &store.load().unwrap(),
+            first,
+            through,
+            CoverageGapReason::ProviderUnavailable,
+        )
+        .unwrap();
+    values[0].outputs.state.tempo_block_number += 1;
+    let mut runtime = runtime(&store, 2);
+    runtime.push(notification(values)).unwrap();
+    store.inject_abort();
+    assert!(matches!(
+        runtime.poll(&store, identity(), authenticate, Instant::now()),
+        Err(PersistenceError::InjectedAbort)
+    ));
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.meta.active_finding, None);
+    assert_eq!(snapshot.meta.coverage, original);
+}
+
+#[test]
 fn overflow_and_stream_failure_are_durable_fail_open_apis() {
     let (directory, store) = create();
     let state = store.load().unwrap().state;

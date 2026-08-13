@@ -11,8 +11,8 @@ use crate::{
     failure::{Failure, FailureClass},
     notification::NotificationPlan,
     persistence::{
-        BlockNumHash, CoverageGapReason, Identity, JournalEntry, Persistence, PersistenceError,
-        Snapshot, make_finding,
+        BlockNumHash, Coverage, CoverageGapReason, Identity, JournalEntry, Persistence,
+        PersistenceError, Snapshot, make_finding,
     },
 };
 
@@ -82,6 +82,7 @@ pub(crate) struct Runtime<N> {
     budget: RetryBudget,
     retry: Option<RetryState>,
     current_unwound: bool,
+    processed_notification_tip: Option<BlockNumHash>,
 }
 
 struct QueuedNotification<N> {
@@ -172,6 +173,7 @@ impl<N> Runtime<N> {
             budget,
             retry: None,
             current_unwound: false,
+            processed_notification_tip: None,
         }
     }
     #[cfg(test)]
@@ -207,6 +209,7 @@ impl<N> Runtime<N> {
         self.current = None;
         self.queue.clear();
         self.retry = None;
+        self.processed_notification_tip = None;
         Ok(())
     }
 
@@ -291,8 +294,8 @@ impl<N> Runtime<N> {
         };
         let last = plans.last().expect("nonempty plan set").acknowledge;
         let reason = match &self.snapshot.meta.coverage {
-            crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
-            crate::persistence::Coverage::Complete => CoverageGapReason::ProviderUnavailable,
+            Coverage::Gap { reason, .. } => reason.clone(),
+            Coverage::Complete => CoverageGapReason::ProviderUnavailable,
         };
         self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
@@ -316,10 +319,8 @@ impl<N> Runtime<N> {
             return Ok(StreamFailureAction::Blocked);
         }
         let (first, reason) = match &self.snapshot.meta.coverage {
-            crate::persistence::Coverage::Complete => {
-                (canonical_suffix[0], CoverageGapReason::ProviderUnavailable)
-            }
-            crate::persistence::Coverage::Gap {
+            Coverage::Complete => (canonical_suffix[0], CoverageGapReason::ProviderUnavailable),
+            Coverage::Gap {
                 first_unchecked,
                 reason,
                 ..
@@ -345,7 +346,7 @@ impl<N> Runtime<N> {
         notification: N,
         plan: NotificationPlan,
     ) -> Result<EnqueueAction, PersistenceError> {
-        let crate::persistence::Coverage::Gap { reason, .. } = &self.snapshot.meta.coverage else {
+        let Coverage::Gap { reason, .. } = &self.snapshot.meta.coverage else {
             self.block(store, CoverageGapReason::Other(2))?;
             return Ok(EnqueueAction::Blocked);
         };
@@ -361,10 +362,7 @@ impl<N> Runtime<N> {
             }
             self.reorg(store, plan.ancestor)?;
         }
-        if matches!(
-            self.snapshot.meta.coverage,
-            crate::persistence::Coverage::Complete
-        ) {
+        if matches!(self.snapshot.meta.coverage, Coverage::Complete) {
             if plan.applied.is_empty() {
                 return Ok(EnqueueAction::Acknowledge(plan.acknowledge));
             }
@@ -390,6 +388,7 @@ impl<N> Runtime<N> {
     ) -> Result<(), PersistenceError> {
         let snapshot = store.reorg(&self.snapshot, ancestor)?;
         self.retry = None;
+        self.processed_notification_tip = Some(ancestor);
         self.state = if snapshot.meta.active_finding.is_some() {
             RuntimeState::Alerting
         } else {
@@ -400,6 +399,10 @@ impl<N> Runtime<N> {
     }
     /// Discard the completed current notification and promote the next queued item.
     fn advance(&mut self) {
+        self.processed_notification_tip = self
+            .current
+            .as_ref()
+            .map(|current| current.plan.acknowledge);
         self.current = self.queue.pop_front();
         self.retry = None;
         self.current_unwound = false;
@@ -408,11 +411,34 @@ impl<N> Runtime<N> {
     /// Return the durable start of an unchecked range, or `fallback` when complete.
     fn first_unchecked_or(&self, fallback: BlockNumHash) -> BlockNumHash {
         match self.snapshot.meta.coverage {
-            crate::persistence::Coverage::Gap {
+            Coverage::Gap {
                 first_unchecked, ..
             } => first_unchecked,
-            crate::persistence::Coverage::Complete => fallback,
+            Coverage::Complete => fallback,
         }
+    }
+
+    /// Extend a divergence gap without regressing its durable acknowledgement.
+    fn record_unchecked_descendants(
+        &mut self,
+        store: &Persistence,
+        first_unchecked: BlockNumHash,
+        observed_through: BlockNumHash,
+    ) -> Result<BlockNumHash, PersistenceError> {
+        let acknowledged_through = match &self.snapshot.meta.coverage {
+            Coverage::Gap {
+                acknowledged_through,
+                ..
+            } if acknowledged_through.number > observed_through.number => *acknowledged_through,
+            _ => observed_through,
+        };
+        self.snapshot = store.record_gap(
+            &self.snapshot,
+            first_unchecked,
+            acknowledged_through,
+            CoverageGapReason::NotCheckedAncestorDivergence,
+        )?;
+        Ok(self.snapshot.meta.acknowledged_zone_tip)
     }
 
     /// Restore the current notification's ancestor before processing its replacement.
@@ -445,7 +471,7 @@ impl<N> Runtime<N> {
             return WorkSelection::Complete;
         }
         let gap_next = match &self.snapshot.meta.coverage {
-            crate::persistence::Coverage::Gap {
+            Coverage::Gap {
                 acknowledged_through,
                 ..
             } if applied[index] != *acknowledged_through => {
@@ -489,11 +515,13 @@ impl<N> Runtime<N> {
                 });
             let exact_commit_descendant = plan.reverted.is_empty()
                 && (plan.ancestor == self.snapshot.meta.acknowledged_zone_tip
-                    || plan.ancestor == active.zone);
+                    || plan.ancestor == active.zone
+                    || self.processed_notification_tip == Some(plan.ancestor));
             let exact_reorg_descendant = !plan.reverted.is_empty()
                 && (plan.ancestor == active.zone
                     || plan.reverted.last().copied()
-                        == Some(self.snapshot.meta.acknowledged_zone_tip));
+                        == Some(self.snapshot.meta.acknowledged_zone_tip)
+                    || plan.reverted.last().copied() == self.processed_notification_tip);
             let preserves = !same_height_conflict
                 && (plan.applied.contains(&active.zone)
                     || exact_commit_descendant
@@ -504,15 +532,10 @@ impl<N> Runtime<N> {
             }
             self.unwind_current(store, plan)?;
             let first = self.first_unchecked_or(active.zone);
-            self.snapshot = store.record_gap(
-                &self.snapshot,
-                first,
-                plan.acknowledge,
-                CoverageGapReason::NotCheckedAncestorDivergence,
-            )?;
+            let acknowledged = self.record_unchecked_descendants(store, first, plan.acknowledge)?;
             self.state = RuntimeState::Alerting;
             self.advance();
-            return Ok(Some(RuntimeAction::Acknowledge(plan.acknowledge)));
+            return Ok(Some(RuntimeAction::Acknowledge(acknowledged)));
         }
         self.unwind_current(store, plan)?;
         if plan.applied.is_empty() {
@@ -529,15 +552,10 @@ impl<N> Runtime<N> {
                 == Some(plan.applied[0].number)
         {
             let first = self.first_unchecked_or(plan.applied[0]);
-            self.snapshot = store.record_gap(
-                &self.snapshot,
-                first,
-                plan.acknowledge,
-                CoverageGapReason::NotCheckedAncestorDivergence,
-            )?;
+            let acknowledged = self.record_unchecked_descendants(store, first, plan.acknowledge)?;
             self.state = RuntimeState::Alerting;
             self.advance();
-            return Ok(Some(RuntimeAction::Acknowledge(plan.acknowledge)));
+            return Ok(Some(RuntimeAction::Acknowledge(acknowledged)));
         }
         Ok(None)
     }
@@ -579,8 +597,8 @@ impl<N> Runtime<N> {
                     previous = plan.acknowledge;
                 }
                 let reason = match &self.snapshot.meta.coverage {
-                    crate::persistence::Coverage::Gap { reason, .. } => reason.clone(),
-                    crate::persistence::Coverage::Complete => failure.gap_reason,
+                    Coverage::Gap { reason, .. } => reason.clone(),
+                    Coverage::Complete => failure.gap_reason,
                 };
                 self.snapshot = store.record_gap(&self.snapshot, work.coordinate, last, reason)?;
                 self.state = RuntimeState::Disabled;
@@ -599,16 +617,13 @@ impl<N> Runtime<N> {
                     *typed,
                     failure.message,
                 )?;
-                self.snapshot = store.record_finding(&self.snapshot, key, finding)?;
-                self.snapshot = store.record_gap(
-                    &self.snapshot,
-                    work.coordinate,
-                    work.suffix_end,
-                    CoverageGapReason::NotCheckedAncestorDivergence,
-                )?;
+                self.snapshot =
+                    store.record_divergence(&self.snapshot, key, finding, work.suffix_end)?;
                 self.state = RuntimeState::Alerting;
                 self.advance();
-                Ok(RuntimeAction::Acknowledge(work.suffix_end))
+                Ok(RuntimeAction::Acknowledge(
+                    self.snapshot.meta.acknowledged_zone_tip,
+                ))
             }
             FailureClass::ImmediateTerminal => {
                 self.block(store, failure.gap_reason)?;
@@ -759,12 +774,7 @@ impl<N> Runtime<N> {
     ) -> Result<(), PersistenceError> {
         if self.snapshot.meta.active_finding.is_some() {
             let first = self.first_unchecked_or(block.zone);
-            self.snapshot = store.record_gap(
-                &self.snapshot,
-                first,
-                suffix_end,
-                CoverageGapReason::NotCheckedAncestorDivergence,
-            )?;
+            self.record_unchecked_descendants(store, first, suffix_end)?;
             self.state = RuntimeState::Alerting;
             return Ok(());
         }
@@ -782,37 +792,39 @@ impl<N> Runtime<N> {
             }
         };
 
-        let coverage = match &self.snapshot.meta.coverage {
-            crate::persistence::Coverage::Gap {
+        let (coverage, acknowledged) = match &self.snapshot.meta.coverage {
+            Coverage::Gap {
                 first_unchecked,
                 acknowledged_through,
                 reason,
-            } if *first_unchecked == block.zone => {
-                if block.zone == *acknowledged_through {
-                    crate::persistence::Coverage::Complete
+            } if first_unchecked.number == block.zone.number => {
+                if block.zone.number == acknowledged_through.number {
+                    (Coverage::Complete, block.zone)
                 } else {
-                    crate::persistence::Coverage::Gap {
-                        first_unchecked: gap_next.ok_or_else(|| {
-                            PersistenceError::Invalid("durable gap has no next coordinate".into())
-                        })?,
-                        acknowledged_through: *acknowledged_through,
-                        reason: reason.clone(),
-                    }
+                    let next_first = gap_next.ok_or_else(|| {
+                        PersistenceError::Invalid("durable gap has no next coordinate".into())
+                    })?;
+                    let next_through = if next_first.number == acknowledged_through.number {
+                        next_first
+                    } else {
+                        *acknowledged_through
+                    };
+                    (
+                        Coverage::Gap {
+                            first_unchecked: next_first,
+                            acknowledged_through: next_through,
+                            reason: reason.clone(),
+                        },
+                        next_through,
+                    )
                 }
             }
-            crate::persistence::Coverage::Complete => crate::persistence::Coverage::Complete,
+            Coverage::Complete => (Coverage::Complete, block.zone),
             _ => {
                 return Err(PersistenceError::Invalid(
                     "applied block does not begin at durable gap".into(),
                 ));
             }
-        };
-        let acknowledged = match &coverage {
-            crate::persistence::Coverage::Complete => block.zone,
-            crate::persistence::Coverage::Gap {
-                acknowledged_through,
-                ..
-            } => *acknowledged_through,
         };
         self.snapshot = store.apply(
             &self.snapshot,
@@ -852,13 +864,7 @@ impl<N> Runtime<N> {
             failure.message,
         )?;
         let logged_finding = finding.clone();
-        self.snapshot = store.record_finding(&self.snapshot, key, finding)?;
-        self.snapshot = store.record_gap(
-            &self.snapshot,
-            block.zone,
-            suffix_end,
-            CoverageGapReason::NotCheckedAncestorDivergence,
-        )?;
+        self.snapshot = store.record_divergence(&self.snapshot, key, finding, suffix_end)?;
         logging::divergence(block, &logged_finding);
         self.state = RuntimeState::Alerting;
         Ok(())

@@ -77,6 +77,25 @@ fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
 }
 
 #[test]
+fn final_metadata_validation_aborts_the_finding_write() {
+    let (_directory, store) = create();
+    let prior = current(&store);
+    let finding_block = block(1, 0x11);
+    let conflicting_endpoint = block(1, 0x21);
+    let (key, value) = finding(finding_block);
+
+    assert!(matches!(
+        store.record_divergence(&prior, key, value, conflicting_endpoint),
+        Err(PersistenceError::Invalid(_))
+    ));
+    assert_eq!(current(&store), prior);
+
+    let tx = store.db.tx().unwrap();
+    assert_eq!(tx.get::<Findings>(key).unwrap(), None);
+    tx.commit().unwrap();
+}
+
+#[test]
 fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
     let (_directory, store) = create();
     let mut conflicting = state();

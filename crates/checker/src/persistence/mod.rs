@@ -381,6 +381,7 @@ impl Persistence {
     }
 
     /// Persist a finding at the next verified Zone coordinate.
+    #[cfg(test)]
     pub(crate) fn record_finding(
         &self,
         prior: &Snapshot,
@@ -388,19 +389,49 @@ impl Persistence {
         finding: Finding,
     ) -> Result<Snapshot> {
         self.write(prior, prior.state.clone(), |tx, meta| {
-            validate_finding(key, &finding, Some(meta))?;
-            codec::encode(&finding)?;
-            if let Some(old) = tx.get::<Findings>(key)? {
-                if !same_finding_evidence(&old, &finding) {
-                    return Err(invalid("conflicting same-height finding evidence"));
-                }
-                if old.summary != finding.summary {
-                    tx.put::<Findings>(key, finding)?;
-                }
-            } else {
-                tx.put::<Findings>(key, finding)?;
+            Self::record_finding_tx(tx, meta, key, finding)
+        })
+    }
+
+    /// Atomically persist a divergence finding and its unchecked suffix.
+    pub(crate) fn record_divergence(
+        &self,
+        prior: &Snapshot,
+        key: FindingKey,
+        finding: Finding,
+        observed_through: BlockNumHash,
+    ) -> Result<Snapshot> {
+        self.write(prior, prior.state.clone(), |tx, meta| {
+            let first_unchecked = finding.zone;
+            if observed_through.number < first_unchecked.number {
+                return Err(invalid("divergence suffix precedes its finding"));
             }
-            meta.active_finding = Some(key);
+            let acknowledged_through = match &meta.coverage {
+                Coverage::Complete => observed_through,
+                Coverage::Gap {
+                    first_unchecked: existing_first,
+                    acknowledged_through: existing_through,
+                    ..
+                } => {
+                    if existing_first.number != first_unchecked.number {
+                        return Err(invalid("divergence does not begin at the coverage gap"));
+                    }
+                    if *existing_first != first_unchecked
+                        || observed_through.number >= existing_through.number
+                    {
+                        observed_through
+                    } else {
+                        *existing_through
+                    }
+                }
+            };
+            Self::record_finding_tx(tx, meta, key, finding)?;
+            meta.acknowledged_zone_tip = acknowledged_through;
+            meta.coverage = Coverage::Gap {
+                first_unchecked,
+                acknowledged_through,
+                reason: CoverageGapReason::NotCheckedAncestorDivergence,
+            };
             Ok(())
         })
     }
@@ -483,9 +514,14 @@ impl Persistence {
                     "unverified reorg ancestor precedes the coverage gap",
                 ));
             }
+            let first_unchecked = if first_unchecked.number == ancestor.number {
+                ancestor
+            } else {
+                *first_unchecked
+            };
             meta.acknowledged_zone_tip = ancestor;
             meta.coverage = Coverage::Gap {
-                first_unchecked: *first_unchecked,
+                first_unchecked,
                 acknowledged_through: ancestor,
                 reason: reason.clone(),
             };
@@ -621,6 +657,29 @@ impl Persistence {
         Ok(())
     }
 
+    /// Insert or update one finding and install its active latch in `tx`.
+    fn record_finding_tx(
+        tx: &<DatabaseEnv as Database>::TXMut,
+        meta: &mut Metadata,
+        key: FindingKey,
+        finding: Finding,
+    ) -> Result<()> {
+        validate_finding(key, &finding, Some(meta))?;
+        codec::encode(&finding)?;
+        if let Some(existing) = tx.get::<Findings>(key)? {
+            if !same_finding_evidence(&existing, &finding) {
+                return Err(invalid("conflicting same-height finding evidence"));
+            }
+            if existing.summary != finding.summary {
+                tx.put::<Findings>(key, finding)?;
+            }
+        } else {
+            tx.put::<Findings>(key, finding)?;
+        }
+        meta.active_finding = Some(key);
+        Ok(())
+    }
+
     /// Apply one metadata mutation against the expected prior snapshot atomically.
     fn write<F>(&self, prior: &Snapshot, state: State, f: F) -> Result<Snapshot>
     where
@@ -629,24 +688,19 @@ impl Persistence {
         let tx = self.db.tx_mut()?;
         let mut meta = read_metadata(&tx)?;
         if meta.identity != self.identity {
-            tx.abort();
             return Err(PersistenceError::Identity);
         }
         if meta != prior.meta {
-            tx.abort();
             return Err(PersistenceError::StaleSnapshot);
         }
-        if let Err(error) = f(&tx, &mut meta) {
-            tx.abort();
-            return Err(error);
-        }
+        f(&tx, &mut meta)?;
+        validate_metadata(&meta)?;
         tx.put::<Meta>(
             MetaKey::Metadata,
             MetaValue::Metadata(Box::new(meta.clone())),
         )?;
         #[cfg(test)]
         if self.abort_next_write.swap(false, Ordering::SeqCst) {
-            tx.abort();
             return Err(PersistenceError::InjectedAbort);
         }
         tx.commit()?;

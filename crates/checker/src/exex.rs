@@ -204,14 +204,11 @@ where
                 }
                 continue;
             }
-            RuntimeAction::Acknowledge(height) => {
+            RuntimeAction::Acknowledge(height) | RuntimeAction::AcknowledgeAndDisable(height) => {
                 ctx.send_finished_height(height.into())?;
-                retry_at = None;
-                continue;
-            }
-            RuntimeAction::AcknowledgeAndDisable(height) => {
-                ctx.send_finished_height(height.into())?;
-                tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording an unchecked range");
+                if matches!(action, RuntimeAction::AcknowledgeAndDisable(_)) {
+                    tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording an unchecked range");
+                }
                 retry_at = None;
                 continue;
             }
@@ -311,8 +308,9 @@ where
             next = ctx.notifications.try_next() => {
                 match handle_notification(ctx, runtime, store, &l2_state_provider, next)? {
                     NotificationOutcome::Continue => {}
-                    NotificationOutcome::Disabled => return Ok(AuthenticationOutcome::Interrupted),
-                    NotificationOutcome::Blocked => return Ok(AuthenticationOutcome::Interrupted),
+                    NotificationOutcome::Disabled | NotificationOutcome::Blocked => {
+                        return Ok(AuthenticationOutcome::Interrupted);
+                    }
                 }
             }
         }
@@ -634,11 +632,8 @@ where
         )
         .await
         .map_err(Failure::from)?;
-        if accounting
-            .collateral()
-            .is_none_or(|required| collateral_balance < required)
-        {
-            let required = accounting.collateral().unwrap_or(U256::ZERO);
+        let required = accounting.collateral().unwrap_or(U256::ZERO);
+        if collateral_balance < required {
             return Err(Failure::authenticated_divergence(
                 "imported collateral is insufficient",
                 crate::kernel::Finding {
