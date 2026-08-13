@@ -21,8 +21,6 @@ fn checker_is_parsed_by_the_top_level_cli() {
         "tempo-zone",
         "checker",
         "build-checkpoint",
-        "--checker.portal-creation-block-hash",
-        "0x1111111111111111111111111111111111111111111111111111111111111111",
         "--checker.database-path",
         "checker-db",
         "--",

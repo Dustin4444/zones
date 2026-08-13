@@ -13,14 +13,14 @@ See [DESIGN.md](DESIGN.md) for the data flow and persistence contract.
 
 ## Operator setup
 
-Build the initial checkpoint from the local Zone database and a Tempo archive
-endpoint. The checkpoint is bound to the Zone genesis, chain IDs, Portal,
-creation block, and imported Tempo block.
+Observe mode automatically builds the initial checkpoint when its database path
+is absent. The checkpoint is bound to the local Zone genesis, chain IDs,
+Portal, discovered creation block, and imported Tempo block. The explicit
+command remains useful for preflight or init-container workflows.
 
 ```sh
 tempo-zone checker build-checkpoint \
-  --checker.database-path /var/lib/tempo-zone/checker \
-  --checker.portal-creation-block-hash 0x... \
+  --checker.database-path /var/lib/tempo-zone/checker/db \
   -- \
   node \
   --chain /etc/tempo-zone/genesis.json \
@@ -31,28 +31,29 @@ tempo-zone checker build-checkpoint \
 
 tempo-zone \
   --checker.mode observe \
-  --checker.database-path /var/lib/tempo-zone/checker \
-  --checker.portal-creation-block-hash 0x... \
+  --checker.database-path /var/lib/tempo-zone/checker/db \
   --l1.rpc-url wss://tempo-archive.example \
   --l1.portal-address 0x... \
   --zone.id 123
 ```
 
-Use `tempo-zone checker build-checkpoint --help` for CLI details. Observe mode
-requires `--checker.database-path` and
-`--checker.portal-creation-block-hash`. The checker is off by default.
+Use `tempo-zone checker build-checkpoint --help` for CLI details. Bootstrap
+discovers the matching `ZoneCreated` event from Tempo and authenticates its
+containing block before persisting it as the checker identity. Observe mode
+requires `--checker.database-path`. The checker is off by default.
 `--checker.acquisition-timeout-secs` defaults to 30 seconds.
 
 Checkpoint publication uses a sibling staging directory and validates the
 database before moving it to the requested path. An existing database is not
 replaced. Build a new checkpoint at another path after a schema change or when
-the existing database is invalid.
+the existing database is invalid. When the parent is a mounted volume, use an
+absent child path such as `/var/lib/tempo-zone/checker/db`.
 
 Inspect durable progress and alert state with:
 
 ```sh
 tempo-zone checker inspect \
-  --checker.database-path /var/lib/tempo-zone/checker \
+  --checker.database-path /var/lib/tempo-zone/checker/db \
   --json
 ```
 
@@ -72,8 +73,8 @@ git -C ../tempo worktree add --detach ../tempo-zone-checker "$TEMPO_REV"
 export TEMPO_ROOT="$PWD/../tempo-zone-checker"
 ```
 
-Start the persistent L1, provision a Zone, build its checker checkpoint, and
-start the Zone in checker observe mode:
+Start the persistent L1, provision a Zone, and start the Zone in checker
+observe mode. The checker builds its missing checkpoint during startup:
 
 ```sh
 just checker-lab-up

@@ -54,6 +54,20 @@ async fn wait_for_checker_to_catch_up(
     .await
 }
 
+async fn wait_for_checker_checkpoint(path: &Path) -> eyre::Result<()> {
+    let path = path.to_path_buf();
+    poll_until(
+        TIMEOUT,
+        Duration::from_millis(100),
+        "checker to create its checkpoint",
+        move || {
+            let path = path.clone();
+            async move { Ok(path.is_dir().then_some(())) }
+        },
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "checker progress is not externally observable while MDBX is writer-owned"]
 async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
@@ -77,7 +91,6 @@ async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
     let config = CheckerConfig {
         l1_rpc_url: l1.http_url().to_string(),
         portal_address: provisioned.portal,
-        portal_creation_block_hash: provisioned.portal_creation_block_hash,
         zone_id: provisioned.zone_id,
         database_path: path.clone(),
         acquisition_timeout: Duration::from_secs(30),
@@ -91,9 +104,10 @@ async fn checker_restarts_and_advances_from_checkpoint() -> eyre::Result<()> {
         )
         .with_genesis(provisioned.genesis.clone())
         .with_sequencer_signer(l1.dev_signer())
-        .with_checker_checkpoint(config.clone()),
+        .with_checker(CheckerExEx::new(config.clone())),
     )
     .await?;
+    wait_for_checker_checkpoint(&path).await?;
     builder.crash();
     drop(builder);
     tokio::time::sleep(Duration::from_millis(250)).await;

@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use clap::{Args, Parser, Subcommand};
 use reth_ethereum::cli::Cli;
 use zone_chainspec::ZoneChainSpecParser;
@@ -27,10 +27,6 @@ enum CheckerSubcommand {
 /// Checkpoint output and node arguments.
 #[derive(Debug, Args)]
 struct CheckerBuildCheckpointArgs {
-    /// Tempo block hash containing the `ZoneCreated` event.
-    #[arg(long = "checker.portal-creation-block-hash", value_name = "HASH")]
-    portal_creation_block_hash: B256,
-
     /// Destination for the checker database.
     #[arg(long = "checker.database-path", value_name = "PATH")]
     database_path: PathBuf,
@@ -64,7 +60,6 @@ impl CheckerCommand {
                 run_node(
                     cli,
                     NodeAction::BuildCheckpoint {
-                        portal_creation_block_hash: args.portal_creation_block_hash,
                         database_path: args.database_path,
                     },
                 )
@@ -147,14 +142,6 @@ pub struct CheckerArgs {
     #[arg(long = "checker.mode", env = "CHECKER_MODE", default_value = "off")]
     pub mode: CheckerMode,
 
-    /// Tempo block hash containing this Portal's `ZoneCreated` event.
-    #[arg(
-        long = "checker.portal-creation-block-hash",
-        env = "CHECKER_PORTAL_CREATION_BLOCK_HASH",
-        value_name = "HASH"
-    )]
-    pub portal_creation_block_hash: Option<B256>,
-
     /// Path to the checker's dedicated database.
     #[arg(
         long = "checker.database-path",
@@ -186,26 +173,12 @@ impl CheckerArgs {
                     self.database_path.is_none(),
                     "--checker.database-path requires --checker.mode observe"
                 );
-                eyre::ensure!(
-                    self.portal_creation_block_hash.is_none(),
-                    "--checker.portal-creation-block-hash requires --checker.mode observe"
-                );
                 Ok(None)
             }
             CheckerMode::Observe => {
                 eyre::ensure!(
                     zone_id != 0,
                     "--zone.id must not be zero with --checker.mode observe"
-                );
-                let portal_creation_block_hash =
-                    self.portal_creation_block_hash.ok_or_else(|| {
-                        eyre::eyre!(
-                            "--checker.portal-creation-block-hash is required with --checker.mode observe"
-                        )
-                    })?;
-                eyre::ensure!(
-                    !portal_creation_block_hash.is_zero(),
-                    "--checker.portal-creation-block-hash must not be zero"
                 );
                 eyre::ensure!(
                     self.acquisition_timeout_secs != 0,
@@ -217,7 +190,6 @@ impl CheckerArgs {
                 Ok(Some(CheckerConfig {
                     l1_rpc_url: l1_rpc_url.to_owned(),
                     portal_address,
-                    portal_creation_block_hash,
                     zone_id,
                     database_path,
                     acquisition_timeout: Duration::from_secs(self.acquisition_timeout_secs),
@@ -231,14 +203,12 @@ impl CheckerArgs {
 mod tests {
     use std::{ffi::OsString, path::PathBuf, time::Duration};
 
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::Address;
     use clap::Parser as _;
     use zone_checker::CheckerMode;
 
     use super::{CheckerArgs, CheckerCommand, CheckerSubcommand, validate_node_args};
 
-    const CREATION_HASH: &str =
-        "0x1111111111111111111111111111111111111111111111111111111111111111";
     const PORTAL: Address = Address::repeat_byte(0x22);
 
     #[derive(Debug, clap::Parser)]
@@ -269,8 +239,6 @@ mod tests {
             "tempo-zone",
             "--checker.mode",
             "observe",
-            "--checker.portal-creation-block-hash",
-            CREATION_HASH,
             "--checker.database-path",
             "checker-test-db",
         ]);
@@ -281,10 +249,6 @@ mod tests {
             .unwrap();
         assert_eq!(config.l1_rpc_url, "ws://localhost:8546");
         assert_eq!(config.portal_address, PORTAL);
-        assert_eq!(
-            config.portal_creation_block_hash,
-            CREATION_HASH.parse::<B256>().unwrap()
-        );
         assert_eq!(config.zone_id, 7);
         assert_eq!(config.database_path, PathBuf::from("checker-test-db"));
         assert_eq!(config.acquisition_timeout, Duration::from_secs(30));
@@ -292,13 +256,7 @@ mod tests {
 
     #[test]
     fn observe_requires_a_database_path() {
-        let args = parse([
-            "tempo-zone",
-            "--checker.mode",
-            "observe",
-            "--checker.portal-creation-block-hash",
-            CREATION_HASH,
-        ]);
+        let args = parse(["tempo-zone", "--checker.mode", "observe"]);
 
         let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
         assert!(
@@ -309,40 +267,8 @@ mod tests {
     }
 
     #[test]
-    fn observe_requires_a_creation_hash() {
-        let args = parse(["tempo-zone", "--checker.mode", "observe"]);
-
-        let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("--checker.portal-creation-block-hash is required")
-        );
-    }
-
-    #[test]
-    fn observe_requires_a_nonzero_creation_hash() {
-        let args = parse([
-            "tempo-zone",
-            "--checker.mode",
-            "observe",
-            "--checker.portal-creation-block-hash",
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        ]);
-
-        let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
-        assert!(error.to_string().contains("must not be zero"));
-    }
-
-    #[test]
     fn observe_requires_a_nonzero_zone_id() {
-        let args = parse([
-            "tempo-zone",
-            "--checker.mode",
-            "observe",
-            "--checker.portal-creation-block-hash",
-            CREATION_HASH,
-        ]);
+        let args = parse(["tempo-zone", "--checker.mode", "observe"]);
 
         let error = args.config("ws://localhost:8546", PORTAL, 0).unwrap_err();
         assert!(error.to_string().contains("--zone.id must not be zero"));
@@ -350,10 +276,7 @@ mod tests {
 
     #[test]
     fn checker_only_options_require_observe_mode() {
-        for (option, value) in [
-            ("--checker.database-path", "checker-test-db"),
-            ("--checker.portal-creation-block-hash", CREATION_HASH),
-        ] {
+        for (option, value) in [("--checker.database-path", "checker-test-db")] {
             let args = parse(["tempo-zone", option, value]);
             let error = args.config("ws://localhost:8546", PORTAL, 7).unwrap_err();
             assert!(
@@ -362,20 +285,6 @@ mod tests {
                     .contains("requires --checker.mode observe")
             );
         }
-    }
-
-    #[test]
-    fn malformed_creation_hash_is_rejected_by_clap() {
-        assert!(
-            Parser::try_parse_from([
-                "tempo-zone",
-                "--checker.mode",
-                "observe",
-                "--checker.portal-creation-block-hash",
-                "not-a-hash",
-            ])
-            .is_err()
-        );
     }
 
     #[test]
@@ -388,8 +297,6 @@ mod tests {
         let valid = CheckerCommand::try_parse_from([
             "checker",
             "build-checkpoint",
-            "--checker.portal-creation-block-hash",
-            CREATION_HASH,
             "--checker.database-path",
             "checkpoint",
             "--",
@@ -408,15 +315,10 @@ mod tests {
             CheckerSubcommand::BuildCheckpoint(_)
         ));
 
-        for omitted in [
-            "--checker.portal-creation-block-hash",
-            "--checker.database-path",
-        ] {
+        for omitted in ["--checker.database-path"] {
             let mut args = vec![
                 "checker",
                 "build-checkpoint",
-                "--checker.portal-creation-block-hash",
-                CREATION_HASH,
                 "--checker.database-path",
                 "checkpoint",
                 "--",
@@ -439,6 +341,19 @@ mod tests {
             validate_node_args(&arguments).unwrap_err().to_string(),
             "checker options must appear before `--`"
         );
+    }
+
+    #[test]
+    fn build_checkpoint_rejects_a_configured_creation_block() {
+        let error = CheckerCommand::try_parse_from([
+            "checker",
+            "build-checkpoint",
+            "--checker.portal-creation-block-hash",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -167,9 +167,11 @@ the checker rather than advancing verified progress.
 ## Checkpoint builder
 
 The builder uses the same observation adapters and kernel transitions as the
-runtime. It validates the local Zone genesis, chain IDs, Portal creation,
+runtime. It discovers the `ZoneCreated` event matching the configured Portal
+and Zone ID, then validates the local Zone genesis, chain IDs, Portal creation,
 Tempo ancestry, initial token, zero genesis supply, and the genesis token
-handoff.
+handoff. The discovered creation block becomes part of the durable checkpoint
+identity; observe mode does not accept it as operator configuration.
 
 Checkpoint construction uses the local Zone database and configured Tempo
 endpoint. The checker does not import third-party state snapshots.

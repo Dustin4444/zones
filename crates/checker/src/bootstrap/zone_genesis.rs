@@ -31,9 +31,6 @@ impl LocalZoneIdentity {
         if config.zone_id == 0 {
             return Err(BootstrapError::MissingZoneId.into());
         }
-        if config.portal_creation_block_hash.is_zero() {
-            return Err(BootstrapError::MissingCreationBlockHash.into());
-        }
         let expected = zone_primitives::constants::zone_chain_id(l1_chain_id, config.zone_id)?;
         if zone_chain_id != expected {
             return Err(BootstrapError::ZoneChainIdMismatch {

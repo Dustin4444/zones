@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     future::Future,
+    io::ErrorKind,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,7 +31,7 @@ use crate::{
         L2BlockObservation, ZonePostStateOutputs, acquire_portal_token_balance,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
-    persistence::{BlockNumHash, Identity, Persistence},
+    persistence::{BlockNumHash, Identity, Persistence, Snapshot},
     runtime::{
         AuthenticatedBlock, AuthenticationFailure, AuthenticationRequest, Runtime, RuntimeAction,
     },
@@ -44,12 +45,20 @@ where
         BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
+    let mut failures = 0;
     loop {
         match start_and_run(&config, &mut ctx).await {
             Ok(()) => std::future::pending::<()>().await,
             Err(error) => {
-                tracing::error!(target: "zone::checker", %error, "checker recovery attempt failed");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let delay = retry_delay(failures);
+                failures = failures.saturating_add(1);
+                tracing::error!(target: "zone::checker", %error, ?delay, "checker recovery attempt failed");
+                if let Err(error) =
+                    await_while_draining_notifications(&mut ctx, tokio::time::sleep(delay)).await
+                {
+                    tracing::error!(target: "zone::checker", %error, "checker notification stream closed while waiting to retry");
+                    std::future::pending::<()>().await;
+                }
             }
         }
     }
@@ -71,9 +80,14 @@ where
         "checker acquisition timeout must not be zero"
     );
     let path = config.database_path.as_path();
-    let identity = Persistence::inspect_identity(path)?;
-    validate_checkpoint_identity(config, ctx.config.chain.chain().id(), identity)?;
-    let (store, snapshot) = Persistence::open(path, identity)?;
+    bootstrap_if_missing_while_draining(config, ctx).await?;
+    let (identity, store, snapshot) = match open_checkpoint(config, ctx.config.chain.chain().id()) {
+        Ok(opened) => opened,
+        Err(error) => {
+            tracing::error!(target: "zone::checker", %error, path = %path.display(), "checker database cannot be used");
+            return drain_notifications(ctx).await;
+        }
+    };
     let mut runtime = Runtime::new(snapshot);
 
     // The local node retains the replay journal; ExEx notifications only wake recovery.
@@ -97,6 +111,94 @@ where
     }
     run_loop(config, ctx, &store, identity, &mut runtime, &l1_provider).await?;
     Ok(())
+}
+
+/// Validate and open an existing checker checkpoint as its sole writer.
+fn open_checkpoint(
+    config: &CheckerConfig,
+    zone_chain_id: u64,
+) -> eyre::Result<(Identity, Persistence, Snapshot)> {
+    let identity = Persistence::inspect_identity(&config.database_path)?;
+    validate_checkpoint_identity(config, zone_chain_id, identity)?;
+    let (store, snapshot) = Persistence::open(&config.database_path, identity)?;
+    Ok((identity, store, snapshot))
+}
+
+/// Build a checkpoint only when no durable checker database exists yet.
+async fn bootstrap_if_missing_while_draining<Node>(
+    config: &CheckerConfig,
+    ctx: &mut ExExContext<Node>,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+{
+    let provider = ctx.provider().clone();
+    let zone_chain_id = ctx.config.chain.chain().id();
+    let mut failures = 0;
+    loop {
+        if !checkpoint_is_missing(&config.database_path)? {
+            return Ok(());
+        }
+
+        tracing::info!(target: "zone::checker", path = %config.database_path.display(), "building missing checker checkpoint");
+        match await_while_draining_notifications(
+            ctx,
+            crate::build_checkpoint(config.clone(), zone_chain_id, &provider),
+        )
+        .await?
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let delay = retry_delay(failures);
+                failures = failures.saturating_add(1);
+                tracing::warn!(target: "zone::checker", %error, ?delay, "checker bootstrap failed; retrying");
+                await_while_draining_notifications(ctx, tokio::time::sleep(delay)).await?;
+            }
+        }
+    }
+}
+
+/// Await startup work without applying notification-channel backpressure to the node.
+async fn await_while_draining_notifications<Node, F, T>(
+    ctx: &mut ExExContext<Node>,
+    future: F,
+) -> eyre::Result<T>
+where
+    Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return Ok(output),
+            notification = ctx.notifications.try_next() => match notification {
+                Ok(Some(_)) => {}
+                Ok(None) => eyre::bail!("checker notification stream closed"),
+                Err(error) => {
+                    tracing::error!(target: "zone::checker", %error, "checker notification stream failed; resuming direct delivery");
+                    ctx.set_notifications_without_head();
+                }
+            }
+        }
+    }
+}
+
+/// Delay repeated startup failures without busy-looping on an unavailable dependency.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((1_u64 << failures.min(5)).min(30))
+}
+
+/// Return whether the checkpoint path is absent without treating invalid paths as missing.
+fn checkpoint_is_missing(path: &std::path::Path) -> eyre::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Keep a blocked checker from applying notification-channel backpressure to the node.
@@ -278,9 +380,16 @@ where
         let action = runtime.next_action(Instant::now());
         match action {
             RuntimeAction::Authenticate(request) => {
-                let Some(result) =
-                    authenticate_while_draining(config, ctx, store, runtime, request, l1_provider)
-                        .await?
+                let Some(result) = authenticate_while_draining(
+                    config,
+                    ctx,
+                    store,
+                    runtime,
+                    request,
+                    identity.creation_block,
+                    l1_provider,
+                )
+                .await?
                 else {
                     continue;
                 };
@@ -321,6 +430,7 @@ async fn authenticate_while_draining<Node, P>(
     store: &Persistence,
     runtime: &mut Runtime,
     request: AuthenticationRequest,
+    creation_block: B256,
     l1_provider: &P,
 ) -> eyre::Result<Option<Result<AuthenticatedBlock, AuthenticationFailure>>>
 where
@@ -339,7 +449,7 @@ where
             request.height(),
             l1_provider,
             Arc::clone(&runtime.snapshot().state),
-            config.portal_creation_block_hash,
+            creation_block,
             config.zone_id,
         ),
     );
@@ -379,7 +489,6 @@ fn validate_checkpoint_identity(
     if identity.zone_chain_id != zone_chain_id
         || identity.zone_id != config.zone_id
         || identity.portal != config.portal_address
-        || identity.creation_block != config.portal_creation_block_hash
     {
         eyre::bail!("checker checkpoint identity does not match the node configuration");
     }
@@ -680,4 +789,29 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{checkpoint_is_missing, retry_delay};
+
+    #[test]
+    fn only_an_absent_checkpoint_path_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("checker");
+        assert!(checkpoint_is_missing(&missing).unwrap());
+
+        std::fs::create_dir(&missing).unwrap();
+        assert!(!checkpoint_is_missing(&missing).unwrap());
+    }
+
+    #[test]
+    fn startup_retry_delay_is_bounded() {
+        assert_eq!(retry_delay(0), Duration::from_secs(1));
+        assert_eq!(retry_delay(4), Duration::from_secs(16));
+        assert_eq!(retry_delay(5), Duration::from_secs(30));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(30));
+    }
 }

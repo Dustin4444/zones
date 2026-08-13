@@ -1,10 +1,11 @@
 //! Builds the initial authenticated checker checkpoint from Zone genesis.
 
 mod ancestry;
+mod creation;
 mod error;
 mod zone_genesis;
 
-use crate::kernel::{ImportedOperation, PortalIdentity, State, apply_genesis_handoff};
+use crate::kernel::{PortalIdentity, State, apply_genesis_handoff};
 use alloy_eips::BlockNumHash;
 use alloy_provider::{Provider as _, ProviderBuilder};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
@@ -13,10 +14,11 @@ use tempo_alloy::TempoNetwork;
 use crate::{
     CheckerConfig,
     adapter::adapt_imported,
-    observe::{acquire_l1_header, observe_l1},
+    observe::observe_l1,
     persistence::{BlockNumHash as StoredBlockNumHash, ChainCut, Identity, Persistence},
 };
 use ancestry::{anchor_header, authenticated_path};
+use creation::discover_creation;
 use error::BootstrapError;
 use zone_genesis::{LocalZoneIdentity, genesis_anchor, validate_zero_supply};
 
@@ -41,48 +43,45 @@ where
     } = LocalZoneIdentity::load(&config, l1_chain_id, zone_chain_id, zone_provider)?;
     let anchor = genesis_anchor(zone_provider, genesis)?;
     let anchor_header = anchor_header(&l1_provider, anchor).await?;
-    let creation_header =
-        acquire_l1_header(&l1_provider, config.portal_creation_block_hash).await?;
-    let creation_tip = BlockNumHash::new(creation_header.number(), creation_header.hash());
-    let creation_observation =
-        observe_l1(&l1_provider, &creation_header, config.portal_address).await?;
-    let creation_facts = adapt_imported(
-        &creation_observation,
-        &creation_header,
-        config.portal_creation_block_hash,
-        config.zone_id,
-    )
-    .map_err(|failure| eyre::eyre!(failure.message))?
-    .facts;
     let expected_identity = PortalIdentity {
         portal: config.portal_address,
         zone_id: config.zone_id,
         initial_token,
     };
-    validate_creation(&creation_facts.operations, expected_identity)?;
+    let creation = discover_creation(&l1_provider, expected_identity).await?;
+    let creation_tip = BlockNumHash::new(creation.header.number(), creation.header.hash());
 
     // Authenticate and replay Tempo history into the Zone genesis state.
     let mut state = State::awaiting(expected_identity);
     if creation_tip.number <= anchor.number {
-        for header in authenticated_path(&l1_provider, &creation_header, anchor_header).await? {
+        for header in authenticated_path(&l1_provider, &creation.header, anchor_header).await? {
             if header.hash() == creation_tip.hash {
                 imported_block(
                     &mut state,
-                    &creation_observation,
+                    &creation.observation,
                     &header,
-                    &config,
+                    creation_tip.hash,
+                    config.zone_id,
                     &l1_provider,
                 )
                 .await?;
             } else {
                 let observation = observe_l1(&l1_provider, &header, config.portal_address).await?;
-                imported_block(&mut state, &observation, &header, &config, &l1_provider).await?;
+                imported_block(
+                    &mut state,
+                    &observation,
+                    &header,
+                    creation_tip.hash,
+                    config.zone_id,
+                    &l1_provider,
+                )
+                .await?;
             }
         }
         validate_zero_supply(zone_provider, genesis.hash, state.tokens().map(|(t, _)| t))?;
         state.apply(&apply_genesis_handoff(&state)?)?;
     } else {
-        authenticated_path(&l1_provider, &anchor_header, creation_header).await?;
+        authenticated_path(&l1_provider, &anchor_header, creation.header.clone()).await?;
         validate_zero_supply(zone_provider, genesis.hash, [initial_token])?;
     }
 
@@ -104,28 +103,32 @@ where
             hash: anchor.hash,
         },
     };
+    ensure_canonical(&l1_provider, creation_tip, "creation").await?;
+    ensure_canonical(&l1_provider, anchor, "genesis anchor").await?;
     // Persist the initial authenticated checker checkpoint.
     Persistence::create_atomic(&config.database_path, identity, cut, state)?;
     Ok(())
 }
 
-/// Validate the Portal creation operation against local Zone identity.
-fn validate_creation(
-    operations: &[ImportedOperation],
-    expected_identity: PortalIdentity,
+/// Confirm an authenticated Tempo coordinate still belongs to the canonical chain.
+async fn ensure_canonical(
+    provider: &alloy_provider::DynProvider<TempoNetwork>,
+    coordinate: BlockNumHash,
+    name: &str,
 ) -> eyre::Result<()> {
-    let [
-        ImportedOperation::Create {
-            identity,
-            initial_token,
-        },
-    ] = operations
-    else {
-        eyre::bail!("creation block must contain one portal creation operation");
-    };
-    if *identity != expected_identity || initial_token.token != expected_identity.initial_token {
-        eyre::bail!("creation identity does not match configuration and Zone genesis");
-    }
+    let block = provider
+        .get_block_by_number(coordinate.number.into())
+        .await?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "canonical Tempo {name} block {} is unavailable",
+                coordinate.number
+            )
+        })?;
+    eyre::ensure!(
+        block.header.hash == coordinate.hash,
+        "Tempo {name} block changed during checker bootstrap"
+    );
     Ok(())
 }
 
@@ -134,16 +137,12 @@ async fn imported_block(
     state: &mut State,
     observation: &crate::observe::L1BlockObservation,
     header: &crate::observe::ImportedTempoHeader,
-    config: &CheckerConfig,
+    creation_block: alloy_primitives::B256,
+    zone_id: u32,
     provider: &alloy_provider::DynProvider<TempoNetwork>,
 ) -> eyre::Result<()> {
-    let adaptation = adapt_imported(
-        observation,
-        header,
-        config.portal_creation_block_hash,
-        config.zone_id,
-    )
-    .map_err(|failure| eyre::eyre!(failure.message))?;
+    let adaptation = adapt_imported(observation, header, creation_block, zone_id)
+        .map_err(|failure| eyre::eyre!(failure.message))?;
     let candidate = crate::kernel::apply_imported(state, &adaptation.facts)?;
     if adaptation.effects != candidate.expected_effects() {
         eyre::bail!("imported effects differ from expected effects");

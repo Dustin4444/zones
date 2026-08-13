@@ -230,11 +230,13 @@ The zone node stores data in `/tmp/tempo-zone-<name>/`.
 
 #### Enable the observe-only Zone checker
 
-The checker is off by default. Observe mode requires a local, identity-bound
-checkpoint, `--checker.database-path`, and
-`--checker.portal-creation-block-hash`. Build the checkpoint from the Zone
-database and an archive-capable Tempo RPC; third-party snapshots are not
-supported. See the
+The checker is off by default. Observe mode requires `--checker.database-path`.
+If that path is absent, it builds a local, identity-bound checkpoint from the
+Zone database and an archive-capable Tempo RPC, then discovers and authenticates
+the matching `ZoneCreated` block. An existing invalid path is never replaced.
+When the parent is a mounted volume, configure an absent child path such as
+`/var/lib/tempo-zone/checker/db`.
+Third-party snapshots are not supported. See the
 [checker README](../crates/checker/README.md) for commands, data requirements,
 failure behavior, and trust limits.
 

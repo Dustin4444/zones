@@ -107,10 +107,7 @@ impl ZoneCli {
 #[derive(Debug)]
 enum NodeAction {
     Run,
-    BuildCheckpoint {
-        portal_creation_block_hash: alloy_primitives::B256,
-        database_path: PathBuf,
-    },
+    BuildCheckpoint { database_path: PathBuf },
 }
 
 fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> eyre::Result<()> {
@@ -274,14 +271,12 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
         }
 
         if let NodeAction::BuildCheckpoint {
-            portal_creation_block_hash,
             database_path,
         } = action
         {
             let config = zone_checker::CheckerConfig {
                 l1_rpc_url: args.l1_rpc_url.clone(),
                 portal_address: args.portal_address,
-                portal_creation_block_hash,
                 zone_id: args.zone_id,
                 database_path: database_path.clone(),
                 acquisition_timeout: Duration::from_secs(30),

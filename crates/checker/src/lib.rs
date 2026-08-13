@@ -15,7 +15,7 @@ pub mod inspection;
 
 use std::{fmt, future::Future, path::PathBuf, str::FromStr, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use reth_exex::ExExContext;
 use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
@@ -90,8 +90,6 @@ pub struct CheckerConfig {
     pub l1_rpc_url: String,
     /// ZonePortal checked by this instance.
     pub portal_address: Address,
-    /// Tempo block containing the ZoneFactory creation event.
-    pub portal_creation_block_hash: B256,
     /// ZoneFactory Zone ID bound to the local Zone chain ID.
     pub zone_id: u32,
     /// Checker database path.

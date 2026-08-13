@@ -9,8 +9,14 @@ use reth_storage_api::errors::provider::ProviderError;
 pub(super) enum BootstrapError {
     #[error("Zone ID must not be zero")]
     MissingZoneId,
-    #[error("Portal creation block hash must not be zero")]
-    MissingCreationBlockHash,
+    #[error(
+        "expected one ZoneCreated event for Portal {portal} and Zone ID {zone_id}, found {count}"
+    )]
+    CreationCandidates {
+        portal: Address,
+        zone_id: u32,
+        count: usize,
+    },
     #[error("unsupported bootstrap: Zone genesis has a zero TempoState checkpoint")]
     UnsupportedBootstrapStyle,
     #[error(
