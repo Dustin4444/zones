@@ -130,6 +130,10 @@ fn user_withdrawal(seed: u8, amount: u128) -> UserWithdrawal {
 }
 
 fn finalized_user_state() -> (State, crate::kernel::Withdrawal) {
+    finalized_user_state_with_gas_limit(0)
+}
+
+fn finalized_user_state_with_gas_limit(gas_limit: u64) -> (State, crate::kernel::Withdrawal) {
     let mut state = funded_state();
     commit(
         &mut state,
@@ -137,7 +141,10 @@ fn finalized_user_state() -> (State, crate::kernel::Withdrawal) {
         ZoneFacts {
             block_hash: B256::repeat_byte(1),
             block_number: 1,
-            operations: vec![ZoneOperation::AcceptWithdrawal(user_withdrawal(0x40, 40))],
+            operations: vec![ZoneOperation::AcceptWithdrawal(UserWithdrawal {
+                gas_limit,
+                ..user_withdrawal(0x40, 40)
+            })],
             ..ZoneFacts::default()
         },
     );

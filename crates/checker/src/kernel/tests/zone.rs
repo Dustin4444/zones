@@ -202,6 +202,39 @@ fn user_delivery_closes_batch_withdrawal_fallback_accounting() {
 }
 
 #[test]
+fn user_delivery_preserves_same_token_callback_deposit_accounting() {
+    let (mut state, withdrawal) = finalized_user_state_with_gas_limit(1);
+    submit_first_batch(&mut state);
+    let callback = deposit();
+    state = apply_imported(
+        &state,
+        &ImportedFacts {
+            operations: vec![ImportedOperation::ProcessWithdrawals(
+                WithdrawalProcessing {
+                    base_fee: U256::ZERO,
+                    withdrawals: vec![withdrawal],
+                    remaining_queue: B256::ZERO,
+                    outcomes: vec![WithdrawalOutcome::UserDelivered {
+                        callback_deposits: vec![callback.clone()],
+                    }],
+                },
+            )],
+            ..ImportedFacts::default()
+        },
+    )
+    .unwrap()
+    .into_state();
+
+    let StateValue::Token(token) = state.rows()[&StateKey::Token(callback.token)] else {
+        unreachable!()
+    };
+    assert_eq!(token.accounting.supply, U256::from(60));
+    assert_eq!(token.accounting.withdrawals, U256::ZERO);
+    assert_eq!(token.accounting.deposits, U256::from(callback.amount));
+    validate(&state).unwrap();
+}
+
+#[test]
 fn user_bounce_pending_and_inbox_claim_close_complete_lifecycle() {
     let (mut state, withdrawal) = finalized_user_state();
     submit_first_batch(&mut state);

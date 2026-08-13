@@ -346,7 +346,7 @@ fn process_withdrawals(
         if &data != supplied_value {
             return Err(TransitionError::CommitmentMismatch);
         }
-        let mut t = token(overlay, data.token)?;
+        let mut withdrawal_token = token(overlay, data.token)?;
         let terminal_effect = match (origin, outcome) {
             (
                 WithdrawalOrigin::User { fallback },
@@ -356,14 +356,15 @@ fn process_withdrawals(
                 if data.gas_limit == 0 && !callback_deposits.is_empty() {
                     return Err(TransitionError::OwnerMismatch);
                 }
-                t.accounting.withdrawals = t
+                for callback in callback_deposits {
+                    append_deposit(overlay, callback, effects)?;
+                }
+                withdrawal_token = token(overlay, data.token)?;
+                withdrawal_token.accounting.withdrawals = withdrawal_token
                     .accounting
                     .withdrawals
                     .checked_sub(U256::from(data.amount))
                     .ok_or(TransitionError::Underflow)?;
-                for callback in callback_deposits {
-                    append_deposit(overlay, callback, effects)?;
-                }
                 overlay.set(StateKey::Fallback(fallback), None);
                 Effect::UserWithdrawalProcessed {
                     to: data.to,
@@ -445,7 +446,7 @@ fn process_withdrawals(
                 if *collected_fee != 0 && *collected_fee != max_fee {
                     return Err(TransitionError::CommitmentMismatch);
                 }
-                t.accounting.deposits = t
+                withdrawal_token.accounting.deposits = withdrawal_token
                     .accounting
                     .deposits
                     .checked_sub(U256::from(data.amount))
@@ -467,7 +468,7 @@ fn process_withdrawals(
                 if *collected_fee != 0 && *collected_fee != max_fee {
                     return Err(TransitionError::CommitmentMismatch);
                 }
-                t.accounting.deposits = t
+                withdrawal_token.accounting.deposits = withdrawal_token
                     .accounting
                     .deposits
                     .checked_sub(U256::from(*collected_fee))
@@ -496,7 +497,10 @@ fn process_withdrawals(
             }
             _ => return Err(TransitionError::OwnerMismatch),
         };
-        overlay.set(StateKey::Token(data.token), Some(StateValue::Token(t)));
+        overlay.set(
+            StateKey::Token(data.token),
+            Some(StateValue::Token(withdrawal_token)),
+        );
         overlay.set(StateKey::Withdrawal(wid), None);
         effects.push(terminal_effect);
     }

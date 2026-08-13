@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::kernel::state::PortalIdentity;
 
+/// Token metadata authenticated when the Portal enables a token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenEnable {
     pub(crate) token: Address,
@@ -13,6 +14,7 @@ pub(crate) struct TokenEnable {
     pub(crate) currency: String,
 }
 
+/// Encrypted recipient data carried by an ordinary deposit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DepositPayload {
     pub(crate) ephemeral_pubkey_x: B256,
@@ -22,6 +24,7 @@ pub(crate) struct DepositPayload {
     pub(crate) tag: FixedBytes<16>,
 }
 
+/// Portal deposit that the Zone may mint or fail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OrdinaryDeposit {
     pub(crate) token: Address,
@@ -32,6 +35,7 @@ pub(crate) struct OrdinaryDeposit {
     pub(crate) encrypted: DepositPayload,
 }
 
+/// Deposit returned to a failed user withdrawal's fallback path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BounceBackDeposit {
     pub(crate) token: Address,
@@ -39,12 +43,14 @@ pub(crate) struct BounceBackDeposit {
     pub(crate) amount: u128,
 }
 
+/// Deposit representation consumed by a Zone transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Deposit {
     Ordinary(OrdinaryDeposit),
     BounceBack(BounceBackDeposit),
 }
 
+/// Portal operation authenticated from a Tempo transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ImportedOperation {
     Create {
@@ -67,6 +73,7 @@ pub(crate) struct ImportedFacts {
     pub(crate) operations: Vec<ImportedOperation>,
 }
 
+/// Portal or inbox refund claimed by its authenticated recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RefundClaim {
     pub(crate) token: Address,
@@ -74,6 +81,7 @@ pub(crate) struct RefundClaim {
     pub(crate) amount: u128,
 }
 
+/// Portal commitment advancing the submitted Zone batch chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BatchSubmission {
     pub(crate) tempo_block: u64,
@@ -85,6 +93,7 @@ pub(crate) struct BatchSubmission {
     pub(crate) next_zone_height: U256,
 }
 
+/// Portal withdrawal queue segment and its authenticated outcomes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WithdrawalProcessing {
     pub(crate) base_fee: U256,
@@ -93,6 +102,7 @@ pub(crate) struct WithdrawalProcessing {
     pub(crate) outcomes: Vec<WithdrawalOutcome>,
 }
 
+/// Authenticated terminal result for a processed Portal withdrawal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum WithdrawalOutcome {
     UserDelivered {
@@ -107,6 +117,7 @@ pub(crate) enum WithdrawalOutcome {
     },
 }
 
+/// Authenticated Zone outcome for one submitted deposit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DepositOutcome {
     Minted,
@@ -115,6 +126,7 @@ pub(crate) enum DepositOutcome {
     BounceBackPending { recipient: Address },
 }
 
+/// User withdrawal accepted by the Zone and queued for Portal processing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UserWithdrawal {
     pub(crate) sender: Address,
@@ -128,6 +140,7 @@ pub(crate) struct UserWithdrawal {
     pub(crate) reveal_to: Bytes,
 }
 
+/// Zone system operation authenticated from the finalized Zone block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ZoneOperation {
     UpdateTempoGasRate(u128),
