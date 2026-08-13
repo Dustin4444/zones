@@ -22,7 +22,7 @@ use tempo_primitives::{Block, TempoHeader, TempoTxEnvelope};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents};
+use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
     P2pPeerId, PeerTip,
@@ -1115,21 +1115,13 @@ where
     let (l1_header, portal_inputs) = decode_advance_tempo(&block)?;
     let anchor = l1_header.num_hash();
 
-    // Anchor-aware fence for live blocks: the sender must
-    // be the scheduled leader of the block's anchor. This stops an honest stale
-    // leader's broadcast from splitting followers.
+    // Observe and validate the anchor before authenticating a live sender. The anchor itself can
+    // finalize a leadership transition that assigns the sender for this block.
+    //
+    // The post-observation sender check stops an honest stale leader's broadcast from splitting
+    // followers.
     // Backfilled blocks carry no producer claim and are judged by parent/anchor/execution/conflict
     // validation only.
-    //
-    // Check once before waiting to reject an already-known invalid sender without blocking the
-    // import loop. `wait_for_validated_peer_anchor` checks again after observing the anchor:
-    // the anchor itself may finalize a leadership transition that changes its assigned producer.
-    validate_live_block_sender(
-        schedule,
-        peer_block.live_sender.as_ref(),
-        anchor.number,
-        block_number,
-    )?;
     wait_for_validated_peer_anchor(
         l1_block_tracker,
         schedule,
