@@ -8,8 +8,7 @@ use std::{
 use crate::kernel::{State, TokenPhase, apply_imported};
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{Address, U256};
-use alloy_provider::{Provider, ProviderBuilder};
-use eyre::WrapErr as _;
+use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use futures::TryStreamExt;
 use reth_chainspec::EthChainSpec as _;
 use reth_execution_types::Chain;
@@ -41,8 +40,45 @@ struct ChainFragment {
     parent: BlockNumHash,
 }
 
-/// Run the checker ExEx until the notification stream or runtime terminates.
+/// Whether notification handling can continue acquiring and checking blocks.
+enum NotificationOutcome {
+    Continue,
+    Disabled,
+    Blocked,
+}
+
+/// Result of an acquisition attempt, including interruption by disabled draining.
+enum AuthenticationOutcome {
+    Acquired(Box<Result<AuthenticatedBlock, Failure>>),
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFailureDisposition {
+    Reconstruct,
+    Resume,
+    Block,
+}
+
+/// Run the checker ExEx without allowing checker-local failures to finish it.
 pub(super) async fn run<Node>(config: CheckerConfig, mut ctx: ExExContext<Node>) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+{
+    if let Err(error) = start_and_run(&config, &mut ctx).await {
+        tracing::error!(target: "zone::checker", %error, "checker stopped; retaining the ExEx without acknowledging further work");
+    }
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Open checker state and drive it until a checker-local failure blocks progress.
+async fn start_and_run<Node>(
+    config: &CheckerConfig,
+    ctx: &mut ExExContext<Node>,
+) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
     Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
@@ -54,48 +90,118 @@ where
     );
     let path = config.database_path.as_path();
     let identity = Persistence::inspect_identity(path)?;
-    validate_checkpoint_identity(&config, ctx.config.chain.chain().id(), identity)?;
+    validate_checkpoint_identity(config, ctx.config.chain.chain().id(), identity)?;
     let (store, snapshot) = Persistence::open(path, identity)?;
-    let l1_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect(&config.l1_rpc_url)
-        .await?
-        .erased();
-    let actual_l1_chain_id = l1_provider.get_chain_id().await?;
-    if actual_l1_chain_id != identity.l1_chain_id {
-        eyre::bail!("Tempo chain ID does not match the checker checkpoint");
-    }
+    let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
 
     // Resend the persisted acknowledgement, then catch up from the verified tip.
-    ctx.send_finished_height(snapshot.meta.acknowledged_zone_tip.into())?;
-    ctx.catch_up_notifications_with_head(ExExHead::new(snapshot.meta.verified_zone_tip.into()))?;
+    if let Err(error) =
+        ctx.send_finished_height(runtime.snapshot().meta.acknowledged_zone_tip.into())
+    {
+        return block_startup(&store, &mut runtime, error);
+    }
+    if runtime.snapshot().meta.blocked.is_some() {
+        tracing::error!(target: "zone::checker", "checker remains blocked from a previous run");
+        return Ok(());
+    }
+    let (l1_provider, actual_l1_chain_id) = match connect_l1(config).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::error!(target: "zone::checker", %error, "checker could not connect to Tempo; restart to retry");
+            return Ok(());
+        }
+    };
+    if actual_l1_chain_id != identity.l1_chain_id {
+        runtime.block(&store, CoverageGapReason::Other(2))?;
+        tracing::error!(target: "zone::checker", expected = identity.l1_chain_id, actual = actual_l1_chain_id, "Tempo chain ID does not match the checker checkpoint");
+        return Ok(());
+    }
+    if let Err(error) = ctx.catch_up_notifications_with_head(ExExHead::new(
+        runtime.snapshot().meta.verified_zone_tip.into(),
+    )) {
+        return block_startup(&store, &mut runtime, error);
+    }
 
-    let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
+    if let Err(error) = run_loop(config, ctx, &store, identity, &mut runtime, &l1_provider).await {
+        runtime.block(&store, CoverageGapReason::Other(2))?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Persist that startup failed after opening the checker database.
+fn block_startup<N>(
+    store: &Persistence,
+    runtime: &mut Runtime<N>,
+    error: impl Into<eyre::Report>,
+) -> eyre::Result<()> {
+    runtime.block(store, CoverageGapReason::Other(2))?;
+    Err(error.into())
+}
+
+/// Connect to Tempo once and authenticate its chain identity.
+async fn connect_l1(config: &CheckerConfig) -> eyre::Result<(DynProvider<TempoNetwork>, u64)> {
+    tokio::time::timeout(config.acquisition_timeout, async {
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect(&config.l1_rpc_url)
+            .await?
+            .erased();
+        let chain_id = provider.get_chain_id().await?;
+        Ok((provider, chain_id))
+    })
+    .await
+    .map_err(|_| eyre::eyre!("Tempo connection attempt timed out"))?
+}
+
+/// Decide whether a failed notification stream left an unchecked suffix.
+fn classify_stream_failure(
+    head: u64,
+    verified: u64,
+    resume_notifications: bool,
+) -> StreamFailureDisposition {
+    match head.cmp(&verified) {
+        std::cmp::Ordering::Greater => StreamFailureDisposition::Reconstruct,
+        std::cmp::Ordering::Equal if resume_notifications => StreamFailureDisposition::Resume,
+        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => StreamFailureDisposition::Block,
+    }
+}
+
+/// Drive checker work after startup without allowing a checker failure to finish the ExEx.
+async fn run_loop<Node, P>(
+    config: &CheckerConfig,
+    ctx: &mut ExExContext<Node>,
+    store: &Persistence,
+    identity: Identity,
+    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
+    l1_provider: &P,
+) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+    P: Provider<TempoNetwork>,
+{
     let mut authentication = None;
     let mut retry_at: Option<Instant> = None;
 
     loop {
         let action = match authentication.take() {
-            Some((request, result)) => runtime.complete_authentication(
-                &store,
-                identity,
-                request,
-                result,
-                Instant::now(),
-            )?,
-            None => runtime.next_action(&store, Instant::now())?,
+            Some((request, result)) => {
+                runtime.complete_authentication(store, identity, request, result, Instant::now())?
+            }
+            None => runtime.next_action(store, Instant::now())?,
         };
         match action {
             RuntimeAction::Authenticate(request) => {
-                let result = authenticate_requested_block(
-                    &config,
-                    &mut ctx,
-                    &store,
-                    &mut runtime,
-                    request,
-                    &l1_provider,
-                )
-                .await?;
-                authentication = Some((request, result));
+                let result =
+                    authenticate_requested_block(config, ctx, store, runtime, request, l1_provider)
+                        .await?;
+                match result {
+                    AuthenticationOutcome::Acquired(result) => {
+                        authentication = Some((request, *result));
+                    }
+                    AuthenticationOutcome::Interrupted => {}
+                }
                 continue;
             }
             RuntimeAction::Acknowledge(height) => {
@@ -103,13 +209,16 @@ where
                 retry_at = None;
                 continue;
             }
-            RuntimeAction::AcknowledgeAndTerminate(height) => {
+            RuntimeAction::AcknowledgeAndDisable(height) => {
                 ctx.send_finished_height(height.into())?;
-                eyre::bail!("checker stopped after recording an unchecked range");
+                tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording an unchecked range");
+                retry_at = None;
+                continue;
             }
             RuntimeAction::RetryAt(deadline) => retry_at = Some(deadline),
-            RuntimeAction::Terminal => {
-                eyre::bail!("checker stopped");
+            RuntimeAction::Blocked => {
+                tracing::error!(target: "zone::checker", "checker is blocked and will not acknowledge further notifications");
+                return Ok(());
             }
             RuntimeAction::AwaitNotification => {}
             RuntimeAction::None if runtime.current().is_some() => continue,
@@ -126,7 +235,13 @@ where
         };
         let Some(next) = next else { continue };
         let l2_state_provider = ctx.provider().clone();
-        handle_notification(&mut ctx, &mut runtime, &store, &l2_state_provider, next)?;
+        if matches!(
+            handle_notification(ctx, runtime, store, &l2_state_provider, next)?,
+            NotificationOutcome::Blocked
+        ) {
+            tracing::error!(target: "zone::checker", "checker is blocked after a notification failure");
+            return Ok(());
+        }
     }
 }
 
@@ -154,7 +269,7 @@ async fn authenticate_requested_block<Node, P>(
     runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
     request: AuthenticationRequest,
     l1_provider: &P,
-) -> eyre::Result<Result<AuthenticatedBlock, Failure>>
+) -> eyre::Result<AuthenticationOutcome>
 where
     Node: FullNodeComponents,
     Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
@@ -194,11 +309,15 @@ where
                 break Err(Failure::transient("checker acquisition timed out"));
             }
             next = ctx.notifications.try_next() => {
-                handle_notification(ctx, runtime, store, &l2_state_provider, next)?;
+                match handle_notification(ctx, runtime, store, &l2_state_provider, next)? {
+                    NotificationOutcome::Continue => {}
+                    NotificationOutcome::Disabled => return Ok(AuthenticationOutcome::Interrupted),
+                    NotificationOutcome::Blocked => return Ok(AuthenticationOutcome::Interrupted),
+                }
             }
         }
     };
-    Ok(acquired)
+    Ok(AuthenticationOutcome::Acquired(Box::new(acquired)))
 }
 
 /// Handle one notification-stream result and apply its ExEx lifecycle outcome.
@@ -208,7 +327,7 @@ fn handle_notification<Node, P, E>(
     store: &Persistence,
     l2_state_provider: &P,
     next: Result<Option<ExExNotification<TempoPrimitives>>, E>,
-) -> eyre::Result<()>
+) -> eyre::Result<NotificationOutcome>
 where
     Node: FullNodeComponents,
     P: BlockNumReader + ?Sized,
@@ -217,35 +336,71 @@ where
     let notification = match next {
         Ok(Some(notification)) => notification,
         Ok(None) => {
-            return handle_notification_stream_failure(runtime, store, l2_state_provider);
+            return handle_notification_stream_failure(
+                ctx,
+                runtime,
+                store,
+                l2_state_provider,
+                false,
+            );
         }
         Err(error) => {
-            return handle_notification_stream_failure(runtime, store, l2_state_provider)
-                .wrap_err_with(|| format!("notification stream error: {error}"));
+            tracing::error!(target: "zone::checker", %error, "checker notification stream failed; resuming direct notification delivery");
+            return handle_notification_stream_failure(
+                ctx,
+                runtime,
+                store,
+                l2_state_provider,
+                true,
+            );
         }
     };
-    let plan = notification_plan(&notification)
-        .map_err(|_| eyre::eyre!("checker rejected notification"))?;
-    match runtime.push_planned_or_record_overflow(store, notification, plan)? {
-        EnqueueAction::Queued => Ok(()),
-        EnqueueAction::AcknowledgeAndTerminate(height) => {
-            ctx.send_finished_height(height.into())?;
-            eyre::bail!("checker stopped after recording a queue overflow gap");
+    let plan = match notification_plan(&notification) {
+        Ok(plan) => plan,
+        Err(failure) => {
+            runtime.block(store, failure.gap_reason)?;
+            return Ok(NotificationOutcome::Blocked);
         }
-        EnqueueAction::Terminal => Err(eyre::eyre!("checker rejected notification")),
+    };
+    match runtime.push_planned_or_record_overflow(store, notification, plan)? {
+        EnqueueAction::Queued => Ok(NotificationOutcome::Continue),
+        EnqueueAction::Acknowledge(height) => {
+            ctx.send_finished_height(height.into())?;
+            Ok(NotificationOutcome::Continue)
+        }
+        EnqueueAction::AcknowledgeAndDisable(height) => {
+            ctx.send_finished_height(height.into())?;
+            tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording a queue overflow gap");
+            Ok(NotificationOutcome::Disabled)
+        }
+        EnqueueAction::Blocked => Ok(NotificationOutcome::Blocked),
     }
 }
 
-/// Persist the unchecked suffix and terminate after the notification stream fails.
-fn handle_notification_stream_failure<P: BlockNumReader + ?Sized>(
+/// Persist the unchecked suffix and retain the ExEx after the notification stream fails.
+fn handle_notification_stream_failure<Node, P>(
+    ctx: &mut ExExContext<Node>,
     runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
     store: &Persistence,
     provider: &P,
-) -> eyre::Result<()> {
+    resume_notifications: bool,
+) -> eyre::Result<NotificationOutcome>
+where
+    Node: FullNodeComponents,
+    P: BlockNumReader + ?Sized,
+{
     let tip = runtime.snapshot().meta.verified_zone_tip;
     let head = provider.best_block_number()?;
-    if head <= tip.number {
-        eyre::bail!("notification stream failed without a reconstructable unchecked suffix");
+    match classify_stream_failure(head, tip.number, resume_notifications) {
+        StreamFailureDisposition::Reconstruct => {}
+        StreamFailureDisposition::Resume => {
+            ctx.set_notifications_without_head();
+            return Ok(NotificationOutcome::Continue);
+        }
+        StreamFailureDisposition::Block => {
+            runtime.block(store, CoverageGapReason::Other(2))?;
+            return Ok(NotificationOutcome::Blocked);
+        }
     }
     let mut suffix = Vec::with_capacity((head - tip.number) as usize);
     for number in tip.number + 1..=head {
@@ -255,11 +410,19 @@ fn handle_notification_stream_failure<P: BlockNumReader + ?Sized>(
         suffix.push(BlockNumHash { number, hash });
     }
     match runtime.record_stream_failure(store, &suffix)? {
-        StreamFailureAction::GapRecorded(_) => {
-            // The durable watermark remains available for startup recovery.
-            Err(eyre::eyre!("checker notification stream unavailable"))
+        StreamFailureAction::GapRecorded(height) => {
+            tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after notification stream failure");
+            if resume_notifications {
+                ctx.send_finished_height(height.into())?;
+                ctx.set_notifications_without_head();
+                Ok(NotificationOutcome::Disabled)
+            } else {
+                runtime.block(store, CoverageGapReason::ProviderUnavailable)?;
+                ctx.send_finished_height(height.into())?;
+                Ok(NotificationOutcome::Blocked)
+            }
         }
-        StreamFailureAction::Terminal => Err(eyre::eyre!("failed to record canonical stream gap")),
+        StreamFailureAction::Blocked => Ok(NotificationOutcome::Blocked),
     }
 }
 /// Convert a contiguous ExEx notification into a checked runtime plan.
@@ -491,4 +654,29 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamFailureDisposition, classify_stream_failure};
+
+    #[test]
+    fn stream_error_only_resumes_at_the_verified_tip() {
+        assert_eq!(
+            classify_stream_failure(10, 10, true),
+            StreamFailureDisposition::Resume
+        );
+        assert_eq!(
+            classify_stream_failure(11, 10, true),
+            StreamFailureDisposition::Reconstruct
+        );
+        assert_eq!(
+            classify_stream_failure(10, 10, false),
+            StreamFailureDisposition::Block
+        );
+        assert_eq!(
+            classify_stream_failure(9, 10, true),
+            StreamFailureDisposition::Block
+        );
+    }
 }

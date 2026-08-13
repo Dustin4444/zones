@@ -116,7 +116,7 @@ fn active_finding_rejects_same_height_wrong_ancestor_hash() {
         runtime
             .poll(&store, identity(), authenticate, Instant::now())
             .unwrap(),
-        RuntimeAction::Terminal
+        RuntimeAction::Blocked
     );
     assert_eq!(
         store.load().unwrap().meta.acknowledged_zone_tip,

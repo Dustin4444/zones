@@ -89,6 +89,7 @@ impl CheckerCommand {
                             },
                             "activeFinding": snapshot.active_finding,
                             "hasCoverageGap": snapshot.has_coverage_gap,
+                            "isBlocked": snapshot.is_blocked,
                         }))?
                     );
                 } else {
@@ -106,6 +107,7 @@ impl CheckerCommand {
                     );
                     println!("Active finding:       {}", snapshot.active_finding);
                     println!("Coverage gap:         {}", snapshot.has_coverage_gap);
+                    println!("Blocked:              {}", snapshot.is_blocked);
                 }
                 Ok(())
             }

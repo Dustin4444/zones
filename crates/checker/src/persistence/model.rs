@@ -57,6 +57,7 @@ pub(crate) enum CoverageGapReason {
     NotCheckedAncestorDivergence,
     Other(u16),
 }
+
 /// Whether checker coverage reaches the acknowledged Zone tip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Coverage {
@@ -77,6 +78,8 @@ pub(crate) struct Metadata {
     pub acknowledged_zone_tip: BlockNumHash,
     pub active_finding: Option<FindingKey>,
     pub coverage: Coverage,
+    /// Reason the checker stopped without being able to safely acknowledge more work.
+    pub blocked: Option<CoverageGapReason>,
 }
 /// One value stored in the metadata table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

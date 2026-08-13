@@ -36,7 +36,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 const CHECKPOINT_INTERVAL: u64 = 64;
 /// Result returned by durable persistence operations.
 pub(crate) type Result<T> = std::result::Result<T, PersistenceError>;
@@ -180,6 +180,7 @@ impl Persistence {
             acknowledged_zone_tip: cut.zone,
             active_finding: None,
             coverage: Coverage::Complete,
+            blocked: None,
         };
         let checkpoint = Checkpoint {
             cut,
@@ -436,6 +437,18 @@ impl Persistence {
                 acknowledged_through,
                 reason,
             };
+            Ok(())
+        })
+    }
+
+    /// Persist that the checker cannot safely advance its acknowledgement watermark.
+    pub(crate) fn record_blocked(
+        &self,
+        prior: &Snapshot,
+        reason: CoverageGapReason,
+    ) -> Result<Snapshot> {
+        self.write(prior, prior.state.clone(), |_tx, meta| {
+            meta.blocked = Some(reason);
             Ok(())
         })
     }

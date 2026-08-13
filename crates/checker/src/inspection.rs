@@ -14,6 +14,7 @@ pub struct CheckerSnapshot {
     pub acknowledged_zone_tip: BlockNumHash,
     pub active_finding: bool,
     pub has_coverage_gap: bool,
+    pub is_blocked: bool,
 }
 
 /// Inspect a stopped checker database or a consistent copy.
@@ -25,5 +26,6 @@ pub fn inspect_database(path: impl AsRef<Path>) -> eyre::Result<CheckerSnapshot>
         acknowledged_zone_tip: snapshot.meta.acknowledged_zone_tip.into(),
         active_finding: snapshot.meta.active_finding.is_some(),
         has_coverage_gap: !matches!(snapshot.meta.coverage, Coverage::Complete),
+        is_blocked: snapshot.meta.blocked.is_some(),
     })
 }

@@ -85,7 +85,7 @@ fn retry_spans_polls_accepts_queued_work_and_names_full_suffix() {
                 now + Duration::from_millis(25)
             )
             .unwrap(),
-        RuntimeAction::AcknowledgeAndTerminate(coordinate(3, 0x10))
+        RuntimeAction::AcknowledgeAndDisable(coordinate(3, 0x10))
     );
     assert_eq!(
         store.load().unwrap().meta.coverage,
@@ -147,7 +147,7 @@ fn overflow_and_stream_failure_are_durable_fail_open_apis() {
         overflow_runtime
             .push_or_record_overflow(&store, rejected)
             .unwrap(),
-        EnqueueAction::AcknowledgeAndTerminate(coordinate(4, 0x10))
+        EnqueueAction::AcknowledgeAndDisable(coordinate(4, 0x10))
     );
     assert_eq!(
         store.load().unwrap().meta.coverage,
@@ -192,4 +192,145 @@ fn overflow_and_stream_failure_are_durable_fail_open_apis() {
             reason: CoverageGapReason::ProviderUnavailable
         }
     );
+}
+
+#[test]
+fn disabled_runtime_extends_and_replaces_its_durable_gap_before_acknowledging() {
+    let (_directory, store) = create();
+    let state = store.load().unwrap().state;
+    let mut runtime = Runtime::new(
+        store.load().unwrap(),
+        1,
+        RetryBudget::new(2, Duration::from_secs(1)),
+    );
+    for number in 1..=2 {
+        runtime
+            .push(notification(blocks(&state, number, 1, 0x10)))
+            .unwrap();
+    }
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, notification(blocks(&state, 3, 2, 0x10)))
+            .unwrap(),
+        EnqueueAction::AcknowledgeAndDisable(coordinate(4, 0x10))
+    );
+    assert_eq!(
+        runtime.next_action(&store, Instant::now()).unwrap(),
+        RuntimeAction::AwaitNotification
+    );
+
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, notification(blocks(&state, 5, 1, 0x10)))
+            .unwrap(),
+        EnqueueAction::AcknowledgeAndDisable(coordinate(5, 0x10))
+    );
+    assert!(matches!(
+        store.load().unwrap().meta.coverage,
+        Coverage::Gap { first_unchecked, acknowledged_through, .. }
+            if first_unchecked == coordinate(1, 0x10) && acknowledged_through == coordinate(5, 0x10)
+    ));
+
+    let replacement = FakeNotification {
+        plan: NotificationPlan::new(
+            vec![
+                coordinate(3, 0x10),
+                coordinate(4, 0x10),
+                coordinate(5, 0x10),
+            ],
+            vec![
+                coordinate(3, 0x20),
+                coordinate(4, 0x20),
+                coordinate(5, 0x20),
+            ],
+            coordinate(2, 0x10),
+        )
+        .unwrap(),
+        blocks: Ok(blocks(&state, 3, 3, 0x20)),
+    };
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, replacement)
+            .unwrap(),
+        EnqueueAction::AcknowledgeAndDisable(coordinate(5, 0x20))
+    );
+    assert!(matches!(
+        store.load().unwrap().meta.coverage,
+        Coverage::Gap { first_unchecked, acknowledged_through, .. }
+            if first_unchecked == coordinate(1, 0x10) && acknowledged_through == coordinate(5, 0x20)
+    ));
+
+    let truncated_reorg = FakeNotification {
+        plan: NotificationPlan::new(
+            vec![coordinate(3, 0x20), coordinate(4, 0x20)],
+            vec![
+                coordinate(3, 0x30),
+                coordinate(4, 0x30),
+                coordinate(5, 0x30),
+            ],
+            coordinate(2, 0x10),
+        )
+        .unwrap(),
+        blocks: Ok(blocks(&state, 3, 3, 0x30)),
+    };
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, truncated_reorg)
+            .unwrap(),
+        EnqueueAction::Blocked
+    );
+    let snapshot = store.load().unwrap();
+    assert!(snapshot.meta.blocked.is_some());
+    assert_eq!(snapshot.meta.acknowledged_zone_tip, coordinate(5, 0x20));
+}
+
+#[test]
+fn disabled_runtime_resumes_after_a_reorg_removes_the_entire_gap() {
+    let (_directory, store) = create();
+    let state = store.load().unwrap().state;
+    let mut runtime = Runtime::new(
+        store.load().unwrap(),
+        1,
+        RetryBudget::new(2, Duration::from_secs(1)),
+    );
+    for number in 1..=2 {
+        runtime
+            .push(notification(blocks(&state, number, 1, 0x10)))
+            .unwrap();
+    }
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, notification(blocks(&state, 3, 3, 0x10)))
+            .unwrap(),
+        EnqueueAction::AcknowledgeAndDisable(coordinate(5, 0x10))
+    );
+
+    let reverted = FakeNotification {
+        plan: NotificationPlan::new(
+            (1..=5).map(|number| coordinate(number, 0x10)).collect(),
+            Vec::new(),
+            anchor().zone,
+        )
+        .unwrap(),
+        blocks: Ok(Vec::new()),
+    };
+    assert_eq!(
+        runtime.push_or_record_overflow(&store, reverted).unwrap(),
+        EnqueueAction::Acknowledge(anchor().zone)
+    );
+    assert_eq!(store.load().unwrap().meta.coverage, Coverage::Complete);
+
+    let replacement = notification(blocks(&state, 1, 1, 0x10));
+    assert_eq!(
+        runtime
+            .push_or_record_overflow(&store, replacement)
+            .unwrap(),
+        EnqueueAction::Queued
+    );
+    assert!(matches!(
+        runtime
+            .poll(&store, identity(), authenticate, Instant::now())
+            .unwrap(),
+        RuntimeAction::Acknowledge(_)
+    ));
 }

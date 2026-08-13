@@ -26,7 +26,10 @@ pub(crate) enum RuntimeState {
     Healthy,
     Retrying,
     Alerting,
+    /// Checking stopped after a durable coverage gap; notifications may still be drained.
     Disabled,
+    /// The checker cannot safely acknowledge additional notifications.
+    Blocked,
 }
 
 /// Receipt- and state-derived output, constructed separately from the kernel result.
@@ -130,31 +133,39 @@ pub(crate) enum RuntimeAction {
     AwaitNotification,
     RetryAt(Instant),
     Acknowledge(BlockNumHash),
-    AcknowledgeAndTerminate(BlockNumHash),
-    Terminal,
+    /// Acknowledge a durably recorded gap and continue draining notifications.
+    AcknowledgeAndDisable(BlockNumHash),
+    /// Keep the ExEx alive without acknowledging further notifications.
+    Blocked,
 }
 
 /// Outcome of enqueueing a notification into the bounded runtime queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnqueueAction {
     Queued,
-    AcknowledgeAndTerminate(BlockNumHash),
-    Terminal,
+    Acknowledge(BlockNumHash),
+    AcknowledgeAndDisable(BlockNumHash),
+    Blocked,
 }
 
 /// Outcome of durably recording a notification-stream failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamFailureAction {
     GapRecorded(BlockNumHash),
-    Terminal,
+    Blocked,
 }
 
 impl<N> Runtime<N> {
     /// Start from a durable snapshot with one current notification and a bounded backlog.
     pub(crate) fn new(snapshot: Snapshot, capacity: usize, budget: RetryBudget) -> Self {
+        let state = if snapshot.meta.blocked.is_some() {
+            RuntimeState::Blocked
+        } else {
+            RuntimeState::Starting
+        };
         Self {
             snapshot,
-            state: RuntimeState::Starting,
+            state,
             current: None,
             queue: VecDeque::with_capacity(capacity),
             capacity,
@@ -178,6 +189,27 @@ impl<N> Runtime<N> {
         &self.snapshot
     }
 
+    /// Persist a blocked state without advancing the acknowledgement watermark.
+    pub(crate) fn block(
+        &mut self,
+        store: &Persistence,
+        reason: CoverageGapReason,
+    ) -> Result<(), PersistenceError> {
+        match store.record_blocked(&self.snapshot, reason.clone()) {
+            Ok(snapshot) => self.snapshot = snapshot,
+            Err(PersistenceError::StaleSnapshot) => {
+                self.snapshot = store.load()?;
+                self.snapshot = store.record_blocked(&self.snapshot, reason)?;
+            }
+            Err(error) => return Err(error),
+        }
+        self.state = RuntimeState::Blocked;
+        self.current = None;
+        self.queue.clear();
+        self.retry = None;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn push_planned(
         &mut self,
@@ -189,7 +221,7 @@ impl<N> Runtime<N> {
 
     /// Append a validated notification without recording an overflow gap.
     fn enqueue(&mut self, notification: N, plan: NotificationPlan) -> Result<(), N> {
-        if self.state == RuntimeState::Disabled {
+        if matches!(self.state, RuntimeState::Disabled | RuntimeState::Blocked) {
             return Err(notification);
         }
         let queued = QueuedNotification { notification, plan };
@@ -210,7 +242,10 @@ impl<N> Runtime<N> {
         plan: NotificationPlan,
     ) -> Result<EnqueueAction, PersistenceError> {
         if self.state == RuntimeState::Disabled {
-            return Ok(EnqueueAction::Terminal);
+            return self.drain_disabled(store, notification, plan);
+        }
+        if self.state == RuntimeState::Blocked {
+            return Ok(EnqueueAction::Blocked);
         }
         if self.current.is_none() || self.queue.len() < self.capacity {
             let accepted = self.enqueue(notification, plan);
@@ -236,8 +271,8 @@ impl<N> Runtime<N> {
                 .windows(2)
                 .all(|pair| pair[1].ancestor == pair[0].acknowledge);
         if !valid {
-            self.state = RuntimeState::Disabled;
-            return Ok(EnqueueAction::Terminal);
+            self.block(store, CoverageGapReason::Other(2))?;
+            return Ok(EnqueueAction::Blocked);
         }
         let first_plan = &plans[0];
         let first = if self.snapshot.meta.verified_zone_tip == first_plan.ancestor {
@@ -251,8 +286,8 @@ impl<N> Runtime<N> {
                 PersistenceError::Invalid("overflow has no unchecked suffix".into())
             })?
         } else {
-            self.state = RuntimeState::Disabled;
-            return Ok(EnqueueAction::Terminal);
+            self.block(store, CoverageGapReason::Other(2))?;
+            return Ok(EnqueueAction::Blocked);
         };
         let last = plans.last().expect("nonempty plan set").acknowledge;
         let reason = match &self.snapshot.meta.coverage {
@@ -263,7 +298,7 @@ impl<N> Runtime<N> {
         self.state = RuntimeState::Disabled;
         self.current = None;
         self.queue.clear();
-        Ok(EnqueueAction::AcknowledgeAndTerminate(last))
+        Ok(EnqueueAction::AcknowledgeAndDisable(last))
     }
 
     /// Persist a canonical suffix reconstructed locally after stream failure.
@@ -277,8 +312,8 @@ impl<N> Runtime<N> {
                 .windows(2)
                 .any(|pair| pair[0].number.checked_add(1) != Some(pair[1].number))
         {
-            self.state = RuntimeState::Disabled;
-            return Ok(StreamFailureAction::Terminal);
+            self.block(store, CoverageGapReason::Other(2))?;
+            return Ok(StreamFailureAction::Blocked);
         }
         let (first, reason) = match &self.snapshot.meta.coverage {
             crate::persistence::Coverage::Complete => {
@@ -295,12 +330,56 @@ impl<N> Runtime<N> {
             != Some(canonical_suffix[0].number)
             || canonical_suffix[0] != first
         {
-            self.state = RuntimeState::Disabled;
-            return Ok(StreamFailureAction::Terminal);
+            self.block(store, CoverageGapReason::Other(2))?;
+            return Ok(StreamFailureAction::Blocked);
         }
         self.snapshot = store.record_gap(&self.snapshot, first, last, reason)?;
         self.state = RuntimeState::Disabled;
         Ok(StreamFailureAction::GapRecorded(last))
+    }
+
+    /// Extend or rewind durable gap coverage for one notification after checking is disabled.
+    fn drain_disabled(
+        &mut self,
+        store: &Persistence,
+        notification: N,
+        plan: NotificationPlan,
+    ) -> Result<EnqueueAction, PersistenceError> {
+        let crate::persistence::Coverage::Gap { reason, .. } = &self.snapshot.meta.coverage else {
+            self.block(store, CoverageGapReason::Other(2))?;
+            return Ok(EnqueueAction::Blocked);
+        };
+        let reason = reason.clone();
+        if plan.ancestor != self.snapshot.meta.acknowledged_zone_tip {
+            if plan.reverted.is_empty() {
+                self.block(store, CoverageGapReason::Other(2))?;
+                return Ok(EnqueueAction::Blocked);
+            }
+            if plan.reverted.last().copied() != Some(self.snapshot.meta.acknowledged_zone_tip) {
+                self.block(store, CoverageGapReason::Other(2))?;
+                return Ok(EnqueueAction::Blocked);
+            }
+            self.reorg(store, plan.ancestor)?;
+        }
+        if matches!(
+            self.snapshot.meta.coverage,
+            crate::persistence::Coverage::Complete
+        ) {
+            if plan.applied.is_empty() {
+                return Ok(EnqueueAction::Acknowledge(plan.acknowledge));
+            }
+            let accepted = self.enqueue(notification, plan);
+            debug_assert!(accepted.is_ok());
+            return Ok(EnqueueAction::Queued);
+        }
+        if plan.applied.is_empty() {
+            self.state = RuntimeState::Disabled;
+            return Ok(EnqueueAction::AcknowledgeAndDisable(plan.acknowledge));
+        }
+        let first = self.first_unchecked_or(plan.applied[0]);
+        self.snapshot = store.record_gap(&self.snapshot, first, plan.acknowledge, reason)?;
+        self.state = RuntimeState::Disabled;
+        Ok(EnqueueAction::AcknowledgeAndDisable(plan.acknowledge))
     }
 
     /// Restore the durable state at `ancestor` and reset in-flight retry state.
@@ -420,8 +499,8 @@ impl<N> Runtime<N> {
                     || exact_commit_descendant
                     || exact_reorg_descendant);
             if !preserves {
-                self.state = RuntimeState::Disabled;
-                return Ok(Some(RuntimeAction::Terminal));
+                self.block(store, CoverageGapReason::Other(2))?;
+                return Ok(Some(RuntimeAction::Blocked));
             }
             self.unwind_current(store, plan)?;
             let first = self.first_unchecked_or(active.zone);
@@ -493,8 +572,8 @@ impl<N> Runtime<N> {
                         || plan.applied.is_empty()
                         || plan.ancestor != previous
                     {
-                        self.state = RuntimeState::Disabled;
-                        return Ok(RuntimeAction::Terminal);
+                        self.block(store, CoverageGapReason::Other(2))?;
+                        return Ok(RuntimeAction::Blocked);
                     }
                     last = plan.acknowledge;
                     previous = plan.acknowledge;
@@ -507,7 +586,7 @@ impl<N> Runtime<N> {
                 self.state = RuntimeState::Disabled;
                 self.current = None;
                 self.queue.clear();
-                Ok(RuntimeAction::AcknowledgeAndTerminate(last))
+                Ok(RuntimeAction::AcknowledgeAndDisable(last))
             }
             FailureClass::AuthenticatedDivergence => {
                 let typed = failure
@@ -532,8 +611,8 @@ impl<N> Runtime<N> {
                 Ok(RuntimeAction::Acknowledge(work.suffix_end))
             }
             FailureClass::ImmediateTerminal => {
-                self.state = RuntimeState::Disabled;
-                Ok(RuntimeAction::Terminal)
+                self.block(store, failure.gap_reason)?;
+                Ok(RuntimeAction::Blocked)
             }
         }
     }
@@ -555,7 +634,9 @@ impl<N> Runtime<N> {
                 CoverageGapReason::MissingReceipts,
             )?;
             self.state = RuntimeState::Disabled;
-            return Ok(RuntimeAction::AcknowledgeAndTerminate(work.suffix_end));
+            self.current = None;
+            self.queue.clear();
+            return Ok(RuntimeAction::AcknowledgeAndDisable(work.suffix_end));
         }
         self.process_block(
             store,
@@ -566,13 +647,14 @@ impl<N> Runtime<N> {
             work.is_last,
         )?;
         let ready = self.snapshot.meta.acknowledged_zone_tip;
-        if work.is_last || matches!(self.state, RuntimeState::Alerting | RuntimeState::Disabled) {
+        if self.state == RuntimeState::Disabled {
+            self.current = None;
+            self.queue.clear();
+            return Ok(RuntimeAction::AcknowledgeAndDisable(ready));
+        }
+        if work.is_last || self.state == RuntimeState::Alerting {
             self.advance();
-            Ok(if self.state == RuntimeState::Disabled {
-                RuntimeAction::AcknowledgeAndTerminate(ready)
-            } else {
-                RuntimeAction::Acknowledge(ready)
-            })
+            Ok(RuntimeAction::Acknowledge(ready))
         } else {
             Ok(RuntimeAction::None)
         }
@@ -585,7 +667,10 @@ impl<N> Runtime<N> {
         now: Instant,
     ) -> Result<RuntimeAction, PersistenceError> {
         if self.state == RuntimeState::Disabled {
-            return Ok(RuntimeAction::Terminal);
+            return Ok(RuntimeAction::AwaitNotification);
+        }
+        if self.state == RuntimeState::Blocked {
+            return Ok(RuntimeAction::Blocked);
         }
         let Some(current) = self.current.as_ref() else {
             return Ok(RuntimeAction::None);
@@ -601,8 +686,8 @@ impl<N> Runtime<N> {
                 return Ok(RuntimeAction::Acknowledge(plan.acknowledge));
             }
             WorkSelection::Terminal => {
-                self.state = RuntimeState::Disabled;
-                return Ok(RuntimeAction::Terminal);
+                self.block(store, CoverageGapReason::Other(2))?;
+                return Ok(RuntimeAction::Blocked);
             }
             WorkSelection::AwaitNotification => return Ok(RuntimeAction::AwaitNotification),
         };
