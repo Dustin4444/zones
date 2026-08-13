@@ -41,7 +41,7 @@ fn restart_replays_checkpoint_and_unbroken_journal_and_rejects_missing_rows() {
                 zone: two,
                 tempo: block(2, 0x22),
             },
-            snapshot.state,
+            snapshot.state.as_ref().clone(),
         )
         .unwrap();
     let three = apply(&store, 3, two);
@@ -121,7 +121,7 @@ fn restart_checks_active_history_but_defers_orphan_audit_validation() {
                 zone: one,
                 tempo: block(1, 0x21),
             },
-            snapshot.state,
+            snapshot.state.as_ref().clone(),
         )
         .unwrap();
     apply(&store, 2, one);
@@ -175,7 +175,7 @@ fn stale_checkpoint_from_an_orphaned_branch_is_skipped() {
                 zone: one_a,
                 tempo: block(1, 0x21),
             },
-            snapshot.state,
+            snapshot.state.as_ref().clone(),
         )
         .unwrap();
     apply(&store, 2, one_a);
@@ -238,7 +238,7 @@ fn checkpoint_size_and_bounded_journal_replay_are_measured() {
                         zone: parent,
                         tempo: block(number, 0x20u8.wrapping_add(number as u8)),
                     },
-                    snapshot.state,
+                    snapshot.state.as_ref().clone(),
                 )
                 .unwrap();
         }

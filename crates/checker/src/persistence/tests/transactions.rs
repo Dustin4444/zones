@@ -30,7 +30,7 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
                 zone: one,
                 tempo: block(1, 0x21)
             },
-            snapshot.state
+            snapshot.state.as_ref().clone()
         ),
         Err(PersistenceError::InjectedAbort)
     ));
@@ -49,29 +49,18 @@ fn transaction_abort_leaves_apply_checkpoint_and_reorg_fully_old() {
 }
 
 #[test]
-fn finding_and_gap_abort_leave_latches_and_acknowledgement_fully_old() {
+fn divergence_abort_leaves_finding_and_coverage_fully_old() {
     let (directory, store) = create();
     let (key, value) = finding(block(1, 0x41));
     store.inject_abort();
     assert!(matches!(
-        store.record_finding(&current(&store), key, value),
+        store.record_divergence(&current(&store), key, value, key.zone),
         Err(PersistenceError::InjectedAbort)
     ));
     assert_eq!(store.load().unwrap().meta.active_finding, None);
-
-    store.inject_abort();
-    assert!(matches!(
-        store.record_gap(
-            &current(&store),
-            block(1, 0x41),
-            block(3, 0x43),
-            CoverageGapReason::MissingTempoData,
-        ),
-        Err(PersistenceError::InjectedAbort)
-    ));
     drop(store);
     let (_, snapshot) = Persistence::open(directory.path(), identity()).unwrap();
-    assert_eq!(snapshot.meta.acknowledged_zone_tip, bootstrap().zone);
+    assert_eq!(snapshot.meta.observed_zone_tip, bootstrap().zone);
     assert_eq!(snapshot.meta.coverage, Coverage::Complete);
     assert_eq!(snapshot.meta.active_finding, None);
 }
@@ -111,7 +100,7 @@ fn checkpoint_ids_are_immutable_including_the_bootstrap_checkpoint() {
         store.checkpoint(identity(), bootstrap(), conflicting),
         Err(PersistenceError::Invalid(_))
     ));
-    assert_eq!(store.load().unwrap().state, state());
+    assert_eq!(*store.load().unwrap().state, state());
 }
 
 #[test]

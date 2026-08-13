@@ -2,12 +2,12 @@
 
 `zone-checker` observes one Zone and its imported Tempo blocks. It authenticates
 block data, evaluates bridge transitions, compares the resulting effects and
-state, and stores progress in a dedicated MDBX database before acknowledging
-Reth.
+state, and stores progress in a dedicated MDBX database before advancing Reth's
+verified watermark.
 
 The checker does not affect consensus. When it finds a mismatch, it commits an
-active finding. Descendants are acknowledged as not checked until a reorg
-removes the finding's block.
+active finding. Descendants remain unverified until a reorg removes the
+finding's block.
 
 See [DESIGN.md](DESIGN.md) for the data flow and persistence contract.
 
@@ -188,39 +188,33 @@ recovery, and active checkpoints, plus at least 16,384 Zone blocks of journal
 history after the recovery checkpoint. It prunes older journal rows atomically;
 normal checkpoint cadence retains at most one additional interval.
 
-The runtime keeps one current notification and a bounded queue. It commits each
-block separately and sends Reth `FinishedHeight` only after all state, finding,
-and coverage updates through that height have committed.
+ExEx notifications are wakeups, not the replay journal. The runtime records the
+local canonical head as its recovery target, then reads each missing canonical
+block and receipt set from the local node in order. Reth's `FinishedHeight`
+remains at the durably verified tip. Each verified block commits separately.
 
-Verified, acknowledged, and unchecked progress are stored separately. Before
-acknowledging an unchecked suffix, the checker records it as a coverage gap. A
-finding leaves semantic state at the verified parent. Restart validates retained
-journal continuity, then replays only the active checkpoint's journal suffix.
-A reorg within retained history restores
-the common ancestor and then applies the replacement branch. A deeper reorg
-durably blocks the checker without acknowledging further notifications and
-requires rebuilding its database. Removing the finding's block clears the
-active finding atomically; retaining it keeps the finding active.
+Verified and observed progress are stored separately. A finding leaves semantic
+state at the verified parent. Restart validates retained journal continuity,
+then resumes from the verified checkpoint toward the locally retained canonical
+head. A reorg within retained history restores the common ancestor and then
+applies the replacement branch. A deeper reorg durably blocks the checker
+without advancing its verified watermark and requires rebuilding its database.
+Removing the finding's block clears the active finding atomically; retaining it
+keeps the finding active.
 
-Malformed or discontinuous notification plans are not treated as verified. The
-checker records an unchecked range when it can establish the affected canonical
-suffix; otherwise it blocks without advancing progress.
+Malformed notifications are not treated as verified.
 
 ## Failure policy
 
 - **Immediate terminal:** invalid local identity, schema, or notification data.
-- **Bounded retry:** unavailable notification/provider data with a finite
-  retry budget.
-- **Transient retry:** temporarily unavailable provider data or an acquisition
-  timeout.
-- **Authenticated divergence:** record a finding before acknowledging the
+- **Retry:** unavailable local or Tempo provider data pauses sequential recovery
+  and retries with bounded backoff.
+- **Authenticated divergence:** record a finding without advancing past the
   block; do not check descendants.
 
-If retries are exhausted, the checker commits the unchecked suffix before
-acknowledging it and disabling checks. Acknowledged blocks in that suffix are not
-verified. Notification-stream loss and queue overflow also fail closed: the
-checker records the canonical unchecked suffix before acknowledging and
-blocking.
+Temporary provider failures never create a coverage gap. The verified tip stays
+at the last authenticated block until recovery succeeds. A coverage gap records
+the descendants left unchecked by an authenticated divergence.
 
 ## Trust assumptions and non-claims
 

@@ -7,16 +7,16 @@ fn same_height_finding_is_idempotent_but_conflicting_evidence_is_rejected() {
     let (_directory, store) = create();
     let (key, value) = finding(block(1, 0x11));
     store
-        .record_finding(&current(&store), key, value.clone())
+        .record_divergence(&current(&store), key, value.clone(), key.zone)
         .unwrap();
     store
-        .record_finding(&current(&store), key, value.clone())
+        .record_divergence(&current(&store), key, value.clone(), key.zone)
         .unwrap();
 
     let mut conflicting = value;
     conflicting.details.actual = Some(Datum::Code(5));
     assert!(matches!(
-        store.record_finding(&current(&store), key, conflicting),
+        store.record_divergence(&current(&store), key, conflicting, key.zone),
         Err(PersistenceError::Invalid(_))
     ));
     assert_eq!(store.load().unwrap().meta.active_finding, Some(key));
@@ -28,9 +28,11 @@ fn finding_identity_ignores_summary_but_separates_codes() {
     let (key, value) = finding(block(1, 0x11));
     let mut reworded = value.clone();
     reworded.summary = "new display wording".into();
-    store.record_finding(&current(&store), key, value).unwrap();
     store
-        .record_finding(&current(&store), key, reworded)
+        .record_divergence(&current(&store), key, value, key.zone)
+        .unwrap();
+    store
+        .record_divergence(&current(&store), key, reworded, key.zone)
         .unwrap();
 
     let mut other_key = key;
@@ -38,7 +40,7 @@ fn finding_identity_ignores_summary_but_separates_codes() {
     let mut other = finding(block(1, 0x11)).1;
     other.details.code = other_key.code;
     store
-        .record_finding(&current(&store), other_key, other)
+        .record_divergence(&current(&store), other_key, other, other_key.zone)
         .unwrap();
     assert_eq!(store.load().unwrap().meta.active_finding, Some(other_key));
 }
@@ -49,21 +51,29 @@ fn finding_rejects_forged_evidence_and_wrong_coordinates() {
     let (key, value) = finding(block(1, 0x11));
     let mut forged = value.clone();
     forged.evidence_len += 1;
-    assert!(store.record_finding(&current(&store), key, forged).is_err());
+    assert!(
+        store
+            .record_divergence(&current(&store), key, forged, key.zone)
+            .is_err()
+    );
     let mut forged = value.clone();
     forged.evidence_digest = B256::ZERO;
-    assert!(store.record_finding(&current(&store), key, forged).is_err());
+    assert!(
+        store
+            .record_divergence(&current(&store), key, forged, key.zone)
+            .is_err()
+    );
     let (wrong_key, wrong) = finding(block(2, 0x12));
     assert!(
         store
-            .record_finding(&current(&store), wrong_key, wrong)
+            .record_divergence(&current(&store), wrong_key, wrong, wrong_key.zone)
             .is_err()
     );
     let mut wrong_parent = value;
     wrong_parent.parent.hash = B256::ZERO;
     assert!(
         store
-            .record_finding(&current(&store), key, wrong_parent)
+            .record_divergence(&current(&store), key, wrong_parent, key.zone)
             .is_err()
     );
 }
@@ -90,7 +100,9 @@ fn finding_retains_typed_state_location_and_multi_block_tempo_coordinate() {
     )
     .unwrap();
     let prior = store.load().unwrap();
-    store.record_finding(&prior, key, value).unwrap();
+    store
+        .record_divergence(&prior, key, value, key.zone)
+        .unwrap();
 
     let tx = store.db.tx().unwrap();
     let persisted = tx.get::<Findings>(key).unwrap().unwrap();
@@ -107,14 +119,8 @@ fn stale_orphan_cannot_be_installed_as_active_finding() {
     let (_directory, store) = create();
     let old = block(1, 0x41);
     let (key, value) = finding(old);
-    store.record_finding(&current(&store), key, value).unwrap();
     store
-        .record_gap(
-            &current(&store),
-            old,
-            old,
-            CoverageGapReason::NotCheckedAncestorDivergence,
-        )
+        .record_divergence(&current(&store), key, value, old)
         .unwrap();
     store.reorg(&current(&store), bootstrap().zone).unwrap();
     let replacement = apply(&store, 1, bootstrap().zone);
@@ -130,30 +136,23 @@ fn stale_orphan_cannot_be_installed_as_active_finding() {
 }
 
 #[test]
-fn divergence_reanchors_a_replaced_gap_start() {
+fn repeated_divergence_preserves_the_farthest_observed_tip() {
     let (directory, store) = create();
-    let old_first = block(1, 0x41);
+    let first = block(1, 0x11);
+    let through = block(3, 0x13);
+    let (key, value) = finding(first);
     store
-        .record_gap(
-            &current(&store),
-            old_first,
-            block(3, 0x43),
-            CoverageGapReason::ProviderUnavailable,
-        )
+        .record_divergence(&current(&store), key, value.clone(), through)
         .unwrap();
-
-    let replacement = block(1, 0x11);
-    let (key, value) = finding(replacement);
     let snapshot = store
-        .record_divergence(&current(&store), key, value, replacement)
+        .record_divergence(&current(&store), key, value, first)
         .unwrap();
-    assert_eq!(snapshot.meta.acknowledged_zone_tip, replacement);
+    assert_eq!(snapshot.meta.observed_zone_tip, through);
     assert_eq!(
         snapshot.meta.coverage,
         Coverage::Gap {
-            first_unchecked: replacement,
-            acknowledged_through: replacement,
-            reason: CoverageGapReason::NotCheckedAncestorDivergence,
+            first_unchecked: first,
+            observed_through: through,
         }
     );
 

@@ -26,9 +26,11 @@ status() {
             return
         fi
 
-        local imported_tip verified_tip active_finding coverage_gap
+        local imported_tip verified_tip observed_tip recovering active_finding coverage_gap
         imported_tip="$(jq -r '.importedTempoTip.number' <<<"$checker_state")"
         verified_tip="$(jq -r '.verifiedZoneTip.number' <<<"$checker_state")"
+        observed_tip="$(jq -r '.observedZoneTip.number' <<<"$checker_state")"
+        recovering="$(jq -r '.recovering' <<<"$checker_state")"
         active_finding="$(jq -r '.activeFinding' <<<"$checker_state")"
         coverage_gap="$(jq -r '.hasCoverageGap' <<<"$checker_state")"
 
@@ -55,6 +57,8 @@ status() {
             printf '  Verified Zone tip:   %s\n' "$verified_tip"
         fi
         printf '\nChecker:\n'
+        printf '  Observed Zone tip:   %s\n' "$observed_tip"
+        printf '  Recovering:          %s\n' "$recovering"
         printf '  Active finding:      %s\n' "$active_finding"
         printf '  Coverage gap:        %s\n' "$coverage_gap"
         printf '\nDurable checker state:\n%s\n' "$checker_state"

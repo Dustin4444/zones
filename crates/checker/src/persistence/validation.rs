@@ -161,27 +161,32 @@ pub(super) fn validate_finding(
 pub(super) fn validate_metadata(meta: &Metadata) -> Result<()> {
     if meta.recovery_checkpoint.height > meta.active_checkpoint.height
         || meta.active_checkpoint.height > meta.verified_zone_tip.number
-        || meta.acknowledged_zone_tip.number < meta.verified_zone_tip.number
+        || meta.observed_zone_tip.number < meta.verified_zone_tip.number
     {
         return Err(invalid("metadata tips or active checkpoint are incoherent"));
     }
-    match &meta.coverage {
-        Coverage::Complete if meta.acknowledged_zone_tip != meta.verified_zone_tip => {
-            Err(invalid("complete coverage tips differ"))
-        }
-        Coverage::Gap {
-            first_unchecked,
-            acknowledged_through,
-            ..
-        } if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
-            || first_unchecked.number > acknowledged_through.number
-            || (first_unchecked.number == acknowledged_through.number
-                && first_unchecked != acknowledged_through)
-            || *acknowledged_through != meta.acknowledged_zone_tip =>
+    match (&meta.coverage, meta.active_finding) {
+        (Coverage::Complete, None) if meta.observed_zone_tip == meta.verified_zone_tip => Ok(()),
+        (Coverage::Recovering, None)
+            if meta.observed_zone_tip.number > meta.verified_zone_tip.number =>
         {
-            Err(invalid("coverage gap coordinates are incoherent"))
+            Ok(())
         }
-        _ => Ok(()),
+        (
+            Coverage::Gap {
+                first_unchecked,
+                observed_through,
+            },
+            Some(finding),
+        ) if finding.zone == *first_unchecked
+            && meta.verified_zone_tip.number.checked_add(1) == Some(first_unchecked.number)
+            && (first_unchecked.number < observed_through.number
+                || first_unchecked == observed_through)
+            && *observed_through == meta.observed_zone_tip =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid("coverage and finding metadata are incoherent")),
     }
 }
 
@@ -189,72 +194,23 @@ pub(super) fn validate_metadata(meta: &Metadata) -> Result<()> {
 pub(super) fn validate_coverage_advance(
     meta: &Metadata,
     child: BlockNumHash,
-    acknowledged: BlockNumHash,
+    observed: BlockNumHash,
     next: &Coverage,
 ) -> Result<()> {
-    if acknowledged.number < meta.acknowledged_zone_tip.number {
-        return Err(invalid("acknowledged tip cannot regress"));
+    if observed.number < meta.observed_zone_tip.number {
+        return Err(invalid("observed tip cannot regress"));
     }
     match (&meta.coverage, next) {
-        (Coverage::Complete, Coverage::Complete) if acknowledged == child => Ok(()),
-        (
-            Coverage::Complete,
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                ..
-            },
-        ) if child.number.checked_add(1) == Some(first_unchecked.number)
-            && *acknowledged_through == acknowledged
-            && acknowledged.number >= first_unchecked.number =>
+        (Coverage::Complete, Coverage::Complete) if observed == child => Ok(()),
+        (Coverage::Recovering, Coverage::Recovering)
+            if child.number == meta.verified_zone_tip.number.saturating_add(1)
+                && observed == meta.observed_zone_tip =>
         {
             Ok(())
         }
-        (
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                reason: _,
-            },
-            Coverage::Complete,
-        ) if child.number == first_unchecked.number
-            && child.number == acknowledged_through.number
-            && acknowledged == child =>
+        (Coverage::Recovering, Coverage::Complete)
+            if child == meta.observed_zone_tip && observed == child =>
         {
-            Ok(())
-        }
-        (
-            Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                reason,
-            },
-            Coverage::Gap {
-                first_unchecked: next_first,
-                acknowledged_through: next_through,
-                reason: next_reason,
-            },
-        ) => {
-            if child.number != first_unchecked.number
-                || child.number.checked_add(1) != Some(next_first.number)
-            {
-                return Err(invalid("gap recovery does not advance by one block"));
-            }
-            if next_first.number > next_through.number {
-                return Err(invalid("gap recovery begins after its endpoint"));
-            }
-            if next_first.number == next_through.number && next_first != next_through {
-                return Err(invalid("single-block gap has conflicting coordinates"));
-            }
-            if next_through.number != acknowledged_through.number {
-                return Err(invalid("gap recovery changes endpoint height"));
-            }
-            if *next_through != *acknowledged_through && next_first != next_through {
-                return Err(invalid("gap recovery changes an unverified endpoint hash"));
-            }
-            if acknowledged != *next_through || next_reason != reason {
-                return Err(invalid("gap recovery changes acknowledgement or reason"));
-            }
             Ok(())
         }
         _ => Err(invalid("coverage transition is inconsistent")),

@@ -11,8 +11,8 @@ use reth_db::{
 use tempfile::TempDir;
 
 use super::{
-    BlockNumHash, ChainCut, Coverage, CoverageGapReason, Finding, FindingKey, Identity,
-    JournalEntry, MetaValue, Persistence, PersistenceError, SCHEMA_VERSION, codec,
+    BlockNumHash, ChainCut, Coverage, Finding, FindingKey, Identity, JournalEntry, MetaValue,
+    Persistence, PersistenceError, SCHEMA_VERSION, codec,
     schema::{Checkpoints, Findings, Journal, Meta, MetaKey, PersistenceTables},
 };
 

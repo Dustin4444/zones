@@ -1,8 +1,26 @@
+use std::time::Duration;
+
 use crate::{
     kernel::{Deposit, DepositOutcome, ImportedOperation, ZoneOperation},
     persistence::{BlockNumHash, Finding},
     runtime::AuthenticatedBlock,
 };
+
+pub(super) fn retry(zone: Option<BlockNumHash>, attempt: u32, delay: Duration, error: &str) {
+    tracing::warn!(
+        target: "zone::checker",
+        zone_block = zone.map(|block| block.number),
+        zone_hash = ?zone.map(|block| block.hash),
+        attempt,
+        retry_in_ms = delay.as_millis(),
+        error,
+        "checker acquisition failed; retrying"
+    );
+}
+
+pub(super) fn terminal(error: &str) {
+    tracing::error!(target: "zone::checker", error, "checker authentication failed permanently");
+}
 
 #[derive(Clone, Copy)]
 struct BlockContext {
@@ -62,13 +80,13 @@ pub(super) fn verified(block: &AuthenticatedBlock) {
     }
 }
 
-pub(super) fn divergence(block: &AuthenticatedBlock, finding: &Finding) {
+pub(super) fn finding(finding: &Finding) {
     tracing::error!(
         target: "zone::checker",
-        zone_block = block.zone.number,
-        zone_hash = %block.zone.hash,
-        tempo_block = block.tempo.number,
-        tempo_hash = %block.tempo.hash,
+        zone_block = finding.zone.number,
+        zone_hash = %finding.zone.hash,
+        tempo_block = finding.imported_tempo.map(|block| block.number),
+        tempo_hash = ?finding.imported_tempo.map(|block| block.hash),
         category = ?finding.details.category,
         code = finding.details.code,
         location = ?finding.details.location,

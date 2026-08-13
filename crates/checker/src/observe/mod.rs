@@ -14,10 +14,7 @@ mod state;
 pub(crate) use abi::ImportedTempoHeader;
 pub(crate) use error::{AcquisitionError, ObservationError};
 #[cfg(test)]
-pub(crate) use error::{
-    AcquisitionSource, AuthenticatedDataEvidence, AuthenticatedTransaction, DataSource,
-    EnvelopeRule, PortalCallError, ProtocolChain,
-};
+pub(crate) use error::{AcquisitionSource, ProtocolChain};
 pub(crate) use l1::{
     L1BlockObservation, acquire_l1_header, acquire_portal_token_balance, observe_l1,
     observe_l1_range,

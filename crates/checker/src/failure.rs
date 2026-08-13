@@ -3,62 +3,38 @@
 use crate::{
     kernel::{Datum, Finding, FindingCategory, FindingLocation},
     observe::{AcquisitionError, ObservationError},
-    persistence::CoverageGapReason,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Policy outcome for a failed observation or comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
-    ImmediateTerminal,
-    BoundedRetry,
-    TransientRetry,
-    AuthenticatedDivergence,
+    Terminal,
+    Retry,
+    Divergence,
 }
 
-#[derive(Debug, Clone)]
 /// A failure together with the durable action it requires.
+#[derive(Debug, Clone)]
 pub(crate) struct Failure {
     pub(crate) class: FailureClass,
-    gap_reason: Option<CoverageGapReason>,
     pub(crate) message: String,
     pub(crate) finding: Option<Box<Finding>>,
 }
 
 impl Failure {
-    /// Construct a failure that stops checking without acknowledgement.
+    /// Construct a failure that stops verification at the current tip.
     pub(crate) fn terminal(message: impl Into<String>) -> Self {
         Self {
-            class: FailureClass::ImmediateTerminal,
-            gap_reason: None,
+            class: FailureClass::Terminal,
             message: message.into(),
             finding: None,
         }
     }
 
-    /// Construct a retryable provider failure.
-    pub(crate) fn transient(message: impl Into<String>) -> Self {
+    /// Construct a retryable acquisition failure.
+    pub(crate) fn retry(message: impl Into<String>) -> Self {
         Self {
-            class: FailureClass::TransientRetry,
-            gap_reason: Some(CoverageGapReason::ProviderUnavailable),
-            message: message.into(),
-            finding: None,
-        }
-    }
-
-    /// Construct a retryable failure for an absent Zone receipt set.
-    pub(crate) fn missing_receipts(message: impl Into<String>) -> Self {
-        Self {
-            class: FailureClass::BoundedRetry,
-            gap_reason: Some(CoverageGapReason::MissingReceipts),
-            message: message.into(),
-            finding: None,
-        }
-    }
-
-    fn incomplete(message: impl Into<String>) -> Self {
-        Self {
-            class: FailureClass::BoundedRetry,
-            gap_reason: Some(CoverageGapReason::MissingTempoData),
+            class: FailureClass::Retry,
             message: message.into(),
             finding: None,
         }
@@ -67,30 +43,16 @@ impl Failure {
     /// Construct a failure that must be persisted as a finding.
     pub(crate) fn authenticated_divergence(message: impl Into<String>, finding: Finding) -> Self {
         Self {
-            class: FailureClass::AuthenticatedDivergence,
-            gap_reason: Some(CoverageGapReason::NotCheckedAncestorDivergence),
+            class: FailureClass::Divergence,
             message: message.into(),
             finding: Some(Box::new(finding)),
         }
-    }
-
-    /// Return the durable coverage reason for a retryable failure.
-    pub(crate) fn gap_reason(&self) -> CoverageGapReason {
-        self.gap_reason
-            .clone()
-            .expect("terminal failures do not create coverage gaps")
     }
 }
 
 impl From<AcquisitionError> for Failure {
     fn from(error: AcquisitionError) -> Self {
-        let message = error.to_string();
-        match error {
-            AcquisitionError::Unavailable { .. } => Self::transient(message),
-            AcquisitionError::Missing { .. } | AcquisitionError::Inconsistent { .. } => {
-                Self::incomplete(message)
-            }
-        }
+        Self::retry(error.to_string())
     }
 }
 

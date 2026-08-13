@@ -14,11 +14,19 @@ use crate::{
 pub struct CheckerSnapshot {
     /// Oldest Zone coordinate from which local reorg recovery is supported.
     pub recovery_zone_tip: BlockNumHash,
+    /// Last Zone block whose checker transition committed durably.
     pub verified_zone_tip: BlockNumHash,
+    /// Imported Tempo tip represented by the verified checker state.
     pub imported_tempo_tip: BlockNumHash,
-    pub acknowledged_zone_tip: BlockNumHash,
+    /// Latest canonical Zone head observed from the local node.
+    pub observed_zone_tip: BlockNumHash,
+    /// Whether observed Zone history remains to be verified.
+    pub recovering: bool,
+    /// Whether an authenticated divergence remains on the canonical branch.
     pub active_finding: bool,
+    /// Whether descendants are durably marked as unchecked.
     pub has_coverage_gap: bool,
+    /// Durable reason verification cannot resume automatically.
     pub blocked_reason: Option<CheckerBlockedReason>,
 }
 
@@ -32,9 +40,10 @@ pub fn inspect_database(path: impl AsRef<Path>) -> eyre::Result<CheckerSnapshot>
         ),
         verified_zone_tip: snapshot.meta.verified_zone_tip.into(),
         imported_tempo_tip: snapshot.meta.imported_tempo_tip.into(),
-        acknowledged_zone_tip: snapshot.meta.acknowledged_zone_tip.into(),
+        observed_zone_tip: snapshot.meta.observed_zone_tip.into(),
+        recovering: matches!(snapshot.meta.coverage, Coverage::Recovering),
         active_finding: snapshot.meta.active_finding.is_some(),
-        has_coverage_gap: !matches!(snapshot.meta.coverage, Coverage::Complete),
+        has_coverage_gap: matches!(snapshot.meta.coverage, Coverage::Gap { .. }),
         blocked_reason: snapshot.meta.blocked,
     })
 }

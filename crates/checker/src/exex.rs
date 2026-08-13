@@ -1,20 +1,23 @@
-//! Reth ExEx integration for acquiring, checking, and acknowledging Zone blocks.
+//! Reth ExEx integration for acquiring and verifying canonical Zone blocks.
 
 use std::{
     collections::BTreeSet,
+    future::Future,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::kernel::{State, TokenPhase, apply_imported};
 use alloy_consensus::BlockHeader as _;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use futures::TryStreamExt;
 use reth_chainspec::EthChainSpec as _;
 use reth_execution_types::Chain;
-use reth_exex::{ExExContext, ExExHead, ExExNotification};
+use reth_exex::{ExExContext, ExExNotification};
 use reth_node_api::{FullNodeComponents, NodeTypes};
-use reth_storage_api::{BlockNumReader, BlockReader, StateProviderFactory};
+use reth_storage_api::{
+    BlockHashReader, BlockNumReader, BlockReader, StateProviderFactory, TransactionVariant,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::{Block, TempoPrimitives, TempoReceipt};
 
@@ -22,57 +25,34 @@ use crate::{
     CheckerBlockedReason, CheckerConfig,
     adapter::{AuthenticatedObservation, adapt},
     failure::Failure,
-    notification::NotificationPlan,
+    kernel::{State, TokenPhase, apply_imported},
     observe::{
         L2BlockObservation, ZonePostStateOutputs, acquire_portal_token_balance,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
     persistence::{BlockNumHash, Identity, Persistence},
     runtime::{
-        AuthenticatedBlock, AuthenticationRequest, EnqueueAction, RetryBudget, Runtime,
-        RuntimeAction, StreamFailureAction,
+        AuthenticatedBlock, AuthenticationFailure, AuthenticationRequest, Runtime, RuntimeAction,
     },
 };
-
-/// A contiguous ExEx chain fragment and its common parent.
-struct ChainFragment {
-    coordinates: Vec<BlockNumHash>,
-    parent: BlockNumHash,
-}
-
-/// Whether notification handling can continue acquiring and checking blocks.
-enum NotificationOutcome {
-    Continue,
-    Disabled,
-    Blocked,
-}
-
-/// Result of an acquisition attempt, including interruption by disabled draining.
-enum AuthenticationOutcome {
-    Acquired(Box<Result<AuthenticatedBlock, Failure>>),
-    Interrupted,
-}
-
-/// Recovery action after the ExEx notification stream fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamFailureDisposition {
-    Reconstruct,
-    Resume,
-    Block,
-}
 
 /// Run the checker ExEx without allowing checker-local failures to finish it.
 pub(super) async fn run<Node>(config: CheckerConfig, mut ctx: ExExContext<Node>) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
-    if let Err(error) = start_and_run(&config, &mut ctx).await {
-        tracing::error!(target: "zone::checker", %error, "checker stopped; retaining the ExEx without acknowledging further work");
+    loop {
+        match start_and_run(&config, &mut ctx).await {
+            Ok(()) => std::future::pending::<()>().await,
+            Err(error) => {
+                tracing::error!(target: "zone::checker", %error, "checker recovery attempt failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
-    std::future::pending::<()>().await;
-    Ok(())
 }
 
 /// Open checker state and drive it until a checker-local failure blocks progress.
@@ -82,7 +62,8 @@ async fn start_and_run<Node>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
 {
     eyre::ensure!(
@@ -93,51 +74,133 @@ where
     let identity = Persistence::inspect_identity(path)?;
     validate_checkpoint_identity(config, ctx.config.chain.chain().id(), identity)?;
     let (store, snapshot) = Persistence::open(path, identity)?;
-    let mut runtime = Runtime::new(snapshot, 32, RetryBudget::new(20, Duration::from_secs(30)));
+    let mut runtime = Runtime::new(snapshot);
 
-    // Resend the persisted acknowledgement, then catch up from the verified tip.
-    if let Err(error) =
-        ctx.send_finished_height(runtime.snapshot().meta.acknowledged_zone_tip.into())
-    {
-        return block_startup(&store, &mut runtime, error);
-    }
+    // The local node retains the replay journal; ExEx notifications only wake recovery.
+    ctx.send_finished_height(runtime.snapshot().meta.verified_zone_tip.into())?;
     if runtime.snapshot().meta.blocked.is_some() {
         tracing::error!(target: "zone::checker", "checker remains blocked from a previous run");
-        return Ok(());
+        return drain_notifications(ctx).await;
     }
-    let (l1_provider, actual_l1_chain_id) = match connect_l1(config).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::error!(target: "zone::checker", %error, "checker could not connect to Tempo; restart to retry");
-            return Ok(());
-        }
-    };
+    let l2_provider = ctx.provider().clone();
+    refresh_canonical_head(&mut runtime, &store, &l2_provider)?;
+    if runtime.snapshot().meta.blocked.is_some() {
+        return drain_notifications(ctx).await;
+    }
+
+    let (l1_provider, actual_l1_chain_id) =
+        connect_l1_while_draining(config, ctx, &store, &mut runtime).await?;
     if actual_l1_chain_id != identity.l1_chain_id {
         runtime.block(&store, CheckerBlockedReason::TempoChainMismatch)?;
         tracing::error!(target: "zone::checker", expected = identity.l1_chain_id, actual = actual_l1_chain_id, "Tempo chain ID does not match the checker checkpoint");
-        return Ok(());
+        return drain_notifications(ctx).await;
     }
-    if let Err(error) = ctx.catch_up_notifications_with_head(ExExHead::new(
-        runtime.snapshot().meta.verified_zone_tip.into(),
-    )) {
-        return block_startup(&store, &mut runtime, error);
-    }
-
-    if let Err(error) = run_loop(config, ctx, &store, identity, &mut runtime, &l1_provider).await {
-        runtime.block(&store, CheckerBlockedReason::RuntimeFailure)?;
-        return Err(error);
-    }
+    run_loop(config, ctx, &store, identity, &mut runtime, &l1_provider).await?;
     Ok(())
 }
 
-/// Persist that startup failed after opening the checker database.
-fn block_startup<N>(
+/// Keep a blocked checker from applying notification-channel backpressure to the node.
+async fn drain_notifications<Node>(ctx: &mut ExExContext<Node>) -> eyre::Result<()>
+where
+    Node: FullNodeComponents,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+{
+    loop {
+        match ctx.notifications.try_next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => eyre::bail!("checker notification stream closed"),
+            Err(error) => {
+                tracing::error!(target: "zone::checker", %error, "checker notification stream failed; resuming direct delivery");
+                ctx.set_notifications_without_head();
+            }
+        }
+    }
+}
+
+/// Await checker work while consuming notification wakeups from the node.
+async fn await_with_notifications<Node, F, T>(
+    ctx: &mut ExExContext<Node>,
     store: &Persistence,
-    runtime: &mut Runtime<N>,
-    error: impl Into<eyre::Report>,
-) -> eyre::Result<()> {
-    runtime.block(store, CheckerBlockedReason::ExExCommunication)?;
-    Err(error.into())
+    runtime: &mut Runtime,
+    future: F,
+) -> eyre::Result<Option<T>>
+where
+    Node: FullNodeComponents,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+    F: Future<Output = T>,
+{
+    if runtime.snapshot().meta.blocked.is_some() {
+        return Ok(None);
+    }
+    let provider = ctx.provider().clone();
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return Ok(Some(output)),
+            next = ctx.notifications.try_next() => {
+                handle_notification(ctx, runtime, store, &provider, next)?;
+                if runtime.snapshot().meta.blocked.is_some() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Restore the newest retained checker checkpoint that remains canonical locally.
+fn reconcile_canonical_head<P>(
+    runtime: &mut Runtime,
+    store: &Persistence,
+    provider: &P,
+) -> eyre::Result<()>
+where
+    P: BlockHashReader + BlockNumReader + ?Sized,
+{
+    let verified = runtime.snapshot().meta.verified_zone_tip;
+    if provider.block_hash(verified.number)? == Some(verified.hash) {
+        if let Some(finding) = runtime.snapshot().meta.active_finding
+            && provider.block_hash(finding.zone.number)? != Some(finding.zone.hash)
+        {
+            runtime.reorg(store, verified)?;
+        }
+        return Ok(());
+    }
+    let head = provider.best_block_number()?;
+    for retained in store.retained_zone_coordinates()?.into_iter().rev() {
+        if retained.number > head {
+            continue;
+        }
+        if provider.block_hash(retained.number)? == Some(retained.hash) {
+            runtime.reorg(store, retained)?;
+            return Ok(());
+        }
+    }
+    tracing::error!(target: "zone::checker", verified_block = verified.number, local_head = head, "Zone reorg exceeds retained checker history");
+    runtime.block(store, CheckerBlockedReason::DeepReorgBeyondRetention)?;
+    Ok(())
+}
+
+/// Reconcile verified history and record the current local canonical head.
+fn refresh_canonical_head<P>(
+    runtime: &mut Runtime,
+    store: &Persistence,
+    provider: &P,
+) -> eyre::Result<()>
+where
+    P: BlockHashReader + BlockNumReader + ?Sized,
+{
+    reconcile_canonical_head(runtime, store, provider)?;
+    if runtime.snapshot().meta.blocked.is_some() {
+        return Ok(());
+    }
+    let number = provider.best_block_number()?;
+    let hash = provider
+        .block_hash(number)?
+        .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
+    runtime.observe_tip(store, BlockNumHash { number, hash })?;
+    Ok(())
 }
 
 /// Connect to Tempo once and authenticate its chain identity.
@@ -154,16 +217,41 @@ async fn connect_l1(config: &CheckerConfig) -> eyre::Result<(DynProvider<TempoNe
     .map_err(|_| eyre::eyre!("Tempo connection attempt timed out"))?
 }
 
-/// Decide whether a failed notification stream left an unchecked suffix.
-fn classify_stream_failure(
-    head: u64,
-    verified: u64,
-    resume_notifications: bool,
-) -> StreamFailureDisposition {
-    match head.cmp(&verified) {
-        std::cmp::Ordering::Greater => StreamFailureDisposition::Reconstruct,
-        std::cmp::Ordering::Equal if resume_notifications => StreamFailureDisposition::Resume,
-        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => StreamFailureDisposition::Block,
+/// Connect to Tempo while continuing to consume and coalesce Zone notifications.
+async fn connect_l1_while_draining<Node>(
+    config: &CheckerConfig,
+    ctx: &mut ExExContext<Node>,
+    store: &Persistence,
+    runtime: &mut Runtime,
+) -> eyre::Result<(DynProvider<TempoNetwork>, u64)>
+where
+    Node: FullNodeComponents,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+{
+    loop {
+        let Some(result) =
+            await_with_notifications(ctx, store, runtime, connect_l1(config)).await?
+        else {
+            eyre::bail!("checker blocked while connecting to Tempo");
+        };
+        let error = match result {
+            Ok(connection) => return Ok(connection),
+            Err(error) => error,
+        };
+        tracing::warn!(target: "zone::checker", %error, "checker could not connect to Tempo; retrying");
+        if await_with_notifications(
+            ctx,
+            store,
+            runtime,
+            tokio::time::sleep(Duration::from_secs(1)),
+        )
+        .await?
+        .is_none()
+        {
+            eyre::bail!("checker blocked while connecting to Tempo");
+        }
     }
 }
 
@@ -173,74 +261,113 @@ async fn run_loop<Node, P>(
     ctx: &mut ExExContext<Node>,
     store: &Persistence,
     identity: Identity,
-    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
+    runtime: &mut Runtime,
     l1_provider: &P,
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
     Node::Types: NodeTypes<Primitives = TempoPrimitives>,
     P: Provider<TempoNetwork>,
 {
-    let mut authentication = None;
-    let mut retry_at: Option<Instant> = None;
-
     loop {
-        let action = match authentication.take() {
-            Some((request, result)) => {
-                runtime.complete_authentication(store, identity, request, result, Instant::now())?
-            }
-            None => runtime.next_action(store, Instant::now())?,
-        };
+        if runtime.snapshot().meta.blocked.is_some() {
+            return drain_notifications(ctx).await;
+        }
+        let action = runtime.next_action(Instant::now());
         match action {
             RuntimeAction::Authenticate(request) => {
-                let result =
-                    authenticate_requested_block(config, ctx, store, runtime, request, l1_provider)
-                        .await?;
-                match result {
-                    AuthenticationOutcome::Acquired(result) => {
-                        authentication = Some((request, *result));
-                    }
-                    AuthenticationOutcome::Interrupted => {}
+                let Some(result) =
+                    authenticate_while_draining(config, ctx, store, runtime, request, l1_provider)
+                        .await?
+                else {
+                    continue;
+                };
+                if let Some(verified) = runtime.complete_authentication(
+                    store,
+                    identity,
+                    request,
+                    result,
+                    Instant::now(),
+                )? {
+                    ctx.send_finished_height(verified.into())?;
                 }
                 continue;
             }
-            RuntimeAction::Acknowledge(height) | RuntimeAction::AcknowledgeAndDisable(height) => {
-                ctx.send_finished_height(height.into())?;
-                if matches!(action, RuntimeAction::AcknowledgeAndDisable(_)) {
-                    tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording an unchecked range");
-                }
-                retry_at = None;
+            RuntimeAction::RetryAt(deadline) => {
+                await_with_notifications(
+                    ctx,
+                    store,
+                    runtime,
+                    tokio::time::sleep_until(deadline.into()),
+                )
+                .await?;
                 continue;
-            }
-            RuntimeAction::RetryAt(deadline) => retry_at = Some(deadline),
-            RuntimeAction::Blocked => {
-                tracing::error!(target: "zone::checker", "checker is blocked and will not acknowledge further notifications");
-                return Ok(());
             }
             RuntimeAction::AwaitNotification => {}
-            RuntimeAction::None if runtime.current().is_some() => continue,
-            RuntimeAction::None => {}
         }
 
-        let next = if let Some(deadline) = retry_at {
-            tokio::select! {
-                value = ctx.notifications.try_next() => Some(value),
-                () = tokio::time::sleep_until(deadline.into()) => None,
-            }
-        } else {
-            Some(ctx.notifications.try_next().await)
-        };
-        let Some(next) = next else { continue };
+        let next = ctx.notifications.try_next().await;
         let l2_state_provider = ctx.provider().clone();
-        if matches!(
-            handle_notification(ctx, runtime, store, &l2_state_provider, next)?,
-            NotificationOutcome::Blocked
-        ) {
-            tracing::error!(target: "zone::checker", "checker is blocked after a notification failure");
-            return Ok(());
-        }
+        handle_notification(ctx, runtime, store, &l2_state_provider, next)?;
     }
+}
+
+/// Authenticate one canonical block while continuing to consume notification wakeups.
+async fn authenticate_while_draining<Node, P>(
+    config: &CheckerConfig,
+    ctx: &mut ExExContext<Node>,
+    store: &Persistence,
+    runtime: &mut Runtime,
+    request: AuthenticationRequest,
+    l1_provider: &P,
+) -> eyre::Result<Option<Result<AuthenticatedBlock, AuthenticationFailure>>>
+where
+    Node: FullNodeComponents,
+    Node::Provider:
+        BlockReader<Block = Block, Receipt = TempoReceipt> + BlockNumReader + StateProviderFactory,
+    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
+    P: Provider<TempoNetwork>,
+{
+    let provider = ctx.provider().clone();
+    let parent = runtime.snapshot().meta.verified_zone_tip;
+    let authentication = tokio::time::timeout(
+        config.acquisition_timeout,
+        authenticate_canonical_zone_block(
+            &provider,
+            request.height(),
+            l1_provider,
+            Arc::clone(&runtime.snapshot().state),
+            config.portal_creation_block_hash,
+            config.zone_id,
+        ),
+    );
+    let Some(result) = await_with_notifications(ctx, store, runtime, authentication).await? else {
+        return Ok(None);
+    };
+    let result = result.unwrap_or_else(|_| {
+        Err(AuthenticationFailure::unlocated(Failure::retry(
+            "checker acquisition timed out",
+        )))
+    });
+    refresh_canonical_head(runtime, store, &provider)?;
+    if runtime.snapshot().meta.blocked.is_some()
+        || runtime.snapshot().meta.verified_zone_tip != parent
+    {
+        return Ok(None);
+    }
+    let coordinate = match &result {
+        Ok(block) => Some(block.zone),
+        Err(failure) => failure.coordinate(),
+    };
+    if let Some(coordinate) = coordinate
+        && provider.block_hash(coordinate.number)? != Some(coordinate.hash)
+    {
+        reconcile_canonical_head(runtime, store, &provider)?;
+        return Ok(None);
+    }
+    Ok(Some(result))
 }
 
 /// Ensure the persisted checker identity matches the active node configuration.
@@ -259,74 +386,14 @@ fn validate_checkpoint_identity(
     Ok(())
 }
 
-/// Authenticate a requested block while continuing to buffer notifications.
-async fn authenticate_requested_block<Node, P>(
-    config: &CheckerConfig,
-    ctx: &mut ExExContext<Node>,
-    store: &Persistence,
-    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
-    request: AuthenticationRequest,
-    l1_provider: &P,
-) -> eyre::Result<AuthenticationOutcome>
-where
-    Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = Block> + BlockNumReader + StateProviderFactory,
-    Node::Types: NodeTypes<Primitives = TempoPrimitives>,
-    P: Provider<TempoNetwork>,
-{
-    let (notification, plan) = runtime
-        .current()
-        .ok_or_else(|| eyre::eyre!("applied index has no current notification"))?;
-    debug_assert!(!plan.applied.is_empty());
-    let l2_chain = match notification {
-        ExExNotification::ChainCommitted { new } | ExExNotification::ChainReorged { new, .. } => {
-            new.clone()
-        }
-        ExExNotification::ChainReverted { .. } => {
-            eyre::bail!("applied plan has no applied fragment");
-        }
-    };
-    let l2_state_provider = ctx.provider().clone();
-    let parent_state = runtime.snapshot().state.clone();
-    let acquisition = authenticate_applied_l2_block(
-        &l2_chain,
-        request.index(),
-        l1_provider,
-        &l2_state_provider,
-        parent_state,
-        config.portal_creation_block_hash,
-        config.zone_id,
-    );
-    tokio::pin!(acquisition);
-    let timeout = tokio::time::sleep(config.acquisition_timeout);
-    tokio::pin!(timeout);
-    let acquired = loop {
-        tokio::select! {
-            result = &mut acquisition => break result,
-            () = &mut timeout => {
-                break Err(Failure::transient("checker acquisition timed out"));
-            }
-            next = ctx.notifications.try_next() => {
-                match handle_notification(ctx, runtime, store, &l2_state_provider, next)? {
-                    NotificationOutcome::Continue => {}
-                    NotificationOutcome::Disabled | NotificationOutcome::Blocked => {
-                        return Ok(AuthenticationOutcome::Interrupted);
-                    }
-                }
-            }
-        }
-    };
-    Ok(AuthenticationOutcome::Acquired(Box::new(acquired)))
-}
-
 /// Handle one notification-stream result and apply its ExEx lifecycle outcome.
 fn handle_notification<Node, P, E>(
     ctx: &mut ExExContext<Node>,
-    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
+    runtime: &mut Runtime,
     store: &Persistence,
     l2_state_provider: &P,
     next: Result<Option<ExExNotification<TempoPrimitives>>, E>,
-) -> eyre::Result<NotificationOutcome>
+) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
     P: BlockNumReader + ?Sized,
@@ -334,124 +401,47 @@ where
 {
     let notification = match next {
         Ok(Some(notification)) => notification,
-        Ok(None) => {
-            return handle_notification_stream_failure(
-                ctx,
-                runtime,
-                store,
-                l2_state_provider,
-                false,
-            );
-        }
+        Ok(None) => eyre::bail!("checker notification stream closed"),
         Err(error) => {
             tracing::error!(target: "zone::checker", %error, "checker notification stream failed; resuming direct notification delivery");
-            return handle_notification_stream_failure(
-                ctx,
-                runtime,
-                store,
-                l2_state_provider,
-                true,
-            );
+            ctx.set_notifications_without_head();
+            refresh_canonical_head(runtime, store, l2_state_provider)?;
+            return Ok(());
         }
     };
-    let plan = match notification_plan(&notification) {
-        Ok(plan) => plan,
-        Err(_) => {
-            runtime.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
-            return Ok(NotificationOutcome::Blocked);
-        }
-    };
-    match runtime.push_planned_or_record_overflow(store, notification, plan)? {
-        EnqueueAction::Queued => Ok(NotificationOutcome::Continue),
-        EnqueueAction::Acknowledge(height) => {
-            ctx.send_finished_height(height.into())?;
-            Ok(NotificationOutcome::Continue)
-        }
-        EnqueueAction::AcknowledgeAndDisable(height) => {
-            ctx.send_finished_height(height.into())?;
-            tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after recording a queue overflow gap");
-            Ok(NotificationOutcome::Disabled)
-        }
-        EnqueueAction::Blocked => Ok(NotificationOutcome::Blocked),
+    if let Err(error) = validate_notification(&notification) {
+        tracing::error!(target: "zone::checker", message = %error.message, "checker received an invalid notification");
+        runtime.block(store, CheckerBlockedReason::InvalidNotificationSequence)?;
+        return Ok(());
     }
+    refresh_canonical_head(runtime, store, l2_state_provider)?;
+    Ok(())
 }
 
-/// Persist the unchecked suffix and retain the ExEx after the notification stream fails.
-fn handle_notification_stream_failure<Node, P>(
-    ctx: &mut ExExContext<Node>,
-    runtime: &mut Runtime<ExExNotification<TempoPrimitives>>,
-    store: &Persistence,
-    provider: &P,
-    resume_notifications: bool,
-) -> eyre::Result<NotificationOutcome>
-where
-    Node: FullNodeComponents,
-    P: BlockNumReader + ?Sized,
-{
-    let tip = runtime.snapshot().meta.verified_zone_tip;
-    let head = provider.best_block_number()?;
-    match classify_stream_failure(head, tip.number, resume_notifications) {
-        StreamFailureDisposition::Reconstruct => {}
-        StreamFailureDisposition::Resume => {
-            ctx.set_notifications_without_head();
-            return Ok(NotificationOutcome::Continue);
-        }
-        StreamFailureDisposition::Block => {
-            runtime.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
-            return Ok(NotificationOutcome::Blocked);
-        }
-    }
-    let mut suffix = Vec::with_capacity((head - tip.number) as usize);
-    for number in tip.number + 1..=head {
-        let hash = provider
-            .block_hash(number)?
-            .ok_or_else(|| eyre::eyre!("canonical Zone block {number} is unavailable"))?;
-        suffix.push(BlockNumHash { number, hash });
-    }
-    match runtime.record_stream_failure(store, &suffix)? {
-        StreamFailureAction::GapRecorded(height) => {
-            tracing::error!(target: "zone::checker", zone_block = height.number, zone_hash = %height.hash, "checker disabled after notification stream failure");
-            if resume_notifications {
-                ctx.send_finished_height(height.into())?;
-                ctx.set_notifications_without_head();
-                Ok(NotificationOutcome::Disabled)
-            } else {
-                runtime.block(store, CheckerBlockedReason::NotificationStreamUnavailable)?;
-                ctx.send_finished_height(height.into())?;
-                Ok(NotificationOutcome::Blocked)
-            }
-        }
-        StreamFailureAction::Blocked => Ok(NotificationOutcome::Blocked),
-    }
-}
-/// Convert a contiguous ExEx notification into a checked runtime plan.
-fn notification_plan(
-    notification: &ExExNotification<TempoPrimitives>,
-) -> Result<NotificationPlan, Failure> {
+/// Validate the internal continuity of one ExEx notification.
+fn validate_notification(notification: &ExExNotification<TempoPrimitives>) -> Result<(), Failure> {
     match notification {
         ExExNotification::ChainCommitted { new } => {
-            let applied = validate_fragment(new, "committed")?;
-            NotificationPlan::new(Vec::new(), applied.coordinates, applied.parent)
+            validate_fragment(new, "committed")?;
         }
         ExExNotification::ChainReverted { old } => {
-            let reverted = validate_fragment(old, "reverted")?;
-            NotificationPlan::new(reverted.coordinates, Vec::new(), reverted.parent)
+            validate_fragment(old, "reverted")?;
         }
         ExExNotification::ChainReorged { old, new } => {
-            let reverted = validate_fragment(old, "reverted")?;
-            let applied = validate_fragment(new, "replacement")?;
-            if reverted.parent != applied.parent {
+            let reverted_parent = validate_fragment(old, "reverted")?;
+            let applied_parent = validate_fragment(new, "replacement")?;
+            if reverted_parent != applied_parent {
                 return Err(Failure::terminal(
                     "reorg fragments have different common ancestors",
                 ));
             }
-            NotificationPlan::new(reverted.coordinates, applied.coordinates, reverted.parent)
         }
     }
+    Ok(())
 }
 
-/// Validate a contiguous chain fragment and derive its coordinates and parent.
-fn validate_fragment(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<ChainFragment, Failure> {
+/// Validate a contiguous chain fragment and return its parent.
+fn validate_fragment(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<BlockNumHash, Failure> {
     let first = chain
         .blocks()
         .values()
@@ -464,10 +454,9 @@ fn validate_fragment(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<Chain
             .ok_or_else(|| Failure::terminal("fragment starts at genesis"))?,
         hash: first.parent_hash(),
     };
-    let mut coordinates: Vec<BlockNumHash> = Vec::with_capacity(chain.len());
+    let mut previous: Option<BlockNumHash> = None;
     for block in chain.blocks().values() {
-        // Each block must directly extend the preceding block in the fragment.
-        if let Some(previous) = coordinates.last()
+        if let Some(previous) = previous
             && (previous.number.checked_add(1) != Some(block.number())
                 || block.parent_hash() != previous.hash)
         {
@@ -475,32 +464,99 @@ fn validate_fragment(chain: &Chain<TempoPrimitives>, kind: &str) -> Result<Chain
                 "{kind} fragment is not contiguous"
             )));
         }
-        coordinates.push(BlockNumHash {
+        previous = Some(BlockNumHash {
             number: block.number(),
             hash: block.hash(),
         });
     }
-    Ok(ChainFragment {
-        coordinates,
-        parent,
-    })
+    Ok(parent)
 }
 
-/// Authenticate one applied L2 block against its L1 import and parent state.
-async fn authenticate_applied_l2_block<P, S>(
-    l2_chain: &Chain<TempoPrimitives>,
-    applied_index: usize,
+/// Acquire a canonical Zone block directly from the local node's retained history.
+async fn authenticate_canonical_zone_block<P, S>(
+    l2_provider: &S,
+    height: u64,
+    l1_provider: &P,
+    parent_state: Arc<State>,
+    portal_creation_block_hash: B256,
+    zone_id: u32,
+) -> Result<AuthenticatedBlock, AuthenticationFailure>
+where
+    P: Provider<TempoNetwork>,
+    S: BlockReader<Block = Block, Receipt = TempoReceipt> + StateProviderFactory + ?Sized,
+{
+    let block = l2_provider
+        .recovered_block(height.into(), TransactionVariant::WithHash)
+        .map_err(|error| AuthenticationFailure::unlocated(Failure::retry(error.to_string())))?
+        .ok_or_else(|| {
+            AuthenticationFailure::unlocated(Failure::retry(format!(
+                "canonical Zone block {height} is unavailable"
+            )))
+        })?;
+    let zone = BlockNumHash {
+        number: block.number(),
+        hash: block.hash(),
+    };
+    let parent = BlockNumHash {
+        number: block.number().checked_sub(1).ok_or_else(|| {
+            AuthenticationFailure::at(
+                zone,
+                zone,
+                Failure::terminal("cannot recover Zone genesis as a child block"),
+            )
+        })?,
+        hash: block.parent_hash(),
+    };
+    let canonical = l2_provider.block_hash(height).map_err(|error| {
+        AuthenticationFailure::at(zone, parent, Failure::retry(error.to_string()))
+    })?;
+    if canonical != Some(zone.hash) {
+        return Err(AuthenticationFailure::at(
+            zone,
+            parent,
+            Failure::retry("Zone block changed during checker acquisition"),
+        ));
+    }
+    let receipts = l2_provider
+        .receipts_by_block(zone.hash.into())
+        .map_err(|error| {
+            AuthenticationFailure::at(zone, parent, Failure::retry(error.to_string()))
+        })?
+        .ok_or_else(|| {
+            AuthenticationFailure::at(
+                zone,
+                parent,
+                Failure::retry("local Zone receipt set is unavailable"),
+            )
+        })?;
+    let observation = observe_l2_block_with_context(&block, &receipts).map_err(|failure| {
+        AuthenticationFailure::at(zone, parent, Failure::from(failure.into_parts().0))
+    })?;
+    authenticate_zone_observation(
+        l1_provider,
+        l2_provider,
+        parent_state,
+        observation,
+        portal_creation_block_hash,
+        zone_id,
+    )
+    .await
+    .map_err(|failure| AuthenticationFailure::at(zone, parent, failure))
+}
+
+/// Authenticate a Zone observation against its imported Tempo block and post-state.
+async fn authenticate_zone_observation<P, S>(
     l1_provider: &P,
     l2_state_provider: &S,
-    parent_state: State,
-    portal_creation_block_hash: alloy_primitives::B256,
+    parent_state: Arc<State>,
+    l2_observation: L2BlockObservation,
+    portal_creation_block_hash: B256,
     zone_id: u32,
 ) -> Result<AuthenticatedBlock, Failure>
 where
     P: Provider<TempoNetwork>,
     S: StateProviderFactory + ?Sized,
 {
-    let l2_observation = observe_applied_l2_block(l2_chain, applied_index)?;
     let imported_l1_header = l2_observation.inputs().advance_tempo().imported_header();
     let portal_address = parent_state
         .portal()
@@ -531,27 +587,6 @@ where
     )
     .await?;
     Ok(authenticated_block)
-}
-
-/// Observe one applied L2 block and its receipts.
-fn observe_applied_l2_block(
-    l2_chain: &Chain<TempoPrimitives>,
-    applied_index: usize,
-) -> Result<L2BlockObservation, Failure> {
-    validate_fragment(l2_chain, "applied")?;
-    let l2_block = l2_chain
-        .blocks()
-        .values()
-        .nth(applied_index)
-        .ok_or_else(|| Failure::terminal("applied block index is out of bounds"))?;
-    let l2_receipts: Vec<TempoReceipt> = l2_chain
-        .receipts_by_block_hash(l2_block.hash())
-        .ok_or_else(|| Failure::missing_receipts("notification is missing receipt set"))?
-        .into_iter()
-        .cloned()
-        .collect();
-    observe_l2_block_with_context(l2_block.as_ref(), &l2_receipts)
-        .map_err(|failure| Failure::from(failure.into_parts().0))
 }
 
 /// Read the post-block Zone state needed to verify the observation.
@@ -645,29 +680,4 @@ where
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{StreamFailureDisposition, classify_stream_failure};
-
-    #[test]
-    fn stream_error_only_resumes_at_the_verified_tip() {
-        assert_eq!(
-            classify_stream_failure(10, 10, true),
-            StreamFailureDisposition::Resume
-        );
-        assert_eq!(
-            classify_stream_failure(11, 10, true),
-            StreamFailureDisposition::Reconstruct
-        );
-        assert_eq!(
-            classify_stream_failure(10, 10, false),
-            StreamFailureDisposition::Block
-        );
-        assert_eq!(
-            classify_stream_failure(9, 10, true),
-            StreamFailureDisposition::Block
-        );
-    }
 }

@@ -87,10 +87,11 @@ impl CheckerCommand {
                                 "number": snapshot.imported_tempo_tip.number,
                                 "hash": snapshot.imported_tempo_tip.hash,
                             },
-                            "acknowledgedZoneTip": {
-                                "number": snapshot.acknowledged_zone_tip.number,
-                                "hash": snapshot.acknowledged_zone_tip.hash,
+                            "observedZoneTip": {
+                                "number": snapshot.observed_zone_tip.number,
+                                "hash": snapshot.observed_zone_tip.hash,
                             },
+                            "recovering": snapshot.recovering,
                             "activeFinding": snapshot.active_finding,
                             "hasCoverageGap": snapshot.has_coverage_gap,
                             "blockedReason": snapshot.blocked_reason,
@@ -110,9 +111,10 @@ impl CheckerCommand {
                         snapshot.imported_tempo_tip.number, snapshot.imported_tempo_tip.hash
                     );
                     println!(
-                        "Acknowledged Zone tip: {}/{}",
-                        snapshot.acknowledged_zone_tip.number, snapshot.acknowledged_zone_tip.hash
+                        "Observed Zone tip:     {}/{}",
+                        snapshot.observed_zone_tip.number, snapshot.observed_zone_tip.hash
                     );
+                    println!("Recovering:            {}", snapshot.recovering);
                     println!("Active finding:       {}", snapshot.active_finding);
                     println!("Coverage gap:         {}", snapshot.has_coverage_gap);
                     println!(

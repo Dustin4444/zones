@@ -14,8 +14,8 @@ use validation::{
 };
 
 pub(crate) use model::{
-    BlockNumHash, ChainCut, Checkpoint, CheckpointId, Coverage, CoverageGapReason, Finding,
-    FindingKey, Identity, JournalEntry, MetaValue, Metadata, Snapshot,
+    BlockNumHash, ChainCut, Checkpoint, CheckpointId, Coverage, Finding, FindingKey, Identity,
+    JournalEntry, MetaValue, Metadata, Snapshot,
 };
 
 use crate::{CheckerBlockedReason, kernel::State};
@@ -36,7 +36,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 6;
+pub(crate) const SCHEMA_VERSION: u32 = 7;
 const CHECKPOINT_INTERVAL: u64 = 64;
 /// Minimum Zone history retained for local reorg recovery.
 ///
@@ -201,7 +201,7 @@ impl Persistence {
             active_checkpoint: id,
             verified_zone_tip: cut.zone,
             imported_tempo_tip: cut.tempo,
-            acknowledged_zone_tip: cut.zone,
+            observed_zone_tip: cut.zone,
             active_finding: None,
             coverage: Coverage::Complete,
             blocked: None,
@@ -219,7 +219,13 @@ impl Persistence {
             MetaValue::Metadata(Box::new(meta.clone())),
         )?;
         tx.commit()?;
-        Ok((this, Snapshot { meta, state }))
+        Ok((
+            this,
+            Snapshot {
+                meta,
+                state: Arc::new(state),
+            },
+        ))
     }
 
     /// Open the sole-writer database handle and reconstruct its active snapshot.
@@ -313,7 +319,10 @@ impl Persistence {
             validate_finding(key, &finding, Some(&meta))?;
         }
         tx.commit()?;
-        Ok(Snapshot { meta, state })
+        Ok(Snapshot {
+            meta,
+            state: Arc::new(state),
+        })
     }
 
     /// Persist one contiguous verified transition and its resulting state.
@@ -321,17 +330,16 @@ impl Persistence {
         &self,
         prior: &Snapshot,
         entry: JournalEntry,
-        acknowledged: BlockNumHash,
+        observed: BlockNumHash,
         coverage: Coverage,
     ) -> Result<Snapshot> {
-        let mut candidate = prior.state.clone();
+        let mut candidate = prior.state.as_ref().clone();
         candidate
             .apply(&entry.delta)
             .map_err(|error| invalid(error.to_string()))?;
         validate_state(&candidate, self.identity)?;
         codec::encode(&entry)?;
-        let candidate_state = candidate.clone();
-        self.write(prior, candidate_state, |tx, meta| {
+        self.write(prior, candidate, |tx, meta, candidate| {
             if entry.zone.number
                 != meta
                     .verified_zone_tip
@@ -344,7 +352,7 @@ impl Persistence {
             {
                 return Err(invalid("journal parent or height mismatch"));
             }
-            validate_coverage_advance(meta, entry.zone, acknowledged, &coverage)?;
+            validate_coverage_advance(meta, entry.zone, observed, &coverage)?;
             if tx.get::<Journal>(entry.zone.number)?.is_some() {
                 return Err(invalid("journal height conflict"));
             }
@@ -352,25 +360,89 @@ impl Persistence {
             meta.verified_zone_tip = entry.zone;
             meta.imported_tempo_tip = entry.imported_tempo;
             meta.coverage = coverage;
-            meta.acknowledged_zone_tip = acknowledged;
+            meta.observed_zone_tip = observed;
             if entry
                 .zone
                 .number
                 .saturating_sub(meta.active_checkpoint.height)
                 >= self.retention.checkpoint_interval
             {
-                self.checkpoint_in_tx(tx, meta, &candidate)?;
+                self.checkpoint_in_tx(tx, meta, candidate)?;
             }
             Ok(())
         })
+    }
+
+    /// Record the latest canonical Zone block retained by the local node.
+    pub(crate) fn record_observed_tip(
+        &self,
+        prior: &Snapshot,
+        observed: BlockNumHash,
+    ) -> Result<Metadata> {
+        if observed == prior.meta.observed_zone_tip {
+            return Ok(prior.meta.clone());
+        }
+        if observed.number < prior.meta.verified_zone_tip.number
+            || (observed.number == prior.meta.verified_zone_tip.number
+                && observed != prior.meta.verified_zone_tip)
+        {
+            return Err(invalid("observed Zone tip precedes verified tip"));
+        }
+        self.write_metadata(prior, |_tx, meta| {
+            let coverage = match meta.coverage {
+                Coverage::Gap {
+                    first_unchecked, ..
+                } => {
+                    if observed.number < first_unchecked.number
+                        || (observed.number == first_unchecked.number
+                            && observed != first_unchecked)
+                    {
+                        return Err(invalid("observed tip precedes the active finding"));
+                    }
+                    Coverage::Gap {
+                        first_unchecked,
+                        observed_through: observed,
+                    }
+                }
+                Coverage::Complete | Coverage::Recovering => {
+                    if observed == meta.verified_zone_tip {
+                        Coverage::Complete
+                    } else {
+                        Coverage::Recovering
+                    }
+                }
+            };
+            meta.observed_zone_tip = observed;
+            meta.coverage = coverage;
+            Ok(())
+        })
+    }
+
+    /// Return retained verified coordinates used to locate a reorg ancestor.
+    pub(crate) fn retained_zone_coordinates(&self) -> Result<Vec<BlockNumHash>> {
+        let tx = self.db.tx()?;
+        let meta = read_metadata(&tx)?;
+        let recovery = tx
+            .get::<Checkpoints>(meta.recovery_checkpoint)?
+            .ok_or_else(|| invalid("recovery checkpoint is missing"))?;
+        let mut coordinates = Vec::new();
+        coordinates.push(recovery.cut.zone);
+        for height in recovery.cut.zone.number.saturating_add(1)..=meta.verified_zone_tip.number {
+            let entry = tx
+                .get::<Journal>(height)?
+                .ok_or_else(|| invalid("retained journal is incomplete"))?;
+            coordinates.push(entry.zone);
+        }
+        tx.commit()?;
+        Ok(coordinates)
     }
 
     /// Persist a checkpoint for the already active snapshot.
     #[cfg(test)]
     pub(crate) fn checkpoint_current(&self, prior: &Snapshot) -> Result<Snapshot> {
         validate_state(&prior.state, self.identity)?;
-        self.write(prior, prior.state.clone(), |tx, meta| {
-            self.checkpoint_in_tx(tx, meta, &prior.state)?;
+        self.write(prior, prior.state.as_ref().clone(), |tx, meta, state| {
+            self.checkpoint_in_tx(tx, meta, state)?;
             Ok(())
         })
     }
@@ -389,24 +461,11 @@ impl Persistence {
         let prior = self.load()?;
         if cut.zone != prior.meta.verified_zone_tip
             || cut.tempo != prior.meta.imported_tempo_tip
-            || state != prior.state
+            || state != *prior.state
         {
             return Err(invalid("checkpoint is not current"));
         }
         self.checkpoint_current(&prior)
-    }
-
-    /// Persist a finding at the next verified Zone coordinate.
-    #[cfg(test)]
-    pub(crate) fn record_finding(
-        &self,
-        prior: &Snapshot,
-        key: FindingKey,
-        finding: Finding,
-    ) -> Result<Snapshot> {
-        self.write(prior, prior.state.clone(), |tx, meta| {
-            Self::record_finding_tx(tx, meta, key, finding)
-        })
     }
 
     /// Atomically persist a divergence finding and its unchecked suffix.
@@ -417,135 +476,64 @@ impl Persistence {
         finding: Finding,
         observed_through: BlockNumHash,
     ) -> Result<Snapshot> {
-        self.write(prior, prior.state.clone(), |tx, meta| {
+        self.write(prior, prior.state.as_ref().clone(), |tx, meta, _state| {
             let first_unchecked = finding.zone;
             if observed_through.number < first_unchecked.number {
                 return Err(invalid("divergence suffix precedes its finding"));
             }
-            let acknowledged_through = match &meta.coverage {
-                Coverage::Complete => observed_through,
+            let observed_through = match meta.coverage {
+                Coverage::Complete | Coverage::Recovering => observed_through,
                 Coverage::Gap {
                     first_unchecked: existing_first,
-                    acknowledged_through: existing_through,
-                    ..
+                    observed_through: existing_through,
                 } => {
                     if existing_first.number != first_unchecked.number {
                         return Err(invalid("divergence does not begin at the coverage gap"));
                     }
-                    if *existing_first != first_unchecked
+                    if existing_first != first_unchecked
                         || observed_through.number >= existing_through.number
                     {
                         observed_through
                     } else {
-                        *existing_through
+                        existing_through
                     }
                 }
             };
             Self::record_finding_tx(tx, meta, key, finding)?;
-            meta.acknowledged_zone_tip = acknowledged_through;
+            meta.observed_zone_tip = observed_through;
             meta.coverage = Coverage::Gap {
                 first_unchecked,
-                acknowledged_through,
-                reason: CoverageGapReason::NotCheckedAncestorDivergence,
+                observed_through,
             };
             Ok(())
         })
     }
 
-    /// Record a durable gap in otherwise contiguous checker coverage.
-    pub(crate) fn record_gap(
-        &self,
-        prior: &Snapshot,
-        first_unchecked: BlockNumHash,
-        acknowledged_through: BlockNumHash,
-        reason: CoverageGapReason,
-    ) -> Result<Snapshot> {
-        self.write(prior, prior.state.clone(), |_tx, meta| {
-            if meta.verified_zone_tip.number.checked_add(1) != Some(first_unchecked.number)
-                || acknowledged_through.number < first_unchecked.number
-                || acknowledged_through.number < meta.acknowledged_zone_tip.number
-            {
-                return Err(invalid("invalid coverage gap range"));
-            }
-            if let Coverage::Gap {
-                first_unchecked: existing_first,
-                reason: existing_reason,
-                ..
-            } = &meta.coverage
-                && (*existing_first != first_unchecked || *existing_reason != reason)
-            {
-                return Err(invalid(
-                    "coverage gap identity cannot change before recovery",
-                ));
-            }
-            meta.acknowledged_zone_tip = acknowledged_through;
-            meta.coverage = Coverage::Gap {
-                first_unchecked,
-                acknowledged_through,
-                reason,
-            };
-            Ok(())
-        })
-    }
-
-    /// Persist that the checker cannot safely advance its acknowledgement watermark.
+    /// Persist that the checker cannot safely advance verification.
     pub(crate) fn record_blocked_current(&self, reason: CheckerBlockedReason) -> Result<Snapshot> {
         let current = self.load()?;
-        self.write(&current, current.state.clone(), |_tx, meta| {
-            meta.blocked = Some(reason);
-            Ok(())
-        })
+        self.write(
+            &current,
+            current.state.as_ref().clone(),
+            |_tx, meta, _state| {
+                meta.blocked = Some(reason);
+                Ok(())
+            },
+        )
     }
 
     /// Rewind durable journal and coverage state to a retained ancestor.
     pub(crate) fn reorg(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         if ancestor.number > prior.meta.verified_zone_tip.number {
-            return self.reorg_unverified(prior, ancestor);
+            return Err(invalid("reorg ancestor exceeds verified history"));
         }
         self.reorg_verified(prior, ancestor)
-    }
-
-    /// Rewind acknowledged coverage that has not yet been verified.
-    fn reorg_unverified(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
-        if ancestor.number > prior.meta.acknowledged_zone_tip.number {
-            return Err(invalid("reorg ancestor exceeds acknowledged history"));
-        }
-        self.write(prior, prior.state.clone(), |_tx, meta| {
-            update_active_finding(meta, ancestor)?;
-            let Coverage::Gap {
-                first_unchecked,
-                reason,
-                ..
-            } = &meta.coverage
-            else {
-                return Err(invalid(
-                    "unverified reorg ancestor has no durable coverage gap",
-                ));
-            };
-            if first_unchecked.number > ancestor.number {
-                return Err(invalid(
-                    "unverified reorg ancestor precedes the coverage gap",
-                ));
-            }
-            let first_unchecked = if first_unchecked.number == ancestor.number {
-                ancestor
-            } else {
-                *first_unchecked
-            };
-            meta.acknowledged_zone_tip = ancestor;
-            meta.coverage = Coverage::Gap {
-                first_unchecked,
-                acknowledged_through: ancestor,
-                reason: reason.clone(),
-            };
-            Ok(())
-        })
     }
 
     /// Reconstruct verified state and remove journal entries after the ancestor.
     fn reorg_verified(&self, prior: &Snapshot, ancestor: BlockNumHash) -> Result<Snapshot> {
         let snapshot = self.reconstruct_at(ancestor)?;
-        self.write(prior, snapshot.state.clone(), |tx, meta| {
+        self.write(prior, snapshot.state.as_ref().clone(), |tx, meta, state| {
             let previous_active = meta.active_checkpoint;
             let previous_recovery = meta.recovery_checkpoint;
             let checkpoint = Checkpoint {
@@ -553,7 +541,7 @@ impl Persistence {
                     zone: ancestor,
                     tempo: snapshot.meta.imported_tempo_tip,
                 },
-                state: snapshot.state.clone(),
+                state: state.clone(),
             };
             let active_checkpoint = CheckpointId::from(ancestor);
             Self::write_checkpoint(tx, active_checkpoint, checkpoint)?;
@@ -567,22 +555,11 @@ impl Persistence {
             meta.verified_zone_tip = ancestor;
             meta.imported_tempo_tip = snapshot.meta.imported_tempo_tip;
             meta.active_checkpoint = active_checkpoint;
-            if meta.acknowledged_zone_tip.number > ancestor.number {
-                meta.acknowledged_zone_tip = ancestor;
+            if meta.observed_zone_tip.number > ancestor.number {
+                meta.observed_zone_tip = ancestor;
             }
-            meta.coverage = match &meta.coverage {
-                Coverage::Gap {
-                    first_unchecked,
-                    reason,
-                    ..
-                } if first_unchecked.number <= ancestor.number => Coverage::Gap {
-                    first_unchecked: *first_unchecked,
-                    acknowledged_through: ancestor,
-                    reason: reason.clone(),
-                },
-                _ => Coverage::Complete,
-            };
-            update_active_finding(meta, ancestor)?;
+            meta.active_finding = None;
+            meta.coverage = Coverage::Complete;
             Self::remove_obsolete_checkpoints(tx, meta, previous_active, previous_recovery)?;
             Ok(())
         })
@@ -636,7 +613,10 @@ impl Persistence {
         out.active_checkpoint = checkpoint_id;
         out.verified_zone_tip = ancestor;
         out.imported_tempo_tip = imported;
-        Ok(Snapshot { meta: out, state })
+        Ok(Snapshot {
+            meta: out,
+            state: Arc::new(state),
+        })
     }
 
     /// Write or verify the immutable checkpoint at the current metadata tips.
@@ -840,6 +820,18 @@ impl Persistence {
     /// Apply one metadata mutation against the expected prior snapshot atomically.
     fn write<F>(&self, prior: &Snapshot, state: State, f: F) -> Result<Snapshot>
     where
+        F: FnOnce(&<DatabaseEnv as Database>::TXMut, &mut Metadata, &State) -> Result<()>,
+    {
+        let meta = self.write_metadata(prior, |tx, meta| f(tx, meta, &state))?;
+        Ok(Snapshot {
+            meta,
+            state: Arc::new(state),
+        })
+    }
+
+    /// Apply a metadata mutation without cloning the unchanged checker state.
+    fn write_metadata<F>(&self, prior: &Snapshot, f: F) -> Result<Metadata>
+    where
         F: FnOnce(&<DatabaseEnv as Database>::TXMut, &mut Metadata) -> Result<()>,
     {
         let tx = self.db.tx_mut()?;
@@ -861,7 +853,7 @@ impl Persistence {
             return Err(PersistenceError::InjectedAbort);
         }
         tx.commit()?;
-        Ok(Snapshot { meta, state })
+        Ok(meta)
     }
 
     /// Make the next write transaction abort before commit.
@@ -923,19 +915,6 @@ fn schema_error(actual: u32, path: &Path) -> PersistenceError {
 /// Construct a durable-data validation error.
 pub(super) fn invalid(message: impl Into<String>) -> PersistenceError {
     PersistenceError::Invalid(message.into())
-}
-
-/// Remove an active finding discarded by a reorg, or reject a height conflict.
-fn update_active_finding(meta: &mut Metadata, ancestor: BlockNumHash) -> Result<()> {
-    if let Some(key) = meta.active_finding {
-        if key.zone.number == ancestor.number && key.zone.hash != ancestor.hash {
-            return Err(invalid("conflicting evidence at finding height"));
-        }
-        if key.zone.number > ancestor.number {
-            meta.active_finding = None;
-        }
-    }
-    Ok(())
 }
 
 /// Return whether two findings retain identical immutable evidence.

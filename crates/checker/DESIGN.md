@@ -22,7 +22,7 @@ state/supply/collateral comparisons
              │
              ▼
 metadata + journal + checkpoint + finding transaction
-             │ commit before acknowledgement
+             │ commit before watermark advance
              ▼
 Reth FinishedHeight
 ```
@@ -45,17 +45,18 @@ source chain alone:
 - `kernel` contains the checker-owned state model, deterministic transitions,
   derived effects, and internal consistency invariants. It has no provider or
   ExEx dependency.
-- `runtime` turns notification plans and authenticated blocks into durable
-  progress, retry, acknowledgement, and coverage-gap decisions.
+- `runtime` turns the locally retained canonical history into durable,
+  sequentially verified progress.
 - `persistence` owns the MDBX schema, codecs, durable model, and atomic
   checkpoint, journal, finding, and reorg updates.
 - `bootstrap` authenticates local Zone genesis and historical Tempo imports to
   construct the initial checkpoint.
-- `exex` is the integration boundary: it receives Reth notifications, keeps
-  buffering them during acquisition, and forwards runtime actions to Reth.
+- `exex` is the integration boundary: notifications wake recovery, canonical
+  replay data comes from the local node, and Reth's watermark follows verified
+  progress.
 
-`failure`, `notification`, and `inspection` provide the shared failure policy,
-notification-plan representation, and public read-only inspection API.
+`failure` and `inspection` provide the shared failure policy and public
+read-only inspection API.
 
 ## Authenticated observation
 
@@ -72,8 +73,8 @@ them against the imported header. It also checks receipt count, order, block
 and transaction coordinates, and the aggregate bloom. It decodes `submitBatch`
 and non-empty `processWithdrawals` calls from those transactions.
 
-Unavailable data is retried and may become a coverage gap. It is never replaced
-with a default value. A contradiction in authenticated data becomes a finding.
+Unavailable data pauses recovery and is retried. It is never replaced with a
+default value. A contradiction in authenticated data becomes a finding.
 
 ## Kernel transitions
 
@@ -134,37 +135,34 @@ On a reorg within the retained history, the checker reconstructs the common
 ancestor from the recovery or active checkpoint and journal, removes the old
 suffix in the same transaction, and applies the replacement branch in order.
 A reorg before the recovery checkpoint durably blocks checking without
-acknowledging further notifications; it requires a rebuilt checker database.
+advancing verified progress; it requires a rebuilt checker database.
 
-A semantic mismatch atomically records a finding without applying the expected
-state delta. Descendants are recorded as `NotCheckedAncestorDivergence`, not as
-verified blocks. A reorg that retains the finding's block keeps it active. A
-reorg that removes the block clears the active finding in the same transaction;
-the finding row remains as an audit record.
+A semantic mismatch atomically records a finding and the observed unchecked
+suffix without applying the expected state delta. A reorg that retains the
+finding's block keeps it active. A reorg that removes the block clears the
+active finding in the same transaction; the finding row remains as an audit
+record.
 
-## Runtime state machine
+## Runtime recovery
 
-The runtime has one current notification and one bounded queue:
+The runtime recovers directly from local canonical history:
 
-- `Starting`: validate state and acquire catch-up work;
-- `Healthy`: follow the canonical stream;
-- `Retrying`: retain work while retrying acquisition;
-- `Alerting`: retain a finding and skip descendants;
-- `Disabled`: stop checking after a terminal failure.
+- `Complete` coverage means the verified and observed tips agree;
+- `Recovering` coverage means retained canonical history remains to be checked;
+- `Gap` coverage is paired with an active authenticated divergence;
+- a blocked reason means durable verification cannot resume automatically.
 
-Notifications containing several blocks are applied one block at a time, each
-with its own commit. The runtime acknowledges a height only after state or a
-coverage gap through that height commits. A crash after commit may resend the
-acknowledgement. A crash before commit leaves the parent state unchanged.
+Notifications only update the observed canonical head. The runtime acquires and
+commits every missing block one at a time. A crash leaves the verified checkpoint
+unchanged and recovery resumes from it.
 
-Retry policy distinguishes immediate terminal, bounded retry, transient retry,
-and authenticated divergence. When retries are exhausted, the unchecked suffix
-is committed as a gap before acknowledgement. Verified and acknowledged tips
-remain separate.
+Temporary acquisition failures retry with bounded backoff. Verified and observed
+tips remain separate, so no unchecked suffix is recorded merely because Tempo is
+temporarily unavailable.
 
-Stream loss triggers canonical catch-up reconstruction rather than trusting
-the next fragment. A malformed or discontinuous `FinishedHeight` update records
-an unchecked range rather than advancing the verified tip.
+Stream loss is harmless while local history remains available: the next wakeup,
+or a restart, resumes direct canonical recovery. A malformed notification blocks
+the checker rather than advancing verified progress.
 
 ## Checkpoint builder
 
@@ -193,8 +191,7 @@ observed data.
 Coverage has three relevant states:
 
 - **verified:** observation, transition, comparisons, and commit succeeded;
-- **acknowledged with gap:** the unchecked range was recorded before
-  acknowledgement;
+- **recovering:** the local canonical head is ahead of verified progress;
 - **ancestor divergence:** a finding stopped checks of descendant blocks.
 
 ## Operational limitations

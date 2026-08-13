@@ -1,5 +1,7 @@
 //! Durable checker records persisted in the local database.
 
+use std::sync::Arc;
+
 use crate::{
     CheckerBlockedReason,
     kernel::{Finding as FindingDetails, State, StateDelta},
@@ -19,12 +21,14 @@ impl From<BlockNumHash> for alloy_eips::BlockNumHash {
         Self::new(value.number, value.hash)
     }
 }
+
 /// The Zone and imported Tempo tips represented by a checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChainCut {
     pub zone: BlockNumHash,
     pub tempo: BlockNumHash,
 }
+
 /// Immutable chain and Portal identity bound to one persistence database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Identity {
@@ -35,41 +39,37 @@ pub(crate) struct Identity {
     pub creation_block: B256,
     pub creation_height: u64,
 }
+
 /// Stable checkpoint key derived from its Zone tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct CheckpointId {
     pub height: u64,
     pub hash: B256,
 }
+
 impl From<BlockNumHash> for CheckpointId {
-    fn from(v: BlockNumHash) -> Self {
+    fn from(value: BlockNumHash) -> Self {
         Self {
-            height: v.number,
-            hash: v.hash,
+            height: value.number,
+            hash: value.hash,
         }
     }
 }
-/// Why a contiguous range of Zone blocks could not be checked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum CoverageGapReason {
-    MissingReceipts,
-    MissingTempoData,
-    ProviderUnavailable,
-    /// The notification is a descendant of a retained finding and therefore
-    /// cannot be checked until that finding is removed by a reorg.
-    NotCheckedAncestorDivergence,
-}
 
-/// Whether checker coverage reaches the acknowledged Zone tip.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Whether checker coverage reaches the observed Zone tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Coverage {
+    /// The verified and observed Zone tips agree.
     Complete,
+    /// Canonical Zone history is retained locally but has not been verified yet.
+    Recovering,
+    /// An active finding prevents verification of the observed suffix.
     Gap {
         first_unchecked: BlockNumHash,
-        acknowledged_through: BlockNumHash,
-        reason: CoverageGapReason,
+        observed_through: BlockNumHash,
     },
 }
+
 /// Mutable durable pointers and coverage state for the active checker history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Metadata {
@@ -77,26 +77,31 @@ pub(crate) struct Metadata {
     /// Oldest checkpoint from which local reorg recovery is supported.
     pub recovery_checkpoint: CheckpointId,
     pub active_checkpoint: CheckpointId,
+    /// Last Zone block represented by the durable checker state.
     pub verified_zone_tip: BlockNumHash,
     pub imported_tempo_tip: BlockNumHash,
-    pub acknowledged_zone_tip: BlockNumHash,
+    /// Latest canonical Zone head observed from the local node.
+    pub observed_zone_tip: BlockNumHash,
     pub active_finding: Option<FindingKey>,
     pub coverage: Coverage,
-    /// Why the checker stopped acknowledging new work.
+    /// Why the checker stopped verifying new work.
     pub blocked: Option<CheckerBlockedReason>,
 }
+
 /// One value stored in the metadata table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MetaValue {
     Version(u32),
     Metadata(Box<Metadata>),
 }
+
 /// A durable state snapshot at a chain cut.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Checkpoint {
     pub cut: ChainCut,
     pub state: State,
 }
+
 /// One verified Zone transition and its imported Tempo advancement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct JournalEntry {
@@ -106,6 +111,7 @@ pub(crate) struct JournalEntry {
     pub imported_tempo_parent: BlockNumHash,
     pub delta: StateDelta,
 }
+
 /// Stable coordinate for one durable checker finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct FindingKey {
@@ -113,6 +119,7 @@ pub(crate) struct FindingKey {
     pub operation: u32,
     pub code: u16,
 }
+
 /// Durable evidence for a checker divergence at one Zone coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Finding {
@@ -125,9 +132,10 @@ pub(crate) struct Finding {
     pub evidence_digest: B256,
     pub summary: String,
 }
+
 /// The currently reconstructed durable checker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub meta: Metadata,
-    pub state: State,
+    pub state: Arc<State>,
 }

@@ -3,122 +3,72 @@
 use super::*;
 
 #[test]
-fn gap_is_durable_before_acknowledgement_advances() {
-    let (directory, store) = create();
-    let first = block(1, 0x31);
-    let through = block(4, 0x34);
-    store
-        .record_gap(
-            &current(&store),
-            first,
-            through,
-            CoverageGapReason::MissingReceipts,
-        )
+fn observed_tip_marks_retained_history_for_recovery() {
+    let (_directory, store) = create();
+    let observed = block(3, 0x33);
+    let snapshot = store
+        .record_observed_tip(&current(&store), observed)
         .unwrap();
-    drop(store);
-    let (_, snapshot) = Persistence::open(directory.path(), identity()).unwrap();
-    assert_eq!(snapshot.meta.acknowledged_zone_tip, through);
+    assert_eq!(snapshot.observed_zone_tip, observed);
+    assert_eq!(snapshot.coverage, Coverage::Recovering);
+    assert!(matches!(
+        store.record_observed_tip(&current(&store), block(0, 0x44)),
+        Err(PersistenceError::Invalid(_))
+    ));
+}
+
+#[test]
+fn observed_tip_extends_an_active_divergence_gap() {
+    let (_directory, store) = create();
+    let first = block(1, 0x11);
+    let through = block(3, 0x13);
+    let (key, value) = finding(first);
+    store
+        .record_divergence(&current(&store), key, value, first)
+        .unwrap();
+
+    let meta = store
+        .record_observed_tip(&current(&store), through)
+        .unwrap();
+    assert_eq!(meta.observed_zone_tip, through);
     assert_eq!(
-        snapshot.meta.coverage,
+        meta.coverage,
         Coverage::Gap {
             first_unchecked: first,
-            acknowledged_through: through,
-            reason: CoverageGapReason::MissingReceipts,
+            observed_through: through,
         }
     );
 }
 
 #[test]
-fn partial_gap_recovery_never_regresses_acknowledgement_or_erases_the_suffix() {
+fn observed_tip_cannot_move_before_an_active_finding() {
     let (_directory, store) = create();
-    let one = block(1, 0x11);
-    let two = block(2, 0x12);
-    let three = block(3, 0x13);
-    let reason = CoverageGapReason::ProviderUnavailable;
+    let first = block(1, 0x11);
+    let (key, value) = finding(first);
     store
-        .record_gap(&current(&store), one, three, reason.clone())
+        .record_divergence(&current(&store), key, value, block(3, 0x13))
         .unwrap();
+
     assert!(matches!(
-        store.apply(
-            &current(&store),
-            entry(1, bootstrap().zone),
-            one,
-            Coverage::Complete
-        ),
+        store.record_observed_tip(&current(&store), bootstrap().zone),
         Err(PersistenceError::Invalid(_))
     ));
-    store
-        .apply(
-            &current(&store),
-            entry(1, bootstrap().zone),
-            three,
-            Coverage::Gap {
-                first_unchecked: two,
-                acknowledged_through: three,
-                reason: reason.clone(),
-            },
-        )
-        .unwrap();
-    store
-        .apply(
-            &current(&store),
-            entry(2, one),
-            three,
-            Coverage::Gap {
-                first_unchecked: three,
-                acknowledged_through: three,
-                reason,
-            },
-        )
-        .unwrap();
-    let snapshot = store
-        .apply(&current(&store), entry(3, two), three, Coverage::Complete)
-        .unwrap();
-    assert_eq!(snapshot.meta.verified_zone_tip, three);
-    assert_eq!(snapshot.meta.acknowledged_zone_tip, three);
-    assert_eq!(snapshot.meta.coverage, Coverage::Complete);
 }
 
 #[test]
-fn gap_advance_rejects_a_start_beyond_or_conflicting_with_its_endpoint() {
+fn gap_requires_a_matching_active_finding() {
     let (_directory, store) = create();
-    let one = block(1, 0x11);
-    let two = block(2, 0x12);
-    let replacement_two = block(2, 0x22);
-    let reason = CoverageGapReason::ProviderUnavailable;
-
-    store
-        .record_gap(&current(&store), one, one, reason.clone())
+    let first = block(1, 0x11);
+    let mut meta = current(&store).meta;
+    meta.observed_zone_tip = first;
+    meta.coverage = Coverage::Gap {
+        first_unchecked: first,
+        observed_through: first,
+    };
+    let tx = store.db.tx_mut().unwrap();
+    tx.put::<Meta>(MetaKey::Metadata, MetaValue::Metadata(Box::new(meta)))
         .unwrap();
-    assert!(matches!(
-        store.apply(
-            &current(&store),
-            entry(1, bootstrap().zone),
-            one,
-            Coverage::Gap {
-                first_unchecked: two,
-                acknowledged_through: one,
-                reason: reason.clone(),
-            },
-        ),
-        Err(PersistenceError::Invalid(_))
-    ));
+    tx.commit().unwrap();
 
-    let (_directory, store) = create();
-    store
-        .record_gap(&current(&store), one, two, reason.clone())
-        .unwrap();
-    assert!(matches!(
-        store.apply(
-            &current(&store),
-            entry(1, bootstrap().zone),
-            two,
-            Coverage::Gap {
-                first_unchecked: replacement_two,
-                acknowledged_through: two,
-                reason,
-            },
-        ),
-        Err(PersistenceError::Invalid(_))
-    ));
+    assert!(matches!(store.load(), Err(PersistenceError::Invalid(_))));
 }
