@@ -1132,12 +1132,23 @@ where
     // local observation.
     // Backfilled blocks carry no producer claim and are judged by parent/anchor/execution/conflict
     // validation only.
-    validate_live_block_sender(
-        schedule,
-        peer_block.live_sender.as_ref(),
-        anchor.number,
-        block_number,
-    )?;
+    if let Some(sender) = peer_block.live_sender.as_ref() {
+        match schedule.leader_for(anchor.number) {
+            Some(record) if &record.leader == sender => {}
+            Some(record) => eyre::bail!(
+                "live block {block_number} for anchor {} was broadcast by {sender}, but the \
+                 schedule assigns that anchor to {} (epoch {})",
+                anchor.number,
+                record.leader,
+                record.epoch,
+            ),
+            None => eyre::bail!(
+                "live block {block_number} embeds anchor {} which no retained leadership record \
+                 governs",
+                anchor.number,
+            ),
+        }
+    }
 
     // 4. All txns in the block execute properly
     let payload = ZonePayloadTypes::block_to_payload(block, None);
@@ -1167,30 +1178,6 @@ where
 
     info!(target: "zone::p2p", block_number, ?hash, "Imported canonical leader block");
     Ok(())
-}
-
-fn validate_live_block_sender(
-    schedule: &LeadershipSchedule,
-    live_sender: Option<&P2pPeerId>,
-    anchor_number: u64,
-    block_number: u64,
-) -> eyre::Result<()> {
-    let Some(sender) = live_sender else {
-        return Ok(());
-    };
-    match schedule.leader_for(anchor_number) {
-        Some(record) if &record.leader == sender => Ok(()),
-        Some(record) => eyre::bail!(
-            "live block {block_number} for anchor {anchor_number} was broadcast by {sender}, but \
-             the schedule assigns that anchor to {} (epoch {})",
-            record.leader,
-            record.epoch,
-        ),
-        None => eyre::bail!(
-            "live block {block_number} embeds anchor {anchor_number} which no retained leadership \
-             record governs",
-        ),
-    }
 }
 
 struct AdvanceTempoPortalInputs {
@@ -1268,7 +1255,7 @@ mod tests {
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, BroadcasterShutdown, EncodedPersistedBlock,
         MAX_PENDING_BLOCKS, PersistedBlockSource, PersistedTip, broadcast_persisted_blocks,
-        buffer_pending_block, validate_live_block_sender,
+        buffer_pending_block,
     };
     use alloy_primitives::B256;
     use zone_l1::{L1BlockTracker, L1PortalEvents};
@@ -1578,7 +1565,6 @@ mod tests {
         use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 
         const ANCHOR_NUMBER: u64 = 10;
-        const ZONE_BLOCK_NUMBER: u64 = 7;
 
         let outgoing = PrivateKey::from_seed(1).public_key();
         let incoming = PrivateKey::from_seed(2).public_key();
@@ -1587,13 +1573,11 @@ mod tests {
         let anchor = NumHash::new(ANCHOR_NUMBER, B256::repeat_byte(0x10));
 
         // The sender is valid under the pre-observation schedule.
-        validate_live_block_sender(&schedule, Some(&outgoing), ANCHOR_NUMBER, ZONE_BLOCK_NUMBER)
-            .unwrap();
+        assert_eq!(schedule.leader_for(ANCHOR_NUMBER).unwrap().leader, outgoing);
 
         let waiter = {
             let schedule = schedule.clone();
             let tracker = tracker.clone();
-            let outgoing = outgoing.clone();
             tokio::spawn(async move {
                 let portal_inputs = AdvanceTempoPortalInputs {
                     deposits: vec![],
@@ -1603,11 +1587,11 @@ mod tests {
                     .wait_for_portal_events_with_timeout(anchor, std::time::Duration::from_secs(1))
                     .await?;
                 portal_inputs.validate(&observed)?;
-                validate_live_block_sender(
-                    &schedule,
-                    Some(&outgoing),
-                    ANCHOR_NUMBER,
-                    ZONE_BLOCK_NUMBER,
+                Ok::<_, eyre::Report>(
+                    schedule
+                        .leader_for(ANCHOR_NUMBER)
+                        .expect("anchor must have a leader")
+                        .leader,
                 )
             })
         };
@@ -1621,23 +1605,23 @@ mod tests {
             .record_with_portal_events(anchor, L1PortalEvents::default())
             .unwrap();
 
-        let error = waiter
+        let leader = waiter
             .await
             .expect("anchor waiter must not panic")
-            .expect_err("the post-observation sender check must reject the outgoing leader");
-        let message = error.to_string();
-        assert!(message.contains(&outgoing.to_string()));
-        assert!(message.contains(&incoming.to_string()));
-        assert!(message.contains("schedule assigns that anchor"));
+            .expect("anchor waiter must succeed");
+        assert_eq!(leader, incoming);
     }
 
     #[test]
     fn forced_recovery_reassigns_live_sender_for_missing_anchors() {
         use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 
-        let outgoing = PrivateKey::from_seed(1).public_key();
         let incoming = PrivateKey::from_seed(2).public_key();
-        let schedule = LeadershipSchedule::seeded(LeadershipState::new(7, outgoing.clone(), 0));
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(
+            7,
+            PrivateKey::from_seed(1).public_key(),
+            0,
+        ));
         schedule
             .install_forced_recovery(8, incoming.clone(), B256::repeat_byte(0x11), 51)
             .unwrap();
@@ -1645,10 +1629,7 @@ mod tests {
             .publish(LeadershipState::new(8, incoming.clone(), 60))
             .unwrap();
 
-        validate_live_block_sender(&schedule, Some(&incoming), 51, 11).unwrap();
-        let error = validate_live_block_sender(&schedule, Some(&outgoing), 51, 11)
-            .expect_err("the crashed leader must not remain authoritative in the recovery window");
-        assert!(error.to_string().contains(&incoming.to_string()));
+        assert_eq!(schedule.leader_for(51).unwrap().leader, incoming);
     }
 
     #[tokio::test]
