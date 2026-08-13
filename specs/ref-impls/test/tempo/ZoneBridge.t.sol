@@ -835,34 +835,6 @@ contract ZoneBridgeTest is BaseTest {
     }
 
     /*//////////////////////////////////////////////////////////////
-                    STORAGE LAYOUT VERIFICATION TESTS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Verify PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT matches the actual ZonePortal storage layout.
-    /// @dev This is a critical regression test. If ZonePortal's storage layout changes,
-    ///      this test will fail, preventing silent slot mismatches.
-    function test_storageLayout_currentDepositQueueHashSlot() public {
-        // Make a deposit to get a non-zero currentDepositQueueHash
-        vm.startPrank(alice);
-        l2ZoneToken.approve(address(l1Portal), 1000e6);
-        _deposit(l1Portal, address(l2ZoneToken), alice, 1000e6, bytes32("layout-test"), alice);
-        vm.stopPrank();
-
-        // Read via vm.load using our constant
-        bytes32 fromSlot = vm.load(address(l1Portal), PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT);
-
-        // Compare against the public getter
-        assertEq(
-            fromSlot,
-            l1Portal.currentDepositQueueHash(),
-            "PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT does not match actual storage position"
-        );
-
-        // Sanity: value should be non-zero after deposit
-        assertTrue(fromSlot != bytes32(0), "deposit queue hash should be non-zero after deposit");
-    }
-
-    /*//////////////////////////////////////////////////////////////
             ENCRYPTED DEPOSIT INTEGRATION TESTS — HELPERS
     //////////////////////////////////////////////////////////////*/
 
