@@ -679,7 +679,10 @@ mod tests {
         .unwrap();
 
         let factory = ZoneEvmFactory::new(reader.clone(), portal);
-        let mut evm = factory.create_evm(db, EvmEnv::default());
+        let mut env = EvmEnv::<TempoHardfork, TempoBlockEnv>::default();
+        env.block_env.inner.timestamp = U256::from(child.inner.timestamp);
+        env.block_env.timestamp_millis_part = child.timestamp_millis_part;
+        let mut evm = factory.create_evm(db, env);
         let calldata = IZoneInbox::advanceTempoCall {
             header: Bytes::from(child_rlp),
             deposits: Vec::new(),
@@ -715,8 +718,8 @@ mod tests {
             B256::from(policy_slot.to_be_bytes()),
             PARENT,
         );
-        assert!(!reader.requested(CHILD, &portal.is_sequencer[sequencer]));
-        assert!(!reader.requested(PARENT, &portal.is_sequencer[sequencer]));
+        assert!(!reader.requested(CHILD, &portal.role[sequencer]));
+        assert!(!reader.requested(PARENT, &portal.role[sequencer]));
         assert!(requests.contains(&child_policy_request));
         assert!(!requests.contains(&parent_policy_request));
         assert!(reader.requested(CHILD, &portal.current_deposit_queue_hash));
