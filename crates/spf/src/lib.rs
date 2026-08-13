@@ -13,12 +13,11 @@ use reth_storage_api::noop::NoopProvider;
 use revm::{Database as _, database::State, database_interface::bal::EvmDatabaseError};
 use tempo_evm::{TempoBlockAssembler, TempoEvmConfig};
 use tempo_primitives::{TempoHeader, TempoPrimitives};
-use zone_precompiles::tempo_state::slots as tempo_state_slots;
-use zone_primitives::constants::{
-    TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_HASH_SLOT,
-    ZONE_INBOX_PROCESSED_NUMBER_SLOT, ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
-    ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+use zone_precompiles::{
+    inbox::slots as inbox_slots, outbox::slots as outbox_slots,
+    tempo_state::slots as tempo_state_slots,
 };
+use zone_primitives::constants::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS, ZONE_OUTBOX_ADDRESS};
 
 mod execution;
 mod mpt;
@@ -66,14 +65,14 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
         read_zone_storage(
             &mut zone_state,
             ZONE_INBOX_ADDRESS,
-            ZONE_INBOX_PROCESSED_HASH_SLOT,
+            inbox_slots::PROCESSED_DEPOSIT_QUEUE_HASH,
         )?
         .to_be_bytes::<32>(),
     );
     let previous_processed_number = read_zone_storage(
         &mut zone_state,
         ZONE_INBOX_ADDRESS,
-        ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+        inbox_slots::PROCESSED_DEPOSIT_NUMBER,
     )?
     .to::<u64>();
 
@@ -206,14 +205,14 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
         read_zone_storage(
             &mut zone_state,
             ZONE_INBOX_ADDRESS,
-            ZONE_INBOX_PROCESSED_HASH_SLOT,
+            inbox_slots::PROCESSED_DEPOSIT_QUEUE_HASH,
         )?
         .to_be_bytes::<32>(),
     );
     let next_processed_number = read_zone_storage(
         &mut zone_state,
         ZONE_INBOX_ADDRESS,
-        ZONE_INBOX_PROCESSED_NUMBER_SLOT,
+        inbox_slots::PROCESSED_DEPOSIT_NUMBER,
     )?
     .to::<u64>();
     let has_withdrawal_finalization = witness
@@ -225,14 +224,14 @@ pub fn prove_zone_batch(config: &SpfConfig, witness: BatchWitness) -> Result<Bat
             read_zone_storage(
                 &mut zone_state,
                 ZONE_OUTBOX_ADDRESS,
-                ZONE_OUTBOX_LAST_BATCH_HASH_SLOT,
+                outbox_slots::WITHDRAWAL_QUEUE_HASH,
             )?
             .to_be_bytes::<32>(),
         );
         let index_slot = read_zone_storage(
             &mut zone_state,
             ZONE_OUTBOX_ADDRESS,
-            ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT,
+            outbox_slots::WITHDRAWAL_BATCH_INDEX,
         )?;
         // The index occupies the low 64 bits of a packed Solidity slot.
         (hash, index_slot.as_limbs()[0])

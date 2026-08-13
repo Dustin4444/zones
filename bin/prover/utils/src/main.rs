@@ -31,8 +31,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 use zone_chainspec::ZoneChainSpec;
-use zone_precompiles::tempo_state::slots as tempo_state_slots;
-use zone_primitives::constants::{ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT, zone_chain_id};
+use zone_precompiles::{outbox::slots as outbox_slots, tempo_state::slots as tempo_state_slots};
+use zone_primitives::constants::zone_chain_id;
 use zone_rpc::{
     ZoneProvider, ZoneProviderConfig,
     types::{TempoStorageRead, ZoneExecutionWitness},
@@ -960,7 +960,7 @@ async fn withdrawal_batch_index_at(
     block_number: u64,
 ) -> Result<u64> {
     let index = zone
-        .get_storage_at(ZONE_OUTBOX_ADDRESS, ZONE_OUTBOX_LAST_BATCH_INDEX_SLOT)
+        .get_storage_at(ZONE_OUTBOX_ADDRESS, outbox_slots::WITHDRAWAL_BATCH_INDEX)
         .block_id(BlockId::number(block_number))
         .await?;
     Ok(index.as_limbs()[0])

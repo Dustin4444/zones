@@ -73,10 +73,7 @@ use zone_l1::{
 use zone_node::{ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig};
 use zone_p2p::{LeadershipSchedule, LeadershipState, P2pConfig, P2pPeerId, Role};
 use zone_precompiles::ZONE_FEE_MANAGER_ADDRESS;
-use zone_primitives::constants::{
-    ZONE_INBOX_ADDRESS, ZONE_INBOX_PROCESSED_TOKEN_ENABLEMENT_HASH_SLOT,
-    zone_chain_id as derive_zone_chain_id,
-};
+use zone_primitives::constants::{ZONE_INBOX_ADDRESS, zone_chain_id as derive_zone_chain_id};
 
 #[path = "../../../rpc/test-utils/auth_tokens.rs"]
 mod auth_tokens;
@@ -2817,7 +2814,7 @@ async fn patch_clean_portal_snapshot<P: Provider<TempoNetwork>>(
         .storage
         .get_or_insert_with(Default::default)
         .insert(
-            ZONE_INBOX_PROCESSED_TOKEN_ENABLEMENT_HASH_SLOT,
+            zone_precompiles::inbox::slots::PROCESSED_TOKEN_ENABLEMENT_HASH.into(),
             token_enablement_hash,
         );
     Ok(())
