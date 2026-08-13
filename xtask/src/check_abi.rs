@@ -47,7 +47,9 @@ const INTERFACES: &[InterfaceSpec] = &[
         artifact_name: "IZoneInbox",
         source: "IZone.sol",
         rust: || AbiSurface::from_abi(&tempo_zone_contracts::IZoneInbox::abi::contract()),
-        // Alloy's generated JSON ABI currently omits names from a nested struct's components.
+        // FIXME: Bump to an Alloy release containing alloy-rs/core#1162, then remove both
+        // `advanceTempo` exemptions. Alloy's generated JSON ABI currently omits names from a
+        // nested struct's components.
         ignored_rust_functions: &[concat!(
             "function advanceTempo(bytes header, ",
             "tuple(uint8 depositType, bytes depositData, bool rejected)[] deposits, ",
