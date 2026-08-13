@@ -52,40 +52,6 @@ pub const ZONE_FEE_MANAGER_ADDRESS: Address =
 /// Default zone token address (pathUSD TIP-20).
 pub const ZONE_TOKEN_ADDRESS: Address = address!("0x20C0000000000000000000000000000000000000");
 
-/// ZonePortal storage slot 0: `admin` (address).
-pub const PORTAL_ADMIN_SLOT: B256 = B256::ZERO;
-
-/// ZonePortal storage slot 3: `currentDepositQueueHash` (bytes32).
-pub const PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT: B256 = B256::with_last_byte(3);
-
-/// ZonePortal storage slot 5: `_encryptionKeys` dynamic array.
-pub const PORTAL_ENCRYPTION_KEYS_SLOT: B256 = B256::with_last_byte(5);
-
-/// ZonePortal storage slot 6: `_tokenConfigs` mapping.
-pub const PORTAL_TOKEN_CONFIGS_SLOT: B256 = B256::with_last_byte(6);
-
-/// ZonePortal storage slot 26: append-only token-enablement commitment.
-pub const PORTAL_TOKEN_ENABLEMENT_HASH_SLOT: B256 = B256::with_last_byte(26);
-
-/// ZonePortal storage slot 19: `isSequencer` (mapping(address => bool)).
-pub const PORTAL_IS_SEQUENCER_SLOT: B256 = B256::with_last_byte(19);
-
-/// ZonePortal storage slot immediately following Tempo's exported `isSequencer` slot:
-/// `role` (mapping(address => Role)).
-pub const PORTAL_ROLE_SLOT: B256 = B256::with_last_byte(20);
-
-/// ZonePortal slot following `role`: packed account and gateway enforcement booleans.
-pub const PORTAL_ENFORCEMENT_MODES_SLOT: B256 = B256::with_last_byte(21);
-
-/// ZonePortal storage slot 22: `maxTempoGasRate` (uint128).
-pub const PORTAL_MAX_TEMPO_GAS_RATE_SLOT: B256 = B256::with_last_byte(22);
-
-/// Alias used by consumers reading account allowlist enforcement.
-pub const PORTAL_ACCESS_MODE_SLOT: B256 = PORTAL_ENFORCEMENT_MODES_SLOT;
-
-/// Alias used by consumers reading callback gateway enforcement.
-pub const PORTAL_GATEWAY_MODE_SLOT: B256 = PORTAL_ENFORCEMENT_MODES_SLOT;
-
 // ---------------------------------------------------------------------------
 //  Storage slot constants for the proof system
 // ---------------------------------------------------------------------------

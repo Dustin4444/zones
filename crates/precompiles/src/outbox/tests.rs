@@ -7,13 +7,10 @@ use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     storage::{StorageCtx, StorageKey},
     test_util::TIP20Setup,
-    zone_factory::ZonePortalStorage,
+    zone_factory::{ZonePortalStorage, zone_portal_slots},
 };
 use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
-use zone_primitives::constants::{
-    PORTAL_ENFORCEMENT_MODES_SLOT, PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
-    PORTAL_ROLE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT, TEMPO_STATE_ADDRESS,
-};
+use zone_primitives::constants::TEMPO_STATE_ADDRESS;
 
 use crate::{
     create_outbox_precompile,
@@ -48,7 +45,7 @@ impl Harness {
         let token = tempo_precompiles::PATH_USD_ADDRESS;
         let l1 = MockL1Reader::default();
         let sequencer_membership_slot =
-            keccak256((SEQUENCER, PORTAL_IS_SEQUENCER_SLOT).abi_encode());
+            keccak256((SEQUENCER, zone_portal_slots::IS_SEQUENCER).abi_encode());
         l1.insert(
             PORTAL,
             sequencer_membership_slot.into(),
@@ -57,13 +54,13 @@ impl Harness {
         );
         l1.insert(
             PORTAL,
-            token.mapping_slot(PORTAL_TOKEN_CONFIGS_SLOT.into()),
+            token.mapping_slot(zone_portal_slots::TOKEN_CONFIGS),
             ANCHOR,
             U256::ONE,
         );
         l1.insert(
             PORTAL,
-            PORTAL_MAX_TEMPO_GAS_RATE_SLOT.into(),
+            zone_portal_slots::MAX_TEMPO_GAS_RATE,
             ANCHOR,
             U256::from(TEST_MAX_TEMPO_GAS_RATE),
         );
@@ -197,7 +194,7 @@ impl Harness {
     fn set_max_tempo_gas_rate(&self, max: u128) {
         self.l1.insert(
             PORTAL,
-            PORTAL_MAX_TEMPO_GAS_RATE_SLOT.into(),
+            zone_portal_slots::MAX_TEMPO_GAS_RATE,
             ANCHOR,
             U256::from(max),
         );
@@ -207,11 +204,11 @@ impl Harness {
         let modes =
             U256::from(u8::from(access_enforced)) | (U256::from(u8::from(gateway_enforced)) << 8);
         self.l1
-            .insert(PORTAL, PORTAL_ENFORCEMENT_MODES_SLOT.into(), ANCHOR, modes);
+            .insert(PORTAL, zone_portal_slots::IS_ACCESS_ENFORCED, ANCHOR, modes);
     }
 
     fn set_role(&self, account: Address, role: IZonePortal::Role) {
-        let slot = keccak256((account, PORTAL_ROLE_SLOT).abi_encode());
+        let slot = keccak256((account, zone_portal_slots::ROLE).abi_encode());
         self.l1
             .insert(PORTAL, slot.into(), ANCHOR, U256::from(role as u8));
     }
@@ -219,7 +216,7 @@ impl Harness {
     fn set_token_enabled(&self, enabled: bool) {
         self.l1.insert(
             PORTAL,
-            self.token.mapping_slot(PORTAL_TOKEN_CONFIGS_SLOT.into()),
+            self.token.mapping_slot(zone_portal_slots::TOKEN_CONFIGS),
             ANCHOR,
             U256::from(u8::from(enabled)),
         );

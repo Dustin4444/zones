@@ -3,7 +3,7 @@
 //! Run with: `cargo test -p zone-node --test advance_tempo -- --nocapture`
 
 use alloy_evm::{Evm, EvmEnv, EvmFactory};
-use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
+use alloy_primitives::{Address, Bytes, U256, address, keccak256};
 use alloy_sol_types::{SolCall, sol};
 use revm::{
     context::result::{ExecutionResult, Output},

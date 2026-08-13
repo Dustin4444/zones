@@ -1,31 +1,30 @@
 //! Programmatic conformance tests for Solidity and native Rust storage layouts.
 
 use super::{RustStorageField, artifact, assert_layout};
+use tempo_precompiles::zone_factory::zone_portal_slots;
 use tempo_precompiles::test_util::storage_conformance::{RustStorageSlot, assert_foundry_slots};
 use tempo_precompiles_macros::gen_test_fields_layout as layout_fields;
-use zone_primitives::constants::{
-    PORTAL_ADMIN_SLOT, PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT, PORTAL_ENCRYPTION_KEYS_SLOT,
-    PORTAL_ENFORCEMENT_MODES_SLOT, PORTAL_IS_SEQUENCER_SLOT, PORTAL_MAX_TEMPO_GAS_RATE_SLOT,
-    PORTAL_ROLE_SLOT, PORTAL_TOKEN_CONFIGS_SLOT, PORTAL_TOKEN_ENABLEMENT_HASH_SLOT,
-};
 
 #[test]
 fn zone_portal_slot_constants_match_solidity() {
     let fields = [
-        ("admin", PORTAL_ADMIN_SLOT),
+        ("admin", zone_portal_slots::ADMIN),
         (
             "currentDepositQueueHash",
-            PORTAL_CURRENT_DEPOSIT_QUEUE_HASH_SLOT,
+            zone_portal_slots::CURRENT_DEPOSIT_QUEUE_HASH,
         ),
-        ("_encryptionKeys", PORTAL_ENCRYPTION_KEYS_SLOT),
-        ("_tokenConfigs", PORTAL_TOKEN_CONFIGS_SLOT),
-        ("isSequencer", PORTAL_IS_SEQUENCER_SLOT),
-        ("role", PORTAL_ROLE_SLOT),
-        ("_isAccessEnforced", PORTAL_ENFORCEMENT_MODES_SLOT),
-        ("maxTempoGasRate", PORTAL_MAX_TEMPO_GAS_RATE_SLOT),
-        ("tokenEnablementHash", PORTAL_TOKEN_ENABLEMENT_HASH_SLOT),
+        ("_encryptionKeys", zone_portal_slots::ENCRYPTION_KEYS),
+        ("_tokenConfigs", zone_portal_slots::TOKEN_CONFIGS),
+        ("isSequencer", zone_portal_slots::IS_SEQUENCER),
+        ("role", zone_portal_slots::ROLE),
+        ("_isAccessEnforced", zone_portal_slots::IS_ACCESS_ENFORCED),
+        ("maxTempoGasRate", zone_portal_slots::MAX_TEMPO_GAS_RATE),
+        (
+            "tokenEnablementHash",
+            zone_portal_slots::TOKEN_ENABLEMENT_HASH,
+        ),
     ]
-    .map(|(name, slot)| RustStorageSlot::new(name, slot.into()));
+    .map(|(name, slot)| RustStorageSlot::new(name, slot));
     assert_foundry_slots(&artifact("ZonePortal"), &fields);
 }
 
