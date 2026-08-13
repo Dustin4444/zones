@@ -1108,14 +1108,11 @@ where
         );
     }
 
-    // 3. Require the embedded L1 header and portal inputs to match an
-    // independently observed L1 anchor. Execution validates the checkpoint
-    // transition against Zone state.
+    // 3. Decode the `advanceTempo` call and compare it against an independently observed L1 anchor.
     let (l1_header, portal_inputs) = decode_advance_tempo(&block)?;
     let anchor = l1_header.num_hash();
 
-    // Observe and validate the anchor before authenticating a live sender. The anchor itself can
-    // finalize a leadership transition that assigns the sender for this block.
+    // Await the anchor and its portal events.
     let observed = l1_block_tracker
         .wait_for_portal_events_with_timeout(anchor, Duration::from_secs(30))
         .await
@@ -1125,13 +1122,13 @@ where
                 anchor.number, anchor.hash
             )
         })?;
+
+    // Validate the `advanceTempo` inputs against the portal events.
     portal_inputs.validate(&observed)?;
 
-    // The L1 subscriber applies any transition finalized by this anchor before recording the
-    // anchor. Authenticate only against that post-anchor schedule so a new leader cannot race the
-    // local observation.
-    // Backfilled blocks carry no producer claim and are judged by parent/anchor/execution/conflict
-    // validation only.
+    // Validate the live block sender against the leadership schedule.
+    //
+    // This is only safe to do after the anchor has been awaited to avoid a race condition.
     if let Some(sender) = peer_block.live_sender.as_ref() {
         match schedule.leader_for(anchor.number) {
             Some(record) if &record.leader == sender => {}
@@ -1150,14 +1147,14 @@ where
         }
     }
 
-    // 4. All txns in the block execute properly
+    // 4. Execute the block.
     let payload = ZonePayloadTypes::block_to_payload(block, None);
     let status = engine.new_payload(payload).await?;
     if !status.is_valid() {
         eyre::bail!("execution engine rejected peer block {block_number} ({hash}): {status:?}");
     }
 
-    // 5. Forkchoice
+    // 5. Commit and finalize the block.
     let forkchoice = ForkchoiceState::same_hash(hash);
     let result = engine.fork_choice_updated(forkchoice, None).await?;
     if !result.is_valid() {
