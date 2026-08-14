@@ -17,13 +17,18 @@ fn zone_portal_slot_constants_match_solidity() {
         ),
         ("_encryptionKeys", zone_portal_slots::ENCRYPTION_KEYS),
         ("_tokenConfigs", zone_portal_slots::TOKEN_CONFIGS),
-        ("isSequencer", zone_portal_slots::IS_SEQUENCER),
         ("role", zone_portal_slots::ROLE),
         ("_isAccessEnforced", zone_portal_slots::IS_ACCESS_ENFORCED),
+        ("_isGatewayEnforced", zone_portal_slots::IS_GATEWAY_ENFORCED),
         ("maxTempoGasRate", zone_portal_slots::MAX_TEMPO_GAS_RATE),
+        ("pauseExpiry", zone_portal_slots::PAUSE_EXPIRY),
         (
             "tokenEnablementHash",
             zone_portal_slots::TOKEN_ENABLEMENT_HASH,
+        ),
+        (
+            "abdicationEffectiveAt",
+            zone_portal_slots::ABDICATION_EFFECTIVE_AT,
         ),
     ]
     .map(|(name, slot)| RustStorageSlot::new(name, slot));

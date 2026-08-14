@@ -7,6 +7,7 @@ import { ITIP403Registry } from "tempo-std/interfaces/ITIP403Registry.sol";
 
 import {
     BlockTransition,
+    Capability,
     Deposit,
     DepositPayload,
     DepositQueueTransition,
@@ -20,6 +21,7 @@ import {
     PORTAL_ENCRYPTION_KEYS_SLOT,
     PORTAL_LEADER_ACTIVATION_TEMPO_BLOCK_SLOT,
     PORTAL_LEADER_SLOT,
+    PORTAL_ROLE_SLOT,
     Role,
     Withdrawal,
     WithdrawalBounceBackDeposit,
@@ -196,9 +198,8 @@ contract ZonePortalInitializationForwarder {
     )
         external
     {
-        address[] memory accounts = new address[](2);
+        address[] memory accounts = new address[](1);
         accounts[0] = portalAdmin;
-        accounts[1] = sequencer;
         address[] memory gateways = new address[](1);
         gateways[0] = portalMessenger;
         address[] memory sequencers = new address[](1);
@@ -251,6 +252,43 @@ contract ZonePortalProxyStorageTest is Test {
                 sequencers,
                 1,
                 ZONE_VERIFIER_ADDRESS,
+                ""
+            );
+    }
+
+    function test_initialize_rejectsMessengerAsAllowedAccount() public {
+        ZonePortal implementation = new ZonePortal();
+        address proxy = makeAddr("portal proxy");
+        vm.etch(
+            proxy,
+            abi.encodePacked(
+                hex"363d3d373d3d3d363d73",
+                address(implementation),
+                hex"5af43d82803e903d91602b57fd5bf3"
+            )
+        );
+
+        address portalMessenger = makeAddr("messenger");
+        address[] memory allowedAccounts = new address[](1);
+        allowedAccounts[0] = portalMessenger;
+        address[] memory sequencers = new address[](1);
+        sequencers[0] = makeAddr("sequencer");
+
+        vm.prank(ZONE_FACTORY_ADDRESS);
+        vm.expectRevert();
+        ZonePortal(proxy)
+            .initialize(
+                1,
+                makeAddr("initial token"),
+                true,
+                true,
+                allowedAccounts,
+                _emptyAddresses(),
+                portalMessenger,
+                makeAddr("admin"),
+                sequencers,
+                1,
+                makeAddr("verifier"),
                 ""
             );
     }
@@ -367,8 +405,6 @@ contract ZonePortalProxyStorageTest is Test {
         emit IZonePortal.RoleUpdated(portalMessenger, Role.None, Role.CallbackGateway);
         vm.expectEmit(true, false, false, true, proxy);
         emit IZonePortal.RoleUpdated(makeAddr("admin 1"), Role.None, Role.Account);
-        vm.expectEmit(true, false, false, true, proxy);
-        emit IZonePortal.RoleUpdated(makeAddr("sequencer 1"), Role.None, Role.Account);
     }
 
     function test_initializeRevertsIfTokenPolicyBindingIsNotSet() public {
@@ -449,9 +485,8 @@ contract ZonePortalProxyStorageTest is Test {
     }
 
     function _proxyAccounts(uint32 id) internal returns (address[] memory accounts) {
-        accounts = new address[](2);
+        accounts = new address[](1);
         accounts[0] = makeAddr(string.concat("admin ", vm.toString(id)));
-        accounts[1] = makeAddr(string.concat("sequencer ", vm.toString(id)));
     }
 
     function _proxyGateways(address gateway) internal pure returns (address[] memory gateways) {
@@ -473,8 +508,13 @@ contract ZonePortalProxyStorageTest is Test {
             initialSequencer,
             "slot 18: sequencer mismatch"
         );
-        bytes32 membershipSlot = keccak256(abi.encode(initialSequencer, uint256(19)));
-        assertEq(uint256(vm.load(target, membershipSlot)), 1, "slot 19: membership mismatch");
+        assertEq(uint256(vm.load(target, bytes32(uint256(19)))), 0, "slot 19: reserved");
+        bytes32 membershipSlot = keccak256(abi.encode(initialSequencer, PORTAL_ROLE_SLOT));
+        assertEq(
+            uint256(vm.load(target, membershipSlot)),
+            uint8(Role.Sequencer),
+            "slot 20: membership mismatch"
+        );
 
         bytes32 slot23 = vm.load(target, bytes32(uint256(23)));
         assertEq(address(uint160(uint256(slot23))), initialSequencer, "slot 23: leader mismatch");
@@ -1053,6 +1093,51 @@ contract ZonePortalTest is BaseTest {
         portal.setSequencerSet(signers, 2);
     }
 
+    function test_setSequencerSet_rejectsAssignedRoles() public {
+        address[] memory signers = new address[](2);
+        signers[0] = sequencer;
+        signers[1] = alice;
+        vm.prank(admin);
+        vm.expectRevert();
+        portal.setSequencerSet(signers, 2);
+
+        signers[1] = address(zoneGateway);
+        vm.prank(admin);
+        vm.expectRevert();
+        portal.setSequencerSet(signers, 2);
+    }
+
+    function test_setSequencerSet_allowsAdminAsSequencer() public {
+        address[] memory signers = new address[](2);
+        signers[0] = sequencer;
+        signers[1] = admin;
+
+        vm.startPrank(admin);
+        portal.setAllowedAccount(admin, false);
+        portal.setSequencerSet(signers, 2);
+        vm.stopPrank();
+
+        assertTrue(portal.isSequencer(admin));
+        assertTrue(portal.hasRole(admin, Role.Sequencer));
+        assertEq(portal.admin(), admin);
+    }
+
+    function test_roleSetters_cannotModifySequencers() public {
+        vm.startPrank(admin);
+        vm.expectRevert();
+        portal.setAllowedAccount(sequencer, true);
+        vm.expectRevert();
+        portal.setGateway(sequencer, true);
+        vm.expectRevert();
+        portal.setAllowedAccount(sequencer, false);
+        vm.expectRevert();
+        portal.setGateway(sequencer, false);
+        vm.stopPrank();
+
+        assertTrue(portal.isSequencer(sequencer));
+        assertTrue(portal.hasRole(sequencer, Role.Sequencer));
+    }
+
     function test_setSequencerSet_acceptsAnyOrderAndComparesMembership() public {
         address[] memory base = _sequencerSet();
         // Keep the active leader in the set; dropping it is rejected (ActiveLeaderRemoved).
@@ -1097,6 +1182,7 @@ contract ZonePortalTest is BaseTest {
 
         assertEq(portal.sequencerSetVersion(), 3);
         assertFalse(portal.isSequencer(removed));
+        assertTrue(portal.hasRole(removed, Role.None));
     }
 
     function test_allSequencersCanCallSequencerConfigurationMethods() public {
@@ -1401,6 +1487,268 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.areDepositsActive(address(pathUSD)));
     }
 
+    function test_pause_blocksDepositsAndWithdrawalProcessingButAllowsBatchSubmission() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        assertTrue(portal.paused());
+        assertEq(portal.pauseExpiry(), block.timestamp + 30 days);
+        assertFalse(portal.areDepositsActive(address(pathUSD)));
+
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.deposit(address(pathUSD), 1000e6, 0, _makeDepositPayload(), alice);
+
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.processWithdrawals(new Withdrawal[](0), bytes32(0));
+
+        vm.roll(block.number + 1);
+        _submitBatch(
+            portal,
+            uint64(block.number - 1),
+            0,
+            BlockTransition({
+                prevBlockHash: portal.blockHash(), nextBlockHash: keccak256("paused-settlement")
+            }),
+            DepositQueueTransition({
+                prevProcessedHash: bytes32(0),
+                nextProcessedHash: bytes32(0),
+                prevDepositNumber: 0,
+                nextDepositNumber: 0
+            }),
+            bytes32(0),
+            "",
+            ""
+        );
+        assertEq(portal.withdrawalBatchIndex(), 1);
+
+        vm.warp(block.timestamp + 30 days);
+        assertFalse(portal.paused());
+        assertTrue(portal.areDepositsActive(address(pathUSD)));
+    }
+
+    function test_pauseRoleCanPause() public {
+        address guardian = makeAddr("pause guardian");
+        vm.prank(admin);
+        portal.setPauseGuardian(guardian, true);
+
+        vm.prank(guardian);
+        portal.pause();
+        assertTrue(portal.paused());
+    }
+
+    function test_setPauseGuardian_isIdempotent() public {
+        address guardian = makeAddr("pause guardian");
+        vm.startPrank(admin);
+
+        portal.setPauseGuardian(guardian, true);
+        portal.setPauseGuardian(guardian, true);
+        assertTrue(portal.hasRole(guardian, Role.PauseGuardian));
+
+        portal.setPauseGuardian(guardian, false);
+        portal.setPauseGuardian(guardian, false);
+        assertTrue(portal.hasRole(guardian, Role.None));
+
+        vm.stopPrank();
+    }
+
+    function test_setPauseGuardian_cannotBeRemovedAfterCapabilityAbdication() public {
+        address guardian = makeAddr("pause guardian");
+        vm.startPrank(admin);
+        portal.setPauseGuardian(guardian, true);
+        portal.abdicate(Capability.PausePortal);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 30 days);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.setPauseGuardian(guardian, false);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.setPauseGuardian(bob, true);
+
+        assertTrue(portal.hasRole(guardian, Role.PauseGuardian));
+    }
+
+    function test_accessRoles_cannotBeRemovedAfterCapabilityAbdication() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.AccessPolicy);
+        vm.warp(block.timestamp + 30 days);
+
+        vm.startPrank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.CapabilityAbdicated.selector, Capability.AccessPolicy
+            )
+        );
+        portal.setAllowedAccount(alice, false);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.CapabilityAbdicated.selector, Capability.AccessPolicy
+            )
+        );
+        portal.setGateway(address(zoneGateway), false);
+
+        vm.stopPrank();
+
+        assertTrue(portal.hasRole(alice, Role.Account));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
+    }
+
+    function test_setPauseGuardian_cannotModifyAccessRoles() public {
+        vm.startPrank(admin);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(alice, false);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(alice, true);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(address(zoneGateway), false);
+
+        vm.expectRevert();
+        portal.setPauseGuardian(address(zoneGateway), true);
+
+        vm.stopPrank();
+
+        assertTrue(portal.hasRole(alice, Role.Account));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
+    }
+
+    function test_pause_expiresAfterThirtyDays() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 30 days);
+        assertFalse(portal.paused());
+    }
+
+    function test_pause_adminCanResumeEarly() public {
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 1 days);
+        vm.expectEmit(true, false, false, false);
+        emit IZonePortal.PortalResumed(admin);
+        vm.prank(admin);
+        portal.resume();
+
+        assertFalse(portal.paused());
+        assertEq(portal.pauseExpiry(), 0);
+    }
+
+    function test_pause_onlyAdminCanResumeEarly() public {
+        address guardian = makeAddr("pause guardian");
+        vm.prank(admin);
+        portal.setPauseGuardian(guardian, true);
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.resume();
+
+        vm.prank(guardian);
+        vm.expectRevert(IZonePortal.NotAdmin.selector);
+        portal.resume();
+
+        assertTrue(portal.paused());
+    }
+
+    function test_pause_resumeRemainsAvailableAfterAbdication() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.warp(block.timestamp + 29 days);
+        vm.prank(sequencer);
+        portal.pause();
+
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(admin);
+        portal.resume();
+
+        assertFalse(portal.paused());
+        assertEq(portal.pauseExpiry(), 0);
+    }
+
+    function test_pause_cannotExtendActivePause() public {
+        vm.prank(sequencer);
+        portal.pause();
+        uint64 originalExpiry = portal.pauseExpiry();
+
+        vm.warp(block.timestamp + 15 days);
+        vm.prank(sequencer);
+        vm.expectRevert(IZonePortal.PortalIsPaused.selector);
+        portal.pause();
+
+        assertEq(portal.pauseExpiry(), originalExpiry);
+    }
+
+    function test_abdicatePause_delaysPermanentDisable() public {
+        uint64 effectiveAt = uint64(block.timestamp) + 30 days;
+        vm.expectEmit(true, false, false, true);
+        emit IZonePortal.AbdicationScheduled(Capability.PausePortal, effectiveAt);
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+        assertEq(portal.abdicationEffectiveAt(Capability.PausePortal), effectiveAt);
+        assertFalse(portal.paused());
+
+        vm.warp(effectiveAt);
+        vm.prank(sequencer);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.pause();
+    }
+
+    function test_abdicatePause_allowsStartingAPauseBeforeItTakesEffect() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.warp(block.timestamp + 29 days);
+        vm.prank(sequencer);
+        portal.pause();
+        uint64 pauseExpiry = portal.pauseExpiry();
+
+        vm.warp(block.timestamp + 1 days);
+        assertTrue(portal.paused());
+
+        vm.warp(pauseExpiry);
+        vm.prank(sequencer);
+        vm.expectRevert(
+            abi.encodeWithSelector(IZonePortal.CapabilityAbdicated.selector, Capability.PausePortal)
+        );
+        portal.pause();
+    }
+
+    function test_abdicatePause_cannotBeRescheduled() public {
+        vm.prank(admin);
+        portal.abdicate(Capability.PausePortal);
+
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IZonePortal.AbdicationAlreadyScheduled.selector, Capability.PausePortal
+            )
+        );
+        portal.abdicate(Capability.PausePortal);
+    }
+
+    function test_pause_revertsWithoutAuthority() public {
+        vm.prank(alice);
+        vm.expectRevert(IZonePortal.NotPauseAuthority.selector);
+        portal.pause();
+    }
+
     function test_tokenGovernance_revertsIfNotAdmin() public {
         vm.startPrank(sequencer);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
@@ -1564,9 +1912,8 @@ contract ZonePortalTest is BaseTest {
         assertTrue(portal.isTokenEnabled(overflowToken));
     }
 
-    function test_sequencerGovernance_revertsIfAdmin() public {
-        // Admin may rotate the deposit-encryption key, but must not perform the other
-        // sequencer-only actions below.
+    function test_sequencerGovernance_revertsIfAdminLacksSequencerRole() public {
+        // Admin authority alone does not grant sequencer-only powers.
         Withdrawal memory w =
             _withdrawal(address(pathUSD), alice, bob, 500e6, bytes32(0), 0, alice, "");
         // Read state used as call args up front so the staticcall isn't mistaken
@@ -1638,19 +1985,30 @@ contract ZonePortalTest is BaseTest {
 
         // New admin can exercise governance powers.
         vm.prank(alice);
-        portal.pauseDeposits(address(pathUSD));
-        assertFalse(portal.areDepositsActive(address(pathUSD)));
+        portal.pause();
+        assertTrue(portal.paused());
 
-        // Old admin can no longer exercise them.
         vm.prank(admin);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
-        portal.resumeDeposits(address(pathUSD));
+        portal.abdicate(Capability.PausePortal);
     }
 
     function test_transferAdmin_revertsIfNotAdmin() public {
         vm.prank(alice);
         vm.expectRevert(IZonePortal.NotAdmin.selector);
         portal.transferAdmin(alice);
+    }
+
+    function test_acceptAdmin_preservesAssignedRole() public {
+        vm.startPrank(admin);
+        portal.transferAdmin(alice);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        portal.acceptAdmin();
+
+        assertEq(portal.admin(), alice);
+        assertTrue(portal.hasRole(alice, Role.Account));
     }
 
     function test_acceptAdmin_revertsIfNotPendingAdmin() public {
@@ -1724,29 +2082,30 @@ contract ZonePortalTest is BaseTest {
         vm.prank(admin);
         portal.setGateway(replacement, true);
 
-        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.CallbackGateway));
-        assertEq(uint8(portal.role(replacement)), uint8(Role.CallbackGateway));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
+        assertTrue(portal.hasRole(replacement, Role.CallbackGateway));
 
         vm.prank(admin);
         portal.setGateway(address(zoneGateway), false);
-        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.None));
-        assertEq(uint8(portal.role(replacement)), uint8(Role.CallbackGateway));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.None));
+        assertTrue(portal.hasRole(replacement, Role.CallbackGateway));
     }
 
-    function test_setPortalRole_changesAccountToCallbackGatewayAtomically() public {
+    function test_setGateway_cannotOverwriteAccountRole() public {
         vm.prank(admin);
-        portal.setRole(alice, Role.CallbackGateway);
-        assertEq(uint8(portal.role(alice)), uint8(Role.CallbackGateway));
+        vm.expectRevert();
+        portal.setGateway(alice, true);
+        assertTrue(portal.hasRole(alice, Role.Account));
     }
 
     function test_setZoneGateway_enablesAndDisablesZeroAddress() public {
         vm.startPrank(admin);
         portal.setGateway(address(0), true);
-        assertEq(uint8(portal.role(address(0))), uint8(Role.CallbackGateway));
+        assertTrue(portal.hasRole(address(0), Role.CallbackGateway));
         portal.setGateway(address(0), false);
         vm.stopPrank();
 
-        assertEq(uint8(portal.role(address(0))), uint8(Role.None));
+        assertTrue(portal.hasRole(address(0), Role.None));
     }
 
     function test_setZoneGateway_revertsIfNotAdmin() public {
@@ -1769,7 +2128,7 @@ contract ZonePortalTest is BaseTest {
         portal.setAccessMode(false);
 
         vm.prank(admin);
-        portal.setRole(stagedAccount, Role.Account);
+        portal.setAllowedAccount(stagedAccount, true);
 
         vm.prank(pathUSDAdmin);
         pathUSD.mint(outsider, 2);
@@ -1782,7 +2141,7 @@ contract ZonePortalTest is BaseTest {
         portal.setAccessMode(true);
 
         assertTrue(portal.isAccessEnforced());
-        assertEq(uint8(portal.role(stagedAccount)), uint8(Role.Account));
+        assertTrue(portal.hasRole(stagedAccount, Role.Account));
         vm.prank(outsider);
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.AccountNotAllowed.selector, outsider));
         _deposit(portal, address(pathUSD), outsider, 1, bytes32(0), outsider);
@@ -1792,7 +2151,7 @@ contract ZonePortalTest is BaseTest {
         address gateway = makeAddr("mutable mode gateway");
 
         vm.prank(admin);
-        portal.setRole(gateway, Role.CallbackGateway);
+        portal.setGateway(gateway, true);
         vm.prank(pathUSDAdmin);
         pathUSD.mint(gateway, 2);
         vm.startPrank(gateway);
@@ -1805,7 +2164,7 @@ contract ZonePortalTest is BaseTest {
         vm.prank(admin);
         portal.setGatewayMode(false);
 
-        assertEq(uint8(portal.role(gateway)), uint8(Role.CallbackGateway));
+        assertTrue(portal.hasRole(gateway, Role.CallbackGateway));
         vm.prank(gateway);
         vm.expectRevert(abi.encodeWithSelector(IZonePortal.AccountNotAllowed.selector, gateway));
         _deposit(portal, address(pathUSD), alice, 1, bytes32(0), alice);
@@ -1827,40 +2186,43 @@ contract ZonePortalTest is BaseTest {
         emit IZonePortal.RoleUpdated(account, Role.None, Role.Account);
         vm.prank(admin);
         portal.setAllowedAccount(account, true);
-        assertEq(uint8(portal.role(account)), uint8(Role.Account));
+        assertTrue(portal.hasRole(account, Role.Account));
 
         vm.prank(admin);
         portal.setAllowedAccount(account, false);
-        assertEq(uint8(portal.role(account)), uint8(Role.None));
+        assertTrue(portal.hasRole(account, Role.None));
     }
 
-    function test_setPortalRole_changesCallbackGatewayToAccountAtomically() public {
+    function test_setAllowedAccount_cannotOverwriteGatewayRole() public {
         vm.prank(admin);
-        portal.setRole(address(zoneGateway), Role.Account);
-        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.Account));
+        vm.expectRevert();
+        portal.setAllowedAccount(address(zoneGateway), true);
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
     }
 
-    function test_setAllowedAccount_revertsForMessenger() public {
+    function test_setAllowedAccount_rejectsMessenger() public {
         vm.prank(admin);
-        vm.expectRevert(IZonePortal.InvalidAllowedAccount.selector);
+        vm.expectRevert();
         portal.setAllowedAccount(address(messenger), true);
+
+        assertTrue(portal.hasRole(address(messenger), Role.None));
     }
 
-    function test_setPortalRole_eventIncludesold() public {
+    function test_setAllowedAccount_removalEventIncludesPreviousRole() public {
         vm.expectEmit(true, false, false, true);
-        emit IZonePortal.RoleUpdated(address(zoneGateway), Role.CallbackGateway, Role.Account);
+        emit IZonePortal.RoleUpdated(bob, Role.Account, Role.None);
         vm.prank(admin);
-        portal.setRole(address(zoneGateway), Role.Account);
+        portal.setAllowedAccount(bob, false);
     }
 
     function test_setAllowedAccount_enablesAndDisablesZeroAddress() public {
         vm.startPrank(admin);
         portal.setAllowedAccount(address(0), true);
-        assertEq(uint8(portal.role(address(0))), uint8(Role.Account));
+        assertTrue(portal.hasRole(address(0), Role.Account));
         portal.setAllowedAccount(address(0), false);
         vm.stopPrank();
 
-        assertEq(uint8(portal.role(address(0))), uint8(Role.None));
+        assertTrue(portal.hasRole(address(0), Role.None));
     }
 
     function test_setAllowedAccount_revertsIfNotAdmin() public {
@@ -1881,7 +2243,7 @@ contract ZonePortalTest is BaseTest {
 
     function test_deposit_allowsUnlistedZoneRecipient() public {
         address outsider = makeAddr("outsider");
-        assertEq(uint8(portal.role(outsider)), uint8(Role.None));
+        assertTrue(portal.hasRole(outsider, Role.None));
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 1);
@@ -2917,7 +3279,7 @@ contract ZonePortalTest is BaseTest {
     function test_callbackWithdrawal_returnsFundsAndChangesDepositQueue() public {
         uint128 amount = 500e6;
         _fundCallbackWithdrawal(amount);
-        assertEq(uint8(portal.role(address(zoneGateway))), uint8(Role.CallbackGateway));
+        assertTrue(portal.hasRole(address(zoneGateway), Role.CallbackGateway));
 
         Withdrawal memory withdrawal = _withdrawal(
             address(pathUSD),
@@ -3816,7 +4178,7 @@ contract ZonePortalTest is BaseTest {
     function test_withdrawal_revertBombDoesNotStallWithdrawalQueue() public {
         MockRevertingReceiver bomb = new MockRevertingReceiver(900_000);
         vm.prank(admin);
-        portal.setRole(address(bomb), Role.CallbackGateway);
+        portal.setGateway(address(bomb), true);
 
         vm.startPrank(alice);
         pathUSD.approve(address(portal), 2000e6);
