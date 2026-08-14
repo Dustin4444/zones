@@ -193,21 +193,12 @@ fn init_tracing(filter: &str) -> Result<()> {
         .map_err(|error| eyre!("initialize tracing: {error}"))
 }
 
-fn start_phase(name: &'static str) -> (Instant, Span) {
-    let span = match name {
-        "discovery" => info_span!("discovery"),
-        "batch extraction" => info_span!("batch_extraction"),
-        "initial checkpoint" => info_span!("initial_checkpoint"),
-        "Zone state witness" => info_span!("zone_state_witness"),
-        "Tempo state witness" => info_span!("tempo_state_witness"),
-        "Tempo ancestry" => info_span!("tempo_ancestry"),
-        "SPF validation" => info_span!("spf_validation"),
-        "output" => info_span!("output"),
-        "target prover" => info_span!("target_prover"),
-        _ => unreachable!("unknown SPF phase: {name}"),
-    };
-    span.in_scope(|| info!(phase = name, "starting phase"));
-    (Instant::now(), span)
+macro_rules! start_phase {
+    ($name:literal) => {{
+        let span = info_span!($name);
+        span.in_scope(|| info!(phase = $name, "starting phase"));
+        (Instant::now(), span)
+    }};
 }
 
 async fn generate_input(args: GenerateInputArgs) -> Result<()> {
@@ -226,7 +217,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         bail!("--zone-block-count must be greater than zero");
     }
 
-    let started = start_phase("discovery");
+    let started = start_phase!("discovery");
     let tempo_provider = connect(&args.tempo_rpc_url, "Tempo").await?;
     let zone_provider = connect(&args.zone_unrestricted_rpc_url, "unrestricted Zone").await?;
     let signer = args
@@ -257,7 +248,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     );
     timings.record("discovery", started, ());
 
-    let started = start_phase("batch extraction");
+    let started = start_phase!("batch_extraction");
     let (parent_header, parent_number, extracted) = if let Some(block_count) = args.zone_block_count
     {
         let (updated_discovery, parent_header, parent_number, extracted) = discover_counted_batch(
@@ -316,17 +307,17 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     );
     timings.record("batch extraction", started, ());
 
-    let started = start_phase("initial checkpoint");
+    let started = start_phase!("initial_checkpoint");
     let initial_tempo_header =
         initial_tempo_header(&tempo_provider, &zone_provider, parent_number).await?;
     timings.record("initial checkpoint", started, ());
 
-    let started = start_phase("Zone state witness");
+    let started = start_phase!("zone_state_witness");
     let (zone_state_witness, tempo_reads) =
         zone_witnesses(&zone_provider, from_block, to_block).await?;
     timings.record("Zone state witness", started, ());
 
-    let started = start_phase("Tempo state witness");
+    let started = start_phase!("tempo_state_witness");
     let checkpoint_by_zone_block = extracted
         .iter()
         .map(|block| (block.input.number, block.checkpoint_number))
@@ -343,7 +334,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| initial_tempo_header.clone());
 
-    let started = start_phase("Tempo ancestry");
+    let started = start_phase!("tempo_ancestry");
     let (anchor_block_number, anchor_block_hash, tempo_ancestry_headers, anchor_mode) =
         tempo_anchor(&tempo_provider, &final_tempo_header).await?;
     timings.record("Tempo ancestry", started, ());
@@ -365,7 +356,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         tempo_ancestry_headers,
     };
 
-    let started = start_phase("SPF validation");
+    let started = start_phase!("spf_validation");
     let output = prove_zone_batch(&spf_config, witness.clone())
         .context("generated witness failed SPF validation")?;
     if output.block_transition.nextBlockHash != next_block_hash {
@@ -387,7 +378,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
         witness,
     };
 
-    let started = start_phase("output");
+    let started = start_phase!("output");
     let output_bytes = if let Some(path) = &args.output {
         let json =
             serde_json::to_vec_pretty(&request.witness).context("serialize batch witness")?;
@@ -400,7 +391,7 @@ async fn generate_input(args: GenerateInputArgs) -> Result<()> {
     timings.record("output", started, ());
 
     let target_bytes = if let Some(target) = &args.target {
-        let started = start_phase("target prover");
+        let started = start_phase!("target_prover");
         let bytes = send_to_prover(target, &request, &output).await?;
         timings.record("target prover", started, ());
         Some(bytes)
