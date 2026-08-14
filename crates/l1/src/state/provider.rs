@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use zone_precompiles::{L1StateError, L1StorageReader};
 
 use super::cache::L1StateCache;
-use crate::rpc::rpc_connection_config;
+use crate::{L1BlockTracker, rpc::rpc_connection_config};
 
 /// Configuration for the [`L1StateProvider`].
 #[derive(Debug, Clone)]
@@ -33,6 +33,11 @@ pub struct L1StateProviderConfig {
     pub l1_rpc_url: String,
     /// Zone portal address on Tempo L1, used for sequencer lookups.
     pub portal_address: Address,
+    /// Independently validated L1 block hashes retained by the subscriber.
+    ///
+    /// When present, historical storage fallbacks use the observed block hash instead of a block
+    /// number so an L1 reorg cannot silently change Zone replay results.
+    pub block_tracker: Option<L1BlockTracker>,
     /// Maximum number of transport-level retries for failed/rate-limited RPC requests.
     /// Defaults to 10.
     pub max_retries: u32,
@@ -52,6 +57,7 @@ impl Default for L1StateProviderConfig {
             chain_id: None,
             l1_rpc_url: String::new(),
             portal_address: Address::ZERO,
+            block_tracker: None,
             max_retries: 10,
             initial_backoff_ms: 20,
             retry_connection_interval: std::time::Duration::from_millis(100),
@@ -90,6 +96,8 @@ pub struct L1StateProvider {
     runtime_handle: tokio::runtime::Handle,
     /// Optional finite attempt limit for synchronous cache-miss fallback.
     max_sync_attempts: Option<NonZeroU32>,
+    /// Validated L1 block hashes used to bind historical RPC reads to the imported anchor.
+    block_tracker: Option<L1BlockTracker>,
 }
 
 impl L1StateProvider {
@@ -138,6 +146,7 @@ impl L1StateProvider {
             provider,
             runtime_handle,
             max_sync_attempts: config.max_sync_attempts,
+            block_tracker: config.block_tracker,
         })
     }
 
@@ -157,6 +166,7 @@ impl L1StateProvider {
             provider,
             runtime_handle,
             max_sync_attempts: config.max_sync_attempts,
+            block_tracker: config.block_tracker,
         }
     }
 
@@ -249,7 +259,7 @@ impl L1StateProvider {
     /// Fetch a single storage slot from L1 at a specific block via the shared HTTP provider.
     async fn fetch_slot(&self, address: Address, slot: B256, block_number: u64) -> Result<B256> {
         let key = U256::from_be_bytes(slot.0);
-        let block_id = BlockId::number(block_number);
+        let block_id = self.block_id(block_number)?;
         let value: U256 = self.provider.get_storage_at(address, key).block_id(block_id).await.map_err(|e| {
             warn!(%address, %slot, block_number, %e, "eth_getStorageAt RPC call failed");
             eyre::eyre!("eth_getStorageAt failed for address={address} slot={slot} block={block_number}: {e}")
@@ -258,6 +268,22 @@ impl L1StateProvider {
         let result = B256::from(value.to_be_bytes());
         debug!(%address, %slot, block_number, %result, "fetched L1 storage slot from RPC");
         Ok(result)
+    }
+
+    /// Resolve a historical RPC selector from the subscriber-authenticated header.
+    fn block_id(&self, block_number: u64) -> Result<BlockId> {
+        let Some(tracker) = &self.block_tracker else {
+            return Ok(BlockId::number(block_number));
+        };
+
+        tracker
+            .observed_hash(block_number)
+            .map(BlockId::hash)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "validated L1 block hash unavailable for historical state read at block {block_number}"
+                )
+            })
     }
 }
 
@@ -281,6 +307,8 @@ impl L1StorageReader for L1StateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_eips::NumHash;
+    use alloy_primitives::b256;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn finite_sync_attempt_limit_returns_diagnostic_error() {
@@ -308,5 +336,30 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("after 1 attempts"), "{message}");
         assert!(message.contains("block=7"), "{message}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn historical_reads_use_observed_block_hash() {
+        let tracker = L1BlockTracker::default();
+        let block_hash = b256!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        tracker.record(NumHash::new(7, block_hash)).unwrap();
+        let config = L1StateProviderConfig {
+            block_tracker: Some(tracker),
+            ..Default::default()
+        };
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect("http://127.0.0.1:1")
+            .await
+            .expect("HTTP transport construction is lazy")
+            .erased();
+        let reader = L1StateProvider::new_raw(
+            config,
+            L1StateCache::default(),
+            provider,
+            tokio::runtime::Handle::current(),
+        );
+
+        assert_eq!(reader.block_id(7).unwrap(), BlockId::hash(block_hash));
+        assert!(reader.block_id(8).is_err());
     }
 }

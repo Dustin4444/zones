@@ -280,6 +280,7 @@ impl ZoneNode {
         let l1_state_provider_config = L1StateProviderConfig {
             l1_rpc_url,
             portal_address,
+            block_tracker: Some(l1_block_tracker.clone()),
             retry_connection_interval,
             ..Default::default()
         };
