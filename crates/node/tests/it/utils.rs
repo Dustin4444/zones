@@ -56,7 +56,7 @@ use tempo_precompiles::{
         ALLOW_ALL_POLICY_ID, AuthRole, CompoundPolicyData as RawCompoundPolicyData, PolicyData,
         PolicyType, TIP403Registry, tip403_registry_slots,
     },
-    zone_factory::zone_portal_slots,
+    zone_factory::portal,
 };
 use tempo_primitives::{TempoHeader, transaction::tt_signature::TempoSignature};
 use tempo_zone_contracts::{
@@ -4772,12 +4772,11 @@ impl L1Fixture {
         num_blocks: u64,
     ) {
         let mut cache = cache_handle.lock();
-        let deposit_queue_hash_slot = zone_portal_slots::CURRENT_DEPOSIT_QUEUE_HASH.into();
-        let refunds_slot = zone_portal_slots::REFUNDS.into();
-        let sequencer_membership_slot =
-            keccak256((sequencer, zone_portal_slots::ROLE).abi_encode());
+        let deposit_queue_hash_slot = portal::slots::CURRENT_DEPOSIT_QUEUE_HASH.into();
+        let refunds_slot = portal::slots::REFUNDS.into();
+        let sequencer_membership_slot = keccak256((sequencer, portal::slots::ROLE).abi_encode());
         let path_usd_config_slot: B256 = PATH_USD_ADDRESS
-            .mapping_slot(zone_portal_slots::TOKEN_CONFIGS)
+            .mapping_slot(portal::slots::TOKEN_CONFIGS)
             .into();
         let enabled_token_config = enabled_deposits_active_token_config();
         let max_tempo_gas_rate = B256::from(U256::from(1_000_000_000_000_000_000_u128));
@@ -4785,7 +4784,7 @@ impl L1Fixture {
         let encoded_key = encryption_key.public_key().to_encoded_point(true);
         let encryption_key_x = B256::from_slice(&encoded_key.as_bytes()[1..]);
         let encryption_key_y_parity = encoded_key.as_bytes()[0];
-        let encryption_entries_base = keccak256(B256::from(zone_portal_slots::ENCRYPTION_KEYS));
+        let encryption_entries_base = keccak256(B256::from(portal::slots::ENCRYPTION_KEYS));
 
         // Local fixtures have no RPC fallback. Transfers to protocol accounts still consult their
         // address-level receive policies, so seed their absence as baseline raw L1 state.
@@ -4812,7 +4811,7 @@ impl L1Fixture {
             cache.set(portal_address, deposit_queue_hash_slot, block, B256::ZERO);
             cache.set(
                 portal_address,
-                zone_portal_slots::ENCRYPTION_KEYS.into(),
+                portal::slots::ENCRYPTION_KEYS.into(),
                 block,
                 B256::with_last_byte(1),
             );
@@ -4833,7 +4832,7 @@ impl L1Fixture {
             // unrelated closed-loop membership setup or a reachable L1 RPC fallback.
             cache.set(
                 portal_address,
-                zone_portal_slots::IS_ACCESS_ENFORCED.into(),
+                portal::slots::IS_ACCESS_ENFORCED.into(),
                 block,
                 B256::ZERO,
             );
@@ -4841,7 +4840,7 @@ impl L1Fixture {
             // withdrawal validation does not fall back to an unavailable L1 RPC endpoint.
             cache.set(
                 portal_address,
-                zone_portal_slots::PAUSE_EXPIRY.into(),
+                portal::slots::PAUSE_EXPIRY.into(),
                 block,
                 B256::ZERO,
             );
@@ -4849,7 +4848,7 @@ impl L1Fixture {
             // imported from the finalized ZonePortal storage slot.
             cache.set(
                 portal_address,
-                zone_portal_slots::MAX_TEMPO_GAS_RATE.into(),
+                portal::slots::MAX_TEMPO_GAS_RATE.into(),
                 block,
                 max_tempo_gas_rate,
             );

@@ -3,32 +3,29 @@
 use super::{RustStorageField, artifact, assert_layout};
 use tempo_precompiles::{
     test_util::storage_conformance::{RustStorageSlot, assert_foundry_slots},
-    zone_factory::zone_portal_slots,
+    zone_factory::portal,
 };
 use tempo_precompiles_macros::gen_test_fields_layout as layout_fields;
 
 #[test]
 fn zone_portal_slot_constants_match_solidity() {
     let fields = [
-        ("admin", zone_portal_slots::ADMIN),
+        ("admin", portal::slots::ADMIN),
         (
             "currentDepositQueueHash",
-            zone_portal_slots::CURRENT_DEPOSIT_QUEUE_HASH,
+            portal::slots::CURRENT_DEPOSIT_QUEUE_HASH,
         ),
-        ("_encryptionKeys", zone_portal_slots::ENCRYPTION_KEYS),
-        ("_tokenConfigs", zone_portal_slots::TOKEN_CONFIGS),
-        ("role", zone_portal_slots::ROLE),
-        ("_isAccessEnforced", zone_portal_slots::IS_ACCESS_ENFORCED),
-        ("_isGatewayEnforced", zone_portal_slots::IS_GATEWAY_ENFORCED),
-        ("maxTempoGasRate", zone_portal_slots::MAX_TEMPO_GAS_RATE),
-        ("pauseExpiry", zone_portal_slots::PAUSE_EXPIRY),
-        (
-            "tokenEnablementHash",
-            zone_portal_slots::TOKEN_ENABLEMENT_HASH,
-        ),
+        ("_encryptionKeys", portal::slots::ENCRYPTION_KEYS),
+        ("_tokenConfigs", portal::slots::TOKEN_CONFIGS),
+        ("role", portal::slots::ROLE),
+        ("_isAccessEnforced", portal::slots::IS_ACCESS_ENFORCED),
+        ("_isGatewayEnforced", portal::slots::IS_GATEWAY_ENFORCED),
+        ("maxTempoGasRate", portal::slots::MAX_TEMPO_GAS_RATE),
+        ("pauseExpiry", portal::slots::PAUSE_EXPIRY),
+        ("tokenEnablementHash", portal::slots::TOKEN_ENABLEMENT_HASH),
         (
             "abdicationEffectiveAt",
-            zone_portal_slots::ABDICATION_EFFECTIVE_AT,
+            portal::slots::ABDICATION_EFFECTIVE_AT,
         ),
     ]
     .map(|(name, slot)| RustStorageSlot::new(name, slot));

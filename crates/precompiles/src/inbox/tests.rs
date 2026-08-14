@@ -13,7 +13,7 @@ use tempo_precompiles::{
     test_util::TIP20Setup,
     tip20::{ITIP20, TIP20Token},
     tip403_registry::{ALLOW_ALL_POLICY_ID, ITIP403Registry, REJECT_ALL_POLICY_ID, TIP403Registry},
-    zone_factory::{ZonePortalStorage, zone_portal_slots},
+    zone_factory::portal::{self, ZonePortalStorage},
 };
 use tempo_primitives::TempoHeader;
 use zone_primitives::constants::ZONE_OUTBOX_ADDRESS;
@@ -286,7 +286,7 @@ fn failed_deposit_gas(deposits: usize, token_enablements: usize) -> eyre::Result
     let plaintext = build_plaintext(&BOB, &fixture.memo);
     let (ciphertext, nonce, tag) = encrypt_plaintext(&key, &plaintext);
     let (sequencer_x, sequencer_y_parity) = compressed_x_and_parity(&fixture.seq_pub);
-    let base: U256 = keccak256(B256::from(zone_portal_slots::ENCRYPTION_KEYS)).into();
+    let base: U256 = keccak256(B256::from(portal::slots::ENCRYPTION_KEYS)).into();
     let slot_x = base + fixture.key_index * U256::from(2);
     harness
         .l1
@@ -684,7 +684,7 @@ fn deposit_uses_child_anchor_key_and_mints_plaintext_recipient() -> eyre::Result
     let (ciphertext, nonce, tag) = encrypt_plaintext(&key, &plaintext);
     let (sequencer_x, sequencer_y_parity) = compressed_x_and_parity(&fixture.seq_pub);
 
-    let base: U256 = keccak256(B256::from(zone_portal_slots::ENCRYPTION_KEYS)).into();
+    let base: U256 = keccak256(B256::from(portal::slots::ENCRYPTION_KEYS)).into();
     let slot_x = base + fixture.key_index * U256::from(2);
     harness
         .l1
@@ -760,7 +760,7 @@ fn receive_policy_blocked_deposit_enqueues_bounce_back() -> eyre::Result<()> {
     let (ciphertext, nonce, tag) = encrypt_plaintext(&key, &plaintext);
     let (sequencer_x, sequencer_y_parity) = compressed_x_and_parity(&fixture.seq_pub);
 
-    let base: U256 = keccak256(B256::from(zone_portal_slots::ENCRYPTION_KEYS)).into();
+    let base: U256 = keccak256(B256::from(portal::slots::ENCRYPTION_KEYS)).into();
     let slot_x = base + fixture.key_index * U256::from(2);
     harness
         .l1
@@ -839,7 +839,7 @@ fn invalid_encrypted_proof_bounces_without_mint() -> eyre::Result<()> {
     let fixture = EncryptedDepositFixture::new();
     let (sequencer_x, sequencer_y_parity) = compressed_x_and_parity(&fixture.seq_pub);
     let portal = PORTAL;
-    let base: U256 = keccak256(B256::from(zone_portal_slots::ENCRYPTION_KEYS)).into();
+    let base: U256 = keccak256(B256::from(portal::slots::ENCRYPTION_KEYS)).into();
     let slot_x = base + fixture.key_index * U256::from(2);
     harness
         .l1

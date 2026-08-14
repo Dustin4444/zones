@@ -19,7 +19,7 @@ use alloy_consensus::Transaction;
 use eyre::WrapErr as _;
 use futures::future::try_join_all;
 use std::{collections::HashMap, time::Duration};
-use tempo_precompiles::{PATH_USD_ADDRESS, zone_factory::zone_portal_slots};
+use tempo_precompiles::{PATH_USD_ADDRESS, zone_factory::portal};
 use tempo_zone_contracts::{
     IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
     ZonePortal, ZonePortal::Role as PortalRole,
@@ -393,13 +393,13 @@ async fn test_divergent_follower_does_not_create_quorum() -> eyre::Result<()> {
     let divergent_anchor = cluster.l1.provider().get_block_number().await? + 2;
     cluster.nodes[1].l1_state_cache().lock().set(
         cluster.portal_address,
-        zone_portal_slots::CURRENT_DEPOSIT_QUEUE_HASH.into(),
+        portal::slots::CURRENT_DEPOSIT_QUEUE_HASH.into(),
         divergent_anchor,
         B256::repeat_byte(0xD1),
     );
     cluster.nodes[2].l1_state_cache().lock().set(
         cluster.portal_address,
-        zone_portal_slots::CURRENT_DEPOSIT_QUEUE_HASH.into(),
+        portal::slots::CURRENT_DEPOSIT_QUEUE_HASH.into(),
         divergent_anchor,
         B256::repeat_byte(0xD2),
     );

@@ -7,7 +7,7 @@ use revm::precompile::PrecompileResult;
 use tempo_precompiles::{
     storage::{StorageCtx, StorageKey},
     test_util::TIP20Setup,
-    zone_factory::{ZonePortalStorage, zone_portal_slots},
+    zone_factory::portal::{self, ZonePortalStorage},
 };
 use tempo_zone_contracts::IZoneOutbox as ZoneOutboxAbi;
 use zone_primitives::constants::TEMPO_STATE_ADDRESS;
@@ -44,8 +44,7 @@ impl Harness {
         let mut ctx = test_context();
         let token = tempo_precompiles::PATH_USD_ADDRESS;
         let l1 = MockL1Reader::default();
-        let sequencer_membership_slot =
-            keccak256((SEQUENCER, zone_portal_slots::ROLE).abi_encode());
+        let sequencer_membership_slot = keccak256((SEQUENCER, portal::slots::ROLE).abi_encode());
         l1.insert(
             PORTAL,
             sequencer_membership_slot.into(),
@@ -54,13 +53,13 @@ impl Harness {
         );
         l1.insert(
             PORTAL,
-            token.mapping_slot(zone_portal_slots::TOKEN_CONFIGS),
+            token.mapping_slot(portal::slots::TOKEN_CONFIGS),
             ANCHOR,
             U256::ONE,
         );
         l1.insert(
             PORTAL,
-            zone_portal_slots::MAX_TEMPO_GAS_RATE,
+            portal::slots::MAX_TEMPO_GAS_RATE,
             ANCHOR,
             U256::from(TEST_MAX_TEMPO_GAS_RATE),
         );
@@ -194,7 +193,7 @@ impl Harness {
     fn set_max_tempo_gas_rate(&self, max: u128) {
         self.l1.insert(
             PORTAL,
-            zone_portal_slots::MAX_TEMPO_GAS_RATE,
+            portal::slots::MAX_TEMPO_GAS_RATE,
             ANCHOR,
             U256::from(max),
         );
@@ -204,11 +203,11 @@ impl Harness {
         let modes =
             U256::from(u8::from(access_enforced)) | (U256::from(u8::from(gateway_enforced)) << 8);
         self.l1
-            .insert(PORTAL, zone_portal_slots::IS_ACCESS_ENFORCED, ANCHOR, modes);
+            .insert(PORTAL, portal::slots::IS_ACCESS_ENFORCED, ANCHOR, modes);
     }
 
     fn set_role(&self, account: Address, role: Role) {
-        let slot = keccak256((account, zone_portal_slots::ROLE).abi_encode());
+        let slot = keccak256((account, portal::slots::ROLE).abi_encode());
         self.l1
             .insert(PORTAL, slot.into(), ANCHOR, U256::from(u8::from(role)));
     }
@@ -216,7 +215,7 @@ impl Harness {
     fn set_token_enabled(&self, enabled: bool) {
         self.l1.insert(
             PORTAL,
-            self.token.mapping_slot(zone_portal_slots::TOKEN_CONFIGS),
+            self.token.mapping_slot(portal::slots::TOKEN_CONFIGS),
             ANCHOR,
             U256::from(u8::from(enabled)),
         );
@@ -225,7 +224,7 @@ impl Harness {
     fn set_pause_expiry(&self, expiry: u64) {
         self.l1.insert(
             PORTAL,
-            zone_portal_slots::PAUSE_EXPIRY.into(),
+            portal::slots::PAUSE_EXPIRY,
             ANCHOR,
             U256::from(expiry) << 64,
         );
@@ -318,7 +317,7 @@ fn outbox_reads_injected_l1_state_at_tempo_checkpoint() -> eyre::Result<()> {
     assert_eq!(harness.l1.storage_requests().len(), 6);
     assert!(harness.l1.storage_requests().contains(&(
         PORTAL,
-        zone_portal_slots::PAUSE_EXPIRY.into(),
+        portal::slots::PAUSE_EXPIRY.into(),
         ANCHOR
     )));
     assert_eq!(harness.l1.request_count(ANCHOR, &portal.role[SEQUENCER]), 1);
