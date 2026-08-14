@@ -25,7 +25,7 @@ use tempo_zone_contracts::{
     ZONE_OUTBOX_ADDRESS, ZonePortal,
 };
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{Span, debug, info, info_span};
 use tracing_subscriber::EnvFilter;
 use zone_chainspec::ZoneChainSpec;
 use zone_precompiles::tempo_state::slots as tempo_state_slots;
@@ -126,13 +126,16 @@ struct GenerateInputArgs {
 struct Timings(Vec<(&'static str, Duration)>);
 
 impl Timings {
-    fn record<T>(&mut self, name: &'static str, started: Instant, value: T) -> T {
+    fn record<T>(&mut self, name: &'static str, phase: (Instant, Span), value: T) -> T {
+        let (started, span) = phase;
         let elapsed = started.elapsed();
-        info!(
-            phase = name,
-            elapsed_ms = elapsed.as_millis(),
-            "phase complete"
-        );
+        span.in_scope(|| {
+            info!(
+                phase = name,
+                elapsed_ms = elapsed.as_millis(),
+                "phase complete"
+            );
+        });
         self.0.push((name, elapsed));
         value
     }
@@ -190,9 +193,10 @@ fn init_tracing(filter: &str) -> Result<()> {
         .map_err(|error| eyre!("initialize tracing: {error}"))
 }
 
-fn start_phase(name: &'static str) -> Instant {
-    info!(phase = name, "starting phase");
-    Instant::now()
+fn start_phase(name: &'static str) -> (Instant, Span) {
+    let span = info_span!("spf_stage", phase = name);
+    span.in_scope(|| info!(phase = name, "starting phase"));
+    (Instant::now(), span)
 }
 
 async fn generate_input(args: GenerateInputArgs) -> Result<()> {
