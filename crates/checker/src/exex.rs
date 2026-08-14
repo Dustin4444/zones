@@ -32,11 +32,13 @@ use crate::{
         L2BlockObservation, ZonePostStateOutputs, acquire_portal_token_balance,
         acquire_zone_post_state, observe_l1_range, observe_l2_block_with_context,
     },
-    persistence::{BlockNumHash, Identity, Persistence, Snapshot},
+    persistence::{BlockNumHash, Coverage, Identity, Persistence, Snapshot},
     runtime::{
         AuthenticatedBlock, AuthenticationFailure, AuthenticationRequest, Runtime, RuntimeAction,
     },
 };
+
+const MAX_RECLAMATION_LAG_BLOCKS: u64 = 16_384;
 
 /// Run the checker ExEx without allowing checker-local failures to finish it.
 pub(super) async fn run<Node>(config: CheckerConfig, mut ctx: ExExContext<Node>) -> eyre::Result<()>
@@ -357,7 +359,21 @@ where
     P: BlockHashReader + BlockNumReader + ?Sized,
 {
     if let Some(verified) = refresh_canonical_head(runtime, store, provider)? {
-        ctx.send_finished_height(verified.into())?;
+        let canonical = canonical_head(provider)?;
+        let release_canonical = runtime.snapshot().meta.blocked.is_some()
+            || matches!(runtime.snapshot().meta.coverage, Coverage::Gap { .. });
+        let retry_lag_exceeded = runtime.is_retrying()
+            && canonical.number.saturating_sub(verified.number) >= MAX_RECLAMATION_LAG_BLOCKS;
+        if retry_lag_exceeded {
+            runtime.block(store, CheckerBlockedReason::AcquisitionLagExceeded)?;
+        }
+        let finished = if release_canonical || retry_lag_exceeded {
+            canonical
+        } else {
+            verified
+        };
+        ctx.send_finished_height(finished.into())?;
+        runtime.publish_reclamation_height(finished);
     }
     Ok(())
 }
@@ -453,15 +469,15 @@ where
                 else {
                     continue;
                 };
-                if let Some(verified) = runtime.complete_authentication(
+                runtime.complete_authentication(
                     store,
                     identity,
                     request,
                     result,
                     Instant::now(),
-                )? {
-                    ctx.send_finished_height(verified.into())?;
-                }
+                )?;
+                let provider = ctx.provider().clone();
+                refresh_and_publish_canonical_head(ctx, runtime, store, &provider)?;
                 continue;
             }
             RuntimeAction::RetryAt(deadline) => {

@@ -33,12 +33,18 @@ pub(crate) struct CheckerMetrics {
     verification_lag_blocks: Gauge,
     /// Whether an authenticated divergence remains on the canonical branch.
     divergence_active: Gauge,
+    /// Number of durable findings subsequently cleared by canonical reorgs.
+    cleared_findings_total: Gauge,
     /// Whether descendants are durably marked as unchecked.
     coverage_gap: Gauge,
     /// Whether canonical Zone history remains to be verified.
     recovering: Gauge,
     /// Whether a durable terminal condition prevents verification.
     blocked: Gauge,
+    /// ExEx height released for WAL reclamation.
+    reclamation_height: Gauge,
+    /// Whether WAL reclamation is ahead of semantic verification.
+    reclamation_ahead: Gauge,
 }
 
 impl CheckerMetrics {
@@ -69,6 +75,8 @@ impl CheckerMetrics {
         );
         self.divergence_active
             .set(f64::from(meta.active_finding.is_some()));
+        self.cleared_findings_total
+            .set(meta.cleared_findings as f64);
         self.coverage_gap
             .set(f64::from(matches!(meta.coverage, Coverage::Gap { .. })));
         self.recovering
@@ -101,6 +109,12 @@ impl CheckerMetrics {
     /// Record a Zone block whose checker transition committed durably.
     pub(crate) fn record_verified_block(&self) {
         self.verified_zone_blocks_total.increment(1);
+    }
+
+    pub(crate) fn publish_reclamation_height(&self, verified: u64, reclamation: u64) {
+        self.reclamation_height.set(reclamation as f64);
+        self.reclamation_ahead
+            .set(f64::from(reclamation > verified));
     }
 }
 

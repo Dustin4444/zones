@@ -83,6 +83,10 @@ pub(crate) struct Metadata {
     /// Latest canonical Zone head observed from the local node.
     pub observed_zone_tip: BlockNumHash,
     pub active_finding: Option<FindingKey>,
+    /// Number of previously active findings removed from the canonical branch by reorgs.
+    pub cleared_findings: u64,
+    /// Most recently cleared finding, retained for operator inspection.
+    pub last_cleared_finding: Option<FindingKey>,
     pub coverage: Coverage,
     /// Why the checker stopped verifying new work.
     pub blocked: Option<CheckerBlockedReason>,
@@ -100,6 +104,26 @@ pub(crate) enum MetaValue {
 pub(crate) struct Checkpoint {
     pub cut: ChainCut,
     pub state: State,
+}
+
+/// Integrity metadata for one checkpoint split across bounded database values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointManifest {
+    pub cut: ChainCut,
+    pub chunk_count: u32,
+    pub encoded_len: u64,
+    pub commitment: B256,
+}
+
+/// One bounded segment of an encoded checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointChunk(pub Vec<u8>);
+
+/// Stable key for one checkpoint segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct CheckpointChunkKey {
+    pub checkpoint: CheckpointId,
+    pub index: u32,
 }
 
 /// One verified Zone transition and its imported Tempo advancement.

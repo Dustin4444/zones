@@ -24,10 +24,22 @@ pub struct CheckerSnapshot {
     pub recovering: bool,
     /// Whether an authenticated divergence remains on the canonical branch.
     pub active_finding: bool,
+    /// Number of divergences that were later removed from the canonical branch.
+    pub cleared_findings: u64,
+    /// Key of the most recently reorg-cleared finding retained in the database.
+    pub last_cleared_finding: Option<CheckerFindingKey>,
     /// Whether descendants are durably marked as unchecked.
     pub has_coverage_gap: bool,
     /// Durable reason verification cannot resume automatically.
     pub blocked_reason: Option<CheckerBlockedReason>,
+}
+
+/// Stable operator-readable key for retained finding evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckerFindingKey {
+    pub zone: BlockNumHash,
+    pub operation: u32,
+    pub code: u16,
 }
 
 /// Inspect a stopped checker database or a consistent copy.
@@ -43,6 +55,15 @@ pub fn inspect_database(path: impl AsRef<Path>) -> eyre::Result<CheckerSnapshot>
         observed_zone_tip: snapshot.meta.observed_zone_tip.into(),
         recovering: matches!(snapshot.meta.coverage, Coverage::Recovering),
         active_finding: snapshot.meta.active_finding.is_some(),
+        cleared_findings: snapshot.meta.cleared_findings,
+        last_cleared_finding: snapshot
+            .meta
+            .last_cleared_finding
+            .map(|key| CheckerFindingKey {
+                zone: key.zone.into(),
+                operation: key.operation,
+                code: key.code,
+            }),
         has_coverage_gap: matches!(snapshot.meta.coverage, Coverage::Gap { .. }),
         blocked_reason: snapshot.meta.blocked,
     })
