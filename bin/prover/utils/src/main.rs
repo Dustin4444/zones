@@ -194,7 +194,18 @@ fn init_tracing(filter: &str) -> Result<()> {
 }
 
 fn start_phase(name: &'static str) -> (Instant, Span) {
-    let span = info_span!("spf_stage", phase = name);
+    let span = match name {
+        "discovery" => info_span!("discovery"),
+        "batch extraction" => info_span!("batch_extraction"),
+        "initial checkpoint" => info_span!("initial_checkpoint"),
+        "Zone state witness" => info_span!("zone_state_witness"),
+        "Tempo state witness" => info_span!("tempo_state_witness"),
+        "Tempo ancestry" => info_span!("tempo_ancestry"),
+        "SPF validation" => info_span!("spf_validation"),
+        "output" => info_span!("output"),
+        "target prover" => info_span!("target_prover"),
+        _ => unreachable!("unknown SPF phase: {name}"),
+    };
     span.in_scope(|| info!(phase = name, "starting phase"));
     (Instant::now(), span)
 }
