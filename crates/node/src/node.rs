@@ -57,7 +57,6 @@ use reth_transaction_pool::{
 };
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::{DEV, TempoChainSpec, chainspec_from_chain_id};
 use tempo_evm::{TempoInvalidTransaction, consensus::TempoConsensus};
 use tempo_node::{
     DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
@@ -96,22 +95,6 @@ use zone_sequencer::{
     AttestationStore, BatchAnchorConfig, ShadowProverConfig, WithdrawalBatchLimits,
     ZoneSequencerConfig, attestation::AttestationDomain, spawn_zone_sequencer,
 };
-
-/// Returns a known Tempo chain spec for an L1 chain ID.
-///
-/// Tempo Anvil uses chain ID 31337 and the same hardfork schedule as Tempo DEV (1337).
-/// Additional dev-schedule L1 chain IDs can be allowed via the `ZONE_L1_DEV_CHAIN_IDS`
-/// environment variable as a comma-separated list.
-pub(crate) fn tempo_chain_spec_for_l1(chain_id: u64) -> Option<Arc<TempoChainSpec>> {
-    chainspec_from_chain_id(chain_id).or_else(|| match chain_id {
-        1337 | 31337 => Some(DEV.clone()),
-        _ => std::env::var("ZONE_L1_DEV_CHAIN_IDS")
-            .ok()?
-            .split(',')
-            .any(|id| id.trim().parse() == Ok(chain_id))
-            .then(|| DEV.clone()),
-    })
-}
 
 fn validate_zone_chain_id(parent_chain_id: u64, zone_id: u32, chain_id: u64) -> eyre::Result<()> {
     let expected = zone_chain_id(parent_chain_id, zone_id)?;
@@ -1607,17 +1590,7 @@ where
     type Consensus = TempoConsensus<ZoneChainSpec>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        let l1_chain_id = decode_l1_chain_id(ctx.chain_spec().chain().id())?;
-        let tempo_chain_spec = tempo_chain_spec_for_l1(l1_chain_id)
-            .ok_or_else(|| eyre::eyre!("unsupported parent Tempo chain ID {l1_chain_id}"))?;
-        let chain_spec = Arc::new(
-            ctx.chain_spec()
-                .as_ref()
-                .clone()
-                .with_tempo_hardforks_from(tempo_chain_spec.as_ref()),
-        );
-
-        Ok(TempoConsensus::new(chain_spec))
+        Ok(TempoConsensus::new(ctx.chain_spec()))
     }
 }
 
@@ -1638,15 +1611,12 @@ where
         .await?;
 
         let l1_chain_id = l1_provider.chain_id().await?;
-        let tempo_chain_spec = tempo_chain_spec_for_l1(l1_chain_id)
-            .ok_or_else(|| eyre::eyre!("unsupported parent Tempo chain ID {l1_chain_id}"))?;
-        // Keep the Zone chain settings and use the parent L1 schedule for Tempo hardforks.
-        let evm_config = ZoneEvmConfig::new(
-            ctx.chain_spec(),
-            tempo_chain_spec,
-            l1_provider,
-            portal_address,
+        let genesis_l1_chain_id = decode_l1_chain_id(ctx.chain_spec().genesis().config.chain_id)?;
+        eyre::ensure!(
+            l1_chain_id == genesis_l1_chain_id,
+            "L1 chain ID mismatch: genesis requires {genesis_l1_chain_id}, but L1 RPC reports {l1_chain_id}"
         );
+        let evm_config = ZoneEvmConfig::new(ctx.chain_spec(), l1_provider, portal_address);
         info!(target: "reth::cli", "Zone EVM initialized with L1-backed Tempo precompiles");
 
         Ok(evm_config)
@@ -1815,6 +1785,7 @@ mod tests {
     use tempo_primitives::transaction::{
         AASigned, Call, PrimitiveSignature, TempoSignature, TempoTransaction,
     };
+    use zone_chainspec::tempo_chain_spec_for_l1;
 
     fn pooled_transaction(envelope: TempoTxEnvelope, sender: Address) -> TempoPooledTransaction {
         TempoPooledTransaction::new(Recovered::new_unchecked(envelope, sender))
