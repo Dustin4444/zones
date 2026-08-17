@@ -104,10 +104,10 @@ async fn ignored_lifecycle_call_does_not_shift_modeled_multicall_events() {
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
 
     let observed = observe_l1(&provider, &imported, PORTAL).await.unwrap();
-    let adaptation =
+    let result =
         crate::adapter::adapt_imported(&observed, &imported, B256::repeat_byte(0xff), 7).unwrap();
     assert!(matches!(
-        adaptation.facts.operations.as_slice(),
+        result.facts.operations.as_slice(),
         [
             crate::kernel::ImportedOperation::UpdateBouncebackGas(42),
             crate::kernel::ImportedOperation::SubmitBatch(_)

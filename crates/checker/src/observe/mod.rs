@@ -16,8 +16,8 @@ pub(crate) use error::{AcquisitionError, ObservationError};
 #[cfg(test)]
 pub(crate) use error::{AcquisitionSource, ProtocolChain};
 pub(crate) use l1::{
-    L1BlockObservation, acquire_l1_header, acquire_portal_token_balance, observe_l1,
-    observe_l1_range,
+    L1BlockObservation, L1TransactionObservation, acquire_l1_header, acquire_portal_token_balance,
+    observe_l1, observe_l1_range,
 };
 pub(crate) use l2::{L2BlockObservation, OrderedL2Outcome, observe_l2_block_with_context};
 pub(crate) use state::{ZonePostStateOutputs, acquire_zone_post_state};

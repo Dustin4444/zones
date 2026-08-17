@@ -133,10 +133,10 @@ async fn imported_block(
     zone_id: u32,
     provider: &alloy_provider::DynProvider<TempoNetwork>,
 ) -> eyre::Result<()> {
-    let adaptation = adapt_imported(observation, header, creation_block, zone_id)
+    let adapted = adapt_imported(observation, header, creation_block, zone_id)
         .map_err(|failure| eyre::eyre!(failure.message))?;
-    let candidate = crate::kernel::apply_imported(state, &adaptation.facts)?;
-    if adaptation.effects != candidate.expected_effects() {
+    let candidate = crate::kernel::apply_imported(state, &adapted.facts)?;
+    if adapted.effects != candidate.expected_effects() {
         eyre::bail!("imported effects differ from expected effects");
     }
     let expected_accounting = candidate.expected_accounting()?;

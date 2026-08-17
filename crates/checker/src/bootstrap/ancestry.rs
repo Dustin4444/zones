@@ -26,7 +26,9 @@ pub(super) async fn anchor_header(
     Ok(header)
 }
 
-/// Prove and return the inclusive, hash-linked path from ancestor to descendant.
+/// Authenticate the hash-linked relationship between verified Tempo headers.
+///
+/// Returns the inclusive replay path from ancestor to descendant.
 pub(super) async fn authenticated_path(
     provider: &DynProvider<TempoNetwork>,
     ancestor: &ImportedTempoHeader,

@@ -1,4 +1,5 @@
-//! Discovers and authenticates the ZoneFactory creation block for bootstrap.
+//! Locates Portal creation through the RPC log index, then authenticates the
+//! candidate block and binds its decoded creation operation to Zone genesis.
 
 use alloy_primitives::{B256, U256};
 use alloy_provider::{DynProvider, Provider};
@@ -31,21 +32,20 @@ pub(super) async fn discover_creation(
     zone_id: u32,
 ) -> eyre::Result<Creation> {
     let head = provider.get_block_number().await?;
-    let candidates = creation_candidates(provider, portal, zone_id, 0, head).await?;
-    let [candidate] = candidates.as_slice() else {
+    let candidate_hashes = candidate_block_hashes(provider, portal, zone_id, 0, head).await?;
+    let [creation_block_hash] = candidate_hashes.as_slice() else {
         return Err(BootstrapError::CreationCandidates {
             portal,
             zone_id,
-            count: candidates.len(),
+            count: candidate_hashes.len(),
         }
         .into());
     };
-    let header = acquire_l1_header(provider, *candidate).await?;
+    let header = acquire_l1_header(provider, *creation_block_hash).await?;
     let observation = observe_l1(provider, &header, portal).await?;
-    let facts = adapt_imported(&observation, &header, header.hash(), zone_id)
-        .map_err(|failure| eyre::eyre!(failure.message))?
-        .facts;
-    let identity = validate_creation(&facts.operations, portal, zone_id)?;
+    let adapted = adapt_imported(&observation, &header, header.hash(), zone_id)
+        .map_err(|failure| eyre::eyre!(failure.message))?;
+    let identity = validate_authenticated_creation(&adapted.facts.operations, portal, zone_id)?;
     Ok(Creation {
         header,
         observation,
@@ -53,8 +53,10 @@ pub(super) async fn discover_creation(
     })
 }
 
-/// Find canonical factory-log candidates in one inclusive Tempo block range.
-async fn creation_candidates(
+/// Locate candidate block hashes through the unauthenticated RPC log index.
+///
+/// The selected block must be authenticated before its event is used.
+async fn candidate_block_hashes(
     provider: &DynProvider<TempoNetwork>,
     portal: alloy_primitives::Address,
     zone_id: u32,
@@ -93,8 +95,8 @@ async fn creation_candidates(
     Ok(hashes)
 }
 
-/// Validate the authenticated Portal creation operation against Zone genesis.
-fn validate_creation(
+/// Require one creation operation in the authenticated block and bind it to Zone genesis.
+fn validate_authenticated_creation(
     operations: &[ImportedOperation],
     portal: alloy_primitives::Address,
     zone_id: u32,
@@ -152,18 +154,28 @@ mod tests {
     fn creation_requires_one_matching_operation() {
         let expected = identity();
         assert!(
-            validate_creation(&[creation(expected)], expected.portal, expected.zone_id).is_ok()
+            validate_authenticated_creation(
+                &[creation(expected)],
+                expected.portal,
+                expected.zone_id
+            )
+            .is_ok()
         );
-        assert!(validate_creation(&[], expected.portal, expected.zone_id).is_err());
+        assert!(validate_authenticated_creation(&[], expected.portal, expected.zone_id).is_err());
 
         let mut mismatched = expected;
         mismatched.zone_id += 1;
         assert!(
-            validate_creation(&[creation(mismatched)], expected.portal, expected.zone_id).is_err()
+            validate_authenticated_creation(
+                &[creation(mismatched)],
+                expected.portal,
+                expected.zone_id
+            )
+            .is_err()
         );
 
         assert!(
-            validate_creation(
+            validate_authenticated_creation(
                 &[creation(expected), creation(expected)],
                 expected.portal,
                 expected.zone_id
@@ -187,6 +199,8 @@ mod tests {
             ImportedOperation::UpdateBouncebackGas(42),
         ];
 
-        assert!(validate_creation(&operations, expected.portal, expected.zone_id).is_ok());
+        assert!(
+            validate_authenticated_creation(&operations, expected.portal, expected.zone_id).is_ok()
+        );
     }
 }
