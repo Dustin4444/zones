@@ -425,6 +425,7 @@ async fn verify_remotely(
             version,
             request_id,
             output,
+            proof_bundle: _,
         } => {
             ensure!(
                 version == PROTOCOL_VERSION,
@@ -435,7 +436,7 @@ async fn verify_remotely(
                 "remote prover response request ID {request_id:?} does not match {:?}",
                 request.request_id
             );
-            Ok(output)
+            Ok(*output)
         }
         VerifyResponse::Error {
             version,
