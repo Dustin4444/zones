@@ -9,6 +9,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, CommandFactory, FromArgMatches};
+use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use tempo_evm::consensus::TempoConsensus;

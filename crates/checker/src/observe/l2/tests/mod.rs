@@ -1,5 +1,5 @@
 use alloy_consensus::{Header, Sealable as _, SignableTransaction as _, Signed, TxLegacy};
-use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData, Signature, U256, b256};
+use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData, Signature, U256};
 use alloy_rlp::Encodable as _;
 use alloy_sol_types::SolEvent as _;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};

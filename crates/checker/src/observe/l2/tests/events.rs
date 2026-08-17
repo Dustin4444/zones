@@ -147,12 +147,15 @@ fn deposit_rejected_is_unsupported_not_a_failed_deposit() {
         0,
         Log {
             address: ZONE_INBOX_ADDRESS,
-            data: LogData::new_unchecked(
-                vec![b256!(
-                    "4620415fad9c416306a56ca0ee640b3418628a5f2e45ddde3ddf7452a7a654fb"
-                )],
-                Bytes::new(),
-            ),
+            data: IZoneInbox::DepositRejected {
+                depositHash: B256::repeat_byte(0x01),
+                sender: Address::repeat_byte(0x02),
+                depositType: IZoneInbox::DepositType::Deposit,
+                token: Address::repeat_byte(0x03),
+                amount: 4,
+                tempoRefundRecipient: Address::repeat_byte(0x05),
+            }
+            .encode_log_data(),
         },
     );
     let block = reseal_with_receipts(block, &receipts);

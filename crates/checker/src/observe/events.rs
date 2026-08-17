@@ -1,8 +1,8 @@
 //! Strict protocol event classification owned by the checker.
 //!
-//! L1 and L2 classifiers match protocol emitters and generated event signatures
-//! before using the shared ABI decoder. Unknown topics from protocol emitters
-//! fail closed.
+//! L1 and L2 classifiers decode generated event interfaces, then apply the
+//! checker's exhaustive modeled-or-ignored policy. Unknown topics from protocol
+//! emitters fail closed.
 
 use alloy_primitives::{Address, B256, IntoLogData, Log};
 
@@ -15,7 +15,7 @@ use zone_precompiles::{
     outbox::MAX_CALLBACK_DATA_SIZE,
 };
 
-use alloy_sol_types::{SolEvent as _, SolEventInterface};
+use alloy_sol_types::SolEventInterface;
 
 pub(crate) use tempo_zone_contracts::{
     IZoneInbox as Inbox, IZoneOutbox as Outbox, TempoState, ZoneFactory as Factory,
@@ -105,14 +105,13 @@ pub(crate) fn classify_l2_protocol_event(
     Ok(None)
 }
 
-/// Decode a listed ZoneFactory event or reject an unsupported topic.
+/// Decode one generated ZoneFactory event and classify its checker relevance.
 fn decode_factory(log: &Log) -> Result<Option<Factory::ZoneCreated>, ProtocolEventError> {
-    match required_topic(log)? {
-        Factory::ZoneCreated::SIGNATURE_HASH | Factory::OwnershipTransferred::SIGNATURE_HASH => {}
-        _ => return Err(unsupported(log)),
-    }
-
-    match strict_decode_interface::<Factory::ZoneFactoryEvents>(log, "ZoneFactory event")? {
+    match decode_canonical_interface::<Factory::ZoneFactoryEvents>(
+        log,
+        "ZoneFactory event",
+        Factory::ZoneFactoryEvents::signature_by_selector,
+    )? {
         Factory::ZoneFactoryEvents::ZoneCreated(event) => {
             if event.sequencers.len() > MAX_SEQUENCERS {
                 return Err(malformed(
@@ -130,111 +129,119 @@ fn decode_factory(log: &Log) -> Result<Option<Factory::ZoneCreated>, ProtocolEve
     }
 }
 
-/// Decode a listed ZoneInbox event or reject an unsupported topic.
+/// Decode one generated ZoneInbox event and reject excluded protocol behavior.
 fn decode_inbox(log: &Log) -> Result<Inbox::IZoneInboxEvents, ProtocolEventError> {
-    match required_topic(log)? {
-        Inbox::TempoAdvanced::SIGNATURE_HASH
-        | Inbox::DepositProcessed::SIGNATURE_HASH
-        | Inbox::DepositFailed::SIGNATURE_HASH
-        | Inbox::WithdrawalBounceBackProcessed::SIGNATURE_HASH
-        | Inbox::WithdrawalBounceBackPending::SIGNATURE_HASH
-        | Inbox::RefundClaimed::SIGNATURE_HASH
-        | Inbox::TokenEnabled::SIGNATURE_HASH => {}
-        // Pinned Inbox topic that is deliberately excluded rather than unknown.
-        Inbox::DepositRejected::SIGNATURE_HASH => return Err(unsupported(log)),
-        _ => return Err(unsupported(log)),
-    }
-
-    let decoded = strict_decode_interface::<Inbox::IZoneInboxEvents>(log, "ZoneInbox event")?;
-    if let Inbox::IZoneInboxEvents::TokenEnabled(event) = &decoded {
-        validate_token_metadata(
+    let decoded = decode_canonical_interface::<Inbox::IZoneInboxEvents>(
+        log,
+        "ZoneInbox event",
+        Inbox::IZoneInboxEvents::signature_by_selector,
+    )?;
+    match &decoded {
+        // Pinned protocol behavior that the checker deliberately does not model.
+        Inbox::IZoneInboxEvents::DepositRejected(_) => return Err(unsupported(log)),
+        Inbox::IZoneInboxEvents::TokenEnabled(event) => validate_token_metadata(
             log,
             "TokenEnabled",
             &event.name,
             &event.symbol,
             &event.currency,
-        )?;
+        )?,
+        Inbox::IZoneInboxEvents::TempoAdvanced(_)
+        | Inbox::IZoneInboxEvents::DepositProcessed(_)
+        | Inbox::IZoneInboxEvents::DepositFailed(_)
+        | Inbox::IZoneInboxEvents::WithdrawalBounceBackProcessed(_)
+        | Inbox::IZoneInboxEvents::WithdrawalBounceBackPending(_)
+        | Inbox::IZoneInboxEvents::RefundClaimed(_) => {}
     }
     Ok(decoded)
 }
 
-/// Decode a listed ZoneOutbox event or reject an unsupported topic.
+/// Decode one generated ZoneOutbox event and validate bounded fields.
 fn decode_outbox(log: &Log) -> Result<Outbox::IZoneOutboxEvents, ProtocolEventError> {
-    match required_topic(log)? {
-        Outbox::WithdrawalRequested::SIGNATURE_HASH
-        | Outbox::BatchFinalized::SIGNATURE_HASH
-        | Outbox::TempoGasRateUpdated::SIGNATURE_HASH
-        | Outbox::MaxWithdrawalsPerBlockUpdated::SIGNATURE_HASH => {}
-        _ => return Err(unsupported(log)),
-    }
-    let decoded = strict_decode_interface::<Outbox::IZoneOutboxEvents>(log, "ZoneOutbox event")?;
-    if let Outbox::IZoneOutboxEvents::WithdrawalRequested(event) = &decoded {
-        validate_max_bytes(
-            log,
-            "WithdrawalRequested",
-            "data",
-            event.data.len(),
-            MAX_CALLBACK_DATA_SIZE,
-        )?;
-        if !matches!(event.revealTo.len(), 0 | COMPRESSED_PUBLIC_KEY_SIZE) {
-            return Err(malformed(
+    let decoded = decode_canonical_interface::<Outbox::IZoneOutboxEvents>(
+        log,
+        "ZoneOutbox event",
+        Outbox::IZoneOutboxEvents::signature_by_selector,
+    )?;
+    match &decoded {
+        Outbox::IZoneOutboxEvents::WithdrawalRequested(event) => {
+            validate_max_bytes(
                 log,
                 "WithdrawalRequested",
+                "data",
+                event.data.len(),
+                MAX_CALLBACK_DATA_SIZE,
+            )?;
+            if !matches!(event.revealTo.len(), 0 | COMPRESSED_PUBLIC_KEY_SIZE) {
+                return Err(malformed(
+                    log,
+                    "WithdrawalRequested",
+                    format!(
+                        "revealTo byte length {}, expected 0 or {COMPRESSED_PUBLIC_KEY_SIZE}",
+                        event.revealTo.len()
+                    ),
+                ));
+            }
+        }
+        Outbox::IZoneOutboxEvents::BatchFinalized(_)
+        | Outbox::IZoneOutboxEvents::TempoGasRateUpdated(_)
+        | Outbox::IZoneOutboxEvents::MaxWithdrawalsPerBlockUpdated(_) => {}
+    }
+    Ok(decoded)
+}
+
+/// Decode the generated TempoState event interface.
+fn decode_tempo_state(log: &Log) -> Result<TempoState::TempoStateEvents, ProtocolEventError> {
+    match decode_canonical_interface::<TempoState::TempoStateEvents>(
+        log,
+        "TempoState event",
+        TempoState::TempoStateEvents::signature_by_selector,
+    )? {
+        event @ TempoState::TempoStateEvents::TempoBlockFinalized(_) => Ok(event),
+    }
+}
+
+/// Decode one generated Portal event and retain checker-relevant state changes.
+fn decode_portal(log: &Log) -> Result<Option<Portal::ZonePortalEvents>, ProtocolEventError> {
+    let decoded = decode_canonical_interface::<Portal::ZonePortalEvents>(
+        log,
+        "Portal event",
+        Portal::ZonePortalEvents::signature_by_selector,
+    )?;
+    let changes_checker_state = match &decoded {
+        Portal::ZonePortalEvents::DepositMade(event) => {
+            validate_exact_bytes(
+                log,
+                "DepositMade",
+                "ciphertext",
+                event.ciphertext.len(),
+                ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
+            )?;
+            true
+        }
+        Portal::ZonePortalEvents::TokenEnabled(event) => {
+            validate_token_metadata(
+                log,
+                "TokenEnabled",
+                &event.name,
+                &event.symbol,
+                &event.currency,
+            )?;
+            true
+        }
+        Portal::ZonePortalEvents::SequencerSetUpdated(event)
+            if event.sequencers.len() > MAX_SEQUENCERS =>
+        {
+            return Err(malformed(
+                log,
+                "SequencerSetUpdated",
                 format!(
-                    "revealTo byte length {}, expected 0 or {COMPRESSED_PUBLIC_KEY_SIZE}",
-                    event.revealTo.len()
+                    "address array length {} exceeds {MAX_SEQUENCERS}",
+                    event.sequencers.len()
                 ),
             ));
         }
-    }
-    Ok(decoded)
-}
-
-/// Decode the single supported TempoState event.
-fn decode_tempo_state(log: &Log) -> Result<TempoState::TempoStateEvents, ProtocolEventError> {
-    if required_topic(log)? != TempoState::TempoBlockFinalized::SIGNATURE_HASH {
-        return Err(unsupported(log));
-    }
-    strict_decode_interface(log, "TempoState event")
-}
-
-/// Decode a listed Portal event and retain only checker-relevant state changes.
-fn decode_portal(log: &Log) -> Result<Option<Portal::ZonePortalEvents>, ProtocolEventError> {
-    match required_topic(log)? {
-        Portal::DepositMade::SIGNATURE_HASH
-        | Portal::TokenEnabled::SIGNATURE_HASH
-        | Portal::BatchSubmitted::SIGNATURE_HASH
-        | Portal::WithdrawalProcessed::SIGNATURE_HASH
-        | Portal::WithdrawalBounceBack::SIGNATURE_HASH
-        | Portal::DepositBounceBack::SIGNATURE_HASH
-        | Portal::DepositBounceBackPending::SIGNATURE_HASH
-        | Portal::RefundClaimed::SIGNATURE_HASH
-        | Portal::BouncebackGasUpdated::SIGNATURE_HASH
-        | Portal::SequencerEncryptionKeyUpdated::SIGNATURE_HASH
-        | Portal::ZoneGasRateUpdated::SIGNATURE_HASH
-        | Portal::MaxTempoGasRateUpdated::SIGNATURE_HASH
-        | Portal::AdminTransferStarted::SIGNATURE_HASH
-        | Portal::AdminTransferred::SIGNATURE_HASH
-        | Portal::RoleUpdated::SIGNATURE_HASH
-        | Portal::EnforcementModesUpdated::SIGNATURE_HASH
-        | Portal::SequencerSetUpdated::SIGNATURE_HASH
-        | Portal::LeaderUpdated::SIGNATURE_HASH
-        | Portal::DepositsPaused::SIGNATURE_HASH
-        | Portal::DepositsResumed::SIGNATURE_HASH
-        | Portal::PortalPaused::SIGNATURE_HASH
-        | Portal::PortalResumed::SIGNATURE_HASH
-        | Portal::AbdicationScheduled::SIGNATURE_HASH
-        | Portal::RpcUrlUpdated::SIGNATURE_HASH => {}
-        _ => return Err(unsupported(log)),
-    }
-
-    let decoded = strict_decode_interface::<Portal::ZonePortalEvents>(log, "Portal event")?;
-    validate_portal_dynamic_bounds(log, &decoded)?;
-
-    let changes_checker_state = match &decoded {
-        Portal::ZonePortalEvents::DepositMade(_)
-        | Portal::ZonePortalEvents::TokenEnabled(_)
-        | Portal::ZonePortalEvents::BatchSubmitted(_)
+        Portal::ZonePortalEvents::BatchSubmitted(_)
         | Portal::ZonePortalEvents::WithdrawalProcessed(_)
         | Portal::ZonePortalEvents::WithdrawalBounceBack(_)
         | Portal::ZonePortalEvents::DepositBounceBack(_)
@@ -254,46 +261,10 @@ fn decode_portal(log: &Log) -> Result<Option<Portal::ZonePortalEvents>, Protocol
         | Portal::ZonePortalEvents::AdminTransferred(_)
         | Portal::ZonePortalEvents::RoleUpdated(_)
         | Portal::ZonePortalEvents::EnforcementModesUpdated(_)
-        | Portal::ZonePortalEvents::SequencerSetUpdated(_)
         | Portal::ZonePortalEvents::LeaderUpdated(_) => false,
+        Portal::ZonePortalEvents::SequencerSetUpdated(_) => false,
     };
     Ok(changes_checker_state.then_some(decoded))
-}
-
-/// Validate dynamic Portal fields with protocol-specific bounds.
-fn validate_portal_dynamic_bounds(
-    log: &Log,
-    event: &Portal::ZonePortalEvents,
-) -> Result<(), ProtocolEventError> {
-    match event {
-        Portal::ZonePortalEvents::DepositMade(event) => validate_exact_bytes(
-            log,
-            "DepositMade",
-            "ciphertext",
-            event.ciphertext.len(),
-            ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
-        ),
-        Portal::ZonePortalEvents::TokenEnabled(event) => validate_token_metadata(
-            log,
-            "TokenEnabled",
-            &event.name,
-            &event.symbol,
-            &event.currency,
-        ),
-        Portal::ZonePortalEvents::SequencerSetUpdated(event)
-            if event.sequencers.len() > MAX_SEQUENCERS =>
-        {
-            Err(malformed(
-                log,
-                "SequencerSetUpdated",
-                format!(
-                    "address array length {} exceeds {MAX_SEQUENCERS}",
-                    event.sequencers.len()
-                ),
-            ))
-        }
-        _ => Ok(()),
-    }
 }
 
 fn required_topic(log: &Log) -> Result<B256, ProtocolEventError> {
@@ -319,12 +290,18 @@ fn malformed(log: &Log, event: &'static str, reason: impl Into<String>) -> Proto
     }
 }
 
-/// Decode through the shared generated event interface and reject any
-/// encoding that does not round-trip byte-for-byte.
-fn strict_decode_interface<E>(log: &Log, emitter: &'static str) -> Result<E, ProtocolEventError>
+/// Decode through the generated event interface and require canonical encoding.
+fn decode_canonical_interface<E>(
+    log: &Log,
+    emitter: &'static str,
+    signature_by_selector: fn([u8; 32]) -> Option<&'static str>,
+) -> Result<E, ProtocolEventError>
 where
     E: SolEventInterface + IntoLogData,
 {
+    if signature_by_selector(required_topic(log)?.0).is_none() {
+        return Err(unsupported(log));
+    }
     let decoded = E::decode_log(log)
         .map_err(|error| malformed(log, emitter, error.to_string()))?
         .data;
