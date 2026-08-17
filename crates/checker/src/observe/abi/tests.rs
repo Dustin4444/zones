@@ -201,7 +201,7 @@ fn advance_decodes_canonical_payload() {
 }
 
 #[test]
-fn deposit_preflight_rejects_invalid_layout() {
+fn deposit_decoding_rejects_invalid_layout() {
     let mut oversized = ordinary_deposit().abi_encode();
     oversized.extend([0; WORD]);
     let expected_evidence = AuthenticatedDataEvidence::from_bytes(&oversized);
