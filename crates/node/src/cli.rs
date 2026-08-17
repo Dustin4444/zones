@@ -9,7 +9,6 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Args, CommandFactory, FromArgMatches};
-use reth_chainspec::EthChainSpec;
 use reth_ethereum::cli::Cli;
 use reth_tracing::tracing::info;
 use tempo_evm::consensus::TempoConsensus;
@@ -18,11 +17,10 @@ use zone_chainspec::{ZoneChainSpec, ZoneChainSpecParser};
 use zone_evm::ZoneEvmConfig;
 use zone_p2p::{MAX_TRANSACTION_MESSAGE_SIZE, P2pConfig, Role};
 use zone_payload::DEFAULT_WITHDRAWAL_BATCH_INTERVAL_BLOCKS;
-use zone_primitives::constants::decode_l1_chain_id;
 
 use crate::{
     ZoneNode, ZoneRedactedRpcConfig, ZoneSequencerAddOnsConfig, dev::DevCommand,
-    node::tempo_chain_spec_for_l1, rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
+    rpc::auth::DEFAULT_MAX_AUTH_TOKEN_VALIDITY_SECS,
 };
 use zone_checker::CheckerExEx;
 use zone_sequencer::{
@@ -116,15 +114,6 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>, action: NodeAction) -> 
     prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
 
     let components = |spec: Arc<ZoneChainSpec>| {
-        let l1_chain_id = decode_l1_chain_id(spec.chain().id())
-            .expect("CLI components require a valid Zone chain ID");
-        let l1_spec = tempo_chain_spec_for_l1(l1_chain_id)
-            .expect("CLI components require a supported parent Tempo chain ID");
-        let spec = Arc::new(
-            spec.as_ref()
-                .clone()
-                .with_tempo_hardforks_from(l1_spec.as_ref()),
-        );
         (
             ZoneEvmConfig::new_without_l1(spec.clone()),
             TempoConsensus::new(spec),
