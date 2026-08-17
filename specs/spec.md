@@ -2084,7 +2084,6 @@ interface IZoneInbox {
 
     error OnlySequencer();
     error InvalidDepositQueueHash();
-    error InvalidWithdrawalBounceBack();
     error InvalidTokenEnablementHash();
     error MissingDecryptionData();
     error ExtraDecryptionData();
