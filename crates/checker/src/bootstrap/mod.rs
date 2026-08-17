@@ -50,29 +50,25 @@ where
     // Authenticate and replay Tempo history into the Zone genesis state.
     let mut state = State::awaiting(expected_identity);
     if creation_tip.number <= anchor.number {
-        for header in authenticated_path(&l1_provider, &creation.header, anchor_header).await? {
-            if header.hash() == creation_tip.hash {
-                imported_block(
-                    &mut state,
-                    &creation.observation,
-                    &header,
-                    creation_tip.hash,
-                    config.zone_id,
-                    &l1_provider,
-                )
-                .await?;
+        let path = authenticated_path(&l1_provider, &creation.header, anchor_header).await?;
+        let creation_observation = creation.observation;
+        for header in path {
+            let fetched;
+            let observation = if header.hash() == creation_tip.hash {
+                &creation_observation
             } else {
-                let observation = observe_l1(&l1_provider, &header, config.portal_address).await?;
-                imported_block(
-                    &mut state,
-                    &observation,
-                    &header,
-                    creation_tip.hash,
-                    config.zone_id,
-                    &l1_provider,
-                )
-                .await?;
-            }
+                fetched = observe_l1(&l1_provider, &header, config.portal_address).await?;
+                &fetched
+            };
+            imported_block(
+                &mut state,
+                observation,
+                &header,
+                creation_tip.hash,
+                config.zone_id,
+                &l1_provider,
+            )
+            .await?;
         }
         validate_zero_supply(zone_provider, genesis.hash, state.tokens().map(|(t, _)| t))?;
         state.apply(&apply_genesis_handoff(&state)?)?;
@@ -143,14 +139,17 @@ async fn imported_block(
     if adaptation.effects != candidate.expected_effects() {
         eyre::bail!("imported effects differ from expected effects");
     }
-    for (token, accounting) in candidate.expected_accounting()? {
-        let actual = crate::observe::acquire_portal_token_balance(
+    let expected_accounting = candidate.expected_accounting()?;
+    let actual_balances = futures::future::try_join_all(expected_accounting.keys().map(|token| {
+        crate::observe::acquire_portal_token_balance(
             provider,
-            token,
+            *token,
             observation.portal_address(),
             observation.block_hash(),
         )
-        .await?;
+    }))
+    .await?;
+    for ((token, accounting), actual) in expected_accounting.into_iter().zip(actual_balances) {
         if accounting
             .collateral()
             .is_none_or(|required| actual < required)

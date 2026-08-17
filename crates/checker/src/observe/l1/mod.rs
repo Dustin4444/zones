@@ -93,8 +93,11 @@ pub(crate) async fn observe_l1<P>(
 where
     P: Provider<TempoNetwork>,
 {
-    let block = acquisition::acquire_block(provider, imported).await?;
-    let receipts = acquisition::acquire_receipts(provider, imported, &block).await?;
+    let (block, receipts) = tokio::try_join!(
+        acquisition::acquire_block(provider, imported),
+        acquisition::fetch_receipts(provider, imported),
+    )?;
+    let receipts = acquisition::verify_receipts(imported, &block, receipts)?;
     let transaction_hashes = block
         .transactions
         .iter()
@@ -149,11 +152,12 @@ pub(crate) async fn observe_l1_range<P>(
 where
     P: Provider<TempoNetwork>,
 {
-    let mut observations = Vec::with_capacity(imported.len());
-    for header in imported {
-        observations.push(observe_l1(provider, header, portal).await?);
-    }
-    Ok(observations)
+    futures::future::try_join_all(
+        imported
+            .iter()
+            .map(|header| observe_l1(provider, header, portal)),
+    )
+    .await
 }
 
 #[cfg(test)]

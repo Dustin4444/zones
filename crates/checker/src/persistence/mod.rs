@@ -157,6 +157,17 @@ impl Persistence {
         Ok(meta.identity)
     }
 
+    /// Construct a handle wrapping an already-opened database.
+    fn new(db: DatabaseEnv, identity: Identity) -> Self {
+        Self {
+            db: Arc::new(db),
+            identity,
+            retention: RetentionPolicy::PRODUCTION,
+            #[cfg(test)]
+            abort_next_write: AtomicBool::new(false),
+        }
+    }
+
     /// Read and reconstruct an existing database without opening a writer.
     pub(crate) fn inspect_snapshot(path: impl AsRef<Path>) -> Result<Snapshot> {
         let path = path.as_ref();
@@ -166,14 +177,7 @@ impl Persistence {
         let meta = read_metadata(&tx)?;
         validate_metadata(&meta)?;
         tx.commit()?;
-        Self {
-            db: Arc::new(db),
-            identity: meta.identity,
-            retention: RetentionPolicy::PRODUCTION,
-            #[cfg(test)]
-            abort_next_write: AtomicBool::new(false),
-        }
-        .load()
+        Self::new(db, meta.identity).load()
     }
 
     /// Create a fresh database initialized at the supplied chain cut.
@@ -189,13 +193,7 @@ impl Persistence {
         }
         validate_state(&state, identity)?;
         let db = init_db_for::<_, PersistenceTables>(&path, DatabaseArguments::default())?;
-        let this = Self {
-            db: Arc::new(db),
-            identity,
-            retention: RetentionPolicy::PRODUCTION,
-            #[cfg(test)]
-            abort_next_write: AtomicBool::new(false),
-        };
+        let this = Self::new(db, identity);
         let id = CheckpointId::from(cut.zone);
         let meta = Metadata {
             identity,
@@ -237,13 +235,7 @@ impl Persistence {
         let path = path.as_ref().to_path_buf();
         probe(&path)?;
         let db = DatabaseEnv::open(&path, DatabaseEnvKind::RW, DatabaseArguments::default())?;
-        let this = Self {
-            db: Arc::new(db),
-            identity,
-            retention: RetentionPolicy::PRODUCTION,
-            #[cfg(test)]
-            abort_next_write: AtomicBool::new(false),
-        };
+        let this = Self::new(db, identity);
         this.load().map(|snapshot| (this, snapshot))
     }
 
@@ -474,7 +466,7 @@ impl Persistence {
         finding: Finding,
         observed_through: BlockNumHash,
     ) -> Result<Snapshot> {
-        self.write(prior, prior.state.as_ref().clone(), |tx, meta, _state| {
+        let meta = self.write_metadata(prior, |tx, meta| {
             let first_unchecked = finding.zone;
             if observed_through.number < first_unchecked.number {
                 return Err(invalid("divergence suffix precedes its finding"));
@@ -504,20 +496,27 @@ impl Persistence {
                 observed_through,
             };
             Ok(())
+        })?;
+        Ok(Snapshot {
+            meta,
+            state: Arc::clone(&prior.state),
         })
     }
 
     /// Persist that the checker cannot safely advance verification.
-    pub(crate) fn record_blocked_current(&self, reason: CheckerBlockedReason) -> Result<Snapshot> {
-        let current = self.load()?;
-        self.write(
-            &current,
-            current.state.as_ref().clone(),
-            |_tx, meta, _state| {
-                meta.blocked = Some(reason);
-                Ok(())
-            },
-        )
+    pub(crate) fn record_blocked_current(
+        &self,
+        prior: &Snapshot,
+        reason: CheckerBlockedReason,
+    ) -> Result<Snapshot> {
+        let meta = self.write_metadata(prior, |_tx, meta| {
+            meta.blocked = Some(reason);
+            Ok(())
+        })?;
+        Ok(Snapshot {
+            meta,
+            state: Arc::clone(&prior.state),
+        })
     }
 
     /// Rewind durable journal and coverage state to a retained ancestor.

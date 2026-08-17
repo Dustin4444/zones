@@ -147,7 +147,7 @@ impl Runtime {
         store: &Persistence,
         reason: CheckerBlockedReason,
     ) -> Result<(), PersistenceError> {
-        self.replace_snapshot(store.record_blocked_current(reason)?);
+        self.replace_snapshot(store.record_blocked_current(&self.snapshot, reason)?);
         self.retry = None;
         Ok(())
     }

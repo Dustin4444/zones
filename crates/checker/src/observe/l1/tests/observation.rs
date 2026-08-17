@@ -232,8 +232,12 @@ async fn eventful_empty_process_withdrawals_fails_closed() {
 
 #[tokio::test]
 async fn eventful_malformed_direct_calldata_fails_closed() {
+    // Truncate the whole final word (the lone signature's content), not just
+    // its zero padding: a missing pad byte alone decodes identically to the
+    // canonical encoding, since calldata reads past the end are implicitly
+    // zero under real EVM/Solidity semantics.
     let mut malformed = submit_batch_calldata().to_vec();
-    malformed.pop();
+    malformed.truncate(malformed.len() - 32);
     let evidence = AuthenticatedDataEvidence::from_bytes(&malformed);
     let envelope = legacy_call(PORTAL, malformed.into());
     let tx_hash = envelope.trie_hash();

@@ -97,11 +97,9 @@ pub(crate) fn ordinary_deposit_hash(deposit: &OrdinaryDeposit, previous: B256) -
 
 /// Hash a bounceback deposit into the reverse-linked Portal deposit queue.
 pub(crate) fn bounceback_deposit_hash(deposit: BounceBackDeposit, previous: B256) -> B256 {
-    let mut recipient = [0_u8; 20];
-    recipient[12..].copy_from_slice(&deposit.fallback_nonce.get().to_be_bytes());
     let wire = WithdrawalBounceBackDeposit {
         token: deposit.token,
-        to: Address::from(recipient),
+        to: Address::left_padding_from(&deposit.fallback_nonce.get().to_be_bytes()),
         amount: deposit.amount,
     };
     keccak256((DepositType::WithdrawalBounceBack, wire, previous).abi_encode_params())

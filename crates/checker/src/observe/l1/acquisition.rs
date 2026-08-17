@@ -94,20 +94,27 @@ where
     })
 }
 
-/// Fetch the complete receipt stream and authenticate it against the imported header.
-pub(super) async fn acquire_receipts<P>(
+/// Fetch the complete receipt stream over RPC, independent of the block body.
+pub(super) async fn fetch_receipts<P>(
     provider: &P,
     imported: &ImportedTempoHeader,
-    block: &AuthenticatedBlock,
 ) -> Result<Vec<TempoTransactionReceipt>, ObservationError>
 where
     P: Provider<TempoNetwork>,
 {
-    let receipts = provider
+    Ok(provider
         .get_block_receipts(BlockId::hash(imported.hash()))
         .await
         .map_err(|error| AcquisitionError::unavailable(AcquisitionSource::L1Receipts, error))?
-        .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Receipts, imported.hash()))?;
+        .ok_or_else(|| AcquisitionError::missing(AcquisitionSource::L1Receipts, imported.hash()))?)
+}
+
+/// Authenticate a fetched receipt stream against the imported header and block.
+pub(super) fn verify_receipts(
+    imported: &ImportedTempoHeader,
+    block: &AuthenticatedBlock,
+    receipts: Vec<TempoTransactionReceipt>,
+) -> Result<Vec<TempoTransactionReceipt>, ObservationError> {
     let transaction_hashes = block
         .transactions
         .iter()

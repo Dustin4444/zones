@@ -1,6 +1,4 @@
-//! Allocation-bounded, canonical protocol calldata decoding.
-
-mod bounds;
+//! Canonical protocol calldata decoding.
 
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::{B256, Bytes};
@@ -23,13 +21,6 @@ use super::error::{
     AuthenticatedDataEvidence, AuthenticatedTransaction, DataSource, ObservationError,
     PortalCallFamily,
 };
-use bounds::Bounds;
-
-const WORD: usize = 32;
-const SELECTOR_LEN: usize = 4;
-// `ZonePortal.Deposit` is one top-level offset, a six-word tuple head,
-// a five-word encrypted-payload head, and a three-word ciphertext tail.
-const ORDINARY_DEPOSIT_ENCODED_SIZE: usize = 15 * WORD;
 
 /// A malformed ABI surface before it is attached to an authenticated transaction.
 #[derive(Debug)]
@@ -251,96 +242,6 @@ impl DecodedPortalCall {
     }
 }
 
-/// A checked view over an ABI payload, excluding its four-byte selector.
-/// Every helper checks integer conversion and range arithmetic before a
-/// generated decoder can allocate from an attacker-controlled length word.
-/// Validate nested ordinary-deposit offsets before decoding its generated ABI type.
-fn preflight_ordinary_deposit(data: &[u8]) -> Result<(), AbiError> {
-    let surface = Surface::new(DataSource::OrdinaryDepositData, data);
-    if data.len() != ORDINARY_DEPOSIT_ENCODED_SIZE {
-        return Err(surface.malformed(format!(
-            "encoded deposit length {}, expected {ORDINARY_DEPOSIT_ENCODED_SIZE}",
-            data.len()
-        )));
-    }
-    let bounds = Bounds::from_data(surface, data);
-    bounds.ensure_head(1)?;
-    let deposit = bounds.relative(0, 0, 1)?;
-    let encrypted = bounds.relative(deposit, 5, 6)?;
-    let ciphertext = bounds.bytes_field(
-        encrypted,
-        2,
-        5,
-        ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE,
-        "ciphertext",
-    )?;
-    if ciphertext.len() != ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE {
-        return Err(surface.malformed(format!(
-            "ciphertext length {}, expected {ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE}",
-            ciphertext.len()
-        )));
-    }
-    Ok(())
-}
-
-/// Bound every dynamic `advanceTempo` field before its generated decoder can allocate.
-fn preflight_advance_tempo(calldata: &[u8]) -> Result<(), AbiError> {
-    let surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    let bounds = Bounds::from_call(
-        DataSource::AdvanceTempoCalldata,
-        calldata,
-        &IZoneInbox::advanceTempoCall::SELECTOR,
-    )?;
-    bounds.ensure_head(4)?;
-    bounds.bytes_field(0, 0, 4, bounds.data.len(), "header")?;
-
-    let (deposit_head, deposit_count) =
-        bounds.dynamic_array(0, 1, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "deposits")?;
-    let mut ordinary_count = 0usize;
-    for index in 0..deposit_count {
-        let deposit = bounds.dynamic_element(deposit_head, deposit_count, index)?;
-        let kind = bounds.usize_word(deposit)?;
-        let data = bounds.bytes_field(deposit, 1, 2, bounds.data.len(), "depositData")?;
-        match kind {
-            0 => {
-                if data.len() != 3 * WORD {
-                    return Err(Surface::new(DataSource::WithdrawalBounceBackData, data)
-                        .malformed(format!(
-                            "withdrawal bounce-back depositData length {}, expected {}",
-                            data.len(),
-                            3 * WORD
-                        )));
-                }
-            }
-            1 => {
-                ordinary_count += 1;
-                preflight_ordinary_deposit(data)?;
-            }
-            other => {
-                return Err(surface.malformed(format!("unsupported deposit discriminator {other}")));
-            }
-        }
-    }
-
-    let decryption_count =
-        bounds.static_array(0, 2, 4, 4, MAX_DEPOSITS_PER_TEMPO_BLOCK, "decryptions")?;
-    if decryption_count != ordinary_count {
-        return Err(surface.malformed(format!(
-                "decryption count {decryption_count} does not match ordinary deposit count {ordinary_count}"
-            )));
-    }
-
-    let (token_head, token_count) =
-        bounds.dynamic_array(0, 3, 4, MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK, "enabledTokens")?;
-    for index in 0..token_count {
-        let token = bounds.dynamic_element(token_head, token_count, index)?;
-        bounds.bytes_field(token, 1, 4, MAX_TOKEN_METADATA_BYTES, "token name")?;
-        bounds.bytes_field(token, 2, 4, MAX_TOKEN_METADATA_BYTES, "token symbol")?;
-        bounds.bytes_field(token, 3, 4, MAX_TOKEN_METADATA_BYTES, "token currency")?;
-    }
-    Ok(())
-}
-
 /// Strictly decode canonical `advanceTempo` calldata from its authenticated transaction.
 pub(crate) fn decode_advance_tempo(
     calldata: &[u8],
@@ -352,11 +253,35 @@ pub(crate) fn decode_advance_tempo(
 /// Parse `advanceTempo` calldata and reject oversized or non-canonical encodings.
 fn parse_advance_tempo(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError> {
     let advance_surface = Surface::new(DataSource::AdvanceTempoCalldata, calldata);
-    preflight_advance_tempo(calldata)?;
     let decoded = IZoneInbox::advanceTempoCall::abi_decode_validate(calldata)
         .map_err(|error| advance_surface.malformed(error))?;
     if decoded.abi_encode() != calldata {
         return Err(advance_surface.malformed("encoding is non-canonical or has trailing bytes"));
+    }
+    if decoded.deposits.len() > MAX_DEPOSITS_PER_TEMPO_BLOCK {
+        return Err(advance_surface.malformed(format!(
+            "deposit count {} exceeds {MAX_DEPOSITS_PER_TEMPO_BLOCK}",
+            decoded.deposits.len()
+        )));
+    }
+    if decoded.enabledTokens.len() > MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK {
+        return Err(advance_surface.malformed(format!(
+            "enabled token count {} exceeds {MAX_TOKENS_ENABLED_PER_TEMPO_BLOCK}",
+            decoded.enabledTokens.len()
+        )));
+    }
+    for token in &decoded.enabledTokens {
+        for (field, len) in [
+            ("name", token.name.len()),
+            ("symbol", token.symbol.len()),
+            ("currency", token.currency.len()),
+        ] {
+            if len > MAX_TOKEN_METADATA_BYTES {
+                return Err(advance_surface.malformed(format!(
+                    "token {field} byte length {len} exceeds {MAX_TOKEN_METADATA_BYTES}"
+                )));
+            }
+        }
     }
 
     let header_surface = Surface::new(DataSource::AdvanceHeaderRlp, &decoded.header);
@@ -374,6 +299,7 @@ fn parse_advance_tempo(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError>
     let imported_header = ImportedTempoHeader::new(header);
 
     let mut deposits = Vec::with_capacity(decoded.deposits.len());
+    let mut ordinary_count = 0usize;
     for queued in decoded.deposits {
         let data = queued.depositData;
         let deposit = match queued.depositType as u8 {
@@ -399,6 +325,13 @@ fn parse_advance_tempo(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError>
                         surface.malformed("encoding is non-canonical or has trailing bytes")
                     );
                 }
+                if decoded.encrypted.ciphertext.len() != ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE {
+                    return Err(surface.malformed(format!(
+                        "ciphertext length {}, expected {ENCRYPTED_PAYLOAD_PLAINTEXT_SIZE}",
+                        decoded.encrypted.ciphertext.len()
+                    )));
+                }
+                ordinary_count += 1;
                 ImportedDeposit {
                     kind: ImportedDepositKind::Ordinary(decoded),
                 }
@@ -409,46 +342,18 @@ fn parse_advance_tempo(calldata: &[u8]) -> Result<DecodedAdvanceTempo, AbiError>
         };
         deposits.push(deposit);
     }
+    if decoded.decryptions.len() != ordinary_count {
+        return Err(advance_surface.malformed(format!(
+            "decryption count {} does not match ordinary deposit count {ordinary_count}",
+            decoded.decryptions.len()
+        )));
+    }
 
     Ok(DecodedAdvanceTempo {
         imported_header,
         deposits,
         enabled_tokens: decoded.enabledTokens,
     })
-}
-
-/// Bound finalization sender data before its generated decoder can allocate.
-fn preflight_finalization(calldata: &[u8]) -> Result<(), AbiError> {
-    let surface = Surface::new(DataSource::FinalizationCalldata, calldata);
-    let bounds = Bounds::from_call(
-        DataSource::FinalizationCalldata,
-        calldata,
-        &IZoneOutbox::finalizeWithdrawalBatchCall::SELECTOR,
-    )?;
-    bounds.ensure_head(3)?;
-    let count = bounds.usize_word(0)?;
-    let maximum = bounds.data.len() / WORD;
-    let (sender_head, sender_count) = bounds.dynamic_array(0, 2, 3, maximum, "encryptedSenders")?;
-    if count != sender_count {
-        return Err(surface.malformed(format!(
-            "count {count} does not match encryptedSenders length {sender_count}"
-        )));
-    }
-    for index in 0..sender_count {
-        let sender = bounds.dynamic_element(sender_head, sender_count, index)?;
-        let bytes = bounds.direct_bytes(
-            sender,
-            AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
-            "encrypted sender",
-        )?;
-        if !matches!(bytes.len(), 0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE) {
-            return Err(surface.malformed(format!(
-                    "encrypted sender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
-                    bytes.len()
-                )));
-        }
-    }
-    Ok(())
 }
 
 /// Strictly decode canonical finalization calldata from its authenticated transaction.
@@ -462,7 +367,6 @@ pub(crate) fn decode_finalization(
 /// Parse finalization calldata and reject oversized or non-canonical encodings.
 fn parse_finalization(calldata: &[u8]) -> Result<DecodedFinalization, AbiError> {
     let surface = Surface::new(DataSource::FinalizationCalldata, calldata);
-    preflight_finalization(calldata)?;
     let call = IZoneOutbox::finalizeWithdrawalBatchCall::abi_decode_validate(calldata)
         .map_err(|error| surface.malformed(error))?;
     if call.abi_encode() != calldata {
@@ -470,63 +374,25 @@ fn parse_finalization(calldata: &[u8]) -> Result<DecodedFinalization, AbiError> 
     }
     let count =
         usize::try_from(call.count).map_err(|_| surface.malformed("count overflows usize"))?;
+    if count != call.encryptedSenders.len() {
+        return Err(surface.malformed(format!(
+            "count {count} does not match encryptedSenders length {}",
+            call.encryptedSenders.len()
+        )));
+    }
+    for (index, sender) in call.encryptedSenders.iter().enumerate() {
+        if !matches!(sender.len(), 0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE) {
+            return Err(surface.malformed(format!(
+                "encrypted sender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
+                sender.len()
+            )));
+        }
+    }
     Ok(DecodedFinalization {
         count,
         block_number: call.blockNumber,
         encrypted_senders: call.encryptedSenders,
     })
-}
-
-/// Bound every withdrawal field before decoding `processWithdrawals` calldata.
-fn preflight_process_withdrawals(calldata: &[u8]) -> Result<(), AbiError> {
-    let surface = Surface::new(DataSource::ProcessWithdrawalsCalldata, calldata);
-    let bounds = Bounds::from_call(
-        DataSource::ProcessWithdrawalsCalldata,
-        calldata,
-        &ZonePortal::processWithdrawalsCall::SELECTOR,
-    )?;
-    bounds.ensure_head(2)?;
-    let maximum = bounds.data.len() / WORD;
-    let (withdrawal_head, withdrawal_count) =
-        bounds.dynamic_array(0, 0, 2, maximum, "withdrawals")?;
-    for index in 0..withdrawal_count {
-        let withdrawal = bounds.dynamic_element(withdrawal_head, withdrawal_count, index)?;
-        bounds.bytes_field(withdrawal, 7, 9, MAX_CALLBACK_DATA_SIZE, "callbackData")?;
-        let encrypted = bounds.bytes_field(
-            withdrawal,
-            8,
-            9,
-            AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE,
-            "encryptedSender",
-        )?;
-        if !matches!(encrypted.len(), 0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE) {
-            return Err(surface.malformed(format!(
-                    "encryptedSender {index} has length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
-                    encrypted.len()
-                )));
-        }
-    }
-    Ok(())
-}
-
-/// Bound all byte strings and signatures before decoding `submitBatch` calldata.
-fn preflight_submit_batch(calldata: &[u8]) -> Result<(), AbiError> {
-    let bounds = Bounds::from_call(
-        DataSource::SubmitBatchCalldata,
-        calldata,
-        &ZonePortal::submitBatchCall::SELECTOR,
-    )?;
-    bounds.ensure_head(13)?;
-    let maximum = bounds.data.len();
-    bounds.bytes_field(0, 9, 13, maximum, "verifierConfig")?;
-    bounds.bytes_field(0, 10, 13, maximum, "proof")?;
-    let (signature_head, signature_count) =
-        bounds.dynamic_array(0, 12, 13, MAX_SEQUENCERS, "signatures")?;
-    for index in 0..signature_count {
-        let signature = bounds.dynamic_element(signature_head, signature_count, index)?;
-        bounds.direct_bytes(signature, maximum, "signature")?;
-    }
-    Ok(())
 }
 
 /// Strictly decode the Portal calldata whose family was implied by receipt outcomes.
@@ -587,23 +453,44 @@ pub(crate) fn is_direct_portal_state_change(calldata: &[u8]) -> bool {
         || calldata.starts_with(&ZonePortal::claimRefundCall::SELECTOR)
 }
 
-/// Preflight and decode chain-valid `submitBatch` calldata.
+/// Decode `submitBatch` calldata, tolerating the same trailing bytes Solidity accepts.
 fn decode_submit_batch(calldata: &[u8]) -> Result<DecodedPortalCall, AbiError> {
     let surface = Surface::new(DataSource::SubmitBatchCalldata, calldata);
-    preflight_submit_batch(calldata)?;
     let call = ZonePortal::submitBatchCall::abi_decode_validate(calldata)
         .map_err(|error| surface.malformed(error))?;
+    if call.signatures.len() > MAX_SEQUENCERS {
+        return Err(surface.malformed(format!(
+            "signature count {} exceeds {MAX_SEQUENCERS}",
+            call.signatures.len()
+        )));
+    }
     Ok(DecodedPortalCall {
         kind: DecodedPortalCallKind::SubmitBatch(Box::new(call)),
     })
 }
 
-/// Preflight and decode chain-valid `processWithdrawals` calldata.
+/// Decode `processWithdrawals` calldata, tolerating the same trailing bytes Solidity accepts.
 fn decode_process_withdrawals(calldata: &[u8]) -> Result<DecodedPortalCall, AbiError> {
     let surface = Surface::new(DataSource::ProcessWithdrawalsCalldata, calldata);
-    preflight_process_withdrawals(calldata)?;
     let call = ZonePortal::processWithdrawalsCall::abi_decode_validate(calldata)
         .map_err(|error| surface.malformed(error))?;
+    for (index, withdrawal) in call.withdrawals.iter().enumerate() {
+        if withdrawal.callbackData.len() > MAX_CALLBACK_DATA_SIZE {
+            return Err(surface.malformed(format!(
+                "withdrawal {index} callbackData length {} exceeds {MAX_CALLBACK_DATA_SIZE}",
+                withdrawal.callbackData.len()
+            )));
+        }
+        if !matches!(
+            withdrawal.encryptedSender.len(),
+            0 | AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE
+        ) {
+            return Err(surface.malformed(format!(
+                "withdrawal {index} encryptedSender length {}, expected 0 or {AUTHENTICATED_WITHDRAWAL_ENCRYPTED_SIZE}",
+                withdrawal.encryptedSender.len()
+            )));
+        }
+    }
     Ok(DecodedPortalCall {
         kind: DecodedPortalCallKind::ProcessWithdrawals(call),
     })

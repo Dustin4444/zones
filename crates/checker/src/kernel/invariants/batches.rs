@@ -51,7 +51,6 @@ struct BatchValidator<'a> {
     prior_end: Option<u64>,
     submitted_tip: Option<BatchProgress>,
     finalized_tip: BatchProgress,
-    last_end: Option<u64>,
 }
 
 impl<'a> BatchValidator<'a> {
@@ -80,7 +79,6 @@ impl<'a> BatchValidator<'a> {
             prior_end: None,
             submitted_tip: None,
             finalized_tip,
-            last_end: None,
         })
     }
 
@@ -196,7 +194,6 @@ impl<'a> BatchValidator<'a> {
     /// Record the contiguous withdrawal range validated for a batch.
     fn record_range_end(&mut self, end: u64) {
         self.prior_end = Some(end);
-        self.last_end = Some(end);
     }
 
     /// Advance the submitted or finalized sequence represented by a batch.
@@ -373,7 +370,7 @@ impl<'a> BatchValidator<'a> {
             return Err(self.batch_error(StateKey::Zone));
         }
         if self
-            .last_end
+            .prior_end
             .is_some_and(|end| end != self.zone.batch_start.withdrawal_index)
         {
             return Err(self.batch_error(StateKey::Zone));

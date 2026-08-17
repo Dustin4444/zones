@@ -4,6 +4,9 @@ use alloy_primitives::{Address, U256};
 use super::*;
 use crate::observe::ProtocolChain;
 
+const WORD: usize = 32;
+const SELECTOR_LEN: usize = 4;
+
 fn l2_transaction(index: usize) -> AuthenticatedTransaction {
     AuthenticatedTransaction::new(ProtocolChain::ZoneL2, index, B256::repeat_byte(0xa1))
 }
@@ -200,7 +203,6 @@ fn advance_decodes_canonical_payload() {
 #[test]
 fn deposit_preflight_rejects_invalid_layout() {
     let mut oversized = ordinary_deposit().abi_encode();
-    assert_eq!(oversized.len(), ORDINARY_DEPOSIT_ENCODED_SIZE);
     oversized.extend([0; WORD]);
     let expected_evidence = AuthenticatedDataEvidence::from_bytes(&oversized);
     let calldata = advance_with_ordinary_deposit_data(oversized);

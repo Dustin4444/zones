@@ -842,15 +842,20 @@ where
                 ),
             )
         })?;
-    for (token, accounting) in expected_l1_accounting {
-        let collateral_balance = acquire_portal_token_balance(
-            l1_provider,
-            token,
-            portal_address,
-            authenticated_block.tempo.hash,
-        )
+    let collateral_balances =
+        futures::future::try_join_all(expected_l1_accounting.keys().map(|token| {
+            acquire_portal_token_balance(
+                l1_provider,
+                *token,
+                portal_address,
+                authenticated_block.tempo.hash,
+            )
+        }))
         .await
         .map_err(Failure::from)?;
+    for ((token, accounting), collateral_balance) in
+        expected_l1_accounting.into_iter().zip(collateral_balances)
+    {
         let required = accounting.collateral().unwrap_or(U256::ZERO);
         if collateral_balance < required {
             return Err(Failure::authenticated_divergence(
