@@ -50,6 +50,10 @@ pub(crate) struct VerifyClosedLoop {
     #[arg(long, env = "L1_RPC_URL")]
     l1_rpc_url: String,
 
+    /// ZoneFactory contract address.
+    #[arg(long, default_value_t = ZONE_FACTORY_ADDRESS)]
+    zone_factory: Address,
+
     /// Deployed SingleZoneEarnRouter address.
     #[arg(long)]
     earn_router: Address,
@@ -102,7 +106,7 @@ impl VerifyClosedLoop {
             .await
             .wrap_err("failed reading Earn router configuration")?;
 
-        let zone = ZoneFactory::new(ZONE_FACTORY_ADDRESS, &provider)
+        let zone = ZoneFactory::new(self.zone_factory, &provider)
             .zones(zone_id)
             .block(snapshot_block_id)
             .call()
@@ -115,8 +119,14 @@ impl VerifyClosedLoop {
         ensure_has_code(&provider, zone.portal, "ZonePortal", snapshot_block_id).await?;
         ensure_has_code(&provider, earn_vault, "EarnVault", snapshot_block_id).await?;
 
-        let deployment_block =
-            find_zone_deployment_block(&provider, zone_id, zone.portal, snapshot_block).await?;
+        let deployment_block = find_zone_deployment_block(
+            &provider,
+            self.zone_factory,
+            zone_id,
+            zone.portal,
+            snapshot_block,
+        )
+        .await?;
         let portal = ZonePortal::new(zone.portal, &provider);
         let portal_admin = portal
             .admin()
@@ -133,6 +143,7 @@ impl VerifyClosedLoop {
         println!("Closed-loop deployment");
         println!("  Snapshot block: {snapshot_block}");
         println!("  Deployment block: {deployment_block}");
+        println!("  ZoneFactory:  {}", self.zone_factory);
         println!("  Zone ID:      {zone_id}");
         println!("  ZonePortal:   {}", zone.portal);
         println!("  Earn router:  {}", self.earn_router);
@@ -292,11 +303,12 @@ impl VerifyClosedLoop {
 
 async fn find_zone_deployment_block<P: Provider<TempoNetwork>>(
     provider: &P,
+    zone_factory: Address,
     zone_id: u32,
     portal: Address,
     snapshot_block: u64,
 ) -> eyre::Result<u64> {
-    let events = ZoneFactory::new(ZONE_FACTORY_ADDRESS, provider)
+    let events = ZoneFactory::new(zone_factory, provider)
         .ZoneCreated_filter()
         .topic1(B256::from(U256::from(zone_id)))
         .topic2(portal.into_word())
