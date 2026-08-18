@@ -191,6 +191,10 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     // Keep batch submission running, but stop L1 processing so the portal queue
     // is guaranteed to remain pending until after the restart.
     abort_task(withdrawal_handle).await;
+    let admin_provider = l1.admin_provider();
+    let admin_portal = ZonePortal::new(portal_address, &admin_provider);
+    let pause_receipt = admin_portal.pause().send().await?.get_receipt().await?;
+    eyre::ensure!(pause_receipt.status(), "failed to pause portal");
 
     // Request withdrawal — wait for the batch to be submitted to L1
     let withdrawal_amount: u128 = 500_000;
@@ -220,6 +224,8 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
 
     // --- Abort sequencer BEFORE the withdrawal is processed ---
     abort_task(monitor_handle).await;
+    let resume_receipt = admin_portal.resume().send().await?.get_receipt().await?;
+    eyre::ensure!(resume_receipt.status(), "failed to resume portal");
 
     // --- Respawn sequencer (fetch_pending_withdrawals runs during init) ---
     let seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
