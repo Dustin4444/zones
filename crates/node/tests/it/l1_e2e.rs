@@ -21,8 +21,8 @@ use futures::future::try_join_all;
 use std::{collections::HashMap, time::Duration};
 use tempo_precompiles::{PATH_USD_ADDRESS, zone_factory::portal};
 use tempo_zone_contracts::{
-    IZoneOutbox, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS,
-    ZonePortal, ZonePortal::Role as PortalRole,
+    IZoneOutbox, NO_QUEUE_INDEX, TEMPO_STATE_ADDRESS, TempoState, ZONE_OUTBOX_ADDRESS,
+    ZONE_TOKEN_ADDRESS, ZonePortal, ZonePortal::Role as PortalRole,
 };
 use zone_node::dev::{ProvisionConfig, provision_zone};
 
@@ -570,6 +570,7 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
 
     // Request withdrawal on L2
     let withdrawal_amount: u128 = 500_000; // 0.5 pathUSD
+    let withdrawal_start_block = l1.provider().get_block_number().await?;
     account.withdraw(withdrawal_amount).await?;
 
     // Wait for the withdrawal to be fully processed on L1
@@ -581,6 +582,46 @@ async fn test_deposit_via_real_l1() -> eyre::Result<()> {
         withdrawal_timeout,
     )
     .await?;
+
+    // The empty-queue fast path must put submitBatch immediately before processWithdrawals in
+    // one Tempo block. Consecutive nonces on the same 2D lane make the ordering non-optional.
+    let portal = ZonePortal::new(portal_address, l1.provider());
+    let (_, submitted_log) = portal
+        .BatchSubmitted_filter()
+        .from_block(withdrawal_start_block)
+        .query()
+        .await?
+        .into_iter()
+        .find(|(event, _)| event.withdrawalQueueIndex != NO_QUEUE_INDEX)
+        .ok_or_else(|| eyre::eyre!("withdrawal BatchSubmitted event not found"))?;
+    let (_, processed_log) = portal
+        .WithdrawalProcessed_filter()
+        .from_block(withdrawal_start_block)
+        .query()
+        .await?
+        .into_iter()
+        .find(|(event, _)| event.to == account.address() && event.amount == withdrawal_amount)
+        .ok_or_else(|| eyre::eyre!("matching WithdrawalProcessed event not found"))?;
+    let submitted_block = submitted_log
+        .block_number
+        .ok_or_else(|| eyre::eyre!("BatchSubmitted log missing block number"))?;
+    let processed_block = processed_log
+        .block_number
+        .ok_or_else(|| eyre::eyre!("WithdrawalProcessed log missing block number"))?;
+    let submitted_tx_index = submitted_log
+        .transaction_index
+        .ok_or_else(|| eyre::eyre!("BatchSubmitted log missing transaction index"))?;
+    let processed_tx_index = processed_log
+        .transaction_index
+        .ok_or_else(|| eyre::eyre!("WithdrawalProcessed log missing transaction index"))?;
+    assert_eq!(
+        submitted_block, processed_block,
+        "submitBatch and processWithdrawals should land in the same Tempo block"
+    );
+    assert!(
+        submitted_tx_index < processed_tx_index,
+        "processWithdrawals must execute after submitBatch"
+    );
 
     // Verify the L2 balance decreased by at least the withdrawal amount
     let l2_balance_after = zone

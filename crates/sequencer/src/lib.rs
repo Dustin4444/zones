@@ -38,7 +38,8 @@ pub use encryption_key::{
 pub use monitor::{ZoneMonitorConfig, ZoneMonitorSharedState};
 pub use prover::ShadowProverConfig;
 pub use settlement::{
-    BatchAnchorConfig, BatchData, BatchSubmitter, PortalZoneAnchor, resolve_portal_zone_anchor,
+    BatchAnchorConfig, BatchData, BatchSubmission, BatchSubmitter, PortalZoneAnchor,
+    resolve_portal_zone_anchor,
 };
 pub use withdrawals::{
     DEFAULT_MAX_IN_FLIGHT_WITHDRAWAL_BATCHES, DEFAULT_MAX_WITHDRAWAL_BATCH_GAS,
@@ -184,6 +185,7 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
         poll_interval: config.zone_poll_interval,
         portal_address: config.portal_address,
         batch_anchor_config: config.batch_anchor_config,
+        withdrawal_batch_limits: config.withdrawal_batch_limits,
         attestation_store: config.attestation_store,
     };
     let withdrawal_handle = withdrawals::spawn_withdrawal_processor(

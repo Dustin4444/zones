@@ -45,7 +45,7 @@ use crate::{
         WithdrawalPage, ZoneBlockSnapshot, fetch_finalized_batch, fetch_finalized_batch_boundaries,
         read_zone_block_snapshot,
     },
-    withdrawals::SharedWithdrawalStore,
+    withdrawals::{SharedWithdrawalStore, WithdrawalBatchLimits},
 };
 
 /// Maximum number of times to retry a failed batch submission before resyncing.
@@ -70,6 +70,8 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
+    /// Gas limits used to decide whether a new withdrawal slot can use the ordered backrun.
+    pub withdrawal_batch_limits: WithdrawalBatchLimits,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
 }
@@ -569,10 +571,16 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             let submit_started = std::time::Instant::now();
             match self
                 .batch_submitter
-                .submit_batch(batch_data, shutdown)
+                .submit_batch(
+                    batch_data,
+                    &withdrawals,
+                    self.config.withdrawal_batch_limits.max_batch_gas,
+                    shutdown,
+                )
                 .await
             {
-                Ok(event) => {
+                Ok(submission) => {
+                    let event = submission.event;
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None
                     } else {
@@ -613,7 +621,12 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.update_submission_lag();
 
                     // Store withdrawals under the logical portal queue index assigned on-chain.
-                    if let Some(portal_index) = portal_index {
+                    if submission.withdrawals_backrun {
+                        info!(
+                            withdrawal_count = withdrawals.len(),
+                            "Withdrawals processed by ordered submitBatch backrun"
+                        );
+                    } else if let Some(portal_index) = portal_index {
                         if !withdrawals.is_empty() {
                             let count = withdrawals.len();
                             let mut store = self.withdrawal_store.lock();
@@ -635,7 +648,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         }
                     }
 
-                    self.withdrawal_notify.notify_one();
+                    if !submission.withdrawals_backrun {
+                        self.withdrawal_notify.notify_one();
+                    }
 
                     return Ok(());
                 }
@@ -1008,6 +1023,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
         let l1_provider = mock_provider(l1);
@@ -1053,6 +1069,8 @@ mod tests {
         // Preflight portal hash, followed by submission metadata with a 2-of-N threshold.
         l1.push_success(&abi_encode_b256(batch_data.prev_block_hash));
         l1.push_success(&abi_encode_multicall(vec![
+            abi_encode_u64(0),
+            abi_encode_u64(0),
             abi_encode_u64(0),
             abi_encode_u64(1),
             abi_encode_u64(2),
@@ -1107,6 +1125,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
+            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
 

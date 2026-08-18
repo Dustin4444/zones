@@ -932,6 +932,22 @@ fn build_withdrawal_batches(
     batches
 }
 
+/// Return the gas limit for an entire withdrawal slot when it fits in one transaction.
+///
+/// The settlement fast path uses this to backrun `submitBatch` on the same nonce lane. Slots that
+/// require multiple transactions stay on the normal processor path, which preserves its bounded
+/// in-flight scheduling and recovery behavior.
+pub(crate) fn single_batch_gas_limit(
+    withdrawals: &[abi::Withdrawal],
+    max_batch_gas: u64,
+) -> Option<u64> {
+    let batches = build_withdrawal_batches(withdrawals, max_batch_gas);
+    let [batch] = batches.as_slice() else {
+        return None;
+    };
+    (batch.gas_limit <= max_batch_gas).then_some(batch.gas_limit)
+}
+
 /// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
 enum SubmitOutcome {
     /// Every transaction was included on L1 and succeeded.
@@ -1122,6 +1138,29 @@ mod tests {
         assert_eq!(batches[0].end, 2);
         assert_eq!(batches[1].start, 2);
         assert_eq!(batches[1].end, 3);
+    }
+
+    #[test]
+    fn fast_path_requires_one_nonempty_withdrawal_batch() {
+        let withdrawals = simple_withdrawals(2);
+        let one = PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
+
+        assert_eq!(single_batch_gas_limit(&[], u64::MAX), None);
+        assert_eq!(
+            single_batch_gas_limit(
+                &withdrawals[..1],
+                PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + one - 1
+            ),
+            None
+        );
+        assert_eq!(
+            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + one),
+            None
+        );
+        assert_eq!(
+            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one),
+            Some(PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one)
+        );
     }
 
     #[test]
