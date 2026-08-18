@@ -574,7 +574,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                 .submit_batch(
                     batch_data,
                     &withdrawals,
-                    self.config.withdrawal_batch_limits.max_batch_gas,
+                    self.config.withdrawal_batch_limits,
                     shutdown,
                 )
                 .await
