@@ -9,6 +9,7 @@
 
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::primitives::{Address, U256};
+use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 
 /// Longer timeout for real L1 tests.
@@ -183,23 +184,22 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
     l1.fund_user(account.address(), deposit_amount).await?;
     account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
 
-    let zone_sequencer::ZoneSequencerHandle {
-        withdrawal_handle,
-        monitor_handle,
-    } = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
+    // Finalize the withdrawal on L2 before starting L1 settlement. Pausing the portal before the
+    // L2 request would make the ZoneOutbox reject it as well.
+    let withdrawal_amount: u128 = 500_000;
+    account.withdraw(withdrawal_amount).await?;
+    wait_for_withdrawal_requested(&zone, account.address(), withdrawal_amount).await?;
 
-    // Keep batch submission running, but stop L1 processing so the portal queue
-    // is guaranteed to remain pending until after the restart.
-    abort_task(withdrawal_handle).await;
+    // Pause only L1 withdrawal processing, then start settlement. submitBatch remains available,
+    // while both the ordered backrun and the recovery processor stay idle.
     let admin_provider = l1.admin_provider();
     let admin_portal = ZonePortal::new(portal_address, &admin_provider);
     let pause_receipt = admin_portal.pause().send().await?.get_receipt().await?;
     eyre::ensure!(pause_receipt.status(), "failed to pause portal");
-
-    // Request withdrawal — wait for the batch to be submitted to L1
-    let withdrawal_amount: u128 = 500_000;
-    account.withdraw(withdrawal_amount).await?;
-    wait_for_withdrawal_requested(&zone, account.address(), withdrawal_amount).await?;
+    let zone_sequencer::ZoneSequencerHandle {
+        withdrawal_handle,
+        monitor_handle,
+    } = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
     // Wait for the batch to land on L1 (portal tail advances)
     crate::utils::poll_until(
@@ -224,6 +224,7 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
 
     // --- Abort sequencer BEFORE the withdrawal is processed ---
     abort_task(monitor_handle).await;
+    abort_task(withdrawal_handle).await;
     let resume_receipt = admin_portal.resume().send().await?.get_receipt().await?;
     eyre::ensure!(resume_receipt.status(), "failed to resume portal");
 
@@ -261,14 +262,17 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
 
     // Request a NEW withdrawal after restart to verify normal operation continues.
     let second_withdrawal: u128 = 400_000;
+    let l1_balance_before_second = l1.balance_of(PATH_USD_ADDRESS, account.address()).await?;
     account.withdraw(second_withdrawal).await?;
-    l1.wait_for_withdrawal_on_l1(
-        portal_address,
+    l1.wait_for_balance(
+        PATH_USD_ADDRESS,
         account.address(),
-        second_withdrawal,
+        l1_balance_before_second + U256::from(second_withdrawal),
         WITHDRAWAL_TIMEOUT,
     )
     .await?;
+    l1.assert_withdrawal_processed(portal_address, account.address(), second_withdrawal)
+        .await?;
 
     // Portal queue should have advanced further
     let (head_after, tail_after) = portal_queue_state(&l1, portal_address).await?;
@@ -457,6 +461,7 @@ async fn test_finalized_withdrawal_survives_sequencer_restart() -> eyre::Result<
     let deposit_amount: u128 = 2_000_000;
     l1.fund_user(account.address(), deposit_amount).await?;
     account.deposit(deposit_amount, L1_TIMEOUT, &zone).await?;
+    let l1_balance_before = l1.balance_of(PATH_USD_ADDRESS, account.address()).await?;
 
     let seq_handle = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
@@ -484,13 +489,18 @@ async fn test_finalized_withdrawal_survives_sequencer_restart() -> eyre::Result<
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let _seq_handle2 = spawn_sequencer(&l1, &zone, portal_address, l1.dev_signer()).await;
 
-    l1.wait_for_withdrawal_on_l1(
-        portal_address,
+    // Use the pre-withdrawal balance. The fast path may complete before this code resumes after
+    // spawning the sequencer, so taking the baseline here would wait for a second withdrawal.
+    l1.wait_for_balance(
+        PATH_USD_ADDRESS,
         account.address(),
-        withdrawal_amount,
+        l1_balance_before + U256::from(withdrawal_amount),
         WITHDRAWAL_TIMEOUT,
     )
     .await?;
+    l1.assert_batch_submitted(portal_address).await?;
+    l1.assert_withdrawal_processed(portal_address, account.address(), withdrawal_amount)
+        .await?;
 
     Ok(())
 }
