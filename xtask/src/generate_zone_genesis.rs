@@ -43,8 +43,6 @@ const TEMPO_STATE_ADDRESS: Address = address!("0x1c00000000000000000000000000000
 const ZONE_INBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000001");
 const ZONE_OUTBOX_ADDRESS: Address = address!("0x1c00000000000000000000000000000000000002");
 
-const DEPLOYER: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
 #[derive(Debug, clap::Parser)]
 pub(crate) struct GenerateZoneGenesis {
     #[arg(short, long)]
@@ -68,9 +66,6 @@ pub(crate) struct GenerateZoneGenesis {
     pub(crate) tempo_genesis_header_rlp: Option<String>,
 
     #[arg(long)]
-    pub(crate) admin: Address,
-
-    #[arg(long)]
     pub(crate) sequencer: Option<Address>,
 
     /// Include CreateX factory in genesis.
@@ -90,10 +85,6 @@ pub(crate) struct GenerateZoneGenesis {
 
 impl GenerateZoneGenesis {
     pub(crate) async fn run(self) -> eyre::Result<()> {
-        if self.admin == Address::ZERO {
-            return Err(eyre!("--admin must not be the zero address"));
-        }
-
         let header_rlp = match &self.tempo_genesis_header_rlp {
             Some(header_rlp) => {
                 const_hex::decode(header_rlp).wrap_err("failed to decode hex string")?
@@ -102,14 +93,6 @@ impl GenerateZoneGenesis {
         };
 
         let mut evm = setup_zone_evm(self.chain_id, self.gas_limit);
-
-        evm.db_mut().insert_account_info(
-            DEPLOYER,
-            AccountInfo {
-                balance: U256::from(1_000_000_000_000_000_000_000u128),
-                ..Default::default()
-            },
-        );
 
         // Initialize all precompiles and deploy standard contracts to match the
         // L1 genesis setup. The zone EVM uses the same TempoEvmFactory, so all
@@ -154,7 +137,7 @@ impl GenerateZoneGenesis {
             .cache
             .accounts
             .iter()
-            .filter(|(addr, _)| **addr != DEPLOYER && **addr != TIP20_FACTORY_ADDRESS)
+            .filter(|(addr, _)| **addr != TIP20_FACTORY_ADDRESS)
             .filter(|(addr, _)| {
                 self.with_create2_factory || **addr != ARACHNID_CREATE2_FACTORY_ADDRESS
             })

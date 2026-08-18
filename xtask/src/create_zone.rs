@@ -308,7 +308,6 @@ impl CreateZone {
             gas_limit: self.gas_limit,
             default_fee_token: self.initial_token,
             tempo_genesis_header_rlp: Some(header_rlp_hex),
-            admin: self.admin,
             sequencer: Some(leader),
             with_createx: true,
             with_safe_deployer: true,

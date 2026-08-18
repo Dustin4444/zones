@@ -31,7 +31,6 @@ regen-zone-dev-genesis:
     cargo run -p tempo-xtask -- generate-zone-genesis \
         --output {{zone_dev_genesis_tmp}} \
         --chain-id 1337 \
-        --admin 0xaAaAaAaa00000000000000000000000000000000 \
         --with-createx \
         --with-safe-deployer \
         --with-create2-factory
