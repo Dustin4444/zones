@@ -5,6 +5,47 @@ zone_rpc := env("ZONE_RPC_URL", "http://localhost:8546")
 zone_http_port := env("ZONE_HTTP_PORT", "8546")
 zone_dev_genesis_tmp := "./target/zone-dev-genesis"
 
+[group('checker')]
+[doc('Build and start the local checker verification lab')]
+checker-lab-up:
+    bash contrib/checker-lab/checker-lab.sh up
+
+[group('checker')]
+[doc('Trigger token, deposit, withdrawal, or all checker lab scenarios')]
+checker-lab-trigger scenario:
+    bash contrib/checker-lab/checker-lab.sh trigger {{scenario}}
+
+[group('checker')]
+[doc('Show local checker lab health and verification progress')]
+checker-lab-status:
+    bash contrib/checker-lab/checker-lab.sh status
+
+[group('checker')]
+[doc('Restart the lab Zone node, rebuilding the current source')]
+checker-lab-restart-zone:
+    bash contrib/checker-lab/checker-lab.sh restart-zone
+
+[group('checker')]
+[doc('Follow checker lab logs for zone (default) or l1')]
+checker-lab-logs name="zone":
+    bash contrib/checker-lab/checker-lab.sh logs {{name}}
+
+[group('checker')]
+[doc('Stop the checker lab while preserving its state')]
+checker-lab-down:
+    bash contrib/checker-lab/checker-lab.sh down
+
+[group('checker')]
+[doc('Stop the checker lab and remove its disposable state')]
+checker-lab-reset:
+    bash contrib/checker-lab/checker-lab.sh reset
+
+[group('checker')]
+[doc('Validate checker lab shell scripts')]
+checker-lab-check:
+    bash -n contrib/checker-lab/*.sh
+    bash contrib/checker-lab/checker-lab.sh help >/dev/null
+
 [group('deps')]
 install-cross:
     cargo install cross --git https://github.com/cross-rs/cross
@@ -292,7 +333,7 @@ max-approve-outbox token="0x20C0000000000000000000000000000000000000" rpc=zone_r
     OUTBOX="0x1c00000000000000000000000000000000000002"
     echo "Approving ZoneOutbox for max zone tokens..."
     TX_OUTPUT=$(cast send "{{token}}" "approve(address,uint256)" "$OUTBOX" "$(cast max-uint)" \
-        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 150000 --json)
+        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 500000 --json)
     STATUS=$(echo "$TX_OUTPUT" | jq -r '.status')
     if [[ "$STATUS" == "0x1" ]]; then
         echo "Approved!"
@@ -321,7 +362,13 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
     L2_OUTPUT=$(cast send "$OUTBOX" \
         "requestWithdrawal(address,address,uint128,bytes32,uint64,address,bytes,bytes)" \
         "{{token}}" "$TO" "{{amount}}" "{{memo}}" "{{gas-limit}}" "$FALLBACK" "{{data}}" "{{reveal-to}}" \
-        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 500000 --json)
+        --rpc-url "{{rpc}}" --private-key "$PK" --json)
+    L2_STATUS=$(echo "$L2_OUTPUT" | jq -r '.status')
+    if [[ "$L2_STATUS" != "0x1" ]]; then
+        echo "Withdrawal request failed on L2." >&2
+        echo "$L2_OUTPUT" | jq . >&2
+        exit 1
+    fi
     L2_TX=$(echo "$L2_OUTPUT" | jq -r '.transactionHash')
     L2_BLOCK=$(echo "$L2_OUTPUT" | jq -r '.blockNumber')
     echo "Withdrawal requested on L2! tx: $L2_TX (block $(printf '%d' "$L2_BLOCK"))"
@@ -335,6 +382,9 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
     fi
     HTTP_RPC=$(echo "$L1_RPC" | sed 's|^wss://|https://|' | sed 's|^ws://|http://|')
     FROM_BLOCK=$(cast block-number --rpc-url "$HTTP_RPC")
+    WAIT_TIMEOUT="${WITHDRAWAL_WAIT_TIMEOUT_SECS:-180}"
+    START_TIME=$SECONDS
+    POLLS=0
     echo "Waiting for withdrawal to be processed on L1 (from block $FROM_BLOCK)..."
     while true; do
         LOGS=$(cast logs --address "$PORTAL" --from-block "$FROM_BLOCK" --rpc-url "$HTTP_RPC" \
@@ -347,6 +397,22 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
             echo "Withdrawal processed on L1! (block $L1_BLOCK_DEC)"
             echo "Explorer: https://explore.moderato.tempo.xyz/tx/$L1_TX"
             break
+        fi
+        if (( SECONDS - START_TIME >= WAIT_TIMEOUT )); then
+            echo "Timed out after ${WAIT_TIMEOUT}s waiting for withdrawal processing." >&2
+            exit 1
+        fi
+        ((POLLS += 1))
+        if (( POLLS % 40 == 0 )); then
+            L1_HEAD=$(cast block-number --rpc-url "$HTTP_RPC") || {
+                echo "Tempo RPC became unavailable while waiting for withdrawal processing." >&2
+                exit 1
+            }
+            ZONE_HEAD=$(cast block-number --rpc-url "{{rpc}}") || {
+                echo "Zone RPC became unavailable while waiting for withdrawal processing." >&2
+                exit 1
+            }
+            echo "Still waiting... Zone head: $ZONE_HEAD, Tempo head: $L1_HEAD"
         fi
         sleep 0.25
     done
