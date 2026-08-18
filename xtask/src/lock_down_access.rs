@@ -132,18 +132,18 @@ impl LockDownAccess {
             .map(|account| {
                 let portal = portal.clone();
                 async move {
-                    let role = portal
-                        .role(account)
+                    let is_account = portal
+                        .hasRole(account, PortalRole::Account)
                         .call()
                         .await
                         .wrap_err_with(|| format!("failed querying role for {account}"))?;
-                    Ok::<_, eyre::Report>((account, role))
+                    Ok::<_, eyre::Report>((account, is_account))
                 }
             })
             .buffer_unordered(self.max_concurrent_requests)
-            .try_filter_map(|(account, role)| async move {
-                Ok((role == PortalRole::Account).then_some(account))
-            })
+            .try_filter_map(
+                |(account, is_account)| async move { Ok(is_account.then_some(account)) },
+            )
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -197,7 +197,7 @@ impl LockDownAccess {
         );
         for account in &accounts {
             ensure!(
-                portal.role(*account).call().await? != PortalRole::Account,
+                !portal.hasRole(*account, PortalRole::Account).call().await?,
                 "account {account} remained allowed after lockdown"
             );
         }

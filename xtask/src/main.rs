@@ -6,8 +6,8 @@ use crate::{
     deploy_neobank_fixtures::DeployNeobankFixtures, deploy_router::DeployRouter, deposit::Deposit,
     generate_p2p_key::GenerateP2pKey, generate_zone_genesis::GenerateZoneGenesis,
     install_reference_zone_factory::InstallReferenceZoneFactory, lock_down_access::LockDownAccess,
-    portal_pause::PausePortal, set_encryption_key::SetEncryptionKey,
-    spam_deposits::SpamDeposits, verify_closed_loop::VerifyClosedLoop, zone_info::ZoneInfoCmd,
+    portal_pause::PausePortal, set_encryption_key::SetEncryptionKey, spam_deposits::SpamDeposits,
+    verify_closed_loop::VerifyClosedLoop, zone_info::ZoneInfoCmd,
 };
 use clap::Parser as _;
 use eyre::Context;
