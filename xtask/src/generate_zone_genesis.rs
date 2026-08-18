@@ -66,8 +66,6 @@ pub(crate) struct GenerateZoneGenesis {
     pub(crate) tempo_genesis_header_rlp: Option<String>,
 
     #[arg(long)]
-    pub(crate) sequencer: Option<Address>,
-
     /// Include CreateX factory in genesis.
     #[arg(long)]
     pub(crate) with_createx: bool,
