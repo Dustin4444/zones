@@ -50,9 +50,9 @@ pub(crate) struct VerifyClosedLoop {
     #[arg(long, env = "L1_RPC_URL")]
     l1_rpc_url: String,
 
-    /// ZoneFactory contract address.
-    #[arg(long, default_value_t = ZONE_FACTORY_ADDRESS)]
-    zone_factory: Address,
+    /// ZonePortal address. When provided, skips resolving the portal through ZoneFactory.
+    #[arg(long)]
+    portal: Option<Address>,
 
     /// Deployed SingleZoneEarnRouter address.
     #[arg(long)]
@@ -106,28 +106,31 @@ impl VerifyClosedLoop {
             .await
             .wrap_err("failed reading Earn router configuration")?;
 
-        let zone = ZoneFactory::new(self.zone_factory, &provider)
-            .zones(zone_id)
-            .block(snapshot_block_id)
-            .call()
-            .await
-            .wrap_err("failed resolving Zone through ZoneFactory")?;
-        ensure!(
-            zone.portal != Address::ZERO,
-            "router targets unknown Zone {zone_id}"
-        );
-        ensure_has_code(&provider, zone.portal, "ZonePortal", snapshot_block_id).await?;
+        let (portal_address, resolved_through_factory) = if let Some(portal) = self.portal {
+            (portal, false)
+        } else {
+            let zone = ZoneFactory::new(ZONE_FACTORY_ADDRESS, &provider)
+                .zones(zone_id)
+                .block(snapshot_block_id)
+                .call()
+                .await
+                .wrap_err("failed resolving Zone through ZoneFactory")?;
+            ensure!(
+                zone.portal != Address::ZERO,
+                "router targets unknown Zone {zone_id}"
+            );
+            (zone.portal, true)
+        };
+        ensure_has_code(&provider, portal_address, "ZonePortal", snapshot_block_id).await?;
         ensure_has_code(&provider, earn_vault, "EarnVault", snapshot_block_id).await?;
 
-        let deployment_block = find_zone_deployment_block(
-            &provider,
-            self.zone_factory,
-            zone_id,
-            zone.portal,
-            snapshot_block,
-        )
-        .await?;
-        let portal = ZonePortal::new(zone.portal, &provider);
+        let deployment_block = if resolved_through_factory {
+            find_zone_deployment_block(&provider, zone_id, portal_address, snapshot_block).await?
+        } else {
+            find_contract_deployment_block(&provider, portal_address, snapshot_block).await?
+        };
+
+        let portal = ZonePortal::new(portal_address, &provider);
         let portal_admin = portal
             .admin()
             .block(snapshot_block_id)
@@ -143,9 +146,8 @@ impl VerifyClosedLoop {
         println!("Closed-loop deployment");
         println!("  Snapshot block: {snapshot_block}");
         println!("  Deployment block: {deployment_block}");
-        println!("  ZoneFactory:  {}", self.zone_factory);
         println!("  Zone ID:      {zone_id}");
-        println!("  ZonePortal:   {}", zone.portal);
+        println!("  ZonePortal:   {portal_address}");
         println!("  Earn router:  {}", self.earn_router);
         println!("  EarnVault:    {earn_vault}");
         println!("  Private asset: {private_asset}");
@@ -175,14 +177,14 @@ impl VerifyClosedLoop {
         }
         println!();
 
-        let portal_tokens = PortalTokenView::new(zone.portal, &provider);
+        let portal_tokens = PortalTokenView::new(portal_address, &provider);
         let vault = EarnVaultView::new(earn_vault, &provider);
         let mut checks = Checks::default();
 
         let expected_tokens = BTreeSet::from([private_asset, earn_share]);
         let (roles, event_tokens) = tokio::try_join!(
-            read_role_updates(&provider, zone.portal, deployment_block, snapshot_block,),
-            read_token_enablements(&provider, zone.portal, deployment_block, snapshot_block,),
+            read_role_updates(&provider, portal_address, deployment_block, snapshot_block,),
+            read_token_enablements(&provider, portal_address, deployment_block, snapshot_block,),
         )?;
 
         checks.expect(
@@ -303,12 +305,11 @@ impl VerifyClosedLoop {
 
 async fn find_zone_deployment_block<P: Provider<TempoNetwork>>(
     provider: &P,
-    zone_factory: Address,
     zone_id: u32,
     portal: Address,
     snapshot_block: u64,
 ) -> eyre::Result<u64> {
-    let events = ZoneFactory::new(zone_factory, provider)
+    let events = ZoneFactory::new(ZONE_FACTORY_ADDRESS, provider)
         .ZoneCreated_filter()
         .topic1(B256::from(U256::from(zone_id)))
         .topic2(portal.into_word())
@@ -333,6 +334,29 @@ async fn find_zone_deployment_block<P: Provider<TempoNetwork>>(
     ensure!(!log.removed, "ZoneCreated query returned a removed log");
     log.block_number
         .ok_or_else(|| eyre::eyre!("ZoneCreated log is missing its block number"))
+}
+
+async fn find_contract_deployment_block<P: Provider<TempoNetwork>>(
+    provider: &P,
+    address: Address,
+    snapshot_block: u64,
+) -> eyre::Result<u64> {
+    let mut low = 0;
+    let mut high = snapshot_block;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let code = provider
+            .get_code_at(address)
+            .block_id(BlockId::number(mid))
+            .await
+            .wrap_err_with(|| format!("failed reading ZonePortal bytecode at block {mid}"))?;
+        if code.is_empty() {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(low)
 }
 
 async fn read_role_updates<P: Provider<TempoNetwork>>(

@@ -203,8 +203,8 @@ deploy-router name dex="0xDEc0000000000000000000000000000000000000":
         --stablecoin-dex "{{dex}}"
 
 [group('zone')]
-[doc('Checks an Earn router and its ZonePortal closed-loop configuration, then prints Account roles for manual review. Requires L1_RPC_URL. Optionally accepts a custom ZoneFactory address.')]
-verify-closed-loop earn_router zone_factory="":
+[doc('Checks an Earn router and its ZonePortal closed-loop configuration, then prints Account roles for manual review. Requires L1_RPC_URL. Optionally accepts a ZonePortal address to bypass ZoneFactory resolution.')]
+verify-closed-loop earn_router portal="":
     #!/bin/bash
     set -euo pipefail
     L1_RPC="${L1_RPC_URL:?Set L1_RPC_URL env var}"
@@ -212,8 +212,8 @@ verify-closed-loop earn_router zone_factory="":
         --l1-rpc-url "$L1_RPC"
         --earn-router "{{earn_router}}"
     )
-    if [[ -n "{{zone_factory}}" ]]; then
-        ARGS+=(--zone-factory "{{zone_factory}}")
+    if [[ -n "{{portal}}" ]]; then
+        ARGS+=(--portal "{{portal}}")
     fi
     cargo run -p tempo-xtask -- verify-closed-loop "${ARGS[@]}"
 
