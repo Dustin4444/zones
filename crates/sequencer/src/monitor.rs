@@ -45,7 +45,7 @@ use crate::{
         WithdrawalPage, ZoneBlockSnapshot, fetch_finalized_batch, fetch_finalized_batch_boundaries,
         read_zone_block_snapshot,
     },
-    withdrawals::{SharedWithdrawalStore, WithdrawalBatchLimits},
+    withdrawals::SharedWithdrawalStore,
 };
 
 /// Maximum number of times to retry a failed batch submission before resyncing.
@@ -70,8 +70,6 @@ pub struct ZoneMonitorConfig {
     pub portal_address: Address,
     /// EIP-2935 history and safety-margin limits used by the batch submitter.
     pub batch_anchor_config: BatchAnchorConfig,
-    /// Gas limits used to decide whether a new withdrawal slot can use the ordered backrun.
-    pub withdrawal_batch_limits: WithdrawalBatchLimits,
     /// Shared P2P attestations, required after a settlement signer set is activated.
     pub attestation_store: Option<AttestationStore>,
 }
@@ -571,16 +569,10 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
             let submit_started = std::time::Instant::now();
             match self
                 .batch_submitter
-                .submit_batch(
-                    batch_data,
-                    &withdrawals,
-                    self.config.withdrawal_batch_limits,
-                    shutdown,
-                )
+                .submit_batch(batch_data, &withdrawals, shutdown)
                 .await
             {
-                Ok(submission) => {
-                    let event = submission.event;
+                Ok(event) => {
                     let portal_index = if event.withdrawalQueueIndex == NO_QUEUE_INDEX {
                         None
                     } else {
@@ -621,12 +613,9 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.update_submission_lag();
 
                     // Store withdrawals under the logical portal queue index assigned on-chain.
-                    if submission.withdrawals_backrun {
-                        info!(
-                            withdrawal_count = withdrawals.len(),
-                            "Withdrawals processed by ordered submitBatch backrun"
-                        );
-                    } else if let Some(portal_index) = portal_index {
+                    // If the ordered backrun already consumed them, the idempotent processor drops
+                    // this stale entry after observing the advanced portal head.
+                    if let Some(portal_index) = portal_index {
                         if !withdrawals.is_empty() {
                             let count = withdrawals.len();
                             let mut store = self.withdrawal_store.lock();
@@ -648,9 +637,7 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                         }
                     }
 
-                    if !submission.withdrawals_backrun {
-                        self.withdrawal_notify.notify_one();
-                    }
+                    self.withdrawal_notify.notify_one();
 
                     return Ok(());
                 }
@@ -1023,7 +1010,6 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
-            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
         let l1_provider = mock_provider(l1);
@@ -1126,7 +1112,6 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             portal_address,
             batch_anchor_config: BatchAnchorConfig::default(),
-            withdrawal_batch_limits: WithdrawalBatchLimits::default(),
             attestation_store: None,
         };
 

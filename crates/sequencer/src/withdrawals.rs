@@ -881,14 +881,14 @@ const fn process_withdrawal_item_gas(callback_gas_limit: u64, fallback_nonce: u6
 
 /// A contiguous, gas-bounded transaction within one withdrawal queue slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WithdrawalBatch {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) gas_limit: u64,
+struct WithdrawalBatch {
+    start: usize,
+    end: usize,
+    gas_limit: u64,
 }
 
 impl WithdrawalBatch {
-    pub(crate) fn len(self) -> usize {
+    fn len(self) -> usize {
         self.end - self.start
     }
 }
@@ -896,7 +896,7 @@ impl WithdrawalBatch {
 /// Split FIFO withdrawals by the configured per-transaction gas limit.
 ///
 /// A withdrawal that exceeds the limit is kept as a singleton so it cannot block the queue.
-pub(crate) fn build_withdrawal_batches(
+fn build_withdrawal_batches(
     withdrawals: &[abi::Withdrawal],
     max_batch_gas: u64,
 ) -> Vec<WithdrawalBatch> {
@@ -930,6 +930,21 @@ pub(crate) fn build_withdrawal_batches(
     }
 
     batches
+}
+
+/// Return the gas limit when an entire withdrawal slot fits in one transaction.
+///
+/// The settlement fast path is intentionally limited to one backrun. Larger slots stay on the
+/// normal processor path, which owns multi-transaction scheduling and recovery.
+pub(crate) fn single_batch_gas_limit(
+    withdrawals: &[abi::Withdrawal],
+    max_batch_gas: u64,
+) -> Option<u64> {
+    let batches = build_withdrawal_batches(withdrawals, max_batch_gas);
+    let [batch] = batches.as_slice() else {
+        return None;
+    };
+    (batch.gas_limit <= max_batch_gas).then_some(batch.gas_limit)
 }
 
 /// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
@@ -1125,21 +1140,19 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_batches_expose_fast_path_chunks() {
+    fn single_batch_gas_limit_requires_the_entire_slot_to_fit() {
         let withdrawals = simple_withdrawals(2);
         let one = PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
 
-        assert!(build_withdrawal_batches(&[], u64::MAX).is_empty());
-        let split =
-            build_withdrawal_batches(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + one);
-        assert_eq!(split.len(), 2);
-        assert_eq!((split[0].start, split[0].end), (0, 1));
-        assert_eq!((split[1].start, split[1].end), (1, 2));
-
-        let packed =
-            build_withdrawal_batches(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one);
-        assert_eq!(packed.len(), 1);
-        assert_eq!((packed[0].start, packed[0].end), (0, 2));
+        assert_eq!(single_batch_gas_limit(&[], u64::MAX), None);
+        assert_eq!(
+            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + one),
+            None
+        );
+        assert_eq!(
+            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one),
+            Some(PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one)
+        );
     }
 
     #[test]
