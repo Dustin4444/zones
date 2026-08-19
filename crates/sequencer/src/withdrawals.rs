@@ -932,21 +932,6 @@ fn build_withdrawal_batches(
     batches
 }
 
-/// Return the gas limit when an entire withdrawal slot fits in one transaction.
-///
-/// The settlement fast path is intentionally limited to one backrun. Larger slots stay on the
-/// normal processor path, which owns multi-transaction scheduling and recovery.
-pub(crate) fn single_batch_gas_limit(
-    withdrawals: &[abi::Withdrawal],
-    max_batch_gas: u64,
-) -> Option<u64> {
-    let batches = build_withdrawal_batches(withdrawals, max_batch_gas);
-    let [batch] = batches.as_slice() else {
-        return None;
-    };
-    (batch.gas_limit <= max_batch_gas).then_some(batch.gas_limit)
-}
-
 /// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
 enum SubmitOutcome {
     /// Every transaction was included on L1 and succeeded.
@@ -1137,22 +1122,6 @@ mod tests {
         assert_eq!(batches[0].end, 2);
         assert_eq!(batches[1].start, 2);
         assert_eq!(batches[1].end, 3);
-    }
-
-    #[test]
-    fn single_batch_gas_limit_requires_the_entire_slot_to_fit() {
-        let withdrawals = simple_withdrawals(2);
-        let one = PROCESS_SIMPLE_WITHDRAWAL_ITEM_OVERHEAD_GAS;
-
-        assert_eq!(single_batch_gas_limit(&[], u64::MAX), None);
-        assert_eq!(
-            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + one),
-            None
-        );
-        assert_eq!(
-            single_batch_gas_limit(&withdrawals, PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one),
-            Some(PROCESS_WITHDRAWAL_TX_OVERHEAD_GAS + 2 * one)
-        );
     }
 
     #[test]

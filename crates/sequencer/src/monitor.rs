@@ -613,8 +613,6 @@ impl<P: ZoneSequencerProvider> ZoneMonitor<P> {
                     self.update_submission_lag();
 
                     // Store withdrawals under the logical portal queue index assigned on-chain.
-                    // If the ordered backrun already consumed them, the idempotent processor drops
-                    // this stale entry after observing the advanced portal head.
                     if let Some(portal_index) = portal_index {
                         if !withdrawals.is_empty() {
                             let count = withdrawals.len();
@@ -1055,8 +1053,6 @@ mod tests {
         // Preflight portal hash, followed by submission metadata with a 2-of-N threshold.
         l1.push_success(&abi_encode_b256(batch_data.prev_block_hash));
         l1.push_success(&abi_encode_multicall(vec![
-            abi_encode_u64(0),
-            abi_encode_u64(0),
             abi_encode_u64(0),
             abi_encode_u64(1),
             abi_encode_u64(2),

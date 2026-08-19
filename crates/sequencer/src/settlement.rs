@@ -29,7 +29,7 @@ use crate::{
     ZoneSequencerProvider,
     abi::{self, BlockTransition, DepositQueueTransition, IZoneInbox, IZoneOutbox, ZonePortal},
     attestation::{AttestationStore, SettlementAttestation, SettlementCertificate},
-    withdrawals::{MAX_WITHDRAWAL_BATCH_GAS, single_batch_gas_limit},
+    withdrawals::MAX_WITHDRAWAL_BATCH_GAS,
 };
 use alloy_consensus::{Transaction, TxReceipt as _, transaction::TxHashRef as _};
 use alloy_eips::BlockHashOrNumber;
@@ -99,12 +99,6 @@ const DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY: u32 = 262_144;
 /// observing N can only execute in N+1 or later, where that hash is available. Eight certificate
 /// signatures still fit comfortably within this limit.
 const SUBMIT_BATCH_GAS_LIMIT: u64 = 2_000_000;
-
-/// Maximum planned gas admitted for the same-block withdrawal backrun.
-///
-/// Tempo currently caps the general (non-payment) gas section at 30M. Together with the 2M
-/// `submitBatch` allowance, this leaves 8M of general-gas headroom for unrelated transactions.
-const MAX_WITHDRAWAL_BACKRUN_GAS: u64 = MAX_WITHDRAWAL_BATCH_GAS;
 
 /// Maximum number of pending withdrawal slots reconstructed in one recovery page.
 /// Bounds L1 topic filters and temporary withdrawal data without limiting the on-chain FIFO.
@@ -443,8 +437,7 @@ impl BatchSubmitter {
         let submission_address = signer
             .ok_or_eyre("batch submission requires the local sequencer signer")?
             .address();
-        let backrun_gas_limit = plan_withdrawal_backrun(metadata, withdrawals);
-        let submission_nonce_key = if backrun_gas_limit.is_none() {
+        let submission_nonce_key = if withdrawals.is_empty() {
             SUBMIT_BATCH_NONCE_KEY
         } else {
             WITHDRAWAL_NONCE_KEY
@@ -490,68 +483,33 @@ impl BatchSubmitter {
             submission = submission.gas(SUBMIT_BATCH_GAS_LIMIT);
         }
 
-        let receipt = if let Some(gas_limit) = backrun_gas_limit {
-            let backrun_nonce = nonce
-                .checked_add(1)
-                .ok_or_else(|| eyre::eyre!("withdrawal backrun nonce overflow at {nonce}"))?;
-            // Submit the first transaction before broadcasting the future-nonce backrun. Both use
-            // the dedicated fast-path key, so Tempo cannot execute a withdrawal first. This lane
-            // is never required for later settlement.
+        let receipt = if withdrawals.is_empty() {
+            tokio::time::timeout(Duration::from_secs(30), submission.send_sync())
+                .await
+                .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))?
+                .map_err(|error| BatchSubmitError::Other(error.into()))?
+        } else {
             let pending_submission = submission
                 .send()
                 .await
                 .map_err(|error| BatchSubmitError::Other(error.into()))?;
-            let submit_tx_hash = *pending_submission.tx_hash();
-            let backrun = self
+            let withdrawal = self
                 .portal
                 .processWithdrawals(withdrawals.to_vec(), B256::ZERO)
                 .from(submission_address)
                 .nonce_key(WITHDRAWAL_NONCE_KEY)
-                .nonce(backrun_nonce)
+                .nonce(nonce + 1)
                 .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
                 .max_priority_fee_per_gas(0)
-                .gas(gas_limit);
+                .gas(MAX_WITHDRAWAL_BATCH_GAS);
 
-            info!(
-                %submit_tx_hash,
-                nonce_key = ?WITHDRAWAL_NONCE_KEY,
-                submit_nonce = nonce,
-                backrun_nonce,
-                withdrawals = withdrawals.len(),
-                gas_limit,
-                "Broadcasting ordered withdrawal backrun"
-            );
-
-            let (submission_result, backrun_result) = tokio::join!(
-                tokio::time::timeout(Duration::from_secs(30), pending_submission.get_receipt()),
-                tokio::time::timeout(Duration::from_secs(30), backrun.send_sync()),
-            );
-            let receipt = submission_result
-                .map_err(|_| eyre::eyre!("submitBatch receipt timed out after 30 seconds"))?
-                .map_err(|error| BatchSubmitError::Other(error.into()))?;
-
-            match backrun_result {
-                Ok(Ok(backrun_receipt)) if backrun_receipt.status() => {
-                    info!(
-                        tx_hash = %backrun_receipt.transaction_hash(),
-                        l1_block = ?backrun_receipt.block_number,
-                        backrun_nonce,
-                        withdrawals = withdrawals.len(),
-                        "Ordered withdrawal backrun confirmed"
-                    );
-                }
-                result => {
-                    warn!(
-                        ?result,
-                        backrun_nonce, "Ordered withdrawal backrun did not confirm"
-                    );
-                }
+            if let Err(error) = withdrawal.send().await {
+                warn!(%error, "Failed to broadcast withdrawal transaction");
             }
-            receipt
-        } else {
-            tokio::time::timeout(Duration::from_secs(30), submission.send_sync())
+
+            tokio::time::timeout(Duration::from_secs(30), pending_submission.get_receipt())
                 .await
-                .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))?
+                .map_err(|_| eyre::eyre!("submitBatch receipt timed out after 30 seconds"))?
                 .map_err(|error| BatchSubmitError::Other(error.into()))?
         };
 
@@ -665,8 +623,6 @@ impl BatchSubmitter {
         if let Some(stable) = self.stable_portal_metadata.get().copied() {
             let (
                 withdrawal_batch_index,
-                withdrawal_queue_head,
-                withdrawal_queue_tail,
                 sequencer_set_version,
                 sequencer_threshold,
                 signer_is_sequencer,
@@ -675,8 +631,6 @@ impl BatchSubmitter {
                 .l1_provider
                 .multicall()
                 .add(self.portal.withdrawalBatchIndex())
-                .add(self.portal.withdrawalQueueHead())
-                .add(self.portal.withdrawalQueueTail())
                 .add(self.portal.sequencerSetVersion())
                 .add(self.portal.sequencerThreshold())
                 .add(self.portal.isSequencer(signer))
@@ -686,8 +640,6 @@ impl BatchSubmitter {
             return Ok(Self::build_submission_metadata(
                 RawPortalSubmissionMetadata {
                     withdrawal_batch_index,
-                    withdrawal_queue_head,
-                    withdrawal_queue_tail,
                     sequencer_set_version,
                     sequencer_threshold,
                     signer_is_sequencer,
@@ -699,8 +651,6 @@ impl BatchSubmitter {
 
         let (
             withdrawal_batch_index,
-            withdrawal_queue_head,
-            withdrawal_queue_tail,
             sequencer_set_version,
             sequencer_threshold,
             signer_is_sequencer,
@@ -711,8 +661,6 @@ impl BatchSubmitter {
             .l1_provider
             .multicall()
             .add(self.portal.withdrawalBatchIndex())
-            .add(self.portal.withdrawalQueueHead())
-            .add(self.portal.withdrawalQueueTail())
             .add(self.portal.sequencerSetVersion())
             .add(self.portal.sequencerThreshold())
             .add(self.portal.isSequencer(signer))
@@ -731,8 +679,6 @@ impl BatchSubmitter {
         Ok(Self::build_submission_metadata(
             RawPortalSubmissionMetadata {
                 withdrawal_batch_index,
-                withdrawal_queue_head,
-                withdrawal_queue_tail,
                 sequencer_set_version,
                 sequencer_threshold,
                 signer_is_sequencer,
@@ -748,8 +694,6 @@ impl BatchSubmitter {
     ) -> PortalSubmissionMetadata {
         PortalSubmissionMetadata {
             withdrawal_batch_index: raw.withdrawal_batch_index,
-            withdrawal_queue_head: raw.withdrawal_queue_head,
-            withdrawal_queue_tail: raw.withdrawal_queue_tail,
             stable,
             sequencer_set_version: raw.sequencer_set_version,
             sequencer_threshold: raw.sequencer_threshold,
@@ -1325,8 +1269,6 @@ struct StablePortalMetadata {
 
 struct RawPortalSubmissionMetadata {
     withdrawal_batch_index: u64,
-    withdrawal_queue_head: U256,
-    withdrawal_queue_tail: U256,
     sequencer_set_version: u64,
     sequencer_threshold: u8,
     signer_is_sequencer: bool,
@@ -1336,32 +1278,12 @@ struct RawPortalSubmissionMetadata {
 #[derive(Debug, Clone, Copy)]
 struct PortalSubmissionMetadata {
     withdrawal_batch_index: u64,
-    withdrawal_queue_head: U256,
-    withdrawal_queue_tail: U256,
     stable: StablePortalMetadata,
     sequencer_set_version: u64,
     sequencer_threshold: u8,
     signer_is_sequencer: bool,
     verifier: Address,
 }
-
-impl PortalSubmissionMetadata {
-    fn withdrawal_queue_is_empty(self) -> bool {
-        self.withdrawal_queue_head == self.withdrawal_queue_tail
-    }
-}
-
-fn plan_withdrawal_backrun(
-    metadata: PortalSubmissionMetadata,
-    withdrawals: &[abi::Withdrawal],
-) -> Option<u64> {
-    if !metadata.withdrawal_queue_is_empty() {
-        return None;
-    }
-
-    single_batch_gas_limit(withdrawals, MAX_WITHDRAWAL_BACKRUN_GAS)
-}
-
 /// One validated L1 header retained for ancestry proof construction.
 #[derive(Debug, Clone)]
 struct CachedAncestryHeader {
@@ -2167,58 +2089,6 @@ mod tests {
     }
 
     #[test]
-    fn withdrawal_backrun_requires_an_empty_queue() {
-        let withdrawals = vec![test_withdrawal(Address::repeat_byte(0x22), 1)];
-        let mut metadata = PortalSubmissionMetadata {
-            withdrawal_batch_index: 0,
-            withdrawal_queue_head: U256::ZERO,
-            withdrawal_queue_tail: U256::ZERO,
-            stable: StablePortalMetadata {
-                zone_id: 1,
-                chain_id: 1,
-            },
-            sequencer_set_version: 1,
-            sequencer_threshold: 1,
-            signer_is_sequencer: true,
-            verifier: Address::ZERO,
-        };
-
-        assert!(plan_withdrawal_backrun(metadata, &withdrawals).is_some());
-        assert!(plan_withdrawal_backrun(metadata, &[]).is_none());
-
-        metadata.withdrawal_queue_tail = U256::from(1);
-        assert!(plan_withdrawal_backrun(metadata, &withdrawals).is_none());
-
-        assert_ne!(SUBMIT_BATCH_NONCE_KEY, WITHDRAWAL_NONCE_KEY);
-    }
-
-    #[test]
-    fn withdrawal_backrun_requires_the_entire_slot_to_fit() {
-        let withdrawals = (0u8..20)
-            .map(|index| test_withdrawal(Address::repeat_byte(index), 1))
-            .collect::<Vec<_>>();
-        let metadata = PortalSubmissionMetadata {
-            withdrawal_batch_index: 0,
-            withdrawal_queue_head: U256::ZERO,
-            withdrawal_queue_tail: U256::ZERO,
-            stable: StablePortalMetadata {
-                zone_id: 1,
-                chain_id: 1,
-            },
-            sequencer_set_version: 1,
-            sequencer_threshold: 1,
-            signer_is_sequencer: true,
-            verifier: Address::ZERO,
-        };
-
-        assert!(plan_withdrawal_backrun(metadata, &withdrawals).is_none());
-        assert!(
-            plan_withdrawal_backrun(metadata, &withdrawals[..19])
-                .is_some_and(|gas| gas <= MAX_WITHDRAWAL_BACKRUN_GAS)
-        );
-    }
-
-    #[test]
     fn batch_anchor_config_validates_effective_window() {
         let config = BatchAnchorConfig::new(10, 4).unwrap();
         assert_eq!(config.history_window(), 10);
@@ -2376,8 +2246,6 @@ mod tests {
 
         asserter.push_success(&abi_encode_multicall(vec![
             abi_word(7_u64),
-            abi_word(U256::from(3)),
-            abi_word(U256::from(3)),
             abi_word(11_u64),
             abi_word(U256::from(1)),
             abi_word(true),
@@ -2387,7 +2255,6 @@ mod tests {
         ]));
         let first = submitter.read_submission_metadata(signer).await.unwrap();
         assert_eq!(first.withdrawal_batch_index, 7);
-        assert!(first.withdrawal_queue_is_empty());
         assert_eq!(first.sequencer_set_version, 11);
         assert!(first.signer_is_sequencer);
         assert_eq!(first.verifier, verifier);
@@ -2397,8 +2264,6 @@ mod tests {
         let next_verifier = Address::repeat_byte(0x55);
         asserter.push_success(&abi_encode_multicall(vec![
             abi_word(8_u64),
-            abi_word(U256::from(3)),
-            abi_word(U256::from(4)),
             abi_word(12_u64),
             abi_word(U256::from(1)),
             abi_word(false),
@@ -2406,7 +2271,6 @@ mod tests {
         ]));
         let second = submitter.read_submission_metadata(signer).await.unwrap();
         assert_eq!(second.withdrawal_batch_index, 8);
-        assert!(!second.withdrawal_queue_is_empty());
         assert_eq!(second.sequencer_set_version, 12);
         assert!(!second.signer_is_sequencer);
         assert_eq!(second.verifier, next_verifier);
@@ -2435,8 +2299,6 @@ mod tests {
         };
         let metadata = PortalSubmissionMetadata {
             withdrawal_batch_index: 0,
-            withdrawal_queue_head: U256::ZERO,
-            withdrawal_queue_tail: U256::ZERO,
             stable: StablePortalMetadata {
                 zone_id: 1,
                 chain_id: 1,
