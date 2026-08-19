@@ -34,7 +34,7 @@ use zone_chainspec::ZoneChainSpec;
 use zone_l1::{DepositQueue, EncryptionKeyRing, L1BlockTracker, TempoStateExt as _};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
-    P2pPeerId,
+    P2pPeerId, ZoneManifest,
 };
 use zone_payload::ZonePayloadTypes;
 use zone_sequencer::{
@@ -73,6 +73,7 @@ const GENERATION_EVENT_BACKLOG: usize = 128;
 pub(crate) struct RoleControllerContext<P, Pool> {
     pub local_ed25519_public_key: P2pPeerId,
     pub schedule: LeadershipSchedule,
+    pub manifest: Arc<ZoneManifest>,
     pub provider: P,
     pub pool: Pool,
     pub engine_handle: ConsensusEngineHandle<ZonePayloadTypes>,
@@ -895,6 +896,7 @@ where
             let queue = context.deposit_queue.clone();
             let attestation = context.attestation.clone();
             let schedule = context.schedule.clone();
+            let manifest = context.manifest.clone();
             let peer_tips = context.peer_tips.clone();
             tasks.spawn(async move {
                 run_follower_block_sync(
@@ -908,6 +910,7 @@ where
                     queue,
                     attestation,
                     schedule,
+                    manifest,
                     peer_tips,
                     follower_token.clone(),
                 )

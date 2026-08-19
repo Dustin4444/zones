@@ -1084,6 +1084,23 @@ impl ZoneManifest {
             .or_else(|| self.historical_leaders.get(&secp256k1_address))
     }
 
+    /// Resolves a leader's Ed25519 block-author identity to its secp256k1 beneficiary address.
+    ///
+    /// Historical leaders remain resolvable so followers can validate blocks received through
+    /// backfill after a leadership transition.
+    pub fn leader_secp256k1_by_ed25519_public_key(
+        &self,
+        ed25519_public_key: &PublicKey,
+    ) -> Option<EthereumAddress> {
+        self.node_by_ed25519_public_key(ed25519_public_key)
+            .and_then(ManifestNode::secp256k1_address)
+            .or_else(|| {
+                self.historical_leaders
+                    .iter()
+                    .find_map(|(&address, key)| (key == ed25519_public_key).then_some(address))
+            })
+    }
+
     pub(crate) fn has_dns_addresses(&self) -> bool {
         self.nodes.iter().any(|node| node.address.is_dns())
     }
@@ -1750,9 +1767,17 @@ mod tests {
             Some(&public_key(8))
         );
         assert_eq!(
+            manifest.leader_secp256k1_by_ed25519_public_key(&public_key(8)),
+            Some(historical_address)
+        );
+        assert_eq!(
             manifest.leader_ed25519_by_secp256k1_address(secp256k1_address(2).parse().unwrap()),
             Some(&public_key(2)),
             "the leadership resolver must still resolve active nodes"
+        );
+        assert_eq!(
+            manifest.leader_secp256k1_by_ed25519_public_key(&public_key(2)),
+            Some(secp256k1_address(2).parse().unwrap())
         );
     }
 

@@ -2,7 +2,7 @@
 
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::NumHash;
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_provider::DynProvider;
 use alloy_rlp::Decodable as _;
 use alloy_rpc_types_engine::ForkchoiceState;
@@ -15,6 +15,7 @@ use reth_provider::HeaderProvider;
 use reth_storage_api::{BlockNumReader, BlockReader, ReceiptProvider, StateProviderFactory};
 use std::{
     collections::{BTreeMap, HashMap},
+    sync::Arc,
     time::Duration,
 };
 use tempo_alloy::TempoNetwork;
@@ -25,7 +26,7 @@ use tracing::{debug, info};
 use zone_l1::{DepositQueue, L1BlockTracker, L1PortalEvents, TempoStateExt as _};
 use zone_p2p::{
     BackfillCommand, BackfillRequest, BackfillResponse, LeadershipSchedule, P2pCommand, P2pEvent,
-    P2pPeerId, PeerTip,
+    P2pPeerId, PeerTip, ZoneManifest,
 };
 use zone_payload::{
     ZonePayloadTypes,
@@ -715,6 +716,7 @@ pub(crate) async fn run_follower_block_sync<P>(
     deposit_queue: DepositQueue,
     attestation: AttestationContext,
     schedule: LeadershipSchedule,
+    manifest: Arc<ZoneManifest>,
     peer_tips: PeerTipRegistry,
     stop: sync::CancellationToken,
 ) where
@@ -771,6 +773,7 @@ pub(crate) async fn run_follower_block_sync<P>(
                             &l1_block_tracker,
                             &deposit_queue,
                             &schedule,
+                            &manifest,
                             &mut pending,
                             &mut backfill,
                             number,
@@ -880,6 +883,7 @@ pub(crate) async fn run_follower_block_sync<P>(
                             &l1_block_tracker,
                             &deposit_queue,
                             &schedule,
+                            &manifest,
                             &mut pending,
                             &mut backfill,
                             number,
@@ -947,6 +951,7 @@ async fn process_follower_block<P>(
     l1_block_tracker: &L1BlockTracker,
     deposit_queue: &DepositQueue,
     schedule: &LeadershipSchedule,
+    manifest: &ZoneManifest,
     pending: &mut BTreeMap<u64, PendingPeerBlock>,
     backfill: &mut BackfillProgress,
     number: u64,
@@ -983,6 +988,7 @@ where
             l1_block_tracker,
             deposit_queue,
             schedule,
+            manifest,
             &peer_block,
             stop,
         )
@@ -1012,6 +1018,7 @@ where
         l1_block_tracker,
         deposit_queue,
         schedule,
+        manifest,
         pending,
         stop,
     )
@@ -1050,6 +1057,7 @@ async fn drain_pending_blocks<P>(
     l1_block_tracker: &L1BlockTracker,
     deposit_queue: &DepositQueue,
     schedule: &LeadershipSchedule,
+    manifest: &ZoneManifest,
     pending: &mut BTreeMap<u64, PendingPeerBlock>,
     stop: &sync::CancellationToken,
 ) -> eyre::Result<PeerBlockImportOutcome>
@@ -1073,6 +1081,7 @@ where
             l1_block_tracker,
             deposit_queue,
             schedule,
+            manifest,
             &block,
             stop,
         )
@@ -1086,6 +1095,7 @@ async fn import_peer_block<P>(
     l1_block_tracker: &L1BlockTracker,
     deposit_queue: &DepositQueue,
     schedule: &LeadershipSchedule,
+    manifest: &ZoneManifest,
     peer_block: &PendingPeerBlock,
     stop: &sync::CancellationToken,
 ) -> eyre::Result<PeerBlockImportOutcome>
@@ -1194,6 +1204,13 @@ where
         }
         Err(PeerAnchorWaitError::Other(error)) => return Err(error),
     };
+    validate_block_beneficiary(
+        schedule,
+        manifest,
+        anchor.number,
+        block_number,
+        block.beneficiary(),
+    )?;
 
     // The subscriber normally enqueues immediately after recording this observation. Enqueueing
     // here as well closes that small scheduling window and makes follower import self-contained;
@@ -1255,6 +1272,33 @@ fn validate_live_block_sender(
              record governs",
         ),
     }
+}
+
+fn validate_block_beneficiary(
+    schedule: &LeadershipSchedule,
+    manifest: &ZoneManifest,
+    anchor_number: u64,
+    block_number: u64,
+    beneficiary: Address,
+) -> eyre::Result<()> {
+    let authority = schedule.leader_for(anchor_number).ok_or_else(|| {
+        eyre::eyre!(
+            "peer block {block_number} embeds anchor {anchor_number} which no retained leadership record governs"
+        )
+    })?;
+    let expected = manifest
+        .leader_secp256k1_by_ed25519_public_key(&authority.leader)
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "scheduled leader {} for anchor {anchor_number} has no manifest beneficiary",
+                authority.leader
+            )
+        })?;
+    eyre::ensure!(
+        beneficiary == expected,
+        "peer block {block_number} beneficiary mismatch for anchor {anchor_number}: expected {expected}, received {beneficiary}"
+    );
+    Ok(())
 }
 
 async fn wait_for_validated_peer_anchor(
@@ -1411,12 +1455,14 @@ mod tests {
     use super::{
         AdvanceTempoPortalInputs, BackfillProgress, BroadcasterShutdown, EncodedPersistedBlock,
         MAX_PENDING_BLOCKS, PEER_ANCHOR_WAIT_TIMEOUT, PersistedBlockSource, PersistedTip,
-        broadcast_persisted_blocks, buffer_pending_block, validate_live_block_sender,
-        wait_for_validated_peer_anchor,
+        broadcast_persisted_blocks, buffer_pending_block, validate_block_beneficiary,
+        validate_live_block_sender, wait_for_validated_peer_anchor,
     };
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256};
     use zone_l1::{L1BlockTracker, L1PortalEvents};
-    use zone_p2p::{BackfillCommand, LeadershipSchedule, LeadershipState, P2pCommand};
+    use zone_p2p::{
+        BackfillCommand, LeadershipSchedule, LeadershipState, P2pCommand, ZoneManifest,
+    };
 
     #[derive(Clone)]
     struct StartupRaceSource {
@@ -1741,6 +1787,36 @@ mod tests {
             super::validate_l1_checkpoint_transition(&header, 10, B256::repeat_byte(0x99), 7)
                 .unwrap_err();
         assert!(wrong_parent.to_string().contains("does not extend"));
+    }
+
+    #[test]
+    fn rejects_block_beneficiary_that_does_not_match_scheduled_leader() {
+        use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+
+        let keys = [1, 2, 3].map(|seed| PrivateKey::from_seed(seed).public_key());
+        let mut input = format!(
+            "zone_id = 7\nleader_ed25519_public_key = \"{}\"\n",
+            const_hex::encode_prefixed(keys[0].as_ref())
+        );
+        for (index, key) in keys.iter().enumerate() {
+            input.push_str(&format!(
+                "\n[[nodes]]\nname = \"node-{index}\"\ned25519_public_key = \"{}\"\nsecp256k1_address = \"0x{:040x}\"\naddress = \"127.0.0.1:{}\"\n",
+                const_hex::encode_prefixed(key.as_ref()),
+                index + 1,
+                9200 + index,
+            ));
+        }
+        let manifest = ZoneManifest::parse(&input).unwrap();
+        let schedule = LeadershipSchedule::seeded(LeadershipState::new(1, keys[0].clone(), 0));
+        let expected = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+
+        validate_block_beneficiary(&schedule, &manifest, 10, 7, expected).unwrap();
+        let error =
+            validate_block_beneficiary(&schedule, &manifest, 10, 7, Address::ZERO).unwrap_err();
+        assert!(error.to_string().contains("beneficiary mismatch"));
+        assert!(error.to_string().contains(&expected.to_string()));
     }
 
     #[tokio::test]
