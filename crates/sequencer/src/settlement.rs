@@ -483,16 +483,12 @@ impl BatchSubmitter {
             submission = submission.gas(SUBMIT_BATCH_GAS_LIMIT);
         }
 
-        let receipt = if withdrawals.is_empty() {
-            tokio::time::timeout(Duration::from_secs(30), submission.send_sync())
-                .await
-                .map_err(|_| eyre::eyre!("submitBatch sync submission timed out after 30 seconds"))?
-                .map_err(|error| BatchSubmitError::Other(error.into()))?
-        } else {
-            let pending_submission = submission
-                .send()
-                .await
-                .map_err(|error| BatchSubmitError::Other(error.into()))?;
+        let pending_submission = submission
+            .send()
+            .await
+            .map_err(|error| BatchSubmitError::Other(error.into()))?;
+
+        if !withdrawals.is_empty() {
             let withdrawal = self
                 .portal
                 .processWithdrawals(withdrawals.to_vec(), B256::ZERO)
@@ -506,12 +502,13 @@ impl BatchSubmitter {
             if let Err(error) = withdrawal.send().await {
                 warn!(%error, "Failed to broadcast withdrawal transaction");
             }
+        }
 
+        let receipt =
             tokio::time::timeout(Duration::from_secs(30), pending_submission.get_receipt())
                 .await
                 .map_err(|_| eyre::eyre!("submitBatch receipt timed out after 30 seconds"))?
-                .map_err(|error| BatchSubmitError::Other(error.into()))?
-        };
+                .map_err(|error| BatchSubmitError::Other(error.into()))?;
 
         let tx_hash = receipt.transaction_hash();
         if !receipt.status() {
