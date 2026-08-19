@@ -476,7 +476,7 @@ impl BatchSubmitter {
             .nonce_key(submission_nonce_key)
             .nonce(nonce)
             .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-            .max_priority_fee_per_gas(0);
+            .max_priority_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS);
         // Estimation against state N cannot see hash(N), although execution in N+1 can. If this
         // send does not settle, a retry after the head advances uses normal estimation.
         if anchors_to_current_tip {
@@ -496,7 +496,7 @@ impl BatchSubmitter {
                 .nonce_key(WITHDRAWAL_NONCE_KEY)
                 .nonce(nonce + 1)
                 .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                .max_priority_fee_per_gas(0)
+                .max_priority_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
                 .gas(MAX_WITHDRAWAL_BATCH_GAS);
 
             if let Err(error) = withdrawal.send().await {
