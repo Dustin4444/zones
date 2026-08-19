@@ -8,12 +8,12 @@
 //! This crate is `no_std` compatible so these precompiles can run inside the
 //! SP1 prover guest (RISC-V) as well as in the zone node.
 //!
-//! ## Crypto precompiles
+//! ## Cryptography
 //!
-//! - **Chaum-Pedersen Verify** ([`chaum_pedersen`]) — verifies DLOG equality proofs
-//!   for ECDH shared secret derivation.
-//! - **AES-256-GCM Decrypt** ([`aes_gcm`]) — decrypts ECIES ciphertext and verifies
-//!   the GCM authentication tag.
+//! - **Chaum-Pedersen verification** ([`chaum_pedersen`]) — verifies DLOG equality proofs
+//!   for ECDH shared secret derivation inside the native inbox.
+//! - **AES-256-GCM decryption** ([`aes_gcm`]) — decrypts ECIES ciphertext and verifies
+//!   the GCM authentication tag inside the native inbox.
 //! - **ECIES** ([`ecies`]) — sequencer-side ECIES decryption logic.
 //!
 //! ## Policy/token precompiles
@@ -81,8 +81,8 @@ pub mod zone_fee_manager;
 pub mod zone_state;
 pub mod ztip20;
 
-pub use aes_gcm::{AES_GCM_DECRYPT_ADDRESS, AesGcmDecrypt};
-pub use chaum_pedersen::{CHAUM_PEDERSEN_VERIFY_ADDRESS, ChaumPedersenVerify};
+pub use aes_gcm::AesGcmDecrypt;
+pub use chaum_pedersen::ChaumPedersenVerify;
 pub use inbox::{ADVANCE_TEMPO_SELECTOR, ZoneInbox};
 pub use outbox::{ZoneOutbox, is_finalize_withdrawal_batch_calldata};
 pub use storage::{L1State, L1StateError, L1StorageReader};
@@ -100,8 +100,7 @@ use revm::context::CfgEnv;
 use tempo_chainspec::hardfork::TempoHardfork;
 use tempo_precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, NONCE_PRECOMPILE_ADDRESS, Precompile as _,
-    RECEIVE_POLICY_GUARD_ADDRESS, STABLECOIN_DEX_ADDRESS, STORAGE_CREDITS_ADDRESS,
-    TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS,
+    RECEIVE_POLICY_GUARD_ADDRESS, STORAGE_CREDITS_ADDRESS,
     account_keychain::AccountKeychain,
     nonce::NonceManager,
     receive_policy_guard::ReceivePolicyGuard,
@@ -110,9 +109,9 @@ use tempo_precompiles::{
     tip20::{ITIP20::InsufficientBalance as TIP20InsufficientBalance, TIP20Token, is_tip20_prefix},
     tip403_registry::TIP403Registry,
 };
-use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS};
 #[cfg(feature = "std")]
-use tempo_zone_contracts::{ZONE_OUTBOX_ADDRESS, ZONE_TX_CONTEXT_ADDRESS};
+use tempo_zone_contracts::ZONE_OUTBOX_ADDRESS;
+use tempo_zone_contracts::{TEMPO_STATE_ADDRESS, ZONE_INBOX_ADDRESS};
 use zone_hardfork::ZoneHardfork;
 
 /// Registers every precompile that is available to a Zone EVM.
@@ -134,45 +133,26 @@ pub fn extend_zone_precompiles<P>(
 {
     let env = ZonePrecompileEnv::new(cfg, zone_hardfork, actions, non_creditable_slots);
 
-    precompiles.apply_precompile(&TEMPO_STATE_ADDRESS, |_| {
-        Some(TempoState::create(l1.clone(), &env))
-    });
-    #[cfg(feature = "std")]
-    precompiles.apply_precompile(&ZONE_TX_CONTEXT_ADDRESS, |_| {
-        Some(tx_context::ZoneTxContext::create())
-    });
-    precompiles.apply_precompile(&ZONE_INBOX_ADDRESS, |_| {
-        Some(ZoneInbox::create(l1.clone(), &env))
-    });
-    #[cfg(feature = "std")]
-    precompiles.apply_precompile(&ZONE_OUTBOX_ADDRESS, |_| {
-        Some(create_outbox_precompile(l1.clone(), &env))
-    });
-    precompiles.apply_precompile(&CHAUM_PEDERSEN_VERIFY_ADDRESS, |_| {
-        Some(zone_precompile!(env, ChaumPedersenVerify))
-    });
-    precompiles.apply_precompile(&AES_GCM_DECRYPT_ADDRESS, |_| {
-        Some(zone_precompile!(env, AesGcmDecrypt))
-    });
-    precompiles.apply_precompile(&ZONE_FEE_MANAGER_ADDRESS, |_| {
-        Some(zone_precompile!(env, ZoneFeeManager))
-    });
-    precompiles.apply_precompile(&TIP403_REGISTRY_ADDRESS, |_| {
-        Some(zone_precompile!(
-            env,
-            TIP403Registry,
-            tip403_proxy::Tip403Rules
-        ))
-    });
-    precompiles.apply_precompile(&TIP20_FACTORY_ADDRESS, |_| None);
-    precompiles.apply_precompile(&TIP_FEE_MANAGER_ADDRESS, |_| None);
-    precompiles.apply_precompile(&TIP20_CHANNEL_RESERVE_ADDRESS, |_| None);
-
     precompiles.set_precompile_lookup(move |address: &Address| {
+        #[cfg(feature = "std")]
+        if *address == ZONE_OUTBOX_ADDRESS {
+            return Some(create_outbox_precompile(l1.clone(), &env));
+        }
+
         if is_tip20_prefix(*address) {
             Some(create_tip20_precompile(*address, &env))
-        } else if *address == STABLECOIN_DEX_ADDRESS {
-            None
+        } else if *address == TEMPO_STATE_ADDRESS {
+            Some(TempoState::create(l1.clone(), &env))
+        } else if *address == ZONE_INBOX_ADDRESS {
+            Some(ZoneInbox::create(l1.clone(), &env))
+        } else if *address == ZONE_FEE_MANAGER_ADDRESS {
+            Some(zone_precompile!(env, ZoneFeeManager))
+        } else if *address == TIP403_REGISTRY_ADDRESS {
+            Some(zone_precompile!(
+                env,
+                TIP403Registry,
+                tip403_proxy::Tip403Rules
+            ))
         } else if *address == NONCE_PRECOMPILE_ADDRESS {
             Some(zone_precompile!(env, NonceManager, nonce::NonceRules))
         } else if *address == ACCOUNT_KEYCHAIN_ADDRESS {
@@ -194,6 +174,8 @@ pub fn extend_zone_precompiles<P>(
                 storage_credits::StorageCreditsRules
             ))
         } else {
+            // unsupported L1 precompiles:
+            // TIP20Factory, TipFeeManager, TIP20ChannelReserve, StablecoinDEX
             None
         }
     });
