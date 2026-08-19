@@ -1054,6 +1054,8 @@ mod tests {
         l1.push_success(&abi_encode_b256(batch_data.prev_block_hash));
         l1.push_success(&abi_encode_multicall(vec![
             abi_encode_u64(0),
+            abi_encode_u64(0),
+            abi_encode_u64(0),
             abi_encode_u64(1),
             abi_encode_u64(2),
             abi_encode_u64(1),

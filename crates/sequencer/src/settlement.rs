@@ -29,7 +29,7 @@ use crate::{
     ZoneSequencerProvider,
     abi::{self, BlockTransition, DepositQueueTransition, IZoneInbox, IZoneOutbox, ZonePortal},
     attestation::{AttestationStore, SettlementAttestation, SettlementCertificate},
-    withdrawals::MAX_WITHDRAWAL_BATCH_GAS,
+    withdrawals::single_transaction_gas_limit,
 };
 use alloy_consensus::{Transaction, TxReceipt as _, transaction::TxHashRef as _};
 use alloy_eips::BlockHashOrNumber;
@@ -437,7 +437,12 @@ impl BatchSubmitter {
         let submission_address = signer
             .ok_or_eyre("batch submission requires the local sequencer signer")?
             .address();
-        let submission_nonce_key = if withdrawals.is_empty() {
+        let withdrawal_gas_limit = if metadata.withdrawal_queue_empty {
+            single_transaction_gas_limit(withdrawals)
+        } else {
+            None
+        };
+        let submission_nonce_key = if withdrawal_gas_limit.is_none() {
             SUBMIT_BATCH_NONCE_KEY
         } else {
             WITHDRAWAL_NONCE_KEY
@@ -488,7 +493,7 @@ impl BatchSubmitter {
             .await
             .map_err(|error| BatchSubmitError::Other(error.into()))?;
 
-        if !withdrawals.is_empty() {
+        if let Some(gas_limit) = withdrawal_gas_limit {
             let withdrawal = self
                 .portal
                 .processWithdrawals(withdrawals.to_vec(), B256::ZERO)
@@ -497,7 +502,7 @@ impl BatchSubmitter {
                 .nonce(nonce + 1)
                 .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
                 .max_priority_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
-                .gas(MAX_WITHDRAWAL_BATCH_GAS);
+                .gas(gas_limit);
 
             if let Err(error) = withdrawal.send().await {
                 warn!(%error, "Failed to broadcast withdrawal transaction");
@@ -620,6 +625,8 @@ impl BatchSubmitter {
         if let Some(stable) = self.stable_portal_metadata.get().copied() {
             let (
                 withdrawal_batch_index,
+                withdrawal_queue_head,
+                withdrawal_queue_tail,
                 sequencer_set_version,
                 sequencer_threshold,
                 signer_is_sequencer,
@@ -628,6 +635,8 @@ impl BatchSubmitter {
                 .l1_provider
                 .multicall()
                 .add(self.portal.withdrawalBatchIndex())
+                .add(self.portal.withdrawalQueueHead())
+                .add(self.portal.withdrawalQueueTail())
                 .add(self.portal.sequencerSetVersion())
                 .add(self.portal.sequencerThreshold())
                 .add(self.portal.isSequencer(signer))
@@ -637,6 +646,7 @@ impl BatchSubmitter {
             return Ok(Self::build_submission_metadata(
                 RawPortalSubmissionMetadata {
                     withdrawal_batch_index,
+                    withdrawal_queue_empty: withdrawal_queue_head == withdrawal_queue_tail,
                     sequencer_set_version,
                     sequencer_threshold,
                     signer_is_sequencer,
@@ -648,6 +658,8 @@ impl BatchSubmitter {
 
         let (
             withdrawal_batch_index,
+            withdrawal_queue_head,
+            withdrawal_queue_tail,
             sequencer_set_version,
             sequencer_threshold,
             signer_is_sequencer,
@@ -658,6 +670,8 @@ impl BatchSubmitter {
             .l1_provider
             .multicall()
             .add(self.portal.withdrawalBatchIndex())
+            .add(self.portal.withdrawalQueueHead())
+            .add(self.portal.withdrawalQueueTail())
             .add(self.portal.sequencerSetVersion())
             .add(self.portal.sequencerThreshold())
             .add(self.portal.isSequencer(signer))
@@ -676,6 +690,7 @@ impl BatchSubmitter {
         Ok(Self::build_submission_metadata(
             RawPortalSubmissionMetadata {
                 withdrawal_batch_index,
+                withdrawal_queue_empty: withdrawal_queue_head == withdrawal_queue_tail,
                 sequencer_set_version,
                 sequencer_threshold,
                 signer_is_sequencer,
@@ -691,6 +706,7 @@ impl BatchSubmitter {
     ) -> PortalSubmissionMetadata {
         PortalSubmissionMetadata {
             withdrawal_batch_index: raw.withdrawal_batch_index,
+            withdrawal_queue_empty: raw.withdrawal_queue_empty,
             stable,
             sequencer_set_version: raw.sequencer_set_version,
             sequencer_threshold: raw.sequencer_threshold,
@@ -1266,6 +1282,7 @@ struct StablePortalMetadata {
 
 struct RawPortalSubmissionMetadata {
     withdrawal_batch_index: u64,
+    withdrawal_queue_empty: bool,
     sequencer_set_version: u64,
     sequencer_threshold: u8,
     signer_is_sequencer: bool,
@@ -1275,12 +1292,14 @@ struct RawPortalSubmissionMetadata {
 #[derive(Debug, Clone, Copy)]
 struct PortalSubmissionMetadata {
     withdrawal_batch_index: u64,
+    withdrawal_queue_empty: bool,
     stable: StablePortalMetadata,
     sequencer_set_version: u64,
     sequencer_threshold: u8,
     signer_is_sequencer: bool,
     verifier: Address,
 }
+
 /// One validated L1 header retained for ancestry proof construction.
 #[derive(Debug, Clone)]
 struct CachedAncestryHeader {
@@ -2243,6 +2262,8 @@ mod tests {
 
         asserter.push_success(&abi_encode_multicall(vec![
             abi_word(7_u64),
+            abi_word(U256::from(3)),
+            abi_word(U256::from(3)),
             abi_word(11_u64),
             abi_word(U256::from(1)),
             abi_word(true),
@@ -2252,6 +2273,7 @@ mod tests {
         ]));
         let first = submitter.read_submission_metadata(signer).await.unwrap();
         assert_eq!(first.withdrawal_batch_index, 7);
+        assert!(first.withdrawal_queue_empty);
         assert_eq!(first.sequencer_set_version, 11);
         assert!(first.signer_is_sequencer);
         assert_eq!(first.verifier, verifier);
@@ -2261,6 +2283,8 @@ mod tests {
         let next_verifier = Address::repeat_byte(0x55);
         asserter.push_success(&abi_encode_multicall(vec![
             abi_word(8_u64),
+            abi_word(U256::from(3)),
+            abi_word(U256::from(4)),
             abi_word(12_u64),
             abi_word(U256::from(1)),
             abi_word(false),
@@ -2268,6 +2292,7 @@ mod tests {
         ]));
         let second = submitter.read_submission_metadata(signer).await.unwrap();
         assert_eq!(second.withdrawal_batch_index, 8);
+        assert!(!second.withdrawal_queue_empty);
         assert_eq!(second.sequencer_set_version, 12);
         assert!(!second.signer_is_sequencer);
         assert_eq!(second.verifier, next_verifier);
@@ -2296,6 +2321,7 @@ mod tests {
         };
         let metadata = PortalSubmissionMetadata {
             withdrawal_batch_index: 0,
+            withdrawal_queue_empty: true,
             stable: StablePortalMetadata {
                 zone_id: 1,
                 chain_id: 1,

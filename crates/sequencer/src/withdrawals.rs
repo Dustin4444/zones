@@ -932,6 +932,14 @@ fn build_withdrawal_batches(
     batches
 }
 
+pub(crate) fn single_transaction_gas_limit(withdrawals: &[abi::Withdrawal]) -> Option<u64> {
+    let batches = build_withdrawal_batches(withdrawals, MAX_WITHDRAWAL_BATCH_GAS);
+    let [batch] = batches.as_slice() else {
+        return None;
+    };
+    Some(batch.gas_limit)
+}
+
 /// Outcome of submitting and confirming a sequence of `processWithdrawals` transactions.
 enum SubmitOutcome {
     /// Every transaction was included on L1 and succeeded.
@@ -1132,6 +1140,8 @@ mod tests {
         let batches = build_withdrawal_batches(&withdrawals, MAX_WITHDRAWAL_BATCH_GAS);
 
         assert_eq!(batches.len(), 2);
+        assert!(single_transaction_gas_limit(&withdrawals).is_none());
+        assert!(single_transaction_gas_limit(&withdrawals[..19]).is_some());
         assert_eq!(batches[0].len(), 19);
         assert_eq!(batches[1].len(), 1);
         assert!(
