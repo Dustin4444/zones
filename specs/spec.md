@@ -76,8 +76,9 @@
     - [Proof Requirements](#proof-requirements)
   - [Zone Precompiles](#zone-precompiles)
     - [TIP-20 Token Precompile](#tip-20-token-precompile)
-    - [Chaum-Pedersen Verify](#chaum-pedersen-verify)
-    - [AES-GCM Decrypt](#aes-gcm-decrypt)
+  - [Encrypted Deposit Cryptography](#encrypted-deposit-cryptography)
+    - [Chaum-Pedersen Verification](#chaum-pedersen-verification)
+    - [AES-GCM Decryption](#aes-gcm-decryption)
   - [Contracts and Interfaces](#contracts-and-interfaces)
     - [Common Types](#common-types)
     - [IZoneFactory](#izonefactory)
@@ -318,14 +319,13 @@ Account and gateway membership is evaluated when each portal or zone-side action
 
 ### Zone Predeploys
 
-Each zone has four system contracts deployed at genesis at fixed addresses:
+Each zone has three system contracts deployed at genesis at fixed addresses:
 
 | Predeploy | Address | Purpose |
 |-----------|---------|---------|
 | [`TempoState`](#itempostate) | `0x1c00...0000` | Stores the finalized Tempo checkpoint used to anchor the zone's Tempo L1 state view. |
 | [`ZoneInbox`](#izoneinbox) | `0x1c00...0001` | Advances the zone's view of Tempo and processes incoming deposits. Sole mint authority. |
 | [`ZoneOutbox`](#izoneoutbox) | `0x1c00...0002` | Handles withdrawal requests and batch finalization. Sole burn authority. |
-| `ZoneTxContext` | `0x1c00...0005` | Provides the current transaction hash to system contracts (used by `ZoneOutbox` for `senderTag` computation). |
 
 ### Zone Token Model
 
@@ -510,9 +510,9 @@ When the sequencer processes an encrypted deposit on the zone, the zone recovers
 
 The sequencer provides the ECDH shared secret alongside a proof of its correct derivation. Verification proceeds in two steps:
 
-1. **Chaum-Pedersen proof.** The sequencer provides a zero-knowledge proof that the shared secret was correctly derived: "I know `privSeq` such that `pubSeq = privSeq * G` AND `sharedSecretPoint = privSeq * ephemeralPub`." The [Chaum-Pedersen Verify](#chaum-pedersen-verify) precompile checks this proof. The sequencer's public key is looked up from the onchain key history, not supplied by the sequencer, preventing key substitution.
+1. **Chaum-Pedersen proof.** The sequencer provides a zero-knowledge proof that the shared secret was correctly derived: "I know `privSeq` such that `pubSeq = privSeq * G` AND `sharedSecretPoint = privSeq * ephemeralPub`." The native inbox checks this proof using its [Chaum-Pedersen verifier](#chaum-pedersen-verification). The sequencer's public key is looked up from the onchain key history, not supplied by the sequencer, preventing key substitution.
 
-2. **AES-GCM decryption.** The zone derives an AES-256 key from the shared secret using HKDF-SHA256 (implemented in Solidity using the SHA256 precompile at `0x02`). The HKDF info string includes `tempoPortal`, `keyIndex`, `ephemeralPubkeyX`, and the public deposit `sender` for domain separation. The [AES-GCM Decrypt](#aes-gcm-decrypt) precompile decrypts the ciphertext and validates the GCM authentication tag. The plaintext is packed as `[address (20 bytes)][memo (32 bytes)][padding (12 bytes)]` totaling 64 bytes; the zone parses `(to, memo)` directly from it and uses those values for the mint. Binding the sender means replaying a payload from another account derives a different AES key and fails authentication, causing the deposit to bounce back instead of minting to the hidden recipient.
+2. **AES-GCM decryption.** The native inbox derives an AES-256 key from the shared secret using HKDF-SHA256. The HKDF info string includes `tempoPortal`, `keyIndex`, `ephemeralPubkeyX`, and the public deposit `sender` for domain separation. It then performs [AES-GCM decryption](#aes-gcm-decryption) and validates the authentication tag. The plaintext is packed as `[address (20 bytes)][memo (32 bytes)][padding (12 bytes)]` totaling 64 bytes; the zone parses `(to, memo)` directly from it and uses those values for the mint. Binding the sender means replaying a payload from another account derives a different AES key and fails authentication, causing the deposit to bounce back instead of minting to the hidden recipient.
 
 If any step fails (invalid proof, GCM tag mismatch, or invalid decrypted plaintext length), the zone does **not** attempt any zone-side mint. Instead, the deposit bounces back immediately to `tempoRefundRecipient` on Tempo via the outbox (see [Deposit Failures and Bounce-Back](#deposit-failures-and-bounce-back)). Because `deposit` requires a non-zero `tempoRefundRecipient` at deposit time, this path always has a well-defined target and never stalls the deposit queue. Because `(to, memo)` are derived from the decrypted plaintext rather than supplied by the sequencer, there is no separate plaintext-mismatch check and the sequencer cannot redirect a valid ciphertext to a different recipient onchain.
 
@@ -666,7 +666,7 @@ flowchart LR
 
 A user withdraws by calling `requestWithdrawal(token, to, amount, memo, gasLimit, zoneFallbackRecipient, data, revealTo)` on the `ZoneOutbox`. The user must first approve the outbox to spend `amount + fee` of the token, and `amount` must be non-zero. The token must be enabled, and the `zoneFallbackRecipient` must be non-zero but need not be a Tempo allowed account. For a plain withdrawal (`gasLimit == 0`), closed access mode requires `to` to have the `Account` role; open access mode does not. Enforced gateway mode prevents accounts with the `CallbackGateway` role from receiving plain withdrawals and requires callback targets (`gasLimit > 0`) to have that role. Open gateway mode skips both role checks.
 
-Withdrawal requests are bounded before they enter the pending queue. `gasLimit` must be less than or equal to `MAX_WITHDRAWAL_GAS_LIMIT` or the request reverts with `GasLimitTooHigh`; `data.length` must be less than or equal to `MAX_CALLBACK_DATA_SIZE` (1,024 bytes) or the request reverts with `CallbackDataTooLarge`; and `revealTo`, when non-empty, must be a valid 33-byte compressed secp256k1 public key or the request reverts with `InvalidRevealTo`. The outbox reads the current zone transaction hash from `ZoneTxContext`; if it is zero, the request reverts with `InvalidCurrentTxHash`, because the transaction hash is part of the authenticated-withdrawal sender tag.
+Withdrawal requests are bounded before they enter the pending queue. `gasLimit` must be less than or equal to `MAX_WITHDRAWAL_GAS_LIMIT` or the request reverts with `GasLimitTooHigh`; `data.length` must be less than or equal to `MAX_CALLBACK_DATA_SIZE` (1,024 bytes) or the request reverts with `CallbackDataTooLarge`; and `revealTo`, when non-empty, must be a valid 33-byte compressed secp256k1 public key or the request reverts with `InvalidRevealTo`. The Zone EVM supplies the current transaction hash directly to the native outbox; if it is zero, the request reverts with `InvalidCurrentTxHash`, because the transaction hash is part of the authenticated-withdrawal sender tag.
 
 The sequencer can additionally configure `maxWithdrawalsPerBlock` on the outbox. A value of `0` means unlimited. When nonzero, only that many `requestWithdrawal` calls can be accepted in a single zone block; further requests in the same block revert with `TooManyWithdrawalsThisBlock` before any token transfer or burn. The outbox tracks the last block number counted and resets the per-block counter when `block.number` changes.
 
@@ -1477,7 +1477,7 @@ For the first proof, requirement 1 specifically means a transition from `prevBlo
 
 ## Zone Precompiles
 
-Zones have three categories of precompiles: TIP-20 token precompiles (one per enabled token) and two cryptographic precompiles for encrypted deposit verification.
+Every enabled TIP-20 token is exposed as a precompile. Encrypted-deposit verification is performed internally by the native `ZoneInbox`, not through separately callable precompiles.
 
 ### TIP-20 Token Precompile
 
@@ -1487,28 +1487,25 @@ Each enabled TIP-20 token is deployed as a precompile at the same address as on 
 - Transfer-family operations (`transfer`, `transferFrom`, `approve`) charge a fixed 100,000 gas.
 - `mint` is restricted to `ZoneInbox`, `burn` is restricted to `ZoneOutbox`.
 
-### Chaum-Pedersen Verify
+## Encrypted Deposit Cryptography
 
-| | |
-|---|---|
-| **Address** | `0x1c00000000000000000000000000000000000100` |
-| **Gas** | ~8,000 |
+The native `ZoneInbox` performs the following cryptographic operations internally. They are consensus execution helpers, not separately addressable precompiles.
+
+### Chaum-Pedersen Verification
 
 ```solidity
-interface IChaumPedersenVerify {
-    function verifyProof(
-        bytes32 ephemeralPubX,
-        uint8 ephemeralPubYParity,
-        bytes32 sharedSecret,
-        uint8 sharedSecretYParity,
-        bytes32 sequencerPubX,
-        uint8 sequencerPubYParity,
-        ChaumPedersenProof calldata proof
-    ) external view returns (bool valid);
-}
+function verifyProof(
+    bytes32 ephemeralPubX,
+    uint8 ephemeralPubYParity,
+    bytes32 sharedSecret,
+    uint8 sharedSecretYParity,
+    bytes32 sequencerPubX,
+    uint8 sequencerPubYParity,
+    ChaumPedersenProof calldata proof
+) internal pure returns (bool valid);
 ```
 
-Verifies that an ECDH shared secret was correctly derived from the sequencer's private key and an ephemeral public key, without exposing the private key. Used during [onchain decryption verification](#onchain-decryption-verification) of encrypted deposits.
+Verifies that an ECDH shared secret was correctly derived from the sequencer's private key and an ephemeral public key, without exposing the private key. Used during [onchain decryption verification](#onchain-decryption-verification) of encrypted deposits. Verification charges 6,000 gas in addition to the inbox call's other costs.
 
 Proof generation uses a deterministic, domain-separated nonce so that independently built versions of the same zone block contain identical `advanceTempo` calldata. For a counter starting at zero, the prover computes:
 
@@ -1519,28 +1516,21 @@ k = OS2IP(candidate)
 
 Here, `uint256_be` and `uint32_be` are fixed-width big-endian encodings, `sec1_compressed` and `sec1_uncompressed` are the 33-byte and 65-byte SEC1 point encodings respectively, and `OS2IP` interprets a byte string as a big-endian nonnegative integer. If `k` is not a valid nonzero secp256k1 scalar, the prover increments the counter and retries. The prover then computes `R1 = k*G`, `R2 = k*ephemeralPub`, `c = OS2IP(keccak256(sec1_uncompressed(G) || sec1_uncompressed(ephemeralPub) || sec1_uncompressed(pubSeq) || sec1_uncompressed(sharedSecretPoint) || sec1_uncompressed(R1) || sec1_uncompressed(R2))) mod n`, where `n` is the secp256k1 group order, and `s = k + c*privSeq`. The verifier reconstructs `R1 = s*G - c*pubSeq` and `R2 = s*ephemeralPub - c*sharedSecretPoint`, recomputes `c'`, and checks `c == c'`.
 
-### AES-GCM Decrypt
-
-| | |
-|---|---|
-| **Address** | `0x1c00000000000000000000000000000000000101` |
-| **Gas** | ~1,000 base + ~500 per 32 bytes of ciphertext |
+### AES-GCM Decryption
 
 ```solidity
-interface IAesGcmDecrypt {
-    function decrypt(
-        bytes32 key,
-        bytes12 nonce,
-        bytes calldata ciphertext,
-        bytes calldata aad,
-        bytes16 tag
-    ) external view returns (bytes memory plaintext, bool valid);
-}
+function decrypt(
+    bytes32 key,
+    bytes12 nonce,
+    bytes calldata ciphertext,
+    bytes calldata aad,
+    bytes16 tag
+) internal pure returns (bytes memory plaintext, bool valid);
 ```
 
-Performs AES-256-GCM decryption and authentication tag verification. Returns the decrypted plaintext and `true` if the tag validates, or empty bytes and `false` otherwise. Used during [onchain decryption verification](#onchain-decryption-verification) of encrypted deposits.
+Performs AES-256-GCM decryption and authentication tag verification. Returns the decrypted plaintext and `true` if the tag validates, or empty bytes and `false` otherwise. Used during [onchain decryption verification](#onchain-decryption-verification) of encrypted deposits. Execution charges 1,000 gas plus 3 gas per byte of ciphertext and additional authenticated data, in addition to the inbox call's other costs.
 
-HKDF-SHA256 key derivation (used to derive the AES key from the ECDH shared secret) is implemented in Solidity using the SHA256 precompile at `0x02`, keeping this precompile minimal.
+HKDF-SHA256 key derivation (used to derive the AES key from the ECDH shared secret) is performed by the native inbox, which supplies empty AAD to the decrypt operation.
 
 <br>
 
