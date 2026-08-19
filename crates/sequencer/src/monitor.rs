@@ -1058,7 +1058,6 @@ mod tests {
             abi_encode_u64(0),
             abi_encode_u64(0),
             abi_encode_u64(0),
-            abi_encode_u64(0),
             abi_encode_u64(1),
             abi_encode_u64(2),
             abi_encode_u64(1),

@@ -21,11 +21,6 @@ pub const SUBMIT_BATCH_NONCE_KEY: U256 = uint!(1_U256);
 pub const PROCESS_WITHDRAWAL_NONCE_KEY: U256 = uint!(2_U256);
 
 /// Nonce key for ordered withdrawal submission.
-///
-/// `submitBatch` and its best-effort `processWithdrawals` transaction use consecutive nonces on
-/// this lane. An uncertain result disables the lane for the process lifetime. Mandatory settlement
-/// continues on [`SUBMIT_BATCH_NONCE_KEY`], while [`PROCESS_WITHDRAWAL_NONCE_KEY`] recovers the
-/// withdrawal queue.
 pub const WITHDRAWAL_NONCE_KEY: U256 = uint!(4_U256);
 
 /// Nonce key for admin operations (`enableToken`, `setZoneGasRate`, `setMaxTempoGasRate`,
