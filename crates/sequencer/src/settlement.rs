@@ -58,7 +58,7 @@ use tempo_primitives::{Block, TempoReceipt};
 use tokio_util::sync;
 use tracing::{info, instrument, warn};
 
-use crate::nonce_keys::{SUBMIT_BATCH_NONCE_KEY, WITHDRAWAL_BACKRUN_NONCE_KEY};
+use crate::nonce_keys::{SUBMIT_BATCH_NONCE_KEY, WITHDRAWAL_NONCE_KEY};
 
 #[derive(Debug)]
 pub enum BatchSubmitError {
@@ -251,7 +251,7 @@ pub struct BatchSubmitter {
     /// Signatures from followers attesting to the batch.
     attestation_store: Option<AttestationStore>,
     /// False after any uncertain fast-path result. Mandatory settlement remains on lane 1.
-    backrun_lane_healthy: AtomicBool,
+    withdrawal_lane_healthy: AtomicBool,
     /// Validated, RLP-encoded L1 headers retained across overlapping ancestry
     /// requests. Settlement batches are submitted in order, so later requests
     /// can reuse almost the entire preceding range.
@@ -316,7 +316,7 @@ impl BatchSubmitter {
             l1_fetch_concurrency: 16,
             anchor_config,
             attestation_store: None,
-            backrun_lane_healthy: AtomicBool::new(true),
+            withdrawal_lane_healthy: AtomicBool::new(true),
             ancestry_header_cache: RwLock::new(LruMap::new(ByLength::new(
                 DEFAULT_ANCESTRY_HEADER_CACHE_CAPACITY,
             ))),
@@ -469,13 +469,13 @@ impl BatchSubmitter {
             .address();
         let backrun_gas_limit = plan_withdrawal_backrun(
             metadata,
-            self.backrun_lane_healthy.load(Ordering::Acquire),
+            self.withdrawal_lane_healthy.load(Ordering::Acquire),
             withdrawals,
         );
         let submission_nonce_key = if backrun_gas_limit.is_none() {
             SUBMIT_BATCH_NONCE_KEY
         } else {
-            WITHDRAWAL_BACKRUN_NONCE_KEY
+            WITHDRAWAL_NONCE_KEY
         };
         // Refetch the committed nonce for the selected lane on every attempt. The mandatory
         // settlement lane never contains optional withdrawals. Any uncertainty on the fast lane
@@ -530,7 +530,7 @@ impl BatchSubmitter {
             let pending_submission = match submission.send().await {
                 Ok(pending) => pending,
                 Err(error) => {
-                    self.backrun_lane_healthy.store(false, Ordering::Release);
+                    self.withdrawal_lane_healthy.store(false, Ordering::Release);
                     return Err(BatchSubmitError::Other(error.into()));
                 }
             };
@@ -539,7 +539,7 @@ impl BatchSubmitter {
                 .portal
                 .processWithdrawals(withdrawals.to_vec(), B256::ZERO)
                 .from(submission_address)
-                .nonce_key(WITHDRAWAL_BACKRUN_NONCE_KEY)
+                .nonce_key(WITHDRAWAL_NONCE_KEY)
                 .nonce(backrun_nonce)
                 .max_fee_per_gas(crate::TEMPO_L1_MAX_FEE_PER_GAS)
                 .max_priority_fee_per_gas(0)
@@ -547,7 +547,7 @@ impl BatchSubmitter {
 
             info!(
                 %submit_tx_hash,
-                nonce_key = ?WITHDRAWAL_BACKRUN_NONCE_KEY,
+                nonce_key = ?WITHDRAWAL_NONCE_KEY,
                 submit_nonce = nonce,
                 backrun_nonce,
                 withdrawals = withdrawals.len(),
@@ -560,7 +560,7 @@ impl BatchSubmitter {
                 tokio::time::timeout(WITHDRAWAL_BACKRUN_CONFIRM_TIMEOUT, backrun.send_sync()),
             );
             if !matches!(&submission_result, Ok(Ok(_))) {
-                self.backrun_lane_healthy.store(false, Ordering::Release);
+                self.withdrawal_lane_healthy.store(false, Ordering::Release);
             }
             let receipt = submission_result
                 .map_err(|_| eyre::eyre!("submitBatch receipt timed out after 30 seconds"))?
@@ -599,10 +599,10 @@ impl BatchSubmitter {
                 }
             };
             if !backrun_succeeded {
-                self.backrun_lane_healthy.store(false, Ordering::Release);
+                self.withdrawal_lane_healthy.store(false, Ordering::Release);
                 warn!(
-                    nonce_key = ?WITHDRAWAL_BACKRUN_NONCE_KEY,
-                    "Disabling withdrawal backrun lane; mandatory settlement remains available"
+                    nonce_key = ?WITHDRAWAL_NONCE_KEY,
+                    "Disabling withdrawal nonce lane; mandatory settlement remains available"
                 );
             }
             receipt
@@ -615,8 +615,8 @@ impl BatchSubmitter {
 
         let tx_hash = receipt.transaction_hash();
         if !receipt.status() {
-            if submission_nonce_key == WITHDRAWAL_BACKRUN_NONCE_KEY {
-                self.backrun_lane_healthy.store(false, Ordering::Release);
+            if submission_nonce_key == WITHDRAWAL_NONCE_KEY {
+                self.withdrawal_lane_healthy.store(false, Ordering::Release);
             }
             return Err(
                 eyre::eyre!("submitBatch tx {tx_hash} was included but reverted on L1").into(),
@@ -2272,7 +2272,7 @@ mod tests {
         metadata.withdrawal_queue_tail = U256::from(1);
         assert!(plan_withdrawal_backrun(metadata, true, &withdrawals).is_none());
 
-        assert_ne!(SUBMIT_BATCH_NONCE_KEY, WITHDRAWAL_BACKRUN_NONCE_KEY);
+        assert_ne!(SUBMIT_BATCH_NONCE_KEY, WITHDRAWAL_NONCE_KEY);
     }
 
     #[test]
