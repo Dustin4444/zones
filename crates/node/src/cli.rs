@@ -293,7 +293,11 @@ pub struct ZoneArgs {
     pub l1_rpc_url: String,
 
     /// ZonePortal contract address on L1.
-    #[arg(long = "l1.portal-address", env = "L1_PORTAL_ADDRESS")]
+    #[arg(
+        long = "l1.portal-address",
+        env = "L1_PORTAL_ADDRESS",
+        value_parser = parse_portal_address
+    )]
     pub portal_address: Address,
 
     /// Block building interval in milliseconds.
@@ -528,6 +532,16 @@ fn parse_l1_rpc_url(l1_rpc_url: &str) -> Result<String, String> {
     Ok(l1_rpc_url.to_owned())
 }
 
+fn parse_portal_address(value: &str) -> Result<Address, String> {
+    let address = value
+        .parse::<Address>()
+        .map_err(|err| format!("invalid --l1.portal-address: {err}"))?;
+    if address.is_zero() {
+        return Err("--l1.portal-address must be nonzero".to_owned());
+    }
+    Ok(address)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{io::Write as _, process::Command, thread, time::Duration};
@@ -536,7 +550,7 @@ mod tests {
 
     use super::{
         Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, parse_l1_rpc_url,
-        sequencer_enabled, validate_p2p_transaction_size_limit,
+        parse_portal_address, sequencer_enabled, validate_p2p_transaction_size_limit,
     };
     use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
@@ -558,6 +572,12 @@ mod tests {
     fn dev_is_parsed_by_the_top_level_cli() {
         let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
         assert!(matches!(parsed, ZoneCli::Dev(_)));
+    }
+
+    #[test]
+    fn portal_address_must_be_nonzero() {
+        assert!(parse_portal_address("0x0000000000000000000000000000000000000000").is_err());
+        assert!(parse_portal_address("0x1111111111111111111111111111111111111111").is_ok());
     }
 
     #[test]
