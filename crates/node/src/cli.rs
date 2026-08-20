@@ -104,10 +104,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
     cli.run_with_components::<ZoneNode>(components, async move |mut builder, args| {
         info!(target: "reth::cli", "Launching Tempo Zone node");
 
-        validate_l1_rpc_url(&args.l1_rpc_url)?;
-        validate_portal_address(args.portal_address)?;
         let zone_id = builder.config().chain.zone_id();
-        validate_deprecated_zone_id(args.zone_id, zone_id)?;
 
         let p2p_config = args
             .sequencer_manifest
@@ -288,7 +285,11 @@ async fn load_decryption_keys(
 #[derive(Debug, Clone, Args)]
 pub struct ZoneArgs {
     /// Certified Tempo follower WebSocket RPC URL for finalized L1 state, deposit events, and chain notifications.
-    #[arg(long = "l1.rpc-url", env = "L1_RPC_URL")]
+    #[arg(
+        long = "l1.rpc-url",
+        env = "L1_RPC_URL",
+        value_parser = parse_l1_rpc_url
+    )]
     pub l1_rpc_url: String,
 
     /// ZonePortal contract address on L1.
@@ -445,10 +446,6 @@ pub struct ZoneArgs {
     )]
     pub l1_retry_connection_interval_ms: u64,
 
-    /// Deprecated: validates the Zone ID encoded in the genesis chain ID.
-    #[arg(long = "zone.id", env = "ZONE_ID")]
-    pub zone_id: Option<u32>,
-
     /// Port for the redacted zone RPC server (0 for OS-assigned).
     #[arg(
         long = "redacted-rpc.port",
@@ -518,34 +515,17 @@ fn validate_p2p_transaction_size_limit(
     Ok(())
 }
 
-fn validate_l1_rpc_url(l1_rpc_url: &str) -> eyre::Result<()> {
+fn parse_l1_rpc_url(l1_rpc_url: &str) -> Result<String, String> {
     let url: url::Url = l1_rpc_url
         .parse()
-        .map_err(|err| eyre::eyre!("failed parsing --l1.rpc-url as URL: {err}"))?;
-    eyre::ensure!(
-        matches!(url.scheme(), "ws" | "wss"),
-        "--l1.rpc-url must use ws:// or wss://, got `{}`",
-        url.scheme()
-    );
-    Ok(())
-}
-
-fn validate_portal_address(portal_address: Address) -> eyre::Result<()> {
-    eyre::ensure!(
-        !portal_address.is_zero(),
-        "--l1.portal-address must be nonzero"
-    );
-    Ok(())
-}
-
-fn validate_deprecated_zone_id(configured: Option<u32>, derived: u32) -> eyre::Result<()> {
-    if let Some(configured) = configured {
-        eyre::ensure!(
-            configured == derived,
-            "deprecated --zone.id value {configured} does not match zone ID {derived} encoded in the genesis chain ID"
-        );
+        .map_err(|err| format!("failed parsing --l1.rpc-url as URL: {err}"))?;
+    if !matches!(url.scheme(), "ws" | "wss") {
+        return Err(format!(
+            "--l1.rpc-url must use ws:// or wss://, got `{}`",
+            url.scheme()
+        ));
     }
-    Ok(())
+    Ok(l1_rpc_url.to_owned())
 }
 
 #[cfg(test)]
@@ -555,9 +535,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
-        validate_deprecated_zone_id, validate_l1_rpc_url, validate_p2p_transaction_size_limit,
-        validate_portal_address,
+        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, parse_l1_rpc_url,
+        sequencer_enabled, validate_p2p_transaction_size_limit,
     };
     use zone_sequencer::MAX_WITHDRAWAL_BATCH_GAS;
 
@@ -579,31 +558,6 @@ mod tests {
     fn dev_is_parsed_by_the_top_level_cli() {
         let parsed = ZoneCli::try_parse_from(["tempo-zone", "dev"]).unwrap();
         assert!(matches!(parsed, ZoneCli::Dev(_)));
-    }
-
-    #[test]
-    fn portal_address_must_be_nonzero() {
-        assert!(validate_portal_address(alloy_primitives::Address::ZERO).is_err());
-        assert!(validate_portal_address(alloy_primitives::Address::repeat_byte(0x11)).is_ok());
-    }
-
-    #[test]
-    fn deprecated_zone_id_is_optional_and_validated() {
-        assert!(validate_deprecated_zone_id(None, 7).is_ok());
-        assert!(validate_deprecated_zone_id(Some(7), 7).is_ok());
-        assert!(validate_deprecated_zone_id(Some(8), 7).is_err());
-
-        let parsed = ZoneArgsParser::try_parse_from([
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-            "--zone.id",
-            "7",
-        ])
-        .unwrap();
-        assert_eq!(parsed.zone.zone_id, Some(7));
     }
 
     #[test]
@@ -932,13 +886,13 @@ mod tests {
 
     #[test]
     fn l1_rpc_url_accepts_websocket_schemes() {
-        validate_l1_rpc_url("ws://localhost:8546").unwrap();
-        validate_l1_rpc_url("wss://rpc.moderato.tempo.xyz").unwrap();
+        parse_l1_rpc_url("ws://localhost:8546").unwrap();
+        parse_l1_rpc_url("wss://rpc.moderato.tempo.xyz").unwrap();
     }
 
     #[test]
     fn l1_rpc_url_rejects_non_websocket_schemes() {
-        assert!(validate_l1_rpc_url("http://localhost:8545").is_err());
-        assert!(validate_l1_rpc_url("https://rpc.moderato.tempo.xyz").is_err());
+        assert!(parse_l1_rpc_url("http://localhost:8545").is_err());
+        assert!(parse_l1_rpc_url("https://rpc.moderato.tempo.xyz").is_err());
     }
 }
