@@ -4,7 +4,7 @@ use std::{future::Future, time::Duration};
 
 use alloy_consensus::TxReceipt as _;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{B256, Bytes, Sealable as _, U256};
+use alloy_primitives::{B256, Sealable as _, U256};
 use alloy_provider::Provider as _;
 use alloy_sol_types::{SolEvent as _, SolValue as _};
 use eyre::{OptionExt as _, WrapErr as _};
@@ -19,6 +19,7 @@ use tempo_zone_contracts::{
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 use zone_p2p::P2pCommand;
+use zone_prover::NITRO_VERIFIER_CONFIG_V1;
 
 use crate::replication::AttestationContext;
 use zone_sequencer::attestation::{SettlementAttestation, SignedSettlementAttestation};
@@ -276,7 +277,7 @@ where
                 .abi_encode(),
         ),
         withdrawalQueueHash: withdrawal_queue_hash,
-        verifierConfigHash: alloy_primitives::keccak256(Bytes::new()),
+        verifierConfigHash: alloy_primitives::keccak256(NITRO_VERIFIER_CONFIG_V1),
     }))
 }
 
@@ -584,6 +585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Bytes;
     use alloy_provider::{ProviderBuilder, mock::Asserter};
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::sync::{

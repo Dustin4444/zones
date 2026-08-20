@@ -8,9 +8,8 @@
 //!
 //! # POC limitations
 //!
-//! Proof validation is currently **skipped** by the stub verifier. Both direct
-//! and ancestry submissions use empty proof bytes until real proof generation is
-//! implemented.
+//! Proof validation is **skipped** by the pre-T11 stub verifier. Direct and ancestry submissions
+//! continue to use empty proof bytes while Nitro proving remains observational.
 //!
 //! # Anchor modes
 //!
@@ -48,6 +47,7 @@ use tempo_alloy::{TempoNetwork, provider::ext::TempoProviderExt, rpc::TempoCallB
 use tempo_primitives::{Block, TempoReceipt};
 use tokio_util::sync;
 use tracing::{info, instrument, warn};
+use zone_prover::NITRO_VERIFIER_CONFIG_V1;
 
 use crate::nonce_keys::SUBMIT_BATCH_NONCE_KEY;
 
@@ -316,12 +316,11 @@ impl BatchSubmitter {
     ///   recent anchor block is used and ancestry headers are collected (for
     ///   future prover integration).
     ///
-    /// `verifierConfig` and `proof` are empty until real proof generation is
-    /// implemented.
+    /// `verifierConfig` selects the Nitro verifier policy. `proof` remains empty while the Nitro
+    /// prover runs observationally.
     ///
     /// Returns the `BatchSubmitted` event decoded from the confirmed receipt. Waiting for a
     /// settlement quorum is cancelled when the leader generation shuts down.
-    // TODO: pass real proof bytes once proof generation is implemented.
     #[instrument(skip_all, fields(
         portal = %self.portal_address,
         tempo_block = batch.tempo_block_number,
@@ -335,6 +334,7 @@ impl BatchSubmitter {
         batch: &BatchData,
         shutdown: &sync::CancellationToken,
     ) -> std::result::Result<ZonePortal::BatchSubmitted, BatchSubmitError> {
+        let verifier_config = Bytes::from_static(NITRO_VERIFIER_CONFIG_V1);
         let block_transition = BlockTransition {
             prevBlockHash: batch.prev_block_hash,
             nextBlockHash: batch.next_block_hash,
@@ -347,7 +347,6 @@ impl BatchSubmitter {
             nextDepositNumber: batch.next_deposit_number,
         };
 
-        let verifier_config = Bytes::new();
         let signer = self.signer.as_ref();
         let metadata = self
             .read_submission_metadata(signer.map_or(Address::ZERO, PrivateKeySigner::address))
@@ -785,7 +784,7 @@ impl BatchSubmitter {
             "certificate withdrawal queue hash changed"
         );
         eyre::ensure!(
-            attestation.verifierConfigHash == alloy_primitives::keccak256(Bytes::new()),
+            attestation.verifierConfigHash == keccak256(NITRO_VERIFIER_CONFIG_V1),
             "certificate verifier config changed"
         );
 
