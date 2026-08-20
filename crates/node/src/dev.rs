@@ -419,6 +419,7 @@ mod command {
             let mut argv: Vec<String> = [
                 "tempo-zone",
                 "node",
+                "--dev",
                 "--chain",
                 &genesis_path.display().to_string(),
                 "--l1.rpc-url",
@@ -447,7 +448,6 @@ mod command {
                 &self.datadir.join("node").display().to_string(),
                 "--log.file.directory",
                 &self.datadir.join("logs").display().to_string(),
-                "--sequencer",
                 "--sequencer-key-file",
                 &sequencer_key_path.display().to_string(),
             ]

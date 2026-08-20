@@ -649,7 +649,7 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | `--l1.rpc-url` | (required) | Certified Tempo follower WebSocket RPC URL |
 | `--l1.portal-address` | (from zone.json) | ZonePortal contract on L1 |
 | `--zone.id` | (deprecated) | Optional compatibility check against the zone ID encoded in the genesis chain ID. |
-| `--sequencer` | false | Enable sequencer mode for block production and withdrawal batch submission |
+| `--sequencer.manifest` | (required unless `--dev`) | Static Zone P2P topology and role manifest |
 | `--sequencer-key-file` | (required for sequencing) | Owner-readable file or FIFO containing the sequencer private key |
 | `--deposit-decryption-keys-file` | (optional) | File containing additional historical or pre-provisioned deposit decryption keys, one hex key per line |
 | `--block.interval-ms` | 250 | Block building interval |

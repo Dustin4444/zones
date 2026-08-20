@@ -107,6 +107,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         validate_l1_rpc_url(&args.l1_rpc_url)?;
         validate_portal_address(args.portal_address)?;
         let zone_id = builder.config().chain.zone_id();
+        let is_dev = builder.config().dev.dev;
         validate_deprecated_zone_id(args.zone_id, zone_id)?;
 
         let p2p_config = args
@@ -118,7 +119,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 })?;
                 // Required for a quorum member and rejected for an `rpc_only` node, which never
                 // signs a settlement attestation; the manifest decides which this node is.
-                P2pConfig::load(
+                let config = P2pConfig::load(
                     manifest_path,
                     ed25519_key_path,
                     args.secp256k1_key.as_ref(),
@@ -126,25 +127,24 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                     args.p2p_bypass_ip_check,
                     zone_id,
                     args.sequencer_role,
-                )
+                )?;
+                info!(
+                    target: "reth::cli",
+                    ed25519_public_key = %config.ed25519_public_key(),
+                    secp256k1_address = ?config.secp256k1_address(),
+                    listen = %config.listen(),
+                    "Validated multi-sequencer manifest and local identity"
+                );
+                Ok(config)
             })
             .transpose()?;
-        if let Some(config) = p2p_config.as_ref() {
-            info!(
-                target: "reth::cli",
-                ed25519_public_key = %config.ed25519_public_key(),
-                secp256k1_address = ?config.secp256k1_address(),
-                listen = %config.listen(),
-                "Validated multi-sequencer manifest and local identity"
-            );
-        }
 
-        let manifest_mode = p2p_config.is_some();
-        validate_p2p_transaction_size_limit(
-            manifest_mode,
-            builder.config().txpool.max_tx_input_bytes,
-        )?;
-        if manifest_mode {
+        eyre::ensure!(
+            is_dev || p2p_config.is_some(),
+            "--sequencer.manifest is required unless Reth --dev is enabled"
+        );
+        if p2p_config.is_some() {
+            validate_p2p_transaction_size_limit(builder.config().txpool.max_tx_input_bytes)?;
             // Replicate only durable blocks. Persist every block immediately so followers can
             // acknowledge each block without waiting for Reth's in-memory buffer to fill.
             builder.config_mut().engine.persistence_threshold = 0;
@@ -157,7 +157,9 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
         // is deliberately left without the shared sequencer key, which is also the zone's ECIES
         // private key for encrypted deposits and must not sit on an internet-facing host.
         let rpc_only = p2p_config.as_ref().is_some_and(P2pConfig::is_rpc_only);
-        let should_sequence_blocks = sequencer_enabled(args.enable_sequencer, p2p_config.as_ref());
+        let should_sequence_blocks = p2p_config
+            .as_ref()
+            .map_or(is_dev, |config| !config.is_rpc_only());
         if rpc_only && args.sequencer_key_file.is_some() {
             return Err(eyre::eyre!(
                 "this node is `rpc_only` in the manifest, so --sequencer-key-file must not be provided: the shared key is never used here and is also the zone ECIES private key for encrypted deposits"
@@ -323,14 +325,15 @@ pub struct ZoneArgs {
     )]
     pub deposit_decryption_keys_file: Option<PathBuf>,
 
-    /// Path to the static multi-sequencer manifest. Its presence activates
-    /// multi-sequencer mode and makes the manifest authoritative for role selection.
+    /// Path to the static Zone P2P topology manifest.
+    ///
+    /// Required unless Reth `--dev` mode is enabled. The manifest is authoritative for role
+    /// selection.
     #[arg(
         long = "sequencer.manifest",
         env = "SEQUENCER_MANIFEST",
         value_name = "PATH",
-        requires = "p2p_key",
-        conflicts_with = "enable_sequencer"
+        requires = "p2p_key"
     )]
     pub sequencer_manifest: Option<PathBuf>,
 
@@ -466,15 +469,6 @@ pub struct ZoneArgs {
     )]
     pub redacted_rpc_max_auth_token_validity_secs: u64,
 
-    /// Enable the Zone node in sequencer mode. This advances block production and submits
-    /// withdrawal batches.
-    #[arg(
-        long = "sequencer",
-        env = "SEQUENCER",
-        conflicts_with = "sequencer_manifest"
-    )]
-    pub enable_sequencer: bool,
-
     /// Validate finalized batch candidates with the SPF without changing settlement.
     #[arg(long = "sequencer.enable-prover", env = "SEQUENCER_ENABLE_PROVER")]
     pub enable_prover: bool,
@@ -497,24 +491,11 @@ fn prepend_log_filter(filter: &mut String, directives: &str) {
     }
 }
 
-/// Whether the sequencer add-on is configured at boot.
-///
-/// `rpc_only` nodes are excluded: they never produce blocks and cannot be promoted without a
-/// restart, so they must not be given the shared sequencer key.
-fn sequencer_enabled(cli_flag: bool, p2p_config: Option<&P2pConfig>) -> bool {
-    cli_flag || p2p_config.is_some_and(|config| !config.is_rpc_only())
-}
-
-fn validate_p2p_transaction_size_limit(
-    manifest_mode: bool,
-    max_tx_input_bytes: usize,
-) -> eyre::Result<()> {
-    if manifest_mode {
-        eyre::ensure!(
-            max_tx_input_bytes <= MAX_TRANSACTION_MESSAGE_SIZE,
-            "--txpool.max-tx-input-bytes ({max_tx_input_bytes}) exceeds the multi-sequencer P2P transaction limit ({MAX_TRANSACTION_MESSAGE_SIZE})"
-        );
-    }
+fn validate_p2p_transaction_size_limit(max_tx_input_bytes: usize) -> eyre::Result<()> {
+    eyre::ensure!(
+        max_tx_input_bytes <= MAX_TRANSACTION_MESSAGE_SIZE,
+        "--txpool.max-tx-input-bytes ({max_tx_input_bytes}) exceeds the multi-sequencer P2P transaction limit ({MAX_TRANSACTION_MESSAGE_SIZE})"
+    );
     Ok(())
 }
 
@@ -555,7 +536,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer, sequencer_enabled,
+        Role, ZoneArgs, ZoneCli, load_decryption_keys, load_sequencer_signer,
         validate_deprecated_zone_id, validate_l1_rpc_url, validate_p2p_transaction_size_limit,
         validate_portal_address,
     };
@@ -609,20 +590,14 @@ mod tests {
     #[test]
     fn manifest_mode_rejects_a_txpool_limit_above_the_p2p_wire_limit() {
         assert!(
-            validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE,)
-                .is_ok()
+            validate_p2p_transaction_size_limit(zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE).is_ok()
         );
-        let error =
-            validate_p2p_transaction_size_limit(true, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
-                .unwrap_err();
+        let error = validate_p2p_transaction_size_limit(zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1)
+            .unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("exceeds the multi-sequencer P2P transaction limit")
-        );
-        assert!(
-            validate_p2p_transaction_size_limit(false, zone_p2p::MAX_TRANSACTION_MESSAGE_SIZE + 1,)
-                .is_ok()
         );
     }
 
@@ -745,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_mode_requires_the_p2p_key_and_conflicts_with_legacy_sequencer() {
+    fn manifest_requires_the_p2p_key() {
         let common = [
             "tempo-zone",
             "--l1.rpc-url",
@@ -777,32 +752,9 @@ mod tests {
         .unwrap();
         assert_eq!(without_secp256k1_key.zone.secp256k1_key, None);
 
-        let conflict = ZoneArgsParser::try_parse_from(common.into_iter().chain([
-            "--sequencer.manifest",
-            "zone.toml",
-            "--p2p.key",
-            "node.key",
-            "--secp256k1.key",
-            "node-secp256k1.key",
-            "--sequencer",
-        ]))
-        .unwrap_err();
-        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn legacy_mode_still_accepts_the_sequencer_flag_without_a_manifest() {
-        let parsed = ZoneArgsParser::try_parse_from([
-            "tempo-zone",
-            "--l1.rpc-url",
-            "ws://localhost:8546",
-            "--l1.portal-address",
-            "0x0000000000000000000000000000000000000001",
-            "--sequencer",
-        ])
-        .unwrap();
-        assert!(parsed.zone.enable_sequencer);
-        assert!(parsed.zone.sequencer_manifest.is_none());
+        let removed_flag =
+            ZoneArgsParser::try_parse_from(common.into_iter().chain(["--sequencer"])).unwrap_err();
+        assert_eq!(removed_flag.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -896,15 +848,6 @@ mod tests {
         ]))
         .unwrap();
         assert!(enabled.zone.p2p_bypass_ip_check);
-    }
-
-    #[test]
-    fn sequencer_resources_follow_the_cli_flag_without_a_manifest() {
-        // Manifest mode is covered by `sequencer_enabled`'s other arm, which needs a real
-        // `P2pConfig`; see `manifest_mode_configures_sequencer_resources_except_on_standbys`
-        // in the integration tests.
-        assert!(sequencer_enabled(true, None));
-        assert!(!sequencer_enabled(false, None));
     }
 
     #[test]
