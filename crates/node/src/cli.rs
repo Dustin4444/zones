@@ -115,7 +115,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                 })?;
                 // Required for a quorum member and rejected for an `rpc_only` node, which never
                 // signs a settlement attestation; the manifest decides which this node is.
-                P2pConfig::load(
+                let config = P2pConfig::load(
                     manifest_path,
                     ed25519_key_path,
                     args.secp256k1_key.as_ref(),
@@ -123,18 +123,17 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
                     args.p2p_bypass_ip_check,
                     zone_id,
                     args.sequencer_role,
-                )
+                )?;
+                info!(
+                    target: "reth::cli",
+                    ed25519_public_key = %config.ed25519_public_key(),
+                    secp256k1_address = ?config.secp256k1_address(),
+                    listen = %config.listen(),
+                    "Validated multi-sequencer manifest and local identity"
+                );
+                Ok(config)
             })
             .transpose()?;
-        if let Some(config) = p2p_config.as_ref() {
-            info!(
-                target: "reth::cli",
-                ed25519_public_key = %config.ed25519_public_key(),
-                secp256k1_address = ?config.secp256k1_address(),
-                listen = %config.listen(),
-                "Validated multi-sequencer manifest and local identity"
-            );
-        }
 
         let manifest_mode = p2p_config.is_some();
         validate_p2p_transaction_size_limit(
