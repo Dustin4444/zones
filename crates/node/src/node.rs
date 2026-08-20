@@ -35,8 +35,8 @@ use reth_node_api::{
 use reth_node_builder::{
     BuilderContext, DebugNode, Node, NodeAdapter,
     components::{
-        BasicPayloadServiceBuilder, ComponentsBuilder, ConsensusBuilder, ExecutorBuilder,
-        NoopNetworkBuilder, PoolBuilder, spawn_maintenance_tasks,
+        BasicPayloadServiceBuilder, ComponentsBuilder, ExecutorBuilder, NoopNetworkBuilder,
+        PoolBuilder, spawn_maintenance_tasks,
     },
     rpc::{
         BasicEngineValidatorBuilder, EngineValidatorAddOn, EthApiBuilder, NoopEngineApiBuilder,
@@ -57,9 +57,10 @@ use reth_transaction_pool::{
 };
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
-use tempo_evm::{TempoInvalidTransaction, consensus::TempoConsensus};
+use tempo_evm::TempoInvalidTransaction;
 use tempo_node::{
-    DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, rpc::TempoEthApiBuilder,
+    DEFAULT_AA_VALID_AFTER_MAX_SECS, engine::TempoEngineValidator, node::TempoConsensusBuilder,
+    rpc::TempoEthApiBuilder,
 };
 use tempo_precompiles::tip20::TIP20Token;
 use tempo_primitives::{
@@ -1517,7 +1518,7 @@ where
         BasicPayloadServiceBuilder<ZonePayloadFactory>,
         NoopNetworkBuilder<ZoneNetworkPrimitives>,
         ZoneExecutorBuilder,
-        ZoneConsensusBuilder,
+        TempoConsensusBuilder,
     >;
     type AddOns = ZoneAddOns<NodeAdapter<N>>;
 
@@ -1539,7 +1540,7 @@ where
             .executor(executor_builder)
             .payload(BasicPayloadServiceBuilder::new(payload_factory))
             .network(NoopNetworkBuilder::<ZoneNetworkPrimitives>::default())
-            .consensus(ZoneConsensusBuilder::default())
+            .consensus(TempoConsensusBuilder::default())
     }
 
     fn add_ons(&self) -> Self::AddOns {
@@ -1611,28 +1612,6 @@ impl ZoneExecutorBuilder {
             l1_state_cache,
             enabled_tokens,
         }
-    }
-}
-
-/// Builds Tempo consensus from the Zone chain spec with Tempo fork activations inherited from L1.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ZoneConsensusBuilder;
-
-impl Default for ZoneConsensusBuilder {
-    fn default() -> Self {
-        Self
-    }
-}
-
-impl<Node> ConsensusBuilder<Node> for ZoneConsensusBuilder
-where
-    Node: FullNodeTypes<Types = ZoneNode>,
-{
-    type Consensus = TempoConsensus<ZoneChainSpec>;
-
-    async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
-        Ok(TempoConsensus::new(ctx.chain_spec()))
     }
 }
 
