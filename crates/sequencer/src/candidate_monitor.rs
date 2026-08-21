@@ -1,4 +1,4 @@
-//! Generation-scoped Zone candidate discovery controlled by the persistent submission actor.
+//! Provider-backed Zone candidate discovery for the persistent submission actor.
 
 use alloy_consensus::BlockHeader as _;
 use alloy_primitives::B256;
@@ -24,11 +24,6 @@ pub(crate) struct CandidateMonitor<P: ZoneSequencerProvider> {
     metrics: crate::metrics::ZoneMonitorMetrics,
     config: ZoneMonitorConfig,
     provider: P,
-    canonical: Option<CanonStateNotificationStream<TempoPrimitives>>,
-    fallback: tokio::time::Interval,
-    latest_observed: u64,
-    anchor: Option<SubmissionAnchor>,
-    needs_catchup: bool,
     shadow_prover: Option<ShadowProver>,
 }
 
@@ -38,19 +33,10 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
         provider: P,
         shadow_prover: Option<ShadowProver>,
     ) -> Self {
-        let fallback = tokio::time::interval_at(
-            tokio::time::Instant::now() + config.poll_interval,
-            config.poll_interval,
-        );
         Self {
             metrics: crate::metrics::ZoneMonitorMetrics::default(),
             config,
             provider,
-            canonical: None,
-            fallback,
-            latest_observed: 0,
-            anchor: None,
-            needs_catchup: true,
             shadow_prover,
         }
     }
@@ -94,29 +80,18 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
             .set(head.saturating_sub(submitted) as f64);
     }
 
-    fn record_observed(&mut self, head: u64, submitted: u64) {
-        self.latest_observed = head;
+    fn record_observed(&self, latest_observed: &mut u64, head: u64, submitted: u64) {
+        *latest_observed = head;
         self.record_metrics(head, submitted);
     }
 
-    fn start_from(&mut self, anchor: SubmissionAnchor) {
-        self.anchor = Some(anchor);
-        self.latest_observed = anchor.zone_height;
-        self.needs_catchup = true;
-        self.canonical = Some(self.provider.canonical_state_stream());
-        self.fallback.reset_after(self.config.poll_interval);
-    }
-
-    fn advance_to(&mut self, anchor: SubmissionAnchor) {
-        self.anchor = Some(anchor);
-        self.latest_observed = anchor.zone_height;
-        self.needs_catchup = true;
-    }
-
-    async fn catch_up(&mut self, anchor: SubmissionAnchor) -> eyre::Result<Option<BatchCandidate>> {
-        self.needs_catchup = false;
+    async fn catch_up(
+        &self,
+        anchor: SubmissionAnchor,
+        latest_observed: &mut u64,
+    ) -> eyre::Result<Option<BatchCandidate>> {
         let head = self.provider.best_block_number()?;
-        let from = self.latest_observed.saturating_add(1);
+        let from = latest_observed.saturating_add(1);
         if head < from {
             return Ok(None);
         }
@@ -127,7 +102,7 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
             head,
         )?;
         let Some(boundary) = boundary else {
-            self.record_observed(head, anchor.zone_height);
+            self.record_observed(latest_observed, head, anchor.zone_height);
             return Ok(None);
         };
         let finalized =
@@ -137,7 +112,7 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
             self.config.inbox_address,
             boundary.block_number,
         )?;
-        self.latest_observed = boundary.block_number;
+        *latest_observed = boundary.block_number;
         self.record_metrics(head, anchor.zone_height);
         let candidate = self.candidate(anchor, boundary, finalized, end);
         self.enqueue_prover(&candidate);
@@ -145,8 +120,9 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
     }
 
     fn notified_candidate(
-        &mut self,
+        &self,
         anchor: SubmissionAnchor,
+        latest_observed: &mut u64,
         number: u64,
         block_hash: B256,
         transactions: &[TempoTxEnvelope],
@@ -163,7 +139,7 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
             "zone block {number} contains more than one BatchFinalized event"
         );
         let Some(boundary) = boundaries.into_iter().next() else {
-            self.record_observed(number, anchor.zone_height);
+            self.record_observed(latest_observed, number, anchor.zone_height);
             return Ok(None);
         };
         let finalized = finalized_batch_from_parts(
@@ -179,26 +155,34 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
             block_hash,
             receipts,
         )?;
-        self.latest_observed = number;
+        *latest_observed = number;
         self.record_metrics(number, anchor.zone_height);
         let candidate = self.candidate(anchor, boundary, finalized, end);
         self.enqueue_prover(&candidate);
         Ok(Some(candidate))
     }
 
-    async fn next(&mut self) -> eyre::Result<BatchCandidate> {
-        let anchor = self
-            .anchor
-            .expect("candidate discovery must be started before polling");
+    async fn next(&self, anchor: SubmissionAnchor) -> eyre::Result<BatchCandidate> {
+        // Subscribe before reading the provider head so canonical changes racing with the initial
+        // backfill are either scanned from storage or retained in the notification stream.
+        let mut canonical: CanonStateNotificationStream<TempoPrimitives> =
+            self.provider.canonical_state_stream();
+        let mut fallback = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.config.poll_interval,
+            self.config.poll_interval,
+        );
+        let mut latest_observed = anchor.zone_height;
+        let mut needs_catchup = true;
         loop {
-            if self.needs_catchup
-                && let Some(candidate) = self.catch_up(anchor).await?
-            {
-                return Ok(candidate);
+            if needs_catchup {
+                needs_catchup = false;
+                if let Some(candidate) = self.catch_up(anchor, &mut latest_observed).await? {
+                    return Ok(candidate);
+                }
             }
             tokio::select! {
                 biased;
-                notification = self.canonical.as_mut().expect("candidate discovery must be active").next() => {
+                notification = canonical.next() => {
                     let Some(notification) = notification else {
                         eyre::bail!("canonical zone state notification stream closed");
                     };
@@ -209,48 +193,36 @@ impl<P: ZoneSequencerProvider> CandidateMonitor<P> {
                     for (block, receipts) in committed.blocks_and_receipts() {
                         let block = block.sealed_block();
                         let number = block.number();
-                        if number <= self.latest_observed {
+                        if number <= latest_observed {
                             continue;
                         }
-                        if number != self.latest_observed.saturating_add(1) {
-                            self.needs_catchup = true;
+                        if number != latest_observed.saturating_add(1) {
+                            needs_catchup = true;
                             break;
                         }
                         if let Some(candidate) = self.notified_candidate(
                             anchor,
+                            &mut latest_observed,
                             number,
                             block.hash(),
                             &block.body().transactions,
                             receipts,
                         )? {
-                            // A notification can contain more blocks after this boundary. The
-                            // next call reconciles that tail without retaining the entire chain.
-                            self.needs_catchup = true;
                             return Ok(candidate);
                         }
                     }
                 }
-                _ = self.fallback.tick() => self.needs_catchup = true,
+                _ = fallback.tick() => needs_catchup = true,
             }
         }
     }
 }
 
 impl<P: ZoneSequencerProvider> BatchCandidateSource for CandidateMonitor<P> {
-    fn start(&mut self, anchor: SubmissionAnchor) {
-        self.start_from(anchor);
-    }
-
-    fn advance(&mut self, anchor: SubmissionAnchor) {
-        self.advance_to(anchor);
-    }
-
-    fn stop(&mut self) {
-        self.anchor = None;
-        self.canonical = None;
-    }
-
-    fn next_candidate(&mut self) -> BoxFuture<'_, eyre::Result<BatchCandidate>> {
-        Box::pin(self.next())
+    fn next_candidate(
+        &self,
+        anchor: SubmissionAnchor,
+    ) -> BoxFuture<'_, eyre::Result<BatchCandidate>> {
+        Box::pin(self.next(anchor))
     }
 }

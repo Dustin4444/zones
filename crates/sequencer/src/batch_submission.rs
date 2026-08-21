@@ -81,19 +81,13 @@ pub struct BatchCandidate {
     pub withdrawals: Vec<abi::Withdrawal>,
 }
 
-/// Ordered candidate discovery owned and polled by the submission actor.
-pub(crate) trait BatchCandidateSource: Send + 'static {
-    /// Start or reset discovery from an authoritative Portal anchor.
-    fn start(&mut self, anchor: SubmissionAnchor);
-
-    /// Advance discovery after the actor confirms the previously returned candidate.
-    fn advance(&mut self, anchor: SubmissionAnchor);
-
-    /// Drop generation-scoped discovery state.
-    fn stop(&mut self);
-
-    /// Wait for the next canonical batch boundary extending the active anchor.
-    fn next_candidate(&mut self) -> BoxFuture<'_, Result<BatchCandidate>>;
+/// Provider-backed candidate discovery polled by the submission actor.
+pub(crate) trait BatchCandidateSource: Send + Sync + 'static {
+    /// Wait for the next canonical batch boundary extending an authoritative Portal anchor.
+    ///
+    /// Each call is an independent discovery operation. Dropping the returned future cancels it;
+    /// the source itself has no leadership-generation lifecycle.
+    fn next_candidate(&self, anchor: SubmissionAnchor) -> BoxFuture<'_, Result<BatchCandidate>>;
 }
 
 /// Candidate work tagged with the leadership generation that accepted it.
@@ -594,13 +588,16 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
                     }
                 }
                 SubmissionState::Discovering => {
+                    let anchor = self
+                        .anchor
+                        .expect("candidate discovery requires a reconciled Portal anchor");
                     tokio::select! {
                         biased;
                         changed = self.control_rx.changed() => {
                             changed.map_err(|_| eyre::eyre!("batch submission control channel closed"))?;
                             self.apply_latest_control()
                         }
-                        candidate = self.candidate_source.next_candidate() => {
+                        candidate = self.candidate_source.next_candidate(anchor) => {
                             match candidate {
                                 Ok(candidate) => {
                                     self.recovery_delay = INITIAL_RETRY_DELAY;
@@ -872,7 +869,7 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
                                 && control.role.generation == work.candidate.generation;
                             match result {
                                 Ok(confirmed) => {
-                                    self.confirm_candidate(work.candidate, confirmed, keep_leading)?;
+                                    self.confirm_candidate(work.candidate, confirmed)?;
                                     if keep_leading {
                                         self.role = control.role;
                                         SubmissionState::Discovering
@@ -904,7 +901,6 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
     fn apply_latest_control(&mut self) -> SubmissionState {
         let control = *self.control_rx.borrow_and_update();
         self.admission.close();
-        self.candidate_source.stop();
         self.role = control.role;
         if control.stopping {
             SubmissionState::Stopped
@@ -1005,7 +1001,6 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
         &mut self,
         candidate: ActiveBatchCandidate,
         confirmed: ConfirmedBatchSubmission,
-        advance_discovery: bool,
     ) -> Result<()> {
         let candidate = candidate.candidate;
         let blocks = candidate.to.saturating_sub(candidate.from) + 1;
@@ -1062,9 +1057,6 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
             processed_deposit_number: candidate.batch.next_deposit_number,
         };
         self.publish_anchor(anchor)?;
-        if advance_discovery {
-            self.candidate_source.advance(anchor);
-        }
         self.withdrawal_notify.notify_one();
         Ok(())
     }
@@ -1078,7 +1070,6 @@ impl<B: BatchSubmissionBackend, S: BatchCandidateSource> BatchSubmissionActor<B,
             store.remove_submitted(resync.anchor.zone_height);
         }
         self.publish_anchor(resync.anchor)?;
-        self.candidate_source.start(resync.anchor);
         self.metrics
             .latest_zone_block_submitted_to_l1
             .set(resync.anchor.zone_height as f64);
@@ -1111,24 +1102,25 @@ mod tests {
 
     use alloy_primitives::B256;
     use parking_lot::Mutex;
-    use tokio::sync::{Notify, mpsc};
+    use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
     use super::*;
 
     struct TestCandidateSource {
-        receiver: mpsc::Receiver<BatchCandidate>,
+        receiver: AsyncMutex<mpsc::Receiver<BatchCandidate>>,
+        observed_anchor: watch::Sender<Option<SubmissionAnchor>>,
     }
 
     impl BatchCandidateSource for TestCandidateSource {
-        fn start(&mut self, _anchor: SubmissionAnchor) {}
-
-        fn advance(&mut self, _anchor: SubmissionAnchor) {}
-
-        fn stop(&mut self) {}
-
-        fn next_candidate(&mut self) -> BoxFuture<'_, Result<BatchCandidate>> {
+        fn next_candidate(
+            &self,
+            anchor: SubmissionAnchor,
+        ) -> BoxFuture<'_, Result<BatchCandidate>> {
+            self.observed_anchor.send_replace(Some(anchor));
             Box::pin(async move {
                 self.receiver
+                    .lock()
+                    .await
                     .recv()
                     .await
                     .ok_or_else(|| eyre::eyre!("test candidate channel closed"))
@@ -1139,11 +1131,22 @@ mod tests {
     struct TestHandle {
         actor: BatchSubmissionHandle,
         candidate_tx: mpsc::Sender<BatchCandidate>,
+        observed_anchor: watch::Receiver<Option<SubmissionAnchor>>,
     }
 
     impl TestHandle {
         fn candidate_sender(&self) -> mpsc::Sender<BatchCandidate> {
             self.candidate_tx.clone()
+        }
+
+        async fn next_observed_anchor(&mut self) -> SubmissionAnchor {
+            self.observed_anchor
+                .changed()
+                .await
+                .expect("candidate source must remain open");
+            self.observed_anchor
+                .borrow_and_update()
+                .expect("candidate discovery must receive an anchor")
         }
     }
 
@@ -1332,10 +1335,12 @@ mod tests {
         attestation_store: Option<AttestationStore>,
     ) -> (MockBackend, TestHandle, tokio::task::JoinHandle<Result<()>>) {
         let (candidate_tx, candidate_rx) = mpsc::channel(1);
+        let (observed_anchor_tx, observed_anchor_rx) = watch::channel(None);
         let (actor, handle) = batch_submission_actor(
             backend.clone(),
             TestCandidateSource {
-                receiver: candidate_rx,
+                receiver: AsyncMutex::new(candidate_rx),
+                observed_anchor: observed_anchor_tx,
             },
             attestation_store,
             SharedWithdrawalStore::new(),
@@ -1348,6 +1353,7 @@ mod tests {
             TestHandle {
                 actor: handle,
                 candidate_tx,
+                observed_anchor: observed_anchor_rx,
             },
             task,
         )
@@ -1371,23 +1377,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_tags_discovered_candidate_with_active_generation() {
-        let (backend, mut handle, task) = spawn_actor(MockBackend::with_anchor(anchor()));
-        handle.candidate_sender().send(candidate()).await.unwrap();
-        tokio::task::yield_now().await;
+    async fn discovery_restarts_from_confirmed_anchor() {
+        let (_, mut handle, task) = spawn_actor(MockBackend::with_anchor(anchor()));
         handle
             .set_role(BatchSubmissionRole::leader(1))
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.0.sends.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("candidate must be submitted under the active generation");
-        assert_eq!(backend.0.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.next_observed_anchor().await, anchor());
+        handle.candidate_sender().send(candidate()).await.unwrap();
+
+        let candidate = candidate();
+        let confirmed_anchor = SubmissionAnchor {
+            zone_height: candidate.to,
+            zone_block_hash: candidate.batch.next_block_hash,
+            processed_deposit_hash: candidate.batch.next_processed_deposit_hash,
+            processed_deposit_number: candidate.batch.next_deposit_number,
+        };
+        assert_eq!(handle.next_observed_anchor().await, confirmed_anchor);
         stop_actor(&handle, task).await;
     }
 
@@ -1565,9 +1572,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demotion_after_send_drains_and_publishes_progress() {
+    async fn demotion_after_send_claim_drains_and_publishes_progress() {
         let backend = MockBackend::with_anchor(anchor());
-        backend.0.block_send.store(true, Ordering::SeqCst);
+        backend.0.block_send_start.store(true, Ordering::SeqCst);
         let (backend, mut handle, task) = spawn_actor(backend);
         handle
             .set_role(BatchSubmissionRole::leader(1))
@@ -1575,7 +1582,8 @@ mod tests {
             .unwrap();
         let mut progress = handle.subscribe_progress();
         handle.candidate_sender().send(candidate()).await.unwrap();
-        backend.0.send_started.notified().await;
+        backend.0.send_created.notified().await;
+        backend.0.send_poll_started.notified().await;
 
         let mut demotion_handle = handle.clone();
         let demotion = tokio::spawn(async move {
@@ -1583,10 +1591,21 @@ mod tests {
                 .set_role(BatchSubmissionRole::inactive(2))
                 .await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                *handle.admission.state.lock().expect("admission fence lock"),
+                AdmissionState::Closed
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("demotion must close the admission fence");
         assert!(!demotion.is_finished());
         assert_eq!(handle.current_progress(), Some(anchor()));
-        backend.0.send_release.notify_waiters();
+        assert_eq!(backend.0.sends.load(Ordering::SeqCst), 0);
+
+        backend.0.send_poll_release.notify_waiters();
         demotion.await.unwrap().unwrap();
         while progress
             .borrow()
@@ -1627,35 +1646,5 @@ mod tests {
 
         assert_eq!(backend.0.sends.load(Ordering::SeqCst), 1);
         assert_eq!(progress.borrow().unwrap().zone_height, 20);
-    }
-
-    #[tokio::test]
-    async fn demotion_waits_for_a_claimed_send_before_acknowledging() {
-        let backend = MockBackend::with_anchor(anchor());
-        backend.0.block_send_start.store(true, Ordering::SeqCst);
-        let (backend, mut handle, task) = spawn_actor(backend);
-        handle
-            .set_role(BatchSubmissionRole::leader(1))
-            .await
-            .unwrap();
-        handle.candidate_sender().send(candidate()).await.unwrap();
-        backend.0.send_created.notified().await;
-        backend.0.send_poll_started.notified().await;
-
-        let mut demotion_handle = handle.clone();
-        let demotion = tokio::spawn(async move {
-            demotion_handle
-                .set_role(BatchSubmissionRole::inactive(2))
-                .await
-        });
-        tokio::task::yield_now().await;
-
-        assert!(!demotion.is_finished());
-        assert_eq!(backend.0.sends.load(Ordering::SeqCst), 0);
-        backend.0.send_poll_release.notify_waiters();
-        demotion.await.unwrap().unwrap();
-        assert_eq!(backend.0.sends.load(Ordering::SeqCst), 1);
-
-        stop_actor(&handle, task).await;
     }
 }

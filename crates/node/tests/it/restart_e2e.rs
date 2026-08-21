@@ -9,6 +9,7 @@
 
 use crate::utils::{L1TestNode, ZoneAccount, ZoneTestNode, spawn_sequencer};
 use alloy::primitives::{Address, U256};
+use tempo_precompiles::PATH_USD_ADDRESS;
 use tempo_zone_contracts::{IZoneOutbox, ZONE_OUTBOX_ADDRESS, ZONE_TOKEN_ADDRESS, ZonePortal};
 
 /// Longer timeout for real L1 tests.
@@ -265,14 +266,21 @@ async fn test_sequencer_restart_with_pending_withdrawal_queue() -> eyre::Result<
 
     // Request a NEW withdrawal after restart to verify normal operation continues.
     let second_withdrawal: u128 = 400_000;
+    // Snapshot before requesting the withdrawal. `wait_for_withdrawal_on_l1` normally takes its
+    // baseline when it is called, which races with the fast restarted processor: if processing
+    // finishes first, it waits for a second credit that will never arrive.
+    let balance_before = l1.balance_of(PATH_USD_ADDRESS, account.address()).await?;
     account.withdraw(second_withdrawal).await?;
-    l1.wait_for_withdrawal_on_l1(
-        portal_address,
+    l1.wait_for_balance(
+        PATH_USD_ADDRESS,
         account.address(),
-        second_withdrawal,
+        balance_before + U256::from(second_withdrawal),
         WITHDRAWAL_TIMEOUT,
     )
     .await?;
+    l1.assert_batch_submitted(portal_address).await?;
+    l1.assert_withdrawal_processed(portal_address, account.address(), second_withdrawal)
+        .await?;
 
     // Portal queue should have advanced further
     let (head_after, tail_after) = portal_queue_state(&l1, portal_address).await?;
