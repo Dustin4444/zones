@@ -185,7 +185,7 @@ just create-zone my-zone alphausd
 ```
 
 This creates `generated/my-zone/` containing:
-- **`genesis.json`** — Zone L2 genesis state (system contracts, fee token, etc.)
+- **`genesis.json`** — Zone L2 genesis state (system contracts, fee token, chain ID, etc.)
 - **`zone.json`** — Deployment metadata (portal address, zone ID, anchor block, `zoneFactory`, public `admin` / `sequencer` addresses, and optional saved keys/router metadata)
 
 This initial token controls the first L1 TIP-20 the portal accepts and mirrors onto the zone. The zone's fee token in genesis remains `pathUSD`.
@@ -204,6 +204,41 @@ ZONE_FACTORY_OWNER_KEY="$SEQUENCER_KEY" cargo run -p tempo-xtask -- create-zone 
 `create-zone` requires the admin address explicitly. Keep the matching `ADMIN_KEY`
 available for admin-only portal calls such as changing either mode or account roles,
 enabling tokens, and pausing or resuming deposits.
+
+### Updating closed-loop access
+
+Configure memberships before enabling their corresponding enforcement mode so existing
+traffic is not denied during the transition:
+
+```bash
+export L1_RPC_URL=https://...
+export L1_PORTAL_ADDRESS=0x<portal>
+export ADMIN_KEY=0x<portal-admin-private-key>
+
+just set-allowed-account 0x<account> true
+just set-gateway 0x<gateway> true
+just set-access-mode true
+just set-gateway-mode true
+```
+
+Account and gateway roles are mutually exclusive. To move an address between roles,
+remove its current role before adding the new one. Disabling enforcement leaves stored
+roles intact, so they take effect again if the mode is re-enabled.
+
+To remove access, revoke the role directly:
+
+```bash
+just set-allowed-account 0x<account> false
+just set-gateway 0x<gateway> false
+```
+
+Revocations apply when each portal or zone-side action executes. In-flight destinations
+and gateways that have been revoked bounce back; revoked refund recipients cannot claim
+parked refunds until their account role is restored. Before closing access or removing a
+role, confirm that affected deposits, withdrawals, callbacks, and refunds have completed.
+
+Each command verifies the signer is the current portal admin, waits for the transaction,
+and reads the resulting mode or role back from the portal.
 
 ### 5. Start the Zone Node
 
@@ -273,11 +308,15 @@ just send-deposit 1000000                       # to your own address
 just send-deposit 1000000 <recipient-address>   # to a specific address
 ```
 
-Before registering a replacement encryption key, add its private key to
-`--deposit-decryption-keys-file`, restart every node that may sequence, and confirm the nodes are
-healthy. Keep each previous key in the file while the Portal still accepts deposits for it during
-the rotation grace period. File order does not matter: finalized Portal registrations bind each
-configured key to its on-chain index. The active sequencer key is included automatically.
+For shared-key rotations, pass the currently deployed
+`--deposit-decryption-keys-file` to `tempo-xtask admin encryption-key prepare`
+with `--existing-decryption-keys-file`. Deploy its merged output before
+registering the replacement encryption key, restart every node that may
+sequence, and confirm the nodes are healthy. Keep every previous key in the
+file while it remains Portal grace-valid or has queued deposits. Retire a
+specific old key only after Portal expiry and deposit-queue drainage. File order
+does not matter: finalized Portal registrations bind each configured key to its
+on-chain index. The active sequencer key is included automatically.
 
 Set `ZONE_RPC_URL` to poll the zone for processing confirmation:
 
@@ -644,11 +683,10 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 |------|---------|-------------|
 | `--l1.rpc-url` | (required) | Certified Tempo follower WebSocket RPC URL |
 | `--l1.portal-address` | (from zone.json) | ZonePortal contract on L1 |
-| `--zone.id` | 0 | Zone ID from ZoneFactory. At startup it must match `ZonePortal.zoneId()`; `0` does not bypass validation. |
+| `--zone.id` | (deprecated) | Optional compatibility check against the zone ID encoded in the genesis chain ID. |
 | `--sequencer` | false | Enable sequencer mode for block production and withdrawal batch submission |
 | `--sequencer-key-file` | (required for sequencing) | Owner-readable file or FIFO containing the sequencer private key |
 | `--deposit-decryption-keys-file` | (optional) | File containing additional historical or pre-provisioned deposit decryption keys, one hex key per line |
-| `--block.interval-ms` | 250 | Block building interval |
 | `--zone.batch-interval-blocks` | 120 | Zone blocks between empty withdrawal batch boundaries / L1 submissions (~1 minute at Tempo's 500 ms block time) |
 | `--zone.poll-interval-secs` | 1 | Fallback interval for reconciling the canonical Zone head when no native notification arrives |
 | `--withdrawal-poll-interval-secs` | 5 | How often (seconds) the withdrawal processor polls the L1 queue |
@@ -692,6 +730,10 @@ cast code 0x5A4d000000000000000000000000000000000000 --rpc-url "$ETH_RPC_URL"
 | `just enable-token <token>` | Enable a TIP-20 token on the portal for bridging (admin only) |
 | `just pause-deposits <token>` | Pause deposits for an enabled token on the portal (admin only) |
 | `just resume-deposits <token>` | Resume deposits for a paused token on the portal (admin only) |
+| `just set-access-mode <true\|false>` | Enable or disable closed-loop account enforcement (admin only) |
+| `just set-gateway-mode <true\|false>` | Enable or disable callback gateway enforcement (admin only) |
+| `just set-allowed-account <account> <true\|false>` | Add or remove an Account role (admin only) |
+| `just set-gateway <account> <true\|false>` | Add or remove a CallbackGateway role (admin only) |
 | `just list-enabled-tokens [portal]` | List TIP-20 token addresses enabled on a portal |
 | `just max-approve-outbox [token] [rpc]` | Approve outbox to spend tokens on zone |
 | `just send-withdrawal [amount] [to] [token] [memo] [gas-limit] [fallback-recipient] [data] [reveal-to] [rpc]` | Withdraw tokens from zone to L1 (defaults to sender) |

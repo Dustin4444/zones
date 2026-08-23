@@ -1,13 +1,25 @@
 //! xtask is a Swiss army knife of tools that help with running and testing tempo.
 use crate::{
-    admin::Admin, benchmark_results::BenchmarkResults, check_abi::CheckAbi,
-    configure_benchmark_fees::ConfigureBenchmarkFees, create_zone::CreateZone,
-    demo_blacklist::DemoBlacklist, demo_swap_and_deposit::DemoSwapAndDeposit,
-    deploy_neobank_fixtures::DeployNeobankFixtures, deploy_router::DeployRouter, deposit::Deposit,
-    generate_p2p_key::GenerateP2pKey, generate_zone_genesis::GenerateZoneGenesis,
-    install_reference_zone_factory::InstallReferenceZoneFactory, portal_pause::PausePortal,
-    set_encryption_key::SetEncryptionKey, spam_deposits::SpamDeposits,
-    verify_closed_loop::VerifyClosedLoop, zone_info::ZoneInfoCmd,
+    admin::Admin,
+    benchmark_results::BenchmarkResults,
+    check_abi::CheckAbi,
+    configure_benchmark_fees::ConfigureBenchmarkFees,
+    create_zone::CreateZone,
+    demo_blacklist::DemoBlacklist,
+    demo_swap_and_deposit::DemoSwapAndDeposit,
+    deploy_neobank_fixtures::DeployNeobankFixtures,
+    deploy_router::DeployRouter,
+    deposit::Deposit,
+    generate_p2p_key::GenerateP2pKey,
+    generate_zone_genesis::GenerateZoneGenesis,
+    install_reference_zone_factory::InstallReferenceZoneFactory,
+    portal_access::{SetAccessMode, SetAllowedAccount, SetGateway, SetGatewayMode},
+    portal_pause::PausePortal,
+    set_encryption_key::SetEncryptionKey,
+    spam_deposits::SpamDeposits,
+    verify_closed_loop::VerifyClosedLoop,
+    verify_portal_backing::VerifyPortalBacking,
+    zone_info::ZoneInfoCmd,
 };
 use clap::Parser as _;
 use eyre::Context;
@@ -25,10 +37,12 @@ mod deposit;
 mod generate_p2p_key;
 mod generate_zone_genesis;
 mod install_reference_zone_factory;
+mod portal_access;
 mod portal_pause;
 mod set_encryption_key;
 mod spam_deposits;
 mod verify_closed_loop;
+mod verify_portal_backing;
 mod zone_info;
 mod zone_utils;
 
@@ -67,11 +81,21 @@ async fn main() -> eyre::Result<()> {
             .run()
             .wrap_err("failed to install reference ZoneFactory"),
         Action::PausePortal(args) => args.run().await.wrap_err("failed to pause portal"),
+        Action::SetAccessMode(args) => args.run().await.wrap_err("failed to set access mode"),
+        Action::SetAllowedAccount(args) => {
+            args.run().await.wrap_err("failed to update account role")
+        }
+        Action::SetGateway(args) => args.run().await.wrap_err("failed to update gateway role"),
+        Action::SetGatewayMode(args) => args.run().await.wrap_err("failed to set gateway mode"),
         Action::SetEncryptionKey(args) => args.run().await.wrap_err("failed to set encryption key"),
         Action::SpamDeposits(args) => args.run().await.wrap_err("failed to spam deposits"),
         Action::VerifyClosedLoop(args) => {
             args.run().await.wrap_err("closed-loop verification failed")
         }
+        Action::VerifyPortalBacking(args) => args
+            .run()
+            .await
+            .wrap_err("Portal backing verification failed"),
         Action::ZoneInfo(args) => args.run().await.wrap_err("failed to fetch zone info"),
     }
 }
@@ -102,8 +126,13 @@ enum Action {
     GenerateZoneGenesis(GenerateZoneGenesis),
     InstallReferenceZoneFactory(InstallReferenceZoneFactory),
     PausePortal(PausePortal),
+    SetAccessMode(SetAccessMode),
+    SetAllowedAccount(SetAllowedAccount),
+    SetGateway(SetGateway),
+    SetGatewayMode(SetGatewayMode),
     SetEncryptionKey(SetEncryptionKey),
     SpamDeposits(SpamDeposits),
     VerifyClosedLoop(VerifyClosedLoop),
+    VerifyPortalBacking(VerifyPortalBacking),
     ZoneInfo(ZoneInfoCmd),
 }
