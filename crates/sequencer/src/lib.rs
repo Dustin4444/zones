@@ -33,7 +33,7 @@ pub mod withdrawals;
 pub use attestation::AttestationStore;
 pub use encryption_key::register_encryption_key;
 pub use monitor::{ZoneMonitorConfig, ZoneMonitorSharedState};
-pub use prover::ShadowProverConfig;
+pub use prover::SettlementProverConfig;
 pub use settlement::{
     BatchAnchorConfig, BatchData, BatchSubmitter, PortalZoneAnchor, resolve_portal_zone_anchor,
 };
@@ -131,8 +131,8 @@ pub struct ZoneSequencerHandle {
 ///   submission.
 /// - **Withdrawal processor** — polls the ZonePortal withdrawal queue on Tempo L1 and calls
 ///   `processWithdrawals` for each pending withdrawal.
-/// - **Shadow prover** — when `prover_config` is set, validates finalized batch candidates and
-///   requests Nitro attestations observationally without delaying or changing settlement.
+/// - **Settlement prover** — when `prover_config` is set, settlement waits for a successful SPF
+///   execution and Nitro NSM attestation before submitting the batch.
 ///
 /// Both tasks share a single L1 provider and nonce manager to prevent signing/nonce contention
 /// when submitting concurrent L1 transactions.
@@ -143,7 +143,7 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
     config: ZoneSequencerConfig,
     signer: PrivateKeySigner,
     zone_provider: P,
-    prover_config: Option<ShadowProverConfig>,
+    prover_config: Option<SettlementProverConfig>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> ZoneSequencerHandle {
     // Build a single shared L1 provider with the sequencer wallet.
@@ -156,8 +156,8 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
     )
     .await
     .expect("valid L1 RPC URL");
-    let shadow_prover = prover_config.map(|prover_config| {
-        prover::spawn_shadow_prover(
+    let settlement_prover = prover_config.map(|prover_config| {
+        prover::spawn_settlement_prover(
             prover_config,
             config.portal_address,
             config.batch_anchor_config,
@@ -205,7 +205,7 @@ pub async fn spawn_zone_sequencer<P: ZoneSequencerProvider>(
         l1_provider,
         signer,
         monitor_shared_state,
-        shadow_prover,
+        settlement_prover,
         shutdown,
     );
 
