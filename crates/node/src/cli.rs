@@ -91,6 +91,10 @@ impl ZoneCli {
 
 /// Main entry point for the `node` command.
 fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
+    // NOTE: jtcn 1: here is where the node is initialized, if you are familiar with reth based
+    // nodes, this will look very familiar. We setup a set of "components" consisting of a
+    // chainspec, evm config (which is used when initializing the zone evm) and consensus (which is
+    // used to validate zone blocks that are produced by the leader and also during syncing)
     prepend_log_filter(&mut cli.logs.log_stdout_filter, ZONE_LOG_FILTER_DIRECTIVES);
     prepend_log_filter(&mut cli.logs.log_file_filter, ZONE_LOG_FILTER_DIRECTIVES);
 
@@ -163,6 +167,9 @@ async fn configure_sequencing(
     zone_id: u32,
     mut node: ZoneNode,
 ) -> eyre::Result<ZoneNode> {
+    // NOTE: jtcn 2: the node is initialized with a p2p config which enables peering
+    // transactions and blocks via commonware p2p. All nodes need this including
+    // sequencers (leader/followers) as well as rpc nodes. More on this later.
     let p2p_config =
         args.sequencer_manifest
             .as_ref()

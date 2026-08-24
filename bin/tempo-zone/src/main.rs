@@ -19,6 +19,7 @@ fn main() {
 
     zone_node::init_version_metadata();
 
+    // NOTE: jtcn 0: mouth of the cave
     if let Err(err) = ZoneCli::parse().run() {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
