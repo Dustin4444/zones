@@ -1526,6 +1526,9 @@ pub(crate) fn read_zone_block_snapshot<P: ZoneSequencerProvider>(
     let mut processed_deposit_number = None;
 
     for receipt in receipts {
+        if !receipt.status() {
+            continue;
+        }
         for log in receipt.logs() {
             if log.address != inbox_address
                 || log.topics().first() != Some(&IZoneInbox::TempoAdvanced::SIGNATURE_HASH)
@@ -1598,6 +1601,9 @@ pub(crate) async fn fetch_finalized_batch<P: ZoneSequencerProvider>(
     let (block, receipts) = block_with_receipts(zone_provider, target.block_number)?;
     let mut requests = Vec::new();
     for (tx, receipt) in block.body.transactions.iter().zip(&receipts) {
+        if !receipt.status() {
+            continue;
+        }
         for log in receipt.logs() {
             if log.address != outbox_address
                 || log.topics().first() != Some(&IZoneOutbox::WithdrawalRequested::SIGNATURE_HASH)
@@ -1712,6 +1718,9 @@ fn fetch_finalized_batch_logs<P: ZoneSequencerProvider>(
             .zip(receipts.iter())
             .enumerate()
         {
+            if !receipt.status() {
+                continue;
+            }
             for (log_index, log) in receipt.logs().iter().enumerate() {
                 if log.address != outbox_address
                     || log.topics().first() != Some(&IZoneOutbox::BatchFinalized::SIGNATURE_HASH)
@@ -1744,16 +1753,18 @@ fn backward_log_query_start(hi: u64, floor: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::abi;
-    use alloy_consensus::Header as ConsensusHeader;
-    use alloy_primitives::{B256, address};
+    use alloy_consensus::{Header as ConsensusHeader, Signed, TxLegacy};
+    use alloy_primitives::{B256, Log, Signature, address};
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_types_eth::Header as RpcHeader;
-    use alloy_sol_types::SolValue;
+    use alloy_sol_types::{SolCall, SolEvent, SolValue};
     use alloy_transport::mock::Asserter;
     use proptest::prelude::*;
     use reth_provider::test_utils::MockEthProvider;
     use tempo_alloy::rpc::TempoHeaderResponse;
-    use tempo_primitives::{Block, TempoHeader, TempoPrimitives};
+    use tempo_primitives::{
+        Block, TempoHeader, TempoPrimitives, TempoReceipt, TempoTxEnvelope, TempoTxType,
+    };
 
     fn mock_l1(asserter: Asserter) -> DynProvider<TempoNetwork> {
         ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -1847,6 +1858,139 @@ mod tests {
             err.to_string()
                 .contains("is not canonical in the Zone node")
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_zone_logs_ignore_reverted_receipts() {
+        let provider = MockEthProvider::<TempoPrimitives>::new();
+        let block_number = 7;
+        let inbox_address = Address::repeat_byte(0x11);
+        let outbox_address = Address::repeat_byte(0x22);
+
+        let transaction = |to: Address, input: Bytes| {
+            TempoTxEnvelope::Legacy(Signed::new_unhashed(
+                TxLegacy {
+                    to: to.into(),
+                    input,
+                    ..Default::default()
+                },
+                Signature::test_signature(),
+            ))
+        };
+        let receipt = |success: bool, address: Address, data| TempoReceipt {
+            tx_type: TempoTxType::Legacy,
+            success,
+            cumulative_gas_used: 0,
+            logs: vec![Log { address, data }],
+        };
+
+        let reverted_tempo_advanced = abi::IZoneInbox::TempoAdvanced {
+            tempoBlockHash: B256::repeat_byte(0x31),
+            tempoBlockNumber: 31,
+            depositsProcessed: U256::ZERO,
+            newProcessedDepositQueueHash: B256::repeat_byte(0x32),
+            lastProcessedDepositNumber: 31,
+        };
+        let tempo_advanced = abi::IZoneInbox::TempoAdvanced {
+            tempoBlockHash: B256::repeat_byte(0x41),
+            tempoBlockNumber: 41,
+            depositsProcessed: U256::ZERO,
+            newProcessedDepositQueueHash: B256::repeat_byte(0x42),
+            lastProcessedDepositNumber: 41,
+        };
+        let reverted_withdrawal = abi::IZoneOutbox::WithdrawalRequested {
+            withdrawalIndex: 0,
+            sender: Address::repeat_byte(0x51),
+            token: Address::repeat_byte(0x52),
+            to: Address::repeat_byte(0x53),
+            amount: 1,
+            fee: 0,
+            memo: B256::ZERO,
+            gasLimit: 0,
+            fallbackNonce: 1,
+            data: Bytes::new(),
+            revealTo: Bytes::new(),
+        };
+        let reverted_boundary = abi::IZoneOutbox::BatchFinalized {
+            withdrawalQueueHash: B256::repeat_byte(0x61),
+            withdrawalBatchIndex: 60,
+        };
+        let boundary = abi::IZoneOutbox::BatchFinalized {
+            withdrawalQueueHash: B256::ZERO,
+            withdrawalBatchIndex: 61,
+        };
+        let finalize_input = abi::IZoneOutbox::finalizeWithdrawalBatchCall {
+            count: U256::ZERO,
+            blockNumber: block_number,
+            encryptedSenders: Vec::new(),
+        }
+        .abi_encode()
+        .into();
+
+        let transactions = vec![
+            transaction(inbox_address, Bytes::from_static(b"reverted-tempo")),
+            transaction(inbox_address, Bytes::from_static(b"tempo")),
+            transaction(outbox_address, Bytes::from_static(b"reverted-withdrawal")),
+            transaction(outbox_address, Bytes::from_static(b"reverted-boundary")),
+            transaction(outbox_address, finalize_input),
+        ];
+        let receipts = vec![
+            receipt(
+                false,
+                inbox_address,
+                reverted_tempo_advanced.encode_log_data(),
+            ),
+            receipt(true, inbox_address, tempo_advanced.encode_log_data()),
+            receipt(false, outbox_address, reverted_withdrawal.encode_log_data()),
+            receipt(false, outbox_address, reverted_boundary.encode_log_data()),
+            receipt(true, outbox_address, boundary.encode_log_data()),
+        ];
+
+        let mut header = TempoHeader::default();
+        header.inner.number = block_number;
+        let block_hash = B256::repeat_byte(0x71);
+        provider.add_block(
+            block_hash,
+            Block {
+                header,
+                body: alloy_consensus::BlockBody {
+                    transactions,
+                    ..Default::default()
+                },
+            },
+        );
+        provider.add_receipts(block_number, receipts);
+
+        let snapshot = read_zone_block_snapshot(&provider, inbox_address, block_number).unwrap();
+        assert_eq!(snapshot.tempo_block_number, tempo_advanced.tempoBlockNumber);
+        assert_eq!(
+            snapshot.processed_deposit_hash,
+            tempo_advanced.newProcessedDepositQueueHash
+        );
+        assert_eq!(
+            snapshot.processed_deposit_number,
+            tempo_advanced.lastProcessedDepositNumber
+        );
+
+        let boundaries =
+            fetch_finalized_batch_boundaries(&provider, outbox_address, block_number, block_number)
+                .await
+                .unwrap();
+        assert_eq!(boundaries.len(), 1);
+        assert_eq!(
+            boundaries[0].withdrawal_batch_index,
+            boundary.withdrawalBatchIndex
+        );
+
+        let finalized = fetch_finalized_batch(&provider, outbox_address, &boundaries[0])
+            .await
+            .unwrap();
+        assert!(finalized.withdrawals.is_empty());
+
+        let restored = fetch_slot_withdrawals(&provider, outbox_address, block_number)
+            .await
+            .unwrap();
+        assert!(restored.is_empty());
     }
 
     fn abi_word(value: impl SolValue) -> Bytes {

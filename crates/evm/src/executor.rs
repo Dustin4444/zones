@@ -240,6 +240,7 @@ where
             .inner
             .receipts()
             .iter()
+            .filter(|receipt| receipt.status())
             .flat_map(|receipt| receipt.logs())
             .any(|log| {
                 log.address == ZONE_OUTBOX_ADDRESS
@@ -522,6 +523,41 @@ mod tests {
             "zone block with withdrawal requests is missing its finalizeWithdrawalBatch system \
              transaction"
         );
+    }
+
+    #[test]
+    fn reverted_withdrawal_requests_do_not_require_same_block_finalization() {
+        let mut zone_genesis = DEV.genesis().clone();
+        zone_genesis.config.chain_id = zone_chain_id(DEV.chain().id(), 2).unwrap();
+        let chain_spec = std::sync::Arc::new(ZoneChainSpec::from_genesis(zone_genesis).unwrap());
+        let factory =
+            ZoneEvmFactory::new(chain_spec.clone(), MockL1Reader::default(), Address::ZERO);
+        let evm = factory.create_evm(CacheDB::new(EmptyDB::default()), EvmEnv::default());
+        let ctx = TempoBlockExecutionCtx {
+            inner: EthBlockExecutionCtx {
+                parent_hash: B256::ZERO,
+                parent_beacon_block_root: None,
+                ommers: &[],
+                withdrawals: None,
+                extra_data: Bytes::new(),
+                tx_count_hint: Some(1),
+                slot_number: None,
+            },
+            general_gas_limit: 0,
+            shared_gas_limit: 0,
+            validator_set: None,
+            consensus_context: None,
+            subblock_fee_recipients: Default::default(),
+        };
+        let mut executor = ZoneBlockExecutor::new(evm, ctx, &chain_spec);
+        executor.phase = ZoneBlockPhase::Executing;
+        let mut receipt = withdrawal_requested_receipt(ZONE_OUTBOX_ADDRESS);
+        receipt.success = false;
+        executor.inner.receipts.push(receipt);
+
+        executor
+            .finish()
+            .expect("reverted withdrawal request must not require finalization");
     }
 
     #[test]
