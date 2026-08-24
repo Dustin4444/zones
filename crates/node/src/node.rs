@@ -678,10 +678,6 @@ where
             .get()
             .saturating_mul(1024 * 1024) as usize;
         let provider = ctx.node.provider().clone();
-        let zone_provider = provider.clone();
-        let pool = ctx.node.pool().clone();
-        let engine_handle = ctx.beacon_engine_handle.clone();
-        let payload_builder = ctx.node.payload_builder_handle().clone();
         let operator_rpc_slot = sequencer_rpc_slot.clone();
         let operator_rpc_provider = provider.clone();
         let operator_zone_api = OperatorZoneApi::new(
@@ -695,7 +691,7 @@ where
         let evm_chain_spec = ctx.node.evm_config().chain_spec().clone();
         let handle = self
             .inner
-            .launch_add_ons_with(ctx, move |container| {
+            .launch_add_ons_with(ctx.clone(), move |container| {
                 container.modules.add_or_replace_if_module_configured(
                     reth_rpc_builder::RethRpcModule::Web3,
                     OperatorWeb3Api.into_rpc(),
@@ -739,92 +735,17 @@ where
         )
         .await?;
 
-        if let Some(P2PRuntime {
-            sinks,
-            commands,
-            backfill_commands,
-            attestation,
-            schedule,
-            local_ed25519_public_key,
-            role_status,
-            peer_tips,
-            backfill_requests_rx,
-        }) = p2p_runtime
-        {
-            // Backfill serving is role-neutral: every role serves the same canonical
-            // provider, so the server outlives role generations and a leadership handoff
-            // can never drop an accepted request.
-            task_executor.spawn_critical_task(
-                "zone-backfill-server",
-                serve_backfill_requests(
-                    provider.clone(),
-                    backfill_commands.clone(),
-                    backfill_requests_rx,
-                ),
-            );
-            let sequencer = match self.sequencer_config.take() {
-                Some(config) => Some(Self::build_leader_sequencer_deps(
-                    config,
-                    self.l1_config.l1_rpc_url.clone(),
-                    self.l1_config.portal_address,
-                    self.l1_config.retry_connection_interval,
-                    attestation.store.clone(),
-                    prover_config.clone(),
-                )?),
-                None => None,
-            };
-            let context = RoleControllerContext {
-                local_ed25519_public_key,
-                schedule,
-                provider: provider.clone(),
-                pool,
-                engine_handle,
-                payload_builder,
-                chain_spec: provider.chain_spec(),
-                deposit_queue: self.deposit_queue.clone(),
-                l1_block_tracker: self.l1_config.block_tracker.clone(),
-                // Follower-only nodes have no private keys and never construct an engine.
-                encryption_keys: self.l1_config.encryption_keys.clone().unwrap_or_default(),
-                commands,
-                backfill_commands,
-                attestation,
-                portal_address: self.portal_address,
-                sequencer,
-                peer_tips,
-                status: role_status,
-            };
-            task_executor
-                .spawn_critical_task("zone-role-controller", run_role_controller(context, sinks));
-
-            // Flush unpersisted blocks on shutdown.
-            let engine_shutdown = handle.engine_shutdown.clone();
-            task_executor.spawn_critical_with_graceful_shutdown_signal(
-                "zone-engine-shutdown",
-                |shutdown| async move {
-                    let _guard = shutdown.await;
-                    info!(target: "reth::cli", "Shutdown signal received — flushing engine state");
-                    if let Some(done) = engine_shutdown.shutdown() {
-                        let _ = done.await;
-                    }
-                },
-            );
-        } else if let Some(config) = self.sequencer_config.take() {
-            let sequencer_addr = config.sequencer_signer.address();
-
-            Self::launch_sequencer_tasks(
-                config,
-                &handle,
-                zone_provider,
-                &task_executor,
-                self.l1_config.l1_rpc_url,
-                self.l1_config.portal_address,
-                self.l1_config.retry_connection_interval,
-                sequencer_addr,
-                None,
-                prover_config,
-            )
-            .await?;
-        }
+        Self::start_sequencing(
+            &ctx,
+            &handle,
+            p2p_runtime,
+            prover_config,
+            &mut self.sequencer_config,
+            &self.l1_config,
+            &self.deposit_queue,
+            self.portal_address,
+        )
+        .await?;
 
         Ok(handle)
     }
@@ -1058,6 +979,112 @@ where
             >,
         >,
 {
+    async fn start_sequencing(
+        ctx: &AddOnsContext<'_, N>,
+        handle: &<Self as NodeAddOns<N>>::Handle,
+        p2p_runtime: Option<P2PRuntime>,
+        prover_config: Option<ShadowProverConfig>,
+        sequencer_config: &mut Option<ZoneSequencerAddOnsConfig>,
+        l1_config: &L1SubscriberConfig,
+        deposit_queue: &DepositQueue,
+        portal_address: Address,
+    ) -> eyre::Result<()> {
+        let provider = ctx.node.provider().clone();
+        let pool = ctx.node.pool().clone();
+        let engine_handle = ctx.beacon_engine_handle.clone();
+        let payload_builder = ctx.node.payload_builder_handle().clone();
+        let task_executor = ctx.node.task_executor().clone();
+
+        if let Some(P2PRuntime {
+            sinks,
+            commands,
+            backfill_commands,
+            attestation,
+            schedule,
+            local_ed25519_public_key,
+            role_status,
+            peer_tips,
+            backfill_requests_rx,
+        }) = p2p_runtime
+        {
+            // Backfill serving is role-neutral: every role serves the same canonical
+            // provider, so the server outlives role generations and a leadership handoff
+            // can never drop an accepted request.
+            task_executor.spawn_critical_task(
+                "zone-backfill-server",
+                serve_backfill_requests(
+                    provider.clone(),
+                    backfill_commands.clone(),
+                    backfill_requests_rx,
+                ),
+            );
+            let sequencer = match sequencer_config.take() {
+                Some(config) => Some(Self::build_leader_sequencer_deps(
+                    config,
+                    l1_config.l1_rpc_url.clone(),
+                    l1_config.portal_address,
+                    l1_config.retry_connection_interval,
+                    attestation.store.clone(),
+                    prover_config.clone(),
+                )?),
+                None => None,
+            };
+            let context = RoleControllerContext {
+                local_ed25519_public_key,
+                schedule,
+                provider: provider.clone(),
+                pool,
+                engine_handle,
+                payload_builder,
+                chain_spec: provider.chain_spec(),
+                deposit_queue: deposit_queue.clone(),
+                l1_block_tracker: l1_config.block_tracker.clone(),
+                // Follower-only nodes have no private keys and never construct an engine.
+                encryption_keys: l1_config.encryption_keys.clone().unwrap_or_default(),
+                commands,
+                backfill_commands,
+                attestation,
+                portal_address,
+                sequencer,
+                peer_tips,
+                status: role_status,
+            };
+            task_executor
+                .spawn_critical_task("zone-role-controller", run_role_controller(context, sinks));
+
+            // Flush unpersisted blocks on shutdown.
+            let engine_shutdown = handle.engine_shutdown.clone();
+            task_executor.spawn_critical_with_graceful_shutdown_signal(
+                "zone-engine-shutdown",
+                |shutdown| async move {
+                    let _guard = shutdown.await;
+                    info!(target: "reth::cli", "Shutdown signal received — flushing engine state");
+                    if let Some(done) = engine_shutdown.shutdown() {
+                        let _ = done.await;
+                    }
+                },
+            );
+        } else if let Some(config) = sequencer_config.take() {
+            let sequencer_addr = config.sequencer_signer.address();
+
+            Self::launch_sequencer_tasks(
+                config,
+                handle,
+                provider,
+                &task_executor,
+                l1_config.l1_rpc_url.clone(),
+                l1_config.portal_address,
+                l1_config.retry_connection_interval,
+                sequencer_addr,
+                None,
+                prover_config,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn start_p2p(
         config: P2pConfig,
         l1_provider: &DynProvider<TempoNetwork>,
