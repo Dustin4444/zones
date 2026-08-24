@@ -23,7 +23,7 @@ use alloy_chains::Chain;
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, U256};
-use alloy_provider::Provider as _;
+use alloy_provider::{DynProvider, Provider as _};
 use alloy_signer_local::PrivateKeySigner;
 use k256::SecretKey;
 use reth_chainspec::EthChainSpec;
@@ -51,11 +51,16 @@ use reth_rpc_eth_api::EthApiTypes;
 use reth_storage_api::{
     BlockNumReader, EmptyBodyStorage, HeaderProvider, StateProvider, StateProviderFactory,
 };
+use reth_tasks::TaskExecutor;
 use reth_transaction_pool::{
     Pool, PoolTransaction, TransactionValidationTaskExecutor, blobstore::InMemoryBlobStore,
     error::InvalidPoolTransactionError,
 };
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU32,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tempo_alloy::TempoNetwork;
 use tempo_evm::{TempoInvalidTransaction, consensus::TempoConsensus};
 use tempo_node::{
@@ -519,6 +524,7 @@ where
             "no Zone chain advancement mechanism configured: enable a sequencer, configure P2P, or register an external deposit consumer"
         );
 
+        // FIXME: this entire thing feels like noise
         let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
@@ -569,6 +575,7 @@ where
             validate_zone_chain_id(l1_chain_id, portal_zone_id, chain_id)?;
         }
 
+        // NOTE: jtcn 4: explain this pls
         self.resolve_and_seed_tokens(&l1_provider, tempo_block_number)
             .await?;
         if let Some(keys) = self.l1_config.encryption_keys.clone() {
@@ -1055,7 +1062,7 @@ where
 {
     async fn start_p2p(
         config: P2pConfig,
-        l1_provider: &alloy_provider::DynProvider<TempoNetwork>,
+        l1_provider: &DynProvider<TempoNetwork>,
         l1_chain_id: u64,
         genesis_zone_id: u32,
         portal_address: Address,
@@ -1063,8 +1070,8 @@ where
         l1_rpc_url: String,
         retry_connection_interval: Duration,
         encryption_keys: EncryptionKeyRing,
-        task_executor: &reth_tasks::TaskExecutor,
-        sequencer_rpc_slot: &Arc<std::sync::OnceLock<SequencerRpcContext>>,
+        task_executor: &TaskExecutor,
+        sequencer_rpc_slot: &Arc<OnceLock<SequencerRpcContext>>,
     ) -> eyre::Result<P2PRuntime> {
         let network_id = P2pNetworkId::new(l1_chain_id, portal_address);
         let attestation_domain = AttestationDomain {
