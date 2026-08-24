@@ -8,6 +8,7 @@ mod tests;
 
 use std::{fs, path::Path, sync::Arc};
 
+use alloy_primitives::Bytes;
 use reth_db::{
     Database, DatabaseEnv, DatabaseEnvKind,
     cursor::DbCursorRO,
@@ -143,7 +144,7 @@ impl Store {
             status: Status::Verifying,
         };
         let tx = store.db.tx_mut()?;
-        tx.put::<Meta>(MetaKey::Version, MetaValue::Version(SCHEMA_VERSION))?;
+        write_schema_version(&tx, SCHEMA_VERSION)?;
         write_metadata(&tx, &metadata)?;
         for (key, value) in checkpoint.state.accounts() {
             tx.put::<Accounts>(key, AccountValue(value))?;
@@ -178,14 +179,7 @@ impl Store {
     /// Load the active row state directly without replaying retained deltas.
     pub(crate) fn load(&self) -> Result<Snapshot, PersistenceError> {
         let tx = self.db.tx()?;
-        let version = match tx.get::<Meta>(MetaKey::Version)? {
-            Some(MetaValue::Version(version)) => version,
-            _ => {
-                return Err(PersistenceError::Invalid(
-                    "schema version is missing".into(),
-                ));
-            }
-        };
+        let version = read_schema_version(&tx)?;
         if version != SCHEMA_VERSION {
             return Err(PersistenceError::Schema {
                 expected: SCHEMA_VERSION,
@@ -329,8 +323,21 @@ impl Store {
     }
 }
 
+fn read_schema_version<T: DbTx>(tx: &T) -> Result<u32, PersistenceError> {
+    match read_meta_value(tx, MetaKey::Version)? {
+        Some(MetaValue::Version(version)) => Ok(version),
+        _ => Err(PersistenceError::Invalid(
+            "schema version is missing".into(),
+        )),
+    }
+}
+
+fn write_schema_version<T: DbTxMut>(tx: &T, version: u32) -> Result<(), PersistenceError> {
+    write_meta_value(tx, MetaKey::Version, &MetaValue::Version(version))
+}
+
 fn read_metadata<T: DbTx>(tx: &T) -> Result<Metadata, PersistenceError> {
-    match tx.get::<Meta>(MetaKey::Metadata)? {
+    match read_meta_value(tx, MetaKey::Metadata)? {
         Some(MetaValue::Metadata(metadata)) => Ok(*metadata),
         _ => Err(PersistenceError::Invalid("metadata is missing".into())),
     }
@@ -338,8 +345,27 @@ fn read_metadata<T: DbTx>(tx: &T) -> Result<Metadata, PersistenceError> {
 
 fn write_metadata<T: DbTxMut>(tx: &T, metadata: &Metadata) -> Result<(), PersistenceError> {
     let value = MetaValue::Metadata(Box::new(metadata.clone()));
-    codec::validate(&value).map_err(PersistenceError::Invalid)?;
-    tx.put::<Meta>(MetaKey::Metadata, value)?;
+    write_meta_value(tx, MetaKey::Metadata, &value)?;
+    Ok(())
+}
+
+fn read_meta_value<T: DbTx>(tx: &T, key: MetaKey) -> Result<Option<MetaValue>, PersistenceError> {
+    tx.get::<Meta>(key)?
+        .map(|value| {
+            codec::decode(&value).map_err(|error| PersistenceError::Invalid(error.to_string()))
+        })
+        .transpose()
+}
+
+fn write_meta_value<T: DbTxMut>(
+    tx: &T,
+    key: MetaKey,
+    value: &MetaValue,
+) -> Result<(), PersistenceError> {
+    let encoded = codec::encode(value)
+        .map(Bytes::from)
+        .map_err(|error| PersistenceError::Invalid(error.to_string()))?;
+    tx.put::<Meta>(key, encoded)?;
     Ok(())
 }
 

@@ -14,21 +14,13 @@ fn options() -> impl bincode::Options {
         .with_limit(MAX_VALUE_SIZE - 1)
 }
 
-/// Validate a dynamic value before passing it to MDBX's infallible codec interface.
-pub(super) fn validate<T: Serialize>(value: &T) -> Result<(), String> {
-    options()
-        .serialized_size(value)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     let mut encoded = vec![VERSION];
     options().serialize_into(&mut encoded, value).map_err(map)?;
     Ok(encoded)
 }
 
-fn decode<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, CodecError> {
+pub(super) fn decode<T: DeserializeOwned>(encoded: &[u8]) -> Result<T, CodecError> {
     let (&version, value) = encoded.split_first().ok_or(CodecError::Empty)?;
     if version != VERSION {
         return Err(CodecError::Version(version));
@@ -64,11 +56,11 @@ macro_rules! values {
     )+};
 }
 
-values!(super::schema::MetaValue, super::schema::TokenValue);
+values!(super::schema::TokenValue);
 
 /// Invalid durable value envelope.
 #[derive(Debug, thiserror::Error)]
-enum CodecError {
+pub(super) enum CodecError {
     #[error("empty persistence value")]
     Empty,
     #[error("unsupported persistence value version {0}")]

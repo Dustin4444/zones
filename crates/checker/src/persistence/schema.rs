@@ -1,6 +1,6 @@
 //! MDBX tables and fixed-width checker keys.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use reth_codecs::{Compress, Decompress, DecompressError};
 use reth_db::{
     DatabaseError, TableSet,
@@ -40,7 +40,7 @@ impl Decode for MetaKey {
     }
 }
 
-/// Versioned payload stored under a `MetaKey`.
+/// Versioned payload encoded under a [`MetaKey`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MetaValue {
     Version(u32),
@@ -121,7 +121,7 @@ macro_rules! table {
     };
 }
 
-table!(Meta, MetaKey, MetaValue, "CheckerMeta");
+table!(Meta, MetaKey, Bytes, "CheckerMeta");
 table!(Accounts, AccountKey, AccountValue, "CheckerAccounts");
 table!(Tokens, Address, TokenValue, "CheckerTokens");
 

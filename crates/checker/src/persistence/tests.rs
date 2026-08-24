@@ -127,6 +127,32 @@ fn finding_survives_restart_and_clears_on_reset() {
 }
 
 #[test]
+fn oversized_finding_is_rejected_without_panicking() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("checker");
+    let genesis = block(0, 10);
+    let checkpoint = Checkpoint {
+        identity: identity(),
+        zone: genesis,
+        tempo: block(20, 20),
+        state: Default::default(),
+    };
+    Store::create_atomic(&path, &checkpoint).unwrap();
+    let (store, snapshot) = Store::open(&path, identity()).unwrap();
+
+    let result = store.record_finding(
+        &snapshot,
+        Finding {
+            zone: block(1, 11),
+            summary: "x".repeat(16 * 1024 * 1024),
+        },
+    );
+
+    assert!(matches!(result, Err(PersistenceError::Invalid(_))));
+    assert_eq!(store.load().unwrap(), snapshot);
+}
+
+#[test]
 fn apply_rejects_stale_candidate_parent() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("checker");
