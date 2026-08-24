@@ -279,15 +279,27 @@ mod tests {
     };
 
     use alloy_consensus::{Header, Signed, TxLegacy};
-    use alloy_evm::{EvmEnv, EvmFactory, block::BlockExecutor, eth::EthBlockExecutionCtx};
+    use alloy_evm::{
+        Evm, EvmEnv, EvmFactory,
+        block::BlockExecutor,
+        eth::{
+            EthBlockExecutionCtx,
+            receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
+        },
+    };
     use alloy_primitives::{Address, B256, Bytes, Log, Signature, U256, keccak256};
     use alloy_rlp::Encodable as _;
     use alloy_sol_types::{SolCall, SolEvent};
     use reth_chainspec::EthChainSpec as _;
     use reth_primitives_traits::Recovered;
-    use revm::database::{CacheDB, EmptyDB};
+    use revm::{
+        bytecode::Bytecode,
+        context::result::ResultAndState,
+        database::{CacheDB, EmptyDB},
+        state::AccountInfo,
+    };
     use tempo_chainspec::spec::DEV;
-    use tempo_evm::TempoBlockExecutionCtx;
+    use tempo_evm::{TempoBlockExecutionCtx, TempoReceiptBuilder};
     use tempo_precompiles::{
         DEFAULT_FEE_TOKEN, TIP_FEE_MANAGER_ADDRESS,
         storage::{ContractStorage, Handler, StorageCtx, hashmap::HashMapStorageProvider},
@@ -364,6 +376,49 @@ mod tests {
                 data: event.encode_log_data(),
             }],
         }
+    }
+
+    fn emit_log_then_revert_bytecode(log: &Log) -> Bytes {
+        let data = &log.data.data;
+        let data_len = u16::try_from(data.len()).unwrap();
+        let [data_len_hi, data_len_lo] = data_len.to_be_bytes();
+
+        // Copy the ABI-encoded event data appended to this bytecode into memory.
+        let mut code = vec![
+            0x61,
+            data_len_hi,
+            data_len_lo, // PUSH2 data length
+            0x61,
+            0,
+            0, // PUSH2 data offset (filled below)
+            0x60,
+            0,    // PUSH1 memory offset
+            0x39, // CODECOPY
+        ];
+
+        for topic in log.topics().iter().rev() {
+            code.push(0x7f); // PUSH32
+            code.extend_from_slice(topic.as_slice());
+        }
+        code.extend_from_slice(&[
+            0x61,
+            data_len_hi,
+            data_len_lo, // PUSH2 data length
+            0x60,
+            0,                               // PUSH1 memory offset
+            0xa0 + log.topics().len() as u8, // LOGn
+            0x60,
+            0, // PUSH1 revert data length
+            0x60,
+            0,    // PUSH1 revert data offset
+            0xfd, // REVERT
+        ]);
+
+        let [data_offset_hi, data_offset_lo] = u16::try_from(code.len()).unwrap().to_be_bytes();
+        code[4] = data_offset_hi;
+        code[5] = data_offset_lo;
+        code.extend_from_slice(data);
+        code.into()
     }
 
     fn ordinary_tx(to: Address, input: Bytes) -> TempoTxEnvelope {
@@ -558,6 +613,43 @@ mod tests {
         executor
             .finish()
             .expect("reverted withdrawal request must not require finalization");
+    }
+
+    #[test]
+    fn reverted_execution_discards_withdrawal_requested_log() {
+        let emitter = Address::repeat_byte(0x44);
+        let expected_log = withdrawal_requested_receipt(emitter).logs.remove(0);
+        let code = emit_log_then_revert_bytecode(&expected_log);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            emitter,
+            AccountInfo {
+                code_hash: keccak256(&code),
+                code: Some(Bytecode::new_raw(code)),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut zone_genesis = DEV.genesis().clone();
+        zone_genesis.config.chain_id = zone_chain_id(DEV.chain().id(), 2).unwrap();
+        let chain_spec = std::sync::Arc::new(ZoneChainSpec::from_genesis(zone_genesis).unwrap());
+        let factory = ZoneEvmFactory::new(chain_spec, MockL1Reader::default(), Address::ZERO);
+        let mut evm = factory.create_evm(db, EvmEnv::default());
+        let ResultAndState { result, state } = evm
+            .transact_system_call(Address::repeat_byte(0x55), emitter, Bytes::new())
+            .expect("reverting transaction should execute");
+
+        let receipt = TempoReceiptBuilder::default().build_receipt(ReceiptBuilderCtx {
+            tx_type: TempoTxType::Legacy,
+            evm: &evm,
+            result,
+            state: &state,
+            cumulative_gas_used: 0,
+        });
+
+        assert!(!receipt.success);
+        assert!(receipt.logs.is_empty());
     }
 
     #[test]
