@@ -321,7 +321,7 @@ send-withdrawal amount="1000000" to="" token="0x20C00000000000000000000000000000
     L2_OUTPUT=$(cast send "$OUTBOX" \
         "requestWithdrawal(address,address,uint128,bytes32,uint64,address,bytes,bytes)" \
         "{{token}}" "$TO" "{{amount}}" "{{memo}}" "{{gas-limit}}" "$FALLBACK" "{{data}}" "{{reveal-to}}" \
-        --rpc-url "{{rpc}}" --private-key "$PK" --json)
+        --rpc-url "{{rpc}}" --private-key "$PK" --gas-limit 10000000 --json)
     L2_STATUS=$(echo "$L2_OUTPUT" | jq -r '.status')
     if [[ "$L2_STATUS" != "0x1" ]]; then
         echo "Withdrawal request failed on L2." >&2
