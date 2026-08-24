@@ -150,7 +150,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
             node = node.with_deposit_decryption_keys(additional_decryption_keys);
         }
 
-        node = configure_sequencer(&args, zone_id, node).await?;
+        node = configure_sequencing(&args, zone_id, node).await?;
 
         let handle = builder.node(node).launch_with_debug_capabilities().await?;
         handle.wait_for_node_exit().await
@@ -158,7 +158,7 @@ fn run_node(mut cli: Cli<ZoneChainSpecParser, ZoneArgs>) -> eyre::Result<()> {
 }
 
 /// Load and attach all sequencer resources to the node.
-async fn configure_sequencer(
+async fn configure_sequencing(
     args: &ZoneArgs,
     zone_id: u32,
     mut node: ZoneNode,
