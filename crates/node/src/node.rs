@@ -497,6 +497,7 @@ where
         Identity,
     > as NodeAddOns<N>>::Handle;
 
+    // NOTE: jtcn 5: start addons for L1 syncing, P2P networking, and sequencing/withdrawal tasks.
     async fn launch_add_ons(mut self, ctx: AddOnsContext<'_, N>) -> eyre::Result<Self::Handle> {
         eyre::ensure!(
             self.sequencer_config.is_some()
@@ -505,6 +506,8 @@ where
             "no Zone chain advancement mechanism configured: enable a sequencer, configure P2P, or register an external deposit consumer"
         );
 
+        // NOTE: jtcn 6: Connect to L1 and read the chain details needed to check that this node
+        // is connected to the right Zone.
         let tempo_block_number = ctx.node.provider().latest()?.tempo_block_number()?;
         let l1_provider = alloy_provider::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_with_config(
@@ -562,6 +565,7 @@ where
                 .await?;
         }
 
+        // NOTE: jtcn 7: In P2P mode, first load who leads each block, then start the network.
         // Multi-sequencer mode: bootstrap the leadership schedule from the portal
         // snapshot at the local Tempo anchor, and install the transition sink before
         // the subscriber starts so no block is ever consumed ahead of its
@@ -611,6 +615,7 @@ where
             }));
         }
 
+        // NOTE: jtcn 8: Start the L1 subscriber so new deposits and L1 updates reach the Zone.
         L1Subscriber::spawn(
             self.l1_config.clone(),
             ctx.node.provider().clone(),
@@ -620,6 +625,7 @@ where
         info!(target: "reth::cli", "L1 subscriber started with deposit enqueueing");
 
         let task_executor = ctx.node.task_executor().clone();
+        // NOTE: jtcn 9: Start P2P networking so nodes can share blocks and coordinate leadership.
         // Start the Commonware network and the long-lived event router
         let sequencer_rpc_slot = Arc::new(std::sync::OnceLock::new());
         let mut p2p_runtime = None;
@@ -724,6 +730,7 @@ where
             ));
         } else if let Some(ref config) = self.sequencer_config {
             // Legacy single-sequencer mode keeps the static engine.
+            // TODO: jtcn: This old single-sequencer path should go once every node uses P2P mode.
             let sequencer_addr = config.sequencer_signer.address();
             self.spawn_zone_engine(&ctx, sequencer_addr)?;
         }
@@ -751,6 +758,7 @@ where
         );
         let portal_address = self.portal_address;
         let evm_chain_spec = ctx.node.evm_config().chain_spec().clone();
+        // NOTE: jtcn 10: Start the normal RPC server, then add the Zone-specific RPC methods.
         let handle = self
             .inner
             .launch_add_ons_with(ctx, move |container| {
@@ -785,6 +793,7 @@ where
                 prover_address: config.prover_address.clone(),
             });
 
+        // NOTE: jtcn 11: Start the restricted RPC server
         Self::launch_redacted_rpc(
             self.redacted_rpc_config,
             &handle,
@@ -820,6 +829,8 @@ where
                     backfill_requests_rx,
                 ),
             );
+            // NOTE: jtcn 12: Start a task that watches the leadership schedule, switches this
+            // node between leader and follower mode, and starts or stops block production.
             let sequencer = match self.sequencer_config.take() {
                 Some(config) => Some(Self::build_leader_sequencer_deps(
                     config,
@@ -869,6 +880,8 @@ where
         } else if let Some(config) = self.sequencer_config.take() {
             let sequencer_addr = config.sequencer_signer.address();
 
+            // NOTE: jtcn 13: Start the background workers that submit Zone batches to L1, process
+            // withdrawals on L1, and shut down cleanly.
             Self::launch_sequencer_tasks(
                 config,
                 &handle,
@@ -1430,7 +1443,7 @@ where
         let l1_transaction_signer = config
             .l1_transaction_signer
             .unwrap_or(config.sequencer_signer);
-        // Legacy single-sequencer mode: the tasks run for the process lifetime.
+        // These tasks run for the process lifetime.
         let seq_handle = spawn_zone_sequencer(
             sequencer_config,
             l1_transaction_signer,

@@ -1,0 +1,28 @@
+# Copy this file to the node's config directory and replace the fake keys and addresses.
+# The same manifest is shared by every P2P node in this Zone.
+
+leader_ed25519_public_key = "0x1111111111111111111111111111111111111111111111111111111111111111"
+
+[[nodes]]
+name = "leader"
+ed25519_public_key = "0x1111111111111111111111111111111111111111111111111111111111111111"
+secp256k1_address = "0x1111111111111111111111111111111111111111"
+address = "leader.zone.internal:9200"
+
+[[nodes]]
+name = "follower-a"
+ed25519_public_key = "0x2222222222222222222222222222222222222222222222222222222222222222"
+secp256k1_address = "0x2222222222222222222222222222222222222222"
+address = "follower-a.zone.internal:9200"
+
+[[nodes]]
+name = "follower-b"
+ed25519_public_key = "0x3333333333333333333333333333333333333333333333333333333333333333"
+secp256k1_address = "0x3333333333333333333333333333333333333333"
+address = "follower-b.zone.internal:9200"
+
+[[nodes]]
+name = "operator-rpc"
+ed25519_public_key = "0x4444444444444444444444444444444444444444444444444444444444444444"
+address = "operator-rpc.zone.internal:9200"
+rpc_only = true

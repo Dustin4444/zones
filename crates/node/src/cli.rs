@@ -173,6 +173,7 @@ async fn configure_sequencing(
     mut node: ZoneNode,
 ) -> eyre::Result<ZoneNode> {
     let p2p_config =
+        // NOTE: jtcn 4: example of sequencer manifest in `crates/p2p/example-manifest.toml
         args.sequencer_manifest
             .as_ref()
             .map(|manifest_path| {
