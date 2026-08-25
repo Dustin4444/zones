@@ -83,13 +83,15 @@ impl P2pChaosNetwork {
     ) -> eyre::Result<(Self, [[SocketAddr; 3]; 3])> {
         let mut manifest_addresses = [node_addresses; 3];
         let mut links = Vec::with_capacity(6);
-        for from in 0..3 {
-            for to in 0..3 {
+        for (from, manifest_row) in manifest_addresses.iter_mut().enumerate() {
+            for (to, (manifest_address, &node_address)) in
+                manifest_row.iter_mut().zip(&node_addresses).enumerate()
+            {
                 if from == to {
                     continue;
                 }
-                let proxy = TcpChaosProxy::start(node_addresses[to]).await?;
-                manifest_addresses[from][to] = proxy.listen_addr();
+                let proxy = TcpChaosProxy::start(node_address).await?;
+                *manifest_address = proxy.listen_addr();
                 links.push(DirectedP2pProxy { from, to, proxy });
             }
         }
